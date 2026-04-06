@@ -41,6 +41,10 @@ pub mod platform;
 pub mod drive;
 pub mod identity;
 pub mod speed;
+pub mod udf;
+pub mod mpls;
+pub mod clpi;
+pub mod disc;
 
 pub use error::{Error, Result};
 pub use drive::DriveSession;
@@ -49,3 +53,4 @@ pub use profile::{DriveProfile, Chipset};
 pub use platform::{Platform, DriveStatus};
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
+pub use disc::{Title, Clip, Extent};

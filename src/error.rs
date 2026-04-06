@@ -43,6 +43,9 @@ pub enum Error {
 
     // 5xxx — I/O errors
     IoError { source: std::io::Error },
+
+    // 6xxx — Disc format errors
+    DiscError { detail: String },
 }
 
 impl Error {
@@ -61,6 +64,7 @@ impl Error {
             Error::ScsiError { .. }         => 4000,
             Error::ScsiTimeout { .. }       => 4001,
             Error::IoError { .. }           => 5000,
+            Error::DiscError { .. }         => 6000,
         }
     }
 }
@@ -87,6 +91,7 @@ impl std::fmt::Display for Error {
                 write!(f, "E4000: SCSI 0x{opcode:02x} failed: status=0x{status:02x} sense=0x{sense_key:02x}"),
             Error::ScsiTimeout { opcode } => write!(f, "E4001: SCSI 0x{opcode:02x} timeout"),
             Error::IoError { source } => write!(f, "E5000: {source}"),
+            Error::DiscError { detail } => write!(f, "E6000: disc: {detail}"),
         }
     }
 }

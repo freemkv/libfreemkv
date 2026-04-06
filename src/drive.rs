@@ -128,4 +128,24 @@ impl DriveSession {
     pub fn probe(&mut self, sub_cmd: u8, address: u32, length: u32) -> Result<Vec<u8>> {
         self.platform.probe(self.scsi.as_mut(), sub_cmd, address, length)
     }
+
+    /// Standard READ(10) — reads unencrypted sectors (UDF filesystem, etc).
+    /// Does not require unlock. Use read_sectors() for raw/encrypted content.
+    pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+        let cdb = [
+            0x28, 0x00, // READ(10), no flags
+            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+            0x00,
+            (count >> 8) as u8, count as u8,
+            0x00,
+        ];
+        let result = self.scsi.as_mut().execute(
+            &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)?;
+        Ok(result.bytes_transferred)
+    }
+
+    /// Send a raw SCSI CDB. Used by UDF reader and disc structure parsers.
+    pub fn scsi_execute(&mut self, cdb: &[u8], direction: crate::scsi::DataDirection, buf: &mut [u8], timeout_ms: u32) -> Result<crate::scsi::ScsiResult> {
+        self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+    }
 }
