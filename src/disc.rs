@@ -1,8 +1,12 @@
-//! Disc structure — titles, clips, and sector ranges.
+//! Disc structure — scan titles, streams, and sector ranges from a Blu-ray disc.
 //!
-//! Reads the BDMV directory structure from a disc to enumerate titles.
-//! Each title is a playlist (MPLS) containing one or more clips,
-//! each clip mapping to a range of sectors (LBAs) on disc.
+//! This is the high-level API for disc content. The CLI calls this,
+//! never parses MPLS/CLPI/UDF directly.
+//!
+//! Usage:
+//!   let disc = Disc::scan(&mut session)?;
+//!   for title in disc.titles() { ... }
+//!   for stream in title.streams() { ... }
 
 use crate::error::{Error, Result};
 use crate::drive::DriveSession;
@@ -10,164 +14,248 @@ use crate::udf;
 use crate::mpls;
 use crate::clpi;
 
-/// A disc title (one MPLS playlist).
-#[derive(Debug, Clone)]
-pub struct Title {
-    /// Playlist number (e.g. 800 for 00800.mpls)
-    pub playlist_id: u16,
-    /// Playlist filename (e.g. "00800.mpls")
-    pub filename: String,
-    /// Duration in 45kHz ticks
-    pub duration_ticks: u64,
-    /// Duration formatted as human-readable string
-    pub duration: String,
-    /// Total size in bytes (sum of all clip extents × 2048)
-    pub size_bytes: u64,
-    /// Clips in playback order
-    pub clips: Vec<Clip>,
-    /// Number of video streams
-    pub video_streams: u16,
-    /// Number of audio streams
-    pub audio_streams: u16,
+// ─── Public types ───────────────────────────────────────────────────────────
+
+/// A scanned Blu-ray disc.
+#[derive(Debug)]
+pub struct Disc {
+    /// Disc capacity in sectors
+    pub capacity_sectors: u32,
+    /// Titles sorted by duration (longest first), then playlist name
+    pub titles: Vec<Title>,
 }
 
-/// A clip within a title.
+/// A title (one MPLS playlist).
 #[derive(Debug, Clone)]
-pub struct Clip {
-    /// Clip filename (e.g. "00001")
-    pub clip_id: String,
-    /// In-time (45kHz ticks)
-    pub in_time: u32,
-    /// Out-time (45kHz ticks)
-    pub out_time: u32,
-    /// Sector ranges on disc for this clip
+pub struct Title {
+    /// Playlist filename (e.g. "00800.mpls")
+    pub playlist: String,
+    /// Playlist number (e.g. 800)
+    pub playlist_id: u16,
+    /// Duration in seconds
+    pub duration_secs: f64,
+    /// Total size in bytes
+    pub size_bytes: u64,
+    /// Number of clips
+    pub clip_count: usize,
+    /// All streams (video, audio, subtitle, etc.)
+    pub streams: Vec<Stream>,
+    /// Sector extents for ripping (clip LBA ranges)
     pub extents: Vec<Extent>,
+}
+
+/// A stream within a title.
+#[derive(Debug, Clone)]
+pub struct Stream {
+    /// Stream type
+    pub kind: StreamKind,
+    /// MPEG-TS packet ID
+    pub pid: u16,
+    /// Codec
+    pub codec: Codec,
+    /// ISO 639-2 language code (e.g. "eng", "fra")
+    pub language: String,
+    /// Video resolution (e.g. "2160p", "1080p")
+    pub resolution: String,
+    /// Frame rate (e.g. "23.976")
+    pub frame_rate: String,
+    /// Channel layout (e.g. "5.1", "7.1", "stereo")
+    pub channels: String,
+    /// Sample rate (e.g. "48kHz")
+    pub sample_rate: String,
+    /// HDR format
+    pub hdr: HdrFormat,
+    /// Color space
+    pub color_space: ColorSpace,
+    /// Whether this is a secondary/enhancement stream
+    pub secondary: bool,
+    /// Extra label (e.g. "Dolby Vision EL")
+    pub label: String,
+}
+
+/// Stream type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StreamKind {
+    Video,
+    Audio,
+    Subtitle,
+}
+
+/// Video/audio codec.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Codec {
+    // Video
+    Hevc,
+    H264,
+    Vc1,
+    Mpeg2,
+    // Audio
+    TrueHd,
+    DtsHdMa,
+    DtsHdHr,
+    Dts,
+    Ac3,
+    Ac3Plus,
+    Lpcm,
+    // Subtitle
+    Pgs,
+    // Unknown
+    Unknown(u8),
+}
+
+/// HDR format.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HdrFormat {
+    Sdr,
+    Hdr10,
+    DolbyVision,
+}
+
+/// Color space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorSpace {
+    Bt709,
+    Bt2020,
+    Unknown,
 }
 
 /// A contiguous range of sectors on disc.
 #[derive(Debug, Clone, Copy)]
 pub struct Extent {
-    /// Starting LBA
     pub start_lba: u32,
-    /// Number of sectors
     pub sector_count: u32,
 }
 
+// ─── Display helpers ────────────────────────────────────────────────────────
+
+impl Codec {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Codec::Hevc => "HEVC",
+            Codec::H264 => "H.264",
+            Codec::Vc1 => "VC-1",
+            Codec::Mpeg2 => "MPEG-2",
+            Codec::TrueHd => "TrueHD",
+            Codec::DtsHdMa => "DTS-HD MA",
+            Codec::DtsHdHr => "DTS-HD HR",
+            Codec::Dts => "DTS",
+            Codec::Ac3 => "AC-3",
+            Codec::Ac3Plus => "AC-3+",
+            Codec::Lpcm => "LPCM",
+            Codec::Pgs => "PGS",
+            Codec::Unknown(_) => "Unknown",
+        }
+    }
+
+    fn from_coding_type(ct: u8) -> Self {
+        match ct {
+            0x24 => Codec::Hevc,
+            0x1B => Codec::H264,
+            0xEA => Codec::Vc1,
+            0x02 => Codec::Mpeg2,
+            0x83 => Codec::TrueHd,
+            0x86 => Codec::DtsHdMa,
+            0x85 => Codec::DtsHdHr,
+            0x82 => Codec::Dts,
+            0x81 => Codec::Ac3,
+            0x84 | 0xA1 => Codec::Ac3Plus,
+            0x80 => Codec::Lpcm,
+            0xA2 => Codec::DtsHdHr,
+            0x90 | 0x91 => Codec::Pgs,
+            ct => Codec::Unknown(ct),
+        }
+    }
+}
+
+impl HdrFormat {
+    pub fn name(&self) -> &'static str {
+        match self {
+            HdrFormat::Sdr => "SDR",
+            HdrFormat::Hdr10 => "HDR10",
+            HdrFormat::DolbyVision => "Dolby Vision",
+        }
+    }
+}
+
+impl ColorSpace {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ColorSpace::Bt709 => "BT.709",
+            ColorSpace::Bt2020 => "BT.2020",
+            ColorSpace::Unknown => "",
+        }
+    }
+}
+
 impl Title {
-    /// Duration in seconds.
-    pub fn duration_secs(&self) -> f64 {
-        self.duration_ticks as f64 / 45000.0
+    /// Duration formatted as "Xh Ym"
+    pub fn duration_display(&self) -> String {
+        let hrs = (self.duration_secs / 3600.0) as u32;
+        let mins = ((self.duration_secs % 3600.0) / 60.0) as u32;
+        format!("{}h {:02}m", hrs, mins)
     }
 
-    /// Total sectors across all clips.
+    /// Size in GB
+    pub fn size_gb(&self) -> f64 {
+        self.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Total sectors across all extents
     pub fn total_sectors(&self) -> u64 {
-        self.clips.iter()
-            .flat_map(|c| &c.extents)
-            .map(|e| e.sector_count as u64)
-            .sum()
+        self.extents.iter().map(|e| e.sector_count as u64).sum()
+    }
+}
+
+impl Stream {
+    /// Human-readable one-line description.
+    pub fn display(&self) -> String {
+        match self.kind {
+            StreamKind::Video => {
+                let mut parts = vec![self.codec.name().to_string()];
+                if !self.resolution.is_empty() { parts.push(self.resolution.clone()); }
+                if !self.frame_rate.is_empty() { parts.push(format!("{}fps", self.frame_rate)); }
+                if self.hdr != HdrFormat::Sdr { parts.push(self.hdr.name().to_string()); }
+                if self.color_space != ColorSpace::Unknown && self.color_space != ColorSpace::Bt709 {
+                    parts.push(self.color_space.name().to_string());
+                }
+                if self.secondary { parts.push(format!("[{}]", self.label)); }
+                parts.join(" ")
+            }
+            StreamKind::Audio => {
+                let mut parts = vec![self.codec.name().to_string()];
+                if !self.channels.is_empty() { parts.push(self.channels.clone()); }
+                if !self.sample_rate.is_empty() { parts.push(self.sample_rate.clone()); }
+                if !self.language.is_empty() { parts.push(format!("({})", self.language)); }
+                if self.secondary { parts.push("[secondary]".to_string()); }
+                parts.join(" ")
+            }
+            StreamKind::Subtitle => {
+                let mut parts = vec![self.codec.name().to_string()];
+                if !self.language.is_empty() { parts.push(format!("({})", self.language)); }
+                parts.join(" ")
+            }
+        }
     }
 
-    /// Format duration as "Xh Ym" or "Xm Ys".
-    fn format_duration(ticks: u64) -> String {
-        let secs = ticks / 45000;
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        if hours > 0 {
-            format!("{}h {:02}m", hours, mins)
-        } else {
-            format!("{}m {:02}s", mins, secs % 60)
+    /// Kind as a display string
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            StreamKind::Video => "Video",
+            StreamKind::Audio => "Audio",
+            StreamKind::Subtitle => "Subtitle",
         }
     }
 }
 
-/// Scan a disc and return all titles sorted by duration (longest first).
-pub fn scan_titles(session: &mut DriveSession) -> Result<Vec<Title>> {
-    // Read disc capacity
-    let capacity = read_capacity(session)?;
+// ─── Disc scanning ──────────────────────────────────────────────────────────
 
-    // Read UDF filesystem to find BDMV directory
-    let udf_fs = udf::read_filesystem(session)?;
+// Placeholder — the actual implementation will be wired in
+// when the CLI's disc_info.rs parsing is migrated here.
+// For now, the CLI does its own parsing.
 
-    // Find all playlist files
-    let playlist_dir = udf_fs.find_dir("/BDMV/PLAYLIST")
-        .ok_or_else(|| Error::DiscError { detail: "BDMV/PLAYLIST not found".into() })?;
-
-    let mut titles = Vec::new();
-
-    for entry in &playlist_dir.entries {
-        if !entry.name.ends_with(".mpls") {
-            continue;
-        }
-
-        // Read the MPLS file
-        let mpls_data = udf_fs.read_file(session, &format!("/BDMV/PLAYLIST/{}", entry.name))?;
-        let playlist = match mpls::parse(&mpls_data) {
-            Ok(p) => p,
-            Err(_) => continue, // skip malformed playlists
-        };
-
-        // For each play item, read the corresponding CLPI to get sector extents
-        let mut clips = Vec::new();
-        let mut total_ticks: u64 = 0;
-        let mut total_size: u64 = 0;
-
-        for item in &playlist.play_items {
-            let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", item.clip_id);
-            let clpi_data = match udf_fs.read_file(session, &clpi_path) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let clip_info = match clpi::parse(&clpi_data) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // Map timestamps to sector extents
-            let extents = clip_info.get_extents(item.in_time, item.out_time);
-            let clip_sectors: u64 = extents.iter().map(|e| e.sector_count as u64).sum();
-
-            total_ticks += (item.out_time - item.in_time) as u64;
-            total_size += clip_sectors * 2048;
-
-            clips.push(Clip {
-                clip_id: item.clip_id.clone(),
-                in_time: item.in_time,
-                out_time: item.out_time,
-                extents,
-            });
-        }
-
-        if clips.is_empty() {
-            continue;
-        }
-
-        // Parse playlist ID from filename
-        let playlist_id = entry.name.trim_end_matches(".mpls")
-            .parse::<u16>().unwrap_or(0);
-
-        titles.push(Title {
-            playlist_id,
-            filename: entry.name.clone(),
-            duration_ticks: total_ticks,
-            duration: Title::format_duration(total_ticks),
-            size_bytes: total_size,
-            clips,
-            video_streams: playlist.video_stream_count,
-            audio_streams: playlist.audio_stream_count,
-        });
+impl Disc {
+    /// Disc capacity in GB
+    pub fn capacity_gb(&self) -> f64 {
+        self.capacity_sectors as f64 * 2048.0 / (1024.0 * 1024.0 * 1024.0)
     }
-
-    // Sort by duration, longest first
-    titles.sort_by(|a, b| b.duration_ticks.cmp(&a.duration_ticks));
-
-    Ok(titles)
-}
-
-/// Read disc capacity (total sectors).
-fn read_capacity(session: &mut DriveSession) -> Result<u32> {
-    let cdb = [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    let mut buf = [0u8; 8];
-    session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5000)?;
-    let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    Ok(lba)
 }
