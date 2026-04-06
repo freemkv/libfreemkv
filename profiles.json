@@ -26,6 +26,19 @@
     ]
   },
   {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS48 ",
+    "product_revision": "1.03",
+    "vendor_specific": "N0A02A0",
+    "firmware_date": "211312061510",
+    "program": "mt1959_b",
+    "signature": "d72d585d",
+    "register_offsets": [
+      "10bc44",
+      "11be98"
+    ]
+  },
+  {
     "vendor_id": "ASUS",
     "product_id": "BW-16D1X-U      ",
     "product_revision": "A104",
@@ -145,6 +158,32 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  WH16NS48 ",
+    "product_revision": "1.D3",
+    "vendor_specific": "N000700",
+    "firmware_date": "211602041103",
+    "program": "mt1959_b",
+    "signature": "de6a2a98",
+    "register_offsets": [
+      "10ae9d",
+      "1198ad"
+    ]
+  },
+  {
+    "vendor_id": "ASUS",
+    "product_id": "BW-12B1ST   a   ",
+    "product_revision": "1.00",
+    "vendor_specific": "E101701",
+    "firmware_date": "211304231147",
+    "program": "mt1959_b",
+    "signature": "dee7a3e6",
+    "register_offsets": [
+      "10ba1f",
+      "11ea75"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BDDVDRW CU20N   ",
     "product_revision": "1.00",
     "vendor_specific": "N003203",
@@ -197,6 +236,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00200",
+    "firmware_date": "211711231626",
+    "program": "mt1959_a",
+    "signature": "e202fe45",
+    "register_offsets": [
+      "1092c4",
+      "1140e8"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  WH16NS40 ",
     "product_revision": "1.02",
     "vendor_specific": "N0C00C0",
@@ -223,6 +275,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH40N    ",
+    "product_revision": "AS00",
+    "vendor_specific": "U101901",
+    "firmware_date": "211304242023",
+    "program": "mt1959_b",
+    "signature": "9ce0f7db",
+    "register_offsets": [
+      "106d23",
+      "117fc9"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  BH16NS55 ",
     "product_revision": "1.04",
     "vendor_specific": "NM01701",
@@ -232,6 +297,32 @@
     "register_offsets": [
       "10c12c",
       "110419"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE16NU50 ",
+    "product_revision": "1.02",
+    "vendor_specific": "NM00500",
+    "firmware_date": "211711201953",
+    "program": "mt1959_a",
+    "signature": "484ecc29",
+    "register_offsets": [
+      "10e201",
+      "1185e5"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS48 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N1A29A2",
+    "firmware_date": "211210311913",
+    "program": "mt1959_b",
+    "signature": "51333090",
+    "register_offsets": [
+      "10c5c3",
+      "11273b"
     ]
   },
   {
@@ -301,6 +392,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS58 ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00500",
+    "firmware_date": "211711161545",
+    "program": "mt1959_a",
+    "signature": "162e352d",
+    "register_offsets": [
+      "10aadc",
+      "11e3a3"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  BH16NS48 ",
     "product_revision": "1.00",
     "vendor_specific": "N1A29A2",
@@ -353,6 +457,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS50 ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00000",
+    "firmware_date": "211711281847",
+    "program": "mt1959_a",
+    "signature": "303d33ad",
+    "register_offsets": [
+      "104e08",
+      "1135f9"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  BH16NS55 ",
     "product_revision": "1.01",
     "vendor_specific": "N000500",
@@ -375,6 +492,32 @@
     "register_offsets": [
       "103686",
       "1132ff"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE16NU50 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N001101",
+    "firmware_date": "211703130907",
+    "program": "mt1959_b",
+    "signature": "39caf17f",
+    "register_offsets": [
+      "10fb22",
+      "1149d1"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS48 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N1A12A1",
+    "firmware_date": "211304042319",
+    "program": "mt1959_b",
+    "signature": "73dfcdbc",
+    "register_offsets": [
+      "104695",
+      "11767c"
     ]
   },
   {
@@ -405,6 +548,32 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.00",
+    "vendor_specific": "N002802",
+    "firmware_date": "211702151823",
+    "program": "mt1959_b",
+    "signature": "0c9f6bda",
+    "register_offsets": [
+      "104b51",
+      "11689a"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BDRW   BU20N    ",
+    "product_revision": "BW20",
+    "vendor_specific": "P018518",
+    "firmware_date": "211504221413",
+    "program": "mt1959_b",
+    "signature": "9533d97a",
+    "register_offsets": [
+      "1075d4",
+      "11d078"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU40N     ",
     "product_revision": "BU10",
     "vendor_specific": "O003703",
@@ -414,6 +583,58 @@
     "register_offsets": [
       "1061f6",
       "11e1fb"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH40N    ",
+    "product_revision": "A102",
+    "vendor_specific": "D0A22A2",
+    "firmware_date": "211303262335",
+    "program": "mt1959_b",
+    "signature": "933c4913",
+    "register_offsets": [
+      "10dbcb",
+      "11b232"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS60 ",
+    "product_revision": "1.00",
+    "vendor_specific": "NM00500",
+    "firmware_date": "211804030945",
+    "program": "mt1959_a",
+    "signature": "73fc400f",
+    "register_offsets": [
+      "10c7b4",
+      "11e0bb"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS50 ",
+    "product_revision": "1.03",
+    "vendor_specific": "NM00400",
+    "firmware_date": "212004211008",
+    "program": "mt1959_a",
+    "signature": "1228f716",
+    "register_offsets": [
+      "109837",
+      "110f99"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS48 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N1A12A1",
+    "firmware_date": "211304042252",
+    "program": "mt1959_b",
+    "signature": "605f8b6c",
+    "register_offsets": [
+      "102b1a",
+      "111151"
     ]
   },
   {
@@ -453,6 +674,19 @@
     "register_offsets": [
       "101918",
       "11be36"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE14NU40 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N0G43G4",
+    "firmware_date": "211206262029",
+    "program": "mt1959_b",
+    "signature": "7570c9dd",
+    "register_offsets": [
+      "10e7c3",
+      "1193c9"
     ]
   },
   {
@@ -522,6 +756,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS50 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N000500",
+    "firmware_date": "211512230930",
+    "program": "mt1959_b",
+    "signature": "32c935fd",
+    "register_offsets": [
+      "1089fb",
+      "117131"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU50N     ",
     "product_revision": "AS00",
     "vendor_specific": "U008408",
@@ -575,6 +822,19 @@
   {
     "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.00",
+    "vendor_specific": "N002802",
+    "firmware_date": "211702151828",
+    "program": "mt1959_b",
+    "signature": "280a561a",
+    "register_offsets": [
+      "10615d",
+      "11dfda"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
     "product_revision": "1.01",
     "vendor_specific": "NM00200",
     "firmware_date": "211711231550",
@@ -600,6 +860,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.00",
+    "vendor_specific": "N000800",
+    "firmware_date": "211701031453",
+    "program": "mt1959_b",
+    "signature": "42571175",
+    "register_offsets": [
+      "10724a",
+      "113c00"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BDDVDRW UH12NS40",
     "product_revision": "1.00",
     "vendor_specific": "N000200",
@@ -609,6 +882,32 @@
     "register_offsets": [
       "10df48",
       "11d920"
+    ]
+  },
+  {
+    "vendor_id": "ASUS",
+    "product_id": "BC-12B1ST   b   ",
+    "product_revision": "3.00",
+    "vendor_specific": "W004704",
+    "firmware_date": "211512151340",
+    "program": "mt1959_b",
+    "signature": "58913be6",
+    "register_offsets": [
+      "103a19",
+      "1154a1"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS48 ",
+    "product_revision": "1.02",
+    "vendor_specific": "N1A12A1",
+    "firmware_date": "211304042322",
+    "program": "mt1959_b",
+    "signature": "05ba1a5c",
+    "register_offsets": [
+      "10cb43",
+      "11d1eb"
     ]
   },
   {
@@ -652,6 +951,45 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS50 ",
+    "product_revision": "1.03",
+    "vendor_specific": "NM00400",
+    "firmware_date": "212004210958",
+    "program": "mt1959_a",
+    "signature": "9c63b66a",
+    "register_offsets": [
+      "100023",
+      "11b028"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BDRW   BU20N    ",
+    "product_revision": "BW20",
+    "vendor_specific": "P017417",
+    "firmware_date": "211412160945",
+    "program": "mt1959_b",
+    "signature": "4a40c940",
+    "register_offsets": [
+      "1059a9",
+      "118b40"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS58 ",
+    "product_revision": "1.02",
+    "vendor_specific": "NM01101",
+    "firmware_date": "211901041359",
+    "program": "mt1959_a",
+    "signature": "287d17cb",
+    "register_offsets": [
+      "1016e2",
+      "11010a"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  BH16NS55 ",
     "product_revision": "1.02",
     "vendor_specific": "N000200",
@@ -674,6 +1012,19 @@
     "register_offsets": [
       "10fe46",
       "11d6f4"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE14NU40 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N001601",
+    "firmware_date": "211406161935",
+    "program": "mt1959_b",
+    "signature": "2c46bb4f",
+    "register_offsets": [
+      "107c36",
+      "11ea7a"
     ]
   },
   {
@@ -756,6 +1107,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE BP55EB40  ",
+    "product_revision": "1.02",
+    "vendor_specific": "NM01801",
+    "firmware_date": "211905031515",
+    "program": "mt1959_a",
+    "signature": "4b293717",
+    "register_offsets": [
+      "10ffa2",
+      "11f52d"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BP60NB10  ",
     "product_revision": "1.01",
     "vendor_specific": "NM01801",
@@ -765,6 +1129,19 @@
     "register_offsets": [
       "100625",
       "113f94"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS48 ",
+    "product_revision": "1.02",
+    "vendor_specific": "N0A02A0",
+    "firmware_date": "211312061545",
+    "program": "mt1959_b",
+    "signature": "6ae778cf",
+    "register_offsets": [
+      "10afbf",
+      "11cc6a"
     ]
   },
   {
@@ -847,6 +1224,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS48 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N1A44A4",
+    "firmware_date": "211206161825",
+    "program": "mt1959_b",
+    "signature": "c6a85537",
+    "register_offsets": [
+      "106fa8",
+      "11431b"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BDDVDRW CH12NS40",
     "product_revision": "1.01",
     "vendor_specific": "NM00400",
@@ -869,6 +1259,19 @@
     "register_offsets": [
       "1004bb",
       "11da12"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE14NU40 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N003803",
+    "firmware_date": "211406251441",
+    "program": "mt1959_b",
+    "signature": "691bad00",
+    "register_offsets": [
+      "1021b2",
+      "112186"
     ]
   },
   {
@@ -921,6 +1324,19 @@
     "register_offsets": [
       "10ce97",
       "11f07f"
+    ]
+  },
+  {
+    "vendor_id": "ASUS",
+    "product_id": "BC-12B1ST   b   ",
+    "product_revision": "3.01",
+    "vendor_specific": "WM00900",
+    "firmware_date": "211711291725",
+    "program": "mt1959_a",
+    "signature": "71f4e446",
+    "register_offsets": [
+      "101a28",
+      "11fd05"
     ]
   },
   {
@@ -977,6 +1393,45 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE BP55EB40  ",
+    "product_revision": "1.00",
+    "vendor_specific": "N000700",
+    "firmware_date": "211701030941",
+    "program": "mt1959_b",
+    "signature": "d4a683a3",
+    "register_offsets": [
+      "10a8f1",
+      "11a8f4"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BD-RE  BH40N    ",
+    "product_revision": "B7C6",
+    "vendor_specific": "P0A12A1",
+    "firmware_date": "211303262313",
+    "program": "mt1959_b",
+    "signature": "2dbc2977",
+    "register_offsets": [
+      "101e5c",
+      "1105e9"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BDDVDRW CH30L   ",
+    "product_revision": "BC56",
+    "vendor_specific": "P0B00B0",
+    "firmware_date": "210000000000",
+    "program": "mt1959_b",
+    "signature": "88bf3b23",
+    "register_offsets": [
+      "10bf5e",
+      "11844d"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  WH14NS40 ",
     "product_revision": "1.00",
     "vendor_specific": "N1A26A2",
@@ -1003,6 +1458,58 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE BP60NB10  ",
+    "product_revision": "1.02",
+    "vendor_specific": "NM00300",
+    "firmware_date": "212107081556",
+    "program": "mt1959_a",
+    "signature": "d605ced2",
+    "register_offsets": [
+      "100693",
+      "11d267"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.03",
+    "vendor_specific": "NM00800",
+    "firmware_date": "212005070924",
+    "program": "mt1959_a",
+    "signature": "162aab78",
+    "register_offsets": [
+      "10706a",
+      "11c381"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE16NU50 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N000900",
+    "firmware_date": "211606090920",
+    "program": "mt1959_b",
+    "signature": "1eb8f8b8",
+    "register_offsets": [
+      "104c11",
+      "11ee01"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BD-RE BU20N     ",
+    "product_revision": "BU24",
+    "vendor_specific": "P005005",
+    "firmware_date": "211504221344",
+    "program": "mt1959_b",
+    "signature": "691017b3",
+    "register_offsets": [
+      "10e03d",
+      "113c4a"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE  WH16NS40 ",
     "product_revision": "1.00",
     "vendor_specific": "N001401",
@@ -1012,6 +1519,32 @@
     "register_offsets": [
       "102349",
       "113ced"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH40N    ",
+    "product_revision": "A1B0",
+    "vendor_specific": "D015815",
+    "firmware_date": "211703101705",
+    "program": "mt1959_b",
+    "signature": "7c23fb16",
+    "register_offsets": [
+      "10e509",
+      "118ef0"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS58 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N006206",
+    "firmware_date": "211512221501",
+    "program": "mt1959_b",
+    "signature": "5ecf3981",
+    "register_offsets": [
+      "101deb",
+      "119f66"
     ]
   },
   {
@@ -1055,6 +1588,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  WH16NS58 ",
+    "product_revision": "1.V5",
+    "vendor_specific": "NM00900",
+    "firmware_date": "211802070957",
+    "program": "mt1959_b",
+    "signature": "0e6593cd",
+    "register_offsets": [
+      "1034a2",
+      "11ec23"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE WP50NB40  ",
     "product_revision": "1.00",
     "vendor_specific": "N000400",
@@ -1064,6 +1610,19 @@
     "register_offsets": [
       "1045b4",
       "110d17"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS48 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N1A03A0",
+    "firmware_date": "210000000000",
+    "program": "mt1959_b",
+    "signature": "0705f3d9",
+    "register_offsets": [
+      "100af7",
+      "11187a"
     ]
   },
   {
@@ -1133,6 +1692,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.03",
+    "vendor_specific": "NM00800",
+    "firmware_date": "212005070929",
+    "program": "mt1959_a",
+    "signature": "61c9d90c",
+    "register_offsets": [
+      "1076c4",
+      "11a1d2"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU20N     ",
     "product_revision": "EB02",
     "vendor_specific": "C000400",
@@ -1159,6 +1731,58 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  WH16NS48 ",
+    "product_revision": "TSTQ",
+    "vendor_specific": "N000500",
+    "firmware_date": "211508121144",
+    "program": "mt1959_b",
+    "signature": "b7763fda",
+    "register_offsets": [
+      "10d7ac",
+      "11fd25"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS60 ",
+    "product_revision": "1.02",
+    "vendor_specific": "NM00600",
+    "firmware_date": "212005081014",
+    "program": "mt1959_a",
+    "signature": "d2a71293",
+    "register_offsets": [
+      "10f935",
+      "1179de"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE WP50NB40  ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00200",
+    "firmware_date": "211711231646",
+    "program": "mt1959_a",
+    "signature": "5722060d",
+    "register_offsets": [
+      "1051aa",
+      "119aba"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS58 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N004204",
+    "firmware_date": "211512221504",
+    "program": "mt1959_b",
+    "signature": "90e44e64",
+    "register_offsets": [
+      "10e9d8",
+      "11535b"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE WP50NB40  ",
     "product_revision": "1.00",
     "vendor_specific": "N002802",
@@ -1172,6 +1796,32 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS40 ",
+    "product_revision": "1.03",
+    "vendor_specific": "N0A09A0",
+    "firmware_date": "211405071012",
+    "program": "mt1959_b",
+    "signature": "95682a25",
+    "register_offsets": [
+      "10680f",
+      "11a501"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE16NU50 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N000800",
+    "firmware_date": "211603171336",
+    "program": "mt1959_b",
+    "signature": "d8053c3b",
+    "register_offsets": [
+      "10bfd7",
+      "117c87"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BDDVDRW CH12NS30",
     "product_revision": "1.01",
     "vendor_specific": "N0A02A0",
@@ -1181,6 +1831,32 @@
     "register_offsets": [
       "107849",
       "118c03"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE16NU50 ",
+    "product_revision": "1.04",
+    "vendor_specific": "NM00300",
+    "firmware_date": "212005081025",
+    "program": "mt1959_a",
+    "signature": "167bf138",
+    "register_offsets": [
+      "10239e",
+      "11402b"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BE14NU40 ",
+    "product_revision": "1.01",
+    "vendor_specific": "N005905",
+    "firmware_date": "211408221631",
+    "program": "mt1959_b",
+    "signature": "4172dace",
+    "register_offsets": [
+      "105cca",
+      "1179ac"
     ]
   },
   {
@@ -1233,6 +1909,19 @@
     "register_offsets": [
       "101391",
       "119b40"
+    ]
+  },
+  {
+    "vendor_id": "ASUS",
+    "product_id": "BC-12B1ST   b   ",
+    "product_revision": "3.11",
+    "vendor_specific": "WM00300",
+    "firmware_date": "211902271321",
+    "program": "mt1959_a",
+    "signature": "c462912f",
+    "register_offsets": [
+      "103f69",
+      "113cc3"
     ]
   },
   {
@@ -1302,6 +1991,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  WH16NS58 ",
+    "product_revision": "TST5",
+    "vendor_specific": "N000900",
+    "firmware_date": "211708221604",
+    "program": "mt1959_b",
+    "signature": "9a2c2f5f",
+    "register_offsets": [
+      "10defc",
+      "112f43"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU40N     ",
     "product_revision": "A101",
     "vendor_specific": "D000700",
@@ -1311,6 +2013,32 @@
     "register_offsets": [
       "10e1f1",
       "116aa6"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS50 ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00000",
+    "firmware_date": "211712071200",
+    "program": "mt1959_a",
+    "signature": "4bbfe231",
+    "register_offsets": [
+      "10f4a3",
+      "118723"
+    ]
+  },
+  {
+    "vendor_id": "hp",
+    "product_id": "BDDVDRW CU10N   ",
+    "product_revision": "B1C0",
+    "vendor_specific": "P015115",
+    "firmware_date": "211307031530",
+    "program": "mt1959_b",
+    "signature": "6bdf9727",
+    "register_offsets": [
+      "101818",
+      "112d5a"
     ]
   },
   {
@@ -1337,6 +2065,19 @@
     "register_offsets": [
       "10c079",
       "11e1d1"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS40 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N1A11A1",
+    "firmware_date": "211201171401",
+    "program": "mt1959_b",
+    "signature": "e1b22340",
+    "register_offsets": [
+      "109734",
+      "110d25"
     ]
   },
   {
@@ -1389,6 +2130,19 @@
     "register_offsets": [
       "10db35",
       "1143cc"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS48 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N1A44A4",
+    "firmware_date": "211206161823",
+    "program": "mt1959_b",
+    "signature": "eeef23fe",
+    "register_offsets": [
+      "1050b3",
+      "11b1c2"
     ]
   },
   {
@@ -1493,6 +2247,32 @@
     "register_offsets": [
       "108acd",
       "118eef"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS58 ",
+    "product_revision": "1.01",
+    "vendor_specific": "NM00500",
+    "firmware_date": "211711161557",
+    "program": "mt1959_a",
+    "signature": "1fc4cf4d",
+    "register_offsets": [
+      "10bf3e",
+      "1154f0"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS40 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N1A37A3",
+    "firmware_date": "211205021346",
+    "program": "mt1959_b",
+    "signature": "b1edf3c3",
+    "register_offsets": [
+      "10db82",
+      "115ce9"
     ]
   },
   {
@@ -1614,6 +2394,19 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS48 ",
+    "product_revision": "1.02",
+    "vendor_specific": "N0A02A0",
+    "firmware_date": "211312061453",
+    "program": "mt1959_b",
+    "signature": "907ced68",
+    "register_offsets": [
+      "106814",
+      "1177b4"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU20N     ",
     "product_revision": "1.00",
     "vendor_specific": "G004504",
@@ -1623,6 +2416,19 @@
     "register_offsets": [
       "10b69e",
       "112fef"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH14NS58 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N005405",
+    "firmware_date": "211703101612",
+    "program": "mt1959_b",
+    "signature": "9f3fa801",
+    "register_offsets": [
+      "100edc",
+      "11c4ef"
     ]
   },
   {
@@ -1731,6 +2537,32 @@
   },
   {
     "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH16NS58 ",
+    "product_revision": "1.00",
+    "vendor_specific": "N002302",
+    "firmware_date": "211512071657",
+    "program": "mt1959_b",
+    "signature": "88e15486",
+    "register_offsets": [
+      "104a89",
+      "112cd9"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE BU30N     ",
+    "product_revision": "0217",
+    "vendor_specific": "N000700",
+    "firmware_date": "211603081656",
+    "program": "mt1959_b",
+    "signature": "86980641",
+    "register_offsets": [
+      "107d6a",
+      "118ddf"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
     "product_id": "BD-RE BU40N     ",
     "product_revision": "BN11",
     "vendor_specific": "0M00300",
@@ -1779,6 +2611,19 @@
     "register_offsets": [
       "10dcce",
       "11d42d"
+    ]
+  },
+  {
+    "vendor_id": "HL-DT-ST",
+    "product_id": "BD-RE  BH40N    ",
+    "product_revision": "A1B0",
+    "vendor_specific": "D014214",
+    "firmware_date": "211510131446",
+    "program": "mt1959_b",
+    "signature": "3be14b28",
+    "register_offsets": [
+      "10a9d4",
+      "118fad"
     ]
   },
   {
