@@ -10,23 +10,12 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ## Install
 
-### As a library
-
 ```toml
 [dependencies]
 libfreemkv = "0.2"
 ```
 
-### Prebuilt binaries
-
-Download from [GitHub Releases](https://github.com/freemkv/libfreemkv/releases):
-
-| Platform | Architecture | Download |
-|----------|-------------|----------|
-| Linux | x86_64 | [freemkv-info](https://github.com/freemkv/libfreemkv/releases/latest) |
-| Linux | aarch64 | [freemkv-info](https://github.com/freemkv/libfreemkv/releases/latest) |
-
-## Usage
+## Quick Start
 
 ```rust
 use libfreemkv::DriveSession;
@@ -54,12 +43,11 @@ No fingerprints. No encrypted lookups. All identification uses standard SCSI fie
 ## API
 
 ```rust
-// Open and auto-identify
 let mut session = DriveSession::open(device_path)?;
 
 // Drive identity
-session.drive_id.vendor_id       // "HL-DT-ST"
-session.drive_id.product_id      // "BD-RE BU40N"
+session.drive_id.vendor_id        // "HL-DT-ST"
+session.drive_id.product_id       // "BD-RE BU40N"
 session.drive_id.product_revision // "1.03"
 session.drive_id.vendor_specific  // "NM00000"
 session.drive_id.firmware_date    // "211810241934"
@@ -71,12 +59,12 @@ session.profile.unlock_buf_id     // 0x44
 session.profile.signature         // [0x99, 0x9e, 0xc3, 0x75]
 
 // Operations
-session.unlock()?;                // activate raw mode
-session.calibrate()?;             // speed optimization
+session.unlock()?;
+session.calibrate()?;
 session.read_sectors(lba, count, &mut buf)?;
-session.status()?;                // feature flags
-session.read_config()?;           // drive configuration
-session.read_register(index)?;    // hardware registers
+session.status()?;
+session.read_config()?;
+session.read_register(index)?;
 ```
 
 ## Chipset Support
@@ -85,8 +73,6 @@ session.read_register(index)?;    // hardware registers
 |---------|--------|--------|--------|
 | MediaTek MT1959 | Supported | 206 | LG, ASUS, HP |
 | Renesas | Planned | -- | Pioneer |
-
-Each profile stores per-drive `unlock_mode` and `unlock_buf_id` — the exact CDB bytes for that drive's unlock command. A single `Mt1959` implementation handles all MediaTek variants.
 
 ## Drive Profile
 
@@ -109,35 +95,26 @@ Each bundled profile (compiled into the binary):
 
 ## Error Codes
 
-Structured errors for programmatic handling — no user-facing English text in the library.
-
 | Code | Error | Meaning |
 |------|-------|---------|
 | E1000 | DeviceNotFound | Device path doesn't exist |
 | E1001 | DevicePermission | No access (try sudo or cdrom group) |
 | E2000 | UnsupportedDrive | No matching profile |
-| E2001 | ProfileNotFound | Profile lookup failed |
 | E3000 | UnlockFailed | Unlock command rejected |
 | E3001 | SignatureMismatch | Response signature wrong |
 | E3002 | NotUnlocked | Operation requires unlock first |
 | E4000 | ScsiError | SCSI command failed |
 | E5000 | IoError | System I/O error |
 
-## Architecture
-
-```
-DriveSession
-├── ScsiTransport     SG_IO (Linux) / IOKit (macOS, planned)
-├── DriveProfile      per-drive parameters (bundled JSON, compiled in)
-├── DriveId           INQUIRY + GET_CONFIG 010C fields
-└── Platform
-    ├── Mt1959        MediaTek MT1959 (206 drives)
-    └── (Renesas)     Pioneer (planned)
-```
-
 ## Platform
 
-Linux only today (SG_IO ioctl). The `ScsiTransport` trait abstracts the platform — macOS IOKit and Windows SPTI backends are planned.
+| Platform | Status | Backend |
+|----------|--------|---------|
+| Linux | Supported | SG_IO ioctl |
+| macOS | Planned | IOKit |
+| Windows | Planned | SPTI |
+
+The `ScsiTransport` trait abstracts the platform. Adding a backend is one file behind a `cfg` gate.
 
 ## Contributing
 
