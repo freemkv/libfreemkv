@@ -42,7 +42,7 @@ fn main() {
         .unwrap_or("profiles");
 
     // Open SCSI transport
-    let mut transport = match libfreemkv::scsi::SgIoTransport::open(device) {
+    let mut transport = match libfreemkv::scsi::open(device) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Error: Cannot open {}: {}", device.display(), e);
@@ -51,7 +51,7 @@ fn main() {
     };
 
     // INQUIRY
-    let inquiry = match libfreemkv::scsi::inquiry(&mut transport) {
+    let inquiry = match libfreemkv::scsi::inquiry(transport.as_mut()) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("Error: INQUIRY failed: {}", e);
@@ -60,7 +60,7 @@ fn main() {
     };
 
     // GET CONFIGURATION feature 0x010C
-    let gc_010c = libfreemkv::scsi::get_config_010c(&mut transport).ok();
+    let gc_010c = libfreemkv::scsi::get_config_010c(transport.as_mut()).ok();
 
     if json_mode {
         print_json(&inquiry, &gc_010c);

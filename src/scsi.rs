@@ -1,4 +1,9 @@
-//! SCSI/MMC command interface via Linux SG_IO.
+//! SCSI/MMC command interface.
+//!
+//! Platform backends:
+//!   - Linux: SG_IO ioctl
+//!   - macOS: IOKit SCSI passthrough (planned)
+//!   - Windows: SPTI (planned)
 
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -17,7 +22,7 @@ pub struct ScsiResult {
     pub sense: [u8; 32],
 }
 
-/// Low-level SCSI transport.
+/// Low-level SCSI transport — implemented per platform.
 pub trait ScsiTransport {
     fn execute(
         &mut self,
@@ -28,17 +33,18 @@ pub trait ScsiTransport {
     ) -> Result<ScsiResult>;
 }
 
-/// Linux SG_IO transport.
-pub struct SgIoTransport {
-    fd: i32,
-}
+// ─── Linux: SG_IO ───────────────────────────────────────────────────────────
 
-// SG_IO constants
+#[cfg(target_os = "linux")]
 const SG_IO: libc::c_ulong = 0x2285;
+#[cfg(target_os = "linux")]
 const SG_DXFER_NONE: i32 = -1;
+#[cfg(target_os = "linux")]
 const SG_DXFER_TO_DEV: i32 = -2;
+#[cfg(target_os = "linux")]
 const SG_DXFER_FROM_DEV: i32 = -3;
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sg_io_hdr {
@@ -66,6 +72,12 @@ struct sg_io_hdr {
     info: u32,
 }
 
+#[cfg(target_os = "linux")]
+pub struct SgIoTransport {
+    fd: i32,
+}
+
+#[cfg(target_os = "linux")]
 impl SgIoTransport {
     pub fn open(device: &Path) -> Result<Self> {
         use std::os::unix::ffi::OsStrExt;
@@ -82,12 +94,14 @@ impl SgIoTransport {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for SgIoTransport {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd); }
     }
 }
 
+#[cfg(target_os = "linux")]
 impl ScsiTransport for SgIoTransport {
     fn execute(
         &mut self,
@@ -142,6 +156,31 @@ impl ScsiTransport for SgIoTransport {
     }
 }
 
+// ─── macOS: IOKit (planned) ─────────────────────────────────────────────────
+
+// TODO: IOKit MMC SCSI passthrough
+// Use IOSCSIPeripheralDeviceType05 (MMC device nub)
+// Send SCSITaskInterface commands via IOKit user client
+
+// ─── Windows: SPTI (planned) ────────────────────────────────────────────────
+
+// TODO: SCSI Pass Through Interface
+// Use CreateFile on \\.\CdRomN
+// Send IOCTL_SCSI_PASS_THROUGH_DIRECT
+
+// ─── Platform-agnostic open ─────────────────────────────────────────────────
+
+/// Open a SCSI transport for the given device path.
+pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
+    #[cfg(target_os = "linux")]
+    { Ok(Box::new(SgIoTransport::open(device)?)) }
+
+    #[cfg(not(target_os = "linux"))]
+    { Err(Error::DeviceNotFound { path: format!("{}: platform not yet supported (Linux only)", device.display()) }) }
+}
+
+// ─── CDB builders (platform-agnostic) ───────────────────────────────────────
+
 /// SCSI INQUIRY response.
 #[derive(Debug, Clone)]
 pub struct InquiryResult {
@@ -169,7 +208,7 @@ pub fn inquiry(scsi: &mut dyn ScsiTransport) -> Result<InquiryResult> {
     })
 }
 
-/// Send GET CONFIGURATION for feature 0x010C (drive serial number).
+/// Send GET CONFIGURATION for feature 0x010C (Firmware Information).
 pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
     let cdb = [0x46, 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00];
     let mut buf = [0u8; 16];
@@ -177,38 +216,31 @@ pub fn get_config_010c(scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
     Ok(buf.to_vec())
 }
 
-/// Build a READ BUFFER (0x3C) CDB with the given mode, buffer ID, offset, and length.
+/// Build a READ BUFFER (0x3C) CDB.
 pub fn build_read_buffer(mode: u8, buffer_id: u8, offset: u32, length: u32) -> [u8; 10] {
     [
-        0x3C,                              // READ BUFFER
-        mode,
-        buffer_id,
-        (offset >> 16) as u8,
-        (offset >> 8) as u8,
-        offset as u8,
-        (length >> 16) as u8,
-        (length >> 8) as u8,
-        length as u8,
+        0x3C, mode, buffer_id,
+        (offset >> 16) as u8, (offset >> 8) as u8, offset as u8,
+        (length >> 16) as u8, (length >> 8) as u8, length as u8,
         0x00,
     ]
 }
 
-/// Build a SET CD SPEED (0xBB) CDB with the given read speed.
+/// Build a SET CD SPEED (0xBB) CDB.
 pub fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
     [
         0xBB, 0x00,
         (read_speed >> 8) as u8, read_speed as u8,
-        0xFF, 0xFF, // write speed = max
+        0xFF, 0xFF,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]
 }
 
-/// Build a READ(10) CDB with the raw read flag (0x08) set.
+/// Build a READ(10) CDB with the raw read flag (0x08).
 pub fn build_read10_raw(lba: u32, count: u16) -> [u8; 10] {
     [
-        0x28, 0x08,                                  // READ(10), flag=0x08 (raw)
-        (lba >> 24) as u8, (lba >> 16) as u8,
-        (lba >> 8) as u8, lba as u8,
+        0x28, 0x08,
+        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
         0x00,
         (count >> 8) as u8, count as u8,
         0x00,

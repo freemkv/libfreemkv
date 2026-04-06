@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use crate::error::{Error, Result};
-use crate::scsi::{SgIoTransport, ScsiTransport};
+use crate::scsi::ScsiTransport;
 use crate::identity::DriveId;
 use crate::profile::{self, DriveProfile, Chipset};
 use crate::platform::{Platform, DriveStatus};
@@ -26,12 +26,12 @@ impl DriveSession {
     /// Open a drive, identify it, and find the matching profile.
     /// Uses the bundled profile database — no external files needed.
     pub fn open(device: &Path) -> Result<Self> {
-        let mut transport = SgIoTransport::open(device)?;
+        let mut transport = crate::scsi::open(device)?;
         let profiles = profile::load_bundled()?;
 
         // Identify drive via standard SCSI commands
         // SPC-4 §6.4 (INQUIRY) + MMC-6 §5.3.10 (Feature 010Ch)
-        let drive_id = DriveId::from_drive(&mut transport)?;
+        let drive_id = DriveId::from_drive(transport.as_mut())?;
 
         // Match drive to a profile by INQUIRY fields
         let profile = profile::find_by_drive_id(&profiles, &drive_id)
@@ -56,7 +56,7 @@ impl DriveSession {
         };
 
         Ok(DriveSession {
-            scsi: Box::new(transport),
+            scsi: transport,
             platform,
             profile,
             drive_id,
@@ -65,8 +65,8 @@ impl DriveSession {
 
     /// Open with an explicit profile (skip auto-detection).
     pub fn open_with_profile(device: &Path, profile: DriveProfile) -> Result<Self> {
-        let mut transport = SgIoTransport::open(device)?;
-        let drive_id = DriveId::from_drive(&mut transport)?;
+        let mut transport = crate::scsi::open(device)?;
+        let drive_id = DriveId::from_drive(transport.as_mut())?;
 
         let platform: Box<dyn Platform> = match profile.chipset {
             Chipset::MediaTek => {
@@ -82,7 +82,7 @@ impl DriveSession {
         };
 
         Ok(DriveSession {
-            scsi: Box::new(transport),
+            scsi: transport,
             platform,
             profile,
             drive_id,
