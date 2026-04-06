@@ -1,3 +1,7 @@
+[![Crates.io](https://img.shields.io/crates/v/libfreemkv)](https://crates.io/crates/libfreemkv)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![Drives: 206](https://img.shields.io/badge/drives-206-green)]()
+
 # libfreemkv
 
 Open source raw disc access library for UHD Blu-ray optical drives.
