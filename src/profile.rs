@@ -30,17 +30,18 @@ pub struct DriveProfile {
     #[serde(default)]
     pub firmware_date: String,
 
-    /// Chipset platform type determining the READ BUFFER variant.
+    /// Chipset manufacturer determining unlock/read command structure.
     #[serde(default)]
-    pub platform: PlatformType,
+    pub chipset: Chipset,
 
-    /// Whether this drive supports raw disc access mode.
-    #[serde(default)]
-    pub supported: bool,
+    /// READ BUFFER mode byte for unlock CDB (e.g. 0x01 for MT1959-A, 0x02 for MT1959-B).
+    #[serde(default = "default_unlock_mode")]
+    pub unlock_mode: u8,
 
-    /// Current readiness status of this drive.
-    #[serde(default)]
-    pub status: ReadinessStatus,
+    /// READ BUFFER buffer ID for unlock CDB (e.g. 0x44 for MT1959-A, 0x77 for MT1959-B).
+    #[serde(default = "default_unlock_buf_id")]
+    pub unlock_buf_id: u8,
+
 
     /// Drive identifier string from the profile database.
     #[serde(default)]
@@ -87,70 +88,39 @@ fn default_verify() -> [u8; 4] {
     *b"MMkv"
 }
 
-/// Chipset platform type. Determines the READ BUFFER mode and buffer ID.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-pub enum PlatformType {
-    /// MediaTek MT1959 variant A: mode=0x01, buffer_id=0x44.
-    #[serde(rename = "mt1959_a")]
-    Mt1959A,
-    /// MediaTek MT1959 variant B: mode=0x02, buffer_id=0x77.
-    #[serde(rename = "mt1959_b")]
-    Mt1959B,
-    /// Pioneer chipset (not yet implemented).
-    #[serde(rename = "pioneer")]
-    Pioneer,
+fn default_unlock_mode() -> u8 {
+    0x01
 }
 
-impl Default for PlatformType {
+fn default_unlock_buf_id() -> u8 {
+    0x44
+}
+
+/// Drive chipset — determines CDB structure for unlock and raw read commands.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub enum Chipset {
+    /// MediaTek MT1959 — LG, ASUS, hp drives.
+    /// CDB: READ_BUFFER with mode and buf_id from profile.
+    #[serde(rename = "mediatek")]
+    MediaTek,
+    /// Renesas RS8xxx/RS9xxx — Pioneer, some HL-DT-ST drives.
+    /// Not yet implemented.
+    #[serde(rename = "renesas")]
+    Renesas,
+}
+
+impl Default for Chipset {
     fn default() -> Self {
-        PlatformType::Mt1959A
+        Chipset::MediaTek
     }
 }
 
-/// Readiness status of a drive for raw disc access.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-pub enum ReadinessStatus {
-    /// Drive is ready — raw disc access can be enabled.
-    Ready,
-    /// Drive firmware needs an update before raw access is possible.
-    NeedsFirmwareUpdate,
-    /// Drive uses encrypted commands (not yet supported).
-    Encrypted,
-    /// Status unknown.
-    Unknown,
-}
-
-impl Default for ReadinessStatus {
-    fn default() -> Self {
-        ReadinessStatus::Unknown
-    }
-}
-
-impl PlatformType {
-    /// Human-readable name for this platform.
+impl Chipset {
+    /// Human-readable name for this chipset.
     pub fn name(&self) -> &'static str {
         match self {
-            PlatformType::Mt1959A => "MT1959-A",
-            PlatformType::Mt1959B => "MT1959-B",
-            PlatformType::Pioneer => "Pioneer",
-        }
-    }
-
-    /// READ BUFFER mode byte for this chipset platform.
-    pub fn mode(&self) -> u8 {
-        match self {
-            PlatformType::Mt1959A => 0x01,
-            PlatformType::Mt1959B => 0x02,
-            PlatformType::Pioneer => 0x01, // TBD
-        }
-    }
-
-    /// READ BUFFER buffer ID for this chipset platform.
-    pub fn buffer_id(&self) -> u8 {
-        match self {
-            PlatformType::Mt1959A => 0x44,
-            PlatformType::Mt1959B => 0x77,
-            PlatformType::Pioneer => 0x44, // TBD
+            Chipset::MediaTek => "MediaTek MT1959",
+            Chipset::Renesas => "Renesas",
         }
     }
 }
@@ -206,28 +176,19 @@ pub fn load_from_json(json: &serde_json::Value) -> Result<DriveProfile> {
     let revision = json["product_revision"].as_str().unwrap_or("").to_string();
     let firmware_type = json["vendor_specific"].as_str().unwrap_or("").to_string();
     let firmware_date = json["firmware_date"].as_str().unwrap_or("").to_string();
-    let program = json["program"].as_str().unwrap_or("unknown");
+    let chipset_str = json["chipset"].as_str().unwrap_or("unknown");
 
-    let platform = match program {
-        "mt1959_a" => PlatformType::Mt1959A,
-        "mt1959_b" => PlatformType::Mt1959B,
-        _ => PlatformType::Mt1959A, // default
+    let chipset = match chipset_str {
+        "mediatek" => Chipset::MediaTek,
+        "renesas" => Chipset::Renesas,
+        _ => Chipset::MediaTek,
     };
+
+    let unlock_mode = json["unlock_mode"].as_u64().map(|v| v as u8).unwrap_or(0x01);
+    let unlock_buf_id = json["unlock_buf_id"].as_u64().map(|v| v as u8).unwrap_or(0x44);
 
     let sig_str = json["signature"].as_str().unwrap_or("");
 
-    // Drive is supported if it has a known program and valid signature
-    let has_program = matches!(program, "mt1959_a" | "mt1959_b");
-    let has_signature = sig_str.len() == 8;
-    let supported = has_program && has_signature;
-
-    let status = if supported {
-        ReadinessStatus::Ready
-    } else if json["status"].as_str() == Some("needs_flash") || program == "none" {
-        ReadinessStatus::NeedsFirmwareUpdate
-    } else {
-        ReadinessStatus::Unknown
-    };
     let signature = if sig_str.len() == 8 {
         parse_hex4(sig_str)?
     } else {
@@ -260,9 +221,9 @@ pub fn load_from_json(json: &serde_json::Value) -> Result<DriveProfile> {
         product_revision: revision,
         vendor_specific: firmware_type,
         firmware_date,
-        platform,
-        supported,
-        status,
+        chipset,
+        unlock_mode,
+        unlock_buf_id,
         drive_id: json["drive_id"].as_str().unwrap_or("").to_string(),
         drive_version: json["drive_version"].as_str().unwrap_or("").to_string(),
         signature,
@@ -334,4 +295,34 @@ pub fn find_by_drive_id<'a>(
             && p.product_revision.trim() == r
             && p.vendor_specific.trim() == vs
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::DriveId;
+
+    fn make_drive_id(vendor: &str, rev: &str, vs: &str, date: &str) -> DriveId {
+        let mut inquiry = vec![0u8; 96];
+        inquiry[8..8+vendor.len().min(8)].copy_from_slice(&vendor.as_bytes()[..vendor.len().min(8)]);
+        inquiry[32..32+rev.len().min(4)].copy_from_slice(&rev.as_bytes()[..rev.len().min(4)]);
+        inquiry[36..36+vs.len().min(7)].copy_from_slice(&vs.as_bytes()[..vs.len().min(7)]);
+        DriveId::from_inquiry(&inquiry, date)
+    }
+
+    #[test]
+    fn test_find_known_drive() {
+        let profiles = load_bundled().unwrap();
+        let id = make_drive_id("HL-DT-ST", "1.03", "NM00000", "211810241934");
+        let p = find_by_drive_id(&profiles, &id).unwrap();
+        assert_eq!(p.vendor_id.trim(), "HL-DT-ST");
+        assert_eq!(p.vendor_specific.trim(), "NM00000");
+    }
+
+    #[test]
+    fn test_find_unknown_drive() {
+        let profiles = load_bundled().unwrap();
+        let id = make_drive_id("FAKE-VND", "9.99", "XX12345", "");
+        assert!(find_by_drive_id(&profiles, &id).is_none());
+    }
 }

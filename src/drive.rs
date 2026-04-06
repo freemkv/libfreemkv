@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::scsi::{SgIoTransport, ScsiTransport};
 use crate::identity::DriveId;
-use crate::profile::{self, DriveProfile, PlatformType};
+use crate::profile::{self, DriveProfile, Chipset};
 use crate::platform::{Platform, DriveStatus};
 use crate::platform::mt1959::Mt1959;
 
@@ -42,23 +42,15 @@ impl DriveSession {
                 product_revision: drive_id.product_revision.trim().to_string(),
             })?;
 
-        if !profile.supported {
-            return Err(Error::UnsupportedDrive {
-                vendor_id: drive_id.vendor_id.trim().to_string(),
-                product_id: drive_id.product_id.trim().to_string(),
-                product_revision: drive_id.product_revision.trim().to_string(),
-            });
-        }
-
-        let platform: Box<dyn Platform> = match profile.platform {
-            PlatformType::Mt1959A | PlatformType::Mt1959B => {
+        let platform: Box<dyn Platform> = match profile.chipset {
+            Chipset::MediaTek => {
                 Box::new(Mt1959::new(profile.clone()))
             }
-            PlatformType::Pioneer => {
+            Chipset::Renesas => {
                 return Err(Error::UnsupportedDrive {
                     vendor_id: drive_id.vendor_id.trim().to_string(),
                     product_id: drive_id.product_id.trim().to_string(),
-                    product_revision: "Pioneer not yet implemented".to_string(),
+                    product_revision: "Renesas not yet implemented".to_string(),
                 });
             }
         };
@@ -76,15 +68,15 @@ impl DriveSession {
         let mut transport = SgIoTransport::open(device)?;
         let drive_id = DriveId::from_drive(&mut transport)?;
 
-        let platform: Box<dyn Platform> = match profile.platform {
-            PlatformType::Mt1959A | PlatformType::Mt1959B => {
+        let platform: Box<dyn Platform> = match profile.chipset {
+            Chipset::MediaTek => {
                 Box::new(Mt1959::new(profile.clone()))
             }
-            PlatformType::Pioneer => {
+            Chipset::Renesas => {
                 return Err(Error::UnsupportedDrive {
                     vendor_id: drive_id.vendor_id.trim().to_string(),
                     product_id: drive_id.product_id.trim().to_string(),
-                    product_revision: "Pioneer not yet implemented".to_string(),
+                    product_revision: "Renesas not yet implemented".to_string(),
                 });
             }
         };

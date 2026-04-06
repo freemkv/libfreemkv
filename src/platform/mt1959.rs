@@ -25,8 +25,8 @@ pub struct Mt1959 {
 
 impl Mt1959 {
     pub fn new(profile: DriveProfile) -> Self {
-        let mode = profile.platform.mode();
-        let buffer_id = profile.platform.buffer_id();
+        let mode = profile.unlock_mode;
+        let buffer_id = profile.unlock_buf_id;
         Mt1959 {
             profile,
             mode,

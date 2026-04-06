@@ -34,7 +34,7 @@ fn main() {
     };
 
     println!("  Drive ID: {}", session.profile.drive_id);
-    println!("  Platform: {}", session.profile.platform.name());
+    println!("  Chipset:  {}", session.profile.chipset.name());
     println!();
 
     // Enable raw read mode

@@ -5,12 +5,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00100",
     "firmware_date": "211711202000",
-    "program": "mt1959_a",
     "signature": "00db13d6",
     "register_offsets": [
       "10e1ed",
       "118093"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -18,12 +20,14 @@
     "product_revision": "0420",
     "vendor_specific": "N000000",
     "firmware_date": "211605241901",
-    "program": "mt1959_b",
     "signature": "7730540d",
     "register_offsets": [
       "10300d",
       "11f664"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -31,12 +35,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061510",
-    "program": "mt1959_b",
     "signature": "d72d585d",
     "register_offsets": [
       "10bc44",
       "11be98"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -44,13 +50,15 @@
     "product_revision": "A104",
     "vendor_specific": "WM01001",
     "firmware_date": "211901041047",
-    "program": "mt1959_a",
     "signature": "f3643b82",
     "register_offsets": [
       "10f8c2",
       "112881",
       "9b44dc"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -58,12 +66,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304042250",
-    "program": "mt1959_b",
     "signature": "e59ccbda",
     "register_offsets": [
       "10e8e9",
       "11b929"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -71,12 +81,14 @@
     "product_revision": "AS00",
     "vendor_specific": "S002102",
     "firmware_date": "211306141459",
-    "program": "mt1959_b",
     "signature": "088a5c68",
     "register_offsets": [
       "107f5c",
       "11e882"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -84,12 +96,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N000500",
     "firmware_date": "211511051004",
-    "program": "mt1959_b",
     "signature": "25fb97df",
     "register_offsets": [
       "104053",
       "11d9f5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -97,12 +111,14 @@
     "product_revision": "A203",
     "vendor_specific": "WM01501",
     "firmware_date": "211801111117",
-    "program": "mt1959_a",
     "signature": "36b76b16",
     "register_offsets": [
       "104078",
       "11a844"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -110,12 +126,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A37A3",
     "firmware_date": "211204261630",
-    "program": "mt1959_b",
     "signature": "051a1381",
     "register_offsets": [
       "108c86",
       "110721"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -123,12 +141,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N004304",
     "firmware_date": "211412161016",
-    "program": "mt1959_b",
     "signature": "1647e02f",
     "register_offsets": [
       "105f68",
       "11e13c"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -136,12 +156,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM01201",
     "firmware_date": "211711301218",
-    "program": "mt1959_a",
     "signature": "bb81818e",
     "register_offsets": [
       "1038a9",
       "11b0d1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -149,12 +171,14 @@
     "product_revision": "1.04",
     "vendor_specific": "NM01201",
     "firmware_date": "211901041351",
-    "program": "mt1959_a",
     "signature": "4fba1843",
     "register_offsets": [
       "1094f4",
       "11bd66"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -162,12 +186,14 @@
     "product_revision": "1.D3",
     "vendor_specific": "N000700",
     "firmware_date": "211602041103",
-    "program": "mt1959_b",
     "signature": "de6a2a98",
     "register_offsets": [
       "10ae9d",
       "1198ad"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -175,12 +201,14 @@
     "product_revision": "1.00",
     "vendor_specific": "E101701",
     "firmware_date": "211304231147",
-    "program": "mt1959_b",
     "signature": "dee7a3e6",
     "register_offsets": [
       "10ba1f",
       "11ea75"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -188,12 +216,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N003203",
     "firmware_date": "211412161022",
-    "program": "mt1959_b",
     "signature": "64106528",
     "register_offsets": [
       "1068b9",
       "116a59"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -201,12 +231,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N001501",
     "firmware_date": "211504221534",
-    "program": "mt1959_b",
     "signature": "a80424b3",
     "register_offsets": [
       "1000f3",
       "113f87"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -214,12 +246,14 @@
     "product_revision": "1.04",
     "vendor_specific": "NM01701",
     "firmware_date": "211901041338",
-    "program": "mt1959_a",
     "signature": "f84f9141",
     "register_offsets": [
       "108170",
       "11c7fa"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -227,12 +261,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N0A20A2",
     "firmware_date": "211306131532",
-    "program": "mt1959_b",
     "signature": "35e835f9",
     "register_offsets": [
       "1075e9",
       "111970"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -240,12 +276,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00200",
     "firmware_date": "211711231626",
-    "program": "mt1959_a",
     "signature": "e202fe45",
     "register_offsets": [
       "1092c4",
       "1140e8"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -253,12 +291,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0C00C0",
     "firmware_date": "211505261638",
-    "program": "mt1959_b",
     "signature": "c8a13745",
     "register_offsets": [
       "10a0fe",
       "115326"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -266,12 +306,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002502",
     "firmware_date": "211508191146",
-    "program": "mt1959_b",
     "signature": "3d92c6e9",
     "register_offsets": [
       "100933",
       "11d0df"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -279,12 +321,14 @@
     "product_revision": "AS00",
     "vendor_specific": "U101901",
     "firmware_date": "211304242023",
-    "program": "mt1959_b",
     "signature": "9ce0f7db",
     "register_offsets": [
       "106d23",
       "117fc9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -292,12 +336,14 @@
     "product_revision": "1.04",
     "vendor_specific": "NM01701",
     "firmware_date": "211901041342",
-    "program": "mt1959_a",
     "signature": "9c96426b",
     "register_offsets": [
       "10c12c",
       "110419"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -305,12 +351,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00500",
     "firmware_date": "211711201953",
-    "program": "mt1959_a",
     "signature": "484ecc29",
     "register_offsets": [
       "10e201",
       "1185e5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -318,12 +366,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A29A2",
     "firmware_date": "211210311913",
-    "program": "mt1959_b",
     "signature": "51333090",
     "register_offsets": [
       "10c5c3",
       "11273b"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -331,12 +381,14 @@
     "product_revision": "1.00",
     "vendor_specific": "G005705",
     "firmware_date": "211504221429",
-    "program": "mt1959_b",
     "signature": "1daa6ee6",
     "register_offsets": [
       "100b74",
       "113790"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -344,12 +396,14 @@
     "product_revision": "1.00",
     "vendor_specific": "NM00100",
     "firmware_date": "211711211006",
-    "program": "mt1959_a",
     "signature": "5c70e4e3",
     "register_offsets": [
       "10c8f2",
       "11ad06"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -357,12 +411,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061535",
-    "program": "mt1959_b",
     "signature": "031dbbb5",
     "register_offsets": [
       "101450",
       "11a8ed"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -370,12 +426,14 @@
     "product_revision": "1.00",
     "vendor_specific": "R004504",
     "firmware_date": "211703231903",
-    "program": "mt1959_b",
     "signature": "9fe13149",
     "register_offsets": [
       "10e3cb",
       "116888"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -383,12 +441,14 @@
     "product_revision": "U101",
     "vendor_specific": "MM01201",
     "firmware_date": "211711301153",
-    "program": "mt1959_a",
     "signature": "7f4f83db",
     "register_offsets": [
       "107b7d",
       "113491"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -396,12 +456,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00500",
     "firmware_date": "211711161545",
-    "program": "mt1959_a",
     "signature": "162e352d",
     "register_offsets": [
       "10aadc",
       "11e3a3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -409,12 +471,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A29A2",
     "firmware_date": "211210311917",
-    "program": "mt1959_b",
     "signature": "433f74a7",
     "register_offsets": [
       "1037d3",
       "112c09"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -422,12 +486,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0A03A0",
     "firmware_date": "211403261115",
-    "program": "mt1959_b",
     "signature": "bbc3b4f5",
     "register_offsets": [
       "104691",
       "114055"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -435,12 +501,14 @@
     "product_revision": "A204",
     "vendor_specific": "WM01001",
     "firmware_date": "211901041044",
-    "program": "mt1959_a",
     "signature": "0119431d",
     "register_offsets": [
       "10eed4",
       "112f06"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -448,12 +516,14 @@
     "product_revision": "BU10",
     "vendor_specific": "O002602",
     "firmware_date": "211701060941",
-    "program": "mt1959_b",
     "signature": "0e345f8e",
     "register_offsets": [
       "1063db",
       "1191df"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -461,12 +531,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00000",
     "firmware_date": "211711281847",
-    "program": "mt1959_a",
     "signature": "303d33ad",
     "register_offsets": [
       "104e08",
       "1135f9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -474,12 +546,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N000500",
     "firmware_date": "211511050956",
-    "program": "mt1959_b",
     "signature": "08b1cda4",
     "register_offsets": [
       "10ab0f",
       "1142f4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -487,12 +561,14 @@
     "product_revision": "BN12",
     "vendor_specific": "0M01001",
     "firmware_date": "211905141415",
-    "program": "mt1959_a",
     "signature": "a5b7799a",
     "register_offsets": [
       "103686",
       "1132ff"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -500,12 +576,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N001101",
     "firmware_date": "211703130907",
-    "program": "mt1959_b",
     "signature": "39caf17f",
     "register_offsets": [
       "10fb22",
       "1149d1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -513,12 +591,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304042319",
-    "program": "mt1959_b",
     "signature": "73dfcdbc",
     "register_offsets": [
       "104695",
       "11767c"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -526,12 +606,14 @@
     "product_revision": "1.01",
     "vendor_specific": "W100600",
     "firmware_date": "211302051930",
-    "program": "mt1959_b",
     "signature": "de0a4146",
     "register_offsets": [
       "101f94",
       "116d4e"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -539,12 +621,14 @@
     "product_revision": "1.00",
     "vendor_specific": "M103703",
     "firmware_date": "210000000000",
-    "program": "mt1959_b",
     "signature": "2c16f09d",
     "register_offsets": [
       "1086bb",
       "11f9e1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -552,12 +636,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002802",
     "firmware_date": "211702151823",
-    "program": "mt1959_b",
     "signature": "0c9f6bda",
     "register_offsets": [
       "104b51",
       "11689a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "hp",
@@ -565,12 +651,14 @@
     "product_revision": "BW20",
     "vendor_specific": "P018518",
     "firmware_date": "211504221413",
-    "program": "mt1959_b",
     "signature": "9533d97a",
     "register_offsets": [
       "1075d4",
       "11d078"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -578,12 +666,14 @@
     "product_revision": "BU10",
     "vendor_specific": "O003703",
     "firmware_date": "211705301728",
-    "program": "mt1959_b",
     "signature": "3d782ce4",
     "register_offsets": [
       "1061f6",
       "11e1fb"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -591,12 +681,14 @@
     "product_revision": "A102",
     "vendor_specific": "D0A22A2",
     "firmware_date": "211303262335",
-    "program": "mt1959_b",
     "signature": "933c4913",
     "register_offsets": [
       "10dbcb",
       "11b232"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -604,12 +696,14 @@
     "product_revision": "1.00",
     "vendor_specific": "NM00500",
     "firmware_date": "211804030945",
-    "program": "mt1959_a",
     "signature": "73fc400f",
     "register_offsets": [
       "10c7b4",
       "11e0bb"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -617,12 +711,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00400",
     "firmware_date": "212004211008",
-    "program": "mt1959_a",
     "signature": "1228f716",
     "register_offsets": [
       "109837",
       "110f99"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -630,12 +726,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304042252",
-    "program": "mt1959_b",
     "signature": "605f8b6c",
     "register_offsets": [
       "102b1a",
       "111151"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -643,12 +741,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A05A0",
     "firmware_date": "211404241908",
-    "program": "mt1959_b",
     "signature": "984a3ccb",
     "register_offsets": [
       "1014ec",
       "11b2a6"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -656,12 +756,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000900",
     "firmware_date": "211609091048",
-    "program": "mt1959_b",
     "signature": "af7f5706",
     "register_offsets": [
       "1090b4",
       "119465"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -669,12 +771,14 @@
     "product_revision": "1.01",
     "vendor_specific": "RM01801",
     "firmware_date": "211910161032",
-    "program": "mt1959_a",
     "signature": "8f5ff6f8",
     "register_offsets": [
       "101918",
       "11be36"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -682,12 +786,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N0G43G4",
     "firmware_date": "211206262029",
-    "program": "mt1959_b",
     "signature": "7570c9dd",
     "register_offsets": [
       "10e7c3",
       "1193c9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -695,12 +801,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N005505",
     "firmware_date": "211504221517",
-    "program": "mt1959_b",
     "signature": "0faa09dd",
     "register_offsets": [
       "1044da",
       "1144a1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -708,12 +816,14 @@
     "product_revision": "U100",
     "vendor_specific": "3M01801",
     "firmware_date": "211910161036",
-    "program": "mt1959_a",
     "signature": "43c71953",
     "register_offsets": [
       "10f8c1",
       "11d230"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -721,12 +831,14 @@
     "product_revision": "CCT5",
     "vendor_specific": "V000700",
     "firmware_date": "211705182023",
-    "program": "mt1959_b",
     "signature": "c4f9ccbc",
     "register_offsets": [
       "10abe0",
       "116e03"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -734,12 +846,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N001901",
     "firmware_date": "211703101630",
-    "program": "mt1959_b",
     "signature": "78c4d5e4",
     "register_offsets": [
       "10903f",
       "115481"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -747,12 +861,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N0A13A1",
     "firmware_date": "211303221728",
-    "program": "mt1959_b",
     "signature": "bef533e2",
     "register_offsets": [
       "103c76",
       "11f449"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -760,12 +876,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000500",
     "firmware_date": "211512230930",
-    "program": "mt1959_b",
     "signature": "32c935fd",
     "register_offsets": [
       "1089fb",
       "117131"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -773,12 +891,14 @@
     "product_revision": "AS00",
     "vendor_specific": "U008408",
     "firmware_date": "211607291602",
-    "program": "mt1959_b",
     "signature": "f3587486",
     "register_offsets": [
       "10c1e7",
       "1127f5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -786,12 +906,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002602",
     "firmware_date": "211409031732",
-    "program": "mt1959_b",
     "signature": "abf9ea31",
     "register_offsets": [
       "1072dc",
       "111926"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -799,12 +921,14 @@
     "product_revision": "3.03",
     "vendor_specific": "WM00000",
     "firmware_date": "211801191558",
-    "program": "mt1959_a",
     "signature": "a33c4440",
     "register_offsets": [
       "10a024",
       "11fb60"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -812,12 +936,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00800",
     "firmware_date": "212005070917",
-    "program": "mt1959_a",
     "signature": "c222c5fe",
     "register_offsets": [
       "105bd7",
       "111fd9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -825,12 +951,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002802",
     "firmware_date": "211702151828",
-    "program": "mt1959_b",
     "signature": "280a561a",
     "register_offsets": [
       "10615d",
       "11dfda"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -838,12 +966,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00200",
     "firmware_date": "211711231550",
-    "program": "mt1959_a",
     "signature": "1da5dbbd",
     "register_offsets": [
       "104b8a",
       "117215"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -851,12 +981,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N005305",
     "firmware_date": "211504211939",
-    "program": "mt1959_b",
     "signature": "96423b29",
     "register_offsets": [
       "10d622",
       "117102"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -864,12 +996,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000800",
     "firmware_date": "211701031453",
-    "program": "mt1959_b",
     "signature": "42571175",
     "register_offsets": [
       "10724a",
       "113c00"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -877,12 +1011,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000200",
     "firmware_date": "211602231042",
-    "program": "mt1959_b",
     "signature": "973fb48e",
     "register_offsets": [
       "10df48",
       "11d920"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -890,12 +1026,14 @@
     "product_revision": "3.00",
     "vendor_specific": "W004704",
     "firmware_date": "211512151340",
-    "program": "mt1959_b",
     "signature": "58913be6",
     "register_offsets": [
       "103a19",
       "1154a1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -903,12 +1041,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304042322",
-    "program": "mt1959_b",
     "signature": "05ba1a5c",
     "register_offsets": [
       "10cb43",
       "11d1eb"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -916,12 +1056,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00800",
     "firmware_date": "212005070935",
-    "program": "mt1959_a",
     "signature": "f1147025",
     "register_offsets": [
       "10e9aa",
       "11b030"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -929,12 +1071,14 @@
     "product_revision": "A100",
     "vendor_specific": "D00D60D",
     "firmware_date": "211507301534",
-    "program": "mt1959_b",
     "signature": "acf75868",
     "register_offsets": [
       "10dbbb",
       "1116fc"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -942,12 +1086,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00300",
     "firmware_date": "212107081603",
-    "program": "mt1959_a",
     "signature": "65605ec5",
     "register_offsets": [
       "10bd36",
       "110f44"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -955,12 +1101,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00400",
     "firmware_date": "212004210958",
-    "program": "mt1959_a",
     "signature": "9c63b66a",
     "register_offsets": [
       "100023",
       "11b028"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "hp",
@@ -968,12 +1116,14 @@
     "product_revision": "BW20",
     "vendor_specific": "P017417",
     "firmware_date": "211412160945",
-    "program": "mt1959_b",
     "signature": "4a40c940",
     "register_offsets": [
       "1059a9",
       "118b40"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -981,12 +1131,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM01101",
     "firmware_date": "211901041359",
-    "program": "mt1959_a",
     "signature": "287d17cb",
     "register_offsets": [
       "1016e2",
       "11010a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -994,12 +1146,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N000200",
     "firmware_date": "211512111436",
-    "program": "mt1959_b",
     "signature": "325bd482",
     "register_offsets": [
       "10909f",
       "113223"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1007,12 +1161,14 @@
     "product_revision": "3.10",
     "vendor_specific": "WM01601",
     "firmware_date": "211901041014",
-    "program": "mt1959_a",
     "signature": "a5f54fa0",
     "register_offsets": [
       "10fe46",
       "11d6f4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1020,12 +1176,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N001601",
     "firmware_date": "211406161935",
-    "program": "mt1959_b",
     "signature": "2c46bb4f",
     "register_offsets": [
       "107c36",
       "11ea7a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1033,12 +1191,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061614",
-    "program": "mt1959_b",
     "signature": "14caa906",
     "register_offsets": [
       "1016ae",
       "111125"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1046,12 +1206,14 @@
     "product_revision": "1514",
     "vendor_specific": "N100400",
     "firmware_date": "211205301654",
-    "program": "mt1959_b",
     "signature": "6d03a2b5",
     "register_offsets": [
       "10adf8",
       "113305"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1059,12 +1221,14 @@
     "product_revision": "1.04",
     "vendor_specific": "NM00500",
     "firmware_date": "212005061142",
-    "program": "mt1959_a",
     "signature": "fabd3b21",
     "register_offsets": [
       "107e3f",
       "11e816"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "ASUS",
@@ -1072,12 +1236,14 @@
     "product_revision": "A101",
     "vendor_specific": "W000600",
     "firmware_date": "211412080959",
-    "program": "mt1959_b",
     "signature": "f761430c",
     "register_offsets": [
       "108c63",
       "112661"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1085,12 +1251,14 @@
     "product_revision": "3.01",
     "vendor_specific": "WM00900",
     "firmware_date": "211711151926",
-    "program": "mt1959_a",
     "signature": "f097cca9",
     "register_offsets": [
       "102678",
       "11471d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1098,12 +1266,14 @@
     "product_revision": "FR07",
     "vendor_specific": "J001101",
     "firmware_date": "211612201651",
-    "program": "mt1959_b",
     "signature": "2f8658d7",
     "register_offsets": [
       "10a556",
       "110626"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1111,12 +1281,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM01801",
     "firmware_date": "211905031515",
-    "program": "mt1959_a",
     "signature": "4b293717",
     "register_offsets": [
       "10ffa2",
       "11f52d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1124,12 +1296,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM01801",
     "firmware_date": "211905031534",
-    "program": "mt1959_a",
     "signature": "8b3d800f",
     "register_offsets": [
       "100625",
       "113f94"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1137,12 +1311,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061545",
-    "program": "mt1959_b",
     "signature": "6ae778cf",
     "register_offsets": [
       "10afbf",
       "11cc6a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1150,12 +1326,14 @@
     "product_revision": "3.02",
     "vendor_specific": "W000800",
     "firmware_date": "211711241413",
-    "program": "mt1959_b",
     "signature": "22a0be7d",
     "register_offsets": [
       "105b78",
       "11ffd6"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1163,12 +1341,14 @@
     "product_revision": "CCT2",
     "vendor_specific": "V000700",
     "firmware_date": "211703071420",
-    "program": "mt1959_b",
     "signature": "fdc8610e",
     "register_offsets": [
       "104c5b",
       "11ada8"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1176,12 +1356,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N000100",
     "firmware_date": "211512111503",
-    "program": "mt1959_b",
     "signature": "e548ce88",
     "register_offsets": [
       "10a453",
       "118786"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1189,12 +1371,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N003103",
     "firmware_date": "211612201528",
-    "program": "mt1959_b",
     "signature": "9feaad54",
     "register_offsets": [
       "108c89",
       "1170e5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1202,12 +1386,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304042325",
-    "program": "mt1959_b",
     "signature": "f5da20d5",
     "register_offsets": [
       "10c63e",
       "11103b"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1215,12 +1401,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00600",
     "firmware_date": "212005081010",
-    "program": "mt1959_a",
     "signature": "66e1159d",
     "register_offsets": [
       "103285",
       "111a6f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1228,12 +1416,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A44A4",
     "firmware_date": "211206161825",
-    "program": "mt1959_b",
     "signature": "c6a85537",
     "register_offsets": [
       "106fa8",
       "11431b"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1241,12 +1431,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00400",
     "firmware_date": "211711211606",
-    "program": "mt1959_a",
     "signature": "9b912db5",
     "register_offsets": [
       "10ef24",
       "117d88"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "ASUS",
@@ -1254,12 +1446,14 @@
     "product_revision": "3.00",
     "vendor_specific": "W004504",
     "firmware_date": "211508101633",
-    "program": "mt1959_b",
     "signature": "c0b8ef5e",
     "register_offsets": [
       "1004bb",
       "11da12"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1267,12 +1461,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N003803",
     "firmware_date": "211406251441",
-    "program": "mt1959_b",
     "signature": "691bad00",
     "register_offsets": [
       "1021b2",
       "112186"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1280,12 +1476,14 @@
     "product_revision": "1.05",
     "vendor_specific": "NM00400",
     "firmware_date": "212004211049",
-    "program": "mt1959_a",
     "signature": "96121b34",
     "register_offsets": [
       "108470",
       "11507a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1293,12 +1491,14 @@
     "product_revision": "T.00",
     "vendor_specific": "V003403",
     "firmware_date": "211606241658",
-    "program": "mt1959_b",
     "signature": "8fae0907",
     "register_offsets": [
       "109c71",
       "11eb93"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1306,12 +1506,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A00A0",
     "firmware_date": "211405071026",
-    "program": "mt1959_b",
     "signature": "540a4152",
     "register_offsets": [
       "10e233",
       "1144e3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1319,12 +1521,14 @@
     "product_revision": "A101",
     "vendor_specific": "D000100",
     "firmware_date": "211602241144",
-    "program": "mt1959_b",
     "signature": "eea9b99a",
     "register_offsets": [
       "10ce97",
       "11f07f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1332,12 +1536,14 @@
     "product_revision": "3.01",
     "vendor_specific": "WM00900",
     "firmware_date": "211711291725",
-    "program": "mt1959_a",
     "signature": "71f4e446",
     "register_offsets": [
       "101a28",
       "11fd05"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1345,12 +1551,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N001401",
     "firmware_date": "211703101650",
-    "program": "mt1959_b",
     "signature": "a17bf024",
     "register_offsets": [
       "10013d",
       "1110a0"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1358,12 +1566,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000500",
     "firmware_date": "211704251756",
-    "program": "mt1959_b",
     "signature": "3b3e9586",
     "register_offsets": [
       "10707a",
       "1114de"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1371,12 +1581,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00800",
     "firmware_date": "212005080959",
-    "program": "mt1959_a",
     "signature": "eb731968",
     "register_offsets": [
       "1068b3",
       "110140"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1384,12 +1596,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00000",
     "firmware_date": "211711201704",
-    "program": "mt1959_a",
     "signature": "673be581",
     "register_offsets": [
       "1065a6",
       "11662f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1397,12 +1611,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000700",
     "firmware_date": "211701030941",
-    "program": "mt1959_b",
     "signature": "d4a683a3",
     "register_offsets": [
       "10a8f1",
       "11a8f4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "hp",
@@ -1410,12 +1626,14 @@
     "product_revision": "B7C6",
     "vendor_specific": "P0A12A1",
     "firmware_date": "211303262313",
-    "program": "mt1959_b",
     "signature": "2dbc2977",
     "register_offsets": [
       "101e5c",
       "1105e9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "hp",
@@ -1423,12 +1641,14 @@
     "product_revision": "BC56",
     "vendor_specific": "P0B00B0",
     "firmware_date": "210000000000",
-    "program": "mt1959_b",
     "signature": "88bf3b23",
     "register_offsets": [
       "10bf5e",
       "11844d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1436,12 +1656,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A26A2",
     "firmware_date": "211202091126",
-    "program": "mt1959_b",
     "signature": "86b99610",
     "register_offsets": [
       "10fe2d",
       "11a000"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1449,12 +1671,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N000500",
     "firmware_date": "211511051001",
-    "program": "mt1959_b",
     "signature": "01bc1296",
     "register_offsets": [
       "10232f",
       "119df2"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1462,12 +1686,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00300",
     "firmware_date": "212107081556",
-    "program": "mt1959_a",
     "signature": "d605ced2",
     "register_offsets": [
       "100693",
       "11d267"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1475,12 +1701,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00800",
     "firmware_date": "212005070924",
-    "program": "mt1959_a",
     "signature": "162aab78",
     "register_offsets": [
       "10706a",
       "11c381"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1488,12 +1716,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N000900",
     "firmware_date": "211606090920",
-    "program": "mt1959_b",
     "signature": "1eb8f8b8",
     "register_offsets": [
       "104c11",
       "11ee01"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "hp",
@@ -1501,12 +1731,14 @@
     "product_revision": "BU24",
     "vendor_specific": "P005005",
     "firmware_date": "211504221344",
-    "program": "mt1959_b",
     "signature": "691017b3",
     "register_offsets": [
       "10e03d",
       "113c4a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1514,12 +1746,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N001401",
     "firmware_date": "211508180940",
-    "program": "mt1959_b",
     "signature": "1402ac30",
     "register_offsets": [
       "102349",
       "113ced"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1527,12 +1761,14 @@
     "product_revision": "A1B0",
     "vendor_specific": "D015815",
     "firmware_date": "211703101705",
-    "program": "mt1959_b",
     "signature": "7c23fb16",
     "register_offsets": [
       "10e509",
       "118ef0"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1540,12 +1776,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N006206",
     "firmware_date": "211512221501",
-    "program": "mt1959_b",
     "signature": "5ecf3981",
     "register_offsets": [
       "101deb",
       "119f66"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1553,12 +1791,14 @@
     "product_revision": "1.01",
     "vendor_specific": "RM00000",
     "firmware_date": "211712221221",
-    "program": "mt1959_a",
     "signature": "a36409fd",
     "register_offsets": [
       "107aad",
       "1103c4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1566,12 +1806,14 @@
     "product_revision": "1.00",
     "vendor_specific": "R002202",
     "firmware_date": "211609090954",
-    "program": "mt1959_b",
     "signature": "8ea02dd3",
     "register_offsets": [
       "10d55e",
       "11e031"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1579,12 +1821,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N001501",
     "firmware_date": "211504221546",
-    "program": "mt1959_b",
     "signature": "f0406959",
     "register_offsets": [
       "10199d",
       "11acdb"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1592,12 +1836,14 @@
     "product_revision": "1.V5",
     "vendor_specific": "NM00900",
     "firmware_date": "211802070957",
-    "program": "mt1959_b",
     "signature": "0e6593cd",
     "register_offsets": [
       "1034a2",
       "11ec23"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1605,12 +1851,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000400",
     "firmware_date": "211502161437",
-    "program": "mt1959_b",
     "signature": "7558d085",
     "register_offsets": [
       "1045b4",
       "110d17"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1618,12 +1866,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N1A03A0",
     "firmware_date": "210000000000",
-    "program": "mt1959_b",
     "signature": "0705f3d9",
     "register_offsets": [
       "100af7",
       "11187a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1631,12 +1881,14 @@
     "product_revision": "BU12",
     "vendor_specific": "OM01001",
     "firmware_date": "211902230922",
-    "program": "mt1959_a",
     "signature": "dae22292",
     "register_offsets": [
       "10c1e7",
       "11cce9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1644,12 +1896,14 @@
     "product_revision": "1.00",
     "vendor_specific": "NM00200",
     "firmware_date": "211711211720",
-    "program": "mt1959_a",
     "signature": "300773cc",
     "register_offsets": [
       "108edc",
       "11db54"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1657,12 +1911,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N0A13A1",
     "firmware_date": "211303221725",
-    "program": "mt1959_b",
     "signature": "a6b89410",
     "register_offsets": [
       "10da60",
       "11a750"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1670,12 +1926,14 @@
     "product_revision": "A100",
     "vendor_specific": "D032232",
     "firmware_date": "211701021159",
-    "program": "mt1959_b",
     "signature": "4d528af5",
     "register_offsets": [
       "10b2ba",
       "11267f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1683,12 +1941,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N000200",
     "firmware_date": "211512111440",
-    "program": "mt1959_b",
     "signature": "3657bdc5",
     "register_offsets": [
       "108a9b",
       "111b06"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1696,12 +1956,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00800",
     "firmware_date": "212005070929",
-    "program": "mt1959_a",
     "signature": "61c9d90c",
     "register_offsets": [
       "1076c4",
       "11a1d2"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1709,12 +1971,14 @@
     "product_revision": "EB02",
     "vendor_specific": "C000400",
     "firmware_date": "211610101049",
-    "program": "mt1959_b",
     "signature": "fe7ea043",
     "register_offsets": [
       "1059f0",
       "1199c3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1722,12 +1986,14 @@
     "product_revision": "3.00",
     "vendor_specific": "W004704",
     "firmware_date": "211512091147",
-    "program": "mt1959_b",
     "signature": "9aa93ae2",
     "register_offsets": [
       "100df4",
       "11c10f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1735,12 +2001,14 @@
     "product_revision": "TSTQ",
     "vendor_specific": "N000500",
     "firmware_date": "211508121144",
-    "program": "mt1959_b",
     "signature": "b7763fda",
     "register_offsets": [
       "10d7ac",
       "11fd25"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1748,12 +2016,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00600",
     "firmware_date": "212005081014",
-    "program": "mt1959_a",
     "signature": "d2a71293",
     "register_offsets": [
       "10f935",
       "1179de"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1761,12 +2031,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00200",
     "firmware_date": "211711231646",
-    "program": "mt1959_a",
     "signature": "5722060d",
     "register_offsets": [
       "1051aa",
       "119aba"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1774,12 +2046,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N004204",
     "firmware_date": "211512221504",
-    "program": "mt1959_b",
     "signature": "90e44e64",
     "register_offsets": [
       "10e9d8",
       "11535b"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1787,12 +2061,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002802",
     "firmware_date": "211702151837",
-    "program": "mt1959_b",
     "signature": "59108959",
     "register_offsets": [
       "106efd",
       "112bc2"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1800,12 +2076,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0A09A0",
     "firmware_date": "211405071012",
-    "program": "mt1959_b",
     "signature": "95682a25",
     "register_offsets": [
       "10680f",
       "11a501"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1813,12 +2091,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000800",
     "firmware_date": "211603171336",
-    "program": "mt1959_b",
     "signature": "d8053c3b",
     "register_offsets": [
       "10bfd7",
       "117c87"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1826,12 +2106,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061658",
-    "program": "mt1959_b",
     "signature": "151486a8",
     "register_offsets": [
       "107849",
       "118c03"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1839,12 +2121,14 @@
     "product_revision": "1.04",
     "vendor_specific": "NM00300",
     "firmware_date": "212005081025",
-    "program": "mt1959_a",
     "signature": "167bf138",
     "register_offsets": [
       "10239e",
       "11402b"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1852,12 +2136,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N005905",
     "firmware_date": "211408221631",
-    "program": "mt1959_b",
     "signature": "4172dace",
     "register_offsets": [
       "105cca",
       "1179ac"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1865,12 +2151,14 @@
     "product_revision": "T.02",
     "vendor_specific": "V001301",
     "firmware_date": "211405091428",
-    "program": "mt1959_b",
     "signature": "f648ef99",
     "register_offsets": [
       "10a964",
       "115837"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1878,12 +2166,14 @@
     "product_revision": "GE02",
     "vendor_specific": "V000700",
     "firmware_date": "211705182030",
-    "program": "mt1959_b",
     "signature": "44c8c30e",
     "register_offsets": [
       "105de0",
       "11e39d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1891,12 +2181,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A12A1",
     "firmware_date": "211304041441",
-    "program": "mt1959_b",
     "signature": "93cc063e",
     "register_offsets": [
       "10d00d",
       "11d043"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1904,12 +2196,14 @@
     "product_revision": "3.01",
     "vendor_specific": "W000800",
     "firmware_date": "211703311426",
-    "program": "mt1959_b",
     "signature": "a675253a",
     "register_offsets": [
       "101391",
       "119b40"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -1917,12 +2211,14 @@
     "product_revision": "3.11",
     "vendor_specific": "WM00300",
     "firmware_date": "211902271321",
-    "program": "mt1959_a",
     "signature": "c462912f",
     "register_offsets": [
       "103f69",
       "113cc3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1930,12 +2226,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002202",
     "firmware_date": "211602231047",
-    "program": "mt1959_b",
     "signature": "7b57ef4b",
     "register_offsets": [
       "10ef00",
       "11d0a7"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1943,12 +2241,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00700",
     "firmware_date": "211811011016",
-    "program": "mt1959_a",
     "signature": "ee676129",
     "register_offsets": [
       "10fe7f",
       "11b6c3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1956,12 +2256,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00600",
     "firmware_date": "211711211658",
-    "program": "mt1959_a",
     "signature": "a7324936",
     "register_offsets": [
       "1015d7",
       "1168df"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1969,12 +2271,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A44A4",
     "firmware_date": "211206161828",
-    "program": "mt1959_b",
     "signature": "8b4abdb4",
     "register_offsets": [
       "101b59",
       "1196a6"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1982,12 +2286,14 @@
     "product_revision": "A100",
     "vendor_specific": "D031531",
     "firmware_date": "211608041137",
-    "program": "mt1959_b",
     "signature": "9c0289c5",
     "register_offsets": [
       "1086ce",
       "111e53"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -1995,12 +2301,14 @@
     "product_revision": "TST5",
     "vendor_specific": "N000900",
     "firmware_date": "211708221604",
-    "program": "mt1959_b",
     "signature": "9a2c2f5f",
     "register_offsets": [
       "10defc",
       "112f43"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2008,12 +2316,14 @@
     "product_revision": "A101",
     "vendor_specific": "D000700",
     "firmware_date": "211703131630",
-    "program": "mt1959_b",
     "signature": "a26e07ef",
     "register_offsets": [
       "10e1f1",
       "116aa6"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2021,12 +2331,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00000",
     "firmware_date": "211712071200",
-    "program": "mt1959_a",
     "signature": "4bbfe231",
     "register_offsets": [
       "10f4a3",
       "118723"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "hp",
@@ -2034,12 +2346,14 @@
     "product_revision": "B1C0",
     "vendor_specific": "P015115",
     "firmware_date": "211307031530",
-    "program": "mt1959_b",
     "signature": "6bdf9727",
     "register_offsets": [
       "101818",
       "112d5a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2047,12 +2361,14 @@
     "product_revision": "GP01",
     "vendor_specific": "V001701",
     "firmware_date": "211504221450",
-    "program": "mt1959_b",
     "signature": "83dce37a",
     "register_offsets": [
       "104a72",
       "116470"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2060,12 +2376,14 @@
     "product_revision": "1.02",
     "vendor_specific": "RM00200",
     "firmware_date": "212012011716",
-    "program": "mt1959_a",
     "signature": "3d35d118",
     "register_offsets": [
       "10c079",
       "11e1d1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2073,12 +2391,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A11A1",
     "firmware_date": "211201171401",
-    "program": "mt1959_b",
     "signature": "e1b22340",
     "register_offsets": [
       "109734",
       "110d25"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2086,12 +2406,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N0A20A2",
     "firmware_date": "211306131457",
-    "program": "mt1959_b",
     "signature": "6321461d",
     "register_offsets": [
       "1079da",
       "11acf5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2099,12 +2421,14 @@
     "product_revision": "A101",
     "vendor_specific": "D000300",
     "firmware_date": "210000000000",
-    "program": "mt1959_b",
     "signature": "cd02cdf5",
     "register_offsets": [
       "10564a",
       "117615"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2112,12 +2436,14 @@
     "product_revision": "1.05",
     "vendor_specific": "NM00900",
     "firmware_date": "212005061444",
-    "program": "mt1959_a",
     "signature": "ac2cc83d",
     "register_offsets": [
       "10ccb7",
       "1175e6"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2125,12 +2451,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N001901",
     "firmware_date": "211703101637",
-    "program": "mt1959_b",
     "signature": "18b7b43b",
     "register_offsets": [
       "10db35",
       "1143cc"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2138,12 +2466,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A44A4",
     "firmware_date": "211206161823",
-    "program": "mt1959_b",
     "signature": "eeef23fe",
     "register_offsets": [
       "1050b3",
       "11b1c2"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -2151,12 +2481,14 @@
     "product_revision": "A201",
     "vendor_specific": "W000000",
     "firmware_date": "211601141358",
-    "program": "mt1959_b",
     "signature": "99655dfb",
     "register_offsets": [
       "102349",
       "11b85d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2164,12 +2496,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061523",
-    "program": "mt1959_b",
     "signature": "37cabea0",
     "register_offsets": [
       "100a82",
       "115fa1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2177,12 +2511,14 @@
     "product_revision": "FR07",
     "vendor_specific": "JM02202",
     "firmware_date": "211801221536",
-    "program": "mt1959_a",
     "signature": "0e9388dc",
     "register_offsets": [
       "10e05d",
       "11b36a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2190,12 +2526,14 @@
     "product_revision": "1.01",
     "vendor_specific": "SM00800",
     "firmware_date": "212009071143",
-    "program": "mt1959_a",
     "signature": "43007dbe",
     "register_offsets": [
       "103827",
       "117261"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2203,12 +2541,14 @@
     "product_revision": "1.00",
     "vendor_specific": "G002202",
     "firmware_date": "211405090917",
-    "program": "mt1959_b",
     "signature": "262e187e",
     "register_offsets": [
       "10fcc6",
       "118db1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2216,12 +2556,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00000",
     "firmware_date": "211810241934",
-    "program": "mt1959_a",
     "signature": "999ec375",
     "register_offsets": [
       "10e291",
       "11ab1c"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2229,12 +2571,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00200",
     "firmware_date": "211711231615",
-    "program": "mt1959_a",
     "signature": "bbc51d41",
     "register_offsets": [
       "1079f7",
       "113374"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2242,12 +2586,14 @@
     "product_revision": "1.02",
     "vendor_specific": "NM00100",
     "firmware_date": "211810291936",
-    "program": "mt1959_a",
     "signature": "c0ab269e",
     "register_offsets": [
       "108acd",
       "118eef"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2255,12 +2601,14 @@
     "product_revision": "1.01",
     "vendor_specific": "NM00500",
     "firmware_date": "211711161557",
-    "program": "mt1959_a",
     "signature": "1fc4cf4d",
     "register_offsets": [
       "10bf3e",
       "1154f0"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2268,12 +2616,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N1A37A3",
     "firmware_date": "211205021346",
-    "program": "mt1959_b",
     "signature": "b1edf3c3",
     "register_offsets": [
       "10db82",
       "115ce9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2281,12 +2631,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0A09A0",
     "firmware_date": "211403261105",
-    "program": "mt1959_b",
     "signature": "b81c571c",
     "register_offsets": [
       "10aae4",
       "11c1c7"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -2294,12 +2646,14 @@
     "product_revision": "3.11",
     "vendor_specific": "WM00300",
     "firmware_date": "211902271319",
-    "program": "mt1959_a",
     "signature": "43404cf4",
     "register_offsets": [
       "1020a9",
       "11e360"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2307,12 +2661,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0C06C0",
     "firmware_date": "211505261714",
-    "program": "mt1959_b",
     "signature": "62ca1a71",
     "register_offsets": [
       "108de0",
       "11cfe8"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2320,12 +2676,14 @@
     "product_revision": "1.05",
     "vendor_specific": "NM00900",
     "firmware_date": "212005061440",
-    "program": "mt1959_a",
     "signature": "1378d521",
     "register_offsets": [
       "10259b",
       "11c38a"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2333,12 +2691,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N001401",
     "firmware_date": "211703101655",
-    "program": "mt1959_b",
     "signature": "3f55e249",
     "register_offsets": [
       "10459d",
       "115409"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2346,12 +2706,14 @@
     "product_revision": "AS00",
     "vendor_specific": "U00B50B",
     "firmware_date": "211608041424",
-    "program": "mt1959_b",
     "signature": "5bd6025e",
     "register_offsets": [
       "108be5",
       "11b172"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2359,12 +2721,14 @@
     "product_revision": "EB02",
     "vendor_specific": "C000900",
     "firmware_date": "211412181002",
-    "program": "mt1959_b",
     "signature": "f8a561c7",
     "register_offsets": [
       "106918",
       "11aa95"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2372,12 +2736,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N004904",
     "firmware_date": "211409041512",
-    "program": "mt1959_b",
     "signature": "1e332fe5",
     "register_offsets": [
       "1094a1",
       "1127f4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2385,12 +2751,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N001401",
     "firmware_date": "211508180932",
-    "program": "mt1959_b",
     "signature": "94ea21ae",
     "register_offsets": [
       "10da3d",
       "111864"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2398,12 +2766,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061453",
-    "program": "mt1959_b",
     "signature": "907ced68",
     "register_offsets": [
       "106814",
       "1177b4"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2411,12 +2781,14 @@
     "product_revision": "1.00",
     "vendor_specific": "G004504",
     "firmware_date": "211412160950",
-    "program": "mt1959_b",
     "signature": "a87061f7",
     "register_offsets": [
       "10b69e",
       "112fef"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2424,12 +2796,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N005405",
     "firmware_date": "211703101612",
-    "program": "mt1959_b",
     "signature": "9f3fa801",
     "register_offsets": [
       "100edc",
       "11c4ef"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2437,12 +2811,14 @@
     "product_revision": "1.05",
     "vendor_specific": "NM00600",
     "firmware_date": "212005061331",
-    "program": "mt1959_a",
     "signature": "fbe14883",
     "register_offsets": [
       "10d32e",
       "112d0e"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2450,12 +2826,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0A05A0",
     "firmware_date": "211404241900",
-    "program": "mt1959_b",
     "signature": "a156efd7",
     "register_offsets": [
       "10ec21",
       "1175ee"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2463,12 +2841,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N000600",
     "firmware_date": "211508191151",
-    "program": "mt1959_b",
     "signature": "70a565ed",
     "register_offsets": [
       "101a4e",
       "11cfb3"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2476,12 +2856,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N007307",
     "firmware_date": "211412161028",
-    "program": "mt1959_b",
     "signature": "a331f23e",
     "register_offsets": [
       "10ad2d",
       "1169b5"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2489,12 +2871,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00800",
     "firmware_date": "212005080957",
-    "program": "mt1959_a",
     "signature": "a6c32d92",
     "register_offsets": [
       "1015c8",
       "1182ed"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2502,12 +2886,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00000",
     "firmware_date": "211711201943",
-    "program": "mt1959_a",
     "signature": "b113e869",
     "register_offsets": [
       "1094f6",
       "11a8dd"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2515,12 +2901,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N0A04A0",
     "firmware_date": "211403261141",
-    "program": "mt1959_b",
     "signature": "939cd6d7",
     "register_offsets": [
       "101c37",
       "118020"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2528,12 +2916,14 @@
     "product_revision": "1.03",
     "vendor_specific": "NM00600",
     "firmware_date": "211711211653",
-    "program": "mt1959_a",
     "signature": "d4fd4cab",
     "register_offsets": [
       "101fda",
       "11f0a1"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2541,12 +2931,14 @@
     "product_revision": "1.00",
     "vendor_specific": "N002302",
     "firmware_date": "211512071657",
-    "program": "mt1959_b",
     "signature": "88e15486",
     "register_offsets": [
       "104a89",
       "112cd9"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2554,12 +2946,14 @@
     "product_revision": "0217",
     "vendor_specific": "N000700",
     "firmware_date": "211603081656",
-    "program": "mt1959_b",
     "signature": "86980641",
     "register_offsets": [
       "107d6a",
       "118ddf"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2567,12 +2961,14 @@
     "product_revision": "BN11",
     "vendor_specific": "0M00300",
     "firmware_date": "211711201351",
-    "program": "mt1959_a",
     "signature": "fc13f7d1",
     "register_offsets": [
       "107db1",
       "1186f7"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 1,
+    "unlock_buf_id": 68
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2580,12 +2976,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N0A02A0",
     "firmware_date": "211312061625",
-    "program": "mt1959_b",
     "signature": "ea1e378d",
     "register_offsets": [
       "10205b",
       "113e62"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "ASUS",
@@ -2593,12 +2991,14 @@
     "product_revision": "3.00",
     "vendor_specific": "W006706",
     "firmware_date": "211511031110",
-    "program": "mt1959_b",
     "signature": "98946e16",
     "register_offsets": [
       "105237",
       "111cdb"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2606,12 +3006,14 @@
     "product_revision": "CC01",
     "vendor_specific": "V000700",
     "firmware_date": "211706280934",
-    "program": "mt1959_b",
     "signature": "4a178208",
     "register_offsets": [
       "10dcce",
       "11d42d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2619,12 +3021,14 @@
     "product_revision": "A1B0",
     "vendor_specific": "D014214",
     "firmware_date": "211510131446",
-    "program": "mt1959_b",
     "signature": "3be14b28",
     "register_offsets": [
       "10a9d4",
       "118fad"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2632,12 +3036,14 @@
     "product_revision": "1.01",
     "vendor_specific": "N000000",
     "firmware_date": "211706291017",
-    "program": "mt1959_b",
     "signature": "cda102c2",
     "register_offsets": [
       "10be46",
       "11f43d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2645,12 +3051,14 @@
     "product_revision": "1.02",
     "vendor_specific": "N000100",
     "firmware_date": "211512111459",
-    "program": "mt1959_b",
     "signature": "debebf49",
     "register_offsets": [
       "10fa29",
       "11273f"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2658,12 +3066,14 @@
     "product_revision": "1.03",
     "vendor_specific": "N0C08C0",
     "firmware_date": "211505261653",
-    "program": "mt1959_b",
     "signature": "accf6a38",
     "register_offsets": [
       "102c97",
       "11383d"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   },
   {
     "vendor_id": "HL-DT-ST",
@@ -2671,11 +3081,13 @@
     "product_revision": "GS01",
     "vendor_specific": "V001701",
     "firmware_date": "211305020921",
-    "program": "mt1959_b",
     "signature": "9e25a4d8",
     "register_offsets": [
       "10e50c",
       "119977"
-    ]
+    ],
+    "chipset": "mediatek",
+    "unlock_mode": 2,
+    "unlock_buf_id": 119
   }
 ]

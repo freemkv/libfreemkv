@@ -100,7 +100,7 @@ fn print_human(
         println!();
         match matched {
             Some(p) => {
-                println!("Profile:  FOUND ({})", p.platform.name());
+                println!("Profile:  FOUND ({})", p.chipset.name());
                 println!("Raw Read: Supported");
             }
             None => {

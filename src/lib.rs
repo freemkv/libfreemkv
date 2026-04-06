@@ -25,10 +25,9 @@
 //!
 //! let mut session = DriveSession::open(
 //!     Path::new("/dev/sr0"),
-//!     Path::new("profiles/"),
 //! ).unwrap();
 //!
-//! session.enable().unwrap();
+//! session.unlock().unwrap();
 //! session.calibrate().unwrap();
 //!
 //! let mut buf = vec![0u8; 2048];
@@ -46,7 +45,7 @@ pub mod speed;
 pub use error::{Error, Result};
 pub use drive::DriveSession;
 pub use identity::DriveId;
-pub use profile::{DriveProfile, PlatformType};
+pub use profile::{DriveProfile, Chipset};
 pub use platform::{Platform, DriveStatus};
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
