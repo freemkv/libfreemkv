@@ -79,6 +79,7 @@ pub mod udf;
 pub mod mpls;
 pub mod clpi;
 pub mod disc;
+pub mod jar;
 
 pub use error::{Error, Result};
 pub use drive::DriveSession;
