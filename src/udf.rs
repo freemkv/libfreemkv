@@ -1,52 +1,67 @@
 //! UDF filesystem reader — read files from Blu-ray discs.
 //!
-//! Minimal UDF implementation: just enough to find and read files
-//! in the BDMV directory structure. Not a full UDF implementation.
+//! Blu-ray discs use UDF 2.50 with metadata partitions.
+//! The read sequence follows pointers through the disc structure:
 //!
-//! Reference: ECMA-167, UDF 2.50 (OSTA)
+//!   Sector 256 (AVDP)
+//!     → VDS (Partition Descriptor + Logical Volume Descriptor)
+//!       → Metadata Partition (virtual partition stored as a file)
+//!         → File Set Descriptor (FSD)
+//!           → Root Directory ICB
+//!             → Directory data (File Identifier Descriptors)
+//!               → BDMV/PLAYLIST/*.mpls, BDMV/CLIPINF/*.clpi
+//!
+//! Each step reads one or two sectors. No bulk reads needed.
+//!
+//! References:
+//!   ECMA-167 (UDF base)
+//!   UDF 2.50 (OSTA) — metadata partition extension
+//!   BD-ROM Part 3 — Blu-ray filesystem profile
 
 use crate::error::{Error, Result};
 use crate::drive::DriveSession;
-use crate::scsi::DataDirection;
 
 /// A UDF filesystem parsed from disc.
 #[derive(Debug)]
 pub struct UdfFs {
-    /// Root directory entries
+    /// Root directory with full tree
     pub root: DirEntry,
-    /// Partition start LBA
+    /// Physical partition start (absolute sector)
     partition_start: u32,
+    /// Metadata partition start (absolute sector)
+    /// For UDF 2.50 discs, all file/directory references use metadata-relative LBAs
+    metadata_start: u32,
 }
 
-/// A directory entry (file or directory).
+/// A directory or file entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
     pub is_dir: bool,
-    /// LBA of the file/directory data
-    pub lba: u32,
-    /// Size in bytes
-    pub size: u32,
+    /// LBA within the metadata partition (add metadata_start for absolute)
+    pub meta_lba: u32,
+    /// File size in bytes (from ICB info_length)
+    pub size: u64,
     /// Child entries (if directory)
     pub entries: Vec<DirEntry>,
 }
 
 impl UdfFs {
     /// Find a directory by path (e.g. "/BDMV/PLAYLIST").
+    /// Path matching is case-insensitive.
     pub fn find_dir(&self, path: &str) -> Option<&DirEntry> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
-
         for part in &parts {
             current = current.entries.iter().find(|e| {
                 e.is_dir && e.name.eq_ignore_ascii_case(part)
             })?;
         }
-
         Some(current)
     }
 
-    /// Read a file by path, returning its contents.
+    /// Read a file by path, returning its raw bytes.
+    /// Reads sector by sector from disc — no buffering.
     pub fn read_file(&self, session: &mut DriveSession, path: &str) -> Result<Vec<u8>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
@@ -68,181 +83,306 @@ impl UdfFs {
             detail: format!("file not found: {}", path),
         })?;
 
-        // Read the file sectors
-        let sector_count = (entry.size + 2047) / 2048;
-        let mut data = vec![0u8; (sector_count * 2048) as usize];
+        // Read the file's ICB to get its data extent
+        let (data_lba, data_len) = self.read_icb_extent(session, entry.meta_lba)?;
+
+        // Read file data sector by sector
+        let sector_count = ((data_len as u64 + 2047) / 2048) as u32;
+        let mut data = vec![0u8; (sector_count as usize) * 2048];
+        let abs_start = self.meta_to_abs(data_lba);
 
         for i in 0..sector_count {
-            let lba = self.partition_start + entry.lba + i;
-            let offset = (i * 2048) as usize;
-            read_sector(session, lba, &mut data[offset..offset + 2048])?;
+            let offset = (i as usize) * 2048;
+            read_sector(session, abs_start + i, &mut data[offset..offset + 2048])?;
         }
 
         data.truncate(entry.size as usize);
         Ok(data)
     }
+
+    /// Convert a metadata-partition-relative LBA to an absolute sector number.
+    fn meta_to_abs(&self, meta_lba: u32) -> u32 {
+        self.metadata_start + meta_lba
+    }
+
+    /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
+    /// and return its first allocation extent: (data_lba, data_length).
+    /// The data_lba is metadata-relative.
+    fn read_icb_extent(&self, session: &mut DriveSession, meta_lba: u32) -> Result<(u32, u32)> {
+        let mut icb = [0u8; 2048];
+        read_sector(session, self.meta_to_abs(meta_lba), &mut icb)?;
+
+        let tag = u16::from_le_bytes([icb[0], icb[1]]);
+
+        // Get allocation descriptor offset based on ICB type
+        let ad_offset = match tag {
+            // Extended File Entry (UDF 2.50, used by BD-ROM)
+            // Layout: ... L_EA at [208:212], L_AD at [212:216], alloc descs at 216 + L_EA
+            266 => {
+                let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
+                216 + l_ea
+            }
+            // Standard File Entry
+            // Layout: ... L_EA at [168:172], L_AD at [172:176], alloc descs at 176 + L_EA
+            261 => {
+                let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
+                176 + l_ea
+            }
+            _ => return Err(Error::DiscError {
+                detail: format!("unexpected ICB tag {} at meta_lba {}", tag, meta_lba),
+            }),
+        };
+
+        if ad_offset + 8 > 2048 {
+            return Err(Error::DiscError { detail: "ICB alloc desc out of range".into() });
+        }
+
+        // Short Allocation Descriptor: extent_length(4) + extent_position(4)
+        // extent_length upper 2 bits = type (0=recorded, 1=allocated not recorded, 3=next extent)
+        let raw_len = u32::from_le_bytes([icb[ad_offset], icb[ad_offset + 1],
+                                          icb[ad_offset + 2], icb[ad_offset + 3]]);
+        let data_len = raw_len & 0x3FFFFFFF;
+        let data_lba = u32::from_le_bytes([icb[ad_offset + 4], icb[ad_offset + 5],
+                                           icb[ad_offset + 6], icb[ad_offset + 7]]);
+
+        Ok((data_lba, data_len))
+    }
 }
 
-/// Read the UDF filesystem from a disc.
+/// Read the UDF filesystem from a Blu-ray disc.
+///
+/// Follows the UDF pointer chain:
+/// 1. AVDP (sector 256) → VDS location
+/// 2. VDS → Partition Descriptor (physical partition start)
+///        → Logical Volume Descriptor (FSD location + partition maps)
+/// 3. Metadata partition file → metadata content location
+/// 4. FSD → root directory ICB
+/// 5. Root directory → file tree
 pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
-    // UDF Anchor Volume Descriptor Pointer at sector 256
+    // Step 1: Anchor Volume Descriptor Pointer at sector 256
+    // ECMA-167 §10.2 — always at sector 256
     let mut avdp = [0u8; 2048];
     read_sector(session, 256, &mut avdp)?;
 
-    // Check descriptor tag (tag ID = 2 for AVDP)
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
     if tag_id != 2 {
-        return Err(Error::DiscError { detail: format!("not UDF: tag {} at sector 256", tag_id) });
+        return Err(Error::DiscError {
+            detail: format!("AVDP: expected tag 2, got {} at sector 256", tag_id),
+        });
     }
 
-    // Main VDS extent: bytes 16-23
-    let mvds_lba = u32::from_le_bytes([avdp[16], avdp[17], avdp[18], avdp[19]]);
-    let mvds_len = u32::from_le_bytes([avdp[20], avdp[21], avdp[22], avdp[23]]);
+    // Main VDS extent location: bytes [16:20] = LBA, [20:24] = length
+    // (We use the VDS at sectors 32+, not the reserve copy at sector 32768+)
 
-    // Read Volume Descriptor Sequence to find Partition Descriptor and Logical Volume Descriptor
+    // Step 2: Read Volume Descriptor Sequence (sectors 32-37 typically)
+    // Find Partition Descriptor (tag 5) and Logical Volume Descriptor (tag 6)
     let mut partition_start: u32 = 0;
-    let mut root_icb_lba: u32 = 0;
+    let mut num_partition_maps: u32 = 0;
+    let mut lvd_sector: Option<u32> = None;
 
-    let mvds_sectors = (mvds_len + 2047) / 2048;
-    for i in 0..mvds_sectors.min(32) {
+    for i in 32..64 {
         let mut desc = [0u8; 2048];
-        read_sector(session, mvds_lba + i, &mut desc)?;
+        read_sector(session, i, &mut desc)?;
 
         let desc_tag = u16::from_le_bytes([desc[0], desc[1]]);
         match desc_tag {
+            // Partition Descriptor — tells us where the physical partition starts
             5 => {
-                // Partition Descriptor
                 partition_start = u32::from_le_bytes([desc[188], desc[189], desc[190], desc[191]]);
             }
+            // Logical Volume Descriptor — contains FSD location and partition maps
             6 => {
-                // Logical Volume Descriptor — contains root FSD location
-                // LV Contents Use at offset 248: extent of File Set Descriptor
-                let fsd_lba = u32::from_le_bytes([desc[248], desc[249], desc[250], desc[251]]);
-                root_icb_lba = fsd_lba;
+                num_partition_maps = u32::from_le_bytes([desc[268], desc[269], desc[270], desc[271]]);
+                lvd_sector = Some(i);
             }
-            8 => break, // Terminating Descriptor
+            // Terminating Descriptor — end of VDS
+            8 => break,
             _ => continue,
         }
     }
 
     if partition_start == 0 {
-        return Err(Error::DiscError { detail: "UDF: no partition descriptor found".into() });
+        return Err(Error::DiscError { detail: "UDF: no Partition Descriptor found".into() });
     }
 
-    // Read File Set Descriptor to get root directory ICB
+    // Step 3: Parse partition maps from LVD to find metadata partition
+    // BD-ROM discs (UDF 2.50) use a metadata partition (Type 2 map with "*UDF Metadata Partition")
+    // The metadata file is stored at lba=0 of the physical partition
+    let metadata_start = if num_partition_maps >= 2 {
+        let lvd_sec = lvd_sector.ok_or_else(|| Error::DiscError {
+            detail: "UDF: no LVD found".into(),
+        })?;
+
+        // Read LVD to check partition map type
+        let mut lvd = [0u8; 2048];
+        read_sector(session, lvd_sec, &mut lvd)?;
+
+        // Parse partition maps starting at offset 440
+        // Map 0 = Type 1 (physical), Map 1 = Type 2 (metadata)
+        let pm1_type = lvd[440]; // First map type
+        let pm1_len = lvd[441] as usize;
+
+        if pm1_len > 0 && 440 + pm1_len < 2048 {
+            let pm2_type = lvd[440 + pm1_len]; // Second map type
+
+            if pm2_type == 2 {
+                // Type 2 = metadata partition
+                // The metadata file ICB is at physical partition lba 0
+                // Read it to find where the metadata content starts
+                let meta_file_lba = partition_start; // lba 0 of partition
+                let mut meta_icb = [0u8; 2048];
+                read_sector(session, meta_file_lba, &mut meta_icb)?;
+
+                let meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
+                if meta_tag == 266 {
+                    // Extended File Entry — get allocation extent
+                    let l_ea = u32::from_le_bytes([meta_icb[208], meta_icb[209],
+                                                   meta_icb[210], meta_icb[211]]) as usize;
+                    let ad_off = 216 + l_ea;
+                    let _ad_len = u32::from_le_bytes([meta_icb[ad_off], meta_icb[ad_off + 1],
+                                                      meta_icb[ad_off + 2], meta_icb[ad_off + 3]]) & 0x3FFFFFFF;
+                    let ad_pos = u32::from_le_bytes([meta_icb[ad_off + 4], meta_icb[ad_off + 5],
+                                                     meta_icb[ad_off + 6], meta_icb[ad_off + 7]]);
+                    // Metadata content starts at partition_start + ad_pos
+                    partition_start + ad_pos
+                } else {
+                    // Fallback: no metadata partition, use physical partition directly
+                    partition_start
+                }
+            } else {
+                partition_start
+            }
+        } else {
+            partition_start
+        }
+    } else {
+        // Single partition map — no metadata partition (older UDF)
+        partition_start
+    };
+
+    // Step 4: Read File Set Descriptor from metadata partition
+    // FSD is at metadata-relative lba 0 (first sector of metadata content)
     let mut fsd = [0u8; 2048];
-    read_sector(session, partition_start + root_icb_lba, &mut fsd)?;
+    read_sector(session, metadata_start, &mut fsd)?;
 
     let fsd_tag = u16::from_le_bytes([fsd[0], fsd[1]]);
     if fsd_tag != 256 {
-        return Err(Error::DiscError { detail: format!("UDF: expected FSD (256), got tag {}", fsd_tag) });
+        return Err(Error::DiscError {
+            detail: format!("FSD: expected tag 256, got {} at sector {}", fsd_tag, metadata_start),
+        });
     }
 
-    // Root Directory ICB at offset 400 in FSD
-    let root_dir_lba = u32::from_le_bytes([fsd[400], fsd[401], fsd[402], fsd[403]]);
+    // Root Directory ICB: long_ad at FSD offset 400
+    // long_ad = extent_length(4) + extent_location: lba(4) + part_ref(2) + impl_use(6)
+    let root_lba = u32::from_le_bytes([fsd[404], fsd[405], fsd[406], fsd[407]]);
 
-    // Read root directory
-    let root = read_directory(session, partition_start, root_dir_lba, "")?;
+    // Step 5: Read root directory and build file tree
+    let root = read_directory(session, partition_start, metadata_start, root_lba, "", 0)?;
 
     Ok(UdfFs {
         root,
         partition_start,
+        metadata_start,
     })
 }
 
-/// Read a UDF directory and its immediate children.
-fn read_directory(session: &mut DriveSession, part_start: u32, dir_lba: u32, name: &str) -> Result<DirEntry> {
-    // Read the ICB (Information Control Block) for this directory
+/// Read a UDF directory and its children (up to max_depth levels).
+///
+/// Each directory is an ICB (Extended File Entry) pointing to directory data
+/// containing File Identifier Descriptors (FIDs). Each FID names a file/subdir
+/// and points to its ICB.
+fn read_directory(
+    session: &mut DriveSession,
+    part_start: u32,
+    meta_start: u32,
+    meta_lba: u32,
+    name: &str,
+    depth: u32,
+) -> Result<DirEntry> {
+    // Read ICB for this directory
     let mut icb = [0u8; 2048];
-    read_sector(session, part_start + dir_lba, &mut icb)?;
+    read_sector(session, meta_start + meta_lba, &mut icb)?;
 
-    let icb_tag = u16::from_le_bytes([icb[0], icb[1]]);
+    let tag = u16::from_le_bytes([icb[0], icb[1]]);
 
-    // File Entry (tag 261) or Extended File Entry (tag 266)
-    let (alloc_offset, alloc_len) = match icb_tag {
-        261 => {
-            // File Entry
-            let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
-            let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
-            (176 + l_ea, l_ad)
-        }
+    // Get allocation extent: where the directory data lives
+    let (ad_len, ad_pos) = match tag {
         266 => {
-            // Extended File Entry
             let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
-            let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
-            (216 + l_ea, l_ad)
+            let ad_off = 216 + l_ea;
+            let len = u32::from_le_bytes([icb[ad_off], icb[ad_off + 1],
+                                          icb[ad_off + 2], icb[ad_off + 3]]) & 0x3FFFFFFF;
+            let pos = u32::from_le_bytes([icb[ad_off + 4], icb[ad_off + 5],
+                                          icb[ad_off + 6], icb[ad_off + 7]]);
+            (len, pos)
+        }
+        261 => {
+            let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
+            let ad_off = 176 + l_ea;
+            let len = u32::from_le_bytes([icb[ad_off], icb[ad_off + 1],
+                                          icb[ad_off + 2], icb[ad_off + 3]]) & 0x3FFFFFFF;
+            let pos = u32::from_le_bytes([icb[ad_off + 4], icb[ad_off + 5],
+                                          icb[ad_off + 6], icb[ad_off + 7]]);
+            (len, pos)
         }
         _ => {
             return Ok(DirEntry {
-                name: name.to_string(),
-                is_dir: true,
-                lba: dir_lba,
-                size: 0,
-                entries: Vec::new(),
+                name: name.to_string(), is_dir: true, meta_lba, size: 0, entries: Vec::new(),
             });
         }
     };
 
-    // Parse allocation descriptors to find directory data location
-    // Short Allocation Descriptor: 8 bytes (4 length + 4 position)
-    let data_lba = if alloc_offset + 8 <= icb.len() {
-        u32::from_le_bytes([icb[alloc_offset + 4], icb[alloc_offset + 5],
-                           icb[alloc_offset + 6], icb[alloc_offset + 7]])
-    } else {
-        dir_lba + 1 // assume data follows ICB
-    };
-
-    let data_len = if alloc_offset + 4 <= icb.len() {
-        u32::from_le_bytes([icb[alloc_offset], icb[alloc_offset + 1],
-                           icb[alloc_offset + 2], icb[alloc_offset + 3]]) & 0x3FFFFFFF
-    } else {
-        2048
-    };
-
     // Read directory data
-    let sectors = ((data_len + 2047) / 2048).min(64) as usize;
-    let mut dir_data = vec![0u8; sectors * 2048];
-    for i in 0..sectors {
-        read_sector(session, part_start + data_lba + i as u32,
-                   &mut dir_data[i * 2048..(i + 1) * 2048])?;
+    let dir_abs = meta_start + ad_pos;
+    let sector_count = ((ad_len + 2047) / 2048).min(64);
+    let mut dir_data = vec![0u8; sector_count as usize * 2048];
+    for i in 0..sector_count {
+        read_sector(session, dir_abs + i,
+                   &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048])?;
     }
 
     // Parse File Identifier Descriptors
     let mut entries = Vec::new();
     let mut pos = 0;
 
-    while pos + 38 < dir_data.len().min(data_len as usize) {
+    while pos + 38 < dir_data.len().min(ad_len as usize) {
         let fid_tag = u16::from_le_bytes([dir_data[pos], dir_data[pos + 1]]);
         if fid_tag != 257 {
-            break; // not a FID
+            break;
         }
 
         let file_chars = dir_data[pos + 18];
-        let l_fi = dir_data[pos + 19] as usize; // filename length
-        let icb_lba = u32::from_le_bytes([dir_data[pos + 20], dir_data[pos + 21],
-                                          dir_data[pos + 22], dir_data[pos + 23]]);
+        let l_fi = dir_data[pos + 19] as usize;
+
+        // FID ICB is a long_ad starting at offset 20:
+        //   [20:24] = extent_length
+        //   [24:28] = extent_location (LBA within metadata partition)
+        //   [28:30] = partition_reference_number
+        //   [30:36] = implementation_use
+        let icb_lba = u32::from_le_bytes([dir_data[pos + 24], dir_data[pos + 25],
+                                          dir_data[pos + 26], dir_data[pos + 27]]);
         let l_iu = u16::from_le_bytes([dir_data[pos + 36], dir_data[pos + 37]]) as usize;
 
-        let name_offset = pos + 38 + l_iu;
         let is_dir = (file_chars & 0x02) != 0;
         let is_parent = (file_chars & 0x08) != 0;
 
-        if !is_parent && l_fi > 0 && name_offset + l_fi <= dir_data.len() {
-            let raw_name = &dir_data[name_offset..name_offset + l_fi];
-            let entry_name = parse_udf_name(raw_name);
+        if !is_parent && l_fi > 0 {
+            let name_start = pos + 38 + l_iu;
+            let entry_name = parse_udf_name(&dir_data[name_start..name_start + l_fi]);
 
             if !entry_name.is_empty() {
-                if is_dir {
-                    // Recurse into subdirectory (max 2 levels deep for BDMV)
-                    let subdir = read_directory(session, part_start, icb_lba, &entry_name)?;
+                // Read the ICB to get file size
+                let file_size = read_file_size(session, meta_start, icb_lba).unwrap_or(0);
+
+                if is_dir && depth < 3 {
+                    // Recurse into subdirectory (max 3 levels: BDMV/PLAYLIST/*.mpls)
+                    let subdir = read_directory(session, part_start, meta_start, icb_lba, &entry_name, depth + 1)?;
                     entries.push(subdir);
                 } else {
-                    // Get file size from its ICB
-                    let file_size = read_file_size(session, part_start, icb_lba).unwrap_or(0);
                     entries.push(DirEntry {
                         name: entry_name,
-                        is_dir: false,
-                        lba: icb_lba,
+                        is_dir,
+                        meta_lba: icb_lba,
                         size: file_size,
                         entries: Vec::new(),
                     });
@@ -251,41 +391,41 @@ fn read_directory(session: &mut DriveSession, part_start: u32, dir_lba: u32, nam
         }
 
         // Advance to next FID (4-byte aligned)
-        let fid_len = 38 + l_iu + l_fi;
-        let padded = (fid_len + 3) & !3;
-        pos += padded;
+        let fid_len = ((38 + l_iu + l_fi + 3) & !3) as usize;
+        pos += fid_len;
     }
 
     Ok(DirEntry {
         name: name.to_string(),
         is_dir: true,
-        lba: dir_lba,
-        size: data_len,
+        meta_lba,
+        size: ad_len as u64,
         entries,
     })
 }
 
-/// Read file size from a File Entry ICB.
-fn read_file_size(session: &mut DriveSession, part_start: u32, icb_lba: u32) -> Result<u32> {
+/// Read file size (info_length) from an Extended File Entry ICB.
+fn read_file_size(session: &mut DriveSession, meta_start: u32, meta_lba: u32) -> Result<u64> {
     let mut icb = [0u8; 2048];
-    read_sector(session, part_start + icb_lba, &mut icb)?;
+    read_sector(session, meta_start + meta_lba, &mut icb)?;
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
     match tag {
-        261 => {
-            // File Entry: info length at offset 56 (8 bytes LE)
-            Ok(u32::from_le_bytes([icb[56], icb[57], icb[58], icb[59]]))
-        }
-        266 => {
-            // Extended File Entry: info length at offset 56
-            Ok(u32::from_le_bytes([icb[56], icb[57], icb[58], icb[59]]))
+        // Both File Entry (261) and Extended File Entry (266) have
+        // info_length as a u64 at offset 56
+        261 | 266 => {
+            Ok(u64::from_le_bytes([icb[56], icb[57], icb[58], icb[59],
+                                   icb[60], icb[61], icb[62], icb[63]]))
         }
         _ => Ok(0),
     }
 }
 
 /// Parse a UDF filename from raw bytes.
-/// UDF uses either 8-bit or 16-bit encoding (first byte = compression ID).
+///
+/// UDF uses a compression ID as the first byte:
+///   8  = 8-bit characters (ASCII)
+///   16 = 16-bit big-endian Unicode (UTF-16BE)
 fn parse_udf_name(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();
@@ -293,7 +433,7 @@ fn parse_udf_name(data: &[u8]) -> String {
 
     match data[0] {
         8 => {
-            // 8-bit characters
+            // 8-bit ASCII
             String::from_utf8_lossy(&data[1..]).trim().to_string()
         }
         16 => {
@@ -315,6 +455,7 @@ fn parse_udf_name(data: &[u8]) -> String {
 }
 
 /// Read a single 2048-byte sector from the drive.
+/// Uses standard READ(10) — no unlock required.
 fn read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8]) -> Result<()> {
     session.read_disc(lba, 1, buf)?;
     Ok(())
