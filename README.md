@@ -1,128 +1,136 @@
 [![Crates.io](https://img.shields.io/crates/v/libfreemkv)](https://crates.io/crates/libfreemkv)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Drives: 206](https://img.shields.io/badge/drives-206-green)]()
+[![Drives: 206](https://img.shields.io/badge/drives-206-brightgreen)]()
 
 # libfreemkv
 
-Open source raw disc access library for UHD Blu-ray optical drives.
+Rust library for raw sector access on optical drives. Identifies drives using standard SCSI commands, matches them against 206 bundled profiles, and unlocks raw read mode. No external files, no configuration.
 
-Enables direct sector reading on compatible drives for UHD Blu-ray archival,
-backup, and media extraction. Ships with community-contributed drive profiles —
-no proprietary data files needed at runtime.
+Part of the [freemkv](https://github.com/freemkv) project.
 
-## Features
-
-- **Drive identification** — SCSI INQUIRY + GET CONFIGURATION for automatic profile matching
-- **Raw read mode** — activate enhanced read mode on supported drives
-- **Speed calibration** — optimal read speed per disc region
-- **Raw sector reading** — direct READ(10) access to disc sectors
-- **Drive profiles** — per-drive SCSI command data, shipped as JSON files
-- **Community-driven** — submit new drive profiles via `freemkv-info`
-
-## Supported Drives
-
-Currently supports 280+ LG, ASUS, and HP optical drive firmware versions
-across the MediaTek MT1959 chipset family. Pioneer Renesas support is in progress.
-
-See [profiles/](profiles/) for the full list.
-
-## Installation
-
-```bash
-cargo install libfreemkv
-```
-
-Or add to your `Cargo.toml`:
+## Install
 
 ```toml
 [dependencies]
 libfreemkv = "0.1"
 ```
 
-## Quick Start
-
-### As a library
+## Usage
 
 ```rust
 use libfreemkv::DriveSession;
 use std::path::Path;
 
-let mut session = DriveSession::open(
-    Path::new("/dev/sr0"),
-    Path::new("profiles/"),
-)?;
+let mut session = DriveSession::open(Path::new("/dev/sr0"))?;
 
-session.enable()?;        // activate raw read mode
-session.calibrate()?;     // optimize read speed
+session.unlock()?;       // activate raw read mode
+session.calibrate()?;    // optimize read speed
 
 let mut buf = vec![0u8; 2048];
-session.read_sectors(0, 1, &mut buf)?;
+let n = session.read_sectors(0, 1, &mut buf)?;
 ```
 
-### freemkv-info
+## How It Works
 
-Identify your drive and check compatibility:
+1. **INQUIRY** (SPC-4 §6.4) — reads vendor_id, product_id, product_revision, vendor_specific
+2. **GET CONFIGURATION 010C** (MMC-6 §5.3.10) — reads firmware_date
+3. **Profile match** — five fields uniquely identify the drive against 206 bundled profiles
+4. **READ BUFFER** — single command with per-drive mode/buffer_id activates raw read mode
+5. **Signature verify** — drive responds with 4-byte signature + "MMkv" confirmation
 
-```bash
-$ freemkv-info /dev/sr0
-Drive: HL-DT-ST BD-RE BU40N 1.03
-Chipset: MT1959
-Raw Read: Supported
-Profile: Found (mt1959_a)
+No fingerprints. No encrypted lookups. All identification uses standard SCSI fields.
 
-$ freemkv-info /dev/sr0 --raw
-# Dumps full INQUIRY and GET CONFIGURATION responses as hex
-# Useful for contributing profiles for unsupported drives
+## API
+
+```rust
+// Open and auto-identify
+let mut session = DriveSession::open(device_path)?;
+
+// Drive identity
+session.drive_id.vendor_id       // "HL-DT-ST"
+session.drive_id.product_id      // "BD-RE BU40N"
+session.drive_id.product_revision // "1.03"
+session.drive_id.vendor_specific  // "NM00000"
+session.drive_id.firmware_date    // "211810241934"
+
+// Profile data
+session.profile.chipset           // Chipset::MediaTek
+session.profile.unlock_mode       // 0x01
+session.profile.unlock_buf_id     // 0x44
+session.profile.signature         // [0x99, 0x9e, 0xc3, 0x75]
+
+// Operations
+session.unlock()?;                // activate raw mode
+session.calibrate()?;             // speed optimization
+session.read_sectors(lba, count, &mut buf)?;
+session.status()?;                // feature flags
+session.read_config()?;           // drive configuration
+session.read_register(index)?;    // hardware registers
 ```
 
-### freemkv-test
+## Chipset Support
 
-Verify raw read mode works:
+| Chipset | Status | Drives | Brands |
+|---------|--------|--------|--------|
+| MediaTek MT1959 | Supported | 206 | LG, ASUS, HP |
+| Renesas | Planned | -- | Pioneer |
 
-```bash
-$ freemkv-test /dev/sr0
-Enabling raw read mode... OK
-Calibrating speed... OK (42 speed zones)
-Reading sector 0... OK (2048 bytes)
-Reading sector 1000... OK (2048 bytes)
-All checks passed.
+Each profile stores per-drive `unlock_mode` and `unlock_buf_id` — the exact CDB bytes for that drive's unlock command. A single `Mt1959` implementation handles all MediaTek variants.
+
+## Drive Profile
+
+Each bundled profile (compiled into the binary):
+
+```json
+{
+  "vendor_id": "HL-DT-ST",
+  "product_id": "BD-RE BU40N     ",
+  "product_revision": "1.03",
+  "vendor_specific": "NM00000",
+  "firmware_date": "211810241934",
+  "chipset": "mediatek",
+  "unlock_mode": 1,
+  "unlock_buf_id": 68,
+  "signature": "999ec375",
+  "register_offsets": ["10e291", "11ab1c"]
+}
 ```
 
-## Contributing Drive Profiles
+## Error Codes
 
-If your drive isn't supported, you can help:
+Structured errors for programmatic handling — no user-facing English text in the library.
 
-1. Run `freemkv-info /dev/sr0 --raw > my_drive.txt`
-2. Open an issue or PR with the output
-3. We'll generate a profile from your drive data
-
-This is especially needed for Pioneer drives.
+| Code | Error | Meaning |
+|------|-------|---------|
+| E1000 | DeviceNotFound | Device path doesn't exist |
+| E1001 | DevicePermission | No access (try sudo or cdrom group) |
+| E2000 | UnsupportedDrive | No matching profile |
+| E2001 | ProfileNotFound | Profile lookup failed |
+| E3000 | UnlockFailed | Unlock command rejected |
+| E3001 | SignatureMismatch | Response signature wrong |
+| E3002 | NotUnlocked | Operation requires unlock first |
+| E4000 | ScsiError | SCSI command failed |
+| E5000 | IoError | System I/O error |
 
 ## Architecture
 
 ```
 DriveSession
-├── ScsiTransport     — SG_IO (Linux) / IOKit (macOS)
-├── DriveProfile      — per-drive JSON data
-└── Platform          — per-chipset unlock + read logic
-    ├── Mt1959        — LG/ASUS MediaTek drives
-    └── Pioneer       — Pioneer Renesas drives (WIP)
+├── ScsiTransport     SG_IO (Linux) / IOKit (macOS, planned)
+├── DriveProfile      per-drive parameters (bundled JSON, compiled in)
+├── DriveId           INQUIRY + GET_CONFIG 010C fields
+└── Platform
+    ├── Mt1959        MediaTek MT1959 (206 drives)
+    └── (Renesas)     Pioneer (planned)
 ```
 
-The library implements 10 drive commands per platform:
+## Platform
 
-| Command | Purpose |
-|---------|---------|
-| enable | Activate raw read mode |
-| read_config | Read drive configuration |
-| read_register | Read hardware registers |
-| calibrate | Build speed optimization table |
-| keepalive | Session keepalive |
-| status | Read mode status and features |
-| probe | Generic drive query |
-| read_sectors | Read raw disc sectors |
-| read_disc_structure | Read disc metadata |
-| timing | Timing calibration |
+Linux only today (SG_IO ioctl). The `ScsiTransport` trait abstracts the platform — macOS IOKit and Windows SPTI backends are planned.
+
+## Contributing
+
+Run `freemkv info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to submit your drive's profile.
 
 ## License
 
