@@ -158,12 +158,12 @@ impl PlatformType {
 /// Parse a hex string like "999ec375" into [u8; 4].
 fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     if s.len() != 8 {
-        return Err(Error::ProfileParse(format!("expected 8 hex chars, got {}", s.len())));
+        return Err(Error::ProfileParse { detail: format!("expected 8 hex chars, got {}", s.len()) });
     }
     let mut out = [0u8; 4];
     for i in 0..4 {
         out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16)
-            .map_err(|e| Error::ProfileParse(format!("bad hex: {e}")))?;
+            .map_err(|e| Error::ProfileParse { detail: format!("bad hex: {e}") })?;
     }
     Ok(out)
 }
@@ -171,12 +171,12 @@ fn parse_hex4(s: &str) -> Result<[u8; 4]> {
 /// Parse a hex string into a byte vector.
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
-        return Err(Error::ProfileParse("odd hex length".into()));
+        return Err(Error::ProfileParse { detail: "odd hex length".into() });
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in (0..s.len()).step_by(2) {
         out.push(u8::from_str_radix(&s[i..i+2], 16)
-            .map_err(|e| Error::ProfileParse(format!("bad hex: {e}")))?);
+            .map_err(|e| Error::ProfileParse { detail: format!("bad hex: {e}") })?);
     }
     Ok(out)
 }
@@ -294,10 +294,10 @@ pub fn load_all(path: &std::path::Path) -> Result<Vec<DriveProfile>> {
 /// Parse profiles from a JSON string.
 fn load_from_str(data: &str) -> Result<Vec<DriveProfile>> {
     let json: serde_json::Value = serde_json::from_str(data)
-        .map_err(|e| Error::ProfileParse(format!("JSON: {e}")))?;
+        .map_err(|e| Error::ProfileParse { detail: format!("JSON: {e}") })?;
 
     let arr = json.as_array()
-        .ok_or_else(|| Error::ProfileParse("expected array".into()))?;
+        .ok_or_else(|| Error::ProfileParse { detail: "expected array".into() })?;
 
     let mut profiles = Vec::with_capacity(arr.len());
     for entry in arr {

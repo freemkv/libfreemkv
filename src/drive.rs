@@ -36,12 +36,18 @@ impl DriveSession {
         // Match drive to a profile by INQUIRY fields
         let profile = profile::find_by_drive_id(&profiles, &drive_id)
             .cloned()
-            .ok_or_else(|| Error::UnsupportedDrive(format!("{}", drive_id)))?;
+            .ok_or_else(|| Error::UnsupportedDrive {
+                vendor_id: drive_id.vendor_id.trim().to_string(),
+                product_id: drive_id.product_id.trim().to_string(),
+                product_revision: drive_id.product_revision.trim().to_string(),
+            })?;
 
         if !profile.supported {
-            return Err(Error::UnsupportedDrive(format!(
-                "{} — status: {:?}", drive_id, profile.status
-            )));
+            return Err(Error::UnsupportedDrive {
+                vendor_id: drive_id.vendor_id.trim().to_string(),
+                product_id: drive_id.product_id.trim().to_string(),
+                product_revision: drive_id.product_revision.trim().to_string(),
+            });
         }
 
         let platform: Box<dyn Platform> = match profile.platform {
@@ -49,7 +55,11 @@ impl DriveSession {
                 Box::new(Mt1959::new(profile.clone()))
             }
             PlatformType::Pioneer => {
-                return Err(Error::UnsupportedDrive("Pioneer not yet implemented".into()));
+                return Err(Error::UnsupportedDrive {
+                    vendor_id: drive_id.vendor_id.trim().to_string(),
+                    product_id: drive_id.product_id.trim().to_string(),
+                    product_revision: "Pioneer not yet implemented".to_string(),
+                });
             }
         };
 
@@ -71,7 +81,11 @@ impl DriveSession {
                 Box::new(Mt1959::new(profile.clone()))
             }
             PlatformType::Pioneer => {
-                return Err(Error::UnsupportedDrive("Pioneer not yet implemented".into()));
+                return Err(Error::UnsupportedDrive {
+                    vendor_id: drive_id.vendor_id.trim().to_string(),
+                    product_id: drive_id.product_id.trim().to_string(),
+                    product_revision: "Pioneer not yet implemented".to_string(),
+                });
             }
         };
 

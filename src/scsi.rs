@@ -76,7 +76,7 @@ impl SgIoTransport {
 
         let fd = unsafe { libc::open(c_path.as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
-            return Err(Error::DeviceNotFound(device.display().to_string()));
+            return Err(Error::DeviceNotFound { path: device.display().to_string() });
         }
         Ok(SgIoTransport { fd })
     }
@@ -120,16 +120,17 @@ impl ScsiTransport for SgIoTransport {
         };
 
         if ret < 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
+            return Err(Error::IoError { source: std::io::Error::last_os_error() });
         }
 
         let bytes_transferred = (data.len() as i32 - hdr.resid) as usize;
 
         if hdr.status != 0 {
+            let sense_key = if hdr.sb_len_wr > 2 { sense[2] & 0x0F } else { 0 };
             return Err(Error::ScsiError {
-                cdb: cdb.to_vec(),
+                opcode: cdb[0],
                 status: hdr.status,
-                sense: sense[..hdr.sb_len_wr as usize].to_vec(),
+                sense_key,
             });
         }
 

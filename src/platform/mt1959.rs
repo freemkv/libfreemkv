@@ -78,10 +78,10 @@ impl Mt1959 {
 
         // Check verification bytes at response[12:16]
         if &response[12..16] != self.profile.verify.as_slice() {
-            return Err(Error::UnlockFailed(format!(
+            return Err(Error::UnlockFailed { detail: format!(
                 "verify mismatch at [12:16]: {:02x}{:02x}{:02x}{:02x}",
                 response[12], response[13], response[14], response[15]
-            )));
+            ) });
         }
 
         self.unlocked = true;
@@ -110,9 +110,9 @@ impl Mt1959 {
             }
         }
         Err(Error::ScsiError {
-            cdb: vec![0x3C],
+            opcode: 0x3C,
             status: 0xFF,
-            sense: vec![],
+            sense_key: 0,
         })
     }
 
@@ -180,10 +180,10 @@ impl Platform for Mt1959 {
         self.validate(scsi)?;
 
         let offset = *self.profile.register_offsets.get(index as usize)
-            .ok_or_else(|| Error::ScsiError {
-                cdb: vec![],
-                status: 0,
-                sense: vec![],
+            .ok_or_else(|| Error::ProfileNotFound {
+                vendor_id: self.profile.vendor_id.clone(),
+                product_revision: self.profile.product_revision.clone(),
+                vendor_specific: format!("register index {} out of range", index),
             })?;
 
         let cdb = scsi::build_read_buffer(self.mode, self.buffer_id, offset, 36);
