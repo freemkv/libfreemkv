@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          for bin in freemkv-info freemkv-test; do
+            if [ -f "$bin" ]; then
+              tar czf "../../../${bin}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" "$bin"
+            fi
+          done
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.tar.gz'

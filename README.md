@@ -10,10 +10,21 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ## Install
 
+### As a library
+
 ```toml
 [dependencies]
-libfreemkv = "0.1"
+libfreemkv = "0.2"
 ```
+
+### Prebuilt binaries
+
+Download from [GitHub Releases](https://github.com/freemkv/libfreemkv/releases):
+
+| Platform | Architecture | Download |
+|----------|-------------|----------|
+| Linux | x86_64 | [freemkv-info](https://github.com/freemkv/libfreemkv/releases/latest) |
+| Linux | aarch64 | [freemkv-info](https://github.com/freemkv/libfreemkv/releases/latest) |
 
 ## Usage
 
