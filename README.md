@@ -1,10 +1,13 @@
 [![Crates.io](https://img.shields.io/crates/v/libfreemkv)](https://crates.io/crates/libfreemkv)
+[![docs.rs](https://img.shields.io/docsrs/libfreemkv)](https://docs.rs/libfreemkv)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![Drives: 206](https://img.shields.io/badge/drives-206-brightgreen)]()
 
 # libfreemkv
 
-Rust library for raw sector access on optical drives. Identifies drives using standard SCSI commands, matches them against 206 bundled profiles, and unlocks raw read mode. No external files, no configuration.
+Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc format parsing, and raw sector reading in one crate. 206 bundled drive profiles.
+
+**[API Documentation](https://docs.rs/libfreemkv)**
 
 Part of the [freemkv](https://github.com/freemkv) project.
 
