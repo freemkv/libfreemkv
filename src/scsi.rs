@@ -36,7 +36,7 @@ pub trait ScsiTransport {
 // ─── Linux: SG_IO ───────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-const SG_IO: libc::c_ulong = 0x2285;
+const SG_IO: u32 = 0x2285;
 #[cfg(target_os = "linux")]
 const SG_DXFER_NONE: i32 = -1;
 #[cfg(target_os = "linux")]
@@ -130,7 +130,7 @@ impl ScsiTransport for SgIoTransport {
         hdr.timeout = timeout_ms;
 
         let ret = unsafe {
-            libc::ioctl(self.fd, SG_IO, &mut hdr as *mut sg_io_hdr)
+            libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr)
         };
 
         if ret < 0 {
