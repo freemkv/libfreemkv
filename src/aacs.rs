@@ -633,6 +633,179 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     None
 }
 
+// ── AACS-G3 key derivation (subset-difference tree) ─────────────────────────
+
+/// AACS-G3 seed constant.
+const AESG3_SEED: [u8; 16] = [
+    0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5,
+    0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
+];
+
+/// AACS-G3: derive a subkey from a parent key.
+/// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
+fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
+    let mut seed = AESG3_SEED;
+    seed[15] = seed[15].wrapping_add(inc);
+    let mut out = aes_ecb_decrypt(key, &seed);
+    for i in 0..16 {
+        out[i] ^= seed[i];
+    }
+    out
+}
+
+/// Compute v_mask from a UV value.
+fn calc_v_mask(uv: u32) -> u32 {
+    let mut v_mask: u32 = 0xFFFFFFFF;
+    while (uv & !v_mask) == 0 && v_mask != 0 {
+        v_mask <<= 1;
+    }
+    v_mask
+}
+
+/// Derive processing key from device key using subset-difference tree traversal.
+fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> [u8; 16] {
+    // Initial derivation: left_child = aesg3(dk, 0), pk = aesg3(dk, 1), right_child = aesg3(dk, 2)
+    let mut left_child = aesg3(dk, 0);
+    let mut pk = aesg3(dk, 1);
+    let mut right_child = aesg3(dk, 2);
+    let mut current_v_mask = dev_key_v_mask;
+
+    while current_v_mask != v_mask {
+        // Find the highest unset bit in current_v_mask
+        let mut bit_pos: i32 = -1;
+        for i in (0..32).rev() {
+            if (current_v_mask & (1u32 << i)) == 0 {
+                bit_pos = i as i32;
+                break;
+            }
+        }
+
+        let curr_key = if bit_pos < 0 || (uv & (1u32 << bit_pos as u32)) == 0 {
+            left_child
+        } else {
+            right_child
+        };
+
+        left_child = aesg3(&curr_key, 0);
+        pk = aesg3(&curr_key, 1);
+        right_child = aesg3(&curr_key, 2);
+
+        current_v_mask = ((current_v_mask as i32) >> 1) as u32;
+    }
+
+    pk
+}
+
+/// Derive Media Key from MKB using device keys (subset-difference tree).
+pub fn derive_media_key_from_dk(
+    mkb: &[u8],
+    device_keys: &[DeviceKey],
+) -> Option<[u8; 16]> {
+    let mk_dv = mkb_find_mk_dv(mkb)?;
+    let uvs = mkb_find_subdiff_records(mkb)?;
+    let cvalues = mkb_find_cvalues(mkb)?;
+
+    // Count UV entries
+    let num_uvs = uvs.chunks(5).take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0).count();
+
+    for dk in device_keys {
+        let device_number = dk.node as u32;
+
+        // Find applying subset-difference for this device
+        for uvs_idx in 0..num_uvs {
+            let p_uv = &uvs[1 + 5 * uvs_idx..];
+            let u_mask_shift = uvs[5 * uvs_idx]; // byte before the UV value
+
+            if u_mask_shift & 0xC0 != 0 {
+                break; // device revoked
+            }
+
+            let uv = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
+            if uv == 0 { continue; }
+
+            let u_mask: u32 = 0xFFFFFFFF << u_mask_shift;
+            let v_mask = calc_v_mask(uv);
+
+            if ((device_number & u_mask) == (uv & u_mask)) &&
+               ((device_number & v_mask) != (uv & v_mask))
+            {
+                // Found matching subset-difference — find the right device key
+                let dev_key_v_mask = calc_v_mask(dk.uv);
+                let dev_key_u_mask: u32 = 0xFFFFFFFF << dk.u_mask_shift;
+
+                if u_mask == dev_key_u_mask &&
+                   (uv & dev_key_v_mask) == (dk.uv & dev_key_v_mask)
+                {
+                    // Derive processing key via tree traversal
+                    let pk = calc_pk_from_dk(&dk.key, uv, v_mask, dev_key_v_mask);
+
+                    // Validate and derive media key
+                    if uvs_idx < cvalues.len() / 16 {
+                        let cv = &cvalues[uvs_idx * 16..(uvs_idx + 1) * 16];
+                        if let Some(mk) = validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], &mk_dv) {
+                            return Some(mk);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
+/// Returns the concatenated MKB data from all packs.
+pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::error::Result<Vec<u8>> {
+    use crate::scsi::DataDirection;
+
+    // First pack: get pack count and initial data
+    let cdb = [
+        0xAD, 0x01, // REPORT DISC STRUCTURE, Blu-ray
+        0x00, 0x00, 0x00, 0x00, // address = 0 (pack 0)
+        0x00, 0x83, // format = 0x83 (MKB)
+        0x80, 0x04, // allocation length = 32772
+        0x00, 0x00,
+    ];
+    let mut buf = vec![0u8; 32772];
+    session.scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
+
+    let data_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if data_len < 2 { return Ok(Vec::new()); }
+    let len = data_len - 2;
+    let num_packs = buf[3] as usize;
+
+    let mut mkb = Vec::with_capacity(32768 * num_packs.max(1));
+    if len > 0 && len <= 32768 {
+        mkb.extend_from_slice(&buf[4..4 + len]);
+    }
+
+    // Read remaining packs
+    for pack in 1..num_packs {
+        let mut cdb = [
+            0xAD, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x83,
+            0x80, 0x04,
+            0x00, 0x00,
+        ];
+        // Pack number goes in address field
+        cdb[2] = ((pack >> 24) & 0xFF) as u8;
+        cdb[3] = ((pack >> 16) & 0xFF) as u8;
+        cdb[4] = ((pack >> 8) & 0xFF) as u8;
+        cdb[5] = (pack & 0xFF) as u8;
+
+        let mut buf = vec![0u8; 32772];
+        if session.scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000).is_ok() {
+            let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+            if len > 2 && len - 2 <= 32768 {
+                mkb.extend_from_slice(&buf[4..4 + len - 2]);
+            }
+        }
+    }
+
+    Ok(mkb)
+}
+
 // ── Content Certificate parsing ─────────────────────────────────────────────
 
 /// AACS Content Certificate — identifies disc AACS version and features.
@@ -763,6 +936,23 @@ pub fn resolve_keys(
     // Path 3: MKB + processing keys → media key → VUK
     if let Some(mkb) = mkb_data {
         if let Some(mk) = derive_media_key_from_pk(mkb, &keydb.processing_keys) {
+            let vuk = derive_vuk(&mk, volume_id);
+            let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
+                .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
+                .collect();
+
+            return Some(ResolvedKeys {
+                disc_hash: uk_file.disc_hash,
+                vuk,
+                unit_keys,
+                title_cps_unit: uk_file.title_cps_unit,
+                aacs2,
+                bus_encryption,
+            });
+        }
+
+        // Path 4: MKB + device keys → processing key → media key → VUK
+        if let Some(mk) = derive_media_key_from_dk(mkb, &keydb.device_keys) {
             let vuk = derive_vuk(&mk, volume_id);
             let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
                 .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
