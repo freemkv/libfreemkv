@@ -26,12 +26,16 @@ impl DriveSession {
     /// Open a drive, identify it, and find the matching profile.
     /// Uses the bundled profile database — no external files needed.
     pub fn open(device: &Path) -> Result<Self> {
+        eprintln!("  [dbg] opening device...");
         let mut transport = crate::scsi::open(device)?;
+        eprintln!("  [dbg] loading profiles...");
         let profiles = profile::load_bundled()?;
 
         // Identify drive via standard SCSI commands
         // SPC-4 §6.4 (INQUIRY) + MMC-6 §5.3.10 (Feature 010Ch)
+        eprintln!("  [dbg] identifying drive...");
         let drive_id = DriveId::from_drive(transport.as_mut())?;
+        eprintln!("  [dbg] drive: {} {}", drive_id.vendor_id.trim(), drive_id.product_id.trim());
 
         // Match drive to a profile by INQUIRY fields
         let profile = profile::find_by_drive_id(&profiles, &drive_id)
@@ -64,7 +68,9 @@ impl DriveSession {
 
         // Always unlock on open — makes all reads work immediately.
         // Silently ignore failures (unencrypted discs don't need it).
+        eprintln!("  [dbg] unlocking...");
         let _ = session.unlock();
+        eprintln!("  [dbg] unlocked, session ready");
 
         Ok(session)
     }
@@ -135,8 +141,8 @@ impl DriveSession {
         self.platform.probe(self.scsi.as_mut(), sub_cmd, address, length)
     }
 
-    /// Standard READ(10) — reads unencrypted sectors (UDF filesystem, etc).
-    /// Does not require unlock. Use read_sectors() for raw/encrypted content.
+    /// Standard READ(10) — reads disc sectors for UDF filesystem, MPLS, CLPI, etc.
+    /// Uses a 5-second timeout to avoid hanging on encrypted/unreadable sectors.
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
             0x28, 0x00, // READ(10), no flags
@@ -146,7 +152,7 @@ impl DriveSession {
             0x00,
         ];
         let result = self.scsi.as_mut().execute(
-            &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)?;
+            &cdb, crate::scsi::DataDirection::FromDevice, buf, 5_000)?;
         Ok(result.bytes_transferred)
     }
 
