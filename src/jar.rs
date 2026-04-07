@@ -30,6 +30,10 @@ pub struct JarLabels {
 pub struct TrackLabel {
     /// Human-readable description (e.g. "English Dolby Atmos", "TrueHD", "Descriptive Audio (US)")
     pub description: String,
+    /// ISO 639-2 language code if available (e.g. "eng", "fra")
+    pub language: String,
+    /// Codec hint if available (e.g. "MLP"=TrueHD, "AC3"=DD, "DTS")
+    pub codec_hint: String,
     /// The raw string from the class file
     pub raw: String,
 }
@@ -99,8 +103,12 @@ fn try_textfield_format(strings: &[String]) -> Option<JarLabels> {
     subtitle.sort_by_key(|s| s.0);
 
     Some(JarLabels {
-        audio: audio.into_iter().map(|(_, desc, raw)| TrackLabel { description: desc, raw }).collect(),
-        subtitle: subtitle.into_iter().map(|(_, desc, raw)| TrackLabel { description: desc, raw }).collect(),
+        audio: audio.into_iter().map(|(_, desc, raw)| TrackLabel {
+            description: desc, language: String::new(), codec_hint: String::new(), raw,
+        }).collect(),
+        subtitle: subtitle.into_iter().map(|(_, desc, raw)| TrackLabel {
+            description: desc, language: String::new(), codec_hint: String::new(), raw,
+        }).collect(),
         playlists,
     })
 }
@@ -118,9 +126,15 @@ fn try_label_format(strings: &[String]) -> Option<JarLabels> {
     for s in strings {
         if let Some(label) = parse_label_string(s) {
             if label.is_audio && !audio.iter().any(|a: &TrackLabel| a.raw == label.raw) {
-                audio.push(TrackLabel { description: label.description, raw: label.raw });
+                audio.push(TrackLabel {
+                    description: label.description, language: label.language,
+                    codec_hint: label.codec_hint, raw: label.raw,
+                });
             } else if label.is_subtitle && !subtitle.iter().any(|a: &TrackLabel| a.raw == label.raw) {
-                subtitle.push(TrackLabel { description: label.description, raw: label.raw });
+                subtitle.push(TrackLabel {
+                    description: label.description, language: label.language,
+                    codec_hint: label.codec_hint, raw: label.raw,
+                });
             }
         }
 
@@ -136,6 +150,8 @@ fn try_label_format(strings: &[String]) -> Option<JarLabels> {
 
 struct ParsedLabel {
     description: String,
+    language: String,
+    codec_hint: String,
     raw: String,
     is_audio: bool,
     is_subtitle: bool,
@@ -154,25 +170,28 @@ fn parse_label_string(s: &str) -> Option<ParsedLabel> {
     let hint = parts[1];
     let variant = if parts.len() > 2 { parts[2] } else { "" };
 
-    let (description, is_audio, is_subtitle) = match hint {
-        "MLP" => ("TrueHD".to_string(), true, false),
+    let (description, codec_hint, is_audio, is_subtitle) = match hint {
+        "MLP" => ("TrueHD".to_string(), "MLP".to_string(), true, false),
         "AC3" => {
             let d = if variant.is_empty() { "compatibility".to_string() } else { variant.to_string() };
-            (d, true, false)
+            (d, "AC3".to_string(), true, false)
         }
-        "DTS" => ("DTS".to_string(), true, false),
-        "LPCM" => ("LPCM".to_string(), true, false),
+        "DTS" => ("DTS".to_string(), "DTS".to_string(), true, false),
+        "LPCM" => ("LPCM".to_string(), "LPCM".to_string(), true, false),
         "ADES" => {
             let d = if variant.is_empty() { "Descriptive Audio".to_string() }
                     else { format!("Descriptive Audio ({})", variant) };
-            (d, true, false)
+            (d, "ADES".to_string(), true, false)
         }
-        h if h.starts_with("AudioStream") => (String::new(), true, false),
-        h if h.starts_with("PGStream") => (String::new(), false, true),
+        h if h.starts_with("AudioStream") => (String::new(), String::new(), true, false),
+        h if h.starts_with("PGStream") => (String::new(), String::new(), false, true),
         _ => return None,
     };
 
-    Some(ParsedLabel { description, raw: s.to_string(), is_audio, is_subtitle })
+    Some(ParsedLabel {
+        description, language: language.to_string(), codec_hint,
+        raw: s.to_string(), is_audio, is_subtitle,
+    })
 }
 
 // ── Format 3: Playlist-only ─────────────────────────────────────────────────
