@@ -33,6 +33,8 @@ pub struct UdfFs {
     /// Metadata partition start (absolute sector)
     /// For UDF 2.50 discs, all file/directory references use metadata-relative LBAs
     metadata_start: u32,
+    /// Metadata partition size in sectors
+    metadata_sectors: u32,
 }
 
 /// A directory or file entry.
@@ -122,8 +124,10 @@ impl UdfFs {
     pub fn metadata_sector_ranges(&self, session: &mut DriveSession) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
-        // UDF structure: AVDP + VDS + metadata partition + FSD + some margin
-        ranges.push((0, self.metadata_start + 256));
+        // UDF structure: sector 0 through end of metadata partition
+        // Covers AVDP, VDS, partition descriptor, metadata ICB, FSD, all directories
+        let meta_end = self.metadata_start + self.metadata_sectors;
+        ranges.push((0, meta_end));
 
         // Walk tree, collect ranges for each metadata file
         self.collect_file_ranges(session, &self.root, &mut ranges)?;
@@ -246,6 +250,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
     let mut num_partition_maps: u32 = 0;
     let mut lvd_sector: Option<u32> = None;
     let mut volume_id = String::new();
+    let mut metadata_size_bytes: u32 = 0;
 
     for i in 32..64 {
         let mut desc = [0u8; 2048];
@@ -310,8 +315,9 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
                     let l_ea = u32::from_le_bytes([meta_icb[208], meta_icb[209],
                                                    meta_icb[210], meta_icb[211]]) as usize;
                     let ad_off = 216 + l_ea;
-                    let _ad_len = u32::from_le_bytes([meta_icb[ad_off], meta_icb[ad_off + 1],
+                    let ad_len = u32::from_le_bytes([meta_icb[ad_off], meta_icb[ad_off + 1],
                                                       meta_icb[ad_off + 2], meta_icb[ad_off + 3]]) & 0x3FFFFFFF;
+                    metadata_size_bytes = ad_len;
                     let ad_pos = u32::from_le_bytes([meta_icb[ad_off + 4], meta_icb[ad_off + 5],
                                                      meta_icb[ad_off + 6], meta_icb[ad_off + 7]]);
                     // Metadata content starts at partition_start + ad_pos
@@ -350,11 +356,14 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
     // Step 5: Read root directory and build file tree
     let root = read_directory(session, partition_start, metadata_start, root_lba, "", 0)?;
 
+    let metadata_sectors = (metadata_size_bytes + 2047) / 2048;
+
     Ok(UdfFs {
         root,
         volume_id,
         partition_start,
         metadata_start,
+        metadata_sectors,
     })
 }
 

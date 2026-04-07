@@ -660,7 +660,7 @@ impl Disc {
             return None;
         }
 
-        // Parse each clip for EP map → sector extents
+        // Parse each clip for size and sector extents
         let mut extents = Vec::new();
         let mut total_size: u64 = 0;
         let clip_count = parsed.play_items.len();
@@ -669,11 +669,11 @@ impl Disc {
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
             if let Ok(clpi_data) = udf_fs.read_file(session, &clpi_path) {
                 if let Ok(clip_info) = clpi::parse(&clpi_data) {
-                    // Use EP map to get sector extents for this clip's time range
+                    // Size from source packet count (192 bytes per packet)
+                    total_size += clip_info.source_packet_count as u64 * 192;
+
+                    // EP map extents for ripping (sector ranges on disc)
                     let clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
-                    for ext in &clip_extents {
-                        total_size += ext.sector_count as u64 * 2048;
-                    }
                     extents.extend(clip_extents);
                 }
             }
