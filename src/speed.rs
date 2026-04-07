@@ -65,9 +65,7 @@ impl DriveSpeed {
             22_001..=31_000   => DriveSpeed::BD6x,
             31_001..=40_000   => DriveSpeed::BD8x,
             40_001..=49_000   => DriveSpeed::BD10x,
-            49_001..=0xFFFE   => DriveSpeed::BD12x,
-            0xFFFF            => DriveSpeed::Max,
-            _                 => DriveSpeed::Max,
+            49_001..=u16::MAX => DriveSpeed::BD12x,
         }
     }
 

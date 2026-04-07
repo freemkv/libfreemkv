@@ -1,8 +1,13 @@
-//! High-level drive session — the main API for consumers.
+//! Drive session — open, identify, unlock, and read from optical drives.
 //!
-//! Opens a drive, identifies it via standard SCSI commands,
-//! matches it against the profile database, and provides
-//! raw disc access methods.
+//! `DriveSession` is the entry point for all drive interaction. It handles
+//! device identification, profile matching, platform-specific unlock, and
+//! provides both raw sector reads and standard SCSI command execution.
+//!
+//! Two open modes:
+//!   - `open()` — identify + unlock. Ready for reading immediately.
+//!   - `open_no_unlock()` — identify only. Used for AACS authentication
+//!     which must happen before the drive enters raw mode.
 
 use std::path::Path;
 use crate::error::{Error, Result};
@@ -12,9 +17,10 @@ use crate::profile::{self, DriveProfile, Chipset};
 use crate::platform::{Platform, DriveStatus};
 use crate::platform::mt1959::Mt1959;
 
-/// A complete drive session.
+/// A drive session with identification, platform, and SCSI transport.
 ///
-/// Handles: identify → match profile → create platform → execute commands.
+/// Created via `DriveSession::open()` or `DriveSession::open_no_unlock()`.
+/// All disc reading goes through this struct.
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
     platform: Box<dyn Platform>,
@@ -24,61 +30,22 @@ pub struct DriveSession {
 }
 
 impl DriveSession {
-    /// Open a drive, identify it, and find the matching profile.
-    /// Uses the bundled profile database — no external files needed.
+    /// Open a drive, identify it, match a profile, and unlock for raw reads.
+    ///
+    /// This is the standard entry point. After `open()`, the drive is ready
+    /// for sector reads, disc scanning, and content extraction.
     pub fn open(device: &Path) -> Result<Self> {
-        eprintln!("  [dbg] opening device...");
-        let mut transport = crate::scsi::open(device)?;
-        eprintln!("  [dbg] loading profiles...");
-        let profiles = profile::load_bundled()?;
-
-        // Identify drive via standard SCSI commands
-        // SPC-4 §6.4 (INQUIRY) + MMC-6 §5.3.10 (Feature 010Ch)
-        eprintln!("  [dbg] identifying drive...");
-        let drive_id = DriveId::from_drive(transport.as_mut())?;
-        eprintln!("  [dbg] drive: {} {}", drive_id.vendor_id.trim(), drive_id.product_id.trim());
-
-        // Match drive to a profile by INQUIRY fields
-        let profile = profile::find_by_drive_id(&profiles, &drive_id)
-            .cloned()
-            .ok_or_else(|| Error::UnsupportedDrive {
-                vendor_id: drive_id.vendor_id.trim().to_string(),
-                product_id: drive_id.product_id.trim().to_string(),
-                product_revision: drive_id.product_revision.trim().to_string(),
-            })?;
-
-        let platform: Box<dyn Platform> = match profile.chipset {
-            Chipset::MediaTek => {
-                Box::new(Mt1959::new(profile.clone()))
-            }
-            Chipset::Renesas => {
-                return Err(Error::UnsupportedDrive {
-                    vendor_id: drive_id.vendor_id.trim().to_string(),
-                    product_id: drive_id.product_id.trim().to_string(),
-                    product_revision: "Renesas not yet implemented".to_string(),
-                });
-            }
-        };
-
-        let mut session = DriveSession {
-            scsi: transport,
-            platform,
-            profile,
-            drive_id,
-            device_path: device.to_string_lossy().to_string(),
-        };
-
-        // Always unlock on open — makes all reads work immediately.
-        // Silently ignore failures (unencrypted discs don't need it).
-        eprintln!("  [dbg] unlocking...");
-        let _ = session.unlock();
-        eprintln!("  [dbg] unlocked, session ready");
-
+        let mut session = Self::open_no_unlock(device)?;
+        let _ = session.unlock(); // silently ignore — unencrypted discs don't need it
         Ok(session)
     }
 
-    /// Open a drive WITHOUT unlocking (raw mode).
-    /// Used for AACS authentication which must happen before unlock.
+    /// Open a drive WITHOUT unlocking.
+    ///
+    /// Used when AACS authentication must happen before raw mode.
+    /// The AACS SCSI handshake requires the drive's standard firmware
+    /// state — unlocking puts the drive in vendor-specific raw mode
+    /// which disables the AACS layer.
     pub fn open_no_unlock(device: &Path) -> Result<Self> {
         let mut transport = crate::scsi::open(device)?;
         let profiles = profile::load_bundled()?;
@@ -92,16 +59,22 @@ impl DriveSession {
                 product_revision: drive_id.product_revision.trim().to_string(),
             })?;
 
-        let platform: Box<dyn Platform> = match profile.chipset {
-            Chipset::MediaTek => Box::new(Mt1959::new(profile.clone())),
-            Chipset::Renesas => {
-                return Err(Error::UnsupportedDrive {
-                    vendor_id: drive_id.vendor_id.trim().to_string(),
-                    product_id: drive_id.product_id.trim().to_string(),
-                    product_revision: "Renesas not yet implemented".to_string(),
-                });
-            }
-        };
+        let platform = create_platform(&profile, &drive_id)?;
+
+        Ok(DriveSession {
+            scsi: transport,
+            platform,
+            profile,
+            drive_id,
+            device_path: device.to_string_lossy().to_string(),
+        })
+    }
+
+    /// Open with an explicit profile, skipping auto-detection.
+    pub fn open_with_profile(device: &Path, profile: DriveProfile) -> Result<Self> {
+        let mut transport = crate::scsi::open(device)?;
+        let drive_id = DriveId::from_drive(transport.as_mut())?;
+        let platform = create_platform(&profile, &drive_id)?;
 
         Ok(DriveSession {
             scsi: transport,
@@ -117,39 +90,12 @@ impl DriveSession {
         &self.device_path
     }
 
-    /// Open with an explicit profile (skip auto-detection).
-    pub fn open_with_profile(device: &Path, profile: DriveProfile) -> Result<Self> {
-        let mut transport = crate::scsi::open(device)?;
-        let drive_id = DriveId::from_drive(transport.as_mut())?;
-
-        let platform: Box<dyn Platform> = match profile.chipset {
-            Chipset::MediaTek => {
-                Box::new(Mt1959::new(profile.clone()))
-            }
-            Chipset::Renesas => {
-                return Err(Error::UnsupportedDrive {
-                    vendor_id: drive_id.vendor_id.trim().to_string(),
-                    product_id: drive_id.product_id.trim().to_string(),
-                    product_revision: "Renesas not yet implemented".to_string(),
-                });
-            }
-        };
-
-        Ok(DriveSession {
-            scsi: transport,
-            platform,
-            profile,
-            drive_id,
-            device_path: String::new(),
-        })
-    }
-
-    /// Activate raw disc access mode.
+    /// Activate raw disc access mode (vendor-specific unlock).
     pub fn unlock(&mut self) -> Result<()> {
         self.platform.unlock(self.scsi.as_mut())
     }
 
-    /// Check if raw disc access mode is enabled.
+    /// Check if raw disc access mode is active.
     pub fn is_unlocked(&self) -> bool {
         self.platform.is_unlocked()
     }
@@ -174,21 +120,20 @@ impl DriveSession {
         self.platform.calibrate(self.scsi.as_mut())
     }
 
-    /// Read raw disc sectors.
+    /// Read raw disc sectors via platform-specific command.
     pub fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         self.platform.read_sectors(self.scsi.as_mut(), lba, count, buf)
     }
 
-    /// Generic probe command.
+    /// Platform-specific probe command.
     pub fn probe(&mut self, sub_cmd: u8, address: u32, length: u32) -> Result<Vec<u8>> {
         self.platform.probe(self.scsi.as_mut(), sub_cmd, address, length)
     }
 
-    /// Standard READ(10) — reads disc sectors for UDF filesystem, MPLS, CLPI, etc.
-    /// Uses a 5-second timeout to avoid hanging on encrypted/unreadable sectors.
+    /// Standard SCSI READ(10) for disc filesystem data (UDF, MPLS, CLPI).
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
-            0x28, 0x00, // READ(10), no flags
+            0x28, 0x00,
             (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
             0x00,
             (count >> 8) as u8, count as u8,
@@ -199,8 +144,26 @@ impl DriveSession {
         Ok(result.bytes_transferred)
     }
 
-    /// Send a raw SCSI CDB. Used by UDF reader and disc structure parsers.
-    pub fn scsi_execute(&mut self, cdb: &[u8], direction: crate::scsi::DataDirection, buf: &mut [u8], timeout_ms: u32) -> Result<crate::scsi::ScsiResult> {
+    /// Execute a raw SCSI CDB. Used by parsers and AACS handshake.
+    pub fn scsi_execute(
+        &mut self,
+        cdb: &[u8],
+        direction: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<crate::scsi::ScsiResult> {
         self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+    }
+}
+
+/// Create the platform-specific driver for a given chipset.
+fn create_platform(profile: &DriveProfile, drive_id: &DriveId) -> Result<Box<dyn Platform>> {
+    match profile.chipset {
+        Chipset::MediaTek => Ok(Box::new(Mt1959::new(profile.clone()))),
+        Chipset::Renesas => Err(Error::UnsupportedDrive {
+            vendor_id: drive_id.vendor_id.trim().to_string(),
+            product_id: drive_id.product_id.trim().to_string(),
+            product_revision: "Renesas not yet implemented".to_string(),
+        }),
     }
 }

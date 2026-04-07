@@ -141,10 +141,6 @@ impl ScsiTransport for SgIoTransport {
 
         if hdr.status != 0 {
             let sense_key = if hdr.sb_len_wr > 2 { sense[2] & 0x0F } else { 0 };
-            let asc = if hdr.sb_len_wr > 12 { sense[12] } else { 0 };
-            let ascq = if hdr.sb_len_wr > 13 { sense[13] } else { 0 };
-            eprintln!("  [scsi] CDB {:02x?} failed: status=0x{:02x} sense={:02x}/{:02x}/{:02x}",
-                &cdb[..cdb.len().min(12)], hdr.status, sense_key, asc, ascq);
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
