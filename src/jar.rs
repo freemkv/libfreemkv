@@ -170,15 +170,15 @@ fn parse_label_string(s: &str) -> Option<ParsedLabel> {
     let hint = parts[1];
     let variant = if parts.len() > 2 { parts[2] } else { "" };
 
+    // Only set description when the JAR adds info beyond what MPLS provides.
+    // Codec (MLP, AC3, DTS) is already known from the stream. Don't make up labels.
     let (description, codec_hint, is_audio, is_subtitle) = match hint {
-        "MLP" => ("TrueHD".to_string(), "MLP".to_string(), true, false),
-        "AC3" => {
-            let d = if variant.is_empty() { "compatibility".to_string() } else { variant.to_string() };
-            (d, "AC3".to_string(), true, false)
-        }
-        "DTS" => ("DTS".to_string(), "DTS".to_string(), true, false),
-        "LPCM" => ("LPCM".to_string(), "LPCM".to_string(), true, false),
+        "MLP" => (String::new(), "MLP".to_string(), true, false),
+        "AC3" => (String::new(), "AC3".to_string(), true, false),
+        "DTS" => (String::new(), "DTS".to_string(), true, false),
+        "LPCM" => (String::new(), "LPCM".to_string(), true, false),
         "ADES" => {
+            // Descriptive Audio — real value-add, can't be derived from MPLS
             let d = if variant.is_empty() { "Descriptive Audio".to_string() }
                     else { format!("Descriptive Audio ({})", variant) };
             (d, "ADES".to_string(), true, false)
@@ -322,8 +322,8 @@ mod tests {
         ];
         let labels = try_label_format(&strings).unwrap();
         assert_eq!(labels.audio.len(), 3);
-        assert_eq!(labels.audio[0].description, "TrueHD");
-        assert_eq!(labels.audio[1].description, "Descriptive Audio (US)");
+        assert_eq!(labels.audio[0].description, ""); // MLP — codec already known from stream
+        assert_eq!(labels.audio[1].description, "Descriptive Audio (US)"); // ADES — real value-add
     }
 
     #[test]
