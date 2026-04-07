@@ -183,11 +183,32 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
         return Ok((Vec::new(), Vec::new()));
     }
 
+    // Stream PID entry — bit-packed per BD spec (libbluray clpi_parse.c):
+    //   stream_PID: 16 bits           → ep_map[2..4]
+    //   reserved: 10 bits             ┐
+    //   EP_stream_type: 4 bits        │ ep_map[4..14] = 80 bits
+    //   num_EP_coarse: 16 bits        │ (10+4+16+18+32 = 80)
+    //   num_EP_fine: 18 bits          │
+    //   EP_map_start_address: 32 bits ┘
+    if ep_map.len() < 16 { return Ok((Vec::new(), Vec::new())); }
     let _stream_pid = u16::from_be_bytes([ep_map[2], ep_map[3]]);
-    // ep_map[4..6] = reserved + EP stream type
-    let num_coarse = u16::from_be_bytes([ep_map[6], ep_map[7]]) as usize;
-    let num_fine = u32::from_be_bytes([ep_map[8], ep_map[9], ep_map[10], ep_map[11]]) as usize;
-    let ep_map_offset = u32::from_be_bytes([ep_map[12], ep_map[13], ep_map[14], ep_map[15]]) as usize;
+
+    // Read 10 bytes (80 bits) from ep_map[4..14] for bit extraction
+    // Use two u64s since we need 80 bits
+    let hi = u64::from_be_bytes([ep_map[4], ep_map[5], ep_map[6], ep_map[7],
+                                  ep_map[8], ep_map[9], ep_map[10], ep_map[11]]);
+    let lo_bytes = [ep_map[12], ep_map[13]];
+
+    // Bit 0-9: reserved (10)
+    // Bit 10-13: EP_stream_type (4)
+    // Bit 14-29: num_coarse (16)
+    // Bit 30-47: num_fine (18)
+    // Bit 48-79: EP_map_start (32) — bits 48-63 in hi, bits 64-79 in lo
+    let num_coarse = ((hi >> 34) & 0xFFFF) as usize;
+    let num_fine = ((hi >> 16) & 0x3FFFF) as usize;
+    let ep_map_offset = (((hi & 0xFFFF) as u32) << 16)
+                        | (u16::from_be_bytes(lo_bytes) as u32);
+    let ep_map_offset = ep_map_offset as usize;
 
     // EP map for this stream starts at ep_map_offset relative to ep_map start
     if ep_map_offset + 4 > ep_map.len() {
