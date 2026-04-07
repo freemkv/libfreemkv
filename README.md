@@ -1,13 +1,12 @@
 [![Crates.io](https://img.shields.io/crates/v/libfreemkv)](https://crates.io/crates/libfreemkv)
 [![docs.rs](https://img.shields.io/docsrs/libfreemkv)](https://docs.rs/libfreemkv)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
-[![Drives: 206](https://img.shields.io/badge/drives-206-brightgreen)]()
 
 # libfreemkv
 
-Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc format parsing, and raw sector reading in one crate. 206 bundled drive profiles.
+Rust library for 4K UHD / Blu-ray optical drives. Drive access, disc scanning, AACS decryption, and content reading in one crate. Bundled drive profiles — no external files needed.
 
-**[API Documentation](https://docs.rs/libfreemkv)**
+**[API Documentation](https://docs.rs/libfreemkv)** · **[Technical Docs](docs/)**
 
 Part of the [freemkv](https://github.com/freemkv) project.
 
@@ -15,101 +14,74 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.2"
+libfreemkv = "0.3"
 ```
 
 ## Quick Start
 
 ```rust
-use libfreemkv::DriveSession;
+use libfreemkv::{DriveSession, Disc, ScanOptions};
 use std::path::Path;
 
+// Open drive — profiles are bundled, auto-identified
 let mut session = DriveSession::open(Path::new("/dev/sr0"))?;
 
-session.unlock()?;       // activate raw read mode
-session.calibrate()?;    // optimize read speed
+// Scan disc — UDF, playlists, streams, AACS (all automatic)
+let disc = Disc::scan(&mut session, &ScanOptions::default())?;
 
-let mut buf = vec![0u8; 2048];
-let n = session.read_sectors(0, 1, &mut buf)?;
-```
+for title in &disc.titles {
+    println!("{} — {} streams", title.duration_display(), title.streams.len());
+}
 
-## How It Works
-
-1. **INQUIRY** (SPC-4 §6.4) — reads vendor_id, product_id, product_revision, vendor_specific
-2. **GET CONFIGURATION 010C** (MMC-6 §5.3.10) — reads firmware_date
-3. **Profile match** — five fields uniquely identify the drive against 206 bundled profiles
-4. **READ BUFFER** — single command with per-drive mode/buffer_id activates raw read mode
-5. **Signature verify** — drive responds with 4-byte signature + "MMkv" confirmation
-
-No fingerprints. No encrypted lookups. All identification uses standard SCSI fields.
-
-## API
-
-```rust
-let mut session = DriveSession::open(device_path)?;
-
-// Drive identity
-session.drive_id.vendor_id        // "HL-DT-ST"
-session.drive_id.product_id       // "BD-RE BU40N"
-session.drive_id.product_revision // "1.03"
-session.drive_id.vendor_specific  // "NM00000"
-session.drive_id.firmware_date    // "211810241934"
-
-// Profile data
-session.profile.chipset           // Chipset::MediaTek
-session.profile.unlock_mode       // 0x01
-session.profile.unlock_buf_id     // 0x44
-session.profile.signature         // [0x99, 0x9e, 0xc3, 0x75]
-
-// Operations
-session.unlock()?;
-session.calibrate()?;
-session.read_sectors(lba, count, &mut buf)?;
-session.status()?;
-session.read_config()?;
-session.read_register(index)?;
-```
-
-## Chipset Support
-
-| Chipset | Status | Drives | Brands |
-|---------|--------|--------|--------|
-| MediaTek MT1959 | Supported | 206 | LG, ASUS, HP |
-| Renesas | Planned | -- | Pioneer |
-
-## Drive Profile
-
-Each bundled profile (compiled into the binary):
-
-```json
-{
-  "vendor_id": "HL-DT-ST",
-  "product_id": "BD-RE BU40N     ",
-  "product_revision": "1.03",
-  "vendor_specific": "NM00000",
-  "firmware_date": "211810241934",
-  "chipset": "mediatek",
-  "unlock_mode": 1,
-  "unlock_buf_id": 68,
-  "signature": "999ec375",
-  "register_offsets": ["10e291", "11ab1c"]
+// Read content (decrypted transparently if AACS keys available)
+let mut reader = disc.open_title(&mut session, 0)?;
+while let Some(unit) = reader.read_unit()? {
+    // 6144 bytes of content per aligned unit
 }
 ```
 
+## What It Does
+
+- **Drive access** — open, identify, unlock for raw reads
+- **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info, BD-J labels
+- **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0)
+- **Content reading** — sector reads with automatic decryption
+
+AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
+
+## Architecture
+
+```text
+DriveSession           — open, identify, unlock, read sectors
+  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS planned)
+  ├── DriveProfile     — per-drive unlock parameters (bundled)
+  └── Platform         — MediaTek (supported), Renesas (planned)
+
+Disc                   — scan titles, streams, AACS state
+  ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions
+  ├── MPLS parser      — playlists → titles + clips + streams
+  ├── CLPI parser      — clip info → EP map → sector extents
+  ├── JAR parser       — BD-J audio track labels
+  └── AACS             — key resolution + content decryption
+```
+
+See [docs/](docs/) for detailed technical documentation on each module.
+
 ## Error Codes
 
-| Code | Error | Meaning |
-|------|-------|---------|
-| E1000 | DeviceNotFound | Device path doesn't exist |
-| E1001 | DevicePermission | No access (try sudo or cdrom group) |
-| E2000 | UnsupportedDrive | No matching profile |
-| E3000 | UnlockFailed | Unlock command rejected |
-| E3001 | SignatureMismatch | Response signature wrong |
-| E3002 | NotUnlocked | Operation requires unlock first |
-| E4000 | ScsiError | SCSI command failed |
-| E5000 | IoError | System I/O error |
+All errors are structured with numeric codes. No user-facing English text — applications format their own messages.
 
-## Platform
+| Range | Category |
+|-------|----------|
+| E1xxx | Device errors (not found, permission) |
+| E2xxx | Profile errors (unsupported drive) |
+| E3xxx | Unlock errors (failed, signature) |
+| E4xxx | SCSI errors (command failed, timeout) |
+| E5xxx | I/O errors |
+| E6xxx | Disc format errors |
+| E7xxx | AACS errors |
+
+## Platform Support
 
 | Platform | Status | Backend |
 |----------|--------|---------|
@@ -117,11 +89,9 @@ Each bundled profile (compiled into the binary):
 | macOS | Planned | IOKit |
 | Windows | Planned | SPTI |
 
-The `ScsiTransport` trait abstracts the platform. Adding a backend is one file behind a `cfg` gate.
-
 ## Contributing
 
-Run `freemkv info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to submit your drive's profile.
+Run `freemkv info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to contribute your drive's profile.
 
 ## License
 
