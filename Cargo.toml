@@ -32,3 +32,7 @@ path = "src/bin/freemkv_info.rs"
 [[bin]]
 name = "freemkv-test"
 path = "src/bin/freemkv_test.rs"
+
+[[bin]]
+name = "aacs-test"
+path = "src/bin/aacs_test.rs"
