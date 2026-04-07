@@ -14,19 +14,45 @@ use crate::udf;
 use crate::mpls;
 use crate::clpi;
 
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// A scanned Blu-ray disc.
 #[derive(Debug)]
 pub struct Disc {
+    /// UDF Volume Identifier from Primary Volume Descriptor (always present)
+    pub volume_id: String,
+    /// Disc title from META/DL/bdmt_eng.xml (None if disc has no metadata)
+    pub meta_title: Option<String>,
+    /// Disc format (BD, UHD, DVD)
+    pub format: DiscFormat,
     /// Disc capacity in sectors
     pub capacity_sectors: u32,
+    /// Disc capacity in bytes
+    pub capacity_bytes: u64,
+    /// Number of layers (1 = single, 2 = dual)
+    pub layers: u8,
     /// Titles sorted by duration (longest first), then playlist name
     pub titles: Vec<Title>,
+    /// JAR track labels (audio/subtitle names from BD-J menus)
+    pub jar_labels: crate::jar::JarLabels,
     /// AACS state — None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
     /// Whether this disc requires AACS decryption
     pub encrypted: bool,
+}
+
+/// Disc format.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiscFormat {
+    /// 4K UHD Blu-ray (HEVC 2160p)
+    Uhd,
+    /// Standard Blu-ray (1080p/1080i)
+    BluRay,
+    /// DVD
+    Dvd,
+    /// Unknown
+    Unknown,
 }
 
 /// A title (one MPLS playlist).
@@ -393,11 +419,17 @@ impl Disc {
         // Sort: longest first
         titles.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Step 4: Detect AACS encryption
+        // Step 4: Read disc title from META/DL/bdmt_eng.xml
+        let meta_title = Self::read_meta_title(session, &udf_fs);
+
+        // Step 5: Extract JAR track labels
+        let jar_labels = Self::read_jar_labels(session, &udf_fs);
+
+        // Step 6: Detect AACS encryption
         let encrypted = udf_fs.find_dir("/AACS").is_some()
             || udf_fs.find_dir("/BDMV/AACS").is_some();
 
-        // Step 5: If encrypted and KEYDB available, authenticate and derive keys
+        // Step 7: If encrypted and KEYDB available, authenticate and derive keys
         let aacs = if encrypted {
             if let Some(keydb_path) = opts.resolve_keydb() {
                 match Self::setup_aacs(session, &keydb_path) {
@@ -411,9 +443,24 @@ impl Disc {
             None
         };
 
+        // Derive disc format from main title video codec
+        let format = Self::detect_format(&titles);
+
+        // Derive layer count from capacity
+        // BD-25 single layer: up to ~12M sectors (~25GB)
+        // BD-50 dual layer: ~12M-25M sectors (~50GB)
+        // BD-66/100 UHD: 25M+ sectors
+        let layers = if capacity > 24_000_000 { 2 } else { 1 };
+
         Ok(Disc {
+            volume_id: udf_fs.volume_id.clone(),
+            meta_title: meta_title,
+            format,
             capacity_sectors: capacity,
+            capacity_bytes: capacity as u64 * 2048,
+            layers,
             titles,
+            jar_labels,
             aacs,
             encrypted,
         })
@@ -512,6 +559,80 @@ impl Disc {
 
     // ── Internal helpers ────────────────────────────────────────────────────
 
+    /// Detect disc format from the main title's video streams.
+    fn detect_format(titles: &[Title]) -> DiscFormat {
+        // Check the longest title (first after sort) for 2160p HEVC
+        for title in titles.iter().take(3) {
+            for stream in &title.streams {
+                if stream.kind == StreamKind::Video {
+                    if stream.resolution.contains("2160") {
+                        return DiscFormat::Uhd;
+                    }
+                    if stream.resolution.contains("1080") || stream.resolution.contains("720") {
+                        return DiscFormat::BluRay;
+                    }
+                    if stream.resolution.contains("480") || stream.resolution.contains("576") {
+                        return DiscFormat::Dvd;
+                    }
+                }
+            }
+        }
+        DiscFormat::Unknown
+    }
+
+    /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
+    /// Prefers English, falls back to first available language.
+    /// Returns None if META directory is empty or XML has no usable title.
+    fn read_meta_title(session: &mut DriveSession, udf_fs: &udf::UdfFs) -> Option<String> {
+        let meta_dir = udf_fs.find_dir("/BDMV/META")?;
+        for sub in &meta_dir.entries {
+            if !sub.is_dir { continue; }
+            let dl_path = format!("/BDMV/META/{}", sub.name);
+            if let Some(dl_dir) = udf_fs.find_dir(&dl_path) {
+                let xml_files: Vec<_> = dl_dir.entries.iter()
+                    .filter(|e| !e.is_dir && e.name.to_lowercase().ends_with(".xml"))
+                    .collect();
+
+                let eng = xml_files.iter().find(|e| e.name.to_lowercase().contains("eng"));
+                let target = eng.or_else(|| xml_files.first());
+
+                if let Some(entry) = target {
+                    let path = format!("{}/{}", dl_path, entry.name);
+                    if let Ok(data) = udf_fs.read_file(session, &path) {
+                        let xml = String::from_utf8_lossy(&data);
+                        if let Some(start) = xml.find("<di:name>") {
+                            let s = start + "<di:name>".len();
+                            if let Some(end) = xml[s..].find("</di:name>") {
+                                let title = xml[s..s + end].trim().to_string();
+                                if !title.is_empty() && title != "Blu-ray" {
+                                    return Some(title);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract track labels from BD-J JAR files.
+    fn read_jar_labels(session: &mut DriveSession, udf_fs: &udf::UdfFs) -> crate::jar::JarLabels {
+        if let Some(jar_dir) = udf_fs.find_dir("/BDMV/JAR") {
+            for entry in &jar_dir.entries {
+                if !entry.is_dir && entry.name.to_lowercase().ends_with(".jar") {
+                    let path = format!("/BDMV/JAR/{}", entry.name);
+                    if let Ok(jar_data) = udf_fs.read_file(session, &path) {
+                        if let Some(labels) = crate::jar::extract_labels(&jar_data) {
+                            return labels;
+                        }
+                    }
+                }
+            }
+        }
+        crate::jar::JarLabels::default()
+    }
+
     fn read_capacity(session: &mut DriveSession) -> Result<u32> {
         let cdb = [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut buf = [0u8; 8];
@@ -561,12 +682,27 @@ impl Disc {
         // Build streams from STN table
         let streams: Vec<Stream> = parsed.streams.iter().map(|s| {
             let kind = match s.stream_type {
-                1 => StreamKind::Video,
-                2 => StreamKind::Audio,
+                1 | 6 | 7 => StreamKind::Video,
+                2 | 5 => StreamKind::Audio,
                 3 => StreamKind::Subtitle,
                 _ => StreamKind::Video,
             };
             let codec = Codec::from_coding_type(s.coding_type);
+            let hdr = match s.dynamic_range {
+                1 => HdrFormat::Hdr10,
+                2 => HdrFormat::DolbyVision,
+                _ => HdrFormat::Sdr,
+            };
+            let cs = match s.color_space {
+                1 => ColorSpace::Bt709,
+                2 => ColorSpace::Bt2020,
+                _ => ColorSpace::Unknown,
+            };
+            let label = match s.stream_type {
+                5 => "secondary".to_string(),
+                7 => "Dolby Vision EL".to_string(),
+                _ => String::new(),
+            };
             Stream {
                 kind,
                 pid: s.pid,
@@ -576,10 +712,10 @@ impl Disc {
                 frame_rate: format_framerate(s.video_rate),
                 channels: format_channels(s.audio_format),
                 sample_rate: format_samplerate(s.audio_rate),
-                hdr: HdrFormat::Sdr,
-                color_space: ColorSpace::Unknown,
-                secondary: false,
-                label: String::new(),
+                hdr,
+                color_space: cs,
+                secondary: s.secondary,
+                label,
             }
         }).collect();
 

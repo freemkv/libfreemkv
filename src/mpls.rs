@@ -35,22 +35,28 @@ pub struct PlayItem {
 /// A stream entry from the STN table.
 #[derive(Debug, Clone)]
 pub struct StreamEntry {
-    /// Stream category: 1=primary video, 2=primary audio, 3=PG subtitle, 4=IG
+    /// Stream category: 1=video, 2=audio, 3=PG subtitle, 4=IG, 5=secondary audio, 6=secondary video, 7=DV EL
     pub stream_type: u8,
     /// MPEG-TS PID
     pub pid: u16,
     /// Coding type (0x24=HEVC, 0x1B=H264, 0x83=TrueHD, etc.)
     pub coding_type: u8,
-    /// Video format (1=480i, 6=1080p, 8=2160p, etc.)
+    /// Video format (1=480i, 4=1080i, 5=720p, 6=1080p, 8=2160p)
     pub video_format: u8,
-    /// Video frame rate (1=23.976, 3=25, 4=29.97, etc.)
+    /// Video frame rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94)
     pub video_rate: u8,
-    /// Audio format (3=stereo, 6=5.1, 12=7.1, etc.)
+    /// Audio channel layout (1=mono, 3=stereo, 6=5.1, 12=7.1)
     pub audio_format: u8,
     /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz)
     pub audio_rate: u8,
     /// ISO 639-2 language code (e.g. "eng")
     pub language: String,
+    /// HDR dynamic range (0=SDR, 1=HDR10, 2=Dolby Vision)
+    pub dynamic_range: u8,
+    /// Color space (0=unknown, 1=BT.709, 2=BT.2020)
+    pub color_space: u8,
+    /// Whether this is a secondary stream (commentary, PiP, DV EL)
+    pub secondary: bool,
 }
 
 /// Parse an MPLS file from raw bytes.
@@ -58,40 +64,31 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     if data.len() < 40 {
         return Err(Error::DiscError { detail: "MPLS too short".into() });
     }
-
-    // Header: "MPLS" + version (4 bytes ASCII)
     if &data[0..4] != b"MPLS" {
         return Err(Error::DiscError { detail: "not an MPLS file".into() });
     }
-    let version = String::from_utf8_lossy(&data[4..8]).to_string();
 
-    // Offsets table at bytes 8-19
+    let version = String::from_utf8_lossy(&data[4..8]).to_string();
     let playlist_start = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
     if playlist_start + 10 > data.len() {
         return Err(Error::DiscError { detail: "MPLS playlist offset out of range".into() });
     }
 
-    // PlayList section
     let pl = &data[playlist_start..];
     let num_play_items = u16::from_be_bytes([pl[6], pl[7]]) as usize;
 
     let mut play_items = Vec::with_capacity(num_play_items);
     let mut streams = Vec::new();
-    let mut pos = 10; // start of first play item
+    let mut pos = 10;
 
     for item_idx in 0..num_play_items {
-        if playlist_start + pos + 2 > data.len() {
-            break;
-        }
-
+        if pos + 2 > pl.len() { break; }
         let item_length = u16::from_be_bytes([pl[pos], pl[pos + 1]]) as usize;
-        if playlist_start + pos + item_length + 2 > data.len() {
-            break;
-        }
+        if pos + 2 + item_length > pl.len() { break; }
 
         let item = &pl[pos + 2..pos + 2 + item_length];
-        if item.len() < 20 { break; }
+        if item.len() < 20 { pos += 2 + item_length; continue; }
 
         let clip_id = String::from_utf8_lossy(&item[0..5]).to_string();
         let connection_condition = item[9] & 0x0F;
@@ -99,83 +96,91 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         let out_time = u32::from_be_bytes([item[16], item[17], item[18], item[19]]);
 
         // Parse STN table from the first play item
-        if item_idx == 0 && item.len() > 32 {
-            // UO mask is 8 bytes (64 bits) at offset 20
-            // STN table starts after: 2 bytes length + 2 bytes reserved + UO mask (8 bytes)
-            // STN offset within play_item = 20 (UO start)
-            // Actually: offset 20 = UO_mask_table (8 bytes)
-            //           offset 28 = random_access_flag + ... (2 bytes)
-            //           offset 30 = still_mode (1 byte) + still_time (2 bytes if still)
-            // Then STN table
-            // The STN table position varies. Let's find it by looking for the STN length field.
+        // PlayItem layout after out_time:
+        //   [20:28] UO_mask_table (8 bytes)
+        //   [28]    misc flags (1 byte)
+        //   [29]    still_mode (1 byte)
+        //   [30:32] still_time (2 bytes)
+        //   [32:]   STN_table
+        const STN_OFFSET: usize = 32;
+        if item_idx == 0 && item.len() > STN_OFFSET + 16 {
+            // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
+            let n_video = item[STN_OFFSET + 4] as usize;
+            let n_audio = item[STN_OFFSET + 5] as usize;
+            let n_pg = item[STN_OFFSET + 6] as usize;
+            let n_ig = item[STN_OFFSET + 7] as usize;
+            let n_sec_audio = item[STN_OFFSET + 8] as usize;
+            let n_sec_video = item[STN_OFFSET + 9] as usize;
+            let _n_pip_pg = item[STN_OFFSET + 10] as usize;
+            let n_dv = item[STN_OFFSET + 11] as usize;
 
-            // Per BD spec: play_item structure after out_time:
-            //   [20..28] UO_mask_table (8 bytes)
-            //   [28] misc flags (1 byte)
-            //   [29] still_mode (1 byte)
-            //   [30..32] still_time (2 bytes) if still_mode != 0
-            //   Then STN_table
+            let mut spos = STN_OFFSET + 16;
 
-            let still_mode = if item.len() > 29 { item[29] } else { 0 };
-            let stn_offset = if still_mode != 0 { 32 } else { 32 };
-            // Actually it's always 32 based on our previous work (UO mask = 8 bytes, not 64)
-
-            if item.len() > stn_offset + 6 {
-                let stn = &item[stn_offset..];
-                let _stn_length = u16::from_be_bytes([stn[0], stn[1]]) as usize;
-                if stn.len() > 6 {
-                    // reserved 2 bytes at [2..4]
-                    let n_video = stn[4] as usize;
-                    let n_audio = stn[5] as usize;
-                    let n_pg = if stn.len() > 6 { stn[6] as usize } else { 0 };
-                    let n_ig = if stn.len() > 7 { stn[7] as usize } else { 0 };
-
-                    // Parse stream entries starting at offset 8
-                    // But there's another 2 bytes reserved before entries
-                    let mut stn_pos = 8;
-                    // Possible 2 more reserved bytes
-                    // Let's skip and parse entries
-
-                    // Primary video streams
-                    for _ in 0..n_video {
-                        if let Some((entry, len)) = parse_stream_entry(stn, stn_pos, 1) {
-                            streams.push(entry);
-                            stn_pos += len;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Primary audio streams
-                    for _ in 0..n_audio {
-                        if let Some((entry, len)) = parse_stream_entry(stn, stn_pos, 2) {
-                            streams.push(entry);
-                            stn_pos += len;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // PG (subtitle) streams
-                    for _ in 0..n_pg {
-                        if let Some((entry, len)) = parse_stream_entry(stn, stn_pos, 3) {
-                            streams.push(entry);
-                            stn_pos += len;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // IG streams
-                    for _ in 0..n_ig {
-                        if let Some((entry, len)) = parse_stream_entry(stn, stn_pos, 4) {
-                            streams.push(entry);
-                            stn_pos += len;
-                        } else {
-                            break;
-                        }
-                    }
-                }
+            // Primary video
+            for _ in 0..n_video {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, 1) {
+                    streams.push(entry);
+                    spos = next;
+                } else { break; }
+            }
+            // Primary audio
+            for _ in 0..n_audio {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, 2) {
+                    streams.push(entry);
+                    spos = next;
+                } else { break; }
+            }
+            // PG subtitles
+            for _ in 0..n_pg {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, 3) {
+                    streams.push(entry);
+                    spos = next;
+                } else { break; }
+            }
+            // IG (skip but advance)
+            for _ in 0..n_ig {
+                if let Some((_, next)) = parse_stream_entry(item, spos, 4) {
+                    spos = next;
+                } else { break; }
+            }
+            // Secondary audio
+            for _ in 0..n_sec_audio {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 2) {
+                    entry.stream_type = 5;
+                    entry.secondary = true;
+                    streams.push(entry);
+                    // Skip extra ref bytes: num_refs(1) + reserved(1) + refs + padding
+                    if next < item.len() {
+                        let n_refs = item[next] as usize;
+                        spos = next + 2 + n_refs + (n_refs % 2);
+                    } else { spos = next; }
+                } else { break; }
+            }
+            // Secondary video (PiP)
+            for _ in 0..n_sec_video {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 1) {
+                    entry.stream_type = 6;
+                    entry.secondary = true;
+                    streams.push(entry);
+                    // Skip extra ref bytes (audio refs + PG refs)
+                    if next + 2 < item.len() {
+                        let n_arefs = item[next] as usize;
+                        let after_arefs = next + 2 + n_arefs + (n_arefs % 2);
+                        if after_arefs < item.len() {
+                            let n_prefs = item[after_arefs] as usize;
+                            spos = after_arefs + 2 + n_prefs + (n_prefs % 2);
+                        } else { spos = after_arefs; }
+                    } else { spos = next; }
+                } else { break; }
+            }
+            // Dolby Vision enhancement layer
+            for _ in 0..n_dv {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 1) {
+                    entry.stream_type = 7;
+                    entry.secondary = true;
+                    streams.push(entry);
+                    spos = next;
+                } else { break; }
             }
         }
 
@@ -197,86 +202,69 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 }
 
 /// Parse one stream entry from the STN table.
-/// Returns (StreamEntry, bytes consumed) or None.
-fn parse_stream_entry(stn: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
-    if pos + 2 > stn.len() { return None; }
+/// Returns (StreamEntry, next position) or None.
+fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
+    if pos + 2 > item.len() { return None; }
 
-    // Stream entry format:
-    //   [0] length of stream entry (1 byte)
-    //   [1] stream_type (1=PlayItem, 2=SubPath, 3=InMux)
-    //   Then stream_pid reference (varies by stream_type)
-    //   Then stream attributes
+    // Stream entry: length(1) + data
+    let se_len = item[pos] as usize;
+    let se_end = pos + 1 + se_len;
+    if se_end > item.len() { return None; }
 
-    let entry_len = stn[pos] as usize;
-    if entry_len < 4 || pos + 1 + entry_len > stn.len() { return None; }
-
-    let entry = &stn[pos + 1..pos + 1 + entry_len];
-
-    // Stream entry: type(1) + ref_type-dependent PID extraction
-    // For type 1 (PlayItem stream): [0]=type, [1..3]=ref_to_stream_PID_of_playItem
-    // ref format: [0] = subpath/playitem ref type, [1..2] = PID (big-endian u16)
-    let pid = if entry.len() >= 3 {
-        u16::from_be_bytes([entry[1], entry[2]])
+    // PID from stream entry (type 0x01 = PlayItem stream: PID at bytes 2-3)
+    let pid = if item[pos + 1] == 0x01 && pos + 4 <= item.len() {
+        u16::from_be_bytes([item[pos + 2], item[pos + 3]])
     } else {
         0
     };
 
-    // Stream attributes follow after the PID reference
-    // Attributes block: length(1) + coding_type(1) + format-specific data + language(3)
-    let attr_start = pos + 1 + entry_len;
-    if attr_start + 2 > stn.len() { return None; }
+    // Stream attributes: length(1) + coding_type(1) + format-specific data
+    if se_end + 2 > item.len() { return None; }
+    let sa_len = item[se_end] as usize;
+    let sa_end = se_end + 1 + sa_len;
+    if sa_end > item.len() || sa_len < 1 { return None; }
 
-    let attr_len = stn[attr_start] as usize;
-    if attr_len < 4 || attr_start + 1 + attr_len > stn.len() {
-        return Some((StreamEntry {
-            stream_type, pid, coding_type: 0, video_format: 0, video_rate: 0,
-            audio_format: 0, audio_rate: 0, language: String::new(),
-        }, 1 + entry_len + 1 + attr_len.max(1)));
-    }
-
-    let attr = &stn[attr_start + 1..attr_start + 1 + attr_len];
-    let coding_type = attr[0];
+    let sa = &item[se_end + 1..se_end + 1 + sa_len];
+    let coding_type = sa[0];
 
     let mut video_format = 0u8;
     let mut video_rate = 0u8;
     let mut audio_format = 0u8;
     let mut audio_rate = 0u8;
+    let mut dynamic_range = 0u8;
+    let mut color_space_val = 0u8;
     let mut language = String::new();
 
     match stream_type {
         1 => {
-            // Video: coding_type(1) + format_and_rate(1) + ...
-            if attr.len() >= 2 {
-                video_format = (attr[1] >> 4) & 0x0F;
-                video_rate = attr[1] & 0x0F;
+            // Video: coding_type(1) + format_rate(1) + [hdr_info(1) if HEVC]
+            if sa.len() >= 2 {
+                video_format = (sa[1] >> 4) & 0x0F;
+                video_rate = sa[1] & 0x0F;
+            }
+            if coding_type == 0x24 && sa.len() > 2 {
+                dynamic_range = (sa[2] >> 4) & 0x0F;
+                color_space_val = sa[2] & 0x0F;
             }
         }
         2 => {
-            // Audio: coding_type(1) + format_and_rate(1) + language(3)
-            if attr.len() >= 2 {
-                audio_format = (attr[1] >> 4) & 0x0F;
-                audio_rate = attr[1] & 0x0F;
+            // Audio: coding_type(1) + format_rate(1) + language(3)
+            if sa.len() >= 2 {
+                audio_format = (sa[1] >> 4) & 0x0F;
+                audio_rate = sa[1] & 0x0F;
             }
-            if attr.len() >= 5 {
-                language = String::from_utf8_lossy(&attr[2..5]).to_string();
-            }
-        }
-        3 => {
-            // PG subtitle: coding_type(1) + language(3)
-            if attr.len() >= 4 {
-                language = String::from_utf8_lossy(&attr[1..4]).to_string();
+            if sa.len() >= 5 {
+                language = String::from_utf8_lossy(&sa[2..5]).to_string();
             }
         }
-        4 => {
-            // IG: coding_type(1) + language(3)
-            if attr.len() >= 4 {
-                language = String::from_utf8_lossy(&attr[1..4]).to_string();
+        3 | 4 => {
+            // PG/IG: coding_type(1) + language(3)
+            if sa.len() >= 4 {
+                language = String::from_utf8_lossy(&sa[1..4]).to_string();
             }
         }
         _ => {}
     }
-
-    let total_consumed = 1 + entry_len + 1 + attr_len;
 
     Some((StreamEntry {
         stream_type,
@@ -287,5 +275,8 @@ fn parse_stream_entry(stn: &[u8], pos: usize, stream_type: u8) -> Option<(Stream
         audio_format,
         audio_rate,
         language,
-    }, total_consumed))
+        dynamic_range,
+        color_space: color_space_val,
+        secondary: false,
+    }, sa_end))
 }

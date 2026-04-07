@@ -26,6 +26,8 @@ use crate::drive::DriveSession;
 pub struct UdfFs {
     /// Root directory with full tree
     pub root: DirEntry,
+    /// UDF Volume Identifier from Primary Volume Descriptor
+    pub volume_id: String,
     /// Physical partition start (absolute sector)
     partition_start: u32,
     /// Metadata partition start (absolute sector)
@@ -143,11 +145,10 @@ impl UdfFs {
             } else {
                 let name_upper = child.name.to_uppercase();
 
-                // Skip large AACS files we don't need for disc-info
-                if name_upper.starts_with("MKB_")
-                    || name_upper.starts_with("CONTENTHASH")
-                    || name_upper.starts_with("CONTENTREVOCATION")
-                {
+                // Skip large files we don't need for disc-info:
+                // MKB_RO.inf (134MB), ContentHash*.tbl (1MB), ContentRevocation (1MB)
+                // Everything disc-info reads is under 3MB.
+                if child.size > 10_000_000 {
                     continue;
                 }
 
@@ -244,6 +245,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
     let mut partition_start: u32 = 0;
     let mut num_partition_maps: u32 = 0;
     let mut lvd_sector: Option<u32> = None;
+    let mut volume_id = String::new();
 
     for i in 32..64 {
         let mut desc = [0u8; 2048];
@@ -251,6 +253,10 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
 
         let desc_tag = u16::from_le_bytes([desc[0], desc[1]]);
         match desc_tag {
+            // Primary Volume Descriptor — volume identifier at offset 24, 32-byte d-string
+            1 => {
+                volume_id = parse_dstring(&desc[24..56]);
+            }
             // Partition Descriptor — tells us where the physical partition starts
             5 => {
                 partition_start = u32::from_le_bytes([desc[188], desc[189], desc[190], desc[191]]);
@@ -346,6 +352,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
 
     Ok(UdfFs {
         root,
+        volume_id,
         partition_start,
         metadata_start,
     })
@@ -535,6 +542,34 @@ fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
         }
     }
     result
+}
+
+/// Parse a UDF d-string (fixed-length field with length byte at the end).
+/// Used for Volume Identifier and other UDF descriptor strings.
+/// The first byte of content is a compression ID: 8 = ASCII, 16 = UTF-16BE.
+fn parse_dstring(data: &[u8]) -> String {
+    if data.is_empty() { return String::new(); }
+    let len = *data.last().unwrap() as usize;
+    if len == 0 || len > data.len() { return String::new(); }
+    let content = &data[..len];
+    if content.is_empty() { return String::new(); }
+    match content[0] {
+        8 => String::from_utf8_lossy(&content[1..]).trim_end_matches('\0').trim().to_string(),
+        16 => {
+            let mut s = String::new();
+            let chars = &content[1..];
+            for i in (0..chars.len()).step_by(2) {
+                if i + 1 < chars.len() {
+                    let c = ((chars[i] as u16) << 8) | chars[i + 1] as u16;
+                    if c != 0 {
+                        if let Some(ch) = char::from_u32(c as u32) { s.push(ch); }
+                    }
+                }
+            }
+            s.trim().to_string()
+        }
+        _ => String::from_utf8_lossy(&content[1..]).trim_end_matches('\0').trim().to_string(),
+    }
 }
 
 /// Read a single 2048-byte sector from the drive.
