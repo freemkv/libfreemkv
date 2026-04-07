@@ -66,12 +66,27 @@ pub struct Title {
     pub duration_secs: f64,
     /// Total size in bytes
     pub size_bytes: u64,
-    /// Number of clips
-    pub clip_count: usize,
+    /// Clip references in playback order
+    pub clips: Vec<Clip>,
     /// All streams (video, audio, subtitle, etc.)
     pub streams: Vec<Stream>,
     /// Sector extents for ripping (clip LBA ranges)
     pub extents: Vec<Extent>,
+}
+
+/// A clip reference within a title.
+#[derive(Debug, Clone)]
+pub struct Clip {
+    /// Clip filename without extension (e.g. "00001")
+    pub clip_id: String,
+    /// In-time in 45kHz ticks
+    pub in_time: u32,
+    /// Out-time in 45kHz ticks
+    pub out_time: u32,
+    /// Duration in seconds
+    pub duration_secs: f64,
+    /// Source packet count (from CLPI, 0 if unavailable)
+    pub source_packets: u32,
 }
 
 /// A stream within a title.
@@ -660,23 +675,33 @@ impl Disc {
             return None;
         }
 
-        // Parse each clip for size and sector extents
+        // Parse each clip for size, duration, and sector extents
         let mut extents = Vec::new();
         let mut total_size: u64 = 0;
-        let clip_count = parsed.play_items.len();
+        let mut clips = Vec::with_capacity(parsed.play_items.len());
 
         for play_item in &parsed.play_items {
+            let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
+            let mut pkt_count: u32 = 0;
+
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
             if let Ok(clpi_data) = udf_fs.read_file(session, &clpi_path) {
                 if let Ok(clip_info) = clpi::parse(&clpi_data) {
-                    // Size from source packet count (192 bytes per packet)
-                    total_size += clip_info.source_packet_count as u64 * 192;
+                    pkt_count = clip_info.source_packet_count;
+                    total_size += pkt_count as u64 * 192;
 
-                    // EP map extents for ripping (sector ranges on disc)
                     let clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
                     extents.extend(clip_extents);
                 }
             }
+
+            clips.push(Clip {
+                clip_id: play_item.clip_id.clone(),
+                in_time: play_item.in_time,
+                out_time: play_item.out_time,
+                duration_secs: clip_dur,
+                source_packets: pkt_count,
+            });
         }
 
         // Build streams from STN table
@@ -727,7 +752,7 @@ impl Disc {
             playlist_id,
             duration_secs,
             size_bytes: total_size,
-            clip_count,
+            clips,
             streams,
             extents,
         })
