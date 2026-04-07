@@ -256,14 +256,48 @@ impl Stream {
 /// AACS decryption state for a disc.
 #[derive(Debug)]
 pub struct AacsState {
-    /// Volume Unique Key
-    pub vuk: [u8; 16],
-    /// Decrypted unit keys indexed by CPS unit number
-    pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// Read data key (AACS 2.0 bus decryption) — None for AACS 1.0
-    pub read_data_key: Option<[u8; 16]>,
-    /// Whether bus encryption is enabled
+    /// AACS version (1 or 2)
+    pub version: u8,
+    /// Whether bus encryption is enabled (always true for AACS 2.0 / UHD)
     pub bus_encryption: bool,
+    /// MKB version from disc (e.g. 68, 77)
+    pub mkb_version: Option<u32>,
+    /// Disc hash (SHA1 of Unit_Key_RO.inf) — hex string with 0x prefix
+    pub disc_hash: String,
+    /// How keys were resolved
+    pub key_source: KeySource,
+    /// Volume Unique Key (16 bytes)
+    pub vuk: [u8; 16],
+    /// Decrypted unit keys (CPS unit number, key)
+    pub unit_keys: Vec<(u32, [u8; 16])>,
+    /// Read data key for AACS 2.0 bus decryption — None for AACS 1.0
+    pub read_data_key: Option<[u8; 16]>,
+    /// Volume ID (16 bytes) — from SCSI handshake
+    pub volume_id: [u8; 16],
+}
+
+/// How AACS keys were resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeySource {
+    /// VUK found directly in KEYDB by disc hash
+    KeyDb,
+    /// Media key + Volume ID from KEYDB → derived VUK
+    KeyDbDerived,
+    /// MKB + processing keys → media key → VUK
+    ProcessingKey,
+    /// MKB + device keys → subset-difference tree → VUK
+    DeviceKey,
+}
+
+impl KeySource {
+    pub fn name(&self) -> &'static str {
+        match self {
+            KeySource::KeyDb => "KEYDB",
+            KeySource::KeyDbDerived => "KEYDB (derived)",
+            KeySource::ProcessingKey => "MKB + processing key",
+            KeySource::DeviceKey => "MKB + device key",
+        }
+    }
 }
 
 // ─── Disc scanning ──────────────────────────────────────────────────────────
@@ -428,21 +462,38 @@ impl Disc {
         //   Path 1: disc hash → KEYDB → VUK (fast, 99% of discs)
         //   Path 2: KEYDB media key + VID → VUK
         //   Path 3: MKB + processing keys → media key → VUK (fallback)
+        // Read MKB from drive
+        let mkb_data = aacs::read_mkb_from_drive(session).ok();
+        let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
+
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
             &vid,
             &keydb,
-            aacs::read_mkb_from_drive(session).ok().as_deref(),
+            mkb_data.as_deref(),
         ).ok_or_else(|| Error::AacsError {
             detail: "failed to resolve AACS keys".into(),
         })?;
 
+        let key_source = match resolved.key_source {
+            1 => KeySource::KeyDb,
+            2 => KeySource::KeyDbDerived,
+            3 => KeySource::ProcessingKey,
+            4 => KeySource::DeviceKey,
+            _ => KeySource::KeyDb,
+        };
+
         Ok(AacsState {
+            version: if resolved.aacs2 { 2 } else { 1 },
+            bus_encryption: resolved.bus_encryption,
+            mkb_version: mkb_ver,
+            disc_hash: aacs::disc_hash_hex(&resolved.disc_hash),
+            key_source,
             vuk: resolved.vuk,
             unit_keys: resolved.unit_keys,
             read_data_key,
-            bus_encryption: resolved.bus_encryption,
+            volume_id: vid,
         })
     }
 
