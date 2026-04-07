@@ -384,7 +384,7 @@ impl Disc {
         session: &mut DriveSession,
         keydb_path: &std::path::Path,
     ) -> Result<AacsState> {
-        use crate::aacs::{KeyDb, derive_vuk, decrypt_unit_key};
+        use crate::aacs::{self, KeyDb};
         use crate::aacs_handshake;
 
         // Load KEYDB
@@ -396,76 +396,53 @@ impl Disc {
             detail: "no host certificate in KEYDB".into(),
         })?;
 
-        // Authenticate with drive
+        // Step 1: SCSI handshake → bus key + Volume ID
         let mut auth = aacs_handshake::aacs_authenticate(
             session,
             &host_cert.private_key,
             &host_cert.certificate,
         )?;
 
-        // Read Volume ID
         let vid = aacs_handshake::read_volume_id(session, &mut auth)?;
 
-        // Try to read data keys (AACS 2.0)
-        let (read_data_key, bus_encryption) = match aacs_handshake::read_data_keys(session, &mut auth) {
-            Ok((rdk, _wdk)) => (Some(rdk), true),
-            Err(_) => (None, false),
+        // Try to read data keys (AACS 2.0 bus encryption)
+        let read_data_key = match aacs_handshake::read_data_keys(session, &mut auth) {
+            Ok((rdk, _wdk)) => Some(rdk),
+            Err(_) => None,
         };
 
-        // Compute disc hash (SHA1 of Unit_Key_RO.inf) for KEYDB lookup
-        // First try: look up by VID-derived entries
-        // The KEYDB has entries indexed by disc_hash, but we can also
-        // find entries that match our MK+VID combination
+        // Step 2: Read Unit_Key_RO.inf from disc via UDF
+        let udf_fs = udf::read_filesystem(session)?;
+        let uk_ro_data = udf_fs.read_file(session, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(session, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsError {
+                detail: "failed to read Unit_Key_RO.inf from disc".into(),
+            })?;
 
-        // Try all entries — find one whose MK+VID produces a VUK that decrypts unit keys
-        let mut found_vuk = None;
+        // Step 3: Read Content Certificate (optional — for AACS version detection)
+        let cc_data = udf_fs.read_file(session, "/AACS/Content000.cer")
+            .or_else(|_| udf_fs.read_file(session, "/AACS/Content001.cer"))
+            .ok();
 
-        // First: try entries that have a disc_id matching our VID
-        for entry in keydb.disc_entries.values() {
-            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-                if did == vid {
-                    let vuk = derive_vuk(&mk, &vid);
-                    found_vuk = Some((vuk, entry.unit_keys.clone()));
-                    break;
-                }
-            }
-        }
-
-        // Fallback: if we have a VUK that works, use it
-        if found_vuk.is_none() {
-            for entry in keydb.disc_entries.values() {
-                if let Some(vuk) = entry.vuk {
-                    if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-                        if did == vid {
-                            found_vuk = Some((vuk, entry.unit_keys.clone()));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let (vuk, keydb_unit_keys) = found_vuk.ok_or_else(|| Error::AacsError {
-            detail: format!("no matching disc found in KEYDB for VID {:02x?}", &vid[..4]),
+        // Step 4: Resolve all keys via the full chain
+        //   Path 1: disc hash → KEYDB → VUK (fast, 99% of discs)
+        //   Path 2: KEYDB media key + VID → VUK
+        //   Path 3: MKB + processing keys → media key → VUK (fallback)
+        let resolved = aacs::resolve_keys(
+            &uk_ro_data,
+            cc_data.as_deref(),
+            &vid,
+            &keydb,
+            None, // MKB: TODO read via REPORT DISC STRUCTURE 0x83
+        ).ok_or_else(|| Error::AacsError {
+            detail: "failed to resolve AACS keys".into(),
         })?;
 
-        // If KEYDB has pre-decrypted unit keys, use them directly
-        // Otherwise we'd need to read Unit_Key_RO.inf and decrypt with VUK
-        let unit_keys = if !keydb_unit_keys.is_empty() {
-            keydb_unit_keys
-        } else {
-            // Would need to read AACS/Unit_Key_RO.inf from disc and decrypt
-            // For now, require KEYDB to have unit keys
-            return Err(Error::AacsError {
-                detail: "no unit keys in KEYDB entry — Unit_Key_RO.inf parsing not yet implemented".into(),
-            });
-        };
-
         Ok(AacsState {
-            vuk,
-            unit_keys,
+            vuk: resolved.vuk,
+            unit_keys: resolved.unit_keys,
             read_data_key,
-            bus_encryption,
+            bus_encryption: resolved.bus_encryption,
         })
     }
 
