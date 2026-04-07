@@ -55,12 +55,18 @@ impl DriveSession {
             }
         };
 
-        Ok(DriveSession {
+        let mut session = DriveSession {
             scsi: transport,
             platform,
             profile,
             drive_id,
-        })
+        };
+
+        // Always unlock on open — makes all reads work immediately.
+        // Silently ignore failures (unencrypted discs don't need it).
+        let _ = session.unlock();
+
+        Ok(session)
     }
 
     /// Open with an explicit profile (skip auto-detection).
