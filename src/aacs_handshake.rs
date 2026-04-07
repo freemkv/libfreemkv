@@ -23,7 +23,6 @@ use crate::drive::DriveSession;
 use crate::scsi::DataDirection;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use num_integer::Integer;
 use sha1::{Sha1, Digest};
 
 /// Execute a SCSI command that reads data from the device.
@@ -50,6 +49,7 @@ const EC_A: [u8; 20] = [
     0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD,
     0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4, 0x79, 0xA7, 0xD7, 0xDC,
 ];
+#[cfg(test)]
 const EC_B: [u8; 20] = [
     0x40, 0x2D, 0xAD, 0x3E, 0xC1, 0xCB, 0xCD, 0x16, 0x52, 0x48,
     0xD6, 0x8E, 0x12, 0x45, 0xE0, 0xC4, 0xDA, 0xAC, 0xB1, 0xD8,
@@ -769,10 +769,13 @@ mod tests {
     #[test]
     fn test_verify_host_cert_from_keydb() {
         // Verify the host cert from our KEYDB
-        let keydb_path = std::path::Path::new("");
+        let keydb_path = match std::env::var("KEYDB_PATH").ok() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return, // skip if KEYDB_PATH not set
+        };
         if !keydb_path.exists() { return; }
 
-        let db = crate::aacs::KeyDb::load(keydb_path).unwrap();
+        let db = crate::aacs::KeyDb::load(&keydb_path).unwrap();
         if let Some(hc) = &db.host_cert {
             let valid = verify_cert(&hc.certificate);
             eprintln!("Host cert verification: {}", if valid { "PASS" } else { "FAIL" });

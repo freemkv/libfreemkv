@@ -548,7 +548,7 @@ fn validate_processing_key(pk: &[u8; 16], cvalue: &[u8], _uv: &[u8], mk_dv: &[u8
     }
 
     // Verify: AES-ECB(mk, mk_dv) should produce a specific pattern
-    let verify = aes_ecb_encrypt(&mk, mk_dv);
+    let _verify = aes_ecb_encrypt(&mk, mk_dv);
     // mk_dv verification: the first 12 bytes of AES(mk, mk_dv) should be all 0xDEADBEEF...
     // Actually per AACS spec: verify record value is AES(mk, all_zeros)
     // No — the mk_dv IS the verification value. We compute AES-ECB(mk, verify_data)
@@ -1058,6 +1058,12 @@ pub fn decrypt_unit_full(
 mod tests {
     use super::*;
 
+    /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
+    fn keydb_path() -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
+        if path.exists() { Some(path) } else { None }
+    }
+
     #[test]
     fn test_parse_disc_entry() {
         let line = r#"***REMOVED*** = DUNE_PART_TWO (Dune: Part Two) | D | 2024-04-02 | M | ***REMOVED*** | I | ***REMOVED*** | V | ***REMOVED*** | U | 1-***REMOVED*** ; MKBv77"#;
@@ -1090,10 +1096,9 @@ mod tests {
         // Civil War UHD: known MK, VID, VUK from KEYDB
         // MK = 15665F98..., VID (disc_id) = from entry, VUK = F96D7908...
         // VUK = AES-DEC(MK, VID) XOR VID
-        let path = std::path::Path::new("");
-        if !path.exists() { return; }
+        let path = match keydb_path() { Some(p) => p, None => return };
 
-        let db = KeyDb::load(path).unwrap();
+        let db = KeyDb::load(&path).unwrap();
 
         // Find a disc with both MK, disc_id, and VUK so we can verify derivation
         let entry = db.disc_entries.values()
@@ -1221,10 +1226,9 @@ mod tests {
     fn test_decrypt_unit_key_from_vuk() {
         // Test the full chain: VUK → decrypt encrypted unit key → unit key
         // Use a known disc from KEYDB that has both VUK and unit keys
-        let path = std::path::Path::new("");
-        if !path.exists() { return; }
+        let path = match keydb_path() { Some(p) => p, None => return };
 
-        let db = KeyDb::load(path).unwrap();
+        let db = KeyDb::load(&path).unwrap();
 
         // Find a disc with VUK and unit keys
         let entry = db.disc_entries.values()
@@ -1261,9 +1265,8 @@ mod tests {
         assert_eq!(original.len(), ALIGNED_UNIT_LEN);
         assert!(is_unit_encrypted(&original), "Unit should be encrypted");
 
-        let keydb_path = std::path::Path::new("");
-        if !keydb_path.exists() { return; }
-        let db = KeyDb::load(keydb_path).unwrap();
+        let kp = match keydb_path() { Some(p) => p, None => return };
+        let db = KeyDb::load(&kp).unwrap();
 
         // Civil War UHD entries
         let civil_war_entries: Vec<&DiscEntry> = db.disc_entries.values()
@@ -1292,10 +1295,9 @@ mod tests {
 
     #[test]
     fn test_parse_full_keydb() {
-        let path = std::path::Path::new("");
-        if !path.exists() { return; } // skip if not available
+        let path = match keydb_path() { Some(p) => p, None => return }; // skip if not available
 
-        let db = KeyDb::load(path).unwrap();
+        let db = KeyDb::load(&path).unwrap();
 
         assert_eq!(db.device_keys.len(), 4);
         assert_eq!(db.processing_keys.len(), 3);
@@ -1392,9 +1394,8 @@ mod tests {
     #[test]
     fn test_resolve_keys_vuk_path() {
         // Test the full resolve chain using VUK path
-        let path = std::path::Path::new("");
-        if !path.exists() { return; }
-        let db = KeyDb::load(path).unwrap();
+        let path = match keydb_path() { Some(p) => p, None => return };
+        let db = KeyDb::load(&path).unwrap();
 
         // Find V for Vendetta BD — has VUK and unit keys
         // hash: ***REMOVED***

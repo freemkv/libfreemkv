@@ -221,7 +221,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
 
         // Parse partition maps starting at offset 440
         // Map 0 = Type 1 (physical), Map 1 = Type 2 (metadata)
-        let pm1_type = lvd[440]; // First map type
+        let _pm1_type = lvd[440]; // First map type
         let pm1_len = lvd[441] as usize;
 
         if pm1_len > 0 && 440 + pm1_len < 2048 {

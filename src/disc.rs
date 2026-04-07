@@ -302,10 +302,16 @@ impl KeySource {
 
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
+/// Standard KEYDB.cfg search locations (compatible with libaacs).
+const KEYDB_SEARCH_PATHS: &[&str] = &[
+    ".config/aacs/KEYDB.cfg",  // relative to $HOME
+];
+const KEYDB_SYSTEM_PATH: &str = "/etc/aacs/KEYDB.cfg";
+
 /// Options for disc scanning.
 pub struct ScanOptions {
     /// Path to KEYDB.cfg for AACS key lookup.
-    /// If None, tries ~/.config/aacs/KEYDB.cfg and /etc/aacs/KEYDB.cfg.
+    /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
     pub keydb_path: Option<std::path::PathBuf>,
 }
 
@@ -321,17 +327,18 @@ impl ScanOptions {
         ScanOptions { keydb_path: Some(path.into()) }
     }
 
-    /// Resolve KEYDB path: explicit, then standard locations.
+    /// Resolve KEYDB path: explicit path first, then standard locations.
     fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
         if let Some(p) = &self.keydb_path {
             if p.exists() { return Some(p.clone()); }
         }
-        // Standard locations
         if let Some(home) = std::env::var_os("HOME") {
-            let p = std::path::PathBuf::from(home).join(".config/aacs/KEYDB.cfg");
-            if p.exists() { return Some(p); }
+            for relative in KEYDB_SEARCH_PATHS {
+                let p = std::path::PathBuf::from(&home).join(relative);
+                if p.exists() { return Some(p); }
+            }
         }
-        let p = std::path::PathBuf::from("/etc/aacs/KEYDB.cfg");
+        let p = std::path::PathBuf::from(KEYDB_SYSTEM_PATH);
         if p.exists() { return Some(p); }
         None
     }
@@ -424,10 +431,6 @@ impl Disc {
         // Load KEYDB
         let keydb = KeyDb::load(keydb_path).map_err(|e| Error::AacsError {
             detail: format!("failed to load KEYDB: {}", e),
-        })?;
-
-        let host_cert = keydb.host_cert.as_ref().ok_or_else(|| Error::AacsError {
-            detail: "no host certificate in KEYDB".into(),
         })?;
 
         // Step 1: Try SCSI handshake for Volume ID + read_data_key
