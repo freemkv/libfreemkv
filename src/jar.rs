@@ -2,29 +2,24 @@
 //!
 //! Blu-ray discs with BD-J menus store the menu application as Java JAR files
 //! in BDMV/JAR/. These contain .class files with string constants that label
-//! audio and subtitle tracks (e.g. "eng_ADES_US_" = Descriptive Audio US).
+//! audio and subtitle tracks.
 //!
-//! with no way to tell them apart (e.g. 3x "AC-3 5.1 English").
+//! Multiple label formats exist across studios:
+//!   - Label format: "eng_MLP_", "fra_AudioStream3" (Warner UHD, e.g. Barbie, Dune)
+//!   - TextField format: "TextField,Audio1,English Dolby Atmos,..." (A24/Lionsgate, e.g. Civil War)
 //!
-//! The JAR is a ZIP file. Each .class file has a Java constant pool containing
-//! UTF-8 string literals. We scan for patterns like:
-//!   {lang}_{codec}_{variant}_   → audio track labels
-//!   {lang}_PGStream{n}          → subtitle track labels
-//!   MAIN_FEATURE                → playlist identification
-//!   FORCED_TRAILER              → forced content identification
-//!
-//! This is best-effort: if the JAR doesn't contain labels or the format
-//! is unexpected, we return empty results. The caller falls back to
-//! showing streams without labels.
+//! Labels match to streams by STN index — the Nth audio label in the JAR
+//! corresponds to the Nth audio stream in the MPLS STN table. This is defined
+//! by the BD-J API where stream numbers = STN indices (1-based).
 
 use std::io::Read;
 
 /// Labels extracted from a BD-J JAR file.
 #[derive(Debug, Default)]
 pub struct JarLabels {
-    /// Audio track labels in STN order: (language, codec_hint, variant, raw_label)
+    /// Audio track labels in STN order
     pub audio: Vec<TrackLabel>,
-    /// Subtitle track labels: (language, stream_index, raw_label)
+    /// Subtitle track labels in STN order
     pub subtitle: Vec<TrackLabel>,
     /// Playlist purpose labels (MAIN_FEATURE, FORCED_TRAILER, etc.)
     pub playlists: Vec<String>,
@@ -33,155 +28,211 @@ pub struct JarLabels {
 /// A parsed track label from the JAR.
 #[derive(Debug, Clone)]
 pub struct TrackLabel {
-    /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
-    /// Codec or type hint (e.g. "MLP", "AC3", "ADES", "PGStream")
-    pub hint: String,
-    /// Variant or region (e.g. "US", "UK", "3", "4")
-    pub variant: String,
-    /// Human-readable description derived from the label
+    /// Human-readable description (e.g. "English Dolby Atmos", "TrueHD", "Descriptive Audio (US)")
     pub description: String,
     /// The raw string from the class file
     pub raw: String,
 }
 
-impl TrackLabel {
-    /// Parse a label string like "eng_ADES_US_" or "dan_PGStream4"
-    fn parse(s: &str) -> Option<Self> {
-        let clean = s.trim_end_matches('_');
-        let parts: Vec<&str> = clean.splitn(3, '_').collect();
-        if parts.len() < 2 {
-            return None;
+/// Extract track labels from a JAR file (raw ZIP bytes).
+///
+/// Tries multiple format parsers. Returns None if no labels found.
+pub fn extract_labels(jar_data: &[u8]) -> Option<JarLabels> {
+    let strings = extract_all_jar_strings(jar_data)?;
+
+    // Try each format parser in order
+    try_textfield_format(&strings)
+        .or_else(|| try_label_format(&strings))
+        .or_else(|| try_playlist_only(&strings))
+}
+
+// ── Format 1: TextField (A24/Lionsgate) ─────────────────────────────────────
+//
+// Pattern: "TextField,Audio{N},{description},..."
+//          "TextField,Subtitle{N},{description},..."
+// Found in: Civil War, and similar A24/Lionsgate discs
+
+fn try_textfield_format(strings: &[String]) -> Option<JarLabels> {
+    let mut audio: Vec<(u32, String, String)> = Vec::new(); // (index, description, raw)
+    let mut subtitle: Vec<(u32, String, String)> = Vec::new();
+    let mut playlists = Vec::new();
+
+    for s in strings {
+        if s.starts_with("TextField,Audio") {
+            // TextField,Audio{N},{description},...
+            let parts: Vec<&str> = s.splitn(4, ',').collect();
+            if parts.len() >= 3 {
+                let key = parts[1]; // "Audio1", "Audio2", etc.
+                let desc = parts[2].to_string();
+                if let Some(num_str) = key.strip_prefix("Audio") {
+                    if let Ok(idx) = num_str.parse::<u32>() {
+                        if !desc.is_empty() {
+                            audio.push((idx, desc, s.clone()));
+                        }
+                    }
+                }
+            }
+        } else if s.starts_with("TextField,Subtitle") {
+            let parts: Vec<&str> = s.splitn(4, ',').collect();
+            if parts.len() >= 3 {
+                let key = parts[1];
+                let desc = parts[2].to_string();
+                if let Some(num_str) = key.strip_prefix("Subtitle") {
+                    if let Ok(idx) = num_str.parse::<u32>() {
+                        if !desc.eq_ignore_ascii_case("None") && !desc.is_empty() {
+                            subtitle.push((idx, desc, s.clone()));
+                        }
+                    }
+                }
+            }
         }
 
-        let language = parts[0].to_string();
-        // Language should be 2-3 lowercase letters
-        if language.len() < 2 || language.len() > 3 || !language.chars().all(|c| c.is_ascii_lowercase()) {
-            return None;
+        collect_playlist_label(s, &mut playlists);
+    }
+
+    if audio.is_empty() && subtitle.is_empty() {
+        return None;
+    }
+
+    // Sort by index to ensure STN order
+    audio.sort_by_key(|a| a.0);
+    subtitle.sort_by_key(|s| s.0);
+
+    Some(JarLabels {
+        audio: audio.into_iter().map(|(_, desc, raw)| TrackLabel { description: desc, raw }).collect(),
+        subtitle: subtitle.into_iter().map(|(_, desc, raw)| TrackLabel { description: desc, raw }).collect(),
+        playlists,
+    })
+}
+
+// ── Format 2: Label strings (Warner UHD) ────────────────────────────────────
+//
+// Pattern: "eng_MLP_", "fra_AudioStream3", "dan_PGStream4"
+// Found in: Barbie, Dune Part Two, and similar Warner UHD discs
+
+fn try_label_format(strings: &[String]) -> Option<JarLabels> {
+    let mut audio = Vec::new();
+    let mut subtitle = Vec::new();
+    let mut playlists = Vec::new();
+
+    for s in strings {
+        if let Some(label) = parse_label_string(s) {
+            if label.is_audio && !audio.iter().any(|a: &TrackLabel| a.raw == label.raw) {
+                audio.push(TrackLabel { description: label.description, raw: label.raw });
+            } else if label.is_subtitle && !subtitle.iter().any(|a: &TrackLabel| a.raw == label.raw) {
+                subtitle.push(TrackLabel { description: label.description, raw: label.raw });
+            }
         }
 
-        let hint = parts[1].to_string();
-        let variant = if parts.len() > 2 { parts[2].to_string() } else { String::new() };
-
-        let description = match hint.as_str() {
-            "MLP" => "TrueHD".to_string(),
-            "AC3" => {
-                if variant.is_empty() { "compatibility".to_string() }
-                else { variant.clone() }
-            }
-            "DTS" => "DTS".to_string(),
-            "LPCM" => "LPCM".to_string(),
-            "ADES" => {
-                if variant.is_empty() { "Descriptive Audio".to_string() }
-                else { format!("Descriptive Audio ({})", variant) }
-            }
-            h if h.starts_with("AudioStream") => String::new(), // generic, no extra info
-            h if h.starts_with("PGStream") => String::new(),    // generic subtitle
-            _ => String::new(),
-        };
-
-        Some(TrackLabel {
-            language,
-            hint,
-            variant,
-            description,
-            raw: s.to_string(),
-        })
+        collect_playlist_label(s, &mut playlists);
     }
 
-    /// Is this an audio track label?
-    fn is_audio(&self) -> bool {
-        matches!(self.hint.as_str(), "MLP" | "AC3" | "DTS" | "LPCM" | "ADES")
-            || self.hint.starts_with("AudioStream")
+    if audio.is_empty() && subtitle.is_empty() {
+        return None;
     }
 
-    /// Is this a subtitle track label?
-    fn is_subtitle(&self) -> bool {
-        self.hint.starts_with("PGStream")
+    Some(JarLabels { audio, subtitle, playlists })
+}
+
+struct ParsedLabel {
+    description: String,
+    raw: String,
+    is_audio: bool,
+    is_subtitle: bool,
+}
+
+fn parse_label_string(s: &str) -> Option<ParsedLabel> {
+    let clean = s.trim_end_matches('_');
+    let parts: Vec<&str> = clean.splitn(3, '_').collect();
+    if parts.len() < 2 { return None; }
+
+    let language = parts[0];
+    if language.len() < 2 || language.len() > 3 || !language.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+
+    let hint = parts[1];
+    let variant = if parts.len() > 2 { parts[2] } else { "" };
+
+    let (description, is_audio, is_subtitle) = match hint {
+        "MLP" => ("TrueHD".to_string(), true, false),
+        "AC3" => {
+            let d = if variant.is_empty() { "compatibility".to_string() } else { variant.to_string() };
+            (d, true, false)
+        }
+        "DTS" => ("DTS".to_string(), true, false),
+        "LPCM" => ("LPCM".to_string(), true, false),
+        "ADES" => {
+            let d = if variant.is_empty() { "Descriptive Audio".to_string() }
+                    else { format!("Descriptive Audio ({})", variant) };
+            (d, true, false)
+        }
+        h if h.starts_with("AudioStream") => (String::new(), true, false),
+        h if h.starts_with("PGStream") => (String::new(), false, true),
+        _ => return None,
+    };
+
+    Some(ParsedLabel { description, raw: s.to_string(), is_audio, is_subtitle })
+}
+
+// ── Format 3: Playlist-only ─────────────────────────────────────────────────
+//
+// Some JARs have no track labels but do have playlist purpose markers.
+
+fn try_playlist_only(strings: &[String]) -> Option<JarLabels> {
+    let mut playlists = Vec::new();
+    for s in strings {
+        collect_playlist_label(s, &mut playlists);
+    }
+    if playlists.is_empty() { return None; }
+    Some(JarLabels { audio: Vec::new(), subtitle: Vec::new(), playlists })
+}
+
+// ── Common helpers ──────────────────────────────────────────────────────────
+
+fn collect_playlist_label(s: &str, playlists: &mut Vec<String>) {
+    if matches!(s.as_ref(),
+        "MAIN_FEATURE" | "MAIN_FEATURE_INTRO" |
+        "FORCED_TRAILER" | "INTL_FORCED_TRAILER" |
+        "commentary_extras" | "extras"
+    ) {
+        if !playlists.iter().any(|p| p == s) {
+            playlists.push(s.to_string());
+        }
     }
 }
 
-/// Extract track labels from a JAR file (raw ZIP bytes).
-///
-/// Returns None if the JAR can't be parsed or contains no labels.
-/// This is best-effort — failure is not an error.
-pub fn extract_labels(jar_data: &[u8]) -> Option<JarLabels> {
+/// Extract all UTF-8 string constants from all .class files in a JAR.
+fn extract_all_jar_strings(jar_data: &[u8]) -> Option<Vec<String>> {
     let cursor = std::io::Cursor::new(jar_data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
 
-    let mut all_audio = Vec::new();
-    let mut all_subtitle = Vec::new();
-    let mut all_playlists = Vec::new();
+    let mut all_strings = Vec::new();
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).ok()?;
-        if !file.name().ends_with(".class") {
-            continue;
-        }
+        if !file.name().ends_with(".class") { continue; }
 
         let mut data = Vec::new();
         file.read_to_end(&mut data).ok()?;
 
-        let strings = extract_class_strings(&data);
-
-        for s in &strings {
-            // Track labels: {lang}_{type}_{variant}_
-            if let Some(label) = TrackLabel::parse(s) {
-                if label.is_audio() && !all_audio.iter().any(|a: &TrackLabel| a.raw == label.raw) {
-                    all_audio.push(label);
-                } else if label.is_subtitle() && !all_subtitle.iter().any(|a: &TrackLabel| a.raw == label.raw) {
-                    all_subtitle.push(label);
-                }
-            }
-
-            // Playlist purpose labels
-            if matches!(s.as_str(),
-                "MAIN_FEATURE" | "MAIN_FEATURE_INTRO" |
-                "FORCED_TRAILER" | "INTL_FORCED_TRAILER" |
-                "commentary_extras" | "extras"
-            ) {
-                if !all_playlists.contains(s) {
-                    all_playlists.push(s.clone());
-                }
-            }
-        }
+        extract_class_strings(&data, &mut all_strings);
     }
 
-    if all_audio.is_empty() && all_subtitle.is_empty() {
-        return None;
-    }
-
-    Some(JarLabels {
-        audio: all_audio,
-        subtitle: all_subtitle,
-        playlists: all_playlists,
-    })
+    if all_strings.is_empty() { return None; }
+    Some(all_strings)
 }
 
-/// Extract all UTF-8 string constants from a Java .class file's constant pool.
-///
-/// Java class file format:
-///   [0:4]   magic (0xCAFEBABE)
-///   [4:6]   minor version
-///   [6:8]   major version
-///   [8:10]  constant_pool_count
-///   [10:]   constant_pool entries
-///
-/// CONSTANT_Utf8 (tag=1): u8 tag + u16 length + bytes
-/// We only extract these — they contain all string literals.
-fn extract_class_strings(data: &[u8]) -> Vec<String> {
-    let mut strings = Vec::new();
-
-    // Verify Java class magic
+/// Extract UTF-8 string constants from a Java .class file's constant pool.
+fn extract_class_strings(data: &[u8], out: &mut Vec<String>) {
     if data.len() < 10 || &data[0..4] != &[0xCA, 0xFE, 0xBA, 0xBE] {
-        return strings;
+        return;
     }
 
     let cp_count = ((data[8] as u16) << 8 | data[9] as u16) as usize;
     let mut pos = 10;
+    let mut entry = 1;
 
-    // Parse constant pool entries
-    let mut entry = 1; // constant pool is 1-indexed
     while entry < cp_count && pos < data.len() {
         let tag = data[pos];
         pos += 1;
@@ -195,32 +246,21 @@ fn extract_class_strings(data: &[u8]) -> Vec<String> {
                 if pos + len > data.len() { break; }
 
                 if let Ok(s) = std::str::from_utf8(&data[pos..pos + len]) {
-                    // Only keep strings that look like track labels
-                    // Must contain underscore and be reasonable length
-                    if s.len() >= 5 && s.len() <= 100 && s.contains('_') {
-                        strings.push(s.to_string());
+                    if s.len() >= 3 && s.len() <= 500 {
+                        out.push(s.to_string());
                     }
                 }
                 pos += len;
             }
-            // CONSTANT_Integer, CONSTANT_Float
             3 | 4 => { pos += 4; }
-            // CONSTANT_Long, CONSTANT_Double (take 2 entries)
             5 | 6 => { pos += 8; entry += 1; }
-            // CONSTANT_Class, CONSTANT_String, CONSTANT_MethodType
             7 | 8 | 16 => { pos += 2; }
-            // CONSTANT_Fieldref, CONSTANT_Methodref, CONSTANT_InterfaceMethodref,
-            // CONSTANT_NameAndType, CONSTANT_InvokeDynamic
             9 | 10 | 11 | 12 | 18 => { pos += 4; }
-            // CONSTANT_MethodHandle
             15 => { pos += 3; }
-            // Unknown tag — can't continue parsing safely
             _ => { break; }
         }
         entry += 1;
     }
-
-    strings
 }
 
 #[cfg(test)]
@@ -228,36 +268,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_audio_labels() {
-        let l = TrackLabel::parse("eng_MLP_").unwrap();
-        assert_eq!(l.language, "eng");
-        assert_eq!(l.hint, "MLP");
-        assert_eq!(l.description, "TrueHD");
-        assert!(l.is_audio());
-
-        let l = TrackLabel::parse("eng_ADES_US_").unwrap();
-        assert_eq!(l.language, "eng");
-        assert_eq!(l.hint, "ADES");
-        assert_eq!(l.variant, "US");
-        assert_eq!(l.description, "Descriptive Audio (US)");
-        assert!(l.is_audio());
-
-        let l = TrackLabel::parse("fra_AudioStream3").unwrap();
-        assert_eq!(l.language, "fra");
-        assert!(l.is_audio());
+    fn test_textfield_audio() {
+        let strings = vec![
+            "TextField,Audio1,English Dolby Atmos,Font,296,763,275,25,left".to_string(),
+            "TextField,Audio2,English Descriptive Audio,Font,296,803,275,25,left".to_string(),
+            "TextField,Audio3,Spanish 5.1 Dolby Digital,Font,296,843,275,25,left".to_string(),
+        ];
+        let labels = try_textfield_format(&strings).unwrap();
+        assert_eq!(labels.audio.len(), 3);
+        assert_eq!(labels.audio[0].description, "English Dolby Atmos");
+        assert_eq!(labels.audio[1].description, "English Descriptive Audio");
+        assert_eq!(labels.audio[2].description, "Spanish 5.1 Dolby Digital");
     }
 
     #[test]
-    fn test_parse_subtitle_labels() {
-        let l = TrackLabel::parse("dan_PGStream4").unwrap();
-        assert_eq!(l.language, "dan");
-        assert!(l.is_subtitle());
+    fn test_textfield_subtitle_skips_none() {
+        let strings = vec![
+            "TextField,Subtitle0,None,Font,1312,843,275,25,left".to_string(),
+            "TextField,Subtitle1,English SDH,Font,1312,763,275,25,left".to_string(),
+            "TextField,Subtitle2,Spanish,Font,1312,803,275,25,left".to_string(),
+        ];
+        let labels = try_textfield_format(&strings).unwrap();
+        assert_eq!(labels.subtitle.len(), 2);
+        assert_eq!(labels.subtitle[0].description, "English SDH");
+        assert_eq!(labels.subtitle[1].description, "Spanish");
     }
 
     #[test]
-    fn test_reject_non_labels() {
-        assert!(TrackLabel::parse("substring").is_none());
-        assert!(TrackLabel::parse("equals").is_none());
-        assert!(TrackLabel::parse("Code").is_none());
+    fn test_label_format_audio() {
+        let strings = vec![
+            "eng_MLP_".to_string(),
+            "eng_ADES_US_".to_string(),
+            "fra_AudioStream3".to_string(),
+        ];
+        let labels = try_label_format(&strings).unwrap();
+        assert_eq!(labels.audio.len(), 3);
+        assert_eq!(labels.audio[0].description, "TrueHD");
+        assert_eq!(labels.audio[1].description, "Descriptive Audio (US)");
+    }
+
+    #[test]
+    fn test_label_format_subtitle() {
+        let strings = vec!["dan_PGStream4".to_string()];
+        let labels = try_label_format(&strings).unwrap();
+        assert_eq!(labels.subtitle.len(), 1);
+    }
+
+    #[test]
+    fn test_no_labels() {
+        let strings = vec!["java/lang/Object".to_string(), "toString".to_string()];
+        assert!(try_textfield_format(&strings).is_none());
+        assert!(try_label_format(&strings).is_none());
     }
 }
