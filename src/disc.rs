@@ -430,22 +430,30 @@ impl Disc {
             detail: "no host certificate in KEYDB".into(),
         })?;
 
-        // Step 1: SCSI handshake → bus key + Volume ID
-        let mut auth = aacs_handshake::aacs_authenticate(
-            session,
-            &host_cert.private_key,
-            &host_cert.certificate,
-        )?;
+        // Step 1: Try SCSI handshake for Volume ID + read_data_key
+        // Open a separate transport (AACS auth must happen before raw mode).
+        // If handshake fails (drive doesn't support AACS layer, e.g. raw-mode drives),
+        // fall back to disc-hash-only KEYDB lookup.
+        let device_path = session.device_path().to_string();
+        let mut vid: Option<[u8; 16]> = None;
+        let mut read_data_key: Option<[u8; 16]> = None;
 
-        let vid = aacs_handshake::read_volume_id(session, &mut auth)?;
+        if !device_path.is_empty() {
+            if let Ok(mut aacs_session) = DriveSession::open_no_unlock(std::path::Path::new(&device_path)) {
+                if let Ok(hc) = keydb.host_cert.as_ref().ok_or(()) {
+                    if let Ok(mut auth) = aacs_handshake::aacs_authenticate(
+                        &mut aacs_session, &hc.private_key, &hc.certificate,
+                    ) {
+                        vid = aacs_handshake::read_volume_id(&mut aacs_session, &mut auth).ok();
+                        read_data_key = aacs_handshake::read_data_keys(&mut aacs_session, &mut auth)
+                            .ok().map(|(rdk, _)| rdk);
+                    }
+                }
+            }
+            // Handshake failure is not fatal — we can still resolve via disc hash
+        }
 
-        // Try to read data keys (AACS 2.0 bus encryption)
-        let read_data_key = match aacs_handshake::read_data_keys(session, &mut auth) {
-            Ok((rdk, _wdk)) => Some(rdk),
-            Err(_) => None,
-        };
-
-        // Step 2: Read Unit_Key_RO.inf from disc via UDF
+        // Step 2: Read Unit_Key_RO.inf from disc via UDF (uses the unlocked main session)
         let udf_fs = udf::read_filesystem(session)?;
         let uk_ro_data = udf_fs.read_file(session, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(session, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
@@ -458,22 +466,24 @@ impl Disc {
             .or_else(|_| udf_fs.read_file(session, "/AACS/Content001.cer"))
             .ok();
 
-        // Step 4: Resolve all keys via the full chain
-        //   Path 1: disc hash → KEYDB → VUK (fast, 99% of discs)
-        //   Path 2: KEYDB media key + VID → VUK
-        //   Path 3: MKB + processing keys → media key → VUK (fallback)
-        // Read MKB from drive
+        // Step 4: Resolve keys
+        // If we have VID from handshake, use full 4-path chain.
+        // If no VID (handshake failed), use disc-hash-only KEYDB lookup.
         let mkb_data = aacs::read_mkb_from_drive(session).ok();
         let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
+
+        // Use a zero VID placeholder if handshake failed — resolve_keys
+        // will still work via disc hash (path 1)
+        let vid_for_resolve = vid.unwrap_or([0u8; 16]);
 
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
-            &vid,
+            &vid_for_resolve,
             &keydb,
             mkb_data.as_deref(),
         ).ok_or_else(|| Error::AacsError {
-            detail: "failed to resolve AACS keys".into(),
+            detail: "failed to resolve AACS keys — disc not in KEYDB".into(),
         })?;
 
         let key_source = match resolved.key_source {
@@ -493,7 +503,7 @@ impl Disc {
             vuk: resolved.vuk,
             unit_keys: resolved.unit_keys,
             read_data_key,
-            volume_id: vid,
+            volume_id: vid.unwrap_or([0u8; 16]),
         })
     }
 

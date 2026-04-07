@@ -529,7 +529,7 @@ pub fn aacs_authenticate(
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
     let response = scsi_read(session, &cdb, 8)
-        .map_err(|_| Error::AacsError { detail: "failed to allocate AGID".into() })?;
+        .map_err(|e| Error::AacsError { detail: format!("failed to allocate AGID: {}", e) })?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce and ephemeral key pair
