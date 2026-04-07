@@ -91,39 +91,63 @@ pub struct Clip {
 
 /// A stream within a title.
 #[derive(Debug, Clone)]
-pub struct Stream {
-    /// Stream type
-    pub kind: StreamKind,
+pub enum Stream {
+    Video(VideoStream),
+    Audio(AudioStream),
+    Subtitle(SubtitleStream),
+}
+
+/// A video stream.
+#[derive(Debug, Clone)]
+pub struct VideoStream {
     /// MPEG-TS packet ID
     pub pid: u16,
-    /// Codec
+    /// Codec (HEVC, H.264, VC-1, MPEG-2)
     pub codec: Codec,
-    /// ISO 639-2 language code (e.g. "eng", "fra")
-    pub language: String,
-    /// Video resolution (e.g. "2160p", "1080p")
+    /// Resolution (e.g. "2160p", "1080p", "1080i")
     pub resolution: String,
-    /// Frame rate (e.g. "23.976")
+    /// Frame rate (e.g. "23.976", "25")
     pub frame_rate: String,
-    /// Channel layout (e.g. "5.1", "7.1", "stereo")
-    pub channels: String,
-    /// Sample rate (e.g. "48kHz")
-    pub sample_rate: String,
     /// HDR format
     pub hdr: HdrFormat,
     /// Color space
     pub color_space: ColorSpace,
-    /// Whether this is a secondary/enhancement stream
+    /// Whether this is a secondary stream (PiP, Dolby Vision EL)
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
     pub label: String,
 }
 
-/// Stream type.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StreamKind {
-    Video,
-    Audio,
-    Subtitle,
+/// An audio stream.
+#[derive(Debug, Clone)]
+pub struct AudioStream {
+    /// MPEG-TS packet ID
+    pub pid: u16,
+    /// Codec (TrueHD, DTS-HD MA, DD, LPCM, etc.)
+    pub codec: Codec,
+    /// Channel layout (e.g. "5.1", "7.1", "stereo", "mono")
+    pub channels: String,
+    /// ISO 639-2 language code (e.g. "eng", "fra")
+    pub language: String,
+    /// Sample rate (e.g. "48kHz", "96kHz")
+    pub sample_rate: String,
+    /// Whether this is a secondary stream (commentary)
+    pub secondary: bool,
+    /// Extra label
+    pub label: String,
+}
+
+/// A subtitle stream.
+#[derive(Debug, Clone)]
+pub struct SubtitleStream {
+    /// MPEG-TS packet ID
+    pub pid: u16,
+    /// Codec (PGS)
+    pub codec: Codec,
+    /// ISO 639-2 language code (e.g. "eng", "fra")
+    pub language: String,
+    /// Whether this is a forced subtitle
+    pub forced: bool,
 }
 
 /// Video/audio codec.
@@ -251,46 +275,6 @@ impl Title {
     }
 }
 
-impl Stream {
-    /// Human-readable one-line description.
-    pub fn display(&self) -> String {
-        match self.kind {
-            StreamKind::Video => {
-                let mut parts = vec![self.codec.name().to_string()];
-                if !self.resolution.is_empty() { parts.push(self.resolution.clone()); }
-                if !self.frame_rate.is_empty() { parts.push(format!("{}fps", self.frame_rate)); }
-                if self.hdr != HdrFormat::Sdr { parts.push(self.hdr.name().to_string()); }
-                if self.color_space != ColorSpace::Unknown && self.color_space != ColorSpace::Bt709 {
-                    parts.push(self.color_space.name().to_string());
-                }
-                if self.secondary { parts.push(format!("[{}]", self.label)); }
-                parts.join(" ")
-            }
-            StreamKind::Audio => {
-                let mut parts = vec![self.codec.name().to_string()];
-                if !self.channels.is_empty() { parts.push(self.channels.clone()); }
-                if !self.sample_rate.is_empty() { parts.push(self.sample_rate.clone()); }
-                if !self.language.is_empty() { parts.push(format!("({})", self.language)); }
-                if self.secondary { parts.push("[secondary]".to_string()); }
-                parts.join(" ")
-            }
-            StreamKind::Subtitle => {
-                let mut parts = vec![self.codec.name().to_string()];
-                if !self.language.is_empty() { parts.push(format!("({})", self.language)); }
-                parts.join(" ")
-            }
-        }
-    }
-
-    /// Kind as a display string
-    pub fn kind_name(&self) -> &'static str {
-        match self.kind {
-            StreamKind::Video => "Video",
-            StreamKind::Audio => "Audio",
-            StreamKind::Subtitle => "Subtitle",
-        }
-    }
-}
 
 // ─── AACS state ─────────────────────────────────────────────────────────────
 
@@ -576,17 +560,16 @@ impl Disc {
 
     /// Detect disc format from the main title's video streams.
     fn detect_format(titles: &[Title]) -> DiscFormat {
-        // Check the longest title (first after sort) for 2160p HEVC
         for title in titles.iter().take(3) {
             for stream in &title.streams {
-                if stream.kind == StreamKind::Video {
-                    if stream.resolution.contains("2160") {
+                if let Stream::Video(v) = stream {
+                    if v.resolution.contains("2160") {
                         return DiscFormat::Uhd;
                     }
-                    if stream.resolution.contains("1080") || stream.resolution.contains("720") {
+                    if v.resolution.contains("1080") || v.resolution.contains("720") {
                         return DiscFormat::BluRay;
                     }
-                    if stream.resolution.contains("480") || stream.resolution.contains("576") {
+                    if v.resolution.contains("480") || v.resolution.contains("576") {
                         return DiscFormat::Dvd;
                     }
                 }
@@ -706,41 +689,54 @@ impl Disc {
 
         // Build streams from STN table
         let streams: Vec<Stream> = parsed.streams.iter().map(|s| {
-            let kind = match s.stream_type {
-                1 | 6 | 7 => StreamKind::Video,
-                2 | 5 => StreamKind::Audio,
-                3 => StreamKind::Subtitle,
-                _ => StreamKind::Video,
-            };
             let codec = Codec::from_coding_type(s.coding_type);
-            let hdr = match s.dynamic_range {
-                1 => HdrFormat::Hdr10,
-                2 => HdrFormat::DolbyVision,
-                _ => HdrFormat::Sdr,
-            };
-            let cs = match s.color_space {
-                1 => ColorSpace::Bt709,
-                2 => ColorSpace::Bt2020,
-                _ => ColorSpace::Unknown,
-            };
-            let label = match s.stream_type {
-                5 => "secondary".to_string(),
-                7 => "Dolby Vision EL".to_string(),
-                _ => String::new(),
-            };
-            Stream {
-                kind,
-                pid: s.pid,
-                codec,
-                language: s.language.clone(),
-                resolution: format_resolution(s.video_format, s.video_rate),
-                frame_rate: format_framerate(s.video_rate),
-                channels: format_channels(s.audio_format),
-                sample_rate: format_samplerate(s.audio_rate),
-                hdr,
-                color_space: cs,
-                secondary: s.secondary,
-                label,
+            match s.stream_type {
+                1 | 6 | 7 => Stream::Video(VideoStream {
+                    pid: s.pid,
+                    codec,
+                    resolution: format_resolution(s.video_format, s.video_rate),
+                    frame_rate: format_framerate(s.video_rate),
+                    hdr: match s.dynamic_range {
+                        1 => HdrFormat::Hdr10,
+                        2 => HdrFormat::DolbyVision,
+                        _ => HdrFormat::Sdr,
+                    },
+                    color_space: match s.color_space {
+                        1 => ColorSpace::Bt709,
+                        2 => ColorSpace::Bt2020,
+                        _ => ColorSpace::Unknown,
+                    },
+                    secondary: s.secondary,
+                    label: match s.stream_type {
+                        7 => "Dolby Vision EL".to_string(),
+                        _ => String::new(),
+                    },
+                }),
+                2 | 5 => Stream::Audio(AudioStream {
+                    pid: s.pid,
+                    codec,
+                    channels: format_channels(s.audio_format),
+                    language: s.language.clone(),
+                    sample_rate: format_samplerate(s.audio_rate),
+                    secondary: s.stream_type == 5,
+                    label: String::new(),
+                }),
+                3 => Stream::Subtitle(SubtitleStream {
+                    pid: s.pid,
+                    codec,
+                    language: s.language.clone(),
+                    forced: false, // TODO: parse from MPLS stream attributes
+                }),
+                _ => Stream::Video(VideoStream {
+                    pid: s.pid,
+                    codec,
+                    resolution: String::new(),
+                    frame_rate: String::new(),
+                    hdr: HdrFormat::Sdr,
+                    color_space: ColorSpace::Unknown,
+                    secondary: false,
+                    label: String::new(),
+                }),
             }
         }).collect();
 
