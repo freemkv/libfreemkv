@@ -2,12 +2,15 @@
 //!
 //! Platform backends are in separate files:
 //!   - `linux.rs` — SG_IO ioctl
-//!   - `macos.rs` — IOKit (planned)
+//!   - `macos.rs` — IOKit SCSITaskDeviceInterface
 //!   - `windows.rs` — SPTI (planned)
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
+#[allow(unused_imports)]
 use crate::error::{Error, Result};
 use std::path::Path;
 
@@ -64,7 +67,7 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     { Ok(Box::new(linux::SgIoTransport::open(device)?)) }
 
     #[cfg(target_os = "macos")]
-    { Err(Error::DeviceNotFound { path: format!("{}: macOS not yet supported", device.display()) }) }
+    { Ok(Box::new(macos::MacScsiTransport::open(device)?)) }
 
     #[cfg(target_os = "windows")]
     { Err(Error::DeviceNotFound { path: format!("{}: Windows not yet supported", device.display()) }) }

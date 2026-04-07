@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! DriveSession           — open, identify, unlock, read sectors
-//!   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS planned)
+//!   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS)
 //!   ├── DriveProfile     — per-drive unlock parameters (206 bundled)
 //!   ├── DriveId          — INQUIRY + GET_CONFIG identification
 //!   └── Platform
