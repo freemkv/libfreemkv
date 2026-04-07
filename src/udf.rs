@@ -47,6 +47,12 @@ pub struct DirEntry {
 }
 
 impl UdfFs {
+    /// Physical partition start sector.
+    pub fn partition_start(&self) -> u32 { self.partition_start }
+
+    /// Metadata partition start sector.
+    pub fn metadata_start(&self) -> u32 { self.metadata_start }
+
     /// Find a directory by path (e.g. "/BDMV/PLAYLIST").
     /// Path matching is case-insensitive.
     pub fn find_dir(&self, path: &str) -> Option<&DirEntry> {
@@ -100,6 +106,63 @@ impl UdfFs {
 
         data.truncate(entry.size as usize);
         Ok(data)
+    }
+
+    /// Collect all sector ranges needed for disc-info and AACS.
+    ///
+    /// Returns a list of (start_lba, sector_count) ranges covering:
+    ///   - UDF structure (AVDP, VDS, metadata partition, directories)
+    ///   - BDMV/PLAYLIST/*.mpls, CLIPINF/*.clpi, JAR/*, META/*, *.bdmv
+    ///   - AACS/* (Content*.cer, Unit_Key_RO.inf, CPSUnit*.cci)
+    ///
+    /// Skips: STREAM/ (video), BACKUP/, DUPLICATE/,
+    ///   MKB_RO.inf, ContentHash*, ContentRevocation*
+    pub fn metadata_sector_ranges(&self, session: &mut DriveSession) -> Result<Vec<(u32, u32)>> {
+        let mut ranges = Vec::new();
+
+        // UDF structure: AVDP + VDS + metadata partition + FSD + some margin
+        ranges.push((0, self.metadata_start + 256));
+
+        // Walk tree, collect ranges for each metadata file
+        self.collect_file_ranges(session, &self.root, &mut ranges)?;
+
+        // Merge overlapping/adjacent ranges and sort
+        ranges.sort_by_key(|r| r.0);
+        let merged = merge_ranges(&ranges);
+        Ok(merged)
+    }
+
+    fn collect_file_ranges(&self, session: &mut DriveSession, entry: &DirEntry, ranges: &mut Vec<(u32, u32)>) -> Result<()> {
+        for child in &entry.entries {
+            if child.is_dir {
+                let name_upper = child.name.to_uppercase();
+                if matches!(name_upper.as_str(), "STREAM" | "BACKUP" | "DUPLICATE") {
+                    continue;
+                }
+                self.collect_file_ranges(session, child, ranges)?;
+            } else {
+                let name_upper = child.name.to_uppercase();
+
+                // Skip large AACS files we don't need for disc-info
+                if name_upper.starts_with("MKB_")
+                    || name_upper.starts_with("CONTENTHASH")
+                    || name_upper.starts_with("CONTENTREVOCATION")
+                {
+                    continue;
+                }
+
+                // Include everything else (mpls, clpi, jar, bdmv, cer, cci, xml, png, inf)
+                if let Ok((data_lba, data_len)) = self.read_icb_extent(session, child.meta_lba) {
+                    let abs_start = self.partition_start + data_lba;
+                    let sector_count = (data_len + 2047) / 2048;
+                    ranges.push((abs_start, sector_count));
+                }
+
+                // Also include the ICB sector itself (in metadata partition)
+                ranges.push((self.meta_to_abs(child.meta_lba), 1));
+            }
+        }
+        Ok(())
     }
 
     /// Convert a metadata-partition-relative LBA to an absolute sector number.
@@ -454,6 +517,24 @@ fn parse_udf_name(data: &[u8]) -> String {
         }
         _ => String::from_utf8_lossy(&data[1..]).trim().to_string(),
     }
+}
+
+/// Merge overlapping or adjacent (start, count) ranges.
+fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    if ranges.is_empty() { return Vec::new(); }
+    let mut result = vec![ranges[0]];
+    for &(start, count) in &ranges[1..] {
+        let last = result.last_mut().unwrap();
+        let last_end = last.0 + last.1;
+        if start <= last_end + 1 {
+            // Overlapping or adjacent — extend
+            let new_end = (start + count).max(last_end);
+            last.1 = new_end - last.0;
+        } else {
+            result.push((start, count));
+        }
+    }
+    result
 }
 
 /// Read a single 2048-byte sector from the drive.
