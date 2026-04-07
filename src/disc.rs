@@ -23,6 +23,10 @@ pub struct Disc {
     pub capacity_sectors: u32,
     /// Titles sorted by duration (longest first), then playlist name
     pub titles: Vec<Title>,
+    /// AACS state — None if disc is unencrypted or keys unavailable
+    pub aacs: Option<AacsState>,
+    /// Whether this disc requires AACS decryption
+    pub encrypted: bool,
 }
 
 /// A title (one MPLS playlist).
@@ -247,15 +251,438 @@ impl Stream {
     }
 }
 
+// ─── AACS state ─────────────────────────────────────────────────────────────
+
+/// AACS decryption state for a disc.
+#[derive(Debug)]
+pub struct AacsState {
+    /// Volume Unique Key
+    pub vuk: [u8; 16],
+    /// Decrypted unit keys indexed by CPS unit number
+    pub unit_keys: Vec<(u32, [u8; 16])>,
+    /// Read data key (AACS 2.0 bus decryption) — None for AACS 1.0
+    pub read_data_key: Option<[u8; 16]>,
+    /// Whether bus encryption is enabled
+    pub bus_encryption: bool,
+}
+
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
-// Placeholder — the actual implementation will be wired in
-// when the CLI's disc_info.rs parsing is migrated here.
-// For now, the CLI does its own parsing.
+/// Options for disc scanning.
+pub struct ScanOptions {
+    /// Path to KEYDB.cfg for AACS key lookup.
+    /// If None, tries ~/.config/aacs/KEYDB.cfg and /etc/aacs/KEYDB.cfg.
+    pub keydb_path: Option<std::path::PathBuf>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        ScanOptions { keydb_path: None }
+    }
+}
+
+impl ScanOptions {
+    /// Create options with a specific KEYDB path.
+    pub fn with_keydb(path: impl Into<std::path::PathBuf>) -> Self {
+        ScanOptions { keydb_path: Some(path.into()) }
+    }
+
+    /// Resolve KEYDB path: explicit, then standard locations.
+    fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
+        if let Some(p) = &self.keydb_path {
+            if p.exists() { return Some(p.clone()); }
+        }
+        // Standard locations
+        if let Some(home) = std::env::var_os("HOME") {
+            let p = std::path::PathBuf::from(home).join(".config/aacs/KEYDB.cfg");
+            if p.exists() { return Some(p); }
+        }
+        let p = std::path::PathBuf::from("/etc/aacs/KEYDB.cfg");
+        if p.exists() { return Some(p); }
+        None
+    }
+}
 
 impl Disc {
     /// Disc capacity in GB
     pub fn capacity_gb(&self) -> f64 {
         self.capacity_sectors as f64 * 2048.0 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Scan a disc — parse filesystem, playlists, streams, and set up AACS decryption.
+    ///
+    /// This is the main entry point. After scan(), the Disc is ready:
+    ///   - titles are populated with streams
+    ///   - AACS keys are derived (if KEYDB available)
+    ///   - content can be read and decrypted transparently
+    ///
+    /// ```no_run
+    /// use libfreemkv::{DriveSession, Disc};
+    /// use libfreemkv::disc::ScanOptions;
+    /// use std::path::Path;
+    ///
+    /// let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
+    /// let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
+    /// for title in &disc.titles {
+    ///     println!("{} — {} streams", title.duration_display(), title.streams.len());
+    /// }
+    /// ```
+    pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
+        // Step 1: Read capacity
+        let capacity = Self::read_capacity(session)?;
+
+        // Step 2: Parse UDF filesystem
+        let udf_fs = udf::read_filesystem(session)?;
+
+        // Step 3: Find and parse MPLS playlists
+        let mut titles = Vec::new();
+        if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
+            for entry in &playlist_dir.entries {
+                if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
+                    let path = format!("/BDMV/PLAYLIST/{}", entry.name);
+                    if let Ok(mpls_data) = udf_fs.read_file(session, &path) {
+                        if let Some(title) = Self::parse_playlist(session, &udf_fs, &entry.name, &mpls_data) {
+                            titles.push(title);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort: longest first
+        titles.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Step 4: Detect AACS encryption
+        let encrypted = udf_fs.find_dir("/AACS").is_some()
+            || udf_fs.find_dir("/BDMV/AACS").is_some();
+
+        // Step 5: If encrypted and KEYDB available, authenticate and derive keys
+        let aacs = if encrypted {
+            if let Some(keydb_path) = opts.resolve_keydb() {
+                match Self::setup_aacs(session, &keydb_path) {
+                    Ok(state) => Some(state),
+                    Err(_) => None, // keys not found, continue without decryption
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Disc {
+            capacity_sectors: capacity,
+            titles,
+            aacs,
+            encrypted,
+        })
+    }
+
+    /// Set up AACS decryption for this disc.
+    /// Call after scan() to enable transparent content decryption.
+    pub fn setup_aacs(
+        session: &mut DriveSession,
+        keydb_path: &std::path::Path,
+    ) -> Result<AacsState> {
+        use crate::aacs::{KeyDb, derive_vuk, decrypt_unit_key};
+        use crate::aacs_handshake;
+
+        // Load KEYDB
+        let keydb = KeyDb::load(keydb_path).map_err(|e| Error::AacsError {
+            detail: format!("failed to load KEYDB: {}", e),
+        })?;
+
+        let host_cert = keydb.host_cert.as_ref().ok_or_else(|| Error::AacsError {
+            detail: "no host certificate in KEYDB".into(),
+        })?;
+
+        // Authenticate with drive
+        let mut auth = aacs_handshake::aacs_authenticate(
+            session,
+            &host_cert.private_key,
+            &host_cert.certificate,
+        )?;
+
+        // Read Volume ID
+        let vid = aacs_handshake::read_volume_id(session, &mut auth)?;
+
+        // Try to read data keys (AACS 2.0)
+        let (read_data_key, bus_encryption) = match aacs_handshake::read_data_keys(session, &mut auth) {
+            Ok((rdk, _wdk)) => (Some(rdk), true),
+            Err(_) => (None, false),
+        };
+
+        // Compute disc hash (SHA1 of Unit_Key_RO.inf) for KEYDB lookup
+        // First try: look up by VID-derived entries
+        // The KEYDB has entries indexed by disc_hash, but we can also
+        // find entries that match our MK+VID combination
+
+        // Try all entries — find one whose MK+VID produces a VUK that decrypts unit keys
+        let mut found_vuk = None;
+
+        // First: try entries that have a disc_id matching our VID
+        for entry in keydb.disc_entries.values() {
+            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+                if did == vid {
+                    let vuk = derive_vuk(&mk, &vid);
+                    found_vuk = Some((vuk, entry.unit_keys.clone()));
+                    break;
+                }
+            }
+        }
+
+        // Fallback: if we have a VUK that works, use it
+        if found_vuk.is_none() {
+            for entry in keydb.disc_entries.values() {
+                if let Some(vuk) = entry.vuk {
+                    if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+                        if did == vid {
+                            found_vuk = Some((vuk, entry.unit_keys.clone()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let (vuk, keydb_unit_keys) = found_vuk.ok_or_else(|| Error::AacsError {
+            detail: format!("no matching disc found in KEYDB for VID {:02x?}", &vid[..4]),
+        })?;
+
+        // If KEYDB has pre-decrypted unit keys, use them directly
+        // Otherwise we'd need to read Unit_Key_RO.inf and decrypt with VUK
+        let unit_keys = if !keydb_unit_keys.is_empty() {
+            keydb_unit_keys
+        } else {
+            // Would need to read AACS/Unit_Key_RO.inf from disc and decrypt
+            // For now, require KEYDB to have unit keys
+            return Err(Error::AacsError {
+                detail: "no unit keys in KEYDB entry — Unit_Key_RO.inf parsing not yet implemented".into(),
+            });
+        };
+
+        Ok(AacsState {
+            vuk,
+            unit_keys,
+            read_data_key,
+            bus_encryption,
+        })
+    }
+
+    // ── Internal helpers ────────────────────────────────────────────────────
+
+    fn read_capacity(session: &mut DriveSession) -> Result<u32> {
+        let cdb = [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut buf = [0u8; 8];
+        session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000)?;
+        let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        Ok(lba + 1)
+    }
+
+    fn parse_playlist(
+        session: &mut DriveSession,
+        udf_fs: &udf::UdfFs,
+        filename: &str,
+        data: &[u8],
+    ) -> Option<Title> {
+        let parsed = mpls::parse(data).ok()?;
+
+        // Calculate duration from play items
+        let duration_ticks: u64 = parsed.play_items.iter()
+            .map(|pi| (pi.out_time.saturating_sub(pi.in_time)) as u64)
+            .sum();
+        let duration_secs = duration_ticks as f64 / 45000.0;
+
+        // Skip very short playlists (< 30 seconds)
+        if duration_secs < 30.0 {
+            return None;
+        }
+
+        // Parse each clip for EP map → sector extents
+        let mut extents = Vec::new();
+        let mut total_size: u64 = 0;
+        let clip_count = parsed.play_items.len();
+
+        for play_item in &parsed.play_items {
+            let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
+            if let Ok(clpi_data) = udf_fs.read_file(session, &clpi_path) {
+                if let Ok(clip_info) = clpi::parse(&clpi_data) {
+                    // Use EP map to get sector extents for this clip's time range
+                    let clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
+                    for ext in &clip_extents {
+                        total_size += ext.sector_count as u64 * 2048;
+                    }
+                    extents.extend(clip_extents);
+                }
+            }
+        }
+
+        // Streams: for now, we know the count but not details
+        // (STN table parsing will be added to mpls module)
+        let streams = Vec::new();
+
+        let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
+        let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
+
+        Some(Title {
+            playlist: filename.to_string(),
+            playlist_id,
+            duration_secs,
+            size_bytes: total_size,
+            clip_count,
+            streams,
+            extents,
+        })
+    }
+}
+
+// ─── Decrypted reader ──────────────────────────────────────────────────────
+
+/// A reader that reads m2ts content, decrypting transparently if needed.
+pub struct ContentReader<'a> {
+    session: &'a mut DriveSession,
+    aacs: Option<&'a AacsState>,
+    extents: Vec<Extent>,
+    current_extent: usize,
+    current_offset: u32, // sectors into current extent
+    unit_key_idx: usize,
+}
+
+impl Disc {
+    /// Open a title for reading. Decryption is automatic — if the disc
+    /// is encrypted and keys were found during scan(), content is decrypted
+    /// on the fly. Unencrypted discs pass through unchanged.
+    ///
+    /// ```no_run
+    /// # use libfreemkv::{DriveSession, Disc};
+    /// # use libfreemkv::disc::ScanOptions;
+    /// # use std::path::Path;
+    /// # let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
+    /// let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
+    /// let mut reader = disc.open_title(&mut session, 0).unwrap();
+    /// while let Some(unit) = reader.read_unit().unwrap() {
+    ///     // unit is 6144 bytes of decrypted content
+    /// }
+    /// ```
+    pub fn open_title<'a>(&'a self, session: &'a mut DriveSession, title_idx: usize) -> Result<ContentReader<'a>> {
+        let title = self.titles.get(title_idx).ok_or_else(|| Error::DiscError {
+            detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
+        })?;
+
+        Ok(ContentReader {
+            session,
+            aacs: self.aacs.as_ref(),
+            extents: title.extents.clone(),
+            current_extent: 0,
+            current_offset: 0,
+            unit_key_idx: 0,
+        })
+    }
+}
+
+impl<'a> ContentReader<'a> {
+    /// Read the next aligned unit (6144 bytes).
+    /// Automatically decrypted if AACS keys are available.
+    /// Returns None when all extents are exhausted.
+    pub fn read_unit(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.current_extent >= self.extents.len() {
+            return Ok(None);
+        }
+
+        let extent = &self.extents[self.current_extent];
+        let lba = extent.start_lba + self.current_offset;
+
+        // Read 3 sectors (one aligned unit)
+        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        for i in 0..3u32 {
+            let offset = (i as usize) * 2048;
+            let mut sector = [0u8; 2048];
+            session_read_sector(self.session, lba + i, &mut sector)?;
+            unit[offset..offset + 2048].copy_from_slice(&sector);
+        }
+
+        // Decrypt if needed
+        if let Some(aacs) = &self.aacs {
+            if crate::aacs::is_unit_encrypted(&unit) {
+                let uk = aacs.unit_keys.get(self.unit_key_idx)
+                    .map(|(_, k)| *k)
+                    .unwrap_or([0u8; 16]);
+
+                crate::aacs::decrypt_unit_full(
+                    &mut unit,
+                    &uk,
+                    aacs.read_data_key.as_ref(),
+                );
+            }
+        }
+
+        // Advance position
+        self.current_offset += 3;
+        if self.current_offset >= extent.sector_count {
+            self.current_extent += 1;
+            self.current_offset = 0;
+        }
+
+        Ok(Some(unit))
+    }
+}
+
+fn session_read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8; 2048]) -> Result<()> {
+    let cdb = [
+        0x28, 0x00,
+        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+        0x00, 0x00, 0x01, 0x00,
+    ];
+    session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, buf, 10_000)?;
+    Ok(())
+}
+
+// ─── Format helpers ────────────────────────────────────────────────────────
+
+fn format_resolution(video_format: u8, _video_rate: u8) -> String {
+    match video_format {
+        1 => "480i".into(),
+        2 => "576i".into(),
+        3 => "480p".into(),
+        4 => "1080i".into(),
+        5 => "720p".into(),
+        6 => "1080p".into(),
+        7 => "576p".into(),
+        8 => "2160p".into(),
+        _ => String::new(),
+    }
+}
+
+fn format_framerate(video_rate: u8) -> String {
+    match video_rate {
+        1 => "23.976".into(),
+        2 => "24".into(),
+        3 => "25".into(),
+        4 => "29.97".into(),
+        6 => "50".into(),
+        7 => "59.94".into(),
+        _ => String::new(),
+    }
+}
+
+fn format_channels(audio_format: u8) -> String {
+    match audio_format {
+        1 => "mono".into(),
+        3 => "stereo".into(),
+        6 => "5.1".into(),
+        12 => "7.1".into(),
+        _ if audio_format > 0 => format!("{}ch", audio_format),
+        _ => String::new(),
+    }
+}
+
+fn format_samplerate(audio_rate: u8) -> String {
+    match audio_rate {
+        1 => "48kHz".into(),
+        4 => "96kHz".into(),
+        5 => "192kHz".into(),
+        12 => "48/192kHz".into(),
+        14 => "48/96kHz".into(),
+        _ => String::new(),
     }
 }

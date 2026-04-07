@@ -81,6 +81,7 @@ pub mod clpi;
 pub mod disc;
 pub mod jar;
 pub mod aacs;
+pub mod aacs_handshake;
 
 pub use error::{Error, Result};
 pub use drive::DriveSession;
@@ -89,4 +90,4 @@ pub use profile::{DriveProfile, Chipset};
 pub use platform::{Platform, DriveStatus};
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
-pub use disc::{Disc, Title, Stream, StreamKind, Codec, HdrFormat, ColorSpace, Extent};
+pub use disc::{Disc, Title, Stream, StreamKind, Codec, HdrFormat, ColorSpace, Extent, ContentReader, AacsState, ScanOptions};
