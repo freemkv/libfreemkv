@@ -46,6 +46,9 @@ pub enum Error {
 
     // 6xxx — Disc format errors
     DiscError { detail: String },
+
+    // 7xxx — AACS errors
+    AacsError { detail: String },
 }
 
 impl Error {
@@ -65,6 +68,7 @@ impl Error {
             Error::ScsiTimeout { .. }       => 4001,
             Error::IoError { .. }           => 5000,
             Error::DiscError { .. }         => 6000,
+            Error::AacsError { .. }         => 7000,
         }
     }
 }
@@ -92,6 +96,7 @@ impl std::fmt::Display for Error {
             Error::ScsiTimeout { opcode } => write!(f, "E4001: SCSI 0x{opcode:02x} timeout"),
             Error::IoError { source } => write!(f, "E5000: {source}"),
             Error::DiscError { detail } => write!(f, "E6000: disc: {detail}"),
+            Error::AacsError { detail } => write!(f, "E7000: AACS: {detail}"),
         }
     }
 }
