@@ -13,6 +13,8 @@
 //! The VUK decrypts title keys from AACS/Unit_Key_RO.inf on disc.
 //! Title keys decrypt m2ts stream content (AES-128-CBC).
 
+pub mod handshake;
+
 use std::collections::HashMap;
 use aes::Aes128;
 use aes::cipher::{BlockEncrypt, BlockDecrypt, KeyInit, generic_array::GenericArray};

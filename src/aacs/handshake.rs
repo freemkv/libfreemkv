@@ -670,8 +670,8 @@ pub fn read_data_keys(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
     enc_wdk.copy_from_slice(&response[20..36]);
 
     // Decrypt with bus key (AES-ECB)
-    let read_data_key = crate::aacs::aes_ecb_decrypt(&auth.bus_key, &enc_rdk);
-    let write_data_key = crate::aacs::aes_ecb_decrypt(&auth.bus_key, &enc_wdk);
+    let read_data_key = super::aes_ecb_decrypt(&auth.bus_key, &enc_rdk);
+    let write_data_key = super::aes_ecb_decrypt(&auth.bus_key, &enc_wdk);
 
     auth.read_data_key = Some(read_data_key);
     Ok((read_data_key, write_data_key))

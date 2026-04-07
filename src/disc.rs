@@ -426,7 +426,7 @@ impl Disc {
         keydb_path: &std::path::Path,
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
-        use crate::aacs_handshake;
+        use crate::aacs::handshake;
 
         // Load KEYDB
         let keydb = KeyDb::load(keydb_path).map_err(|e| Error::AacsError {
@@ -444,11 +444,11 @@ impl Disc {
         if !device_path.is_empty() {
             if let Ok(mut aacs_session) = DriveSession::open_no_unlock(std::path::Path::new(&device_path)) {
                 if let Ok(hc) = keydb.host_cert.as_ref().ok_or(()) {
-                    if let Ok(mut auth) = aacs_handshake::aacs_authenticate(
+                    if let Ok(mut auth) = handshake::aacs_authenticate(
                         &mut aacs_session, &hc.private_key, &hc.certificate,
                     ) {
-                        vid = aacs_handshake::read_volume_id(&mut aacs_session, &mut auth).ok();
-                        read_data_key = aacs_handshake::read_data_keys(&mut aacs_session, &mut auth)
+                        vid = handshake::read_volume_id(&mut aacs_session, &mut auth).ok();
+                        read_data_key = handshake::read_data_keys(&mut aacs_session, &mut auth)
                             .ok().map(|(rdk, _)| rdk);
                     }
                 }

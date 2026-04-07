@@ -49,7 +49,7 @@ fn main() {
     // AACS handshake
     println!();
     print!("AACS authenticate... ");
-    let mut auth = match libfreemkv::aacs_handshake::aacs_authenticate(
+    let mut auth = match libfreemkv::aacs::handshake::aacs_authenticate(
         &mut session,
         &host_cert.private_key,
         &host_cert.certificate,
@@ -69,7 +69,7 @@ fn main() {
 
     // Read Volume ID
     print!("Reading Volume ID... ");
-    match libfreemkv::aacs_handshake::read_volume_id(&mut session, &mut auth) {
+    match libfreemkv::aacs::handshake::read_volume_id(&mut session, &mut auth) {
         Ok(vid) => {
             println!("OK");
             println!("  VID: {:02x?}", vid);
@@ -91,7 +91,7 @@ fn main() {
 
     // Read data keys (AACS 2.0)
     print!("Reading data keys... ");
-    match libfreemkv::aacs_handshake::read_data_keys(&mut session, &mut auth) {
+    match libfreemkv::aacs::handshake::read_data_keys(&mut session, &mut auth) {
         Ok((rdk, wdk)) => {
             println!("OK (AACS 2.0 bus encryption)");
             println!("  Read data key:  {:02x?}", rdk);
