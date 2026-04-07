@@ -433,7 +433,7 @@ impl Disc {
             cc_data.as_deref(),
             &vid,
             &keydb,
-            None, // MKB: TODO read via REPORT DISC STRUCTURE 0x83
+            aacs::read_mkb_from_drive(session).ok().as_deref(),
         ).ok_or_else(|| Error::AacsError {
             detail: "failed to resolve AACS keys".into(),
         })?;
@@ -494,9 +494,30 @@ impl Disc {
             }
         }
 
-        // Streams: for now, we know the count but not details
-        // (STN table parsing will be added to mpls module)
-        let streams = Vec::new();
+        // Build streams from STN table
+        let streams: Vec<Stream> = parsed.streams.iter().map(|s| {
+            let kind = match s.stream_type {
+                1 => StreamKind::Video,
+                2 => StreamKind::Audio,
+                3 => StreamKind::Subtitle,
+                _ => StreamKind::Video,
+            };
+            let codec = Codec::from_coding_type(s.coding_type);
+            Stream {
+                kind,
+                pid: s.pid,
+                codec,
+                language: s.language.clone(),
+                resolution: format_resolution(s.video_format, s.video_rate),
+                frame_rate: format_framerate(s.video_rate),
+                channels: format_channels(s.audio_format),
+                sample_rate: format_samplerate(s.audio_rate),
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Unknown,
+                secondary: false,
+                label: String::new(),
+            }
+        }).collect();
 
         let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
