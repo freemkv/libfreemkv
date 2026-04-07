@@ -133,7 +133,7 @@ impl DriveSession {
     /// Standard SCSI READ(10) for disc filesystem data (UDF, MPLS, CLPI).
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
-            0x28, 0x00,
+            crate::scsi::SCSI_READ_10, 0x00,
             (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
             0x00,
             (count >> 8) as u8, count as u8,

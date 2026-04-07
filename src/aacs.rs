@@ -753,17 +753,21 @@ pub fn derive_media_key_from_dk(
     None
 }
 
+/// MKB disc structure format code.
+const MKB_DISC_STRUCTURE_FORMAT: u8 = 0x83;
+/// MKB pack buffer size.
+const MKB_PACK_SIZE: usize = 32772;
+
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs.
 pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::error::Result<Vec<u8>> {
-    use crate::scsi::DataDirection;
+    use crate::scsi::{DataDirection, SCSI_READ_DISC_STRUCTURE};
 
-    // First pack: get pack count and initial data
     let cdb = [
-        0xAD, 0x01, // REPORT DISC STRUCTURE, Blu-ray
-        0x00, 0x00, 0x00, 0x00, // address = 0 (pack 0)
-        0x00, 0x83, // format = 0x83 (MKB)
-        0x80, 0x04, // allocation length = 32772
+        SCSI_READ_DISC_STRUCTURE, 0x01,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, MKB_DISC_STRUCTURE_FORMAT,
+        (MKB_PACK_SIZE >> 8) as u8, (MKB_PACK_SIZE & 0xFF) as u8,
         0x00, 0x00,
     ];
     let mut buf = vec![0u8; 32772];
@@ -782,10 +786,10 @@ pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::e
     // Read remaining packs
     for pack in 1..num_packs {
         let mut cdb = [
-            0xAD, 0x01,
+            SCSI_READ_DISC_STRUCTURE, 0x01,
             0x00, 0x00, 0x00, 0x00,
-            0x00, 0x83,
-            0x80, 0x04,
+            0x00, MKB_DISC_STRUCTURE_FORMAT,
+            (MKB_PACK_SIZE >> 8) as u8, (MKB_PACK_SIZE & 0xFF) as u8,
             0x00, 0x00,
         ];
         // Pack number goes in address field

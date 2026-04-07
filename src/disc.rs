@@ -691,7 +691,7 @@ impl<'a> ContentReader<'a> {
 
 fn session_read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8; 2048]) -> Result<()> {
     let cdb = [
-        0x28, 0x00,
+        crate::scsi::SCSI_READ_10, 0x00,
         (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
         0x00, 0x00, 0x01, 0x00,
     ];

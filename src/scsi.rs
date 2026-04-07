@@ -8,6 +8,22 @@
 use crate::error::{Error, Result};
 use std::path::Path;
 
+// ── SCSI opcodes (SPC-4, MMC-6) ────────────────────────────────────────────
+
+pub const SCSI_INQUIRY: u8             = 0x12;
+pub const SCSI_READ_CAPACITY: u8       = 0x25;
+pub const SCSI_READ_10: u8             = 0x28;
+pub const SCSI_READ_BUFFER: u8         = 0x3C;
+pub const SCSI_READ_TOC: u8            = 0x43;
+pub const SCSI_GET_CONFIGURATION: u8   = 0x46;
+pub const SCSI_SEND_KEY: u8            = 0xA3;
+pub const SCSI_REPORT_KEY: u8          = 0xA4;
+pub const SCSI_READ_12: u8             = 0xA8;
+pub const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
+
+/// AACS key class for REPORT KEY / SEND KEY commands.
+pub const AACS_KEY_CLASS: u8 = 0x02;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DataDirection {
     None,

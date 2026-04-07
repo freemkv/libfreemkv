@@ -459,8 +459,8 @@ fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
 /// Build REPORT KEY CDB (0xA4).
 fn cdb_report_key(agid: u8, format: u8, len: u16) -> [u8; 12] {
     let mut cdb = [0u8; 12];
-    cdb[0] = 0xA4;
-    cdb[7] = 0x02; // key class = AACS
+    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
+    cdb[7] = crate::scsi::AACS_KEY_CLASS;
     cdb[8] = (len >> 8) as u8;
     cdb[9] = (len & 0xFF) as u8;
     cdb[10] = (agid << 6) | (format & 0x3F);
@@ -470,8 +470,8 @@ fn cdb_report_key(agid: u8, format: u8, len: u16) -> [u8; 12] {
 /// Build SEND KEY CDB (0xA3).
 fn cdb_send_key(agid: u8, format: u8, len: u16) -> [u8; 12] {
     let mut cdb = [0u8; 12];
-    cdb[0] = 0xA3;
-    cdb[7] = 0x02; // key class = AACS
+    cdb[0] = crate::scsi::SCSI_SEND_KEY;
+    cdb[7] = crate::scsi::AACS_KEY_CLASS;
     cdb[8] = (len >> 8) as u8;
     cdb[9] = (len & 0xFF) as u8;
     cdb[10] = (agid << 6) | (format & 0x3F);
@@ -481,7 +481,7 @@ fn cdb_send_key(agid: u8, format: u8, len: u16) -> [u8; 12] {
 /// Build REPORT DISC STRUCTURE CDB (0xAD).
 fn cdb_report_disc_structure(agid: u8, format: u8, len: u16) -> [u8; 12] {
     let mut cdb = [0u8; 12];
-    cdb[0] = 0xAD;
+    cdb[0] = crate::scsi::SCSI_READ_DISC_STRUCTURE;
     cdb[1] = 0x01; // Blu-ray
     cdb[7] = format;
     cdb[8] = (len >> 8) as u8;
