@@ -18,9 +18,9 @@ fn main() {
     println!("aacs-test v{}", env!("CARGO_PKG_VERSION"));
     println!();
 
-    // Open drive
-    print!("Opening {}... ", device.display());
-    let mut session = match libfreemkv::DriveSession::open(device) {
+    // Open drive WITHOUT unlock — AACS auth must happen before raw mode
+    print!("Opening {} (no unlock)... ", device.display());
+    let mut session = match libfreemkv::DriveSession::open_no_unlock(device) {
         Ok(s) => { println!("OK"); s }
         Err(e) => { println!("FAILED: {}", e); std::process::exit(1); }
     };

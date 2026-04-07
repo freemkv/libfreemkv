@@ -20,6 +20,7 @@ pub struct DriveSession {
     platform: Box<dyn Platform>,
     pub profile: DriveProfile,
     pub drive_id: DriveId,
+    device_path: String,
 }
 
 impl DriveSession {
@@ -64,6 +65,7 @@ impl DriveSession {
             platform,
             profile,
             drive_id,
+            device_path: device.to_string_lossy().to_string(),
         };
 
         // Always unlock on open — makes all reads work immediately.
@@ -73,6 +75,46 @@ impl DriveSession {
         eprintln!("  [dbg] unlocked, session ready");
 
         Ok(session)
+    }
+
+    /// Open a drive WITHOUT unlocking (raw mode).
+    /// Used for AACS authentication which must happen before unlock.
+    pub fn open_no_unlock(device: &Path) -> Result<Self> {
+        let mut transport = crate::scsi::open(device)?;
+        let profiles = profile::load_bundled()?;
+        let drive_id = DriveId::from_drive(transport.as_mut())?;
+
+        let profile = profile::find_by_drive_id(&profiles, &drive_id)
+            .cloned()
+            .ok_or_else(|| Error::UnsupportedDrive {
+                vendor_id: drive_id.vendor_id.trim().to_string(),
+                product_id: drive_id.product_id.trim().to_string(),
+                product_revision: drive_id.product_revision.trim().to_string(),
+            })?;
+
+        let platform: Box<dyn Platform> = match profile.chipset {
+            Chipset::MediaTek => Box::new(Mt1959::new(profile.clone())),
+            Chipset::Renesas => {
+                return Err(Error::UnsupportedDrive {
+                    vendor_id: drive_id.vendor_id.trim().to_string(),
+                    product_id: drive_id.product_id.trim().to_string(),
+                    product_revision: "Renesas not yet implemented".to_string(),
+                });
+            }
+        };
+
+        Ok(DriveSession {
+            scsi: transport,
+            platform,
+            profile,
+            drive_id,
+            device_path: device.to_string_lossy().to_string(),
+        })
+    }
+
+    /// Device path this session was opened on.
+    pub fn device_path(&self) -> &str {
+        &self.device_path
     }
 
     /// Open with an explicit profile (skip auto-detection).
@@ -98,6 +140,7 @@ impl DriveSession {
             platform,
             profile,
             drive_id,
+            device_path: String::new(),
         })
     }
 
