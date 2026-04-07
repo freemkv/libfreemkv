@@ -421,8 +421,9 @@ impl Disc {
         // Step 4: Read disc title from META/DL/bdmt_eng.xml
         let meta_title = Self::read_meta_title(session, &udf_fs);
 
-        // Step 5: Extract JAR track labels
+        // Step 5: Extract JAR track labels and merge into streams
         let jar_labels = Self::read_jar_labels(session, &udf_fs);
+        Self::apply_jar_labels(&mut titles, &jar_labels);
 
         // Step 6: Detect AACS encryption
         let encrypted = udf_fs.find_dir("/AACS").is_some()
@@ -576,6 +577,39 @@ impl Disc {
             }
         }
         DiscFormat::Unknown
+    }
+
+    /// Merge JAR labels into title streams.
+    /// Matches by position — JAR audio labels correspond to audio streams in order,
+    /// JAR subtitle labels correspond to subtitle streams in order.
+    fn apply_jar_labels(titles: &mut [Title], jar: &crate::jar::JarLabels) {
+        if jar.audio.is_empty() && jar.subtitle.is_empty() {
+            return;
+        }
+
+        for title in titles.iter_mut() {
+            let mut audio_idx = 0;
+            let mut sub_idx = 0;
+
+            for stream in &mut title.streams {
+                match stream {
+                    Stream::Audio(a) => {
+                        if let Some(label) = jar.audio.get(audio_idx) {
+                            if !label.description.is_empty() {
+                                a.label = label.description.clone();
+                            }
+                        }
+                        audio_idx += 1;
+                    }
+                    Stream::Subtitle(_s) => {
+                        // TODO: JAR subtitle labels could set forced flag or description
+                        sub_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = sub_idx; // suppress warning
+        }
     }
 
     /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
