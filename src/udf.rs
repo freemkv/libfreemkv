@@ -87,9 +87,11 @@ impl UdfFs {
         let (data_lba, data_len) = self.read_icb_extent(session, entry.meta_lba)?;
 
         // Read file data sector by sector
+        // File DATA is in the physical partition (partition_start + lba),
+        // NOT the metadata partition. ICBs are in metadata, data is in physical.
         let sector_count = ((data_len as u64 + 2047) / 2048) as u32;
         let mut data = vec![0u8; (sector_count as usize) * 2048];
-        let abs_start = self.meta_to_abs(data_lba);
+        let abs_start = self.partition_start + data_lba;
 
         for i in 0..sector_count {
             let offset = (i as usize) * 2048;
