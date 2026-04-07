@@ -580,35 +580,63 @@ impl Disc {
     }
 
     /// Merge JAR labels into title streams.
-    /// Matches by position — JAR audio labels correspond to audio streams in order,
-    /// JAR subtitle labels correspond to subtitle streams in order.
+    ///
+    /// Two matching strategies:
+    /// 1. By language+codec (label format like eng_MLP_) — matches stream by content
+    /// 2. By index (TextField format) — Nth label → Nth stream
     fn apply_jar_labels(titles: &mut [Title], jar: &crate::jar::JarLabels) {
         if jar.audio.is_empty() && jar.subtitle.is_empty() {
             return;
         }
 
-        for title in titles.iter_mut() {
-            let mut audio_idx = 0;
-            let mut sub_idx = 0;
+        // Check if labels have language+codec info (label format)
+        let has_content_match = jar.audio.iter().any(|l| !l.language.is_empty() && !l.codec_hint.is_empty());
 
-            for stream in &mut title.streams {
-                match stream {
-                    Stream::Audio(a) => {
-                        if let Some(label) = jar.audio.get(audio_idx) {
-                            if !label.description.is_empty() {
-                                a.label = label.description.clone();
-                            }
+        for title in titles.iter_mut() {
+            if has_content_match {
+                // Match by language + codec
+                Self::apply_labels_by_content(title, jar);
+            } else {
+                // Match by index
+                Self::apply_labels_by_index(title, jar);
+            }
+        }
+    }
+
+    /// Match labels to streams by language + codec hint.
+    fn apply_labels_by_content(title: &mut Title, jar: &crate::jar::JarLabels) {
+        // For each JAR audio label, find the matching stream
+        let mut used = vec![false; jar.audio.len()];
+
+        for stream in &mut title.streams {
+            if let Stream::Audio(a) = stream {
+                // Find a JAR label matching this stream's language + codec
+                for (i, label) in jar.audio.iter().enumerate() {
+                    if used[i] { continue; }
+                    if label.language == a.language && codec_matches(&label.codec_hint, a.codec) {
+                        if !label.description.is_empty() {
+                            a.label = label.description.clone();
                         }
-                        audio_idx += 1;
+                        used[i] = true;
+                        break;
                     }
-                    Stream::Subtitle(_s) => {
-                        // TODO: JAR subtitle labels could set forced flag or description
-                        sub_idx += 1;
-                    }
-                    _ => {}
                 }
             }
-            let _ = sub_idx; // suppress warning
+        }
+    }
+
+    /// Match labels to streams by STN index position.
+    fn apply_labels_by_index(title: &mut Title, jar: &crate::jar::JarLabels) {
+        let mut audio_idx = 0;
+        for stream in &mut title.streams {
+            if let Stream::Audio(a) = stream {
+                if let Some(label) = jar.audio.get(audio_idx) {
+                    if !label.description.is_empty() {
+                        a.label = label.description.clone();
+                    }
+                }
+                audio_idx += 1;
+            }
         }
     }
 
@@ -891,6 +919,18 @@ fn session_read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8; 2048
 }
 
 // ─── Format helpers ────────────────────────────────────────────────────────
+
+/// Check if a JAR codec hint matches a stream codec.
+fn codec_matches(hint: &str, codec: Codec) -> bool {
+    match hint {
+        "MLP" => codec == Codec::TrueHd,
+        "AC3" => codec == Codec::Ac3 || codec == Codec::Ac3Plus,
+        "DTS" => codec == Codec::Dts || codec == Codec::DtsHdMa || codec == Codec::DtsHdHr,
+        "LPCM" => codec == Codec::Lpcm,
+        "ADES" => codec == Codec::Ac3, // descriptive audio is usually DD
+        _ => false,
+    }
+}
 
 fn format_resolution(video_format: u8, _video_rate: u8) -> String {
     match video_format {
