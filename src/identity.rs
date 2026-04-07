@@ -39,6 +39,9 @@ pub struct DriveId {
     /// Format: CCYYMMDDHHMI (12 ASCII characters)
     pub firmware_date: String,
 
+    /// Drive serial number — GET CONFIGURATION Feature 0108h
+    pub serial_number: String,
+
     /// Raw 96-byte INQUIRY response for additional parsing if needed.
     pub raw_inquiry: Vec<u8>,
 }
@@ -63,10 +66,29 @@ impl DriveId {
             String::new()
         };
 
-        Ok(Self::from_inquiry(&inquiry, &firmware_date))
+        // GET CONFIGURATION Feature 0108h — Serial Number
+        let mut gc_serial = vec![0u8; 256];
+        let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+        let serial_number = if let Ok(r) = transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000) {
+            if r.bytes_transferred > 12 {
+                String::from_utf8_lossy(&gc_serial[12..r.bytes_transferred])
+                    .trim().to_string()
+            } else { String::new() }
+        } else { String::new() };
+
+        Ok(DriveId {
+            vendor_id: ascii_field(&inquiry, 8, 16),
+            product_id: ascii_field(&inquiry, 16, 32),
+            product_revision: ascii_field(&inquiry, 32, 36),
+            vendor_specific: ascii_field(&inquiry, 36, 43),
+            firmware_date,
+            serial_number,
+            raw_inquiry: inquiry.to_vec(),
+        })
     }
 
     /// Build identity from raw INQUIRY bytes and firmware date string.
+    /// Used by tests and when serial isn't available.
     pub fn from_inquiry(inquiry: &[u8], firmware_date: &str) -> Self {
         DriveId {
             vendor_id: ascii_field(inquiry, 8, 16),
@@ -74,6 +96,7 @@ impl DriveId {
             product_revision: ascii_field(inquiry, 32, 36),
             vendor_specific: ascii_field(inquiry, 36, 43),
             firmware_date: firmware_date.to_string(),
+            serial_number: String::new(),
             raw_inquiry: inquiry.to_vec(),
         }
     }
