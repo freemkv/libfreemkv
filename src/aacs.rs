@@ -858,6 +858,8 @@ pub struct ResolvedKeys {
     pub aacs2: bool,
     /// Whether bus encryption is enabled (from Content Certificate)
     pub bus_encryption: bool,
+    /// Which resolution path succeeded (1=KEYDB, 2=KEYDB derived, 3=PK, 4=DK)
+    pub key_source: u8,
 }
 
 /// Resolve all AACS keys for a disc given:
@@ -893,22 +895,26 @@ pub fn resolve_keys(
 
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
 
+    // Helper to build result
+    let build = |vuk: [u8; 16], key_source: u8| -> ResolvedKeys {
+        let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
+            .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
+            .collect();
+        ResolvedKeys {
+            disc_hash: uk_file.disc_hash,
+            vuk,
+            unit_keys,
+            title_cps_unit: uk_file.title_cps_unit.clone(),
+            aacs2,
+            bus_encryption,
+            key_source,
+        }
+    };
+
     // Path 1: Look up VUK by disc hash in KEYDB
     if let Some(entry) = keydb.find_disc(&hash_hex) {
         if let Some(vuk) = entry.vuk {
-            // Decrypt unit keys with VUK
-            let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
-                .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-                .collect();
-
-            return Some(ResolvedKeys {
-                disc_hash: uk_file.disc_hash,
-                vuk,
-                unit_keys,
-                title_cps_unit: uk_file.title_cps_unit,
-                aacs2,
-                bus_encryption,
-            });
+            return Some(build(vuk, 1));
         }
     }
 
@@ -916,19 +922,7 @@ pub fn resolve_keys(
     for entry in keydb.disc_entries.values() {
         if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
             if did == *volume_id {
-                let vuk = derive_vuk(&mk, volume_id);
-                let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
-                    .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-                    .collect();
-
-                return Some(ResolvedKeys {
-                    disc_hash: uk_file.disc_hash,
-                    vuk,
-                    unit_keys,
-                    title_cps_unit: uk_file.title_cps_unit,
-                    aacs2,
-                    bus_encryption,
-                });
+                return Some(build(derive_vuk(&mk, volume_id), 2));
             }
         }
     }
@@ -936,36 +930,12 @@ pub fn resolve_keys(
     // Path 3: MKB + processing keys → media key → VUK
     if let Some(mkb) = mkb_data {
         if let Some(mk) = derive_media_key_from_pk(mkb, &keydb.processing_keys) {
-            let vuk = derive_vuk(&mk, volume_id);
-            let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
-                .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-                .collect();
-
-            return Some(ResolvedKeys {
-                disc_hash: uk_file.disc_hash,
-                vuk,
-                unit_keys,
-                title_cps_unit: uk_file.title_cps_unit,
-                aacs2,
-                bus_encryption,
-            });
+            return Some(build(derive_vuk(&mk, volume_id), 3));
         }
 
         // Path 4: MKB + device keys → processing key → media key → VUK
         if let Some(mk) = derive_media_key_from_dk(mkb, &keydb.device_keys) {
-            let vuk = derive_vuk(&mk, volume_id);
-            let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
-                .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-                .collect();
-
-            return Some(ResolvedKeys {
-                disc_hash: uk_file.disc_hash,
-                vuk,
-                unit_keys,
-                title_cps_unit: uk_file.title_cps_unit,
-                aacs2,
-                bus_encryption,
-            });
+            return Some(build(derive_vuk(&mk, volume_id), 4));
         }
     }
 
