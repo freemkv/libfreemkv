@@ -53,7 +53,7 @@ AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB
 
 ```text
 DriveSession           — open, identify, unlock, read sectors
-  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS planned)
+  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS)
   ├── DriveProfile     — per-drive unlock parameters (bundled)
   └── Platform         — MediaTek (supported), Renesas (planned)
 
@@ -86,7 +86,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 | Platform | Status | Backend |
 |----------|--------|---------|
 | Linux | Supported | SG_IO ioctl |
-| macOS | Planned | IOKit |
+| macOS | Supported | IOKit SCSITask |
 | Windows | Planned | SPTI |
 
 ## Contributing
