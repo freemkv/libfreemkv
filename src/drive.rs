@@ -36,6 +36,7 @@ impl DriveSession {
     /// for sector reads, disc scanning, and content extraction.
     pub fn open(device: &Path) -> Result<Self> {
         let mut session = Self::open_no_unlock(device)?;
+        session.wait_ready()?;
         let _ = session.unlock(); // silently ignore — unencrypted discs don't need it
         Ok(session)
     }
@@ -82,6 +83,24 @@ impl DriveSession {
             profile,
             drive_id,
             device_path: device.to_string_lossy().to_string(),
+        })
+    }
+
+    /// Wait for the drive to become ready (disc spun up).
+    /// Polls TEST UNIT READY up to 30 seconds.
+    pub fn wait_ready(&mut self) -> Result<()> {
+        let tur = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // TEST UNIT READY
+        for _ in 0..60 {
+            let mut buf = [0u8; 0];
+            if self.scsi.as_mut().execute(
+                &tur, crate::scsi::DataDirection::None, &mut buf, 5000
+            ).is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        Err(Error::DeviceNotFound {
+            path: format!("{}: drive not ready after 30s", self.device_path),
         })
     }
 

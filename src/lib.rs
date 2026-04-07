@@ -87,5 +87,5 @@ pub use profile::{DriveProfile, Chipset};
 pub use platform::{Platform, DriveStatus};
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
-pub use disc::{Disc, Title, Stream, StreamKind, Codec, HdrFormat, ColorSpace,
+pub use disc::{Disc, DiscFormat, Title, Stream, StreamKind, Codec, HdrFormat, ColorSpace,
                Extent, ContentReader, AacsState, KeySource, ScanOptions};
