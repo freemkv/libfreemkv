@@ -25,14 +25,3 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[[bin]]
-name = "freemkv-info"
-path = "src/bin/freemkv_info.rs"
-
-[[bin]]
-name = "freemkv-test"
-path = "src/bin/freemkv_test.rs"
-
-[[bin]]
-name = "aacs-test"
-path = "src/bin/aacs_test.rs"
