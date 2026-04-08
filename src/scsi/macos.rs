@@ -368,6 +368,7 @@ impl ScsiTransport for MacScsiTransport {
             sense,
         })
     }
+
 }
 
 // ── IOKit service discovery ─────────────────────────────────────────────────

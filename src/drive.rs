@@ -163,6 +163,22 @@ impl DriveSession {
         Ok(result.bytes_transferred)
     }
 
+    /// Eject the disc tray.
+    ///
+    /// Sends PREVENT ALLOW MEDIUM REMOVAL (allow) first to release any
+    /// locks, then START STOP UNIT with LoEj=1 to open the tray.
+    pub fn eject(&mut self) -> Result<()> {
+        // PREVENT ALLOW MEDIUM REMOVAL: allow removal
+        let allow_cdb = [0x1Eu8, 0, 0, 0, 0x00, 0];
+        let mut buf = [0u8; 0];
+        let _ = self.scsi.as_mut().execute(&allow_cdb, crate::scsi::DataDirection::None, &mut buf, 5_000);
+
+        // START STOP UNIT: LoEj=1, Start=0
+        let eject_cdb = [0x1Bu8, 0, 0, 0, 0x02, 0];
+        self.scsi.as_mut().execute(&eject_cdb, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        Ok(())
+    }
+
     /// Execute a raw SCSI CDB. Used by parsers and AACS handshake.
     pub fn scsi_execute(
         &mut self,

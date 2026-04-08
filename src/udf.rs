@@ -141,30 +141,25 @@ impl UdfFs {
     fn collect_file_ranges(&self, session: &mut DriveSession, entry: &DirEntry, ranges: &mut Vec<(u32, u32)>) -> Result<()> {
         for child in &entry.entries {
             if child.is_dir {
-                let name_upper = child.name.to_uppercase();
-                if matches!(name_upper.as_str(), "STREAM" | "BACKUP" | "DUPLICATE") {
+                // Only skip STREAM — those are the multi-GB video files
+                if child.name.eq_ignore_ascii_case("STREAM") {
                     continue;
                 }
                 self.collect_file_ranges(session, child, ranges)?;
             } else {
-                let name_upper = child.name.to_uppercase();
+                // Include the ICB sector itself (in metadata partition)
+                ranges.push((self.meta_to_abs(child.meta_lba), 1));
 
-                // Skip large files we don't need for disc-info:
-                // MKB_RO.inf (134MB), ContentHash*.tbl (1MB), ContentRevocation (1MB)
-                // Everything disc-info reads is under 3MB.
-                if child.size > 10_000_000 {
+                // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
+                if child.size > 50_000_000 {
                     continue;
                 }
 
-                // Include everything else (mpls, clpi, jar, bdmv, cer, cci, xml, png, inf)
                 if let Ok((data_lba, data_len)) = self.read_icb_extent(session, child.meta_lba) {
                     let abs_start = self.partition_start + data_lba;
                     let sector_count = (data_len + 2047) / 2048;
                     ranges.push((abs_start, sector_count));
                 }
-
-                // Also include the ICB sector itself (in metadata partition)
-                ranges.push((self.meta_to_abs(child.meta_lba), 1));
             }
         }
         Ok(())

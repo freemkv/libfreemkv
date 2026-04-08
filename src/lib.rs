@@ -77,7 +77,6 @@ pub mod udf;
 pub mod mpls;
 pub mod clpi;
 pub mod disc;
-pub mod jar;
 pub mod aacs;
 pub mod labels;
 
