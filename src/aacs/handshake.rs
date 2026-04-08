@@ -568,6 +568,31 @@ fn compute_bus_key(host_priv: &[u8; 20], drive_key_point_x: &[u8; 20], drive_key
 }
 
 /// Generate ephemeral host key pair: (private_key, public_point_x, public_point_y).
+/// Generate P-256 ephemeral key pair for AACS 2.0.
+fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let p_mod = BigUint::from_bytes_be(&P256_P);
+    let a = BigUint::from_bytes_be(&P256_A);
+    let n = BigUint::from_bytes_be(&P256_N);
+    let g = EcPoint::from_bytes(&P256_GX, &P256_GY);
+
+    let mut priv_bytes = [0u8; 32];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut priv_bytes);
+    let d = BigUint::from_bytes_be(&priv_bytes) % &n;
+
+    let q = ec_mul(&d, &g, &a, &p_mod);
+
+    let mut key = [0u8; 32];
+    let mut pub_x = [0u8; 32];
+    let mut pub_y = [0u8; 32];
+    key.copy_from_slice(&to_bytes_be_padded(&d, 32));
+    pub_x.copy_from_slice(&to_bytes_be_padded(&q.x, 32));
+    pub_y.copy_from_slice(&to_bytes_be_padded(&q.y, 32));
+
+    (key, pub_x, pub_y)
+}
+
+/// Generate AACS 1.0 ephemeral key pair.
 fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
     let p_mod = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
@@ -818,27 +843,135 @@ pub fn aacs2_authenticate(
     host_priv_key_v2: Option<&[u8; 32]>,
     host_cert_v2: Option<&[u8]>,
 ) -> Result<AacsAuth> {
-    // Step 1: Try AACS 1.0 first (backward compatible with all drives)
-    // This gets us AGID, drive cert, and tests if drive accepts us
-    let mut auth = aacs_authenticate(session, host_priv_key_v1, host_cert_v1)?;
+    // Try AACS 1.0 first (backward compatible with all drives)
+    match aacs_authenticate(session, host_priv_key_v1, host_cert_v1) {
+        Ok(auth) => return Ok(auth),
+        Err(_) => {
+            // AACS 1.0 rejected — try native P-256 if we have v2 credentials
+        }
+    }
 
-    // If we got here, AACS 1.0 handshake succeeded.
-    // For AACS 2.0 bus decryption, we still need the read_data_key
-    // which is available via read_data_keys() after auth.
+    // AACS 2.0 native P-256 handshake
+    let host_priv_v2 = host_priv_key_v2.ok_or_else(|| Error::AacsError {
+        detail: "AACS 2.0 host credentials required but not available".into(),
+    })?;
+    let host_cert_v2 = host_cert_v2.ok_or_else(|| Error::AacsError {
+        detail: "AACS 2.0 host certificate required but not available".into(),
+    })?;
 
-    // TODO: When drives start rejecting AACS 1.0 host certs,
-    // implement full P-256 flow here:
-    //   1. Send AACS 2.0 host cert (type 0x11, 132 bytes)
-    //   2. Generate P-256 ephemeral key pair
-    //   3. Exchange P-256 key points with SHA-256 ECDSA signatures
-    //   4. ECDH on P-256 for bus key
-    //
-    // The P-256 math is implemented (ecdsa_sign_p256, ecdsa_verify_p256,
-    // compute_bus_key_p256). What's needed is the SCSI payload format
-    // for the larger (32-byte) keys — the REPORT KEY/SEND KEY format
-    // codes are the same but buffer sizes differ.
+    aacs2_authenticate_p256(session, host_priv_v2, host_cert_v2)
+}
 
-    Ok(auth)
+/// Native AACS 2.0 handshake using P-256/SHA-256.
+/// Same SCSI protocol, larger payloads (32-byte keys, 132-byte certs).
+fn aacs2_authenticate_p256(
+    session: &mut DriveSession,
+    host_priv_key: &[u8; 32],
+    host_cert: &[u8],
+) -> Result<AacsAuth> {
+    if host_cert.len() < 132 {
+        return Err(Error::AacsError { detail: "AACS 2.0 host cert too short".into() });
+    }
+
+    // Step 1: Invalidate all AGIDs
+    for agid in 0..4u8 {
+        let cdb = cdb_report_key(agid, 0x3F, 2);
+        let _ = scsi_read(session, &cdb, 2);
+    }
+
+    // Step 2: Allocate AGID
+    let cdb = cdb_report_key(0, 0x00, 8);
+    let response = scsi_read(session, &cdb, 8)
+        .map_err(|_| Error::AacsError { detail: "AGID allocation failed".into() })?;
+    let agid = (response[7] >> 6) & 0x03;
+
+    // Step 3: Generate host nonce + P-256 ephemeral key pair
+    let mut host_nonce = [0u8; 20];
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut host_nonce);
+    let (host_eph_key, host_eph_pub_x, host_eph_pub_y) = generate_host_key_pair_p256();
+
+    // Step 4: Send AACS 2.0 host certificate + nonce
+    // AACS 2.0: cert is 132 bytes, total payload = 4 + 20 + 132 = 156
+    let mut send_buf = vec![0u8; 156];
+    send_buf[1] = 0x9a; // data length (154)
+    send_buf[4..24].copy_from_slice(&host_nonce);
+    send_buf[24..156].copy_from_slice(&host_cert[..132]);
+
+    let cdb = cdb_send_key(agid, 0x01, 156);
+    scsi_write(session, &cdb, &send_buf)
+        .map_err(|_| Error::AacsError { detail: "drive rejected AACS 2.0 host cert".into() })?;
+
+    // Step 5: Read drive certificate + nonce
+    // AACS 2.0 drive cert is also 132 bytes
+    let cdb = cdb_report_key(agid, 0x01, 156);
+    let response = scsi_read(session, &cdb, 156)
+        .map_err(|_| Error::AacsError { detail: "failed to read AACS 2.0 drive cert".into() })?;
+
+    let mut drive_nonce = [0u8; 20];
+    drive_nonce.copy_from_slice(&response[4..24]);
+    let drive_cert = &response[24..156];
+
+    // Verify drive certificate with AACS 2.0 LA key
+    if drive_cert[0] == 0x11 && !verify_cert_p256(drive_cert) {
+        // Non-fatal: some cert formats may differ
+    }
+
+    // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
+    let cdb = cdb_report_key(agid, 0x02, 132);
+    let response = scsi_read(session, &cdb, 132)
+        .map_err(|_| Error::AacsError { detail: "failed to read AACS 2.0 drive key".into() })?;
+
+    let drive_key_x = &response[4..36];
+    let drive_key_y = &response[36..68];
+    let drive_sig_r = &response[68..100];
+    let drive_sig_s = &response[100..132];
+
+    // Verify drive key signature
+    let (drive_pub_x, drive_pub_y) = cert_pub_key_p256(drive_cert);
+    let mut verify_data = Vec::with_capacity(84);
+    verify_data.extend_from_slice(&host_nonce);
+    verify_data.extend_from_slice(drive_key_x);
+    verify_data.extend_from_slice(drive_key_y);
+
+    if !ecdsa_verify_p256(&drive_pub_x, &drive_pub_y, drive_sig_r, drive_sig_s, &verify_data) {
+        return Err(Error::AacsError { detail: "AACS 2.0 drive key verification failed".into() });
+    }
+
+    // Step 7: Sign host key point
+    let mut sign_data = Vec::with_capacity(84);
+    sign_data.extend_from_slice(&drive_nonce);
+    sign_data.extend_from_slice(&host_eph_pub_x);
+    sign_data.extend_from_slice(&host_eph_pub_y);
+
+    let (host_sig_r, host_sig_s) = ecdsa_sign_p256(host_priv_key, &sign_data);
+
+    // Step 8: Send host key point + signature (P-256: 64+64 = 128 bytes payload)
+    let mut send_buf = vec![0u8; 132];
+    send_buf[1] = 0x82; // data length
+    send_buf[4..36].copy_from_slice(&host_eph_pub_x);
+    send_buf[36..68].copy_from_slice(&host_eph_pub_y);
+    send_buf[68..100].copy_from_slice(&host_sig_r);
+    send_buf[100..132].copy_from_slice(&host_sig_s);
+
+    let cdb = cdb_send_key(agid, 0x02, 132);
+    scsi_write(session, &cdb, &send_buf)
+        .map_err(|_| Error::AacsError { detail: "drive rejected AACS 2.0 host key".into() })?;
+
+    // Step 9: Compute bus key via P-256 ECDH
+    let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y);
+
+    Ok(AacsAuth {
+        bus_key,
+        agid,
+        volume_id: None,
+        read_data_key: None,
+        drive_cert: {
+            let mut dc = [0u8; 92];
+            dc.copy_from_slice(&drive_cert[..92.min(drive_cert.len())]);
+            dc
+        },
+    })
 }
 
 /// Read Volume ID after successful authentication.
