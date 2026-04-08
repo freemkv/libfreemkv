@@ -133,7 +133,18 @@ impl KeyDb {
                 continue;
             }
 
-            // Host Certificate
+            // Host Certificate (AACS 2.0)
+            if line.starts_with("| HC2") {
+                if let Some(ref mut hc) = db.host_cert {
+                    if let Some((pk, cert)) = Self::parse_host_cert_v2(line) {
+                        hc.private_key_v2 = Some(pk);
+                        hc.certificate_v2 = Some(cert);
+                    }
+                }
+                continue;
+            }
+
+            // Host Certificate (AACS 1.0)
             if line.starts_with("| HC") {
                 db.host_cert = Self::parse_host_cert(line);
                 continue;
@@ -210,6 +221,22 @@ impl KeyDb {
             private_key_v2: None,
             certificate_v2: None,
         })
+    }
+
+    /// Parse AACS 2.0 host cert: `| HC2 | HOST_PRIV_KEY 0x... | HOST_CERT 0x...`
+    fn parse_host_cert_v2(line: &str) -> Option<([u8; 32], Vec<u8>)> {
+        let priv_str = line.split("HOST_PRIV_KEY").nth(1)?.split('|').next()?.trim();
+        let cert_str = line.split("HOST_CERT").nth(1)?.split(';').next()?.split('|').next()?.trim();
+
+        let priv_bytes = parse_hex(priv_str)?;
+        if priv_bytes.len() != 32 { return None; }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&priv_bytes);
+
+        let cert = parse_hex(cert_str)?;
+        if cert.len() < 132 { return None; }
+
+        Some((pk, cert))
     }
 
     fn parse_disc_entry(line: &str) -> Option<DiscEntry> {
