@@ -421,9 +421,12 @@ impl Disc {
         // Step 4: Read disc title from META/DL/bdmt_eng.xml
         let meta_title = Self::read_meta_title(session, &udf_fs);
 
-        // Step 5: Extract JAR track labels and merge into streams
+        // Step 5: Extract stream labels from disc config files
+        let disc_labels = crate::labels::extract(session, &udf_fs);
+        Self::apply_disc_labels(&mut titles, &disc_labels);
+
+        // JAR labels (for playlist purpose markers only, not stream labels)
         let jar_labels = Self::read_jar_labels(session, &udf_fs);
-        Self::apply_jar_labels(&mut titles, &jar_labels);
 
         // Step 6: Detect AACS encryption
         let encrypted = udf_fs.find_dir("/AACS").is_some()
@@ -584,6 +587,64 @@ impl Disc {
     /// Two matching strategies:
     /// 1. By language+codec (label format like eng_MLP_) — matches stream by content
     /// 2. By index (TextField format) — Nth label → Nth stream
+    /// Apply disc config file labels to streams by stream number.
+    /// Matches by STN index — label stream_number N → Nth audio/subtitle stream.
+    fn apply_disc_labels(titles: &mut [Title], labels: &[crate::labels::StreamLabel]) {
+        use crate::labels::{StreamLabelType, LabelPurpose, LabelQualifier};
+
+        for title in titles.iter_mut() {
+            let mut audio_idx: u16 = 0;
+            let mut sub_idx: u16 = 0;
+
+            for stream in &mut title.streams {
+                match stream {
+                    Stream::Audio(a) => {
+                        audio_idx += 1;
+                        // Find label with matching stream number
+                        if let Some(label) = labels.iter().find(|l|
+                            l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
+                        ) {
+                            // Build label string from purpose + region
+                            let mut parts = Vec::new();
+                            match label.purpose {
+                                LabelPurpose::Commentary => parts.push("Commentary".to_string()),
+                                LabelPurpose::Descriptive => parts.push("Descriptive Audio".to_string()),
+                                LabelPurpose::Score => parts.push("Score".to_string()),
+                                LabelPurpose::Ime => parts.push("IME".to_string()),
+                                LabelPurpose::Normal => {}
+                            }
+                            if !label.region.is_empty() { parts.push(format!("({})", label.region)); }
+                            if !label.codec_hint.is_empty() && label.codec_hint != "MLP" && label.codec_hint != "AC3" {
+                                parts.push(label.codec_hint.clone());
+                            }
+                            if !label.name.is_empty() && parts.is_empty() {
+                                a.label = label.name.clone();
+                            } else if !parts.is_empty() {
+                                a.label = parts.join(" ");
+                            }
+                        }
+                    }
+                    Stream::Subtitle(s) => {
+                        sub_idx += 1;
+                        if let Some(label) = labels.iter().find(|l|
+                            l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
+                        ) {
+                            if label.qualifier == LabelQualifier::Sdh {
+                                // Set a label for SDH
+                                s.forced = false;
+                                // TODO: add sdh field to SubtitleStream
+                            }
+                            if label.qualifier == LabelQualifier::Forced {
+                                s.forced = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn apply_jar_labels(titles: &mut [Title], jar: &crate::jar::JarLabels) {
         if jar.audio.is_empty() && jar.subtitle.is_empty() {
             return;

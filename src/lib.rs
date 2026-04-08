@@ -79,6 +79,7 @@ pub mod clpi;
 pub mod disc;
 pub mod jar;
 pub mod aacs;
+pub mod labels;
 
 pub use error::{Error, Result};
 pub use drive::DriveSession;
