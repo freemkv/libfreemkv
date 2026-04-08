@@ -2,12 +2,8 @@
 //!
 //! Searches the disc UDF filesystem for known config files that contain
 //! stream labels (language, purpose, codec, forced flags). Four formats
-//! supported, tried in order:
-//!
-//! 1. `language_streams.txt` — Warner CTRM CSV format
-//! 2. `menu_base.prop` — Warner CTRM properties format
-//! 3. `streamproperties.xml` + `playbackconfig.xml` — Criterion XML format
-//! 4. `bluray_project.bin` — Pixelogic binary format
+//! supported, tried in order. If found, labels are applied directly
+//! to the title streams. If not found, streams keep MPLS data as-is.
 
 mod language_streams;
 mod menu_base;
@@ -16,6 +12,7 @@ mod bluray_project;
 
 use crate::drive::DriveSession;
 use crate::udf::UdfFs;
+use crate::disc::{Title, Stream};
 
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
@@ -46,43 +43,81 @@ pub enum StreamLabelType {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LabelPurpose {
-    /// Normal dialogue track
     Normal,
-    /// Audio commentary
     Commentary,
-    /// Descriptive audio (visually impaired)
     Descriptive,
-    /// Music score only
     Score,
-    /// In-movie experience
     Ime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LabelQualifier {
     None,
-    /// Subtitles for deaf and hard of hearing
     Sdh,
-    /// Descriptive service
     DescriptiveService,
-    /// Forced/narrative subtitle
     Forced,
 }
 
-/// Try all parsers in order, return first successful result.
-pub fn extract(session: &mut DriveSession, udf: &UdfFs) -> Vec<StreamLabel> {
-    // Try each format in order
-    if let Some(labels) = language_streams::parse(session, udf) {
-        return labels;
+/// Search disc for config files, extract labels, apply to streams.
+/// If no config files found, streams are left unchanged.
+pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
+    let labels = extract(session, udf);
+    if labels.is_empty() { return; }
+
+    for title in titles.iter_mut() {
+        let mut audio_idx: u16 = 0;
+        let mut sub_idx: u16 = 0;
+
+        for stream in &mut title.streams {
+            match stream {
+                Stream::Audio(a) => {
+                    audio_idx += 1;
+                    if let Some(label) = labels.iter().find(|l|
+                        l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
+                    ) {
+                        let mut parts = Vec::new();
+                        match label.purpose {
+                            LabelPurpose::Commentary => parts.push("Commentary".to_string()),
+                            LabelPurpose::Descriptive => parts.push("Descriptive Audio".to_string()),
+                            LabelPurpose::Score => parts.push("Score".to_string()),
+                            LabelPurpose::Ime => parts.push("IME".to_string()),
+                            LabelPurpose::Normal => {}
+                        }
+                        if !label.region.is_empty() {
+                            parts.push(format!("({})", label.region));
+                        }
+                        if !label.codec_hint.is_empty()
+                            && !matches!(label.codec_hint.as_str(), "MLP" | "AC3" | "DTS")
+                        {
+                            parts.push(label.codec_hint.clone());
+                        }
+                        if !parts.is_empty() {
+                            a.label = parts.join(" ");
+                        } else if !label.name.is_empty() {
+                            a.label = label.name.clone();
+                        }
+                    }
+                }
+                Stream::Subtitle(s) => {
+                    sub_idx += 1;
+                    if let Some(label) = labels.iter().find(|l|
+                        l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
+                    ) {
+                        if label.qualifier == LabelQualifier::Forced {
+                            s.forced = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    if let Some(labels) = menu_base::parse(session, udf) {
-        return labels;
-    }
-    if let Some(labels) = stream_properties::parse(session, udf) {
-        return labels;
-    }
-    if let Some(labels) = bluray_project::parse(session, udf) {
-        return labels;
-    }
+}
+
+fn extract(session: &mut DriveSession, udf: &UdfFs) -> Vec<StreamLabel> {
+    if let Some(labels) = language_streams::parse(session, udf) { return labels; }
+    if let Some(labels) = menu_base::parse(session, udf) { return labels; }
+    if let Some(labels) = stream_properties::parse(session, udf) { return labels; }
+    if let Some(labels) = bluray_project::parse(session, udf) { return labels; }
     Vec::new()
 }

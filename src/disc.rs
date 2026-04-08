@@ -421,9 +421,8 @@ impl Disc {
         // Step 4: Read disc title from META/DL/bdmt_eng.xml
         let meta_title = Self::read_meta_title(session, &udf_fs);
 
-        // Step 5: Extract stream labels from disc config files
-        let disc_labels = crate::labels::extract(session, &udf_fs);
-        Self::apply_disc_labels(&mut titles, &disc_labels);
+        // Step 5: Enhance streams with disc config file labels (if available)
+        crate::labels::apply(session, &udf_fs, &mut titles);
 
         // JAR labels (for playlist purpose markers only, not stream labels)
         let jar_labels = Self::read_jar_labels(session, &udf_fs);
