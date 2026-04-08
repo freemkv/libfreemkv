@@ -12,6 +12,7 @@ categories = ["hardware-support", "multimedia"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
+sha2 = "0.10"
 aes = "0.8"
 cbc = "0.1"
 flate2 = "1"
