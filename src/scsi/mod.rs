@@ -56,6 +56,7 @@ pub trait ScsiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult>;
+
 }
 
 // ── Platform-agnostic open ──────────────────────────────────────────────────

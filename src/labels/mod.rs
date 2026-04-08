@@ -1,14 +1,17 @@
 //! Stream label extraction from BD-J disc files.
 //!
-//! Searches the disc UDF filesystem for known config files that contain
-//! stream labels (language, purpose, codec, forced flags). Four formats
-//! supported, tried in order. If found, labels are applied directly
-//! to the title streams. If not found, streams keep MPLS data as-is.
+//! Each parser module represents one BD-J authoring framework.
+//! To add a new format:
+//!   1. Create `src/labels/myformat.rs`
+//!   2. Implement `pub fn detect(udf: &UdfFs) -> bool`
+//!   3. Implement `pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
+//!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
-mod language_streams;
-mod menu_base;
-mod stream_properties;
-mod bluray_project;
+mod paramount;
+mod criterion;
+mod pixelogic;
+mod ctrm;
+pub mod vocab;
 
 use crate::drive::DriveSession;
 use crate::udf::UdfFs;
@@ -23,16 +26,16 @@ pub struct StreamLabel {
     pub stream_type: StreamLabelType,
     /// ISO 639-2 language code
     pub language: String,
-    /// Display name (e.g. "AudioEnglishDolby", "English Dolby Atmos")
+    /// Display name (e.g. "Commentary", "Descriptive Audio")
     pub name: String,
     /// Stream purpose
     pub purpose: LabelPurpose,
     /// Additional qualifier
     pub qualifier: LabelQualifier,
-    /// Codec hint from config (e.g. "MLP", "AC3", "atmos")
+    /// Codec hint from config (e.g. "TrueHD", "Dolby Digital", "Dolby Atmos")
     pub codec_hint: String,
-    /// Regional variant (e.g. "US", "UK", "CF", "CS")
-    pub region: String,
+    /// Regional variant (e.g. "US", "UK", "Castilian", "Canadian")
+    pub variant: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,8 +61,23 @@ pub enum LabelQualifier {
     Forced,
 }
 
+// ── Parser registry ────────────────────────────────────────────────────────
+//
+// Each entry: (name, detect_fn, parse_fn)
+// Order = priority. First match wins. Highest quality output first.
+
+type DetectFn = fn(&UdfFs) -> bool;
+type ParseFn = fn(&mut DriveSession, &UdfFs) -> Option<Vec<StreamLabel>>;
+
+const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
+    ("paramount",  paramount::detect,  paramount::parse),
+    ("criterion",  criterion::detect,  criterion::parse),
+    ("pixelogic",  pixelogic::detect,  pixelogic::parse),
+    ("ctrm",       ctrm::detect,       ctrm::parse),
+    // ("deluxe",  deluxe::detect,     deluxe::parse),  // TODO: bytecode parser
+];
+
 /// Search disc for config files, extract labels, apply to streams.
-/// If no config files found, streams are left unchanged.
 pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
     let labels = extract(session, udf);
     if labels.is_empty() { return; }
@@ -83,12 +101,10 @@ pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
                             LabelPurpose::Ime => parts.push("IME".to_string()),
                             LabelPurpose::Normal => {}
                         }
-                        if !label.region.is_empty() {
-                            parts.push(format!("({})", label.region));
+                        if !label.variant.is_empty() {
+                            parts.push(format!("({})", label.variant));
                         }
-                        if !label.codec_hint.is_empty()
-                            && !matches!(label.codec_hint.as_str(), "MLP" | "AC3" | "DTS")
-                        {
+                        if !label.codec_hint.is_empty() {
                             parts.push(label.codec_hint.clone());
                         }
                         if !parts.is_empty() {
@@ -115,9 +131,42 @@ pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
 }
 
 fn extract(session: &mut DriveSession, udf: &UdfFs) -> Vec<StreamLabel> {
-    if let Some(labels) = language_streams::parse(session, udf) { return labels; }
-    if let Some(labels) = menu_base::parse(session, udf) { return labels; }
-    if let Some(labels) = stream_properties::parse(session, udf) { return labels; }
-    if let Some(labels) = bluray_project::parse(session, udf) { return labels; }
+    for (_name, detect, parse) in PARSERS {
+        if detect(udf) {
+            if let Some(labels) = parse(session, udf) {
+                return labels;
+            }
+        }
+    }
     Vec::new()
+}
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+
+/// Check if a file exists in any BDMV/JAR subdirectory.
+pub(crate) fn jar_file_exists(udf: &UdfFs, filename: &str) -> bool {
+    find_jar_file(udf, filename).is_some()
+}
+
+/// Find a file in any BDMV/JAR subdirectory, return its path.
+pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
+    let jar_dir = udf.find_dir("/BDMV/JAR")?;
+    for entry in &jar_dir.entries {
+        if entry.is_dir {
+            let path = format!("/BDMV/JAR/{}/{}", entry.name, filename);
+            // Check if file exists in this subdirectory
+            for child in &entry.entries {
+                if !child.is_dir && child.name.eq_ignore_ascii_case(filename) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read a file from any BDMV/JAR subdirectory by filename.
+pub(crate) fn read_jar_file(session: &mut DriveSession, udf: &UdfFs, filename: &str) -> Option<Vec<u8>> {
+    let path = find_jar_file(udf, filename)?;
+    udf.read_file(session, &path).ok().filter(|d| !d.is_empty())
 }

@@ -34,8 +34,8 @@ pub struct Disc {
     pub layers: u8,
     /// Titles sorted by duration (longest first), then playlist name
     pub titles: Vec<Title>,
-    /// JAR track labels (audio/subtitle names from BD-J menus)
-    pub jar_labels: crate::jar::JarLabels,
+    /// Disc region
+    pub region: DiscRegion,
     /// AACS state — None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
     /// Whether this disc requires AACS decryption
@@ -53,6 +53,28 @@ pub enum DiscFormat {
     Dvd,
     /// Unknown
     Unknown,
+}
+
+/// Disc playback region.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiscRegion {
+    /// Region-free (all UHD discs, some BD/DVD)
+    Free,
+    /// Blu-ray regions (A/B/C or combination)
+    BluRay(Vec<BdRegion>),
+    /// DVD regions (1-8 or combination)
+    Dvd(Vec<u8>),
+}
+
+/// Blu-ray region codes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BdRegion {
+    /// Region A/1 — Americas, East Asia (Japan, Korea, Southeast Asia)
+    A,
+    /// Region B/2 — Europe, Africa, Australia, Middle East
+    B,
+    /// Region C/3 — Central/South Asia, China, Russia
+    C,
 }
 
 /// A title (one MPLS playlist).
@@ -424,9 +446,6 @@ impl Disc {
         // Step 5: Enhance streams with disc config file labels (if available)
         crate::labels::apply(session, &udf_fs, &mut titles);
 
-        // JAR labels (for playlist purpose markers only, not stream labels)
-        let jar_labels = Self::read_jar_labels(session, &udf_fs);
-
         // Step 6: Detect AACS encryption
         let encrypted = udf_fs.find_dir("/AACS").is_some()
             || udf_fs.find_dir("/BDMV/AACS").is_some();
@@ -454,6 +473,13 @@ impl Disc {
         // BD-66/100 UHD: 25M+ sectors
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
 
+        // UHD is always region-free. BD/DVD region parsing TODO.
+        let region = if format == DiscFormat::Uhd {
+            DiscRegion::Free
+        } else {
+            DiscRegion::Free // TODO: parse from index.bdmv
+        };
+
         Ok(Disc {
             volume_id: udf_fs.volume_id.clone(),
             meta_title: meta_title,
@@ -462,7 +488,7 @@ impl Disc {
             capacity_bytes: capacity as u64 * 2048,
             layers,
             titles,
-            jar_labels,
+            region,
             aacs,
             encrypted,
         })
@@ -581,125 +607,6 @@ impl Disc {
         DiscFormat::Unknown
     }
 
-    /// Merge JAR labels into title streams.
-    ///
-    /// Two matching strategies:
-    /// 1. By language+codec (label format like eng_MLP_) — matches stream by content
-    /// 2. By index (TextField format) — Nth label → Nth stream
-    /// Apply disc config file labels to streams by stream number.
-    /// Matches by STN index — label stream_number N → Nth audio/subtitle stream.
-    fn apply_disc_labels(titles: &mut [Title], labels: &[crate::labels::StreamLabel]) {
-        use crate::labels::{StreamLabelType, LabelPurpose, LabelQualifier};
-
-        for title in titles.iter_mut() {
-            let mut audio_idx: u16 = 0;
-            let mut sub_idx: u16 = 0;
-
-            for stream in &mut title.streams {
-                match stream {
-                    Stream::Audio(a) => {
-                        audio_idx += 1;
-                        // Find label with matching stream number
-                        if let Some(label) = labels.iter().find(|l|
-                            l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
-                        ) {
-                            // Build label string from purpose + region
-                            let mut parts = Vec::new();
-                            match label.purpose {
-                                LabelPurpose::Commentary => parts.push("Commentary".to_string()),
-                                LabelPurpose::Descriptive => parts.push("Descriptive Audio".to_string()),
-                                LabelPurpose::Score => parts.push("Score".to_string()),
-                                LabelPurpose::Ime => parts.push("IME".to_string()),
-                                LabelPurpose::Normal => {}
-                            }
-                            if !label.region.is_empty() { parts.push(format!("({})", label.region)); }
-                            if !label.codec_hint.is_empty() && label.codec_hint != "MLP" && label.codec_hint != "AC3" {
-                                parts.push(label.codec_hint.clone());
-                            }
-                            if !label.name.is_empty() && parts.is_empty() {
-                                a.label = label.name.clone();
-                            } else if !parts.is_empty() {
-                                a.label = parts.join(" ");
-                            }
-                        }
-                    }
-                    Stream::Subtitle(s) => {
-                        sub_idx += 1;
-                        if let Some(label) = labels.iter().find(|l|
-                            l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
-                        ) {
-                            if label.qualifier == LabelQualifier::Sdh {
-                                // Set a label for SDH
-                                s.forced = false;
-                                // TODO: add sdh field to SubtitleStream
-                            }
-                            if label.qualifier == LabelQualifier::Forced {
-                                s.forced = true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    fn apply_jar_labels(titles: &mut [Title], jar: &crate::jar::JarLabels) {
-        if jar.audio.is_empty() && jar.subtitle.is_empty() {
-            return;
-        }
-
-        // Check if labels have language+codec info (label format)
-        let has_content_match = jar.audio.iter().any(|l| !l.language.is_empty() && !l.codec_hint.is_empty());
-
-        for title in titles.iter_mut() {
-            if has_content_match {
-                // Match by language + codec
-                Self::apply_labels_by_content(title, jar);
-            } else {
-                // Match by index
-                Self::apply_labels_by_index(title, jar);
-            }
-        }
-    }
-
-    /// Match labels to streams by language + codec hint.
-    fn apply_labels_by_content(title: &mut Title, jar: &crate::jar::JarLabels) {
-        // For each JAR audio label, find the matching stream
-        let mut used = vec![false; jar.audio.len()];
-
-        for stream in &mut title.streams {
-            if let Stream::Audio(a) = stream {
-                // Find a JAR label matching this stream's language + codec
-                for (i, label) in jar.audio.iter().enumerate() {
-                    if used[i] { continue; }
-                    if label.language == a.language && codec_matches(&label.codec_hint, a.codec) {
-                        if !label.description.is_empty() {
-                            a.label = label.description.clone();
-                        }
-                        used[i] = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Match labels to streams by STN index position.
-    fn apply_labels_by_index(title: &mut Title, jar: &crate::jar::JarLabels) {
-        let mut audio_idx = 0;
-        for stream in &mut title.streams {
-            if let Stream::Audio(a) = stream {
-                if let Some(label) = jar.audio.get(audio_idx) {
-                    if !label.description.is_empty() {
-                        a.label = label.description.clone();
-                    }
-                }
-                audio_idx += 1;
-            }
-        }
-    }
-
     /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
     /// Prefers English, falls back to first available language.
     /// Returns None if META directory is empty or XML has no usable title.
@@ -734,23 +641,6 @@ impl Disc {
             }
         }
         None
-    }
-
-    /// Extract track labels from BD-J JAR files.
-    fn read_jar_labels(session: &mut DriveSession, udf_fs: &udf::UdfFs) -> crate::jar::JarLabels {
-        if let Some(jar_dir) = udf_fs.find_dir("/BDMV/JAR") {
-            for entry in &jar_dir.entries {
-                if !entry.is_dir && entry.name.to_lowercase().ends_with(".jar") {
-                    let path = format!("/BDMV/JAR/{}", entry.name);
-                    if let Ok(jar_data) = udf_fs.read_file(session, &path) {
-                        if let Some(labels) = crate::jar::extract_labels(&jar_data) {
-                            return labels;
-                        }
-                    }
-                }
-            }
-        }
-        crate::jar::JarLabels::default()
     }
 
     fn read_capacity(session: &mut DriveSession) -> Result<u32> {
@@ -979,18 +869,6 @@ fn session_read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8; 2048
 }
 
 // ─── Format helpers ────────────────────────────────────────────────────────
-
-/// Check if a JAR codec hint matches a stream codec.
-fn codec_matches(hint: &str, codec: Codec) -> bool {
-    match hint {
-        "MLP" => codec == Codec::TrueHd,
-        "AC3" => codec == Codec::Ac3 || codec == Codec::Ac3Plus,
-        "DTS" => codec == Codec::Dts || codec == Codec::DtsHdMa || codec == Codec::DtsHdHr,
-        "LPCM" => codec == Codec::Lpcm,
-        "ADES" => codec == Codec::Ac3, // descriptive audio is usually DD
-        _ => false,
-    }
-}
 
 fn format_resolution(video_format: u8, _video_rate: u8) -> String {
     match video_format {
