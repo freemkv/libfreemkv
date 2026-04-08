@@ -78,8 +78,11 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
 ];
 
 /// Search disc for config files, extract labels, apply to streams.
+/// This is 100% optional — if anything fails, streams are untouched.
 pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
-    let labels = extract(session, udf);
+    let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract(session, udf)
+    })).unwrap_or_default();
     if labels.is_empty() { return; }
 
     for title in titles.iter_mut() {
