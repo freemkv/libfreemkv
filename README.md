@@ -14,7 +14,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.3"
+libfreemkv = "0.4"
 ```
 
 ## Quick Start
