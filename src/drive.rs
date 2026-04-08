@@ -149,7 +149,7 @@ impl DriveSession {
         self.platform.probe(self.scsi.as_mut(), sub_cmd, address, length)
     }
 
-    /// Standard SCSI READ(10) for disc filesystem data (UDF, MPLS, CLPI).
+    /// SCSI READ(10) for disc filesystem data (UDF, MPLS, CLPI).
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
             crate::scsi::SCSI_READ_10, 0x00,
@@ -160,6 +160,20 @@ impl DriveSession {
         ];
         let result = self.scsi.as_mut().execute(
             &cdb, crate::scsi::DataDirection::FromDevice, buf, 5_000)?;
+        Ok(result.bytes_transferred)
+    }
+
+    /// SCSI READ(10) for m2ts content — bulk reads with longer timeout.
+    pub fn read_content(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+        let cdb = [
+            crate::scsi::SCSI_READ_10, 0x00,
+            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+            0x00,
+            (count >> 8) as u8, count as u8,
+            0x00,
+        ];
+        let result = self.scsi.as_mut().execute(
+            &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)?;
         Ok(result.bytes_transferred)
     }
 

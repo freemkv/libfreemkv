@@ -689,7 +689,15 @@ impl Disc {
                     pkt_count = clip_info.source_packet_count;
                     total_size += pkt_count as u64 * 192;
 
-                    let clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
+                    // Get the m2ts file's absolute starting LBA on disc
+                    let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
+                    let file_lba = udf_fs.file_start_lba(session, &m2ts_path).unwrap_or(0);
+
+                    let mut clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
+                    // Extents from CLPI are relative to m2ts file start — add file LBA
+                    for ext in &mut clip_extents {
+                        ext.start_lba += file_lba;
+                    }
                     extents.extend(clip_extents);
                 }
             }
@@ -779,8 +787,17 @@ pub struct ContentReader<'a> {
     aacs: Option<&'a AacsState>,
     extents: Vec<Extent>,
     current_extent: usize,
-    current_offset: u32, // sectors into current extent
+    current_offset: u32,
     unit_key_idx: usize,
+    read_buf: Vec<u8>,
+    buf_pos: usize,
+    buf_len: usize,
+    /// Current batch size (adapts on errors)
+    batch_sectors: u16,
+    /// Consecutive successful batch reads (for ramp-up)
+    ok_streak: u32,
+    /// Total read errors encountered
+    pub errors: u32,
 }
 
 impl Disc {
@@ -804,6 +821,11 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
+        // Set drive to max read speed
+        let speed_cdb = crate::scsi::build_set_cd_speed(0xFFFF);
+        let mut dummy = [0u8; 0];
+        let _ = session.scsi_execute(&speed_cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
+
         Ok(ContentReader {
             session,
             aacs: self.aacs.as_ref(),
@@ -811,30 +833,37 @@ impl Disc {
             current_extent: 0,
             current_offset: 0,
             unit_key_idx: 0,
+            read_buf: Vec::with_capacity(MAX_BATCH_SECTORS as usize * 2048),
+            buf_pos: 0,
+            buf_len: 0,
+            batch_sectors: MAX_BATCH_SECTORS,
+            ok_streak: 0,
+            errors: 0,
         })
     }
 }
+
+/// Read strategy constants
+const MAX_BATCH_SECTORS: u16 = 96;   // 32 aligned units = 192KB per command (fast)
+const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (slow, for error recovery)
+const RAMP_UP_AFTER: u32 = 10;       // successful reads before ramping back up
 
 impl<'a> ContentReader<'a> {
     /// Read the next aligned unit (6144 bytes).
     /// Automatically decrypted if AACS keys are available.
     /// Returns None when all extents are exhausted.
     pub fn read_unit(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.current_extent >= self.extents.len() {
-            return Ok(None);
+        // Refill buffer if empty
+        if self.buf_pos >= self.buf_len {
+            if !self.fill_buffer()? {
+                return Ok(None);
+            }
         }
 
-        let extent = &self.extents[self.current_extent];
-        let lba = extent.start_lba + self.current_offset;
-
-        // Read 3 sectors (one aligned unit)
-        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
-        for i in 0..3u32 {
-            let offset = (i as usize) * 2048;
-            let mut sector = [0u8; 2048];
-            session_read_sector(self.session, lba + i, &mut sector)?;
-            unit[offset..offset + 2048].copy_from_slice(&sector);
-        }
+        // Extract one aligned unit from buffer
+        let start = self.buf_pos * crate::aacs::ALIGNED_UNIT_LEN;
+        let end = start + crate::aacs::ALIGNED_UNIT_LEN;
+        let mut unit = self.read_buf[start..end].to_vec();
 
         // Decrypt if needed
         if let Some(aacs) = &self.aacs {
@@ -851,14 +880,99 @@ impl<'a> ContentReader<'a> {
             }
         }
 
-        // Advance position
-        self.current_offset += 3;
-        if self.current_offset >= extent.sector_count {
-            self.current_extent += 1;
-            self.current_offset = 0;
-        }
-
+        self.buf_pos += 1;
         Ok(Some(unit))
+    }
+
+    /// Read a batch of sectors into the internal buffer.
+    /// Adapts batch size on errors: shrinks on failure, grows on success.
+    fn fill_buffer(&mut self) -> Result<bool> {
+        loop {
+            if self.current_extent >= self.extents.len() {
+                eprintln!("  [done] extent {}/{} offset {} errors {}",
+                    self.current_extent, self.extents.len(), self.current_offset, self.errors);
+                return Ok(false);
+            }
+
+            let extent = &self.extents[self.current_extent];
+            let remaining = extent.sector_count - self.current_offset;
+
+            // Align to 3 sectors (one aligned unit)
+            let sectors_to_read = remaining.min(self.batch_sectors as u32) as u16;
+            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
+            if sectors_to_read == 0 {
+                self.current_extent += 1;
+                self.current_offset = 0;
+                continue;
+            }
+
+            let lba = extent.start_lba + self.current_offset;
+            let byte_count = sectors_to_read as usize * 2048;
+            self.read_buf.resize(byte_count, 0);
+
+            if self.current_offset < 100 || sectors_to_read < self.batch_sectors {
+                eprintln!("  [fill] lba={} count={} offset={}/{} batch={} err={} remaining={}",
+                    lba, sectors_to_read, self.current_offset, extent.sector_count,
+                    self.batch_sectors, self.errors, remaining);
+            }
+            match self.session.read_content(lba, sectors_to_read, &mut self.read_buf) {
+                Ok(_) => {
+                    self.buf_len = sectors_to_read as usize / 3;
+                    self.buf_pos = 0;
+                    self.current_offset += sectors_to_read as u32;
+
+                    if self.current_offset >= extent.sector_count {
+                        self.current_extent += 1;
+                        self.current_offset = 0;
+                    }
+
+                    // Ramp up batch size after consecutive successes
+                    self.ok_streak += 1;
+                    if self.ok_streak >= RAMP_UP_AFTER && self.batch_sectors < MAX_BATCH_SECTORS {
+                        self.batch_sectors = (self.batch_sectors * 2).min(MAX_BATCH_SECTORS);
+                        self.ok_streak = 0;
+                    }
+
+                    return Ok(true);
+                }
+                Err(_) => {
+                    self.errors += 1;
+                    self.ok_streak = 0;
+
+                    if self.batch_sectors > MIN_BATCH_SECTORS {
+                        // Shrink batch and retry
+                        self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
+                        // Brief pause to let drive recover
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    } else {
+                        // At minimum batch — retry once with a longer pause
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
+                        if self.session.read_content(lba, MIN_BATCH_SECTORS, &mut self.read_buf).is_ok() {
+                            self.buf_len = 1;
+                            self.buf_pos = 0;
+                            self.current_offset += MIN_BATCH_SECTORS as u32;
+                            if self.current_offset >= extent.sector_count {
+                                self.current_extent += 1;
+                                self.current_offset = 0;
+                            }
+                            return Ok(true);
+                        }
+                        // Still failing — skip this unit
+                        self.current_offset += 3;
+                        if self.current_offset >= extent.sector_count {
+                            self.current_extent += 1;
+                            self.current_offset = 0;
+                        }
+                        self.read_buf.resize(crate::aacs::ALIGNED_UNIT_LEN, 0);
+                        self.read_buf.fill(0);
+                        self.buf_len = 1;
+                        self.buf_pos = 0;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
     }
 }
 
