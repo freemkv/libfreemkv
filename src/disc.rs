@@ -519,8 +519,12 @@ impl Disc {
         if !device_path.is_empty() {
             if let Ok(mut aacs_session) = DriveSession::open_no_unlock(std::path::Path::new(&device_path)) {
                 if let Ok(hc) = keydb.host_cert.as_ref().ok_or(()) {
-                    if let Ok(mut auth) = handshake::aacs_authenticate(
-                        &mut aacs_session, &hc.private_key, &hc.certificate,
+                    if let Ok(mut auth) = handshake::aacs2_authenticate(
+                        &mut aacs_session,
+                        &hc.private_key,
+                        &hc.certificate,
+                        hc.private_key_v2.as_ref(),
+                        hc.certificate_v2.as_deref(),
                     ) {
                         vid = handshake::read_volume_id(&mut aacs_session, &mut auth).ok();
                         read_data_key = handshake::read_data_keys(&mut aacs_session, &mut auth)

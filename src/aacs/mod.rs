@@ -44,8 +44,14 @@ pub struct DeviceKey {
 /// Host certificate + private key for AACS SCSI authentication.
 #[derive(Debug, Clone)]
 pub struct HostCert {
+    /// AACS 1.0: 20 bytes. AACS 2.0: 32 bytes.
     pub private_key: [u8; 20],
-    pub certificate: Vec<u8>, // 92 bytes
+    /// AACS 1.0: 92 bytes. AACS 2.0: 132 bytes.
+    pub certificate: Vec<u8>,
+    /// AACS 2.0 host private key (P-256, 32 bytes). None for AACS 1.0 only.
+    pub private_key_v2: Option<[u8; 32]>,
+    /// AACS 2.0 host certificate (type 0x11). None for AACS 1.0 only.
+    pub certificate_v2: Option<Vec<u8>>,
 }
 
 /// A per-disc entry from the key database.
@@ -201,6 +207,8 @@ impl KeyDb {
         Some(HostCert {
             private_key: parse_hex20(priv_str)?,
             certificate: parse_hex(cert_str)?,
+            private_key_v2: None,
+            certificate_v2: None,
         })
     }
 
