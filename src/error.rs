@@ -32,6 +32,11 @@ pub const E_SCSI_TIMEOUT: u16         = 4001;
 pub const E_IO_ERROR: u16             = 5000;
 pub const E_DISC_ERROR: u16           = 6000;
 pub const E_AACS_ERROR: u16           = 7000;
+pub const E_KEYDB_CONNECT: u16        = 8000;
+pub const E_KEYDB_HTTP: u16           = 8001;
+pub const E_KEYDB_INVALID: u16        = 8002;
+pub const E_KEYDB_WRITE: u16          = 8003;
+pub const E_KEYDB_PARSE: u16          = 8004;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -52,6 +57,11 @@ pub enum Error {
     IoError { source: std::io::Error },
     DiscError { detail: String },
     AacsError { detail: String },
+    KeydbConnect { host: String },
+    KeydbHttp { status: u16 },
+    KeydbInvalid,
+    KeydbWrite { path: String },
+    KeydbParse,
 }
 
 impl Error {
@@ -72,6 +82,11 @@ impl Error {
             Error::IoError { .. }           => E_IO_ERROR,
             Error::DiscError { .. }         => E_DISC_ERROR,
             Error::AacsError { .. }         => E_AACS_ERROR,
+            Error::KeydbConnect { .. }      => E_KEYDB_CONNECT,
+            Error::KeydbHttp { .. }         => E_KEYDB_HTTP,
+            Error::KeydbInvalid             => E_KEYDB_INVALID,
+            Error::KeydbWrite { .. }        => E_KEYDB_WRITE,
+            Error::KeydbParse               => E_KEYDB_PARSE,
         }
     }
 }
@@ -115,6 +130,16 @@ impl std::fmt::Display for Error {
                 write!(f, "E{}: {}", E_DISC_ERROR, detail),
             Error::AacsError { detail } =>
                 write!(f, "E{}: {}", E_AACS_ERROR, detail),
+            Error::KeydbConnect { host } =>
+                write!(f, "E{}: {}", E_KEYDB_CONNECT, host),
+            Error::KeydbHttp { status } =>
+                write!(f, "E{}: {}", E_KEYDB_HTTP, status),
+            Error::KeydbInvalid =>
+                write!(f, "E{}", E_KEYDB_INVALID),
+            Error::KeydbWrite { path } =>
+                write!(f, "E{}: {}", E_KEYDB_WRITE, path),
+            Error::KeydbParse =>
+                write!(f, "E{}", E_KEYDB_PARSE),
         }
     }
 }

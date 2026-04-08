@@ -4,7 +4,9 @@
 
 # libfreemkv
 
-Rust library for 4K UHD / Blu-ray optical drives. Drive access, disc scanning, AACS decryption, and content reading in one crate. Bundled drive profiles — no external files needed.
+Rust library for 4K UHD / Blu-ray optical drives. Drive access, disc scanning, stream labels, AACS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
+
+Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
 
 **[API Documentation](https://docs.rs/libfreemkv)** · **[Technical Docs](docs/)**
 
@@ -42,9 +44,11 @@ while let Some(unit) = reader.read_unit()? {
 
 ## What It Does
 
-- **Drive access** — open, identify, unlock for raw reads
-- **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info, BD-J labels
-- **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0)
+- **Drive access** — open, identify, unlock, eject
+- **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
+- **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
+- **AACS decryption** — transparent key resolution and content decrypt (1.0, 2.0 in progress)
+- **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
 - **Content reading** — sector reads with automatic decryption
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
@@ -61,8 +65,9 @@ Disc                   — scan titles, streams, AACS state
   ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions
   ├── MPLS parser      — playlists → titles + clips + streams
   ├── CLPI parser      — clip info → EP map → sector extents
-  ├── JAR parser       — BD-J audio track labels
-  └── AACS             — key resolution + content decryption
+  ├── Labels           — 5 BD-J format parsers (detect + parse)
+  ├── AACS             — key resolution + content decryption
+  └── KEYDB            — download + verify + save
 ```
 
 See [docs/](docs/) for detailed technical documentation on each module.
@@ -80,6 +85,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 | E5xxx | I/O errors |
 | E6xxx | Disc format errors |
 | E7xxx | AACS errors |
+| E8xxx | KEYDB update errors |
 
 ## Platform Support
 
