@@ -415,14 +415,39 @@ impl Disc {
     ///     println!("{} — {} streams", title.duration_display(), title.streams.len());
     /// }
     /// ```
+    /// Scan a disc. One pipeline, one order:
+    ///   1. Read capacity
+    ///   2. Read UDF filesystem
+    ///   3. Resolve AACS keys (all via UDF, no SCSI commands)
+    ///   4. Parse playlists + streams
+    ///   5. Apply labels
+    ///
+    /// The session must be open and unlocked (DriveSession::open handles this).
+    /// All disc reads use standard READ(10) via UDF — no vendor SCSI commands.
     pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
-        // Step 1: Read capacity
+        use crate::aacs::{self, KeyDb};
+
+        // 1. Capacity
         let capacity = Self::read_capacity(session)?;
 
-        // Step 2: Parse UDF filesystem
+        // 2. UDF filesystem
         let udf_fs = udf::read_filesystem(session)?;
 
-        // Step 3: Find and parse MPLS playlists
+        // 3. AACS — read files from disc via UDF, resolve keys via KEYDB
+        let encrypted = udf_fs.find_dir("/AACS").is_some()
+            || udf_fs.find_dir("/BDMV/AACS").is_some();
+
+        let aacs = if encrypted {
+            if let Some(keydb_path) = opts.resolve_keydb() {
+                Self::resolve_aacs(&udf_fs, session, &keydb_path).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 4. Playlists
         let mut titles = Vec::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
@@ -436,53 +461,20 @@ impl Disc {
                 }
             }
         }
-
-        // Sort: longest first
         titles.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Step 4: Read disc title from META/DL/bdmt_eng.xml
+        // 5. Metadata + labels
         let meta_title = Self::read_meta_title(session, &udf_fs);
-
-        // Step 5: Enhance streams with disc config file labels (if available)
         crate::labels::apply(session, &udf_fs, &mut titles);
 
-        // Step 6: Detect AACS encryption
-        let encrypted = udf_fs.find_dir("/AACS").is_some()
-            || udf_fs.find_dir("/BDMV/AACS").is_some();
-
-        // Step 7: If encrypted and KEYDB available, authenticate and derive keys
-        let aacs = if encrypted {
-            if let Some(keydb_path) = opts.resolve_keydb() {
-                match Self::setup_aacs(session, &keydb_path) {
-                    Ok(state) => Some(state),
-                    Err(_) => None, // keys not found, continue without decryption
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Derive disc format from main title video codec
+        // 6. Derive format, layers, region
         let format = Self::detect_format(&titles);
-
-        // Derive layer count from capacity
-        // BD-25 single layer: up to ~12M sectors (~25GB)
-        // BD-50 dual layer: ~12M-25M sectors (~50GB)
-        // BD-66/100 UHD: 25M+ sectors
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
-
-        // UHD is always region-free. BD/DVD region parsing TODO.
-        let region = if format == DiscFormat::Uhd {
-            DiscRegion::Free
-        } else {
-            DiscRegion::Free // TODO: parse from index.bdmv
-        };
+        let region = if format == DiscFormat::Uhd { DiscRegion::Free } else { DiscRegion::Free };
 
         Ok(Disc {
             volume_id: udf_fs.volume_id.clone(),
-            meta_title: meta_title,
+            meta_title,
             format,
             capacity_sectors: capacity,
             capacity_bytes: capacity as u64 * 2048,
@@ -494,98 +486,63 @@ impl Disc {
         })
     }
 
-    /// Set up AACS decryption for this disc.
-    /// Call after scan() to enable transparent content decryption.
-    pub fn setup_aacs(
+    /// Resolve AACS keys from disc files + KEYDB. No SCSI commands.
+    /// Reads Unit_Key_RO.inf, Content Certificate, and MKB from UDF.
+    fn resolve_aacs(
+        udf_fs: &udf::UdfFs,
         session: &mut DriveSession,
         keydb_path: &std::path::Path,
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
-        use crate::aacs::handshake;
 
-        // Load KEYDB
         let keydb = KeyDb::load(keydb_path).map_err(|e| Error::AacsError {
             detail: format!("failed to load KEYDB: {}", e),
         })?;
 
-        // Step 1: Try SCSI handshake for Volume ID + read_data_key
-        // Open a separate transport (AACS auth must happen before raw mode).
-        // If handshake fails (drive doesn't support AACS layer, e.g. raw-mode drives),
-        // fall back to disc-hash-only KEYDB lookup.
-        let device_path = session.device_path().to_string();
-        let mut vid: Option<[u8; 16]> = None;
-        let mut read_data_key: Option<[u8; 16]> = None;
-
-        if !device_path.is_empty() {
-            if let Ok(mut aacs_session) = DriveSession::open_no_unlock(std::path::Path::new(&device_path)) {
-                if let Ok(hc) = keydb.host_cert.as_ref().ok_or(()) {
-                    if let Ok(mut auth) = handshake::aacs2_authenticate(
-                        &mut aacs_session,
-                        &hc.private_key,
-                        &hc.certificate,
-                        hc.private_key_v2.as_ref(),
-                        hc.certificate_v2.as_deref(),
-                    ) {
-                        vid = handshake::read_volume_id(&mut aacs_session, &mut auth).ok();
-                        read_data_key = handshake::read_data_keys(&mut aacs_session, &mut auth)
-                            .ok().map(|(rdk, _)| rdk);
-                    }
-                }
-            }
-            // Handshake failure is not fatal — we can still resolve via disc hash
-        }
-
-        // Step 2: Read Unit_Key_RO.inf from disc via UDF (uses the unlocked main session)
-        let udf_fs = udf::read_filesystem(session)?;
+        // Read AACS files from disc via UDF (standard READ(10), no vendor commands)
         let uk_ro_data = udf_fs.read_file(session, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(session, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsError {
-                detail: "failed to read Unit_Key_RO.inf from disc".into(),
+                detail: "Unit_Key_RO.inf not found on disc".into(),
             })?;
 
-        // Step 3: Read Content Certificate (optional — for AACS version detection)
         let cc_data = udf_fs.read_file(session, "/AACS/Content000.cer")
             .or_else(|_| udf_fs.read_file(session, "/AACS/Content001.cer"))
             .ok();
 
-        // Step 4: Resolve keys
-        // If we have VID from handshake, use full 4-path chain.
-        // If no VID (handshake failed), use disc-hash-only KEYDB lookup.
-        let mkb_data = aacs::read_mkb_from_drive(session).ok();
+        let mkb_data = udf_fs.read_file(session, "/AACS/MKB_RW.inf")
+            .or_else(|_| udf_fs.read_file(session, "/AACS/MKB_RO.inf"))
+            .ok();
         let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
 
-        // Use a zero VID placeholder if handshake failed — resolve_keys
-        // will still work via disc hash (path 1)
-        let vid_for_resolve = vid.unwrap_or([0u8; 16]);
-
+        // Resolve: disc hash → KEYDB lookup → VUK → unit keys
+        let vid_zero = [0u8; 16];
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
-            &vid_for_resolve,
+            &vid_zero,
             &keydb,
             mkb_data.as_deref(),
         ).ok_or_else(|| Error::AacsError {
-            detail: "failed to resolve AACS keys — disc not in KEYDB".into(),
+            detail: "disc not in KEYDB".into(),
         })?;
-
-        let key_source = match resolved.key_source {
-            1 => KeySource::KeyDb,
-            2 => KeySource::KeyDbDerived,
-            3 => KeySource::ProcessingKey,
-            4 => KeySource::DeviceKey,
-            _ => KeySource::KeyDb,
-        };
 
         Ok(AacsState {
             version: if resolved.aacs2 { 2 } else { 1 },
             bus_encryption: resolved.bus_encryption,
             mkb_version: mkb_ver,
             disc_hash: aacs::disc_hash_hex(&resolved.disc_hash),
-            key_source,
+            key_source: match resolved.key_source {
+                1 => KeySource::KeyDb,
+                2 => KeySource::KeyDbDerived,
+                3 => KeySource::ProcessingKey,
+                4 => KeySource::DeviceKey,
+                _ => KeySource::KeyDb,
+            },
             vuk: resolved.vuk,
             unit_keys: resolved.unit_keys,
-            read_data_key,
-            volume_id: vid.unwrap_or([0u8; 16]),
+            read_data_key: None,
+            volume_id: [0u8; 16],
         })
     }
 
@@ -689,16 +646,18 @@ impl Disc {
                     pkt_count = clip_info.source_packet_count;
                     total_size += pkt_count as u64 * 192;
 
-                    // Get the m2ts file's absolute starting LBA on disc
+                    // Get m2ts file start LBA and compute extent from packet count.
+                    // BD-ROM m2ts files are contiguous on disc (mastering requirement).
                     let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
                     let file_lba = udf_fs.file_start_lba(session, &m2ts_path).unwrap_or(0);
-
-                    let mut clip_extents = clip_info.get_extents(play_item.in_time, play_item.out_time);
-                    // Extents from CLPI are relative to m2ts file start — add file LBA
-                    for ext in &mut clip_extents {
-                        ext.start_lba += file_lba;
+                    let total_bytes = pkt_count as u64 * 192;
+                    let total_sectors = ((total_bytes + 2047) / 2048) as u32;
+                    if total_sectors > 0 && file_lba > 0 {
+                        extents.push(Extent {
+                            start_lba: file_lba,
+                            sector_count: total_sectors,
+                        });
                     }
-                    extents.extend(clip_extents);
                 }
             }
 
@@ -782,6 +741,13 @@ impl Disc {
 // ─── Decrypted reader ──────────────────────────────────────────────────────
 
 /// A reader that reads m2ts content, decrypting transparently if needed.
+///
+/// Adaptive read strategy:
+///   - Starts at max batch size (510 sectors ≈ 1MB) and full disc speed
+///   - On read error: halves batch size, brief pause for drive recovery
+///   - On repeated errors: reduces disc spin speed (scratched region)
+///   - On success streak: ramps batch back up, then restores disc speed
+///   - At minimum batch + still failing: retries once, then skips + zero-fills
 pub struct ContentReader<'a> {
     session: &'a mut DriveSession,
     aacs: Option<&'a AacsState>,
@@ -792,10 +758,16 @@ pub struct ContentReader<'a> {
     read_buf: Vec<u8>,
     buf_pos: usize,
     buf_len: usize,
-    /// Current batch size (adapts on errors)
+    /// Current batch size in sectors (adapts on errors)
     batch_sectors: u16,
-    /// Consecutive successful batch reads (for ramp-up)
+    /// Consecutive successful batch reads
     ok_streak: u32,
+    /// Consecutive errors at current position
+    error_streak: u32,
+    /// Current speed tier index (0 = max, higher = slower)
+    speed_tier: usize,
+    /// Last time maintain_speed was called
+    last_speed_maintain: std::time::Instant,
     /// Total read errors encountered
     pub errors: u32,
 }
@@ -821,7 +793,12 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
-        // Set drive to max read speed
+        // Ensure drive is unlocked
+        if !session.is_unlocked() {
+            session.unlock()?;
+        }
+
+        // Set max read speed — nothing else. No calibration, no probes.
         let speed_cdb = crate::scsi::build_set_cd_speed(0xFFFF);
         let mut dummy = [0u8; 0];
         let _ = session.scsi_execute(&speed_cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
@@ -838,17 +815,61 @@ impl Disc {
             buf_len: 0,
             batch_sectors: MAX_BATCH_SECTORS,
             ok_streak: 0,
+            error_streak: 0,
+            speed_tier: 0,
+            last_speed_maintain: std::time::Instant::now(),
             errors: 0,
         })
     }
 }
 
+/// Detect the maximum transfer size in sectors for a device.
+/// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
+/// Returns a value aligned to 3 sectors (one aligned unit).
+fn detect_max_batch_sectors(device_path: &str) -> u16 {
+    // Extract block device name: /dev/sr0 → sr0
+    let dev_name = device_path.rsplit('/').next().unwrap_or("");
+    if !dev_name.is_empty() {
+        let sysfs_path = format!("/sys/block/{}/queue/max_hw_sectors_kb", dev_name);
+        if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
+            if let Ok(kb) = content.trim().parse::<u32>() {
+                // Convert KB to sectors (1 sector = 2 KB on disc = 2048 bytes)
+                let sectors = (kb / 2) as u16;
+                // Align down to 3 (one aligned unit) and cap at a reasonable max
+                let aligned = (sectors / 3) * 3;
+                if aligned >= MIN_BATCH_SECTORS {
+                    return aligned.min(MAX_BATCH_SECTORS);
+                }
+            }
+        }
+    }
+    // Fallback: conservative default
+    MAX_BATCH_SECTORS
+}
+
 /// Read strategy constants
-const MAX_BATCH_SECTORS: u16 = 96;   // 32 aligned units = 192KB per command (fast)
-const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (slow, for error recovery)
-const RAMP_UP_AFTER: u32 = 10;       // successful reads before ramping back up
+const MAX_BATCH_SECTORS: u16 = 510;  // 170 aligned units ≈ 1MB (kernel caps to hw limit)
+const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (error recovery)
+const RAMP_BATCH_AFTER: u32 = 5;     // successes before doubling batch size
+const RAMP_SPEED_AFTER: u32 = 50;    // successes at max batch before restoring speed
+const SLOW_SPEED_AFTER: u32 = 3;     // consecutive errors before reducing disc speed
+
+/// Disc speed tiers (KB/s for SET CD SPEED).
+/// Blu-ray: 1x=4500, 2x=9000, 4x=18000, 8x=36000, 12x=54000
+const SPEED_TIERS: &[u16] = &[
+    0xFFFF, // tier 0: max (drive decides, typically 8-12x)
+    36000,  // tier 1: 8x BD (~36 MB/s)
+    18000,  // tier 2: 4x BD (~18 MB/s)
+    9000,   // tier 3: 2x BD (~9 MB/s)
+    4500,   // tier 4: 1x BD (~4.5 MB/s) — last resort
+];
 
 impl<'a> ContentReader<'a> {
+    /// Total bytes across all extents (for progress display).
+    pub fn total_bytes(&self) -> u64 {
+        self.extents.iter().map(|e| e.sector_count as u64 * 2048).sum()
+    }
+
     /// Read the next aligned unit (6144 bytes).
     /// Automatically decrypted if AACS keys are available.
     /// Returns None when all extents are exhausted.
@@ -866,36 +887,99 @@ impl<'a> ContentReader<'a> {
         let mut unit = self.read_buf[start..end].to_vec();
 
         // Decrypt if needed
+        self.decrypt_unit(&mut unit);
+        self.buf_pos += 1;
+        Ok(Some(unit))
+    }
+
+    /// Read the next batch of aligned units, decrypted in-place.
+    /// Returns the decrypted data as a single contiguous slice.
+    /// More efficient than read_unit() — one write_all() per batch instead of per unit.
+    /// Returns None when all extents are exhausted.
+    pub fn read_batch(&mut self) -> Result<Option<&[u8]>> {
+        if !self.fill_buffer()? {
+            return Ok(None);
+        }
+
+        // Decrypt all units in the buffer in-place
+        let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
         if let Some(aacs) = &self.aacs {
-            if crate::aacs::is_unit_encrypted(&unit) {
+            let uk = aacs.unit_keys.get(self.unit_key_idx)
+                .map(|(_, k)| *k)
+                .unwrap_or([0u8; 16]);
+            let rdk = aacs.read_data_key.as_ref();
+
+            for i in 0..self.buf_len {
+                let start = i * unit_len;
+                let end = start + unit_len;
+                let unit = &mut self.read_buf[start..end];
+                if crate::aacs::is_unit_encrypted(unit) {
+                    crate::aacs::decrypt_unit_full(unit, &uk, rdk);
+                }
+            }
+        }
+
+        let total_bytes = self.buf_len * unit_len;
+        self.buf_pos = self.buf_len; // mark fully consumed
+        Ok(Some(&self.read_buf[..total_bytes]))
+    }
+
+    /// Decrypt a single aligned unit in-place if needed.
+    fn decrypt_unit(&self, unit: &mut [u8]) {
+        if let Some(aacs) = &self.aacs {
+            if crate::aacs::is_unit_encrypted(unit) {
                 let uk = aacs.unit_keys.get(self.unit_key_idx)
                     .map(|(_, k)| *k)
                     .unwrap_or([0u8; 16]);
 
                 crate::aacs::decrypt_unit_full(
-                    &mut unit,
+                    unit,
                     &uk,
                     aacs.read_data_key.as_ref(),
                 );
             }
         }
+    }
 
-        self.buf_pos += 1;
-        Ok(Some(unit))
+    /// Read sectors via standard READ(10) 0x00.
+    /// calibration primers. Standard reads are faster on most drives.
+    fn read_sectors(&mut self, lba: u32, count: u16) -> Result<()> {
+        self.session.read_content(lba, count, &mut self.read_buf)?;
+        Ok(())
+    }
+
+    /// Set disc spin speed via SCSI SET CD SPEED.
+    fn set_speed(&mut self, tier: usize) {
+        let tier = tier.min(SPEED_TIERS.len() - 1);
+        if tier != self.speed_tier {
+            self.speed_tier = tier;
+            let speed_kbs = SPEED_TIERS[tier];
+            let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
+            let mut dummy = [0u8; 0];
+            let _ = self.session.scsi_execute(
+                &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
+            );
+        }
     }
 
     /// Read a batch of sectors into the internal buffer.
-    /// Adapts batch size on errors: shrinks on failure, grows on success.
+    ///
+    /// Adaptive strategy:
+    ///   1. Read at current batch size
+    ///   2. On success: ramp batch up (double after 5 successes),
+    ///      then restore disc speed (after 50 at max batch)
+    ///   3. On error: halve batch, pause. After 3 consecutive errors,
+    ///      also reduce disc spin speed (scratched/damaged region).
+    ///   4. At min batch + still failing: retry once, then skip + zero-fill.
     fn fill_buffer(&mut self) -> Result<bool> {
         loop {
             if self.current_extent >= self.extents.len() {
-                eprintln!("  [done] extent {}/{} offset {} errors {}",
-                    self.current_extent, self.extents.len(), self.current_offset, self.errors);
                 return Ok(false);
             }
 
-            let extent = &self.extents[self.current_extent];
-            let remaining = extent.sector_count - self.current_offset;
+            let ext_start = self.extents[self.current_extent].start_lba;
+            let ext_sectors = self.extents[self.current_extent].sector_count;
+            let remaining = ext_sectors - self.current_offset;
 
             // Align to 3 sectors (one aligned unit)
             let sectors_to_read = remaining.min(self.batch_sectors as u32) as u16;
@@ -906,30 +990,32 @@ impl<'a> ContentReader<'a> {
                 continue;
             }
 
-            let lba = extent.start_lba + self.current_offset;
+            let lba = ext_start + self.current_offset;
             let byte_count = sectors_to_read as usize * 2048;
             self.read_buf.resize(byte_count, 0);
 
-            if self.current_offset < 100 || sectors_to_read < self.batch_sectors {
-                eprintln!("  [fill] lba={} count={} offset={}/{} batch={} err={} remaining={}",
-                    lba, sectors_to_read, self.current_offset, extent.sector_count,
-                    self.batch_sectors, self.errors, remaining);
-            }
-            match self.session.read_content(lba, sectors_to_read, &mut self.read_buf) {
+            match self.read_sectors(lba, sectors_to_read) {
                 Ok(_) => {
                     self.buf_len = sectors_to_read as usize / 3;
                     self.buf_pos = 0;
                     self.current_offset += sectors_to_read as u32;
+                    self.error_streak = 0;
 
-                    if self.current_offset >= extent.sector_count {
+                    if self.current_offset >= ext_sectors {
                         self.current_extent += 1;
                         self.current_offset = 0;
                     }
 
-                    // Ramp up batch size after consecutive successes
+                    // Ramp up: batch size first, then disc speed
                     self.ok_streak += 1;
-                    if self.ok_streak >= RAMP_UP_AFTER && self.batch_sectors < MAX_BATCH_SECTORS {
-                        self.batch_sectors = (self.batch_sectors * 2).min(MAX_BATCH_SECTORS);
+                    if self.batch_sectors < MAX_BATCH_SECTORS {
+                        if self.ok_streak >= RAMP_BATCH_AFTER {
+                            self.batch_sectors = (self.batch_sectors * 2).min(MAX_BATCH_SECTORS);
+                            self.ok_streak = 0;
+                        }
+                    } else if self.speed_tier > 0 && self.ok_streak >= RAMP_SPEED_AFTER {
+                        // At max batch for a while — try faster disc speed
+                        self.set_speed(self.speed_tier - 1);
                         self.ok_streak = 0;
                     }
 
@@ -937,30 +1023,39 @@ impl<'a> ContentReader<'a> {
                 }
                 Err(_) => {
                     self.errors += 1;
+                    self.error_streak += 1;
                     self.ok_streak = 0;
+
+                    // Reduce disc speed after repeated errors (physical problem)
+                    if self.error_streak >= SLOW_SPEED_AFTER
+                        && self.speed_tier < SPEED_TIERS.len() - 1
+                    {
+                        self.set_speed(self.speed_tier + 1);
+                        self.error_streak = 0; // reset — give new speed a chance
+                    }
 
                     if self.batch_sectors > MIN_BATCH_SECTORS {
                         // Shrink batch and retry
                         self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
-                        // Brief pause to let drive recover
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     } else {
-                        // At minimum batch — retry once with a longer pause
+                        // At minimum batch — retry once with longer pause
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
-                        if self.session.read_content(lba, MIN_BATCH_SECTORS, &mut self.read_buf).is_ok() {
+                        if self.read_sectors(lba, MIN_BATCH_SECTORS).is_ok() {
                             self.buf_len = 1;
                             self.buf_pos = 0;
+                            self.error_streak = 0;
                             self.current_offset += MIN_BATCH_SECTORS as u32;
-                            if self.current_offset >= extent.sector_count {
+                            if self.current_offset >= ext_sectors {
                                 self.current_extent += 1;
                                 self.current_offset = 0;
                             }
                             return Ok(true);
                         }
-                        // Still failing — skip this unit
+                        // Still failing — skip this unit (zero-fill)
                         self.current_offset += 3;
-                        if self.current_offset >= extent.sector_count {
+                        if self.current_offset >= ext_sectors {
                             self.current_extent += 1;
                             self.current_offset = 0;
                         }
@@ -974,16 +1069,6 @@ impl<'a> ContentReader<'a> {
             }
         }
     }
-}
-
-fn session_read_sector(session: &mut DriveSession, lba: u32, buf: &mut [u8; 2048]) -> Result<()> {
-    let cdb = [
-        crate::scsi::SCSI_READ_10, 0x00,
-        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-        0x00, 0x00, 0x01, 0x00,
-    ];
-    session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, buf, 10_000)?;
-    Ok(())
 }
 
 // ─── Format helpers ────────────────────────────────────────────────────────

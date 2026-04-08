@@ -6,10 +6,11 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use libfreemkv::{DriveSession, Disc, ScanOptions};
+//! use libfreemkv::{DriveSession, Disc, ScanOptions, find_drive};
 //! use std::path::Path;
 //!
-//! let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
+//! let device = find_drive().expect("no optical drive found");
+//! let mut session = DriveSession::open(Path::new(&device)).unwrap();
 //! let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
 //!
 //! for title in &disc.titles {
@@ -82,7 +83,7 @@ pub mod labels;
 pub mod keydb;
 
 pub use error::{Error, Result};
-pub use drive::DriveSession;
+pub use drive::{DriveSession, find_drive, find_drives, resolve_device};
 pub use identity::DriveId;
 pub use profile::{DriveProfile, Chipset};
 pub use platform::{Platform, DriveStatus};

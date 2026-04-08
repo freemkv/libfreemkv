@@ -194,45 +194,94 @@ impl UdfFs {
 
     /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
     /// and return its first allocation extent: (data_lba, data_length).
-    /// The data_lba is metadata-relative.
+    /// The data_lba is partition-relative.
     fn read_icb_extent(&self, session: &mut DriveSession, meta_lba: u32) -> Result<(u32, u32)> {
+        let extents = self.read_icb_extents(session, meta_lba)?;
+        extents.first().copied().ok_or_else(|| Error::DiscError {
+            detail: "no allocation descriptors in ICB".into(),
+        })
+    }
+
+    /// Read ALL allocation extents for a file from its ICB.
+    /// Returns Vec of (partition_relative_lba, byte_length) pairs.
+    /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents).
+    fn read_icb_extents(&self, session: &mut DriveSession, meta_lba: u32) -> Result<Vec<(u32, u32)>> {
         let mut icb = [0u8; 2048];
         read_sector(session, self.meta_to_abs(meta_lba), &mut icb)?;
 
         let tag = u16::from_le_bytes([icb[0], icb[1]]);
 
-        // Get allocation descriptor offset based on ICB type
-        let ad_offset = match tag {
+        // Get allocation descriptor offset and total length based on ICB type
+        let (ad_offset, l_ad) = match tag {
             // Extended File Entry (UDF 2.50, used by BD-ROM)
-            // Layout: ... L_EA at [208:212], L_AD at [212:216], alloc descs at 216 + L_EA
             266 => {
                 let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
-                216 + l_ea
+                let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
+                (216 + l_ea, l_ad)
             }
             // Standard File Entry
-            // Layout: ... L_EA at [168:172], L_AD at [172:176], alloc descs at 176 + L_EA
             261 => {
                 let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
-                176 + l_ea
+                let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
+                (176 + l_ea, l_ad)
             }
             _ => return Err(Error::DiscError {
                 detail: format!("unexpected ICB tag {} at meta_lba {}", tag, meta_lba),
             }),
         };
 
-        if ad_offset + 8 > 2048 {
-            return Err(Error::DiscError { detail: "ICB alloc desc out of range".into() });
+        let mut extents = Vec::new();
+        let num_descriptors = l_ad / 8; // Short Allocation Descriptor = 8 bytes
+
+        for i in 0..num_descriptors {
+            let off = ad_offset + i * 8;
+            if off + 8 > 2048 {
+                break; // TODO: follow Allocation Extent Descriptors (tag 258) for overflow
+            }
+
+            let raw_len = u32::from_le_bytes([icb[off], icb[off + 1], icb[off + 2], icb[off + 3]]);
+            let extent_type = raw_len >> 30;
+            let data_len = raw_len & 0x3FFFFFFF;
+            let data_lba = u32::from_le_bytes([icb[off + 4], icb[off + 5], icb[off + 6], icb[off + 7]]);
+
+            match extent_type {
+                0 => extents.push((data_lba, data_len)), // recorded and allocated
+                1 => {} // allocated but not recorded (sparse) — skip
+                3 => break, // next extent of allocation descriptors — TODO
+                _ => break,
+            }
         }
 
-        // Short Allocation Descriptor: extent_length(4) + extent_position(4)
-        // extent_length upper 2 bits = type (0=recorded, 1=allocated not recorded, 3=next extent)
-        let raw_len = u32::from_le_bytes([icb[ad_offset], icb[ad_offset + 1],
-                                          icb[ad_offset + 2], icb[ad_offset + 3]]);
-        let data_len = raw_len & 0x3FFFFFFF;
-        let data_lba = u32::from_le_bytes([icb[ad_offset + 4], icb[ad_offset + 5],
-                                           icb[ad_offset + 6], icb[ad_offset + 7]]);
+        Ok(extents)
+    }
 
-        Ok((data_lba, data_len))
+    /// Get all absolute disc sector extents for a file.
+    /// Returns Vec of (absolute_lba, sector_count) covering the entire file.
+    pub fn file_extents(&self, session: &mut DriveSession, path: &str) -> Result<Vec<(u32, u32)>> {
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let mut current = &self.root;
+        for part in &parts[..parts.len() - 1] {
+            current = current.entries.iter().find(|e| {
+                e.is_dir && e.name.eq_ignore_ascii_case(part)
+            }).ok_or_else(|| Error::DiscError {
+                detail: format!("directory not found: {}", part),
+            })?;
+        }
+        let filename = parts.last().unwrap();
+        let entry = current.entries.iter().find(|e| {
+            !e.is_dir && e.name.eq_ignore_ascii_case(filename)
+        }).ok_or_else(|| Error::DiscError {
+            detail: format!("file not found: {}", path),
+        })?;
+
+        let alloc_extents = self.read_icb_extents(session, entry.meta_lba)?;
+        let mut disc_extents = Vec::new();
+        for (lba, byte_len) in alloc_extents {
+            let abs_lba = self.partition_start + lba;
+            let sectors = ((byte_len as u64 + 2047) / 2048) as u32;
+            disc_extents.push((abs_lba, sectors));
+        }
+        Ok(disc_extents)
     }
 }
 
