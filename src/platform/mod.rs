@@ -55,6 +55,14 @@ pub trait Platform {
 
     fn timing(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
+    /// Continuous speed management during reading.
+    ///
+    /// Called periodically (~every 2 seconds) during bulk reads.
+    /// Probes the current disc zone, reads drive registers, and
+    /// sends SET CD SPEED to maintain optimal read performance.
+    /// Without this, MediaTek drives drift back to 1x speed.
+    fn maintain_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()>;
+
     /// Check if raw disc access mode is currently enabled.
     fn is_unlocked(&self) -> bool;
 }

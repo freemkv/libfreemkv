@@ -30,23 +30,32 @@ pub struct DriveSession {
 }
 
 impl DriveSession {
-    /// Open a drive, identify it, match a profile, and unlock for raw reads.
+    /// Open a drive — identify, wait for disc, and unlock for raw reads.
     ///
-    /// This is the standard entry point. After `open()`, the drive is ready
-    /// for sector reads, disc scanning, and content extraction.
+    /// This is the standard entry point. After `open()`, the drive is
+    /// ready for scanning and content reads.
     pub fn open(device: &Path) -> Result<Self> {
         let mut session = Self::open_no_unlock(device)?;
         session.wait_ready()?;
-        let _ = session.unlock(); // silently ignore — unencrypted discs don't need it
+        let _ = session.unlock();
         Ok(session)
     }
 
-    /// Open a drive WITHOUT unlocking.
+    /// Open a drive and immediately unlock for raw reads.
     ///
-    /// Used when AACS authentication must happen before raw mode.
-    /// The AACS SCSI handshake requires the drive's standard firmware
-    /// state — unlocking puts the drive in vendor-specific raw mode
-    /// which disables the AACS layer.
+    /// Use this when you need raw disc access without AACS (e.g. capture,
+    /// sector dumps). Skips AACS authentication — cannot be done after unlock.
+    pub fn open_unlocked(device: &Path) -> Result<Self> {
+        let mut session = Self::open_no_unlock(device)?;
+        session.wait_ready()?;
+        let _ = session.unlock();
+        Ok(session)
+    }
+
+    /// Open a drive — identify only, no wait, no unlock.
+    ///
+    /// Low-level entry point. Caller is responsible for wait_ready()
+    /// and unlock() ordering.
     pub fn open_no_unlock(device: &Path) -> Result<Self> {
         let mut transport = crate::scsi::open(device)?;
         let profiles = profile::load_bundled()?;
@@ -139,6 +148,12 @@ impl DriveSession {
         self.platform.calibrate(self.scsi.as_mut())
     }
 
+    /// Maintain read speed during bulk reading.
+    /// Call every ~2 seconds during ripping to prevent speed decay.
+    pub fn maintain_speed(&mut self, lba: u32) -> Result<()> {
+        self.platform.maintain_speed(self.scsi.as_mut(), lba)
+    }
+
     /// Read raw disc sectors via platform-specific command.
     pub fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         self.platform.read_sectors(self.scsi.as_mut(), lba, count, buf)
@@ -203,6 +218,94 @@ impl DriveSession {
     ) -> Result<crate::scsi::ScsiResult> {
         self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
     }
+}
+
+/// Discover optical drives on the system.
+///
+/// Scans `/dev/sg0` through `/dev/sg15` (Linux SCSI Generic devices),
+/// sends INQUIRY to each, and returns paths for optical drives (device type 5).
+/// Always uses sg devices — sr devices have kernel-level speed management
+/// that interferes with raw disc access.
+///
+/// Returns a list of (device_path, DriveId) for each found drive.
+pub fn find_drives() -> Vec<(String, DriveId)> {
+    let mut drives = Vec::new();
+    for i in 0..16 {
+        let path = format!("/dev/sg{}", i);
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
+            if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
+                // INQUIRY device type 5 = CD/DVD/BD
+                // We check by trying to match a profile — only optical drives have profiles
+                let profiles = match profile::load_bundled() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if profile::find_by_drive_id(&profiles, &id).is_some() {
+                    drives.push((path, id));
+                }
+            }
+        }
+    }
+    drives
+}
+
+/// Find the first optical drive on the system.
+/// Returns the sg device path, or None if no drive found.
+pub fn find_drive() -> Option<String> {
+    find_drives().into_iter().next().map(|(path, _)| path)
+}
+
+/// Resolve a device path to the correct sg device.
+///
+/// If the user passes `/dev/sr0`, maps it to the corresponding `/dev/sg*`.
+/// If they pass `/dev/sg*`, validates it exists.
+/// Returns `(resolved_path, warning)` where warning is set if the path was remapped.
+pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
+    // Already an sg device — use as-is
+    if path.contains("/sg") {
+        if !std::path::Path::new(path).exists() {
+            return Err(Error::DeviceNotFound { path: path.to_string() });
+        }
+        return Ok((path.to_string(), None));
+    }
+
+    // sr device — find the matching sg device by comparing INQUIRY data
+    if path.contains("/sr") {
+        // Open the sr device to get its identity
+        let mut sr_transport = crate::scsi::open(std::path::Path::new(path))?;
+        let sr_id = DriveId::from_drive(sr_transport.as_mut())?;
+        drop(sr_transport);
+
+        // Find matching sg device
+        for (sg_path, sg_id) in find_drives() {
+            if sg_id.vendor_id == sr_id.vendor_id
+                && sg_id.product_id == sr_id.product_id
+                && sg_id.serial_number == sr_id.serial_number
+            {
+                let warning = format!(
+                    "{} is a block device (sr) — using {} (sg) for raw access",
+                    path, sg_path
+                );
+                return Ok((sg_path, Some(warning)));
+            }
+        }
+
+        // No sg match found — fall back to sr with warning
+        let warning = format!(
+            "{} is a block device (sr) — no matching sg device found, performance may be limited",
+            path
+        );
+        return Ok((path.to_string(), Some(warning)));
+    }
+
+    // Unknown device type — use as-is
+    if !std::path::Path::new(path).exists() {
+        return Err(Error::DeviceNotFound { path: path.to_string() });
+    }
+    Ok((path.to_string(), None))
 }
 
 /// Create the platform-specific driver for a given chipset.

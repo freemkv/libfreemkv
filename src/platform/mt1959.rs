@@ -13,13 +13,20 @@ use crate::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
 use super::{Platform, DriveStatus};
 
+/// BD 1x speed in KB/s — used to convert speed multipliers to SET CD SPEED values.
+const BD_1X_SPEED: u16 = 4500;
+
 /// MT1959 driver state.
 pub struct Mt1959 {
     profile: DriveProfile,
     mode: u8,
     buffer_id: u8,
     unlocked: bool,
-    speed_table: [u16; 64],
+    /// Speed table: maps disc zone (probe address >> 8) to speed in KB/s.
+    /// Populated by calibrate(). Entry 0 = address 0x0000, entry 255 = address 0xFF00.
+    speed_table: [u16; 256],
+    /// Total disc sectors — for mapping LBA to zone index in speed table.
+    disc_sectors: u32,
     calibrated: bool,
 }
 
@@ -32,7 +39,8 @@ impl Mt1959 {
             mode,
             buffer_id,
             unlocked: false,
-            speed_table: [0u16; 64],
+            speed_table: [0u16; 256],
+            disc_sectors: 0,
             calibrated: false,
         }
     }
@@ -117,24 +125,14 @@ impl Mt1959 {
     }
 
     /// Look up optimal read speed for a given LBA from the calibration table.
-    fn lookup_speed(&self, lba: u32) -> u16 {
-        if !self.calibrated {
+    /// Returns speed in KB/s for SET CD SPEED, or 0 if not calibrated.
+    fn lookup_speed(&self, lba: u32, disc_sectors: u32) -> u16 {
+        if !self.calibrated || disc_sectors == 0 {
             return 0;
         }
-        let mut best_speed = 0u16;
-        let mut best_diff = u32::MAX;
-        for &entry in &self.speed_table {
-            if entry == 0 {
-                continue;
-            }
-            let entry_lba = entry as u32;
-            let diff = if lba > entry_lba { lba - entry_lba } else { entry_lba - lba };
-            if diff < best_diff {
-                best_diff = diff;
-                best_speed = entry;
-            }
-        }
-        best_speed
+        // Map LBA to zone index (0-255). Probe address space is 0x0000-0xFF00.
+        let zone = ((lba as u64 * 256) / disc_sectors as u64).min(255) as usize;
+        self.speed_table[zone]
     }
 
     /// Send SET CD SPEED command.
@@ -196,47 +194,57 @@ impl Platform for Mt1959 {
     }
 
     ///
-    /// Scans disc surface addresses via READ BUFFER sub-command 0x14 to
-    /// build a 64-entry speed lookup table. Issues SET CD SPEED(max) when done.
+    /// Probes the disc surface to build a speed profile. Each zone gets
+    /// an optimal speed in KB/s. The drive firmware returns a speed
+    /// multiplier (resp[0]) for each probe address.
+    ///
+    /// Probe address 0x0000-0xFF00 maps linearly to the disc's LBA range.
+    /// resp[0] = speed multiplier (e.g. 6 = 6x BD, 12 = 12x BD).
     fn calibrate(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         self.ensure_unlocked(scsi)?;
         self.validate(scsi)?;
 
-        // Initial probe: READ BUFFER sub_cmd=0x12
-        let cdb = self.read_buffer_sub(0x12, 0, 4);
+        // Read disc capacity for LBA-to-zone mapping
+        let cap_cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut cap_buf = [0u8; 8];
+        if let Ok(_) = scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000) {
+            self.disc_sectors = u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]) + 1;
+        }
+
+        // Step 1: Calibration init — sub_cmd 0x12 with address 0x0200
+        // (primes the firmware for disc surface analysis)
+        let cdb = self.read_buffer_sub(0x12, 0x0200, 4);
         let mut resp = [0u8; 4];
         let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000);
 
-        self.validate(scsi)?;
+        // Step 2: Raw read primers — read a few sectors with 0x08 flag
+        // to force the drive to spin up and measure disc characteristics.
+        // Without these, the speed probes return stale data.
+        let mut primer_buf = [0u8; 2048];
+        let _ = scsi.execute(
+            &scsi::build_read10_raw(0, 1), DataDirection::FromDevice, &mut primer_buf, 30_000);
+        let _ = scsi.execute(
+            &scsi::build_read10_raw(0x200, 1), DataDirection::FromDevice, &mut primer_buf, 30_000);
+        let _ = scsi.execute(
+            &scsi::build_read10_raw(0, 1), DataDirection::FromDevice, &mut primer_buf, 30_000);
 
-        // Clear speed table
-        self.speed_table = [0u16; 64];
+        // Step 3: Speed probes — sub_cmd 0x14, addresses 0x00 through 0xFF
+        self.speed_table = [0u16; 256];
 
-        // Scan disc surface — probe addresses up to 0x10000, 256 at a time
-        let mut table_idx = 0usize;
-        let mut addr: u32 = 0;
-        while addr < 0x10000 && table_idx < 64 {
-            let cdb = self.read_buffer_sub(0x14, addr as u16, 4);
+        for zone in 0..256u16 {
+            let cdb = self.read_buffer_sub(0x14, zone, 4);
             let mut resp = [0u8; 4];
             match scsi.execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000) {
-                Ok(r) if r.bytes_transferred == 4 => {
-                    let val = resp[0];
-                    if val > 0 {
-                        let speed_entry = ((resp[0] as u16) << 8) | (resp[1] as u16);
-                        if speed_entry > 0 {
-                            self.speed_table[table_idx] = speed_entry;
-                            table_idx += 1;
-                        }
-                    }
-                    addr += 256;
+                Ok(r) if r.bytes_transferred >= 1 && resp[0] > 0 => {
+                    self.speed_table[zone as usize] = resp[0] as u16 * BD_1X_SPEED;
                 }
                 _ => {
-                    addr += 256;
+                    self.speed_table[zone as usize] = 0xFFFF;
                 }
             }
         }
 
-        // Set max speed after calibration
+        // Step 4: Set max speed
         self.set_cd_speed(scsi, 0xFFFF)?;
 
         self.calibrated = true;
@@ -305,14 +313,7 @@ impl Platform for Mt1959 {
             return Err(Error::NotUnlocked);
         }
 
-        // Speed optimization from calibration
-        if self.calibrated {
-            let speed = self.lookup_speed(lba);
-            if speed > 0 {
-                let _ = self.set_cd_speed(scsi, speed);
-            }
-        }
-
+        // No per-read speed changes — calibrate + SET CD SPEED at open_title handles it.
         // READ(10) with raw flag 0x08
         let cdb = scsi::build_read10_raw(lba, count);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 30_000)?;
@@ -320,6 +321,63 @@ impl Platform for Mt1959 {
     }
 
     fn timing(&mut self, _scsi: &mut dyn ScsiTransport) -> Result<()> {
+        Ok(())
+    }
+
+    /// Continuous speed management — probes zone, reads registers, sets speed.
+    ///
+    /// MediaTek drives decay to 1x BD speed (~5 MB/s instead of 15-20 MB/s).
+    ///
+    /// Sequence (from strace analysis):
+    ///   1. Speed probe (sub_cmd 0x14) for current LBA zone
+    ///   2. Read register A (sub_cmd 0x10 at profile offset A)
+    ///   3. Read register B (sub_cmd 0x11 at profile offset B)
+    ///   4. SET CD SPEED: max → zone_speed → max
+    fn maintain_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
+        if !self.unlocked || self.disc_sectors == 0 {
+            return Ok(());
+        }
+
+        // 1. Probe current zone
+        let zone = ((lba as u64 * 256) / self.disc_sectors as u64).min(255) as u16;
+        let cdb = self.read_buffer_sub(0x14, zone, 4);
+        let mut resp = [0u8; 4];
+        let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000);
+        let zone_speed = if resp[0] > 0 {
+            resp[0] as u16 * BD_1X_SPEED
+        } else {
+            0xFFFF
+        };
+
+        // 2. Read drive registers (handlers 2 & 3)
+        if self.profile.register_offsets.len() >= 2 {
+            for i in 0..2 {
+                let offset = self.profile.register_offsets[i];
+                let sub_cmd = 0x10 + i as u8;
+                let cdb = [
+                    0x3C,
+                    self.mode,
+                    self.buffer_id,
+                    sub_cmd,
+                    (offset >> 16) as u8,
+                    (offset >> 8) as u8,
+                    offset as u8,
+                    0x00,
+                    0x24, // 36 bytes
+                    0x00,
+                ];
+                let mut buf = [0u8; 36];
+                let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000);
+            }
+        }
+
+        // 3. Triple SET CD SPEED: max → zone → max
+        let _ = self.set_cd_speed(scsi, 0xFFFF);
+        if zone_speed < 0xFFFF {
+            let _ = self.set_cd_speed(scsi, zone_speed);
+        }
+        let _ = self.set_cd_speed(scsi, 0xFFFF);
+
         Ok(())
     }
 
