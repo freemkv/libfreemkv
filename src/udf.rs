@@ -72,6 +72,28 @@ impl UdfFs {
 
     /// Read a file by path, returning its raw bytes.
     /// Reads sector by sector from disc — no buffering.
+    /// Get the absolute starting LBA of a file on disc.
+    /// Used by the rip pipeline to locate m2ts content sectors.
+    pub fn file_start_lba(&self, session: &mut DriveSession, path: &str) -> Result<u32> {
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let mut current = &self.root;
+        for part in &parts[..parts.len() - 1] {
+            current = current.entries.iter().find(|e| {
+                e.is_dir && e.name.eq_ignore_ascii_case(part)
+            }).ok_or_else(|| Error::DiscError {
+                detail: format!("directory not found: {}", part),
+            })?;
+        }
+        let filename = parts.last().unwrap();
+        let entry = current.entries.iter().find(|e| {
+            !e.is_dir && e.name.eq_ignore_ascii_case(filename)
+        }).ok_or_else(|| Error::DiscError {
+            detail: format!("file not found: {}", path),
+        })?;
+        let (data_lba, _) = self.read_icb_extent(session, entry.meta_lba)?;
+        Ok(self.partition_start + data_lba)
+    }
+
     pub fn read_file(&self, session: &mut DriveSession, path: &str) -> Result<Vec<u8>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
