@@ -486,7 +486,6 @@ fn verify_cert_p256(cert: &[u8]) -> bool {
     if cert.len() < 132 { return false; }
     // AACS 2.0 cert: type(1) + flags(1) + padding(2) + serial(6) + pub_x(32) + pub_y(32) + sig_r(32) + sig_s(32)
     // Signature is over the first 74 bytes
-    &cert[..74];
     let sig_r = &cert[74..106];
     let sig_s = &cert[106..138]; // some certs may be padded differently
 
