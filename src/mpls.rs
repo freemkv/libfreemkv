@@ -263,6 +263,27 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
                 language = String::from_utf8_lossy(&sa[1..4]).to_string();
             }
         }
+        5 => {
+            // Secondary audio: same as primary audio
+            if sa.len() >= 2 {
+                audio_format = (sa[1] >> 4) & 0x0F;
+                audio_rate = sa[1] & 0x0F;
+            }
+            if sa.len() >= 5 {
+                language = String::from_utf8_lossy(&sa[2..5]).to_string();
+            }
+        }
+        6 | 7 => {
+            // Secondary video: same as primary video
+            if sa.len() >= 2 {
+                video_format = (sa[1] >> 4) & 0x0F;
+                video_rate = sa[1] & 0x0F;
+            }
+            if coding_type == 0x24 && sa.len() > 2 {
+                dynamic_range = (sa[2] >> 4) & 0x0F;
+                color_space_val = sa[2] & 0x0F;
+            }
+        }
         _ => {}
     }
 
