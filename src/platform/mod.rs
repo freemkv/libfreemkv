@@ -15,7 +15,7 @@ use crate::scsi::ScsiTransport;
 ///   init()           — one-time initialization
 ///   set_read_speed() — per-zone speed during reads
 ///   is_ready()       — state check
-pub(crate) trait Platform {
+pub(crate) trait PlatformDriver {
     fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
     fn set_read_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()>;
     fn is_ready(&self) -> bool;

@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
-use super::Platform;
+use super::PlatformDriver;
 
 const UNLOCK_RESPONSE_SIZE: u8 = 64;
 
@@ -29,10 +29,11 @@ pub struct Mt1959 {
 }
 
 impl Mt1959 {
-    pub fn new(profile: DriveProfile) -> Self {
-        let (mode, buffer_id) = match profile.variant.as_str() {
-            "b" => (MODE_B, BUFFER_ID_B),
-            _ => (MODE_A, BUFFER_ID_A),
+    pub fn new(profile: DriveProfile, is_variant_b: bool) -> Self {
+        let (mode, buffer_id) = if is_variant_b {
+            (MODE_B, BUFFER_ID_B)
+        } else {
+            (MODE_A, BUFFER_ID_A)
         };
         Mt1959 {
             profile,
@@ -125,7 +126,7 @@ impl Mt1959 {
     }
 }
 
-impl Platform for Mt1959 {
+impl PlatformDriver for Mt1959 {
     fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if self.unlocked && self.calibrated {
             return Ok(());
