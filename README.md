@@ -29,8 +29,9 @@ use std::path::Path;
 
 // Open drive — profiles are bundled, auto-identified
 let mut session = DriveSession::open(Path::new("/dev/sr0"))?;
-session.wait_ready()?;        // wait for disc
-session.init()?;               // optional: unlock + calibrate for full speed
+session.wait_ready()?;            // wait for disc
+session.init()?;                   // unlock + firmware upload
+session.probe_disc()?;             // probe disc surface for optimal speeds
 
 // Scan disc — UDF, playlists, streams, AACS (all automatic)
 let disc = Disc::scan(&mut session, &ScanOptions::default())?;

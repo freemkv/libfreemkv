@@ -3,21 +3,20 @@
 //! Three-step open:
 //!   1. `open()` — open device, identify drive. Always OEM.
 //!   2. `wait_ready()` — wait for disc to spin up. Call before reading.
-//!   3. `init()` — activate custom firmware. Optional, caller decides.
+//!   3. `init()` — activate custom firmware. Removes riplock.
+//!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
 
 use std::path::Path;
 use crate::error::{Error, Result};
 use crate::scsi::ScsiTransport;
 use crate::identity::DriveId;
-use crate::profile::{self, DriveProfile, ProfileMatch};
+use crate::profile::{self, DriveProfile};
 use crate::platform::PlatformDriver;
 use crate::platform::mt1959::Mt1959;
-use crate::speed::SpeedTable;
 
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
     driver: Box<dyn PlatformDriver>,
-    pub speed_table: SpeedTable,
     pub profile: DriveProfile,
     pub platform: profile::Platform,
     pub drive_id: DriveId,
@@ -42,7 +41,6 @@ impl DriveSession {
         Ok(DriveSession {
             scsi: transport,
             driver,
-            speed_table: SpeedTable::new(),
             platform: m.platform,
             profile: m.profile,
             drive_id,
@@ -74,15 +72,16 @@ impl DriveSession {
         &self.device_path
     }
 
-    /// Initialize drive — unlock + firmware upload.
+    /// Initialize drive — unlock + firmware upload. Removes riplock.
     pub fn init(&mut self) -> Result<()> {
         self.driver.init(self.scsi.as_mut())
     }
 
-    /// Read speed zones from disc into speed table.
-    /// Requires init() first. Optional — without this, drive manages speed itself.
-    pub fn read_speed_table(&mut self) -> Result<()> {
-        self.driver.read_speed_table(self.scsi.as_mut(), &mut self.speed_table)
+    /// Probe disc surface so the drive firmware learns optimal read speeds
+    /// per region. After this the host reads at max speed and the drive
+    /// manages zones internally.
+    pub fn probe_disc(&mut self) -> Result<()> {
+        self.driver.probe_disc(self.scsi.as_mut())
     }
 
     pub fn is_ready(&self) -> bool {
@@ -109,6 +108,12 @@ impl DriveSession {
         let result = self.scsi.as_mut().execute(
             &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)?;
         Ok(result.bytes_transferred)
+    }
+
+    pub fn set_speed(&mut self, speed_kbs: u16) {
+        let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
+        let mut dummy = [0u8; 0];
+        let _ = self.scsi_execute(&cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
     }
 
     pub fn eject(&mut self) -> Result<()> {
