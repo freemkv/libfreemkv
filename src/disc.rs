@@ -774,9 +774,7 @@ pub struct ContentReader<'a> {
     /// Consecutive errors at current position
     error_streak: u32,
     /// Current speed tier index (0 = max, higher = slower)
-    speed_tier: usize,
     /// Last time maintain_speed was called
-    last_speed_maintain: std::time::Instant,
     /// Total read errors encountered
     pub errors: u32,
 }
@@ -823,8 +821,6 @@ impl Disc {
             max_batch_sectors: max_batch,
             ok_streak: 0,
             error_streak: 0,
-            speed_tier: 0,
-            last_speed_maintain: std::time::Instant::now(),
             errors: 0,
         })
     }
@@ -879,15 +875,6 @@ const RAMP_BATCH_AFTER: u32 = 5;     // successes before doubling batch size
 const RAMP_SPEED_AFTER: u32 = 50;    // successes at max batch before restoring speed
 const SLOW_SPEED_AFTER: u32 = 3;     // consecutive errors before reducing disc speed
 
-/// Disc speed tiers (KB/s for SET CD SPEED).
-/// Blu-ray: 1x=4500, 2x=9000, 4x=18000, 8x=36000, 12x=54000
-const SPEED_TIERS: &[u16] = &[
-    0xFFFF, // tier 0: max (drive decides, typically 8-12x)
-    36000,  // tier 1: 8x BD (~36 MB/s)
-    18000,  // tier 2: 4x BD (~18 MB/s)
-    9000,   // tier 3: 2x BD (~9 MB/s)
-    4500,   // tier 4: 1x BD (~4.5 MB/s) — last resort
-];
 
 impl<'a> ContentReader<'a> {
     /// Total bytes across all extents (for progress display).
@@ -973,29 +960,10 @@ impl<'a> ContentReader<'a> {
         Ok(())
     }
 
-    /// Set disc spin speed via SCSI SET CD SPEED.
-    fn set_speed(&mut self, tier: usize) {
-        let tier = tier.min(SPEED_TIERS.len() - 1);
-        if tier != self.speed_tier {
-            self.speed_tier = tier;
-            let speed_kbs = SPEED_TIERS[tier];
-            let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
-            let mut dummy = [0u8; 0];
-            let _ = self.session.scsi_execute(
-                &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
-            );
-        }
-    }
-
     /// Read a batch of sectors into the internal buffer.
     ///
-    /// Adaptive strategy:
-    ///   1. Read at current batch size
-    ///   2. On success: ramp batch up (double after 5 successes),
-    ///      then restore disc speed (after 50 at max batch)
-    ///   3. On error: halve batch, pause. After 3 consecutive errors,
-    ///      also reduce disc spin speed (scratched/damaged region).
-    ///   4. At min batch + still failing: retry once, then skip + zero-fill.
+    /// Speed management: speed table checked before each read.
+    /// On error: reduce speed, halve batch. On recovery: resume from table.
     fn fill_buffer(&mut self) -> Result<bool> {
         loop {
             if self.current_extent >= self.extents.len() {
@@ -1019,6 +987,15 @@ impl<'a> ContentReader<'a> {
             let byte_count = sectors_to_read as usize * 2048;
             self.read_buf.resize(byte_count, 0);
 
+            // Check speed table — send SET_CD_SPEED if zone changed
+            if let Some(speed_kbs) = self.session.speed_table.speed_for(lba) {
+                let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
+                let mut dummy = [0u8; 0];
+                let _ = self.session.scsi_execute(
+                    &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
+                );
+            }
+
             match self.read_sectors(lba, sectors_to_read) {
                 Ok(_) => {
                     self.buf_len = sectors_to_read as usize / 3;
@@ -1031,17 +1008,16 @@ impl<'a> ContentReader<'a> {
                         self.current_offset = 0;
                     }
 
-                    // Ramp up: batch size first, then disc speed
+                    // Ramp up batch size after consecutive successes
                     self.ok_streak += 1;
-                    if self.batch_sectors < self.max_batch_sectors {
-                        if self.ok_streak >= RAMP_BATCH_AFTER {
-                            self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
-                            self.ok_streak = 0;
-                        }
-                    } else if self.speed_tier > 0 && self.ok_streak >= RAMP_SPEED_AFTER {
-                        // At max batch for a while — try faster disc speed
-                        self.set_speed(self.speed_tier - 1);
+                    if self.batch_sectors < self.max_batch_sectors && self.ok_streak >= RAMP_BATCH_AFTER {
+                        self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
                         self.ok_streak = 0;
+                    }
+
+                    // Resume table-driven speed after sustained success
+                    if self.error_streak == 0 && self.ok_streak >= RAMP_SPEED_AFTER {
+                        self.session.speed_table.resume(lba);
                     }
 
                     return Ok(true);
@@ -1051,11 +1027,14 @@ impl<'a> ContentReader<'a> {
                     self.error_streak += 1;
                     self.ok_streak = 0;
 
-                    // Reduce disc speed after repeated errors (physical problem)
-                    if self.error_streak >= SLOW_SPEED_AFTER
-                        && self.speed_tier < SPEED_TIERS.len() - 1
-                    {
-                        self.set_speed(self.speed_tier + 1);
+                    // Reduce speed after repeated errors
+                    if self.error_streak >= SLOW_SPEED_AFTER {
+                        let speed = self.session.speed_table.reduce();
+                        let cdb = crate::scsi::build_set_cd_speed(speed);
+                        let mut dummy = [0u8; 0];
+                        let _ = self.session.scsi_execute(
+                            &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
+                        );
                         self.error_streak = 0; // reset — give new speed a chance
                     }
 
