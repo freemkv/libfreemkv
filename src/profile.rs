@@ -78,6 +78,16 @@ pub struct DriveProfile {
     pub hardware_register_b_cdb: Vec<u8>,
 
 
+    /// 16 bytes written via WRITE_BUFFER mode=6 during B firmware upload.
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub fw_write_data: Vec<u8>,
+
+    /// Vendor-specific verify CDB after B firmware upload (10 bytes).
+    /// B-only. Empty for A-variant drives.
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub verify_cdb: Vec<u8>,
+
+
     /// Pre-built SET_CD_SPEED CDB with drive's nominal speed (12 bytes).
     /// Used in calibration "triple play": max → this → max.
     #[serde(default, deserialize_with = "deserialize_hex_vec")]
