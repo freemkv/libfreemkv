@@ -10,7 +10,14 @@
 use crate::error::{Error, Result};
 use crate::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
-use super::{Platform, DriveStatus};
+use super::Platform;
+
+/// Internal drive status — not exposed to callers.
+#[derive(Debug)]
+struct DriveStatus {
+    unlocked: bool,
+    features: [u8; 16],
+}
 
 /// MT1959 driver state.
 pub struct Mt1959 {
@@ -151,7 +158,29 @@ impl Mt1959 {
 }
 
 impl Platform for Mt1959 {
-    /// Thin wrapper → do_unlock(). Returns Ok if mode active, Err if not.
+    fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+        // Guard: don't re-init an already-ready drive
+        if self.unlocked && self.calibrated {
+            return Ok(());
+        }
+        self.run_init(scsi)
+    }
+
+    fn set_read_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
+        if !self.calibrated {
+            return Ok(());
+        }
+        self.run_set_read_speed(scsi, lba)
+    }
+
+    fn is_ready(&self) -> bool {
+        self.unlocked && self.calibrated
+    }
+}
+
+// ── All handlers are PRIVATE — only callable through init() ────────────
+
+impl Mt1959 {
     fn unlock(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         self.do_unlock(scsi)?;
         Ok(())
@@ -399,7 +428,7 @@ impl Platform for Mt1959 {
     ///      d. Build custom SET_CD_SPEED: BB 00 [r6>>8] [r6&FF] FF FF 00...
     ///      e. Send custom SET_CD_SPEED
     ///      f. Return next speed_table entry to host
-    fn set_read_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
+    fn run_set_read_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
         if !self.calibrated {
             return Ok(());
         }
@@ -455,13 +484,7 @@ impl Platform for Mt1959 {
     }
 
     /// Full init sequence — matches x86 dispatch exactly.
-    ///
-    ///   Phase 1: cmd 0 → [cmd 1 if fail] × 6 retries (unlock + fw upload)
-    ///   Phase 2: cmd 4 × 6 retries (calibrate)
-    ///   Phase 3: cmd 7 → [cmd 5 fallback] (drive info)
-    ///   Phase 4: cmd 2 + cmd 3 × 5 retries (registers)
-    ///   Phase 5: cmd 9 × 6 retries (status)
-    fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+    fn run_init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         // Phase 1: Unlock + firmware upload (6 retries)
         //
         // Three unlock outcomes:
@@ -515,9 +538,6 @@ impl Platform for Mt1959 {
         Ok(())
     }
 
-    fn is_unlocked(&self) -> bool {
-        self.unlocked
-    }
 }
 
 // ── Private firmware upload variants ───────────────────────────────────
