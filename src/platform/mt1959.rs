@@ -503,10 +503,9 @@ impl Platform for Mt1959 {
             if a_ok && b_ok { break; }
         }
 
-        // Phase 5: Status (6 retries)
-        for _attempt in 0..6 {
-            if self.status(scsi).is_ok() { break; }
-        }
+        // Phase 5: Status — non-fatal, single attempt
+        // Some drives reject sub_cmd 0x13. Not required for reads.
+        let _ = self.status(scsi);
 
         Ok(())
     }
