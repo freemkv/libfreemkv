@@ -548,50 +548,52 @@ impl Mt1959 {
     }
 
     ///
-    /// Multi-step handshake:
-    ///   1. WRITE initial block via mode/buf (0x9C0 bytes from microcode)
-    ///   2. READ firmware metadata at offset 0x3000 (16 bytes)
-    ///   3. WRITE 16 bytes from microcode+16 via mode=6
-    ///   4. READ verify
-    ///   5. do_unlock() × 5 retries
+    ///   1. MODE SELECT (0x55) — send 2496 bytes from ld_microcode
+    ///   2. Check result == 2 (firmware accepted)
+    ///   3. READ_BUFFER mode=6 offset=0x3000 (16 bytes firmware metadata)
+    ///   4. WRITE_BUFFER mode=6 (16 bytes from profile's fw_write_data)
+    ///   5. Vendor verify command (from profile's verify_cdb)
+    ///   6. do_unlock() × 5 retries + 1 final
     fn load_firmware_b(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         let microcode = &self.profile.ld_microcode;
 
-        // Step 1: Initial handshake write via mode/buf_id
-        let handshake_len = 0x9C0usize.min(microcode.len());
-        let cdb = [
-            0x3B, self.mode, self.buffer_id,
+        // Step 1: MODE SELECT (0x55) with vendor mode page data
+        // Transfer: 0x9C0 = 2496 bytes from the firmware payload
+        let write_len = 0x9C0usize.min(microcode.len());
+        let mode_select_cdb = [
+            0x55, 0x10, 0x00,
             0x00, 0x00, 0x00,
-            (handshake_len >> 16) as u8, (handshake_len >> 8) as u8, handshake_len as u8,
+            (write_len >> 16) as u8, (write_len >> 8) as u8, write_len as u8,
             0x00,
         ];
-        let mut data = microcode[..handshake_len].to_vec();
-        scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
+        let mut data = microcode[..write_len].to_vec();
+        scsi.execute(&mode_select_cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
-        // Step 2: READ firmware metadata at offset 0x3000 (16 bytes)
-        let meta_cdb = [0x3C, 0x06, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x10, 0x00];
+        // The execute above will Err on SCSI failure. If we get here, command accepted.
+
+        // Step 3: READ_BUFFER mode=6, offset=0x3000, 16 bytes
+        let read_meta_cdb = [0x3C, 0x06, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x10, 0x00];
         let mut meta_resp = [0u8; 16];
-        let _ = scsi.execute(&meta_cdb, DataDirection::FromDevice, &mut meta_resp, 5_000);
+        let _ = scsi.execute(&read_meta_cdb, DataDirection::FromDevice, &mut meta_resp, 5_000);
 
-        // Step 3: WRITE 16 bytes from microcode offset 16 via mode=6
-        if microcode.len() > 32 {
-            let write2_cdb = [
-                0x3B, 0x06, 0x00,
-                0x00, 0x00, 0x00,
-                0x00, 0x00, 0x10, 0x00,
-            ];
-            let mut data2 = microcode[16..32].to_vec();
+        // Step 4: WRITE_BUFFER mode=6, 16 bytes
+        // This data is stored in profile.fw_write_data (16 bytes)
+        if self.profile.fw_write_data.len() >= 16 {
+            let write2_cdb = [0x3B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00];
+            let mut data2 = self.profile.fw_write_data[..16].to_vec();
             let _ = scsi.execute(&write2_cdb, DataDirection::ToDevice, &mut data2, 5_000);
         }
 
-        // Step 4: READ verify
-        let verify_cdb = [0x3C, self.mode, self.buffer_id, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00];
-        let mut verify_resp = [0u8; 4];
-        let _ = scsi.execute(&verify_cdb, DataDirection::FromDevice, &mut verify_resp, 5_000);
+        // Step 5: Vendor verify command
+        if self.profile.verify_cdb.len() >= 10 {
+            let mut dummy = [0u8; 0];
+            let _ = scsi.execute(&self.profile.verify_cdb, DataDirection::None, &mut dummy, 5_000);
+        }
 
-        // Step 5: do_unlock() × 5 retries
+        // Step 6: do_unlock() × 5 retries + 1 confirmation
         for _attempt in 0..5 {
             if self.do_unlock(scsi).is_ok() {
+                let _ = self.do_unlock(scsi);
                 return Ok(());
             }
         }
