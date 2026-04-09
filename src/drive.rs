@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::scsi::ScsiTransport;
 use crate::identity::DriveId;
 use crate::profile::{self, DriveProfile, Chipset};
-use crate::platform::{Platform, DriveStatus};
+use crate::platform::Platform;
 use crate::platform::mt1959::Mt1959;
 
 /// A drive session with identification, platform, and SCSI transport.
@@ -116,9 +116,9 @@ impl DriveSession {
         self.platform.init(self.scsi.as_mut())
     }
 
-    /// Check if raw disc access mode is active.
-    pub fn is_unlocked(&self) -> bool {
-        self.platform.is_unlocked()
+    /// Check if drive is initialized and ready for reads.
+    pub fn is_ready(&self) -> bool {
+        self.platform.is_ready()
     }
 
     /// Called per zone change during content reads.

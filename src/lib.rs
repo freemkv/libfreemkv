@@ -86,7 +86,7 @@ pub use error::{Error, Result};
 pub use drive::{DriveSession, find_drive, find_drives, resolve_device};
 pub use identity::DriveId;
 pub use profile::{DriveProfile, Chipset};
-pub use platform::{Platform, DriveStatus};
+// Platform trait is pub(crate) — callers use DriveSession, not Platform directly
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
 pub use disc::{Disc, DiscFormat, Title, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
