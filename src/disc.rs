@@ -671,10 +671,10 @@ impl Disc {
         }
 
         // Build streams from STN table
-        let streams: Vec<Stream> = parsed.streams.iter().map(|s| {
+        let streams: Vec<Stream> = parsed.streams.iter().filter_map(|s| {
             let codec = Codec::from_coding_type(s.coding_type);
             match s.stream_type {
-                1 | 6 | 7 => Stream::Video(VideoStream {
+                1 | 6 | 7 => Some(Stream::Video(VideoStream {
                     pid: s.pid,
                     codec,
                     resolution: format_resolution(s.video_format, s.video_rate),
@@ -694,32 +694,37 @@ impl Disc {
                         7 => "Dolby Vision EL".to_string(),
                         _ => String::new(),
                     },
-                }),
-                2 | 5 => Stream::Audio(AudioStream {
+                })),
+                2 | 5 => {
+                    // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
+                    // this is a misaligned stream — treat as subtitle, not audio
+                    if matches!(codec, Codec::Pgs) {
+                        Some(Stream::Subtitle(SubtitleStream {
+                            pid: s.pid,
+                            codec,
+                            language: s.language.clone(),
+                            forced: false,
+                        }))
+                    } else {
+                        Some(Stream::Audio(AudioStream {
+                            pid: s.pid,
+                            codec,
+                            channels: format_channels(s.audio_format),
+                            language: s.language.clone(),
+                            sample_rate: format_samplerate(s.audio_rate),
+                            secondary: s.stream_type == 5,
+                            label: String::new(),
+                        }))
+                    }
+                }
+                3 => Some(Stream::Subtitle(SubtitleStream {
                     pid: s.pid,
                     codec,
-                    channels: format_channels(s.audio_format),
                     language: s.language.clone(),
-                    sample_rate: format_samplerate(s.audio_rate),
-                    secondary: s.stream_type == 5,
-                    label: String::new(),
-                }),
-                3 => Stream::Subtitle(SubtitleStream {
-                    pid: s.pid,
-                    codec,
-                    language: s.language.clone(),
-                    forced: false, // TODO: parse from MPLS stream attributes
-                }),
-                _ => Stream::Video(VideoStream {
-                    pid: s.pid,
-                    codec,
-                    resolution: String::new(),
-                    frame_rate: String::new(),
-                    hdr: HdrFormat::Sdr,
-                    color_space: ColorSpace::Unknown,
-                    secondary: false,
-                    label: String::new(),
-                }),
+                    forced: false,
+                })),
+                // Stream type 4 = IG, unknown types — skip
+                _ => None,
             }
         }).collect();
 
