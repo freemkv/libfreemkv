@@ -111,7 +111,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             let n_ig = item[STN_OFFSET + 7] as usize;
             let n_sec_audio = item[STN_OFFSET + 8] as usize;
             let n_sec_video = item[STN_OFFSET + 9] as usize;
-            let _n_pip_pg = item[STN_OFFSET + 10] as usize;
+            let n_pip_pg = item[STN_OFFSET + 10] as usize;
             let n_dv = item[STN_OFFSET + 11] as usize;
 
             let mut spos = STN_OFFSET + 16;
@@ -173,6 +173,18 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     } else { spos = next; }
                 } else { break; }
             }
+            // Secondary PG (PiP subtitles) — must consume to keep spos aligned
+            for _ in 0..n_pip_pg {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 3) {
+                    entry.secondary = true;
+                    streams.push(entry);
+                    // Skip reference data: num_refs(1) + reserved(1) + refs + padding
+                    if next < item.len() {
+                        let n_refs = item[next] as usize;
+                        spos = next + 2 + n_refs + (n_refs % 2);
+                    } else { spos = next; }
+                } else { break; }
+            }
             // Dolby Vision enhancement layer
             for _ in 0..n_dv {
                 if let Some((mut entry, next)) = parse_stream_entry(item, spos, 1) {
@@ -227,6 +239,7 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     let sa = &item[se_end + 1..se_end + 1 + sa_len];
     let coding_type = sa[0];
 
+
     let mut video_format = 0u8;
     let mut video_rate = 0u8;
     let mut audio_format = 0u8;
@@ -249,12 +262,19 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         }
         2 => {
             // Audio: coding_type(1) + format_rate(1) + language(3)
-            if sa.len() >= 2 {
-                audio_format = (sa[1] >> 4) & 0x0F;
-                audio_rate = sa[1] & 0x0F;
-            }
-            if sa.len() >= 5 {
-                language = String::from_utf8_lossy(&sa[2..5]).to_string();
+            // Exception: PGS (0x90/0x91) in audio slot uses PG layout: coding_type(1) + language(3)
+            if coding_type == 0x90 || coding_type == 0x91 {
+                if sa.len() >= 4 {
+                    language = String::from_utf8_lossy(&sa[1..4]).to_string();
+                }
+            } else {
+                if sa.len() >= 2 {
+                    audio_format = (sa[1] >> 4) & 0x0F;
+                    audio_rate = sa[1] & 0x0F;
+                }
+                if sa.len() >= 5 {
+                    language = String::from_utf8_lossy(&sa[2..5]).to_string();
+                }
             }
         }
         3 | 4 => {
