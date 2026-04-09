@@ -463,11 +463,21 @@ impl Platform for Mt1959 {
     ///   Phase 5: cmd 9 × 6 retries (status)
     fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         // Phase 1: Unlock + firmware upload (6 retries)
+        //
+        // Three unlock outcomes:
+        //   Ok → warm drive, firmware loaded, skip to calibrate
+        //   Err(other) → cold drive or SCSI error, try load_firmware
         let mut unlocked = false;
         for _attempt in 0..6 {
             match self.unlock(scsi) {
                 Ok(_) => { unlocked = true; break; }
+                Err(Error::SignatureMismatch { .. }) => {
+                    return Err(Error::UnlockFailed {
+                        detail: "signature mismatch — wrong profile for this drive".into(),
+                    });
+                }
                 Err(_) => {
+                    // Cold boot or SCSI error — try uploading firmware
                     if self.load_firmware(scsi).is_ok() {
                         unlocked = true;
                         break;
@@ -493,17 +503,12 @@ impl Platform for Mt1959 {
             return Err(Error::ScsiError { opcode: 0x3C, status: 0xFF, sense_key: 0 });
         }
 
-        // If fails: cmd 5 fallback (keepalive)
-        // In our context: this fetches a display string, not critical for reads
-        let _ = self.probe(scsi, 0x00, 0, 0x3FF);
+        // Phase 3: Read registers — non-fatal
+        // x86 retries 5×, but we do a single attempt each. Not required for reads.
+        let _ = self.read_register_a(scsi);
+        let _ = self.read_register_b(scsi);
 
-        for _attempt in 0..5 {
-            let a_ok = self.read_register_a(scsi).is_ok();
-            let b_ok = self.read_register_b(scsi).is_ok();
-            if a_ok && b_ok { break; }
-        }
-
-        // Phase 5: Status — non-fatal, single attempt
+        // Phase 4: Status — non-fatal, single attempt
         // Some drives reject sub_cmd 0x13. Not required for reads.
         let _ = self.status(scsi);
 
