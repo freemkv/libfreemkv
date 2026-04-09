@@ -802,11 +802,9 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
-        // init() already called by DriveSession::open(). No re-init needed.
-
-        let speed_cdb = crate::scsi::build_set_cd_speed(0xFFFF);
-        let mut dummy = [0u8; 0];
-        let _ = session.scsi_execute(&speed_cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
+        // Let the drive manage its own read speed after init.
+        // SET_CD_SPEED is only used reactively by the error handler to slow
+        // down on read errors, then let the drive recover.
 
         // Detect kernel max transfer size for this device
         let max_batch = detect_max_batch_sectors(session.device_path());
