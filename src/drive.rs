@@ -12,10 +12,12 @@ use crate::identity::DriveId;
 use crate::profile::{self, DriveProfile, ProfileMatch};
 use crate::platform::PlatformDriver;
 use crate::platform::mt1959::Mt1959;
+use crate::speed::SpeedTable;
 
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
     driver: Box<dyn PlatformDriver>,
+    pub speed_table: SpeedTable,
     pub profile: DriveProfile,
     pub platform: profile::Platform,
     pub drive_id: DriveId,
@@ -40,6 +42,7 @@ impl DriveSession {
         Ok(DriveSession {
             scsi: transport,
             driver,
+            speed_table: SpeedTable::new(),
             platform: m.platform,
             profile: m.profile,
             drive_id,
@@ -71,16 +74,19 @@ impl DriveSession {
         &self.device_path
     }
 
+    /// Initialize drive — unlock + firmware upload.
     pub fn init(&mut self) -> Result<()> {
         self.driver.init(self.scsi.as_mut())
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.driver.is_ready()
+    /// Read speed zones from disc into speed table.
+    /// Requires init() first. Optional — without this, drive manages speed itself.
+    pub fn read_speed_table(&mut self) -> Result<()> {
+        self.driver.read_speed_table(self.scsi.as_mut(), &mut self.speed_table)
     }
 
-    pub fn set_read_speed(&mut self, lba: u32) -> Result<()> {
-        self.driver.set_read_speed(self.scsi.as_mut(), lba)
+    pub fn is_ready(&self) -> bool {
+        self.driver.is_ready()
     }
 
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
