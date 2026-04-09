@@ -10,6 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::drive::DriveSession;
+use crate::speed::DriveSpeed;
 use crate::udf;
 use crate::mpls;
 use crate::clpi;
@@ -853,10 +854,8 @@ fn detect_max_batch_sectors(device_path: &str) -> u16 {
             if let Ok(kb) = content.trim().parse::<u32>() {
                 // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
                 let sectors = (kb / 2) as u16;
-                // Stay well under kernel limit (80% of max) to avoid edge cases
-                let safe = (sectors * 4 / 5).max(MIN_BATCH_SECTORS);
                 // Align down to 3 (one aligned unit)
-                let aligned = (safe / 3) * 3;
+                let aligned = (sectors / 3) * 3;
                 if aligned >= MIN_BATCH_SECTORS {
                     return aligned.min(MAX_BATCH_SECTORS);
                 }
@@ -869,7 +868,7 @@ fn detect_max_batch_sectors(device_path: &str) -> u16 {
 
 /// Read strategy constants
 const MAX_BATCH_SECTORS: u16 = 510;  // absolute max (170 aligned units ≈ 1MB)
-const DEFAULT_BATCH_SECTORS: u16 = 48;  // safe fallback (96KB, under typical 120KB kernel limit)
+const DEFAULT_BATCH_SECTORS: u16 = 60;  // fallback: typical kernel limit (120KB = 60 sectors)
 const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (error recovery)
 const RAMP_BATCH_AFTER: u32 = 5;     // successes before doubling batch size
 const RAMP_SPEED_AFTER: u32 = 50;    // successes at max batch before restoring speed
@@ -962,8 +961,11 @@ impl<'a> ContentReader<'a> {
 
     /// Read a batch of sectors into the internal buffer.
     ///
-    /// Speed management: speed table checked before each read.
-    /// On error: reduce speed, halve batch. On recovery: resume from table.
+    /// Error handling:
+    ///   - First error: re-init drive (may have re-locked), halve batch
+    ///   - Repeated errors: reduce speed, keep halving batch
+    ///   - At minimum batch: retry once, then skip + zero-fill
+    ///   - After sustained success: ramp batch back up, restore max speed
     fn fill_buffer(&mut self) -> Result<bool> {
         loop {
             if self.current_extent >= self.extents.len() {
@@ -987,15 +989,6 @@ impl<'a> ContentReader<'a> {
             let byte_count = sectors_to_read as usize * 2048;
             self.read_buf.resize(byte_count, 0);
 
-            // Check speed table — send SET_CD_SPEED if zone changed
-            if let Some(speed_kbs) = self.session.speed_table.speed_for(lba) {
-                let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
-                let mut dummy = [0u8; 0];
-                let _ = self.session.scsi_execute(
-                    &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
-                );
-            }
-
             match self.read_sectors(lba, sectors_to_read) {
                 Ok(_) => {
                     self.buf_len = sectors_to_read as usize / 3;
@@ -1015,9 +1008,10 @@ impl<'a> ContentReader<'a> {
                         self.ok_streak = 0;
                     }
 
-                    // Resume table-driven speed after sustained success
-                    if self.error_streak == 0 && self.ok_streak >= RAMP_SPEED_AFTER {
-                        self.session.speed_table.resume(lba);
+                    // Restore max speed after sustained success at full batch
+                    if self.batch_sectors == self.max_batch_sectors && self.ok_streak >= RAMP_SPEED_AFTER {
+                        self.session.set_speed(0xFFFF);
+                        self.ok_streak = 0;
                     }
 
                     return Ok(true);
@@ -1027,19 +1021,19 @@ impl<'a> ContentReader<'a> {
                     self.error_streak += 1;
                     self.ok_streak = 0;
 
-                    // Reduce speed after repeated errors
+                    // First error: re-init (drive may have re-locked)
+                    if self.error_streak == 1 {
+                        let _ = self.session.init();
+                        let _ = self.session.probe_disc();
+                    }
+
+                    // Repeated errors: slow down
                     if self.error_streak >= SLOW_SPEED_AFTER {
-                        let speed = self.session.speed_table.reduce();
-                        let cdb = crate::scsi::build_set_cd_speed(speed);
-                        let mut dummy = [0u8; 0];
-                        let _ = self.session.scsi_execute(
-                            &cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000,
-                        );
-                        self.error_streak = 0; // reset — give new speed a chance
+                        self.session.set_speed(DriveSpeed::BD2x.to_kbps());
+                        self.error_streak = 0;
                     }
 
                     if self.batch_sectors > MIN_BATCH_SECTORS {
-                        // Shrink batch and retry
                         self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     } else {

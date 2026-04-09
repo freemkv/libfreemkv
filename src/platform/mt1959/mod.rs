@@ -6,26 +6,48 @@ mod variant_b;
 use crate::error::{Error, Result};
 use crate::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
-use crate::speed::SpeedTable;
 use super::PlatformDriver;
 
-const UNLOCK_RESPONSE_SIZE: u8 = 64;
+// ── Variant constants ──────────────────────────────────────────────────
+// Every vendor command: 3C [mode] [buffer_id] [sub_cmd] [addr] ...
 const MODE_A: u8 = 0x01;
 const MODE_B: u8 = 0x02;
 const BUFFER_ID_A: u8 = 0x44;
 const BUFFER_ID_B: u8 = 0x77;
-const NOMINAL_SPEED_A: [u8; 12] = [0xBB, 0x00, 0x23, 0x28, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-const NOMINAL_SPEED_B: [u8; 12] = [0x00, 0x00, 0xBB, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+
+// ── SCSI opcodes ──────────────────────────────────────────────────────
+const SCSI_READ_BUFFER: u8 = 0x3C;
+const SCSI_READ_CAPACITY: u8 = 0x25;
+
+// ── Sub-commands (shared A/B) ─────────────────────────────────────────
+const SUB_CMD_UNLOCK: u8 = 0x00;
+const SUB_CMD_INIT: u8 = 0x12;
+const SUB_CMD_PROBE: u8 = 0x14;
+const UNLOCK_RESPONSE_SIZE: u8 = 64;
+const VALIDATE_RESPONSE_SIZE: u8 = 4;
+const FIRMWARE_ACTIVE_OFFSET: usize = 12;
+const FIRMWARE_ACTIVE_SIG: [u8; 4] = [0x4D, 0x4D, 0x6B, 0x76];
+
+// ── Init address (per disc type) ──────────────────────────────────────
+const INIT_ADDR_BD: u16 = 0x0100;
+const INIT_ADDR_UHD: u16 = 0x0200;
+
+// ── Probe scan ranges ─────────────────────────────────────────────────
+const PROBE_COARSE_END: u16 = 0x5800;
+const PROBE_FINE_END: u32 = 0x10000;
+const PROBE_STEP: u16 = 0x0100;
+const PROBE_RESPONSE_SIZE: u8 = 4;
+
+// ── Disc type threshold ───────────────────────────────────────────────
+const UHD_SECTOR_THRESHOLD: u32 = 25_000_000; // ~50 GB
+const READ_CAPACITY_RESPONSE_SIZE: usize = 8;
 
 pub struct Mt1959 {
     pub(crate) profile: DriveProfile,
     pub(crate) mode: u8,
     pub(crate) buffer_id: u8,
     pub(crate) unlocked: bool,
-    speed_table: [u16; 64],
-    disc_sectors: u32,
-    calibrated: bool,
-    calibration_config: [u8; 4],
+    probed: bool,
 }
 
 impl Mt1959 {
@@ -38,10 +60,7 @@ impl Mt1959 {
         Mt1959 {
             profile, mode, buffer_id,
             unlocked: false,
-            speed_table: [0u16; 64],
-            disc_sectors: 0,
-            calibrated: false,
-            calibration_config: [0u8; 4],
+            probed: false,
         }
     }
 
@@ -49,7 +68,7 @@ impl Mt1959 {
 
     pub(crate) fn read_buffer_sub(&self, sub_cmd: u8, address: u16, length: u8) -> [u8; 10] {
         [
-            0x3C, self.mode, self.buffer_id, sub_cmd,
+            SCSI_READ_BUFFER, self.mode, self.buffer_id, sub_cmd,
             (address >> 8) as u8, address as u8,
             0x00, 0x00, length, 0x00,
         ]
@@ -62,7 +81,7 @@ impl Mt1959 {
         let cdb = self.read_buffer_sub(sub_cmd, address, expected as u8);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
         if result.bytes_transferred != expected {
-            return Err(Error::ScsiError { opcode: 0x3C, status: 0xFF, sense_key: 0 });
+            return Err(Error::ScsiError { opcode: SCSI_READ_BUFFER, status: 0xFF, sense_key: 0 });
         }
         Ok(result.bytes_transferred)
     }
@@ -79,7 +98,7 @@ impl Mt1959 {
     pub(crate) fn do_unlock(&mut self, scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>> {
         let cdb = [
             0x3C, self.mode, self.buffer_id,
-            0x00, 0x00, 0x00,
+            SUB_CMD_UNLOCK, 0x00, 0x00,
             0x00, 0x00, UNLOCK_RESPONSE_SIZE, 0x00,
         ];
         let mut response = vec![0u8; UNLOCK_RESPONSE_SIZE as usize];
@@ -92,7 +111,8 @@ impl Mt1959 {
             });
         }
 
-        if response.len() >= 16 && &response[12..16] != b"MMkv" {
+        if response.len() >= FIRMWARE_ACTIVE_OFFSET + 4
+            && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] != FIRMWARE_ACTIVE_SIG {
             return Err(Error::UnlockFailed {
                 detail: format!(
                     "mode not active: {:02x}{:02x}{:02x}{:02x}",
@@ -109,15 +129,15 @@ impl Mt1959 {
         for _attempt in 0..5 {
             let cdb = [
                 0x3C, self.mode, self.buffer_id,
-                0x00, 0x00, 0x00,
-                0x00, 0x00, 0x04, 0x00,
+                SUB_CMD_UNLOCK, 0x00, 0x00,
+                0x00, 0x00, VALIDATE_RESPONSE_SIZE, 0x00,
             ];
             let mut resp = [0u8; 4];
             if scsi.execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000).is_ok() {
                 return Ok(());
             }
         }
-        Err(Error::ScsiError { opcode: 0x3C, status: 0xFF, sense_key: 0 })
+        Err(Error::ScsiError { opcode: SCSI_READ_BUFFER, status: 0xFF, sense_key: 0 })
     }
 
     // ── Init (unlock + firmware) ───────────────────────────────────────
@@ -148,70 +168,55 @@ impl Mt1959 {
         Ok(())
     }
 
-    // ── Calibrate (disc surface probes) ────────────────────────────────
+    // ── Probe disc ─────────────────────────────────────────────────────
 
-    fn run_calibrate(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+    /// Probe the disc surface so the drive firmware learns optimal speeds
+    /// per region. Two passes, then SET_CD_SPEED(max). After this the
+    /// drive manages per-zone speeds internally.
+    fn run_probe(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if !self.unlocked { self.do_unlock(scsi)?; }
 
-        let cap_cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut cap_buf = [0u8; 8];
-        if scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000).is_ok() {
-            self.disc_sectors = u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]) + 1;
-        }
-
-        let init_addr: u16 = 0x0100;
-        let mut init_resp = [0u8; 4];
-        let _ = self.read_buffer_probe(scsi, 0x12, init_addr, &mut init_resp, 4);
+        // Detect disc type from capacity to select probe mode.
+        // BD:  3C 01 44 12 01 00 00 00 04 00  (init_addr = 0x0100)
+        // UHD: 3C 01 44 12 02 00 00 00 04 00  (init_addr = 0x0200)
+        // Verified from MakeMKV strace: BD and UHD use different init addresses.
+        let cap_cdb = [SCSI_READ_CAPACITY, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut cap_buf = [0u8; READ_CAPACITY_RESPONSE_SIZE];
+        let disc_sectors = if scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000).is_ok() {
+            u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]) + 1
+        } else {
+            0
+        };
+        let init_addr = if disc_sectors > UHD_SECTOR_THRESHOLD { INIT_ADDR_UHD } else { INIT_ADDR_BD };
+        let mut init_resp = [0u8; PROBE_RESPONSE_SIZE as usize];
+        let _ = self.read_buffer_probe(scsi, SUB_CMD_INIT, init_addr, &mut init_resp, PROBE_RESPONSE_SIZE as usize);
 
         self.validate(scsi)?;
-        self.speed_table = [0u16; 64];
 
-        let mut probe_buf = [0u8; 4];
-        let _ = self.read_buffer_probe(scsi, 0x14, 0, &mut probe_buf, 4);
-        let initial_speed = probe_buf[0];
-        self.calibration_config[0] = probe_buf[0];
-        self.calibration_config[1] = probe_buf[1];
-        self.calibration_config[2] = probe_buf[2];
-
+        // Pass 1: coarse scan
         let mut addr: u16 = 0;
-        let mut prev_speed = initial_speed;
-        while addr < 0x5800 {
-            let mut resp = [0u8; 4];
-            if self.read_buffer_probe(scsi, 0x14, addr, &mut resp, 4).is_err() {
-                self.speed_table = [0u16; 64];
-                self.calibration_config = [0u8; 4];
-                return Err(Error::ScsiError { opcode: 0x3C, status: 0xFF, sense_key: 0 });
+        while addr < PROBE_COARSE_END {
+            let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
+            if self.read_buffer_probe(scsi, SUB_CMD_PROBE, addr, &mut resp, PROBE_RESPONSE_SIZE as usize).is_err() {
+                return Err(Error::ScsiError { opcode: SCSI_READ_BUFFER, status: 0xFF, sense_key: 0 });
             }
-            if resp[0] != prev_speed { prev_speed = resp[0]; }
-            addr = addr.wrapping_add(0x100);
+            addr = addr.wrapping_add(PROBE_STEP);
         }
 
+        // Pass 2: fine scan
         let mut addr: u32 = 0;
-        let mut prev_speed: u8 = 0;
-        while addr < 0x10000 {
-            let mut resp = [0u8; 4];
-            if self.read_buffer_probe(scsi, 0x14, addr as u16, &mut resp, 4).is_err() {
+        while addr < PROBE_FINE_END {
+            let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
+            if self.read_buffer_probe(scsi, SUB_CMD_PROBE, addr as u16, &mut resp, PROBE_RESPONSE_SIZE as usize).is_err() {
                 break;
             }
-            let speed = resp[0];
-            if speed > prev_speed && speed > 0 {
-                let idx = ((speed as usize) >> 1).saturating_sub(1);
-                if idx < 64 && self.speed_table[idx] == 0 {
-                    self.speed_table[idx] = addr as u16;
-                }
-            }
-            prev_speed = speed;
-            addr += 0x100;
+            addr += PROBE_STEP as u32;
         }
-        self.calibration_config[3] = prev_speed;
 
-        let _ = self.set_cd_speed_max(scsi);
-        let nominal = if self.mode == MODE_A { &NOMINAL_SPEED_A } else { &NOMINAL_SPEED_B };
-        let mut dummy = [0u8; 0];
-        let _ = scsi.execute(nominal, DataDirection::None, &mut dummy, 5_000);
+        // Set max speed — drive manages zones from here
         let _ = self.set_cd_speed_max(scsi);
 
-        self.calibrated = true;
+        self.probed = true;
         Ok(())
     }
 }
@@ -224,23 +229,10 @@ impl PlatformDriver for Mt1959 {
         self.run_init(scsi)
     }
 
-    fn read_speed_table(&mut self, scsi: &mut dyn ScsiTransport, speed_table: &mut SpeedTable) -> Result<()> {
+    fn probe_disc(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if !self.unlocked { self.run_init(scsi)?; }
-        if self.calibrated { return Ok(()); }
-        self.run_calibrate(scsi)?;
-
-        let mut probes: Vec<(u16, u8)> = Vec::new();
-        for i in 0..64 {
-            let addr = self.speed_table[i];
-            if addr == 0 { continue; }
-            let speed_idx = ((i + 1) << 1) as u8;
-            probes.push((addr, speed_idx));
-        }
-        const PROBE_RANGE: u32 = 0x10000;
-        const BD_1X_KBS: u16 = 4500;
-        speed_table.load_calibration(self.disc_sectors, &probes, PROBE_RANGE, BD_1X_KBS);
-
-        Ok(())
+        if self.probed { return Ok(()); }
+        self.run_probe(scsi)
     }
 
     fn is_ready(&self) -> bool {
