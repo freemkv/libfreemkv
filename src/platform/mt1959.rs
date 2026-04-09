@@ -158,10 +158,18 @@ impl Platform for Mt1959 {
     }
 
     ///
-    ///   1. WRITE_BUFFER mode=6 with ld_microcode (size = payload.len())
-    ///   2. Check all bytes transferred
-    ///   3. READ_BUFFER buf=0x45 verify (4 bytes, expect response == 2)
-    ///   4. do_unlock() × 2
+    /// Two variants with different upload sequences:
+    ///
+    ///   1. WRITE_BUFFER mode=6 with ld_microcode
+    ///   2. READ_BUFFER buf=0x45 verify (expect response == 2)
+    ///   3. do_unlock() × 2
+    ///
+    ///   1. WRITE_BUFFER with mode=2 buf=0x77 initial handshake (0x9C0 bytes)
+    ///   2. Check response == 2
+    ///   3. READ_BUFFER at offset 0x3000 (16 bytes, firmware metadata check)
+    ///   4. WRITE_BUFFER mode=6 with ld_microcode (16 bytes from payload+16)
+    ///   5. READ verify
+    ///   6. do_unlock() × 5 retries
     fn load_firmware(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         let microcode = &self.profile.ld_microcode;
         if microcode.is_empty() {
@@ -170,25 +178,13 @@ impl Platform for Mt1959 {
             });
         }
 
-        //      scsi_send(TO_DEVICE, ld_microcode, len)
-        let len = microcode.len();
-        let cdb = [
-            0x3B, 0x06, 0x00,
-            0x00, 0x00, 0x00,
-            (len >> 16) as u8, (len >> 8) as u8, len as u8,
-            0x00,
-        ];
-        let mut data = microcode.clone();
-        scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
-
-        let verify_cdb = [0x3C, 0x01, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00];
-        let mut verify_resp = [0u8; 4];
-        let _ = scsi.execute(
-            &verify_cdb, DataDirection::FromDevice, &mut verify_resp, 5_000,
-        );
-
-        self.do_unlock(scsi)?;
-        self.do_unlock(scsi)?;
+        if self.mode == 0x01 {
+            // ── MT1959-A path ──────────────────────────────────────────
+            self.load_firmware_a(scsi)?;
+        } else {
+            // ── MT1959-B path ──────────────────────────────────────────
+            self.load_firmware_b(scsi)?;
+        }
 
         Ok(())
     }
@@ -517,5 +513,89 @@ impl Platform for Mt1959 {
 
     fn is_unlocked(&self) -> bool {
         self.unlocked
+    }
+}
+
+// ── Private firmware upload variants ───────────────────────────────────
+
+impl Mt1959 {
+    ///
+    /// Simple: WRITE all microcode → verify buf=0x45 → unlock × 2.
+    fn load_firmware_a(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+        let microcode = &self.profile.ld_microcode;
+        let len = microcode.len();
+
+        // WRITE_BUFFER mode=6: send entire microcode payload
+        let cdb = [
+            0x3B, 0x06, 0x00,
+            0x00, 0x00, 0x00,
+            (len >> 16) as u8, (len >> 8) as u8, len as u8,
+            0x00,
+        ];
+        let mut data = microcode.clone();
+        scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
+
+        let verify_cdb = [0x3C, 0x01, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00];
+        let mut verify_resp = [0u8; 4];
+        let _ = scsi.execute(
+            &verify_cdb, DataDirection::FromDevice, &mut verify_resp, 5_000,
+        );
+
+        // Unlock × 2
+        self.do_unlock(scsi)?;
+        self.do_unlock(scsi)?;
+        Ok(())
+    }
+
+    ///
+    /// Multi-step handshake:
+    ///   1. WRITE initial block via mode/buf (0x9C0 bytes from microcode)
+    ///   2. READ firmware metadata at offset 0x3000 (16 bytes)
+    ///   3. WRITE 16 bytes from microcode+16 via mode=6
+    ///   4. READ verify
+    ///   5. do_unlock() × 5 retries
+    fn load_firmware_b(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+        let microcode = &self.profile.ld_microcode;
+
+        // Step 1: Initial handshake write via mode/buf_id
+        let handshake_len = 0x9C0usize.min(microcode.len());
+        let cdb = [
+            0x3B, self.mode, self.buffer_id,
+            0x00, 0x00, 0x00,
+            (handshake_len >> 16) as u8, (handshake_len >> 8) as u8, handshake_len as u8,
+            0x00,
+        ];
+        let mut data = microcode[..handshake_len].to_vec();
+        scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
+
+        // Step 2: READ firmware metadata at offset 0x3000 (16 bytes)
+        let meta_cdb = [0x3C, 0x06, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x10, 0x00];
+        let mut meta_resp = [0u8; 16];
+        let _ = scsi.execute(&meta_cdb, DataDirection::FromDevice, &mut meta_resp, 5_000);
+
+        // Step 3: WRITE 16 bytes from microcode offset 16 via mode=6
+        if microcode.len() > 32 {
+            let write2_cdb = [
+                0x3B, 0x06, 0x00,
+                0x00, 0x00, 0x00,
+                0x00, 0x00, 0x10, 0x00,
+            ];
+            let mut data2 = microcode[16..32].to_vec();
+            let _ = scsi.execute(&write2_cdb, DataDirection::ToDevice, &mut data2, 5_000);
+        }
+
+        // Step 4: READ verify
+        let verify_cdb = [0x3C, self.mode, self.buffer_id, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00];
+        let mut verify_resp = [0u8; 4];
+        let _ = scsi.execute(&verify_cdb, DataDirection::FromDevice, &mut verify_resp, 5_000);
+
+        // Step 5: do_unlock() × 5 retries
+        for _attempt in 0..5 {
+            if self.do_unlock(scsi).is_ok() {
+                return Ok(());
+            }
+        }
+        self.do_unlock(scsi)?;
+        Ok(())
     }
 }
