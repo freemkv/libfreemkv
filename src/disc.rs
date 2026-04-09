@@ -798,9 +798,7 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
-        if !session.is_unlocked() {
-            let _ = session.init();
-        }
+        // init() already called by DriveSession::open(). No re-init needed.
 
         let speed_cdb = crate::scsi::build_set_cd_speed(0xFFFF);
         let mut dummy = [0u8; 0];

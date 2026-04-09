@@ -30,22 +30,12 @@ pub struct DriveSession {
 }
 
 impl DriveSession {
-    /// Open a drive — identify, wait for disc, and unlock for raw reads.
     ///
-    /// This is the standard entry point. After `open()`, the drive is
-    /// ready for scanning and content reads.
+    /// This is the only entry point. After `open()`, the drive is
+    /// ready for scanning and content reads. init() handles everything:
+    /// unlock, firmware upload if needed, calibration, registers.
+    /// Called once per session. Non-fatal if init fails (BD works without it).
     pub fn open(device: &Path) -> Result<Self> {
-        let mut session = Self::open_no_unlock(device)?;
-        session.wait_ready()?;
-        let _ = session.init();
-        Ok(session)
-    }
-
-    /// Open a drive and immediately init for raw reads.
-    ///
-    /// Use this when you need raw disc access without AACS (e.g. capture,
-    /// sector dumps). Skips AACS authentication — cannot be done after init.
-    pub fn open_unlocked(device: &Path) -> Result<Self> {
         let mut session = Self::open_no_unlock(device)?;
         session.wait_ready()?;
         let _ = session.init();
