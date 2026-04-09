@@ -672,6 +672,8 @@ impl Disc {
 
         // Build streams from STN table
         let streams: Vec<Stream> = parsed.streams.iter().filter_map(|s| {
+            // Skip empty/padding entries (coding_type 0x00)
+            if s.coding_type == 0 { return None; }
             let codec = Codec::from_coding_type(s.coding_type);
             match s.stream_type {
                 1 | 6 | 7 => Some(Stream::Video(VideoStream {
@@ -765,6 +767,8 @@ pub struct ContentReader<'a> {
     buf_len: usize,
     /// Current batch size in sectors (adapts on errors)
     batch_sectors: u16,
+    /// Maximum batch size detected from kernel limits
+    max_batch_sectors: u16,
     /// Consecutive successful batch reads
     ok_streak: u32,
     /// Consecutive errors at current position
@@ -804,6 +808,9 @@ impl Disc {
         let mut dummy = [0u8; 0];
         let _ = session.scsi_execute(&speed_cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
 
+        // Detect kernel max transfer size for this device
+        let max_batch = detect_max_batch_sectors(session.device_path());
+
         Ok(ContentReader {
             session,
             aacs: self.aacs.as_ref(),
@@ -811,10 +818,11 @@ impl Disc {
             current_extent: 0,
             current_offset: 0,
             unit_key_idx: 0,
-            read_buf: Vec::with_capacity(MAX_BATCH_SECTORS as usize * 2048),
+            read_buf: Vec::with_capacity(max_batch as usize * 2048),
             buf_pos: 0,
             buf_len: 0,
-            batch_sectors: MAX_BATCH_SECTORS,
+            batch_sectors: max_batch,
+            max_batch_sectors: max_batch,
             ok_streak: 0,
             error_streak: 0,
             speed_tier: 0,
@@ -826,30 +834,48 @@ impl Disc {
 
 /// Detect the maximum transfer size in sectors for a device.
 /// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
+/// For sg devices, resolves the corresponding block device via sysfs.
 /// Returns a value aligned to 3 sectors (one aligned unit).
 fn detect_max_batch_sectors(device_path: &str) -> u16 {
-    // Extract block device name: /dev/sr0 → sr0
     let dev_name = device_path.rsplit('/').next().unwrap_or("");
-    if !dev_name.is_empty() {
-        let sysfs_path = format!("/sys/block/{}/queue/max_hw_sectors_kb", dev_name);
+    if dev_name.is_empty() {
+        return DEFAULT_BATCH_SECTORS;
+    }
+
+    // For sg devices, find the corresponding block device name
+    let block_name = if dev_name.starts_with("sg") {
+        let block_dir = format!("/sys/class/scsi_generic/{}/device/block", dev_name);
+        std::fs::read_dir(&block_dir).ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+    } else {
+        Some(dev_name.to_string())
+    };
+
+    if let Some(bname) = block_name {
+        let sysfs_path = format!("/sys/block/{}/queue/max_hw_sectors_kb", bname);
         if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
             if let Ok(kb) = content.trim().parse::<u32>() {
-                // Convert KB to sectors (1 sector = 2 KB on disc = 2048 bytes)
+                // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
                 let sectors = (kb / 2) as u16;
-                // Align down to 3 (one aligned unit) and cap at a reasonable max
-                let aligned = (sectors / 3) * 3;
+                // Stay well under kernel limit (80% of max) to avoid edge cases
+                let safe = (sectors * 4 / 5).max(MIN_BATCH_SECTORS);
+                // Align down to 3 (one aligned unit)
+                let aligned = (safe / 3) * 3;
                 if aligned >= MIN_BATCH_SECTORS {
                     return aligned.min(MAX_BATCH_SECTORS);
                 }
             }
         }
     }
-    // Fallback: conservative default
-    MAX_BATCH_SECTORS
+    // Fallback: safe default well under typical kernel limits
+    DEFAULT_BATCH_SECTORS
 }
 
 /// Read strategy constants
-const MAX_BATCH_SECTORS: u16 = 510;  // 170 aligned units ≈ 1MB (kernel caps to hw limit)
+const MAX_BATCH_SECTORS: u16 = 510;  // absolute max (170 aligned units ≈ 1MB)
+const DEFAULT_BATCH_SECTORS: u16 = 48;  // safe fallback (96KB, under typical 120KB kernel limit)
 const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (error recovery)
 const RAMP_BATCH_AFTER: u32 = 5;     // successes before doubling batch size
 const RAMP_SPEED_AFTER: u32 = 50;    // successes at max batch before restoring speed
@@ -1009,9 +1035,9 @@ impl<'a> ContentReader<'a> {
 
                     // Ramp up: batch size first, then disc speed
                     self.ok_streak += 1;
-                    if self.batch_sectors < MAX_BATCH_SECTORS {
+                    if self.batch_sectors < self.max_batch_sectors {
                         if self.ok_streak >= RAMP_BATCH_AFTER {
-                            self.batch_sectors = (self.batch_sectors * 2).min(MAX_BATCH_SECTORS);
+                            self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
                             self.ok_streak = 0;
                         }
                     } else if self.speed_tier > 0 && self.ok_streak >= RAMP_SPEED_AFTER {
