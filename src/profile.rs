@@ -3,11 +3,13 @@
 use serde::Deserialize;
 use crate::error::{Error, Result};
 
-/// Top-level profiles file — keyed by chipset.
+/// Top-level profiles file — keyed by chipset + variant.
 #[derive(Debug, Deserialize)]
 pub struct ProfilesFile {
     #[serde(default)]
-    pub mt1959: Vec<DriveProfile>,
+    pub mt1959_a: Vec<DriveProfile>,
+    #[serde(default)]
+    pub mt1959_b: Vec<DriveProfile>,
     #[serde(default)]
     pub renesas: Vec<DriveProfile>,
 }
@@ -29,51 +31,37 @@ pub struct Identity {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DriveProfile {
     pub identity: Identity,
-    #[serde(default)]
-    pub variant: String,
     #[serde(default, deserialize_with = "deserialize_hex4")]
     pub signature: [u8; 4],
     #[serde(default, deserialize_with = "deserialize_base64")]
     pub firmware: Vec<u8>,
-
-    #[serde(default)]
-    pub dvd_all_regions: bool,
-    #[serde(default)]
-    pub bd_raw_read: bool,
-    #[serde(default)]
-    pub bd_raw_metadata: bool,
-    #[serde(default)]
-    pub unrestricted_speed: bool,
-
-    #[serde(default)]
-    pub drive_id: String,
-    #[serde(default)]
-    pub drive_version: String,
 }
 
-/// Chipset — determined by which section the profile was found in.
+/// Chipset + variant — determined by which section the profile was found in.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Chipset {
-    MediaTek,
+pub enum Platform {
+    Mt1959A,
+    Mt1959B,
     Renesas,
 }
 
-impl Chipset {
+impl Platform {
     pub fn name(&self) -> &'static str {
         match self {
-            Chipset::MediaTek => "MediaTek MT1959",
-            Chipset::Renesas => "Renesas",
+            Platform::Mt1959A => "MediaTek MT1959",
+            Platform::Mt1959B => "MediaTek MT1959",
+            Platform::Renesas => "Renesas",
         }
     }
 }
 
-/// Result of profile lookup — includes chipset from the section it was found in.
+/// Result of profile lookup.
 pub struct ProfileMatch {
     pub profile: DriveProfile,
-    pub chipset: Chipset,
+    pub platform: Platform,
 }
 
-// ── Hex/base64 parsing ─────────────────────────────────────────────────
+// ── Parsing ────────────────────────────────────────────────────────────
 
 fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     if s.len() != 8 {
@@ -117,7 +105,7 @@ fn load_from_str(data: &str) -> Result<ProfilesFile> {
         .map_err(|e| Error::ProfileParse { detail: format!("JSON: {e}") })
 }
 
-/// Find a profile matching a drive's INQUIRY fields. Returns profile + chipset.
+/// Find a profile matching a drive's INQUIRY fields.
 pub fn find_by_drive_id(
     profiles: &ProfilesFile,
     drive_id: &crate::identity::DriveId,
@@ -127,9 +115,10 @@ pub fn find_by_drive_id(
     let vs = drive_id.vendor_specific.trim();
     let date = drive_id.firmware_date.trim();
 
-    for (chipset, list) in [
-        (Chipset::MediaTek, &profiles.mt1959),
-        (Chipset::Renesas, &profiles.renesas),
+    for (platform, list) in [
+        (Platform::Mt1959A, &profiles.mt1959_a),
+        (Platform::Mt1959B, &profiles.mt1959_b),
+        (Platform::Renesas, &profiles.renesas),
     ] {
         if let Some(p) = list.iter().find(|p| {
             p.identity.vendor_id.trim() == v
@@ -137,7 +126,7 @@ pub fn find_by_drive_id(
                 && p.identity.vendor_specific.trim() == vs
                 && p.identity.firmware_date.trim() == date
         }) {
-            return Some(ProfileMatch { profile: p.clone(), chipset });
+            return Some(ProfileMatch { profile: p.clone(), platform });
         }
 
         if let Some(p) = list.iter().find(|p| {
@@ -145,7 +134,7 @@ pub fn find_by_drive_id(
                 && p.identity.product_revision.trim() == r
                 && p.identity.vendor_specific.trim() == vs
         }) {
-            return Some(ProfileMatch { profile: p.clone(), chipset });
+            return Some(ProfileMatch { profile: p.clone(), platform });
         }
     }
 
@@ -171,7 +160,7 @@ mod tests {
         let id = make_drive_id("HL-DT-ST", "1.03", "NM00000", "211810241934");
         let m = find_by_drive_id(&profiles, &id).unwrap();
         assert_eq!(m.profile.identity.vendor_id.trim(), "HL-DT-ST");
-        assert_eq!(m.chipset, Chipset::MediaTek);
+        assert_eq!(m.platform, Platform::Mt1959A);
     }
 
     #[test]
