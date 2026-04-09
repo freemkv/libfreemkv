@@ -1,69 +1,76 @@
 //! Platform-specific implementations of raw disc access commands.
 //!
 //! Each chipset family (MT1959, Pioneer) implements the Platform trait.
-//! accessed via SCSI READ BUFFER with platform-specific mode and buffer ID.
+//! The trait methods correspond to the 10 command handlers in the per-drive
+//!
+//! x86 dispatch order (proven from code + hardware traces):
+//!   1. unlock()        — try activate raw mode
+//!   2. load_firmware() — if unlock fails, write ld_microcode then retry
+//!   3. calibrate()     — probe disc zones, build speed table, triple SET_CD_SPEED
+//!   5. read_register() — read hardware registers A and B (mid-rip, retried)
+//!   6. status()        — query feature flags
+//!   7. probe()         — parameterized register read
+//!   8. set_read_speed()— per-zone SET_CD_SPEED during content reads
+//!
+//! The full init sequence is:
+//!   unlock → [load_firmware if fail] × 6 → calibrate × 6 →
+//!   drive_info → registers × 5 → status × 6 → probe
 
 pub mod mt1959;
 
 use crate::error::Result;
 use crate::scsi::ScsiTransport;
 
-/// Platform trait — raw disc access commands implemented per chipset.
-///
-/// Command handlers accessed via READ BUFFER:
 pub trait Platform {
     ///
-    /// Sends the platform-specific READ BUFFER CDB and verifies
-    /// the response signature bytes.
+    /// Sends READ_BUFFER with drive-specific mode/buf_id.
+    /// Checks response against drive_signature and mode_active_magic ("MMkv").
+    /// Returns Ok if mode already active (warm), Err if firmware needed (cold).
     fn unlock(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
     ///
-    /// Performs a primary READ BUFFER for the configuration data,
-    /// followed by a secondary 4-byte status read.
-    fn read_config(&mut self, scsi: &mut dyn ScsiTransport) -> Result<Vec<u8>>;
-
-    /// Handlers 2-3: Read hardware register.
-    ///
-    /// `index` selects which register offset from the profile to use.
-    /// Returns 16 bytes of register data extracted from a 36-byte response.
-    fn read_register(&mut self, scsi: &mut dyn ScsiTransport, index: u8) -> Result<[u8; 16]>;
+    /// Sends WRITE_BUFFER mode=6 with ld_microcode (1888 bytes).
+    /// Verifies with READ_BUFFER buf=0x45 (expects response == 2).
+    /// Then calls unlock() twice to activate mode.
+    /// Only called when unlock() fails (cold boot, firmware not in drive RAM).
+    fn load_firmware(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
     ///
-    /// Probes the disc surface via READ BUFFER sub-commands to build
-    /// a 64-entry speed lookup table for optimal read performance.
-    /// Issues SET CD SPEED at maximum after calibration completes.
+    /// Sends pre-built hardware_register_a_cdb. Returns 16 bytes from
+    /// the 36-byte response at offset [4:20].
+    fn read_register_a(&mut self, scsi: &mut dyn ScsiTransport) -> Result<[u8; 16]>;
+
+    ///
+    /// Sends pre-built hardware_register_b_cdb. Returns 16 bytes from
+    /// the 36-byte response at offset [4:20].
+    fn read_register_b(&mut self, scsi: &mut dyn ScsiTransport) -> Result<[u8; 16]>;
+
+    ///
+    /// Probes disc zones via READ_BUFFER sub_cmd=0x14, builds speed table,
+    /// then commits with triple SET_CD_SPEED (max → nominal → max).
     fn calibrate(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
-    ///
-    /// Periodic command to maintain the raw access session.
     fn keepalive(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
     ///
-    /// Verifies the response signature and returns 16 bytes of
-    /// feature/status data.
+    /// Returns 16 bytes of feature data via READ_BUFFER sub_cmd=0x13.
     fn status(&mut self, scsi: &mut dyn ScsiTransport) -> Result<DriveStatus>;
 
-    ///
-    /// Sends a READ BUFFER command with dynamic sub-command, address,
-    /// and length. Used for disc structure reads and feature queries.
     fn probe(&mut self, scsi: &mut dyn ScsiTransport, sub_cmd: u8, address: u32, length: u32) -> Result<Vec<u8>>;
 
     ///
-    /// Looks up the LBA in the speed table, issues SET CD SPEED,
-    /// then performs a READ(10) with the raw read flag (0x08).
-    fn read_sectors(&mut self, scsi: &mut dyn ScsiTransport, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize>;
+    /// Looks up LBA in speed_zone_table, sends SET_CD_SPEED.
+    /// Called by x86 before each zone change during content reads.
+    fn set_read_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()>;
 
     fn timing(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
-    /// Continuous speed management during reading.
+    /// Full init sequence — matches x86 dispatch order.
     ///
-    /// Called periodically (~every 2 seconds) during bulk reads.
-    /// Probes the current disc zone, reads drive registers, and
-    /// sends SET CD SPEED to maintain optimal read performance.
-    /// Without this, MediaTek drives drift back to 1x speed.
-    fn maintain_speed(&mut self, scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()>;
+    /// unlock → [load_firmware if fail] × 6 → calibrate × 6
+    fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
-    /// Check if raw disc access mode is currently enabled.
+    /// Check if raw disc access mode is currently active.
     fn is_unlocked(&self) -> bool;
 }
 
