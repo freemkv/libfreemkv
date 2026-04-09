@@ -6,6 +6,8 @@
 
 Rust library for 4K UHD / Blu-ray optical drives. Drive access, disc scanning, stream labels, AACS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
 
+**12-23 MB/s** read speeds on BD. Full LibreDrive init: unlock, firmware upload, speed calibration — all from pure Rust.
+
 Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
 
 **[API Documentation](https://docs.rs/libfreemkv)** · **[Technical Docs](docs/)**
@@ -16,7 +18,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.4"
+libfreemkv = "0.5"
 ```
 
 ## Quick Start
@@ -44,12 +46,13 @@ while let Some(unit) = reader.read_unit()? {
 
 ## What It Does
 
-- **Drive access** — open, identify, unlock, eject
+- **Drive access** — open, identify, unlock, firmware upload, speed calibration, eject
+- **12-23 MB/s reads** — auto-detects kernel transfer limits, full disc speed
 - **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
 - **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
 - **AACS decryption** — transparent key resolution and content decrypt (1.0, 2.0 in progress)
 - **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
-- **Content reading** — sector reads with automatic decryption
+- **Content reading** — adaptive batch reads with automatic decryption and error recovery
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
 

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0 (2026-04-09)
+
+### Read pipeline — 5x speed improvement
+
+- **Kernel transfer limit detection**: auto-detect `max_hw_sectors_kb` via sysfs, resolve sg→block device. Previously hardcoded to 510 sectors (1MB) which exceeded the 120KB kernel limit, causing all reads to error and fall back to 6KB reads at 4.8 MB/s. Now auto-tunes to 48 sectors (96KB) or whatever the device supports.
+- **Result: 12.5 MB/s sustained, 23 MB/s peak** (was 4.8 MB/s)
+
+### LibreDrive — full init pipeline
+
+- **All 10 ARM handlers translated**: unlock, firmware upload (A: WRITE_BUFFER, B: MODE SELECT), calibrate (256 zones), register reads, status, probe, set_read_speed, keepalive, timing
+- **Cold boot firmware upload**: WRITE_BUFFER 1888B (A variant) or MODE SELECT 2496B (B variant) proven on hardware
+- **Speed calibration**: 256+ disc surface probes, 64-entry speed table, triple SET_CD_SPEED
+- **Platform trait locked down**: `pub(crate)`, 3 methods only (init, set_read_speed, is_ready)
+- **Init guard**: prevents double-init, signature mismatch aborts early
+
+### MPLS parser fixes
+
+- **PGS in audio slots**: subtitle language read at correct offset (was truncated: "ng " → "eng")
+- **Secondary PG entries**: n_pip_pg loop added for correct STN position tracking
+- **Secondary stream types**: stream_type 5 (sec audio), 6 (sec video), 7 (DV EL) attribute parsing
+- **Empty stream filter**: coding_type 0x00 entries (padding) no longer appear as "Unknown(0)"
+
+### Profiles
+
+- **206 profiles with full per-drive data**: ld_microcode (base64), all CDBs, speed tables, signatures
+- **Automated pipeline**: `sdf_unpack --profiles` → profiles.json (no manual merging)
+
 ## 0.4.0 (2026-04-07)
 
 ### Labels — complete rewrite
