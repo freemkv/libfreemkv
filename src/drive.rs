@@ -37,18 +37,18 @@ impl DriveSession {
     pub fn open(device: &Path) -> Result<Self> {
         let mut session = Self::open_no_unlock(device)?;
         session.wait_ready()?;
-        let _ = session.unlock();
+        let _ = session.init();
         Ok(session)
     }
 
-    /// Open a drive and immediately unlock for raw reads.
+    /// Open a drive and immediately init for raw reads.
     ///
     /// Use this when you need raw disc access without AACS (e.g. capture,
-    /// sector dumps). Skips AACS authentication — cannot be done after unlock.
+    /// sector dumps). Skips AACS authentication — cannot be done after init.
     pub fn open_unlocked(device: &Path) -> Result<Self> {
         let mut session = Self::open_no_unlock(device)?;
         session.wait_ready()?;
-        let _ = session.unlock();
+        let _ = session.init();
         Ok(session)
     }
 
@@ -118,9 +118,12 @@ impl DriveSession {
         &self.device_path
     }
 
-    /// Activate raw disc access mode (vendor-specific unlock).
-    pub fn unlock(&mut self) -> Result<()> {
-        self.platform.unlock(self.scsi.as_mut())
+    ///
+    /// This is the ONLY entry point for activating raw disc access.
+    /// Handles the full x86 dispatch sequence internally:
+    ///   unlock → [load_firmware if cold] × 6 → calibrate × 6 → registers
+    pub fn init(&mut self) -> Result<()> {
+        self.platform.init(self.scsi.as_mut())
     }
 
     /// Check if raw disc access mode is active.
@@ -128,40 +131,9 @@ impl DriveSession {
         self.platform.is_unlocked()
     }
 
-    /// Read drive status and feature flags.
-    pub fn status(&mut self) -> Result<DriveStatus> {
-        self.platform.status(self.scsi.as_mut())
-    }
-
-    /// Read drive configuration block.
-    pub fn read_config(&mut self) -> Result<Vec<u8>> {
-        self.platform.read_config(self.scsi.as_mut())
-    }
-
-    /// Read hardware register.
-    pub fn read_register(&mut self, index: u8) -> Result<[u8; 16]> {
-        self.platform.read_register(self.scsi.as_mut(), index)
-    }
-
-    /// Calibrate read speed for the current disc.
-    pub fn calibrate(&mut self) -> Result<()> {
-        self.platform.calibrate(self.scsi.as_mut())
-    }
-
-    /// Maintain read speed during bulk reading.
-    /// Call every ~2 seconds during ripping to prevent speed decay.
-    pub fn maintain_speed(&mut self, lba: u32) -> Result<()> {
-        self.platform.maintain_speed(self.scsi.as_mut(), lba)
-    }
-
-    /// Read raw disc sectors via platform-specific command.
-    pub fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        self.platform.read_sectors(self.scsi.as_mut(), lba, count, buf)
-    }
-
-    /// Platform-specific probe command.
-    pub fn probe(&mut self, sub_cmd: u8, address: u32, length: u32) -> Result<Vec<u8>> {
-        self.platform.probe(self.scsi.as_mut(), sub_cmd, address, length)
+    /// Called per zone change during content reads.
+    pub fn set_read_speed(&mut self, lba: u32) -> Result<()> {
+        self.platform.set_read_speed(self.scsi.as_mut(), lba)
     }
 
     /// SCSI READ(10) for disc filesystem data (UDF, MPLS, CLPI).

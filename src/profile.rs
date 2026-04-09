@@ -1,20 +1,21 @@
 //! Drive profile loading and matching.
 //!
-//! Each supported drive has a profile containing the SCSI command
-//! parameters needed to enable raw disc access mode. Profiles are
-//! loaded from JSON files so new drives can be added without rebuilding.
+//! The profile contains all per-drive data needed by the MT1959 platform handlers.
+//! Profiles are loaded from JSON so new drives can be added without rebuilding.
 
 use serde::Deserialize;
 use crate::error::{Error, Result};
 
-/// Per-drive profile containing SCSI parameters for raw disc access.
+///
 #[derive(Debug, Clone, Deserialize)]
 pub struct DriveProfile {
+    // ── Drive identity (from INQUIRY + GET_CONFIG) ─────────────────────
+
     /// Drive vendor from INQUIRY[8:16] (e.g. "HL-DT-ST")
     #[serde(default)]
     pub vendor_id: String,
 
-    /// Drive product (devtype) from INQUIRY product field (e.g. "BD-RE")
+    /// Drive product from INQUIRY[16:32] (e.g. "BD-RE BU40N")
     #[serde(default)]
     pub product_id: String,
 
@@ -30,42 +31,67 @@ pub struct DriveProfile {
     #[serde(default)]
     pub firmware_date: String,
 
-    /// Chipset manufacturer determining unlock/read command structure.
+    // ── Platform variant ───────────────────────────────────────────────
+
+    /// Chipset family: "mediatek" or "renesas".
     #[serde(default)]
     pub chipset: Chipset,
 
-    /// READ BUFFER mode byte for unlock CDB (e.g. 0x01 for MT1959-A, 0x02 for MT1959-B).
+    /// Program variant: "mt1959_a" or "mt1959_b".
+    /// Determines unlock mode/buf_id and handler layout.
+    #[serde(default)]
+    pub program: String,
+
+    /// READ_BUFFER mode byte (0x01 for mt1959_a, 0x02 for mt1959_b).
     #[serde(default = "default_unlock_mode")]
     pub unlock_mode: u8,
 
-    /// READ BUFFER buffer ID for unlock CDB (e.g. 0x44 for MT1959-A, 0x77 for MT1959-B).
+    /// READ_BUFFER buffer ID (0x44 for mt1959_a, 0x77 for mt1959_b).
     #[serde(default = "default_unlock_buf_id")]
     pub unlock_buf_id: u8,
 
 
-    /// Drive identifier string from the profile database.
-    #[serde(default)]
-    pub drive_id: String,
+    /// Used with unlock_response_size_minus_init to compute response size.
+    #[serde(default = "default_init_value")]
+    pub unlock_init_value: u8,
 
-    /// Profile version string.
-    #[serde(default)]
-    pub drive_version: String,
+    /// Response size = unlock_init_value + this (e.g. 1 + 63 = 64).
+    #[serde(default = "default_response_size_minus_init")]
+    pub unlock_response_size_minus_init: u8,
 
-    /// Expected response signature bytes [0:4] from the enable command.
+    /// Per-drive signature checked against unlock response[0:4].
     #[serde(default, deserialize_with = "deserialize_hex4")]
-    pub signature: [u8; 4],
+    pub drive_signature: [u8; 4],
 
-    /// Expected verification bytes [12:16] from the enable response.
-    #[serde(skip, default = "default_verify")]
-    pub verify: [u8; 4],
 
-    /// 10-byte READ BUFFER CDB used to enable raw disc access.
+    /// Uploaded on cold boot when unlock fails. ~1888 bytes typically.
+    /// Contains volatile RAM-only runtime code for the drive's MediaTek SOC.
+    #[serde(default, deserialize_with = "deserialize_base64")]
+    pub ld_microcode: Vec<u8>,
+
+    // ── Handlers 2/3: register reads ──────────────────────────────────
+
     #[serde(default, deserialize_with = "deserialize_hex_vec")]
-    pub unlock_cdb: Vec<u8>,
+    pub hardware_register_a_cdb: Vec<u8>,
 
-    /// Register read offsets (bytes 3-5 of READ BUFFER CDB).
-    #[serde(default)]
-    pub register_offsets: Vec<u32>,
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub hardware_register_b_cdb: Vec<u8>,
+
+
+    /// Pre-built SET_CD_SPEED CDB with drive's nominal speed (12 bytes).
+    /// Used in calibration "triple play": max → this → max.
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub drive_nominal_speed_cdb: Vec<u8>,
+
+
+    /// for per-zone speed decisions. Per-drive calibration constants.
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub speed_zone_table: Vec<u8>,
+
+    /// raw sector reads for speed math.
+    #[serde(default, deserialize_with = "deserialize_hex_vec")]
+    pub speed_calc_table: Vec<u8>,
+
 
     /// Drive supports reading DVDs regardless of region code.
     #[serde(default)]
@@ -82,41 +108,35 @@ pub struct DriveProfile {
     /// Drive supports unrestricted read speed.
     #[serde(default)]
     pub unrestricted_speed: bool,
+
+    // ── Metadata ──────────────────────────────────────────────────────
+
+    #[serde(default)]
+    pub drive_id: String,
+
+    #[serde(default)]
+    pub drive_version: String,
 }
 
-fn default_verify() -> [u8; 4] {
-    *b"MMkv"
-}
+fn default_unlock_mode() -> u8 { 0x01 }
+fn default_unlock_buf_id() -> u8 { 0x44 }
+fn default_init_value() -> u8 { 1 }
+fn default_response_size_minus_init() -> u8 { 0x3F }
 
-fn default_unlock_mode() -> u8 {
-    0x01
-}
-
-fn default_unlock_buf_id() -> u8 {
-    0x44
-}
-
-/// Drive chipset — determines CDB structure for unlock and raw read commands.
+/// Drive chipset family.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub enum Chipset {
-    /// MediaTek MT1959 — LG, ASUS, hp drives.
-    /// CDB: READ_BUFFER with mode and buf_id from profile.
     #[serde(rename = "mediatek")]
     MediaTek,
-    /// Renesas RS8xxx/RS9xxx — Pioneer, some HL-DT-ST drives.
-    /// Not yet implemented.
     #[serde(rename = "renesas")]
     Renesas,
 }
 
 impl Default for Chipset {
-    fn default() -> Self {
-        Chipset::MediaTek
-    }
+    fn default() -> Self { Chipset::MediaTek }
 }
 
 impl Chipset {
-    /// Human-readable name for this chipset.
     pub fn name(&self) -> &'static str {
         match self {
             Chipset::MediaTek => "MediaTek MT1959",
@@ -125,7 +145,8 @@ impl Chipset {
     }
 }
 
-/// Parse a hex string like "999ec375" into [u8; 4].
+// ── Hex/base64 parsing ─────────────────────────────────────────────────
+
 fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     if s.len() != 8 {
         return Err(Error::ProfileParse { detail: format!("expected 8 hex chars, got {}", s.len()) });
@@ -138,7 +159,6 @@ fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     Ok(out)
 }
 
-/// Parse a hex string into a byte vector.
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     if s.len() % 2 != 0 {
         return Err(Error::ProfileParse { detail: "odd hex length".into() });
@@ -151,94 +171,33 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Custom serde deserializer for 4-byte hex signature strings.
 fn deserialize_hex4<'de, D>(deserializer: D) -> std::result::Result<[u8; 4], D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+where D: serde::Deserializer<'de> {
     let s = String::deserialize(deserializer)?;
+    if s.is_empty() { return Ok([0; 4]); }
     parse_hex4(&s).map_err(serde::de::Error::custom)
 }
 
-/// Custom serde deserializer for hex-encoded byte vectors.
 fn deserialize_hex_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+where D: serde::Deserializer<'de> {
     let s = String::deserialize(deserializer)?;
+    if s.is_empty() { return Ok(Vec::new()); }
     parse_hex(&s).map_err(serde::de::Error::custom)
 }
 
-/// Load a profile from a parsed JSON value.
-pub fn load_from_json(json: &serde_json::Value) -> Result<DriveProfile> {
-    let vendor = json["vendor_id"].as_str().unwrap_or("").to_string();
-    let product = json["product_id"].as_str().unwrap_or("").to_string();
-    let revision = json["product_revision"].as_str().unwrap_or("").to_string();
-    let firmware_type = json["vendor_specific"].as_str().unwrap_or("").to_string();
-    let firmware_date = json["firmware_date"].as_str().unwrap_or("").to_string();
-    let chipset_str = json["chipset"].as_str().unwrap_or("unknown");
-
-    let chipset = match chipset_str {
-        "mediatek" => Chipset::MediaTek,
-        "renesas" => Chipset::Renesas,
-        _ => Chipset::MediaTek,
-    };
-
-    let unlock_mode = json["unlock_mode"].as_u64().map(|v| v as u8).unwrap_or(0x01);
-    let unlock_buf_id = json["unlock_buf_id"].as_u64().map(|v| v as u8).unwrap_or(0x44);
-
-    let sig_str = json["signature"].as_str().unwrap_or("");
-
-    let signature = if sig_str.len() == 8 {
-        parse_hex4(sig_str)?
-    } else {
-        [0; 4]
-    };
-
-    let unlock_cdb = json["unlock_cdb"].as_str()
-        .map(|s| parse_hex(s))
-        .transpose()?
-        .unwrap_or_default();
-
-    let register_offsets = json["register_cdbs"].as_array()
-        .map(|arr| {
-            arr.iter().filter_map(|v| {
-                let s = v.as_str()?;
-                // CDB format: 3c 01 44 XX XX XX 00 00 24 00
-                // Register offset is bytes 3-5 (chars 6-12 in hex)
-                if s.len() >= 12 {
-                    u32::from_str_radix(&s[6..12], 16).ok()
-                } else {
-                    None
-                }
-            }).collect()
-        })
-        .unwrap_or_default();
-
-    Ok(DriveProfile {
-        vendor_id: vendor,
-        product_id: product,
-        product_revision: revision,
-        vendor_specific: firmware_type,
-        firmware_date,
-        chipset,
-        unlock_mode,
-        unlock_buf_id,
-        drive_id: json["drive_id"].as_str().unwrap_or("").to_string(),
-        drive_version: json["drive_version"].as_str().unwrap_or("").to_string(),
-        signature,
-        verify: *b"MMkv",
-        unlock_cdb,
-        register_offsets,
-        dvd_all_regions: json["capabilities"]["dvd_all_regions"].as_bool().unwrap_or(false),
-        bd_raw_read: json["capabilities"]["bd_raw_read"].as_bool().unwrap_or(false),
-        bd_raw_metadata: json["capabilities"]["bd_raw_metadata"].as_bool().unwrap_or(false),
-        unrestricted_speed: json["capabilities"]["unrestricted_speed"].as_bool().unwrap_or(false),
-    })
+fn deserialize_base64<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where D: serde::Deserializer<'de> {
+    use base64::Engine;
+    let s = String::deserialize(deserializer)?;
+    if s.is_empty() { return Ok(Vec::new()); }
+    base64::engine::general_purpose::STANDARD
+        .decode(&s)
+        .map_err(serde::de::Error::custom)
 }
 
+// ── Loading ────────────────────────────────────────────────────────────
+
 /// Bundled profiles — compiled into the binary.
-/// Override with load_all() to load from a file instead.
 const BUNDLED_PROFILES: &str = include_str!("../profiles.json");
 
 /// Load profiles from the bundled database.
@@ -252,28 +211,13 @@ pub fn load_all(path: &std::path::Path) -> Result<Vec<DriveProfile>> {
     load_from_str(&data)
 }
 
-/// Parse profiles from a JSON string.
 fn load_from_str(data: &str) -> Result<Vec<DriveProfile>> {
-    let json: serde_json::Value = serde_json::from_str(data)
+    let arr: Vec<DriveProfile> = serde_json::from_str(data)
         .map_err(|e| Error::ProfileParse { detail: format!("JSON: {e}") })?;
-
-    let arr = json.as_array()
-        .ok_or_else(|| Error::ProfileParse { detail: "expected array".into() })?;
-
-    let mut profiles = Vec::with_capacity(arr.len());
-    for entry in arr {
-        match load_from_json(entry) {
-            Ok(p) => profiles.push(p),
-            Err(_) => continue, // skip malformed entries
-        }
-    }
-    Ok(profiles)
+    Ok(arr)
 }
 
 /// Find a profile matching a drive's INQUIRY fields.
-///
-/// Matches by vendor + product + revision + vendor_specific (firmware type).
-/// All fields trimmed before comparison.
 pub fn find_by_drive_id<'a>(
     profiles: &'a [DriveProfile],
     drive_id: &crate::identity::DriveId,
@@ -282,14 +226,14 @@ pub fn find_by_drive_id<'a>(
     let r = drive_id.product_revision.trim();
     let vs = drive_id.vendor_specific.trim();
 
-    // Match all four INQUIRY fields for precise identification
+    // Match all four INQUIRY fields
     profiles.iter().find(|p| {
         p.vendor_id.trim() == v
             && p.product_revision.trim() == r
             && p.vendor_specific.trim() == vs
             && p.firmware_date.trim() == drive_id.firmware_date.trim()
     })
-    // Fallback: match without date (for drives where 010C isn't available)
+    // Fallback: match without date
     .or_else(|| profiles.iter().find(|p| {
         p.vendor_id.trim() == v
             && p.product_revision.trim() == r

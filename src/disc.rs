@@ -793,12 +793,10 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
-        // Try to unlock for raw reads. Non-fatal — BD discs work without unlock.
         if !session.is_unlocked() {
-            let _ = session.unlock();
+            let _ = session.init();
         }
 
-        // Set max read speed — nothing else. No calibration, no probes.
         let speed_cdb = crate::scsi::build_set_cd_speed(0xFFFF);
         let mut dummy = [0u8; 0];
         let _ = session.scsi_execute(&speed_cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
