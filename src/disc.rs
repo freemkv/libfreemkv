@@ -793,9 +793,9 @@ impl Disc {
             detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
         })?;
 
-        // Ensure drive is unlocked
+        // Try to unlock for raw reads. Non-fatal — BD discs work without unlock.
         if !session.is_unlocked() {
-            session.unlock()?;
+            let _ = session.unlock();
         }
 
         // Set max read speed — nothing else. No calibration, no probes.
