@@ -113,12 +113,7 @@ impl Mt1959 {
 
         if response.len() >= FIRMWARE_ACTIVE_OFFSET + 4
             && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] != FIRMWARE_ACTIVE_SIG {
-            return Err(Error::UnlockFailed {
-                detail: format!(
-                    "mode not active: {:02x}{:02x}{:02x}{:02x}",
-                    response[12], response[13], response[14], response[15]
-                ),
-            });
+            return Err(Error::UnlockFailed);
         }
 
         self.unlocked = true;
@@ -148,9 +143,7 @@ impl Mt1959 {
             match self.do_unlock(scsi) {
                 Ok(_) => { unlocked = true; break; }
                 Err(Error::SignatureMismatch { .. }) => {
-                    return Err(Error::UnlockFailed {
-                        detail: "signature mismatch — wrong profile for this drive".into(),
-                    });
+                    return Err(Error::UnlockFailed);
                 }
                 Err(_) => {
                     let ok = if self.mode == MODE_A {
@@ -163,7 +156,7 @@ impl Mt1959 {
             }
         }
         if !unlocked {
-            return Err(Error::UnlockFailed { detail: "failed after 6 attempts".into() });
+            return Err(Error::UnlockFailed);
         }
         Ok(())
     }

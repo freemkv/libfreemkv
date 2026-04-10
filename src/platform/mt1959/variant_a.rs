@@ -12,9 +12,7 @@ const VERIFY_BUFFER_ID: u8 = 0x45;
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
     if firmware.is_empty() {
-        return Err(crate::error::Error::UnlockFailed {
-            detail: "no firmware in profile".into(),
-        });
+        return Err(crate::error::Error::UnlockFailed);
     }
 
     // Upload firmware via WRITE_BUFFER

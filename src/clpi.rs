@@ -114,11 +114,11 @@ impl ClipInfo {
 /// Parse a CLPI file from raw bytes.
 pub fn parse(data: &[u8]) -> Result<ClipInfo> {
     if data.len() < 40 {
-        return Err(Error::DiscError { detail: "CLPI too short".into() });
+        return Err(Error::ClpiParse);
     }
 
     if &data[0..4] != b"HDMV" {
-        return Err(Error::DiscError { detail: "not a CLPI file".into() });
+        return Err(Error::ClpiParse);
     }
     let version = String::from_utf8_lossy(&data[4..8]).to_string();
 

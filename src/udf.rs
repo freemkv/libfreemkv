@@ -80,16 +80,17 @@ impl UdfFs {
         for part in &parts[..parts.len() - 1] {
             current = current.entries.iter().find(|e| {
                 e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::DiscError {
-                detail: format!("directory not found: {}", part),
-            })?;
+            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
+)?;
         }
-        let filename = parts.last().unwrap();
+        let filename = match parts.last() {
+            Some(f) => f,
+            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+        };
         let entry = current.entries.iter().find(|e| {
             !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::DiscError {
-            detail: format!("file not found: {}", path),
-        })?;
+        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
+)?;
         let (data_lba, _) = self.read_icb_extent(session, entry.meta_lba)?;
         Ok(self.partition_start + data_lba)
     }
@@ -102,18 +103,19 @@ impl UdfFs {
         for part in &parts[..parts.len() - 1] {
             current = current.entries.iter().find(|e| {
                 e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::DiscError {
-                detail: format!("directory not found: {}", part),
-            })?;
+            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
+)?;
         }
 
         // Find the file
-        let filename = parts.last().unwrap();
+        let filename = match parts.last() {
+            Some(f) => f,
+            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+        };
         let entry = current.entries.iter().find(|e| {
             !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::DiscError {
-            detail: format!("file not found: {}", path),
-        })?;
+        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
+)?;
 
         // Read the file's ICB to get its data extent
         let (data_lba, data_len) = self.read_icb_extent(session, entry.meta_lba)?;
@@ -197,9 +199,7 @@ impl UdfFs {
     /// The data_lba is partition-relative.
     fn read_icb_extent(&self, session: &mut DriveSession, meta_lba: u32) -> Result<(u32, u32)> {
         let extents = self.read_icb_extents(session, meta_lba)?;
-        extents.first().copied().ok_or_else(|| Error::DiscError {
-            detail: "no allocation descriptors in ICB".into(),
-        })
+        extents.first().copied().ok_or_else(|| Error::DiscRead { sector: 0 })
     }
 
     /// Read ALL allocation extents for a file from its ICB.
@@ -225,9 +225,7 @@ impl UdfFs {
                 let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
                 (176 + l_ea, l_ad)
             }
-            _ => return Err(Error::DiscError {
-                detail: format!("unexpected ICB tag {} at meta_lba {}", tag, meta_lba),
-            }),
+            _ => return Err(Error::DiscRead { sector: 0 }),
         };
 
         let mut extents = Vec::new();
@@ -235,8 +233,8 @@ impl UdfFs {
 
         for i in 0..num_descriptors {
             let off = ad_offset + i * 8;
-            if off + 8 > 2048 {
-                break; // TODO: follow Allocation Extent Descriptors (tag 258) for overflow
+            if off + 8 > icb.len() {
+                break;
             }
 
             let raw_len = u32::from_le_bytes([icb[off], icb[off + 1], icb[off + 2], icb[off + 3]]);
@@ -263,16 +261,17 @@ impl UdfFs {
         for part in &parts[..parts.len() - 1] {
             current = current.entries.iter().find(|e| {
                 e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::DiscError {
-                detail: format!("directory not found: {}", part),
-            })?;
+            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
+)?;
         }
-        let filename = parts.last().unwrap();
+        let filename = match parts.last() {
+            Some(f) => f,
+            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+        };
         let entry = current.entries.iter().find(|e| {
             !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::DiscError {
-            detail: format!("file not found: {}", path),
-        })?;
+        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
+)?;
 
         let alloc_extents = self.read_icb_extents(session, entry.meta_lba)?;
         let mut disc_extents = Vec::new();
@@ -302,9 +301,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
 
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
     if tag_id != 2 {
-        return Err(Error::DiscError {
-            detail: format!("AVDP: expected tag 2, got {} at sector 256", tag_id),
-        });
+        return Err(Error::DiscRead { sector: 0 });
     }
 
     // Main VDS extent location: bytes [16:20] = LBA, [20:24] = length
@@ -344,16 +341,14 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
     }
 
     if partition_start == 0 {
-        return Err(Error::DiscError { detail: "UDF: no Partition Descriptor found".into() });
+        return Err(Error::DiscRead { sector: 0 });
     }
 
     // Step 3: Parse partition maps from LVD to find metadata partition
     // BD-ROM discs (UDF 2.50) use a metadata partition (Type 2 map with "*UDF Metadata Partition")
     // The metadata file is stored at lba=0 of the physical partition
     let metadata_start = if num_partition_maps >= 2 {
-        let lvd_sec = lvd_sector.ok_or_else(|| Error::DiscError {
-            detail: "UDF: no LVD found".into(),
-        })?;
+        let lvd_sec = lvd_sector.ok_or_else(|| Error::DiscRead { sector: 0 })?;
 
         // Read LVD to check partition map type
         let mut lvd = [0u8; 2048];
@@ -410,9 +405,7 @@ pub fn read_filesystem(session: &mut DriveSession) -> Result<UdfFs> {
 
     let fsd_tag = u16::from_le_bytes([fsd[0], fsd[1]]);
     if fsd_tag != 256 {
-        return Err(Error::DiscError {
-            detail: format!("FSD: expected tag 256, got {} at sector {}", fsd_tag, metadata_start),
-        });
+        return Err(Error::DiscRead { sector: 0 });
     }
 
     // Root Directory ICB: long_ad at FSD offset 400

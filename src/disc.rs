@@ -1,4 +1,4 @@
-//! Disc structure — scan titles, streams, and sector ranges from a Blu-ray disc.
+//! Disc structure -- scan titles, streams, and sector ranges from a Blu-ray disc.
 //!
 //! This is the high-level API for disc content. The CLI calls this,
 //! never parses MPLS/CLPI/UDF directly.
@@ -37,7 +37,7 @@ pub struct Disc {
     pub titles: Vec<Title>,
     /// Disc region
     pub region: DiscRegion,
-    /// AACS state — None if disc is unencrypted or keys unavailable
+    /// AACS state -- None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
     /// Whether this disc requires AACS decryption
     pub encrypted: bool,
@@ -70,11 +70,11 @@ pub enum DiscRegion {
 /// Blu-ray region codes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BdRegion {
-    /// Region A/1 — Americas, East Asia (Japan, Korea, Southeast Asia)
+    /// Region A/1 -- Americas, East Asia (Japan, Korea, Southeast Asia)
     A,
-    /// Region B/2 — Europe, Africa, Australia, Middle East
+    /// Region B/2 -- Europe, Africa, Australia, Middle East
     B,
-    /// Region C/3 — Central/South Asia, China, Russia
+    /// Region C/3 -- Central/South Asia, China, Russia
     C,
 }
 
@@ -310,7 +310,7 @@ pub struct AacsState {
     pub bus_encryption: bool,
     /// MKB version from disc (e.g. 68, 77)
     pub mkb_version: Option<u32>,
-    /// Disc hash (SHA1 of Unit_Key_RO.inf) — hex string with 0x prefix
+    /// Disc hash (SHA1 of Unit_Key_RO.inf) -- hex string with 0x prefix
     pub disc_hash: String,
     /// How keys were resolved
     pub key_source: KeySource,
@@ -318,9 +318,9 @@ pub struct AacsState {
     pub vuk: [u8; 16],
     /// Decrypted unit keys (CPS unit number, key)
     pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// Read data key for AACS 2.0 bus decryption — None for AACS 1.0
+    /// Read data key for AACS 2.0 bus decryption -- None for AACS 1.0
     pub read_data_key: Option<[u8; 16]>,
-    /// Volume ID (16 bytes) — from SCSI handshake
+    /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
 }
 
@@ -392,30 +392,84 @@ impl ScanOptions {
     }
 }
 
+/// A disc with an active drive session -- the main API.
+///
+/// Owns both the disc metadata and the drive connection.
+/// Created by `Disc::open()`. Provides `rip()` to read title data.
+pub struct OpenDisc {
+    pub disc: Disc,
+    pub session: DriveSession,
+}
+
+impl OpenDisc {
+    /// Open a drive, wait for disc, initialize, probe, and scan.
+    /// This is the single entry point -- one call does everything.
+    ///
+    pub fn open(device: &str, keydb_path: Option<&str>) -> Result<Self> {
+        use std::path::Path;
+
+        let mut session = DriveSession::open(Path::new(device))?;
+        session.wait_ready()?;
+
+        // Init (unlock + firmware) -- non-fatal if fails
+        let _ = session.init();
+        let _ = session.probe_disc();
+
+        let opts = if let Some(kp) = keydb_path {
+            ScanOptions::with_keydb(kp)
+        } else {
+            ScanOptions::default()
+        };
+
+        let disc = Disc::scan(&mut session, &opts)?;
+        Ok(Self { disc, session })
+    }
+
+    /// Rip a title to any output stream.
+    ///
+    /// Reads sectors from disc, decrypts AACS, handles errors/retries,
+    /// and writes decrypted BD-TS bytes to the output.
+    /// Knows nothing about the output format -- just calls `write_all()`.
+    ///
+    pub fn rip(&mut self, title_idx: usize, mut output: impl std::io::Write) -> Result<()> {
+        let mut reader = self.disc.open_title(&mut self.session, title_idx)?;
+
+        loop {
+            match reader.read_batch() {
+                Ok(Some(batch)) => {
+                    output.write_all(batch).map_err(|_| Error::WriteError)?;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // ContentReader handles retries internally
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Total bytes for a title (for progress tracking).
+    pub fn title_size(&self, title_idx: usize) -> u64 {
+        self.disc.titles.get(title_idx)
+            .map(|t| t.size_bytes)
+            .unwrap_or(0)
+    }
+}
+
 impl Disc {
     /// Disc capacity in GB
     pub fn capacity_gb(&self) -> f64 {
         self.capacity_sectors as f64 * 2048.0 / (1024.0 * 1024.0 * 1024.0)
     }
 
-    /// Scan a disc — parse filesystem, playlists, streams, and set up AACS decryption.
+    /// Scan a disc -- parse filesystem, playlists, streams, and set up AACS decryption.
     ///
     /// This is the main entry point. After scan(), the Disc is ready:
     ///   - titles are populated with streams
     ///   - AACS keys are derived (if KEYDB available)
     ///   - content can be read and decrypted transparently
     ///
-    /// ```no_run
-    /// use libfreemkv::{DriveSession, Disc};
-    /// use libfreemkv::disc::ScanOptions;
-    /// use std::path::Path;
-    ///
-    /// let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
-    /// let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
-    /// for title in &disc.titles {
-    ///     println!("{} — {} streams", title.duration_display(), title.streams.len());
-    /// }
-    /// ```
     /// Scan a disc. One pipeline, one order:
     ///   1. Read capacity
     ///   2. Read UDF filesystem
@@ -424,7 +478,7 @@ impl Disc {
     ///   5. Apply labels
     ///
     /// The session must be open and unlocked (DriveSession::open handles this).
-    /// All disc reads use standard READ(10) via UDF — no vendor SCSI commands.
+    /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
         use crate::aacs::{self, KeyDb};
 
@@ -434,7 +488,7 @@ impl Disc {
         // 2. UDF filesystem
         let udf_fs = udf::read_filesystem(session)?;
 
-        // 3. AACS — read files from disc via UDF, resolve keys via KEYDB
+        // 3. AACS -- read files from disc via UDF, resolve keys via KEYDB
         let encrypted = udf_fs.find_dir("/AACS").is_some()
             || udf_fs.find_dir("/BDMV/AACS").is_some();
 
@@ -496,16 +550,12 @@ impl Disc {
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
 
-        let keydb = KeyDb::load(keydb_path).map_err(|e| Error::AacsError {
-            detail: format!("failed to load KEYDB: {}", e),
-        })?;
+        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad { path: keydb_path.display().to_string() })?;
 
         // Read AACS files from disc via UDF (standard READ(10), no vendor commands)
         let uk_ro_data = udf_fs.read_file(session, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(session, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsError {
-                detail: "Unit_Key_RO.inf not found on disc".into(),
-            })?;
+            .map_err(|_| Error::AacsNoKeys)?;
 
         let cc_data = udf_fs.read_file(session, "/AACS/Content000.cer")
             .or_else(|_| udf_fs.read_file(session, "/AACS/Content001.cer"))
@@ -524,9 +574,7 @@ impl Disc {
             &vid_zero,
             &keydb,
             mkb_data.as_deref(),
-        ).ok_or_else(|| Error::AacsError {
-            detail: "disc not in KEYDB".into(),
-        })?;
+        ).ok_or_else(|| Error::AacsNoKeys)?;
 
         Ok(AacsState {
             version: if resolved.aacs2 { 2 } else { 1 },
@@ -606,7 +654,7 @@ impl Disc {
     }
 
     fn read_capacity(session: &mut DriveSession) -> Result<u32> {
-        let cdb = [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let cdb = [crate::scsi::SCSI_READ_CAPACITY, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut buf = [0u8; 8];
         session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000)?;
         let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -700,7 +748,7 @@ impl Disc {
                 })),
                 2 | 5 => {
                     // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
-                    // this is a misaligned stream — treat as subtitle, not audio
+                    // this is a misaligned stream -- treat as subtitle, not audio
                     if matches!(codec, Codec::Pgs) {
                         Some(Stream::Subtitle(SubtitleStream {
                             pid: s.pid,
@@ -726,7 +774,7 @@ impl Disc {
                     language: s.language.clone(),
                     forced: false,
                 })),
-                // Stream type 4 = IG, unknown types — skip
+                // Stream type 4 = IG, unknown types -- skip
                 _ => None,
             }
         }).collect();
@@ -781,25 +829,12 @@ pub struct ContentReader<'a> {
 }
 
 impl Disc {
-    /// Open a title for reading. Decryption is automatic — if the disc
+    /// Open a title for reading. Decryption is automatic -- if the disc
     /// is encrypted and keys were found during scan(), content is decrypted
     /// on the fly. Unencrypted discs pass through unchanged.
     ///
-    /// ```no_run
-    /// # use libfreemkv::{DriveSession, Disc};
-    /// # use libfreemkv::disc::ScanOptions;
-    /// # use std::path::Path;
-    /// # let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
-    /// let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
-    /// let mut reader = disc.open_title(&mut session, 0).unwrap();
-    /// while let Some(unit) = reader.read_unit().unwrap() {
-    ///     // unit is 6144 bytes of decrypted content
-    /// }
-    /// ```
     pub fn open_title<'a>(&'a self, session: &'a mut DriveSession, title_idx: usize) -> Result<ContentReader<'a>> {
-        let title = self.titles.get(title_idx).ok_or_else(|| Error::DiscError {
-            detail: format!("title index {} out of range (have {})", title_idx, self.titles.len()),
-        })?;
+        let title = self.titles.get(title_idx).ok_or_else(|| Error::DiscTitleRange { index: title_idx, count: self.titles.len() })?;
 
         // Let the drive manage its own read speed after init.
         // SET_CD_SPEED is only used reactively by the error handler to slow
@@ -905,7 +940,7 @@ impl<'a> ContentReader<'a> {
 
     /// Read the next batch of aligned units, decrypted in-place.
     /// Returns the decrypted data as a single contiguous slice.
-    /// More efficient than read_unit() — one write_all() per batch instead of per unit.
+    /// More efficient than read_unit() -- one write_all() per batch instead of per unit.
     /// Returns None when all extents are exhausted.
     pub fn read_batch(&mut self) -> Result<Option<&[u8]>> {
         if !self.fill_buffer()? {
@@ -1037,7 +1072,7 @@ impl<'a> ContentReader<'a> {
                         self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     } else {
-                        // At minimum batch — retry once with longer pause
+                        // At minimum batch -- retry once with longer pause
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
                         if self.read_sectors(lba, MIN_BATCH_SECTORS).is_ok() {
@@ -1051,7 +1086,7 @@ impl<'a> ContentReader<'a> {
                             }
                             return Ok(true);
                         }
-                        // Still failing — skip this unit (zero-fill)
+                        // Still failing -- skip this unit (zero-fill)
                         self.current_offset += 3;
                         if self.current_offset >= ext_sectors {
                             self.current_extent += 1;

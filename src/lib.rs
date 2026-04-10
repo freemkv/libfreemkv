@@ -1,4 +1,4 @@
-//! libfreemkv — Open source optical drive library for 4K UHD / Blu-ray / DVD.
+//! libfreemkv -- Open source optical drive library for 4K UHD / Blu-ray / DVD.
 //!
 //! Handles drive access, disc structure parsing, AACS decryption, and raw
 //! sector reading. 206 bundled drive profiles. No external files needed.
@@ -14,7 +14,7 @@
 //! let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
 //!
 //! for title in &disc.titles {
-//!     println!("{} — {} streams", title.duration_display(), title.streams.len());
+//!     println!("{} -- {} streams", title.duration_display(), title.streams.len());
 //! }
 //!
 //! // Read content (decrypted automatically if AACS keys available)
@@ -27,21 +27,21 @@
 //! # Architecture
 //!
 //! ```text
-//! DriveSession           — open, identify, unlock, read sectors
-//!   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS)
-//!   ├── DriveProfile     — per-drive unlock parameters (206 bundled)
-//!   ├── DriveId          — INQUIRY + GET_CONFIG identification
+//! DriveSession           -- open, identify, unlock, read sectors
+//!   ├── ScsiTransport    -- SG_IO (Linux), IOKit (macOS)
+//!   ├── DriveProfile     -- per-drive unlock parameters (206 bundled)
+//!   ├── DriveId          -- INQUIRY + GET_CONFIG identification
 //!   └── Platform
-//!       └── Mt1959       — MediaTek unlock/read (Renesas planned)
+//!       └── Mt1959       -- MediaTek unlock/read (Renesas planned)
 //!
-//! Disc                   — scan titles, streams, AACS state
-//!   ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions
-//!   ├── MPLS parser      — playlists → titles + clips + STN streams
-//!   ├── CLPI parser      — clip info → EP map → sector extents
-//!   ├── JAR parser       — BD-J audio track labels
-//!   └── AACS             — encryption: key resolution + content decrypt
-//!       ├── aacs         — KEYDB, VUK, MKB, unit decrypt
-//!       └── handshake    — SCSI auth, ECDH, bus key
+//! Disc                   -- scan titles, streams, AACS state
+//!   ├── UDF reader       -- Blu-ray UDF 2.50 with metadata partitions
+//!   ├── MPLS parser      -- playlists → titles + clips + STN streams
+//!   ├── CLPI parser      -- clip info → EP map → sector extents
+//!   ├── JAR parser       -- BD-J audio track labels
+//!   └── AACS             -- encryption: key resolution + content decrypt
+//!       ├── aacs         -- KEYDB, VUK, MKB, unit decrypt
+//!       └── handshake    -- SCSI auth, ECDH, bus key
 //! ```
 //!
 //! # AACS Encryption
@@ -55,7 +55,7 @@
 //! # Error Codes
 //!
 //! All errors are structured with numeric codes. No user-facing English
-//! text — applications format their own messages.
+//! text -- applications format their own messages.
 //!
 //! | Range | Category |
 //! |-------|----------|
@@ -81,14 +81,18 @@ pub mod disc;
 pub mod aacs;
 pub mod labels;
 pub mod keydb;
+pub mod event;
+pub mod mux;
 
 pub use error::{Error, Result};
+pub use event::{Event, EventKind};
 pub use drive::{DriveSession, find_drive, find_drives, resolve_device};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
-// Platform trait is pub(crate) — callers use DriveSession, not Platform directly
+// Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
 pub use disc::{Disc, DiscFormat, Title, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
                Codec, HdrFormat, ColorSpace,
                Extent, ContentReader, AacsState, KeySource, ScanOptions};
+pub use mux::MkvStream;

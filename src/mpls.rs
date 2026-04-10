@@ -62,17 +62,17 @@ pub struct StreamEntry {
 /// Parse an MPLS file from raw bytes.
 pub fn parse(data: &[u8]) -> Result<Playlist> {
     if data.len() < 40 {
-        return Err(Error::DiscError { detail: "MPLS too short".into() });
+        return Err(Error::MplsParse);
     }
     if &data[0..4] != b"MPLS" {
-        return Err(Error::DiscError { detail: "not an MPLS file".into() });
+        return Err(Error::MplsParse);
     }
 
     let version = String::from_utf8_lossy(&data[4..8]).to_string();
     let playlist_start = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
     if playlist_start + 10 > data.len() {
-        return Err(Error::DiscError { detail: "MPLS playlist offset out of range".into() });
+        return Err(Error::MplsParse);
     }
 
     let pl = &data[playlist_start..];
