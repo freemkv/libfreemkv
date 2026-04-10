@@ -65,12 +65,12 @@ pub struct ProfileMatch {
 
 fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     if s.len() != 8 {
-        return Err(Error::ProfileParse { detail: format!("expected 8 hex chars, got {}", s.len()) });
+        return Err(Error::ProfileParse);
     }
     let mut out = [0u8; 4];
     for i in 0..4 {
         out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16)
-            .map_err(|e| Error::ProfileParse { detail: format!("bad hex: {e}") })?;
+            .map_err(|_| Error::ProfileParse)?;
     }
     Ok(out)
 }
@@ -102,7 +102,7 @@ pub fn load_bundled() -> Result<ProfilesFile> {
 
 fn load_from_str(data: &str) -> Result<ProfilesFile> {
     serde_json::from_str(data)
-        .map_err(|e| Error::ProfileParse { detail: format!("JSON: {e}") })
+        .map_err(|_| Error::ProfileParse)
 }
 
 /// Find a profile matching a drive's INQUIRY fields.

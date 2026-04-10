@@ -103,7 +103,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 
 ## Contributing
 
-Run `freemkv info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to contribute your drive's profile.
+Run `freemkv drive-info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to contribute your drive's profile.
 
 ## License
 
