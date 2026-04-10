@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0 (2026-04-10)
+
+### API improvements
+
+- **`open()` works on all drives** — no profile match required. Unknown drives can scan, read BD/DVD at OEM speed. `init()` is optional and adds features (riplock removal, UHD reads, speed control).
+- **`has_profile()`** — check if unlock parameters are available for this drive
+- **`find_drives()`** — returns all optical drives, not just profile-matched ones
+- **`raw_gc_010c`** on `DriveId` — raw GET_CONFIG 010C response bytes for profile sharing
+
+### AACS 2.0
+
+- **SCSI handshake wired end-to-end** — ECDH key agreement, real Volume ID from drive, read data key for bus decryption
+- **Bus decryption active** — UHD discs with bus encryption now decrypted transparently
+- **VUK derivation from Media Key + VID** — works for discs not in KEYDB (processing key + device key paths)
+
+### MKV muxer
+
+- **15 new files** — EBML writer, TS demuxer, stream assembly pipeline
+- **Codec parsers** — H.264, HEVC, AC-3, DTS, TrueHD, PGS, VC-1
+- **`MkvStream`** — builder pattern, wraps any `impl Write`, configurable lookahead buffer
+
+### Cleanup
+
+- Removed orphaned `jar.rs` (342 lines) — replaced by `labels/` module
+- Error refactor: 40+ sites converted from English strings to typed error codes
+
 ## 0.5.0 (2026-04-09)
 
 ### Read pipeline — 5x speed improvement
