@@ -16,9 +16,9 @@ use crate::platform::mt1959::Mt1959;
 
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
-    driver: Box<dyn PlatformDriver>,
-    pub profile: DriveProfile,
-    pub platform: profile::Platform,
+    driver: Option<Box<dyn PlatformDriver>>,
+    pub profile: Option<DriveProfile>,
+    pub platform: Option<profile::Platform>,
     pub drive_id: DriveId,
     device_path: String,
 }
@@ -29,23 +29,29 @@ impl DriveSession {
         let profiles = profile::load_bundled()?;
         let drive_id = DriveId::from_drive(transport.as_mut())?;
 
-        let m = profile::find_by_drive_id(&profiles, &drive_id)
-            .ok_or_else(|| Error::UnsupportedDrive {
-                vendor_id: drive_id.vendor_id.trim().to_string(),
-                product_id: drive_id.product_id.trim().to_string(),
-                product_revision: drive_id.product_revision.trim().to_string(),
-            })?;
-
-        let driver = create_driver(m.platform, &m.profile)?;
+        let m = profile::find_by_drive_id(&profiles, &drive_id);
+        let (driver, platform, profile) = match m {
+            Some(m) => (
+                create_driver(m.platform, &m.profile).ok(),
+                Some(m.platform),
+                Some(m.profile),
+            ),
+            None => (None, None, None),
+        };
 
         Ok(DriveSession {
             scsi: transport,
             driver,
-            platform: m.platform,
-            profile: m.profile,
+            platform,
+            profile,
             drive_id,
             device_path: device.to_string_lossy().to_string(),
         })
+    }
+
+    /// Whether this drive has a known profile (unlock parameters available).
+    pub fn has_profile(&self) -> bool {
+        self.profile.is_some()
     }
 
     pub fn wait_ready(&mut self) -> Result<()> {
@@ -65,27 +71,48 @@ impl DriveSession {
     }
 
     pub fn platform_name(&self) -> &str {
-        self.platform.name()
+        match self.platform {
+            Some(ref p) => p.name(),
+            None => "Unknown",
+        }
     }
 
     pub fn device_path(&self) -> &str {
         &self.device_path
     }
 
-    /// Initialize drive — unlock + firmware upload. Removes riplock.
+    /// Initialize drive — unlock + firmware upload.
+    /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
     pub fn init(&mut self) -> Result<()> {
-        self.driver.init(self.scsi.as_mut())
+        match self.driver {
+            Some(ref mut d) => d.init(self.scsi.as_mut()),
+            None => Err(Error::UnsupportedDrive {
+                vendor_id: self.drive_id.vendor_id.trim().to_string(),
+                product_id: self.drive_id.product_id.trim().to_string(),
+                product_revision: self.drive_id.product_revision.trim().to_string(),
+            }),
+        }
     }
 
     /// Probe disc surface so the drive firmware learns optimal read speeds
     /// per region. After this the host reads at max speed and the drive
     /// manages zones internally.
     pub fn probe_disc(&mut self) -> Result<()> {
-        self.driver.probe_disc(self.scsi.as_mut())
+        match self.driver {
+            Some(ref mut d) => d.probe_disc(self.scsi.as_mut()),
+            None => Err(Error::UnsupportedDrive {
+                vendor_id: self.drive_id.vendor_id.trim().to_string(),
+                product_id: self.drive_id.product_id.trim().to_string(),
+                product_revision: self.drive_id.product_revision.trim().to_string(),
+            }),
+        }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.driver.is_ready()
+        match self.driver {
+            Some(ref d) => d.is_ready(),
+            None => false,
+        }
     }
 
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
@@ -140,10 +167,8 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
         if !std::path::Path::new(&path).exists() { continue; }
         if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
             if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                let profiles = match profile::load_bundled() {
-                    Ok(p) => p, Err(_) => continue,
-                };
-                if profile::find_by_drive_id(&profiles, &id).is_some() {
+                // Include all optical drives (peripheral device type 0x05)
+                if id.raw_inquiry.len() > 0 && (id.raw_inquiry[0] & 0x1F) == 0x05 {
                     drives.push((path, id));
                 }
             }

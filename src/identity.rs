@@ -44,6 +44,9 @@ pub struct DriveId {
 
     /// Raw 96-byte INQUIRY response for additional parsing if needed.
     pub raw_inquiry: Vec<u8>,
+
+    /// Raw GET CONFIGURATION Feature 010Ch response bytes.
+    pub raw_gc_010c: Vec<u8>,
 }
 
 impl DriveId {
@@ -84,6 +87,7 @@ impl DriveId {
             firmware_date,
             serial_number,
             raw_inquiry: inquiry.to_vec(),
+            raw_gc_010c: gc[..result.bytes_transferred].to_vec(),
         })
     }
 
@@ -98,6 +102,7 @@ impl DriveId {
             firmware_date: firmware_date.to_string(),
             serial_number: String::new(),
             raw_inquiry: inquiry.to_vec(),
+            raw_gc_010c: Vec::new(),
         }
     }
 
