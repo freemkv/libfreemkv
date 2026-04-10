@@ -7,9 +7,7 @@
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// H.264 NAL unit types we care about.
-const NAL_SLICE: u8 = 1;
 const NAL_SLICE_IDR: u8 = 5;
-const NAL_SEI: u8 = 6;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
