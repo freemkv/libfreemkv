@@ -53,7 +53,7 @@ while let Some(unit) = reader.read_unit()? {
 - **12+ MB/s reads** — auto-detects kernel transfer limits, sustained full speed
 - **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
 - **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
-- **AACS decryption** — transparent key resolution and content decrypt (1.0, 2.0 in progress)
+- **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0 bus decryption)
 - **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
 - **Content reading** — adaptive batch reads with automatic decryption and error recovery
 
@@ -62,9 +62,9 @@ AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB
 ## Architecture
 
 ```text
-DriveSession           — open, identify, init (optional), read sectors
+DriveSession           — open any drive, identify, init (optional), read sectors
   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS)
-  ├── DriveProfile     — per-drive parameters (bundled)
+  ├── DriveProfile     — per-drive unlock parameters (bundled)
   └── PlatformDriver   — MediaTek (supported), Renesas (planned)
 
 Disc                   — scan titles, streams, AACS state
