@@ -1190,7 +1190,7 @@ mod tests {
         if !keydb_path.exists() { return; }
 
         let db = crate::aacs::KeyDb::load(&keydb_path).unwrap();
-        if let Some(hc) = &db.host_cert {
+        if let Some(hc) = db.host_certs.first() {
             let valid = verify_cert(&hc.certificate);
             eprintln!("Host cert verification: {}", if valid { "PASS" } else { "FAIL" });
             // Note: our cert is revoked but should still have valid LA signature
