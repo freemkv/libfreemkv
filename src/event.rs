@@ -4,7 +4,7 @@
 //! The app registers a callback to receive them.
 //! No display logic, no English text — just data.
 //!
-//! ```rust
+//! ```rust,ignore
 //! disc.rip(&mut session, 0, output, |event| {
 //!     match event.kind {
 //!         EventKind::BytesRead { bytes, total } => update_progress(bytes, total),

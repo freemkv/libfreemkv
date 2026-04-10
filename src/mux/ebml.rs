@@ -234,7 +234,7 @@ mod tests {
 
         buf.clear();
         write_size(&mut buf, 127).unwrap();
-        assert_eq!(buf, [0xC0, 127]); // 127 >= 0x7F, uses 2 bytes
+        assert_eq!(buf, [0x40, 127]); // 127 >= 0x7F, uses 2 bytes: (0>>8)|0x40, 127
 
         buf.clear();
         write_size(&mut buf, 126).unwrap();

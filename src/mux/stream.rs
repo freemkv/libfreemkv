@@ -1,6 +1,6 @@
 //! MkvStream — a Write adapter that demuxes BD-TS and writes MKV.
 //!
-//! ```rust
+//! ```rust,ignore
 //! let output = MkvStream::new(file)
 //!     .title(&disc.titles[0])
 //!     .max_buffer(20 * 1024 * 1024);
