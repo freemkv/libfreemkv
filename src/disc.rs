@@ -480,8 +480,6 @@ impl Disc {
     /// The session must be open and unlocked (DriveSession::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
-        use crate::aacs::{self, KeyDb};
-
         // 1. Capacity
         let capacity = Self::read_capacity(session)?;
 
