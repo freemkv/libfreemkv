@@ -16,9 +16,7 @@ const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3,
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
     if firmware.is_empty() {
-        return Err(crate::error::Error::UnlockFailed {
-            detail: "no firmware in profile".into(),
-        });
+        return Err(crate::error::Error::UnlockFailed);
     }
 
     // Step 1: Upload firmware via MODE SELECT

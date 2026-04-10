@@ -203,7 +203,9 @@ fn ec_add(p1: &EcPoint, p2: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
         (p - (&p1.x - &p2.x) % p) % p
     };
 
-    let dx_inv = mod_inv(&dx, p).unwrap();
+    // Safety: mod_inv only returns None if dx == 0 (points identical),
+    // which is prevented by the caller using ec_double for that case.
+    let dx_inv = mod_inv(&dx, p).expect("ec_add: dx has no inverse");
     let lam = (&dy * &dx_inv) % p;
 
     // x3 = λ² - x1 - x2 mod p
@@ -247,7 +249,9 @@ fn ec_double(pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
 
     let numerator = (&three * &pt.x * &pt.x + a) % p;
     let denominator = (&two * &pt.y) % p;
-    let denom_inv = mod_inv(&denominator, p).unwrap();
+    // Safety: mod_inv only returns None if 2*y == 0 (point at infinity),
+    // which shouldn't occur with valid curve points.
+    let denom_inv = mod_inv(&denominator, p).expect("ec_double: denominator has no inverse");
     let lam = (&numerator * &denom_inv) % p;
 
     // x3 = λ² - 2x mod p
@@ -715,7 +719,7 @@ pub fn aacs_authenticate(
     host_cert: &[u8],
 ) -> Result<AacsAuth> {
     if host_cert.len() < 92 {
-        return Err(Error::AacsError { detail: "host certificate too short".into() });
+        return Err(Error::AacsCertShort);
     }
 
     // Step 1: Invalidate all AGIDs
@@ -727,7 +731,7 @@ pub fn aacs_authenticate(
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
     let response = scsi_read(session, &cdb, 8)
-        .map_err(|e| Error::AacsError { detail: format!("failed to allocate AGID: {}", e) })?;
+        .map_err(|_| Error::AacsAgidAlloc)?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce and ephemeral key pair
@@ -744,12 +748,12 @@ pub fn aacs_authenticate(
 
     let cdb = cdb_send_key(agid, 0x01, 116);
     scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsError { detail: "drive rejected host certificate".into() })?;
+        .map_err(|_| Error::AacsCertRejected)?;
 
     // Step 5: Read drive certificate + nonce (REPORT KEY format 0x01)
     let cdb = cdb_report_key(agid, 0x01, 116);
     let response = scsi_read(session, &cdb, 116)
-        .map_err(|_| Error::AacsError { detail: "failed to read drive certificate".into() })?;
+        .map_err(|_| Error::AacsCertRead)?;
 
     let mut drive_nonce = [0u8; 20];
     let mut drive_cert = [0u8; 92];
@@ -760,7 +764,7 @@ pub fn aacs_authenticate(
     if drive_cert[0] == 0x01 {
         // AACS 1.0 certificate
         if !verify_cert(&drive_cert) {
-            return Err(Error::AacsError { detail: "drive certificate verification failed".into() });
+            return Err(Error::AacsCertVerify);
         }
     } else if drive_cert[0] == 0x11 {
         // AACS 2.0 certificate — verify with P-256 LA key
@@ -771,7 +775,7 @@ pub fn aacs_authenticate(
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
     let cdb = cdb_report_key(agid, 0x02, 84);
     let response = scsi_read(session, &cdb, 84)
-        .map_err(|_| Error::AacsError { detail: "failed to read drive key".into() })?;
+        .map_err(|_| Error::AacsKeyRead)?;
 
     let mut drive_key_point = [0u8; 40];   // x(20) + y(20)
     let mut drive_key_sig = [0u8; 40];     // r(20) + s(20)
@@ -790,7 +794,7 @@ pub fn aacs_authenticate(
     sig_s.copy_from_slice(&drive_key_sig[20..40]);
 
     if !ecdsa_verify(&drive_pub_x, &drive_pub_y, &sig_r, &sig_s, &verify_data) {
-        return Err(Error::AacsError { detail: "drive key signature verification failed".into() });
+        return Err(Error::AacsKeyVerify);
     }
 
     // Step 7: Sign host key point (ECDSA over drive_nonce || host_key_point)
@@ -811,7 +815,7 @@ pub fn aacs_authenticate(
 
     let cdb = cdb_send_key(agid, 0x02, 84);
     scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsError { detail: "drive rejected host key".into() })?;
+        .map_err(|_| Error::AacsKeyRejected)?;
 
     // Step 9: Compute bus key via ECDH
     let mut dkp_x = [0u8; 20];
@@ -851,12 +855,8 @@ pub fn aacs2_authenticate(
     }
 
     // AACS 2.0 native P-256 handshake
-    let host_priv_v2 = host_priv_key_v2.ok_or_else(|| Error::AacsError {
-        detail: "AACS 2.0 host credentials required but not available".into(),
-    })?;
-    let host_cert_v2 = host_cert_v2.ok_or_else(|| Error::AacsError {
-        detail: "AACS 2.0 host certificate required but not available".into(),
-    })?;
+    let host_priv_v2 = host_priv_key_v2.ok_or(Error::AacsCertShort)?;
+    let host_cert_v2 = host_cert_v2.ok_or(Error::AacsCertShort)?;
 
     aacs2_authenticate_p256(session, host_priv_v2, host_cert_v2)
 }
@@ -869,7 +869,7 @@ fn aacs2_authenticate_p256(
     host_cert: &[u8],
 ) -> Result<AacsAuth> {
     if host_cert.len() < 132 {
-        return Err(Error::AacsError { detail: "AACS 2.0 host cert too short".into() });
+        return Err(Error::AacsCertShort);
     }
 
     // Step 1: Invalidate all AGIDs
@@ -881,7 +881,7 @@ fn aacs2_authenticate_p256(
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
     let response = scsi_read(session, &cdb, 8)
-        .map_err(|_| Error::AacsError { detail: "AGID allocation failed".into() })?;
+        .map_err(|_| Error::AacsAgidAlloc)?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce + P-256 ephemeral key pair
@@ -899,13 +899,13 @@ fn aacs2_authenticate_p256(
 
     let cdb = cdb_send_key(agid, 0x01, 156);
     scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsError { detail: "drive rejected AACS 2.0 host cert".into() })?;
+        .map_err(|_| Error::AacsCertRejected)?;
 
     // Step 5: Read drive certificate + nonce
     // AACS 2.0 drive cert is also 132 bytes
     let cdb = cdb_report_key(agid, 0x01, 156);
     let response = scsi_read(session, &cdb, 156)
-        .map_err(|_| Error::AacsError { detail: "failed to read AACS 2.0 drive cert".into() })?;
+        .map_err(|_| Error::AacsCertRead)?;
 
     let mut drive_nonce = [0u8; 20];
     drive_nonce.copy_from_slice(&response[4..24]);
@@ -919,7 +919,7 @@ fn aacs2_authenticate_p256(
     // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
     let cdb = cdb_report_key(agid, 0x02, 132);
     let response = scsi_read(session, &cdb, 132)
-        .map_err(|_| Error::AacsError { detail: "failed to read AACS 2.0 drive key".into() })?;
+        .map_err(|_| Error::AacsKeyRead)?;
 
     let drive_key_x = &response[4..36];
     let drive_key_y = &response[36..68];
@@ -934,7 +934,7 @@ fn aacs2_authenticate_p256(
     verify_data.extend_from_slice(drive_key_y);
 
     if !ecdsa_verify_p256(&drive_pub_x, &drive_pub_y, drive_sig_r, drive_sig_s, &verify_data) {
-        return Err(Error::AacsError { detail: "AACS 2.0 drive key verification failed".into() });
+        return Err(Error::AacsKeyVerify);
     }
 
     // Step 7: Sign host key point
@@ -955,7 +955,7 @@ fn aacs2_authenticate_p256(
 
     let cdb = cdb_send_key(agid, 0x02, 132);
     scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsError { detail: "drive rejected AACS 2.0 host key".into() })?;
+        .map_err(|_| Error::AacsKeyRejected)?;
 
     // Step 9: Compute bus key via P-256 ECDH
     let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y);
@@ -978,7 +978,7 @@ pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
     // REPORT DISC STRUCTURE format 0x80
     let cdb = cdb_report_disc_structure(auth.agid, 0x80, 36);
     let response = scsi_read(session, &cdb, 36)
-        .map_err(|_| Error::AacsError { detail: "failed to read Volume ID".into() })?;
+        .map_err(|_| Error::AacsVidRead)?;
 
     let mut vid = [0u8; 16];
     let mut mac = [0u8; 16];
@@ -988,7 +988,7 @@ pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
     // Verify MAC: AES-CMAC(VID, bus_key) should equal mac
     let calc_mac = aes_cmac_16(&vid, &auth.bus_key);
     if calc_mac != mac {
-        return Err(Error::AacsError { detail: "VID MAC verification failed".into() });
+        return Err(Error::AacsVidMac);
     }
 
     auth.volume_id = Some(vid);
@@ -1000,7 +1000,7 @@ pub fn read_data_keys(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
     // REPORT DISC STRUCTURE format 0x84
     let cdb = cdb_report_disc_structure(auth.agid, 0x84, 36);
     let response = scsi_read(session, &cdb, 36)
-        .map_err(|_| Error::AacsError { detail: "failed to read data keys".into() })?;
+        .map_err(|_| Error::AacsDataKey)?;
 
     let mut enc_rdk = [0u8; 16];
     let mut enc_wdk = [0u8; 16];
