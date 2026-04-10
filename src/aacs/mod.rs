@@ -27,7 +27,7 @@ pub struct KeyDb {
     /// Processing keys (pre-computed media keys for specific MKB versions)
     pub processing_keys: Vec<[u8; 16]>,
     /// Host certificate + private key for SCSI authentication
-    pub host_cert: Option<HostCert>,
+    pub host_certs: Vec<HostCert>,
     /// Per-disc VUK entries indexed by disc hash (hex lowercase)
     pub disc_entries: HashMap<String, DiscEntry>,
 }
@@ -105,7 +105,7 @@ impl KeyDb {
         let mut db = KeyDb {
             device_keys: Vec::new(),
             processing_keys: Vec::new(),
-            host_cert: None,
+            host_certs: Vec::new(),
             disc_entries: HashMap::new(),
         };
 
@@ -135,7 +135,7 @@ impl KeyDb {
 
             // Host Certificate (AACS 2.0)
             if line.starts_with("| HC2") {
-                if let Some(ref mut hc) = db.host_cert {
+                if let Some(hc) = db.host_certs.last_mut() {
                     if let Some((pk, cert)) = Self::parse_host_cert_v2(line) {
                         hc.private_key_v2 = Some(pk);
                         hc.certificate_v2 = Some(cert);
@@ -146,7 +146,9 @@ impl KeyDb {
 
             // Host Certificate (AACS 1.0)
             if line.starts_with("| HC") {
-                db.host_cert = Self::parse_host_cert(line);
+                if let Some(hc) = Self::parse_host_cert(line) {
+                    db.host_certs.push(hc);
+                }
                 continue;
             }
 
@@ -1342,7 +1344,7 @@ mod tests {
 
         assert_eq!(db.device_keys.len(), 4);
         assert_eq!(db.processing_keys.len(), 3);
-        assert!(db.host_cert.is_some());
+        assert!(!db.host_certs.is_empty());
         assert!(db.disc_entries.len() > 170000);
 
         // Look up Dune: Part Two

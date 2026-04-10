@@ -322,6 +322,8 @@ pub struct AacsState {
     pub read_data_key: Option<[u8; 16]>,
     /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
+    /// Handshake error code if authentication failed (None = no HC, or success)
+    pub handshake_error: Option<crate::error::Error>,
 }
 
 /// How AACS keys were resolved.
@@ -567,19 +569,28 @@ impl Disc {
         // AACS SCSI handshake — get Volume ID (and read data key for AACS 2.0)
         let mut volume_id = [0u8; 16];
         let mut read_data_key = None;
+        let mut handshake_error = None;
 
-        if let Some(ref hc) = keydb.host_cert {
-            if let Ok(mut auth) = aacs::handshake::aacs_authenticate(
+        for hc in &keydb.host_certs {
+            match aacs::handshake::aacs_authenticate(
                 session, &hc.private_key, &hc.certificate,
             ) {
-                // Read Volume ID (needed for MK → VUK derivation)
-                if let Ok(vid) = aacs::handshake::read_volume_id(session, &mut auth) {
-                    volume_id = vid;
-                }
+                Ok(mut auth) => {
+                    // Read Volume ID (needed for MK → VUK derivation)
+                    if let Ok(vid) = aacs::handshake::read_volume_id(session, &mut auth) {
+                        volume_id = vid;
+                    }
 
-                // Read data keys for bus decryption (AACS 2.0 / UHD)
-                if let Ok((rdk, _wdk)) = aacs::handshake::read_data_keys(session, &mut auth) {
-                    read_data_key = Some(rdk);
+                    // Read data keys for bus decryption (AACS 2.0 / UHD)
+                    if let Ok((rdk, _wdk)) = aacs::handshake::read_data_keys(session, &mut auth) {
+                        read_data_key = Some(rdk);
+                    }
+
+                    handshake_error = None;
+                    break;
+                }
+                Err(e) => {
+                    handshake_error = Some(e);
                 }
             }
         }
@@ -609,6 +620,7 @@ impl Disc {
             unit_keys: resolved.unit_keys,
             read_data_key,
             volume_id,
+            handshake_error,
         })
     }
 
