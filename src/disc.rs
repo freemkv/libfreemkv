@@ -564,12 +564,31 @@ impl Disc {
             .ok();
         let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
 
+        // AACS SCSI handshake — get Volume ID (and read data key for AACS 2.0)
+        let mut volume_id = [0u8; 16];
+        let mut read_data_key = None;
+
+        if let Some(ref hc) = keydb.host_cert {
+            if let Ok(mut auth) = aacs::handshake::aacs_authenticate(
+                session, &hc.private_key, &hc.certificate,
+            ) {
+                // Read Volume ID (needed for MK → VUK derivation)
+                if let Ok(vid) = aacs::handshake::read_volume_id(session, &mut auth) {
+                    volume_id = vid;
+                }
+
+                // Read data keys for bus decryption (AACS 2.0 / UHD)
+                if let Ok((rdk, _wdk)) = aacs::handshake::read_data_keys(session, &mut auth) {
+                    read_data_key = Some(rdk);
+                }
+            }
+        }
+
         // Resolve: disc hash → KEYDB lookup → VUK → unit keys
-        let vid_zero = [0u8; 16];
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
-            &vid_zero,
+            &volume_id,
             &keydb,
             mkb_data.as_deref(),
         ).ok_or_else(|| Error::AacsNoKeys)?;
@@ -588,8 +607,8 @@ impl Disc {
             },
             vuk: resolved.vuk,
             unit_keys: resolved.unit_keys,
-            read_data_key: None,
-            volume_id: [0u8; 16],
+            read_data_key,
+            volume_id,
         })
     }
 
