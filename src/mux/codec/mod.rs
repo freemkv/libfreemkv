@@ -8,15 +8,16 @@
 //! - Convert PTS from 90kHz to nanoseconds
 
 pub mod ac3;
+pub mod dts;
 pub mod h264;
 pub mod hevc;
-pub mod vc1;
-pub mod dts;
-pub mod truehd;
+pub mod mpeg2;
 pub mod pgs;
+pub mod truehd;
+pub mod vc1;
 
-use crate::disc::Codec;
 use super::ts::PesPacket;
+use crate::disc::Codec;
 
 /// A single frame ready for MKV muxing.
 pub struct Frame {
@@ -53,7 +54,9 @@ pub struct PassthroughParser {
 
 impl PassthroughParser {
     pub fn new(always_keyframe: bool) -> Self {
-        Self { keyframe: always_keyframe }
+        Self {
+            keyframe: always_keyframe,
+        }
     }
 }
 
@@ -77,6 +80,7 @@ pub fn parser_for_codec(codec: Codec) -> Box<dyn CodecParser> {
     match codec {
         Codec::H264 => Box::new(h264::H264Parser::new()),
         Codec::Hevc => Box::new(hevc::HevcParser::new()),
+        Codec::Mpeg2 => Box::new(mpeg2::Mpeg2Parser::new()),
         Codec::Vc1 => Box::new(vc1::Vc1Parser::new()),
         Codec::Ac3 | Codec::Ac3Plus => Box::new(ac3::Ac3Parser::new()),
         Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => Box::new(dts::DtsParser::new()),

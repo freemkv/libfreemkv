@@ -7,10 +7,10 @@
 //! NetworkStream reader can hand off to any output stream (MKV, M2TS, etc.)
 //! with full metadata (labels, languages, duration).
 
-use std::io::{self, Read, Write, BufReader, BufWriter};
-use std::net::{TcpListener, TcpStream};
-use super::{IOStream, meta};
+use super::{meta, IOStream};
 use crate::disc::DiscTitle;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::net::{TcpListener, TcpStream};
 
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
@@ -37,7 +37,6 @@ impl NetworkStream {
     /// Sends FMKV metadata header on first write.
     pub fn connect(addr: &str) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
         Ok(Self {
             disc_title: DiscTitle::empty(),
             mode: Mode::Write {
@@ -64,10 +63,12 @@ impl NetworkStream {
 
         // Read FMKV metadata header (inline, since TcpStream doesn't impl Seek)
         let disc_title = meta::read_header_from_stream(&mut reader)?
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::InvalidData,
-                "no FMKV metadata header from sender",
-            ))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no FMKV metadata header from sender",
+                )
+            })?
             .to_title();
 
         Ok(Self {
@@ -79,10 +80,14 @@ impl NetworkStream {
 }
 
 impl IOStream for NetworkStream {
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
 
     fn finish(&mut self) -> io::Result<()> {
-        if self.finished { return Ok(()); }
+        if self.finished {
+            return Ok(());
+        }
         self.finished = true;
         if let Mode::Write { ref mut writer, .. } = self.mode {
             writer.flush()?;
@@ -95,7 +100,10 @@ impl IOStream for NetworkStream {
 impl Write for NetworkStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.mode {
-            Mode::Write { ref mut writer, ref mut header_written } => {
+            Mode::Write {
+                ref mut writer,
+                ref mut header_written,
+            } => {
                 if !*header_written {
                     if !self.disc_title.streams.is_empty() {
                         let m = meta::M2tsMeta::from_title(&self.disc_title);
@@ -105,7 +113,10 @@ impl Write for NetworkStream {
                 }
                 writer.write(buf)
             }
-            Mode::Read { .. } => Err(io::Error::new(io::ErrorKind::Unsupported, "stream opened for reading")),
+            Mode::Read { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stream opened for reading",
+            )),
         }
     }
 
@@ -122,7 +133,10 @@ impl Read for NetworkStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.mode {
             Mode::Read { ref mut reader } => reader.read(buf),
-            Mode::Write { .. } => Err(io::Error::new(io::ErrorKind::Unsupported, "stream opened for writing")),
+            Mode::Write { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stream opened for writing",
+            )),
         }
     }
 }

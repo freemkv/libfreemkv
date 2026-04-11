@@ -3,7 +3,7 @@
 //! EBML uses variable-length integers for element IDs and sizes.
 //! This module provides low-level writers for constructing MKV files.
 
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Write an EBML element ID (1-4 bytes, already encoded).
 /// Element IDs are predefined constants — we write them verbatim.
@@ -15,7 +15,12 @@ pub fn write_id(w: &mut impl Write, id: u32) -> io::Result<()> {
     } else if id <= 0xFF_FFFF {
         w.write_all(&[(id >> 16) as u8, (id >> 8) as u8, id as u8])
     } else {
-        w.write_all(&[(id >> 24) as u8, (id >> 16) as u8, (id >> 8) as u8, id as u8])
+        w.write_all(&[
+            (id >> 24) as u8,
+            (id >> 16) as u8,
+            (id >> 8) as u8,
+            id as u8,
+        ])
     }
 }
 
@@ -27,11 +32,7 @@ pub fn write_size(w: &mut impl Write, size: u64) -> io::Result<()> {
     } else if size < 0x3FFF {
         w.write_all(&[((size >> 8) as u8) | 0x40, size as u8])
     } else if size < 0x1F_FFFF {
-        w.write_all(&[
-            ((size >> 16) as u8) | 0x20,
-            (size >> 8) as u8,
-            size as u8,
-        ])
+        w.write_all(&[((size >> 16) as u8) | 0x20, (size >> 8) as u8, size as u8])
     } else if size < 0x0FFF_FFFF {
         w.write_all(&[
             ((size >> 24) as u8) | 0x10,
@@ -75,8 +76,10 @@ pub fn write_uint(w: &mut impl Write, id: u32, val: u64) -> io::Result<()> {
     } else if val <= 0xFFFF_FFFF {
         write_size(w, 4)?;
         w.write_all(&[
-            (val >> 24) as u8, (val >> 16) as u8,
-            (val >> 8) as u8, val as u8,
+            (val >> 24) as u8,
+            (val >> 16) as u8,
+            (val >> 8) as u8,
+            val as u8,
         ])
     } else {
         write_size(w, 8)?;
@@ -163,9 +166,15 @@ pub fn read_id(r: &mut impl Read) -> io::Result<(u32, usize)> {
     } else if b0 & 0x10 != 0 {
         let mut b = [0u8; 3];
         r.read_exact(&mut b)?;
-        Ok((((b0 as u32) << 24) | (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32, 4))
+        Ok((
+            ((b0 as u32) << 24) | (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32,
+            4,
+        ))
     } else {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "invalid EBML ID"))
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid EBML ID",
+        ))
     }
 }
 
@@ -178,46 +187,78 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
 
     if b0 & 0x80 != 0 {
         let val = (b0 & 0x7F) as u64;
-        if val == 0x7F { return Ok((u64::MAX, 1)); } // unknown
+        if val == 0x7F {
+            return Ok((u64::MAX, 1));
+        } // unknown
         Ok((val, 1))
     } else if b0 & 0x40 != 0 {
         let mut b = [0u8; 1];
         r.read_exact(&mut b)?;
         let val = (((b0 & 0x3F) as u64) << 8) | b[0] as u64;
-        if val == 0x3FFF { return Ok((u64::MAX, 2)); }
+        if val == 0x3FFF {
+            return Ok((u64::MAX, 2));
+        }
         Ok((val, 2))
     } else if b0 & 0x20 != 0 {
         let mut b = [0u8; 2];
         r.read_exact(&mut b)?;
         let val = (((b0 & 0x1F) as u64) << 16) | (b[0] as u64) << 8 | b[1] as u64;
-        if val == 0x1FFFFF { return Ok((u64::MAX, 3)); }
+        if val == 0x1FFFFF {
+            return Ok((u64::MAX, 3));
+        }
         Ok((val, 3))
     } else if b0 & 0x10 != 0 {
         let mut b = [0u8; 3];
         r.read_exact(&mut b)?;
-        let val = (((b0 & 0x0F) as u64) << 24) | (b[0] as u64) << 16 | (b[1] as u64) << 8 | b[2] as u64;
-        if val == 0x0FFFFFFF { return Ok((u64::MAX, 4)); }
+        let val =
+            (((b0 & 0x0F) as u64) << 24) | (b[0] as u64) << 16 | (b[1] as u64) << 8 | b[2] as u64;
+        if val == 0x0FFFFFFF {
+            return Ok((u64::MAX, 4));
+        }
         Ok((val, 4))
     } else if b0 & 0x08 != 0 {
         let mut b = [0u8; 4];
         r.read_exact(&mut b)?;
-        let val = (((b0 & 0x07) as u64) << 32) | (b[0] as u64) << 24 | (b[1] as u64) << 16 | (b[2] as u64) << 8 | b[3] as u64;
+        let val = (((b0 & 0x07) as u64) << 32)
+            | (b[0] as u64) << 24
+            | (b[1] as u64) << 16
+            | (b[2] as u64) << 8
+            | b[3] as u64;
         Ok((val, 5))
     } else if b0 & 0x04 != 0 {
         let mut b = [0u8; 5];
         r.read_exact(&mut b)?;
-        let val = (((b0 & 0x03) as u64) << 40) | (b[0] as u64) << 32 | (b[1] as u64) << 24 | (b[2] as u64) << 16 | (b[3] as u64) << 8 | b[4] as u64;
+        let val = (((b0 & 0x03) as u64) << 40)
+            | (b[0] as u64) << 32
+            | (b[1] as u64) << 24
+            | (b[2] as u64) << 16
+            | (b[3] as u64) << 8
+            | b[4] as u64;
         Ok((val, 6))
     } else if b0 & 0x02 != 0 {
         let mut b = [0u8; 6];
         r.read_exact(&mut b)?;
-        let val = (((b0 & 0x01) as u64) << 48) | (b[0] as u64) << 40 | (b[1] as u64) << 32 | (b[2] as u64) << 24 | (b[3] as u64) << 16 | (b[4] as u64) << 8 | b[5] as u64;
+        let val = (((b0 & 0x01) as u64) << 48)
+            | (b[0] as u64) << 40
+            | (b[1] as u64) << 32
+            | (b[2] as u64) << 24
+            | (b[3] as u64) << 16
+            | (b[4] as u64) << 8
+            | b[5] as u64;
         Ok((val, 7))
     } else {
         let mut b = [0u8; 7];
         r.read_exact(&mut b)?;
-        let val = (b[0] as u64) << 48 | (b[1] as u64) << 40 | (b[2] as u64) << 32 | (b[3] as u64) << 24 | (b[4] as u64) << 16 | (b[5] as u64) << 8 | b[6] as u64;
-        if val == 0x00FFFFFFFFFFFFFF { return Ok((u64::MAX, 8)); }
+        let val = (b[0] as u64) << 48
+            | (b[1] as u64) << 40
+            | (b[2] as u64) << 32
+            | (b[3] as u64) << 24
+            | (b[4] as u64) << 16
+            | (b[5] as u64) << 8
+            | b[6] as u64;
+        if val == 0x00FFFFFFFFFFFFFF {
+            return Ok((u64::MAX, 8));
+        }
         Ok((val, 8))
     }
 }
@@ -258,7 +299,9 @@ pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     // Strip trailing nulls
-    while buf.last() == Some(&0) { buf.pop(); }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -274,13 +317,18 @@ pub fn read_vint(r: &mut impl Read) -> io::Result<(u64, usize)> {
     let mut first = [0u8; 1];
     r.read_exact(&mut first)?;
     let b0 = first[0];
-    if b0 & 0x80 != 0 { return Ok(((b0 & 0x7F) as u64, 1)); }
+    if b0 & 0x80 != 0 {
+        return Ok(((b0 & 0x7F) as u64, 1));
+    }
     if b0 & 0x40 != 0 {
         let mut b = [0u8; 1];
         r.read_exact(&mut b)?;
         return Ok(((((b0 & 0x3F) as u64) << 8) | b[0] as u64, 2));
     }
-    Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported VINT width"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "unsupported VINT width",
+    ))
 }
 
 // ============================================================
@@ -389,7 +437,7 @@ mod tests {
     fn test_write_uint() {
         let mut buf = Vec::new();
         write_uint(&mut buf, 0x4286, 1).unwrap(); // EBML_VERSION = 1
-        // ID: 42 86, Size: 81 (1 byte), Data: 01
+                                                  // ID: 42 86, Size: 81 (1 byte), Data: 01
         assert_eq!(buf, [0x42, 0x86, 0x81, 0x01]);
     }
 
@@ -460,7 +508,19 @@ mod tests {
 
     #[test]
     fn write_read_size_roundtrip() {
-        let test_sizes: &[u64] = &[0, 1, 0x7E, 127, 128, 0x3FFE, 16383, 16384, 0x1FFFFE, 0x0FFFFFFE, 0x1_0000_0000];
+        let test_sizes: &[u64] = &[
+            0,
+            1,
+            0x7E,
+            127,
+            128,
+            0x3FFE,
+            16383,
+            16384,
+            0x1FFFFE,
+            0x0FFFFFFE,
+            0x1_0000_0000,
+        ];
         for &size in test_sizes {
             let mut buf = Vec::new();
             write_size(&mut buf, size).unwrap();
@@ -472,7 +532,17 @@ mod tests {
 
     #[test]
     fn write_read_uint_roundtrip() {
-        let test_vals: &[u64] = &[0, 1, 127, 255, 256, 0xFFFF, 0xFF_FFFF, 0xFFFF_FFFF, 1_000_000_000_000];
+        let test_vals: &[u64] = &[
+            0,
+            1,
+            127,
+            255,
+            256,
+            0xFFFF,
+            0xFF_FFFF,
+            0xFFFF_FFFF,
+            1_000_000_000_000,
+        ];
         let test_id = EBML_VERSION;
         for &val in test_vals {
             let mut buf = Vec::new();
@@ -488,7 +558,13 @@ mod tests {
 
     #[test]
     fn write_read_string_roundtrip() {
-        let test_strings = &["", "matroska", "freemkv", "Hello, World!", "unicode: \u{1F600}"];
+        let test_strings = &[
+            "",
+            "matroska",
+            "freemkv",
+            "Hello, World!",
+            "unicode: \u{1F600}",
+        ];
         let test_id = EBML_DOC_TYPE;
         for &s in test_strings {
             let mut buf = Vec::new();
@@ -504,7 +580,16 @@ mod tests {
 
     #[test]
     fn write_read_float_roundtrip() {
-        let test_vals: &[f64] = &[0.0, 1.0, -1.0, 3.14159265358979, 48000.0, 7200000.0, f64::MIN, f64::MAX];
+        let test_vals: &[f64] = &[
+            0.0,
+            1.0,
+            -1.0,
+            3.14159265358979,
+            48000.0,
+            7200000.0,
+            f64::MIN,
+            f64::MAX,
+        ];
         let test_id = DURATION;
         for &val in test_vals {
             let mut buf = Vec::new();
@@ -515,7 +600,12 @@ mod tests {
             let (size, _) = read_size(&mut cursor).unwrap();
             assert_eq!(size, 8);
             let read_val = read_float_val(&mut cursor, size as usize).unwrap();
-            assert_eq!(read_val.to_bits(), val.to_bits(), "float roundtrip failed for {}", val);
+            assert_eq!(
+                read_val.to_bits(),
+                val.to_bits(),
+                "float roundtrip failed for {}",
+                val
+            );
         }
     }
 
@@ -526,7 +616,10 @@ mod tests {
         assert_eq!(buf.len(), 8);
         assert_eq!(buf[0], 0x01);
         for &b in &buf[1..] {
-            assert_eq!(b, 0xFF, "unknown size bytes should all be 0xFF after first byte");
+            assert_eq!(
+                b, 0xFF,
+                "unknown size bytes should all be 0xFF after first byte"
+            );
         }
         // Reading it back should yield u64::MAX
         let mut cursor = Cursor::new(&buf);

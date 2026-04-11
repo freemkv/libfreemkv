@@ -12,9 +12,9 @@
 //!   sub_com1_idx="23,24,25" />
 //! ```
 
+use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
-use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier};
 
 pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
@@ -31,12 +31,13 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
 
     // Parse audio streams
     if let Some(aud) = extract_attr(&feature, "aud") {
-        let com_idx = extract_attr(&feature, "aud_com1_idx")
-            .and_then(|s| s.parse::<usize>().ok());
+        let com_idx = extract_attr(&feature, "aud_com1_idx").and_then(|s| s.parse::<usize>().ok());
 
         for (i, lang) in aud.split(',').enumerate() {
             let lang = lang.trim();
-            if lang.is_empty() { continue; }
+            if lang.is_empty() {
+                continue;
+            }
             let purpose = if com_idx == Some(i) {
                 LabelPurpose::Commentary
             } else {
@@ -67,7 +68,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
 
         for (i, lang) in sub.split(',').enumerate() {
             let lang = lang.trim();
-            if lang.is_empty() { continue; }
+            if lang.is_empty() {
+                continue;
+            }
 
             let purpose = if com_indices.contains(&i) {
                 LabelPurpose::Commentary
@@ -94,7 +97,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
         }
     }
 
-    if labels.is_empty() { return None; }
+    if labels.is_empty() {
+        return None;
+    }
     Some(labels)
 }
 
@@ -134,7 +139,7 @@ fn find_feature_playlist(xml: &str) -> Option<String> {
 }
 
 /// Extract an XML attribute value from an element string.
-fn extract_attr<'a>(element: &'a str, name: &str) -> Option<String> {
+fn extract_attr(element: &str, name: &str) -> Option<String> {
     let needle = format!("{}=\"", name);
     let start = element.find(&needle)? + needle.len();
     let end = element[start..].find('"')? + start;

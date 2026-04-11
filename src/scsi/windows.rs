@@ -5,8 +5,8 @@
 //!
 //! Requires administrator privileges for raw SCSI access.
 
-use crate::error::{Error, Result};
 use super::{DataDirection, ScsiResult, ScsiTransport};
+use crate::error::{Error, Result};
 use std::path::Path;
 
 // ── Windows constants ──────────────────────────────────────────────────────
@@ -89,7 +89,9 @@ pub struct SptiTransport {
 
 /// Normalize a device path to Windows \\.\X: format.
 fn normalize_device_path(path: &str) -> String {
-    if path.starts_with("\\\\.\\") { return path.to_string(); }
+    if path.starts_with("\\\\.\\") {
+        return path.to_string();
+    }
     let trimmed = path.trim_end_matches('\\');
     if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
         return format!("\\\\.\\{}", trimmed);
@@ -134,7 +136,9 @@ impl SptiTransport {
 
 impl Drop for SptiTransport {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle); }
+        unsafe {
+            CloseHandle(self.handle);
+        }
     }
 }
 
@@ -159,7 +163,11 @@ impl ScsiTransport for SptiTransport {
         };
         sptwb.spt.DataTransferLength = data.len() as u32;
         sptwb.spt.TimeOutValue = (timeout_ms / 1000).max(1) as u32;
-        sptwb.spt.DataBuffer = if data.is_empty() { std::ptr::null_mut() } else { data.as_mut_ptr() };
+        sptwb.spt.DataBuffer = if data.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            data.as_mut_ptr()
+        };
         sptwb.spt.SenseInfoOffset = std::mem::offset_of!(SptwbDirect, sense) as u32;
         sptwb.spt.Cdb[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
 
@@ -188,7 +196,11 @@ impl ScsiTransport for SptiTransport {
         }
 
         if sptwb.spt.ScsiStatus != 0 {
-            let sense_key = if sptwb.sense[2] != 0 { sptwb.sense[2] & 0x0F } else { 0 };
+            let sense_key = if sptwb.sense[2] != 0 {
+                sptwb.sense[2] & 0x0F
+            } else {
+                0
+            };
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: sptwb.spt.ScsiStatus,
@@ -206,4 +218,3 @@ impl ScsiTransport for SptiTransport {
         })
     }
 }
-

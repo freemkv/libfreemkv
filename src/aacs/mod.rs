@@ -15,9 +15,9 @@
 
 pub mod handshake;
 
-use std::collections::HashMap;
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
-use aes::cipher::{BlockEncrypt, BlockDecrypt, KeyInit, generic_array::GenericArray};
+use std::collections::HashMap;
 
 /// Parsed AACS key database.
 #[derive(Debug)]
@@ -74,10 +74,12 @@ pub struct DiscEntry {
 /// Parse a hex string like "0xABCD..." into bytes.
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if s.len() % 2 != 0 { return None; }
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in (0..s.len()).step_by(2) {
-        out.push(u8::from_str_radix(&s[i..i+2], 16).ok()?);
+        out.push(u8::from_str_radix(&s[i..i + 2], 16).ok()?);
     }
     Some(out)
 }
@@ -85,7 +87,9 @@ fn parse_hex(s: &str) -> Option<Vec<u8>> {
 /// Parse hex into a fixed-size array.
 fn parse_hex16(s: &str) -> Option<[u8; 16]> {
     let v = parse_hex(s)?;
-    if v.len() != 16 { return None; }
+    if v.len() != 16 {
+        return None;
+    }
     let mut out = [0u8; 16];
     out.copy_from_slice(&v);
     Some(out)
@@ -93,7 +97,9 @@ fn parse_hex16(s: &str) -> Option<[u8; 16]> {
 
 fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     let v = parse_hex(s)?;
-    if v.len() != 20 { return None; }
+    if v.len() != 20 {
+        return None;
+    }
     let mut out = [0u8; 20];
     out.copy_from_slice(&v);
     Some(out)
@@ -171,17 +177,27 @@ impl KeyDb {
 
     /// Look up a disc by its hash. Returns the VUK if found.
     pub fn find_vuk(&self, disc_hash: &str) -> Option<[u8; 16]> {
-        let hash = disc_hash.trim().to_lowercase().trim_start_matches("0x").to_string();
+        let hash = disc_hash
+            .trim()
+            .to_lowercase()
+            .trim_start_matches("0x")
+            .to_string();
         // Try with 0x prefix and without
-        self.disc_entries.get(&format!("0x{}", hash))
+        self.disc_entries
+            .get(&format!("0x{}", hash))
             .or_else(|| self.disc_entries.get(&hash))
             .and_then(|e| e.vuk)
     }
 
     /// Look up a disc by its hash. Returns the full entry.
     pub fn find_disc(&self, disc_hash: &str) -> Option<&DiscEntry> {
-        let hash = disc_hash.trim().to_lowercase().trim_start_matches("0x").to_string();
-        self.disc_entries.get(&format!("0x{}", hash))
+        let hash = disc_hash
+            .trim()
+            .to_lowercase()
+            .trim_start_matches("0x")
+            .to_string();
+        self.disc_entries
+            .get(&format!("0x{}", hash))
             .or_else(|| self.disc_entries.get(&hash))
     }
 
@@ -192,7 +208,14 @@ impl KeyDb {
         let key_str = line.split("DEVICE_KEY").nth(1)?.split('|').next()?.trim();
         let node_str = line.split("DEVICE_NODE").nth(1)?.split('|').next()?.trim();
         let uv_str = line.split("KEY_UV").nth(1)?.split('|').next()?.trim();
-        let shift_str = line.split("KEY_U_MASK_SHIFT").nth(1)?.split(';').next()?.split('|').next()?.trim();
+        let shift_str = line
+            .split("KEY_U_MASK_SHIFT")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .split('|')
+            .next()?
+            .trim();
 
         Some(DeviceKey {
             key: parse_hex16(key_str)?,
@@ -214,8 +237,20 @@ impl KeyDb {
 
     fn parse_host_cert(line: &str) -> Option<HostCert> {
         // | HC | HOST_PRIV_KEY 0x... | HOST_CERT 0x...
-        let priv_str = line.split("HOST_PRIV_KEY").nth(1)?.split('|').next()?.trim();
-        let cert_str = line.split("HOST_CERT").nth(1)?.split(';').next()?.split('|').next()?.trim();
+        let priv_str = line
+            .split("HOST_PRIV_KEY")
+            .nth(1)?
+            .split('|')
+            .next()?
+            .trim();
+        let cert_str = line
+            .split("HOST_CERT")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .split('|')
+            .next()?
+            .trim();
 
         Some(HostCert {
             private_key: parse_hex20(priv_str)?,
@@ -227,16 +262,32 @@ impl KeyDb {
 
     /// Parse AACS 2.0 host cert: `| HC2 | HOST_PRIV_KEY 0x... | HOST_CERT 0x...`
     fn parse_host_cert_v2(line: &str) -> Option<([u8; 32], Vec<u8>)> {
-        let priv_str = line.split("HOST_PRIV_KEY").nth(1)?.split('|').next()?.trim();
-        let cert_str = line.split("HOST_CERT").nth(1)?.split(';').next()?.split('|').next()?.trim();
+        let priv_str = line
+            .split("HOST_PRIV_KEY")
+            .nth(1)?
+            .split('|')
+            .next()?
+            .trim();
+        let cert_str = line
+            .split("HOST_CERT")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .split('|')
+            .next()?
+            .trim();
 
         let priv_bytes = parse_hex(priv_str)?;
-        if priv_bytes.len() != 32 { return None; }
+        if priv_bytes.len() != 32 {
+            return None;
+        }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&priv_bytes);
 
         let cert = parse_hex(cert_str)?;
-        if cert.len() < 132 { return None; }
+        if cert.len() < 132 {
+            return None;
+        }
 
         Some((pk, cert))
     }
@@ -251,7 +302,7 @@ impl KeyDb {
         // Clean title: "TITLE_NAME (Display Title)" → use display title if present
         let title = if let Some(start) = title_part.find('(') {
             if let Some(end) = title_part.rfind(')') {
-                title_part[start+1..end].to_string()
+                title_part[start + 1..end].to_string()
             } else {
                 title_part.to_string()
             }
@@ -271,26 +322,26 @@ impl KeyDb {
             match parts[i].trim() {
                 "M" => {
                     if i + 1 < parts.len() {
-                        media_key = parse_hex16(parts[i+1].trim());
+                        media_key = parse_hex16(parts[i + 1].trim());
                         i += 1;
                     }
                 }
                 "I" => {
                     if i + 1 < parts.len() {
-                        disc_id = parse_hex16(parts[i+1].trim());
+                        disc_id = parse_hex16(parts[i + 1].trim());
                         i += 1;
                     }
                 }
                 "V" => {
                     if i + 1 < parts.len() {
-                        vuk = parse_hex16(parts[i+1].trim());
+                        vuk = parse_hex16(parts[i + 1].trim());
                         i += 1;
                     }
                 }
                 "U" => {
                     if i + 1 < parts.len() {
                         // Unit keys: "1-0xKEY" or "1-0xKEY ; comment"
-                        let uk_str = parts[i+1].split(';').next().unwrap_or("").trim();
+                        let uk_str = parts[i + 1].split(';').next().unwrap_or("").trim();
                         for uk in uk_str.split(' ') {
                             let uk = uk.trim();
                             if let Some((num, key)) = uk.split_once('-') {
@@ -324,8 +375,7 @@ impl KeyDb {
 
 /// Fixed IV used by AACS for all AES-CBC operations.
 const AACS_IV: [u8; 16] = [
-    0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3,
-    0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
+    0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
 ];
 
 /// Size of an AACS aligned unit (3 × 2048-byte sectors).
@@ -425,7 +475,7 @@ pub struct UnitKeyFile {
 
 /// Compute disc hash (SHA1 of Unit_Key_RO.inf content).
 pub fn disc_hash(data: &[u8]) -> [u8; 20] {
-    use sha1::{Sha1, Digest};
+    use sha1::{Digest, Sha1};
     let hash = Sha1::digest(data);
     let mut out = [0u8; 20];
     out.copy_from_slice(&hash);
@@ -481,8 +531,13 @@ pub fn parse_unit_key_ro(data: &[u8], aacs2: bool) -> Option<UnitKeyFile> {
     let num_uk = u16::from_be_bytes([data[uk_pos], data[uk_pos + 1]]) as usize;
     if num_uk == 0 {
         return Some(UnitKeyFile {
-            disc_hash: hash, app_type, num_bdmv_dir, use_skb_mkb,
-            aacs2, encrypted_keys: Vec::new(), title_cps_unit: Vec::new(),
+            disc_hash: hash,
+            app_type,
+            num_bdmv_dir,
+            use_skb_mkb,
+            aacs2,
+            encrypted_keys: Vec::new(),
+            title_cps_unit: Vec::new(),
         });
     }
 
@@ -557,7 +612,10 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
     let cvalues = mkb_find_cvalues(mkb)?;
 
     // Count UV entries (each 5 bytes, stop when high bits set)
-    let num_uvs = uvs.chunks(5).take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0).count();
+    let num_uvs = uvs
+        .chunks(5)
+        .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
+        .count();
 
     // Try each processing key against each UV/cvalue pair
     for pk in processing_keys {
@@ -574,7 +632,12 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
 
 /// Validate a processing key against a cvalue/UV pair.
 /// Returns the Media Key if valid.
-fn validate_processing_key(pk: &[u8; 16], cvalue: &[u8], _uv: &[u8], mk_dv: &[u8; 16]) -> Option<[u8; 16]> {
+fn validate_processing_key(
+    pk: &[u8; 16],
+    cvalue: &[u8],
+    _uv: &[u8],
+    mk_dv: &[u8; 16],
+) -> Option<[u8; 16]> {
     if cvalue.len() < 16 {
         return None;
     }
@@ -611,7 +674,9 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() { break; }
+        if rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
 
         if rec_type == 0x10 && rec_len >= 20 {
             // mk_dv is at offset 4 (after record header)
@@ -630,7 +695,9 @@ fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() { break; }
+        if rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
 
         if rec_type == 0x04 && rec_len > 4 {
             return Some(mkb[pos + 4..pos + rec_len].to_vec());
@@ -646,7 +713,9 @@ fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() { break; }
+        if rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
 
         if rec_type == 0x07 && rec_len > 4 {
             return Some(mkb[pos + 4..pos + rec_len].to_vec());
@@ -662,10 +731,17 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() { break; }
+        if rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
 
         if rec_type == 0x81 && rec_len >= 8 {
-            return Some(u32::from_be_bytes([mkb[pos + 4], mkb[pos + 5], mkb[pos + 6], mkb[pos + 7]]));
+            return Some(u32::from_be_bytes([
+                mkb[pos + 4],
+                mkb[pos + 5],
+                mkb[pos + 6],
+                mkb[pos + 7],
+            ]));
         }
         pos += rec_len;
     }
@@ -676,8 +752,7 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
 
 /// AACS-G3 seed constant.
 const AESG3_SEED: [u8; 16] = [
-    0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5,
-    0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
+    0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
 ];
 
 /// AACS-G3: derive a subkey from a parent key.
@@ -714,7 +789,7 @@ fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> 
         let mut bit_pos: i32 = -1;
         for i in (0..32).rev() {
             if (current_v_mask & (1u32 << i)) == 0 {
-                bit_pos = i as i32;
+                bit_pos = i;
                 break;
             }
         }
@@ -736,16 +811,16 @@ fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> 
 }
 
 /// Derive Media Key from MKB using device keys (subset-difference tree).
-pub fn derive_media_key_from_dk(
-    mkb: &[u8],
-    device_keys: &[DeviceKey],
-) -> Option<[u8; 16]> {
+pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option<[u8; 16]> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
     let cvalues = mkb_find_cvalues(mkb)?;
 
     // Count UV entries
-    let num_uvs = uvs.chunks(5).take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0).count();
+    let num_uvs = uvs
+        .chunks(5)
+        .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
+        .count();
 
     for dk in device_keys {
         let device_number = dk.node as u32;
@@ -760,28 +835,30 @@ pub fn derive_media_key_from_dk(
             }
 
             let uv = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
-            if uv == 0 { continue; }
+            if uv == 0 {
+                continue;
+            }
 
             let u_mask: u32 = 0xFFFFFFFF << u_mask_shift;
             let v_mask = calc_v_mask(uv);
 
-            if ((device_number & u_mask) == (uv & u_mask)) &&
-               ((device_number & v_mask) != (uv & v_mask))
+            if ((device_number & u_mask) == (uv & u_mask))
+                && ((device_number & v_mask) != (uv & v_mask))
             {
                 // Found matching subset-difference — find the right device key
                 let dev_key_v_mask = calc_v_mask(dk.uv);
                 let dev_key_u_mask: u32 = 0xFFFFFFFF << dk.u_mask_shift;
 
-                if u_mask == dev_key_u_mask &&
-                   (uv & dev_key_v_mask) == (dk.uv & dev_key_v_mask)
-                {
+                if u_mask == dev_key_u_mask && (uv & dev_key_v_mask) == (dk.uv & dev_key_v_mask) {
                     // Derive processing key via tree traversal
                     let pk = calc_pk_from_dk(&dk.key, uv, v_mask, dev_key_v_mask);
 
                     // Validate and derive media key
                     if uvs_idx < cvalues.len() / 16 {
                         let cv = &cvalues[uvs_idx * 16..(uvs_idx + 1) * 16];
-                        if let Some(mk) = validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], &mk_dv) {
+                        if let Some(mk) =
+                            validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], &mk_dv)
+                        {
                             return Some(mk);
                         }
                     }
@@ -799,21 +876,32 @@ const MKB_PACK_SIZE: usize = 32772;
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs.
-pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::error::Result<Vec<u8>> {
+pub fn read_mkb_from_drive(
+    session: &mut crate::drive::DriveSession,
+) -> crate::error::Result<Vec<u8>> {
     use crate::scsi::{DataDirection, SCSI_READ_DISC_STRUCTURE};
 
     let cdb = [
-        SCSI_READ_DISC_STRUCTURE, 0x01,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, MKB_DISC_STRUCTURE_FORMAT,
-        (MKB_PACK_SIZE >> 8) as u8, (MKB_PACK_SIZE & 0xFF) as u8,
-        0x00, 0x00,
+        SCSI_READ_DISC_STRUCTURE,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        MKB_DISC_STRUCTURE_FORMAT,
+        (MKB_PACK_SIZE >> 8) as u8,
+        (MKB_PACK_SIZE & 0xFF) as u8,
+        0x00,
+        0x00,
     ];
     let mut buf = vec![0u8; 32772];
     session.scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
 
     let data_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    if data_len < 2 { return Ok(Vec::new()); }
+    if data_len < 2 {
+        return Ok(Vec::new());
+    }
     let len = data_len - 2;
     let num_packs = buf[3] as usize;
 
@@ -825,11 +913,18 @@ pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::e
     // Read remaining packs
     for pack in 1..num_packs {
         let mut cdb = [
-            SCSI_READ_DISC_STRUCTURE, 0x01,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, MKB_DISC_STRUCTURE_FORMAT,
-            (MKB_PACK_SIZE >> 8) as u8, (MKB_PACK_SIZE & 0xFF) as u8,
-            0x00, 0x00,
+            SCSI_READ_DISC_STRUCTURE,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            MKB_DISC_STRUCTURE_FORMAT,
+            (MKB_PACK_SIZE >> 8) as u8,
+            (MKB_PACK_SIZE & 0xFF) as u8,
+            0x00,
+            0x00,
         ];
         // Pack number goes in address field
         cdb[2] = ((pack >> 24) & 0xFF) as u8;
@@ -838,7 +933,10 @@ pub fn read_mkb_from_drive(session: &mut crate::drive::DriveSession) -> crate::e
         cdb[5] = (pack & 0xFF) as u8;
 
         let mut buf = vec![0u8; 32772];
-        if session.scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000).is_ok() {
+        if session
+            .scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)
+            .is_ok()
+        {
             let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
             if len > 2 && len - 2 <= 32768 {
                 mkb.extend_from_slice(&buf[4..4 + len - 2]);
@@ -924,12 +1022,12 @@ pub fn resolve_keys(
 ) -> Option<ResolvedKeys> {
     // Detect AACS version
     let aacs2 = content_cert_data
-        .and_then(|d| parse_content_cert(d))
+        .and_then(parse_content_cert)
         .map(|cc| cc.aacs2)
         .unwrap_or(false);
 
     let bus_encryption = content_cert_data
-        .and_then(|d| parse_content_cert(d))
+        .and_then(parse_content_cert)
         .map(|cc| cc.bus_encryption)
         .unwrap_or(false);
 
@@ -940,7 +1038,9 @@ pub fn resolve_keys(
 
     // Helper to build result
     let build = |vuk: [u8; 16], key_source: u8| -> ResolvedKeys {
-        let unit_keys: Vec<(u32, [u8; 16])> = uk_file.encrypted_keys.iter()
+        let unit_keys: Vec<(u32, [u8; 16])> = uk_file
+            .encrypted_keys
+            .iter()
             .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
             .collect();
         ResolvedKeys {
@@ -1078,7 +1178,10 @@ pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
             break;
         }
         // First 16 bytes of each sector are plaintext
-        aes_cbc_decrypt(read_data_key, &mut unit[sector_start + 16..sector_start + SECTOR_LEN]);
+        aes_cbc_decrypt(
+            read_data_key,
+            &mut unit[sector_start + 16..sector_start + SECTOR_LEN],
+        );
     }
 }
 
@@ -1104,7 +1207,11 @@ mod tests {
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
     fn keydb_path() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     #[test]
@@ -1139,12 +1246,17 @@ mod tests {
         // Civil War UHD: known MK, VID, VUK from KEYDB
         // MK = 15665F98..., VID (disc_id) = from entry, VUK = F96D7908...
         // VUK = AES-DEC(MK, VID) XOR VID
-        let path = match keydb_path() { Some(p) => p, None => return };
+        let path = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        };
 
         let db = KeyDb::load(&path).unwrap();
 
         // Find a disc with both MK, disc_id, and VUK so we can verify derivation
-        let entry = db.disc_entries.values()
+        let entry = db
+            .disc_entries
+            .values()
             .find(|e| e.media_key.is_some() && e.disc_id.is_some() && e.vuk.is_some())
             .expect("No disc with MK + VID + VUK");
 
@@ -1153,15 +1265,20 @@ mod tests {
         let expected_vuk = entry.vuk.unwrap();
 
         let derived = derive_vuk(&mk, &vid);
-        assert_eq!(derived, expected_vuk,
-            "VUK derivation failed for disc: {} (hash {})", entry.title, entry.disc_hash);
+        assert_eq!(
+            derived, expected_vuk,
+            "VUK derivation failed for disc: {} (hash {})",
+            entry.title, entry.disc_hash
+        );
         eprintln!("VUK derivation verified for: {}", entry.title);
     }
 
     #[test]
     fn test_aes_ecb_roundtrip() {
-        let key = [0x15u8, 0x66, 0x5F, 0x98, 0x01, 0x02, 0x03, 0x04,
-                   0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let key = [
+            0x15u8, 0x66, 0x5F, 0x98, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C,
+        ];
         let plain = [0x41u8; 16];
         let enc = aes_ecb_encrypt(&key, &plain);
         let dec = aes_ecb_decrypt(&key, &enc);
@@ -1179,8 +1296,10 @@ mod tests {
 
     #[test]
     fn test_aes_cbc_roundtrip() {
-        let key = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-                   0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00];
+        let key = [
+            0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
         let original = vec![0x42u8; 128]; // 8 blocks
         let mut data = original.clone();
 
@@ -1269,16 +1388,24 @@ mod tests {
     fn test_decrypt_unit_key_from_vuk() {
         // Test the full chain: VUK → decrypt encrypted unit key → unit key
         // Use a known disc from KEYDB that has both VUK and unit keys
-        let path = match keydb_path() { Some(p) => p, None => return };
+        let path = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        };
 
         let db = KeyDb::load(&path).unwrap();
 
         // Find a disc with VUK and unit keys
-        let entry = db.disc_entries.values()
+        let entry = db
+            .disc_entries
+            .values()
             .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty())
             .expect("No disc with VUK + unit keys");
 
-        eprintln!("Testing unit key decrypt for: {} ({})", entry.title, entry.disc_hash);
+        eprintln!(
+            "Testing unit key decrypt for: {} ({})",
+            entry.title, entry.disc_hash
+        );
         eprintln!("  VUK: {:02X?}", entry.vuk.unwrap());
         for (num, key) in &entry.unit_keys {
             eprintln!("  Unit key {}: {:02X?}", num, key);
@@ -1290,8 +1417,11 @@ mod tests {
         for (num, expected_uk) in &entry.unit_keys {
             let encrypted = aes_ecb_encrypt(&vuk, expected_uk);
             let decrypted = decrypt_unit_key(&vuk, &encrypted);
-            assert_eq!(&decrypted, expected_uk,
-                "Unit key {} roundtrip failed for {}", num, entry.title);
+            assert_eq!(
+                &decrypted, expected_uk,
+                "Unit key {} roundtrip failed for {}",
+                num, entry.title
+            );
         }
         eprintln!("  All {} unit key roundtrips passed", entry.unit_keys.len());
     }
@@ -1302,21 +1432,31 @@ mod tests {
         // This disc is AACS 2.0 (BEE) so unit key alone won't work —
         // we need bus decryption first. But this verifies the pipeline.
         let unit_path = std::path::Path::new("/tmp/encrypted_unit.bin");
-        if !unit_path.exists() { return; }
+        if !unit_path.exists() {
+            return;
+        }
 
         let original = std::fs::read(unit_path).unwrap();
         assert_eq!(original.len(), ALIGNED_UNIT_LEN);
         assert!(is_unit_encrypted(&original), "Unit should be encrypted");
 
-        let kp = match keydb_path() { Some(p) => p, None => return };
+        let kp = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        };
         let db = KeyDb::load(&kp).unwrap();
 
         // Civil War UHD entries
-        let civil_war_entries: Vec<&DiscEntry> = db.disc_entries.values()
+        let civil_war_entries: Vec<&DiscEntry> = db
+            .disc_entries
+            .values()
             .filter(|e| e.title.contains("CIVIL WAR") && !e.unit_keys.is_empty())
             .collect();
 
-        eprintln!("Found {} Civil War entries with unit keys", civil_war_entries.len());
+        eprintln!(
+            "Found {} Civil War entries with unit keys",
+            civil_war_entries.len()
+        );
 
         // Try each entry's unit keys
         for entry in &civil_war_entries {
@@ -1324,7 +1464,10 @@ mod tests {
             let mut unit = original.clone();
 
             if let Some(idx) = decrypt_unit_try_keys(&mut unit, &keys) {
-                eprintln!("SUCCESS: Decrypted with entry {} key {}", entry.disc_hash, idx);
+                eprintln!(
+                    "SUCCESS: Decrypted with entry {} key {}",
+                    entry.disc_hash, idx
+                );
                 // Count TS sync bytes
                 let ts = (0..32).filter(|&i| unit[4 + i * 192] == 0x47).count();
                 eprintln!("  TS sync bytes: {}/32", ts);
@@ -1338,7 +1481,10 @@ mod tests {
 
     #[test]
     fn test_parse_full_keydb() {
-        let path = match keydb_path() { Some(p) => p, None => return }; // skip if not available
+        let path = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        }; // skip if not available
 
         let db = KeyDb::load(&path).unwrap();
 
@@ -1348,15 +1494,21 @@ mod tests {
         assert!(db.disc_entries.len() > 170000);
 
         // Look up Dune: Part Two
-        let dune = db.disc_entries.values()
+        let dune = db
+            .disc_entries
+            .values()
             .find(|e| e.title.contains("Dune: Part Two") && e.vuk.is_some())
             .expect("Dune: Part Two not found");
         assert!(dune.media_key.is_some());
         assert!(dune.vuk.is_some());
         assert!(!dune.unit_keys.is_empty());
 
-        eprintln!("Parsed {} disc entries, {} DK, {} PK",
-            db.disc_entries.len(), db.device_keys.len(), db.processing_keys.len());
+        eprintln!(
+            "Parsed {} disc entries, {} DK, {} PK",
+            db.disc_entries.len(),
+            db.device_keys.len(),
+            db.processing_keys.len()
+        );
     }
 
     #[test]
@@ -1371,8 +1523,10 @@ mod tests {
 
     #[test]
     fn test_disc_hash_hex() {
-        let hash = [0x55, 0xBF, 0xD0, 0x51, 0xD1, 0xF8, 0x2C, 0xBB, 0x67, 0x76,
-                    0x46, 0x3B, 0x6D, 0x70, 0x09, 0x12, 0x47, 0xBA, 0x61, 0x5D];
+        let hash = [
+            0x55, 0xBF, 0xD0, 0x51, 0xD1, 0xF8, 0x2C, 0xBB, 0x67, 0x76, 0x46, 0x3B, 0x6D, 0x70,
+            0x09, 0x12, 0x47, 0xBA, 0x61, 0x5D,
+        ];
         let hex = disc_hash_hex(&hash);
         assert_eq!(hex, "0x55BFD051D1F82CBB6776463B6D70091247BA615D");
     }
@@ -1385,7 +1539,10 @@ mod tests {
         let mut data = vec![0u8; 256];
 
         // uk_pos = 0x60 (96)
-        data[0] = 0x00; data[1] = 0x00; data[2] = 0x00; data[3] = 0x60;
+        data[0] = 0x00;
+        data[1] = 0x00;
+        data[2] = 0x00;
+        data[3] = 0x60;
 
         // Header fields at 16-18
         data[16] = 1; // app_type = BD-ROM
@@ -1393,23 +1550,32 @@ mod tests {
         data[18] = 0; // no SKB
 
         // Title mapping at 20-25
-        data[20] = 0; data[21] = 1; // first_play = CPS unit 1
-        data[22] = 0; data[23] = 1; // top_menu = CPS unit 1
-        data[24] = 0; data[25] = 1; // num_titles = 1
-        // Title 0 entry: 2 bytes pad + CPS unit
-        data[28] = 0; data[29] = 1; // CPS unit 1
+        data[20] = 0;
+        data[21] = 1; // first_play = CPS unit 1
+        data[22] = 0;
+        data[23] = 1; // top_menu = CPS unit 1
+        data[24] = 0;
+        data[25] = 1; // num_titles = 1
+                      // Title 0 entry: 2 bytes pad + CPS unit
+        data[28] = 0;
+        data[29] = 1; // CPS unit 1
 
         // Key storage at offset 0x60
         let uk_pos = 0x60usize;
-        data[uk_pos] = 0; data[uk_pos + 1] = 2; // 2 unit keys
+        data[uk_pos] = 0;
+        data[uk_pos + 1] = 2; // 2 unit keys
 
         // Key 1 at uk_pos + 48
         let key1_pos = uk_pos + 48;
-        for i in 0..16 { data[key1_pos + i] = 0xAA; }
+        for i in 0..16 {
+            data[key1_pos + i] = 0xAA;
+        }
 
         // Key 2 at uk_pos + 48 + 48
         let key2_pos = key1_pos + 48;
-        for i in 0..16 { data[key2_pos + i] = 0xBB; }
+        for i in 0..16 {
+            data[key2_pos + i] = 0xBB;
+        }
 
         let parsed = parse_unit_key_ro(&data, false).unwrap();
         assert_eq!(parsed.app_type, 1);
@@ -1428,9 +1594,14 @@ mod tests {
         let mut mkb = vec![0u8; 32];
         // Record: type=0x81, length=12 (BE24)
         mkb[0] = 0x81;
-        mkb[1] = 0x00; mkb[2] = 0x00; mkb[3] = 0x0C;
+        mkb[1] = 0x00;
+        mkb[2] = 0x00;
+        mkb[3] = 0x0C;
         // Version = 77
-        mkb[4] = 0x00; mkb[5] = 0x00; mkb[6] = 0x00; mkb[7] = 77;
+        mkb[4] = 0x00;
+        mkb[5] = 0x00;
+        mkb[6] = 0x00;
+        mkb[7] = 77;
 
         assert_eq!(mkb_version(&mkb), Some(77));
     }
@@ -1438,13 +1609,18 @@ mod tests {
     #[test]
     fn test_resolve_keys_vuk_path() {
         // Test the full resolve chain using VUK path
-        let path = match keydb_path() { Some(p) => p, None => return };
+        let path = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        };
         let db = KeyDb::load(&path).unwrap();
 
         // Find V for Vendetta BD — has VUK and unit keys
         // hash: 0x55BFD051D1F82CBB6776463B6D70091247BA615D
         let entry = db.find_disc("0x55BFD051D1F82CBB6776463B6D70091247BA615D");
-        if entry.is_none() { return; }
+        if entry.is_none() {
+            return;
+        }
         let entry = entry.unwrap();
         let vuk = entry.vuk.unwrap();
         let vid = entry.disc_id.unwrap();

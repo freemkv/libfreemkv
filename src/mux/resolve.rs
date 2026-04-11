@@ -14,15 +14,15 @@
 //!
 //! Bare paths without a scheme are rejected.
 
-use std::io::{self, BufReader, BufWriter};
-use std::path::Path;
-use super::{IOStream, M2tsStream, MkvStream};
+use super::disc::{DiscOptions, DiscStream};
+use super::iso::IsoStream;
 use super::network::NetworkStream;
 use super::null::NullStream;
 use super::stdio::StdioStream;
-use super::iso::IsoStream;
-use super::disc::{DiscStream, DiscOptions};
+use super::{IOStream, M2tsStream, MkvStream};
 use crate::disc::DiscTitle;
+use std::io::{self, BufReader, BufWriter};
+use std::path::Path;
 
 /// I/O buffer size for file streams.
 const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
@@ -50,40 +50,74 @@ pub struct StreamUrl {
 /// ```
 pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("disc://") {
-        return StreamUrl { scheme: "disc".into(), path: rest.to_string() };
+        return StreamUrl {
+            scheme: "disc".into(),
+            path: rest.to_string(),
+        };
     }
     if let Some(rest) = url.strip_prefix("m2ts://") {
-        return StreamUrl { scheme: "m2ts".into(), path: rest.to_string() };
+        return StreamUrl {
+            scheme: "m2ts".into(),
+            path: rest.to_string(),
+        };
     }
     if let Some(rest) = url.strip_prefix("mkv://") {
-        return StreamUrl { scheme: "mkv".into(), path: rest.to_string() };
+        return StreamUrl {
+            scheme: "mkv".into(),
+            path: rest.to_string(),
+        };
     }
     if let Some(rest) = url.strip_prefix("network://") {
-        return StreamUrl { scheme: "network".into(), path: rest.to_string() };
+        return StreamUrl {
+            scheme: "network".into(),
+            path: rest.to_string(),
+        };
     }
     if url == "null://" || url.starts_with("null://") {
-        return StreamUrl { scheme: "null".into(), path: String::new() };
+        return StreamUrl {
+            scheme: "null".into(),
+            path: String::new(),
+        };
     }
     if url == "stdio://" || url.starts_with("stdio://") {
-        return StreamUrl { scheme: "stdio".into(), path: String::new() };
+        return StreamUrl {
+            scheme: "stdio".into(),
+            path: String::new(),
+        };
     }
     if let Some(rest) = url.strip_prefix("iso://") {
-        return StreamUrl { scheme: "iso".into(), path: rest.to_string() };
+        return StreamUrl {
+            scheme: "iso".into(),
+            path: rest.to_string(),
+        };
     }
 
-    StreamUrl { scheme: "unknown".into(), path: url.to_string() }
+    StreamUrl {
+        scheme: "unknown".into(),
+        path: url.to_string(),
+    }
 }
 
 /// Validate that a file path is non-empty and has a filename component.
 fn validate_file_path(path: &str, scheme: &str) -> io::Result<()> {
     if path.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("{}:// requires a file path (e.g. {}://movie.{})", scheme, scheme, scheme)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}:// requires a file path (e.g. {}://movie.{})",
+                scheme, scheme, scheme
+            ),
+        ));
     }
     let p = Path::new(path);
     if p.file_name().is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("{}://{} is not a valid file path — must include a filename", scheme, path)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{}://{} is not a valid file path — must include a filename",
+                scheme, path
+            ),
+        ));
     }
     Ok(())
 }
@@ -91,12 +125,19 @@ fn validate_file_path(path: &str, scheme: &str) -> io::Result<()> {
 /// Validate that a network address has host:port format.
 fn validate_network_addr(addr: &str) -> io::Result<()> {
     if addr.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            "network:// requires host:port (e.g. network://0.0.0.0:9000)"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "network:// requires host:port (e.g. network://0.0.0.0:9000)",
+        ));
     }
     if !addr.contains(':') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("network://{} missing port — use network://{}:PORT", addr, addr)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "network://{} missing port — use network://{}:PORT",
+                addr, addr
+            ),
+        ));
     }
     Ok(())
 }
@@ -113,7 +154,7 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
                 title_index: opts.title_index,
             };
             let stream = DiscStream::open(disc_opts)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(Box::new(stream))
         }
         "m2ts" => {
@@ -209,13 +250,9 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
 }
 
 /// Options for opening an input stream.
+#[derive(Default)]
 pub struct InputOptions {
     pub keydb_path: Option<String>,
     pub title_index: Option<usize>,
 }
 
-impl Default for InputOptions {
-    fn default() -> Self {
-        Self { keydb_path: None, title_index: None }
-    }
-}

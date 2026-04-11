@@ -1,9 +1,9 @@
 //! UDF parser tests using a MockSectorReader.
 
-use std::collections::HashMap;
 use libfreemkv::error::Result;
 use libfreemkv::sector::SectorReader;
 use libfreemkv::udf;
+use std::collections::HashMap;
 
 const SECTOR_SIZE: usize = 2048;
 
@@ -15,12 +15,18 @@ struct MockSectorReader {
 
 impl MockSectorReader {
     fn new() -> Self {
-        Self { sectors: HashMap::new() }
+        Self {
+            sectors: HashMap::new(),
+        }
     }
 
     /// Write a full 2048-byte sector at the given LBA.
     fn set_sector(&mut self, lba: u32, data: Vec<u8>) {
-        assert_eq!(data.len(), SECTOR_SIZE, "sector data must be exactly 2048 bytes");
+        assert_eq!(
+            data.len(),
+            SECTOR_SIZE,
+            "sector data must be exactly 2048 bytes"
+        );
         self.sectors.insert(lba, data);
     }
 
@@ -273,7 +279,10 @@ fn read_filesystem_no_partition_descriptor() {
     reader.set_sector(32, make_terminator());
 
     let result = udf::read_filesystem(&mut reader);
-    assert!(result.is_err(), "should fail when no partition descriptor in VDS");
+    assert!(
+        result.is_err(),
+        "should fail when no partition descriptor in VDS"
+    );
 }
 
 #[test]
@@ -425,7 +434,10 @@ fn find_dir_case_insensitive() {
 
     // PLAYLIST (empty)
     let playlist_data = make_parent_fid();
-    reader.set_sector(partition_start + 5, make_dir_icb(6, playlist_data.len() as u32));
+    reader.set_sector(
+        partition_start + 5,
+        make_dir_icb(6, playlist_data.len() as u32),
+    );
     reader.set_sector_partial(partition_start + 6, &playlist_data);
 
     let fs = udf::read_filesystem(&mut reader).expect("should parse");

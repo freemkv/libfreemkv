@@ -6,8 +6,8 @@
 //!
 //! Reference: https://github.com/lw/BluRay/wiki/CLPI
 
-use crate::error::{Error, Result};
 use crate::disc::Extent;
+use crate::error::{Error, Result};
 
 /// Parsed CLPI clip info.
 #[derive(Debug)]
@@ -102,7 +102,7 @@ impl ClipInfo {
         let start_byte = start_spn as u64 * 192;
         let end_byte = end_spn as u64 * 192;
         let start_sector = (start_byte / 2048) as u32;
-        let end_sector = ((end_byte + 2047) / 2048) as u32;
+        let end_sector = end_byte.div_ceil(2048) as u32;
 
         vec![Extent {
             start_lba: start_sector, // relative to m2ts file start
@@ -190,13 +190,16 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
     //   num_EP_coarse: 16 bits        │ (10+4+16+18+32 = 80)
     //   num_EP_fine: 18 bits          │
     //   EP_map_start_address: 32 bits ┘
-    if ep_map.len() < 16 { return Ok((Vec::new(), Vec::new())); }
+    if ep_map.len() < 16 {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let _stream_pid = u16::from_be_bytes([ep_map[2], ep_map[3]]);
 
     // Read 10 bytes (80 bits) from ep_map[4..14] for bit extraction
     // Use two u64s since we need 80 bits
-    let hi = u64::from_be_bytes([ep_map[4], ep_map[5], ep_map[6], ep_map[7],
-                                  ep_map[8], ep_map[9], ep_map[10], ep_map[11]]);
+    let hi = u64::from_be_bytes([
+        ep_map[4], ep_map[5], ep_map[6], ep_map[7], ep_map[8], ep_map[9], ep_map[10], ep_map[11],
+    ]);
     let lo_bytes = [ep_map[12], ep_map[13]];
 
     // Bit 0-9: reserved (10)
@@ -206,8 +209,7 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
     // Bit 48-79: EP_map_start (32) — bits 48-63 in hi, bits 64-79 in lo
     let num_coarse = ((hi >> 34) & 0xFFFF) as usize;
     let num_fine = ((hi >> 16) & 0x3FFFF) as usize;
-    let ep_map_offset = (((hi & 0xFFFF) as u32) << 16)
-                        | (u16::from_be_bytes(lo_bytes) as u32);
+    let ep_map_offset = (((hi & 0xFFFF) as u32) << 16) | (u16::from_be_bytes(lo_bytes) as u32);
     let ep_map_offset = ep_map_offset as usize;
 
     // EP map for this stream starts at ep_map_offset relative to ep_map start
@@ -221,7 +223,8 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
     }
 
     // Fine table start address (relative to this stream EP map)
-    let fine_start = u32::from_be_bytes([stream_ep[0], stream_ep[1], stream_ep[2], stream_ep[3]]) as usize;
+    let fine_start =
+        u32::from_be_bytes([stream_ep[0], stream_ep[1], stream_ep[2], stream_ep[3]]) as usize;
 
     // Coarse entries start at offset 4, 8 bytes each
     let coarse_data = &stream_ep[4..];
@@ -232,12 +235,20 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
             break;
         }
 
-        let dword0 = u32::from_be_bytes([coarse_data[off], coarse_data[off + 1],
-                                          coarse_data[off + 2], coarse_data[off + 3]]);
+        let dword0 = u32::from_be_bytes([
+            coarse_data[off],
+            coarse_data[off + 1],
+            coarse_data[off + 2],
+            coarse_data[off + 3],
+        ]);
         let ref_to_fine_id = dword0 >> 14;
         let pts_coarse = dword0 & 0x3FFF;
-        let spn_coarse = u32::from_be_bytes([coarse_data[off + 4], coarse_data[off + 5],
-                                              coarse_data[off + 6], coarse_data[off + 7]]);
+        let spn_coarse = u32::from_be_bytes([
+            coarse_data[off + 4],
+            coarse_data[off + 5],
+            coarse_data[off + 6],
+            coarse_data[off + 7],
+        ]);
 
         ep_coarse.push(EpCoarse {
             ref_to_fine_id,
@@ -256,8 +267,12 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
                 break;
             }
 
-            let dword = u32::from_be_bytes([fine_data[off], fine_data[off + 1],
-                                            fine_data[off + 2], fine_data[off + 3]]);
+            let dword = u32::from_be_bytes([
+                fine_data[off],
+                fine_data[off + 1],
+                fine_data[off + 2],
+                fine_data[off + 3],
+            ]);
             // Bits: is_angle(1) + i_end_offset(3) + pts_fine(11) + spn_fine(17)
             let pts_fine = (dword >> 17) & 0x7FF;
             let spn_fine = dword & 0x1FFFF;
@@ -350,7 +365,7 @@ mod tests {
             | ((ep_stream_type as u128) << 66)                      // EP_stream_type: 4 bits
             | ((num_coarse as u128) << 50)                          // num_coarse: 16 bits
             | ((num_fine as u128) << 32)                            // num_fine: 18 bits
-            | (ep_map_start as u128);                               // EP_map_start: 32 bits
+            | (ep_map_start as u128); // EP_map_start: 32 bits
         let packed_bytes = packed.to_be_bytes(); // 16 bytes, we want the last 10
         let stream_header_bits = &packed_bytes[6..16];
 
@@ -398,8 +413,8 @@ mod tests {
     fn parse_valid_clpi() {
         let cpi = build_cpi(
             0x1011,
-            &[(0, 100, 0x00020000)],    // 1 coarse
-            &[(50, 1024)],               // 1 fine
+            &[(0, 100, 0x00020000)], // 1 coarse
+            &[(50, 1024)],           // 1 fine
         );
         let data = build_clpi(500_000, Some(&cpi));
 
@@ -415,14 +430,14 @@ mod tests {
         let cpi = build_cpi(
             0x1011,
             &[
-                (0, 100, 0x00020000),  // coarse 0: fine starts at 0, pts_coarse=100, spn_coarse=0x20000
-                (2, 200, 0x00040000),  // coarse 1: fine starts at 2, pts_coarse=200, spn_coarse=0x40000
+                (0, 100, 0x00020000), // coarse 0: fine starts at 0, pts_coarse=100, spn_coarse=0x20000
+                (2, 200, 0x00040000), // coarse 1: fine starts at 2, pts_coarse=200, spn_coarse=0x40000
             ],
             &[
-                (50, 1024),   // fine 0
-                (100, 2048),  // fine 1
-                (25, 512),    // fine 2
-                (75, 1536),   // fine 3
+                (50, 1024),  // fine 0
+                (100, 2048), // fine 1
+                (25, 512),   // fine 2
+                (75, 1536),  // fine 3
             ],
         );
         let data = build_clpi(1_000_000, Some(&cpi));
@@ -457,8 +472,15 @@ mod tests {
 
     #[test]
     fn full_pts_calculation() {
-        let coarse = EpCoarse { ref_to_fine_id: 0, pts_coarse: 100, spn_coarse: 0 };
-        let fine = EpFine { pts_fine: 50, spn_fine: 0 };
+        let coarse = EpCoarse {
+            ref_to_fine_id: 0,
+            pts_coarse: 100,
+            spn_coarse: 0,
+        };
+        let fine = EpFine {
+            pts_fine: 50,
+            spn_fine: 0,
+        };
         // full_pts = (100 << 19) + (50 << 8) = 52_428_800 + 12_800 = 52_441_600
         let pts = ClipInfo::full_pts(&coarse, &fine);
         assert_eq!(pts, (100 << 19) + (50 << 8));
@@ -467,15 +489,26 @@ mod tests {
 
     #[test]
     fn full_spn_calculation() {
-        let coarse = EpCoarse { ref_to_fine_id: 0, pts_coarse: 0, spn_coarse: 0x00FE0000 };
-        let fine = EpFine { pts_fine: 0, spn_fine: 0x1234 };
+        let coarse = EpCoarse {
+            ref_to_fine_id: 0,
+            pts_coarse: 0,
+            spn_coarse: 0x00FE0000,
+        };
+        let fine = EpFine {
+            pts_fine: 0,
+            spn_fine: 0x1234,
+        };
         // full_spn = (0x00FE0000 & 0xFFFE0000) + 0x1234 = 0x00FE0000 + 0x1234 = 0x00FE1234
         let spn = ClipInfo::full_spn(&coarse, &fine);
         assert_eq!(spn, 0x00FE0000 + 0x1234);
         assert_eq!(spn, 0x00FE1234);
 
         // Test that the low bit of spn_coarse is masked out
-        let coarse2 = EpCoarse { ref_to_fine_id: 0, pts_coarse: 0, spn_coarse: 0x00FF0000 };
+        let coarse2 = EpCoarse {
+            ref_to_fine_id: 0,
+            pts_coarse: 0,
+            spn_coarse: 0x00FF0000,
+        };
         let spn2 = ClipInfo::full_spn(&coarse2, &fine);
         // 0x00FF0000 & 0xFFFE0000 = 0x00FE0000, so low 17 bits of coarse are zeroed
         assert_eq!(spn2, 0x00FE0000 + 0x1234);

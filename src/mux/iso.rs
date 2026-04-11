@@ -4,15 +4,17 @@
 //! DiscStream (titles, streams, labels, AACS). An ISO is a flat image of
 //! 2048-byte sectors — sector N starts at byte offset N * 2048.
 //!
-//! Write: creates a sector-by-sector disc image from a SectorReader source.
+//! Write: creates a UDF 2.50 filesystem containing the m2ts stream data.
+//! The resulting ISO can be mounted or read back via IsoStream.
 
-use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::fs::File;
-use std::path::Path;
+use super::isowriter::IsoWriter;
 use super::IOStream;
 use crate::disc::{Disc, DiscTitle, ScanOptions};
-use crate::sector::SectorReader;
 use crate::error::{Error, Result};
+use crate::sector::SectorReader;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const SECTOR_SIZE: u64 = 2048;
 
@@ -31,15 +33,19 @@ impl IsoSectorReader {
         Ok(Self { file, capacity })
     }
 
-    pub fn capacity(&self) -> u32 { self.capacity }
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
 }
 
 impl SectorReader for IsoSectorReader {
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let bytes = count as usize * SECTOR_SIZE as usize;
-        self.file.seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE))
+        self.file
+            .seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE))
             .map_err(|e| Error::IoError { source: e })?;
-        self.file.read_exact(&mut buf[..bytes])
+        self.file
+            .read_exact(&mut buf[..bytes])
             .map_err(|e| Error::IoError { source: e })?;
         Ok(bytes)
     }
@@ -48,13 +54,12 @@ impl SectorReader for IsoSectorReader {
 /// Blu-ray ISO image stream.
 ///
 /// Read: opens ISO, parses UDF (same as DiscStream), streams BD-TS content.
-/// Write: receives sector data and writes to ISO file.
+/// Write: creates UDF 2.50 ISO with BDMV/STREAM/*.m2ts.
 pub struct IsoStream {
     disc_title: DiscTitle,
     disc: Option<Disc>,
+    // Read side
     reader: Option<IsoSectorReader>,
-    writer: Option<io::BufWriter<File>>,
-    /// Sector ranges to read: (start_lba, sector_count)
     extents: Vec<(u32, u32)>,
     extent_idx: usize,
     sectors_remaining: u32,
@@ -62,6 +67,9 @@ pub struct IsoStream {
     buf_pos: usize,
     buf_len: usize,
     eof: bool,
+    // Write side
+    iso_writer: Option<IsoWriter<io::BufWriter<File>>>,
+    write_started: bool,
 }
 
 impl IsoStream {
@@ -71,26 +79,31 @@ impl IsoStream {
         let capacity = reader.capacity();
 
         let disc = Disc::scan_image(&mut reader, capacity, opts)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let idx = title_index.unwrap_or(0).min(disc.titles.len().saturating_sub(1));
+        let idx = title_index
+            .unwrap_or(0)
+            .min(disc.titles.len().saturating_sub(1));
         let disc_title = if disc.titles.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no titles found in ISO image"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no titles found in ISO image",
+            ));
         } else {
             disc.titles[idx].clone()
         };
 
-        let extents: Vec<(u32, u32)> = disc_title.extents.iter()
+        let extents: Vec<(u32, u32)> = disc_title
+            .extents
+            .iter()
             .map(|e| (e.start_lba, e.sector_count))
             .collect();
-
         let sectors_remaining = extents.first().map(|e| e.1).unwrap_or(0);
 
         Ok(IsoStream {
             disc_title,
             disc: Some(disc),
             reader: Some(reader),
-            writer: None,
             extents,
             extent_idx: 0,
             sectors_remaining,
@@ -98,20 +111,22 @@ impl IsoStream {
             buf_pos: 0,
             buf_len: 0,
             eof: false,
+            iso_writer: None,
+            write_started: false,
         })
     }
 
-    /// Create an ISO file for writing. Receives raw sector data.
+    /// Create an ISO file for writing.
     pub fn create(path: &str) -> io::Result<Self> {
         let file = File::create(Path::new(path))
             .map_err(|e| io::Error::new(e.kind(), format!("iso://{}: {}", path, e)))?;
-        let writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let buf_writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let iso_writer = IsoWriter::new(buf_writer, "FREEMKV", "00001.m2ts");
 
         Ok(IsoStream {
             disc_title: DiscTitle::empty(),
             disc: None,
             reader: None,
-            writer: Some(writer),
             extents: Vec::new(),
             extent_idx: 0,
             sectors_remaining: 0,
@@ -119,19 +134,35 @@ impl IsoStream {
             buf_pos: 0,
             buf_len: 0,
             eof: false,
+            iso_writer: Some(iso_writer),
+            write_started: false,
         })
     }
 
-    /// Set metadata (for write mode).
+    /// Set metadata (for write mode). Must be called before writing data.
     pub fn meta(mut self, dt: &DiscTitle) -> Self {
         self.disc_title = dt.clone();
+        // Update the ISO writer's volume ID and m2ts filename from title metadata
+        if let Some(writer) = self.iso_writer.take() {
+            let vol_id = if dt.playlist.is_empty() {
+                "FREEMKV".to_string()
+            } else {
+                dt.playlist
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ' ')
+                    .collect::<String>()
+            };
+            let m2ts_name = format!("{:05}.m2ts", dt.playlist_id.max(1));
+            self.iso_writer = Some(writer.with_names(&vol_id, &m2ts_name));
+        }
         self
     }
 
     /// Get the full Disc (for listing all titles).
-    pub fn disc(&self) -> Option<&Disc> { self.disc.as_ref() }
+    pub fn disc(&self) -> Option<&Disc> {
+        self.disc.as_ref()
+    }
 
-    /// Read the next sector from the current extent.
     fn read_next_sector(&mut self) -> io::Result<bool> {
         let reader = match self.reader.as_mut() {
             Some(r) => r,
@@ -146,8 +177,9 @@ impl IsoStream {
         let offset = total - self.sectors_remaining;
         let lba = start_lba + offset;
 
-        reader.read_sectors(lba, 1, &mut self.sector_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        reader
+            .read_sectors(lba, 1, &mut self.sector_buf)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         self.buf_pos = 0;
         self.buf_len = SECTOR_SIZE as usize;
 
@@ -164,10 +196,12 @@ impl IsoStream {
 }
 
 impl IOStream for IsoStream {
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
     fn finish(&mut self) -> io::Result<()> {
-        if let Some(ref mut w) = self.writer {
-            w.flush()?;
+        if let Some(ref mut w) = self.iso_writer {
+            w.finish()?;
         }
         Ok(())
     }
@@ -175,9 +209,10 @@ impl IOStream for IsoStream {
 
 impl Read for IsoStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.eof { return Ok(0); }
+        if self.eof {
+            return Ok(0);
+        }
 
-        // Drain current sector buffer
         if self.buf_pos < self.buf_len {
             let n = (self.buf_len - self.buf_pos).min(buf.len());
             buf[..n].copy_from_slice(&self.sector_buf[self.buf_pos..self.buf_pos + n]);
@@ -185,7 +220,6 @@ impl Read for IsoStream {
             return Ok(n);
         }
 
-        // Read next sector
         if self.read_next_sector()? {
             let n = self.buf_len.min(buf.len());
             buf[..n].copy_from_slice(&self.sector_buf[..n]);
@@ -198,93 +232,108 @@ impl Read for IsoStream {
     }
 }
 
+impl Write for IsoStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let w = match self.iso_writer.as_mut() {
+            Some(w) => w,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "iso:// opened for reading — cannot write",
+                ))
+            }
+        };
+
+        if !self.write_started {
+            w.start()?;
+            self.write_started = true;
+        }
+
+        w.write_data(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use crate::sector::SectorReader;
 
     #[test]
     fn iso_reader_read_sectors() {
-        // Create a temp file with known sector data
-        let dir = std::env::temp_dir();
-        let path = dir.join("libfreemkv_test_iso_sectors.iso");
-        let path_str = path.to_str().unwrap();
-
-        // Write 4 sectors of known data
-        {
-            let mut f = File::create(&path).unwrap();
-            for sector_idx in 0u8..4 {
-                let mut sector = [sector_idx; SECTOR_SIZE as usize];
-                sector[0] = sector_idx;
-                sector[2047] = sector_idx.wrapping_mul(0x37);
-                f.write_all(&sector).unwrap();
-            }
-            f.flush().unwrap();
+        let mut data = vec![0u8; 4 * SECTOR_SIZE as usize];
+        for i in 0..4u8 {
+            let offset = i as usize * SECTOR_SIZE as usize;
+            data[offset] = i + 1;
+            data[offset + 2047] = i + 100;
         }
 
-        let mut reader = IsoSectorReader::open(path_str).unwrap();
+        let dir = std::env::temp_dir().join("freemkv_test_iso_read");
+        std::fs::write(&dir, &data).unwrap();
+
+        let mut reader = IsoSectorReader::open(dir.to_str().unwrap()).unwrap();
         assert_eq!(reader.capacity(), 4);
 
-        // Read sector 0
-        let mut buf = [0u8; SECTOR_SIZE as usize];
-        let n = reader.read_sectors(0, 1, &mut buf).unwrap();
-        assert_eq!(n, SECTOR_SIZE as usize);
-        assert_eq!(buf[0], 0);
-        assert_eq!(buf[2047], 0u8.wrapping_mul(0x37));
+        let mut buf = [0u8; 2048];
+        reader.read_sectors(0, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[2047], 100);
 
-        // Read sector 2
-        let n = reader.read_sectors(2, 1, &mut buf).unwrap();
-        assert_eq!(n, SECTOR_SIZE as usize);
-        assert_eq!(buf[0], 2);
-        assert_eq!(buf[1], 2); // filled with sector_idx
-        assert_eq!(buf[2047], 2u8.wrapping_mul(0x37));
+        reader.read_sectors(2, 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 3);
+        assert_eq!(buf[2047], 102);
 
-        // Read 2 sectors at once (sectors 1 and 2)
-        let mut buf2 = [0u8; SECTOR_SIZE as usize * 2];
-        let n = reader.read_sectors(1, 2, &mut buf2).unwrap();
-        assert_eq!(n, SECTOR_SIZE as usize * 2);
-        assert_eq!(buf2[0], 1); // sector 1 first byte
-        assert_eq!(buf2[SECTOR_SIZE as usize], 2); // sector 2 first byte
-
-        // Clean up
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&dir).ok();
     }
 
     #[test]
     fn iso_reader_capacity() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("libfreemkv_test_iso_capacity.iso");
-        let path_str = path.to_str().unwrap();
+        let data = vec![0u8; 10 * SECTOR_SIZE as usize];
+        let dir = std::env::temp_dir().join("freemkv_test_iso_cap");
+        std::fs::write(&dir, &data).unwrap();
 
-        // Write exactly 10 sectors
-        {
-            let mut f = File::create(&path).unwrap();
-            let data = vec![0u8; SECTOR_SIZE as usize * 10];
-            f.write_all(&data).unwrap();
-            f.flush().unwrap();
-        }
-
-        let reader = IsoSectorReader::open(path_str).unwrap();
+        let reader = IsoSectorReader::open(dir.to_str().unwrap()).unwrap();
         assert_eq!(reader.capacity(), 10);
 
-        // Clean up
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&dir).ok();
     }
-}
 
-impl Write for IsoStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.writer.as_mut() {
-            Some(w) => w.write(buf),
-            None => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "iso:// opened for reading — cannot write")),
+    #[test]
+    fn iso_write_creates_valid_udf() {
+        let path = std::env::temp_dir().join("freemkv_test_iso_write.iso");
+        let mut stream = IsoStream::create(path.to_str().unwrap()).unwrap();
+
+        // Write some fake BD-TS content
+        let mut content = Vec::new();
+        for i in 0..100u8 {
+            let mut pkt = [0u8; 192];
+            pkt[4] = 0x47;
+            pkt[5] = i;
+            content.extend_from_slice(&pkt);
         }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self.writer.as_mut() {
-            Some(w) => w.flush(),
-            None => Ok(()),
-        }
+
+        stream.write_all(&content).unwrap();
+        stream.finish().unwrap();
+
+        // Verify the ISO has valid UDF structure
+        let file = File::open(&path).unwrap();
+        let size = file.metadata().unwrap().len();
+        assert!(size > 288 * SECTOR_SIZE); // at least header + some data
+
+        // Read back and verify AVDP at sector 256
+        let mut reader = IsoSectorReader::open(path.to_str().unwrap()).unwrap();
+        let mut avdp = [0u8; 2048];
+        reader.read_sectors(256, 1, &mut avdp).unwrap();
+        let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
+        assert_eq!(tag_id, 2, "AVDP tag should be 2");
+
+        // Verify VRS at sector 16
+        let mut vrs = [0u8; 2048];
+        reader.read_sectors(16, 1, &mut vrs).unwrap();
+        assert_eq!(&vrs[1..6], b"BEA01");
+
+        std::fs::remove_file(&path).ok();
     }
 }

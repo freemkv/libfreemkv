@@ -8,14 +8,13 @@
 //!   for title in disc.titles() { ... }
 //!   for stream in title.streams() { ... }
 
-use crate::error::{Error, Result};
+use crate::clpi;
 use crate::drive::DriveSession;
+use crate::error::{Error, Result};
+use crate::mpls;
 use crate::sector::SectorReader;
 use crate::speed::DriveSpeed;
 use crate::udf;
-use crate::mpls;
-use crate::clpi;
-
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -40,7 +39,9 @@ pub struct Disc {
     pub region: DiscRegion,
     /// AACS state -- None if disc is unencrypted or keys unavailable
     pub aacs: Option<AacsState>,
-    /// Whether this disc requires AACS decryption
+    /// CSS state -- None if not a CSS-encrypted DVD
+    pub css: Option<crate::css::CssState>,
+    /// Whether this disc requires decryption (AACS or CSS)
     pub encrypted: bool,
 }
 
@@ -312,7 +313,6 @@ impl DiscTitle {
     }
 }
 
-
 // ─── Encryption ─────────────────────────────────────────────────────────────
 
 /// Result of SCSI AACS handshake (ECDH authentication).
@@ -377,42 +377,46 @@ impl KeySource {
 
 /// Standard KEYDB.cfg search locations (compatible with libaacs).
 const KEYDB_SEARCH_PATHS: &[&str] = &[
-    ".config/aacs/KEYDB.cfg",  // relative to $HOME
+    ".config/aacs/KEYDB.cfg", // relative to $HOME
 ];
 const KEYDB_SYSTEM_PATH: &str = "/etc/aacs/KEYDB.cfg";
 
 /// Options for disc scanning.
+#[derive(Default)]
 pub struct ScanOptions {
     /// Path to KEYDB.cfg for AACS key lookup.
     /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
     pub keydb_path: Option<std::path::PathBuf>,
 }
 
-impl Default for ScanOptions {
-    fn default() -> Self {
-        ScanOptions { keydb_path: None }
-    }
-}
 
 impl ScanOptions {
     /// Create options with a specific KEYDB path.
     pub fn with_keydb(path: impl Into<std::path::PathBuf>) -> Self {
-        ScanOptions { keydb_path: Some(path.into()) }
+        ScanOptions {
+            keydb_path: Some(path.into()),
+        }
     }
 
     /// Resolve KEYDB path: explicit path first, then standard locations.
     fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
         if let Some(p) = &self.keydb_path {
-            if p.exists() { return Some(p.clone()); }
+            if p.exists() {
+                return Some(p.clone());
+            }
         }
         if let Some(home) = std::env::var_os("HOME") {
             for relative in KEYDB_SEARCH_PATHS {
                 let p = std::path::PathBuf::from(&home).join(relative);
-                if p.exists() { return Some(p); }
+                if p.exists() {
+                    return Some(p);
+                }
             }
         }
         let p = std::path::PathBuf::from(KEYDB_SYSTEM_PATH);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
         None
     }
 }
@@ -476,7 +480,9 @@ impl OpenDisc {
 
     /// Total bytes for a title (for progress tracking).
     pub fn title_size(&self, title_idx: usize) -> u64 {
-        self.disc.titles.get(title_idx)
+        self.disc
+            .titles
+            .get(title_idx)
             .map(|t| t.size_bytes)
             .unwrap_or(0)
     }
@@ -512,7 +518,11 @@ impl Disc {
 
     /// Scan a disc image (ISO or any SectorReader). No SCSI, no handshake.
     /// AACS resolution uses KEYDB VUK lookup only.
-    pub fn scan_image(reader: &mut dyn SectorReader, capacity: u32, opts: &ScanOptions) -> Result<Self> {
+    pub fn scan_image(
+        reader: &mut dyn SectorReader,
+        capacity: u32,
+        opts: &ScanOptions,
+    ) -> Result<Self> {
         Self::scan_with(reader, capacity, None, opts)
     }
 
@@ -527,8 +537,8 @@ impl Disc {
         let udf_fs = udf::read_filesystem(reader)?;
 
         // 2. Resolve encryption (AACS, CSS, or none)
-        let encrypted = udf_fs.find_dir("/AACS").is_some()
-            || udf_fs.find_dir("/BDMV/AACS").is_some();
+        let encrypted =
+            udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
         let aacs = if encrypted {
             if let Some(keydb_path) = opts.resolve_keydb() {
@@ -547,14 +557,20 @@ impl Disc {
                 if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
                     if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
-                        if let Some(title) = Self::parse_playlist(reader, &udf_fs, &entry.name, &mpls_data) {
+                        if let Some(title) =
+                            Self::parse_playlist(reader, &udf_fs, &entry.name, &mpls_data)
+                        {
                             titles.push(title);
                         }
                     }
                 }
             }
         }
-        titles.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
+        titles.sort_by(|a, b| {
+            b.duration_secs
+                .partial_cmp(&a.duration_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
@@ -563,7 +579,16 @@ impl Disc {
         // 5. Derive format, layers, region
         let format = Self::detect_format(&titles);
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
-        let region = if format == DiscFormat::Uhd { DiscRegion::Free } else { DiscRegion::Free };
+        let region = DiscRegion::Free;
+
+        // 6. CSS detection for DVDs (VIDEO_TS directory = DVD structure)
+        let is_dvd = udf_fs.find_dir("/VIDEO_TS").is_some();
+        let css = if is_dvd && !titles.is_empty() {
+            crate::css::crack_key(reader, &titles[0].extents)
+        } else {
+            None
+        };
+        let encrypted = encrypted || css.is_some();
 
         Ok(Disc {
             volume_id: udf_fs.volume_id.clone(),
@@ -575,6 +600,7 @@ impl Disc {
             titles,
             region,
             aacs,
+            css,
             encrypted,
         })
     }
@@ -587,28 +613,33 @@ impl Disc {
         let keydb_path = opts.resolve_keydb()?;
         let keydb = KeyDb::load(&keydb_path).ok()?;
 
+        let mut last_error = None;
         for hc in &keydb.host_certs {
-            match aacs::handshake::aacs_authenticate(
-                session, &hc.private_key, &hc.certificate,
-            ) {
+            match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
-                    let volume_id = aacs::handshake::read_volume_id(session, &mut auth)
-                        .unwrap_or([0u8; 16]);
+                    let volume_id =
+                        aacs::handshake::read_volume_id(session, &mut auth).unwrap_or([0u8; 16]);
                     let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
-                        .ok().map(|(rdk, _)| rdk);
-                    return Some(HandshakeResult { volume_id, read_data_key, error: None });
+                        .ok()
+                        .map(|(rdk, _)| rdk);
+                    return Some(HandshakeResult {
+                        volume_id,
+                        read_data_key,
+                        error: None,
+                    });
                 }
                 Err(e) => {
                     // Try next host cert
-                    return Some(HandshakeResult {
-                        volume_id: [0u8; 16],
-                        read_data_key: None,
-                        error: Some(e),
-                    });
+                    last_error = Some(e);
+                    continue;
                 }
             }
         }
-        None
+        last_error.map(|e| HandshakeResult {
+            volume_id: [0u8; 16],
+            read_data_key: None,
+            error: Some(e),
+        })
     }
 
     /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
@@ -624,18 +655,23 @@ impl Disc {
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
 
-        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad { path: keydb_path.display().to_string() })?;
+        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
+            path: keydb_path.display().to_string(),
+        })?;
 
         // Read AACS files from disc/image via UDF
-        let uk_ro_data = udf_fs.read_file(reader, "/AACS/Unit_Key_RO.inf")
+        let uk_ro_data = udf_fs
+            .read_file(reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
 
-        let cc_data = udf_fs.read_file(reader, "/AACS/Content000.cer")
+        let cc_data = udf_fs
+            .read_file(reader, "/AACS/Content000.cer")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
             .ok();
 
-        let mkb_data = udf_fs.read_file(reader, "/AACS/MKB_RW.inf")
+        let mkb_data = udf_fs
+            .read_file(reader, "/AACS/MKB_RW.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
             .ok();
         let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
@@ -653,7 +689,8 @@ impl Disc {
             &volume_id,
             &keydb,
             mkb_data.as_deref(),
-        ).ok_or_else(|| Error::AacsNoKeys)?;
+        )
+        .ok_or(Error::AacsNoKeys)?;
 
         Ok(AacsState {
             version: if resolved.aacs2 { 2 } else { 1 },
@@ -703,14 +740,20 @@ impl Disc {
     fn read_meta_title(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Option<String> {
         let meta_dir = udf_fs.find_dir("/BDMV/META")?;
         for sub in &meta_dir.entries {
-            if !sub.is_dir { continue; }
+            if !sub.is_dir {
+                continue;
+            }
             let dl_path = format!("/BDMV/META/{}", sub.name);
             if let Some(dl_dir) = udf_fs.find_dir(&dl_path) {
-                let xml_files: Vec<_> = dl_dir.entries.iter()
+                let xml_files: Vec<_> = dl_dir
+                    .entries
+                    .iter()
                     .filter(|e| !e.is_dir && e.name.to_lowercase().ends_with(".xml"))
                     .collect();
 
-                let eng = xml_files.iter().find(|e| e.name.to_lowercase().contains("eng"));
+                let eng = xml_files
+                    .iter()
+                    .find(|e| e.name.to_lowercase().contains("eng"));
                 let target = eng.or_else(|| xml_files.first());
 
                 if let Some(entry) = target {
@@ -734,9 +777,25 @@ impl Disc {
     }
 
     fn read_capacity(session: &mut DriveSession) -> Result<u32> {
-        let cdb = [crate::scsi::SCSI_READ_CAPACITY, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let cdb = [
+            crate::scsi::SCSI_READ_CAPACITY,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
         let mut buf = [0u8; 8];
-        session.scsi_execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000)?;
+        session.scsi_execute(
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            &mut buf,
+            5_000,
+        )?;
         let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         Ok(lba + 1)
     }
@@ -750,7 +809,9 @@ impl Disc {
         let parsed = mpls::parse(data).ok()?;
 
         // Calculate duration from play items
-        let duration_ticks: u64 = parsed.play_items.iter()
+        let duration_ticks: u64 = parsed
+            .play_items
+            .iter()
             .map(|pi| (pi.out_time.saturating_sub(pi.in_time)) as u64)
             .sum();
         let duration_secs = duration_ticks as f64 / 45000.0;
@@ -780,7 +841,7 @@ impl Disc {
                     let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
                     let file_lba = udf_fs.file_start_lba(reader, &m2ts_path).unwrap_or(0);
                     let total_bytes = pkt_count as u64 * 192;
-                    let total_sectors = ((total_bytes + 2047) / 2048) as u32;
+                    let total_sectors = total_bytes.div_ceil(2048) as u32;
                     if total_sectors > 0 && file_lba > 0 {
                         extents.push(Extent {
                             start_lba: file_lba,
@@ -800,64 +861,70 @@ impl Disc {
         }
 
         // Build streams from STN table
-        let streams: Vec<Stream> = parsed.streams.iter().filter_map(|s| {
-            // Skip empty/padding entries (coding_type 0x00)
-            if s.coding_type == 0 { return None; }
-            let codec = Codec::from_coding_type(s.coding_type);
-            match s.stream_type {
-                1 | 6 | 7 => Some(Stream::Video(VideoStream {
-                    pid: s.pid,
-                    codec,
-                    resolution: format_resolution(s.video_format, s.video_rate),
-                    frame_rate: format_framerate(s.video_rate),
-                    hdr: match s.dynamic_range {
-                        1 => HdrFormat::Hdr10,
-                        2 => HdrFormat::DolbyVision,
-                        _ => HdrFormat::Sdr,
-                    },
-                    color_space: match s.color_space {
-                        1 => ColorSpace::Bt709,
-                        2 => ColorSpace::Bt2020,
-                        _ => ColorSpace::Unknown,
-                    },
-                    secondary: s.secondary,
-                    label: match s.stream_type {
-                        7 => "Dolby Vision EL".to_string(),
-                        _ => String::new(),
-                    },
-                })),
-                2 | 5 => {
-                    // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
-                    // this is a misaligned stream -- treat as subtitle, not audio
-                    if matches!(codec, Codec::Pgs) {
-                        Some(Stream::Subtitle(SubtitleStream {
-                            pid: s.pid,
-                            codec,
-                            language: s.language.clone(),
-                            forced: false,
-                        }))
-                    } else {
-                        Some(Stream::Audio(AudioStream {
-                            pid: s.pid,
-                            codec,
-                            channels: format_channels(s.audio_format),
-                            language: s.language.clone(),
-                            sample_rate: format_samplerate(s.audio_rate),
-                            secondary: s.stream_type == 5,
-                            label: String::new(),
-                        }))
-                    }
+        let streams: Vec<Stream> = parsed
+            .streams
+            .iter()
+            .filter_map(|s| {
+                // Skip empty/padding entries (coding_type 0x00)
+                if s.coding_type == 0 {
+                    return None;
                 }
-                3 => Some(Stream::Subtitle(SubtitleStream {
-                    pid: s.pid,
-                    codec,
-                    language: s.language.clone(),
-                    forced: false,
-                })),
-                // Stream type 4 = IG, unknown types -- skip
-                _ => None,
-            }
-        }).collect();
+                let codec = Codec::from_coding_type(s.coding_type);
+                match s.stream_type {
+                    1 | 6 | 7 => Some(Stream::Video(VideoStream {
+                        pid: s.pid,
+                        codec,
+                        resolution: format_resolution(s.video_format, s.video_rate),
+                        frame_rate: format_framerate(s.video_rate),
+                        hdr: match s.dynamic_range {
+                            1 => HdrFormat::Hdr10,
+                            2 => HdrFormat::DolbyVision,
+                            _ => HdrFormat::Sdr,
+                        },
+                        color_space: match s.color_space {
+                            1 => ColorSpace::Bt709,
+                            2 => ColorSpace::Bt2020,
+                            _ => ColorSpace::Unknown,
+                        },
+                        secondary: s.secondary,
+                        label: match s.stream_type {
+                            7 => "Dolby Vision EL".to_string(),
+                            _ => String::new(),
+                        },
+                    })),
+                    2 | 5 => {
+                        // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
+                        // this is a misaligned stream -- treat as subtitle, not audio
+                        if matches!(codec, Codec::Pgs) {
+                            Some(Stream::Subtitle(SubtitleStream {
+                                pid: s.pid,
+                                codec,
+                                language: s.language.clone(),
+                                forced: false,
+                            }))
+                        } else {
+                            Some(Stream::Audio(AudioStream {
+                                pid: s.pid,
+                                codec,
+                                channels: format_channels(s.audio_format),
+                                language: s.language.clone(),
+                                sample_rate: format_samplerate(s.audio_rate),
+                                secondary: s.stream_type == 5,
+                                label: String::new(),
+                            }))
+                        }
+                    }
+                    3 => Some(Stream::Subtitle(SubtitleStream {
+                        pid: s.pid,
+                        codec,
+                        language: s.language.clone(),
+                        forced: false,
+                    })),
+                    // Stream type 4 = IG, unknown types -- skip
+                    _ => None,
+                }
+            })
+            .collect();
 
         let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
@@ -913,8 +980,18 @@ impl Disc {
     /// is encrypted and keys were found during scan(), content is decrypted
     /// on the fly. Unencrypted discs pass through unchanged.
     ///
-    pub fn open_title<'a>(&'a self, session: &'a mut DriveSession, title_idx: usize) -> Result<ContentReader<'a>> {
-        let title = self.titles.get(title_idx).ok_or_else(|| Error::DiscTitleRange { index: title_idx, count: self.titles.len() })?;
+    pub fn open_title<'a>(
+        &'a self,
+        session: &'a mut DriveSession,
+        title_idx: usize,
+    ) -> Result<ContentReader<'a>> {
+        let title = self
+            .titles
+            .get(title_idx)
+            .ok_or(Error::DiscTitleRange {
+                index: title_idx,
+                count: self.titles.len(),
+            })?;
 
         // Let the drive manage its own read speed after init.
         // SET_CD_SPEED is only used reactively by the error handler to slow
@@ -955,7 +1032,8 @@ fn detect_max_batch_sectors(device_path: &str) -> u16 {
     // For sg devices, find the corresponding block device name
     let block_name = if dev_name.starts_with("sg") {
         let block_dir = format!("/sys/class/scsi_generic/{}/device/block", dev_name);
-        std::fs::read_dir(&block_dir).ok()
+        std::fs::read_dir(&block_dir)
+            .ok()
             .and_then(|mut entries| entries.next())
             .and_then(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -982,18 +1060,20 @@ fn detect_max_batch_sectors(device_path: &str) -> u16 {
 }
 
 /// Read strategy constants
-const MAX_BATCH_SECTORS: u16 = 510;  // absolute max (170 aligned units ≈ 1MB)
-const DEFAULT_BATCH_SECTORS: u16 = 60;  // fallback: typical kernel limit (120KB = 60 sectors)
-const MIN_BATCH_SECTORS: u16 = 3;    // 1 aligned unit = 6KB (error recovery)
-const RAMP_BATCH_AFTER: u32 = 5;     // successes before doubling batch size
-const RAMP_SPEED_AFTER: u32 = 50;    // successes at max batch before restoring speed
-const SLOW_SPEED_AFTER: u32 = 3;     // consecutive errors before reducing disc speed
-
+const MAX_BATCH_SECTORS: u16 = 510; // absolute max (170 aligned units ≈ 1MB)
+const DEFAULT_BATCH_SECTORS: u16 = 60; // fallback: typical kernel limit (120KB = 60 sectors)
+const MIN_BATCH_SECTORS: u16 = 3; // 1 aligned unit = 6KB (error recovery)
+const RAMP_BATCH_AFTER: u32 = 5; // successes before doubling batch size
+const RAMP_SPEED_AFTER: u32 = 50; // successes at max batch before restoring speed
+const SLOW_SPEED_AFTER: u32 = 3; // consecutive errors before reducing disc speed
 
 impl<'a> ContentReader<'a> {
     /// Total bytes across all extents (for progress display).
     pub fn total_bytes(&self) -> u64 {
-        self.extents.iter().map(|e| e.sector_count as u64 * 2048).sum()
+        self.extents
+            .iter()
+            .map(|e| e.sector_count as u64 * 2048)
+            .sum()
     }
 
     /// Read the next aligned unit (6144 bytes).
@@ -1001,11 +1081,10 @@ impl<'a> ContentReader<'a> {
     /// Returns None when all extents are exhausted.
     pub fn read_unit(&mut self) -> Result<Option<Vec<u8>>> {
         // Refill buffer if empty
-        if self.buf_pos >= self.buf_len {
-            if !self.fill_buffer()? {
+        if self.buf_pos >= self.buf_len
+            && !self.fill_buffer()? {
                 return Ok(None);
             }
-        }
 
         // Extract one aligned unit from buffer
         let start = self.buf_pos * crate::aacs::ALIGNED_UNIT_LEN;
@@ -1030,9 +1109,11 @@ impl<'a> ContentReader<'a> {
         // Decrypt all units in the buffer in-place
         let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
         if let Some(aacs) = &self.aacs {
-            let uk = aacs.unit_keys.get(self.unit_key_idx)
+            let uk = aacs
+                .unit_keys
+                .get(self.unit_key_idx)
                 .map(|(_, k)| *k)
-                .unwrap_or([0u8; 16]);
+                .ok_or(Error::AacsDataKey)?;
             let rdk = aacs.read_data_key.as_ref();
 
             for i in 0..self.buf_len {
@@ -1054,15 +1135,13 @@ impl<'a> ContentReader<'a> {
     fn decrypt_unit(&self, unit: &mut [u8]) {
         if let Some(aacs) = &self.aacs {
             if crate::aacs::is_unit_encrypted(unit) {
-                let uk = aacs.unit_keys.get(self.unit_key_idx)
+                let uk = aacs
+                    .unit_keys
+                    .get(self.unit_key_idx)
                     .map(|(_, k)| *k)
                     .unwrap_or([0u8; 16]);
 
-                crate::aacs::decrypt_unit_full(
-                    unit,
-                    &uk,
-                    aacs.read_data_key.as_ref(),
-                );
+                crate::aacs::decrypt_unit_full(unit, &uk, aacs.read_data_key.as_ref());
             }
         }
     }
@@ -1089,7 +1168,7 @@ impl<'a> ContentReader<'a> {
 
             let ext_start = self.extents[self.current_extent].start_lba;
             let ext_sectors = self.extents[self.current_extent].sector_count;
-            let remaining = ext_sectors - self.current_offset;
+            let remaining = ext_sectors.saturating_sub(self.current_offset);
 
             // Align to 3 sectors (one aligned unit)
             let sectors_to_read = remaining.min(self.batch_sectors as u32) as u16;
@@ -1118,13 +1197,17 @@ impl<'a> ContentReader<'a> {
 
                     // Ramp up batch size after consecutive successes
                     self.ok_streak += 1;
-                    if self.batch_sectors < self.max_batch_sectors && self.ok_streak >= RAMP_BATCH_AFTER {
+                    if self.batch_sectors < self.max_batch_sectors
+                        && self.ok_streak >= RAMP_BATCH_AFTER
+                    {
                         self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
                         self.ok_streak = 0;
                     }
 
                     // Restore max speed after sustained success at full batch
-                    if self.batch_sectors == self.max_batch_sectors && self.ok_streak >= RAMP_SPEED_AFTER {
+                    if self.batch_sectors == self.max_batch_sectors
+                        && self.ok_streak >= RAMP_SPEED_AFTER
+                    {
                         self.session.set_speed(0xFFFF);
                         self.ok_streak = 0;
                     }

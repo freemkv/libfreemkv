@@ -4,9 +4,15 @@
 //! Each PES packet typically contains exactly one AC3 frame.
 //! All AC3 frames are effectively keyframes (no inter-frame dependencies).
 
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
 pub struct Ac3Parser;
+
+impl Default for Ac3Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Ac3Parser {
     pub fn new() -> Self {
@@ -54,7 +60,12 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket { pid: 0x1100, pts, dts: None, data }
+        PesPacket {
+            pid: 0x1100,
+            pts,
+            dts: None,
+            data,
+        }
     }
 
     // --- syncword detection ---

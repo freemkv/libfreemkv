@@ -5,7 +5,7 @@
 //! Frame start = Frame header start code (0x0D).
 //! I-frames (keyframes) are identified from the frame header.
 
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
 const SC_SEQUENCE_HEADER: u8 = 0x0F;
 const SC_ENTRY_POINT: u8 = 0x0E;
@@ -16,9 +16,18 @@ pub struct Vc1Parser {
     entry_point: Option<Vec<u8>>,
 }
 
+impl Default for Vc1Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Vc1Parser {
     pub fn new() -> Self {
-        Self { seq_header: None, entry_point: None }
+        Self {
+            seq_header: None,
+            entry_point: None,
+        }
     }
 }
 
@@ -92,17 +101,17 @@ impl CodecParser for Vc1Parser {
         let mut cp = Vec::with_capacity(header_size as usize);
 
         // BITMAPINFOHEADER (40 bytes, little-endian)
-        cp.extend_from_slice(&header_size.to_le_bytes());   // biSize
-        cp.extend_from_slice(&1920u32.to_le_bytes());        // biWidth (updated by player)
-        cp.extend_from_slice(&1080u32.to_le_bytes());        // biHeight
-        cp.extend_from_slice(&1u16.to_le_bytes());           // biPlanes
-        cp.extend_from_slice(&24u16.to_le_bytes());          // biBitCount
-        cp.extend_from_slice(b"WVC1");                       // biCompression = "WVC1" FOURCC
-        cp.extend_from_slice(&0u32.to_le_bytes());           // biSizeImage
-        cp.extend_from_slice(&0u32.to_le_bytes());           // biXPelsPerMeter
-        cp.extend_from_slice(&0u32.to_le_bytes());           // biYPelsPerMeter
-        cp.extend_from_slice(&0u32.to_le_bytes());           // biClrUsed
-        cp.extend_from_slice(&0u32.to_le_bytes());           // biClrImportant
+        cp.extend_from_slice(&header_size.to_le_bytes()); // biSize
+        cp.extend_from_slice(&1920u32.to_le_bytes()); // biWidth (updated by player)
+        cp.extend_from_slice(&1080u32.to_le_bytes()); // biHeight
+        cp.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        cp.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+        cp.extend_from_slice(b"WVC1"); // biCompression = "WVC1" FOURCC
+        cp.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        cp.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+        cp.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+        cp.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        cp.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
 
         // Extra codec data: sequence header + entry point (Annex B)
         cp.extend_from_slice(sh);
@@ -127,7 +136,12 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket { pid: 0x1011, pts, dts: None, data }
+        PesPacket {
+            pid: 0x1011,
+            pts,
+            dts: None,
+            data,
+        }
     }
 
     /// Build a VC-1 PES with sequence header + entry point + frame start code.
@@ -157,7 +171,10 @@ mod tests {
 
         assert_eq!(frames.len(), 1);
         // Sequence header present → keyframe
-        assert!(frames[0].keyframe, "PES with sequence header should be keyframe");
+        assert!(
+            frames[0].keyframe,
+            "PES with sequence header should be keyframe"
+        );
         // seq_header should be stored internally
         assert!(parser.seq_header.is_some());
     }
@@ -184,15 +201,25 @@ mod tests {
         parser.parse(&pes);
 
         let cp = parser.codec_private();
-        assert!(cp.is_some(), "codec_private should be Some after seq header + entry point");
+        assert!(
+            cp.is_some(),
+            "codec_private should be Some after seq header + entry point"
+        );
 
         let cp = cp.unwrap();
         // BITMAPINFOHEADER is 40 bytes + extra data
-        assert!(cp.len() >= 40, "codec_private should be at least 40 bytes (BITMAPINFOHEADER)");
+        assert!(
+            cp.len() >= 40,
+            "codec_private should be at least 40 bytes (BITMAPINFOHEADER)"
+        );
 
         // biSize (first 4 bytes, little-endian) should equal total length
         let bi_size = u32::from_le_bytes([cp[0], cp[1], cp[2], cp[3]]);
-        assert_eq!(bi_size as usize, cp.len(), "biSize should match total codec_private length");
+        assert_eq!(
+            bi_size as usize,
+            cp.len(),
+            "biSize should match total codec_private length"
+        );
 
         // biCompression = "WVC1" at offset 16
         assert_eq!(&cp[16..20], b"WVC1", "FOURCC should be WVC1");
@@ -226,7 +253,10 @@ mod tests {
         let pes = make_pes(data, Some(0));
         parser.parse(&pes);
 
-        assert!(parser.codec_private().is_none(), "should be None without entry point");
+        assert!(
+            parser.codec_private().is_none(),
+            "should be None without entry point"
+        );
     }
 
     // --- frame without sequence header → not keyframe ---
@@ -244,7 +274,10 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        assert!(!frames[0].keyframe, "frame without sequence header should not be keyframe");
+        assert!(
+            !frames[0].keyframe,
+            "frame without sequence header should not be keyframe"
+        );
     }
 
     // --- frame data starts from frame start code ---
@@ -337,7 +370,10 @@ mod tests {
         let cp = parser.codec_private().unwrap();
         // After the 40-byte BITMAPINFOHEADER, we should have seq_header + entry_point data
         let extra = &cp[40..];
-        assert!(!extra.is_empty(), "extra data after BITMAPINFOHEADER should not be empty");
+        assert!(
+            !extra.is_empty(),
+            "extra data after BITMAPINFOHEADER should not be empty"
+        );
         // Extra data should start with the sequence header start code
         assert_eq!(&extra[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
     }

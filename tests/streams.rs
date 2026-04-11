@@ -1,8 +1,8 @@
 //! Integration tests for the IOStream pipeline.
 
-use std::io::{Cursor, Read, Write, Seek, SeekFrom};
-use libfreemkv::*;
 use libfreemkv::mux::meta::M2tsMeta;
+use libfreemkv::*;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 fn sample_disc_title() -> DiscTitle {
     DiscTitle {
@@ -13,26 +13,38 @@ fn sample_disc_title() -> DiscTitle {
         clips: Vec::new(),
         streams: vec![
             Stream::Video(VideoStream {
-                pid: 0x1011, codec: Codec::Hevc,
-                resolution: "2160p".into(), frame_rate: "23.976".into(),
-                hdr: HdrFormat::Hdr10, color_space: ColorSpace::Bt709,
-                secondary: false, label: "Main".into(),
+                pid: 0x1011,
+                codec: Codec::Hevc,
+                resolution: "2160p".into(),
+                frame_rate: "23.976".into(),
+                hdr: HdrFormat::Hdr10,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: "Main".into(),
             }),
             Stream::Audio(AudioStream {
-                pid: 0x1100, codec: Codec::TrueHd,
-                channels: "7.1".into(), language: "eng".into(),
-                sample_rate: "48kHz".into(), secondary: false,
+                pid: 0x1100,
+                codec: Codec::TrueHd,
+                channels: "7.1".into(),
+                language: "eng".into(),
+                sample_rate: "48kHz".into(),
+                secondary: false,
                 label: "English Atmos".into(),
             }),
             Stream::Audio(AudioStream {
-                pid: 0x1101, codec: Codec::Ac3,
-                channels: "5.1".into(), language: "fra".into(),
-                sample_rate: "48kHz".into(), secondary: false,
+                pid: 0x1101,
+                codec: Codec::Ac3,
+                channels: "5.1".into(),
+                language: "fra".into(),
+                sample_rate: "48kHz".into(),
+                secondary: false,
                 label: "French".into(),
             }),
             Stream::Subtitle(SubtitleStream {
-                pid: 0x1200, codec: Codec::Pgs,
-                language: "eng".into(), forced: false,
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
             }),
         ],
         extents: Vec::new(),
@@ -100,7 +112,10 @@ fn parse_url_m2ts_relative() {
 fn open_input_bare_path_errors() {
     let result = libfreemkv::open_input("Dune.mkv", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
 }
 
@@ -109,7 +124,10 @@ fn open_output_bare_path_errors() {
     let dt = sample_disc_title();
     let result = libfreemkv::open_output("Dune.mkv", &dt);
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
 }
 
@@ -117,7 +135,10 @@ fn open_output_bare_path_errors() {
 fn open_input_m2ts_empty_path_errors() {
     let result = libfreemkv::open_input("m2ts://", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("requires a file path"), "got: {}", msg);
 }
 
@@ -125,7 +146,10 @@ fn open_input_m2ts_empty_path_errors() {
 fn open_output_null_input_errors() {
     let result = libfreemkv::open_input("null://", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("write-only"), "got: {}", msg);
 }
 
@@ -134,7 +158,10 @@ fn open_output_disc_errors() {
     let dt = sample_disc_title();
     let result = libfreemkv::open_output("disc://", &dt);
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("read-only"), "got: {}", msg);
 }
 
@@ -142,7 +169,10 @@ fn open_output_disc_errors() {
 fn open_input_network_no_port_errors() {
     let result = libfreemkv::open_input("network://10.0.0.1", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
-    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error"),
+    };
     assert!(msg.contains("missing port"), "got: {}", msg);
 }
 
@@ -170,20 +200,26 @@ fn m2ts_meta_roundtrip() {
         assert_eq!(v.codec, Codec::Hevc);
         assert_eq!(v.resolution, "2160p");
         assert_eq!(v.label, "Main");
-    } else { panic!("expected video"); }
+    } else {
+        panic!("expected video");
+    }
 
     // Check audio
     if let Stream::Audio(a) = &restored.streams[1] {
         assert_eq!(a.codec, Codec::TrueHd);
         assert_eq!(a.language, "eng");
         assert_eq!(a.label, "English Atmos");
-    } else { panic!("expected audio"); }
+    } else {
+        panic!("expected audio");
+    }
 
     // Check subtitle
     if let Stream::Subtitle(s) = &restored.streams[3] {
         assert_eq!(s.language, "eng");
         assert!(!s.forced);
-    } else { panic!("expected subtitle"); }
+    } else {
+        panic!("expected subtitle");
+    }
 }
 
 // ── M2TS header write + read ──────────────────────────────────
@@ -205,7 +241,9 @@ fn m2ts_header_write_read() {
 
     // Read it back
     let mut cursor = Cursor::new(&buf);
-    let read_back = libfreemkv::mux::meta::read_header(&mut cursor).unwrap().unwrap();
+    let read_back = libfreemkv::mux::meta::read_header(&mut cursor)
+        .unwrap()
+        .unwrap();
     assert_eq!(read_back.title, "Test Movie");
     assert_eq!(read_back.duration, 7200.0);
     assert_eq!(read_back.streams.len(), 4);
@@ -284,7 +322,9 @@ fn m2ts_passthrough_preserves_data() {
         pkt[4] = 0x47;
         pkt[5] = (i % 3) << 4;
         pkt[6] = i;
-        for j in 8..192 { pkt[j] = i.wrapping_add(j as u8); }
+        for j in 8..192 {
+            pkt[j] = i.wrapping_add(j as u8);
+        }
         original.extend_from_slice(&pkt);
     }
 
@@ -354,30 +394,47 @@ fn disc_title_empty() {
 fn meta_codec_roundtrip() {
     // Test that all codec types survive from_title -> to_title
     let codecs_video = &[Codec::Hevc, Codec::H264, Codec::Vc1, Codec::Mpeg2];
-    let codecs_audio = &[Codec::Ac3, Codec::Ac3Plus, Codec::TrueHd, Codec::DtsHdMa, Codec::DtsHdHr, Codec::Dts, Codec::Lpcm];
+    let codecs_audio = &[
+        Codec::Ac3,
+        Codec::Ac3Plus,
+        Codec::TrueHd,
+        Codec::DtsHdMa,
+        Codec::DtsHdHr,
+        Codec::Dts,
+        Codec::Lpcm,
+    ];
     let codecs_sub = &[Codec::Pgs];
 
     let mut streams = Vec::new();
     for (i, &codec) in codecs_video.iter().enumerate() {
         streams.push(Stream::Video(VideoStream {
-            pid: (0x1011 + i) as u16, codec,
-            resolution: "1080p".into(), frame_rate: "23.976".into(),
-            hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
-            secondary: false, label: String::new(),
+            pid: (0x1011 + i) as u16,
+            codec,
+            resolution: "1080p".into(),
+            frame_rate: "23.976".into(),
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            secondary: false,
+            label: String::new(),
         }));
     }
     for (i, &codec) in codecs_audio.iter().enumerate() {
         streams.push(Stream::Audio(AudioStream {
-            pid: (0x1100 + i) as u16, codec,
-            channels: "5.1".into(), language: "eng".into(),
-            sample_rate: "48kHz".into(), secondary: false,
+            pid: (0x1100 + i) as u16,
+            codec,
+            channels: "5.1".into(),
+            language: "eng".into(),
+            sample_rate: "48kHz".into(),
+            secondary: false,
             label: String::new(),
         }));
     }
     for (i, &codec) in codecs_sub.iter().enumerate() {
         streams.push(Stream::Subtitle(SubtitleStream {
-            pid: (0x1200 + i) as u16, codec,
-            language: "eng".into(), forced: false,
+            pid: (0x1200 + i) as u16,
+            codec,
+            language: "eng".into(),
+            forced: false,
         }));
     }
 
@@ -397,9 +454,15 @@ fn meta_codec_roundtrip() {
     assert_eq!(restored.streams.len(), dt.streams.len());
     for (orig, rest) in dt.streams.iter().zip(restored.streams.iter()) {
         match (orig, rest) {
-            (Stream::Video(o), Stream::Video(r)) => assert_eq!(o.codec, r.codec, "video codec mismatch"),
-            (Stream::Audio(o), Stream::Audio(r)) => assert_eq!(o.codec, r.codec, "audio codec mismatch"),
-            (Stream::Subtitle(o), Stream::Subtitle(r)) => assert_eq!(o.codec, r.codec, "subtitle codec mismatch"),
+            (Stream::Video(o), Stream::Video(r)) => {
+                assert_eq!(o.codec, r.codec, "video codec mismatch")
+            }
+            (Stream::Audio(o), Stream::Audio(r)) => {
+                assert_eq!(o.codec, r.codec, "audio codec mismatch")
+            }
+            (Stream::Subtitle(o), Stream::Subtitle(r)) => {
+                assert_eq!(o.codec, r.codec, "subtitle codec mismatch")
+            }
             _ => panic!("stream type mismatch"),
         }
     }
@@ -434,25 +497,37 @@ fn meta_all_stream_types() {
         clips: Vec::new(),
         streams: vec![
             Stream::Video(VideoStream {
-                pid: 0x1011, codec: Codec::Hevc,
-                resolution: "2160p".into(), frame_rate: "23.976".into(),
-                hdr: HdrFormat::Hdr10, color_space: ColorSpace::Bt709,
-                secondary: false, label: "Primary".into(),
+                pid: 0x1011,
+                codec: Codec::Hevc,
+                resolution: "2160p".into(),
+                frame_rate: "23.976".into(),
+                hdr: HdrFormat::Hdr10,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: "Primary".into(),
             }),
             Stream::Audio(AudioStream {
-                pid: 0x1100, codec: Codec::TrueHd,
-                channels: "7.1".into(), language: "eng".into(),
-                sample_rate: "48kHz".into(), secondary: false,
+                pid: 0x1100,
+                codec: Codec::TrueHd,
+                channels: "7.1".into(),
+                language: "eng".into(),
+                sample_rate: "48kHz".into(),
+                secondary: false,
                 label: "Primary Audio".into(),
             }),
             Stream::Subtitle(SubtitleStream {
-                pid: 0x1200, codec: Codec::Pgs,
-                language: "fra".into(), forced: true,
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "fra".into(),
+                forced: true,
             }),
             Stream::Audio(AudioStream {
-                pid: 0x1110, codec: Codec::Ac3,
-                channels: "stereo".into(), language: "eng".into(),
-                sample_rate: "48kHz".into(), secondary: true,
+                pid: 0x1110,
+                codec: Codec::Ac3,
+                channels: "stereo".into(),
+                language: "eng".into(),
+                sample_rate: "48kHz".into(),
+                secondary: true,
                 label: "Commentary".into(),
             }),
         ],
@@ -470,27 +545,35 @@ fn meta_all_stream_types() {
         assert_eq!(v.resolution, "2160p");
         assert_eq!(v.label, "Primary");
         assert!(!v.secondary);
-    } else { panic!("expected video"); }
+    } else {
+        panic!("expected video");
+    }
 
     // Primary audio preserved
     if let Stream::Audio(a) = &restored.streams[1] {
         assert_eq!(a.codec, Codec::TrueHd);
         assert_eq!(a.channels, "7.1");
         assert!(!a.secondary);
-    } else { panic!("expected audio"); }
+    } else {
+        panic!("expected audio");
+    }
 
     // Subtitle preserved (forced flag)
     if let Stream::Subtitle(s) = &restored.streams[2] {
         assert_eq!(s.language, "fra");
         assert!(s.forced);
-    } else { panic!("expected subtitle"); }
+    } else {
+        panic!("expected subtitle");
+    }
 
     // Secondary audio preserved
     if let Stream::Audio(a) = &restored.streams[3] {
         assert_eq!(a.codec, Codec::Ac3);
         assert!(a.secondary);
         assert_eq!(a.label, "Commentary");
-    } else { panic!("expected secondary audio"); }
+    } else {
+        panic!("expected secondary audio");
+    }
 }
 
 // ── MkvStream tests ──────────────────────────────────────────

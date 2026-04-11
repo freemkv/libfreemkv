@@ -1,7 +1,7 @@
 //! Linux SCSI transport via SG_IO ioctl.
 
+use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
-use super::{ScsiTransport, ScsiResult, DataDirection};
 use std::path::Path;
 
 const SG_IO: u32 = 0x2285;
@@ -49,10 +49,15 @@ impl SgIoTransport {
         c_path.push(0);
 
         let fd = unsafe {
-            libc::open(c_path.as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NONBLOCK)
+            libc::open(
+                c_path.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_NONBLOCK,
+            )
         };
         if fd < 0 {
-            return Err(Error::DeviceNotFound { path: device.display().to_string() });
+            return Err(Error::DeviceNotFound {
+                path: device.display().to_string(),
+            });
         }
         Ok(SgIoTransport { fd })
     }
@@ -60,7 +65,9 @@ impl SgIoTransport {
 
 impl Drop for SgIoTransport {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -80,10 +87,20 @@ impl ScsiTransport for SgIoTransport {
             DataDirection::ToDevice => SG_DXFER_TO_DEV,
         };
 
+        if data.len() > u32::MAX as usize {
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: 0xFF,
+                sense_key: 0,
+            });
+        }
+
+        let cmd_len = cdb.len().min(16) as u8;
+
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
         hdr.interface_id = b'S' as i32;
         hdr.dxfer_direction = dxfer_direction;
-        hdr.cmd_len = cdb.len() as u8;
+        hdr.cmd_len = cmd_len;
         hdr.mx_sb_len = sense.len() as u8;
         hdr.dxfer_len = data.len() as u32;
         hdr.dxferp = data.as_mut_ptr();
@@ -91,18 +108,22 @@ impl ScsiTransport for SgIoTransport {
         hdr.sbp = sense.as_mut_ptr();
         hdr.timeout = timeout_ms;
 
-        let ret = unsafe {
-            libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr)
-        };
+        let ret = unsafe { libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
 
         if ret < 0 {
-            return Err(Error::IoError { source: std::io::Error::last_os_error() });
+            return Err(Error::IoError {
+                source: std::io::Error::last_os_error(),
+            });
         }
 
-        let bytes_transferred = (data.len() as i32 - hdr.resid) as usize;
+        let bytes_transferred = (data.len() as i32).saturating_sub(hdr.resid).max(0) as usize;
 
         if hdr.status != 0 {
-            let sense_key = if hdr.sb_len_wr > 2 { sense[2] & 0x0F } else { 0 };
+            let sense_key = if hdr.sb_len_wr > 2 {
+                sense[2] & 0x0F
+            } else {
+                0
+            };
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
@@ -116,5 +137,4 @@ impl ScsiTransport for SgIoTransport {
             sense,
         })
     }
-
 }

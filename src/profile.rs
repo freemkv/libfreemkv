@@ -1,7 +1,7 @@
 //! Drive profile loading and matching.
 
-use serde::Deserialize;
 use crate::error::{Error, Result};
+use serde::Deserialize;
 
 /// Top-level profiles file — keyed by chipset + variant.
 #[derive(Debug, Deserialize)]
@@ -69,24 +69,31 @@ fn parse_hex4(s: &str) -> Result<[u8; 4]> {
     }
     let mut out = [0u8; 4];
     for i in 0..4 {
-        out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16)
-            .map_err(|_| Error::ProfileParse)?;
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| Error::ProfileParse)?;
     }
     Ok(out)
 }
 
 fn deserialize_hex4<'de, D>(deserializer: D) -> std::result::Result<[u8; 4], D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     let s = String::deserialize(deserializer)?;
-    if s.is_empty() { return Ok([0; 4]); }
+    if s.is_empty() {
+        return Ok([0; 4]);
+    }
     parse_hex4(&s).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_base64<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     use base64::Engine;
     let s = String::deserialize(deserializer)?;
-    if s.is_empty() { return Ok(Vec::new()); }
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
     base64::engine::general_purpose::STANDARD
         .decode(&s)
         .map_err(serde::de::Error::custom)
@@ -101,8 +108,7 @@ pub fn load_bundled() -> Result<ProfilesFile> {
 }
 
 fn load_from_str(data: &str) -> Result<ProfilesFile> {
-    serde_json::from_str(data)
-        .map_err(|_| Error::ProfileParse)
+    serde_json::from_str(data).map_err(|_| Error::ProfileParse)
 }
 
 /// Find a profile matching a drive's INQUIRY fields.
@@ -126,7 +132,10 @@ pub fn find_by_drive_id(
                 && p.identity.vendor_specific.trim() == vs
                 && p.identity.firmware_date.trim() == date
         }) {
-            return Some(ProfileMatch { profile: p.clone(), platform });
+            return Some(ProfileMatch {
+                profile: p.clone(),
+                platform,
+            });
         }
 
         if let Some(p) = list.iter().find(|p| {
@@ -134,7 +143,10 @@ pub fn find_by_drive_id(
                 && p.identity.product_revision.trim() == r
                 && p.identity.vendor_specific.trim() == vs
         }) {
-            return Some(ProfileMatch { profile: p.clone(), platform });
+            return Some(ProfileMatch {
+                profile: p.clone(),
+                platform,
+            });
         }
     }
 
@@ -148,9 +160,10 @@ mod tests {
 
     fn make_drive_id(vendor: &str, rev: &str, vs: &str, date: &str) -> DriveId {
         let mut inquiry = vec![0u8; 96];
-        inquiry[8..8+vendor.len().min(8)].copy_from_slice(&vendor.as_bytes()[..vendor.len().min(8)]);
-        inquiry[32..32+rev.len().min(4)].copy_from_slice(&rev.as_bytes()[..rev.len().min(4)]);
-        inquiry[36..36+vs.len().min(7)].copy_from_slice(&vs.as_bytes()[..vs.len().min(7)]);
+        inquiry[8..8 + vendor.len().min(8)]
+            .copy_from_slice(&vendor.as_bytes()[..vendor.len().min(8)]);
+        inquiry[32..32 + rev.len().min(4)].copy_from_slice(&rev.as_bytes()[..rev.len().min(4)]);
+        inquiry[36..36 + vs.len().min(7)].copy_from_slice(&vs.as_bytes()[..vs.len().min(7)]);
         DriveId::from_inquiry(&inquiry, date)
     }
 

@@ -52,10 +52,14 @@ pub struct DirEntry {
 
 impl UdfFs {
     /// Physical partition start sector.
-    pub fn partition_start(&self) -> u32 { self.partition_start }
+    pub fn partition_start(&self) -> u32 {
+        self.partition_start
+    }
 
     /// Metadata partition start sector.
-    pub fn metadata_start(&self) -> u32 { self.metadata_start }
+    pub fn metadata_start(&self) -> u32 {
+        self.metadata_start
+    }
 
     /// Find a directory by path (e.g. "/BDMV/PLAYLIST").
     /// Path matching is case-insensitive.
@@ -63,9 +67,10 @@ impl UdfFs {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
         for part in &parts {
-            current = current.entries.iter().find(|e| {
-                e.is_dir && e.name.eq_ignore_ascii_case(part)
-            })?;
+            current = current
+                .entries
+                .iter()
+                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))?;
         }
         Some(current)
     }
@@ -78,19 +83,29 @@ impl UdfFs {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
         for part in &parts[..parts.len() - 1] {
-            current = current.entries.iter().find(|e| {
-                e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
-)?;
+            current = current
+                .entries
+                .iter()
+                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))
+                .ok_or_else(|| Error::UdfNotFound {
+                    path: part.to_string(),
+                })?;
         }
         let filename = match parts.last() {
             Some(f) => f,
-            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+            None => {
+                return Err(Error::UdfNotFound {
+                    path: path.to_string(),
+                })
+            }
         };
-        let entry = current.entries.iter().find(|e| {
-            !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
-)?;
+        let entry = current
+            .entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
+            .ok_or_else(|| Error::UdfNotFound {
+                path: path.to_string(),
+            })?;
         let (data_lba, _) = self.read_icb_extent(reader, entry.meta_lba)?;
         Ok(self.partition_start + data_lba)
     }
@@ -101,21 +116,31 @@ impl UdfFs {
 
         // Navigate to parent directory
         for part in &parts[..parts.len() - 1] {
-            current = current.entries.iter().find(|e| {
-                e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
-)?;
+            current = current
+                .entries
+                .iter()
+                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))
+                .ok_or_else(|| Error::UdfNotFound {
+                    path: part.to_string(),
+                })?;
         }
 
         // Find the file
         let filename = match parts.last() {
             Some(f) => f,
-            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+            None => {
+                return Err(Error::UdfNotFound {
+                    path: path.to_string(),
+                })
+            }
         };
-        let entry = current.entries.iter().find(|e| {
-            !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
-)?;
+        let entry = current
+            .entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
+            .ok_or_else(|| Error::UdfNotFound {
+                path: path.to_string(),
+            })?;
 
         // Read the file's ICB to get its data extent
         let (data_lba, data_len) = self.read_icb_extent(reader, entry.meta_lba)?;
@@ -123,7 +148,7 @@ impl UdfFs {
         // Read file data sector by sector
         // File DATA is in the physical partition (partition_start + lba),
         // NOT the metadata partition. ICBs are in metadata, data is in physical.
-        let sector_count = ((data_len as u64 + 2047) / 2048) as u32;
+        let sector_count = (data_len as u64).div_ceil(2048) as u32;
         let mut data = vec![0u8; (sector_count as usize) * 2048];
         let abs_start = self.partition_start + data_lba;
 
@@ -162,7 +187,12 @@ impl UdfFs {
         Ok(merged)
     }
 
-    fn collect_file_ranges(&self, reader: &mut dyn SectorReader, entry: &DirEntry, ranges: &mut Vec<(u32, u32)>) -> Result<()> {
+    fn collect_file_ranges(
+        &self,
+        reader: &mut dyn SectorReader,
+        entry: &DirEntry,
+        ranges: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
         for child in &entry.entries {
             if child.is_dir {
                 // Only skip STREAM — those are the multi-GB video files
@@ -181,7 +211,7 @@ impl UdfFs {
 
                 if let Ok((data_lba, data_len)) = self.read_icb_extent(reader, child.meta_lba) {
                     let abs_start = self.partition_start + data_lba;
-                    let sector_count = (data_len + 2047) / 2048;
+                    let sector_count = ((data_len as u64 + 2047) / 2048) as u32;
                     ranges.push((abs_start, sector_count));
                 }
             }
@@ -199,13 +229,20 @@ impl UdfFs {
     /// The data_lba is partition-relative.
     fn read_icb_extent(&self, reader: &mut dyn SectorReader, meta_lba: u32) -> Result<(u32, u32)> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
-        extents.first().copied().ok_or_else(|| Error::DiscRead { sector: 0 })
+        extents
+            .first()
+            .copied()
+            .ok_or(Error::DiscRead { sector: 0 })
     }
 
     /// Read ALL allocation extents for a file from its ICB.
     /// Returns Vec of (partition_relative_lba, byte_length) pairs.
     /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents).
-    fn read_icb_extents(&self, reader: &mut dyn SectorReader, meta_lba: u32) -> Result<Vec<(u32, u32)>> {
+    fn read_icb_extents(
+        &self,
+        reader: &mut dyn SectorReader,
+        meta_lba: u32,
+    ) -> Result<Vec<(u32, u32)>> {
         let mut icb = [0u8; 2048];
         read_sector(reader, self.meta_to_abs(meta_lba), &mut icb)?;
 
@@ -217,13 +254,21 @@ impl UdfFs {
             266 => {
                 let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
                 let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
-                (216 + l_ea, l_ad)
+                let ad_offset = 216 + l_ea;
+                if ad_offset + l_ad > icb.len() {
+                    return Err(Error::DiscRead { sector: self.meta_to_abs(meta_lba) as u64 });
+                }
+                (ad_offset, l_ad)
             }
             // Standard File Entry
             261 => {
                 let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
                 let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
-                (176 + l_ea, l_ad)
+                let ad_offset = 176 + l_ea;
+                if ad_offset + l_ad > icb.len() {
+                    return Err(Error::DiscRead { sector: self.meta_to_abs(meta_lba) as u64 });
+                }
+                (ad_offset, l_ad)
             }
             _ => return Err(Error::DiscRead { sector: 0 }),
         };
@@ -240,11 +285,12 @@ impl UdfFs {
             let raw_len = u32::from_le_bytes([icb[off], icb[off + 1], icb[off + 2], icb[off + 3]]);
             let extent_type = raw_len >> 30;
             let data_len = raw_len & 0x3FFFFFFF;
-            let data_lba = u32::from_le_bytes([icb[off + 4], icb[off + 5], icb[off + 6], icb[off + 7]]);
+            let data_lba =
+                u32::from_le_bytes([icb[off + 4], icb[off + 5], icb[off + 6], icb[off + 7]]);
 
             match extent_type {
                 0 => extents.push((data_lba, data_len)), // recorded and allocated
-                1 => {} // allocated but not recorded (sparse) — skip
+                1 => {}     // allocated but not recorded (sparse) — skip
                 3 => break, // next extent of allocation descriptors — TODO
                 _ => break,
             }
@@ -255,29 +301,43 @@ impl UdfFs {
 
     /// Get all absolute disc sector extents for a file.
     /// Returns Vec of (absolute_lba, sector_count) covering the entire file.
-    pub fn file_extents(&self, reader: &mut dyn SectorReader, path: &str) -> Result<Vec<(u32, u32)>> {
+    pub fn file_extents(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &str,
+    ) -> Result<Vec<(u32, u32)>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
         for part in &parts[..parts.len() - 1] {
-            current = current.entries.iter().find(|e| {
-                e.is_dir && e.name.eq_ignore_ascii_case(part)
-            }).ok_or_else(|| Error::UdfNotFound { path: part.to_string() }
-)?;
+            current = current
+                .entries
+                .iter()
+                .find(|e| e.is_dir && e.name.eq_ignore_ascii_case(part))
+                .ok_or_else(|| Error::UdfNotFound {
+                    path: part.to_string(),
+                })?;
         }
         let filename = match parts.last() {
             Some(f) => f,
-            None => return Err(Error::UdfNotFound { path: path.to_string() }),
+            None => {
+                return Err(Error::UdfNotFound {
+                    path: path.to_string(),
+                })
+            }
         };
-        let entry = current.entries.iter().find(|e| {
-            !e.is_dir && e.name.eq_ignore_ascii_case(filename)
-        }).ok_or_else(|| Error::UdfNotFound { path: path.to_string() }
-)?;
+        let entry = current
+            .entries
+            .iter()
+            .find(|e| !e.is_dir && e.name.eq_ignore_ascii_case(filename))
+            .ok_or_else(|| Error::UdfNotFound {
+                path: path.to_string(),
+            })?;
 
         let alloc_extents = self.read_icb_extents(reader, entry.meta_lba)?;
         let mut disc_extents = Vec::new();
         for (lba, byte_len) in alloc_extents {
             let abs_lba = self.partition_start + lba;
-            let sectors = ((byte_len as u64 + 2047) / 2048) as u32;
+            let sectors = (byte_len as u64).div_ceil(2048) as u32;
             disc_extents.push((abs_lba, sectors));
         }
         Ok(disc_extents)
@@ -331,7 +391,8 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
             }
             // Logical Volume Descriptor — contains FSD location and partition maps
             6 => {
-                num_partition_maps = u32::from_le_bytes([desc[268], desc[269], desc[270], desc[271]]);
+                num_partition_maps =
+                    u32::from_le_bytes([desc[268], desc[269], desc[270], desc[271]]);
                 lvd_sector = Some(i);
             }
             // Terminating Descriptor — end of VDS
@@ -348,7 +409,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
     // BD-ROM discs (UDF 2.50) use a metadata partition (Type 2 map with "*UDF Metadata Partition")
     // The metadata file is stored at lba=0 of the physical partition
     let metadata_start = if num_partition_maps >= 2 {
-        let lvd_sec = lvd_sector.ok_or_else(|| Error::DiscRead { sector: 0 })?;
+        let lvd_sec = lvd_sector.ok_or(Error::DiscRead { sector: 0 })?;
 
         // Read LVD to check partition map type
         let mut lvd = [0u8; 2048];
@@ -373,14 +434,29 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
                 let meta_tag = u16::from_le_bytes([meta_icb[0], meta_icb[1]]);
                 if meta_tag == 266 {
                     // Extended File Entry — get allocation extent
-                    let l_ea = u32::from_le_bytes([meta_icb[208], meta_icb[209],
-                                                   meta_icb[210], meta_icb[211]]) as usize;
+                    let l_ea = u32::from_le_bytes([
+                        meta_icb[208],
+                        meta_icb[209],
+                        meta_icb[210],
+                        meta_icb[211],
+                    ]) as usize;
                     let ad_off = 216 + l_ea;
-                    let ad_len = u32::from_le_bytes([meta_icb[ad_off], meta_icb[ad_off + 1],
-                                                      meta_icb[ad_off + 2], meta_icb[ad_off + 3]]) & 0x3FFFFFFF;
+                    if ad_off + 8 > meta_icb.len() {
+                        return Err(Error::DiscRead { sector: meta_file_lba as u64 });
+                    }
+                    let ad_len = u32::from_le_bytes([
+                        meta_icb[ad_off],
+                        meta_icb[ad_off + 1],
+                        meta_icb[ad_off + 2],
+                        meta_icb[ad_off + 3],
+                    ]) & 0x3FFFFFFF;
                     metadata_size_bytes = ad_len;
-                    let ad_pos = u32::from_le_bytes([meta_icb[ad_off + 4], meta_icb[ad_off + 5],
-                                                     meta_icb[ad_off + 6], meta_icb[ad_off + 7]]);
+                    let ad_pos = u32::from_le_bytes([
+                        meta_icb[ad_off + 4],
+                        meta_icb[ad_off + 5],
+                        meta_icb[ad_off + 6],
+                        meta_icb[ad_off + 7],
+                    ]);
                     // Metadata content starts at partition_start + ad_pos
                     partition_start + ad_pos
                 } else {
@@ -415,7 +491,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
     // Step 5: Read root directory and build file tree
     let root = read_directory(reader, partition_start, metadata_start, root_lba, "", 0)?;
 
-    let metadata_sectors = (metadata_size_bytes + 2047) / 2048;
+    let metadata_sectors = ((metadata_size_bytes as u64 + 2047) / 2048) as u32;
 
     Ok(UdfFs {
         root,
@@ -450,35 +526,64 @@ fn read_directory(
         266 => {
             let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
             let ad_off = 216 + l_ea;
-            let len = u32::from_le_bytes([icb[ad_off], icb[ad_off + 1],
-                                          icb[ad_off + 2], icb[ad_off + 3]]) & 0x3FFFFFFF;
-            let pos = u32::from_le_bytes([icb[ad_off + 4], icb[ad_off + 5],
-                                          icb[ad_off + 6], icb[ad_off + 7]]);
+            if ad_off + 8 > icb.len() {
+                return Err(Error::DiscRead { sector: (meta_start + meta_lba) as u64 });
+            }
+            let len = u32::from_le_bytes([
+                icb[ad_off],
+                icb[ad_off + 1],
+                icb[ad_off + 2],
+                icb[ad_off + 3],
+            ]) & 0x3FFFFFFF;
+            let pos = u32::from_le_bytes([
+                icb[ad_off + 4],
+                icb[ad_off + 5],
+                icb[ad_off + 6],
+                icb[ad_off + 7],
+            ]);
             (len, pos)
         }
         261 => {
             let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
             let ad_off = 176 + l_ea;
-            let len = u32::from_le_bytes([icb[ad_off], icb[ad_off + 1],
-                                          icb[ad_off + 2], icb[ad_off + 3]]) & 0x3FFFFFFF;
-            let pos = u32::from_le_bytes([icb[ad_off + 4], icb[ad_off + 5],
-                                          icb[ad_off + 6], icb[ad_off + 7]]);
+            if ad_off + 8 > icb.len() {
+                return Err(Error::DiscRead { sector: (meta_start + meta_lba) as u64 });
+            }
+            let len = u32::from_le_bytes([
+                icb[ad_off],
+                icb[ad_off + 1],
+                icb[ad_off + 2],
+                icb[ad_off + 3],
+            ]) & 0x3FFFFFFF;
+            let pos = u32::from_le_bytes([
+                icb[ad_off + 4],
+                icb[ad_off + 5],
+                icb[ad_off + 6],
+                icb[ad_off + 7],
+            ]);
             (len, pos)
         }
         _ => {
             return Ok(DirEntry {
-                name: name.to_string(), is_dir: true, meta_lba, size: 0, entries: Vec::new(),
+                name: name.to_string(),
+                is_dir: true,
+                meta_lba,
+                size: 0,
+                entries: Vec::new(),
             });
         }
     };
 
     // Read directory data
     let dir_abs = meta_start + ad_pos;
-    let sector_count = ((ad_len + 2047) / 2048).min(64);
+    let sector_count = ad_len.div_ceil(2048).min(64);
     let mut dir_data = vec![0u8; sector_count as usize * 2048];
     for i in 0..sector_count {
-        read_sector(reader, dir_abs + i,
-                   &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048])?;
+        read_sector(
+            reader,
+            dir_abs + i,
+            &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048],
+        )?;
     }
 
     // Parse File Identifier Descriptors
@@ -499,8 +604,12 @@ fn read_directory(
         //   [24:28] = extent_location (LBA within metadata partition)
         //   [28:30] = partition_reference_number
         //   [30:36] = implementation_use
-        let icb_lba = u32::from_le_bytes([dir_data[pos + 24], dir_data[pos + 25],
-                                          dir_data[pos + 26], dir_data[pos + 27]]);
+        let icb_lba = u32::from_le_bytes([
+            dir_data[pos + 24],
+            dir_data[pos + 25],
+            dir_data[pos + 26],
+            dir_data[pos + 27],
+        ]);
         let l_iu = u16::from_le_bytes([dir_data[pos + 36], dir_data[pos + 37]]) as usize;
 
         let is_dir = (file_chars & 0x02) != 0;
@@ -508,7 +617,11 @@ fn read_directory(
 
         if !is_parent && l_fi > 0 {
             let name_start = pos + 38 + l_iu;
-            let entry_name = parse_udf_name(&dir_data[name_start..name_start + l_fi]);
+            let name_end = name_start + l_fi;
+            if name_end > dir_data.len() {
+                break;
+            }
+            let entry_name = parse_udf_name(&dir_data[name_start..name_end]);
 
             if !entry_name.is_empty() {
                 // Read the ICB to get file size
@@ -516,7 +629,14 @@ fn read_directory(
 
                 if is_dir && depth < 3 {
                     // Recurse into subdirectory (max 3 levels: BDMV/PLAYLIST/*.mpls)
-                    let subdir = read_directory(reader, part_start, meta_start, icb_lba, &entry_name, depth + 1)?;
+                    let subdir = read_directory(
+                        reader,
+                        part_start,
+                        meta_start,
+                        icb_lba,
+                        &entry_name,
+                        depth + 1,
+                    )?;
                     entries.push(subdir);
                 } else {
                     entries.push(DirEntry {
@@ -531,7 +651,7 @@ fn read_directory(
         }
 
         // Advance to next FID (4-byte aligned)
-        let fid_len = ((38 + l_iu + l_fi + 3) & !3) as usize;
+        let fid_len = ((38 + l_iu + l_fi + 3) & !3);
         pos += fid_len;
     }
 
@@ -553,10 +673,9 @@ fn read_file_size(reader: &mut dyn SectorReader, meta_start: u32, meta_lba: u32)
     match tag {
         // Both File Entry (261) and Extended File Entry (266) have
         // info_length as a u64 at offset 56
-        261 | 266 => {
-            Ok(u64::from_le_bytes([icb[56], icb[57], icb[58], icb[59],
-                                   icb[60], icb[61], icb[62], icb[63]]))
-        }
+        261 | 266 => Ok(u64::from_le_bytes([
+            icb[56], icb[57], icb[58], icb[59], icb[60], icb[61], icb[62], icb[63],
+        ])),
         _ => Ok(0),
     }
 }
@@ -596,7 +715,9 @@ fn parse_udf_name(data: &[u8]) -> String {
 
 /// Merge overlapping or adjacent (start, count) ranges.
 fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    if ranges.is_empty() { return Vec::new(); }
+    if ranges.is_empty() {
+        return Vec::new();
+    }
     let mut result = vec![ranges[0]];
     for &(start, count) in &ranges[1..] {
         let last = result.last_mut().unwrap();
@@ -616,13 +737,22 @@ fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 /// Used for Volume Identifier and other UDF descriptor strings.
 /// The first byte of content is a compression ID: 8 = ASCII, 16 = UTF-16BE.
 fn parse_dstring(data: &[u8]) -> String {
-    if data.is_empty() { return String::new(); }
+    if data.is_empty() {
+        return String::new();
+    }
     let len = *data.last().unwrap() as usize;
-    if len == 0 || len > data.len() { return String::new(); }
+    if len == 0 || len > data.len() {
+        return String::new();
+    }
     let content = &data[..len];
-    if content.is_empty() { return String::new(); }
+    if content.is_empty() {
+        return String::new();
+    }
     match content[0] {
-        8 => String::from_utf8_lossy(&content[1..]).trim_end_matches('\0').trim().to_string(),
+        8 => String::from_utf8_lossy(&content[1..])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string(),
         16 => {
             let mut s = String::new();
             let chars = &content[1..];
@@ -630,13 +760,18 @@ fn parse_dstring(data: &[u8]) -> String {
                 if i + 1 < chars.len() {
                     let c = ((chars[i] as u16) << 8) | chars[i + 1] as u16;
                     if c != 0 {
-                        if let Some(ch) = char::from_u32(c as u32) { s.push(ch); }
+                        if let Some(ch) = char::from_u32(c as u32) {
+                            s.push(ch);
+                        }
                     }
                 }
             }
             s.trim().to_string()
         }
-        _ => String::from_utf8_lossy(&content[1..]).trim_end_matches('\0').trim().to_string(),
+        _ => String::from_utf8_lossy(&content[1..])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string(),
     }
 }
 

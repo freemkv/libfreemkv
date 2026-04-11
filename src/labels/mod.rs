@@ -7,15 +7,15 @@
 //!   3. Implement `pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
-mod paramount;
 mod criterion;
-mod pixelogic;
 mod ctrm;
+mod paramount;
+mod pixelogic;
 pub mod vocab;
 
+use crate::disc::{DiscTitle, Stream};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
-use crate::disc::{DiscTitle, Stream};
 
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
@@ -70,20 +70,21 @@ type DetectFn = fn(&UdfFs) -> bool;
 type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<Vec<StreamLabel>>;
 
 const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
-    ("paramount",  paramount::detect,  paramount::parse),
-    ("criterion",  criterion::detect,  criterion::parse),
-    ("pixelogic",  pixelogic::detect,  pixelogic::parse),
-    ("ctrm",       ctrm::detect,       ctrm::parse),
+    ("paramount", paramount::detect, paramount::parse),
+    ("criterion", criterion::detect, criterion::parse),
+    ("pixelogic", pixelogic::detect, pixelogic::parse),
+    ("ctrm", ctrm::detect, ctrm::parse),
     // ("deluxe",  deluxe::detect,     deluxe::parse),  // TODO: bytecode parser
 ];
 
 /// Search disc for config files, extract labels, apply to streams.
 /// This is 100% optional — if anything fails, streams are untouched.
 pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle]) {
-    let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        extract(reader, udf)
-    })).unwrap_or_default();
-    if labels.is_empty() { return; }
+    let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf)))
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return;
+    }
 
     for title in titles.iter_mut() {
         let mut audio_idx: u16 = 0;
@@ -93,13 +94,15 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
             match stream {
                 Stream::Audio(a) => {
                     audio_idx += 1;
-                    if let Some(label) = labels.iter().find(|l|
+                    if let Some(label) = labels.iter().find(|l| {
                         l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
-                    ) {
+                    }) {
                         let mut parts = Vec::new();
                         match label.purpose {
                             LabelPurpose::Commentary => parts.push("Commentary".to_string()),
-                            LabelPurpose::Descriptive => parts.push("Descriptive Audio".to_string()),
+                            LabelPurpose::Descriptive => {
+                                parts.push("Descriptive Audio".to_string())
+                            }
                             LabelPurpose::Score => parts.push("Score".to_string()),
                             LabelPurpose::Ime => parts.push("IME".to_string()),
                             LabelPurpose::Normal => {}
@@ -119,9 +122,9 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
                 }
                 Stream::Subtitle(s) => {
                     sub_idx += 1;
-                    if let Some(label) = labels.iter().find(|l|
+                    if let Some(label) = labels.iter().find(|l| {
                         l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
-                    ) {
+                    }) {
                         if label.qualifier == LabelQualifier::Forced {
                             s.forced = true;
                         }
@@ -169,7 +172,11 @@ pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
 }
 
 /// Read a file from any BDMV/JAR subdirectory by filename.
-pub(crate) fn read_jar_file(reader: &mut dyn SectorReader, udf: &UdfFs, filename: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_jar_file(
+    reader: &mut dyn SectorReader,
+    udf: &UdfFs,
+    filename: &str,
+) -> Option<Vec<u8>> {
     let path = find_jar_file(udf, filename)?;
     udf.read_file(reader, &path).ok().filter(|d| !d.is_empty())
 }

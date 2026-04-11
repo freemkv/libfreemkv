@@ -11,14 +11,14 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-use std::path::Path;
 use crate::error::{Error, Result};
-use crate::sector::SectorReader;
-use crate::scsi::ScsiTransport;
 use crate::identity::DriveId;
-use crate::profile::{self, DriveProfile};
-use crate::platform::PlatformDriver;
 use crate::platform::mt1959::Mt1959;
+use crate::platform::PlatformDriver;
+use crate::profile::{self, DriveProfile};
+use crate::scsi::ScsiTransport;
+use crate::sector::SectorReader;
+use std::path::Path;
 
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
@@ -64,9 +64,12 @@ impl DriveSession {
         let tur = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         for _ in 0..60 {
             let mut buf = [0u8; 0];
-            if self.scsi.as_mut().execute(
-                &tur, crate::scsi::DataDirection::None, &mut buf, 5000
-            ).is_ok() {
+            if self
+                .scsi
+                .as_mut()
+                .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5000)
+                .is_ok()
+            {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -123,23 +126,43 @@ impl DriveSession {
 
     pub fn read_disc(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
-            crate::scsi::SCSI_READ_10, 0x00,
-            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-            0x00, (count >> 8) as u8, count as u8, 0x00,
+            crate::scsi::SCSI_READ_10,
+            0x00,
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0x00,
+            (count >> 8) as u8,
+            count as u8,
+            0x00,
         ];
-        let result = self.scsi.as_mut().execute(
-            &cdb, crate::scsi::DataDirection::FromDevice, buf, 5_000)?;
+        let result =
+            self.scsi
+                .as_mut()
+                .execute(&cdb, crate::scsi::DataDirection::FromDevice, buf, 5_000)?;
         Ok(result.bytes_transferred)
     }
 
     pub fn read_content(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         let cdb = [
-            crate::scsi::SCSI_READ_10, 0x00,
-            (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-            0x00, (count >> 8) as u8, count as u8, 0x00,
+            crate::scsi::SCSI_READ_10,
+            0x00,
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0x00,
+            (count >> 8) as u8,
+            count as u8,
+            0x00,
         ];
         let result = self.scsi.as_mut().execute(
-            &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)?;
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            buf,
+            30_000,
+        )?;
         Ok(result.bytes_transferred)
     }
 
@@ -152,15 +175,28 @@ impl DriveSession {
     pub fn eject(&mut self) -> Result<()> {
         let allow_cdb = [0x1Eu8, 0, 0, 0, 0x00, 0];
         let mut buf = [0u8; 0];
-        let _ = self.scsi.as_mut().execute(&allow_cdb, crate::scsi::DataDirection::None, &mut buf, 5_000);
+        let _ = self.scsi.as_mut().execute(
+            &allow_cdb,
+            crate::scsi::DataDirection::None,
+            &mut buf,
+            5_000,
+        );
         let eject_cdb = [0x1Bu8, 0, 0, 0, 0x02, 0];
-        self.scsi.as_mut().execute(&eject_cdb, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        self.scsi.as_mut().execute(
+            &eject_cdb,
+            crate::scsi::DataDirection::None,
+            &mut buf,
+            30_000,
+        )?;
         Ok(())
     }
 
     pub fn scsi_execute(
-        &mut self, cdb: &[u8], direction: crate::scsi::DataDirection,
-        buf: &mut [u8], timeout_ms: u32,
+        &mut self,
+        cdb: &[u8],
+        direction: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
         self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
     }
@@ -174,9 +210,13 @@ impl SectorReader for DriveSession {
 
 pub fn find_drives() -> Vec<(String, DriveId)> {
     #[cfg(unix)]
-    { unix::find_drives() }
+    {
+        unix::find_drives()
+    }
     #[cfg(windows)]
-    { windows::find_drives() }
+    {
+        windows::find_drives()
+    }
 }
 
 pub fn find_drive() -> Option<String> {
@@ -185,12 +225,19 @@ pub fn find_drive() -> Option<String> {
 
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
     #[cfg(unix)]
-    { unix::resolve_device(path) }
+    {
+        unix::resolve_device(path)
+    }
     #[cfg(windows)]
-    { windows::resolve_device(path) }
+    {
+        windows::resolve_device(path)
+    }
 }
 
-fn create_driver(platform: profile::Platform, profile: &DriveProfile) -> Result<Box<dyn PlatformDriver>> {
+fn create_driver(
+    platform: profile::Platform,
+    profile: &DriveProfile,
+) -> Result<Box<dyn PlatformDriver>> {
     match platform {
         profile::Platform::Mt1959A => Ok(Box::new(Mt1959::new(profile.clone(), false))),
         profile::Platform::Mt1959B => Ok(Box::new(Mt1959::new(profile.clone(), true))),

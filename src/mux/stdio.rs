@@ -1,8 +1,8 @@
 //! StdioStream — raw byte pipe via stdin/stdout. Format-agnostic.
 
-use std::io::{self, Read, Write};
 use super::IOStream;
 use crate::disc::DiscTitle;
+use std::io::{self, Read, Write};
 
 /// Stdio stream — reads from stdin, writes to stdout.
 ///
@@ -41,7 +41,9 @@ impl StdioStream {
 }
 
 impl IOStream for StdioStream {
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
     fn finish(&mut self) -> io::Result<()> {
         if let Some(ref mut w) = self.writer {
             w.flush()?;
@@ -54,8 +56,10 @@ impl Read for StdioStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.reader {
             Some(ref mut r) => r.read(buf),
-            None => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "stdio:// opened for output — cannot read")),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stdio:// opened for output — cannot read",
+            )),
         }
     }
 }
@@ -64,8 +68,10 @@ impl Write for StdioStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.writer {
             Some(ref mut w) => w.write(buf),
-            None => Err(io::Error::new(io::ErrorKind::Unsupported,
-                "stdio:// opened for input — cannot write")),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stdio:// opened for input — cannot write",
+            )),
         }
     }
     fn flush(&mut self) -> io::Result<()> {

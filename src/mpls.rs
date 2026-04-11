@@ -83,12 +83,19 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     let mut pos = 10;
 
     for item_idx in 0..num_play_items {
-        if pos + 2 > pl.len() { break; }
+        if pos + 2 > pl.len() {
+            break;
+        }
         let item_length = u16::from_be_bytes([pl[pos], pl[pos + 1]]) as usize;
-        if pos + 2 + item_length > pl.len() { break; }
+        if pos + 2 + item_length > pl.len() {
+            break;
+        }
 
         let item = &pl[pos + 2..pos + 2 + item_length];
-        if item.len() < 20 { pos += 2 + item_length; continue; }
+        if item.len() < 20 {
+            pos += 2 + item_length;
+            continue;
+        }
 
         let clip_id = String::from_utf8_lossy(&item[0..5]).to_string();
         let connection_condition = item[9] & 0x0F;
@@ -121,27 +128,35 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 if let Some((entry, next)) = parse_stream_entry(item, spos, 1) {
                     streams.push(entry);
                     spos = next;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             // Primary audio
             for _ in 0..n_audio {
                 if let Some((entry, next)) = parse_stream_entry(item, spos, 2) {
                     streams.push(entry);
                     spos = next;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             // PG subtitles
             for _ in 0..n_pg {
                 if let Some((entry, next)) = parse_stream_entry(item, spos, 3) {
                     streams.push(entry);
                     spos = next;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             // IG (skip but advance)
             for _ in 0..n_ig {
                 if let Some((_, next)) = parse_stream_entry(item, spos, 4) {
                     spos = next;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
             // Secondary audio
             for _ in 0..n_sec_audio {
@@ -153,8 +168,12 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     if next < item.len() {
                         let n_refs = item[next] as usize;
                         spos = next + 2 + n_refs + (n_refs % 2);
-                    } else { spos = next; }
-                } else { break; }
+                    } else {
+                        spos = next;
+                    }
+                } else {
+                    break;
+                }
             }
             // Secondary video (PiP)
             for _ in 0..n_sec_video {
@@ -169,9 +188,15 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                         if after_arefs < item.len() {
                             let n_prefs = item[after_arefs] as usize;
                             spos = after_arefs + 2 + n_prefs + (n_prefs % 2);
-                        } else { spos = after_arefs; }
-                    } else { spos = next; }
-                } else { break; }
+                        } else {
+                            spos = after_arefs;
+                        }
+                    } else {
+                        spos = next;
+                    }
+                } else {
+                    break;
+                }
             }
             // Secondary PG (PiP subtitles) — must consume to keep spos aligned
             for _ in 0..n_pip_pg {
@@ -182,8 +207,12 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     if next < item.len() {
                         let n_refs = item[next] as usize;
                         spos = next + 2 + n_refs + (n_refs % 2);
-                    } else { spos = next; }
-                } else { break; }
+                    } else {
+                        spos = next;
+                    }
+                } else {
+                    break;
+                }
             }
             // Dolby Vision enhancement layer
             for _ in 0..n_dv {
@@ -192,7 +221,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     entry.secondary = true;
                     streams.push(entry);
                     spos = next;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         }
 
@@ -216,12 +247,16 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 /// Parse one stream entry from the STN table.
 /// Returns (StreamEntry, next position) or None.
 fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
-    if pos + 2 > item.len() { return None; }
+    if pos + 2 > item.len() {
+        return None;
+    }
 
     // Stream entry: length(1) + data
     let se_len = item[pos] as usize;
     let se_end = pos + 1 + se_len;
-    if se_end > item.len() { return None; }
+    if se_end > item.len() {
+        return None;
+    }
 
     // PID from stream entry (type 0x01 = PlayItem stream: PID at bytes 2-3)
     let pid = if item[pos + 1] == 0x01 && pos + 4 <= item.len() {
@@ -231,14 +266,17 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     };
 
     // Stream attributes: length(1) + coding_type(1) + format-specific data
-    if se_end + 2 > item.len() { return None; }
+    if se_end + 2 > item.len() {
+        return None;
+    }
     let sa_len = item[se_end] as usize;
     let sa_end = se_end + 1 + sa_len;
-    if sa_end > item.len() || sa_len < 1 { return None; }
+    if sa_end > item.len() || sa_len < 1 {
+        return None;
+    }
 
     let sa = &item[se_end + 1..se_end + 1 + sa_len];
     let coding_type = sa[0];
-
 
     let mut video_format = 0u8;
     let mut video_rate = 0u8;
@@ -307,19 +345,22 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         _ => {}
     }
 
-    Some((StreamEntry {
-        stream_type,
-        pid,
-        coding_type,
-        video_format,
-        video_rate,
-        audio_format,
-        audio_rate,
-        language,
-        dynamic_range,
-        color_space: color_space_val,
-        secondary: false,
-    }, sa_end))
+    Some((
+        StreamEntry {
+            stream_type,
+            pid,
+            coding_type,
+            video_format,
+            video_rate,
+            audio_format,
+            audio_rate,
+            language,
+            dynamic_range,
+            color_space: color_space_val,
+            secondary: false,
+        },
+        sa_end,
+    ))
 }
 
 #[cfg(test)]
@@ -329,7 +370,12 @@ mod tests {
     /// Build a minimal MPLS binary with given play items and STN streams on the first item.
     /// STN counts: (n_video, n_audio, n_pg, n_ig, n_sec_audio, n_sec_video, n_pip_pg, n_dv)
     fn build_mpls(
-        play_items_data: &[(/*clip_id*/&[u8;5], /*conn*/u8, /*in_time*/u32, /*out_time*/u32)],
+        play_items_data: &[(
+            /*clip_id*/ &[u8; 5],
+            /*conn*/ u8,
+            /*in_time*/ u32,
+            /*out_time*/ u32,
+        )],
         stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
         stream_entries: &[Vec<u8>], // raw stream entry + attributes bytes for each stream
     ) -> Vec<u8> {
@@ -424,7 +470,13 @@ mod tests {
     /// For video: attrs = coding_type(1) + format_rate(1) [+ hdr_byte if HEVC]
     /// For audio: attrs = coding_type(1) + format_rate(1) + language(3)
     /// For PG:    attrs = coding_type(1) + language(3)
-    fn build_stream_entry_video(pid: u16, coding_type: u8, format: u8, rate: u8, hdr: Option<u8>) -> Vec<u8> {
+    fn build_stream_entry_video(
+        pid: u16,
+        coding_type: u8,
+        format: u8,
+        rate: u8,
+        hdr: Option<u8>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         // Stream entry: length(1) + sub_path_type(1) + pid(2)
         out.push(3); // se_len = 3 bytes (type + pid_hi + pid_lo)
@@ -440,13 +492,25 @@ mod tests {
         out
     }
 
-    fn build_stream_entry_audio(pid: u16, coding_type: u8, ch_layout: u8, sample_rate: u8, lang: &[u8; 3]) -> Vec<u8> {
+    fn build_stream_entry_audio(
+        pid: u16,
+        coding_type: u8,
+        ch_layout: u8,
+        sample_rate: u8,
+        lang: &[u8; 3],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(3);
         out.push(0x01);
         out.extend_from_slice(&pid.to_be_bytes());
         // attrs: coding_type(1) + format_rate(1) + language(3)
-        let attrs = vec![coding_type, (ch_layout << 4) | sample_rate, lang[0], lang[1], lang[2]];
+        let attrs = vec![
+            coding_type,
+            (ch_layout << 4) | sample_rate,
+            lang[0],
+            lang[1],
+            lang[2],
+        ];
         out.push(attrs.len() as u8);
         out.extend_from_slice(&attrs);
         out
@@ -466,7 +530,7 @@ mod tests {
 
     #[test]
     fn parse_valid_mpls() {
-        let in_time: u32 = 90000;   // 2 seconds at 45kHz
+        let in_time: u32 = 90000; // 2 seconds at 45kHz
         let out_time: u32 = 4500000; // 100 seconds
 
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None); // H264, 1080p, 23.976
@@ -508,10 +572,10 @@ mod tests {
         assert_eq!(v.stream_type, 1);
         assert_eq!(v.pid, 0x1011);
         assert_eq!(v.coding_type, 0x24); // HEVC
-        assert_eq!(v.video_format, 8);   // 2160p
-        assert_eq!(v.video_rate, 1);     // 23.976
-        assert_eq!(v.dynamic_range, 1);  // HDR10
-        assert_eq!(v.color_space, 2);    // BT.2020
+        assert_eq!(v.video_format, 8); // 2160p
+        assert_eq!(v.video_rate, 1); // 23.976
+        assert_eq!(v.dynamic_range, 1); // HDR10
+        assert_eq!(v.color_space, 2); // BT.2020
         assert!(!v.secondary);
 
         // Audio stream
@@ -519,8 +583,8 @@ mod tests {
         assert_eq!(a.stream_type, 2);
         assert_eq!(a.pid, 0x1100);
         assert_eq!(a.coding_type, 0x83); // TrueHD
-        assert_eq!(a.audio_format, 6);   // 5.1
-        assert_eq!(a.audio_rate, 1);     // 48kHz
+        assert_eq!(a.audio_format, 6); // 5.1
+        assert_eq!(a.audio_rate, 1); // 48kHz
         assert_eq!(a.language, "eng");
         assert!(!a.secondary);
 
@@ -535,11 +599,7 @@ mod tests {
 
     #[test]
     fn parse_invalid_magic() {
-        let mut data = build_mpls(
-            &[(b"00001", 1, 0, 9000000)],
-            (0, 0, 0, 0, 0, 0, 0, 0),
-            &[],
-        );
+        let mut data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
         data[0] = b'X';
         data[1] = b'X';
         data[2] = b'X';

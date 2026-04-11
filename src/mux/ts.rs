@@ -100,7 +100,7 @@ impl PesAssembler {
 pub struct TsDemuxer {
     assemblers: Vec<PesAssembler>,
     pid_index: [i16; 8192], // PID → index into assemblers, -1 = not tracked
-    remainder: Vec<u8>,      // leftover bytes from previous feed() call
+    remainder: Vec<u8>,     // leftover bytes from previous feed() call
 }
 
 impl TsDemuxer {
@@ -112,7 +112,11 @@ impl TsDemuxer {
             pid_index[pid as usize] = i as i16;
             assemblers.push(PesAssembler::new(pid));
         }
-        Self { assemblers, pid_index, remainder: Vec::new() }
+        Self {
+            assemblers,
+            pid_index,
+            remainder: Vec::new(),
+        }
     }
 
     /// Feed a chunk of BD transport stream data. Handles non-192-byte-aligned input
@@ -225,8 +229,12 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     // Some stream IDs don't have the standard PES header extension
     // (program_stream_map, padding, private_stream_2, ECM, EMM, etc.)
-    if stream_id == 0xBC || stream_id == 0xBE || stream_id == 0xBF
-        || stream_id == 0xF0 || stream_id == 0xF1 || stream_id == 0xFF
+    if stream_id == 0xBC
+        || stream_id == 0xBE
+        || stream_id == 0xBF
+        || stream_id == 0xF0
+        || stream_id == 0xF1
+        || stream_id == 0xFF
     {
         return (None, None, 6);
     }
@@ -261,11 +269,7 @@ fn parse_timestamp(data: &[u8]) -> i64 {
     let b3 = data[3] as i64;
     let b4 = data[4] as i64;
 
-    ((b0 >> 1) & 0x07) << 30
-        | b1 << 22
-        | (b2 >> 1) << 15
-        | b3 << 7
-        | b4 >> 1
+    ((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1
 }
 
 // ============================================================
@@ -281,7 +285,10 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
     let mut pat_pmt_pid: Option<u16> = None;
     let mut offset = 0;
     while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE { offset += 1; continue; }
+        if data[offset + 4] != SYNC_BYTE {
+            offset += 1;
+            continue;
+        }
         let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
         let pusi = data[offset + 5] & 0x40 != 0;
 
@@ -291,7 +298,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                 let pointer = data[payload_start] as usize;
                 let pat_start = payload_start + 1 + pointer;
                 if pat_start + 12 < data.len() && data[pat_start] == 0x00 {
-                    let section_len = (((data[pat_start + 1] & 0x0F) as usize) << 8) | data[pat_start + 2] as usize;
+                    let section_len = (((data[pat_start + 1] & 0x0F) as usize) << 8)
+                        | data[pat_start + 2] as usize;
                     let entries_start = pat_start + 8;
                     let entries_end = pat_start + 3 + section_len - 4;
                     let mut e = entries_start;
@@ -316,20 +324,34 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
     let mut streams = Vec::new();
     offset = 0;
     while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE { offset += 1; continue; }
+        if data[offset + 4] != SYNC_BYTE {
+            offset += 1;
+            continue;
+        }
         let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
         let pusi = data[offset + 5] & 0x40 != 0;
 
         if pid == pmt_pid && pusi {
             let payload_start = offset + 4 + 4;
-            if payload_start + 1 >= data.len() { offset += BD_TS_PACKET_SIZE; continue; }
+            if payload_start + 1 >= data.len() {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            }
             let pointer = data[payload_start] as usize;
             let pmt_start = payload_start + 1 + pointer;
-            if pmt_start + 12 >= data.len() { offset += BD_TS_PACKET_SIZE; continue; }
-            if data[pmt_start] != 0x02 { offset += BD_TS_PACKET_SIZE; continue; }
+            if pmt_start + 12 >= data.len() {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            }
+            if data[pmt_start] != 0x02 {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            }
 
-            let section_len = (((data[pmt_start + 1] & 0x0F) as usize) << 8) | data[pmt_start + 2] as usize;
-            let prog_info_len = (((data[pmt_start + 10] & 0x0F) as usize) << 8) | data[pmt_start + 11] as usize;
+            let section_len =
+                (((data[pmt_start + 1] & 0x0F) as usize) << 8) | data[pmt_start + 2] as usize;
+            let prog_info_len =
+                (((data[pmt_start + 10] & 0x0F) as usize) << 8) | data[pmt_start + 11] as usize;
             let mut pos = pmt_start + 12 + prog_info_len;
             let end = pmt_start + 3 + section_len - 4;
 
@@ -340,57 +362,95 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
 
                 let stream = match stream_type {
                     0x1B => Some(Stream::Video(VideoStream {
-                        pid: es_pid, codec: Codec::H264,
-                        resolution: "1080p".into(), frame_rate: String::new(),
-                        hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
-                        secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::H264,
+                        resolution: "1080p".into(),
+                        frame_rate: String::new(),
+                        hdr: HdrFormat::Sdr,
+                        color_space: ColorSpace::Bt709,
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x24 => Some(Stream::Video(VideoStream {
-                        pid: es_pid, codec: Codec::Hevc,
-                        resolution: "2160p".into(), frame_rate: String::new(),
-                        hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
-                        secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Hevc,
+                        resolution: "2160p".into(),
+                        frame_rate: String::new(),
+                        hdr: HdrFormat::Sdr,
+                        color_space: ColorSpace::Bt709,
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0xEA => Some(Stream::Video(VideoStream {
-                        pid: es_pid, codec: Codec::Vc1,
-                        resolution: "1080p".into(), frame_rate: String::new(),
-                        hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
-                        secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Vc1,
+                        resolution: "1080p".into(),
+                        frame_rate: String::new(),
+                        hdr: HdrFormat::Sdr,
+                        color_space: ColorSpace::Bt709,
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x02 => Some(Stream::Video(VideoStream {
-                        pid: es_pid, codec: Codec::Mpeg2,
-                        resolution: "1080i".into(), frame_rate: String::new(),
-                        hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
-                        secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Mpeg2,
+                        resolution: "1080i".into(),
+                        frame_rate: String::new(),
+                        hdr: HdrFormat::Sdr,
+                        color_space: ColorSpace::Bt709,
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x81 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid, codec: Codec::Ac3,
-                        channels: "5.1".into(), language: "und".into(),
-                        sample_rate: "48kHz".into(), secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Ac3,
+                        channels: "5.1".into(),
+                        language: "und".into(),
+                        sample_rate: "48kHz".into(),
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x83 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid, codec: Codec::TrueHd,
-                        channels: "5.1".into(), language: "und".into(),
-                        sample_rate: "48kHz".into(), secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::TrueHd,
+                        channels: "5.1".into(),
+                        language: "und".into(),
+                        sample_rate: "48kHz".into(),
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x84 | 0xA1 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid, codec: Codec::Ac3Plus,
-                        channels: "5.1".into(), language: "und".into(),
-                        sample_rate: "48kHz".into(), secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Ac3Plus,
+                        channels: "5.1".into(),
+                        language: "und".into(),
+                        sample_rate: "48kHz".into(),
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x85 | 0x86 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid, codec: Codec::DtsHdMa,
-                        channels: "5.1".into(), language: "und".into(),
-                        sample_rate: "48kHz".into(), secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::DtsHdMa,
+                        channels: "5.1".into(),
+                        language: "und".into(),
+                        sample_rate: "48kHz".into(),
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x82 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid, codec: Codec::Dts,
-                        channels: "5.1".into(), language: "und".into(),
-                        sample_rate: "48kHz".into(), secondary: false, label: String::new(),
+                        pid: es_pid,
+                        codec: Codec::Dts,
+                        channels: "5.1".into(),
+                        language: "und".into(),
+                        sample_rate: "48kHz".into(),
+                        secondary: false,
+                        label: String::new(),
                     })),
                     0x90 => Some(Stream::Subtitle(SubtitleStream {
-                        pid: es_pid, codec: Codec::Pgs,
-                        language: "und".into(), forced: false,
+                        pid: es_pid,
+                        codec: Codec::Pgs,
+                        language: "und".into(),
+                        forced: false,
                     })),
                     _ => None,
                 };
@@ -405,7 +465,11 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         offset += BD_TS_PACKET_SIZE;
     }
 
-    if streams.is_empty() { None } else { Some(streams) }
+    if streams.is_empty() {
+        None
+    } else {
+        Some(streams)
+    }
 }
 
 // ============================================================
@@ -416,7 +480,10 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
 pub fn scan_first_pts(data: &[u8], target_pid: u16) -> Option<i64> {
     let mut offset = 0;
     while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE { offset += 1; continue; }
+        if data[offset + 4] != SYNC_BYTE {
+            offset += 1;
+            continue;
+        }
         let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
         let pusi = data[offset + 5] & 0x40 != 0;
         if pid == target_pid && pusi {
@@ -443,7 +510,10 @@ pub fn scan_last_pts(data: &[u8], target_pid: u16) -> Option<i64> {
     let mut last_pts = None;
     let mut offset = 0;
     while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE { offset += 1; continue; }
+        if data[offset + 4] != SYNC_BYTE {
+            offset += 1;
+            continue;
+        }
         let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
         let pusi = data[offset + 5] & 0x40 != 0;
         if pid == target_pid && pusi {
@@ -482,7 +552,7 @@ pub fn scan_duration<R: std::io::Read + std::io::Seek>(r: &mut R, video_pid: u16
     // Read last 2MB for last PTS (aligned to 192-byte boundary)
     let file_size = r.seek(SeekFrom::End(0)).ok()?;
     let tail_size: u64 = SCAN_TAIL_SIZE as u64;
-    let raw_pos = if file_size > tail_size { file_size - tail_size } else { 0 };
+    let raw_pos = file_size.saturating_sub(tail_size);
     let seek_pos = (raw_pos / BD_TS_PACKET_SIZE as u64) * BD_TS_PACKET_SIZE as u64;
     r.seek(SeekFrom::Start(seek_pos)).ok()?;
     let mut tail_buf = vec![0u8; tail_size as usize];

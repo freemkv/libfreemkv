@@ -4,9 +4,9 @@
 //! When both exist, language_streams.txt provides structured types while
 //! menu_base.prop provides stream number → button name mapping.
 
+use super::{vocab, LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
-use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier, vocab};
 use std::collections::HashMap;
 
 pub fn detect(udf: &UdfFs) -> bool {
@@ -35,9 +35,10 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
     // Match by stream number + type, take name from menu_base
     let mut result = ls;
     for label in &mut result {
-        if let Some(mb_match) = mb.iter().find(|m|
-            m.stream_type == label.stream_type && m.stream_number == label.stream_number
-        ) {
+        if let Some(mb_match) = mb
+            .iter()
+            .find(|m| m.stream_type == label.stream_type && m.stream_number == label.stream_number)
+        {
             if label.name.is_empty() && !mb_match.name.is_empty() {
                 label.name = mb_match.name.clone();
             }
@@ -56,10 +57,14 @@ fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<
 
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
 
         let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-        if parts.len() < 4 { continue; }
+        if parts.len() < 4 {
+            continue;
+        }
 
         let type_str = parts[1];
         let stream_num: u16 = match parts[2].parse() {
@@ -67,19 +72,63 @@ fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<
             Err(_) => continue,
         };
         let language = parts[3].to_string();
-        let variant = if parts.len() > 4 { parts[4].to_string() } else { String::new() };
+        let variant = if parts.len() > 4 {
+            parts[4].to_string()
+        } else {
+            String::new()
+        };
 
         let (stream_type, purpose, qualifier) = match type_str {
-            "audio_production" => (StreamLabelType::Audio, LabelPurpose::Normal, LabelQualifier::None),
-            "audio_commentary" => (StreamLabelType::Audio, LabelPurpose::Commentary, LabelQualifier::None),
-            "audio_ime" => (StreamLabelType::Audio, LabelPurpose::Ime, LabelQualifier::None),
-            "subtitle_production" => (StreamLabelType::Subtitle, LabelPurpose::Normal, LabelQualifier::None),
-            "subtitle_commentary" => (StreamLabelType::Subtitle, LabelPurpose::Commentary, LabelQualifier::None),
-            "subtitle_narrative" => (StreamLabelType::Subtitle, LabelPurpose::Normal, LabelQualifier::Forced),
-            "subtitle_dual" => (StreamLabelType::Subtitle, LabelPurpose::Normal, LabelQualifier::None),
-            "subtitle_bonus" => (StreamLabelType::Subtitle, LabelPurpose::Normal, LabelQualifier::None),
-            "subtitle_ime" => (StreamLabelType::Subtitle, LabelPurpose::Ime, LabelQualifier::None),
-            "subtitle_ime_narrative" => (StreamLabelType::Subtitle, LabelPurpose::Ime, LabelQualifier::Forced),
+            "audio_production" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "audio_commentary" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Commentary,
+                LabelQualifier::None,
+            ),
+            "audio_ime" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Ime,
+                LabelQualifier::None,
+            ),
+            "subtitle_production" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_commentary" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Commentary,
+                LabelQualifier::None,
+            ),
+            "subtitle_narrative" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::Forced,
+            ),
+            "subtitle_dual" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_bonus" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_ime" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Ime,
+                LabelQualifier::None,
+            ),
+            "subtitle_ime_narrative" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Ime,
+                LabelQualifier::Forced,
+            ),
             _ => continue,
         };
 
@@ -117,7 +166,9 @@ fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<
         });
     }
 
-    if labels.is_empty() { return None; }
+    if labels.is_empty() {
+        return None;
+    }
     Some(labels)
 }
 
@@ -132,7 +183,9 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
 
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let eq_pos = match line.find('=') {
             Some(p) => p,
             None => continue,
@@ -143,7 +196,10 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
         if let Some(dot_pos) = full_key.rfind('.') {
             let prefix = full_key[..dot_pos].to_string();
             let key = full_key[dot_pos + 1..].to_string();
-            entries.entry(prefix).or_default().insert(key, value.to_string());
+            entries
+                .entry(prefix)
+                .or_default()
+                .insert(key, value.to_string());
         }
     }
 
@@ -151,12 +207,17 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
 
     for (prefix, props) in &entries {
         // Audio: has "streamNumber" or "audioStream" and audio-related class
-        let is_audio = props.get("class").map_or(false, |c| c.contains("AudioButton"))
+        let is_audio = props
+            .get("class")
+            .is_some_and(|c| c.contains("AudioButton"))
             || prefix.starts_with("audio_");
-        let is_subtitle = props.get("class").map_or(false, |c| c.contains("SubtitleButton"))
+        let is_subtitle = props
+            .get("class")
+            .is_some_and(|c| c.contains("SubtitleButton"))
             || prefix.starts_with("subtitle_");
 
-        let stream_num_str = props.get("streamNumber")
+        let stream_num_str = props
+            .get("streamNumber")
             .or_else(|| props.get("audioStream"))
             .or_else(|| props.get("subtitleStream"));
 
@@ -165,7 +226,9 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
             _ => continue,
         };
 
-        if !is_audio && !is_subtitle { continue; }
+        if !is_audio && !is_subtitle {
+            continue;
+        }
 
         let name = props.get("name").cloned().unwrap_or_default();
         let name_lower = name.to_lowercase();
@@ -182,10 +245,15 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
             LabelQualifier::None
         };
 
-        let stream_type = if is_audio { StreamLabelType::Audio } else { StreamLabelType::Subtitle };
+        let stream_type = if is_audio {
+            StreamLabelType::Audio
+        } else {
+            StreamLabelType::Subtitle
+        };
 
         // Try to extract language from audioLanguage/subtitleLanguage prop
-        let language = props.get("audioLanguage")
+        let language = props
+            .get("audioLanguage")
             .or_else(|| props.get("subtitleLanguage"))
             .cloned()
             .unwrap_or_default();
@@ -202,7 +270,9 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
         });
     }
 
-    if labels.is_empty() { return None; }
+    if labels.is_empty() {
+        return None;
+    }
     labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
     Some(labels)
 }
