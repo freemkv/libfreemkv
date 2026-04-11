@@ -22,6 +22,7 @@ pub struct DriveCapture {
     pub rb_mode6: Option<Vec<u8>>,
 }
 
+/// A single GET CONFIGURATION feature response from the drive.
 #[derive(Debug, Clone)]
 pub struct CapturedFeature {
     pub code: u16,

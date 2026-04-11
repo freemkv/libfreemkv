@@ -24,6 +24,7 @@ use crate::scsi::ScsiTransport;
 use crate::sector::SectorReader;
 use std::path::Path;
 
+/// Optical disc drive session -- open, identify, unlock, and read.
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
     driver: Option<Box<dyn PlatformDriver>>,
@@ -257,6 +258,7 @@ impl SectorReader for DriveSession {
     }
 }
 
+/// Find all optical drives connected to this system.
 pub fn find_drives() -> Vec<(String, DriveId)> {
     #[cfg(target_os = "linux")]
     {
@@ -272,10 +274,12 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     }
 }
 
+/// Find the first optical drive, returning its device path.
 pub fn find_drive() -> Option<String> {
     find_drives().into_iter().next().map(|(path, _)| path)
 }
 
+/// Resolve a device path to its raw SCSI device, with optional warning message.
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
     #[cfg(target_os = "linux")]
     {
