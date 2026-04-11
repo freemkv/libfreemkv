@@ -12,6 +12,7 @@
 
 pub mod crack;
 pub mod lfsr;
+pub(crate) mod tables;
 
 use crate::disc::Extent;
 use crate::sector::SectorReader;
