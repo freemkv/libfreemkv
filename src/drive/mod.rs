@@ -67,15 +67,28 @@ impl DriveSession {
 
     pub fn wait_ready(&mut self) -> Result<()> {
         let tur = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        for _ in 0..60 {
+        for i in 0..60 {
             let mut buf = [0u8; 0];
-            if self
-                .scsi
-                .as_mut()
-                .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5000)
-                .is_ok()
-            {
-                return Ok(());
+            match self.scsi.as_mut().execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5000) {
+                Ok(_) => return Ok(()),
+                Err(Error::ScsiError { sense_key: 5, .. }) => {
+                    // Illegal Request on TUR — drive may be in LibreDrive mode
+                    // where standard commands fail but the drive is functional.
+                    // Check if vendor unlock probe responds (MT1959 signature).
+                    if i == 0 {
+                        let probe = crate::scsi::build_read_buffer(0x01, 0x44, 0, 64);
+                        let mut probe_buf = vec![0u8; 64];
+                        if let Ok(r) = self.scsi.as_mut().execute(
+                            &probe, crate::scsi::DataDirection::FromDevice, &mut probe_buf, 5000,
+                        ) {
+                            if r.bytes_transferred >= 16 && &probe_buf[12..16] == b"MMkv" {
+                                // Drive is in LibreDrive mode — it's ready
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
