@@ -423,3 +423,227 @@ fn parse_channels(s: &str) -> u8 {
         6
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Helper: search for a 4-byte big-endian EBML ID in a byte slice.
+    fn find_id(data: &[u8], id: u32) -> Option<usize> {
+        let bytes = id.to_be_bytes();
+        // Determine how many leading zero bytes to skip
+        let start = if bytes[0] != 0 {
+            0
+        } else if bytes[1] != 0 {
+            1
+        } else if bytes[2] != 0 {
+            2
+        } else {
+            3
+        };
+        let needle = &bytes[start..];
+        data.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn make_video_track() -> MkvTrack {
+        MkvTrack {
+            track_type: ebml::TRACK_TYPE_VIDEO,
+            codec_id: "V_MPEG4/ISO/AVC",
+            language: "und".into(),
+            name: String::new(),
+            codec_private: Some(vec![0x00, 0x01, 0x02, 0x03]),
+            is_default: true,
+            is_forced: false,
+            pixel_width: 1920,
+            pixel_height: 1080,
+            sample_rate: 0.0,
+            channels: 0,
+            bit_depth: 0,
+        }
+    }
+
+    fn make_audio_track() -> MkvTrack {
+        MkvTrack {
+            track_type: ebml::TRACK_TYPE_AUDIO,
+            codec_id: "A_AC3",
+            language: "eng".into(),
+            name: "English".into(),
+            codec_private: None,
+            is_default: true,
+            is_forced: false,
+            pixel_width: 0,
+            pixel_height: 0,
+            sample_rate: 48000.0,
+            channels: 6,
+            bit_depth: 0,
+        }
+    }
+
+    #[test]
+    fn mkv_writes_ebml_header() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let muxer = MkvMuxer::new(buf, &tracks, Some("Test"), 120.0).unwrap();
+        let data = muxer.writer.into_inner();
+        // EBML header element ID: 0x1A45DFA3
+        assert!(data.len() >= 4);
+        assert_eq!(&data[0..4], &[0x1A, 0x45, 0xDF, 0xA3]);
+    }
+
+    #[test]
+    fn mkv_writes_segment() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 0.0).unwrap();
+        let data = muxer.writer.into_inner();
+        // Segment element ID: 0x18538067
+        assert!(
+            find_id(&data, ebml::SEGMENT).is_some(),
+            "Segment element not found in output"
+        );
+    }
+
+    #[test]
+    fn mkv_write_frame_creates_cluster() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::CLUSTER).is_some(),
+            "Cluster element not found after write_frame"
+        );
+    }
+
+    #[test]
+    fn mkv_finish_writes_cues_element() {
+        // Use a Vec wrapped in Cursor, then check after finish
+        use std::sync::{Arc, Mutex};
+
+        // We'll write to a Cursor, but finish() consumes self.
+        // The trick: Cursor<Vec<u8>> - we can get data back via into_inner chain.
+        // But MkvMuxer::finish consumes self and flushes writer.
+        // We need a way to inspect the output. Let's use a wrapper.
+
+        struct SharedWriter(Arc<Mutex<Cursor<Vec<u8>>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.lock().unwrap().flush()
+            }
+        }
+        impl Seek for SharedWriter {
+            fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+                self.0.lock().unwrap().seek(pos)
+            }
+        }
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let tracks = [make_video_track()];
+        let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0x01, 0x02, 0x03])
+            .unwrap();
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+        assert!(
+            find_id(&data, ebml::CUES).is_some(),
+            "Cues element (0x1C53BB6B) not found after finish()"
+        );
+    }
+
+    #[test]
+    fn mkv_multiple_tracks() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track(), make_audio_track()];
+        let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0).unwrap();
+        // Write frames to both tracks
+        muxer
+            .write_frame(0, 0, true, &[0x00, 0x00, 0x01])
+            .unwrap();
+        muxer
+            .write_frame(1, 0, false, &[0x0B, 0x77, 0x00])
+            .unwrap();
+        muxer
+            .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01])
+            .unwrap();
+        muxer
+            .write_frame(1, 32_000_000, false, &[0x0B, 0x77, 0x01])
+            .unwrap();
+        // Should not panic
+        let data = muxer.writer.into_inner();
+        assert!(data.len() > 100, "output too small for multi-track MKV");
+    }
+
+    #[test]
+    fn mkv_keyframe_flag() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let mut muxer = MkvMuxer::new(buf, &tracks, None, 10.0).unwrap();
+
+        // Record position before first frame
+        let pos_before_kf = muxer.writer.position();
+        muxer
+            .write_frame(0, 0, true, &[0xAA])
+            .unwrap();
+        let pos_after_kf = muxer.writer.position();
+
+        muxer
+            .write_frame(0, 1_000_000, false, &[0xBB])
+            .unwrap();
+        let pos_after_nkf = muxer.writer.position();
+
+        let data = muxer.writer.into_inner();
+
+        // Extract the SimpleBlock regions
+        let kf_region = &data[pos_before_kf as usize..pos_after_kf as usize];
+        let nkf_region = &data[pos_after_kf as usize..pos_after_nkf as usize];
+
+        // In a SimpleBlock, after ID + size + track_vint + 2-byte timestamp,
+        // the next byte is flags. Keyframe flag = 0x80, non-keyframe = 0x00.
+        // Find the flags byte in each region: it's the byte after the 2-byte timestamp.
+        // SimpleBlock ID is 0xA3. Find it and walk past ID + size + vint + ts.
+        fn extract_flags(region: &[u8]) -> u8 {
+            // Find 0xA3 (SimpleBlock ID)
+            let sb_pos = region.iter().position(|&b| b == 0xA3).unwrap();
+            // After ID: size (variable), track vint (1 byte for track<128), ts (2 bytes), flags (1 byte)
+            // Size is 1 byte for small blocks (< 127 bytes)
+            let after_id = sb_pos + 1;
+            // Read VINT size: first byte has high bit set for 1-byte sizes
+            let size_byte = region[after_id];
+            let size_len = if size_byte & 0x80 != 0 { 1 } else { 2 };
+            // Track VINT: 1 byte (track 1 = 0x81)
+            let track_vint_pos = after_id + size_len;
+            let track_vint_len = 1; // track 1 encoded as 0x81
+            // 2-byte relative timestamp
+            let ts_pos = track_vint_pos + track_vint_len;
+            // flags byte
+            let flags_pos = ts_pos + 2;
+            region[flags_pos]
+        }
+
+        let kf_flags = extract_flags(kf_region);
+        let nkf_flags = extract_flags(nkf_region);
+
+        assert_eq!(
+            kf_flags & 0x80,
+            0x80,
+            "keyframe flag should be set (0x80), got 0x{:02X}",
+            kf_flags
+        );
+        assert_eq!(
+            nkf_flags & 0x80,
+            0x00,
+            "non-keyframe flag should be clear, got 0x{:02X}",
+            nkf_flags
+        );
+    }
+}

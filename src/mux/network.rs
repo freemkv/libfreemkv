@@ -140,3 +140,135 @@ impl Read for NetworkStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc::{
+        AudioStream, Codec, ColorSpace, ContentFormat, HdrFormat, Stream, VideoStream,
+    };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Build a DiscTitle with streams for metadata tests.
+    fn sample_title() -> DiscTitle {
+        DiscTitle {
+            playlist: "NetworkTest".into(),
+            playlist_id: 1,
+            duration_secs: 3600.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: vec![
+                Stream::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::Hevc,
+                    resolution: "2160p".into(),
+                    frame_rate: "23.976".into(),
+                    hdr: HdrFormat::Hdr10,
+                    color_space: ColorSpace::Bt2020,
+                    secondary: false,
+                    label: "Main".into(),
+                }),
+                Stream::Audio(AudioStream {
+                    pid: 0x1100,
+                    codec: Codec::TrueHd,
+                    channels: "7.1".into(),
+                    language: "eng".into(),
+                    sample_rate: "48kHz".into(),
+                    secondary: false,
+                    label: "English".into(),
+                }),
+            ],
+            extents: Vec::new(),
+            content_format: ContentFormat::BdTs,
+        }
+    }
+
+    #[test]
+    #[ignore] // Requires TCP; may be flaky in CI environments
+    fn network_listen_connect_roundtrip() {
+        // Bind to OS-assigned port
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Release so NetworkStream::listen can bind
+
+        let addr = format!("127.0.0.1:{}", port);
+        let addr_clone = addr.clone();
+
+        // Spawn listener in a thread
+        let handle = std::thread::spawn(move || {
+            let mut ns = NetworkStream::listen(&addr_clone).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut received = Vec::new();
+            loop {
+                match ns.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            received
+        });
+
+        // Small delay to let the listener thread bind
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Connect and write data
+        let dt = sample_title();
+        let mut writer = NetworkStream::connect(&addr).unwrap().meta(&dt);
+        let payload = b"Hello from the write side of the network stream!";
+        writer.write_all(payload).unwrap();
+        writer.finish().unwrap();
+
+        let received = handle.join().unwrap();
+        // The received data should end with our payload (after the FMKV header)
+        assert!(
+            received.windows(payload.len()).any(|w| w == payload),
+            "payload not found in received data (got {} bytes)",
+            received.len()
+        );
+    }
+
+    #[test]
+    #[ignore] // Requires TCP; may be flaky in CI environments
+    fn network_metadata_flows() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let addr = format!("127.0.0.1:{}", port);
+        let addr_clone = addr.clone();
+
+        let handle = std::thread::spawn(move || {
+            let ns = NetworkStream::listen(&addr_clone).unwrap();
+            let info = ns.info().clone();
+            info
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let dt = sample_title();
+        let mut writer = NetworkStream::connect(&addr).unwrap().meta(&dt);
+        // Must write at least one byte to trigger header send
+        writer.write_all(&[0u8; 192]).unwrap();
+        writer.finish().unwrap();
+
+        let info = handle.join().unwrap();
+        assert_eq!(info.playlist, "NetworkTest");
+        assert_eq!(info.duration_secs, 3600.0);
+        assert_eq!(info.streams.len(), 2);
+    }
+
+    #[test]
+    fn network_empty_addr_errors() {
+        let result = NetworkStream::connect("");
+        assert!(result.is_err(), "empty address should fail");
+    }
+
+    #[test]
+    fn network_no_port_errors() {
+        // Connecting to an address without a port should fail
+        let result = NetworkStream::connect("127.0.0.1");
+        assert!(result.is_err(), "address without port should fail");
+    }
+}
