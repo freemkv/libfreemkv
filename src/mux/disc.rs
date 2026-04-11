@@ -10,7 +10,7 @@
 use super::IOStream;
 use crate::disc::{
     ContentFormat, Disc, DiscTitle, Extent,
-    DEFAULT_BATCH_SECTORS, MIN_BATCH_SECTORS, RAMP_BATCH_AFTER, RAMP_SPEED_AFTER,
+    MIN_BATCH_SECTORS, RAMP_BATCH_AFTER, RAMP_SPEED_AFTER,
     SLOW_SPEED_AFTER, detect_max_batch_sectors,
 };
 use crate::drive::DriveSession;
@@ -54,6 +54,7 @@ pub struct DiscStream {
     extents: Vec<Extent>,
     current_extent: usize,
     current_offset: u32,
+    #[allow(dead_code)]
     content_format: ContentFormat,
     aacs: Option<AacsDecrypt>,
     css: Option<crate::css::CssState>,
@@ -349,8 +350,7 @@ impl Write for DiscStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::disc::{ContentFormat, DiscTitle, Extent};
+    use crate::disc::Extent;
 
     /// Build a minimal DiscStream with fake extents for testing state advancement.
     /// We cannot call `DiscStream::open()` without a real drive, so we construct
