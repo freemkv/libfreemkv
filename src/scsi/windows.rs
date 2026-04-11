@@ -87,6 +87,19 @@ pub struct SptiTransport {
     handle: isize,
 }
 
+/// Normalize a device path to Windows \\.\X: format.
+fn normalize_device_path(path: &str) -> String {
+    if path.starts_with("\\\\.\\") { return path.to_string(); }
+    let trimmed = path.trim_end_matches('\\');
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        return format!("\\\\.\\{}", trimmed);
+    }
+    if path.to_lowercase().starts_with("cdrom") {
+        return format!("\\\\.\\{}", path);
+    }
+    format!("\\\\.\\{}", path)
+}
+
 impl SptiTransport {
     pub fn open(device: &Path) -> Result<Self> {
         let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
