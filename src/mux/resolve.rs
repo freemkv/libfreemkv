@@ -1,12 +1,26 @@
 //! Stream URL resolver — parses URL strings into IOStream instances.
 //!
-//! Schemes: disc://, m2ts://, mkv://, network://
-//! Bare paths infer scheme from file extension.
+//! Format: `scheme://path`
+//!
+//! | Scheme | Input | Output | Path |
+//! |--------|-------|--------|------|
+//! | disc:// | Yes | -- | empty (auto-detect) or /dev/sgN |
+//! | m2ts:// | Yes | Yes | file path (required) |
+//! | mkv://  | Yes | Yes | file path (required) |
+//! | network:// | Yes (listen) | Yes (connect) | host:port (required) |
+//! | stdio:// | Yes (stdin) | Yes (stdout) | empty |
+//! | iso://   | Yes | -- | file path (required) |
+//! | null:// | -- | Yes | empty |
+//!
+//! Bare paths without a scheme are rejected.
 
 use std::io::{self, BufReader, BufWriter};
+use std::path::Path;
 use super::{IOStream, M2tsStream, MkvStream};
 use super::network::NetworkStream;
 use super::null::NullStream;
+use super::stdio::StdioStream;
+use super::iso::IsoStream;
 use super::disc::{DiscStream, DiscOptions};
 use crate::disc::DiscTitle;
 
@@ -24,8 +38,16 @@ pub struct StreamUrl {
 
 /// Parse a URL string into scheme + path.
 ///
-/// Supports: `disc://`, `disc:///dev/sg4`, `m2ts://path`, `mkv://path`,
-/// `network://host:port`, or bare paths (infer from extension).
+/// All URLs must use the `scheme://path` format. Bare paths are not supported.
+///
+/// ```text
+/// disc://              → scheme="disc",    path=""
+/// disc:///dev/sg4      → scheme="disc",    path="/dev/sg4"
+/// m2ts:///tmp/Dune.m2ts → scheme="m2ts",   path="/tmp/Dune.m2ts"
+/// mkv://Dune.mkv       → scheme="mkv",     path="Dune.mkv"
+/// network://10.0.0.1:9000 → scheme="network", path="10.0.0.1:9000"
+/// null://              → scheme="null",    path=""
+/// ```
 pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("disc://") {
         return StreamUrl { scheme: "disc".into(), path: rest.to_string() };
@@ -42,17 +64,41 @@ pub fn parse_url(url: &str) -> StreamUrl {
     if url == "null://" || url.starts_with("null://") {
         return StreamUrl { scheme: "null".into(), path: String::new() };
     }
+    if url == "stdio://" || url.starts_with("stdio://") {
+        return StreamUrl { scheme: "stdio".into(), path: String::new() };
+    }
+    if let Some(rest) = url.strip_prefix("iso://") {
+        return StreamUrl { scheme: "iso".into(), path: rest.to_string() };
+    }
 
-    // Infer from extension
-    let scheme = if url.ends_with(".m2ts") {
-        "m2ts"
-    } else if url.ends_with(".mkv") {
-        "mkv"
-    } else {
-        "m2ts" // default
-    };
+    StreamUrl { scheme: "unknown".into(), path: url.to_string() }
+}
 
-    StreamUrl { scheme: scheme.into(), path: url.to_string() }
+/// Validate that a file path is non-empty and has a filename component.
+fn validate_file_path(path: &str, scheme: &str) -> io::Result<()> {
+    if path.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("{}:// requires a file path (e.g. {}://movie.{})", scheme, scheme, scheme)));
+    }
+    let p = Path::new(path);
+    if p.file_name().is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("{}://{} is not a valid file path — must include a filename", scheme, path)));
+    }
+    Ok(())
+}
+
+/// Validate that a network address has host:port format.
+fn validate_network_addr(addr: &str) -> io::Result<()> {
+    if addr.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "network:// requires host:port (e.g. network://0.0.0.0:9000)"));
+    }
+    if !addr.contains(':') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("network://{} missing port — use network://{}:PORT", addr, addr)));
+    }
+    Ok(())
 }
 
 /// Open a stream URL for reading (source).
@@ -71,20 +117,42 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
             Ok(Box::new(stream))
         }
         "m2ts" => {
-            let file = std::fs::File::open(&parsed.path)?;
+            validate_file_path(&parsed.path, "m2ts")?;
+            let file = std::fs::File::open(&parsed.path)
+                .map_err(|e| io::Error::new(e.kind(),
+                    format!("m2ts://{}: {}", parsed.path, e)))?;
             let reader = BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::open(reader)?))
         }
         "mkv" => {
-            let file = std::fs::File::open(&parsed.path)?;
+            validate_file_path(&parsed.path, "mkv")?;
+            let file = std::fs::File::open(&parsed.path)
+                .map_err(|e| io::Error::new(e.kind(),
+                    format!("mkv://{}: {}", parsed.path, e)))?;
             let reader = BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::open(reader)?))
         }
         "network" => {
+            validate_network_addr(&parsed.path)?;
             Ok(Box::new(NetworkStream::listen(&parsed.path)?))
         }
+        "stdio" => {
+            Ok(Box::new(StdioStream::input()))
+        }
+        "iso" => {
+            validate_file_path(&parsed.path, "iso")?;
+            Ok(Box::new(IsoStream::open(&parsed.path, opts.title_index)?))
+        }
+        "null" => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "null:// is write-only — cannot use as input"))
+        }
+        "unknown" => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, disc://, m2ts://movie.m2ts)", parsed.path)))
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("unknown scheme: {}", parsed.scheme))),
+            format!("unknown scheme: {}://", parsed.scheme))),
     }
 }
 
@@ -94,26 +162,45 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
 
     match parsed.scheme.as_str() {
         "disc" => {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "disc is read-only"))
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "disc:// is read-only — cannot use as output"))
+        }
+        "iso" => {
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "iso:// is read-only — cannot use as output"))
         }
         "null" => {
             Ok(Box::new(NullStream::new().meta(meta)))
         }
+        "stdio" => {
+            Ok(Box::new(StdioStream::output().meta(meta)))
+        }
         "m2ts" => {
-            let file = std::fs::File::create(&parsed.path)?;
+            validate_file_path(&parsed.path, "m2ts")?;
+            let file = std::fs::File::create(&parsed.path)
+                .map_err(|e| io::Error::new(e.kind(),
+                    format!("m2ts://{}: {}", parsed.path, e)))?;
             let writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::new(writer).meta(meta)))
         }
         "mkv" => {
-            let file = std::fs::File::create(&parsed.path)?;
+            validate_file_path(&parsed.path, "mkv")?;
+            let file = std::fs::File::create(&parsed.path)
+                .map_err(|e| io::Error::new(e.kind(),
+                    format!("mkv://{}: {}", parsed.path, e)))?;
             let writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::new(writer).meta(meta).max_buffer(MKV_LOOKAHEAD)))
         }
         "network" => {
+            validate_network_addr(&parsed.path)?;
             Ok(Box::new(NetworkStream::connect(&parsed.path)?.meta(meta)))
         }
+        "unknown" => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, m2ts://movie.m2ts, null://)", parsed.path)))
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput,
-            format!("unknown scheme: {}", parsed.scheme))),
+            format!("unknown scheme: {}://", parsed.scheme))),
     }
 }
 

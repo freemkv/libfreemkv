@@ -56,6 +56,21 @@ while let Some(unit) = reader.read_unit()? {
 - **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0 bus decryption)
 - **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
 - **Content reading** — adaptive batch reads with automatic decryption and error recovery
+- **Stream I/O** — unified stream pipeline for reading and writing any format
+
+### Streams
+
+| Stream | Input | Output | Transport |
+|--------|-------|--------|-----------|
+| DiscStream | Yes | -- | Optical drive via SCSI |
+| IsoStream | Yes | -- | Blu-ray ISO image file |
+| MkvStream | Yes | Yes | Matroska container |
+| M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
+| NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
+| StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
+| NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
+
+All streams implement the `IOStream` trait. `open_input()` and `open_output()` resolve URL strings to stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
 

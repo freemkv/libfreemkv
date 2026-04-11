@@ -101,5 +101,7 @@ pub use mux::M2tsStream;
 pub use mux::NetworkStream;
 pub use mux::DiscStream;
 pub use mux::NullStream;
+pub use mux::StdioStream;
+pub use mux::IsoStream;
 pub use mux::DiscOptions;
 pub use mux::{open_input, open_output, parse_url, InputOptions};
