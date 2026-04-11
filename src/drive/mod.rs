@@ -6,6 +6,8 @@
 //!   3. `init()` — activate custom firmware. Removes riplock.
 //!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
 
+pub mod capture;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -117,6 +119,51 @@ impl DriveSession {
                 product_revision: self.drive_id.product_revision.trim().to_string(),
             }),
         }
+    }
+
+    /// Query a specific GET CONFIGURATION feature by code.
+    /// Returns the feature data (without the 8-byte header), or None if not available.
+    pub fn get_config_feature(&mut self, feature_code: u16) -> Option<Vec<u8>> {
+        let cdb = [
+            crate::scsi::SCSI_GET_CONFIGURATION, 0x02,
+            (feature_code >> 8) as u8, feature_code as u8,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        ];
+        let mut buf = vec![0u8; 256];
+        let r = self.scsi.as_mut()
+            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
+        if r.bytes_transferred > 8 {
+            Some(buf[8..r.bytes_transferred].to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Read REPORT KEY RPC state (region playback control).
+    pub fn report_key_rpc_state(&mut self) -> Option<Vec<u8>> {
+        let cdb = [0xA4u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00];
+        let mut buf = vec![0u8; 8];
+        let r = self.scsi.as_mut()
+            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
+        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
+    }
+
+    /// Read MODE SENSE page data.
+    pub fn mode_sense_page(&mut self, page: u8) -> Option<Vec<u8>> {
+        let cdb = [0x5Au8, 0x00, page, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00];
+        let mut buf = vec![0u8; 252];
+        let r = self.scsi.as_mut()
+            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
+        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
+    }
+
+    /// Read vendor-specific READ BUFFER data.
+    pub fn read_buffer(&mut self, mode: u8, buffer_id: u8, length: u16) -> Option<Vec<u8>> {
+        let cdb = crate::scsi::build_read_buffer(mode, buffer_id, 0, length as u32);
+        let mut buf = vec![0u8; length as usize];
+        let r = self.scsi.as_mut()
+            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
+        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
     }
 
     pub fn is_ready(&self) -> bool {

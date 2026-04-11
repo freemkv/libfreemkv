@@ -88,6 +88,7 @@ pub(crate) mod speed;
 pub(crate) mod udf;
 
 pub use drive::{find_drive, find_drives, resolve_device, DriveSession};
+pub use drive::capture::{DriveCapture, CapturedFeature, capture_drive_data, mask_string, mask_bytes};
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
