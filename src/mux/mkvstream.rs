@@ -84,7 +84,11 @@ impl MkvStream {
             for s in &dt.streams {
                 let (pid, track, parser) = match s {
                     crate::disc::Stream::Video(v) => {
-                        ws.video_pending += 1;
+                        // Only count primary video as pending — secondary streams
+                        // (Dolby Vision EL, PiP) may never produce codec headers
+                        if !v.secondary {
+                            ws.video_pending += 1;
+                        }
                         (v.pid, MkvTrack::video(v), codec::parser_for_codec(v.codec))
                     }
                     crate::disc::Stream::Audio(a) => {

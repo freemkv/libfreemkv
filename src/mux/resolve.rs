@@ -27,8 +27,10 @@ use std::path::Path;
 /// I/O buffer size for file streams.
 const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// MKV lookahead buffer size.
-const MKV_LOOKAHEAD: usize = 10 * 1024 * 1024;
+/// Default MKV lookahead buffer size.
+/// Dynamically increased for UHD content (many streams delay video codec headers).
+const MKV_LOOKAHEAD_DEFAULT: usize = 10 * 1024 * 1024;
+const MKV_LOOKAHEAD_UHD: usize = 100 * 1024 * 1024;
 
 /// Parsed stream URL.
 pub struct StreamUrl {
@@ -231,7 +233,14 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
                 .map_err(|e| io::Error::new(e.kind(),
                     format!("mkv://{}: {}", parsed.path, e)))?;
             let writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
-            Ok(Box::new(MkvStream::new(writer).meta(meta).max_buffer(MKV_LOOKAHEAD)))
+            // Size lookahead based on content: UHD (many streams) needs larger buffer
+            // because HEVC SPS/PPS may not appear until well past 10 MB
+            let lookahead = if meta.streams.len() > 15 {
+                MKV_LOOKAHEAD_UHD
+            } else {
+                MKV_LOOKAHEAD_DEFAULT
+            };
+            Ok(Box::new(MkvStream::new(writer).meta(meta).max_buffer(lookahead)))
         }
         "network" => {
             validate_network_addr(&parsed.path)?;
