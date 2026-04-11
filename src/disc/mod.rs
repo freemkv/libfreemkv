@@ -533,7 +533,8 @@ impl Disc {
     /// The session must be open and unlocked (DriveSession::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
-        let capacity = Self::read_capacity(session)?;
+        // READ CAPACITY may fail in LibreDrive mode — proceed with 0 and estimate later
+        let capacity = Self::read_capacity(session).unwrap_or(0);
         let handshake = Self::do_handshake(session, opts);
         Self::scan_with(session, capacity, handshake, opts)
     }
