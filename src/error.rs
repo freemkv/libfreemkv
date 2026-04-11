@@ -71,102 +71,135 @@ pub const E_MUX_WRITE: u16 = 9001;
 /// Structured error with numeric code and context data. No English text.
 #[derive(Debug)]
 pub enum Error {
-    // Device
+    /// Device not found at the given path.
     DeviceNotFound {
         path: String,
     },
+    /// Insufficient permissions to open the device.
     DevicePermission {
         path: String,
     },
 
-    // Profile
+    /// Drive model is not in the profile database.
     UnsupportedDrive {
         vendor_id: String,
         product_id: String,
         product_revision: String,
     },
+    /// No matching firmware profile found for this drive revision.
     ProfileNotFound {
         vendor_id: String,
         product_revision: String,
         vendor_specific: String,
     },
+    /// Failed to parse the bundled profile database.
     ProfileParse,
 
-    // Unlock
+    /// Drive unlock (firmware upload) failed.
     UnlockFailed,
+    /// Firmware signature verification failed.
     SignatureMismatch {
         expected: [u8; 4],
         got: [u8; 4],
     },
+    /// Operation requires an unlocked drive.
     NotUnlocked,
+    /// Operation requires a calibrated drive.
     NotCalibrated,
 
-    // SCSI
+    /// SCSI command returned an error status.
     ScsiError {
         opcode: u8,
         status: u8,
         sense_key: u8,
     },
+    /// SCSI command timed out.
     ScsiTimeout {
         opcode: u8,
     },
 
-    // I/O
+    /// Underlying I/O error.
     IoError {
         source: std::io::Error,
     },
+    /// Write operation failed.
     WriteError,
 
-    // Disc format
+    /// Failed to read disc sector.
     DiscRead {
         sector: u64,
     },
+    /// MPLS playlist parsing failed.
     MplsParse,
+    /// CLPI clip info parsing failed.
     ClpiParse,
+    /// File not found on the UDF filesystem.
     UdfNotFound {
         path: String,
     },
+    /// Disc contains no playable titles.
     DiscNoTitles,
+    /// Title index out of range.
     DiscTitleRange {
         index: usize,
         count: usize,
     },
+    /// Title has no sector extents to read.
     DiscNoExtents,
+    /// DVD IFO file parsing failed.
     IfoParse,
 
-    // AACS
+    /// No AACS decryption keys available for this disc.
     AacsNoKeys,
+    /// Host certificate too short.
     AacsCertShort,
+    /// Failed to allocate AGID for AACS handshake.
     AacsAgidAlloc,
+    /// Drive rejected the host certificate.
     AacsCertRejected,
+    /// Failed to read drive certificate.
     AacsCertRead,
+    /// Drive certificate verification failed.
     AacsCertVerify,
+    /// Failed to read host key from drive.
     AacsKeyRead,
+    /// Drive rejected the host key.
     AacsKeyRejected,
+    /// Host key verification failed.
     AacsKeyVerify,
+    /// Failed to read Volume ID.
     AacsVidRead,
+    /// Volume ID MAC verification failed.
     AacsVidMac,
+    /// Failed to derive the data key.
     AacsDataKey,
+    /// Failed to derive the Volume Unique Key.
     AacsVukDerive,
 
-    // Keydb
+    /// Failed to connect to the KEYDB server.
     KeydbConnect {
         host: String,
     },
+    /// KEYDB server returned an HTTP error.
     KeydbHttp {
         status: u16,
     },
+    /// Downloaded KEYDB file is invalid (no entries found).
     KeydbInvalid,
+    /// Failed to write KEYDB to disk.
     KeydbWrite {
         path: String,
     },
+    /// Failed to parse KEYDB file.
     KeydbParse,
+    /// Failed to load KEYDB from disk.
     KeydbLoad {
         path: String,
     },
 
-    // Mux
+    /// Lookahead buffer exhausted before codec headers found.
     MuxLookahead,
+    /// Muxer write failed.
     MuxWrite,
 }
 
@@ -306,4 +339,5 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;

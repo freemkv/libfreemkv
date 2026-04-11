@@ -167,7 +167,7 @@ impl KeyDb {
             .to_string();
         // Try with 0x prefix and without
         self.disc_entries
-            .get(&format!("0x{}", hash))
+            .get(&format!("0x{hash}"))
             .or_else(|| self.disc_entries.get(&hash))
             .and_then(|e| e.vuk)
     }
@@ -180,7 +180,7 @@ impl KeyDb {
             .trim_start_matches("0x")
             .to_string();
         self.disc_entries
-            .get(&format!("0x{}", hash))
+            .get(&format!("0x{hash}"))
             .or_else(|| self.disc_entries.get(&hash))
     }
 

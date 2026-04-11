@@ -203,7 +203,7 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
         let mut b = [0u8; 2];
         r.read_exact(&mut b)?;
         let val = (((b0 & 0x1F) as u64) << 16) | (b[0] as u64) << 8 | b[1] as u64;
-        if val == 0x1FFFFF {
+        if val == 0x1F_FFFF {
             return Ok((u64::MAX, 3));
         }
         Ok((val, 3))
@@ -212,7 +212,7 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
         r.read_exact(&mut b)?;
         let val =
             (((b0 & 0x0F) as u64) << 24) | (b[0] as u64) << 16 | (b[1] as u64) << 8 | b[2] as u64;
-        if val == 0x0FFFFFFF {
+        if val == 0x0FFF_FFFF {
             return Ok((u64::MAX, 4));
         }
         Ok((val, 4))
@@ -256,7 +256,7 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
             | (b[4] as u64) << 16
             | (b[5] as u64) << 8
             | b[6] as u64;
-        if val == 0x00FFFFFFFFFFFFFF {
+        if val == 0x00FF_FFFF_FFFF_FFFF {
             return Ok((u64::MAX, 8));
         }
         Ok((val, 8))
@@ -336,7 +336,7 @@ pub fn read_vint(r: &mut impl Read) -> io::Result<(u64, usize)> {
 // ============================================================
 
 // EBML Header
-pub const EBML: u32 = 0x1A45DFA3;
+pub const EBML: u32 = 0x1A45_DFA3;
 pub const EBML_VERSION: u32 = 0x4286;
 pub const EBML_READ_VERSION: u32 = 0x42F7;
 pub const EBML_MAX_ID_LENGTH: u32 = 0x42F2;
@@ -346,16 +346,16 @@ pub const EBML_DOC_TYPE_VERSION: u32 = 0x4287;
 pub const EBML_DOC_TYPE_READ_VERSION: u32 = 0x4285;
 
 // Segment
-pub const SEGMENT: u32 = 0x18538067;
+pub const SEGMENT: u32 = 0x1853_8067;
 
 // Seek Head
-pub const SEEK_HEAD: u32 = 0x114D9B74;
+pub const SEEK_HEAD: u32 = 0x114D_9B74;
 pub const SEEK: u32 = 0x4DBB;
 pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
 
 // Segment Info
-pub const INFO: u32 = 0x1549A966;
+pub const INFO: u32 = 0x1549_A966;
 pub const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
 pub const DURATION: u32 = 0x4489;
 pub const MUXING_APP: u32 = 0x4D80;
@@ -363,7 +363,7 @@ pub const WRITING_APP: u32 = 0x5741;
 pub const TITLE: u32 = 0x7BA9;
 
 // Tracks
-pub const TRACKS: u32 = 0x1654AE6B;
+pub const TRACKS: u32 = 0x1654_AE6B;
 pub const TRACK_ENTRY: u32 = 0xAE;
 pub const TRACK_NUMBER: u32 = 0xD7;
 pub const TRACK_UID: u32 = 0x73C5;
@@ -396,12 +396,12 @@ pub const CHANNELS: u32 = 0x9F;
 pub const BIT_DEPTH: u32 = 0x6264;
 
 // Cluster
-pub const CLUSTER: u32 = 0x1F43B675;
+pub const CLUSTER: u32 = 0x1F43_B675;
 pub const CLUSTER_TIMESTAMP: u32 = 0xE7;
 pub const SIMPLE_BLOCK: u32 = 0xA3;
 
 // Cues
-pub const CUES: u32 = 0x1C53BB6B;
+pub const CUES: u32 = 0x1C53_BB6B;
 pub const CUE_POINT: u32 = 0xBB;
 pub const CUE_TIME: u32 = 0xB3;
 pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
@@ -409,7 +409,7 @@ pub const CUE_TRACK: u32 = 0xF7;
 pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
 
 // Chapters
-pub const CHAPTERS: u32 = 0x1043A770;
+pub const CHAPTERS: u32 = 0x1043_A770;
 pub const EDITION_ENTRY: u32 = 0x45B9;
 pub const CHAPTER_ATOM: u32 = 0xB6;
 pub const CHAPTER_UID: u32 = 0x73C4;

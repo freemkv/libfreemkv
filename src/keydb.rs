@@ -71,6 +71,7 @@ pub fn save(data: &[u8]) -> Result<UpdateResult> {
     })
 }
 
+/// Result of a KEYDB update -- path written, entry count, and byte size.
 #[derive(Debug)]
 pub struct UpdateResult {
     pub path: PathBuf,

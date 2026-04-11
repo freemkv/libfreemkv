@@ -55,7 +55,7 @@ pub fn disc_hash_hex(hash: &[u8; 20]) -> String {
     let mut s = String::with_capacity(42);
     s.push_str("0x");
     for b in hash {
-        s.push_str(&format!("{:02X}", b));
+        s.push_str(&format!("{b:02X}"));
     }
     s
 }
@@ -341,7 +341,7 @@ fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
 
 /// Compute v_mask from a UV value.
 fn calc_v_mask(uv: u32) -> u32 {
-    let mut v_mask: u32 = 0xFFFFFFFF;
+    let mut v_mask: u32 = 0xFFFF_FFFF;
     while (uv & !v_mask) == 0 && v_mask != 0 {
         v_mask <<= 1;
     }
@@ -411,7 +411,7 @@ pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option
                 continue;
             }
 
-            let u_mask: u32 = 0xFFFFFFFF << u_mask_shift;
+            let u_mask: u32 = 0xFFFF_FFFF << u_mask_shift;
             let v_mask = calc_v_mask(uv);
 
             if ((device_number & u_mask) == (uv & u_mask))
@@ -419,7 +419,7 @@ pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option
             {
                 // Found matching subset-difference — find the right device key
                 let dev_key_v_mask = calc_v_mask(dk.uv);
-                let dev_key_u_mask: u32 = 0xFFFFFFFF << dk.u_mask_shift;
+                let dev_key_u_mask: u32 = 0xFFFF_FFFF << dk.u_mask_shift;
 
                 if u_mask == dev_key_u_mask && (uv & dev_key_v_mask) == (dk.uv & dev_key_v_mask) {
                     // Derive processing key via tree traversal

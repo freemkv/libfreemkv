@@ -46,7 +46,7 @@ impl ClipInfo {
 
     /// Reconstruct full SPN from coarse + fine entry.
     pub fn full_spn(coarse: &EpCoarse, fine: &EpFine) -> u32 {
-        (coarse.spn_coarse & 0xFFFE0000) + fine.spn_fine
+        (coarse.spn_coarse & 0xFFFE_0000) + fine.spn_fine
     }
 
     /// Get all EP entries as (PTS, SPN) pairs, fully resolved.
