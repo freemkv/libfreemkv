@@ -118,8 +118,8 @@ impl PsDemuxer {
                     if sc + 6 > self.buffer.len() {
                         break;
                     }
-                    let header_len = ((self.buffer[sc + 4] as usize) << 8)
-                        | self.buffer[sc + 5] as usize;
+                    let header_len =
+                        ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
                     let total = 6 + header_len;
                     if sc + total > self.buffer.len() {
                         break;
@@ -131,8 +131,8 @@ impl PsDemuxer {
                     if sc + 6 > self.buffer.len() {
                         break;
                     }
-                    let pes_packet_len = ((self.buffer[sc + 4] as usize) << 8)
-                        | self.buffer[sc + 5] as usize;
+                    let pes_packet_len =
+                        ((self.buffer[sc + 4] as usize) << 8) | self.buffer[sc + 5] as usize;
 
                     // Total bytes = 6 (start code + stream_id + length) + pes_packet_len.
                     // A length of 0 means unbounded (video streams); in that case we need
@@ -176,7 +176,7 @@ fn is_pes_stream_id(id: u8) -> bool {
     // Video: 0xE0-0xEF, MPEG audio: 0xC0-0xDF, private stream 1: 0xBD,
     // private stream 2: 0xBF, padding: 0xBE, ECM/EMM etc.
     // We parse anything in the PES range.
-    matches!(id, 0xBD | 0xBE | 0xBF | 0xC0..=0xEF)
+    matches!(id, 0xBD..=0xEF)
 }
 
 /// Parse a single PES packet from a byte slice that starts at the start code.
@@ -267,11 +267,7 @@ fn parse_pts(buf: &[u8]) -> u64 {
     let b3 = buf[3] as u64;
     let b4 = buf[4] as u64;
 
-    ((b0 >> 1) & 0x07) << 30
-        | b1 << 22
-        | (b2 >> 1) << 15
-        | b3 << 7
-        | b4 >> 1
+    ((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1
 }
 
 /// Find the position of the next start code (00 00 01) at or after `from`.
@@ -325,9 +321,7 @@ mod tests {
 
         // Pack header with 3 stuffing bytes
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBA,
-            0x44, 0x00, 0x04, 0x00, 0x04, 0x01,
-            0x01, 0x89, 0xC3,
+            0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89, 0xC3,
             0xFB, // stuffing_length = 3
             0xFF, 0xFF, 0xFF, // stuffing bytes
         ];
@@ -391,11 +385,10 @@ mod tests {
         let mut demuxer = PsDemuxer::new();
 
         let pts_bytes = encode_pts(180000, 0x30); // PTS marker = 0x30
-        let dts_bytes = encode_pts(90000, 0x10);  // DTS marker = 0x10
+        let dts_bytes = encode_pts(90000, 0x10); // DTS marker = 0x10
 
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xE0,
-            0x00, 0x11, // length = 17
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x11, // length = 17
             0x80, 0xC0, 0x0A, // flags: PTS+DTS, header_data_len=10
         ];
         data.extend_from_slice(&pts_bytes);
@@ -438,10 +431,8 @@ mod tests {
         let mut demuxer = PsDemuxer::new();
 
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBD,
-            0x00, 0x06, // length = 6
-            0x80, 0x00, 0x00,
-            0x88, // sub-stream ID: DTS stream 0
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, // length = 6
+            0x80, 0x00, 0x00, 0x88, // sub-stream ID: DTS stream 0
             0x11, 0x22,
         ];
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
@@ -456,9 +447,7 @@ mod tests {
         let mut demuxer = PsDemuxer::new();
 
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBD,
-            0x00, 0x06,
-            0x80, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, 0x80, 0x00, 0x00,
             0x20, // sub-stream ID: subtitle stream 0
             0xFF, 0xFE,
         ];
@@ -474,9 +463,7 @@ mod tests {
         let mut demuxer = PsDemuxer::new();
 
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBD,
-            0x00, 0x06,
-            0x80, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, 0x80, 0x00, 0x00,
             0xA0, // sub-stream ID: LPCM stream 0
             0x01, 0x02,
         ];
@@ -494,8 +481,7 @@ mod tests {
         let mut demuxer = PsDemuxer::new();
 
         let mut full = vec![
-            0x00, 0x00, 0x01, 0xE0,
-            0x00, 0x06, // length = 6
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x06, // length = 6
             0x80, 0x00, 0x00, // no PTS, header_data_len=0
             0xAA, 0xBB, 0xCC,
         ];
@@ -521,18 +507,12 @@ mod tests {
 
         // First PES: video
         data.extend_from_slice(&[
-            0x00, 0x00, 0x01, 0xE0,
-            0x00, 0x05,
-            0x80, 0x00, 0x00,
-            0x11, 0x22,
+            0x00, 0x00, 0x01, 0xE0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x11, 0x22,
         ]);
 
         // Second PES: audio
         data.extend_from_slice(&[
-            0x00, 0x00, 0x01, 0xC0,
-            0x00, 0x05,
-            0x80, 0x00, 0x00,
-            0x33, 0x44,
+            0x00, 0x00, 0x01, 0xC0, 0x00, 0x05, 0x80, 0x00, 0x00, 0x33, 0x44,
         ]);
 
         // Delimiter

@@ -39,10 +39,10 @@ const FRAME_RATES: [(u32, u32); 9] = [
 
 /// Aspect ratio table (index from sequence header aspect_ratio_information).
 const ASPECT_RATIOS: [(u8, u8); 5] = [
-    (0, 0),   // 0: forbidden
-    (1, 1),   // 1: square pixels (1:1 SAR)
-    (4, 3),   // 2: 4:3 display
-    (16, 9),  // 3: 16:9 display
+    (0, 0),     // 0: forbidden
+    (1, 1),     // 1: square pixels (1:1 SAR)
+    (4, 3),     // 2: 4:3 display
+    (16, 9),    // 3: 16:9 display
     (221, 100), // 4: 2.21:1 display
 ];
 
@@ -114,8 +114,7 @@ impl CodecParser for Mpeg2Parser {
 
                     // Check if sequence extension follows immediately.
                     if hdr_end + 3 < data.len() && data[hdr_end + 3] == SEQ_EXT_CODE {
-                        let ext_end =
-                            find_start_code(data, hdr_end + 4).unwrap_or(data.len());
+                        let ext_end = find_start_code(data, hdr_end + 4).unwrap_or(data.len());
                         seq_data.extend_from_slice(&data[hdr_end..ext_end]);
                     }
 
@@ -344,7 +343,10 @@ mod tests {
         let _frames = parser.parse(&pes);
 
         let cp = parser.codec_private();
-        assert!(cp.is_some(), "codec_private should be available after sequence header");
+        assert!(
+            cp.is_some(),
+            "codec_private should be available after sequence header"
+        );
         let cp = cp.unwrap();
         // Should start with the sequence header start code.
         assert_eq!(&cp[..4], &[0x00, 0x00, 0x01, SEQ_HEADER_CODE]);
@@ -368,7 +370,7 @@ mod tests {
         // Sequence extension: 00 00 01 B5 [ext data]
         data.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE]);
         data.extend_from_slice(&[0x14, 0x8A, 0x00, 0x01, 0x00, 0x00]); // ext payload
-        // Picture header follows.
+                                                                       // Picture header follows.
         data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
         data.extend_from_slice(&[0xFF; 4]);
 

@@ -143,7 +143,9 @@ fn parse_playback_config(xml: &str, map: &mut HashMap<String, u16>) {
     while pos < xml.len() {
         let tag_start = if let Some(p) = xml[pos..].find("<AudioStreams>") {
             Some(p + pos)
-        } else { xml[pos..].find("<SubtitlesStreams>").map(|p| p + pos) };
+        } else {
+            xml[pos..].find("<SubtitlesStreams>").map(|p| p + pos)
+        };
 
         let tag_start = match tag_start {
             Some(p) => p,

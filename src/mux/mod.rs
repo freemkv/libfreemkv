@@ -31,9 +31,9 @@ pub mod mkv;
 mod mkvstream;
 pub mod network;
 pub mod null;
+pub mod ps;
 pub mod resolve;
 pub mod stdio;
-pub mod ps;
 pub mod ts;
 
 pub use disc::{DiscOptions, DiscStream};

@@ -16,7 +16,7 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 /// Sector layout constants.
 const SECTOR_SIZE: usize = 2048;
 const ENCRYPTED_START: usize = 0x80; // byte 128
-const SEED_OFFSET: usize = 0x54;     // sector seed at bytes 0x54-0x58
+const SEED_OFFSET: usize = 0x54; // sector seed at bytes 0x54-0x58
 const FLAG_BYTE: usize = 0x14;
 
 /// Recover the CSS title key from a scrambled sector using known plaintext.
@@ -26,10 +26,7 @@ const FLAG_BYTE: usize = 0x14;
 /// a PES header: `00 00 01 [stream_id] ...`
 ///
 /// Returns the recovered 5-byte title key, or None if recovery fails.
-pub fn recover_title_key(
-    sector: &[u8],
-    plain: &[u8],
-) -> Option<[u8; 5]> {
+pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
     if sector.len() < SECTOR_SIZE || plain.len() < 10 {
         return None;
     }
@@ -58,14 +55,13 @@ pub fn recover_title_key(
     let mut result_key = [0u8; 5];
     let mut found = false;
 
-    for i_try in 0u32..0x10000 {
+    'outer: for i_try in 0u32..0x10000 {
         let mut t1 = (i_try >> 8) | 0x100;
         let mut t2 = i_try & 0xFF;
         let mut t5: u32 = 0;
 
         // Clock LFSR1 forward 4 steps to reconstruct LFSR0 state
         let mut t3: u32 = 0;
-        let mut ok = true;
 
         for i in 0..4 {
             // Advance LFSR1
@@ -102,7 +98,7 @@ pub fn recover_title_key(
             let t4_perm = TAB5[t4 as usize];
 
             // Clock LFSR0 forward
-            let t6 = ((((((t3 >> 3) ^ t3) >> 1) ^ t3) >> 8) ^ t3) >> 5;
+            let t6 = (((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7);
             t3 = (t3 << 8) | (t6 & 0xFF);
             let t6_perm = TAB4[(t6 & 0xFF) as usize];
 
@@ -120,6 +116,7 @@ pub fn recover_title_key(
 
         // Phase 4: Recover the initial LFSR0 state from the candidate
         t3 = candidate;
+        let mut recovery_ok = true;
         for _ in 0..4 {
             let t1_byte = t3 & 0xFF;
             t3 >>= 8;
@@ -127,15 +124,19 @@ pub fn recover_title_key(
             let mut found_j = false;
             for j in 0u32..256 {
                 t3 = (t3 & 0x1FFFF) | (j << 17);
-                let t6 = ((((((t3 >> 3) ^ t3) >> 1) ^ t3) >> 8) ^ t3) >> 5;
+                let t6 = (((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7);
                 if (t6 & 0xFF) == t1_byte {
                     found_j = true;
                     break;
                 }
             }
             if !found_j {
-                continue;
+                recovery_ok = false;
+                break;
             }
+        }
+        if !recovery_ok {
+            continue 'outer;
         }
 
         // Convert LFSR0 initial state back to key bytes
@@ -356,9 +357,8 @@ mod tests {
                 );
 
                 // Try with exact known plaintext instead of guessing
-                let exact_plain: [u8; 10] = [
-                    0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21,
-                ];
+                let exact_plain: [u8; 10] =
+                    [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
                 let recovered = recover_title_key(&plaintext, &exact_plain);
                 if let Some(key) = recovered {
                     let mut test = plaintext.clone();
@@ -366,7 +366,10 @@ mod tests {
                     assert_eq!(test[0x80], 0x00);
                     assert_eq!(test[0x81], 0x00);
                     assert_eq!(test[0x82], 0x01);
-                    eprintln!("recover_title_key with exact plaintext succeeded: {:02X?}", key);
+                    eprintln!(
+                        "recover_title_key with exact plaintext succeeded: {:02X?}",
+                        key
+                    );
                 } else {
                     eprintln!(
                         "recover_title_key also returned None. The attack may not converge \

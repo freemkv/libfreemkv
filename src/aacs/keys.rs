@@ -655,9 +655,9 @@ pub fn resolve_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::decrypt::{aes_ecb_encrypt, ALIGNED_UNIT_LEN};
     use super::super::keydb::{DiscEntry, KeyDb};
+    use super::*;
 
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
     fn keydb_path() -> Option<std::path::PathBuf> {
@@ -755,7 +755,10 @@ mod tests {
 
         let original = std::fs::read(unit_path).unwrap();
         assert_eq!(original.len(), ALIGNED_UNIT_LEN);
-        assert!(super::super::decrypt::is_unit_encrypted(&original), "Unit should be encrypted");
+        assert!(
+            super::super::decrypt::is_unit_encrypted(&original),
+            "Unit should be encrypted"
+        );
 
         let kp = match keydb_path() {
             Some(p) => p,

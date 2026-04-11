@@ -211,7 +211,7 @@ impl UdfFs {
 
                 if let Ok((data_lba, data_len)) = self.read_icb_extent(reader, child.meta_lba) {
                     let abs_start = self.partition_start + data_lba;
-                    let sector_count = ((data_len as u64 + 2047) / 2048) as u32;
+                    let sector_count = (data_len as u64).div_ceil(2048) as u32;
                     ranges.push((abs_start, sector_count));
                 }
             }
@@ -256,7 +256,9 @@ impl UdfFs {
                 let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
                 let ad_offset = 216 + l_ea;
                 if ad_offset + l_ad > icb.len() {
-                    return Err(Error::DiscRead { sector: self.meta_to_abs(meta_lba) as u64 });
+                    return Err(Error::DiscRead {
+                        sector: self.meta_to_abs(meta_lba) as u64,
+                    });
                 }
                 (ad_offset, l_ad)
             }
@@ -266,7 +268,9 @@ impl UdfFs {
                 let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
                 let ad_offset = 176 + l_ea;
                 if ad_offset + l_ad > icb.len() {
-                    return Err(Error::DiscRead { sector: self.meta_to_abs(meta_lba) as u64 });
+                    return Err(Error::DiscRead {
+                        sector: self.meta_to_abs(meta_lba) as u64,
+                    });
                 }
                 (ad_offset, l_ad)
             }
@@ -442,7 +446,9 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
                     ]) as usize;
                     let ad_off = 216 + l_ea;
                     if ad_off + 8 > meta_icb.len() {
-                        return Err(Error::DiscRead { sector: meta_file_lba as u64 });
+                        return Err(Error::DiscRead {
+                            sector: meta_file_lba as u64,
+                        });
                     }
                     let ad_len = u32::from_le_bytes([
                         meta_icb[ad_off],
@@ -491,7 +497,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
     // Step 5: Read root directory and build file tree
     let root = read_directory(reader, partition_start, metadata_start, root_lba, "", 0)?;
 
-    let metadata_sectors = ((metadata_size_bytes as u64 + 2047) / 2048) as u32;
+    let metadata_sectors = (metadata_size_bytes as u64).div_ceil(2048) as u32;
 
     Ok(UdfFs {
         root,
@@ -527,7 +533,9 @@ fn read_directory(
             let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
             let ad_off = 216 + l_ea;
             if ad_off + 8 > icb.len() {
-                return Err(Error::DiscRead { sector: (meta_start + meta_lba) as u64 });
+                return Err(Error::DiscRead {
+                    sector: (meta_start + meta_lba) as u64,
+                });
             }
             let len = u32::from_le_bytes([
                 icb[ad_off],
@@ -547,7 +555,9 @@ fn read_directory(
             let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
             let ad_off = 176 + l_ea;
             if ad_off + 8 > icb.len() {
-                return Err(Error::DiscRead { sector: (meta_start + meta_lba) as u64 });
+                return Err(Error::DiscRead {
+                    sector: (meta_start + meta_lba) as u64,
+                });
             }
             let len = u32::from_le_bytes([
                 icb[ad_off],
@@ -651,7 +661,7 @@ fn read_directory(
         }
 
         // Advance to next FID (4-byte aligned)
-        let fid_len = ((38 + l_iu + l_fi + 3) & !3);
+        let fid_len = (38 + l_iu + l_fi + 3) & !3;
         pos += fid_len;
     }
 

@@ -11,13 +11,15 @@ use crate::udf;
 pub(super) struct HandshakeResult {
     pub volume_id: [u8; 16],
     pub read_data_key: Option<[u8; 16]>,
-    pub error: Option<crate::error::Error>,
 }
 
 impl Disc {
     /// SCSI handshake result — volume ID and bus keys from ECDH authentication.
     /// Only available when scanning from a real drive (not ISO images).
-    pub(super) fn do_handshake(session: &mut crate::drive::DriveSession, opts: &ScanOptions) -> Option<HandshakeResult> {
+    pub(super) fn do_handshake(
+        session: &mut crate::drive::DriveSession,
+        opts: &ScanOptions,
+    ) -> Option<HandshakeResult> {
         use crate::aacs::{self, KeyDb};
 
         let keydb_path = opts.resolve_keydb()?;
@@ -35,7 +37,6 @@ impl Disc {
                     return Some(HandshakeResult {
                         volume_id,
                         read_data_key,
-                        error: None,
                     });
                 }
                 Err(e) => {
@@ -45,10 +46,9 @@ impl Disc {
                 }
             }
         }
-        last_error.map(|e| HandshakeResult {
+        last_error.map(|_e| HandshakeResult {
             volume_id: [0u8; 16],
             read_data_key: None,
-            error: Some(e),
         })
     }
 
@@ -90,7 +90,6 @@ impl Disc {
         // (KEYDB VUK lookup by disc hash works without volume ID)
         let volume_id = handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]);
         let read_data_key = handshake.and_then(|h| h.read_data_key);
-        let handshake_error = None;
 
         // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key
         let resolved = aacs::resolve_keys(
@@ -118,7 +117,6 @@ impl Disc {
             unit_keys: resolved.unit_keys,
             read_data_key,
             volume_id,
-            handshake_error,
         })
     }
 }

@@ -255,4 +255,3 @@ pub struct InputOptions {
     pub keydb_path: Option<String>,
     pub title_index: Option<usize>,
 }
-

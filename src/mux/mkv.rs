@@ -578,9 +578,7 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0).unwrap();
-        muxer
-            .write_frame(0, 0, true, &[0x01, 0x02, 0x03])
-            .unwrap();
+        muxer.write_frame(0, 0, true, &[0x01, 0x02, 0x03]).unwrap();
         muxer.finish().unwrap();
 
         let data = shared.lock().unwrap().clone().into_inner();
@@ -596,12 +594,8 @@ mod tests {
         let tracks = [make_video_track(), make_audio_track()];
         let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0).unwrap();
         // Write frames to both tracks
-        muxer
-            .write_frame(0, 0, true, &[0x00, 0x00, 0x01])
-            .unwrap();
-        muxer
-            .write_frame(1, 0, false, &[0x0B, 0x77, 0x00])
-            .unwrap();
+        muxer.write_frame(0, 0, true, &[0x00, 0x00, 0x01]).unwrap();
+        muxer.write_frame(1, 0, false, &[0x0B, 0x77, 0x00]).unwrap();
         muxer
             .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01])
             .unwrap();
@@ -621,14 +615,10 @@ mod tests {
 
         // Record position before first frame
         let pos_before_kf = muxer.writer.position();
-        muxer
-            .write_frame(0, 0, true, &[0xAA])
-            .unwrap();
+        muxer.write_frame(0, 0, true, &[0xAA]).unwrap();
         let pos_after_kf = muxer.writer.position();
 
-        muxer
-            .write_frame(0, 1_000_000, false, &[0xBB])
-            .unwrap();
+        muxer.write_frame(0, 1_000_000, false, &[0xBB]).unwrap();
         let pos_after_nkf = muxer.writer.position();
 
         let data = muxer.writer.into_inner();
@@ -653,7 +643,7 @@ mod tests {
             // Track VINT: 1 byte (track 1 = 0x81)
             let track_vint_pos = after_id + size_len;
             let track_vint_len = 1; // track 1 encoded as 0x81
-            // 2-byte relative timestamp
+                                    // 2-byte relative timestamp
             let ts_pos = track_vint_pos + track_vint_len;
             // flags byte
             let flags_pos = ts_pos + 2;
@@ -682,13 +672,22 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
         let chapters = vec![
-            Chapter { time_secs: 0.0, name: "Chapter 1".into() },
-            Chapter { time_secs: 300.0, name: "Chapter 2".into() },
-            Chapter { time_secs: 600.0, name: "Chapter 3".into() },
+            Chapter {
+                time_secs: 0.0,
+                name: "Chapter 1".into(),
+            },
+            Chapter {
+                time_secs: 300.0,
+                name: "Chapter 2".into(),
+            },
+            Chapter {
+                time_secs: 600.0,
+                name: "Chapter 3".into(),
+            },
         ];
-        let muxer = MkvMuxer::new_with_chapters(
-            buf, &tracks, Some("Chapter Test"), 900.0, &chapters,
-        ).unwrap();
+        let muxer =
+            MkvMuxer::new_with_chapters(buf, &tracks, Some("Chapter Test"), 900.0, &chapters)
+                .unwrap();
         let data = muxer.writer.into_inner();
 
         // Chapters element ID: 0x1043A770
@@ -742,7 +741,10 @@ mod tests {
         let count = data.windows(1).filter(|w| w[0] == 0x88).count();
         // 0x88 appears as FlagDefault + as TrackType (also 0x83... no, 0x83 != 0x88)
         // FlagDefault (0x88) should appear for the non-default track
-        assert!(count >= 1, "FlagDefault should be written for non-default tracks");
+        assert!(
+            count >= 1,
+            "FlagDefault should be written for non-default tracks"
+        );
     }
 
     #[test]

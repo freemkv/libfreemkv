@@ -295,7 +295,9 @@ fn build_minimal_udf(reader: &mut MockSectorReader) {
     let partition_start: u32 = 512;
     reader.sectors.insert(256, make_avdp_sector(32));
     reader.sectors.insert(32, make_pvd_sector("TEST_DISC"));
-    reader.sectors.insert(33, make_partition_desc(partition_start));
+    reader
+        .sectors
+        .insert(33, make_partition_desc(partition_start));
     reader.sectors.insert(34, make_lvd_sector_simple());
     reader.sectors.insert(35, make_terminator());
 
@@ -316,7 +318,9 @@ fn build_udf_with_aacs_dir(reader: &mut MockSectorReader) {
     let partition_start: u32 = 512;
     reader.sectors.insert(256, make_avdp_sector(32));
     reader.sectors.insert(32, make_pvd_sector("ENCRYPTED_DISC"));
-    reader.sectors.insert(33, make_partition_desc(partition_start));
+    reader
+        .sectors
+        .insert(33, make_partition_desc(partition_start));
     reader.sectors.insert(34, make_lvd_sector_simple());
     reader.sectors.insert(35, make_terminator());
 
@@ -357,7 +361,10 @@ fn resolve_encryption_no_aacs_dir() {
     let opts = ScanOptions::default();
     let disc = Disc::scan_image(&mut reader, 1000, &opts).unwrap();
 
-    assert!(!disc.encrypted, "disc without /AACS should not be encrypted");
+    assert!(
+        !disc.encrypted,
+        "disc without /AACS should not be encrypted"
+    );
     assert!(disc.aacs.is_none(), "aacs should be None without /AACS dir");
 }
 

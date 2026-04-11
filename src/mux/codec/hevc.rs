@@ -525,7 +525,9 @@ mod tests {
         let mut nal_types = Vec::new();
         let mut offset = 0;
         while offset + 4 <= fd.len() {
-            let length = u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]]) as usize;
+            let length =
+                u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]])
+                    as usize;
             offset += 4;
             assert!(offset + length <= fd.len(), "NAL length exceeds frame data");
             let nal_type = (fd[offset] >> 1) & 0x3F;
@@ -553,7 +555,9 @@ mod tests {
         // Verify RPU payload is intact
         let mut offset = 0;
         while offset + 4 <= fd.len() {
-            let length = u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]]) as usize;
+            let length =
+                u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]])
+                    as usize;
             offset += 4;
             let nal_type = (fd[offset] >> 1) & 0x3F;
             if nal_type == 62 {
