@@ -4,7 +4,7 @@
 //! Detects keyframes (IDR slices).
 //! Each PES packet = one access unit = one frame.
 
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
 /// H.264 NAL unit types we care about.
 const NAL_SLICE_IDR: u8 = 5;
@@ -17,9 +17,18 @@ pub struct H264Parser {
     pps: Option<Vec<u8>>,
 }
 
+impl Default for H264Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H264Parser {
     pub fn new() -> Self {
-        Self { sps: None, pps: None }
+        Self {
+            sps: None,
+            pps: None,
+        }
     }
 }
 
@@ -83,6 +92,10 @@ impl CodecParser for H264Parser {
         // Build AVCDecoderConfigurationRecord from SPS + PPS
         let sps = self.sps.as_ref()?;
         let pps = self.pps.as_ref()?;
+
+        if sps.len() < 4 {
+            return None;
+        }
 
         // AVCDecoderConfigurationRecord (ISO 14496-15):
         // configurationVersion = 1
@@ -196,7 +209,12 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket { pid: 0x1011, pts, dts: None, data }
+        PesPacket {
+            pid: 0x1011,
+            pts,
+            dts: None,
+            data,
+        }
     }
 
     // --- find_start_code tests ---
@@ -246,7 +264,7 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x67); // SPS
         data.extend_from_slice(&[0x42, 0x00, 0x1E, 0xAB, 0xCD]); // profile=0x42, compat=0x00, level=0x1E
-        // PPS: 00 00 01 [68 <payload>]
+                                                                 // PPS: 00 00 01 [68 <payload>]
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x68); // PPS
         data.extend_from_slice(&[0xCE, 0x01]);
@@ -260,7 +278,10 @@ mod tests {
 
         // codec_private should now be available
         let cp = parser.codec_private();
-        assert!(cp.is_some(), "codec_private should be Some after seeing SPS+PPS");
+        assert!(
+            cp.is_some(),
+            "codec_private should be Some after seeing SPS+PPS"
+        );
         let cp = cp.unwrap();
 
         // AVCDecoderConfigurationRecord checks
@@ -297,7 +318,10 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        assert!(frames[0].keyframe, "IDR slice should be detected as keyframe");
+        assert!(
+            frames[0].keyframe,
+            "IDR slice should be detected as keyframe"
+        );
     }
 
     // --- non-IDR → not keyframe ---
@@ -338,16 +362,25 @@ mod tests {
         let frame_data = &frames[0].data;
 
         // Should start with 4-byte big-endian length prefix
-        assert!(frame_data.len() >= 4, "frame data should have length prefix");
-        let length = u32::from_be_bytes([frame_data[0], frame_data[1], frame_data[2], frame_data[3]]);
-        assert_eq!(length as usize, nal_payload.len(), "length prefix should match NAL size");
+        assert!(
+            frame_data.len() >= 4,
+            "frame data should have length prefix"
+        );
+        let length =
+            u32::from_be_bytes([frame_data[0], frame_data[1], frame_data[2], frame_data[3]]);
+        assert_eq!(
+            length as usize,
+            nal_payload.len(),
+            "length prefix should match NAL size"
+        );
 
         // Followed by the NAL data itself
         assert_eq!(&frame_data[4..], &nal_payload);
 
         // No start code (00 00 01) should appear in the output
         for i in 0..frame_data.len().saturating_sub(2) {
-            let is_sc = frame_data[i] == 0x00 && frame_data[i + 1] == 0x00 && frame_data[i + 2] == 0x01;
+            let is_sc =
+                frame_data[i] == 0x00 && frame_data[i + 1] == 0x00 && frame_data[i + 2] == 0x01;
             assert!(!is_sc, "output should not contain Annex B start codes");
         }
     }
@@ -429,8 +462,8 @@ mod tests {
 
         let pes = PesPacket {
             pid: 0x1011,
-            pts: Some(180000),  // 2 seconds
-            dts: Some(90000),   // 1 second
+            pts: Some(180000), // 2 seconds
+            dts: Some(90000),  // 1 second
             data,
         };
         let frames = parser.parse(&pes);

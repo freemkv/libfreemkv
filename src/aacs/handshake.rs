@@ -18,12 +18,12 @@
 //!   - AACS 2.0: drives accept AACS 1.0 host certs for backward compatibility
 //!     (full P-256/SHA-256 AACS 2.0 handshake prepared but rarely needed)
 
-use crate::error::{Error, Result};
 use crate::drive::DriveSession;
+use crate::error::{Error, Result};
 use crate::scsi::DataDirection;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use sha1::{Sha1, Digest};
+use sha1::{Digest, Sha1};
 
 /// Execute a SCSI command that reads data from the device.
 fn scsi_read(session: &mut DriveSession, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
@@ -42,87 +42,79 @@ fn scsi_write(session: &mut DriveSession, cdb: &[u8], data: &[u8]) -> Result<()>
 // ── AACS 1.0 elliptic curve parameters (160-bit) ───────────────────────────
 
 const EC_P: [u8; 20] = [
-    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD,
-    0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4, 0x79, 0xA7, 0xD7, 0xDF,
+    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD, 0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4,
+    0x79, 0xA7, 0xD7, 0xDF,
 ];
 const EC_A: [u8; 20] = [
-    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD,
-    0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4, 0x79, 0xA7, 0xD7, 0xDC,
+    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD, 0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4,
+    0x79, 0xA7, 0xD7, 0xDC,
 ];
 #[cfg(test)]
 const EC_B: [u8; 20] = [
-    0x40, 0x2D, 0xAD, 0x3E, 0xC1, 0xCB, 0xCD, 0x16, 0x52, 0x48,
-    0xD6, 0x8E, 0x12, 0x45, 0xE0, 0xC4, 0xDA, 0xAC, 0xB1, 0xD8,
+    0x40, 0x2D, 0xAD, 0x3E, 0xC1, 0xCB, 0xCD, 0x16, 0x52, 0x48, 0xD6, 0x8E, 0x12, 0x45, 0xE0, 0xC4,
+    0xDA, 0xAC, 0xB1, 0xD8,
 ];
 const EC_N: [u8; 20] = [
-    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD,
-    0xC4, 0x4F, 0x54, 0x81, 0x7B, 0x2C, 0x7F, 0x5A, 0xB0, 0x17,
+    0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD, 0xC4, 0x4F, 0x54, 0x81, 0x7B, 0x2C,
+    0x7F, 0x5A, 0xB0, 0x17,
 ];
 const EC_GX: [u8; 20] = [
-    0x2E, 0x64, 0xFC, 0x22, 0x57, 0x83, 0x51, 0xE6, 0xF4, 0xCC,
-    0xA7, 0xEB, 0x81, 0xD0, 0xA4, 0xBD, 0xC5, 0x4C, 0xCE, 0xC6,
+    0x2E, 0x64, 0xFC, 0x22, 0x57, 0x83, 0x51, 0xE6, 0xF4, 0xCC, 0xA7, 0xEB, 0x81, 0xD0, 0xA4, 0xBD,
+    0xC5, 0x4C, 0xCE, 0xC6,
 ];
 const EC_GY: [u8; 20] = [
-    0x09, 0x14, 0xA2, 0x5D, 0xD0, 0x54, 0x42, 0x88, 0x9D, 0xB4,
-    0x55, 0xC7, 0xF2, 0x3C, 0x9A, 0x07, 0x07, 0xF5, 0xCB, 0xB9,
+    0x09, 0x14, 0xA2, 0x5D, 0xD0, 0x54, 0x42, 0x88, 0x9D, 0xB4, 0x55, 0xC7, 0xF2, 0x3C, 0x9A, 0x07,
+    0x07, 0xF5, 0xCB, 0xB9,
 ];
 
 // ── AACS 2.0 elliptic curve parameters (P-256 / secp256r1 / NIST prime256v1)
 
 const P256_P: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 const P256_A: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC,
 ];
 #[cfg(test)]
 const P256_B: [u8; 32] = [
-    0x5A, 0xC6, 0x35, 0xD8, 0xAA, 0x3A, 0x93, 0xE7, 0xB3, 0xEB, 0xBD, 0x55,
-    0x76, 0x98, 0x86, 0xBC, 0x65, 0x1D, 0x06, 0xB0, 0xCC, 0x53, 0xB0, 0xF6,
-    0x3B, 0xCE, 0x3C, 0x3E, 0x27, 0xD2, 0x60, 0x4B,
+    0x5A, 0xC6, 0x35, 0xD8, 0xAA, 0x3A, 0x93, 0xE7, 0xB3, 0xEB, 0xBD, 0x55, 0x76, 0x98, 0x86, 0xBC,
+    0x65, 0x1D, 0x06, 0xB0, 0xCC, 0x53, 0xB0, 0xF6, 0x3B, 0xCE, 0x3C, 0x3E, 0x27, 0xD2, 0x60, 0x4B,
 ];
 const P256_N: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
-    0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
 const P256_GX: [u8; 32] = [
-    0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5,
-    0x63, 0xA4, 0x40, 0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0,
-    0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96,
+    0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40, 0xF2,
+    0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96,
 ];
 const P256_GY: [u8; 32] = [
-    0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A,
-    0x7C, 0x0F, 0x9E, 0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE,
-    0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5,
+    0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E, 0x16,
+    0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5,
 ];
 
 /// AACS 2.0 LA public key for cert verification (P-256).
 /// From AACS2 specification — used to verify type 0x11 drive certificates.
 const AACS2_LA_PUB_X: [u8; 32] = [
-    0xF9, 0x57, 0xBC, 0x1F, 0xD7, 0xE6, 0x09, 0x7E, 0xCA, 0xCC, 0x35, 0x23,
-    0x4C, 0x9C, 0x66, 0xC3, 0x42, 0xEB, 0x3D, 0xB7, 0x2B, 0x41, 0x06, 0xF4,
-    0x04, 0x9C, 0x6A, 0x88, 0x70, 0x00, 0xAA, 0x2C,
+    0xF9, 0x57, 0xBC, 0x1F, 0xD7, 0xE6, 0x09, 0x7E, 0xCA, 0xCC, 0x35, 0x23, 0x4C, 0x9C, 0x66, 0xC3,
+    0x42, 0xEB, 0x3D, 0xB7, 0x2B, 0x41, 0x06, 0xF4, 0x04, 0x9C, 0x6A, 0x88, 0x70, 0x00, 0xAA, 0x2C,
 ];
 const AACS2_LA_PUB_Y: [u8; 32] = [
-    0x39, 0x55, 0x0B, 0x41, 0x02, 0x27, 0xEA, 0x7B, 0x1A, 0x53, 0xF8, 0x67,
-    0x8C, 0x5A, 0x91, 0x6F, 0xFC, 0x7C, 0x78, 0x01, 0x3E, 0x89, 0x15, 0xE3,
-    0xF0, 0x81, 0xD3, 0xE9, 0x3E, 0x17, 0x55, 0x0B,
+    0x39, 0x55, 0x0B, 0x41, 0x02, 0x27, 0xEA, 0x7B, 0x1A, 0x53, 0xF8, 0x67, 0x8C, 0x5A, 0x91, 0x6F,
+    0xFC, 0x7C, 0x78, 0x01, 0x3E, 0x89, 0x15, 0xE3, 0xF0, 0x81, 0xD3, 0xE9, 0x3E, 0x17, 0x55, 0x0B,
 ];
 
 // ── AACS 1.0 LA (Licensing Administrator) public key for cert verification ──
 
 const AACS_LA_PUB_X: [u8; 20] = [
-    0x01, 0xF3, 0x5D, 0xAB, 0xD8, 0xAE, 0x5F, 0x40, 0x56, 0x5E,
-    0x30, 0xC8, 0x8A, 0x60, 0x42, 0x82, 0x07, 0x61, 0xDF, 0x93,
+    0x01, 0xF3, 0x5D, 0xAB, 0xD8, 0xAE, 0x5F, 0x40, 0x56, 0x5E, 0x30, 0xC8, 0x8A, 0x60, 0x42, 0x82,
+    0x07, 0x61, 0xDF, 0x93,
 ];
 const AACS_LA_PUB_Y: [u8; 20] = [
-    0x44, 0x87, 0xB5, 0xAC, 0x07, 0x10, 0x8D, 0x10, 0x5B, 0xA5,
-    0xB9, 0xE3, 0x2F, 0x3B, 0xBB, 0xFC, 0x0C, 0x2C, 0xBC, 0xD1,
+    0x44, 0x87, 0xB5, 0xAC, 0x07, 0x10, 0x8D, 0x10, 0x5B, 0xA5, 0xB9, 0xE3, 0x2F, 0x3B, 0xBB, 0xFC,
+    0x0C, 0x2C, 0xBC, 0xD1,
 ];
 
 // ── Elliptic curve arithmetic over GF(p) ───────────────────────────────────
@@ -136,15 +128,26 @@ struct EcPoint {
 
 impl EcPoint {
     fn infinity() -> Self {
-        EcPoint { x: BigUint::zero(), y: BigUint::zero(), infinity: true }
+        EcPoint {
+            x: BigUint::zero(),
+            y: BigUint::zero(),
+            infinity: true,
+        }
     }
 
     fn new(x: BigUint, y: BigUint) -> Self {
-        EcPoint { x, y, infinity: false }
+        EcPoint {
+            x,
+            y,
+            infinity: false,
+        }
     }
 
     fn from_bytes(x_bytes: &[u8], y_bytes: &[u8]) -> Self {
-        EcPoint::new(BigUint::from_bytes_be(x_bytes), BigUint::from_bytes_be(y_bytes))
+        EcPoint::new(
+            BigUint::from_bytes_be(x_bytes),
+            BigUint::from_bytes_be(y_bytes),
+        )
     }
 }
 
@@ -181,8 +184,12 @@ fn mod_inv(a: &BigUint, m: &BigUint) -> Option<BigUint> {
 
 /// EC point addition on curve y² = x³ + ax + b (mod p).
 fn ec_add(p1: &EcPoint, p2: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
-    if p1.infinity { return p2.clone(); }
-    if p2.infinity { return p1.clone(); }
+    if p1.infinity {
+        return p2.clone();
+    }
+    if p2.infinity {
+        return p1.clone();
+    }
 
     if p1.x == p2.x {
         if p1.y == p2.y && !p1.y.is_zero() {
@@ -203,9 +210,10 @@ fn ec_add(p1: &EcPoint, p2: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
         (p - (&p1.x - &p2.x) % p) % p
     };
 
-    // Safety: mod_inv only returns None if dx == 0 (points identical),
-    // which is prevented by the caller using ec_double for that case.
-    let dx_inv = mod_inv(&dx, p).expect("ec_add: dx has no inverse");
+    let dx_inv = match mod_inv(&dx, p) {
+        Some(v) => v,
+        None => return EcPoint::infinity(),
+    };
     let lam = (&dy * &dx_inv) % p;
 
     // x3 = λ² - x1 - x2 mod p
@@ -249,9 +257,10 @@ fn ec_double(pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
 
     let numerator = (&three * &pt.x * &pt.x + a) % p;
     let denominator = (&two * &pt.y) % p;
-    // Safety: mod_inv only returns None if 2*y == 0 (point at infinity),
-    // which shouldn't occur with valid curve points.
-    let denom_inv = mod_inv(&denominator, p).expect("ec_double: denominator has no inverse");
+    let denom_inv = match mod_inv(&denominator, p) {
+        Some(v) => v,
+        None => return EcPoint::infinity(),
+    };
     let lam = (&numerator * &denom_inv) % p;
 
     // x3 = λ² - 2x mod p
@@ -337,12 +346,16 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut k_bytes);
         let k = BigUint::from_bytes_be(&k_bytes) % &n;
-        if k.is_zero() { continue; }
+        if k.is_zero() {
+            continue;
+        }
 
         // R = k × G
         let r_point = ec_mul(&k, &g, &a, &p);
         let r = &r_point.x % &n;
-        if r.is_zero() { continue; }
+        if r.is_zero() {
+            continue;
+        }
 
         // s = k⁻¹(z + r·d) mod n
         let k_inv = match mod_inv(&k, &n) {
@@ -350,7 +363,9 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
             None => continue,
         };
         let s = (&k_inv * ((&z + &r * &d) % &n)) % &n;
-        if s.is_zero() { continue; }
+        if s.is_zero() {
+            continue;
+        }
 
         let r_bytes = to_bytes_be_padded(&r, 20);
         let s_bytes = to_bytes_be_padded(&s, 20);
@@ -365,7 +380,13 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
 }
 
 /// ECDSA verify: verify signature (r, s) against SHA-1(data) using public key.
-fn ecdsa_verify(pub_x: &[u8; 20], pub_y: &[u8; 20], sig_r: &[u8; 20], sig_s: &[u8; 20], data: &[u8]) -> bool {
+fn ecdsa_verify(
+    pub_x: &[u8; 20],
+    pub_y: &[u8; 20],
+    sig_r: &[u8; 20],
+    sig_s: &[u8; 20],
+    data: &[u8],
+) -> bool {
     let p = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
     let n = BigUint::from_bytes_be(&EC_N);
@@ -405,7 +426,7 @@ fn ecdsa_verify(pub_x: &[u8; 20], pub_y: &[u8; 20], sig_r: &[u8; 20], sig_s: &[u
 
 /// ECDSA sign with P-256/SHA-256. Returns (r, s) each 32 bytes.
 fn ecdsa_sign_p256(priv_key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
-    use sha2::{Sha256, Digest as Sha2Digest};
+    use sha2::{Digest as Sha2Digest, Sha256};
 
     let p = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
@@ -421,18 +442,24 @@ fn ecdsa_sign_p256(priv_key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut k_bytes);
         let k = BigUint::from_bytes_be(&k_bytes) % &n;
-        if k.is_zero() { continue; }
+        if k.is_zero() {
+            continue;
+        }
 
         let r_point = ec_mul(&k, &g, &a, &p);
         let r = &r_point.x % &n;
-        if r.is_zero() { continue; }
+        if r.is_zero() {
+            continue;
+        }
 
         let k_inv = match mod_inv(&k, &n) {
             Some(v) => v,
             None => continue,
         };
         let s = (&k_inv * ((&z + &r * &d) % &n)) % &n;
-        if s.is_zero() { continue; }
+        if s.is_zero() {
+            continue;
+        }
 
         let r_bytes = to_bytes_be_padded(&r, 32);
         let s_bytes = to_bytes_be_padded(&s, 32);
@@ -448,7 +475,7 @@ fn ecdsa_sign_p256(priv_key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
 
 /// ECDSA verify with P-256/SHA-256.
 fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], data: &[u8]) -> bool {
-    use sha2::{Sha256, Digest as Sha2Digest};
+    use sha2::{Digest as Sha2Digest, Sha256};
 
     let p = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
@@ -487,7 +514,9 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
 
 /// Verify an AACS 2.0 certificate (type 0x11, 132 bytes) against AACS 2.0 LA key.
 fn verify_cert_p256(cert: &[u8]) -> bool {
-    if cert.len() < 132 { return false; }
+    if cert.len() < 132 {
+        return false;
+    }
     // AACS 2.0 cert: type(1) + flags(1) + padding(2) + serial(6) + pub_x(32) + pub_y(32) + sig_r(32) + sig_s(32)
     // Signature is over the first 74 bytes
     let sig_r = &cert[74..106];
@@ -511,12 +540,19 @@ fn cert_pub_key_p256(cert: &[u8]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// Compute bus key via ECDH on P-256 curve.
-fn compute_bus_key_p256(host_priv: &[u8; 32], drive_key_point_x: &[u8], drive_key_point_y: &[u8]) -> [u8; 16] {
+fn compute_bus_key_p256(
+    host_priv: &[u8; 32],
+    drive_key_point_x: &[u8],
+    drive_key_point_y: &[u8],
+) -> [u8; 16] {
     let p = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
 
     let d = BigUint::from_bytes_be(host_priv);
-    let dkp = EcPoint::new(BigUint::from_bytes_be(drive_key_point_x), BigUint::from_bytes_be(drive_key_point_y));
+    let dkp = EcPoint::new(
+        BigUint::from_bytes_be(drive_key_point_x),
+        BigUint::from_bytes_be(drive_key_point_y),
+    );
 
     let shared = ec_mul(&d, &dkp, &a, &p);
 
@@ -531,7 +567,9 @@ fn compute_bus_key_p256(host_priv: &[u8; 32], drive_key_point_x: &[u8], drive_ke
 
 /// Verify an AACS certificate (92 bytes) against the AACS LA public key.
 fn verify_cert(cert: &[u8]) -> bool {
-    if cert.len() < 92 { return false; }
+    if cert.len() < 92 {
+        return false;
+    }
     // Certificate format: type(1) + flags(1) + padding(2) + serial(6) + pub_x(20) + pub_y(20) + sig_r(20) + sig_s(20)
     // Signature is over the first 52 bytes
     let mut sig_r = [0u8; 20];
@@ -554,7 +592,11 @@ fn cert_pub_key(cert: &[u8]) -> ([u8; 20], [u8; 20]) {
 // ── Bus key derivation (ECDH) ───────────────────────────────────────────────
 
 /// Compute bus key via ECDH: bus_key = low 128 bits of (host_priv × drive_key_point).x
-fn compute_bus_key(host_priv: &[u8; 20], drive_key_point_x: &[u8; 20], drive_key_point_y: &[u8; 20]) -> [u8; 16] {
+fn compute_bus_key(
+    host_priv: &[u8; 20],
+    drive_key_point_x: &[u8; 20],
+    drive_key_point_y: &[u8; 20],
+) -> [u8; 16] {
     let p = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
 
@@ -599,32 +641,41 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
 fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
     let p_mod = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
+    let n = BigUint::from_bytes_be(&EC_N);
     let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
 
-    let mut priv_bytes = [0u8; 20];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut priv_bytes);
-    let d = BigUint::from_bytes_be(&priv_bytes);
+    let (d, q) = loop {
+        let mut priv_bytes = [0u8; 20];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut priv_bytes);
+        let d = BigUint::from_bytes_be(&priv_bytes) % &n;
+        if d.is_zero() {
+            continue;
+        }
+        let q = ec_mul(&d, &g, &a, &p_mod);
+        break (d, q);
+    };
 
-    let q = ec_mul(&d, &g, &a, &p_mod);
-
+    let d_bytes = to_bytes_be_padded(&d, 20);
     let qx = to_bytes_be_padded(&q.x, 20);
     let qy = to_bytes_be_padded(&q.y, 20);
 
+    let mut key = [0u8; 20];
     let mut pub_x = [0u8; 20];
     let mut pub_y = [0u8; 20];
+    key.copy_from_slice(&d_bytes);
     pub_x.copy_from_slice(&qx);
     pub_y.copy_from_slice(&qy);
 
-    (priv_bytes, pub_x, pub_y)
+    (key, pub_x, pub_y)
 }
 
 // ── AES-CMAC (for MAC verification) ────────────────────────────────────────
 
 /// AES-128-CMAC over 16 bytes of data.
 fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
+    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
     let cipher = Aes128::new(GenericArray::from_slice(key));
 
@@ -730,8 +781,7 @@ pub fn aacs_authenticate(
 
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
-    let response = scsi_read(session, &cdb, 8)
-        .map_err(|_| Error::AacsAgidAlloc)?;
+    let response = scsi_read(session, &cdb, 8).map_err(|_| Error::AacsAgidAlloc)?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce and ephemeral key pair
@@ -747,13 +797,11 @@ pub fn aacs_authenticate(
     send_buf[24..116].copy_from_slice(&host_cert[..92]);
 
     let cdb = cdb_send_key(agid, 0x01, 116);
-    scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsCertRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsCertRejected)?;
 
     // Step 5: Read drive certificate + nonce (REPORT KEY format 0x01)
     let cdb = cdb_report_key(agid, 0x01, 116);
-    let response = scsi_read(session, &cdb, 116)
-        .map_err(|_| Error::AacsCertRead)?;
+    let response = scsi_read(session, &cdb, 116).map_err(|_| Error::AacsCertRead)?;
 
     let mut drive_nonce = [0u8; 20];
     let mut drive_cert = [0u8; 92];
@@ -774,11 +822,10 @@ pub fn aacs_authenticate(
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
     let cdb = cdb_report_key(agid, 0x02, 84);
-    let response = scsi_read(session, &cdb, 84)
-        .map_err(|_| Error::AacsKeyRead)?;
+    let response = scsi_read(session, &cdb, 84).map_err(|_| Error::AacsKeyRead)?;
 
-    let mut drive_key_point = [0u8; 40];   // x(20) + y(20)
-    let mut drive_key_sig = [0u8; 40];     // r(20) + s(20)
+    let mut drive_key_point = [0u8; 40]; // x(20) + y(20)
+    let mut drive_key_sig = [0u8; 40]; // r(20) + s(20)
     drive_key_point.copy_from_slice(&response[4..44]);
     drive_key_sig.copy_from_slice(&response[44..84]);
 
@@ -814,8 +861,7 @@ pub fn aacs_authenticate(
     send_buf[64..84].copy_from_slice(&host_sig_s);
 
     let cdb = cdb_send_key(agid, 0x02, 84);
-    scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsKeyRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsKeyRejected)?;
 
     // Step 9: Compute bus key via ECDH
     let mut dkp_x = [0u8; 20];
@@ -880,8 +926,7 @@ fn aacs2_authenticate_p256(
 
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
-    let response = scsi_read(session, &cdb, 8)
-        .map_err(|_| Error::AacsAgidAlloc)?;
+    let response = scsi_read(session, &cdb, 8).map_err(|_| Error::AacsAgidAlloc)?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce + P-256 ephemeral key pair
@@ -898,14 +943,12 @@ fn aacs2_authenticate_p256(
     send_buf[24..156].copy_from_slice(&host_cert[..132]);
 
     let cdb = cdb_send_key(agid, 0x01, 156);
-    scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsCertRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsCertRejected)?;
 
     // Step 5: Read drive certificate + nonce
     // AACS 2.0 drive cert is also 132 bytes
     let cdb = cdb_report_key(agid, 0x01, 156);
-    let response = scsi_read(session, &cdb, 156)
-        .map_err(|_| Error::AacsCertRead)?;
+    let response = scsi_read(session, &cdb, 156).map_err(|_| Error::AacsCertRead)?;
 
     let mut drive_nonce = [0u8; 20];
     drive_nonce.copy_from_slice(&response[4..24]);
@@ -918,8 +961,7 @@ fn aacs2_authenticate_p256(
 
     // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
     let cdb = cdb_report_key(agid, 0x02, 132);
-    let response = scsi_read(session, &cdb, 132)
-        .map_err(|_| Error::AacsKeyRead)?;
+    let response = scsi_read(session, &cdb, 132).map_err(|_| Error::AacsKeyRead)?;
 
     let drive_key_x = &response[4..36];
     let drive_key_y = &response[36..68];
@@ -933,7 +975,13 @@ fn aacs2_authenticate_p256(
     verify_data.extend_from_slice(drive_key_x);
     verify_data.extend_from_slice(drive_key_y);
 
-    if !ecdsa_verify_p256(&drive_pub_x, &drive_pub_y, drive_sig_r, drive_sig_s, &verify_data) {
+    if !ecdsa_verify_p256(
+        &drive_pub_x,
+        &drive_pub_y,
+        drive_sig_r,
+        drive_sig_s,
+        &verify_data,
+    ) {
         return Err(Error::AacsKeyVerify);
     }
 
@@ -954,8 +1002,7 @@ fn aacs2_authenticate_p256(
     send_buf[100..132].copy_from_slice(&host_sig_s);
 
     let cdb = cdb_send_key(agid, 0x02, 132);
-    scsi_write(session, &cdb, &send_buf)
-        .map_err(|_| Error::AacsKeyRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsKeyRejected)?;
 
     // Step 9: Compute bus key via P-256 ECDH
     let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y);
@@ -977,8 +1024,7 @@ fn aacs2_authenticate_p256(
 pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result<[u8; 16]> {
     // REPORT DISC STRUCTURE format 0x80
     let cdb = cdb_report_disc_structure(auth.agid, 0x80, 36);
-    let response = scsi_read(session, &cdb, 36)
-        .map_err(|_| Error::AacsVidRead)?;
+    let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsVidRead)?;
 
     let mut vid = [0u8; 16];
     let mut mac = [0u8; 16];
@@ -996,11 +1042,13 @@ pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
 }
 
 /// Read data keys after successful authentication (for AACS 2.0 bus encryption).
-pub fn read_data_keys(session: &mut DriveSession, auth: &mut AacsAuth) -> Result<([u8; 16], [u8; 16])> {
+pub fn read_data_keys(
+    session: &mut DriveSession,
+    auth: &mut AacsAuth,
+) -> Result<([u8; 16], [u8; 16])> {
     // REPORT DISC STRUCTURE format 0x84
     let cdb = cdb_report_disc_structure(auth.agid, 0x84, 36);
-    let response = scsi_read(session, &cdb, 36)
-        .map_err(|_| Error::AacsDataKey)?;
+    let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsDataKey)?;
 
     let mut enc_rdk = [0u8; 16];
     let mut enc_wdk = [0u8; 16];
@@ -1066,12 +1114,16 @@ mod tests {
         let data = b"test data for AACS ECDSA";
 
         let (sig_r, sig_s) = ecdsa_sign(&priv_key, data);
-        assert!(ecdsa_verify(&pub_x, &pub_y, &sig_r, &sig_s, data),
-            "ECDSA signature should verify");
+        assert!(
+            ecdsa_verify(&pub_x, &pub_y, &sig_r, &sig_s, data),
+            "ECDSA signature should verify"
+        );
 
         // Verify with wrong data fails
-        assert!(!ecdsa_verify(&pub_x, &pub_y, &sig_r, &sig_s, b"wrong data"),
-            "ECDSA should fail with wrong data");
+        assert!(
+            !ecdsa_verify(&pub_x, &pub_y, &sig_r, &sig_s, b"wrong data"),
+            "ECDSA should fail with wrong data"
+        );
     }
 
     #[test]
@@ -1113,7 +1165,10 @@ mod tests {
         let g = EcPoint::from_bytes(&P256_GX, &P256_GY);
 
         let result = ec_mul(&n, &g, &a, &p);
-        assert!(result.infinity, "n × G should be point at infinity on P-256");
+        assert!(
+            result.infinity,
+            "n × G should be point at infinity on P-256"
+        );
     }
 
     #[test]
@@ -1160,10 +1215,16 @@ mod tests {
         let pub_a = ec_mul(&da, &g, &a, &p);
         let pub_b = ec_mul(&db, &g, &a, &p);
 
-        let key_a = compute_bus_key_p256(&priv_a,
-            &to_bytes_be_padded(&pub_b.x, 32), &to_bytes_be_padded(&pub_b.y, 32));
-        let key_b = compute_bus_key_p256(&priv_b,
-            &to_bytes_be_padded(&pub_a.x, 32), &to_bytes_be_padded(&pub_a.y, 32));
+        let key_a = compute_bus_key_p256(
+            &priv_a,
+            &to_bytes_be_padded(&pub_b.x, 32),
+            &to_bytes_be_padded(&pub_b.y, 32),
+        );
+        let key_b = compute_bus_key_p256(
+            &priv_b,
+            &to_bytes_be_padded(&pub_a.x, 32),
+            &to_bytes_be_padded(&pub_a.y, 32),
+        );
 
         assert_eq!(key_a, key_b, "P-256 ECDH shared secrets should match");
     }
@@ -1171,8 +1232,10 @@ mod tests {
     #[test]
     fn test_aes_cmac() {
         // Basic CMAC test — at minimum verify it produces consistent output
-        let key = [0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-                   0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c];
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
         let data = [0u8; 16];
         let mac1 = aes_cmac_16(&data, &key);
         let mac2 = aes_cmac_16(&data, &key);
@@ -1187,12 +1250,17 @@ mod tests {
             Some(p) => std::path::PathBuf::from(p),
             None => return, // skip if KEYDB_PATH not set
         };
-        if !keydb_path.exists() { return; }
+        if !keydb_path.exists() {
+            return;
+        }
 
         let db = crate::aacs::KeyDb::load(&keydb_path).unwrap();
         if let Some(hc) = db.host_certs.first() {
             let valid = verify_cert(&hc.certificate);
-            eprintln!("Host cert verification: {}", if valid { "PASS" } else { "FAIL" });
+            eprintln!(
+                "Host cert verification: {}",
+                if valid { "PASS" } else { "FAIL" }
+            );
             // Note: our cert is revoked but should still have valid LA signature
             // If it doesn't verify, the LA public key might be wrong
             if !valid {

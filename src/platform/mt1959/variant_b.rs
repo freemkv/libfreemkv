@@ -2,9 +2,9 @@
 //!
 //! MODE SELECT (0x55) → read metadata → WRITE_BUFFER → vendor verify (0xF1) → unlock × 5+1
 
+use super::Mt1959;
 use crate::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
-use super::Mt1959;
 
 const SCSI_MODE_SELECT: u8 = 0x55;
 const SCSI_WRITE_BUFFER: u8 = 0x3B;
@@ -22,21 +22,54 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     // Step 1: Upload firmware via MODE SELECT
     let write_len = FIRMWARE_MAX_SIZE.min(firmware.len());
     let mode_select_cdb = [
-        SCSI_MODE_SELECT, 0x10, 0x00,
-        0x00, 0x00, 0x00,
-        (write_len >> 16) as u8, (write_len >> 8) as u8, write_len as u8,
+        SCSI_MODE_SELECT,
+        0x10,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        (write_len >> 16) as u8,
+        (write_len >> 8) as u8,
+        write_len as u8,
         0x00,
     ];
     let mut data = firmware[..write_len].to_vec();
     scsi.execute(&mode_select_cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
     // Step 2: Read firmware metadata (READ_BUFFER mode 6, offset 0x3000)
-    let read_meta_cdb = [SCSI_READ_BUFFER, 0x06, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x10, 0x00];
+    let read_meta_cdb = [
+        SCSI_READ_BUFFER,
+        0x06,
+        0x00,
+        0x00,
+        0x30,
+        0x00,
+        0x00,
+        0x00,
+        0x10,
+        0x00,
+    ];
     let mut meta_resp = [0u8; 16];
-    let _ = scsi.execute(&read_meta_cdb, DataDirection::FromDevice, &mut meta_resp, 5_000);
+    let _ = scsi.execute(
+        &read_meta_cdb,
+        DataDirection::FromDevice,
+        &mut meta_resp,
+        5_000,
+    );
 
     // Step 3: Write extra firmware data (all zeros)
-    let write_extra_cdb = [SCSI_WRITE_BUFFER, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00];
+    let write_extra_cdb = [
+        SCSI_WRITE_BUFFER,
+        0x06,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x10,
+        0x00,
+    ];
     let mut data2 = FIRMWARE_EXTRA.to_vec();
     let _ = scsi.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000);
 

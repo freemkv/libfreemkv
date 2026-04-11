@@ -3,9 +3,9 @@
 //! Clean structured XML with Content/Qualifier per stream and
 //! stream number mapping via playbackconfig.
 
+use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
-use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier};
 use std::collections::HashMap;
 
 pub fn detect(udf: &UdfFs) -> bool {
@@ -17,7 +17,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     let sp_text = std::str::from_utf8(&sp_data).ok()?;
 
     let stream_infos = parse_stream_infos(sp_text);
-    if stream_infos.is_empty() { return None; }
+    if stream_infos.is_empty() {
+        return None;
+    }
 
     // Stream number mapping from playbackconfig.xml
     let mut stream_map: HashMap<String, u16> = HashMap::new();
@@ -32,12 +34,22 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     let mut sub_idx: u16 = 1;
 
     for info in &stream_infos {
-        let stream_num = stream_map.get(&info.id).copied().unwrap_or_else(|| {
-            match info.stream_type {
-                StreamLabelType::Audio => { let n = audio_idx; audio_idx += 1; n }
-                StreamLabelType::Subtitle => { let n = sub_idx; sub_idx += 1; n }
-            }
-        });
+        let stream_num =
+            stream_map
+                .get(&info.id)
+                .copied()
+                .unwrap_or_else(|| match info.stream_type {
+                    StreamLabelType::Audio => {
+                        let n = audio_idx;
+                        audio_idx += 1;
+                        n
+                    }
+                    StreamLabelType::Subtitle => {
+                        let n = sub_idx;
+                        sub_idx += 1;
+                        n
+                    }
+                });
 
         labels.push(StreamLabel {
             stream_number: stream_num,
@@ -51,7 +63,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
         });
     }
 
-    if labels.is_empty() { return None; }
+    if labels.is_empty() {
+        return None;
+    }
     Some(labels)
 }
 
@@ -111,7 +125,14 @@ fn parse_stream_infos(xml: &str) -> Vec<StreamInfo> {
             _ => LabelQualifier::None,
         };
 
-        infos.push(StreamInfo { id, stream_type, language, variant, purpose, qualifier });
+        infos.push(StreamInfo {
+            id,
+            stream_type,
+            language,
+            variant,
+            purpose,
+            qualifier,
+        });
         pos = block_end;
     }
     infos
@@ -122,25 +143,25 @@ fn parse_playback_config(xml: &str, map: &mut HashMap<String, u16>) {
     while pos < xml.len() {
         let tag_start = if let Some(p) = xml[pos..].find("<AudioStreams>") {
             Some(p + pos)
-        } else if let Some(p) = xml[pos..].find("<SubtitlesStreams>") {
-            Some(p + pos)
-        } else {
-            None
-        };
+        } else { xml[pos..].find("<SubtitlesStreams>").map(|p| p + pos) };
 
         let tag_start = match tag_start {
             Some(p) => p,
             None => break,
         };
 
-        let block_end = xml[tag_start..].find("</AudioStreams>")
+        let block_end = xml[tag_start..]
+            .find("</AudioStreams>")
             .or_else(|| xml[tag_start..].find("</SubtitlesStreams>"))
             .map(|p| tag_start + p + 20)
             .unwrap_or(xml.len());
 
         let block = &xml[tag_start..block_end];
 
-        if let (Some(stream_id_str), Some(info_id)) = (extract_tag(block, "StreamID"), extract_tag(block, "StreamInfo_ID")) {
+        if let (Some(stream_id_str), Some(info_id)) = (
+            extract_tag(block, "StreamID"),
+            extract_tag(block, "StreamInfo_ID"),
+        ) {
             if let Ok(stream_num) = stream_id_str.parse::<u16>() {
                 map.insert(info_id, stream_num);
             }

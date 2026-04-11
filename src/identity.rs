@@ -8,7 +8,7 @@
 //!   MMC-6 §5.3.10 — Feature 010Ch (Firmware Information)
 
 use crate::error::Result;
-use crate::scsi::{ScsiTransport, DataDirection};
+use crate::scsi::{DataDirection, ScsiTransport};
 
 /// Drive identity from standard SCSI commands.
 ///
@@ -64,7 +64,8 @@ impl DriveId {
 
         let firmware_date = if result.bytes_transferred > 12 {
             String::from_utf8_lossy(&gc[12..24.min(result.bytes_transferred)])
-                .trim().to_string()
+                .trim()
+                .to_string()
         } else {
             String::new()
         };
@@ -72,12 +73,19 @@ impl DriveId {
         // GET CONFIGURATION Feature 0108h — Serial Number
         let mut gc_serial = vec![0u8; 256];
         let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-        let serial_number = if let Ok(r) = transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000) {
+        let serial_number = if let Ok(r) =
+            transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000)
+        {
             if r.bytes_transferred > 12 {
                 String::from_utf8_lossy(&gc_serial[12..r.bytes_transferred])
-                    .trim().to_string()
-            } else { String::new() }
-        } else { String::new() };
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
 
         Ok(DriveId {
             vendor_id: ascii_field(&inquiry, 8, 16),
@@ -111,21 +119,26 @@ impl DriveId {
     /// Used to look up this drive in the profile database.
     /// All fields trimmed for consistent matching.
     pub fn match_key(&self) -> String {
-        format!("{}|{}|{}|{}",
+        format!(
+            "{}|{}|{}|{}",
             self.vendor_id.trim(),
             self.product_id.trim(),
             self.product_revision.trim(),
-            self.vendor_specific.trim())
+            self.vendor_specific.trim()
+        )
     }
 }
 
 impl std::fmt::Display for DriveId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {} {} {}",
+        write!(
+            f,
+            "{} {} {} {}",
             self.vendor_id.trim(),
             self.product_id.trim(),
             self.product_revision.trim(),
-            self.vendor_specific.trim())
+            self.vendor_specific.trim()
+        )
     }
 }
 

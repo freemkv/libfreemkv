@@ -4,8 +4,8 @@
 //! Detects keyframes (IRAP pictures: IDR, CRA, BLA).
 //! Each PES packet = one access unit = one frame.
 
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 use super::h264::{find_start_code, skip_start_code};
+use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
 // HEVC NAL unit types
 const NAL_VPS: u8 = 32;
@@ -22,9 +22,19 @@ pub struct HevcParser {
     pps: Option<Vec<u8>>,
 }
 
+impl Default for HevcParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HevcParser {
     pub fn new() -> Self {
-        Self { vps: None, sps: None, pps: None }
+        Self {
+            vps: None,
+            sps: None,
+            pps: None,
+        }
     }
 }
 
@@ -45,7 +55,9 @@ impl CodecParser for HevcParser {
             if let Some(nal_start) = skip_start_code(data, sc_pos) {
                 let next = find_start_code(data, nal_start).unwrap_or(data.len());
                 let mut end = next;
-                while end > nal_start && data[end - 1] == 0x00 { end -= 1; }
+                while end > nal_start && data[end - 1] == 0x00 {
+                    end -= 1;
+                }
 
                 if nal_start < data.len() {
                     // HEVC NAL header: 2 bytes. Type is bits 1-6 of first byte.
@@ -55,7 +67,7 @@ impl CodecParser for HevcParser {
                         NAL_VPS => self.vps = Some(data[nal_start..end].to_vec()),
                         NAL_SPS => self.sps = Some(data[nal_start..end].to_vec()),
                         NAL_PPS => self.pps = Some(data[nal_start..end].to_vec()),
-                        t if t >= NAL_BLA_W_LP && t <= NAL_RSV_IRAP_VCL23 => {
+                        t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;
                         }
                         _ => {}
@@ -75,12 +87,18 @@ impl CodecParser for HevcParser {
             if let Some(nal_start) = skip_start_code(&pes.data, sc_pos) {
                 let next = find_start_code(&pes.data, nal_start).unwrap_or(pes.data.len());
                 let mut end = next;
-                while end > nal_start && pes.data[end - 1] == 0x00 { end -= 1; }
+                while end > nal_start && pes.data[end - 1] == 0x00 {
+                    end -= 1;
+                }
 
                 if nal_start < pes.data.len() {
                     let nal_type = (pes.data[nal_start] >> 1) & 0x3F;
                     // Skip parameter sets and AUD
-                    if nal_type != NAL_VPS && nal_type != NAL_SPS && nal_type != NAL_PPS && nal_type != NAL_AUD {
+                    if nal_type != NAL_VPS
+                        && nal_type != NAL_SPS
+                        && nal_type != NAL_PPS
+                        && nal_type != NAL_AUD
+                    {
                         let nal = &pes.data[nal_start..end];
                         let len = nal.len() as u32;
                         frame_data.extend_from_slice(&len.to_be_bytes());
@@ -115,8 +133,8 @@ impl CodecParser for HevcParser {
         let mut record = Vec::new();
 
         // Minimal HEVCDecoderConfigurationRecord header
-        record.push(1);  // configurationVersion
-        // General profile space, tier flag, profile IDC from SPS
+        record.push(1); // configurationVersion
+                        // General profile space, tier flag, profile IDC from SPS
         if sps.len() > 3 {
             record.push(sps[1]); // general_profile_space + general_tier_flag + general_profile_idc
         } else {
@@ -134,7 +152,7 @@ impl CodecParser for HevcParser {
         record.push(0xFC);
         // chromaFormat (6 + 2 bits)
         record.push(0xFC | 1); // 4:2:0
-        // bitDepthLumaMinus8 (5 + 3 bits)
+                               // bitDepthLumaMinus8 (5 + 3 bits)
         record.push(0xF8);
         // bitDepthChromaMinus8 (5 + 3 bits)
         record.push(0xF8);
@@ -142,7 +160,7 @@ impl CodecParser for HevcParser {
         record.extend_from_slice(&[0, 0]);
         // constantFrameRate + numTemporalLayers + temporalIdNested + lengthSizeMinusOne
         record.push(0x03); // lengthSizeMinusOne = 3 (4 bytes)
-        // numOfArrays
+                           // numOfArrays
         record.push(3); // VPS, SPS, PPS
 
         // VPS array
@@ -176,7 +194,12 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket { pid: 0x1011, pts, dts: None, data }
+        PesPacket {
+            pid: 0x1011,
+            pts,
+            dts: None,
+            data,
+        }
     }
 
     /// Build an HEVC NAL header (2 bytes). Type is bits 1-6 of first byte.
@@ -202,8 +225,9 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         let sps_hdr = hevc_nal_header(33);
         data.extend_from_slice(&sps_hdr);
-        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                  0x09, 0x0A, 0x0B, 0x0C, 0x0D]); // SPS payload (>12 bytes for level)
+        data.extend_from_slice(&[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+        ]); // SPS payload (>12 bytes for level)
 
         // PPS (type 34)
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -221,7 +245,10 @@ mod tests {
         let _frames = parser.parse(&pes);
 
         let cp = parser.codec_private();
-        assert!(cp.is_some(), "codec_private should be Some after VPS+SPS+PPS");
+        assert!(
+            cp.is_some(),
+            "codec_private should be Some after VPS+SPS+PPS"
+        );
 
         let cp = cp.unwrap();
         // configurationVersion = 1
@@ -229,7 +256,10 @@ mod tests {
         // numOfArrays = 3 (VPS, SPS, PPS)
         assert_eq!(cp[22], 3);
         // Should be longer than the minimal header (23 bytes) + array entries
-        assert!(cp.len() > 23, "codec_private should contain VPS+SPS+PPS data");
+        assert!(
+            cp.len() > 23,
+            "codec_private should contain VPS+SPS+PPS data"
+        );
     }
 
     #[test]
@@ -257,7 +287,10 @@ mod tests {
 
         let pes = make_pes(data, Some(0));
         parser.parse(&pes);
-        assert!(parser.codec_private().is_none(), "should be None without PPS");
+        assert!(
+            parser.codec_private().is_none(),
+            "should be None without PPS"
+        );
     }
 
     // --- IRAP keyframe detection ---
@@ -276,7 +309,10 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        assert!(frames[0].keyframe, "IDR_W_RADL (type 19) should be keyframe");
+        assert!(
+            frames[0].keyframe,
+            "IDR_W_RADL (type 19) should be keyframe"
+        );
     }
 
     #[test]
@@ -343,7 +379,10 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        assert!(!frames[0].keyframe, "TRAIL_R (type 1) should not be keyframe");
+        assert!(
+            !frames[0].keyframe,
+            "TRAIL_R (type 1) should not be keyframe"
+        );
     }
 
     #[test]
@@ -395,7 +434,11 @@ mod tests {
         let fd = &frames[0].data;
         let length = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]);
         // IDR NAL = 2 bytes header + 2 bytes payload = 4 bytes
-        assert_eq!(length as usize + 4, fd.len(), "frame should contain exactly one length-prefixed NAL");
+        assert_eq!(
+            length as usize + 4,
+            fd.len(),
+            "frame should contain exactly one length-prefixed NAL"
+        );
     }
 
     // --- empty PES ---

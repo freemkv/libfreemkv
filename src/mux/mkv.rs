@@ -4,16 +4,16 @@
 //! Designed for streaming writes: clusters are written as data arrives,
 //! cues and seek head are finalized at the end.
 
-use std::io::{self, Write, Seek, SeekFrom};
 use super::ebml;
-use crate::disc::{VideoStream, AudioStream, SubtitleStream, Codec};
+use crate::disc::{AudioStream, Codec, SubtitleStream, VideoStream};
+use std::io::{self, Seek, SeekFrom, Write};
 
 /// MKV track definition (built from disc stream metadata).
 pub struct MkvTrack {
-    pub track_type: u64,    // 1=video, 2=audio, 17=subtitle
+    pub track_type: u64, // 1=video, 2=audio, 17=subtitle
     pub codec_id: &'static str,
     pub language: String,
-    pub name: String,       // Track name / label (e.g. "English (Lossless)")
+    pub name: String, // Track name / label (e.g. "English (Lossless)")
     pub codec_private: Option<Vec<u8>>,
     pub is_default: bool,
     pub is_forced: bool,
@@ -125,7 +125,12 @@ const CLUSTER_DURATION_MS: i64 = 5000;
 
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks.
-    pub fn new(mut writer: W, tracks: &[MkvTrack], title: Option<&str>, duration_secs: f64) -> io::Result<Self> {
+    pub fn new(
+        mut writer: W,
+        tracks: &[MkvTrack],
+        title: Option<&str>,
+        duration_secs: f64,
+    ) -> io::Result<Self> {
         // EBML Header
         let ebml_pos = ebml::start_master(&mut writer, ebml::EBML)?;
         ebml::write_uint(&mut writer, ebml::EBML_VERSION, 1)?;
@@ -146,7 +151,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let info_pos = ebml::start_master(&mut writer, ebml::INFO)?;
         ebml::write_uint(&mut writer, ebml::TIMESTAMP_SCALE, 1_000_000)?; // 1ms precision
         if duration_secs > 0.0 {
-            ebml::write_float(&mut writer, ebml::DURATION, duration_secs * 1000.0)?; // in ms
+            ebml::write_float(&mut writer, ebml::DURATION, duration_secs * 1000.0)?;
+            // in ms
         }
         ebml::write_string(&mut writer, ebml::MUXING_APP, "freemkv")?;
         ebml::write_string(&mut writer, ebml::WRITING_APP, "freemkv")?;
@@ -233,7 +239,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
     }
 
     /// Write a single frame.
-    pub fn write_frame(&mut self, track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
+    pub fn write_frame(
+        &mut self,
+        track_idx: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: &[u8],
+    ) -> io::Result<()> {
         let pts_ms = pts_ns / 1_000_000;
 
         // Start new cluster if needed
@@ -275,7 +287,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut self.writer, ebml::CUE_TIME, cue.timestamp_ms as u64)?;
                 let ctp_pos = ebml::start_master(&mut self.writer, ebml::CUE_TRACK_POSITIONS)?;
                 ebml::write_uint(&mut self.writer, ebml::CUE_TRACK, cue.track as u64)?;
-                ebml::write_uint(&mut self.writer, ebml::CUE_CLUSTER_POSITION, cue.cluster_pos)?;
+                ebml::write_uint(
+                    &mut self.writer,
+                    ebml::CUE_CLUSTER_POSITION,
+                    cue.cluster_pos,
+                )?;
                 ebml::end_master(&mut self.writer, ctp_pos)?;
                 ebml::end_master(&mut self.writer, cp_pos)?;
             }
@@ -331,7 +347,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
-    fn write_simple_block(&mut self, track_num: usize, relative_ts: i16, keyframe: bool, data: &[u8]) -> io::Result<()> {
+    fn write_simple_block(
+        &mut self,
+        track_num: usize,
+        relative_ts: i16,
+        keyframe: bool,
+        data: &[u8],
+    ) -> io::Result<()> {
         // SimpleBlock: [track_number VINT] [relative_ts i16] [flags u8] [data]
         // Track number as EBML VINT
         let track_vint = if track_num < 0x80 {
@@ -359,24 +381,41 @@ impl<W: Write + Seek> MkvMuxer<W> {
 // ============================================================
 
 fn parse_resolution(s: &str) -> (u32, u32) {
-    if s.contains("2160") { (3840, 2160) }
-    else if s.contains("1080") { (1920, 1080) }
-    else if s.contains("720") { (1280, 720) }
-    else if s.contains("576") { (720, 576) }
-    else if s.contains("480") { (720, 480) }
-    else { (1920, 1080) }
+    if s.contains("2160") {
+        (3840, 2160)
+    } else if s.contains("1080") {
+        (1920, 1080)
+    } else if s.contains("720") {
+        (1280, 720)
+    } else if s.contains("576") {
+        (720, 576)
+    } else if s.contains("480") {
+        (720, 480)
+    } else {
+        (1920, 1080)
+    }
 }
 
 fn parse_sample_rate(s: &str) -> f64 {
-    if s.contains("96") { 96000.0 }
-    else if s.contains("192") { 192000.0 }
-    else { 48000.0 }
+    if s.contains("96") {
+        96000.0
+    } else if s.contains("192") {
+        192000.0
+    } else {
+        48000.0
+    }
 }
 
 fn parse_channels(s: &str) -> u8 {
-    if s.contains("7.1") { 8 }
-    else if s.contains("5.1") { 6 }
-    else if s.contains("stereo") || s.contains("2.0") { 2 }
-    else if s.contains("mono") { 1 }
-    else { 6 }
+    if s.contains("7.1") {
+        8
+    } else if s.contains("5.1") {
+        6
+    } else if s.contains("stereo") || s.contains("2.0") {
+        2
+    } else if s.contains("mono") {
+        1
+    } else {
+        6
+    }
 }

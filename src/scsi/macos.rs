@@ -6,8 +6,8 @@
 //! Requires exclusive access to the device — unmount the disc first:
 //! `diskutil unmountDisk /dev/disk2`
 
-use crate::error::{Error, Result};
 use super::{DataDirection, ScsiResult, ScsiTransport};
+use crate::error::{Error, Result};
 use std::path::Path;
 
 // ── IOKit / CoreFoundation type aliases ─────────────────────────────────────
@@ -40,20 +40,17 @@ const K_SENSE_DATA_SIZE: usize = 32;
 
 /// kIOMMCDeviceUserClientTypeID — plugin type for MMC (optical) devices.
 const K_IO_MMC_DEVICE_USER_CLIENT_TYPE_ID: [u8; 16] = [
-    0x97, 0xAB, 0xCF, 0x5C, 0x45, 0x71, 0x11, 0xD6,
-    0xB6, 0xA0, 0x00, 0x30, 0x65, 0xA4, 0x7A, 0xEE,
+    0x97, 0xAB, 0xCF, 0x5C, 0x45, 0x71, 0x11, 0xD6, 0xB6, 0xA0, 0x00, 0x30, 0x65, 0xA4, 0x7A, 0xEE,
 ];
 
 /// kIOCFPlugInInterfaceID — base IOCFPlugin interface.
 const K_IO_CFPLUGIN_INTERFACE_ID: [u8; 16] = [
-    0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4,
-    0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F,
+    0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4, 0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F,
 ];
 
 /// kIOSCSITaskDeviceInterfaceID — the interface we QueryInterface for.
 const K_IO_SCSI_TASK_DEVICE_INTERFACE_ID: [u8; 16] = [
-    0x61, 0x3E, 0x48, 0xB0, 0x30, 0x01, 0x11, 0xD6,
-    0xA4, 0xC0, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
+    0x61, 0x3E, 0x48, 0xB0, 0x30, 0x01, 0x11, 0xD6, 0xA4, 0xC0, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
 ];
 
 // ── Scatter/gather element ──────────────────────────────────────────────────
@@ -73,10 +70,7 @@ extern "C" {
         options: u32,
         bsd_name: *const u8,
     ) -> CFMutableDictionaryRef;
-    fn IOServiceGetMatchingService(
-        master: MachPort,
-        matching: CFMutableDictionaryRef,
-    ) -> IOObject;
+    fn IOServiceGetMatchingService(master: MachPort, matching: CFMutableDictionaryRef) -> IOObject;
     fn IOObjectRelease(object: IOObject) -> IOReturn;
     fn IORegistryEntryGetParentEntry(
         entry: IOObject,
@@ -216,7 +210,11 @@ impl MacScsiTransport {
         let hr = unsafe {
             type QiFn = unsafe extern "C" fn(ComRef, *const [u8; 16], *mut ComRef) -> i32;
             let qi: QiFn = vtable_fn(plugin, 1);
-            qi(plugin, &K_IO_SCSI_TASK_DEVICE_INTERFACE_ID, &mut device_iface)
+            qi(
+                plugin,
+                &K_IO_SCSI_TASK_DEVICE_INTERFACE_ID,
+                &mut device_iface,
+            )
         };
         com_release(plugin);
 
@@ -307,17 +305,15 @@ impl ScsiTransport for MacScsiTransport {
                 length: data.len() as u64,
             };
             unsafe {
-                type Fn = unsafe extern "C" fn(
-                    ComRef, *const SCSITaskSGElement, u8, u64, u8,
-                ) -> IOReturn;
+                type Fn =
+                    unsafe extern "C" fn(ComRef, *const SCSITaskSGElement, u8, u64, u8) -> IOReturn;
                 let f: Fn = vtable_fn(task, VTIDX_SET_SG);
                 f(task, &sg, 1, data.len() as u64, iokit_dir);
             }
         } else {
             unsafe {
-                type Fn = unsafe extern "C" fn(
-                    ComRef, *const SCSITaskSGElement, u8, u64, u8,
-                ) -> IOReturn;
+                type Fn =
+                    unsafe extern "C" fn(ComRef, *const SCSITaskSGElement, u8, u64, u8) -> IOReturn;
                 let f: Fn = vtable_fn(task, VTIDX_SET_SG);
                 f(task, std::ptr::null(), 0, 0, K_SCSI_DATA_TRANSFER_NO_DATA);
             }
@@ -332,15 +328,18 @@ impl ScsiTransport for MacScsiTransport {
 
         // Execute synchronously
         let mut sense = [0u8; K_SENSE_DATA_SIZE];
-        let mut task_status: u8 = 0;
+        let mut task_status: u32 = 0;
         let mut realized_count: u64 = 0;
 
         let kr = unsafe {
-            type Fn = unsafe extern "C" fn(
-                ComRef, *mut u8, *mut u8, *mut u64,
-            ) -> IOReturn;
+            type Fn = unsafe extern "C" fn(ComRef, *mut u8, *mut u32, *mut u64) -> IOReturn;
             let f: Fn = vtable_fn(task, VTIDX_EXECUTE_SYNC);
-            f(task, sense.as_mut_ptr(), &mut task_status, &mut realized_count)
+            f(
+                task,
+                sense.as_mut_ptr(),
+                &mut task_status,
+                &mut realized_count,
+            )
         };
 
         com_release(task);
@@ -353,22 +352,21 @@ impl ScsiTransport for MacScsiTransport {
             });
         }
 
-        if task_status != K_SCSI_TASK_STATUS_GOOD {
+        if task_status != K_SCSI_TASK_STATUS_GOOD as u32 {
             let sense_key = if sense[2] != 0 { sense[2] & 0x0F } else { 0 };
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: task_status,
+                status: task_status as u8,
                 sense_key,
             });
         }
 
         Ok(ScsiResult {
-            status: task_status,
+            status: task_status as u8,
             bytes_transferred: realized_count as usize,
             sense,
         })
     }
-
 }
 
 // ── IOKit service discovery ─────────────────────────────────────────────────
@@ -436,9 +434,8 @@ fn walk_to_authoring_device(start: IOObject) -> Option<IOObject> {
     // Walk up to 10 levels (more than enough)
     for _ in 0..10 {
         let mut parent: IOObject = 0;
-        let kr = unsafe {
-            IORegistryEntryGetParentEntry(current, b"IOService\0".as_ptr(), &mut parent)
-        };
+        let kr =
+            unsafe { IORegistryEntryGetParentEntry(current, b"IOService\0".as_ptr(), &mut parent) };
 
         if current != start {
             unsafe { IOObjectRelease(current) };

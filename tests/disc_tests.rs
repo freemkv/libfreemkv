@@ -1,9 +1,9 @@
 //! Disc scanning pipeline tests.
 
-use std::collections::HashMap;
 use libfreemkv::error::Result;
 use libfreemkv::sector::SectorReader;
 use libfreemkv::{Disc, DiscTitle, ScanOptions};
+use std::collections::HashMap;
 
 const SECTOR_SIZE: usize = 2048;
 
@@ -14,7 +14,9 @@ struct MockSectorReader {
 
 impl MockSectorReader {
     fn new() -> Self {
-        Self { sectors: HashMap::new() }
+        Self {
+            sectors: HashMap::new(),
+        }
     }
 }
 
@@ -41,7 +43,10 @@ fn scan_image_empty_reader() {
     let mut reader = MockSectorReader::new();
     let opts = ScanOptions::default();
     let result = Disc::scan_image(&mut reader, 0, &opts);
-    assert!(result.is_err(), "scan_image should fail with empty reader (no AVDP)");
+    assert!(
+        result.is_err(),
+        "scan_image should fail with empty reader (no AVDP)"
+    );
 }
 
 // ── DiscTitle tests ────────────────────────────────────────────────────────
@@ -101,8 +106,14 @@ fn disc_title_total_sectors() {
     let mut t = DiscTitle::empty();
     assert_eq!(t.total_sectors(), 0);
 
-    t.extents.push(libfreemkv::Extent { start_lba: 0, sector_count: 100 });
-    t.extents.push(libfreemkv::Extent { start_lba: 200, sector_count: 50 });
+    t.extents.push(libfreemkv::Extent {
+        start_lba: 0,
+        sector_count: 100,
+    });
+    t.extents.push(libfreemkv::Extent {
+        start_lba: 200,
+        sector_count: 50,
+    });
     assert_eq!(t.total_sectors(), 150);
 }
 

@@ -5,12 +5,20 @@
 //! All frames are keyframes (no inter-frame dependencies).
 //! Each PES packet = one frame.
 
-use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
 pub struct DtsParser;
 
+impl Default for DtsParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DtsParser {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl CodecParser for DtsParser {
@@ -19,10 +27,16 @@ impl CodecParser for DtsParser {
             return Vec::new();
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
-        vec![Frame { pts_ns, keyframe: true, data: pes.data.clone() }]
+        vec![Frame {
+            pts_ns,
+            keyframe: true,
+            data: pes.data.clone(),
+        }]
     }
 
-    fn codec_private(&self) -> Option<Vec<u8>> { None }
+    fn codec_private(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -31,7 +45,12 @@ mod tests {
     use crate::mux::ts::PesPacket;
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket { pid: 0x1100, pts, dts: None, data }
+        PesPacket {
+            pid: 0x1100,
+            pts,
+            dts: None,
+            data,
+        }
     }
 
     #[test]

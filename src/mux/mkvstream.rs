@@ -3,19 +3,22 @@
 //! Write: BD-TS bytes in → demux → codec parse → MKV container out.
 //! Read: MKV container in → extract frames → wrap as BD-TS → bytes out.
 
-use std::io::{self, Read, Write, Seek, SeekFrom};
-use super::{IOStream, WriteSeek, ReadSeek, ebml};
-use super::ts::TsDemuxer;
-use super::mkv::{MkvMuxer, MkvTrack};
 use super::codec::{self, CodecParser};
 use super::lookahead::{LookaheadBuffer, LookaheadState, DEFAULT_LOOKAHEAD_SIZE};
+use super::mkv::{MkvMuxer, MkvTrack};
+use super::ts::TsDemuxer;
+use super::{ebml, IOStream, ReadSeek, WriteSeek};
 use crate::disc::*;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Lookahead buffer for codec header detection (5 MB default).
 const DEFAULT_MAX_BUFFER: usize = DEFAULT_LOOKAHEAD_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum WritePhase { Scanning, Streaming }
+enum WritePhase {
+    Scanning,
+    Streaming,
+}
 
 struct WriteState {
     demuxer: TsDemuxer,
@@ -84,9 +87,11 @@ impl MkvStream {
                     crate::disc::Stream::Audio(a) => {
                         (a.pid, MkvTrack::audio(a), codec::parser_for_codec(a.codec))
                     }
-                    crate::disc::Stream::Subtitle(s) => {
-                        (s.pid, MkvTrack::subtitle(s), codec::parser_for_codec(s.codec))
-                    }
+                    crate::disc::Stream::Subtitle(s) => (
+                        s.pid,
+                        MkvTrack::subtitle(s),
+                        codec::parser_for_codec(s.codec),
+                    ),
                 };
                 let idx = ws.tracks.len();
                 pids.push(pid);
@@ -128,10 +133,14 @@ impl MkvStream {
 }
 
 impl IOStream for MkvStream {
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
 
     fn finish(&mut self) -> io::Result<()> {
-        if self.finished { return Ok(()); }
+        if self.finished {
+            return Ok(());
+        }
         self.finished = true;
         if let Mode::Write(ref mut ws) = self.mode {
             // Flush remaining PES packets
@@ -156,7 +165,12 @@ impl Write for MkvStream {
         let dt = &self.disc_title;
         let ws = match self.mode {
             Mode::Write(ref mut ws) => ws,
-            Mode::Read(_) => return Err(io::Error::new(io::ErrorKind::Unsupported, "stream opened for reading")),
+            Mode::Read(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "stream opened for reading",
+                ))
+            }
         };
 
         match ws.phase {
@@ -198,7 +212,9 @@ impl Write for MkvStream {
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // ── Read ───────────────────────────────────────────────────────
@@ -207,7 +223,12 @@ impl Read for MkvStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let rs = match self.mode {
             Mode::Read(ref mut rs) => rs,
-            Mode::Write(_) => return Err(io::Error::new(io::ErrorKind::Unsupported, "stream opened for writing")),
+            Mode::Write(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "stream opened for writing",
+                ))
+            }
         };
 
         // Drain internal buffer first
@@ -233,10 +254,14 @@ impl Read for MkvStream {
                 }
                 ebml::SIMPLE_BLOCK => {
                     let block = ebml::read_binary_val(&mut rs.reader, size as usize)?;
-                    if block.len() < 4 { continue; }
+                    if block.len() < 4 {
+                        continue;
+                    }
 
                     let (track, vl) = block_vint(&block);
-                    if vl + 3 > block.len() { continue; }
+                    if vl + 3 > block.len() {
+                        continue;
+                    }
 
                     let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
                     let frame = &block[vl + 3..];
@@ -267,7 +292,9 @@ impl Read for MkvStream {
 // ── Write internals ────────────────────────────────────────────
 
 fn check_codec_private(ws: &mut WriteState) -> bool {
-    if ws.video_pending == 0 { return true; }
+    if ws.video_pending == 0 {
+        return true;
+    }
     for (pid, parser) in &ws.parsers {
         if let Some(cp) = parser.codec_private() {
             if let Some((_, idx)) = ws.pid_to_track.iter().find(|(p, _)| p == pid) {
@@ -282,10 +309,17 @@ fn check_codec_private(ws: &mut WriteState) -> bool {
 }
 
 fn begin_streaming(ws: &mut WriteState, dt: &DiscTitle) -> io::Result<()> {
-    let writer = ws.writer.take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "writer already consumed"))?;
+    let writer = ws
+        .writer
+        .take()
+        .ok_or_else(|| io::Error::other("writer already consumed"))?;
 
-    ws.muxer = Some(MkvMuxer::new(writer, &ws.tracks, Some(&dt.playlist), dt.duration_secs)?);
+    ws.muxer = Some(MkvMuxer::new(
+        writer,
+        &ws.tracks,
+        Some(&dt.playlist),
+        dt.duration_secs,
+    )?);
     ws.phase = WritePhase::Streaming;
 
     // Re-parse buffered data through a fresh demuxer
@@ -332,17 +366,29 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
     let mut streams: Vec<crate::disc::Stream> = Vec::new();
 
     let (id, size, _) = ebml::read_element_header(r)?;
-    if id != ebml::EBML { return Err(io::Error::new(io::ErrorKind::InvalidData, "not EBML")); }
+    if id != ebml::EBML {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not EBML"));
+    }
+    if size > i64::MAX as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "EBML header too large"));
+    }
     r.seek(SeekFrom::Current(size as i64))?;
 
     let (id, _, _) = ebml::read_element_header(r)?;
-    if id != ebml::SEGMENT { return Err(io::Error::new(io::ErrorKind::InvalidData, "no Segment")); }
+    if id != ebml::SEGMENT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no Segment"));
+    }
 
     let (mut got_info, mut got_tracks) = (false, false);
 
     loop {
-        if got_info && got_tracks { break; }
-        let (id, size, _) = match ebml::read_element_header(r) { Ok(h) => h, Err(_) => break };
+        if got_info && got_tracks {
+            break;
+        }
+        let (id, size, _) = match ebml::read_element_header(r) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
 
         match id {
             ebml::INFO => {
@@ -353,7 +399,9 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
                         ebml::TIMESTAMP_SCALE => ts_scale = ebml::read_uint_val(r, cs as usize)?,
                         ebml::DURATION => duration_ms = ebml::read_float_val(r, cs as usize)?,
                         ebml::TITLE => title = ebml::read_string_val(r, cs as usize)?,
-                        _ => { r.seek(SeekFrom::Current(cs as i64))?; }
+                        _ => {
+                            r.seek(SeekFrom::Current(cs as i64))?;
+                        }
                     }
                 }
                 got_info = true;
@@ -363,13 +411,19 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
                 while r.stream_position()? < end {
                     let (cid, cs, _) = ebml::read_element_header(r)?;
                     if cid == ebml::TRACK_ENTRY {
-                        if let Some(s) = parse_track(r, cs)? { streams.push(s); }
-                    } else { r.seek(SeekFrom::Current(cs as i64))?; }
+                        if let Some(s) = parse_track(r, cs)? {
+                            streams.push(s);
+                        }
+                    } else {
+                        r.seek(SeekFrom::Current(cs as i64))?;
+                    }
                 }
                 got_tracks = true;
             }
             ebml::CLUSTER => break,
-            _ if size != u64::MAX => { r.seek(SeekFrom::Current(size as i64))?; }
+            _ if size != u64::MAX => {
+                r.seek(SeekFrom::Current(size as i64))?;
+            }
             _ => break,
         }
     }
@@ -401,8 +455,11 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
                 let ve = r.stream_position()? + cs;
                 while r.stream_position()? < ve {
                     let (vid, vs, _) = ebml::read_element_header(r)?;
-                    if vid == ebml::PIXEL_HEIGHT { ph = ebml::read_uint_val(r, vs as usize)? as u32; }
-                    else { r.seek(SeekFrom::Current(vs as i64))?; }
+                    if vid == ebml::PIXEL_HEIGHT {
+                        ph = ebml::read_uint_val(r, vs as usize)? as u32;
+                    } else {
+                        r.seek(SeekFrom::Current(vs as i64))?;
+                    }
                 }
             }
             ebml::AUDIO => {
@@ -412,37 +469,67 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
                         ebml::CHANNELS => ch = ebml::read_uint_val(r, as_ as usize)? as u8,
-                        _ => { r.seek(SeekFrom::Current(as_ as i64))?; }
+                        _ => {
+                            r.seek(SeekFrom::Current(as_ as i64))?;
+                        }
                     }
                 }
             }
-            _ => { r.seek(SeekFrom::Current(cs as i64))?; }
+            _ => {
+                r.seek(SeekFrom::Current(cs as i64))?;
+            }
         }
     }
 
     let codec = match codec_id.as_str() {
-        "V_MPEGH/ISO/HEVC" => Codec::Hevc, "V_MPEG4/ISO/AVC" => Codec::H264,
-        "V_MS/VFW/FOURCC" => Codec::Vc1, "V_MPEG2" => Codec::Mpeg2,
-        "A_AC3" => Codec::Ac3, "A_EAC3" => Codec::Ac3Plus,
-        "A_TRUEHD" => Codec::TrueHd, "A_DTS" => Codec::Dts,
-        "A_PCM/INT/BIG" => Codec::Lpcm, "S_HDMV/PGS" => Codec::Pgs,
+        "V_MPEGH/ISO/HEVC" => Codec::Hevc,
+        "V_MPEG4/ISO/AVC" => Codec::H264,
+        "V_MS/VFW/FOURCC" => Codec::Vc1,
+        "V_MPEG2" => Codec::Mpeg2,
+        "A_AC3" => Codec::Ac3,
+        "A_EAC3" => Codec::Ac3Plus,
+        "A_TRUEHD" => Codec::TrueHd,
+        "A_DTS" => Codec::Dts,
+        "A_PCM/INT/BIG" => Codec::Lpcm,
+        "S_HDMV/PGS" => Codec::Pgs,
         _ => Codec::Unknown(0),
     };
     let res = format!("{}p", ph);
-    let chs: String = match ch { 8 => "7.1", 6 => "5.1", 2 => "stereo", 1 => "mono", _ => "5.1" }.into();
+    let chs: String = match ch {
+        8 => "7.1",
+        6 => "5.1",
+        2 => "stereo",
+        1 => "mono",
+        _ => "5.1",
+    }
+    .into();
     let srs: String = if sr >= 96000.0 { "96kHz" } else { "48kHz" }.into();
 
     Ok(match ttype {
         1 => Some(crate::disc::Stream::Video(VideoStream {
-            pid: tnum, codec, resolution: res, frame_rate: String::new(),
-            hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709, secondary: false, label: name,
+            pid: tnum,
+            codec,
+            resolution: res,
+            frame_rate: String::new(),
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            secondary: false,
+            label: name,
         })),
         2 => Some(crate::disc::Stream::Audio(AudioStream {
-            pid: tnum, codec, channels: chs, language: lang, sample_rate: srs,
-            secondary: false, label: name,
+            pid: tnum,
+            codec,
+            channels: chs,
+            language: lang,
+            sample_rate: srs,
+            secondary: false,
+            label: name,
         })),
         17 => Some(crate::disc::Stream::Subtitle(SubtitleStream {
-            pid: tnum, codec, language: lang, forced,
+            pid: tnum,
+            codec,
+            language: lang,
+            forced,
         })),
         _ => None,
     })
@@ -451,8 +538,12 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
 // ── BD-TS frame wrapping (read side) ──────────────────────────
 
 fn block_vint(d: &[u8]) -> (u64, usize) {
-    if d.is_empty() { return (0, 0); }
-    if d[0] & 0x80 != 0 { return ((d[0] & 0x7F) as u64, 1); }
+    if d.is_empty() {
+        return (0, 0);
+    }
+    if d[0] & 0x80 != 0 {
+        return ((d[0] & 0x7F) as u64, 1);
+    }
     if d[0] & 0x40 != 0 && d.len() >= 2 {
         return ((((d[0] & 0x3F) as u64) << 8) | d[1] as u64, 2);
     }
@@ -460,7 +551,11 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
 }
 
 fn frame_to_ts(out: &mut Vec<u8>, track: u16, pts_ms: i64, data: &[u8]) {
-    let pid = if track == 1 { 0x1011 } else { 0x1100 + (track - 2) as u16 };
+    let pid = if track == 1 {
+        0x1011
+    } else {
+        0x1100 + (track - 2)
+    };
     let stream_id: u8 = if track == 1 { 0xE0 } else { 0xBD };
     let pts = encode_pts(pts_ms * 90);
     let hdr = [0x00, 0x00, 0x01, stream_id, 0x00, 0x00, 0x80, 0x80, 0x05];
@@ -476,7 +571,10 @@ fn frame_to_ts(out: &mut Vec<u8>, track: u16, pts_ms: i64, data: &[u8]) {
         let mut pkt = [0u8; 192];
         pkt[4] = 0x47;
         pkt[5] = (pid >> 8) as u8 & 0x1F;
-        if pusi { pkt[5] |= 0x40; pusi = false; }
+        if pusi {
+            pkt[5] |= 0x40;
+            pusi = false;
+        }
         pkt[6] = pid as u8;
 
         let space = 184;
@@ -487,8 +585,12 @@ fn frame_to_ts(out: &mut Vec<u8>, track: u16, pts_ms: i64, data: &[u8]) {
             let pad = space - n;
             pkt[7] = 0x30; // AF + payload
             pkt[8] = pad as u8;
-            if pad > 1 { pkt[9] = 0x00; }
-            for i in 10..(8 + pad).min(192) { pkt[i] = 0xFF; }
+            if pad > 1 {
+                pkt[9] = 0x00;
+            }
+            for i in 10..(8 + pad).min(192) {
+                pkt[i] = 0xFF;
+            }
             pkt[8 + pad..8 + pad + n].copy_from_slice(&pes[off..off + n]);
         } else {
             pkt[7] = 0x10; // payload only

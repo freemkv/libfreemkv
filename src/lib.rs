@@ -67,43 +67,46 @@
 //! | E6xxx | Disc format errors |
 //! | E7xxx | AACS errors |
 
-pub mod error;
-pub mod sector;
-pub mod scsi;
-pub mod profile;
-pub mod platform;
+pub mod aacs;
+pub mod clpi;
+pub mod css;
+pub mod disc;
 pub mod drive;
+pub mod error;
+pub mod ifo;
+pub mod event;
 pub mod identity;
+pub mod keydb;
+pub mod labels;
+pub mod mpls;
+pub mod mux;
+pub mod platform;
+pub mod profile;
+pub mod scsi;
+pub mod sector;
 pub mod speed;
 pub mod udf;
-pub mod mpls;
-pub mod clpi;
-pub mod disc;
-pub mod aacs;
-pub mod labels;
-pub mod keydb;
-pub mod event;
-pub mod mux;
 
+pub use drive::{find_drive, find_drives, resolve_device, DriveSession};
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
-pub use drive::{DriveSession, find_drive, find_drives, resolve_device};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
-pub use sector::SectorReader;
-pub use scsi::ScsiTransport;
-pub use speed::DriveSpeed;
-pub use disc::{Disc, DiscFormat, DiscTitle, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
-               Codec, HdrFormat, ColorSpace,
-               Extent, ContentReader, AacsState, KeySource, ScanOptions};
-pub use mux::IOStream;
-pub use mux::MkvStream;
-pub use mux::M2tsStream;
-pub use mux::NetworkStream;
+pub use disc::{
+    AacsState, AudioStream, Clip, Codec, ColorSpace, ContentReader, Disc, DiscFormat, DiscTitle,
+    Extent, HdrFormat, KeySource, ScanOptions, Stream, SubtitleStream, VideoStream,
+};
+pub use mux::DiscOptions;
 pub use mux::DiscStream;
+pub use mux::IOStream;
+pub use mux::IsoStream;
+pub use mux::M2tsStream;
+pub use mux::MkvStream;
+pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
-pub use mux::IsoStream;
-pub use mux::DiscOptions;
 pub use mux::{open_input, open_output, parse_url, InputOptions};
+pub use scsi::ScsiTransport;
+pub use sector::SectorReader;
+pub use speed::DriveSpeed;
