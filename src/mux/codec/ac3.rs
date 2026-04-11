@@ -16,22 +16,34 @@ impl Ac3Parser {
 
 impl CodecParser for Ac3Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
+        if pes.data.len() < 2 {
             return Vec::new();
         }
 
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
 
-        // AC3: each PES = one frame, always a keyframe
+        // Find AC3 syncword (0x0B77) — skip any garbage before it
+        let data = &pes.data;
+        let start = find_ac3_sync(data).unwrap_or(0);
+
         vec![Frame {
             pts_ns,
             keyframe: true,
-            data: pes.data.clone(),
+            data: data[start..].to_vec(),
         }]
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
-        // AC3 doesn't need codecPrivate in MKV
         None
     }
+}
+
+/// Find AC3 syncword (0x0B77) in data.
+fn find_ac3_sync(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(1) {
+        if data[i] == 0x0B && data[i + 1] == 0x77 {
+            return Some(i);
+        }
+    }
+    None
 }

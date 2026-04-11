@@ -13,6 +13,7 @@ pub struct MkvTrack {
     pub track_type: u64,    // 1=video, 2=audio, 17=subtitle
     pub codec_id: &'static str,
     pub language: String,
+    pub name: String,       // Track name / label (e.g. "English (Lossless)")
     pub codec_private: Option<Vec<u8>>,
     pub is_default: bool,
     pub is_forced: bool,
@@ -39,6 +40,7 @@ impl MkvTrack {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
             language: "und".into(),
+            name: v.label.clone(),
             codec_private: None, // filled later by parser
             is_default: !v.secondary,
             is_forced: false,
@@ -65,6 +67,7 @@ impl MkvTrack {
             track_type: ebml::TRACK_TYPE_AUDIO,
             codec_id,
             language: a.language.clone(),
+            name: a.label.clone(),
             codec_private: None,
             is_default: !a.secondary,
             is_forced: false,
@@ -81,6 +84,7 @@ impl MkvTrack {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
             codec_id: "S_HDMV/PGS",
             language: s.language.clone(),
+            name: String::new(),
             codec_private: None,
             is_default: false,
             is_forced: s.forced,
@@ -163,6 +167,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::write_uint(&mut writer, ebml::FLAG_LACING, 0)?;
             ebml::write_string(&mut writer, ebml::CODEC_ID, track.codec_id)?;
             ebml::write_string(&mut writer, ebml::LANGUAGE, &track.language)?;
+            if !track.name.is_empty() {
+                ebml::write_string(&mut writer, ebml::TRACK_NAME, &track.name)?;
+            }
 
             if !track.is_default {
                 ebml::write_uint(&mut writer, ebml::FLAG_DEFAULT, 0)?;

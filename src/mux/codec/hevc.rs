@@ -34,7 +34,8 @@ impl CodecParser for HevcParser {
             return Vec::new();
         }
 
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // Use DTS when available (monotonic for B-frame content), fall back to PTS
+        let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
 

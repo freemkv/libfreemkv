@@ -28,8 +28,10 @@ impl CodecParser for Vc1Parser {
             return Vec::new();
         }
 
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
-        let mut keyframe = false;
+        // Use DTS when available (monotonic for B-frame content), fall back to PTS
+        let ts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
+        let mut has_seq_header = false;
+        let mut frame_start: Option<usize> = None;
 
         // Scan for start codes (00 00 01 XX)
         let data = &pes.data;
@@ -39,23 +41,18 @@ impl CodecParser for Vc1Parser {
                 let sc_type = data[i + 3];
                 match sc_type {
                     SC_SEQUENCE_HEADER => {
-                        // Capture everything from here to next start code
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
                         self.seq_header = Some(data[i..end].to_vec());
+                        has_seq_header = true;
                     }
                     SC_ENTRY_POINT => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
                         self.entry_point = Some(data[i..end].to_vec());
                     }
                     SC_FRAME => {
-                        // First frame after sequence header + entry point is a keyframe
-                        if self.seq_header.is_some() && self.entry_point.is_some() {
-                            keyframe = true;
-                        }
-                        // Also check frame type from bitstream (bit after start code)
-                        if i + 4 < data.len() {
-                            // For Advanced profile: first 2 bits of frame data indicate type
-                            // But simpler: any frame preceded by seq+entry is I-frame
+                        // Frame data starts at this start code
+                        if frame_start.is_none() {
+                            frame_start = Some(i);
                         }
                     }
                     _ => {}
@@ -66,10 +63,20 @@ impl CodecParser for Vc1Parser {
             }
         }
 
+        // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
+        let keyframe = has_seq_header;
+
+        // Strip sequence header + entry point from frame data — those are in codecPrivate.
+        // Only include data from the frame start code onwards.
+        let frame_data = match frame_start {
+            Some(start) => &data[start..],
+            None => data, // no frame start code found, pass through entire PES
+        };
+
         vec![Frame {
-            pts_ns,
+            pts_ns: ts_ns,
             keyframe,
-            data: pes.data.clone(),
+            data: frame_data.to_vec(),
         }]
     }
 

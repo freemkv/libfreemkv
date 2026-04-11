@@ -34,7 +34,7 @@ pub struct Disc {
     /// Number of layers (1 = single, 2 = dual)
     pub layers: u8,
     /// Titles sorted by duration (longest first), then playlist name
-    pub titles: Vec<Title>,
+    pub titles: Vec<DiscTitle>,
     /// Disc region
     pub region: DiscRegion,
     /// AACS state -- None if disc is unencrypted or keys unavailable
@@ -80,7 +80,7 @@ pub enum BdRegion {
 
 /// A title (one MPLS playlist).
 #[derive(Debug, Clone)]
-pub struct Title {
+pub struct DiscTitle {
     /// Playlist filename (e.g. "00800.mpls")
     pub playlist: String,
     /// Playlist number (e.g. 800)
@@ -279,7 +279,20 @@ impl ColorSpace {
     }
 }
 
-impl Title {
+impl DiscTitle {
+    /// Empty DiscTitle with no streams.
+    pub fn empty() -> Self {
+        Self {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            extents: Vec::new(),
+        }
+    }
+
     /// Duration formatted as "Xh Ym"
     pub fn duration_display(&self) -> String {
         let hrs = (self.duration_secs / 3600.0) as u32;
@@ -627,7 +640,7 @@ impl Disc {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /// Detect disc format from the main title's video streams.
-    fn detect_format(titles: &[Title]) -> DiscFormat {
+    fn detect_format(titles: &[DiscTitle]) -> DiscFormat {
         for title in titles.iter().take(3) {
             for stream in &title.streams {
                 if let Stream::Video(v) = stream {
@@ -695,7 +708,7 @@ impl Disc {
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
-    ) -> Option<Title> {
+    ) -> Option<DiscTitle> {
         let parsed = mpls::parse(data).ok()?;
 
         // Calculate duration from play items
@@ -811,7 +824,7 @@ impl Disc {
         let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
 
-        Some(Title {
+        Some(DiscTitle {
             playlist: filename.to_string(),
             playlist_id,
             duration_secs,

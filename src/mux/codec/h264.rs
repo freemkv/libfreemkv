@@ -29,7 +29,8 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // Use DTS when available (monotonic for B-frame content), fall back to PTS
+        let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
 
         // Scan NAL units for SPS, PPS, and IDR detection
         let mut keyframe = false;

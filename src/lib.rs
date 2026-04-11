@@ -92,7 +92,14 @@ pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
-pub use disc::{Disc, DiscFormat, Title, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
+pub use disc::{Disc, DiscFormat, DiscTitle, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
                Codec, HdrFormat, ColorSpace,
                Extent, ContentReader, AacsState, KeySource, ScanOptions};
+pub use mux::IOStream;
 pub use mux::MkvStream;
+pub use mux::M2tsStream;
+pub use mux::NetworkStream;
+pub use mux::DiscStream;
+pub use mux::NullStream;
+pub use mux::DiscOptions;
+pub use mux::{open_input, open_output, parse_url, InputOptions};
