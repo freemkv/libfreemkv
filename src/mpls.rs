@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 
 /// Parsed MPLS playlist.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Playlist {
     /// MPLS version (e.g. "0200" or "0300")
     pub version: String,
@@ -23,6 +24,7 @@ pub struct Playlist {
 
 /// A playlist mark entry from the PlayListMark section.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PlaylistMark {
     /// Mark type: 1 = chapter entry mark
     pub mark_type: u8,
@@ -34,6 +36,7 @@ pub struct PlaylistMark {
 
 /// A play item — one clip reference with in/out times.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PlayItem {
     /// Clip filename without extension (e.g. "00001")
     pub clip_id: String,

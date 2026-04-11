@@ -125,17 +125,16 @@ impl TsDemuxer {
         let mut completed = Vec::with_capacity(4);
 
         // Prepend any remainder from previous call
-        let work: &[u8];
         let mut combined: Vec<u8> = Vec::new();
-        if !self.remainder.is_empty() {
+        let work: &[u8] = if !self.remainder.is_empty() {
             combined.reserve(self.remainder.len() + data.len());
             combined.extend_from_slice(&self.remainder);
             combined.extend_from_slice(data);
             self.remainder.clear();
-            work = &combined;
+            &combined
         } else {
-            work = data;
-        }
+            data
+        };
 
         let mut offset = 0;
 

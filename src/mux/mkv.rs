@@ -737,7 +737,7 @@ mod tests {
         // (MKV default is 1). When is_default is false, FlagDefault=0 IS written.
         // So we should find at least one FlagDefault element (for the non-default track).
         let flag_default_id = ebml::FLAG_DEFAULT.to_be_bytes();
-        let needle = &[flag_default_id[3]]; // 0x88 is a 1-byte ID
+        let _needle = &[flag_default_id[3]]; // 0x88 is a 1-byte ID
         let count = data.windows(1).filter(|w| w[0] == 0x88).count();
         // 0x88 appears as FlagDefault + as TrackType (also 0x83... no, 0x83 != 0x88)
         // FlagDefault (0x88) should appear for the non-default track

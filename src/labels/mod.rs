@@ -19,6 +19,7 @@ use crate::udf::UdfFs;
 
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StreamLabel {
     /// STN index (1-based)
     pub stream_number: u16,
@@ -45,6 +46,7 @@ pub enum StreamLabelType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum LabelPurpose {
     Normal,
     Commentary,

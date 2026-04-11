@@ -32,8 +32,8 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     sector[0x82] = 0x01;
     sector[0x83] = 0xE0;
     // Fill content
-    for i in 0x84..2048 {
-        sector[i] = (i & 0xFF) as u8;
+    for (i, byte) in sector.iter_mut().enumerate().take(2048).skip(0x84) {
+        *byte = (i & 0xFF) as u8;
     }
     let original = sector.clone();
 

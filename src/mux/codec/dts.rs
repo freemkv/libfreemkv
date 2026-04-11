@@ -70,16 +70,12 @@ pub fn find_dts_hd_ext_sync(data: &[u8]) -> Option<usize> {
     if data.len() < 4 {
         return None;
     }
-    for i in 0..=data.len() - 4 {
-        if data[i] == DTS_HD_EXT_SYNC[0]
+    (0..=data.len() - 4).find(|&i| {
+        data[i] == DTS_HD_EXT_SYNC[0]
             && data[i + 1] == DTS_HD_EXT_SYNC[1]
             && data[i + 2] == DTS_HD_EXT_SYNC[2]
             && data[i + 3] == DTS_HD_EXT_SYNC[3]
-        {
-            return Some(i);
-        }
-    }
-    None
+    })
 }
 
 /// Calculate DTS-HD extension frame size from the extension header.

@@ -63,7 +63,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
         // Clock LFSR1 forward 4 steps to reconstruct LFSR0 state
         let mut t3: u32 = 0;
 
-        for i in 0..4 {
+        for &buf_byte in buf.iter().take(4) {
             // Advance LFSR1
             let t4 = TAB2[t2 as usize] ^ TAB3[t1 as usize];
             t2 = t1 >> 1;
@@ -71,7 +71,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
             let t4_perm = TAB5[t4 as usize];
 
             // Deduce LFSR0 output from the buffer and LFSR1 output
-            let mut t6 = buf[i] as u32;
+            let mut t6 = buf_byte as u32;
             if t5 > 0 {
                 t6 = (t6 + 0xFF) & 0xFF;
             }
@@ -91,7 +91,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
 
         // Phase 3: Validate — clock 6 more steps and check against buffer
         let mut valid = true;
-        for i in 4..10 {
+        for &buf_byte in buf.iter().skip(4) {
             let t4 = TAB2[t2 as usize] ^ TAB3[t1 as usize];
             t2 = t1 >> 1;
             t1 = ((t1 & 1) << 8) ^ t4 as u32;
@@ -103,7 +103,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
             let t6_perm = TAB4[(t6 & 0xFF) as usize];
 
             t5 += t6_perm as u32 + t4_perm as u32;
-            if (t5 & 0xFF) as u8 != buf[i] {
+            if (t5 & 0xFF) as u8 != buf_byte {
                 valid = false;
                 break;
             }

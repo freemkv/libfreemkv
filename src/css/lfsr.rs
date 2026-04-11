@@ -57,7 +57,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     let mut combined: u32 = 0;
 
     // Generate 1920 keystream bytes (for sector bytes 128..2048)
-    for i in 128..2048 {
+    for byte in sector.iter_mut().take(2048).skip(128) {
         // Clock LFSR1
         let o_lfsr1 = TAB2[lfsr1_hi as usize] ^ TAB3[lfsr1_lo as usize];
         lfsr1_hi = lfsr1_lo >> 1;
@@ -70,7 +70,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
 
         // Combine with addition and carry
         combined += (o_lfsr0 ^ 0xFF) as u32 + o_lfsr1_perm as u32;
-        sector[i] ^= (combined & 0xFF) as u8;
+        *byte ^= (combined & 0xFF) as u8;
         combined >>= 8;
     }
 
@@ -102,7 +102,7 @@ pub(crate) fn decrypt_key(invert: u8, p_key: &[u8; 5], p_crypted: &[u8]) -> [u8;
     let mut combined: u32 = 0;
     let mut k = [0u8; 5];
 
-    for i in 0..5 {
+    for byte in &mut k {
         let o_lfsr1 = TAB2[lfsr1_hi as usize] ^ TAB3[lfsr1_lo as usize];
         lfsr1_hi = lfsr1_lo >> 1;
         lfsr1_lo = ((lfsr1_lo & 1) << 8) ^ o_lfsr1 as u32;
@@ -112,7 +112,7 @@ pub(crate) fn decrypt_key(invert: u8, p_key: &[u8; 5], p_crypted: &[u8]) -> [u8;
         lfsr0 = (lfsr0 >> 8) | ((o_lfsr0 as u32) << 24);
 
         combined += (o_lfsr0 ^ invert) as u32 + o_lfsr1_perm as u32;
-        k[i] = (combined & 0xFF) as u8;
+        *byte = (combined & 0xFF) as u8;
         combined >>= 8;
     }
 
@@ -257,8 +257,8 @@ mod tests {
         sector[0x82] = 0x01;
         sector[0x83] = 0xE0;
         // Fill some content in the encrypted region
-        for i in 0x84..2048 {
-            sector[i] = (i & 0xFF) as u8;
+        for (i, byte) in sector.iter_mut().enumerate().take(2048).skip(0x84) {
+            *byte = (i & 0xFF) as u8;
         }
 
         let original = sector.clone();
@@ -299,8 +299,8 @@ mod tests {
     #[test]
     fn css_tab1_is_permutation() {
         let mut seen = [false; 256];
-        for i in 0..256 {
-            let v = TAB1[i] as usize;
+        for tab1_val in &TAB1 {
+            let v = *tab1_val as usize;
             assert!(!seen[v], "TAB1 maps two inputs to {:#04x}", v);
             seen[v] = true;
         }

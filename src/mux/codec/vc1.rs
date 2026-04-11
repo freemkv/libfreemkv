@@ -122,12 +122,7 @@ impl CodecParser for Vc1Parser {
 }
 
 fn find_next_sc(data: &[u8], from: usize) -> Option<usize> {
-    for i in from..data.len().saturating_sub(2) {
-        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
-            return Some(i);
-        }
-    }
-    None
+    (from..data.len().saturating_sub(2)).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 #[cfg(test)]

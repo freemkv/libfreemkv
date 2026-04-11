@@ -490,6 +490,7 @@ mod tests {
     }
 
     /// Read a little-endian u32 from a byte slice at the given offset.
+    #[allow(dead_code)]
     fn le_u32(data: &[u8], off: usize) -> u32 {
         u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
     }
