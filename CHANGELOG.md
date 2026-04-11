@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.8.0 (2026-04-11)
+
+### DVD support
+- **Full DVD pipeline** — VIDEO_TS detection, IFO parsing, CSS decryption, MPEG-2 PS demuxing
+- **CSS cipher** — Stevenson 1999 table-driven implementation, no keys needed
+- **IFO parser** — title sets, PGC chains, cell addresses, audio/subtitle attributes, palette
+- **MPEG-2 PS demuxer** — pack headers, PES extraction, private stream 1 sub-streams
+- **MPEG-2 video parser** — sequence headers, I-frame detection, codec_private
+
+### 100% codec coverage
+- **E-AC-3 (Dolby Digital Plus)** — bsid detection, frame size calculation
+- **DTS-HD MA/HR** — extension substream detection and inclusion
+- **LPCM** — BD header skip, raw PCM extraction
+- **DVD subtitles (VobSub)** — passthrough with IFO palette extraction (YCbCr→RGB)
+- **Dolby Vision** — verified RPU NAL type 62 preserved in HEVC passthrough
+
+### MKV improvements
+- **Chapters** — MPLS PlayList marks → MKV Chapters element
+- **Track flags** — FlagDefault, FlagForced, Language correctly set
+- **HEVC codec_private** — profile compatibility and constraint flags from SPS
+- **VC-1 codec_private** — resolution parsed from sequence header
+
+### Architecture
+- **SectorReader trait** — decouples disc scanning from SCSI
+- **Disc::scan_image()** — scan ISO images or any SectorReader
+- **resolve_encryption()** — single function handles AACS 1.0/2.0/CSS/none
+- **Module refactors** — disc/ (4 files), aacs/ (5 files), drive/ (3 files)
+- **Module visibility** — internal modules pub(crate), explicit AACS re-exports
+
+### Streams
+- **StdioStream** — stdin/stdout pipe
+- **IsoStream** — read/write Blu-ray ISO images with UDF 2.50 filesystem
+- **Strict URLs** — all URLs require scheme:// prefix, bare paths rejected
+- **total_bytes()** — IOStream reports content size for progress display
+
+### Platform
+- **Windows SPTI** — SCSI Pass-Through Interface backend
+- **Windows builds** — CI + release workflow for x86_64-pc-windows-msvc
+- **macOS drive discovery** — separate from Linux (drive/macos.rs)
+- **Stable download URLs** — /latest/download/ with version-free filenames
+
+### Audit fixes (4 rounds, 14→0 critical)
+- UDF bounds checking on all disc-sourced offsets
+- SCSI: Linux residual underflow, macOS task_status type, Windows buffer zeroing
+- AACS: EC mod_inv safe, key reduced mod n, host cert fallback
+- DiscStream: persistent read state (was recreating ContentReader per call)
+- ISO writer: UDF tag checksums, multi-extent >4GB, reserve AVDP placement
+- CSS crack: labeled loop break, polynomial match
+- 0 clippy warnings
+
+### Testing
+- **327 tests** (was 64 at start)
+- CSS/AACS cross-validation against independent AES implementation
+- End-to-end MKV mux test with H.264 codec headers
+
 ## 0.7.2 (2026-04-11)
 
 ### Windows support
