@@ -616,3 +616,142 @@ fn mkvstream_meta_sets_title() {
     assert_eq!(info.duration_secs, 7200.0);
     assert_eq!(info.streams.len(), 4);
 }
+
+// ── MkvStream additional tests ──────────────────────────────
+
+#[test]
+fn mkvstream_roundtrip_bdts() {
+    // Write BD-TS packets through MkvStream and verify the pipeline works.
+    // Without real codec headers (SPS/PPS), the muxer stays in scanning phase.
+    // With a title that has no video streams (audio-only), codec scanning is
+    // skipped and the muxer enters streaming mode immediately, producing EBML output.
+
+    let dt = DiscTitle {
+        playlist: "Audio Only".into(),
+        playlist_id: 0,
+        duration_secs: 60.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams: vec![Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Ac3,
+            channels: "5.1".into(),
+            language: "eng".into(),
+            sample_rate: "48kHz".into(),
+            secondary: false,
+            label: "English".into(),
+        })],
+        extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
+    };
+
+    let output = Cursor::new(Vec::new());
+    let mut stream = MkvStream::new(output).meta(&dt).max_buffer(1024 * 1024);
+
+    // Write BD-TS packets targeting the audio PID 0x1100
+    for i in 0..10u8 {
+        let mut pkt = [0u8; 192];
+        pkt[4] = 0x47;
+        // PID 0x1100
+        pkt[5] = 0x11;
+        pkt[6] = 0x00;
+        pkt[7] = 0x10;
+        pkt[8] = i;
+        stream.write_all(&pkt).unwrap();
+    }
+
+    stream.finish().unwrap();
+
+    // Verify the info is correct
+    let info = stream.info();
+    assert_eq!(info.streams.len(), 1);
+    assert_eq!(info.playlist, "Audio Only");
+}
+
+#[test]
+fn mkvstream_meta_preserves_all_streams() {
+    let dt = DiscTitle {
+        playlist: "Stream Test".into(),
+        playlist_id: 0,
+        duration_secs: 3600.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams: vec![
+            Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec: Codec::H264,
+                resolution: "1080p".into(),
+                frame_rate: "23.976".into(),
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: "Main Video".into(),
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1100,
+                codec: Codec::Ac3,
+                channels: "5.1".into(),
+                language: "eng".into(),
+                sample_rate: "48kHz".into(),
+                secondary: false,
+                label: "English".into(),
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1101,
+                codec: Codec::DtsHdMa,
+                channels: "7.1".into(),
+                language: "fra".into(),
+                sample_rate: "48kHz".into(),
+                secondary: false,
+                label: "French".into(),
+            }),
+            Stream::Subtitle(SubtitleStream {
+                pid: 0x1200,
+                codec: Codec::Pgs,
+                language: "eng".into(),
+                forced: false,
+            }),
+            Stream::Subtitle(SubtitleStream {
+                pid: 0x1201,
+                codec: Codec::Pgs,
+                language: "fra".into(),
+                forced: true,
+            }),
+        ],
+        extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
+    };
+
+    let output = Cursor::new(Vec::new());
+    let stream = MkvStream::new(output).meta(&dt);
+
+    let info = stream.info();
+    assert_eq!(info.streams.len(), 5, "all 5 streams should be preserved");
+    assert_eq!(info.playlist, "Stream Test");
+    assert_eq!(info.duration_secs, 3600.0);
+
+    // Verify stream types preserved in order
+    assert!(matches!(&info.streams[0], Stream::Video(_)));
+    assert!(matches!(&info.streams[1], Stream::Audio(_)));
+    assert!(matches!(&info.streams[2], Stream::Audio(_)));
+    assert!(matches!(&info.streams[3], Stream::Subtitle(_)));
+    assert!(matches!(&info.streams[4], Stream::Subtitle(_)));
+
+    // Check specific attributes
+    if let Stream::Video(v) = &info.streams[0] {
+        assert_eq!(v.codec, Codec::H264);
+    }
+    if let Stream::Audio(a) = &info.streams[1] {
+        assert_eq!(a.language, "eng");
+    }
+    if let Stream::Audio(a) = &info.streams[2] {
+        assert_eq!(a.codec, Codec::DtsHdMa);
+        assert_eq!(a.language, "fra");
+    }
+    if let Stream::Subtitle(s) = &info.streams[3] {
+        assert!(!s.forced);
+    }
+    if let Stream::Subtitle(s) = &info.streams[4] {
+        assert!(s.forced);
+    }
+}

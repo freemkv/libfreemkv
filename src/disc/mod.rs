@@ -1050,3 +1050,121 @@ fn format_samplerate(audio_rate: u8) -> String {
         _ => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a DiscTitle with a single video stream at the given resolution.
+    fn title_with_video(codec: Codec, resolution: &str) -> DiscTitle {
+        DiscTitle {
+            playlist: "00800.mpls".into(),
+            playlist_id: 800,
+            duration_secs: 7200.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: vec![Stream::Video(VideoStream {
+                pid: 0x1011,
+                codec,
+                resolution: resolution.into(),
+                frame_rate: "23.976".into(),
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: String::new(),
+            })],
+            extents: Vec::new(),
+            content_format: ContentFormat::BdTs,
+        }
+    }
+
+    #[test]
+    fn detect_format_uhd() {
+        let titles = vec![title_with_video(Codec::Hevc, "2160p")];
+        assert_eq!(Disc::detect_format(&titles), DiscFormat::Uhd);
+    }
+
+    #[test]
+    fn detect_format_bluray() {
+        let titles = vec![title_with_video(Codec::H264, "1080p")];
+        assert_eq!(Disc::detect_format(&titles), DiscFormat::BluRay);
+    }
+
+    #[test]
+    fn detect_format_dvd() {
+        let titles = vec![title_with_video(Codec::Mpeg2, "480i")];
+        assert_eq!(Disc::detect_format(&titles), DiscFormat::Dvd);
+    }
+
+    #[test]
+    fn detect_format_empty() {
+        let titles: Vec<DiscTitle> = Vec::new();
+        assert_eq!(Disc::detect_format(&titles), DiscFormat::Unknown);
+    }
+
+    #[test]
+    fn content_format_default_bdts() {
+        let t = title_with_video(Codec::H264, "1080p");
+        assert_eq!(t.content_format, ContentFormat::BdTs);
+    }
+
+    #[test]
+    fn content_format_dvd_mpegps() {
+        let t = DiscTitle {
+            content_format: ContentFormat::MpegPs,
+            ..title_with_video(Codec::Mpeg2, "480i")
+        };
+        assert_eq!(t.content_format, ContentFormat::MpegPs);
+    }
+
+    #[test]
+    fn disc_capacity_gb() {
+        // Single-layer BD-25: ~12,219,392 sectors
+        let disc = Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: DiscFormat::BluRay,
+            capacity_sectors: 12_219_392,
+            capacity_bytes: 12_219_392u64 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            content_format: ContentFormat::BdTs,
+        };
+        let gb = disc.capacity_gb();
+        // 12,219,392 * 2048 / 1073741824 = ~23.3 GB
+        assert!((gb - 23.3).abs() < 0.1, "expected ~23.3 GB, got {}", gb);
+
+        // Zero sectors
+        let disc_zero = Disc {
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            ..disc
+        };
+        assert_eq!(disc_zero.capacity_gb(), 0.0);
+    }
+
+    #[test]
+    fn disc_title_duration_display_edge_cases() {
+        let mut t = DiscTitle::empty();
+
+        // 0 seconds
+        t.duration_secs = 0.0;
+        assert_eq!(t.duration_display(), "0h 00m");
+
+        // 1 second
+        t.duration_secs = 1.0;
+        assert_eq!(t.duration_display(), "0h 00m");
+
+        // 59 minutes
+        t.duration_secs = 59.0 * 60.0;
+        assert_eq!(t.duration_display(), "0h 59m");
+
+        // 24 hours
+        t.duration_secs = 24.0 * 3600.0;
+        assert_eq!(t.duration_display(), "24h 00m");
+    }
+}

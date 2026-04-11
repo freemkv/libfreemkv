@@ -469,3 +469,155 @@ fn write_fid(buf: &mut [u8], icb_lba: u32, name: &str, is_parent: bool) -> usize
 
     padded
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Read a little-endian u16 from a byte slice at the given offset.
+    fn le_u16(data: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes([data[off], data[off + 1]])
+    }
+
+    /// Read a little-endian u32 from a byte slice at the given offset.
+    fn le_u32(data: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    }
+
+    /// Read a little-endian u64 from a byte slice at the given offset.
+    fn le_u64(data: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+            data[off + 4],
+            data[off + 5],
+            data[off + 6],
+            data[off + 7],
+        ])
+    }
+
+    /// Get the sector at a given sector number from the output data.
+    fn sector(data: &[u8], num: u32) -> &[u8] {
+        let start = num as usize * SECTOR_SIZE as usize;
+        &data[start..start + SECTOR_SIZE as usize]
+    }
+
+    #[test]
+    fn isowriter_creates_valid_udf() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = IsoWriter::new(buf, "TEST_VOL", "00001.m2ts");
+        w.start().unwrap();
+        w.write_data(&[0xAA; 4096]).unwrap();
+        w.finish().unwrap();
+        let data = w.writer.into_inner();
+
+        // AVDP at sector 256 should have tag ID = 2
+        let avdp = sector(&data, AVDP_SECTOR);
+        assert_eq!(le_u16(avdp, 0), 2, "AVDP tag ID should be 2");
+
+        // VRS at sector 16 should contain "BEA01"
+        let vrs = sector(&data, VRS_START);
+        assert_eq!(
+            &vrs[1..6],
+            b"BEA01",
+            "VRS sector 16 should contain BEA01"
+        );
+
+        // FSD at metadata sector should have tag ID = 256
+        let fsd = sector(&data, FSD_SECTOR);
+        assert_eq!(le_u16(fsd, 0), 256, "FSD tag ID should be 256");
+    }
+
+    #[test]
+    fn isowriter_updates_file_size() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = IsoWriter::new(buf, "SIZE_TEST", "00001.m2ts");
+        w.start().unwrap();
+
+        let test_data = vec![0x42u8; 8192]; // exactly 4 sectors
+        let written = w.write_data(&test_data).unwrap();
+        assert_eq!(written, 8192);
+
+        w.finish().unwrap();
+        let data = w.writer.into_inner();
+
+        // Read m2ts ICB at M2TS_ICB_SECTOR and check information length at offset 56
+        let icb = sector(&data, M2TS_ICB_SECTOR);
+        let file_size = le_u64(icb, 56);
+        assert_eq!(
+            file_size, 8192,
+            "m2ts ICB file size should match bytes written (8192), got {}",
+            file_size
+        );
+    }
+
+    #[test]
+    fn isowriter_with_names() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = IsoWriter::new(buf, "MY_DISC", "00042.m2ts");
+        w.start().unwrap();
+        w.write_data(&[0x00; 2048]).unwrap();
+        w.finish().unwrap();
+        let data = w.writer.into_inner();
+
+        // Check PVD (sector 32) volume_id at offset 24 as d-string
+        let pvd = sector(&data, VDS_START);
+        // d-string: byte 0 = compression ID (8), then ASCII chars
+        assert_eq!(pvd[24], 8, "PVD volume_id compression ID should be 8");
+        assert_eq!(
+            &pvd[25..32],
+            b"MY_DISC",
+            "PVD should contain volume_id 'MY_DISC'"
+        );
+
+        // Check STREAM directory (sector 266) for m2ts filename in FID
+        let stream_dir = sector(&data, STREAM_DIR_SECTOR);
+        // The FID for the m2ts file should contain the filename after the parent entry.
+        // Search for "00042.m2ts" in the sector data
+        let name = b"00042.m2ts";
+        let found = stream_dir
+            .windows(name.len())
+            .any(|w| w == name);
+        assert!(
+            found,
+            "STREAM directory should contain m2ts filename '00042.m2ts'"
+        );
+    }
+
+    #[test]
+    fn isowriter_empty_content() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = IsoWriter::new(buf, "EMPTY", "00001.m2ts");
+        w.start().unwrap();
+        // No data written
+        w.finish().unwrap();
+        let data = w.writer.into_inner();
+
+        // Should still have valid UDF structure
+        // AVDP at sector 256
+        let avdp = sector(&data, AVDP_SECTOR);
+        assert_eq!(le_u16(avdp, 0), 2, "AVDP tag should be present even with no data");
+
+        // VRS
+        let vrs = sector(&data, VRS_START);
+        assert_eq!(&vrs[1..6], b"BEA01");
+
+        // FSD
+        let fsd = sector(&data, FSD_SECTOR);
+        assert_eq!(le_u16(fsd, 0), 256);
+
+        // m2ts ICB should show 0 file size
+        let icb = sector(&data, M2TS_ICB_SECTOR);
+        let file_size = le_u64(icb, 56);
+        assert_eq!(file_size, 0, "empty content should have 0 file size");
+
+        // Output should be at least DATA_START sectors (the header structure)
+        assert!(
+            data.len() >= DATA_START as usize * SECTOR_SIZE as usize,
+            "output too small for valid UDF structure"
+        );
+    }
+}
