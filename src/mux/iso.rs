@@ -198,6 +198,81 @@ impl Read for IsoStream {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use crate::sector::SectorReader;
+
+    #[test]
+    fn iso_reader_read_sectors() {
+        // Create a temp file with known sector data
+        let dir = std::env::temp_dir();
+        let path = dir.join("libfreemkv_test_iso_sectors.iso");
+        let path_str = path.to_str().unwrap();
+
+        // Write 4 sectors of known data
+        {
+            let mut f = File::create(&path).unwrap();
+            for sector_idx in 0u8..4 {
+                let mut sector = [sector_idx; SECTOR_SIZE as usize];
+                sector[0] = sector_idx;
+                sector[2047] = sector_idx.wrapping_mul(0x37);
+                f.write_all(&sector).unwrap();
+            }
+            f.flush().unwrap();
+        }
+
+        let mut reader = IsoSectorReader::open(path_str).unwrap();
+        assert_eq!(reader.capacity(), 4);
+
+        // Read sector 0
+        let mut buf = [0u8; SECTOR_SIZE as usize];
+        let n = reader.read_sectors(0, 1, &mut buf).unwrap();
+        assert_eq!(n, SECTOR_SIZE as usize);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[2047], 0u8.wrapping_mul(0x37));
+
+        // Read sector 2
+        let n = reader.read_sectors(2, 1, &mut buf).unwrap();
+        assert_eq!(n, SECTOR_SIZE as usize);
+        assert_eq!(buf[0], 2);
+        assert_eq!(buf[1], 2); // filled with sector_idx
+        assert_eq!(buf[2047], 2u8.wrapping_mul(0x37));
+
+        // Read 2 sectors at once (sectors 1 and 2)
+        let mut buf2 = [0u8; SECTOR_SIZE as usize * 2];
+        let n = reader.read_sectors(1, 2, &mut buf2).unwrap();
+        assert_eq!(n, SECTOR_SIZE as usize * 2);
+        assert_eq!(buf2[0], 1); // sector 1 first byte
+        assert_eq!(buf2[SECTOR_SIZE as usize], 2); // sector 2 first byte
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn iso_reader_capacity() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("libfreemkv_test_iso_capacity.iso");
+        let path_str = path.to_str().unwrap();
+
+        // Write exactly 10 sectors
+        {
+            let mut f = File::create(&path).unwrap();
+            let data = vec![0u8; SECTOR_SIZE as usize * 10];
+            f.write_all(&data).unwrap();
+            f.flush().unwrap();
+        }
+
+        let reader = IsoSectorReader::open(path_str).unwrap();
+        assert_eq!(reader.capacity(), 10);
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 impl Write for IsoStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.writer.as_mut() {

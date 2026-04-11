@@ -169,3 +169,259 @@ impl CodecParser for HevcParser {
         Some(record)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::ts::PesPacket;
+
+    fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
+        PesPacket { pid: 0x1011, pts, dts: None, data }
+    }
+
+    /// Build an HEVC NAL header (2 bytes). Type is bits 1-6 of first byte.
+    /// Format: forbidden(1) | type(6) | layer_id_high(1) || layer_id_low(5) | tid(3)
+    fn hevc_nal_header(nal_type: u8) -> [u8; 2] {
+        [(nal_type & 0x3F) << 1, 0x01] // tid=1
+    }
+
+    // --- VPS+SPS+PPS → codec_private ---
+
+    #[test]
+    fn parse_vps_sps_pps() {
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        // VPS (type 32)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let vps_hdr = hevc_nal_header(32);
+        data.extend_from_slice(&vps_hdr);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // VPS payload
+
+        // SPS (type 33)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let sps_hdr = hevc_nal_header(33);
+        data.extend_from_slice(&sps_hdr);
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                                  0x09, 0x0A, 0x0B, 0x0C, 0x0D]); // SPS payload (>12 bytes for level)
+
+        // PPS (type 34)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let pps_hdr = hevc_nal_header(34);
+        data.extend_from_slice(&pps_hdr);
+        data.extend_from_slice(&[0xDD, 0xEE]); // PPS payload
+
+        // IRAP slice (type 19 = IDR_W_RADL) so a frame is emitted
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let idr_hdr = hevc_nal_header(19);
+        data.extend_from_slice(&idr_hdr);
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+
+        let pes = make_pes(data, Some(90000));
+        let _frames = parser.parse(&pes);
+
+        let cp = parser.codec_private();
+        assert!(cp.is_some(), "codec_private should be Some after VPS+SPS+PPS");
+
+        let cp = cp.unwrap();
+        // configurationVersion = 1
+        assert_eq!(cp[0], 1);
+        // numOfArrays = 3 (VPS, SPS, PPS)
+        assert_eq!(cp[22], 3);
+        // Should be longer than the minimal header (23 bytes) + array entries
+        assert!(cp.len() > 23, "codec_private should contain VPS+SPS+PPS data");
+    }
+
+    #[test]
+    fn codec_private_none_before_params() {
+        let parser = HevcParser::new();
+        assert!(parser.codec_private().is_none());
+    }
+
+    #[test]
+    fn codec_private_none_missing_pps() {
+        let mut parser = HevcParser::new();
+
+        // Only VPS + SPS, no PPS
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        // Add a slice so parse doesn't return empty
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(1)); // TRAIL_R
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+        assert!(parser.codec_private().is_none(), "should be None without PPS");
+    }
+
+    // --- IRAP keyframe detection ---
+
+    #[test]
+    fn parse_irap_keyframe_idr_w_radl() {
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        // IDR_W_RADL = type 19
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(19));
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "IDR_W_RADL (type 19) should be keyframe");
+    }
+
+    #[test]
+    fn parse_irap_keyframe_bla() {
+        let mut parser = HevcParser::new();
+
+        // BLA_W_LP = type 16
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(16));
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "BLA_W_LP (type 16) should be keyframe");
+    }
+
+    #[test]
+    fn parse_irap_keyframe_cra() {
+        let mut parser = HevcParser::new();
+
+        // CRA_NUT = type 21
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(21));
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "CRA (type 21) should be keyframe");
+    }
+
+    #[test]
+    fn parse_irap_type_23() {
+        let mut parser = HevcParser::new();
+
+        // RSV_IRAP_VCL23 = type 23 (upper boundary)
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(23));
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "type 23 should be keyframe");
+    }
+
+    // --- non-IRAP (trailing) → not keyframe ---
+
+    #[test]
+    fn parse_trailing_not_keyframe() {
+        let mut parser = HevcParser::new();
+
+        // TRAIL_R = type 1
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(1));
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+
+        let pes = make_pes(data, Some(180000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].keyframe, "TRAIL_R (type 1) should not be keyframe");
+    }
+
+    #[test]
+    fn parse_tsa_not_keyframe() {
+        let mut parser = HevcParser::new();
+
+        // TSA_N = type 2
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(2));
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].keyframe, "TSA_N (type 2) should not be keyframe");
+    }
+
+    // --- VPS/SPS/PPS stripped from frame data ---
+
+    #[test]
+    fn param_sets_stripped_from_frame() {
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        // VPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA]);
+        // SPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0xBB]);
+        // PPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xCC]);
+        // IDR slice
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let idr_hdr = hevc_nal_header(19);
+        data.extend_from_slice(&idr_hdr);
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+
+        // Frame data should only have the IDR NAL (length-prefixed)
+        let fd = &frames[0].data;
+        let length = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]);
+        // IDR NAL = 2 bytes header + 2 bytes payload = 4 bytes
+        assert_eq!(length as usize + 4, fd.len(), "frame should contain exactly one length-prefixed NAL");
+    }
+
+    // --- empty PES ---
+
+    #[test]
+    fn parse_empty_pes() {
+        let mut parser = HevcParser::new();
+        let pes = make_pes(Vec::new(), Some(0));
+        let frames = parser.parse(&pes);
+        assert!(frames.is_empty());
+    }
+
+    // --- PTS conversion ---
+
+    #[test]
+    fn pts_conversion() {
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(1));
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+}

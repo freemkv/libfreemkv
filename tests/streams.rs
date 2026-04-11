@@ -347,3 +347,185 @@ fn disc_title_empty() {
     assert_eq!(dt.duration_secs, 0.0);
     assert!(dt.playlist.is_empty());
 }
+
+// ── Meta codec roundtrip ─────────────────────────────────────
+
+#[test]
+fn meta_codec_roundtrip() {
+    // Test that all codec types survive from_title -> to_title
+    let codecs_video = &[Codec::Hevc, Codec::H264, Codec::Vc1, Codec::Mpeg2];
+    let codecs_audio = &[Codec::Ac3, Codec::Ac3Plus, Codec::TrueHd, Codec::DtsHdMa, Codec::DtsHdHr, Codec::Dts, Codec::Lpcm];
+    let codecs_sub = &[Codec::Pgs];
+
+    let mut streams = Vec::new();
+    for (i, &codec) in codecs_video.iter().enumerate() {
+        streams.push(Stream::Video(VideoStream {
+            pid: (0x1011 + i) as u16, codec,
+            resolution: "1080p".into(), frame_rate: "23.976".into(),
+            hdr: HdrFormat::Sdr, color_space: ColorSpace::Bt709,
+            secondary: false, label: String::new(),
+        }));
+    }
+    for (i, &codec) in codecs_audio.iter().enumerate() {
+        streams.push(Stream::Audio(AudioStream {
+            pid: (0x1100 + i) as u16, codec,
+            channels: "5.1".into(), language: "eng".into(),
+            sample_rate: "48kHz".into(), secondary: false,
+            label: String::new(),
+        }));
+    }
+    for (i, &codec) in codecs_sub.iter().enumerate() {
+        streams.push(Stream::Subtitle(SubtitleStream {
+            pid: (0x1200 + i) as u16, codec,
+            language: "eng".into(), forced: false,
+        }));
+    }
+
+    let dt = DiscTitle {
+        playlist: "Codec Test".into(),
+        playlist_id: 0,
+        duration_secs: 100.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams,
+        extents: Vec::new(),
+    };
+
+    let meta = M2tsMeta::from_title(&dt);
+    let restored = meta.to_title();
+
+    assert_eq!(restored.streams.len(), dt.streams.len());
+    for (orig, rest) in dt.streams.iter().zip(restored.streams.iter()) {
+        match (orig, rest) {
+            (Stream::Video(o), Stream::Video(r)) => assert_eq!(o.codec, r.codec, "video codec mismatch"),
+            (Stream::Audio(o), Stream::Audio(r)) => assert_eq!(o.codec, r.codec, "audio codec mismatch"),
+            (Stream::Subtitle(o), Stream::Subtitle(r)) => assert_eq!(o.codec, r.codec, "subtitle codec mismatch"),
+            _ => panic!("stream type mismatch"),
+        }
+    }
+}
+
+#[test]
+fn meta_empty_streams() {
+    let dt = DiscTitle {
+        playlist: "Empty".into(),
+        playlist_id: 0,
+        duration_secs: 0.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams: Vec::new(),
+        extents: Vec::new(),
+    };
+
+    let meta = M2tsMeta::from_title(&dt);
+    assert_eq!(meta.streams.len(), 0);
+    let restored = meta.to_title();
+    assert_eq!(restored.streams.len(), 0);
+    assert_eq!(restored.playlist, "Empty");
+}
+
+#[test]
+fn meta_all_stream_types() {
+    let dt = DiscTitle {
+        playlist: "Full".into(),
+        playlist_id: 0,
+        duration_secs: 3600.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams: vec![
+            Stream::Video(VideoStream {
+                pid: 0x1011, codec: Codec::Hevc,
+                resolution: "2160p".into(), frame_rate: "23.976".into(),
+                hdr: HdrFormat::Hdr10, color_space: ColorSpace::Bt709,
+                secondary: false, label: "Primary".into(),
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1100, codec: Codec::TrueHd,
+                channels: "7.1".into(), language: "eng".into(),
+                sample_rate: "48kHz".into(), secondary: false,
+                label: "Primary Audio".into(),
+            }),
+            Stream::Subtitle(SubtitleStream {
+                pid: 0x1200, codec: Codec::Pgs,
+                language: "fra".into(), forced: true,
+            }),
+            Stream::Audio(AudioStream {
+                pid: 0x1110, codec: Codec::Ac3,
+                channels: "stereo".into(), language: "eng".into(),
+                sample_rate: "48kHz".into(), secondary: true,
+                label: "Commentary".into(),
+            }),
+        ],
+        extents: Vec::new(),
+    };
+
+    let meta = M2tsMeta::from_title(&dt);
+    let restored = meta.to_title();
+
+    assert_eq!(restored.streams.len(), 4);
+
+    // Video preserved
+    if let Stream::Video(v) = &restored.streams[0] {
+        assert_eq!(v.codec, Codec::Hevc);
+        assert_eq!(v.resolution, "2160p");
+        assert_eq!(v.label, "Primary");
+        assert!(!v.secondary);
+    } else { panic!("expected video"); }
+
+    // Primary audio preserved
+    if let Stream::Audio(a) = &restored.streams[1] {
+        assert_eq!(a.codec, Codec::TrueHd);
+        assert_eq!(a.channels, "7.1");
+        assert!(!a.secondary);
+    } else { panic!("expected audio"); }
+
+    // Subtitle preserved (forced flag)
+    if let Stream::Subtitle(s) = &restored.streams[2] {
+        assert_eq!(s.language, "fra");
+        assert!(s.forced);
+    } else { panic!("expected subtitle"); }
+
+    // Secondary audio preserved
+    if let Stream::Audio(a) = &restored.streams[3] {
+        assert_eq!(a.codec, Codec::Ac3);
+        assert!(a.secondary);
+        assert_eq!(a.label, "Commentary");
+    } else { panic!("expected secondary audio"); }
+}
+
+// ── MkvStream tests ──────────────────────────────────────────
+
+#[test]
+fn mkvstream_write_finish() {
+    let output = Cursor::new(Vec::new());
+    let dt = sample_disc_title();
+    let mut stream = MkvStream::new(output).meta(&dt).max_buffer(1024 * 1024);
+
+    // Write some fake BD-TS packets (they won't produce valid MKV frames
+    // since there is no real codec data, but it should not panic)
+    for i in 0..20u8 {
+        let mut pkt = [0u8; 192];
+        pkt[4] = 0x47;
+        // PID 0x1011 (video)
+        pkt[5] = 0x10;
+        pkt[6] = 0x11;
+        pkt[7] = 0x10;
+        pkt[8] = i;
+        stream.write_all(&pkt).unwrap();
+    }
+
+    // finish should not panic even without valid codec data
+    stream.finish().unwrap();
+}
+
+#[test]
+fn mkvstream_meta_sets_title() {
+    let output = Cursor::new(Vec::new());
+    let dt = sample_disc_title();
+    let stream = MkvStream::new(output).meta(&dt);
+
+    let info = stream.info();
+    assert_eq!(info.playlist, "Test Movie");
+    assert_eq!(info.duration_secs, 7200.0);
+    assert_eq!(info.streams.len(), 4);
+}

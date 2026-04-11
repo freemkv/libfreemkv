@@ -75,3 +75,26 @@ impl Write for StdioStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn stdio_output_write_errors_on_read() {
+        let mut stream = StdioStream::output();
+        let mut buf = [0u8; 10];
+        let err = stream.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("cannot read"), "got: {}", err);
+    }
+
+    #[test]
+    fn stdio_input_read_errors_on_write() {
+        let mut stream = StdioStream::input();
+        let err = stream.write(&[0u8; 10]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("cannot write"), "got: {}", err);
+    }
+}

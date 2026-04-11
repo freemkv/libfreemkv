@@ -413,4 +413,125 @@ mod tests {
         // EBML header: 1A 45 DF A3, then 8-byte size, then content
         assert_eq!(&data[0..4], &[0x1A, 0x45, 0xDF, 0xA3]);
     }
+
+    #[test]
+    fn write_read_id_roundtrip() {
+        // 1-byte IDs have high bit set (0x80..=0xFF)
+        for &id in &[0x80u32, 0xA3, 0xFF] {
+            let mut buf = Vec::new();
+            write_id(&mut buf, id).unwrap();
+            assert_eq!(buf.len(), 1);
+            let mut cursor = Cursor::new(&buf);
+            let (read_back, consumed) = read_id(&mut cursor).unwrap();
+            assert_eq!(read_back, id, "1-byte ID roundtrip failed for 0x{:X}", id);
+            assert_eq!(consumed, 1);
+        }
+        // 2-byte IDs (0x4000..=0x7FFF)
+        for &id in &[0x4286u32, 0x4282, 0x7FFF] {
+            let mut buf = Vec::new();
+            write_id(&mut buf, id).unwrap();
+            assert_eq!(buf.len(), 2);
+            let mut cursor = Cursor::new(&buf);
+            let (read_back, consumed) = read_id(&mut cursor).unwrap();
+            assert_eq!(read_back, id, "2-byte ID roundtrip failed for 0x{:X}", id);
+            assert_eq!(consumed, 2);
+        }
+        // 3-byte IDs (0x200000..=0x3FFFFF)
+        for &id in &[0x22B59Cu32, 0x23E383] {
+            let mut buf = Vec::new();
+            write_id(&mut buf, id).unwrap();
+            assert_eq!(buf.len(), 3);
+            let mut cursor = Cursor::new(&buf);
+            let (read_back, consumed) = read_id(&mut cursor).unwrap();
+            assert_eq!(read_back, id, "3-byte ID roundtrip failed for 0x{:X}", id);
+            assert_eq!(consumed, 3);
+        }
+        // 4-byte IDs (0x10000000..=0x1FFFFFFF)
+        for &id in &[EBML, SEGMENT, TRACKS, CLUSTER] {
+            let mut buf = Vec::new();
+            write_id(&mut buf, id).unwrap();
+            assert_eq!(buf.len(), 4);
+            let mut cursor = Cursor::new(&buf);
+            let (read_back, consumed) = read_id(&mut cursor).unwrap();
+            assert_eq!(read_back, id, "4-byte ID roundtrip failed for 0x{:X}", id);
+            assert_eq!(consumed, 4);
+        }
+    }
+
+    #[test]
+    fn write_read_size_roundtrip() {
+        let test_sizes: &[u64] = &[0, 1, 0x7E, 127, 128, 0x3FFE, 16383, 16384, 0x1FFFFE, 0x0FFFFFFE, 0x1_0000_0000];
+        for &size in test_sizes {
+            let mut buf = Vec::new();
+            write_size(&mut buf, size).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let (read_back, _consumed) = read_size(&mut cursor).unwrap();
+            assert_eq!(read_back, size, "size roundtrip failed for {}", size);
+        }
+    }
+
+    #[test]
+    fn write_read_uint_roundtrip() {
+        let test_vals: &[u64] = &[0, 1, 127, 255, 256, 0xFFFF, 0xFF_FFFF, 0xFFFF_FFFF, 1_000_000_000_000];
+        let test_id = EBML_VERSION;
+        for &val in test_vals {
+            let mut buf = Vec::new();
+            write_uint(&mut buf, test_id, val).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let (id, id_len) = read_id(&mut cursor).unwrap();
+            assert_eq!(id, test_id);
+            let (size, _) = read_size(&mut cursor).unwrap();
+            let read_val = read_uint_val(&mut cursor, size as usize).unwrap();
+            assert_eq!(read_val, val, "uint roundtrip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn write_read_string_roundtrip() {
+        let test_strings = &["", "matroska", "freemkv", "Hello, World!", "unicode: \u{1F600}"];
+        let test_id = EBML_DOC_TYPE;
+        for &s in test_strings {
+            let mut buf = Vec::new();
+            write_string(&mut buf, test_id, s).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let (id, _) = read_id(&mut cursor).unwrap();
+            assert_eq!(id, test_id);
+            let (size, _) = read_size(&mut cursor).unwrap();
+            let read_s = read_string_val(&mut cursor, size as usize).unwrap();
+            assert_eq!(read_s, s, "string roundtrip failed for {:?}", s);
+        }
+    }
+
+    #[test]
+    fn write_read_float_roundtrip() {
+        let test_vals: &[f64] = &[0.0, 1.0, -1.0, 3.14159265358979, 48000.0, 7200000.0, f64::MIN, f64::MAX];
+        let test_id = DURATION;
+        for &val in test_vals {
+            let mut buf = Vec::new();
+            write_float(&mut buf, test_id, val).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let (id, _) = read_id(&mut cursor).unwrap();
+            assert_eq!(id, test_id);
+            let (size, _) = read_size(&mut cursor).unwrap();
+            assert_eq!(size, 8);
+            let read_val = read_float_val(&mut cursor, size as usize).unwrap();
+            assert_eq!(read_val.to_bits(), val.to_bits(), "float roundtrip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn unknown_size() {
+        let mut buf = Vec::new();
+        write_unknown_size(&mut buf).unwrap();
+        assert_eq!(buf.len(), 8);
+        assert_eq!(buf[0], 0x01);
+        for &b in &buf[1..] {
+            assert_eq!(b, 0xFF, "unknown size bytes should all be 0xFF after first byte");
+        }
+        // Reading it back should yield u64::MAX
+        let mut cursor = Cursor::new(&buf);
+        let (size, consumed) = read_size(&mut cursor).unwrap();
+        assert_eq!(size, u64::MAX);
+        assert_eq!(consumed, 8);
+    }
 }

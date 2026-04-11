@@ -120,3 +120,225 @@ fn find_next_sc(data: &[u8], from: usize) -> Option<usize> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::ts::PesPacket;
+
+    fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
+        PesPacket { pid: 0x1011, pts, dts: None, data }
+    }
+
+    /// Build a VC-1 PES with sequence header + entry point + frame start code.
+    fn build_vc1_iframe_pes() -> Vec<u8> {
+        let mut data = Vec::new();
+        // Sequence header: 00 00 01 0F + payload
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        // Entry point: 00 00 01 0E + payload
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_ENTRY_POINT]);
+        data.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        // Frame: 00 00 01 0D + payload
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66, 0x77, 0x88, 0x99]);
+        data
+    }
+
+    // --- sequence header detection ---
+
+    #[test]
+    fn parse_sequence_header() {
+        let mut parser = Vc1Parser::new();
+
+        let data = build_vc1_iframe_pes();
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        // Sequence header present → keyframe
+        assert!(frames[0].keyframe, "PES with sequence header should be keyframe");
+        // seq_header should be stored internally
+        assert!(parser.seq_header.is_some());
+    }
+
+    #[test]
+    fn parse_entry_point() {
+        let mut parser = Vc1Parser::new();
+
+        let data = build_vc1_iframe_pes();
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        assert!(parser.entry_point.is_some());
+    }
+
+    // --- codec_private is BITMAPINFOHEADER (40+ bytes) ---
+
+    #[test]
+    fn codec_private_bitmapinfoheader() {
+        let mut parser = Vc1Parser::new();
+
+        let data = build_vc1_iframe_pes();
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        let cp = parser.codec_private();
+        assert!(cp.is_some(), "codec_private should be Some after seq header + entry point");
+
+        let cp = cp.unwrap();
+        // BITMAPINFOHEADER is 40 bytes + extra data
+        assert!(cp.len() >= 40, "codec_private should be at least 40 bytes (BITMAPINFOHEADER)");
+
+        // biSize (first 4 bytes, little-endian) should equal total length
+        let bi_size = u32::from_le_bytes([cp[0], cp[1], cp[2], cp[3]]);
+        assert_eq!(bi_size as usize, cp.len(), "biSize should match total codec_private length");
+
+        // biCompression = "WVC1" at offset 16
+        assert_eq!(&cp[16..20], b"WVC1", "FOURCC should be WVC1");
+
+        // biWidth at offset 4 (little-endian u32) = 1920
+        let width = u32::from_le_bytes([cp[4], cp[5], cp[6], cp[7]]);
+        assert_eq!(width, 1920);
+
+        // biHeight at offset 8 (little-endian u32) = 1080
+        let height = u32::from_le_bytes([cp[8], cp[9], cp[10], cp[11]]);
+        assert_eq!(height, 1080);
+    }
+
+    #[test]
+    fn codec_private_none_before_data() {
+        let parser = Vc1Parser::new();
+        assert!(parser.codec_private().is_none());
+    }
+
+    #[test]
+    fn codec_private_none_missing_entry_point() {
+        let mut parser = Vc1Parser::new();
+
+        // Only sequence header, no entry point
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66]);
+
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        assert!(parser.codec_private().is_none(), "should be None without entry point");
+    }
+
+    // --- frame without sequence header → not keyframe ---
+
+    #[test]
+    fn parse_non_keyframe() {
+        let mut parser = Vc1Parser::new();
+
+        // PES with only a frame start code (no sequence header)
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66, 0x77]);
+
+        let pes = make_pes(data, Some(180000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].keyframe, "frame without sequence header should not be keyframe");
+    }
+
+    // --- frame data starts from frame start code ---
+
+    #[test]
+    fn frame_data_starts_at_frame_sc() {
+        let mut parser = Vc1Parser::new();
+
+        let data = build_vc1_iframe_pes();
+        let pes = make_pes(data.clone(), Some(0));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        // Frame data should start with the frame start code (00 00 01 0D)
+        assert!(frames[0].data.len() >= 4);
+        assert_eq!(&frames[0].data[0..4], &[0x00, 0x00, 0x01, SC_FRAME]);
+    }
+
+    // --- empty PES ---
+
+    #[test]
+    fn parse_empty_pes() {
+        let mut parser = Vc1Parser::new();
+        let pes = make_pes(Vec::new(), Some(0));
+        let frames = parser.parse(&pes);
+        assert!(frames.is_empty());
+    }
+
+    // --- PTS conversion ---
+
+    #[test]
+    fn pts_conversion() {
+        let mut parser = Vc1Parser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    // --- DTS preferred over PTS ---
+
+    #[test]
+    fn dts_preferred_over_pts() {
+        let mut parser = Vc1Parser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66]);
+
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: Some(180000),
+            dts: Some(90000),
+            data,
+        };
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    // --- find_next_sc utility ---
+
+    #[test]
+    fn find_next_sc_basic() {
+        let data = [0xAA, 0x00, 0x00, 0x01, 0x0D, 0xBB];
+        assert_eq!(find_next_sc(&data, 0), Some(1));
+    }
+
+    #[test]
+    fn find_next_sc_none() {
+        let data = [0xAA, 0xBB, 0xCC];
+        assert_eq!(find_next_sc(&data, 0), None);
+    }
+
+    // --- codec_private extra data contains seq header + entry point ---
+
+    #[test]
+    fn codec_private_contains_extra_data() {
+        let mut parser = Vc1Parser::new();
+
+        let data = build_vc1_iframe_pes();
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        let cp = parser.codec_private().unwrap();
+        // After the 40-byte BITMAPINFOHEADER, we should have seq_header + entry_point data
+        let extra = &cp[40..];
+        assert!(!extra.is_empty(), "extra data after BITMAPINFOHEADER should not be empty");
+        // Extra data should start with the sequence header start code
+        assert_eq!(&extra[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+    }
+}

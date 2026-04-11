@@ -23,3 +23,51 @@ impl CodecParser for PgsParser {
 
     fn codec_private(&self) -> Option<Vec<u8>> { None }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::ts::PesPacket;
+
+    fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
+        PesPacket { pid: 0x1200, pts, dts: None, data }
+    }
+
+    #[test]
+    fn parse_basic_segment() {
+        let mut parser = PgsParser::new();
+        // PGS segment data (PCS = presentation composition segment)
+        let data = vec![0x16, 0x00, 0x00, 0x11, 0x01, 0x02, 0x03];
+        let pes = make_pes(data.clone(), Some(90000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, data);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn all_keyframes() {
+        let mut parser = PgsParser::new();
+        for i in 0..3 {
+            let data = vec![0x16, 0x00, i];
+            let pes = make_pes(data, Some(90000 * i as i64));
+            let frames = parser.parse(&pes);
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].keyframe, "PGS segment should always be keyframe");
+        }
+    }
+
+    #[test]
+    fn codec_private_none() {
+        let parser = PgsParser::new();
+        assert!(parser.codec_private().is_none());
+    }
+
+    #[test]
+    fn parse_empty_pes() {
+        let mut parser = PgsParser::new();
+        let pes = make_pes(Vec::new(), Some(0));
+        assert!(parser.parse(&pes).is_empty());
+    }
+}

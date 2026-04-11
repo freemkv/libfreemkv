@@ -321,3 +321,308 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         secondary: false,
     }, sa_end))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal MPLS binary with given play items and STN streams on the first item.
+    /// STN counts: (n_video, n_audio, n_pg, n_ig, n_sec_audio, n_sec_video, n_pip_pg, n_dv)
+    fn build_mpls(
+        play_items_data: &[(/*clip_id*/&[u8;5], /*conn*/u8, /*in_time*/u32, /*out_time*/u32)],
+        stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
+        stream_entries: &[Vec<u8>], // raw stream entry + attributes bytes for each stream
+    ) -> Vec<u8> {
+        let playlist_start: u32 = 40; // right after the 40-byte header
+        let mut buf = Vec::new();
+
+        // File header: "MPLS" + version + playlist_start + 3 more offsets (unused)
+        buf.extend_from_slice(b"MPLS0200");
+        buf.extend_from_slice(&playlist_start.to_be_bytes());
+        // mark_start, extension_start (unused by parser), padding to 40 bytes
+        buf.extend_from_slice(&[0u8; 28]);
+
+        // PlayList section starts here (offset 40)
+        // PlayList: length(4) + reserved(2) + num_play_items(2) + num_sub_paths(2) = 10 header bytes
+        let pl_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // length placeholder
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&(play_items_data.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // num_sub_paths
+
+        for (idx, (clip_id, conn, in_time, out_time)) in play_items_data.iter().enumerate() {
+            // Build play item content
+            let mut item = Vec::new();
+            // [0..5] clip_id
+            item.extend_from_slice(*clip_id);
+            // [5..9] codec_id ("M2TS")
+            item.extend_from_slice(b"M2TS");
+            // [9] connection_condition in low nibble
+            item.push(*conn & 0x0F);
+            // [10..12] reserved
+            item.extend_from_slice(&[0u8; 2]);
+            // [12..16] in_time
+            item.extend_from_slice(&in_time.to_be_bytes());
+            // [16..20] out_time
+            item.extend_from_slice(&out_time.to_be_bytes());
+            // [20..28] UO_mask_table
+            item.extend_from_slice(&[0u8; 8]);
+            // [28] misc flags
+            item.push(0);
+            // [29] still_mode
+            item.push(0);
+            // [30..32] still_time
+            item.extend_from_slice(&[0u8; 2]);
+
+            // STN table (only for the first play item)
+            if idx == 0 {
+                // STN header: length(2) + reserved(2) + counts(8) + reserved(4) = 16 bytes
+                let stn_header_start = item.len();
+                item.extend_from_slice(&[0u8; 2]); // STN length placeholder
+                item.extend_from_slice(&[0u8; 2]); // reserved
+                item.push(stn_counts.0); // n_video
+                item.push(stn_counts.1); // n_audio
+                item.push(stn_counts.2); // n_pg
+                item.push(stn_counts.3); // n_ig
+                item.push(stn_counts.4); // n_sec_audio
+                item.push(stn_counts.5); // n_sec_video
+                item.push(stn_counts.6); // n_pip_pg
+                item.push(stn_counts.7); // n_dv
+                item.extend_from_slice(&[0u8; 4]); // reserved
+
+                // Stream entries
+                for se in stream_entries {
+                    item.extend_from_slice(se);
+                }
+
+                // Patch STN length
+                let stn_len = (item.len() - stn_header_start - 2) as u16;
+                let stn_len_bytes = stn_len.to_be_bytes();
+                item[stn_header_start] = stn_len_bytes[0];
+                item[stn_header_start + 1] = stn_len_bytes[1];
+            }
+
+            // Write item_length(2) + item
+            let item_length = item.len() as u16;
+            buf.extend_from_slice(&item_length.to_be_bytes());
+            buf.extend_from_slice(&item);
+        }
+
+        // Patch PlayList length
+        let pl_len = (buf.len() - pl_start - 4) as u32;
+        let pl_len_bytes = pl_len.to_be_bytes();
+        buf[pl_start] = pl_len_bytes[0];
+        buf[pl_start + 1] = pl_len_bytes[1];
+        buf[pl_start + 2] = pl_len_bytes[2];
+        buf[pl_start + 3] = pl_len_bytes[3];
+
+        buf
+    }
+
+    /// Build a stream entry (stream_entry part + stream_attributes part).
+    /// stream_entry: type=0x01 (PlayItem stream), PID given.
+    /// For video: attrs = coding_type(1) + format_rate(1) [+ hdr_byte if HEVC]
+    /// For audio: attrs = coding_type(1) + format_rate(1) + language(3)
+    /// For PG:    attrs = coding_type(1) + language(3)
+    fn build_stream_entry_video(pid: u16, coding_type: u8, format: u8, rate: u8, hdr: Option<u8>) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Stream entry: length(1) + sub_path_type(1) + pid(2)
+        out.push(3); // se_len = 3 bytes (type + pid_hi + pid_lo)
+        out.push(0x01); // type: PlayItem stream
+        out.extend_from_slice(&pid.to_be_bytes());
+        // Stream attributes
+        let mut attrs = vec![coding_type, (format << 4) | rate];
+        if let Some(h) = hdr {
+            attrs.push(h);
+        }
+        out.push(attrs.len() as u8); // sa_len
+        out.extend_from_slice(&attrs);
+        out
+    }
+
+    fn build_stream_entry_audio(pid: u16, coding_type: u8, ch_layout: u8, sample_rate: u8, lang: &[u8; 3]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(3);
+        out.push(0x01);
+        out.extend_from_slice(&pid.to_be_bytes());
+        // attrs: coding_type(1) + format_rate(1) + language(3)
+        let attrs = vec![coding_type, (ch_layout << 4) | sample_rate, lang[0], lang[1], lang[2]];
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
+
+    fn build_stream_entry_pg(pid: u16, coding_type: u8, lang: &[u8; 3]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(3);
+        out.push(0x01);
+        out.extend_from_slice(&pid.to_be_bytes());
+        // attrs: coding_type(1) + language(3)
+        let attrs = vec![coding_type, lang[0], lang[1], lang[2]];
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
+
+    #[test]
+    fn parse_valid_mpls() {
+        let in_time: u32 = 90000;   // 2 seconds at 45kHz
+        let out_time: u32 = 4500000; // 100 seconds
+
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None); // H264, 1080p, 23.976
+        let audio = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng"); // TrueHD, 5.1, 48kHz
+        let pg = build_stream_entry_pg(0x1200, 0x90, b"eng"); // PGS subtitle
+
+        let data = build_mpls(
+            &[(b"00001", 1, in_time, out_time)],
+            (1, 1, 1, 0, 0, 0, 0, 0),
+            &[video, audio, pg],
+        );
+
+        let playlist = parse(&data).expect("should parse valid MPLS");
+        assert_eq!(playlist.version, "0200");
+        assert_eq!(playlist.play_items.len(), 1);
+        assert_eq!(playlist.play_items[0].clip_id, "00001");
+        assert_eq!(playlist.play_items[0].in_time, in_time);
+        assert_eq!(playlist.play_items[0].out_time, out_time);
+        assert_eq!(playlist.play_items[0].connection_condition, 1);
+    }
+
+    #[test]
+    fn parse_streams() {
+        let video = build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12)); // HEVC, 2160p, 23.976, HDR10+BT.2020
+        let audio = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng");
+        let pg = build_stream_entry_pg(0x1200, 0x90, b"fra");
+
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 1, 1, 0, 0, 0, 0, 0),
+            &[video, audio, pg],
+        );
+
+        let playlist = parse(&data).expect("should parse");
+        assert_eq!(playlist.streams.len(), 3);
+
+        // Video stream
+        let v = &playlist.streams[0];
+        assert_eq!(v.stream_type, 1);
+        assert_eq!(v.pid, 0x1011);
+        assert_eq!(v.coding_type, 0x24); // HEVC
+        assert_eq!(v.video_format, 8);   // 2160p
+        assert_eq!(v.video_rate, 1);     // 23.976
+        assert_eq!(v.dynamic_range, 1);  // HDR10
+        assert_eq!(v.color_space, 2);    // BT.2020
+        assert!(!v.secondary);
+
+        // Audio stream
+        let a = &playlist.streams[1];
+        assert_eq!(a.stream_type, 2);
+        assert_eq!(a.pid, 0x1100);
+        assert_eq!(a.coding_type, 0x83); // TrueHD
+        assert_eq!(a.audio_format, 6);   // 5.1
+        assert_eq!(a.audio_rate, 1);     // 48kHz
+        assert_eq!(a.language, "eng");
+        assert!(!a.secondary);
+
+        // PG subtitle stream
+        let s = &playlist.streams[2];
+        assert_eq!(s.stream_type, 3);
+        assert_eq!(s.pid, 0x1200);
+        assert_eq!(s.coding_type, 0x90); // PGS
+        assert_eq!(s.language, "fra");
+        assert!(!s.secondary);
+    }
+
+    #[test]
+    fn parse_invalid_magic() {
+        let mut data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+        );
+        data[0] = b'X';
+        data[1] = b'X';
+        data[2] = b'X';
+        data[3] = b'X';
+        assert!(parse(&data).is_err());
+    }
+
+    #[test]
+    fn parse_truncated() {
+        // Less than 40 bytes
+        assert!(parse(&[0u8; 10]).is_err());
+        assert!(parse(b"MPLS0200").is_err());
+        assert!(parse(&[0u8; 39]).is_err());
+    }
+
+    #[test]
+    fn parse_multiple_play_items() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+
+        let data = build_mpls(
+            &[
+                (b"00001", 1, 90000, 4500000),
+                (b"00002", 5, 4500000, 9000000),
+                (b"00003", 6, 9000000, 13500000),
+            ],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+
+        let playlist = parse(&data).expect("should parse multiple play items");
+        assert_eq!(playlist.play_items.len(), 3);
+        assert_eq!(playlist.play_items[0].clip_id, "00001");
+        assert_eq!(playlist.play_items[0].connection_condition, 1);
+        assert_eq!(playlist.play_items[1].clip_id, "00002");
+        assert_eq!(playlist.play_items[1].connection_condition, 5);
+        assert_eq!(playlist.play_items[1].in_time, 4500000);
+        assert_eq!(playlist.play_items[2].clip_id, "00003");
+        assert_eq!(playlist.play_items[2].connection_condition, 6);
+        assert_eq!(playlist.play_items[2].out_time, 13500000);
+    }
+
+    #[test]
+    fn parse_secondary_streams() {
+        // Primary video
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        // Secondary audio (stream_type 5): build as audio, parser overrides type to 5
+        let sec_audio_se = build_stream_entry_audio(0x1A00, 0x83, 3, 1, b"eng");
+        // Need ref bytes after secondary audio: num_refs(1) + reserved(1) = 2 bytes min
+        let mut sec_audio_with_refs = sec_audio_se;
+        sec_audio_with_refs.push(0); // num_refs = 0
+        sec_audio_with_refs.push(0); // reserved
+
+        // Secondary video (stream_type 6): build as video, parser overrides type to 6
+        let sec_video_se = build_stream_entry_video(0x1B00, 0x1B, 4, 1, None);
+        // Need ref bytes: n_arefs(1) + reserved(1) + n_prefs(1) + reserved(1) = 4 bytes
+        let mut sec_video_with_refs = sec_video_se;
+        sec_video_with_refs.push(0); // n_arefs = 0
+        sec_video_with_refs.push(0); // reserved
+        sec_video_with_refs.push(0); // n_prefs = 0
+        sec_video_with_refs.push(0); // reserved
+
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 1, 1, 0, 0), // 1 video, 0 audio, 0 pg, 0 ig, 1 sec_audio, 1 sec_video
+            &[video, sec_audio_with_refs, sec_video_with_refs],
+        );
+
+        let playlist = parse(&data).expect("should parse secondary streams");
+        // Should have 3 streams: primary video, secondary audio, secondary video
+        assert_eq!(playlist.streams.len(), 3);
+
+        // Primary video
+        assert_eq!(playlist.streams[0].stream_type, 1);
+        assert!(!playlist.streams[0].secondary);
+
+        // Secondary audio
+        assert_eq!(playlist.streams[1].stream_type, 5);
+        assert!(playlist.streams[1].secondary);
+        assert_eq!(playlist.streams[1].pid, 0x1A00);
+
+        // Secondary video
+        assert_eq!(playlist.streams[2].stream_type, 6);
+        assert!(playlist.streams[2].secondary);
+        assert_eq!(playlist.streams[2].pid, 0x1B00);
+    }
+}
