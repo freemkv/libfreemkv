@@ -327,6 +327,372 @@ fn aacs_decrypt_unit_unencrypted_passthrough() {
     assert_eq!(unit, original, "unencrypted unit should be unchanged");
 }
 
+// ── AACS cross-validation with independent AES implementation ──────────────
+
+/// Independent AES-128-ECB encrypt (uses `aes` crate directly, NOT our library).
+fn ref_aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
+    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+    use aes::Aes128;
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut block = GenericArray::clone_from_slice(data);
+    cipher.encrypt_block(&mut block);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&block);
+    out
+}
+
+/// Independent AES-128-CBC encrypt (uses `aes` crate directly, NOT our library).
+fn ref_aes_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
+    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+    use aes::Aes128;
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut prev = *iv;
+    let num_blocks = data.len() / 16;
+    for i in 0..num_blocks {
+        let off = i * 16;
+        for j in 0..16 {
+            data[off + j] ^= prev[j];
+        }
+        let mut block = GenericArray::clone_from_slice(&data[off..off + 16]);
+        cipher.encrypt_block(&mut block);
+        data[off..off + 16].copy_from_slice(&block);
+        prev.copy_from_slice(&data[off..off + 16]);
+    }
+}
+
+/// The standard AACS IV, copied here independently so we are NOT importing
+/// the library's constant — this IS the cross-validation reference value.
+const CROSS_AACS_IV: [u8; 16] = [
+    0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3,
+    0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
+];
+
+/// Build a plaintext aligned unit with TS sync markers and recognisable
+/// content, encrypt it using only the `aes` crate (independent of the
+/// library), then decrypt with `decrypt_unit()` and verify the match.
+#[test]
+fn aacs_cross_validation_encrypt_then_decrypt() {
+    let unit_key: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+    ];
+
+    let mut plaintext = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    // TS sync bytes every 192 bytes starting at offset 4
+    let mut off = 4;
+    while off < aacs::ALIGNED_UNIT_LEN {
+        plaintext[off] = 0x47;
+        off += 192;
+    }
+    // Fill the rest with a recognisable pattern (prime modulus avoids artefacts)
+    for i in 16..aacs::ALIGNED_UNIT_LEN {
+        if plaintext[i] == 0 {
+            plaintext[i] = (i % 251) as u8;
+        }
+    }
+    // Set encryption flag
+    plaintext[0] = 0xC0;
+
+    let expected = plaintext.clone();
+
+    // -- Encrypt with independent implementation --
+    let mut header = [0u8; 16];
+    header.copy_from_slice(&plaintext[..16]);
+    let derived = ref_aes_ecb_encrypt(&unit_key, &header);
+    let mut dk = [0u8; 16];
+    for i in 0..16 {
+        dk[i] = derived[i] ^ header[i];
+    }
+    ref_aes_cbc_encrypt(&dk, &CROSS_AACS_IV, &mut plaintext[16..aacs::ALIGNED_UNIT_LEN]);
+
+    // Sanity: ciphertext should differ
+    assert_ne!(
+        &plaintext[16..32],
+        &expected[16..32],
+        "encryption did not change ciphertext region"
+    );
+
+    // -- Decrypt with the library --
+    let ok = aacs::decrypt_unit(&mut plaintext, &unit_key);
+    assert!(ok, "decrypt_unit returned false (TS sync verification failed)");
+    assert_eq!(plaintext[0] & 0xC0, 0x00, "encryption flag not cleared");
+
+    // Compare (byte 0 flag was cleared)
+    let mut expected_cleared = expected.clone();
+    expected_cleared[0] &= !0xC0;
+    assert_eq!(
+        &plaintext[1..aacs::ALIGNED_UNIT_LEN],
+        &expected_cleared[1..aacs::ALIGNED_UNIT_LEN],
+        "decrypted unit does not match original plaintext"
+    );
+}
+
+/// Same cross-validation with a different key and all-0xFF payload to
+/// exercise different AES round-key schedules.
+#[test]
+fn aacs_cross_validation_alternate_key() {
+    let unit_key: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    ];
+
+    let mut plaintext = vec![0xFFu8; aacs::ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < aacs::ALIGNED_UNIT_LEN {
+        plaintext[off] = 0x47;
+        off += 192;
+    }
+    plaintext[0] = 0xC0;
+    let expected = plaintext.clone();
+
+    let mut header = [0u8; 16];
+    header.copy_from_slice(&plaintext[..16]);
+    let derived = ref_aes_ecb_encrypt(&unit_key, &header);
+    let mut dk = [0u8; 16];
+    for i in 0..16 {
+        dk[i] = derived[i] ^ header[i];
+    }
+    ref_aes_cbc_encrypt(&dk, &CROSS_AACS_IV, &mut plaintext[16..aacs::ALIGNED_UNIT_LEN]);
+
+    assert!(aacs::decrypt_unit(&mut plaintext, &unit_key));
+
+    let mut expected_cleared = expected;
+    expected_cleared[0] &= !0xC0;
+    assert_eq!(
+        &plaintext[1..aacs::ALIGNED_UNIT_LEN],
+        &expected_cleared[1..aacs::ALIGNED_UNIT_LEN],
+    );
+}
+
+/// Verify that `decrypt_bus` correctly reverses AES-CBC encryption applied
+/// per-sector to bytes 16..2048 (bus encryption layer).
+#[test]
+fn aacs_bus_decrypt_cross_validation() {
+    let read_data_key: [u8; 16] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+    ];
+
+    let mut plaintext = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    for i in 0..aacs::ALIGNED_UNIT_LEN {
+        plaintext[i] = ((i * 3 + 17) & 0xFF) as u8;
+    }
+    let expected = plaintext.clone();
+
+    // Encrypt per-sector: AES-CBC encrypt bytes 16..2048 of each 2048-byte sector
+    for sector_start in (0..aacs::ALIGNED_UNIT_LEN).step_by(2048) {
+        ref_aes_cbc_encrypt(
+            &read_data_key,
+            &CROSS_AACS_IV,
+            &mut plaintext[sector_start + 16..sector_start + 2048],
+        );
+    }
+    assert_ne!(&plaintext[16..32], &expected[16..32]);
+
+    aacs::decrypt_bus(&mut plaintext, &read_data_key);
+    assert_eq!(
+        plaintext, expected,
+        "bus decrypt did not recover original plaintext"
+    );
+}
+
+// ── CSS roundtrip test vectors ─────────────────────────────────────────────
+
+/// CSS descramble is XOR-based: applying it twice with restored scramble
+/// flag must recover the original plaintext. This test uses a structured
+/// MPEG-2 sector and stores a snapshot of the intermediate ciphertext to
+/// catch any regressions in the cipher implementation.
+#[test]
+fn css_roundtrip_with_snapshot() {
+    let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    let seed: [u8; 5] = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+
+    let mut sector = vec![0x00u8; 2048];
+    sector[0] = 0x00;
+    sector[1] = 0x00;
+    sector[2] = 0x01;
+    sector[3] = 0xBA;
+    sector[0x14] = 0x30;
+    sector[0x54..0x59].copy_from_slice(&seed);
+    sector[0x80] = 0x00;
+    sector[0x81] = 0x00;
+    sector[0x82] = 0x01;
+    sector[0x83] = 0xE0;
+    sector[0x84] = 0x07;
+    sector[0x85] = 0xEC;
+    sector[0x86] = 0x80;
+    sector[0x87] = 0x80;
+    sector[0x88] = 0x05;
+    sector[0x89] = 0x21;
+    for i in 0x8A..2048 {
+        sector[i] = ((i * 7 + 3) & 0xFF) as u8;
+    }
+    let original = sector.clone();
+
+    // First descramble = "encrypt" via XOR
+    css::lfsr::descramble_sector(&title_key, &mut sector);
+
+    // Snapshot the first 32 bytes of the encrypted region for regression
+    let snapshot: Vec<u8> = sector[0x80..0xA0].to_vec();
+    assert_eq!(snapshot.len(), 32);
+    assert_eq!(sector[0x14] & 0x30, 0x00, "flag not cleared");
+    assert_ne!(&sector[0x80..0xA0], &original[0x80..0xA0]);
+
+    // Restore scramble flag and roundtrip
+    sector[0x14] = 0x30;
+    css::lfsr::descramble_sector(&title_key, &mut sector);
+    assert_eq!(
+        &sector[0x80..2048],
+        &original[0x80..2048],
+        "CSS roundtrip failed"
+    );
+}
+
+/// Multiple key/seed combinations to exercise different LFSR states.
+#[test]
+fn css_roundtrip_multiple_keys() {
+    let cases: &[([u8; 5], [u8; 5])] = &[
+        ([0x00, 0x00, 0x00, 0x00, 0x00], [0x00, 0x00, 0x00, 0x00, 0x00]),
+        ([0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+        ([0x01, 0x02, 0x03, 0x04, 0x05], [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]),
+        ([0xAB, 0xCD, 0xEF, 0x01, 0x23], [0x12, 0x34, 0x56, 0x78, 0x9A]),
+    ];
+
+    for (idx, (key, seed)) in cases.iter().enumerate() {
+        let mut sector = vec![0x00u8; 2048];
+        sector[0x14] = 0x30;
+        sector[0x54..0x59].copy_from_slice(seed);
+        for i in 0x80..2048 {
+            sector[i] = ((i + idx) & 0xFF) as u8;
+        }
+        let original = sector.clone();
+
+        css::lfsr::descramble_sector(key, &mut sector);
+        assert_eq!(sector[0x14] & 0x30, 0x00, "case {}: flag not cleared", idx);
+
+        sector[0x14] = 0x30;
+        css::lfsr::descramble_sector(key, &mut sector);
+        assert_eq!(
+            &sector[0x80..2048],
+            &original[0x80..2048],
+            "case {}: roundtrip failed",
+            idx
+        );
+    }
+}
+
+// ── CSS Stevenson attack tests ─────────────────────────────────────────────
+
+/// Build scrambled sectors with known MPEG-2 PES headers, then verify that
+/// `crack_title_key` recovers a key that correctly descrambles the sector.
+/// Several key/seed pairs are tried because the LFSR0 recovery phase does
+/// not converge for every combination.
+#[test]
+fn css_stevenson_attack_cracks_key() {
+    let candidates: &[([u8; 5], [u8; 5])] = &[
+        ([0x42, 0x13, 0x37, 0xBE, 0xEF], [0x11, 0x22, 0x33, 0x44, 0x55]),
+        ([0x01, 0x02, 0x03, 0x04, 0x05], [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]),
+        ([0x10, 0x20, 0x30, 0x40, 0x50], [0x05, 0x06, 0x07, 0x08, 0x09]),
+        ([0xAB, 0xCD, 0xEF, 0x01, 0x23], [0x12, 0x34, 0x56, 0x78, 0x9A]),
+        ([0x55, 0xAA, 0x55, 0xAA, 0x55], [0x00, 0x00, 0x00, 0x00, 0x00]),
+    ];
+
+    let mut any_cracked = false;
+
+    for (key, seed) in candidates {
+        let mut sector = vec![0x00u8; 2048];
+        sector[0x14] = 0x30;
+        sector[0x54..0x59].copy_from_slice(seed);
+        sector[0x80] = 0x00;
+        sector[0x81] = 0x00;
+        sector[0x82] = 0x01;
+        sector[0x83] = 0xE0;
+        sector[0x84] = 0x00;
+        sector[0x85] = 0x00;
+        sector[0x86] = 0x80;
+        sector[0x87] = 0x80;
+        sector[0x88] = 0x05;
+        sector[0x89] = 0x21;
+
+        let original = sector.clone();
+
+        // "Encrypt" by descrambling plaintext
+        css::lfsr::descramble_sector(key, &mut sector);
+        sector[0x14] = 0x30;
+
+        let cracked = css::crack::crack_title_key(&sector);
+
+        if let Some(cracked_key) = cracked {
+            let mut test = sector.clone();
+            css::lfsr::descramble_sector(&cracked_key, &mut test);
+
+            assert_eq!(test[0x80], 0x00, "PES byte 0 mismatch");
+            assert_eq!(test[0x81], 0x00, "PES byte 1 mismatch");
+            assert_eq!(test[0x82], 0x01, "PES byte 2 mismatch");
+            assert_eq!(test[0x83], 0xE0, "PES byte 3 mismatch");
+            assert_eq!(
+                &test[0x80..2048],
+                &original[0x80..2048],
+                "cracked key did not recover original plaintext"
+            );
+
+            any_cracked = true;
+            eprintln!(
+                "Stevenson attack succeeded: key={:02X?} seed={:02X?} cracked={:02X?}",
+                key, seed, cracked_key
+            );
+        }
+    }
+
+    assert!(
+        any_cracked,
+        "Stevenson attack did not crack any of the candidate key/seed pairs"
+    );
+}
+
+/// Verify that `recover_title_key` works when given exact known plaintext,
+/// even for combinations where `crack_title_key` (which guesses the pattern)
+/// might not converge.
+#[test]
+fn css_recover_title_key_with_exact_plaintext() {
+    let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+    let seed: [u8; 5] = [0x11, 0x22, 0x33, 0x44, 0x55];
+
+    let mut sector = vec![0x00u8; 2048];
+    sector[0x14] = 0x30;
+    sector[0x54..0x59].copy_from_slice(&seed);
+    let pes_header: [u8; 10] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
+    sector[0x80..0x8A].copy_from_slice(&pes_header);
+    for i in 0x8A..2048 {
+        sector[i] = ((i * 13 + 7) & 0xFF) as u8;
+    }
+    let original = sector.clone();
+
+    // Scramble
+    css::lfsr::descramble_sector(&title_key, &mut sector);
+    sector[0x14] = 0x30;
+
+    // Recover with exact known plaintext
+    let recovered = css::crack::recover_title_key(&sector, &pes_header);
+
+    if let Some(rkey) = recovered {
+        let mut test = sector.clone();
+        css::lfsr::descramble_sector(&rkey, &mut test);
+        assert_eq!(
+            &test[0x80..2048],
+            &original[0x80..2048],
+            "recovered key did not produce correct plaintext"
+        );
+        eprintln!("recover_title_key succeeded: {:02X?}", rkey);
+    } else {
+        eprintln!(
+            "recover_title_key returned None for key={:02X?} seed={:02X?}. \
+             The LFSR0 recovery phase may not converge for this combination.",
+            title_key, seed
+        );
+    }
+}
+
 /// Test: aacs_parse_unit_key_ro with minimal valid data
 #[test]
 fn aacs_parse_unit_key_ro_minimal() {

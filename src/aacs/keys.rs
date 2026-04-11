@@ -188,7 +188,11 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
     // Try each processing key against each UV/cvalue pair
     for pk in processing_keys {
         for i in 0..num_uvs {
-            let uv = &uvs[1 + i * 5..]; // skip first byte
+            if (i + 1) * 16 > cvalues.len() { continue; }
+            let record_start = i * 5;
+            if record_start + 5 > uvs.len() { continue; }
+            let _u_mask_shift = uvs[record_start];
+            let uv = &uvs[record_start + 1..record_start + 5];
             let cv = &cvalues[i * 16..(i + 1) * 16];
             if let Some(mk) = validate_processing_key(pk, cv, uv, &mk_dv) {
                 return Some(mk);
