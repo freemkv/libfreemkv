@@ -143,7 +143,11 @@ impl<W: Write + Seek> IsoWriter<W> {
         self.write_m2ts_icb(self.bytes_written)?;
 
         // Seek to end and write reserve AVDP
-        let reserve_sector = total_sectors;
+        let reserve_sector = if total_sectors > 512 {
+            total_sectors - 256
+        } else {
+            total_sectors.saturating_sub(1).max(AVDP_SECTOR + 1)
+        };
         self.writer
             .seek(SeekFrom::Start(reserve_sector as u64 * SECTOR_SIZE))?;
         self.write_avdp()?;
@@ -391,17 +395,27 @@ impl<W: Write + Seek> IsoWriter<W> {
         icb[27] = 5; // file type: regular file
         icb[56..64].copy_from_slice(&file_size.to_le_bytes());
         icb[208..212].copy_from_slice(&0u32.to_le_bytes());
-        // Allocation: data starts at DATA_START in the physical partition
+        // Allocation: data starts at DATA_START in the physical partition.
+        // UDF short_ad is 30 bits for extent length (max 1 GB = 0x3FFFFFFF).
+        // For files > 1 GB, write multiple short_ad entries of 1 GB each plus remainder.
         let data_offset = self.data_start_sector - PARTITION_START;
-        // Cap allocation length at u32::MAX for files >4GB (UDF short_ad limitation)
-        // TODO: long_ad support is needed for full BD ISO support (files >4GB)
-        let ad_len = if file_size > u32::MAX as u64 {
-            u32::MAX
-        } else {
-            file_size as u32
-        };
-        icb[216..220].copy_from_slice(&ad_len.to_le_bytes());
-        icb[220..224].copy_from_slice(&data_offset.to_le_bytes());
+        const MAX_EXTENT: u64 = 0x3FFF_FFFF; // 1 GB - 1 (30-bit max)
+        let mut remaining = file_size;
+        let mut ad_offset: usize = 216;
+        let mut sector_pos = data_offset;
+        while remaining > 0 && ad_offset + 8 <= SECTOR_SIZE as usize {
+            let extent_len = if remaining > MAX_EXTENT {
+                MAX_EXTENT
+            } else {
+                remaining
+            };
+            icb[ad_offset..ad_offset + 4].copy_from_slice(&(extent_len as u32).to_le_bytes());
+            icb[ad_offset + 4..ad_offset + 8].copy_from_slice(&sector_pos.to_le_bytes());
+            ad_offset += 8; // each short_ad is 8 bytes
+            let extent_sectors = ((extent_len + SECTOR_SIZE - 1) / SECTOR_SIZE) as u32;
+            sector_pos += extent_sectors;
+            remaining -= extent_len;
+        }
         self.writer.write_all(&icb)?;
         Ok(())
     }
@@ -414,18 +428,51 @@ fn write_descriptor_tag(buf: &mut [u8], tag_id: u16, sector: u32) {
     buf[0..2].copy_from_slice(&tag_id.to_le_bytes());
     // Descriptor version: 3 (UDF 2.50)
     buf[2..4].copy_from_slice(&3u16.to_le_bytes());
-    // Descriptor CRC (simplified — set to 0, most implementations accept this)
-    buf[8..10].copy_from_slice(&0u16.to_le_bytes());
-    // Descriptor CRC length
-    buf[10..12].copy_from_slice(&0u16.to_le_bytes());
     // Tag location
     buf[12..16].copy_from_slice(&sector.to_le_bytes());
+    // Compute CRC-CCITT over descriptor body (bytes 16+)
+    let body = &buf[16..];
+    let body_len = body.len();
+    let crc = udf_crc(body);
+    buf[8..10].copy_from_slice(&crc.to_le_bytes());
+    // Descriptor CRC length
+    buf[10..12].copy_from_slice(&(body_len as u16).to_le_bytes());
     // Compute tag checksum: sum of bytes 0-3, 5-15 mod 256
+    buf[4] = 0; // clear before computing
     let checksum: u8 = buf[0..4]
         .iter()
         .chain(buf[5..16].iter())
         .fold(0u8, |acc, &b| acc.wrapping_add(b));
     buf[4] = checksum;
+}
+
+/// UDF CRC-CCITT (CRC-16/ECMA-182 polynomial 0x11021).
+fn udf_crc(data: &[u8]) -> u16 {
+    // CRC lookup table for polynomial 0x11021
+    static CRC_TABLE: [u16; 256] = {
+        let mut table = [0u16; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut crc = (i as u16) << 8;
+            let mut j = 0;
+            while j < 8 {
+                if crc & 0x8000 != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+                j += 1;
+            }
+            table[i] = crc;
+            i += 1;
+        }
+        table
+    };
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc = (crc << 8) ^ CRC_TABLE[((crc >> 8) as u8 ^ byte) as usize];
+    }
+    crc
 }
 
 /// Write a UDF d-string (compressed unicode string with length prefix).

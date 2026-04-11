@@ -81,16 +81,7 @@ impl CodecParser for Ac3Parser {
             }
         }
 
-        // If we found no syncword at all, emit the whole PES as a frame
-        // (backwards-compatible with old behaviour).
-        if frames.is_empty() {
-            frames.push(Frame {
-                pts_ns,
-                keyframe: true,
-                data: data.to_vec(),
-            });
-        }
-
+        // If we found no syncword at all, return empty — the data is not valid AC3.
         frames
     }
 

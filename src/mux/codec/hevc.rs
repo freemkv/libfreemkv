@@ -144,10 +144,24 @@ impl CodecParser for HevcParser {
         } else {
             record.push(0);
         }
-        // general_profile_compatibility_flags (4 bytes)
-        record.extend_from_slice(&[0, 0, 0, 0]);
-        // general_constraint_indicator_flags (6 bytes)
-        record.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        // general_profile_compatibility_flags (4 bytes) — from SPS bytes 2..6
+        if sps.len() > 5 {
+            record.extend_from_slice(&sps[2..6]);
+        } else {
+            record.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        // general_constraint_indicator_flags (6 bytes) — from SPS bytes 6..12
+        if sps.len() > 11 {
+            record.extend_from_slice(&sps[6..12]);
+        } else {
+            let avail = sps.len().saturating_sub(6).min(6);
+            if avail > 0 {
+                record.extend_from_slice(&sps[6..6 + avail]);
+                record.extend_from_slice(&vec![0u8; 6 - avail]);
+            } else {
+                record.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            }
+        }
         // general_level_idc
         record.push(if sps.len() > 12 { sps[12] } else { 0 });
         // min_spatial_segmentation_idc (4 + 12 bits)

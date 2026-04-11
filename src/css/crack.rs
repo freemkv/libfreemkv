@@ -150,7 +150,11 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
                 result_key[3] = ((val >> 8) & 0xFF) as u8;
                 result_key[4] = ((val >> 16) & 0xFF) as u8;
                 found = true;
+                break;
             }
+        }
+        if found {
+            break;
         }
     }
 

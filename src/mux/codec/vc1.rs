@@ -14,6 +14,8 @@ const SC_FRAME: u8 = 0x0D;
 pub struct Vc1Parser {
     seq_header: Option<Vec<u8>>,
     entry_point: Option<Vec<u8>>,
+    width: u32,
+    height: u32,
 }
 
 impl Default for Vc1Parser {
@@ -27,6 +29,8 @@ impl Vc1Parser {
         Self {
             seq_header: None,
             entry_point: None,
+            width: 1920,
+            height: 1080,
         }
     }
 }
@@ -51,7 +55,13 @@ impl CodecParser for Vc1Parser {
                 match sc_type {
                     SC_SEQUENCE_HEADER => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
-                        self.seq_header = Some(data[i..end].to_vec());
+                        let sh = &data[i..end];
+                        self.seq_header = Some(sh.to_vec());
+                        // Try to parse resolution from advanced profile sequence header
+                        if let Some((w, h)) = parse_vc1_resolution(sh) {
+                            self.width = w;
+                            self.height = h;
+                        }
                         has_seq_header = true;
                     }
                     SC_ENTRY_POINT => {
@@ -102,8 +112,8 @@ impl CodecParser for Vc1Parser {
 
         // BITMAPINFOHEADER (40 bytes, little-endian)
         cp.extend_from_slice(&header_size.to_le_bytes()); // biSize
-        cp.extend_from_slice(&1920u32.to_le_bytes()); // biWidth (updated by player)
-        cp.extend_from_slice(&1080u32.to_le_bytes()); // biHeight
+        cp.extend_from_slice(&self.width.to_le_bytes()); // biWidth
+        cp.extend_from_slice(&self.height.to_le_bytes()); // biHeight
         cp.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
         cp.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
         cp.extend_from_slice(b"WVC1"); // biCompression = "WVC1" FOURCC
@@ -118,6 +128,46 @@ impl CodecParser for Vc1Parser {
         cp.extend_from_slice(ep);
 
         Some(cp)
+    }
+}
+
+/// Parse width and height from a VC-1 advanced profile sequence header.
+/// The sequence header starts with 00 00 01 0F. After the start code:
+///   byte 0 bits 7-6: profile (3 = advanced)
+/// For advanced profile, the coded dimensions are encoded as 12-bit fields.
+fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
+    // sh starts at the start code (00 00 01 0F ...)
+    if sh.len() < 8 {
+        return None;
+    }
+    let byte4 = sh[4]; // first byte after start code
+    let profile = (byte4 >> 6) & 0x03;
+    if profile != 3 {
+        // Simple/Main profile: resolution not in sequence header
+        return None;
+    }
+    // Advanced profile layout (bit-level starting from sh[4]):
+    // profile(2) + level(3) + chroma_format(2) + quantizer_spec(3) +
+    // postproc_flag(1) + max_coded_width(12) + max_coded_height(12) ...
+    // Total bits before width: 2+3+2+3+1 = 11 bits
+    // We need at least 11+12+12 = 35 bits = 5 bytes from sh[4..]
+    if sh.len() < 9 {
+        return None;
+    }
+    // Build a u64 from bytes 4..9 for easy bit extraction
+    let mut bits: u64 = 0;
+    for j in 0..5 {
+        bits = (bits << 8) | sh[4 + j] as u64;
+    }
+    // bits has 40 bits. Skip first 11 bits, then read 12+12.
+    let coded_width = ((bits >> (40 - 11 - 12)) & 0xFFF) as u32 + 1;
+    let coded_height = ((bits >> (40 - 11 - 24)) & 0xFFF) as u32 + 1;
+    let w = coded_width * 2;
+    let h = coded_height * 2;
+    if w > 0 && h > 0 && w <= 8192 && h <= 8192 {
+        Some((w, h))
+    } else {
+        None
     }
 }
 

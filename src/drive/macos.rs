@@ -7,11 +7,18 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     let mut drives = Vec::new();
     for i in 0..16 {
         let path = format!("/dev/disk{}", i);
-        if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
-            if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                if !id.raw_inquiry.is_empty() && (id.raw_inquiry[0] & 0x1F) == 0x05 {
-                    drives.push((path, id));
+        if !std::path::Path::new(&path).exists() { continue; }
+        match crate::scsi::open(std::path::Path::new(&path)) {
+            Ok(mut transport) => {
+                if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
+                    if !id.raw_inquiry.is_empty() && (id.raw_inquiry[0] & 0x1F) == 0x05 {
+                        drives.push((path, id));
+                    }
                 }
+            }
+            Err(_) => {
+                // Device exists but can't be opened (likely mounted).
+                // Use `diskutil unmountDisk /dev/diskN` to unmount before accessing.
             }
         }
     }

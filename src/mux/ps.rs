@@ -228,9 +228,17 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
 
     let payload = &data[header_end..];
 
-    // For private stream 1, the first payload byte is the sub-stream ID.
+    // For private stream 1, the first payload byte is the sub-stream ID,
+    // followed by a sub-header whose length depends on the sub-stream type.
     let (sub_stream_id, es_data) = if stream_id == PRIVATE_STREAM_1 && !payload.is_empty() {
-        (Some(payload[0]), payload[1..].to_vec())
+        let sub_id = payload[0];
+        let skip = match sub_id {
+            0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
+            0xA0..=0xA7 => 7, // LPCM: sub_id + frames + ptr(2) + emphasis + quant_freq + channels
+            _ => 1,
+        };
+        let start = skip.min(payload.len());
+        (Some(sub_id), payload[start..].to_vec())
     } else {
         (None, payload.to_vec())
     };
@@ -399,11 +407,13 @@ mod tests {
     fn private_stream_1_ac3_substream() {
         let mut demuxer = PsDemuxer::new();
 
+        // AC3 sub-header: sub_id(1) + frame_count(1) + access_unit_ptr(2) = 4 bytes
         let mut data = vec![
             0x00, 0x00, 0x01, 0xBD, // private stream 1
-            0x00, 0x08, // length = 8
+            0x00, 0x0B, // length = 11
             0x80, 0x00, 0x00, // no PTS, header_data_len=0
             0x80, // sub-stream ID: AC3 stream 0
+            0x01, 0x00, 0x02, // frame_count + access_unit_ptr (sub-header bytes)
             0xAA, 0xBB, 0xCC, 0xDD, // AC3 payload
         ];
 
@@ -420,9 +430,12 @@ mod tests {
     fn private_stream_1_dts_substream() {
         let mut demuxer = PsDemuxer::new();
 
+        // DTS sub-header: sub_id(1) + frame_count(1) + access_unit_ptr(2) = 4 bytes
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, // length = 6
-            0x80, 0x00, 0x00, 0x88, // sub-stream ID: DTS stream 0
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x09, // length = 9
+            0x80, 0x00, 0x00, // no PTS, header_data_len=0
+            0x88, // sub-stream ID: DTS stream 0
+            0x01, 0x00, 0x00, // sub-header (frame_count + access_unit_ptr)
             0x11, 0x22,
         ];
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
@@ -430,6 +443,7 @@ mod tests {
         let packets = demuxer.feed(&data);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].sub_stream_id, Some(0x88));
+        assert_eq!(packets[0].data, vec![0x11, 0x22]);
     }
 
     #[test]
@@ -452,16 +466,20 @@ mod tests {
     fn private_stream_1_lpcm_substream() {
         let mut demuxer = PsDemuxer::new();
 
+        // LPCM sub-header: sub_id(1) + frames(1) + ptr(2) + emphasis(1) + quant_freq(1) + channels(1) = 7 bytes
         let mut data = vec![
-            0x00, 0x00, 0x01, 0xBD, 0x00, 0x06, 0x80, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xBD, 0x00, 0x0C, // length = 12
+            0x80, 0x00, 0x00, // no PTS, header_data_len=0
             0xA0, // sub-stream ID: LPCM stream 0
-            0x01, 0x02,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // LPCM sub-header (6 bytes after sub_id)
+            0x01, 0x02, // LPCM payload
         ];
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
 
         let packets = demuxer.feed(&data);
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].sub_stream_id, Some(0xA0));
+        assert_eq!(packets[0].data, vec![0x01, 0x02]);
     }
 
     // --- Incremental feeding ---

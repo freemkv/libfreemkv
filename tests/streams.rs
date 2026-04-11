@@ -766,3 +766,256 @@ fn mkvstream_meta_preserves_all_streams() {
         assert!(s.forced);
     }
 }
+
+// ── H2: End-to-end MKV mux test ─────────────────────────────
+
+#[test]
+fn mkvstream_e2e_h264_produces_valid_mkv() {
+    // Construct a DiscTitle with one H.264 video stream
+    let dt = DiscTitle {
+        playlist: "H264 Test".into(),
+        playlist_id: 0,
+        duration_secs: 10.0,
+        size_bytes: 0,
+        clips: Vec::new(),
+        streams: vec![Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::H264,
+            resolution: "1080p".into(),
+            frame_rate: "23.976".into(),
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            secondary: false,
+            label: "Main".into(),
+        })],
+        chapters: Vec::new(),
+        extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
+    };
+
+    // Build synthetic BD-TS packets containing valid H.264 NALs
+    // We need PES headers wrapping: SPS (NAL type 7), PPS (NAL type 8), IDR (NAL type 5)
+    let mut ts_data = Vec::new();
+
+    // Build elementary stream data: start codes + NALs
+    let mut es_data = Vec::new();
+
+    // SPS NAL (type 7): minimal valid SPS
+    es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+    es_data.push(0x67); // NAL type 7 (SPS), nal_ref_idc=3
+    // Minimal SPS payload: profile_idc=66 (Baseline), constraint flags, level_idc=30
+    es_data.extend_from_slice(&[
+        0x42, 0xC0, 0x1E, // profile=66, constraint_set0=1, level=30
+        0xD9, 0x00, 0xA0, 0x47, 0xFE, 0x88, // minimal SPS rbsp
+    ]);
+
+    // PPS NAL (type 8): minimal valid PPS
+    es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+    es_data.push(0x68); // NAL type 8 (PPS), nal_ref_idc=3
+    es_data.extend_from_slice(&[0xCE, 0x38, 0x80]); // minimal PPS rbsp
+
+    // IDR NAL (type 5): keyframe
+    es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+    es_data.push(0x65); // NAL type 5 (IDR), nal_ref_idc=3
+    // Some IDR slice data
+    es_data.extend_from_slice(&[0x88, 0x84, 0x00, 0x21, 0xFF, 0xFE, 0xF6, 0xE2]);
+    // Pad to reasonable size
+    es_data.extend_from_slice(&[0x00; 64]);
+
+    // Wrap in PES header with PTS
+    let pts: i64 = 90000; // 1 second in 90kHz ticks
+    let pts_bytes = encode_pts_test(pts);
+    let pes_header_len = 9 + 5; // basic PES header (9) + PTS (5)
+    let pes_length = (3 + 5 + es_data.len()) as u16; // flags(3) + PTS(5) + ES data
+
+    let mut pes = Vec::new();
+    pes.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]); // PES start code + video stream_id
+    pes.extend_from_slice(&pes_length.to_be_bytes()); // PES packet length
+    pes.extend_from_slice(&[0x80, 0x80, 0x05]); // flags: PTS present, header_data_len=5
+    pes.extend_from_slice(&pts_bytes);
+    pes.extend_from_slice(&es_data);
+
+    // Wrap PES in 192-byte BD-TS packets
+    let pid: u16 = 0x1011;
+    let mut pes_offset = 0;
+    let mut pusi = true;
+    let mut cc: u8 = 0;
+
+    while pes_offset < pes.len() {
+        let mut pkt = [0u8; 192];
+        // 4-byte TP_extra_header (zeros)
+        pkt[4] = 0x47; // sync byte
+        pkt[5] = (pid >> 8) as u8 & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40; // PUSI
+            pusi = false;
+        }
+        pkt[6] = pid as u8;
+        pkt[7] = 0x10 | (cc & 0x0F); // payload only + continuity counter
+        cc = cc.wrapping_add(1);
+
+        let space = 184;
+        let rem = pes.len() - pes_offset;
+        let n = rem.min(space);
+
+        if n < space {
+            // Need adaptation field for padding
+            let pad = space - n;
+            pkt[7] = 0x30 | (cc.wrapping_sub(1) & 0x0F); // AF + payload
+            pkt[8] = (pad - 1) as u8; // adaptation_field_length
+            if pad > 1 {
+                pkt[9] = 0x00; // flags
+            }
+            for byte in pkt.iter_mut().take(8 + pad).skip(10) {
+                *byte = 0xFF;
+            }
+            pkt[8 + pad..8 + pad + n].copy_from_slice(&pes[pes_offset..pes_offset + n]);
+        } else {
+            pkt[8..8 + n].copy_from_slice(&pes[pes_offset..pes_offset + n]);
+        }
+
+        ts_data.extend_from_slice(&pkt);
+        pes_offset += n;
+    }
+
+    // Build a second PES (access unit) to trigger the first PES to be output
+    // by the TS demuxer (it needs a new PUSI to emit the previous PES).
+    let pts2: i64 = 90000 + 3753; // ~1 frame later
+    let pts2_bytes = encode_pts_test(pts2);
+    let mut es_data2 = Vec::new();
+    // Just a non-IDR slice (NAL type 1)
+    es_data2.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    es_data2.push(0x41); // NAL type 1 (non-IDR)
+    es_data2.extend_from_slice(&[0x9A, 0x00, 0x10, 0x20]);
+    es_data2.extend_from_slice(&[0x00; 32]);
+
+    let pes2_length = (3 + 5 + es_data2.len()) as u16;
+    let mut pes2 = Vec::new();
+    pes2.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+    pes2.extend_from_slice(&pes2_length.to_be_bytes());
+    pes2.extend_from_slice(&[0x80, 0x80, 0x05]);
+    pes2.extend_from_slice(&pts2_bytes);
+    pes2.extend_from_slice(&es_data2);
+
+    // Wrap second PES in BD-TS packets
+    let mut pes2_offset = 0;
+    let mut pusi2 = true;
+    while pes2_offset < pes2.len() {
+        let mut pkt = [0u8; 192];
+        pkt[4] = 0x47;
+        pkt[5] = (pid >> 8) as u8 & 0x1F;
+        if pusi2 {
+            pkt[5] |= 0x40;
+            pusi2 = false;
+        }
+        pkt[6] = pid as u8;
+        pkt[7] = 0x10 | (cc & 0x0F);
+        cc = cc.wrapping_add(1);
+
+        let space = 184;
+        let rem = pes2.len() - pes2_offset;
+        let n = rem.min(space);
+
+        if n < space {
+            let pad = space - n;
+            pkt[7] = 0x30 | (cc.wrapping_sub(1) & 0x0F);
+            pkt[8] = (pad - 1) as u8;
+            if pad > 1 {
+                pkt[9] = 0x00;
+            }
+            for byte in pkt.iter_mut().take(8 + pad).skip(10) {
+                *byte = 0xFF;
+            }
+            pkt[8 + pad..8 + pad + n].copy_from_slice(&pes2[pes2_offset..pes2_offset + n]);
+        } else {
+            pkt[8..8 + n].copy_from_slice(&pes2[pes2_offset..pes2_offset + n]);
+        }
+
+        ts_data.extend_from_slice(&pkt);
+        pes2_offset += n;
+    }
+
+    // Feed through MkvStream using a shared writer to inspect the output bytes.
+    let output2 = std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(Vec::new())));
+
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Cursor<Vec<u8>>>>);
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+    impl std::io::Seek for SharedWriter {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    let writer = SharedWriter(output2.clone());
+    let mut stream2 = MkvStream::new(writer).meta(&dt).max_buffer(1024 * 1024);
+    stream2.write_all(&ts_data).unwrap();
+    stream2.finish().unwrap();
+
+    let data = output2.lock().unwrap().clone().into_inner();
+
+    // Verify output starts with EBML magic (0x1A45DFA3)
+    assert!(data.len() >= 4, "MKV output too small: {} bytes", data.len());
+    assert_eq!(
+        &data[0..4],
+        &[0x1A, 0x45, 0xDF, 0xA3],
+        "output should start with EBML magic"
+    );
+
+    // Verify output contains a Tracks element (0x1654AE6B)
+    let tracks_needle = [0x16, 0x54, 0xAE, 0x6B];
+    let has_tracks = data
+        .windows(4)
+        .any(|w| w == tracks_needle);
+    assert!(has_tracks, "output should contain Tracks element");
+
+    // Verify codecPrivate is non-empty (not all zeros)
+    // CodecPrivate element ID is 0x63A2
+    let cp_needle = [0x63, 0xA2];
+    let cp_pos = data
+        .windows(2)
+        .position(|w| w == cp_needle);
+    if let Some(pos) = cp_pos {
+        // After the ID, there's a size VINT, then the data
+        let after_id = pos + 2;
+        if after_id < data.len() {
+            // Read VINT size
+            let size_byte = data[after_id];
+            let (cp_size, cp_data_start) = if size_byte & 0x80 != 0 {
+                ((size_byte & 0x7F) as usize, after_id + 1)
+            } else if size_byte & 0x40 != 0 && after_id + 1 < data.len() {
+                (
+                    (((size_byte & 0x3F) as usize) << 8) | data[after_id + 1] as usize,
+                    after_id + 2,
+                )
+            } else {
+                (0, after_id + 1)
+            };
+            if cp_size > 0 && cp_data_start + cp_size <= data.len() {
+                let cp_data = &data[cp_data_start..cp_data_start + cp_size];
+                let all_zeros = cp_data.iter().all(|&b| b == 0);
+                assert!(
+                    !all_zeros,
+                    "codecPrivate should not be all zeros (SPS/PPS should be filled)"
+                );
+            }
+        }
+    }
+}
+
+fn encode_pts_test(pts: i64) -> [u8; 5] {
+    let p = pts as u64;
+    [
+        0x21 | ((p >> 29) & 0x0E) as u8,
+        ((p >> 22) & 0xFF) as u8,
+        0x01 | ((p >> 14) & 0xFE) as u8,
+        ((p >> 7) & 0xFF) as u8,
+        0x01 | ((p << 1) & 0xFE) as u8,
+    ]
+}
