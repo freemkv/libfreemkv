@@ -110,6 +110,8 @@ pub struct DiscTitle {
     pub clips: Vec<Clip>,
     /// All streams (video, audio, subtitle, etc.)
     pub streams: Vec<Stream>,
+    /// Chapter points
+    pub chapters: Vec<Chapter>,
     /// Sector extents for ripping (clip LBA ranges)
     pub extents: Vec<Extent>,
     /// Content format for this title
@@ -190,6 +192,8 @@ pub struct SubtitleStream {
     pub language: String,
     /// Whether this is a forced subtitle
     pub forced: bool,
+    /// Pre-formatted codec private data (e.g. VobSub .idx palette header)
+    pub codec_data: Option<Vec<u8>>,
 }
 
 /// Video/audio codec.
@@ -229,6 +233,15 @@ pub enum ColorSpace {
     Bt709,
     Bt2020,
     Unknown,
+}
+
+/// A chapter point within a title.
+#[derive(Debug, Clone)]
+pub struct Chapter {
+    /// Chapter start time in seconds
+    pub time_secs: f64,
+    /// Chapter name (e.g. "Chapter 1", "Chapter 2")
+    pub name: String,
 }
 
 /// A contiguous range of sectors on disc.
@@ -310,6 +323,7 @@ impl DiscTitle {
             size_bytes: 0,
             clips: Vec::new(),
             streams: Vec::new(),
+            chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
         }
@@ -1073,6 +1087,7 @@ mod tests {
                 secondary: false,
                 label: String::new(),
             })],
+            chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
         }

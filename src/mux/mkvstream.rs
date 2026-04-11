@@ -51,6 +51,8 @@ pub struct MkvStream {
     mode: Mode,
     max_buffer: usize,
     finished: bool,
+    /// File size in bytes, set for read mode.
+    file_size: Option<u64>,
 }
 
 impl MkvStream {
@@ -71,6 +73,7 @@ impl MkvStream {
             }),
             max_buffer: DEFAULT_MAX_BUFFER,
             finished: false,
+            file_size: None,
         }
     }
 
@@ -90,7 +93,7 @@ impl MkvStream {
                     crate::disc::Stream::Subtitle(s) => (
                         s.pid,
                         MkvTrack::subtitle(s),
-                        codec::parser_for_codec(s.codec),
+                        codec::parser_for_codec_with_data(s.codec, s.codec_data.clone()),
                     ),
                 };
                 let idx = ws.tracks.len();
@@ -116,6 +119,8 @@ impl MkvStream {
 
     /// Open an MKV file for reading.
     pub fn open(mut reader: impl Read + Seek + 'static) -> io::Result<Self> {
+        let file_size = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(0))?;
         let disc_title = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
@@ -128,6 +133,7 @@ impl MkvStream {
             }),
             max_buffer: 0,
             finished: false,
+            file_size: Some(file_size),
         })
     }
 }
@@ -155,6 +161,10 @@ impl IOStream for MkvStream {
             }
         }
         Ok(())
+    }
+
+    fn total_bytes(&self) -> Option<u64> {
+        self.file_size
     }
 }
 
@@ -314,11 +324,12 @@ fn begin_streaming(ws: &mut WriteState, dt: &DiscTitle) -> io::Result<()> {
         .take()
         .ok_or_else(|| io::Error::other("writer already consumed"))?;
 
-    ws.muxer = Some(MkvMuxer::new(
+    ws.muxer = Some(MkvMuxer::new_with_chapters(
         writer,
         &ws.tracks,
         Some(&dt.playlist),
         dt.duration_secs,
+        &dt.chapters,
     )?);
     ws.phase = WritePhase::Streaming;
 
@@ -531,6 +542,7 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
             codec,
             language: lang,
             forced,
+            codec_data: None,
         })),
         _ => None,
     })

@@ -128,6 +128,7 @@ impl Disc {
                                 codec,
                                 language: s.language.clone(),
                                 forced: false,
+                                codec_data: None,
                             }))
                         } else {
                             Some(Stream::Audio(AudioStream {
@@ -146,9 +147,26 @@ impl Disc {
                         codec,
                         language: s.language.clone(),
                         forced: false,
+                        codec_data: None,
                     })),
                     // Stream type 4 = IG, unknown types -- skip
                     _ => None,
+                }
+            })
+            .collect();
+
+        // Convert marks to chapters (filter mark_type == 1 = chapter entry)
+        let first_in_time = parsed.play_items.first().map(|pi| pi.in_time).unwrap_or(0);
+        let chapters: Vec<Chapter> = parsed
+            .marks
+            .iter()
+            .filter(|m| m.mark_type == 1)
+            .enumerate()
+            .map(|(i, m)| {
+                let time_secs = (m.timestamp as f64 - first_in_time as f64) / 45000.0;
+                Chapter {
+                    time_secs: if time_secs < 0.0 { 0.0 } else { time_secs },
+                    name: format!("Chapter {}", i + 1),
                 }
             })
             .collect();
@@ -163,6 +181,7 @@ impl Disc {
             size_bytes: total_size,
             clips,
             streams,
+            chapters,
             extents,
             content_format: ContentFormat::BdTs,
         })

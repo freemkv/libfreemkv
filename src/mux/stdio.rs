@@ -103,4 +103,12 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("cannot write"), "got: {}", err);
     }
+
+    #[test]
+    fn stdio_total_bytes_returns_none() {
+        let input = StdioStream::input();
+        assert_eq!(input.total_bytes(), None);
+        let output = StdioStream::output();
+        assert_eq!(output.total_bytes(), None);
+    }
 }

@@ -451,6 +451,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         codec: Codec::Pgs,
                         language: "und".into(),
                         forced: false,
+                        codec_data: None,
                     })),
                     _ => None,
                 };

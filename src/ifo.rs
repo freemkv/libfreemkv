@@ -30,6 +30,8 @@ pub struct DvdTitleSet {
     pub video: DvdVideoAttr,
     /// Audio stream attributes (up to 8)
     pub audio_streams: Vec<DvdAudioAttr>,
+    /// Subtitle stream attributes (up to 32)
+    pub subtitle_streams: Vec<DvdSubtitleAttr>,
     /// Titles within this set
     pub titles: Vec<DvdTitle>,
 }
@@ -43,6 +45,8 @@ pub struct DvdTitle {
     pub duration_secs: f64,
     /// Cell sector ranges
     pub cells: Vec<DvdCell>,
+    /// Subtitle palette from PGC: 16 entries of [padding, Y, Cb, Cr].
+    pub palette: Option<Vec<[u8; 4]>>,
 }
 
 /// A cell — contiguous sector range within a VOB.
@@ -67,6 +71,12 @@ pub struct DvdAudioAttr {
     pub codec: String,
     pub channels: u8,
     pub sample_rate: u32,
+    pub language: String,
+}
+
+/// DVD subtitle stream attributes.
+#[derive(Debug, Clone)]
+pub struct DvdSubtitleAttr {
     pub language: String,
 }
 
@@ -285,6 +295,22 @@ fn parse_vts(
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
 
+    // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
+    let num_subs = if vts_data.len() >= 0x256 {
+        be_u16(&vts_data, 0x254).unwrap_or(0)
+    } else {
+        0
+    };
+    let num_subs = std::cmp::min(num_subs, 32) as usize; // cap at 32
+    let mut subtitle_streams = Vec::with_capacity(num_subs);
+    for i in 0..num_subs {
+        let soff = 0x256 + i * 6;
+        if soff + 6 > vts_data.len() {
+            break;
+        }
+        subtitle_streams.push(parse_subtitle_attr(&vts_data, soff)?);
+    }
+
     // Parse PGC information table
     let pgcit_offset = (pgcit_sector as usize).checked_mul(SECTOR_SIZE).ok_or(Error::IfoParse)?;
     let titles = parse_pgcit(&vts_data, pgcit_offset, titles_info)?;
@@ -294,6 +320,7 @@ fn parse_vts(
         vob_start_sector,
         video,
         audio_streams,
+        subtitle_streams,
         titles,
     })
 }
@@ -406,6 +433,28 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     })
 }
 
+/// Parse one subtitle stream attribute block (6 bytes at `offset`).
+fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
+    // Language code: bytes 2-3 as ISO 639
+    let lang_bytes = sub_slice(data, offset + 2, 2)?;
+    let language = if lang_bytes[0] >= b'a' && lang_bytes[0] <= b'z'
+        && lang_bytes[1] >= b'a' && lang_bytes[1] <= b'z'
+    {
+        String::from_utf8_lossy(lang_bytes).to_string()
+    } else if lang_bytes[0] == 0 && lang_bytes[1] == 0 {
+        String::new()
+    } else {
+        let s: String = lang_bytes
+            .iter()
+            .filter(|&&b| b.is_ascii_alphanumeric())
+            .map(|&b| b as char)
+            .collect();
+        s
+    };
+
+    Ok(DvdSubtitleAttr { language })
+}
+
 // ── PGC parser ──────────────────────────────────────────────────────────────
 
 /// Parse VTS_PGCIT (Program Chain Information Table) to extract titles.
@@ -508,10 +557,28 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         duration_secs
     };
 
+    // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cb, Cr]
+    let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
+        let mut colors = Vec::with_capacity(16);
+        for i in 0..16 {
+            let co = pgc_offset + 0xA4 + i * 4;
+            colors.push([data[co], data[co + 1], data[co + 2], data[co + 3]]);
+        }
+        // Only include palette if it's not all zeros (some DVDs have empty palettes)
+        if colors.iter().any(|c| c[1] != 0 || c[2] != 0 || c[3] != 0) {
+            Some(colors)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(DvdTitle {
         chapters,
         duration_secs,
         cells,
+        palette,
     })
 }
 
@@ -600,6 +667,7 @@ mod tests {
             chapters: 5,
             duration_secs: 3600.0,
             cells: vec![cell.clone()],
+            palette: None,
         };
         assert_eq!(title.chapters, 5);
         assert!((title.duration_secs - 3600.0).abs() < 0.01);
@@ -626,6 +694,7 @@ mod tests {
             vob_start_sector: 512,
             video,
             audio_streams: vec![audio],
+            subtitle_streams: Vec::new(),
             titles: vec![title],
         };
         assert_eq!(ts.vts_number, 1);

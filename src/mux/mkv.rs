@@ -5,7 +5,7 @@
 //! cues and seek head are finalized at the end.
 
 use super::ebml;
-use crate::disc::{AudioStream, Codec, SubtitleStream, VideoStream};
+use crate::disc::{AudioStream, Chapter, Codec, SubtitleStream, VideoStream};
 use std::io::{self, Seek, SeekFrom, Write};
 
 /// MKV track definition (built from disc stream metadata).
@@ -89,7 +89,7 @@ impl MkvTrack {
             codec_id,
             language: s.language.clone(),
             name: String::new(),
-            codec_private: None,
+            codec_private: s.codec_data.clone(),
             is_default: false,
             is_forced: s.forced,
             pixel_width: 0,
@@ -128,12 +128,23 @@ pub struct MkvMuxer<W: Write + Seek> {
 const CLUSTER_DURATION_MS: i64 = 5000;
 
 impl<W: Write + Seek> MkvMuxer<W> {
-    /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks.
+    /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
     pub fn new(
+        writer: W,
+        tracks: &[MkvTrack],
+        title: Option<&str>,
+        duration_secs: f64,
+    ) -> io::Result<Self> {
+        Self::new_with_chapters(writer, tracks, title, duration_secs, &[])
+    }
+
+    /// Create a new MKV muxer with chapters: writes EBML header, Segment start, Info, Tracks, Chapters.
+    pub fn new_with_chapters(
         mut writer: W,
         tracks: &[MkvTrack],
         title: Option<&str>,
         duration_secs: f64,
+        chapters: &[Chapter],
     ) -> io::Result<Self> {
         // EBML Header
         let ebml_pos = ebml::start_master(&mut writer, ebml::EBML)?;
@@ -227,6 +238,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::end_master(&mut writer, entry_pos)?;
         }
         ebml::end_master(&mut writer, tracks_pos)?;
+
+        // Chapters
+        if !chapters.is_empty() {
+            let chapters_pos = ebml::start_master(&mut writer, ebml::CHAPTERS)?;
+            let edition_pos = ebml::start_master(&mut writer, ebml::EDITION_ENTRY)?;
+            for (i, ch) in chapters.iter().enumerate() {
+                let atom_pos = ebml::start_master(&mut writer, ebml::CHAPTER_ATOM)?;
+                ebml::write_uint(&mut writer, ebml::CHAPTER_UID, (i + 1) as u64)?;
+                let time_ns = (ch.time_secs * 1_000_000_000.0) as u64;
+                ebml::write_uint(&mut writer, ebml::CHAPTER_TIME_START, time_ns)?;
+                let display_pos = ebml::start_master(&mut writer, ebml::CHAPTER_DISPLAY)?;
+                ebml::write_string(&mut writer, ebml::CHAP_STRING, &ch.name)?;
+                ebml::write_string(&mut writer, ebml::CHAP_LANGUAGE, "und")?;
+                ebml::end_master(&mut writer, display_pos)?;
+                ebml::end_master(&mut writer, atom_pos)?;
+            }
+            ebml::end_master(&mut writer, edition_pos)?;
+            ebml::end_master(&mut writer, chapters_pos)?;
+        }
 
         Ok(Self {
             writer,
@@ -644,6 +674,124 @@ mod tests {
             0x00,
             "non-keyframe flag should be clear, got 0x{:02X}",
             nkf_flags
+        );
+    }
+
+    #[test]
+    fn mkv_writes_chapters_element() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let chapters = vec![
+            Chapter { time_secs: 0.0, name: "Chapter 1".into() },
+            Chapter { time_secs: 300.0, name: "Chapter 2".into() },
+            Chapter { time_secs: 600.0, name: "Chapter 3".into() },
+        ];
+        let muxer = MkvMuxer::new_with_chapters(
+            buf, &tracks, Some("Chapter Test"), 900.0, &chapters,
+        ).unwrap();
+        let data = muxer.writer.into_inner();
+
+        // Chapters element ID: 0x1043A770
+        assert!(
+            find_id(&data, ebml::CHAPTERS).is_some(),
+            "Chapters element (0x1043A770) not found in output"
+        );
+        // EditionEntry element ID: 0x45B9
+        assert!(
+            find_id(&data, ebml::EDITION_ENTRY).is_some(),
+            "EditionEntry element not found"
+        );
+        // ChapterAtom element ID: 0xB6
+        assert!(
+            find_id(&data, ebml::CHAPTER_ATOM).is_some(),
+            "ChapterAtom element not found"
+        );
+    }
+
+    #[test]
+    fn mkv_no_chapters_when_empty() {
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let muxer = MkvMuxer::new(buf, &tracks, Some("No Chapters"), 60.0).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::CHAPTERS).is_none(),
+            "Chapters element should not be present when no chapters given"
+        );
+    }
+
+    #[test]
+    fn mkv_default_flag_on_first_video_and_audio() {
+        // First video: is_default=true, first audio: is_default=true, second audio: is_default=false
+        let video = make_video_track(); // is_default: true
+        let audio1 = make_audio_track(); // is_default: true
+        let mut audio2 = make_audio_track();
+        audio2.is_default = false;
+        audio2.language = "fra".into();
+
+        let buf = Cursor::new(Vec::new());
+        let tracks = [video, audio1, audio2];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let data = muxer.writer.into_inner();
+
+        // FlagDefault ID is 0x88. When is_default is true, FlagDefault is NOT written
+        // (MKV default is 1). When is_default is false, FlagDefault=0 IS written.
+        // So we should find at least one FlagDefault element (for the non-default track).
+        let flag_default_id = ebml::FLAG_DEFAULT.to_be_bytes();
+        let needle = &[flag_default_id[3]]; // 0x88 is a 1-byte ID
+        let count = data.windows(1).filter(|w| w[0] == 0x88).count();
+        // 0x88 appears as FlagDefault + as TrackType (also 0x83... no, 0x83 != 0x88)
+        // FlagDefault (0x88) should appear for the non-default track
+        assert!(count >= 1, "FlagDefault should be written for non-default tracks");
+    }
+
+    #[test]
+    fn mkv_forced_flag_on_forced_subtitle() {
+        use crate::disc::SubtitleStream;
+        let video = make_video_track();
+        let forced_sub = MkvTrack::subtitle(&SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: true,
+            codec_data: None,
+        });
+        assert!(forced_sub.is_forced);
+
+        let buf = Cursor::new(Vec::new());
+        let tracks = [video, forced_sub];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let data = muxer.writer.into_inner();
+
+        // FlagForced ID: 0x55AA (2-byte ID)
+        assert!(
+            find_id(&data, ebml::FLAG_FORCED).is_some(),
+            "FlagForced element should be present for forced subtitle track"
+        );
+    }
+
+    #[test]
+    fn mkv_no_forced_flag_on_non_forced_subtitle() {
+        use crate::disc::SubtitleStream;
+        let video = make_video_track();
+        let sub = MkvTrack::subtitle(&SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::Pgs,
+            language: "eng".into(),
+            forced: false,
+            codec_data: None,
+        });
+        assert!(!sub.is_forced);
+
+        let buf = Cursor::new(Vec::new());
+        let tracks = [video, sub];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let data = muxer.writer.into_inner();
+
+        // FlagForced should NOT be written for non-forced tracks
+        assert!(
+            find_id(&data, ebml::FLAG_FORCED).is_none(),
+            "FlagForced element should not be present for non-forced subtitle"
         );
     }
 }

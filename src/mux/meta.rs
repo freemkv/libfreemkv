@@ -168,6 +168,7 @@ impl M2tsMeta {
                     codec: str_to_codec(codec),
                     language: language.clone(),
                     forced: *forced,
+                    codec_data: None,
                 }),
             })
             .collect();
@@ -179,6 +180,7 @@ impl M2tsMeta {
             size_bytes: 0,
             clips: Vec::new(),
             streams,
+            chapters: Vec::new(),
             extents: Vec::new(),
             content_format: crate::disc::ContentFormat::BdTs,
         }

@@ -97,8 +97,31 @@ impl Disc {
                     .map(|e| e.sector_count as u64 * 2048)
                     .sum();
 
+                // Build pre-formatted palette codec_data for VobSub subtitle streams
+                let codec_data = dvd_title
+                    .palette
+                    .as_ref()
+                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal));
+
+                // Map DvdSubtitleAttr to Stream::Subtitle
+                let subtitle_streams: Vec<Stream> = ts
+                    .subtitle_streams
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        Stream::Subtitle(SubtitleStream {
+                            pid: 0x20 + i as u16, // DVD sub-stream IDs 0x20-0x3F
+                            codec: Codec::DvdSub,
+                            language: s.language.clone(),
+                            forced: false,
+                            codec_data: codec_data.clone(),
+                        })
+                    })
+                    .collect();
+
                 let mut streams = vec![video_stream.clone()];
                 streams.extend(audio_streams.iter().cloned());
+                streams.extend(subtitle_streams);
 
                 titles.push(DiscTitle {
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
@@ -107,6 +130,7 @@ impl Disc {
                     size_bytes,
                     clips: Vec::new(),
                     streams,
+                    chapters: Vec::new(),
                     extents,
                     content_format: ContentFormat::MpegPs,
                 });

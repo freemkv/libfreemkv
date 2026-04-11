@@ -58,6 +58,11 @@ pub trait IOStream: Read + Write {
 
     /// Finalize the stream (flush, write index/cues, close).
     fn finish(&mut self) -> io::Result<()>;
+
+    /// Total content size in bytes, if known. Used for progress display.
+    fn total_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 // Combined traits for internal trait objects.

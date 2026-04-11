@@ -17,6 +17,19 @@ pub struct Playlist {
     pub play_items: Vec<PlayItem>,
     /// Streams from the first play item's STN table
     pub streams: Vec<StreamEntry>,
+    /// Playlist marks (chapter points, etc.)
+    pub marks: Vec<PlaylistMark>,
+}
+
+/// A playlist mark entry from the PlayListMark section.
+#[derive(Debug, Clone)]
+pub struct PlaylistMark {
+    /// Mark type: 1 = chapter entry mark
+    pub mark_type: u8,
+    /// Which play item this mark belongs to
+    pub play_item_ref: u16,
+    /// Timestamp in 45kHz PTS ticks
+    pub timestamp: u32,
 }
 
 /// A play item — one clip reference with in/out times.
@@ -70,6 +83,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
     let version = String::from_utf8_lossy(&data[4..8]).to_string();
     let playlist_start = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let mark_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
 
     if playlist_start + 10 > data.len() {
         return Err(Error::MplsParse);
@@ -237,10 +251,35 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
         pos += 2 + item_length;
     }
 
+    // Parse PlayListMark section
+    let mut marks = Vec::new();
+    if mark_start > 0 && mark_start + 4 < data.len() {
+        let ms = &data[mark_start..];
+        if ms.len() >= 6 {
+            let num_marks = u16::from_be_bytes([ms[4], ms[5]]) as usize;
+            let mut mpos = 6;
+            for _ in 0..num_marks {
+                if mpos + 14 > ms.len() {
+                    break;
+                }
+                let mark_type = ms[mpos];
+                let play_item_ref = u16::from_be_bytes([ms[mpos + 2], ms[mpos + 3]]);
+                let timestamp = u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
+                marks.push(PlaylistMark {
+                    mark_type,
+                    play_item_ref,
+                    timestamp,
+                });
+                mpos += 14;
+            }
+        }
+    }
+
     Ok(Playlist {
         version,
         play_items,
         streams,
+        marks,
     })
 }
 
@@ -367,6 +406,13 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
 mod tests {
     use super::*;
 
+    /// A mark entry for test MPLS building.
+    struct TestMark {
+        mark_type: u8,
+        play_item_ref: u16,
+        timestamp: u32,
+    }
+
     /// Build a minimal MPLS binary with given play items and STN streams on the first item.
     /// STN counts: (n_video, n_audio, n_pg, n_ig, n_sec_audio, n_sec_video, n_pip_pg, n_dv)
     fn build_mpls(
@@ -379,13 +425,27 @@ mod tests {
         stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
         stream_entries: &[Vec<u8>], // raw stream entry + attributes bytes for each stream
     ) -> Vec<u8> {
+        build_mpls_with_marks(play_items_data, stn_counts, stream_entries, &[])
+    }
+
+    fn build_mpls_with_marks(
+        play_items_data: &[(
+            /*clip_id*/ &[u8; 5],
+            /*conn*/ u8,
+            /*in_time*/ u32,
+            /*out_time*/ u32,
+        )],
+        stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
+        stream_entries: &[Vec<u8>],
+        marks: &[TestMark],
+    ) -> Vec<u8> {
         let playlist_start: u32 = 40; // right after the 40-byte header
         let mut buf = Vec::new();
 
-        // File header: "MPLS" + version + playlist_start + 3 more offsets (unused)
+        // File header: "MPLS" + version + playlist_start + mark_start placeholder
         buf.extend_from_slice(b"MPLS0200");
         buf.extend_from_slice(&playlist_start.to_be_bytes());
-        // mark_start, extension_start (unused by parser), padding to 40 bytes
+        // mark_start placeholder (will be patched), extension_start, padding to 40 bytes
         buf.extend_from_slice(&[0u8; 28]);
 
         // PlayList section starts here (offset 40)
@@ -461,6 +521,27 @@ mod tests {
         buf[pl_start + 1] = pl_len_bytes[1];
         buf[pl_start + 2] = pl_len_bytes[2];
         buf[pl_start + 3] = pl_len_bytes[3];
+
+        // Write PlayListMark section
+        let mark_start = buf.len() as u32;
+        // Patch mark_start offset in header (bytes 12-15)
+        let ms_bytes = mark_start.to_be_bytes();
+        buf[12] = ms_bytes[0];
+        buf[13] = ms_bytes[1];
+        buf[14] = ms_bytes[2];
+        buf[15] = ms_bytes[3];
+
+        // Mark section: length(4) + num_marks(2) + marks(14 each)
+        let mark_section_len = 2 + marks.len() * 14;
+        buf.extend_from_slice(&(mark_section_len as u32).to_be_bytes());
+        buf.extend_from_slice(&(marks.len() as u16).to_be_bytes());
+        for m in marks {
+            buf.push(m.mark_type);            // [0] mark_type
+            buf.push(0);                       // [1] reserved
+            buf.extend_from_slice(&m.play_item_ref.to_be_bytes()); // [2-3] play_item_ref
+            buf.extend_from_slice(&m.timestamp.to_be_bytes());      // [4-7] timestamp
+            buf.extend_from_slice(&[0u8; 6]);  // [8-13] padding (entry_ES_PID + duration + mark_data)
+        }
 
         buf
     }
@@ -684,5 +765,82 @@ mod tests {
         assert_eq!(playlist.streams[2].stream_type, 6);
         assert!(playlist.streams[2].secondary);
         assert_eq!(playlist.streams[2].pid, 0x1B00);
+    }
+
+    #[test]
+    fn parse_marks_chapter_entries() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let marks = vec![
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 90000 },
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 4500000 },
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 9000000 },
+        ];
+
+        let data = build_mpls_with_marks(
+            &[(b"00001", 1, 90000, 13500000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+            &marks,
+        );
+
+        let playlist = parse(&data).expect("should parse marks");
+        assert_eq!(playlist.marks.len(), 3);
+        assert_eq!(playlist.marks[0].mark_type, 1);
+        assert_eq!(playlist.marks[0].play_item_ref, 0);
+        assert_eq!(playlist.marks[0].timestamp, 90000);
+        assert_eq!(playlist.marks[1].timestamp, 4500000);
+        assert_eq!(playlist.marks[2].timestamp, 9000000);
+    }
+
+    #[test]
+    fn parse_marks_chapter_timestamps_correct() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let in_time: u32 = 90000;
+
+        // Chapters at 0s, 100s, 200s relative to in_time
+        let marks = vec![
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time },
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time + 45000 * 100 },
+            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time + 45000 * 200 },
+            TestMark { mark_type: 2, play_item_ref: 0, timestamp: in_time + 45000 * 50 }, // non-chapter mark
+        ];
+
+        let data = build_mpls_with_marks(
+            &[(b"00001", 1, in_time, in_time + 45000 * 300)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+            &marks,
+        );
+
+        let playlist = parse(&data).expect("should parse");
+        // All 4 marks should be parsed
+        assert_eq!(playlist.marks.len(), 4);
+        // Chapter marks (type 1) are 3 of them
+        let chapter_marks: Vec<_> = playlist.marks.iter().filter(|m| m.mark_type == 1).collect();
+        assert_eq!(chapter_marks.len(), 3);
+        // Non-chapter mark (type 2)
+        assert_eq!(playlist.marks[3].mark_type, 2);
+
+        // Verify timestamp conversion: (timestamp - in_time) / 45000
+        let ch0_secs = (chapter_marks[0].timestamp as f64 - in_time as f64) / 45000.0;
+        let ch1_secs = (chapter_marks[1].timestamp as f64 - in_time as f64) / 45000.0;
+        let ch2_secs = (chapter_marks[2].timestamp as f64 - in_time as f64) / 45000.0;
+        assert!((ch0_secs - 0.0).abs() < 0.001);
+        assert!((ch1_secs - 100.0).abs() < 0.001);
+        assert!((ch2_secs - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_no_marks_section() {
+        // When mark_start is 0, no marks should be returned
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let data = build_mpls(
+            &[(b"00001", 1, 90000, 4500000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let playlist = parse(&data).expect("should parse without marks");
+        // build_mpls writes an empty mark section (0 marks)
+        assert_eq!(playlist.marks.len(), 0);
     }
 }
