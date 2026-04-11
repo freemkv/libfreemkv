@@ -10,7 +10,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
-pub(crate) mod windows;
+mod windows;
 
 #[allow(unused_imports)]
 use crate::error::{Error, Result};

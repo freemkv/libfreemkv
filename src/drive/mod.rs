@@ -6,6 +6,11 @@
 //!   3. `init()` — activate custom firmware. Removes riplock.
 //!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
 use std::path::Path;
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
@@ -168,25 +173,10 @@ impl SectorReader for DriveSession {
 }
 
 pub fn find_drives() -> Vec<(String, DriveId)> {
-    #[cfg(target_os = "windows")]
-    { crate::scsi::windows::find_drives() }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut drives = Vec::new();
-        for i in 0..16 {
-            let path = format!("/dev/sg{}", i);
-            if !std::path::Path::new(&path).exists() { continue; }
-            if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
-                if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                    if id.raw_inquiry.len() > 0 && (id.raw_inquiry[0] & 0x1F) == 0x05 {
-                        drives.push((path, id));
-                    }
-                }
-            }
-        }
-        drives
-    }
+    #[cfg(unix)]
+    { unix::find_drives() }
+    #[cfg(windows)]
+    { windows::find_drives() }
 }
 
 pub fn find_drive() -> Option<String> {
@@ -194,42 +184,10 @@ pub fn find_drive() -> Option<String> {
 }
 
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
-    // Windows: drive letters, CdRom paths, UNC paths — pass through directly
-    #[cfg(target_os = "windows")]
-    {
-        return Ok((crate::scsi::windows::normalize_device_path(path), None));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    if path.contains("/sg") {
-        if !std::path::Path::new(path).exists() {
-            return Err(Error::DeviceNotFound { path: path.to_string() });
-        }
-        return Ok((path.to_string(), None));
-    }
-    if path.contains("/sr") {
-        let mut sr_transport = crate::scsi::open(std::path::Path::new(path))?;
-        let sr_id = DriveId::from_drive(sr_transport.as_mut())?;
-        drop(sr_transport);
-        for (sg_path, sg_id) in find_drives() {
-            if sg_id.vendor_id == sr_id.vendor_id
-                && sg_id.product_id == sr_id.product_id
-                && sg_id.serial_number == sr_id.serial_number
-            {
-                let warning = format!(
-                    "{} is a block device (sr) — using {} (sg) for raw access", path, sg_path
-                );
-                return Ok((sg_path, Some(warning)));
-            }
-        }
-        return Ok((path.to_string(), Some(format!(
-            "{} is a block device (sr) — no matching sg device found", path
-        ))));
-    }
-    if !std::path::Path::new(path).exists() {
-        return Err(Error::DeviceNotFound { path: path.to_string() });
-    }
-    Ok((path.to_string(), None))
+    #[cfg(unix)]
+    { unix::resolve_device(path) }
+    #[cfg(windows)]
+    { windows::resolve_device(path) }
 }
 
 fn create_driver(platform: profile::Platform, profile: &DriveProfile) -> Result<Box<dyn PlatformDriver>> {
