@@ -10,6 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::speed::DriveSpeed;
 use crate::udf;
 use crate::mpls;
@@ -312,7 +313,16 @@ impl DiscTitle {
 }
 
 
-// ─── AACS state ─────────────────────────────────────────────────────────────
+// ─── Encryption ─────────────────────────────────────────────────────────────
+
+/// Result of SCSI AACS handshake (ECDH authentication).
+/// Only available when scanning from a real drive, not ISO images.
+#[derive(Debug)]
+struct HandshakeResult {
+    volume_id: [u8; 16],
+    read_data_key: Option<[u8; 16]>,
+    error: Option<crate::error::Error>,
+}
 
 /// AACS decryption state for a disc.
 #[derive(Debug)]
@@ -495,19 +505,34 @@ impl Disc {
     /// The session must be open and unlocked (DriveSession::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
-        // 1. Capacity
         let capacity = Self::read_capacity(session)?;
+        let handshake = Self::do_handshake(session, opts);
+        Self::scan_with(session, capacity, handshake, opts)
+    }
 
-        // 2. UDF filesystem
-        let udf_fs = udf::read_filesystem(session)?;
+    /// Scan a disc image (ISO or any SectorReader). No SCSI, no handshake.
+    /// AACS resolution uses KEYDB VUK lookup only.
+    pub fn scan_image(reader: &mut dyn SectorReader, capacity: u32, opts: &ScanOptions) -> Result<Self> {
+        Self::scan_with(reader, capacity, None, opts)
+    }
 
-        // 3. AACS -- read files from disc via UDF, resolve keys via KEYDB
+    /// Core scan pipeline — works with any SectorReader.
+    fn scan_with(
+        reader: &mut dyn SectorReader,
+        capacity: u32,
+        handshake: Option<HandshakeResult>,
+        opts: &ScanOptions,
+    ) -> Result<Self> {
+        // 1. UDF filesystem
+        let udf_fs = udf::read_filesystem(reader)?;
+
+        // 2. Resolve encryption (AACS, CSS, or none)
         let encrypted = udf_fs.find_dir("/AACS").is_some()
             || udf_fs.find_dir("/BDMV/AACS").is_some();
 
         let aacs = if encrypted {
             if let Some(keydb_path) = opts.resolve_keydb() {
-                Self::resolve_aacs(&udf_fs, session, &keydb_path).ok()
+                Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref()).ok()
             } else {
                 None
             }
@@ -515,14 +540,14 @@ impl Disc {
             None
         };
 
-        // 4. Playlists
+        // 3. Playlists
         let mut titles = Vec::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
                 if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    if let Ok(mpls_data) = udf_fs.read_file(session, &path) {
-                        if let Some(title) = Self::parse_playlist(session, &udf_fs, &entry.name, &mpls_data) {
+                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
+                        if let Some(title) = Self::parse_playlist(reader, &udf_fs, &entry.name, &mpls_data) {
                             titles.push(title);
                         }
                     }
@@ -531,11 +556,11 @@ impl Disc {
         }
         titles.sort_by(|a, b| b.duration_secs.partial_cmp(&a.duration_secs).unwrap_or(std::cmp::Ordering::Equal));
 
-        // 5. Metadata + labels
-        let meta_title = Self::read_meta_title(session, &udf_fs);
-        crate::labels::apply(session, &udf_fs, &mut titles);
+        // 4. Metadata + labels
+        let meta_title = Self::read_meta_title(reader, &udf_fs);
+        crate::labels::apply(reader, &udf_fs, &mut titles);
 
-        // 6. Derive format, layers, region
+        // 5. Derive format, layers, region
         let format = Self::detect_format(&titles);
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = if format == DiscFormat::Uhd { DiscRegion::Free } else { DiscRegion::Free };
@@ -554,61 +579,74 @@ impl Disc {
         })
     }
 
-    /// Resolve AACS keys from disc files + KEYDB. No SCSI commands.
-    /// Reads Unit_Key_RO.inf, Content Certificate, and MKB from UDF.
-    fn resolve_aacs(
-        udf_fs: &udf::UdfFs,
-        session: &mut DriveSession,
-        keydb_path: &std::path::Path,
-    ) -> Result<AacsState> {
+    /// SCSI handshake result — volume ID and bus keys from ECDH authentication.
+    /// Only available when scanning from a real drive (not ISO images).
+    fn do_handshake(session: &mut DriveSession, opts: &ScanOptions) -> Option<HandshakeResult> {
         use crate::aacs::{self, KeyDb};
 
-        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad { path: keydb_path.display().to_string() })?;
-
-        // Read AACS files from disc via UDF (standard READ(10), no vendor commands)
-        let uk_ro_data = udf_fs.read_file(session, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(session, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-
-        let cc_data = udf_fs.read_file(session, "/AACS/Content000.cer")
-            .or_else(|_| udf_fs.read_file(session, "/AACS/Content001.cer"))
-            .ok();
-
-        let mkb_data = udf_fs.read_file(session, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(session, "/AACS/MKB_RO.inf"))
-            .ok();
-        let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
-
-        // AACS SCSI handshake — get Volume ID (and read data key for AACS 2.0)
-        let mut volume_id = [0u8; 16];
-        let mut read_data_key = None;
-        let mut handshake_error = None;
+        let keydb_path = opts.resolve_keydb()?;
+        let keydb = KeyDb::load(&keydb_path).ok()?;
 
         for hc in &keydb.host_certs {
             match aacs::handshake::aacs_authenticate(
                 session, &hc.private_key, &hc.certificate,
             ) {
                 Ok(mut auth) => {
-                    // Read Volume ID (needed for MK → VUK derivation)
-                    if let Ok(vid) = aacs::handshake::read_volume_id(session, &mut auth) {
-                        volume_id = vid;
-                    }
-
-                    // Read data keys for bus decryption (AACS 2.0 / UHD)
-                    if let Ok((rdk, _wdk)) = aacs::handshake::read_data_keys(session, &mut auth) {
-                        read_data_key = Some(rdk);
-                    }
-
-                    handshake_error = None;
-                    break;
+                    let volume_id = aacs::handshake::read_volume_id(session, &mut auth)
+                        .unwrap_or([0u8; 16]);
+                    let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
+                        .ok().map(|(rdk, _)| rdk);
+                    return Some(HandshakeResult { volume_id, read_data_key, error: None });
                 }
                 Err(e) => {
-                    handshake_error = Some(e);
+                    // Try next host cert
+                    return Some(HandshakeResult {
+                        volume_id: [0u8; 16],
+                        read_data_key: None,
+                        error: Some(e),
+                    });
                 }
             }
         }
+        None
+    }
 
-        // Resolve: disc hash → KEYDB lookup → VUK → unit keys
+    /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
+    ///
+    /// Reads AACS files from UDF (via SectorReader), resolves keys through
+    /// whatever path works: KEYDB VUK lookup, media key derivation, processing
+    /// keys, device keys. Uses handshake result (volume ID, bus key) if available.
+    fn resolve_encryption(
+        udf_fs: &udf::UdfFs,
+        reader: &mut dyn SectorReader,
+        keydb_path: &std::path::Path,
+        handshake: Option<&HandshakeResult>,
+    ) -> Result<AacsState> {
+        use crate::aacs::{self, KeyDb};
+
+        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad { path: keydb_path.display().to_string() })?;
+
+        // Read AACS files from disc/image via UDF
+        let uk_ro_data = udf_fs.read_file(reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+
+        let cc_data = udf_fs.read_file(reader, "/AACS/Content000.cer")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
+            .ok();
+
+        let mkb_data = udf_fs.read_file(reader, "/AACS/MKB_RW.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
+            .ok();
+        let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
+
+        // Use handshake volume ID if available, otherwise zeros
+        // (KEYDB VUK lookup by disc hash works without volume ID)
+        let volume_id = handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]);
+        let read_data_key = handshake.and_then(|h| h.read_data_key);
+        let handshake_error = None;
+
+        // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
@@ -662,7 +700,7 @@ impl Disc {
     /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
     /// Prefers English, falls back to first available language.
     /// Returns None if META directory is empty or XML has no usable title.
-    fn read_meta_title(session: &mut DriveSession, udf_fs: &udf::UdfFs) -> Option<String> {
+    fn read_meta_title(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Option<String> {
         let meta_dir = udf_fs.find_dir("/BDMV/META")?;
         for sub in &meta_dir.entries {
             if !sub.is_dir { continue; }
@@ -677,7 +715,7 @@ impl Disc {
 
                 if let Some(entry) = target {
                     let path = format!("{}/{}", dl_path, entry.name);
-                    if let Ok(data) = udf_fs.read_file(session, &path) {
+                    if let Ok(data) = udf_fs.read_file(reader, &path) {
                         let xml = String::from_utf8_lossy(&data);
                         if let Some(start) = xml.find("<di:name>") {
                             let s = start + "<di:name>".len();
@@ -704,7 +742,7 @@ impl Disc {
     }
 
     fn parse_playlist(
-        session: &mut DriveSession,
+        reader: &mut dyn SectorReader,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
@@ -732,7 +770,7 @@ impl Disc {
             let mut pkt_count: u32 = 0;
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            if let Ok(clpi_data) = udf_fs.read_file(session, &clpi_path) {
+            if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path) {
                 if let Ok(clip_info) = clpi::parse(&clpi_data) {
                     pkt_count = clip_info.source_packet_count;
                     total_size += pkt_count as u64 * 192;
@@ -740,7 +778,7 @@ impl Disc {
                     // Get m2ts file start LBA and compute extent from packet count.
                     // BD-ROM m2ts files are contiguous on disc (mastering requirement).
                     let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
-                    let file_lba = udf_fs.file_start_lba(session, &m2ts_path).unwrap_or(0);
+                    let file_lba = udf_fs.file_start_lba(reader, &m2ts_path).unwrap_or(0);
                     let total_bytes = pkt_count as u64 * 192;
                     let total_sectors = ((total_bytes + 2047) / 2048) as u32;
                     if total_sectors > 0 && file_lba > 0 {

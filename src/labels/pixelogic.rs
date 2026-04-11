@@ -5,7 +5,7 @@
 //!
 //! Token format: `{lang}_{codec?}_{purpose?}_{region?}_`
 
-use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier, vocab};
 
@@ -18,8 +18,8 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
 }
 
-pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let data = super::read_jar_file(session, udf, "bluray_project.bin")?;
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let data = super::read_jar_file(reader, udf, "bluray_project.bin")?;
     let strings = extract_strings(&data);
 
     let mut labels = Vec::new();

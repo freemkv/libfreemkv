@@ -141,7 +141,11 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
         }
         "iso" => {
             validate_file_path(&parsed.path, "iso")?;
-            Ok(Box::new(IsoStream::open(&parsed.path, opts.title_index)?))
+            let scan_opts = match &opts.keydb_path {
+                Some(p) => crate::disc::ScanOptions::with_keydb(p),
+                None => crate::disc::ScanOptions::default(),
+            };
+            Ok(Box::new(IsoStream::open(&parsed.path, opts.title_index, &scan_opts)?))
         }
         "null" => {
             Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -166,8 +170,8 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
                 "disc:// is read-only — cannot use as output"))
         }
         "iso" => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "iso:// is read-only — cannot use as output"))
+            validate_file_path(&parsed.path, "iso")?;
+            Ok(Box::new(IsoStream::create(&parsed.path)?.meta(meta)))
         }
         "null" => {
             Ok(Box::new(NullStream::new().meta(meta)))

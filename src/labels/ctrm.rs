@@ -4,7 +4,7 @@
 //! When both exist, language_streams.txt provides structured types while
 //! menu_base.prop provides stream number → button name mapping.
 
-use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier, vocab};
 use std::collections::HashMap;
@@ -14,12 +14,12 @@ pub fn detect(udf: &UdfFs) -> bool {
         || super::jar_file_exists(udf, "language_streams.txt")
 }
 
-pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
     // Try language_streams.txt first (richer structured data)
-    let ls_labels = parse_language_streams(session, udf);
+    let ls_labels = parse_language_streams(reader, udf);
 
     // Try menu_base.prop (stream numbers + key names)
-    let mb_labels = parse_menu_base(session, udf);
+    let mb_labels = parse_menu_base(reader, udf);
 
     // If we have both, merge: language_streams for structure, menu_base for names
     match (ls_labels, mb_labels) {
@@ -48,8 +48,8 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
 
 // ── language_streams.txt parser ────────────────────────────────────────────
 
-fn parse_language_streams(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let data = super::read_jar_file(session, udf, "language_streams.txt")?;
+fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let data = super::read_jar_file(reader, udf, "language_streams.txt")?;
     let text = std::str::from_utf8(&data).ok()?;
 
     let mut labels = Vec::new();
@@ -123,8 +123,8 @@ fn parse_language_streams(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec
 
 // ── menu_base.prop parser ──────────────────────────────────────────────────
 
-fn parse_menu_base(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let data = super::read_jar_file(session, udf, "menu_base.prop")?;
+fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let data = super::read_jar_file(reader, udf, "menu_base.prop")?;
     let text = std::str::from_utf8(&data).ok()?;
 
     // Parse key=value, group by prefix

@@ -68,6 +68,7 @@
 //! | E7xxx | AACS errors |
 
 pub mod error;
+pub mod sector;
 pub mod scsi;
 pub mod profile;
 pub mod platform;
@@ -90,6 +91,7 @@ pub use drive::{DriveSession, find_drive, find_drives, resolve_device};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
+pub use sector::SectorReader;
 pub use scsi::ScsiTransport;
 pub use speed::DriveSpeed;
 pub use disc::{Disc, DiscFormat, DiscTitle, Clip, Stream, VideoStream, AudioStream, SubtitleStream,
