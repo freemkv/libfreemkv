@@ -290,6 +290,7 @@ fn codec_to_str(c: Codec) -> String {
         Codec::Ac3Plus => "eac3",
         Codec::Lpcm => "lpcm",
         Codec::Pgs => "pgs",
+        Codec::DvdSub => "dvdsub",
         Codec::Unknown(_) => "unknown",
     }
     .into()

@@ -12,6 +12,10 @@ const NAL_VPS: u8 = 32;
 const NAL_SPS: u8 = 33;
 const NAL_PPS: u8 = 34;
 const NAL_AUD: u8 = 35;
+// Dolby Vision RPU (Reference Processing Unit) — NAL type 62 (UNSPEC62).
+// This is NOT filtered: all NAL types except VPS/SPS/PPS/AUD pass through
+// to frame data, so DV enhancement layer RPU NALs are preserved automatically.
+const _NAL_UNSPEC62_DV_RPU: u8 = 62;
 // IRAP types (keyframes): BLA, IDR, CRA
 const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
@@ -466,5 +470,101 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    // --- Dolby Vision enhancement layer ---
+
+    #[test]
+    fn dv_rpu_nal_preserved() {
+        // Dolby Vision enhancement layer streams contain RPU (Reference Processing
+        // Unit) metadata as NAL type 62 (UNSPEC62). The HEVC parser must pass these
+        // through to the frame data — only VPS/SPS/PPS/AUD are stripped.
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+
+        // VPS (type 32) — should be stripped from frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA, 0xBB]);
+
+        // SPS (type 33) — should be stripped from frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+
+        // PPS (type 34) — should be stripped from frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xDD, 0xEE]);
+
+        // IDR_W_RADL slice (type 19) — should appear in frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let idr_hdr = hevc_nal_header(19);
+        data.extend_from_slice(&idr_hdr);
+        data.extend_from_slice(&[0x10, 0x20, 0x30]);
+
+        // Dolby Vision RPU (type 62 = UNSPEC62) — MUST appear in frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        let rpu_hdr = hevc_nal_header(62);
+        data.extend_from_slice(&rpu_hdr);
+        let rpu_payload = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4];
+        data.extend_from_slice(&rpu_payload);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1, "should produce one frame");
+        assert!(frames[0].keyframe, "IDR should mark keyframe");
+
+        // Verify the frame data contains both the IDR NAL and the RPU NAL.
+        // Frame data is length-prefixed NALUs (4-byte big-endian length + NAL bytes).
+        let fd = &frames[0].data;
+
+        // Walk the length-prefixed NALUs and collect their types
+        let mut nal_types = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= fd.len() {
+            let length = u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]]) as usize;
+            offset += 4;
+            assert!(offset + length <= fd.len(), "NAL length exceeds frame data");
+            let nal_type = (fd[offset] >> 1) & 0x3F;
+            nal_types.push(nal_type);
+            offset += length;
+        }
+
+        assert!(
+            nal_types.contains(&19),
+            "frame data must contain IDR NAL (type 19), got: {:?}",
+            nal_types
+        );
+        assert!(
+            nal_types.contains(&62),
+            "frame data must contain Dolby Vision RPU NAL (type 62), got: {:?}",
+            nal_types
+        );
+        assert_eq!(
+            nal_types.len(),
+            2,
+            "frame data should have exactly 2 NALs (IDR + RPU), got: {:?}",
+            nal_types
+        );
+
+        // Verify RPU payload is intact
+        let mut offset = 0;
+        while offset + 4 <= fd.len() {
+            let length = u32::from_be_bytes([fd[offset], fd[offset + 1], fd[offset + 2], fd[offset + 3]]) as usize;
+            offset += 4;
+            let nal_type = (fd[offset] >> 1) & 0x3F;
+            if nal_type == 62 {
+                // NAL = 2-byte header + payload
+                let nal_payload = &fd[offset + 2..offset + length];
+                assert_eq!(
+                    nal_payload, &rpu_payload,
+                    "RPU payload must be preserved verbatim"
+                );
+            }
+            offset += length;
+        }
     }
 }
