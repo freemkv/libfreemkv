@@ -5,7 +5,7 @@
 ### Done
 - [x] Drive access: open, identify, unlock, firmware upload, speed calibration, eject
 - [x] 206 bundled drive profiles (MediaTek MT1959 A + B variants)
-- [x] SCSI transport: Linux SG_IO, macOS IOKit
+- [x] SCSI transport: Linux SG_IO, macOS IOKit, Windows SPTI
 - [x] UDF 2.50 filesystem parser (metadata partitions, Blu-ray profile)
 - [x] MPLS playlist parser (play items, STN table, secondary streams)
 - [x] CLPI clip info parser (EP map, sector extents)
@@ -23,7 +23,7 @@
 - [x] Event system for progress callbacks
 
 ### Planned
-- [ ] Windows SCSI transport (SPTI)
+- [ ] Windows testing on real hardware
 - [ ] Pioneer Renesas platform support (48 drives, need GET_CONFIG 010C)
 - [ ] DVD CSS decryption
 - [ ] TranscodeStream (ffmpeg integration)

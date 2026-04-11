@@ -3,12 +3,14 @@
 //! Platform backends are in separate files:
 //!   - `linux.rs` — SG_IO ioctl
 //!   - `macos.rs` — IOKit SCSITaskDeviceInterface
-//!   - `windows.rs` — SPTI (planned)
+//!   - `windows.rs` — SPTI (SCSI Pass-Through Interface)
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
 
 #[allow(unused_imports)]
 use crate::error::{Error, Result};
@@ -71,7 +73,7 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     { Ok(Box::new(macos::MacScsiTransport::open(device)?)) }
 
     #[cfg(target_os = "windows")]
-    { Err(Error::DeviceNotFound { path: format!("{}: Windows not yet supported", device.display()) }) }
+    { Ok(Box::new(windows::SptiTransport::open(device)?)) }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     { Err(Error::DeviceNotFound { path: format!("{}: unsupported platform", device.display()) }) }
