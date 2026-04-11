@@ -3,7 +3,7 @@
 //! Clean structured XML with Content/Qualifier per stream and
 //! stream number mapping via playbackconfig.
 
-use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier};
 use std::collections::HashMap;
@@ -12,8 +12,8 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "streamproperties.xml")
 }
 
-pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let sp_data = super::read_jar_file(session, udf, "streamproperties.xml")?;
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let sp_data = super::read_jar_file(reader, udf, "streamproperties.xml")?;
     let sp_text = std::str::from_utf8(&sp_data).ok()?;
 
     let stream_infos = parse_stream_infos(sp_text);
@@ -21,7 +21,7 @@ pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>
 
     // Stream number mapping from playbackconfig.xml
     let mut stream_map: HashMap<String, u16> = HashMap::new();
-    if let Some(pc_data) = super::read_jar_file(session, udf, "playbackconfig.xml") {
+    if let Some(pc_data) = super::read_jar_file(reader, udf, "playbackconfig.xml") {
         if let Ok(pc_text) = std::str::from_utf8(&pc_data) {
             parse_playback_config(pc_text, &mut stream_map);
         }

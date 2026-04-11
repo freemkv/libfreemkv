@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.1 (2026-04-11)
+
+### SectorReader trait
+
+- **`SectorReader` trait** — decouples disc scanning from SCSI. UDF, MPLS, CLPI, labels, and AACS resolution now work with any sector source.
+- **`Disc::scan_image()`** — scan ISO images or any SectorReader. Full title/stream/label/AACS pipeline, no drive required.
+- **`resolve_encryption()`** — single function handles AACS 1.0, 2.0, or none. Uses whatever path works (KEYDB VUK, handshake, media key, device key).
+
+### Stream types
+
+- **7 stream types** — Disc, ISO, MKV, M2TS, Network, Stdio, Null
+- **`IsoStream`** — read/write Blu-ray ISO images. Uses `Disc::scan_image()` for full UDF parsing (not heuristic scanning).
+- **`StdioStream`** — stdin/stdout pipe, format-agnostic
+- **Strict URL format** — all URLs require `scheme://path`. Bare paths rejected with clear error messages.
+- **Validation** — empty paths, missing ports, read-only/write-only direction errors
+
+### IOStream trait
+
+- `IOStream` trait for all stream types (Read + Write + info + finish)
+- `open_input()` / `open_output()` resolve URL strings to stream instances
+
+## 0.7.0 (2026-04-11)
+
+### Stream I/O architecture
+
+- **5 stream types** — Disc, MKV, M2TS, Network, Null
+- **`IOStream` trait** — common interface for all streams
+- **URL resolver** — `open_input()` / `open_output()` with scheme://path format
+- **FMKV metadata header** — JSON metadata embedded in M2TS and network streams
+- **Bidirectional MKV** — MkvStream reads and writes Matroska containers
+- **Network streaming** — TCP with metadata header, TCP_NODELAY
+- **BD-TS demuxer** — PAT/PMT scanning, PTS duration detection
+- **EBML reader** — parse existing MKV files for read-side MkvStream
+
 ## 0.6.0 (2026-04-10)
 
 ### API improvements

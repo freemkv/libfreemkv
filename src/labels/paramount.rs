@@ -12,7 +12,7 @@
 //!   sub_com1_idx="23,24,25" />
 //! ```
 
-use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use super::{StreamLabel, StreamLabelType, LabelPurpose, LabelQualifier};
 
@@ -20,8 +20,8 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
 }
 
-pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
-    let data = super::read_jar_file(session, udf, "playlists.xml")?;
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+    let data = super::read_jar_file(reader, udf, "playlists.xml")?;
     let text = std::str::from_utf8(&data).ok()?;
 
     // Find the feature playlist — longest duration or name="Feature"

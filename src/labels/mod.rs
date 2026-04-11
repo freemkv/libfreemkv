@@ -4,7 +4,7 @@
 //! To add a new format:
 //!   1. Create `src/labels/myformat.rs`
 //!   2. Implement `pub fn detect(udf: &UdfFs) -> bool`
-//!   3. Implement `pub fn parse(session: &mut DriveSession, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
+//!   3. Implement `pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
 mod paramount;
@@ -13,7 +13,7 @@ mod pixelogic;
 mod ctrm;
 pub mod vocab;
 
-use crate::drive::DriveSession;
+use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use crate::disc::{DiscTitle, Stream};
 
@@ -67,7 +67,7 @@ pub enum LabelQualifier {
 // Order = priority. First match wins. Highest quality output first.
 
 type DetectFn = fn(&UdfFs) -> bool;
-type ParseFn = fn(&mut DriveSession, &UdfFs) -> Option<Vec<StreamLabel>>;
+type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<Vec<StreamLabel>>;
 
 const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ("paramount",  paramount::detect,  paramount::parse),
@@ -79,9 +79,9 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
 
 /// Search disc for config files, extract labels, apply to streams.
 /// This is 100% optional — if anything fails, streams are untouched.
-pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [DiscTitle]) {
+pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle]) {
     let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        extract(session, udf)
+        extract(reader, udf)
     })).unwrap_or_default();
     if labels.is_empty() { return; }
 
@@ -133,10 +133,10 @@ pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [DiscTitle]) 
     }
 }
 
-fn extract(session: &mut DriveSession, udf: &UdfFs) -> Vec<StreamLabel> {
+fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
     for (_name, detect, parse) in PARSERS {
         if detect(udf) {
-            if let Some(labels) = parse(session, udf) {
+            if let Some(labels) = parse(reader, udf) {
                 return labels;
             }
         }
@@ -169,7 +169,7 @@ pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
 }
 
 /// Read a file from any BDMV/JAR subdirectory by filename.
-pub(crate) fn read_jar_file(session: &mut DriveSession, udf: &UdfFs, filename: &str) -> Option<Vec<u8>> {
+pub(crate) fn read_jar_file(reader: &mut dyn SectorReader, udf: &UdfFs, filename: &str) -> Option<Vec<u8>> {
     let path = find_jar_file(udf, filename)?;
-    udf.read_file(session, &path).ok().filter(|d| !d.is_empty())
+    udf.read_file(reader, &path).ok().filter(|d| !d.is_empty())
 }

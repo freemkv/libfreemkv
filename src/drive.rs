@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use crate::error::{Error, Result};
+use crate::sector::SectorReader;
 use crate::scsi::ScsiTransport;
 use crate::identity::DriveId;
 use crate::profile::{self, DriveProfile};
@@ -157,6 +158,12 @@ impl DriveSession {
         buf: &mut [u8], timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
         self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+    }
+}
+
+impl SectorReader for DriveSession {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+        self.read_disc(lba, count, buf)
     }
 }
 
