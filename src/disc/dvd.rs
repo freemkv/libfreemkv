@@ -7,7 +7,10 @@ use crate::udf;
 
 impl Disc {
     /// Scan DVD titles from IFO files (VIDEO_TS.IFO + VTS_XX_0.IFO).
-    pub(super) fn scan_dvd_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
+    pub(super) fn scan_dvd_titles(
+        reader: &mut dyn SectorReader,
+        udf_fs: &udf::UdfFs,
+    ) -> Vec<DiscTitle> {
         let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
             Ok(info) => info,
             Err(_) => return Vec::new(),
@@ -83,8 +86,8 @@ impl Disc {
                     .cells
                     .iter()
                     .map(|cell| {
-                        let start = ts.vob_start_sector + cell.first_sector;
-                        let count = cell.last_sector.saturating_sub(cell.first_sector) + 1;
+                        let start = ts.vob_start_sector.saturating_add(cell.first_sector);
+                        let count = cell.last_sector.saturating_sub(cell.first_sector).saturating_add(1);
                         Extent {
                             start_lba: start,
                             sector_count: count,
@@ -92,10 +95,7 @@ impl Disc {
                     })
                     .collect();
 
-                let size_bytes: u64 = extents
-                    .iter()
-                    .map(|e| e.sector_count as u64 * 2048)
-                    .sum();
+                let size_bytes: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
                 // Build pre-formatted palette codec_data for VobSub subtitle streams
                 let codec_data = dvd_title

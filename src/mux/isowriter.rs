@@ -238,7 +238,7 @@ impl<W: Write + Seek> IsoWriter<W> {
         // Main VDS extent_ad: {length, location} per UDF spec
         avdp[16..20].copy_from_slice(&(6u32 * 2048).to_le_bytes()); // length
         avdp[20..24].copy_from_slice(&VDS_START.to_le_bytes()); // location
-        // Reserve VDS extent_ad (same as main for simplicity)
+                                                                // Reserve VDS extent_ad (same as main for simplicity)
         avdp[24..28].copy_from_slice(&(6u32 * 2048).to_le_bytes()); // length
         avdp[28..32].copy_from_slice(&VDS_START.to_le_bytes()); // location
         self.writer.write_all(&avdp)?;
@@ -394,7 +394,12 @@ impl<W: Write + Seek> IsoWriter<W> {
         // Allocation: data starts at DATA_START in the physical partition
         let data_offset = self.data_start_sector - PARTITION_START;
         // Cap allocation length at u32::MAX for files >4GB (UDF short_ad limitation)
-        let ad_len = if file_size > u32::MAX as u64 { u32::MAX } else { file_size as u32 };
+        // TODO: long_ad support is needed for full BD ISO support (files >4GB)
+        let ad_len = if file_size > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            file_size as u32
+        };
         icb[216..220].copy_from_slice(&ad_len.to_le_bytes());
         icb[220..224].copy_from_slice(&data_offset.to_le_bytes());
         self.writer.write_all(&icb)?;
@@ -409,14 +414,18 @@ fn write_descriptor_tag(buf: &mut [u8], tag_id: u16, sector: u32) {
     buf[0..2].copy_from_slice(&tag_id.to_le_bytes());
     // Descriptor version: 3 (UDF 2.50)
     buf[2..4].copy_from_slice(&3u16.to_le_bytes());
-    // Tag serial number
-    buf[4] = 0;
     // Descriptor CRC (simplified — set to 0, most implementations accept this)
     buf[8..10].copy_from_slice(&0u16.to_le_bytes());
     // Descriptor CRC length
     buf[10..12].copy_from_slice(&0u16.to_le_bytes());
     // Tag location
     buf[12..16].copy_from_slice(&sector.to_le_bytes());
+    // Compute tag checksum: sum of bytes 0-3, 5-15 mod 256
+    let checksum: u8 = buf[0..4]
+        .iter()
+        .chain(buf[5..16].iter())
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    buf[4] = checksum;
 }
 
 /// Write a UDF d-string (compressed unicode string with length prefix).
@@ -520,11 +529,7 @@ mod tests {
 
         // VRS at sector 16 should contain "BEA01"
         let vrs = sector(&data, VRS_START);
-        assert_eq!(
-            &vrs[1..6],
-            b"BEA01",
-            "VRS sector 16 should contain BEA01"
-        );
+        assert_eq!(&vrs[1..6], b"BEA01", "VRS sector 16 should contain BEA01");
 
         // FSD at metadata sector should have tag ID = 256
         let fsd = sector(&data, FSD_SECTOR);
@@ -578,9 +583,7 @@ mod tests {
         // The FID for the m2ts file should contain the filename after the parent entry.
         // Search for "00042.m2ts" in the sector data
         let name = b"00042.m2ts";
-        let found = stream_dir
-            .windows(name.len())
-            .any(|w| w == name);
+        let found = stream_dir.windows(name.len()).any(|w| w == name);
         assert!(
             found,
             "STREAM directory should contain m2ts filename '00042.m2ts'"
@@ -599,7 +602,11 @@ mod tests {
         // Should still have valid UDF structure
         // AVDP at sector 256
         let avdp = sector(&data, AVDP_SECTOR);
-        assert_eq!(le_u16(avdp, 0), 2, "AVDP tag should be present even with no data");
+        assert_eq!(
+            le_u16(avdp, 0),
+            2,
+            "AVDP tag should be present even with no data"
+        );
 
         // VRS
         let vrs = sector(&data, VRS_START);

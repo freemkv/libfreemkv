@@ -200,7 +200,9 @@ pub fn parse_vmg(reader: &mut dyn SectorReader, udf: &UdfFs) -> Result<DvdInfo> 
 
     // Read TT_SRPT — it's at the given sector offset relative to the start of VIDEO_TS.IFO.
     // In the IFO file data we already have, sector offsets are relative to the IFO start.
-    let tt_srpt_offset = (tt_srpt_sector as usize).checked_mul(SECTOR_SIZE).ok_or(Error::IfoParse)?;
+    let tt_srpt_offset = (tt_srpt_sector as usize)
+        .checked_mul(SECTOR_SIZE)
+        .ok_or(Error::IfoParse)?;
 
     // TT_SRPT may be beyond what we read; if so, it's embedded in the file data
     // (IFO files are typically small, a few sectors). Check bounds.
@@ -312,7 +314,9 @@ fn parse_vts(
     }
 
     // Parse PGC information table
-    let pgcit_offset = (pgcit_sector as usize).checked_mul(SECTOR_SIZE).ok_or(Error::IfoParse)?;
+    let pgcit_offset = (pgcit_sector as usize)
+        .checked_mul(SECTOR_SIZE)
+        .ok_or(Error::IfoParse)?;
     let titles = parse_pgcit(&vts_data, pgcit_offset, titles_info)?;
 
     Ok(DvdTitleSet {
@@ -409,8 +413,10 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
 
     // Language code: bytes 2-3 as ISO 639
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
-    let language = if lang_bytes[0] >= b'a' && lang_bytes[0] <= b'z'
-        && lang_bytes[1] >= b'a' && lang_bytes[1] <= b'z'
+    let language = if lang_bytes[0] >= b'a'
+        && lang_bytes[0] <= b'z'
+        && lang_bytes[1] >= b'a'
+        && lang_bytes[1] <= b'z'
     {
         String::from_utf8_lossy(lang_bytes).to_string()
     } else if lang_bytes[0] == 0 && lang_bytes[1] == 0 {
@@ -437,8 +443,10 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
 fn parse_subtitle_attr(data: &[u8], offset: usize) -> Result<DvdSubtitleAttr> {
     // Language code: bytes 2-3 as ISO 639
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
-    let language = if lang_bytes[0] >= b'a' && lang_bytes[0] <= b'z'
-        && lang_bytes[1] >= b'a' && lang_bytes[1] <= b'z'
+    let language = if lang_bytes[0] >= b'a'
+        && lang_bytes[0] <= b'z'
+        && lang_bytes[1] >= b'a'
+        && lang_bytes[1] <= b'z'
     {
         String::from_utf8_lossy(lang_bytes).to_string()
     } else if lang_bytes[0] == 0 && lang_bytes[1] == 0 {
@@ -488,7 +496,9 @@ fn parse_pgcit(
 
         // PGC byte offset relative to VTS_PGCIT start
         let pgc_byte_offset = be_u32(data, entry_offset + 4)? as usize;
-        let pgc_abs = pgcit_offset.checked_add(pgc_byte_offset).ok_or(Error::IfoParse)?;
+        let pgc_abs = pgcit_offset
+            .checked_add(pgc_byte_offset)
+            .ok_or(Error::IfoParse)?;
 
         match parse_pgc(data, pgc_abs, chapter_count) {
             Ok(title) => titles.push(title),
@@ -527,7 +537,9 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
     // Parse cells
     let mut cells = Vec::with_capacity(num_cells);
     if cell_playback_offset > 0 && num_cells > 0 {
-        let cell_base = pgc_offset.checked_add(cell_playback_offset).ok_or(Error::IfoParse)?;
+        let cell_base = pgc_offset
+            .checked_add(cell_playback_offset)
+            .ok_or(Error::IfoParse)?;
         for i in 0..num_cells {
             let co = cell_base + i * 24;
             if co + 24 > data.len() {

@@ -8,7 +8,10 @@ use crate::udf;
 
 impl Disc {
     /// Scan Blu-ray titles from MPLS playlists.
-    pub(super) fn scan_bluray_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
+    pub(super) fn scan_bluray_titles(
+        reader: &mut dyn SectorReader,
+        udf_fs: &udf::UdfFs,
+    ) -> Vec<DiscTitle> {
         let mut titles = Vec::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
             for entry in &playlist_dir.entries {
@@ -190,7 +193,10 @@ impl Disc {
     /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
     /// Prefers English, falls back to first available language.
     /// Returns None if META directory is empty or XML has no usable title.
-    pub(super) fn read_meta_title(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Option<String> {
+    pub(super) fn read_meta_title(
+        reader: &mut dyn SectorReader,
+        udf_fs: &udf::UdfFs,
+    ) -> Option<String> {
         let meta_dir = udf_fs.find_dir("/BDMV/META")?;
         for sub in &meta_dir.entries {
             if !sub.is_dir {

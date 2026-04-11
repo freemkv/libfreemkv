@@ -264,7 +264,8 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                 }
                 let mark_type = ms[mpos];
                 let play_item_ref = u16::from_be_bytes([ms[mpos + 2], ms[mpos + 3]]);
-                let timestamp = u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
+                let timestamp =
+                    u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
                 marks.push(PlaylistMark {
                     mark_type,
                     play_item_ref,
@@ -536,11 +537,11 @@ mod tests {
         buf.extend_from_slice(&(mark_section_len as u32).to_be_bytes());
         buf.extend_from_slice(&(marks.len() as u16).to_be_bytes());
         for m in marks {
-            buf.push(m.mark_type);            // [0] mark_type
-            buf.push(0);                       // [1] reserved
+            buf.push(m.mark_type); // [0] mark_type
+            buf.push(0); // [1] reserved
             buf.extend_from_slice(&m.play_item_ref.to_be_bytes()); // [2-3] play_item_ref
-            buf.extend_from_slice(&m.timestamp.to_be_bytes());      // [4-7] timestamp
-            buf.extend_from_slice(&[0u8; 6]);  // [8-13] padding (entry_ES_PID + duration + mark_data)
+            buf.extend_from_slice(&m.timestamp.to_be_bytes()); // [4-7] timestamp
+            buf.extend_from_slice(&[0u8; 6]); // [8-13] padding (entry_ES_PID + duration + mark_data)
         }
 
         buf
@@ -771,9 +772,21 @@ mod tests {
     fn parse_marks_chapter_entries() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
         let marks = vec![
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 90000 },
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 4500000 },
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: 9000000 },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 90000,
+            },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 4500000,
+            },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 9000000,
+            },
         ];
 
         let data = build_mpls_with_marks(
@@ -799,10 +812,26 @@ mod tests {
 
         // Chapters at 0s, 100s, 200s relative to in_time
         let marks = vec![
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time },
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time + 45000 * 100 },
-            TestMark { mark_type: 1, play_item_ref: 0, timestamp: in_time + 45000 * 200 },
-            TestMark { mark_type: 2, play_item_ref: 0, timestamp: in_time + 45000 * 50 }, // non-chapter mark
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: in_time,
+            },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: in_time + 45000 * 100,
+            },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: in_time + 45000 * 200,
+            },
+            TestMark {
+                mark_type: 2,
+                play_item_ref: 0,
+                timestamp: in_time + 45000 * 50,
+            }, // non-chapter mark
         ];
 
         let data = build_mpls_with_marks(

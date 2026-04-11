@@ -189,7 +189,7 @@ impl M2tsMeta {
 
 /// Write the metadata header to a writer. Padded to 192-byte boundary.
 pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
-    let json = serde_json::to_vec(meta).map_err(|e| io::Error::other(e))?;
+    let json = serde_json::to_vec(meta).map_err(io::Error::other)?;
 
     let json_len = json.len() as u32;
     let raw_len = 8 + 4 + json.len(); // magic + len + json

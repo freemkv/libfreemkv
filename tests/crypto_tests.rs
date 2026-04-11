@@ -26,7 +26,7 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     let mut sector = vec![0x00u8; 2048];
     sector[0x14] = 0x30; // scramble flag
     sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]); // seed
-    // PES header at byte 128
+                                                                         // PES header at byte 128
     sector[0x80] = 0x00;
     sector[0x81] = 0x00;
     sector[0x82] = 0x01;
@@ -40,7 +40,11 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     // First descramble
     css::descramble_sector(&state, &mut sector);
     assert_eq!(sector[0x14] & 0x30, 0x00, "flag not cleared");
-    assert_ne!(&sector[0x80..0x84], &original[0x80..0x84], "content unchanged");
+    assert_ne!(
+        &sector[0x80..0x84],
+        &original[0x80..0x84],
+        "content unchanged"
+    );
 
     // Restore flag for second pass
     sector[0x14] = 0x30;
@@ -58,7 +62,10 @@ fn css_descramble_sector_roundtrip_via_public_api() {
 #[test]
 fn css_is_scrambled_detection() {
     let mut sector = vec![0u8; 2048];
-    assert!(!css::is_scrambled(&sector), "empty sector should not be scrambled");
+    assert!(
+        !css::is_scrambled(&sector),
+        "empty sector should not be scrambled"
+    );
 
     sector[0x14] = 0x10; // bit 4 set
     assert!(css::is_scrambled(&sector), "bit 4 set should be detected");
@@ -67,10 +74,16 @@ fn css_is_scrambled_detection() {
     assert!(css::is_scrambled(&sector), "bit 5 set should be detected");
 
     sector[0x14] = 0x30; // both bits set
-    assert!(css::is_scrambled(&sector), "both bits set should be detected");
+    assert!(
+        css::is_scrambled(&sector),
+        "both bits set should be detected"
+    );
 
     sector[0x14] = 0xCF; // bits 4-5 clear, other bits set
-    assert!(!css::is_scrambled(&sector), "bits 4-5 clear should not be scrambled");
+    assert!(
+        !css::is_scrambled(&sector),
+        "bits 4-5 clear should not be scrambled"
+    );
 }
 
 // ── AACS Public API Tests ───────────────────────────────────────────────────
@@ -87,8 +100,8 @@ fn aacs_decrypt_unit_roundtrip() {
 
     let unit_key = [0xAAu8; 16];
     let aacs_iv: [u8; 16] = [
-        0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05,
-        0x0F, 0x78,
+        0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F,
+        0x78,
     ];
 
     // Build plaintext unit with TS sync bytes every 192 bytes starting at offset 4
@@ -140,8 +153,14 @@ fn aacs_decrypt_unit_roundtrip() {
 
     // Now decrypt
     let result = aacs::decrypt_unit(&mut plain, &unit_key);
-    assert!(result, "decrypt_unit should return true on valid encrypted unit");
-    assert!(!aacs::is_unit_encrypted(&plain), "encryption flag should be cleared");
+    assert!(
+        result,
+        "decrypt_unit should return true on valid encrypted unit"
+    );
+    assert!(
+        !aacs::is_unit_encrypted(&plain),
+        "encryption flag should be cleared"
+    );
 
     // Verify TS sync bytes at expected positions (flag byte is cleared by decrypt)
     let mut sync_count = 0;
@@ -166,7 +185,11 @@ fn aacs_decrypt_unit_roundtrip() {
         "decrypted unit body does not match original"
     );
     // Byte 0: original had 0xC0 set, decrypted has it cleared
-    assert_eq!(plain[0] & !0xC0, expected[0] & !0xC0, "byte 0 mismatch ignoring flag");
+    assert_eq!(
+        plain[0] & !0xC0,
+        expected[0] & !0xC0,
+        "byte 0 mismatch ignoring flag"
+    );
 }
 
 /// Test 7: aacs_disc_hash_deterministic
@@ -182,7 +205,10 @@ fn aacs_disc_hash_deterministic() {
     assert_eq!(hash1a, hash1b, "disc_hash not deterministic on same input");
 
     let hash2 = aacs::disc_hash(data2);
-    assert_ne!(hash1a, hash2, "different inputs should produce different hashes");
+    assert_ne!(
+        hash1a, hash2,
+        "different inputs should produce different hashes"
+    );
 
     // Verify it is a 20-byte SHA-1 hash
     assert_eq!(hash1a.len(), 20);
@@ -190,7 +216,11 @@ fn aacs_disc_hash_deterministic() {
     // Verify disc_hash_hex formatting
     let hex = aacs::disc_hash_hex(&hash1a);
     assert!(hex.starts_with("0x"), "hex should start with 0x prefix");
-    assert_eq!(hex.len(), 42, "hex string should be 42 chars (0x + 40 hex digits)");
+    assert_eq!(
+        hex.len(),
+        42,
+        "hex string should be 42 chars (0x + 40 hex digits)"
+    );
 }
 
 /// Test: aacs_decrypt_unit_key_roundtrip
@@ -203,12 +233,12 @@ fn aacs_decrypt_unit_key_roundtrip() {
     use aes::Aes128;
 
     let vuk = [
-        0x11u8, 0x14, 0x36, 0x0B, 0x10, 0xEE, 0x6E, 0xAC, 0x78, 0xAA, 0x4A, 0xC0, 0xB7, 0x52,
-        0xEA, 0xEB,
+        0x11u8, 0x14, 0x36, 0x0B, 0x10, 0xEE, 0x6E, 0xAC, 0x78, 0xAA, 0x4A, 0xC0, 0xB7, 0x52, 0xEA,
+        0xEB,
     ];
     let original_unit_key = [
-        0x9E, 0x5D, 0x13, 0x10, 0x33, 0x74, 0x43, 0xE8, 0x11, 0xA5, 0x2E, 0xBB, 0xEA, 0xE0,
-        0x47, 0x0F,
+        0x9E, 0x5D, 0x13, 0x10, 0x33, 0x74, 0x43, 0xE8, 0x11, 0xA5, 0x2E, 0xBB, 0xEA, 0xE0, 0x47,
+        0x0F,
     ];
 
     // Encrypt: AES-ECB encrypt the unit key with VUK
@@ -231,10 +261,14 @@ fn aacs_decrypt_unit_key_roundtrip() {
 /// Verify derive_vuk: VUK = AES-ECB-DECRYPT(media_key, volume_id) XOR volume_id
 #[test]
 fn aacs_vuk_derivation_roundtrip() {
-    let media_key = [0x25u8, 0x2F, 0xB6, 0x36, 0xE8, 0x83, 0x52, 0x9E,
-                     0x11, 0x9A, 0xB7, 0x15, 0xF4, 0xEB, 0x16, 0x40];
-    let volume_id = [0xA1u8, 0x3C, 0xBE, 0x2C, 0xE4, 0x05, 0x65, 0xD1,
-                     0x04, 0xB5, 0x3E, 0x76, 0x8C, 0x70, 0x0E, 0x30];
+    let media_key = [
+        0x25u8, 0x2F, 0xB6, 0x36, 0xE8, 0x83, 0x52, 0x9E, 0x11, 0x9A, 0xB7, 0x15, 0xF4, 0xEB, 0x16,
+        0x40,
+    ];
+    let volume_id = [
+        0xA1u8, 0x3C, 0xBE, 0x2C, 0xE4, 0x05, 0x65, 0xD1, 0x04, 0xB5, 0x3E, 0x76, 0x8C, 0x70, 0x0E,
+        0x30,
+    ];
 
     let vuk = aacs::derive_vuk(&media_key, &volume_id);
 
@@ -253,7 +287,10 @@ fn aacs_vuk_derivation_roundtrip() {
 fn aacs_is_unit_encrypted_detection() {
     let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
 
-    assert!(!aacs::is_unit_encrypted(&unit), "zero unit should not be encrypted");
+    assert!(
+        !aacs::is_unit_encrypted(&unit),
+        "zero unit should not be encrypted"
+    );
 
     unit[0] = 0x40; // bit 6 set
     assert!(aacs::is_unit_encrypted(&unit));
@@ -269,7 +306,10 @@ fn aacs_is_unit_encrypted_detection() {
 
     // Too short
     let short = vec![0xC0u8; 100];
-    assert!(!aacs::is_unit_encrypted(&short), "short buffer should not be detected");
+    assert!(
+        !aacs::is_unit_encrypted(&short),
+        "short buffer should not be detected"
+    );
 }
 
 /// Test: aacs_decrypt_unit_unencrypted_passthrough
@@ -299,7 +339,7 @@ fn aacs_parse_unit_key_ro_minimal() {
     data[0..4].copy_from_slice(&uk_pos.to_be_bytes());
     // app_type
     data[16] = 1; // BD-ROM
-    // num_bdmv_dir
+                  // num_bdmv_dir
     data[17] = 1;
     // flags
     data[18] = 0;
@@ -316,7 +356,10 @@ fn aacs_parse_unit_key_ro_minimal() {
     }
 
     let result = aacs::parse_unit_key_ro(&data, false);
-    assert!(result.is_some(), "parse_unit_key_ro should succeed on valid data");
+    assert!(
+        result.is_some(),
+        "parse_unit_key_ro should succeed on valid data"
+    );
 
     let ukf = result.unwrap();
     assert_eq!(ukf.app_type, 1);

@@ -115,7 +115,10 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, sub_data, "VobSub data should pass through unmodified");
+        assert_eq!(
+            frames[0].data, sub_data,
+            "VobSub data should pass through unmodified"
+        );
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
     }
 
@@ -127,7 +130,10 @@ mod tests {
             let pes = make_pes(data, Some(90000 * i as i64));
             let frames = parser.parse(&pes);
             assert_eq!(frames.len(), 1);
-            assert!(frames[0].keyframe, "DVD subtitle frames should always be keyframes");
+            assert!(
+                frames[0].keyframe,
+                "DVD subtitle frames should always be keyframes"
+            );
         }
     }
 
@@ -224,24 +230,37 @@ mod tests {
         ];
         let result = format_palette(&palette);
         let text = String::from_utf8(result).unwrap();
-        assert!(text.starts_with("palette: "), "should start with 'palette: '");
+        assert!(
+            text.starts_with("palette: "),
+            "should start with 'palette: '"
+        );
         assert!(text.ends_with('\n'), "should end with newline");
         // First color: 000000
-        assert!(text.contains("000000"), "black should be 000000, got: {}", text);
+        assert!(
+            text.contains("000000"),
+            "black should be 000000, got: {}",
+            text
+        );
         // Second color: ffffff
-        assert!(text.contains("ffffff"), "white should be ffffff, got: {}", text);
+        assert!(
+            text.contains("ffffff"),
+            "white should be ffffff, got: {}",
+            text
+        );
     }
 
     #[test]
     fn format_palette_16_colors() {
-        let palette: Vec<[u8; 4]> = (0..16)
-            .map(|i| [0x00, (i * 16) as u8, 128, 128])
-            .collect();
+        let palette: Vec<[u8; 4]> = (0..16).map(|i| [0x00, (i * 16) as u8, 128, 128]).collect();
         let result = format_palette(&palette);
         let text = String::from_utf8(result).unwrap();
         // Should have exactly 15 commas (16 colors separated by ", ")
         let comma_count = text.matches(", ").count();
-        assert_eq!(comma_count, 15, "16 colors should have 15 separators, got {}", comma_count);
+        assert_eq!(
+            comma_count, 15,
+            "16 colors should have 15 separators, got {}",
+            comma_count
+        );
     }
 
     #[test]

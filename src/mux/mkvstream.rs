@@ -381,7 +381,10 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not EBML"));
     }
     if size > i64::MAX as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "EBML header too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EBML header too large",
+        ));
     }
     r.seek(SeekFrom::Current(size as i64))?;
 

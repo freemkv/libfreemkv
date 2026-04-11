@@ -87,9 +87,8 @@ pub fn find_dts_hd_ext_sync(data: &[u8]) -> Option<usize> {
 ///   ((ext[6] & 0x1F) << 11) | (ext[7] << 3) | (ext[8] >> 5) + 1
 pub fn dts_hd_ext_frame_size(ext: &[u8]) -> usize {
     debug_assert!(ext.len() >= 9);
-    let raw = ((ext[6] as usize & 0x1F) << 11)
-        | ((ext[7] as usize) << 3)
-        | ((ext[8] as usize) >> 5);
+    let raw =
+        ((ext[6] as usize & 0x1F) << 11) | ((ext[7] as usize) << 3) | ((ext[8] as usize) >> 5);
     raw + 1
 }
 
@@ -218,7 +217,7 @@ mod tests {
     fn parse_core_plus_extension_truncated_at_buffer_end() {
         let mut parser = DtsParser::new();
         let core = make_dts_core(4); // 8 bytes
-        // Extension claims 200 bytes but we only provide 20
+                                     // Extension claims 200 bytes but we only provide 20
         let ext = make_dts_hd_ext(199, 0xDD); // wants 200 bytes
         let mut data = core;
         // Only append partial extension (first 20 bytes)

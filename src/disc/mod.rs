@@ -370,8 +370,6 @@ pub struct AacsState {
     pub read_data_key: Option<[u8; 16]>,
     /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
-    /// Handshake error code if authentication failed (None = no HC, or success)
-    pub handshake_error: Option<crate::error::Error>,
 }
 
 /// How AACS keys were resolved.
@@ -413,7 +411,6 @@ pub struct ScanOptions {
     /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
     pub keydb_path: Option<std::path::PathBuf>,
 }
-
 
 impl ScanOptions {
     /// Create options with a specific KEYDB path.
@@ -577,9 +574,15 @@ impl Disc {
 
         // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
-            (Self::scan_bluray_titles(reader, &udf_fs), ContentFormat::BdTs)
+            (
+                Self::scan_bluray_titles(reader, &udf_fs),
+                ContentFormat::BdTs,
+            )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            (Self::scan_dvd_titles(reader, &udf_fs), ContentFormat::MpegPs)
+            (
+                Self::scan_dvd_titles(reader, &udf_fs),
+                ContentFormat::MpegPs,
+            )
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
@@ -667,7 +670,6 @@ impl Disc {
         let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         Ok(lba + 1)
     }
-
 }
 
 // ─── Decrypted reader ──────────────────────────────────────────────────────
@@ -684,7 +686,6 @@ pub struct ContentReader<'a> {
     session: &'a mut DriveSession,
     aacs: Option<&'a AacsState>,
     css: Option<&'a crate::css::CssState>,
-    content_format: ContentFormat,
     extents: Vec<Extent>,
     current_extent: usize,
     current_offset: u32,
@@ -716,13 +717,10 @@ impl Disc {
         session: &'a mut DriveSession,
         title_idx: usize,
     ) -> Result<ContentReader<'a>> {
-        let title = self
-            .titles
-            .get(title_idx)
-            .ok_or(Error::DiscTitleRange {
-                index: title_idx,
-                count: self.titles.len(),
-            })?;
+        let title = self.titles.get(title_idx).ok_or(Error::DiscTitleRange {
+            index: title_idx,
+            count: self.titles.len(),
+        })?;
 
         // Let the drive manage its own read speed after init.
         // SET_CD_SPEED is only used reactively by the error handler to slow
@@ -735,7 +733,6 @@ impl Disc {
             session,
             aacs: self.aacs.as_ref(),
             css: self.css.as_ref(),
-            content_format: title.content_format,
             extents: title.extents.clone(),
             current_extent: 0,
             current_offset: 0,
@@ -756,7 +753,7 @@ impl Disc {
 /// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
 /// For sg devices, resolves the corresponding block device via sysfs.
 /// Returns a value aligned to 3 sectors (one aligned unit).
-fn detect_max_batch_sectors(device_path: &str) -> u16 {
+pub(crate) fn detect_max_batch_sectors(device_path: &str) -> u16 {
     let dev_name = device_path.rsplit('/').next().unwrap_or("");
     if dev_name.is_empty() {
         return DEFAULT_BATCH_SECTORS;
@@ -793,12 +790,12 @@ fn detect_max_batch_sectors(device_path: &str) -> u16 {
 }
 
 /// Read strategy constants
-const MAX_BATCH_SECTORS: u16 = 510; // absolute max (170 aligned units ≈ 1MB)
-const DEFAULT_BATCH_SECTORS: u16 = 60; // fallback: typical kernel limit (120KB = 60 sectors)
-const MIN_BATCH_SECTORS: u16 = 3; // 1 aligned unit = 6KB (error recovery)
-const RAMP_BATCH_AFTER: u32 = 5; // successes before doubling batch size
-const RAMP_SPEED_AFTER: u32 = 50; // successes at max batch before restoring speed
-const SLOW_SPEED_AFTER: u32 = 3; // consecutive errors before reducing disc speed
+pub(crate) const MAX_BATCH_SECTORS: u16 = 510; // absolute max (170 aligned units ≈ 1MB)
+pub(crate) const DEFAULT_BATCH_SECTORS: u16 = 60; // fallback: typical kernel limit (120KB = 60 sectors)
+pub(crate) const MIN_BATCH_SECTORS: u16 = 3; // 1 aligned unit = 6KB (error recovery)
+pub(crate) const RAMP_BATCH_AFTER: u32 = 5; // successes before doubling batch size
+pub(crate) const RAMP_SPEED_AFTER: u32 = 50; // successes at max batch before restoring speed
+pub(crate) const SLOW_SPEED_AFTER: u32 = 3; // consecutive errors before reducing disc speed
 
 impl<'a> ContentReader<'a> {
     /// Total bytes across all extents (for progress display).
@@ -814,10 +811,9 @@ impl<'a> ContentReader<'a> {
     /// Returns None when all extents are exhausted.
     pub fn read_unit(&mut self) -> Result<Option<Vec<u8>>> {
         // Refill buffer if empty
-        if self.buf_pos >= self.buf_len
-            && !self.fill_buffer()? {
-                return Ok(None);
-            }
+        if self.buf_pos >= self.buf_len && !self.fill_buffer()? {
+            return Ok(None);
+        }
 
         // Extract one aligned unit from buffer
         let start = self.buf_pos * crate::aacs::ALIGNED_UNIT_LEN;

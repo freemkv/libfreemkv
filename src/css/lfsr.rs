@@ -48,9 +48,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
 
     let mut lfsr0: u32 = ((working_key[4] as u32) << 17)
         | ((working_key[3] as u32) << 9)
-        | ((working_key[2] as u32) << 1)
-        + 8
-        - (working_key[2] as u32 & 7);
+        | (((working_key[2] as u32) << 1) + 8 - (working_key[2] as u32 & 7));
     lfsr0 = (TAB4[(lfsr0 & 0xFF) as usize] as u32) << 24
         | (TAB4[((lfsr0 >> 8) & 0xFF) as usize] as u32) << 16
         | (TAB4[((lfsr0 >> 16) & 0xFF) as usize] as u32) << 8
@@ -85,11 +83,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
 /// Decrypts `p_crypted` using `p_key` with the CSS two-LFSR cipher.
 /// The `invert` parameter controls the XOR applied to LFSR0 output
 /// (0x00 for disc key decryption, 0xFF for title key / sector key).
-pub(crate) fn decrypt_key(
-    invert: u8,
-    p_key: &[u8; 5],
-    p_crypted: &[u8],
-) -> [u8; 5] {
+pub(crate) fn decrypt_key(invert: u8, p_key: &[u8; 5], p_crypted: &[u8]) -> [u8; 5] {
     if p_crypted.len() < 5 {
         return *p_key;
     }
@@ -99,9 +93,7 @@ pub(crate) fn decrypt_key(
 
     let mut lfsr0: u32 = ((p_key[4] as u32) << 17)
         | ((p_key[3] as u32) << 9)
-        | ((p_key[2] as u32) << 1)
-        + 8
-        - (p_key[2] as u32 & 7);
+        | (((p_key[2] as u32) << 1) + 8 - (p_key[2] as u32 & 7));
     lfsr0 = (TAB4[(lfsr0 & 0xFF) as usize] as u32) << 24
         | (TAB4[((lfsr0 >> 8) & 0xFF) as usize] as u32) << 16
         | (TAB4[((lfsr0 >> 16) & 0xFF) as usize] as u32) << 8
@@ -160,7 +152,7 @@ mod tests {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];
         let mut sector = vec![0xAA; 2048];
         sector[0x14] = 0x30; // scramble flag set
-        // Set a sector seed
+                             // Set a sector seed
         sector[0x54..0x59].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
         let original = sector.clone();
         descramble_sector(&key, &mut sector);
@@ -230,7 +222,11 @@ mod tests {
                 assert_eq!(rff, rff_again, "decrypt_key(0xFF) not deterministic");
 
                 // With different invert values, the keystream differs
-                assert_ne!(r0, rff, "invert=0x00 and 0xFF gave same result for key {:?}", key);
+                assert_ne!(
+                    r0, rff,
+                    "invert=0x00 and 0xFF gave same result for key {:?}",
+                    key
+                );
             }
         }
     }
@@ -270,10 +266,17 @@ mod tests {
         // First descramble: "encrypts" by XORing keystream
         descramble_sector(&title_key, &mut sector);
         // Flag should be cleared
-        assert_eq!(sector[0x14] & 0x30, 0x00, "scramble flag not cleared after first descramble");
+        assert_eq!(
+            sector[0x14] & 0x30,
+            0x00,
+            "scramble flag not cleared after first descramble"
+        );
         // Encrypted region should differ
-        assert_ne!(&sector[0x80..0x84], &original[0x80..0x84],
-            "encrypted region unchanged after descramble");
+        assert_ne!(
+            &sector[0x80..0x84],
+            &original[0x80..0x84],
+            "encrypted region unchanged after descramble"
+        );
 
         // Restore the scramble flag and sector seed for second pass
         sector[0x14] = 0x30;
@@ -281,8 +284,11 @@ mod tests {
         // Second descramble: XOR again = roundtrip
         descramble_sector(&title_key, &mut sector);
         // Now the encrypted region should match original
-        assert_eq!(&sector[0x80..2048], &original[0x80..2048],
-            "double descramble did not roundtrip");
+        assert_eq!(
+            &sector[0x80..2048],
+            &original[0x80..2048],
+            "double descramble did not roundtrip"
+        );
     }
 
     /// Test 4: css_tab1_relationship
@@ -315,9 +321,7 @@ mod tests {
     #[test]
     fn css_tab4_is_bit_reversal() {
         for i in 0u16..256 {
-            let expected = (0..8).fold(0u8, |acc, bit| {
-                acc | (((i as u8 >> bit) & 1) << (7 - bit))
-            });
+            let expected = (0..8).fold(0u8, |acc, bit| acc | (((i as u8 >> bit) & 1) << (7 - bit)));
             assert_eq!(
                 TAB4[i as usize], expected,
                 "TAB4[{:#04x}] = {:#04x}, expected {:#04x} (bit reversal)",
@@ -328,7 +332,8 @@ mod tests {
         for i in 0..256 {
             assert_eq!(
                 TAB4[TAB4[i] as usize], i as u8,
-                "TAB4 is not an involution at {:#04x}", i
+                "TAB4 is not an involution at {:#04x}",
+                i
             );
         }
     }
