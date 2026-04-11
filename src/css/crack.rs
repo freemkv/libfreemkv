@@ -98,7 +98,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
             let t4_perm = TAB5[t4 as usize];
 
             // Clock LFSR0 forward
-            let t6 = (((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7);
+            let t6 = ((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7;
             t3 = (t3 << 8) | (t6 & 0xFF);
             let t6_perm = TAB4[(t6 & 0xFF) as usize];
 
@@ -124,7 +124,7 @@ pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
             let mut found_j = false;
             for j in 0u32..256 {
                 t3 = (t3 & 0x1FFFF) | (j << 17);
-                let t6 = (((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7);
+                let t6 = ((((((t3 >> 8) ^ t3) >> 1) ^ t3) >> 3) ^ t3) >> 7;
                 if (t6 & 0xFF) == t1_byte {
                     found_j = true;
                     break;
