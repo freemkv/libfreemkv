@@ -815,9 +815,13 @@ pub fn aacs_authenticate(
             return Err(Error::AacsCertVerify);
         }
     } else if drive_cert[0] == 0x11 {
-        // AACS 2.0 certificate — verify with P-256 LA key
-        // Note: AACS 2.0 drives still accept AACS 1.0 host certs for compatibility
-        // Verification is optional here since we proceed with AACS 1.0 flow anyway
+        // AACS 2.0 certificate — verification intentionally skipped here.
+        // Reason: backward compatibility. AACS 2.0 drives accept AACS 1.0 host
+        // certs, so we proceed with the AACS 1.0 flow regardless. The P-256
+        // LA public key needed to verify 2.0 certs is not always available, and
+        // failing here would break handshakes with drives that work fine otherwise.
+        // The drive's identity is still authenticated through the ECDH key
+        // exchange and signature verification in step 6 below.
     }
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
@@ -954,9 +958,13 @@ fn aacs2_authenticate_p256(
     drive_nonce.copy_from_slice(&response[4..24]);
     let drive_cert = &response[24..156];
 
-    // Verify drive certificate with AACS 2.0 LA key
+    // Verify drive certificate with AACS 2.0 LA key.
+    // Verification failure is intentionally non-fatal: some drive firmware
+    // uses certificate formats that differ from the spec, and rejecting them
+    // would break otherwise working drives. The drive is still authenticated
+    // through the ECDH key exchange and P-256 signature verification below.
     if drive_cert[0] == 0x11 && !verify_cert_p256(drive_cert) {
-        // Non-fatal: some cert formats may differ
+        // Certificate verification failed but proceeding for backward compatibility.
     }
 
     // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
@@ -1056,8 +1064,8 @@ pub fn read_data_keys(
     enc_wdk.copy_from_slice(&response[20..36]);
 
     // Decrypt with bus key (AES-ECB)
-    let read_data_key = super::aes_ecb_decrypt(&auth.bus_key, &enc_rdk);
-    let write_data_key = super::aes_ecb_decrypt(&auth.bus_key, &enc_wdk);
+    let read_data_key = super::decrypt::aes_ecb_decrypt(&auth.bus_key, &enc_rdk);
+    let write_data_key = super::decrypt::aes_ecb_decrypt(&auth.bus_key, &enc_wdk);
 
     auth.read_data_key = Some(read_data_key);
     Ok((read_data_key, write_data_key))

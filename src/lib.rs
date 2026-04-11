@@ -68,24 +68,24 @@
 //! | E7xxx | AACS errors |
 
 pub mod aacs;
-pub mod clpi;
+pub(crate) mod clpi;
 pub mod css;
 pub mod disc;
 pub mod drive;
 pub mod error;
 pub mod event;
-pub mod identity;
-pub mod ifo;
+pub(crate) mod identity;
+pub(crate) mod ifo;
 pub mod keydb;
-pub mod labels;
-pub mod mpls;
+pub(crate) mod labels;
+pub(crate) mod mpls;
 pub mod mux;
-pub mod platform;
-pub mod profile;
+pub(crate) mod platform;
+pub(crate) mod profile;
 pub mod scsi;
-pub mod sector;
-pub mod speed;
-pub mod udf;
+pub(crate) mod sector;
+pub(crate) mod speed;
+pub(crate) mod udf;
 
 pub use drive::{find_drive, find_drives, resolve_device, DriveSession};
 pub use error::{Error, Result};
@@ -111,3 +111,4 @@ pub use mux::{open_input, open_output, parse_url, InputOptions};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;
+pub use udf::{read_filesystem, UdfFs};

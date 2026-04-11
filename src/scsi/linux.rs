@@ -55,8 +55,18 @@ impl SgIoTransport {
             )
         };
         if fd < 0 {
-            return Err(Error::DeviceNotFound {
-                path: device.display().to_string(),
+            let err = std::io::Error::last_os_error();
+            return Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
+                Error::DevicePermission {
+                    path: format!(
+                        "{}: permission denied (try running as root)",
+                        device.display()
+                    ),
+                }
+            } else {
+                Error::DeviceNotFound {
+                    path: device.display().to_string(),
+                }
             });
         }
         Ok(SgIoTransport { fd })

@@ -18,6 +18,9 @@ use std::path::Path;
 
 const SECTOR_SIZE: u64 = 2048;
 
+/// Maximum sectors to batch-read at once (64 sectors = 128 KB).
+const BATCH_SECTORS: usize = 64;
+
 /// File-backed sector reader for ISO images.
 pub struct IsoSectorReader {
     file: File,
@@ -63,7 +66,8 @@ pub struct IsoStream {
     extents: Vec<(u32, u32)>,
     extent_idx: usize,
     sectors_remaining: u32,
-    sector_buf: [u8; SECTOR_SIZE as usize],
+    /// Batch buffer: holds up to BATCH_SECTORS sectors (128 KB) at once.
+    batch_buf: Vec<u8>,
     buf_pos: usize,
     buf_len: usize,
     eof: bool,
@@ -107,7 +111,7 @@ impl IsoStream {
             extents,
             extent_idx: 0,
             sectors_remaining,
-            sector_buf: [0u8; SECTOR_SIZE as usize],
+            batch_buf: vec![0u8; BATCH_SECTORS * SECTOR_SIZE as usize],
             buf_pos: 0,
             buf_len: 0,
             eof: false,
@@ -130,7 +134,7 @@ impl IsoStream {
             extents: Vec::new(),
             extent_idx: 0,
             sectors_remaining: 0,
-            sector_buf: [0u8; SECTOR_SIZE as usize],
+            batch_buf: Vec::new(),
             buf_pos: 0,
             buf_len: 0,
             eof: false,
@@ -163,7 +167,8 @@ impl IsoStream {
         self.disc.as_ref()
     }
 
-    fn read_next_sector(&mut self) -> io::Result<bool> {
+    /// Read up to BATCH_SECTORS sectors at once into the batch buffer.
+    fn read_next_batch(&mut self) -> io::Result<bool> {
         let reader = match self.reader.as_mut() {
             Some(r) => r,
             None => return Ok(false),
@@ -177,13 +182,16 @@ impl IsoStream {
         let offset = total - self.sectors_remaining;
         let lba = start_lba + offset;
 
+        // Read up to BATCH_SECTORS, but no more than remaining in this extent
+        let count = (self.sectors_remaining as usize).min(BATCH_SECTORS) as u16;
+
         reader
-            .read_sectors(lba, 1, &mut self.sector_buf)
+            .read_sectors(lba, count, &mut self.batch_buf)
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.buf_pos = 0;
-        self.buf_len = SECTOR_SIZE as usize;
+        self.buf_len = count as usize * SECTOR_SIZE as usize;
 
-        self.sectors_remaining -= 1;
+        self.sectors_remaining -= count as u32;
         if self.sectors_remaining == 0 {
             self.extent_idx += 1;
             if self.extent_idx < self.extents.len() {
@@ -223,14 +231,14 @@ impl Read for IsoStream {
 
         if self.buf_pos < self.buf_len {
             let n = (self.buf_len - self.buf_pos).min(buf.len());
-            buf[..n].copy_from_slice(&self.sector_buf[self.buf_pos..self.buf_pos + n]);
+            buf[..n].copy_from_slice(&self.batch_buf[self.buf_pos..self.buf_pos + n]);
             self.buf_pos += n;
             return Ok(n);
         }
 
-        if self.read_next_sector()? {
+        if self.read_next_batch()? {
             let n = self.buf_len.min(buf.len());
-            buf[..n].copy_from_slice(&self.sector_buf[..n]);
+            buf[..n].copy_from_slice(&self.batch_buf[..n]);
             self.buf_pos = n;
             Ok(n)
         } else {

@@ -9,9 +9,8 @@
 
 use super::IOStream;
 use crate::disc::{
-    ContentFormat, Disc, DiscTitle, Extent,
-    MIN_BATCH_SECTORS, RAMP_BATCH_AFTER, RAMP_SPEED_AFTER,
-    SLOW_SPEED_AFTER, detect_max_batch_sectors,
+    detect_max_batch_sectors, ContentFormat, Disc, DiscTitle, Extent, MIN_BATCH_SECTORS,
+    RAMP_BATCH_AFTER, RAMP_SPEED_AFTER, SLOW_SPEED_AFTER,
 };
 use crate::drive::DriveSession;
 use crate::error::Error;
@@ -187,8 +186,7 @@ impl DiscStream {
                     if self.batch_sectors < self.max_batch_sectors
                         && self.ok_streak >= RAMP_BATCH_AFTER
                     {
-                        self.batch_sectors =
-                            (self.batch_sectors * 2).min(self.max_batch_sectors);
+                        self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
                         self.ok_streak = 0;
                     }
 
@@ -220,14 +218,12 @@ impl DiscStream {
                     }
 
                     if self.batch_sectors > MIN_BATCH_SECTORS {
-                        self.batch_sectors =
-                            (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
+                        self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     } else {
                         // At minimum batch -- retry once with longer pause
                         std::thread::sleep(std::time::Duration::from_millis(500));
-                        self.read_buf
-                            .resize(MIN_BATCH_SECTORS as usize * 2048, 0);
+                        self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
                         if self.read_sectors(lba, MIN_BATCH_SECTORS).is_ok() {
                             self.error_streak = 0;
                             self.current_offset += MIN_BATCH_SECTORS as u32;
@@ -243,8 +239,7 @@ impl DiscStream {
                             self.current_extent += 1;
                             self.current_offset = 0;
                         }
-                        self.read_buf
-                            .resize(crate::aacs::ALIGNED_UNIT_LEN, 0);
+                        self.read_buf.resize(crate::aacs::ALIGNED_UNIT_LEN, 0);
                         self.read_buf.fill(0);
                         return Ok(true);
                     }
@@ -283,8 +278,9 @@ impl DiscStream {
         }
         // No encryption: read_buf is already plaintext
 
-        self.batch_buf.clear();
-        self.batch_buf.extend_from_slice(&self.read_buf[..total_bytes]);
+        // Swap buffers instead of copying — the old batch_buf becomes
+        // read_buf and will be overwritten on the next read.
+        std::mem::swap(&mut self.batch_buf, &mut self.read_buf);
         self.batch_pos = 0;
     }
 }

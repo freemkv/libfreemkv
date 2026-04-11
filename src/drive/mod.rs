@@ -6,8 +6,10 @@
 //!   3. `init()` — activate custom firmware. Removes riplock.
 //!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
 
-#[cfg(unix)]
-mod unix;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -209,9 +211,13 @@ impl SectorReader for DriveSession {
 }
 
 pub fn find_drives() -> Vec<(String, DriveId)> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        unix::find_drives()
+        linux::find_drives()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::find_drives()
     }
     #[cfg(windows)]
     {
@@ -224,9 +230,13 @@ pub fn find_drive() -> Option<String> {
 }
 
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        unix::resolve_device(path)
+        linux::resolve_device(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::resolve_device(path)
     }
     #[cfg(windows)]
     {

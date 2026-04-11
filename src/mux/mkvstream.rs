@@ -333,10 +333,12 @@ fn begin_streaming(ws: &mut WriteState, dt: &DiscTitle) -> io::Result<()> {
     )?);
     ws.phase = WritePhase::Streaming;
 
-    // Re-parse buffered data through a fresh demuxer
+    // Re-parse buffered data through a fresh demuxer, then reset the main
+    // demuxer so stale PES assembler state from scanning doesn't cause
+    // duplicate or incomplete packets during streaming.
+    let pids: Vec<u16> = ws.pid_to_track.iter().map(|(pid, _)| *pid).collect();
     let buffered = ws.lookahead.drain();
     if !buffered.is_empty() {
-        let pids: Vec<u16> = ws.pid_to_track.iter().map(|(pid, _)| *pid).collect();
         let mut temp = TsDemuxer::new(&pids);
         let packets = temp.feed(&buffered);
         if let Some(ref mut muxer) = ws.muxer {
@@ -345,6 +347,7 @@ fn begin_streaming(ws: &mut WriteState, dt: &DiscTitle) -> io::Result<()> {
             }
         }
     }
+    ws.demuxer = TsDemuxer::new(&pids);
     Ok(())
 }
 

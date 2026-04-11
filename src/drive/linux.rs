@@ -1,4 +1,4 @@
-//! Unix (Linux/macOS) drive discovery and device resolution.
+//! Linux drive discovery and device resolution.
 
 use crate::error::{Error, Result};
 use crate::identity::DriveId;

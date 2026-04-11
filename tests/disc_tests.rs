@@ -1,7 +1,7 @@
 //! Disc scanning pipeline tests.
 
 use libfreemkv::error::Result;
-use libfreemkv::sector::SectorReader;
+use libfreemkv::SectorReader;
 use libfreemkv::{Disc, DiscTitle, ScanOptions};
 use std::collections::HashMap;
 

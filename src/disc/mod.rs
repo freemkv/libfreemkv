@@ -427,7 +427,7 @@ impl ScanOptions {
                 return Some(p.clone());
             }
         }
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             for relative in KEYDB_SEARCH_PATHS {
                 let p = std::path::PathBuf::from(&home).join(relative);
                 if p.exists() {

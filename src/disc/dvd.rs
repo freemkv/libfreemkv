@@ -87,7 +87,10 @@ impl Disc {
                     .iter()
                     .map(|cell| {
                         let start = ts.vob_start_sector.saturating_add(cell.first_sector);
-                        let count = cell.last_sector.saturating_sub(cell.first_sector).saturating_add(1);
+                        let count = cell
+                            .last_sector
+                            .saturating_sub(cell.first_sector)
+                            .saturating_add(1);
                         Extent {
                             start_lba: start,
                             sector_count: count,

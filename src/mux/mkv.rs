@@ -431,10 +431,10 @@ fn parse_resolution(s: &str) -> (u32, u32) {
 }
 
 fn parse_sample_rate(s: &str) -> f64 {
-    if s.contains("96") {
-        96000.0
-    } else if s.contains("192") {
+    if s.contains("192") {
         192000.0
+    } else if s.contains("96") {
+        96000.0
     } else {
         48000.0
     }
