@@ -104,8 +104,7 @@ fn validate_file_path(path: &str, scheme: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{}:// requires a file path (e.g. {}://movie.{})",
-                scheme, scheme, scheme
+                "{scheme}:// requires a file path (e.g. {scheme}://movie.{scheme})"
             ),
         ));
     }
@@ -114,8 +113,7 @@ fn validate_file_path(path: &str, scheme: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{}://{} is not a valid file path — must include a filename",
-                scheme, path
+                "{scheme}://{path} is not a valid file path — must include a filename"
             ),
         ));
     }
@@ -134,8 +132,7 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "network://{} missing port — use network://{}:PORT",
-                addr, addr
+                "network://{addr} missing port — use network://{addr}:PORT"
             ),
         ));
     }

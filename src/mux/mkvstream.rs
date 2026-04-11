@@ -512,7 +512,7 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
         "S_VOBSUB" => Codec::DvdSub,
         _ => Codec::Unknown(0),
     };
-    let res = format!("{}p", ph);
+    let res = format!("{ph}p");
     let chs: String = match ch {
         8 => "7.1",
         6 => "5.1",

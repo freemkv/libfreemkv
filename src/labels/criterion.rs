@@ -174,8 +174,8 @@ fn parse_playback_config(xml: &str, map: &mut HashMap<String, u16>) {
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
     Some(xml[start..end].trim().to_string())

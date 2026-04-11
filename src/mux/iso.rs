@@ -30,7 +30,7 @@ pub struct IsoSectorReader {
 impl IsoSectorReader {
     pub fn open(path: &str) -> io::Result<Self> {
         let file = File::open(Path::new(path))
-            .map_err(|e| io::Error::new(e.kind(), format!("iso://{}: {}", path, e)))?;
+            .map_err(|e| io::Error::new(e.kind(), format!("iso://{path}: {e}")))?;
         let size = file.metadata()?.len();
         let capacity = (size / SECTOR_SIZE) as u32;
         Ok(Self { file, capacity })
@@ -123,7 +123,7 @@ impl IsoStream {
     /// Create an ISO file for writing.
     pub fn create(path: &str) -> io::Result<Self> {
         let file = File::create(Path::new(path))
-            .map_err(|e| io::Error::new(e.kind(), format!("iso://{}: {}", path, e)))?;
+            .map_err(|e| io::Error::new(e.kind(), format!("iso://{path}: {e}")))?;
         let buf_writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
         let iso_writer = IsoWriter::new(buf_writer, "FREEMKV", "00001.m2ts");
 

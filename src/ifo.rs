@@ -265,7 +265,7 @@ fn parse_vts(
     vts_number: u8,
     titles_info: &[(u16, u8)],
 ) -> Result<DvdTitleSet> {
-    let path = format!("/VIDEO_TS/VTS_{:02}_0.IFO", vts_number);
+    let path = format!("/VIDEO_TS/VTS_{vts_number:02}_0.IFO");
     let vts_data = udf.read_file(reader, &path)?;
 
     // Validate VTS magic

@@ -288,7 +288,7 @@ impl UdfFs {
 
             let raw_len = u32::from_le_bytes([icb[off], icb[off + 1], icb[off + 2], icb[off + 3]]);
             let extent_type = raw_len >> 30;
-            let data_len = raw_len & 0x3FFFFFFF;
+            let data_len = raw_len & 0x3FFF_FFFF;
             let data_lba =
                 u32::from_le_bytes([icb[off + 4], icb[off + 5], icb[off + 6], icb[off + 7]]);
 
@@ -455,7 +455,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
                         meta_icb[ad_off + 1],
                         meta_icb[ad_off + 2],
                         meta_icb[ad_off + 3],
-                    ]) & 0x3FFFFFFF;
+                    ]) & 0x3FFF_FFFF;
                     metadata_size_bytes = ad_len;
                     let ad_pos = u32::from_le_bytes([
                         meta_icb[ad_off + 4],
@@ -543,7 +543,7 @@ fn read_directory(
                 icb[ad_off + 1],
                 icb[ad_off + 2],
                 icb[ad_off + 3],
-            ]) & 0x3FFFFFFF;
+            ]) & 0x3FFF_FFFF;
             let pos = u32::from_le_bytes([
                 icb[ad_off + 4],
                 icb[ad_off + 5],
@@ -565,7 +565,7 @@ fn read_directory(
                 icb[ad_off + 1],
                 icb[ad_off + 2],
                 icb[ad_off + 3],
-            ]) & 0x3FFFFFFF;
+            ]) & 0x3FFF_FFFF;
             let pos = u32::from_le_bytes([
                 icb[ad_off + 4],
                 icb[ad_off + 5],

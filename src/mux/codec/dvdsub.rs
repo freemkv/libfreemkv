@@ -87,7 +87,7 @@ pub fn format_palette(palette: &[[u8; 4]]) -> Vec<u8> {
     let mut parts: Vec<String> = Vec::with_capacity(palette.len());
     for color in palette {
         let [r, g, b] = ycbcr_to_rgb(color);
-        parts.push(format!("{:02x}{:02x}{:02x}", r, g, b));
+        parts.push(format!("{r:02x}{g:02x}{b:02x}"));
     }
     let line = format!("palette: {}\n", parts.join(", "));
     line.into_bytes()
