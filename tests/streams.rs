@@ -70,17 +70,87 @@ fn parse_url_network() {
 }
 
 #[test]
-fn parse_url_bare_mkv() {
+fn parse_url_bare_path_rejected() {
     let u = parse_url("Dune.mkv");
-    assert_eq!(u.scheme, "mkv");
-    assert_eq!(u.path, "Dune.mkv");
+    assert_eq!(u.scheme, "unknown");
 }
 
 #[test]
-fn parse_url_bare_m2ts() {
-    let u = parse_url("Dune.m2ts");
+fn parse_url_null() {
+    let u = parse_url("null://");
+    assert_eq!(u.scheme, "null");
+    assert_eq!(u.path, "");
+}
+
+#[test]
+fn parse_url_m2ts_with_path() {
+    let u = parse_url("m2ts:///tmp/Dune.m2ts");
+    assert_eq!(u.scheme, "m2ts");
+    assert_eq!(u.path, "/tmp/Dune.m2ts");
+}
+
+#[test]
+fn parse_url_m2ts_relative() {
+    let u = parse_url("m2ts://Dune.m2ts");
     assert_eq!(u.scheme, "m2ts");
     assert_eq!(u.path, "Dune.m2ts");
+}
+
+#[test]
+fn open_input_bare_path_errors() {
+    let result = libfreemkv::open_input("Dune.mkv", &libfreemkv::InputOptions::default());
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
+}
+
+#[test]
+fn open_output_bare_path_errors() {
+    let dt = sample_disc_title();
+    let result = libfreemkv::open_output("Dune.mkv", &dt);
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
+}
+
+#[test]
+fn open_input_m2ts_empty_path_errors() {
+    let result = libfreemkv::open_input("m2ts://", &libfreemkv::InputOptions::default());
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("requires a file path"), "got: {}", msg);
+}
+
+#[test]
+fn open_output_null_input_errors() {
+    let result = libfreemkv::open_input("null://", &libfreemkv::InputOptions::default());
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("write-only"), "got: {}", msg);
+}
+
+#[test]
+fn open_output_disc_errors() {
+    let dt = sample_disc_title();
+    let result = libfreemkv::open_output("disc://", &dt);
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("read-only"), "got: {}", msg);
+}
+
+#[test]
+fn open_input_network_no_port_errors() {
+    let result = libfreemkv::open_input("network://10.0.0.1", &libfreemkv::InputOptions::default());
+    assert!(result.is_err());
+    let msg = match result { Err(e) => e.to_string(), Ok(_) => panic!("expected error") };
+    assert!(msg.contains("missing port"), "got: {}", msg);
+}
+
+#[test]
+fn parse_url_stdio() {
+    let u = parse_url("stdio://");
+    assert_eq!(u.scheme, "stdio");
+    assert_eq!(u.path, "");
 }
 
 // ── M2TS metadata roundtrip ───────────────────────────────────

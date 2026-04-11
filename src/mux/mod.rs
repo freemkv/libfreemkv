@@ -6,6 +6,8 @@
 //! freemkv disc:// mkv://Dune.mkv
 //! freemkv m2ts://Dune.m2ts mkv://Dune.mkv
 //! freemkv disc:// network://10.1.7.11:9000
+//! freemkv disc:// stdio://
+//! freemkv stdio:// mkv://Dune.mkv
 //! ```
 //!
 //! Streams implement `IOStream` for uniform handling:
@@ -28,6 +30,8 @@ mod mkvstream;
 pub mod network;
 pub mod disc;
 pub mod null;
+pub mod stdio;
+pub mod iso;
 pub mod resolve;
 
 pub use m2ts::M2tsStream;
@@ -35,6 +39,8 @@ pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use disc::{DiscStream, DiscOptions};
 pub use null::NullStream;
+pub use stdio::StdioStream;
+pub use iso::IsoStream;
 pub use resolve::{open_input, open_output, parse_url, InputOptions, StreamUrl};
 
 use std::io::{self, Read, Write, Seek};

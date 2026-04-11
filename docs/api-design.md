@@ -148,27 +148,64 @@ pub enum Error {
 
 App maps codes to localized strings. Lib never contains display text.
 
-## Streams the Lib Provides
+## Streams
 
-| Stream | Purpose |
-|--------|---------|
-| MkvStream | BD-TS → MKV (demux + mux) |
+All streams implement the `IOStream` trait (Read + Write). URL-based resolver opens any stream by string.
 
-CLI provides:
-| Stream | Purpose |
-|--------|---------|
-| ProgressStream | Byte counting + progress callback |
-| Future: TranscodeStream | Re-encode video |
+| Stream | Input | Output | URL | Transport |
+|--------|-------|--------|-----|-----------|
+| DiscStream | Yes | -- | `disc://` `disc:///dev/sg4` | Optical drive via SCSI |
+| IsoStream | Yes | -- | `iso://path.iso` | Blu-ray ISO image |
+| MkvStream | Yes | Yes | `mkv://path` | Matroska container |
+| M2tsStream | Yes | Yes | `m2ts://path` | BD-TS with FMKV metadata header |
+| NetworkStream | Yes (listen) | Yes (connect) | `network://host:port` | TCP with FMKV metadata header |
+| StdioStream | Yes (stdin) | Yes (stdout) | `stdio://` | Raw byte pipe |
+| NullStream | -- | Yes | `null://` | Discard sink (byte counter) |
 
-Any `impl Write` works as a stream. Third-party apps create their own.
+All URLs require a `scheme://path` format. Bare paths are rejected.
 
-## MkvStream Internals
+```rust
+// URL-based opening
+let input = open_input("disc://", &opts)?;                   // DiscStream (auto-detect)
+let input = open_input("disc:///dev/sg4", &opts)?;           // DiscStream (specific device)
+let input = open_input("iso://Dune.iso", &opts)?;            // IsoStream
+let input = open_input("m2ts:///tmp/Dune.m2ts", &opts)?;     // M2tsStream
+let input = open_input("mkv://Dune.mkv", &opts)?;            // MkvStream
+let input = open_input("network://0.0.0.0:9000", &opts)?;    // NetworkStream (listen)
+let input = open_input("stdio://", &opts)?;                   // StdioStream (stdin)
+
+let output = open_output("mkv://Dune.mkv", &meta)?;          // MkvStream
+let output = open_output("m2ts://Dune.m2ts", &meta)?;        // M2tsStream
+let output = open_output("network://10.1.7.11:9000", &meta)?;// NetworkStream (connect)
+let output = open_output("stdio://", &meta)?;                 // StdioStream (stdout)
+let output = open_output("null://", &meta)?;                  // NullStream
+
+// Direct construction (for advanced use)
+let mkv = MkvStream::new(writer).meta(&title).max_buffer(10 * 1024 * 1024);
+let m2ts = M2tsStream::new(writer).meta(&title);
+let net = NetworkStream::connect("10.1.7.11:9000")?.meta(&title);
+let null = NullStream::new().meta(&title);
+```
+
+### FMKV Metadata Header
+
+M2tsStream and NetworkStream embed a JSON metadata header before the BD-TS data:
+
+```
+[8B magic "FMKV\0\0\0\0"][4B JSON length][JSON metadata][padding to 192B boundary][BD-TS data...]
+```
+
+The header carries title name, duration, and full stream layout (PIDs, codecs, languages, labels). This allows the receiving end to set up demuxing and track metadata without scanning the TS.
+
+### MkvStream Internals
 
 LookaheadBuffer (default 5MB, configurable):
 1. Phase 1: buffer incoming data, scan for codec setup (SPS/PPS)
 2. Found it? Write MKV header, flush buffer, switch to streaming
 3. Buffer full? Error — app handles it
 4. Phase 2: parse TS → frames → MKV clusters, direct to output
+
+Reading: extracts MKV frames, wraps back into BD-TS PES packets.
 
 ## File Layout
 
@@ -186,18 +223,31 @@ libfreemkv/src/
 ├── mpls.rs             Playlist parser
 ├── clpi.rs             Clip info parser
 ├── mux/
-│   ├── stream.rs       MkvStream (builder pattern, impl Write)
-│   ├── lookahead.rs    LookaheadBuffer (generic, reusable)
-│   ├── ts.rs           BD-TS demuxer
-│   ├── ebml.rs         EBML primitives
-│   ├── mkv.rs          MKV muxer
-│   └── codec/          Frame parsers (H.264, HEVC, VC-1, AC3, DTS, TrueHD, PGS)
+│   ├── mod.rs          IOStream trait, public exports
+│   ├── resolve.rs      URL parser + open_input/open_output
+│   ├── meta.rs         M2tsMeta (FMKV header format)
+│   ├── disc.rs         DiscStream (optical drive)
+│   ├── mkvstream.rs    MkvStream (bidirectional Matroska)
+│   ├── m2ts.rs         M2tsStream (BD-TS + FMKV header)
+│   ├── network.rs      NetworkStream (TCP + FMKV header)
+│   ├── stdio.rs        StdioStream (stdin/stdout pipe)
+│   ├── iso.rs          IsoStream (Blu-ray ISO image)
+│   ├── null.rs         NullStream (discard + byte counter)
+│   ├── lookahead.rs    LookaheadBuffer (codec header scanning)
+│   ├── ts.rs           BD-TS demuxer + PAT/PMT scanner
+│   ├── ebml.rs         EBML read/write primitives
+│   ├── mkv.rs          MKV muxer (tracks, clusters, cues)
+│   └── codec/          Frame parsers (H.264, HEVC, VC-1, AC3, DTS, TrueHD, PGS, LPCM)
 └── ...
 
 freemkv/src/
-├── main.rs             CLI entry, command routing
-├── rip.rs              Rip command (streams + progress)
-├── remux.rs            Remux command (m2ts → MKV, no drive)
-├── info.rs             Drive info display
-└── disc_info.rs        Disc info display
+├── main.rs             CLI dispatcher (URL routing)
+├── pipe.rs             Generic source → dest copy
+├── rip.rs              Rip with progress display
+├── remux.rs            Remux with progress display
+├── disc_info.rs        Disc info display
+├── info.rs             Drive info + profile submission
+├── strings.rs          i18n string table
+├── output.rs           Verbosity-filtered output
+└── build.rs            Bundled locale code generation
 ```
