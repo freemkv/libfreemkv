@@ -78,7 +78,7 @@ impl PsDemuxer {
 
     /// Scan the buffer for complete start-code-delimited units and parse them.
     fn extract_packets(&mut self) -> Vec<PsPacket> {
-        let mut packets = Vec::new();
+        let mut packets = Vec::with_capacity(4);
         let mut pos = 0;
 
         loop {

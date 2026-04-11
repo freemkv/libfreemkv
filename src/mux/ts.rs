@@ -122,7 +122,7 @@ impl TsDemuxer {
     /// Feed a chunk of BD transport stream data. Handles non-192-byte-aligned input
     /// by buffering leftover bytes between calls. Returns completed PES packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
-        let mut completed = Vec::new();
+        let mut completed = Vec::with_capacity(4);
 
         // Prepend any remainder from previous call
         let work: &[u8];

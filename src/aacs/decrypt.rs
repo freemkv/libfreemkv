@@ -35,7 +35,7 @@ pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 }
 
 /// AES-128-ECB decrypt a single 16-byte block.
-pub fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
+pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut block = GenericArray::clone_from_slice(data);
     cipher.decrypt_block(&mut block);

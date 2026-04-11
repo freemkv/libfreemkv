@@ -1,8 +1,7 @@
 //! UDF parser tests using a MockSectorReader.
 
 use libfreemkv::error::Result;
-use libfreemkv::sector::SectorReader;
-use libfreemkv::udf;
+use libfreemkv::{read_filesystem, SectorReader};
 use std::collections::HashMap;
 
 const SECTOR_SIZE: usize = 2048;
@@ -254,7 +253,7 @@ fn mock_sector_reader_multi_sector() {
 fn read_filesystem_no_avdp() {
     // Empty reader — sector 256 is all zeros, tag_id=0 != 2
     let mut reader = MockSectorReader::new();
-    let result = udf::read_filesystem(&mut reader);
+    let result = read_filesystem(&mut reader);
     assert!(result.is_err(), "should fail when no AVDP at sector 256");
 }
 
@@ -266,7 +265,7 @@ fn read_filesystem_bad_avdp_tag() {
     bad[0..2].copy_from_slice(&99u16.to_le_bytes()); // tag_id=99, not 2
     reader.set_sector(256, bad);
 
-    let result = udf::read_filesystem(&mut reader);
+    let result = read_filesystem(&mut reader);
     assert!(result.is_err(), "should fail when AVDP tag_id is not 2");
 }
 
@@ -278,7 +277,7 @@ fn read_filesystem_no_partition_descriptor() {
     // Put a terminator immediately at sector 32
     reader.set_sector(32, make_terminator());
 
-    let result = udf::read_filesystem(&mut reader);
+    let result = read_filesystem(&mut reader);
     assert!(
         result.is_err(),
         "should fail when no partition descriptor in VDS"
@@ -299,7 +298,7 @@ fn read_filesystem_bad_fsd_tag() {
     // With 1 partition map, metadata_start = partition_start.
     // FSD should be at sector partition_start but we leave it as zeros (tag_id=0 != 256).
 
-    let result = udf::read_filesystem(&mut reader);
+    let result = read_filesystem(&mut reader);
     assert!(result.is_err(), "should fail when FSD tag_id is not 256");
 }
 
@@ -335,7 +334,7 @@ fn read_filesystem_minimal_valid() {
     // Root directory data: just a parent FID (empty directory)
     reader.set_sector_partial(partition_start + root_data_meta_lba, &parent_fid);
 
-    let fs = udf::read_filesystem(&mut reader).expect("should parse minimal UDF");
+    let fs = read_filesystem(&mut reader).expect("should parse minimal UDF");
     assert_eq!(fs.volume_id, "MY_DISC");
     assert!(fs.root.is_dir);
     assert!(fs.root.entries.is_empty(), "root should have no children");
@@ -390,7 +389,7 @@ fn read_filesystem_with_subdirectory() {
     // test.mpls file ICB (File Entry tag 261)
     reader.set_sector(partition_start + 5, make_file_icb(10, 1024, 1024));
 
-    let fs = udf::read_filesystem(&mut reader).expect("should parse UDF with subdir");
+    let fs = read_filesystem(&mut reader).expect("should parse UDF with subdir");
     assert_eq!(fs.volume_id, "DISC_WITH_BDMV");
 
     // Root should have one child: BDMV
@@ -440,7 +439,7 @@ fn find_dir_case_insensitive() {
     );
     reader.set_sector_partial(partition_start + 6, &playlist_data);
 
-    let fs = udf::read_filesystem(&mut reader).expect("should parse");
+    let fs = read_filesystem(&mut reader).expect("should parse");
 
     // Exact case
     assert!(fs.find_dir("BDMV/PLAYLIST").is_some());

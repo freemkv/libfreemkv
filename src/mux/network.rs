@@ -1,5 +1,8 @@
 //! NetworkStream — BD-TS over TCP with embedded metadata.
 //!
+//! **Security:** Data is transmitted over plain TCP with no encryption.
+//! Use only on trusted networks (LAN). TLS support is planned.
+//!
 //! Write side (sender): connects to a listener, sends FMKV header + BD-TS data.
 //! Read side (receiver): listens for a connection, reads FMKV header + BD-TS data.
 //!

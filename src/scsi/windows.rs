@@ -88,6 +88,10 @@ pub struct SptiTransport {
 }
 
 /// Normalize a device path to Windows \\.\X: format.
+///
+/// NOTE: A near-identical `normalize_path` exists in `drive::windows`.
+/// Both are kept because they live in separate `cfg(windows)` modules that
+/// cannot easily share a helper without introducing cross-module coupling.
 fn normalize_device_path(path: &str) -> String {
     if path.starts_with("\\\\.\\") {
         return path.to_string();
@@ -150,6 +154,12 @@ impl ScsiTransport for SptiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        // Zero the data buffer for reads to prevent returning uninitialized data
+        // if the driver doesn't fully update DataTransferLength.
+        if direction == DataDirection::FromDevice {
+            data.fill(0);
+        }
+
         let mut sptwb: SptwbDirect = unsafe { std::mem::zeroed() };
 
         let cdb_len = cdb.len().min(K_MAX_CDB_SIZE);
