@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.2 (2026-04-11)
+
+### Windows support
+
+- **SPTI backend** (`scsi/windows.rs`) — SCSI_PASS_THROUGH_DIRECT via DeviceIoControl
+- **Windows drive discovery** (`drive/windows.rs`) — scans CdRom0-15 + drive letters
+- **Platform file separation** — `drive/unix.rs` and `drive/windows.rs`, no inline cfg branches
+- **CI** — `cargo check` on windows-latest, actions/checkout@v5
+
+### Test suite
+
+- **177 tests** (was 64) — MPLS, CLPI, H.264, HEVC, AC3, VC1, DTS, TrueHd, PGS, EBML, UDF, disc scanning, streams
+- **FEATURES.md** created
+
+### Improvements
+
+- **Stable download URLs** — `/latest/download/freemkv-x86_64-unknown-linux-musl.tar.gz` works forever
+
 ## 0.7.1 (2026-04-11)
 
 ### SectorReader trait
