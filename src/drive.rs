@@ -168,20 +168,25 @@ impl SectorReader for DriveSession {
 }
 
 pub fn find_drives() -> Vec<(String, DriveId)> {
-    let mut drives = Vec::new();
-    for i in 0..16 {
-        let path = format!("/dev/sg{}", i);
-        if !std::path::Path::new(&path).exists() { continue; }
-        if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
-            if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                // Include all optical drives (peripheral device type 0x05)
-                if id.raw_inquiry.len() > 0 && (id.raw_inquiry[0] & 0x1F) == 0x05 {
-                    drives.push((path, id));
+    #[cfg(target_os = "windows")]
+    { crate::scsi::windows::find_drives() }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut drives = Vec::new();
+        for i in 0..16 {
+            let path = format!("/dev/sg{}", i);
+            if !std::path::Path::new(&path).exists() { continue; }
+            if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
+                if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
+                    if id.raw_inquiry.len() > 0 && (id.raw_inquiry[0] & 0x1F) == 0x05 {
+                        drives.push((path, id));
+                    }
                 }
             }
         }
+        drives
     }
-    drives
 }
 
 pub fn find_drive() -> Option<String> {
@@ -189,6 +194,13 @@ pub fn find_drive() -> Option<String> {
 }
 
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
+    // Windows: drive letters, CdRom paths, UNC paths — pass through directly
+    #[cfg(target_os = "windows")]
+    {
+        return Ok((crate::scsi::windows::normalize_device_path(path), None));
+    }
+
+    #[cfg(not(target_os = "windows"))]
     if path.contains("/sg") {
         if !std::path::Path::new(path).exists() {
             return Err(Error::DeviceNotFound { path: path.to_string() });

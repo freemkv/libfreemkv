@@ -114,7 +114,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 |----------|--------|---------|
 | Linux | Supported | SG_IO ioctl |
 | macOS | Supported | IOKit SCSITask |
-| Windows | Planned | SPTI |
+| Windows | Supported | SPTI |
 
 ## Contributing
 
