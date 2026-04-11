@@ -41,3 +41,48 @@ impl Read for NullStream {
         Err(io::Error::new(io::ErrorKind::Unsupported, "null stream is write-only"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn null_counts_bytes() {
+        let mut ns = NullStream::new();
+        assert_eq!(ns.bytes_written(), 0);
+        ns.write_all(&[0u8; 100]).unwrap();
+        assert_eq!(ns.bytes_written(), 100);
+        ns.write_all(&[1u8; 50]).unwrap();
+        assert_eq!(ns.bytes_written(), 150);
+        // Single write returns correct count
+        let n = ns.write(&[0u8; 200]).unwrap();
+        assert_eq!(n, 200);
+        assert_eq!(ns.bytes_written(), 350);
+    }
+
+    #[test]
+    fn null_read_errors() {
+        let mut ns = NullStream::new();
+        let mut buf = [0u8; 10];
+        let err = ns.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn null_finish_ok() {
+        let mut ns = NullStream::new();
+        ns.write_all(&[0u8; 1000]).unwrap();
+        ns.finish().unwrap();
+    }
+
+    #[test]
+    fn null_implements_iostream() {
+        let ns = NullStream::new();
+        let mut boxed: Box<dyn IOStream> = Box::new(ns);
+        boxed.write_all(&[0u8; 50]).unwrap();
+        let info = boxed.info();
+        assert_eq!(info.streams.len(), 0);
+        boxed.finish().unwrap();
+    }
+}

@@ -189,3 +189,253 @@ pub fn skip_start_code(data: &[u8], pos: usize) -> Option<usize> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::ts::PesPacket;
+
+    fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
+        PesPacket { pid: 0x1011, pts, dts: None, data }
+    }
+
+    // --- find_start_code tests ---
+
+    #[test]
+    fn find_start_code_3byte() {
+        let data = [0x00, 0x00, 0x01, 0x65];
+        assert_eq!(find_start_code(&data, 0), Some(0));
+    }
+
+    #[test]
+    fn find_start_code_4byte() {
+        let data = [0x00, 0x00, 0x00, 0x01, 0x65];
+        // find_start_code looks for 00 00 01 pattern, which starts at offset 1 in a 4-byte start code
+        assert_eq!(find_start_code(&data, 0), Some(1));
+    }
+
+    #[test]
+    fn find_start_code_offset() {
+        let data = [0xFF, 0xFF, 0x00, 0x00, 0x01, 0x09];
+        assert_eq!(find_start_code(&data, 0), Some(2));
+    }
+
+    #[test]
+    fn find_start_code_none() {
+        let data = [0x00, 0x00, 0x00, 0x00];
+        assert_eq!(find_start_code(&data, 0), None);
+    }
+
+    #[test]
+    fn find_start_code_too_short() {
+        let data = [0x00, 0x00];
+        assert_eq!(find_start_code(&data, 0), None);
+    }
+
+    // --- parse SPS+PPS → codec_private ---
+
+    #[test]
+    fn parse_sps_pps() {
+        let mut parser = H264Parser::new();
+
+        // Build PES with SPS (type 7) + PPS (type 8) + IDR slice (type 5)
+        // SPS NAL: 0x67 = 0_11_00111 (nal_type = 7), followed by profile/compat/level + payload
+        // PPS NAL: 0x68 = 0_11_01000 (nal_type = 8)
+        let mut data = Vec::new();
+        // SPS: 00 00 01 [67 42 00 1E <payload>]
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x67); // SPS
+        data.extend_from_slice(&[0x42, 0x00, 0x1E, 0xAB, 0xCD]); // profile=0x42, compat=0x00, level=0x1E
+        // PPS: 00 00 01 [68 <payload>]
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x68); // PPS
+        data.extend_from_slice(&[0xCE, 0x01]);
+        // IDR slice: 00 00 01 [65 <payload>]
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x65); // IDR
+        data.extend_from_slice(&[0x88, 0x00, 0x10]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        // codec_private should now be available
+        let cp = parser.codec_private();
+        assert!(cp.is_some(), "codec_private should be Some after seeing SPS+PPS");
+        let cp = cp.unwrap();
+
+        // AVCDecoderConfigurationRecord checks
+        assert_eq!(cp[0], 1, "configurationVersion");
+        assert_eq!(cp[1], 0x42, "profile from SPS[1]");
+        assert_eq!(cp[2], 0x00, "compatibility from SPS[2]");
+        assert_eq!(cp[3], 0x1E, "level from SPS[3]");
+        assert_eq!(cp[4], 0xFF, "reserved + lengthSizeMinusOne=3");
+        assert_eq!(cp[5], 0xE1, "reserved + numSPS=1");
+
+        // Frames should have been produced
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn codec_private_none_before_sps_pps() {
+        let parser = H264Parser::new();
+        assert!(parser.codec_private().is_none());
+    }
+
+    // --- IDR keyframe detection ---
+
+    #[test]
+    fn parse_idr_keyframe() {
+        let mut parser = H264Parser::new();
+
+        // PES with IDR NAL (type 5 = 0x65)
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x65); // IDR slice (nal_type = 5)
+        data.extend_from_slice(&[0x88, 0x00, 0x10, 0x20]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "IDR slice should be detected as keyframe");
+    }
+
+    // --- non-IDR → not keyframe ---
+
+    #[test]
+    fn parse_non_idr() {
+        let mut parser = H264Parser::new();
+
+        // PES with non-IDR slice (type 1 = 0x61 or 0x41)
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x41); // non-IDR coded slice (nal_type = 1)
+        data.extend_from_slice(&[0x9A, 0x00, 0x10]);
+
+        let pes = make_pes(data, Some(180000));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].keyframe, "non-IDR slice should not be keyframe");
+    }
+
+    // --- length prefix conversion ---
+
+    #[test]
+    fn length_prefix_conversion() {
+        let mut parser = H264Parser::new();
+
+        // PES with a single non-IDR NAL
+        let nal_payload = [0x41, 0xAA, 0xBB, 0xCC, 0xDD]; // type 1, 5 bytes
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&nal_payload);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        let frame_data = &frames[0].data;
+
+        // Should start with 4-byte big-endian length prefix
+        assert!(frame_data.len() >= 4, "frame data should have length prefix");
+        let length = u32::from_be_bytes([frame_data[0], frame_data[1], frame_data[2], frame_data[3]]);
+        assert_eq!(length as usize, nal_payload.len(), "length prefix should match NAL size");
+
+        // Followed by the NAL data itself
+        assert_eq!(&frame_data[4..], &nal_payload);
+
+        // No start code (00 00 01) should appear in the output
+        for i in 0..frame_data.len().saturating_sub(2) {
+            let is_sc = frame_data[i] == 0x00 && frame_data[i + 1] == 0x00 && frame_data[i + 2] == 0x01;
+            assert!(!is_sc, "output should not contain Annex B start codes");
+        }
+    }
+
+    // --- SPS/PPS/AUD are stripped from frame data ---
+
+    #[test]
+    fn sps_pps_aud_stripped_from_frame_data() {
+        let mut parser = H264Parser::new();
+
+        let mut data = Vec::new();
+        // AUD (type 9)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x09);
+        data.push(0xF0);
+        // SPS (type 7)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x67);
+        data.extend_from_slice(&[0x42, 0x00, 0x1E, 0xAB]);
+        // PPS (type 8)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x68);
+        data.extend_from_slice(&[0xCE, 0x01]);
+        // IDR (type 5) - only this should appear in frame data
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x65);
+        data.extend_from_slice(&[0x88, 0x00]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+
+        // Frame data should only contain the IDR NAL (length-prefixed)
+        let fd = &frames[0].data;
+        let length = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]);
+        // IDR NAL is 0x65, 0x88 (trailing 0x00 is stripped as potential start code prefix)
+        assert_eq!(length, 2);
+        assert_eq!(fd[4], 0x65); // IDR NAL type byte
+    }
+
+    // --- PTS conversion ---
+
+    #[test]
+    fn pts_conversion() {
+        let mut parser = H264Parser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x41);
+        data.extend_from_slice(&[0x00, 0x10]);
+
+        // PTS = 90000 (1 second at 90kHz) → 1_000_000_000 ns
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    // --- empty PES ---
+
+    #[test]
+    fn parse_empty_pes() {
+        let mut parser = H264Parser::new();
+        let pes = make_pes(Vec::new(), Some(0));
+        let frames = parser.parse(&pes);
+        assert!(frames.is_empty());
+    }
+
+    // --- DTS preferred over PTS when present ---
+
+    #[test]
+    fn dts_preferred_over_pts() {
+        let mut parser = H264Parser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x41);
+        data.extend_from_slice(&[0x00, 0x10]);
+
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: Some(180000),  // 2 seconds
+            dts: Some(90000),   // 1 second
+            data,
+        };
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        // DTS should be used, not PTS
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+}
