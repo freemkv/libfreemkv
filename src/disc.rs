@@ -11,6 +11,7 @@
 use crate::clpi;
 use crate::drive::DriveSession;
 use crate::error::{Error, Result};
+use crate::ifo;
 use crate::mpls;
 use crate::sector::SectorReader;
 use crate::speed::DriveSpeed;
@@ -43,6 +44,17 @@ pub struct Disc {
     pub css: Option<crate::css::CssState>,
     /// Whether this disc requires decryption (AACS or CSS)
     pub encrypted: bool,
+    /// Content format (BD transport stream vs DVD program stream)
+    pub content_format: ContentFormat,
+}
+
+/// Content format — determines how sectors are interpreted downstream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContentFormat {
+    /// Blu-ray BD Transport Stream (192-byte packets)
+    BdTs,
+    /// DVD MPEG-2 Program Stream (VOB)
+    MpegPs,
 }
 
 /// Disc format.
@@ -97,6 +109,8 @@ pub struct DiscTitle {
     pub streams: Vec<Stream>,
     /// Sector extents for ripping (clip LBA ranges)
     pub extents: Vec<Extent>,
+    /// Content format for this title
+    pub content_format: ContentFormat,
 }
 
 /// A clip reference within a title.
@@ -292,6 +306,7 @@ impl DiscTitle {
             clips: Vec::new(),
             streams: Vec::new(),
             extents: Vec::new(),
+            content_format: ContentFormat::BdTs,
         }
     }
 
@@ -550,22 +565,14 @@ impl Disc {
             None
         };
 
-        // 3. Playlists
-        let mut titles = Vec::new();
-        if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
-            for entry in &playlist_dir.entries {
-                if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
-                    let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
-                        if let Some(title) =
-                            Self::parse_playlist(reader, &udf_fs, &entry.name, &mpls_data)
-                        {
-                            titles.push(title);
-                        }
-                    }
-                }
-            }
-        }
+        // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)
+        let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
+            (Self::scan_bluray_titles(reader, &udf_fs), ContentFormat::BdTs)
+        } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
+            (Self::scan_dvd_titles(reader, &udf_fs), ContentFormat::MpegPs)
+        } else {
+            (Vec::new(), ContentFormat::BdTs)
+        };
         titles.sort_by(|a, b| {
             b.duration_secs
                 .partial_cmp(&a.duration_secs)
@@ -581,9 +588,8 @@ impl Disc {
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = DiscRegion::Free;
 
-        // 6. CSS detection for DVDs (VIDEO_TS directory = DVD structure)
-        let is_dvd = udf_fs.find_dir("/VIDEO_TS").is_some();
-        let css = if is_dvd && !titles.is_empty() {
+        // 6. CSS detection for DVDs
+        let css = if content_format == ContentFormat::MpegPs && !titles.is_empty() {
             crate::css::crack_key(reader, &titles[0].extents)
         } else {
             None
@@ -602,6 +608,7 @@ impl Disc {
             aacs,
             css,
             encrypted,
+            content_format,
         })
     }
 
@@ -937,7 +944,138 @@ impl Disc {
             clips,
             streams,
             extents,
+            content_format: ContentFormat::BdTs,
         })
+    }
+
+    /// Scan Blu-ray titles from MPLS playlists.
+    fn scan_bluray_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
+        let mut titles = Vec::new();
+        if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
+            for entry in &playlist_dir.entries {
+                if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
+                    let path = format!("/BDMV/PLAYLIST/{}", entry.name);
+                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
+                        if let Some(title) =
+                            Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)
+                        {
+                            titles.push(title);
+                        }
+                    }
+                }
+            }
+        }
+        titles
+    }
+
+    /// Scan DVD titles from IFO files (VIDEO_TS.IFO + VTS_XX_0.IFO).
+    fn scan_dvd_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
+        let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
+            Ok(info) => info,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut titles = Vec::new();
+        let mut title_number: u16 = 0;
+
+        for ts in &dvd_info.title_sets {
+            // Map DvdVideoAttr to Stream::Video
+            let video_codec = match ts.video.codec.as_str() {
+                "mpeg2" => Codec::Mpeg2,
+                "mpeg1" => Codec::Mpeg2, // treat MPEG-1 as MPEG-2 for container purposes
+                _ => Codec::Mpeg2,
+            };
+
+            let video_stream = Stream::Video(VideoStream {
+                pid: 0xE0, // DVD video PID (standard MPEG PS video stream)
+                codec: video_codec,
+                resolution: ts.video.resolution.clone(),
+                frame_rate: match ts.video.standard.as_str() {
+                    "PAL" => "25".to_string(),
+                    _ => "29.97".to_string(),
+                },
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: String::new(),
+            });
+
+            // Map DvdAudioAttr to Stream::Audio
+            let audio_streams: Vec<Stream> = ts
+                .audio_streams
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let codec = match a.codec.as_str() {
+                        "ac3" => Codec::Ac3,
+                        "dts" => Codec::Dts,
+                        "lpcm" => Codec::Lpcm,
+                        "mpeg1" | "mpeg2" => Codec::Mpeg2,
+                        _ => Codec::Unknown(0),
+                    };
+                    let channels = match a.channels {
+                        1 => "mono".to_string(),
+                        2 => "stereo".to_string(),
+                        6 => "5.1".to_string(),
+                        8 => "7.1".to_string(),
+                        n => format!("{}ch", n),
+                    };
+                    let sample_rate = match a.sample_rate {
+                        48000 => "48kHz".to_string(),
+                        96000 => "96kHz".to_string(),
+                        sr => format!("{}kHz", sr / 1000),
+                    };
+                    Stream::Audio(AudioStream {
+                        pid: 0xBD00 + i as u16, // DVD private stream 1 sub-IDs
+                        codec,
+                        channels,
+                        language: a.language.clone(),
+                        sample_rate,
+                        secondary: false,
+                        label: String::new(),
+                    })
+                })
+                .collect();
+
+            for dvd_title in &ts.titles {
+                title_number += 1;
+
+                // Build extents from cell sector ranges (absolute = vob_start + cell offset)
+                let extents: Vec<Extent> = dvd_title
+                    .cells
+                    .iter()
+                    .map(|cell| {
+                        let start = ts.vob_start_sector + cell.first_sector;
+                        let count = cell.last_sector.saturating_sub(cell.first_sector) + 1;
+                        Extent {
+                            start_lba: start,
+                            sector_count: count,
+                        }
+                    })
+                    .collect();
+
+                let size_bytes: u64 = extents
+                    .iter()
+                    .map(|e| e.sector_count as u64 * 2048)
+                    .sum();
+
+                let mut streams = vec![video_stream.clone()];
+                streams.extend(audio_streams.iter().cloned());
+
+                titles.push(DiscTitle {
+                    playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
+                    playlist_id: title_number,
+                    duration_secs: dvd_title.duration_secs,
+                    size_bytes,
+                    clips: Vec::new(),
+                    streams,
+                    extents,
+                    content_format: ContentFormat::MpegPs,
+                });
+            }
+        }
+
+        titles
     }
 }
 
@@ -954,6 +1092,8 @@ impl Disc {
 pub struct ContentReader<'a> {
     session: &'a mut DriveSession,
     aacs: Option<&'a AacsState>,
+    css: Option<&'a crate::css::CssState>,
+    content_format: ContentFormat,
     extents: Vec<Extent>,
     current_extent: usize,
     current_offset: u32,
@@ -1003,6 +1143,8 @@ impl Disc {
         Ok(ContentReader {
             session,
             aacs: self.aacs.as_ref(),
+            css: self.css.as_ref(),
+            content_format: title.content_format,
             extents: title.extents.clone(),
             current_extent: 0,
             current_offset: 0,
@@ -1109,6 +1251,7 @@ impl<'a> ContentReader<'a> {
         // Decrypt all units in the buffer in-place
         let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
         if let Some(aacs) = &self.aacs {
+            // AACS unit decryption (BD/UHD)
             let uk = aacs
                 .unit_keys
                 .get(self.unit_key_idx)
@@ -1124,11 +1267,25 @@ impl<'a> ContentReader<'a> {
                     crate::aacs::decrypt_unit_full(unit, &uk, rdk);
                 }
             }
-        }
 
-        let total_bytes = self.buf_len * unit_len;
-        self.buf_pos = self.buf_len; // mark fully consumed
-        Ok(Some(&self.read_buf[..total_bytes]))
+            let total_bytes = self.buf_len * unit_len;
+            self.buf_pos = self.buf_len;
+            Ok(Some(&self.read_buf[..total_bytes]))
+        } else if let Some(css) = &self.css {
+            // CSS per-sector descrambling (DVD)
+            let total_bytes = self.buf_len * unit_len;
+            for chunk in self.read_buf[..total_bytes].chunks_mut(2048) {
+                crate::css::lfsr::descramble_sector(&css.title_key, chunk);
+            }
+
+            self.buf_pos = self.buf_len;
+            Ok(Some(&self.read_buf[..total_bytes]))
+        } else {
+            // No encryption
+            let total_bytes = self.buf_len * unit_len;
+            self.buf_pos = self.buf_len;
+            Ok(Some(&self.read_buf[..total_bytes]))
+        }
     }
 
     /// Decrypt a single aligned unit in-place if needed.

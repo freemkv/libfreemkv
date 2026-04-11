@@ -180,6 +180,7 @@ impl M2tsMeta {
             clips: Vec::new(),
             streams,
             extents: Vec::new(),
+            content_format: crate::disc::ContentFormat::BdTs,
         }
     }
 }

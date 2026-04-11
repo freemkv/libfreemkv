@@ -48,6 +48,7 @@ fn sample_disc_title() -> DiscTitle {
             }),
         ],
         extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
     }
 }
 
@@ -446,6 +447,7 @@ fn meta_codec_roundtrip() {
         clips: Vec::new(),
         streams,
         extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
     };
 
     let meta = M2tsMeta::from_title(&dt);
@@ -478,6 +480,7 @@ fn meta_empty_streams() {
         clips: Vec::new(),
         streams: Vec::new(),
         extents: Vec::new(),
+        content_format: ContentFormat::BdTs,
     };
 
     let meta = M2tsMeta::from_title(&dt);
@@ -495,6 +498,7 @@ fn meta_all_stream_types() {
         duration_secs: 3600.0,
         size_bytes: 0,
         clips: Vec::new(),
+        content_format: ContentFormat::BdTs,
         streams: vec![
             Stream::Video(VideoStream {
                 pid: 0x1011,

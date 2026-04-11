@@ -94,8 +94,9 @@ pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
 pub use disc::{
-    AacsState, AudioStream, Clip, Codec, ColorSpace, ContentReader, Disc, DiscFormat, DiscTitle,
-    Extent, HdrFormat, KeySource, ScanOptions, Stream, SubtitleStream, VideoStream,
+    AacsState, AudioStream, Clip, Codec, ColorSpace, ContentFormat, ContentReader, Disc,
+    DiscFormat, DiscTitle, Extent, HdrFormat, KeySource, ScanOptions, Stream, SubtitleStream,
+    VideoStream,
 };
 pub use mux::DiscOptions;
 pub use mux::DiscStream;
