@@ -8,14 +8,17 @@
 //!   for title in disc.titles() { ... }
 //!   for stream in title.streams() { ... }
 
-use crate::clpi;
+mod bluray;
+mod dvd;
+mod encrypt;
+
 use crate::drive::DriveSession;
 use crate::error::{Error, Result};
-use crate::ifo;
-use crate::mpls;
 use crate::sector::SectorReader;
 use crate::speed::DriveSpeed;
 use crate::udf;
+
+use encrypt::HandshakeResult;
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -207,6 +210,7 @@ pub enum Codec {
     Lpcm,
     // Subtitle
     Pgs,
+    DvdSub,
     // Unknown
     Unknown(u8),
 }
@@ -251,6 +255,7 @@ impl Codec {
             Codec::Ac3Plus => "AC-3+",
             Codec::Lpcm => "LPCM",
             Codec::Pgs => "PGS",
+            Codec::DvdSub => "DVD Subtitle",
             Codec::Unknown(_) => "Unknown",
         }
     }
@@ -329,15 +334,6 @@ impl DiscTitle {
 }
 
 // ─── Encryption ─────────────────────────────────────────────────────────────
-
-/// Result of SCSI AACS handshake (ECDH authentication).
-/// Only available when scanning from a real drive, not ISO images.
-#[derive(Debug)]
-struct HandshakeResult {
-    volume_id: [u8; 16],
-    read_data_key: Option<[u8; 16]>,
-    error: Option<crate::error::Error>,
-}
 
 /// AACS decryption state for a disc.
 #[derive(Debug)]
@@ -612,113 +608,6 @@ impl Disc {
         })
     }
 
-    /// SCSI handshake result — volume ID and bus keys from ECDH authentication.
-    /// Only available when scanning from a real drive (not ISO images).
-    fn do_handshake(session: &mut DriveSession, opts: &ScanOptions) -> Option<HandshakeResult> {
-        use crate::aacs::{self, KeyDb};
-
-        let keydb_path = opts.resolve_keydb()?;
-        let keydb = KeyDb::load(&keydb_path).ok()?;
-
-        let mut last_error = None;
-        for hc in &keydb.host_certs {
-            match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
-                Ok(mut auth) => {
-                    let volume_id =
-                        aacs::handshake::read_volume_id(session, &mut auth).unwrap_or([0u8; 16]);
-                    let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
-                        .ok()
-                        .map(|(rdk, _)| rdk);
-                    return Some(HandshakeResult {
-                        volume_id,
-                        read_data_key,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    // Try next host cert
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        }
-        last_error.map(|e| HandshakeResult {
-            volume_id: [0u8; 16],
-            read_data_key: None,
-            error: Some(e),
-        })
-    }
-
-    /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
-    ///
-    /// Reads AACS files from UDF (via SectorReader), resolves keys through
-    /// whatever path works: KEYDB VUK lookup, media key derivation, processing
-    /// keys, device keys. Uses handshake result (volume ID, bus key) if available.
-    fn resolve_encryption(
-        udf_fs: &udf::UdfFs,
-        reader: &mut dyn SectorReader,
-        keydb_path: &std::path::Path,
-        handshake: Option<&HandshakeResult>,
-    ) -> Result<AacsState> {
-        use crate::aacs::{self, KeyDb};
-
-        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
-            path: keydb_path.display().to_string(),
-        })?;
-
-        // Read AACS files from disc/image via UDF
-        let uk_ro_data = udf_fs
-            .read_file(reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-
-        let cc_data = udf_fs
-            .read_file(reader, "/AACS/Content000.cer")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
-            .ok();
-
-        let mkb_data = udf_fs
-            .read_file(reader, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
-            .ok();
-        let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
-
-        // Use handshake volume ID if available, otherwise zeros
-        // (KEYDB VUK lookup by disc hash works without volume ID)
-        let volume_id = handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]);
-        let read_data_key = handshake.and_then(|h| h.read_data_key);
-        let handshake_error = None;
-
-        // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key
-        let resolved = aacs::resolve_keys(
-            &uk_ro_data,
-            cc_data.as_deref(),
-            &volume_id,
-            &keydb,
-            mkb_data.as_deref(),
-        )
-        .ok_or(Error::AacsNoKeys)?;
-
-        Ok(AacsState {
-            version: if resolved.aacs2 { 2 } else { 1 },
-            bus_encryption: resolved.bus_encryption,
-            mkb_version: mkb_ver,
-            disc_hash: aacs::disc_hash_hex(&resolved.disc_hash),
-            key_source: match resolved.key_source {
-                1 => KeySource::KeyDb,
-                2 => KeySource::KeyDbDerived,
-                3 => KeySource::ProcessingKey,
-                4 => KeySource::DeviceKey,
-                _ => KeySource::KeyDb,
-            },
-            vuk: resolved.vuk,
-            unit_keys: resolved.unit_keys,
-            read_data_key,
-            volume_id,
-            handshake_error,
-        })
-    }
-
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /// Detect disc format from the main title's video streams.
@@ -739,48 +628,6 @@ impl Disc {
             }
         }
         DiscFormat::Unknown
-    }
-
-    /// Read disc title from META/DL/bdmt_eng.xml (Blu-ray Disc Meta Table).
-    /// Prefers English, falls back to first available language.
-    /// Returns None if META directory is empty or XML has no usable title.
-    fn read_meta_title(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Option<String> {
-        let meta_dir = udf_fs.find_dir("/BDMV/META")?;
-        for sub in &meta_dir.entries {
-            if !sub.is_dir {
-                continue;
-            }
-            let dl_path = format!("/BDMV/META/{}", sub.name);
-            if let Some(dl_dir) = udf_fs.find_dir(&dl_path) {
-                let xml_files: Vec<_> = dl_dir
-                    .entries
-                    .iter()
-                    .filter(|e| !e.is_dir && e.name.to_lowercase().ends_with(".xml"))
-                    .collect();
-
-                let eng = xml_files
-                    .iter()
-                    .find(|e| e.name.to_lowercase().contains("eng"));
-                let target = eng.or_else(|| xml_files.first());
-
-                if let Some(entry) = target {
-                    let path = format!("{}/{}", dl_path, entry.name);
-                    if let Ok(data) = udf_fs.read_file(reader, &path) {
-                        let xml = String::from_utf8_lossy(&data);
-                        if let Some(start) = xml.find("<di:name>") {
-                            let s = start + "<di:name>".len();
-                            if let Some(end) = xml[s..].find("</di:name>") {
-                                let title = xml[s..s + end].trim().to_string();
-                                if !title.is_empty() && title != "Blu-ray" {
-                                    return Some(title);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 
     fn read_capacity(session: &mut DriveSession) -> Result<u32> {
@@ -807,276 +654,6 @@ impl Disc {
         Ok(lba + 1)
     }
 
-    fn parse_playlist(
-        reader: &mut dyn SectorReader,
-        udf_fs: &udf::UdfFs,
-        filename: &str,
-        data: &[u8],
-    ) -> Option<DiscTitle> {
-        let parsed = mpls::parse(data).ok()?;
-
-        // Calculate duration from play items
-        let duration_ticks: u64 = parsed
-            .play_items
-            .iter()
-            .map(|pi| (pi.out_time.saturating_sub(pi.in_time)) as u64)
-            .sum();
-        let duration_secs = duration_ticks as f64 / 45000.0;
-
-        // Skip very short playlists (< 30 seconds)
-        if duration_secs < 30.0 {
-            return None;
-        }
-
-        // Parse each clip for size, duration, and sector extents
-        let mut extents = Vec::new();
-        let mut total_size: u64 = 0;
-        let mut clips = Vec::with_capacity(parsed.play_items.len());
-
-        for play_item in &parsed.play_items {
-            let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
-            let mut pkt_count: u32 = 0;
-
-            let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
-            if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path) {
-                if let Ok(clip_info) = clpi::parse(&clpi_data) {
-                    pkt_count = clip_info.source_packet_count;
-                    total_size += pkt_count as u64 * 192;
-
-                    // Get m2ts file start LBA and compute extent from packet count.
-                    // BD-ROM m2ts files are contiguous on disc (mastering requirement).
-                    let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
-                    let file_lba = udf_fs.file_start_lba(reader, &m2ts_path).unwrap_or(0);
-                    let total_bytes = pkt_count as u64 * 192;
-                    let total_sectors = total_bytes.div_ceil(2048) as u32;
-                    if total_sectors > 0 && file_lba > 0 {
-                        extents.push(Extent {
-                            start_lba: file_lba,
-                            sector_count: total_sectors,
-                        });
-                    }
-                }
-            }
-
-            clips.push(Clip {
-                clip_id: play_item.clip_id.clone(),
-                in_time: play_item.in_time,
-                out_time: play_item.out_time,
-                duration_secs: clip_dur,
-                source_packets: pkt_count,
-            });
-        }
-
-        // Build streams from STN table
-        let streams: Vec<Stream> = parsed
-            .streams
-            .iter()
-            .filter_map(|s| {
-                // Skip empty/padding entries (coding_type 0x00)
-                if s.coding_type == 0 {
-                    return None;
-                }
-                let codec = Codec::from_coding_type(s.coding_type);
-                match s.stream_type {
-                    1 | 6 | 7 => Some(Stream::Video(VideoStream {
-                        pid: s.pid,
-                        codec,
-                        resolution: format_resolution(s.video_format, s.video_rate),
-                        frame_rate: format_framerate(s.video_rate),
-                        hdr: match s.dynamic_range {
-                            1 => HdrFormat::Hdr10,
-                            2 => HdrFormat::DolbyVision,
-                            _ => HdrFormat::Sdr,
-                        },
-                        color_space: match s.color_space {
-                            1 => ColorSpace::Bt709,
-                            2 => ColorSpace::Bt2020,
-                            _ => ColorSpace::Unknown,
-                        },
-                        secondary: s.secondary,
-                        label: match s.stream_type {
-                            7 => "Dolby Vision EL".to_string(),
-                            _ => String::new(),
-                        },
-                    })),
-                    2 | 5 => {
-                        // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),
-                        // this is a misaligned stream -- treat as subtitle, not audio
-                        if matches!(codec, Codec::Pgs) {
-                            Some(Stream::Subtitle(SubtitleStream {
-                                pid: s.pid,
-                                codec,
-                                language: s.language.clone(),
-                                forced: false,
-                            }))
-                        } else {
-                            Some(Stream::Audio(AudioStream {
-                                pid: s.pid,
-                                codec,
-                                channels: format_channels(s.audio_format),
-                                language: s.language.clone(),
-                                sample_rate: format_samplerate(s.audio_rate),
-                                secondary: s.stream_type == 5,
-                                label: String::new(),
-                            }))
-                        }
-                    }
-                    3 => Some(Stream::Subtitle(SubtitleStream {
-                        pid: s.pid,
-                        codec,
-                        language: s.language.clone(),
-                        forced: false,
-                    })),
-                    // Stream type 4 = IG, unknown types -- skip
-                    _ => None,
-                }
-            })
-            .collect();
-
-        let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
-        let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
-
-        Some(DiscTitle {
-            playlist: filename.to_string(),
-            playlist_id,
-            duration_secs,
-            size_bytes: total_size,
-            clips,
-            streams,
-            extents,
-            content_format: ContentFormat::BdTs,
-        })
-    }
-
-    /// Scan Blu-ray titles from MPLS playlists.
-    fn scan_bluray_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
-        let mut titles = Vec::new();
-        if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
-            for entry in &playlist_dir.entries {
-                if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
-                    let path = format!("/BDMV/PLAYLIST/{}", entry.name);
-                    if let Ok(mpls_data) = udf_fs.read_file(reader, &path) {
-                        if let Some(title) =
-                            Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)
-                        {
-                            titles.push(title);
-                        }
-                    }
-                }
-            }
-        }
-        titles
-    }
-
-    /// Scan DVD titles from IFO files (VIDEO_TS.IFO + VTS_XX_0.IFO).
-    fn scan_dvd_titles(reader: &mut dyn SectorReader, udf_fs: &udf::UdfFs) -> Vec<DiscTitle> {
-        let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
-            Ok(info) => info,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut titles = Vec::new();
-        let mut title_number: u16 = 0;
-
-        for ts in &dvd_info.title_sets {
-            // Map DvdVideoAttr to Stream::Video
-            let video_codec = match ts.video.codec.as_str() {
-                "mpeg2" => Codec::Mpeg2,
-                "mpeg1" => Codec::Mpeg2, // treat MPEG-1 as MPEG-2 for container purposes
-                _ => Codec::Mpeg2,
-            };
-
-            let video_stream = Stream::Video(VideoStream {
-                pid: 0xE0, // DVD video PID (standard MPEG PS video stream)
-                codec: video_codec,
-                resolution: ts.video.resolution.clone(),
-                frame_rate: match ts.video.standard.as_str() {
-                    "PAL" => "25".to_string(),
-                    _ => "29.97".to_string(),
-                },
-                hdr: HdrFormat::Sdr,
-                color_space: ColorSpace::Bt709,
-                secondary: false,
-                label: String::new(),
-            });
-
-            // Map DvdAudioAttr to Stream::Audio
-            let audio_streams: Vec<Stream> = ts
-                .audio_streams
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    let codec = match a.codec.as_str() {
-                        "ac3" => Codec::Ac3,
-                        "dts" => Codec::Dts,
-                        "lpcm" => Codec::Lpcm,
-                        "mpeg1" | "mpeg2" => Codec::Mpeg2,
-                        _ => Codec::Unknown(0),
-                    };
-                    let channels = match a.channels {
-                        1 => "mono".to_string(),
-                        2 => "stereo".to_string(),
-                        6 => "5.1".to_string(),
-                        8 => "7.1".to_string(),
-                        n => format!("{}ch", n),
-                    };
-                    let sample_rate = match a.sample_rate {
-                        48000 => "48kHz".to_string(),
-                        96000 => "96kHz".to_string(),
-                        sr => format!("{}kHz", sr / 1000),
-                    };
-                    Stream::Audio(AudioStream {
-                        pid: 0xBD00 + i as u16, // DVD private stream 1 sub-IDs
-                        codec,
-                        channels,
-                        language: a.language.clone(),
-                        sample_rate,
-                        secondary: false,
-                        label: String::new(),
-                    })
-                })
-                .collect();
-
-            for dvd_title in &ts.titles {
-                title_number += 1;
-
-                // Build extents from cell sector ranges (absolute = vob_start + cell offset)
-                let extents: Vec<Extent> = dvd_title
-                    .cells
-                    .iter()
-                    .map(|cell| {
-                        let start = ts.vob_start_sector + cell.first_sector;
-                        let count = cell.last_sector.saturating_sub(cell.first_sector) + 1;
-                        Extent {
-                            start_lba: start,
-                            sector_count: count,
-                        }
-                    })
-                    .collect();
-
-                let size_bytes: u64 = extents
-                    .iter()
-                    .map(|e| e.sector_count as u64 * 2048)
-                    .sum();
-
-                let mut streams = vec![video_stream.clone()];
-                streams.extend(audio_streams.iter().cloned());
-
-                titles.push(DiscTitle {
-                    playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
-                    playlist_id: title_number,
-                    duration_secs: dvd_title.duration_secs,
-                    size_bytes,
-                    clips: Vec::new(),
-                    streams,
-                    extents,
-                    content_format: ContentFormat::MpegPs,
-                });
-            }
-        }
-
-        titles
-    }
 }
 
 // ─── Decrypted reader ──────────────────────────────────────────────────────

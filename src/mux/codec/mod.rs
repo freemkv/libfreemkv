@@ -9,8 +9,10 @@
 
 pub mod ac3;
 pub mod dts;
+pub mod dvdsub;
 pub mod h264;
 pub mod hevc;
+pub mod lpcm;
 pub mod mpeg2;
 pub mod pgs;
 pub mod truehd;
@@ -86,7 +88,8 @@ pub fn parser_for_codec(codec: Codec) -> Box<dyn CodecParser> {
         Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => Box::new(dts::DtsParser::new()),
         Codec::TrueHd => Box::new(truehd::TrueHdParser::new()),
         Codec::Pgs => Box::new(pgs::PgsParser::new()),
-        Codec::Lpcm => Box::new(PassthroughParser::new(true)),
+        Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
+        Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new()),
         _ => Box::new(PassthroughParser::new(true)),
     }
 }

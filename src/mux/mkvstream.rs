@@ -492,6 +492,7 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
         "A_DTS" => Codec::Dts,
         "A_PCM/INT/BIG" => Codec::Lpcm,
         "S_HDMV/PGS" => Codec::Pgs,
+        "S_VOBSUB" => Codec::DvdSub,
         _ => Codec::Unknown(0),
     };
     let res = format!("{}p", ph);

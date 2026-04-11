@@ -80,9 +80,13 @@ impl MkvTrack {
     }
 
     pub fn subtitle(s: &SubtitleStream) -> Self {
+        let codec_id = match s.codec {
+            Codec::DvdSub => "S_VOBSUB",
+            _ => "S_HDMV/PGS",
+        };
         Self {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
-            codec_id: "S_HDMV/PGS",
+            codec_id,
             language: s.language.clone(),
             name: String::new(),
             codec_private: None,
