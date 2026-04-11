@@ -83,7 +83,7 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
     let (mut host, mut port, mut path) = parse_url(url)?;
 
     for _ in 0..5 {
-        let addr = format!("{}:{}", host, port);
+        let addr = format!("{host}:{port}");
         let mut stream =
             TcpStream::connect(&addr).map_err(|_| Error::KeydbConnect { host: host.clone() })?;
         stream
@@ -91,8 +91,7 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             .ok();
 
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n",
-            path, host
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n"
         );
         stream
             .write_all(request.as_bytes())

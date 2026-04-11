@@ -6,7 +6,7 @@ use crate::identity::DriveId;
 pub fn find_drives() -> Vec<(String, DriveId)> {
     let mut drives = Vec::new();
     for i in 0..16 {
-        let path = format!("/dev/sg{}", i);
+        let path = format!("/dev/sg{i}");
         if !std::path::Path::new(&path).exists() {
             continue;
         }
@@ -40,8 +40,7 @@ pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
                 && sg_id.serial_number == sr_id.serial_number
             {
                 let warning = format!(
-                    "{} is a block device (sr) — using {} (sg) for raw access",
-                    path, sg_path
+                    "{path} is a block device (sr) — using {sg_path} (sg) for raw access"
                 );
                 return Ok((sg_path, Some(warning)));
             }
@@ -49,8 +48,7 @@ pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
         return Ok((
             path.to_string(),
             Some(format!(
-                "{} is a block device (sr) — no matching sg device found",
-                path
+                "{path} is a block device (sr) — no matching sg device found"
             )),
         ));
     }

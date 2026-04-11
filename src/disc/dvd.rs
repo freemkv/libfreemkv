@@ -59,7 +59,7 @@ impl Disc {
                         2 => "stereo".to_string(),
                         6 => "5.1".to_string(),
                         8 => "7.1".to_string(),
-                        n => format!("{}ch", n),
+                        n => format!("{n}ch"),
                     };
                     let sample_rate = match a.sample_rate {
                         48000 => "48kHz".to_string(),

@@ -197,7 +197,7 @@ impl<W: Write + Seek> IsoWriter<W> {
         // Partition starting location at offset 188
         pd[188..192].copy_from_slice(&PARTITION_START.to_le_bytes());
         // Partition length (large enough for everything)
-        let part_len: u32 = 0xFFFFFFFF;
+        let part_len: u32 = 0xFFFF_FFFF;
         pd[192..196].copy_from_slice(&part_len.to_le_bytes());
         self.writer.write_all(&pd)?;
 

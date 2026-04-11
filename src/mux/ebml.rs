@@ -356,7 +356,7 @@ pub const SEEK_POSITION: u32 = 0x53AC;
 
 // Segment Info
 pub const INFO: u32 = 0x1549_A966;
-pub const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+pub const TIMESTAMP_SCALE: u32 = 0x2A_D7B1;
 pub const DURATION: u32 = 0x4489;
 pub const MUXING_APP: u32 = 0x4D80;
 pub const WRITING_APP: u32 = 0x5741;
@@ -371,11 +371,11 @@ pub const TRACK_TYPE: u32 = 0x83;
 pub const FLAG_LACING: u32 = 0x9C;
 pub const FLAG_DEFAULT: u32 = 0x88;
 pub const FLAG_FORCED: u32 = 0x55AA;
-pub const LANGUAGE: u32 = 0x22B59C;
+pub const LANGUAGE: u32 = 0x22_B59C;
 pub const CODEC_ID: u32 = 0x86;
 pub const CODEC_PRIVATE: u32 = 0x63A2;
 pub const TRACK_NAME: u32 = 0x536E;
-pub const DEFAULT_DURATION: u32 = 0x23E383;
+pub const DEFAULT_DURATION: u32 = 0x23_E383;
 
 // Video
 pub const VIDEO: u32 = 0xE0;

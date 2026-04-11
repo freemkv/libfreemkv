@@ -333,7 +333,7 @@ impl DiscTitle {
     pub fn duration_display(&self) -> String {
         let hrs = (self.duration_secs / 3600.0) as u32;
         let mins = ((self.duration_secs % 3600.0) / 60.0) as u32;
-        format!("{}h {:02}m", hrs, mins)
+        format!("{hrs}h {mins:02}m")
     }
 
     /// Size in GB
@@ -761,7 +761,7 @@ pub(crate) fn detect_max_batch_sectors(device_path: &str) -> u16 {
 
     // For sg devices, find the corresponding block device name
     let block_name = if dev_name.starts_with("sg") {
-        let block_dir = format!("/sys/class/scsi_generic/{}/device/block", dev_name);
+        let block_dir = format!("/sys/class/scsi_generic/{dev_name}/device/block");
         std::fs::read_dir(&block_dir)
             .ok()
             .and_then(|mut entries| entries.next())
@@ -772,7 +772,7 @@ pub(crate) fn detect_max_batch_sectors(device_path: &str) -> u16 {
     };
 
     if let Some(bname) = block_name {
-        let sysfs_path = format!("/sys/block/{}/queue/max_hw_sectors_kb", bname);
+        let sysfs_path = format!("/sys/block/{bname}/queue/max_hw_sectors_kb");
         if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
             if let Ok(kb) = content.trim().parse::<u32>() {
                 // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
@@ -1045,7 +1045,7 @@ fn format_channels(audio_format: u8) -> String {
         3 => "stereo".into(),
         6 => "5.1".into(),
         12 => "7.1".into(),
-        _ if audio_format > 0 => format!("{}ch", audio_format),
+        _ if audio_format > 0 => format!("{audio_format}ch"),
         _ => String::new(),
     }
 }

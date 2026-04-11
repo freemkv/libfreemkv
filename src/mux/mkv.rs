@@ -183,7 +183,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         for (i, track) in tracks.iter().enumerate() {
             let entry_pos = ebml::start_master(&mut writer, ebml::TRACK_ENTRY)?;
             ebml::write_uint(&mut writer, ebml::TRACK_NUMBER, (i + 1) as u64)?;
-            ebml::write_uint(&mut writer, ebml::TRACK_UID, (i + 1) as u64 | 0x1000000)?;
+            ebml::write_uint(&mut writer, ebml::TRACK_UID, (i + 1) as u64 | 0x100_0000)?;
             ebml::write_uint(&mut writer, ebml::TRACK_TYPE, track.track_type)?;
             ebml::write_uint(&mut writer, ebml::FLAG_LACING, 0)?;
             ebml::write_string(&mut writer, ebml::CODEC_ID, track.codec_id)?;
@@ -432,7 +432,7 @@ fn parse_resolution(s: &str) -> (u32, u32) {
 
 fn parse_sample_rate(s: &str) -> f64 {
     if s.contains("192") {
-        192000.0
+        192_000.0
     } else if s.contains("96") {
         96000.0
     } else {

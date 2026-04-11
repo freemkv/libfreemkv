@@ -140,7 +140,7 @@ fn find_feature_playlist(xml: &str) -> Option<String> {
 
 /// Extract an XML attribute value from an element string.
 fn extract_attr(element: &str, name: &str) -> Option<String> {
-    let needle = format!("{}=\"", name);
+    let needle = format!("{name}=\"");
     let start = element.find(&needle)? + needle.len();
     let end = element[start..].find('"')? + start;
     Some(element[start..end].to_string())
