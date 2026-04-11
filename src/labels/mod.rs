@@ -15,7 +15,7 @@ pub mod vocab;
 
 use crate::drive::DriveSession;
 use crate::udf::UdfFs;
-use crate::disc::{Title, Stream};
+use crate::disc::{DiscTitle, Stream};
 
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
@@ -79,7 +79,7 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
 
 /// Search disc for config files, extract labels, apply to streams.
 /// This is 100% optional — if anything fails, streams are untouched.
-pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [Title]) {
+pub fn apply(session: &mut DriveSession, udf: &UdfFs, titles: &mut [DiscTitle]) {
     let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         extract(session, udf)
     })).unwrap_or_default();

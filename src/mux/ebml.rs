@@ -3,16 +3,16 @@
 //! EBML uses variable-length integers for element IDs and sizes.
 //! This module provides low-level writers for constructing MKV files.
 
-use std::io::{self, Write, Seek, SeekFrom};
+use std::io::{self, Read, Write, Seek, SeekFrom};
 
 /// Write an EBML element ID (1-4 bytes, already encoded).
 /// Element IDs are predefined constants — we write them verbatim.
 pub fn write_id(w: &mut impl Write, id: u32) -> io::Result<()> {
-    if id <= 0x7F {
+    if id <= 0xFF {
         w.write_all(&[id as u8])
-    } else if id <= 0x7FFF {
+    } else if id <= 0xFFFF {
         w.write_all(&[(id >> 8) as u8, id as u8])
-    } else if id <= 0x7F_FFFF {
+    } else if id <= 0xFF_FFFF {
         w.write_all(&[(id >> 16) as u8, (id >> 8) as u8, id as u8])
     } else {
         w.write_all(&[(id >> 24) as u8, (id >> 16) as u8, (id >> 8) as u8, id as u8])
@@ -141,6 +141,149 @@ pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
 }
 
 // ============================================================
+// EBML Read primitives
+// ============================================================
+
+/// Read an EBML element ID. Returns (id, bytes_consumed).
+pub fn read_id(r: &mut impl Read) -> io::Result<(u32, usize)> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    let b0 = first[0];
+
+    if b0 & 0x80 != 0 {
+        Ok((b0 as u32, 1))
+    } else if b0 & 0x40 != 0 {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        Ok((((b0 as u32) << 8) | b[0] as u32, 2))
+    } else if b0 & 0x20 != 0 {
+        let mut b = [0u8; 2];
+        r.read_exact(&mut b)?;
+        Ok((((b0 as u32) << 16) | (b[0] as u32) << 8 | b[1] as u32, 3))
+    } else if b0 & 0x10 != 0 {
+        let mut b = [0u8; 3];
+        r.read_exact(&mut b)?;
+        Ok((((b0 as u32) << 24) | (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32, 4))
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "invalid EBML ID"))
+    }
+}
+
+/// Read an EBML variable-length size. Returns (size, bytes_consumed).
+/// Size of u64::MAX means "unknown size".
+pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    let b0 = first[0];
+
+    if b0 & 0x80 != 0 {
+        let val = (b0 & 0x7F) as u64;
+        if val == 0x7F { return Ok((u64::MAX, 1)); } // unknown
+        Ok((val, 1))
+    } else if b0 & 0x40 != 0 {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x3F) as u64) << 8) | b[0] as u64;
+        if val == 0x3FFF { return Ok((u64::MAX, 2)); }
+        Ok((val, 2))
+    } else if b0 & 0x20 != 0 {
+        let mut b = [0u8; 2];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x1F) as u64) << 16) | (b[0] as u64) << 8 | b[1] as u64;
+        if val == 0x1FFFFF { return Ok((u64::MAX, 3)); }
+        Ok((val, 3))
+    } else if b0 & 0x10 != 0 {
+        let mut b = [0u8; 3];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x0F) as u64) << 24) | (b[0] as u64) << 16 | (b[1] as u64) << 8 | b[2] as u64;
+        if val == 0x0FFFFFFF { return Ok((u64::MAX, 4)); }
+        Ok((val, 4))
+    } else if b0 & 0x08 != 0 {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x07) as u64) << 32) | (b[0] as u64) << 24 | (b[1] as u64) << 16 | (b[2] as u64) << 8 | b[3] as u64;
+        Ok((val, 5))
+    } else if b0 & 0x04 != 0 {
+        let mut b = [0u8; 5];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x03) as u64) << 40) | (b[0] as u64) << 32 | (b[1] as u64) << 24 | (b[2] as u64) << 16 | (b[3] as u64) << 8 | b[4] as u64;
+        Ok((val, 6))
+    } else if b0 & 0x02 != 0 {
+        let mut b = [0u8; 6];
+        r.read_exact(&mut b)?;
+        let val = (((b0 & 0x01) as u64) << 48) | (b[0] as u64) << 40 | (b[1] as u64) << 32 | (b[2] as u64) << 24 | (b[3] as u64) << 16 | (b[4] as u64) << 8 | b[5] as u64;
+        Ok((val, 7))
+    } else {
+        let mut b = [0u8; 7];
+        r.read_exact(&mut b)?;
+        let val = (b[0] as u64) << 48 | (b[1] as u64) << 40 | (b[2] as u64) << 32 | (b[3] as u64) << 24 | (b[4] as u64) << 16 | (b[5] as u64) << 8 | b[6] as u64;
+        if val == 0x00FFFFFFFFFFFFFF { return Ok((u64::MAX, 8)); }
+        Ok((val, 8))
+    }
+}
+
+/// Read an EBML element header (ID + size). Returns (id, data_size, header_bytes).
+pub fn read_element_header(r: &mut impl Read) -> io::Result<(u32, u64, usize)> {
+    let (id, id_len) = read_id(r)?;
+    let (size, size_len) = read_size(r)?;
+    Ok((id, size, id_len + size_len))
+}
+
+/// Read an unsigned integer value of `len` bytes.
+pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf[..len])?;
+    let mut val = 0u64;
+    for &b in &buf[..len] {
+        val = (val << 8) | b as u64;
+    }
+    Ok(val)
+}
+
+/// Read a float value (4 or 8 bytes).
+pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
+    if len == 4 {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf)?;
+        Ok(f32::from_be_bytes(buf) as f64)
+    } else {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf)?;
+        Ok(f64::from_be_bytes(buf))
+    }
+}
+
+/// Read a UTF-8 string value of `len` bytes.
+pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    // Strip trailing nulls
+    while buf.last() == Some(&0) { buf.pop(); }
+    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read binary data of `len` bytes.
+pub fn read_binary_val(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Read a VINT (track number) from a SimpleBlock. Returns (value, bytes_consumed).
+pub fn read_vint(r: &mut impl Read) -> io::Result<(u64, usize)> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    let b0 = first[0];
+    if b0 & 0x80 != 0 { return Ok(((b0 & 0x7F) as u64, 1)); }
+    if b0 & 0x40 != 0 {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        return Ok(((((b0 & 0x3F) as u64) << 8) | b[0] as u64, 2));
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported VINT width"))
+}
+
+// ============================================================
 // Matroska Element IDs
 // ============================================================
 
@@ -183,6 +326,7 @@ pub const FLAG_FORCED: u32 = 0x55AA;
 pub const LANGUAGE: u32 = 0x22B59C;
 pub const CODEC_ID: u32 = 0x86;
 pub const CODEC_PRIVATE: u32 = 0x63A2;
+pub const TRACK_NAME: u32 = 0x536E;
 pub const DEFAULT_DURATION: u32 = 0x23E383;
 
 // Video
