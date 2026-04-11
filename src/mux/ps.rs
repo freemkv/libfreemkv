@@ -81,12 +81,7 @@ impl PsDemuxer {
         let mut packets = Vec::with_capacity(4);
         let mut pos = 0;
 
-        loop {
-            // Find the next start code.
-            let sc = match find_start_code(&self.buffer, pos) {
-                Some(p) => p,
-                None => break,
-            };
+        while let Some(sc) = find_start_code(&self.buffer, pos) {
 
             if sc + 3 >= self.buffer.len() {
                 // Not enough bytes to read the start code ID.
@@ -275,12 +270,7 @@ fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
     if data.len() < from + 3 {
         return None;
     }
-    for i in from..data.len() - 2 {
-        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
-            return Some(i);
-        }
-    }
-    None
+    (from..data.len() - 2).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 #[cfg(test)]

@@ -558,7 +558,7 @@ mod tests {
             let mut buf = Vec::new();
             write_uint(&mut buf, test_id, val).unwrap();
             let mut cursor = Cursor::new(&buf);
-            let (id, id_len) = read_id(&mut cursor).unwrap();
+            let (id, _id_len) = read_id(&mut cursor).unwrap();
             assert_eq!(id, test_id);
             let (size, _) = read_size(&mut cursor).unwrap();
             let read_val = read_uint_val(&mut cursor, size as usize).unwrap();
@@ -594,7 +594,7 @@ mod tests {
             0.0,
             1.0,
             -1.0,
-            3.14159265358979,
+            std::f64::consts::PI,
             48000.0,
             7200000.0,
             f64::MIN,

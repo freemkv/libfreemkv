@@ -38,6 +38,7 @@ pub struct DvdTitleSet {
 
 /// A single title (from PGC + TT_SRPT chapter count).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct DvdTitle {
     /// Number of chapters (PTTs)
     pub chapters: u16,
@@ -58,6 +59,7 @@ pub struct DvdCell {
 
 /// DVD video stream attributes.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DvdVideoAttr {
     pub codec: String,
     pub resolution: String,
@@ -131,7 +133,7 @@ fn sub_slice(data: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
 ///   - Byte 1: minutes in BCD
 ///   - Byte 2: seconds in BCD
 ///   - Byte 3: bits 7-6 = frame rate flag (01=25fps, 11=29.97fps),
-///             bits 5-0 = frame count in BCD
+///     bits 5-0 = frame count in BCD
 ///
 /// Returns 0.0 for invalid BCD digits rather than erroring,
 /// since some authoring tools produce malformed time fields.

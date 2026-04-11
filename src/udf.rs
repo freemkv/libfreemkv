@@ -353,7 +353,7 @@ impl UdfFs {
 /// Follows the UDF pointer chain:
 /// 1. AVDP (sector 256) → VDS location
 /// 2. VDS → Partition Descriptor (physical partition start)
-///        → Logical Volume Descriptor (FSD location + partition maps)
+///    → Logical Volume Descriptor (FSD location + partition maps)
 /// 3. Metadata partition file → metadata content location
 /// 4. FSD → root directory ICB
 /// 5. Root directory → file tree
@@ -513,6 +513,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
 /// Each directory is an ICB (Extended File Entry) pointing to directory data
 /// containing File Identifier Descriptors (FIDs). Each FID names a file/subdir
 /// and points to its ICB.
+#[allow(clippy::only_used_in_recursion)]
 fn read_directory(
     reader: &mut dyn SectorReader,
     part_start: u32,

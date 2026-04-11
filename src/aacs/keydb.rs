@@ -57,7 +57,7 @@ pub struct DiscEntry {
 /// Parse a hex string like "0xABCD..." into bytes.
 pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);

@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 
 /// Parsed CLPI clip info.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ClipInfo {
     pub version: String,
     /// Total source packets in the m2ts (each 192 bytes)
@@ -22,6 +23,7 @@ pub struct ClipInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EpCoarse {
     pub ref_to_fine_id: u32,
     pub pts_coarse: u32,
@@ -29,11 +31,13 @@ pub struct EpCoarse {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EpFine {
     pub pts_fine: u32,
     pub spn_fine: u32,
 }
 
+#[allow(dead_code)]
 impl ClipInfo {
     /// Reconstruct full PTS from coarse + fine entry.
     pub fn full_pts(coarse: &EpCoarse, fine: &EpFine) -> u32 {
@@ -361,8 +365,7 @@ mod tests {
         //
         // Pack into a u128 for convenience then extract 10 bytes
         let ep_stream_type: u32 = 1; // video
-        let packed: u128 = ((0u128) << 70)                         // reserved: 10 bits
-            | ((ep_stream_type as u128) << 66)                      // EP_stream_type: 4 bits
+        let packed: u128 = ((ep_stream_type as u128) << 66)           // EP_stream_type: 4 bits
             | ((num_coarse as u128) << 50)                          // num_coarse: 16 bits
             | ((num_fine as u128) << 32)                            // num_fine: 18 bits
             | (ep_map_start as u128); // EP_map_start: 32 bits

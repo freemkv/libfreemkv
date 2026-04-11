@@ -108,9 +108,7 @@ fn parse_token(s: &str) -> Option<StreamLabel> {
         } else if part == "ACOM" {
             purpose = LabelPurpose::Commentary;
             is_audio = true;
-        } else if part == "ADLG" {
-            is_audio = true;
-        } else if part == "ATRI" {
+        } else if part == "ADLG" || part == "ATRI" {
             is_audio = true;
         } else if part == "SDH" {
             qualifier = LabelQualifier::Sdh;
@@ -120,9 +118,7 @@ fn parse_token(s: &str) -> Option<StreamLabel> {
         } else if part == "SCOM" {
             purpose = LabelPurpose::Commentary;
             is_subtitle = true;
-        } else if part == "STRI" {
-            is_subtitle = true;
-        } else if part == "TXT" {
+        } else if part == "STRI" || part == "TXT" {
             is_subtitle = true;
         } else if part == "FOR" {
             qualifier = LabelQualifier::Forced;

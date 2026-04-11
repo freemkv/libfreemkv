@@ -41,7 +41,7 @@ struct ReadState {
 }
 
 enum Mode {
-    Write(WriteState),
+    Write(Box<WriteState>),
     Read(ReadState),
 }
 
@@ -60,7 +60,7 @@ impl MkvStream {
     pub fn new(writer: impl Write + Seek + 'static) -> Self {
         Self {
             disc_title: DiscTitle::empty(),
-            mode: Mode::Write(WriteState {
+            mode: Mode::Write(Box::new(WriteState {
                 demuxer: TsDemuxer::new(&[]),
                 muxer: None,
                 writer: Some(Box::new(writer)),
@@ -70,7 +70,7 @@ impl MkvStream {
                 lookahead: LookaheadBuffer::new(DEFAULT_MAX_BUFFER),
                 phase: WritePhase::Scanning,
                 video_pending: 0,
-            }),
+            })),
             max_buffer: DEFAULT_MAX_BUFFER,
             finished: false,
             file_size: None,
@@ -607,8 +607,8 @@ fn frame_to_ts(out: &mut Vec<u8>, track: u16, pts_ms: i64, data: &[u8]) {
             if pad > 1 {
                 pkt[9] = 0x00;
             }
-            for i in 10..(8 + pad).min(192) {
-                pkt[i] = 0xFF;
+            for byte in pkt.iter_mut().take((8 + pad).min(192)).skip(10) {
+                *byte = 0xFF;
             }
             pkt[8 + pad..8 + pad + n].copy_from_slice(&pes[off..off + n]);
         } else {

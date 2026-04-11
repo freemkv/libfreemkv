@@ -70,7 +70,7 @@ mod tests {
     fn header_skip_extracts_pcm_data() {
         let mut parser = LpcmParser::new();
         // 4-byte LPCM header + 6 bytes of PCM data
-        let header = vec![0x00, 0x01, 0x00, 0b10_01_0001]; // frame#=1, quant=24bit, rate=48k, ch=1
+        let header = vec![0x00, 0x01, 0x00, 0b1001_0001]; // frame#=1, quant=24bit, rate=48k, ch=1
         let pcm_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
         let mut pes_data = header;
         pes_data.extend_from_slice(&pcm_data);

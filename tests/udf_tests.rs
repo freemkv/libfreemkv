@@ -154,7 +154,7 @@ fn make_fid(name: &str, icb_meta_lba: u32, is_dir: bool) -> Vec<u8> {
     let file_chars: u8 = if is_dir { 0x02 } else { 0x00 };
 
     // Fixed header = 38 bytes, L_IU = 0
-    let fid_len = ((38 + 0 + l_fi as usize + 3) & !3) as usize; // 4-byte aligned
+    let fid_len = (38 + l_fi as usize + 3) & !3; // 4-byte aligned
     let mut fid = vec![0u8; fid_len];
     // tag_id = 257
     fid[0..2].copy_from_slice(&257u16.to_le_bytes());
@@ -176,7 +176,7 @@ fn make_fid(name: &str, icb_meta_lba: u32, is_dir: bool) -> Vec<u8> {
 
 /// Build a parent FID (file_chars = 0x08, no name).
 fn make_parent_fid() -> Vec<u8> {
-    let fid_len = ((38 + 0 + 0 + 3) & !3) as usize;
+    let fid_len = (38 + 3) & !3;
     let mut fid = vec![0u8; fid_len];
     fid[0..2].copy_from_slice(&257u16.to_le_bytes());
     fid[18] = 0x08; // parent
@@ -362,7 +362,7 @@ fn read_filesystem_with_subdirectory() {
     reader.set_sector(35, make_terminator());
 
     // FSD -> root ICB at meta LBA 1
-    reader.set_sector(partition_start + 0, make_fsd_sector(1));
+    reader.set_sector(partition_start, make_fsd_sector(1));
 
     // Root dir: parent FID + BDMV dir FID
     let parent_fid = make_parent_fid();
@@ -419,7 +419,7 @@ fn find_dir_case_insensitive() {
     reader.set_sector(35, make_terminator());
 
     // FSD
-    reader.set_sector(partition_start + 0, make_fsd_sector(1));
+    reader.set_sector(partition_start, make_fsd_sector(1));
 
     // Root -> BDMV
     let root_data = [make_parent_fid(), make_fid("BDMV", 3, true)].concat();

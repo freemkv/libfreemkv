@@ -265,7 +265,7 @@ fn make_dir_icb(data_meta_lba: u32, data_len: u32) -> Vec<u8> {
 }
 
 fn make_parent_fid() -> Vec<u8> {
-    let fid_len = ((38 + 0 + 0 + 3) & !3) as usize;
+    let fid_len = (38 + 3) & !3;
     let mut fid = vec![0u8; fid_len];
     fid[0..2].copy_from_slice(&257u16.to_le_bytes());
     fid[18] = 0x08;
@@ -278,7 +278,7 @@ fn make_fid(name: &str, icb_meta_lba: u32, is_dir: bool) -> Vec<u8> {
     name_bytes.extend_from_slice(name.as_bytes());
     let l_fi = name_bytes.len() as u8;
     let file_chars: u8 = if is_dir { 0x02 } else { 0x00 };
-    let fid_len = ((38 + 0 + l_fi as usize + 3) & !3) as usize;
+    let fid_len = (38 + l_fi as usize + 3) & !3;
     let mut fid = vec![0u8; fid_len];
     fid[0..2].copy_from_slice(&257u16.to_le_bytes());
     fid[18] = file_chars;

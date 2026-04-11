@@ -1137,9 +1137,9 @@ mod tests {
     #[test]
     fn test_ecdh_shared_secret() {
         // Two parties should derive the same shared point
-        let p = BigUint::from_bytes_be(&EC_P);
-        let a = BigUint::from_bytes_be(&EC_A);
-        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let _p = BigUint::from_bytes_be(&EC_P);
+        let _a = BigUint::from_bytes_be(&EC_A);
+        let _g = EcPoint::from_bytes(&EC_GX, &EC_GY);
 
         let (priv_a, pub_ax, pub_ay) = generate_host_key_pair();
         let (priv_b, pub_bx, pub_by) = generate_host_key_pair();

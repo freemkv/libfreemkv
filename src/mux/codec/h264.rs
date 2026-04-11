@@ -110,15 +110,16 @@ impl CodecParser for H264Parser {
         // pictureParameterSetLength = pps.len()
         // pictureParameterSetNALUnit = pps
 
-        let mut record = Vec::new();
-        record.push(1); // configurationVersion
-        record.push(sps[1]); // profile
-        record.push(sps[2]); // compatibility
-        record.push(sps[3]); // level
-        record.push(0xFF); // 6 bits reserved (111111) + 2 bits lengthSizeMinusOne (11 = 3)
-        record.push(0xE1); // 3 bits reserved (111) + 5 bits numSPS (1)
-        record.push((sps.len() >> 8) as u8);
-        record.push(sps.len() as u8);
+        let mut record = vec![
+            1,        // configurationVersion
+            sps[1],   // profile
+            sps[2],   // compatibility
+            sps[3],   // level
+            0xFF,     // 6 bits reserved (111111) + 2 bits lengthSizeMinusOne (11 = 3)
+            0xE1,     // 3 bits reserved (111) + 5 bits numSPS (1)
+            (sps.len() >> 8) as u8,
+            sps.len() as u8,
+        ];
         record.extend_from_slice(sps);
         record.push(1); // numPPS
         record.push((pps.len() >> 8) as u8);
@@ -179,12 +180,7 @@ pub fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
     if data.len() < from + 3 {
         return None;
     }
-    for i in from..data.len() - 2 {
-        if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
-            return Some(i);
-        }
-    }
-    None
+    (from..data.len() - 2).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 /// Skip past the start code at position `pos`, returning the first byte after it.

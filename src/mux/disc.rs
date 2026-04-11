@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn state_advances_across_extents() {
         // Simulate two extents of 6 sectors each (2 aligned units each).
-        let extents = vec![
+        let extents = [
             Extent {
                 start_lba: 100,
                 sector_count: 6,
@@ -406,7 +406,7 @@ mod tests {
     /// (moved past) rather than causing an infinite loop.
     #[test]
     fn unaligned_extent_is_skipped() {
-        let extents = vec![
+        let extents = [
             Extent {
                 start_lba: 50,
                 sector_count: 2, // < 3, cannot form an aligned unit
@@ -449,7 +449,7 @@ mod tests {
     /// Verify that multiple reads from the same extent produce advancing offsets.
     #[test]
     fn multiple_batches_within_one_extent() {
-        let extents = vec![Extent {
+        let extents = [Extent {
             start_lba: 1000,
             sector_count: 18, // 6 aligned units = 3 batches of 6 sectors
         }];

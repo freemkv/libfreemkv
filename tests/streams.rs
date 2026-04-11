@@ -2,7 +2,7 @@
 
 use libfreemkv::mux::meta::M2tsMeta;
 use libfreemkv::*;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Write};
 
 fn sample_disc_title() -> DiscTitle {
     DiscTitle {
@@ -325,8 +325,8 @@ fn m2ts_passthrough_preserves_data() {
         pkt[4] = 0x47;
         pkt[5] = (i % 3) << 4;
         pkt[6] = i;
-        for j in 8..192 {
-            pkt[j] = i.wrapping_add(j as u8);
+        for (j, byte) in pkt.iter_mut().enumerate().skip(8) {
+            *byte = i.wrapping_add(j as u8);
         }
         original.extend_from_slice(&pkt);
     }

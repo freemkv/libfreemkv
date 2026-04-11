@@ -101,12 +101,7 @@ impl CodecParser for Ac3Parser {
 
 /// Find AC3/E-AC-3 syncword (0x0B77) in data.
 fn find_ac3_sync(data: &[u8]) -> Option<usize> {
-    for i in 0..data.len().saturating_sub(1) {
-        if data[i] == 0x0B && data[i + 1] == 0x77 {
-            return Some(i);
-        }
-    }
-    None
+    (0..data.len().saturating_sub(1)).find(|&i| data[i] == 0x0B && data[i + 1] == 0x77)
 }
 
 /// Extract bsid from an AC-3/E-AC-3 frame starting at the syncword.
