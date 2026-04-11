@@ -90,6 +90,9 @@ impl IOStream for DiscStream {
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
+    fn total_bytes(&self) -> Option<u64> {
+        Some(self.disc_title.size_bytes)
+    }
 }
 
 impl Read for DiscStream {

@@ -45,8 +45,10 @@ fn sample_disc_title() -> DiscTitle {
                 codec: Codec::Pgs,
                 language: "eng".into(),
                 forced: false,
+                codec_data: None,
             }),
         ],
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
     }
@@ -436,6 +438,7 @@ fn meta_codec_roundtrip() {
             codec,
             language: "eng".into(),
             forced: false,
+            codec_data: None,
         }));
     }
 
@@ -446,6 +449,7 @@ fn meta_codec_roundtrip() {
         size_bytes: 0,
         clips: Vec::new(),
         streams,
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
     };
@@ -479,6 +483,7 @@ fn meta_empty_streams() {
         size_bytes: 0,
         clips: Vec::new(),
         streams: Vec::new(),
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
     };
@@ -498,6 +503,7 @@ fn meta_all_stream_types() {
         duration_secs: 3600.0,
         size_bytes: 0,
         clips: Vec::new(),
+        chapters: Vec::new(),
         content_format: ContentFormat::BdTs,
         streams: vec![
             Stream::Video(VideoStream {
@@ -524,6 +530,7 @@ fn meta_all_stream_types() {
                 codec: Codec::Pgs,
                 language: "fra".into(),
                 forced: true,
+                codec_data: None,
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1110,
@@ -641,6 +648,7 @@ fn mkvstream_roundtrip_bdts() {
             secondary: false,
             label: "English".into(),
         })],
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
     };
@@ -710,14 +718,17 @@ fn mkvstream_meta_preserves_all_streams() {
                 codec: Codec::Pgs,
                 language: "eng".into(),
                 forced: false,
+                codec_data: None,
             }),
             Stream::Subtitle(SubtitleStream {
                 pid: 0x1201,
                 codec: Codec::Pgs,
                 language: "fra".into(),
                 forced: true,
+                codec_data: None,
             }),
         ],
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
     };

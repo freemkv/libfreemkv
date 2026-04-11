@@ -25,6 +25,8 @@ pub struct M2tsStream {
     disc_title: DiscTitle,
     mode: Mode,
     finished: bool,
+    /// Content size in bytes (file size minus header), set for read mode.
+    content_size: Option<u64>,
 }
 
 impl M2tsStream {
@@ -37,6 +39,7 @@ impl M2tsStream {
                 header_written: false,
             },
             finished: false,
+            content_size: None,
         }
     }
 
@@ -50,14 +53,21 @@ impl M2tsStream {
     ///
     /// Tries FMKV metadata header first. Falls back to PMT scan + PTS duration.
     pub fn open(mut reader: impl Read + Seek + 'static) -> io::Result<Self> {
+        // Get total file size for progress tracking
+        let file_size = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(0))?;
+
         // Try FMKV metadata header
         if let Ok(Some(m)) = meta::read_header(&mut reader) {
+            let header_end = reader.stream_position()?;
+            let content_size = file_size.saturating_sub(header_end);
             return Ok(Self {
                 disc_title: m.to_title(),
                 mode: Mode::Read {
                     reader: Box::new(reader),
                 },
                 finished: false,
+                content_size: Some(content_size),
             });
         }
 
@@ -89,6 +99,7 @@ impl M2tsStream {
                 reader: Box::new(reader),
             },
             finished: false,
+            content_size: Some(file_size),
         })
     }
 }
@@ -108,6 +119,10 @@ impl IOStream for M2tsStream {
         } else {
             Ok(())
         }
+    }
+
+    fn total_bytes(&self) -> Option<u64> {
+        self.content_size
     }
 }
 

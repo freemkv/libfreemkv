@@ -162,6 +162,7 @@ fn title_with_video(codec: Codec, resolution: &str, content_format: ContentForma
             secondary: false,
             label: String::new(),
         })],
+        chapters: Vec::new(),
         extents: Vec::new(),
         content_format,
     }

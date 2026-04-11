@@ -179,6 +179,7 @@ mod tests {
                     label: "English".into(),
                 }),
             ],
+            chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
         }

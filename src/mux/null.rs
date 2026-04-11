@@ -105,4 +105,10 @@ mod tests {
         assert_eq!(info.streams.len(), 0);
         boxed.finish().unwrap();
     }
+
+    #[test]
+    fn null_total_bytes_returns_none() {
+        let ns = NullStream::new();
+        assert_eq!(ns.total_bytes(), None);
+    }
 }

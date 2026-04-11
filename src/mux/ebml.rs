@@ -408,6 +408,16 @@ pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
 pub const CUE_TRACK: u32 = 0xF7;
 pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
 
+// Chapters
+pub const CHAPTERS: u32 = 0x1043A770;
+pub const EDITION_ENTRY: u32 = 0x45B9;
+pub const CHAPTER_ATOM: u32 = 0xB6;
+pub const CHAPTER_UID: u32 = 0x73C4;
+pub const CHAPTER_TIME_START: u32 = 0x91;
+pub const CHAPTER_DISPLAY: u32 = 0x80;
+pub const CHAP_STRING: u32 = 0x85;
+pub const CHAP_LANGUAGE: u32 = 0x437C;
+
 // Track types
 pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;
