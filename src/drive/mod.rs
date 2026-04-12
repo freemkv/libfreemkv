@@ -24,6 +24,21 @@ use crate::scsi::ScsiTransport;
 use crate::sector::SectorReader;
 use std::path::Path;
 
+/// Physical state of the drive tray and disc.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DriveStatus {
+    /// Tray is open
+    TrayOpen,
+    /// Tray closed, no disc
+    NoDisc,
+    /// Tray closed, disc present and ready
+    DiscPresent,
+    /// Drive is loading or spinning up
+    NotReady,
+    /// Could not determine status
+    Unknown,
+}
+
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct DriveSession {
     scsi: Box<dyn ScsiTransport>,
@@ -67,25 +82,28 @@ impl DriveSession {
 
     pub fn wait_ready(&mut self) -> Result<()> {
         let tur = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        for i in 0..60 {
+        let mut tried_reset = false;
+
+        for _ in 0..60 {
             let mut buf = [0u8; 0];
-            match self.scsi.as_mut().execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5000) {
+            match self.scsi.as_mut().execute(
+                &tur,
+                crate::scsi::DataDirection::None,
+                &mut buf,
+                5_000,
+            ) {
                 Ok(_) => return Ok(()),
-                Err(Error::ScsiError { sense_key: 5, .. }) => {
-                    // Illegal Request on TUR — drive may be in LibreDrive mode
-                    // where standard commands fail but the drive is functional.
-                    // Check if vendor unlock probe responds (MT1959 signature).
-                    if i == 0 {
-                        let probe = crate::scsi::build_read_buffer(0x01, 0x44, 0, 64);
-                        let mut probe_buf = vec![0u8; 64];
-                        if let Ok(r) = self.scsi.as_mut().execute(
-                            &probe, crate::scsi::DataDirection::FromDevice, &mut probe_buf, 5000,
-                        ) {
-                            if r.bytes_transferred >= 16 && &probe_buf[12..16] == b"MMkv" {
-                                // Drive is in LibreDrive mode — it's ready
-                                return Ok(());
-                            }
-                        }
+                Err(Error::ScsiError { sense_key: 5, .. }) if !tried_reset => {
+                    // Illegal Request on TUR — drive may be stuck from a previous session.
+                    // Try reset() which attempts multiple recovery approaches.
+                    tried_reset = true;
+                    if self.reset().is_ok() {
+                        return Ok(());
+                    }
+                    // If reset failed but disc is present, proceed anyway —
+                    // the scan path will handle errors individually.
+                    if self.drive_status() == DriveStatus::DiscPresent {
+                        return Ok(());
                     }
                 }
                 Err(_) => {}
@@ -94,6 +112,99 @@ impl DriveSession {
         }
         Err(Error::DeviceNotFound {
             path: format!("{}: drive not ready after 30s", self.device_path),
+        })
+    }
+
+    /// Query the physical state of the drive — disc present, tray open, etc.
+    /// Uses GET EVENT STATUS NOTIFICATION which works regardless of firmware state.
+    pub fn drive_status(&mut self) -> DriveStatus {
+        // GET EVENT STATUS NOTIFICATION: polled, media event class (0x10)
+        let cdb = [0x4Au8, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00];
+        let mut buf = [0u8; 8];
+        match self.scsi.as_mut().execute(
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            &mut buf,
+            5_000,
+        ) {
+            Ok(r) if r.bytes_transferred >= 6 => {
+                let media_status = buf[5];
+                // Bits 1-0: door/tray state
+                // Bit 1: media present, Bit 0: tray open
+                match media_status & 0x03 {
+                    0x00 => DriveStatus::NoDisc,    // tray closed, no disc
+                    0x01 => DriveStatus::TrayOpen,  // tray open
+                    0x02 => DriveStatus::DiscPresent, // tray closed, disc present
+                    0x03 => DriveStatus::DiscPresent, // tray closed, disc present
+                    _ => DriveStatus::Unknown,
+                }
+            }
+            _ => {
+                // Fallback: try TUR
+                let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let mut empty = [0u8; 0];
+                match self.scsi.as_mut().execute(
+                    &tur,
+                    crate::scsi::DataDirection::None,
+                    &mut empty,
+                    5_000,
+                ) {
+                    Ok(_) => DriveStatus::DiscPresent,
+                    Err(Error::ScsiError { sense_key: 2, .. }) => DriveStatus::NotReady,
+                    Err(Error::ScsiError { sense_key: 6, .. }) => DriveStatus::NotReady, // UNIT ATTENTION
+                    _ => DriveStatus::Unknown,
+                }
+            }
+        }
+    }
+
+    /// Attempt to reset the drive to a clean state.
+    /// Tries multiple approaches in order:
+    /// 1. PREVENT ALLOW MEDIUM REMOVAL (allow) — clears command locks
+    /// 2. START STOP UNIT (start) — restarts the disc
+    /// 3. If the drive has a profile, re-init (firmware re-upload + unlock)
+    pub fn reset(&mut self) -> Result<()> {
+        let mut buf = [0u8; 0];
+
+        // 1. Allow medium removal (clears any prevent lock)
+        let allow = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let _ = self.scsi.as_mut().execute(
+            &allow, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        );
+
+        // 2. START STOP UNIT: stop then start (forces disc re-spin)
+        let stop = [0x1Bu8, 0x00, 0x00, 0x00, 0x00, 0x00]; // stop
+        let _ = self.scsi.as_mut().execute(
+            &stop, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let start = [0x1Bu8, 0x00, 0x00, 0x00, 0x01, 0x00]; // start
+        let _ = self.scsi.as_mut().execute(
+            &start, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+
+        // 3. Check if TUR works now
+        let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        if self.scsi.as_mut().execute(
+            &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        ).is_ok() {
+            return Ok(());
+        }
+
+        // 4. If still stuck and we have a profile, try re-init
+        if self.driver.is_some() {
+            self.init()?;
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            if self.scsi.as_mut().execute(
+                &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
+            ).is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(Error::DeviceNotFound {
+            path: format!("{}: drive reset failed", self.device_path),
         })
     }
 
