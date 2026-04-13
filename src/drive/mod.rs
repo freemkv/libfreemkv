@@ -359,6 +359,20 @@ impl Drive {
         Ok(result.bytes_transferred)
     }
 
+    /// Read the disc capacity in sectors (2048 bytes each).
+    pub fn read_capacity(&mut self) -> Result<u32> {
+        let cdb = [
+            crate::scsi::SCSI_READ_CAPACITY, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut buf = [0u8; 8];
+        self.scsi.as_mut().execute(
+            &cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000,
+        )?;
+        let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        Ok(last_lba + 1)
+    }
+
     pub fn set_speed(&mut self, speed_kbs: u16) {
         let cdb = crate::scsi::build_set_cd_speed(speed_kbs);
         let mut dummy = [0u8; 0];
