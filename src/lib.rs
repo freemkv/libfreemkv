@@ -68,6 +68,7 @@
 pub mod aacs;
 pub(crate) mod clpi;
 pub mod css;
+pub mod decrypt;
 pub mod disc;
 pub mod drive;
 pub mod error;
@@ -107,6 +108,7 @@ pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::{open_input, open_output, parse_url, InputOptions, StreamUrl};
+pub use decrypt::{DecryptKeys, decrypt_sectors};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;
