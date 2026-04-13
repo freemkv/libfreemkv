@@ -16,7 +16,6 @@ use crate::drive::Drive;
 use crate::error::Error;
 use crate::speed::DriveSpeed;
 use std::io::{self, Read, Write};
-use std::path::Path;
 
 /// AACS decryption parameters needed at read time.
 /// Extracted from `AacsState` so we don't need `Clone` on the full struct.

@@ -79,7 +79,7 @@ pub(crate) mod labels;
 pub(crate) mod mpls;
 pub mod mux;
 pub(crate) mod platform;
-pub(crate) mod profile;
+pub mod profile;
 pub mod scsi;
 pub(crate) mod sector;
 pub(crate) mod speed;
