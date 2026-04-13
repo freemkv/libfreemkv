@@ -6,19 +6,17 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use libfreemkv::{DriveSession, Disc, ScanOptions, find_drive};
-//! use std::path::Path;
+//! use libfreemkv::{Drive, Disc, ScanOptions, find_drive};
 //!
-//! let device = find_drive().expect("no optical drive found");
-//! let mut session = DriveSession::open(Path::new(&device)).unwrap();
-//! let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
+//! let mut drive = find_drive().expect("no optical drive found");
+//! let disc = Disc::scan(&mut drive, &ScanOptions::default()).unwrap();
 //!
 //! for title in &disc.titles {
 //!     println!("{} -- {} streams", title.duration_display(), title.streams.len());
 //! }
 //!
 //! // Read content (decrypted automatically if AACS keys available)
-//! let mut reader = disc.open_title(&mut session, 0).unwrap();
+//! let mut reader = disc.open_title(&mut drive, 0).unwrap();
 //! while let Some(unit) = reader.read_unit().unwrap() {
 //!     // 6144 bytes of decrypted content per unit
 //! }
@@ -27,7 +25,7 @@
 //! # Architecture
 //!
 //! ```text
-//! DriveSession           -- open, identify, unlock, read sectors
+//! Drive           -- open, identify, unlock, read sectors
 //!   ├── ScsiTransport    -- SG_IO (Linux), IOKit (macOS)
 //!   ├── DriveProfile     -- per-drive unlock parameters (206 bundled)
 //!   ├── DriveId          -- INQUIRY + GET_CONFIG identification
@@ -87,13 +85,13 @@ pub(crate) mod sector;
 pub(crate) mod speed;
 pub(crate) mod udf;
 
-pub use drive::{find_drive, find_drives, resolve_device, DriveSession, DriveStatus};
+pub use drive::{find_drive, find_drives, Drive, DriveStatus};
 pub use drive::capture::{DriveCapture, CapturedFeature, capture_drive_data, mask_string, mask_bytes};
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
-// Platform trait is pub(crate) -- callers use DriveSession, not Platform directly
+// Platform trait is pub(crate) -- callers use Drive, not Platform directly
 pub use disc::{
     AacsState, AudioStream, Clip, Codec, ColorSpace, ContentFormat, ContentReader, Disc,
     DiscFormat, DiscTitle, Extent, HdrFormat, KeySource, ScanOptions, Stream, SubtitleStream,
@@ -108,7 +106,7 @@ pub use mux::MkvStream;
 pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
-pub use mux::{open_input, open_output, parse_url, InputOptions};
+pub use mux::{open_input, open_output, parse_url, InputOptions, StreamUrl};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;

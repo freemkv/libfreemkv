@@ -449,7 +449,7 @@ const MKB_PACK_SIZE: usize = 32772;
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs.
 pub fn read_mkb_from_drive(
-    session: &mut crate::drive::DriveSession,
+    session: &mut crate::drive::Drive,
 ) -> crate::error::Result<Vec<u8>> {
     use crate::scsi::{DataDirection, SCSI_READ_DISC_STRUCTURE};
 

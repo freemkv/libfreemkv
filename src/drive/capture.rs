@@ -1,6 +1,6 @@
 //! Drive data capture — read hardware information via SCSI.
 
-use crate::drive::DriveSession;
+use crate::drive::Drive;
 use crate::error::Result;
 
 /// Raw data captured from a drive's SCSI responses.
@@ -51,14 +51,14 @@ const FEATURES: &[(u16, &str)] = &[
 
 /// Capture all available drive data via SCSI commands.
 /// Returns raw responses — no formatting, no zipping, no presentation.
-pub fn capture_drive_data(session: &mut DriveSession) -> Result<DriveCapture> {
+pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let id = &session.drive_id;
 
     // Already have INQUIRY from drive open
     let inquiry = id.raw_inquiry.clone();
     let gc_010c = id.raw_gc_010c.clone();
 
-    // Capture GET_CONFIG features using DriveSession's query methods
+    // Capture GET_CONFIG features using Drive's query methods
     let mut features = Vec::new();
     for &(code, name) in FEATURES {
         if let Some(data) = session.get_config_feature(code) {

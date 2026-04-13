@@ -40,7 +40,7 @@ pub enum DriveStatus {
 }
 
 /// Optical disc drive session -- open, identify, unlock, and read.
-pub struct DriveSession {
+pub struct Drive {
     scsi: Box<dyn ScsiTransport>,
     driver: Option<Box<dyn PlatformDriver>>,
     pub profile: Option<DriveProfile>,
@@ -49,7 +49,7 @@ pub struct DriveSession {
     device_path: String,
 }
 
-impl DriveSession {
+impl Drive {
     pub fn open(device: &Path) -> Result<Self> {
         let mut transport = crate::scsi::open(device)?;
         let profiles = profile::load_bundled()?;
@@ -65,7 +65,7 @@ impl DriveSession {
             None => (None, None, None),
         };
 
-        Ok(DriveSession {
+        Ok(Drive {
             scsi: transport,
             driver,
             platform,
@@ -159,47 +159,66 @@ impl DriveSession {
     }
 
     /// Attempt to reset the drive to a clean state.
-    /// Tries multiple approaches in order:
-    /// 1. PREVENT ALLOW MEDIUM REMOVAL (allow) — clears command locks
-    /// 2. START STOP UNIT (start) — restarts the disc
-    /// 3. If the drive has a profile, re-init (firmware re-upload + unlock)
+    ///
+    /// Escalates through increasingly aggressive recovery:
+    /// 1. Unlock tray + stop/start — handles normal stuck states
+    /// 2. Eject cycle — clears LibreDrive firmware stuck state (proven on BU40N)
+    /// 3. Re-init — firmware re-upload if profile available
+    ///
+    /// Note: step 2 physically ejects the tray. On slimline drives the user
+    /// must push it back in manually. Returns Ok(()) if TUR succeeds after
+    /// any step, even if the drive reports "tray open" (that's a valid state).
     pub fn reset(&mut self) -> Result<()> {
         let mut buf = [0u8; 0];
+        let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-        // 1. Allow medium removal (clears any prevent lock)
-        let allow = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let _ = self.scsi.as_mut().execute(
-            &allow, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        );
-
-        // 2. START STOP UNIT: stop then start (forces disc re-spin)
-        let stop = [0x1Bu8, 0x00, 0x00, 0x00, 0x00, 0x00]; // stop
+        // 1. Unlock + stop/start
+        self.unlock_tray();
+        let stop = [0x1Bu8, 0x00, 0x00, 0x00, 0x00, 0x00];
         let _ = self.scsi.as_mut().execute(
             &stop, crate::scsi::DataDirection::None, &mut buf, 5_000,
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let start = [0x1Bu8, 0x00, 0x00, 0x00, 0x01, 0x00]; // start
+        let start = [0x1Bu8, 0x00, 0x00, 0x00, 0x01, 0x00];
         let _ = self.scsi.as_mut().execute(
             &start, crate::scsi::DataDirection::None, &mut buf, 5_000,
         );
         std::thread::sleep(std::time::Duration::from_millis(2000));
 
-        // 3. Check if TUR works now
-        let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
         if self.scsi.as_mut().execute(
             &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
         ).is_ok() {
             return Ok(());
         }
 
-        // 4. If still stuck and we have a profile, try re-init
+        // 2. Eject cycle — clears MT1959 LibreDrive stuck state.
+        // After eject, TUR returning "Not Ready — tray open" (sense key 2)
+        // counts as success: the drive is functional, just needs disc reinserted.
+        self.unlock_tray();
+        let eject = [0x1Bu8, 0x00, 0x00, 0x00, 0x02, 0x00];
+        let _ = self.scsi.as_mut().execute(
+            &eject, crate::scsi::DataDirection::None, &mut buf, 30_000,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+
+        match self.scsi.as_mut().execute(
+            &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()), // tray open = valid
+            _ => {}
+        }
+
+        // 3. If still stuck and we have a profile, try re-init
         if self.driver.is_some() {
             self.init()?;
             std::thread::sleep(std::time::Duration::from_millis(1000));
-            if self.scsi.as_mut().execute(
+            match self.scsi.as_mut().execute(
                 &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
-            ).is_ok() {
-                return Ok(());
+            ) {
+                Ok(_) => return Ok(()),
+                Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()),
+                _ => {}
             }
         }
 
@@ -346,16 +365,29 @@ impl DriveSession {
         let _ = self.scsi_execute(&cdb, crate::scsi::DataDirection::None, &mut dummy, 5_000);
     }
 
-    pub fn eject(&mut self) -> Result<()> {
-        let allow_cdb = [0x1Eu8, 0, 0, 0, 0x00, 0];
+    /// Lock the tray so the disc cannot be ejected during a rip.
+    pub fn lock_tray(&mut self) {
+        let prevent = [0x1Eu8, 0x00, 0x00, 0x00, 0x01, 0x00];
         let mut buf = [0u8; 0];
         let _ = self.scsi.as_mut().execute(
-            &allow_cdb,
-            crate::scsi::DataDirection::None,
-            &mut buf,
-            5_000,
+            &prevent, crate::scsi::DataDirection::None, &mut buf, 5_000,
         );
+    }
+
+    /// Unlock the tray so the user can manually eject the disc.
+    pub fn unlock_tray(&mut self) {
+        let allow = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut buf = [0u8; 0];
+        let _ = self.scsi.as_mut().execute(
+            &allow, crate::scsi::DataDirection::None, &mut buf, 5_000,
+        );
+    }
+
+    /// Eject the disc tray. Unlocks first, then ejects.
+    pub fn eject(&mut self) -> Result<()> {
+        self.unlock_tray();
         let eject_cdb = [0x1Bu8, 0, 0, 0, 0x02, 0];
+        let mut buf = [0u8; 0];
         self.scsi.as_mut().execute(
             &eject_cdb,
             crate::scsi::DataDirection::None,
@@ -376,14 +408,29 @@ impl DriveSession {
     }
 }
 
-impl SectorReader for DriveSession {
+impl SectorReader for Drive {
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
         self.read_disc(lba, count, buf)
     }
 }
 
 /// Find all optical drives connected to this system.
-pub fn find_drives() -> Vec<(String, DriveId)> {
+/// Returns opened Drive objects ready for use.
+pub fn find_drives() -> Vec<Drive> {
+    discover_drives()
+        .into_iter()
+        .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
+        .collect()
+}
+
+/// Find the first optical drive.
+/// Returns an opened Drive ready for use.
+pub fn find_drive() -> Option<Drive> {
+    find_drives().into_iter().next()
+}
+
+/// Internal: discover drive paths + IDs without opening full Drive objects.
+fn discover_drives() -> Vec<(String, DriveId)> {
     #[cfg(target_os = "linux")]
     {
         linux::find_drives()
@@ -398,13 +445,8 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     }
 }
 
-/// Find the first optical drive, returning its device path.
-pub fn find_drive() -> Option<String> {
-    find_drives().into_iter().next().map(|(path, _)| path)
-}
-
 /// Resolve a device path to its raw SCSI device, with optional warning message.
-pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
+pub(crate) fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
     #[cfg(target_os = "linux")]
     {
         linux::resolve_device(path)

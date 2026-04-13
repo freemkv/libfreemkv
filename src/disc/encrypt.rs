@@ -17,7 +17,7 @@ impl Disc {
     /// SCSI handshake result — volume ID and bus keys from ECDH authentication.
     /// Only available when scanning from a real drive (not ISO images).
     pub(super) fn do_handshake(
-        session: &mut crate::drive::DriveSession,
+        session: &mut crate::drive::Drive,
         opts: &ScanOptions,
     ) -> Option<HandshakeResult> {
         use crate::aacs::{self, KeyDb};
