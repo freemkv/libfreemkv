@@ -168,6 +168,9 @@ pub struct MacScsiTransport {
     exclusive: bool,
 }
 
+// IOKit COM interface pointers are Mach port references — safe to send between threads.
+unsafe impl Send for MacScsiTransport {}
+
 impl MacScsiTransport {
     pub fn open(device: &Path) -> Result<Self> {
         let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
