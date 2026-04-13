@@ -50,7 +50,7 @@ pub struct ScsiResult {
 }
 
 /// Low-level SCSI transport — one implementation per platform.
-pub trait ScsiTransport {
+pub trait ScsiTransport: Send {
     fn execute(
         &mut self,
         cdb: &[u8],

@@ -12,7 +12,7 @@ mod bluray;
 mod dvd;
 mod encrypt;
 
-use crate::drive::DriveSession;
+use crate::drive::Drive;
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
 use crate::speed::DriveSpeed;
@@ -449,7 +449,7 @@ impl ScanOptions {
 /// Created by `Disc::open()`. Provides `rip()` to read title data.
 pub struct OpenDisc {
     pub disc: Disc,
-    pub session: DriveSession,
+    pub session: Drive,
 }
 
 impl OpenDisc {
@@ -459,7 +459,7 @@ impl OpenDisc {
     pub fn open(device: &str, keydb_path: Option<&str>) -> Result<Self> {
         use std::path::Path;
 
-        let mut session = DriveSession::open(Path::new(device))?;
+        let mut session = Drive::open(Path::new(device))?;
         session.wait_ready()?;
 
         // Init (unlock + firmware) -- non-fatal if fails
@@ -530,9 +530,9 @@ impl Disc {
     ///   4. Parse playlists + streams
     ///   5. Apply labels
     ///
-    /// The session must be open and unlocked (DriveSession::open handles this).
+    /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
-    pub fn scan(session: &mut DriveSession, opts: &ScanOptions) -> Result<Self> {
+    pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         // READ CAPACITY may fail in LibreDrive mode — proceed with 0 and estimate later
         let capacity = Self::read_capacity(session).unwrap_or(0);
         let handshake = Self::do_handshake(session, opts);
@@ -648,7 +648,7 @@ impl Disc {
         DiscFormat::Unknown
     }
 
-    fn read_capacity(session: &mut DriveSession) -> Result<u32> {
+    fn read_capacity(session: &mut Drive) -> Result<u32> {
         let cdb = [
             crate::scsi::SCSI_READ_CAPACITY,
             0x00,
@@ -684,7 +684,7 @@ impl Disc {
 ///   - On success streak: ramps batch back up, then restores disc speed
 ///   - At minimum batch + still failing: retries once, then skips + zero-fills
 pub struct ContentReader<'a> {
-    session: &'a mut DriveSession,
+    session: &'a mut Drive,
     aacs: Option<&'a AacsState>,
     css: Option<&'a crate::css::CssState>,
     extents: Vec<Extent>,
@@ -715,7 +715,7 @@ impl Disc {
     ///
     pub fn open_title<'a>(
         &'a self,
-        session: &'a mut DriveSession,
+        session: &'a mut Drive,
         title_idx: usize,
     ) -> Result<ContentReader<'a>> {
         let title = self.titles.get(title_idx).ok_or(Error::DiscTitleRange {

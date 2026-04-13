@@ -1,6 +1,6 @@
 //! DiscStream — read BD-TS data from an optical disc drive.
 //!
-//! Read-only stream. Wraps DriveSession + Disc.
+//! Read-only stream. Wraps Drive + Disc.
 //! Handles drive init, AACS decryption, and sector reading.
 //!
 //! Reading state (extent index, offset, batch size, error recovery) is stored
@@ -12,7 +12,7 @@ use crate::disc::{
     detect_max_batch_sectors, ContentFormat, Disc, DiscTitle, Extent, MIN_BATCH_SECTORS,
     RAMP_BATCH_AFTER, RAMP_SPEED_AFTER, SLOW_SPEED_AFTER,
 };
-use crate::drive::DriveSession;
+use crate::drive::Drive;
 use crate::error::Error;
 use crate::speed::DriveSpeed;
 use std::io::{self, Read, Write};
@@ -29,9 +29,9 @@ struct AacsDecrypt {
 #[derive(Default)]
 pub struct DiscOptions {
     /// Device path (e.g. "/dev/sg4"). None = auto-detect.
-    pub device: Option<String>,
+    pub device: Option<std::path::PathBuf>,
     /// KEYDB.cfg path. None = search standard locations.
-    pub keydb_path: Option<String>,
+    pub keydb_path: Option<std::path::PathBuf>,
     /// Which title to read (0-based). None = longest title.
     pub title_index: Option<usize>,
 }
@@ -43,7 +43,7 @@ pub struct DiscOptions {
 pub struct DiscStream {
     disc_title: DiscTitle,
     disc: Disc,
-    session: DriveSession,
+    session: Drive,
     // Read buffer: holds one decoded batch
     batch_buf: Vec<u8>,
     batch_pos: usize,
@@ -74,20 +74,18 @@ pub struct DiscStream {
 impl DiscStream {
     /// Open the disc drive and scan disc metadata.
     pub fn open(opts: DiscOptions) -> Result<Self, Error> {
-        let device = match opts.device {
-            Some(ref d) => crate::drive::resolve_device(d)?.0,
+        let mut session = match opts.device {
+            Some(ref d) => Drive::open(d)?,
             None => crate::drive::find_drive().ok_or_else(|| Error::DeviceNotFound {
                 path: String::new(),
             })?,
         };
-
-        let mut session = DriveSession::open(Path::new(&device))?;
         session.wait_ready()?;
         let _ = session.init();
         let _ = session.probe_disc();
 
         let scan_opts = match opts.keydb_path {
-            Some(ref kp) => crate::disc::ScanOptions::with_keydb(kp),
+            Some(ref kp) => crate::disc::ScanOptions::with_keydb(kp.clone()),
             None => crate::disc::ScanOptions::default(),
         };
         let disc = Disc::scan(&mut session, &scan_opts)?;

@@ -18,7 +18,7 @@
 //!   - AACS 2.0: drives accept AACS 1.0 host certs for backward compatibility
 //!     (full P-256/SHA-256 AACS 2.0 handshake prepared but rarely needed)
 
-use crate::drive::DriveSession;
+use crate::drive::Drive;
 use crate::error::{Error, Result};
 use crate::scsi::DataDirection;
 use num_bigint::BigUint;
@@ -26,14 +26,14 @@ use num_traits::{One, Zero};
 use sha1::{Digest, Sha1};
 
 /// Execute a SCSI command that reads data from the device.
-fn scsi_read(session: &mut DriveSession, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
+fn scsi_read(session: &mut Drive, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     session.scsi_execute(cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
     Ok(buf)
 }
 
 /// Execute a SCSI command that writes data to the device.
-fn scsi_write(session: &mut DriveSession, cdb: &[u8], data: &[u8]) -> Result<()> {
+fn scsi_write(session: &mut Drive, cdb: &[u8], data: &[u8]) -> Result<()> {
     let mut buf = data.to_vec();
     session.scsi_execute(cdb, DataDirection::ToDevice, &mut buf, 5_000)?;
     Ok(())
@@ -765,7 +765,7 @@ pub struct AacsAuth {
 /// Requires a host private key (20 bytes) and host certificate (92 bytes)
 /// from the KEYDB.cfg HC entry.
 pub fn aacs_authenticate(
-    session: &mut DriveSession,
+    session: &mut Drive,
     host_priv_key: &[u8; 20],
     host_cert: &[u8],
 ) -> Result<AacsAuth> {
@@ -890,7 +890,7 @@ pub fn aacs_authenticate(
 /// Falls back to aacs_authenticate (AACS 1.0) if AACS 2.0 host credentials
 /// are not available.
 pub fn aacs2_authenticate(
-    session: &mut DriveSession,
+    session: &mut Drive,
     host_priv_key_v1: &[u8; 20],
     host_cert_v1: &[u8],
     host_priv_key_v2: Option<&[u8; 32]>,
@@ -914,7 +914,7 @@ pub fn aacs2_authenticate(
 /// Native AACS 2.0 handshake using P-256/SHA-256.
 /// Same SCSI protocol, larger payloads (32-byte keys, 132-byte certs).
 fn aacs2_authenticate_p256(
-    session: &mut DriveSession,
+    session: &mut Drive,
     host_priv_key: &[u8; 32],
     host_cert: &[u8],
 ) -> Result<AacsAuth> {
@@ -1029,7 +1029,7 @@ fn aacs2_authenticate_p256(
 }
 
 /// Read Volume ID after successful authentication.
-pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result<[u8; 16]> {
+pub fn read_volume_id(session: &mut Drive, auth: &mut AacsAuth) -> Result<[u8; 16]> {
     // REPORT DISC STRUCTURE format 0x80
     let cdb = cdb_report_disc_structure(auth.agid, 0x80, 36);
     let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsVidRead)?;
@@ -1051,7 +1051,7 @@ pub fn read_volume_id(session: &mut DriveSession, auth: &mut AacsAuth) -> Result
 
 /// Read data keys after successful authentication (for AACS 2.0 bus encryption).
 pub fn read_data_keys(
-    session: &mut DriveSession,
+    session: &mut Drive,
     auth: &mut AacsAuth,
 ) -> Result<([u8; 16], [u8; 16])> {
     // REPORT DISC STRUCTURE format 0x84

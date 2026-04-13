@@ -59,56 +59,56 @@ fn sample_disc_title() -> DiscTitle {
 #[test]
 fn parse_url_disc() {
     let u = parse_url("disc://");
-    assert_eq!(u.scheme, "disc");
-    assert_eq!(u.path, "");
+    assert_eq!(u.scheme(), "disc");
+    assert_eq!(u.path_str(), "");
 }
 
 #[test]
 fn parse_url_disc_device() {
     let u = parse_url("disc:///dev/sg4");
-    assert_eq!(u.scheme, "disc");
-    assert_eq!(u.path, "/dev/sg4");
+    assert_eq!(u.scheme(), "disc");
+    assert_eq!(u.path_str(), "/dev/sg4");
 }
 
 #[test]
 fn parse_url_mkv() {
     let u = parse_url("mkv://Dune.mkv");
-    assert_eq!(u.scheme, "mkv");
-    assert_eq!(u.path, "Dune.mkv");
+    assert_eq!(u.scheme(), "mkv");
+    assert_eq!(u.path_str(), "Dune.mkv");
 }
 
 #[test]
 fn parse_url_network() {
     let u = parse_url("network://10.1.7.11:9000");
-    assert_eq!(u.scheme, "network");
-    assert_eq!(u.path, "10.1.7.11:9000");
+    assert_eq!(u.scheme(), "network");
+    assert_eq!(u.path_str(), "10.1.7.11:9000");
 }
 
 #[test]
 fn parse_url_bare_path_rejected() {
     let u = parse_url("Dune.mkv");
-    assert_eq!(u.scheme, "unknown");
+    assert_eq!(u.scheme(), "unknown");
 }
 
 #[test]
 fn parse_url_null() {
     let u = parse_url("null://");
-    assert_eq!(u.scheme, "null");
-    assert_eq!(u.path, "");
+    assert_eq!(u.scheme(), "null");
+    assert_eq!(u.path_str(), "");
 }
 
 #[test]
 fn parse_url_m2ts_with_path() {
     let u = parse_url("m2ts:///tmp/Dune.m2ts");
-    assert_eq!(u.scheme, "m2ts");
-    assert_eq!(u.path, "/tmp/Dune.m2ts");
+    assert_eq!(u.scheme(), "m2ts");
+    assert_eq!(u.path_str(), "/tmp/Dune.m2ts");
 }
 
 #[test]
 fn parse_url_m2ts_relative() {
     let u = parse_url("m2ts://Dune.m2ts");
-    assert_eq!(u.scheme, "m2ts");
-    assert_eq!(u.path, "Dune.m2ts");
+    assert_eq!(u.scheme(), "m2ts");
+    assert_eq!(u.path_str(), "Dune.m2ts");
 }
 
 #[test]
@@ -182,8 +182,8 @@ fn open_input_network_no_port_errors() {
 #[test]
 fn parse_url_stdio() {
     let u = parse_url("stdio://");
-    assert_eq!(u.scheme, "stdio");
-    assert_eq!(u.path, "");
+    assert_eq!(u.scheme(), "stdio");
+    assert_eq!(u.path_str(), "");
 }
 
 // ── M2TS metadata roundtrip ───────────────────────────────────

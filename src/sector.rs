@@ -1,6 +1,6 @@
 //! SectorReader — trait for reading 2048-byte disc sectors.
 //!
-//! Implemented by DriveSession (SCSI) and IsoFile (file-backed).
+//! Implemented by Drive (SCSI) and IsoFile (file-backed).
 //! Used by UDF parser, disc scanner, label parsers — anything that
 //! reads sectors doesn't need to know where they come from.
 

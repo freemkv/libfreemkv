@@ -5,7 +5,7 @@ pub mod mt1959;
 use crate::error::Result;
 use crate::scsi::ScsiTransport;
 
-pub(crate) trait PlatformDriver {
+pub(crate) trait PlatformDriver: Send {
     /// Unlock drive + upload firmware if needed.
     fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()>;
 
