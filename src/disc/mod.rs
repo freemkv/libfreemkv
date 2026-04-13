@@ -685,8 +685,7 @@ impl Disc {
 ///   - At minimum batch + still failing: retries once, then skips + zero-fills
 pub struct ContentReader<'a> {
     session: &'a mut Drive,
-    aacs: Option<&'a AacsState>,
-    css: Option<&'a crate::css::CssState>,
+    decrypt_keys: crate::decrypt::DecryptKeys,
     extents: Vec<Extent>,
     current_extent: usize,
     current_offset: u32,
@@ -709,6 +708,23 @@ pub struct ContentReader<'a> {
 }
 
 impl Disc {
+    /// Get the resolved decryption keys for this disc.
+    /// Used by disc-to-ISO and other full-disc operations.
+    pub fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
+        if let Some(ref aacs) = self.aacs {
+            crate::decrypt::DecryptKeys::Aacs {
+                unit_keys: aacs.unit_keys.clone(),
+                read_data_key: aacs.read_data_key,
+            }
+        } else if let Some(ref css) = self.css {
+            crate::decrypt::DecryptKeys::Css {
+                title_key: css.title_key,
+            }
+        } else {
+            crate::decrypt::DecryptKeys::None
+        }
+    }
+
     /// Open a title for reading. Decryption is automatic -- if the disc
     /// is encrypted and keys were found during scan(), content is decrypted
     /// on the fly. Unencrypted discs pass through unchanged.
@@ -730,10 +746,22 @@ impl Disc {
         // Detect kernel max transfer size for this device
         let max_batch = detect_max_batch_sectors(session.device_path());
 
+        let decrypt_keys = if let Some(ref aacs) = self.aacs {
+            crate::decrypt::DecryptKeys::Aacs {
+                unit_keys: aacs.unit_keys.clone(),
+                read_data_key: aacs.read_data_key,
+            }
+        } else if let Some(ref css) = self.css {
+            crate::decrypt::DecryptKeys::Css {
+                title_key: css.title_key,
+            }
+        } else {
+            crate::decrypt::DecryptKeys::None
+        };
+
         Ok(ContentReader {
             session,
-            aacs: self.aacs.as_ref(),
-            css: self.css.as_ref(),
+            decrypt_keys,
             extents: title.extents.clone(),
             current_extent: 0,
             current_offset: 0,
@@ -838,63 +866,25 @@ impl<'a> ContentReader<'a> {
 
         // Decrypt all units in the buffer in-place
         let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
-        if let Some(aacs) = &self.aacs {
-            // AACS unit decryption (BD/UHD)
-            let uk = aacs
-                .unit_keys
-                .get(self.unit_key_idx)
-                .map(|(_, k)| *k)
-                .ok_or(Error::AacsDataKey)?;
-            let rdk = aacs.read_data_key.as_ref();
-
-            for i in 0..self.buf_len {
-                let start = i * unit_len;
-                let end = start + unit_len;
-                let unit = &mut self.read_buf[start..end];
-                if crate::aacs::is_unit_encrypted(unit) {
-                    crate::aacs::decrypt_unit_full(unit, &uk, rdk);
-                }
-            }
-
-            let total_bytes = self.buf_len * unit_len;
-            self.buf_pos = self.buf_len;
-            Ok(Some(&self.read_buf[..total_bytes]))
-        } else if let Some(css) = &self.css {
-            // CSS per-sector descrambling (DVD)
-            let total_bytes = self.buf_len * unit_len;
-            for chunk in self.read_buf[..total_bytes].chunks_mut(2048) {
-                crate::css::lfsr::descramble_sector(&css.title_key, chunk);
-            }
-
-            self.buf_pos = self.buf_len;
-            Ok(Some(&self.read_buf[..total_bytes]))
-        } else {
-            // No encryption
-            let total_bytes = self.buf_len * unit_len;
-            self.buf_pos = self.buf_len;
-            Ok(Some(&self.read_buf[..total_bytes]))
-        }
+        let total_bytes = self.buf_len * unit_len;
+        crate::decrypt::decrypt_sectors(
+            &mut self.read_buf[..total_bytes],
+            &self.decrypt_keys,
+            self.unit_key_idx,
+        );
+        self.buf_pos = self.buf_len;
+        Ok(Some(&self.read_buf[..total_bytes]))
     }
 
     /// Decrypt a single aligned unit in-place if needed.
     fn decrypt_unit(&self, unit: &mut [u8]) {
-        if let Some(aacs) = &self.aacs {
-            if crate::aacs::is_unit_encrypted(unit) {
-                let uk = aacs
-                    .unit_keys
-                    .get(self.unit_key_idx)
-                    .map(|(_, k)| *k)
-                    .unwrap_or([0u8; 16]);
-
-                crate::aacs::decrypt_unit_full(unit, &uk, aacs.read_data_key.as_ref());
-            }
-        }
+        crate::decrypt::decrypt_sectors(unit, &self.decrypt_keys, self.unit_key_idx);
     }
 
     /// Read sectors via standard READ(10) 0x00.
     /// calibration primers. Standard reads are faster on most drives.
     fn read_sectors(&mut self, lba: u32, count: u16) -> Result<()> {
-        self.session.read_content(lba, count, &mut self.read_buf)?;
+        self.session.read(lba, count, &mut self.read_buf)?;
         Ok(())
     }
 

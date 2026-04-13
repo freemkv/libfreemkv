@@ -17,13 +17,6 @@ use crate::error::Error;
 use crate::speed::DriveSpeed;
 use std::io::{self, Read, Write};
 
-/// AACS decryption parameters needed at read time.
-/// Extracted from `AacsState` so we don't need `Clone` on the full struct.
-struct AacsDecrypt {
-    unit_keys: Vec<(u32, [u8; 16])>,
-    read_data_key: Option<[u8; 16]>,
-}
-
 /// Options for opening a disc stream.
 #[derive(Default)]
 pub struct DiscOptions {
@@ -54,8 +47,7 @@ pub struct DiscStream {
     current_offset: u32,
     #[allow(dead_code)]
     content_format: ContentFormat,
-    aacs: Option<AacsDecrypt>,
-    css: Option<crate::css::CssState>,
+    decrypt_keys: crate::decrypt::DecryptKeys,
     unit_key_idx: usize,
     read_buf: Vec<u8>,
     /// Current batch size in sectors (adapts on errors)
@@ -99,11 +91,7 @@ impl DiscStream {
         let disc_title = disc.titles[title_index].clone();
         let extents = disc_title.extents.clone();
         let content_format = disc_title.content_format;
-        let aacs = disc.aacs.as_ref().map(|a| AacsDecrypt {
-            unit_keys: a.unit_keys.clone(),
-            read_data_key: a.read_data_key,
-        });
-        let css = disc.css.clone();
+        let decrypt_keys = disc.decrypt_keys();
 
         let max_batch = detect_max_batch_sectors(session.device_path());
 
@@ -118,8 +106,7 @@ impl DiscStream {
             current_extent: 0,
             current_offset: 0,
             content_format,
-            aacs,
-            css,
+            decrypt_keys,
             unit_key_idx: 0,
             read_buf: Vec::with_capacity(max_batch as usize * 2048),
             batch_sectors: max_batch,
@@ -137,7 +124,7 @@ impl DiscStream {
 
     /// Read sectors from the drive into `self.read_buf`.
     fn read_sectors(&mut self, lba: u32, count: u16) -> Result<(), Error> {
-        self.session.read_content(lba, count, &mut self.read_buf)?;
+        self.session.read(lba, count, &mut self.read_buf)?;
         Ok(())
     }
 
@@ -248,32 +235,12 @@ impl DiscStream {
     /// Decrypt the contents of `self.read_buf` in-place and copy the
     /// decrypted data into `self.batch_buf`.
     fn decrypt_and_buffer(&mut self) {
-        let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
         let total_bytes = self.read_buf.len();
-
-        if let Some(ref aacs) = self.aacs {
-            let uk = aacs
-                .unit_keys
-                .get(self.unit_key_idx)
-                .map(|(_, k)| *k)
-                .unwrap_or([0u8; 16]);
-            let rdk = aacs.read_data_key.as_ref();
-
-            let num_units = total_bytes / unit_len;
-            for i in 0..num_units {
-                let start = i * unit_len;
-                let end = start + unit_len;
-                let unit = &mut self.read_buf[start..end];
-                if crate::aacs::is_unit_encrypted(unit) {
-                    crate::aacs::decrypt_unit_full(unit, &uk, rdk);
-                }
-            }
-        } else if let Some(ref css) = self.css {
-            for chunk in self.read_buf[..total_bytes].chunks_mut(2048) {
-                crate::css::lfsr::descramble_sector(&css.title_key, chunk);
-            }
-        }
-        // No encryption: read_buf is already plaintext
+        crate::decrypt::decrypt_sectors(
+            &mut self.read_buf[..total_bytes],
+            &self.decrypt_keys,
+            self.unit_key_idx,
+        );
 
         // Swap buffers instead of copying — the old batch_buf becomes
         // read_buf and will be overwritten on the next read.
