@@ -9,6 +9,7 @@
 
 use super::isowriter::IsoWriter;
 use super::IOStream;
+use crate::decrypt::DecryptKeys;
 use crate::disc::{Disc, DiscTitle, ScanOptions};
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
@@ -71,6 +72,8 @@ pub struct IsoStream {
     buf_pos: usize,
     buf_len: usize,
     eof: bool,
+    /// Decrypt on read — auto-detected from disc scan.
+    decrypt_keys: DecryptKeys,
     // Write side
     iso_writer: Option<IsoWriter<io::BufWriter<File>>>,
     write_started: bool,
@@ -85,17 +88,26 @@ impl IsoStream {
         let disc = Disc::scan_image(&mut reader, capacity, opts)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let idx = title_index
-            .unwrap_or(0)
-            .min(disc.titles.len().saturating_sub(1));
-        let disc_title = if disc.titles.is_empty() {
+        if disc.titles.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no titles found in ISO image",
             ));
-        } else {
-            disc.titles[idx].clone()
-        };
+        }
+        let idx = title_index.unwrap_or(0);
+        if idx >= disc.titles.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "title {} out of range (disc has {})",
+                    idx + 1,
+                    disc.titles.len()
+                ),
+            ));
+        }
+        let disc_title = disc.titles[idx].clone();
+
+        let decrypt_keys = disc.decrypt_keys();
 
         let extents: Vec<(u32, u32)> = disc_title
             .extents
@@ -115,6 +127,7 @@ impl IsoStream {
             buf_pos: 0,
             buf_len: 0,
             eof: false,
+            decrypt_keys,
             iso_writer: None,
             write_started: false,
         })
@@ -130,6 +143,7 @@ impl IsoStream {
         Ok(IsoStream {
             disc_title: DiscTitle::empty(),
             disc: None,
+            decrypt_keys: DecryptKeys::None,
             reader: None,
             extents: Vec::new(),
             extent_idx: 0,
@@ -188,8 +202,11 @@ impl IsoStream {
         reader
             .read_sectors(lba, count, &mut self.batch_buf)
             .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let bytes = count as usize * SECTOR_SIZE as usize;
+
         self.buf_pos = 0;
-        self.buf_len = count as usize * SECTOR_SIZE as usize;
+        self.buf_len = bytes;
 
         self.sectors_remaining -= count as u32;
         if self.sectors_remaining == 0 {

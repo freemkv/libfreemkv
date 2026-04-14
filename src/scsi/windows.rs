@@ -136,6 +136,55 @@ impl SptiTransport {
 
         Ok(SptiTransport { handle })
     }
+
+    /// Reset the drive to a known good state.
+    /// Opens the device, sends IOCTL_STORAGE_RESET_DEVICE to reset
+    /// the USB/SCSI bus, then closes. Same concept as SG_SCSI_RESET on Linux.
+    pub fn reset(device: &Path) -> Result<()> {
+        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D1004;
+
+        let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
+            path: device.display().to_string(),
+        })?;
+        let win_path = normalize_device_path(dev_str);
+        let wide: Vec<u16> = win_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // Open
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Ok(()); // can't open — skip reset, not fatal
+        }
+
+        // Send device reset
+        let mut returned: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_RESET_DEVICE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            );
+        }
+
+        // Close and wait for drive to settle
+        unsafe { CloseHandle(handle) };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        Ok(())
+    }
 }
 
 impl Drop for SptiTransport {

@@ -60,7 +60,7 @@ pub trait ScsiTransport: Send {
     ) -> Result<ScsiResult>;
 }
 
-// ── Platform-agnostic open ──────────────────────────────────────────────────
+// ── Platform-agnostic open / reset ──────────────────────────────────────────
 
 /// Open a SCSI transport for the given device path.
 /// Selects the right backend for the current platform.
@@ -85,6 +85,31 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
         Err(Error::DeviceNotFound {
             path: format!("{}: unsupported platform", device.display()),
         })
+    }
+}
+
+/// Reset a SCSI device to a known good state. Platform-specific.
+/// On Linux: open/close fd cycle + TUR + SG_SCSI_RESET escalation.
+pub fn reset(device: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::SgIoTransport::reset(device)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::MacScsiTransport::reset(device)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::SptiTransport::reset(device)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = device;
+        Ok(())
     }
 }
 
