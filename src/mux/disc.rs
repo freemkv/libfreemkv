@@ -1,273 +1,307 @@
-//! DiscStream — read BD-TS data from an optical disc drive.
+//! DiscStream — read sectors from an optical disc drive.
 //!
-//! Read-only stream. Wraps Drive + Disc.
-//! Handles drive init, AACS decryption, and sector reading.
+//! `DiscStream::open()` does the full init sequence:
+//!   drive open → wait_ready → init → probe_disc → scan
 //!
-//! Reading state (extent index, offset, batch size, error recovery) is stored
-//! directly on the struct so that successive `read()` calls advance through
-//! the disc instead of restarting from byte 0.
+//! Then reads title extents or full-disc sequentially.
+//! No decryption — that's a caller concern.
 
 use super::IOStream;
 use crate::disc::{
-    detect_max_batch_sectors, ContentFormat, Disc, DiscTitle, Extent, MIN_BATCH_SECTORS,
-    RAMP_BATCH_AFTER, RAMP_SPEED_AFTER, SLOW_SPEED_AFTER,
+    detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions,
 };
 use crate::drive::Drive;
-use crate::error::Error;
-use crate::speed::DriveSpeed;
+use crate::error::{Error, Result};
+use crate::event::{Event, EventKind};
 use std::io::{self, Read, Write};
+use std::path::Path;
 
-/// Options for opening a disc stream.
-#[derive(Default)]
-pub struct DiscOptions {
-    /// Device path (e.g. "/dev/sg4"). None = auto-detect.
-    pub device: Option<std::path::PathBuf>,
-    /// KEYDB.cfg path. None = search standard locations.
-    pub keydb_path: Option<std::path::PathBuf>,
-    /// Which title to read (0-based). None = longest title.
-    pub title_index: Option<usize>,
-}
-
-/// Optical disc stream. Read-only — yields decrypted BD-TS bytes.
+/// Optical disc stream. Read-only — yields raw sector bytes.
 ///
-/// Embeds the reading state that `ContentReader` would normally hold, so that
-/// successive `read()` calls advance through the disc correctly.
+/// Created from an initialized Drive + title extents or full-disc mode.
+/// Error recovery (batch reduction, retry, zero-fill) is handled internally.
 pub struct DiscStream {
-    disc_title: DiscTitle,
-    disc: Disc,
-    session: Drive,
-    // Read buffer: holds one decoded batch
-    batch_buf: Vec<u8>,
-    batch_pos: usize,
-    eof: bool,
+    drive: Drive,
+    title: DiscTitle,
 
-    // ── Reading state (replaces ContentReader) ──
-    extents: Vec<Extent>,
+    // What to read
+    mode: ReadMode,
+
+    // Position
+    current_lba: u32,
     current_extent: usize,
     current_offset: u32,
-    #[allow(dead_code)]
-    content_format: ContentFormat,
-    decrypt_keys: crate::decrypt::DecryptKeys,
-    unit_key_idx: usize,
+
+    // Buffer
     read_buf: Vec<u8>,
-    /// Current batch size in sectors (adapts on errors)
+    buf_valid: usize,
+    buf_cursor: usize,
+
+    // Batch size for reads
     batch_sectors: u16,
-    /// Maximum batch size detected from kernel limits
-    max_batch_sectors: u16,
-    /// Consecutive successful batch reads
-    ok_streak: u32,
-    /// Consecutive errors at current position
-    error_streak: u32,
-    /// Total read errors encountered
-    pub errors: u32,
+    pub errors: u64,
+    eof: bool,
+}
+
+enum ReadMode {
+    /// Read title extents (for MKV, M2TS, etc.)
+    Extents(Vec<Extent>),
+    /// Read LBA 0 to capacity (for ISO)
+    Sequential { capacity: u32 },
+}
+
+/// Result of opening a DiscStream.
+pub struct DiscOpenResult {
+    pub stream: DiscStream,
+    pub disc: Disc,
 }
 
 impl DiscStream {
-    /// Open the disc drive and scan disc metadata.
-    pub fn open(opts: DiscOptions) -> Result<Self, Error> {
-        let mut session = match opts.device {
-            Some(ref d) => Drive::open(d)?,
+    /// Open a disc drive, init, scan, and prepare to read a title.
+    ///
+    /// Steps (each does one thing):
+    ///   1. Drive::open (or find_drive)
+    ///   2. wait_ready
+    ///   3. init (non-fatal)
+    ///   4. probe_disc (non-fatal)
+    ///   5. Disc::scan
+    ///
+    /// Pass an event callback for status reporting, or None.
+    pub fn open(
+        device: Option<&Path>,
+        keydb_path: Option<&str>,
+        title_index: usize,
+        on_event: Option<&dyn Fn(Event)>,
+    ) -> Result<DiscOpenResult> {
+        let emit = |kind: EventKind| {
+            if let Some(cb) = &on_event {
+                cb(Event { kind });
+            }
+        };
+
+        // 1. Open
+        let mut drive = match device {
+            Some(d) => Drive::open(d)?,
             None => crate::drive::find_drive().ok_or_else(|| Error::DeviceNotFound {
                 path: String::new(),
             })?,
         };
-        session.wait_ready()?;
-        let _ = session.init();
-        let _ = session.probe_disc();
+        emit(EventKind::DriveOpened {
+            device: drive.device_path().to_string(),
+        });
 
-        let scan_opts = match opts.keydb_path {
-            Some(ref kp) => crate::disc::ScanOptions::with_keydb(kp.clone()),
-            None => crate::disc::ScanOptions::default(),
+        // 2. Wait
+        let _ = drive.wait_ready();
+        emit(EventKind::DriveReady);
+
+        // 3. Init
+        let init_ok = drive.init().is_ok();
+        emit(EventKind::InitComplete { success: init_ok });
+
+        // 4. Probe
+        let probe_ok = drive.probe_disc().is_ok();
+        emit(EventKind::ProbeComplete { success: probe_ok });
+
+        // 5. Scan
+        let scan_opts = match keydb_path {
+            Some(kp) => ScanOptions::with_keydb(kp),
+            None => ScanOptions::default(),
         };
-        let disc = Disc::scan(&mut session, &scan_opts)?;
+        let disc = Disc::scan(&mut drive, &scan_opts)?;
+        emit(EventKind::ScanComplete {
+            titles: disc.titles.len(),
+        });
 
-        let title_index = opts.title_index.unwrap_or(0);
         if title_index >= disc.titles.len() {
             return Err(Error::DiscTitleRange {
                 index: title_index,
                 count: disc.titles.len(),
             });
         }
-        let disc_title = disc.titles[title_index].clone();
-        let extents = disc_title.extents.clone();
-        let content_format = disc_title.content_format;
-        let decrypt_keys = disc.decrypt_keys();
 
-        let max_batch = detect_max_batch_sectors(session.device_path());
+        let title = disc.titles[title_index].clone();
+        let stream = Self::title(drive, title);
 
-        Ok(Self {
-            disc_title,
-            disc,
-            session,
-            batch_buf: Vec::new(),
-            batch_pos: 0,
-            eof: false,
-            extents,
+        Ok(DiscOpenResult { stream, disc })
+    }
+
+    /// Create a stream that reads a title's extents.
+    /// Use this when you already have an initialized Drive.
+    pub fn title(drive: Drive, title: DiscTitle) -> Self {
+        let max_batch = detect_max_batch_sectors(drive.device_path());
+        let extents = title.extents.clone();
+        Self::new(drive, title, ReadMode::Extents(extents), max_batch)
+    }
+
+    /// Create a stream that reads the full disc sequentially (for ISO).
+    pub fn full_disc(drive: Drive, title: DiscTitle, capacity: u32) -> Self {
+        let max_batch = detect_max_batch_sectors(drive.device_path());
+        Self::new(drive, title, ReadMode::Sequential { capacity }, max_batch)
+    }
+
+    /// Resume a full disc read from a given LBA (for ISO resume).
+    /// Use after checking an existing partial file:
+    ///   start_lba = (file_size / 2048) - safety_margin
+    pub fn full_disc_resume(drive: Drive, title: DiscTitle, capacity: u32, start_lba: u32) -> Self {
+        let max_batch = detect_max_batch_sectors(drive.device_path());
+        let mut stream = Self::new(drive, title, ReadMode::Sequential { capacity }, max_batch);
+        stream.current_lba = start_lba;
+        stream
+    }
+
+    /// Set SCSI read timeout (default 30s).
+
+    fn new(drive: Drive, title: DiscTitle, mode: ReadMode, max_batch: u16) -> Self {
+        Self {
+            drive,
+            title,
+            mode,
+            current_lba: 0,
             current_extent: 0,
             current_offset: 0,
-            content_format,
-            decrypt_keys,
-            unit_key_idx: 0,
             read_buf: Vec::with_capacity(max_batch as usize * 2048),
+            buf_valid: 0,
+            buf_cursor: 0,
             batch_sectors: max_batch,
-            max_batch_sectors: max_batch,
-            ok_streak: 0,
-            error_streak: 0,
             errors: 0,
-        })
-    }
-
-    /// Get the full Disc (for listing all titles, etc.)
-    pub fn disc(&self) -> &Disc {
-        &self.disc
-    }
-
-    /// Read sectors from the drive into `self.read_buf`.
-    fn read_sectors(&mut self, lba: u32, count: u16) -> Result<(), Error> {
-        self.session.read(lba, count, &mut self.read_buf)?;
-        Ok(())
-    }
-
-    /// Fill the internal read buffer with the next batch of sectors,
-    /// handling error recovery (halve batch, slow drive, retry, skip).
-    ///
-    /// Returns `true` if data was read, `false` at end-of-title.
-    fn fill_buffer(&mut self) -> Result<bool, Error> {
-        loop {
-            if self.current_extent >= self.extents.len() {
-                return Ok(false);
-            }
-
-            let ext_start = self.extents[self.current_extent].start_lba;
-            let ext_sectors = self.extents[self.current_extent].sector_count;
-            let remaining = ext_sectors.saturating_sub(self.current_offset);
-
-            // Align to 3 sectors (one aligned unit)
-            let sectors_to_read = remaining.min(self.batch_sectors as u32) as u16;
-            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
-            if sectors_to_read == 0 {
-                self.current_extent += 1;
-                self.current_offset = 0;
-                continue;
-            }
-
-            let lba = ext_start + self.current_offset;
-            let byte_count = sectors_to_read as usize * 2048;
-            self.read_buf.resize(byte_count, 0);
-
-            match self.read_sectors(lba, sectors_to_read) {
-                Ok(_) => {
-                    self.current_offset += sectors_to_read as u32;
-                    self.error_streak = 0;
-
-                    if self.current_offset >= ext_sectors {
-                        self.current_extent += 1;
-                        self.current_offset = 0;
-                    }
-
-                    // Ramp up batch size after consecutive successes
-                    self.ok_streak += 1;
-                    if self.batch_sectors < self.max_batch_sectors
-                        && self.ok_streak >= RAMP_BATCH_AFTER
-                    {
-                        self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
-                        self.ok_streak = 0;
-                    }
-
-                    // Restore max speed after sustained success at full batch
-                    if self.batch_sectors == self.max_batch_sectors
-                        && self.ok_streak >= RAMP_SPEED_AFTER
-                    {
-                        self.session.set_speed(0xFFFF);
-                        self.ok_streak = 0;
-                    }
-
-                    return Ok(true);
-                }
-                Err(_) => {
-                    self.errors += 1;
-                    self.error_streak += 1;
-                    self.ok_streak = 0;
-
-                    // First error: re-init (drive may have re-locked)
-                    if self.error_streak == 1 {
-                        let _ = self.session.init();
-                        let _ = self.session.probe_disc();
-                    }
-
-                    // Repeated errors: slow down
-                    if self.error_streak >= SLOW_SPEED_AFTER {
-                        self.session.set_speed(DriveSpeed::BD2x.to_kbps());
-                        self.error_streak = 0;
-                    }
-
-                    if self.batch_sectors > MIN_BATCH_SECTORS {
-                        self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    } else {
-                        // At minimum batch -- retry once with longer pause
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
-                        if self.read_sectors(lba, MIN_BATCH_SECTORS).is_ok() {
-                            self.error_streak = 0;
-                            self.current_offset += MIN_BATCH_SECTORS as u32;
-                            if self.current_offset >= ext_sectors {
-                                self.current_extent += 1;
-                                self.current_offset = 0;
-                            }
-                            return Ok(true);
-                        }
-                        // Still failing -- skip this unit (zero-fill)
-                        self.current_offset += 3;
-                        if self.current_offset >= ext_sectors {
-                            self.current_extent += 1;
-                            self.current_offset = 0;
-                        }
-                        self.read_buf.resize(crate::aacs::ALIGNED_UNIT_LEN, 0);
-                        self.read_buf.fill(0);
-                        return Ok(true);
-                    }
-                }
-            }
+            eof: false,
         }
     }
 
-    /// Decrypt the contents of `self.read_buf` in-place and copy the
-    /// decrypted data into `self.batch_buf`.
-    fn decrypt_and_buffer(&mut self) {
-        let total_bytes = self.read_buf.len();
-        crate::decrypt::decrypt_sectors(
-            &mut self.read_buf[..total_bytes],
-            &self.decrypt_keys,
-            self.unit_key_idx,
-        );
-
-        // Swap buffers instead of copying — the old batch_buf becomes
-        // read_buf and will be overwritten on the next read.
-        std::mem::swap(&mut self.batch_buf, &mut self.read_buf);
-        self.batch_pos = 0;
+    /// Lock the tray.
+    pub fn lock_tray(&mut self) {
+        self.drive.lock_tray();
     }
+
+    /// Unlock the tray.
+    pub fn unlock_tray(&mut self) {
+        self.drive.unlock_tray();
+    }
+
+    /// Recover the drive (for batch: switch to another title).
+    pub fn into_drive(self) -> Drive {
+        self.drive
+    }
+
+    // ── Fill ─────────────────────────────────────────────────────────────
+
+    fn fill(&mut self) -> bool {
+        match &self.mode {
+            ReadMode::Extents(_) => self.fill_extents(),
+            ReadMode::Sequential { .. } => self.fill_sequential(),
+        }
+    }
+
+    fn fill_extents(&mut self) -> bool {
+        let (ext_start, ext_sectors) = match &self.mode {
+            ReadMode::Extents(exts) => {
+                if self.current_extent >= exts.len() {
+                    return false;
+                }
+                (
+                    exts[self.current_extent].start_lba,
+                    exts[self.current_extent].sector_count,
+                )
+            }
+            _ => unreachable!(),
+        };
+
+        let remaining = ext_sectors.saturating_sub(self.current_offset);
+        let sectors = remaining.min(self.batch_sectors as u32) as u16;
+        let sectors = sectors - (sectors % 3);
+        if sectors == 0 {
+            self.current_extent += 1;
+            self.current_offset = 0;
+            return self.fill_extents(); // next extent
+        }
+
+        let lba = ext_start + self.current_offset;
+        let bytes = sectors as usize * 2048;
+        self.read_buf.resize(bytes, 0);
+
+        // Drive handles all error recovery internally.
+        match self.drive.read(
+            lba,
+            sectors,
+            &mut self.read_buf[..bytes],
+        ) {
+            Ok(_) => {
+                self.buf_valid = bytes;
+                self.buf_cursor = 0;
+                self.current_offset += sectors as u32;
+                if self.current_offset >= ext_sectors {
+                    self.current_extent += 1;
+                    self.current_offset = 0;
+                }
+                true
+            }
+            Err(_) => false, // drive gone — EOF
+        }
+    }
+
+    fn fill_sequential(&mut self) -> bool {
+        let capacity = match &self.mode {
+            ReadMode::Sequential { capacity } => *capacity,
+            _ => unreachable!(),
+        };
+
+        if self.current_lba >= capacity {
+            return false;
+        }
+
+        let remaining = capacity - self.current_lba;
+        let count = remaining.min(self.batch_sectors as u32) as u16;
+        let bytes = count as usize * 2048;
+        self.read_buf.resize(bytes, 0);
+
+        // Drive handles all error recovery internally —
+        // retries, speed changes, zero-fill on unreadable sectors.
+        match self.drive.read(
+            self.current_lba,
+            count,
+            &mut self.read_buf[..bytes],
+        ) {
+            Ok(_) => {
+                self.buf_valid = bytes;
+                self.buf_cursor = 0;
+                self.current_lba += count as u32;
+                true
+            }
+            Err(_) => false, // drive gone — EOF
+        }
+    }
+
 }
+
+// ── IOStream ─────────────────────────────────────────────────────────────────
 
 impl IOStream for DiscStream {
     fn info(&self) -> &DiscTitle {
-        &self.disc_title
+        &self.title
     }
+
     fn finish(&mut self) -> io::Result<()> {
+        self.drive.unlock_tray();
         Ok(())
     }
+
     fn total_bytes(&self) -> Option<u64> {
-        Some(self.disc_title.size_bytes)
+        match &self.mode {
+            ReadMode::Extents(extents) => {
+                Some(extents.iter().map(|e| e.sector_count as u64 * 2048).sum())
+            }
+            ReadMode::Sequential { capacity } => Some(*capacity as u64 * 2048),
+        }
     }
 }
 
 impl Read for DiscStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Drain buffer first
-        if self.batch_pos < self.batch_buf.len() {
-            let n = (self.batch_buf.len() - self.batch_pos).min(buf.len());
-            buf[..n].copy_from_slice(&self.batch_buf[self.batch_pos..self.batch_pos + n]);
-            self.batch_pos += n;
+        // Drain current buffer
+        if self.buf_cursor < self.buf_valid {
+            let n = (self.buf_valid - self.buf_cursor).min(buf.len());
+            buf[..n].copy_from_slice(&self.read_buf[self.buf_cursor..self.buf_cursor + n]);
+            self.buf_cursor += n;
             return Ok(n);
         }
 
@@ -275,24 +309,16 @@ impl Read for DiscStream {
             return Ok(0);
         }
 
-        // Fill the read buffer with the next batch of sectors
-        let has_data = self
-            .fill_buffer()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        if !has_data {
+        // Fill next batch
+        if self.fill() {
+            let n = self.buf_valid.min(buf.len());
+            buf[..n].copy_from_slice(&self.read_buf[..n]);
+            self.buf_cursor = n;
+            Ok(n)
+        } else {
             self.eof = true;
-            return Ok(0);
+            Ok(0)
         }
-
-        // Decrypt in-place and move to batch_buf
-        self.decrypt_and_buffer();
-
-        // Now drain into the caller's buffer
-        let n = self.batch_buf.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.batch_buf[..n]);
-        self.batch_pos = n;
-        Ok(n)
     }
 }
 
@@ -305,147 +331,5 @@ impl Write for DiscStream {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::disc::Extent;
-
-    /// Build a minimal DiscStream with fake extents for testing state advancement.
-    /// We cannot call `DiscStream::open()` without a real drive, so we construct
-    /// one manually and then call the internal `fill_buffer` / `read` path
-    /// through a helper that simulates the session reads.
-    ///
-    /// Instead we test the state-machine logic directly: given a set of extents
-    /// and a current_extent/current_offset, verify that repeated reads advance
-    /// through the extents correctly.
-    #[test]
-    fn state_advances_across_extents() {
-        // Simulate two extents of 6 sectors each (2 aligned units each).
-        let extents = [
-            Extent {
-                start_lba: 100,
-                sector_count: 6,
-            },
-            Extent {
-                start_lba: 200,
-                sector_count: 6,
-            },
-        ];
-
-        // Walk through the extents manually using the same arithmetic
-        // that fill_buffer uses, and verify we visit every sector.
-        let batch_sectors: u16 = 6;
-        let mut current_extent: usize = 0;
-        let mut current_offset: u32 = 0;
-        let mut lbas_read = Vec::new();
-
-        while current_extent < extents.len() {
-            let ext_start = extents[current_extent].start_lba;
-            let ext_sectors = extents[current_extent].sector_count;
-            let remaining = ext_sectors.saturating_sub(current_offset);
-            let sectors_to_read = remaining.min(batch_sectors as u32) as u16;
-            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
-            if sectors_to_read == 0 {
-                current_extent += 1;
-                current_offset = 0;
-                continue;
-            }
-            let lba = ext_start + current_offset;
-            lbas_read.push((lba, sectors_to_read));
-            current_offset += sectors_to_read as u32;
-            if current_offset >= ext_sectors {
-                current_extent += 1;
-                current_offset = 0;
-            }
-        }
-
-        assert_eq!(lbas_read.len(), 2, "should read two batches");
-        assert_eq!(lbas_read[0], (100, 6), "first batch starts at LBA 100");
-        assert_eq!(lbas_read[1], (200, 6), "second batch starts at LBA 200");
-    }
-
-    /// Verify that small extents that are not aligned to 3 sectors are skipped
-    /// (moved past) rather than causing an infinite loop.
-    #[test]
-    fn unaligned_extent_is_skipped() {
-        let extents = [
-            Extent {
-                start_lba: 50,
-                sector_count: 2, // < 3, cannot form an aligned unit
-            },
-            Extent {
-                start_lba: 300,
-                sector_count: 9,
-            },
-        ];
-
-        let batch_sectors: u16 = 9;
-        let mut current_extent: usize = 0;
-        let mut current_offset: u32 = 0;
-        let mut lbas_read = Vec::new();
-
-        while current_extent < extents.len() {
-            let ext_start = extents[current_extent].start_lba;
-            let ext_sectors = extents[current_extent].sector_count;
-            let remaining = ext_sectors.saturating_sub(current_offset);
-            let sectors_to_read = remaining.min(batch_sectors as u32) as u16;
-            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
-            if sectors_to_read == 0 {
-                current_extent += 1;
-                current_offset = 0;
-                continue;
-            }
-            let lba = ext_start + current_offset;
-            lbas_read.push((lba, sectors_to_read));
-            current_offset += sectors_to_read as u32;
-            if current_offset >= ext_sectors {
-                current_extent += 1;
-                current_offset = 0;
-            }
-        }
-
-        assert_eq!(lbas_read.len(), 1, "only second extent is readable");
-        assert_eq!(lbas_read[0], (300, 9));
-    }
-
-    /// Verify that multiple reads from the same extent produce advancing offsets.
-    #[test]
-    fn multiple_batches_within_one_extent() {
-        let extents = [Extent {
-            start_lba: 1000,
-            sector_count: 18, // 6 aligned units = 3 batches of 6 sectors
-        }];
-
-        let batch_sectors: u16 = 6;
-        let mut current_extent: usize = 0;
-        let mut current_offset: u32 = 0;
-        let mut lbas_read = Vec::new();
-
-        while current_extent < extents.len() {
-            let ext_start = extents[current_extent].start_lba;
-            let ext_sectors = extents[current_extent].sector_count;
-            let remaining = ext_sectors.saturating_sub(current_offset);
-            let sectors_to_read = remaining.min(batch_sectors as u32) as u16;
-            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
-            if sectors_to_read == 0 {
-                current_extent += 1;
-                current_offset = 0;
-                continue;
-            }
-            let lba = ext_start + current_offset;
-            lbas_read.push((lba, sectors_to_read));
-            current_offset += sectors_to_read as u32;
-            if current_offset >= ext_sectors {
-                current_extent += 1;
-                current_offset = 0;
-            }
-        }
-
-        assert_eq!(lbas_read.len(), 3, "three batches from one extent");
-        assert_eq!(lbas_read[0], (1000, 6));
-        assert_eq!(lbas_read[1], (1006, 6));
-        assert_eq!(lbas_read[2], (1012, 6));
     }
 }

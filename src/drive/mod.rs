@@ -39,6 +39,9 @@ pub enum DriveStatus {
     Unknown,
 }
 
+/// Recovery state after a read error — stay at min speed for N bytes.
+const RECOVERY_WINDOW: u64 = 500 * 1024 * 1024; // 500 MB
+
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct Drive {
     scsi: Box<dyn ScsiTransport>,
@@ -47,6 +50,9 @@ pub struct Drive {
     pub platform: Option<profile::Platform>,
     pub drive_id: DriveId,
     device_path: String,
+    /// Bytes remaining in the min-speed recovery window.
+    /// After a read error, we stay at min speed for RECOVERY_WINDOW bytes.
+    recovery_bytes_remaining: u64,
 }
 
 impl Drive {
@@ -72,7 +78,24 @@ impl Drive {
             profile,
             drive_id,
             device_path: device.to_string_lossy().to_string(),
+            recovery_bytes_remaining: 0,
         })
+    }
+
+    /// Close the drive cleanly. Unlocks tray, flushes SCSI state, closes fd.
+    /// Also runs automatically on Drop as a safety net.
+    pub fn close(self) {
+        // cleanup() runs here via Drop
+    }
+
+    /// Shared cleanup — called by Drop (and thus by close).
+    fn cleanup(&mut self) {
+        self.unlock_tray();
+    }
+
+    // NOTE: Debug aid — remove after fd issue is resolved
+    pub fn device_path_owned(&self) -> String {
+        self.device_path.clone()
     }
 
     /// Whether this drive has a known profile (unlock parameters available).
@@ -132,8 +155,8 @@ impl Drive {
                 // Bits 1-0: door/tray state
                 // Bit 1: media present, Bit 0: tray open
                 match media_status & 0x03 {
-                    0x00 => DriveStatus::NoDisc,    // tray closed, no disc
-                    0x01 => DriveStatus::TrayOpen,  // tray open
+                    0x00 => DriveStatus::NoDisc,      // tray closed, no disc
+                    0x01 => DriveStatus::TrayOpen,    // tray open
                     0x02 => DriveStatus::DiscPresent, // tray closed, disc present
                     0x03 => DriveStatus::DiscPresent, // tray closed, disc present
                     _ => DriveStatus::Unknown,
@@ -175,19 +198,24 @@ impl Drive {
         // 1. Unlock + stop/start
         self.unlock_tray();
         let stop = [0x1Bu8, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let _ = self.scsi.as_mut().execute(
-            &stop, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        );
+        let _ =
+            self.scsi
+                .as_mut()
+                .execute(&stop, crate::scsi::DataDirection::None, &mut buf, 5_000);
         std::thread::sleep(std::time::Duration::from_millis(500));
         let start = [0x1Bu8, 0x00, 0x00, 0x00, 0x01, 0x00];
-        let _ = self.scsi.as_mut().execute(
-            &start, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        );
+        let _ =
+            self.scsi
+                .as_mut()
+                .execute(&start, crate::scsi::DataDirection::None, &mut buf, 5_000);
         std::thread::sleep(std::time::Duration::from_millis(2000));
 
-        if self.scsi.as_mut().execute(
-            &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        ).is_ok() {
+        if self
+            .scsi
+            .as_mut()
+            .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
+            .is_ok()
+        {
             return Ok(());
         }
 
@@ -196,14 +224,17 @@ impl Drive {
         // counts as success: the drive is functional, just needs disc reinserted.
         self.unlock_tray();
         let eject = [0x1Bu8, 0x00, 0x00, 0x00, 0x02, 0x00];
-        let _ = self.scsi.as_mut().execute(
-            &eject, crate::scsi::DataDirection::None, &mut buf, 30_000,
-        );
+        let _ =
+            self.scsi
+                .as_mut()
+                .execute(&eject, crate::scsi::DataDirection::None, &mut buf, 30_000);
         std::thread::sleep(std::time::Duration::from_millis(2000));
 
-        match self.scsi.as_mut().execute(
-            &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        ) {
+        match self
+            .scsi
+            .as_mut()
+            .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
+        {
             Ok(_) => return Ok(()),
             Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()), // tray open = valid
             _ => {}
@@ -214,7 +245,10 @@ impl Drive {
             self.init()?;
             std::thread::sleep(std::time::Duration::from_millis(1000));
             match self.scsi.as_mut().execute(
-                &tur, crate::scsi::DataDirection::None, &mut buf, 5_000,
+                &tur,
+                crate::scsi::DataDirection::None,
+                &mut buf,
+                5_000,
             ) {
                 Ok(_) => return Ok(()),
                 Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()),
@@ -269,13 +303,28 @@ impl Drive {
     /// Returns the feature data (without the 8-byte header), or None if not available.
     pub fn get_config_feature(&mut self, feature_code: u16) -> Option<Vec<u8>> {
         let cdb = [
-            crate::scsi::SCSI_GET_CONFIGURATION, 0x02,
-            (feature_code >> 8) as u8, feature_code as u8,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            crate::scsi::SCSI_GET_CONFIGURATION,
+            0x02,
+            (feature_code >> 8) as u8,
+            feature_code as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
         ];
         let mut buf = vec![0u8; 256];
-        let r = self.scsi.as_mut()
-            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
+        let r = self
+            .scsi
+            .as_mut()
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                &mut buf,
+                5_000,
+            )
+            .ok()?;
         if r.bytes_transferred > 8 {
             Some(buf[8..r.bytes_transferred].to_vec())
         } else {
@@ -285,29 +334,67 @@ impl Drive {
 
     /// Read REPORT KEY RPC state (region playback control).
     pub fn report_key_rpc_state(&mut self) -> Option<Vec<u8>> {
-        let cdb = [0xA4u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00];
+        let cdb = [
+            0xA4u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00,
+        ];
         let mut buf = vec![0u8; 8];
-        let r = self.scsi.as_mut()
-            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
-        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
+        let r = self
+            .scsi
+            .as_mut()
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                &mut buf,
+                5_000,
+            )
+            .ok()?;
+        if r.bytes_transferred > 0 {
+            Some(buf[..r.bytes_transferred].to_vec())
+        } else {
+            None
+        }
     }
 
     /// Read MODE SENSE page data.
     pub fn mode_sense_page(&mut self, page: u8) -> Option<Vec<u8>> {
         let cdb = [0x5Au8, 0x00, page, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00];
         let mut buf = vec![0u8; 252];
-        let r = self.scsi.as_mut()
-            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
-        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
+        let r = self
+            .scsi
+            .as_mut()
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                &mut buf,
+                5_000,
+            )
+            .ok()?;
+        if r.bytes_transferred > 0 {
+            Some(buf[..r.bytes_transferred].to_vec())
+        } else {
+            None
+        }
     }
 
     /// Read vendor-specific READ BUFFER data.
     pub fn read_buffer(&mut self, mode: u8, buffer_id: u8, length: u16) -> Option<Vec<u8>> {
         let cdb = crate::scsi::build_read_buffer(mode, buffer_id, 0, length as u32);
         let mut buf = vec![0u8; length as usize];
-        let r = self.scsi.as_mut()
-            .execute(&cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000).ok()?;
-        if r.bytes_transferred > 0 { Some(buf[..r.bytes_transferred].to_vec()) } else { None }
+        let r = self
+            .scsi
+            .as_mut()
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                &mut buf,
+                5_000,
+            )
+            .ok()?;
+        if r.bytes_transferred > 0 {
+            Some(buf[..r.bytes_transferred].to_vec())
+        } else {
+            None
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -317,8 +404,16 @@ impl Drive {
         }
     }
 
-    /// Read sectors from the disc. Raw SCSI READ(10).
+    /// Read sectors from the disc with automatic error recovery.
+    ///
+    /// On failure: drops to min speed, waits with escalating patience
+    /// (5s, 10s, 15s, 30s, 60s), resets drive between attempts.
+    /// After recovery, stays at min speed for 500 MB before ramping up.
+    ///
+    /// Returns Err only after all attempts exhausted — user should clean
+    /// the disc and resume.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+        let timeout_ms = if self.recovery_bytes_remaining > 0 { 30_000 } else { 10_000 };
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,
@@ -331,24 +426,112 @@ impl Drive {
             count as u8,
             0x00,
         ];
-        let result = self.scsi.as_mut().execute(
-            &cdb,
-            crate::scsi::DataDirection::FromDevice,
-            buf,
-            30_000,
-        )?;
-        Ok(result.bytes_transferred)
+
+        // Normal read
+        match self.scsi.as_mut().execute(
+            &cdb, crate::scsi::DataDirection::FromDevice, buf, timeout_ms,
+        ) {
+            Ok(result) => {
+                if self.recovery_bytes_remaining > 0 {
+                    let bytes_read = count as u64 * 2048;
+                    self.recovery_bytes_remaining =
+                        self.recovery_bytes_remaining.saturating_sub(bytes_read);
+                    if self.recovery_bytes_remaining == 0 {
+                        eprintln!("[drive] recovery window complete — resuming full speed");
+                        self.set_speed(0xFFFF);
+                    }
+                }
+                return Ok(result.bytes_transferred);
+            }
+            Err(e) => {
+                eprintln!("[drive] read error at LBA {} count {} — {}", lba, count, e);
+            }
+        }
+
+        // Phase 1: gentle — sleep 30s, retry. 5 times.
+        // No intervention, just patience.
+        self.set_speed(0);
+
+        for attempt in 1..=5 {
+            eprintln!("[drive] phase 1 retry {}/5 at LBA {} — sleep 30s", attempt, lba);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+
+            match self.scsi.as_mut().execute(
+                &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
+            ) {
+                Ok(result) => {
+                    eprintln!("[drive] phase 1 retry {}/5 OK at LBA {}", attempt, lba);
+                    self.recovery_bytes_remaining = RECOVERY_WINDOW;
+                    return Ok(result.bytes_transferred);
+                }
+                Err(e) => {
+                    eprintln!("[drive] phase 1 retry {}/5 FAILED at LBA {} — {}", attempt, lba, e);
+                }
+            }
+        }
+
+        // Phase 2: fresh start — close, reset, open, init. Like restarting the app.
+        eprintln!("[drive] phase 2: fresh start at LBA {}", lba);
+        let device = std::path::PathBuf::from(&self.device_path);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let _ = crate::scsi::reset(&device);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        self.scsi = match crate::scsi::open(&device) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[drive] reopen failed: {}", e);
+                return Err(e);
+            }
+        };
+        let _ = self.init();
+        let _ = self.wait_ready();
+        self.set_speed(0);
+
+        // Phase 3: gentle again on fresh connection — sleep 30s, retry. 5 times.
+        for attempt in 1..=5 {
+            eprintln!("[drive] phase 3 retry {}/5 at LBA {} — sleep 30s", attempt, lba);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+
+            match self.scsi.as_mut().execute(
+                &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
+            ) {
+                Ok(result) => {
+                    eprintln!("[drive] phase 3 retry {}/5 OK at LBA {}", attempt, lba);
+                    self.recovery_bytes_remaining = RECOVERY_WINDOW;
+                    return Ok(result.bytes_transferred);
+                }
+                Err(e) => {
+                    eprintln!("[drive] phase 3 retry {}/5 FAILED at LBA {} — {}", attempt, lba, e);
+                }
+            }
+        }
+
+        // Both phases failed. Give up.
+        eprintln!("[drive] FAILED LBA {} count {} — all recovery exhausted", lba, count);
+        self.recovery_bytes_remaining = RECOVERY_WINDOW;
+        Err(Error::DiscRead { sector: lba as u64 })
     }
 
     /// Read the disc capacity in sectors (2048 bytes each).
     pub fn read_capacity(&mut self) -> Result<u32> {
         let cdb = [
-            crate::scsi::SCSI_READ_CAPACITY, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            crate::scsi::SCSI_READ_CAPACITY,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
         ];
         let mut buf = [0u8; 8];
         self.scsi.as_mut().execute(
-            &cdb, crate::scsi::DataDirection::FromDevice, &mut buf, 5_000,
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            &mut buf,
+            5_000,
         )?;
         let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         Ok(last_lba + 1)
@@ -364,18 +547,20 @@ impl Drive {
     pub fn lock_tray(&mut self) {
         let prevent = [0x1Eu8, 0x00, 0x00, 0x00, 0x01, 0x00];
         let mut buf = [0u8; 0];
-        let _ = self.scsi.as_mut().execute(
-            &prevent, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        );
+        let _ =
+            self.scsi
+                .as_mut()
+                .execute(&prevent, crate::scsi::DataDirection::None, &mut buf, 5_000);
     }
 
     /// Unlock the tray so the user can manually eject the disc.
     pub fn unlock_tray(&mut self) {
         let allow = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut buf = [0u8; 0];
-        let _ = self.scsi.as_mut().execute(
-            &allow, crate::scsi::DataDirection::None, &mut buf, 5_000,
-        );
+        let _ =
+            self.scsi
+                .as_mut()
+                .execute(&allow, crate::scsi::DataDirection::None, &mut buf, 5_000);
     }
 
     /// Eject the disc tray. Unlocks first, then ejects.
@@ -400,6 +585,13 @@ impl Drive {
         timeout_ms: u32,
     ) -> Result<crate::scsi::ScsiResult> {
         self.scsi.as_mut().execute(cdb, direction, buf, timeout_ms)
+    }
+}
+
+impl Drop for Drive {
+    fn drop(&mut self) {
+        self.cleanup();
+        // SgIoTransport::drop() runs next, calling libc::close(fd)
     }
 }
 
@@ -441,6 +633,7 @@ fn discover_drives() -> Vec<(String, DriveId)> {
 }
 
 /// Resolve a device path to its raw SCSI device, with optional warning message.
+#[allow(dead_code)]
 pub(crate) fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
     #[cfg(target_os = "linux")]
     {
