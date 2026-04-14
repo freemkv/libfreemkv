@@ -36,8 +36,8 @@ pub mod resolve;
 pub mod stdio;
 pub mod ts;
 
-pub use disc::{DiscOptions, DiscStream};
-pub use iso::IsoStream;
+pub use disc::{DiscOpenResult, DiscStream};
+pub use iso::{IsoSectorReader, IsoStream};
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
@@ -62,6 +62,12 @@ pub trait IOStream: Read + Write {
     /// Total content size in bytes, if known. Used for progress display.
     fn total_bytes(&self) -> Option<u64> {
         None
+    }
+
+    /// Decryption keys for this stream. Default: no encryption.
+    /// Overridden by DiscStream and IsoStream for AACS/CSS.
+    fn keys(&self) -> crate::decrypt::DecryptKeys {
+        crate::decrypt::DecryptKeys::None
     }
 }
 

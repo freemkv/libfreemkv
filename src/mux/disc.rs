@@ -23,6 +23,7 @@ use std::path::Path;
 pub struct DiscStream {
     drive: Drive,
     title: DiscTitle,
+    decrypt_keys: crate::decrypt::DecryptKeys,
 
     // What to read
     mode: ReadMode,
@@ -120,7 +121,9 @@ impl DiscStream {
         }
 
         let title = disc.titles[title_index].clone();
-        let stream = Self::title(drive, title);
+        let keys = disc.decrypt_keys();
+        let mut stream = Self::title(drive, title);
+        stream.decrypt_keys = keys;
 
         Ok(DiscOpenResult { stream, disc })
     }
@@ -155,6 +158,7 @@ impl DiscStream {
         Self {
             drive,
             title,
+            decrypt_keys: crate::decrypt::DecryptKeys::None,
             mode,
             current_lba: 0,
             current_extent: 0,
@@ -292,6 +296,10 @@ impl IOStream for DiscStream {
             }
             ReadMode::Sequential { capacity } => Some(*capacity as u64 * 2048),
         }
+    }
+
+    fn keys(&self) -> crate::decrypt::DecryptKeys {
+        self.decrypt_keys.clone()
     }
 }
 
