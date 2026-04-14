@@ -231,12 +231,14 @@ impl IOStream for IsoStream {
         Ok(())
     }
     fn total_bytes(&self) -> Option<u64> {
-        // Read mode: size is known from disc scan
         if self.reader.is_some() {
             Some(self.disc_title.size_bytes)
         } else {
             None
         }
+    }
+    fn keys(&self) -> DecryptKeys {
+        self.decrypt_keys.clone()
     }
 }
 
