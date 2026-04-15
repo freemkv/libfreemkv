@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2 (2026-04-15)
+
+### Fixes
+- **Disc::copy() batch overflow** — hardcoded 64-sector batch exceeded BU40N's 60-sector hardware limit, causing every read to fail and trigger 5×30s recovery sleep. Now accepts detected batch size from caller, defaults to 60.
+- **IFO PGC parsing** — playback time read from offset 0x04 (correct) instead of 0x02 (nr_programs). Cell BCD time at cell+4 not cell+0. DVD durations now correct.
+- **Demuxer flush at EOF** — TS and PS demuxers flushed when source reaches EOF, preventing loss of last PES frame. Applied to DiscStream and M2tsStream.
+- **DiscStream demuxer selection** — demuxer set by caller based on content_format (TS for Blu-ray, PS for DVD) instead of unconditionally creating TsDemuxer in from_reader()
+- **StdioStream FMKV header** — writes/reads metadata header for roundtrip compatibility through stdio pipes
+
 ## 0.10.1 (2026-04-15)
 
 ### Architecture: streams are PES, disc.copy() for sector dumps
