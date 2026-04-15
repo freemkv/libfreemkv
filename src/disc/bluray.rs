@@ -187,6 +187,7 @@ impl Disc {
             chapters,
             extents,
             content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
         })
     }
 

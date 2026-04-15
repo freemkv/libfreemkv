@@ -116,6 +116,9 @@ pub struct DiscTitle {
     pub extents: Vec<Extent>,
     /// Content format for this title
     pub content_format: ContentFormat,
+    /// Codec initialization data per stream (SPS/PPS, etc).
+    /// Index matches `streams`. None for streams without codec init data.
+    pub codec_privates: Vec<Option<Vec<u8>>>,
 }
 
 /// A clip reference within a title.
@@ -797,6 +800,7 @@ impl DiscTitle {
             chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
         }
     }
 
@@ -1502,6 +1506,7 @@ mod tests {
             chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
         }
     }
 

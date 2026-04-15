@@ -51,6 +51,7 @@ fn sample_disc_title() -> DiscTitle {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     }
 }
 
@@ -452,6 +453,7 @@ fn meta_codec_roundtrip() {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     };
 
     let meta = M2tsMeta::from_title(&dt);
@@ -486,6 +488,7 @@ fn meta_empty_streams() {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     };
 
     let meta = M2tsMeta::from_title(&dt);
@@ -505,6 +508,7 @@ fn meta_all_stream_types() {
         clips: Vec::new(),
         chapters: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
         streams: vec![
             Stream::Video(VideoStream {
                 pid: 0x1011,
@@ -651,6 +655,7 @@ fn mkvstream_roundtrip_bdts() {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     };
 
     let output = Cursor::new(Vec::new());
@@ -731,6 +736,7 @@ fn mkvstream_meta_preserves_all_streams() {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     };
 
     let output = Cursor::new(Vec::new());
@@ -791,6 +797,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format: ContentFormat::BdTs,
+        codec_privates: Vec::new(),
     };
 
     // Build synthetic BD-TS packets containing valid H.264 NALs

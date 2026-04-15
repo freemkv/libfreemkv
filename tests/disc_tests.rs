@@ -171,6 +171,7 @@ fn title_with_video(
         chapters: Vec::new(),
         extents: Vec::new(),
         content_format,
+        codec_privates: Vec::new(),
     }
 }
 

@@ -90,7 +90,8 @@ impl M2tsStream {
         let file_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
-        // Try FMKV metadata header
+        // Try FMKV metadata header — save position so we can seek back on failure
+        let start = reader.stream_position()?;
         if let Ok(Some(m)) = meta::read_header(&mut reader) {
             let header_end = reader.stream_position()?;
             let content_size = file_size.saturating_sub(header_end);
@@ -113,8 +114,8 @@ impl M2tsStream {
             });
         }
 
-        // Fallback: scan PMT for streams, PTS for duration
-        reader.seek(SeekFrom::Start(0))?;
+        // No FMKV header — seek back and try PMT scan
+        reader.seek(SeekFrom::Start(start))?;
         let mut buf = vec![0u8; SCAN_SIZE];
         let n = reader.read(&mut buf)?;
 

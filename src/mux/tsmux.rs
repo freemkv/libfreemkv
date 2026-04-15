@@ -139,11 +139,7 @@ impl<W: Write> TsMuxer<W> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-
-    pub fn finish_ref(&mut self) -> io::Result<()> {
+    pub fn finish(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 }
