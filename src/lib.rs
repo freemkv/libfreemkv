@@ -110,7 +110,7 @@ pub use mux::MkvStream;
 pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
-pub use mux::{open_input, open_output, parse_url, InputOptions, StreamUrl};
+pub use mux::{open_input, open_output, open_pes_input, open_pes_output, parse_url, InputOptions, StreamUrl};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;
