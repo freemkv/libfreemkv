@@ -384,7 +384,7 @@ pub fn output(
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title)?))
+            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title, codec_privates)?))
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;

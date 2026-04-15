@@ -35,6 +35,8 @@ pub struct M2tsStream {
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
     pes_eof: bool,
+    /// Codec private data per stream (from FMKV header).
+    stored_codec_privates: Vec<Option<Vec<u8>>>,
 }
 
 impl M2tsStream {
@@ -53,6 +55,7 @@ impl M2tsStream {
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track: Vec::new(),
             pes_eof: false,
+            stored_codec_privates: Vec::new(),
         }
     }
 
@@ -91,6 +94,7 @@ impl M2tsStream {
         if let Ok(Some(m)) = meta::read_header(&mut reader) {
             let header_end = reader.stream_position()?;
             let content_size = file_size.saturating_sub(header_end);
+            let codec_privates = m.codec_privates();
             let title = m.to_title();
             let (pids, parsers, pid_to_track) = Self::setup_pes(&title.streams);
             return Ok(Self {
@@ -105,6 +109,7 @@ impl M2tsStream {
                 pending_frames: std::collections::VecDeque::new(),
                 pid_to_track,
                 pes_eof: false,
+                stored_codec_privates: codec_privates,
             });
         }
 
@@ -144,6 +149,7 @@ impl M2tsStream {
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
             pes_eof: false,
+            stored_codec_privates: Vec::new(),
         })
     }
 }
@@ -197,6 +203,11 @@ impl crate::pes::Stream for M2tsStream {
     fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        // First check stored codec_privates from FMKV header
+        if let Some(Some(cp)) = self.stored_codec_privates.get(track) {
+            return Some(cp.clone());
+        }
+        // Fall back to parser-extracted codec_private
         let pid = self.pid_to_track.iter()
             .find(|(_, idx)| *idx == track)
             .map(|(pid, _)| *pid)?;
