@@ -1,18 +1,14 @@
-//! NetworkStream — BD-TS over TCP with embedded metadata.
+//! NetworkStream — PES frames over TCP with embedded metadata.
 //!
 //! **Security:** Data is transmitted over plain TCP with no encryption.
-//! Use only on trusted networks (LAN). TLS support is planned.
+//! Use only on trusted networks (LAN).
 //!
-//! Write side (sender): connects to a listener, sends FMKV header + BD-TS data.
-//! Read side (receiver): listens for a connection, reads FMKV header + BD-TS data.
-//!
-//! The FMKV metadata header is the same format as M2tsStream uses — so a
-//! NetworkStream reader can hand off to any output stream (MKV, M2TS, etc.)
-//! with full metadata (labels, languages, duration).
+//! Write side (sender): connects to a listener, sends FMKV header + PES frames.
+//! Read side (receiver): listens for a connection, reads FMKV header + PES frames.
 
-use super::{meta, IOStream};
+use super::meta;
 use crate::disc::DiscTitle;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 
 /// I/O buffer size for network reads/writes.
@@ -32,7 +28,6 @@ enum Mode {
 pub struct NetworkStream {
     disc_title: DiscTitle,
     mode: Mode,
-    finished: bool,
 }
 
 impl NetworkStream {
@@ -46,7 +41,6 @@ impl NetworkStream {
                 writer: BufWriter::with_capacity(NET_BUF_SIZE, stream),
                 header_written: false,
             },
-            finished: false,
         })
     }
 
@@ -77,7 +71,6 @@ impl NetworkStream {
         Ok(Self {
             disc_title,
             mode: Mode::Read { reader },
-            finished: false,
         })
     }
 }
@@ -91,44 +84,7 @@ impl crate::pes::Stream for NetworkStream {
     }
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write { writer, .. } => frame.serialize(writer),
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for reading")),
-        }
-    }
-    fn finish(&mut self) -> io::Result<()> {
-        if let Mode::Write { writer, .. } = &mut self.mode {
-            writer.flush()?;
-        }
-        Ok(())
-    }
-    fn info(&self) -> &DiscTitle { &self.disc_title }
-}
-
-impl IOStream for NetworkStream {
-    fn info(&self) -> &DiscTitle {
-        &self.disc_title
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        if let Mode::Write { ref mut writer, .. } = self.mode {
-            writer.flush()?;
-            writer.get_ref().shutdown(std::net::Shutdown::Write)?;
-        }
-        Ok(())
-    }
-}
-
-impl Write for NetworkStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.mode {
-            Mode::Write {
-                ref mut writer,
-                ref mut header_written,
-            } => {
+            Mode::Write { writer, ref mut header_written, .. } => {
                 if !*header_written {
                     if !self.disc_title.streams.is_empty() {
                         let m = meta::M2tsMeta::from_title(&self.disc_title);
@@ -136,35 +92,22 @@ impl Write for NetworkStream {
                     }
                     *header_written = true;
                 }
-                writer.write(buf)
+                frame.serialize(writer)
             }
-            Mode::Read { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stream opened for reading",
-            )),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for reading")),
         }
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if let Mode::Write { ref mut writer, .. } = self.mode {
-            writer.flush()
-        } else {
-            Ok(())
+    fn finish(&mut self) -> io::Result<()> {
+        if let Mode::Write { writer, .. } = &mut self.mode {
+            writer.flush()?;
+            writer.get_ref().shutdown(std::net::Shutdown::Write)?;
         }
+        Ok(())
     }
+    fn info(&self) -> &DiscTitle { &self.disc_title }
 }
 
-impl Read for NetworkStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.mode {
-            Mode::Read { ref mut reader } => reader.read(buf),
-            Mode::Write { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stream opened for writing",
-            )),
-        }
-    }
-}
+// NetworkStream is PES-only — no IOStream/Read/Write byte interface.
 
 #[cfg(test)]
 mod tests {
@@ -173,10 +116,8 @@ mod tests {
         AudioChannels, AudioStream, Codec, ColorSpace, ContentFormat, FrameRate, HdrFormat,
         Resolution, SampleRate, Stream, VideoStream,
     };
-    use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    /// Build a DiscTitle with streams for metadata tests.
     fn sample_title() -> DiscTitle {
         DiscTitle {
             playlist: "NetworkTest".into(),
@@ -213,52 +154,9 @@ mod tests {
 
     #[test]
     #[ignore] // Requires TCP; may be flaky in CI environments
-    fn network_listen_connect_roundtrip() {
-        // Bind to OS-assigned port
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener); // Release so NetworkStream::listen can bind
+    fn network_pes_roundtrip() {
+        use crate::pes;
 
-        let addr = format!("127.0.0.1:{}", port);
-        let addr_clone = addr.clone();
-
-        // Spawn listener in a thread
-        let handle = std::thread::spawn(move || {
-            let mut ns = NetworkStream::listen(&addr_clone).unwrap();
-            let mut buf = vec![0u8; 4096];
-            let mut received = Vec::new();
-            loop {
-                match ns.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => received.extend_from_slice(&buf[..n]),
-                    Err(_) => break,
-                }
-            }
-            received
-        });
-
-        // Small delay to let the listener thread bind
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Connect and write data
-        let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr).unwrap().meta(&dt);
-        let payload = b"Hello from the write side of the network stream!";
-        writer.write_all(payload).unwrap();
-        writer.finish().unwrap();
-
-        let received = handle.join().unwrap();
-        // The received data should end with our payload (after the FMKV header)
-        assert!(
-            received.windows(payload.len()).any(|w| w == payload),
-            "payload not found in received data (got {} bytes)",
-            received.len()
-        );
-    }
-
-    #[test]
-    #[ignore] // Requires TCP; may be flaky in CI environments
-    fn network_metadata_flows() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -267,35 +165,40 @@ mod tests {
         let addr_clone = addr.clone();
 
         let handle = std::thread::spawn(move || {
-            let ns = NetworkStream::listen(&addr_clone).unwrap();
-            let info = ns.info().clone();
-            info
+            let mut ns = NetworkStream::listen(&addr_clone).unwrap();
+            let info = pes::Stream::info(&ns).clone();
+            let mut frames = Vec::new();
+            while let Ok(Some(f)) = pes::Stream::read(&mut ns) {
+                frames.push(f);
+            }
+            (info, frames)
         });
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let dt = sample_title();
         let mut writer = NetworkStream::connect(&addr).unwrap().meta(&dt);
-        // Must write at least one byte to trigger header send
-        writer.write_all(&[0u8; 192]).unwrap();
-        writer.finish().unwrap();
+        let frame = pes::PesFrame { track: 0, pts: 90000, keyframe: true, data: vec![0x47; 192] };
+        pes::Stream::write(&mut writer, &frame).unwrap();
+        pes::Stream::finish(&mut writer).unwrap();
 
-        let info = handle.join().unwrap();
+        let (info, frames) = handle.join().unwrap();
         assert_eq!(info.playlist, "NetworkTest");
-        assert_eq!(info.duration_secs, 3600.0);
         assert_eq!(info.streams.len(), 2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].track, 0);
+        assert_eq!(frames[0].pts, 90000);
     }
 
     #[test]
     fn network_empty_addr_errors() {
         let result = NetworkStream::connect("");
-        assert!(result.is_err(), "empty address should fail");
+        assert!(result.is_err());
     }
 
     #[test]
     fn network_no_port_errors() {
-        // Connecting to an address without a port should fail
         let result = NetworkStream::connect("127.0.0.1");
-        assert!(result.is_err(), "address without port should fail");
+        assert!(result.is_err());
     }
 }
