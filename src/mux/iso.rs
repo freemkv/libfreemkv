@@ -205,7 +205,8 @@ impl IsoStream {
 
         // Decrypt after read — stream handles its own decryption
         let bytes = count as usize * SECTOR_SIZE as usize;
-        decrypt_sectors(&mut self.batch_buf[..bytes], &self.decrypt_keys, 0);
+        decrypt_sectors(&mut self.batch_buf[..bytes], &self.decrypt_keys, 0)
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         self.buf_pos = 0;
         self.buf_len = bytes;

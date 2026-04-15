@@ -55,6 +55,7 @@ pub const E_AACS_VID_READ: u16 = 7009;
 pub const E_AACS_VID_MAC: u16 = 7010;
 pub const E_AACS_DATA_KEY: u16 = 7011;
 pub const E_AACS_VUK_DERIVE: u16 = 7012;
+pub const E_DECRYPT_FAILED: u16 = 7013;
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
 pub const E_KEYDB_HTTP: u16 = 8001;
@@ -72,13 +73,9 @@ pub const E_MUX_WRITE: u16 = 9001;
 #[derive(Debug)]
 pub enum Error {
     /// Device not found at the given path.
-    DeviceNotFound {
-        path: String,
-    },
+    DeviceNotFound { path: String },
     /// Insufficient permissions to open the device.
-    DevicePermission {
-        path: String,
-    },
+    DevicePermission { path: String },
 
     /// Drive model is not in the profile database.
     UnsupportedDrive {
@@ -98,10 +95,7 @@ pub enum Error {
     /// Drive unlock (firmware upload) failed.
     UnlockFailed,
     /// Firmware signature verification failed.
-    SignatureMismatch {
-        expected: [u8; 4],
-        got: [u8; 4],
-    },
+    SignatureMismatch { expected: [u8; 4], got: [u8; 4] },
     /// Operation requires an unlocked drive.
     NotUnlocked,
     /// Operation requires a calibrated drive.
@@ -114,36 +108,25 @@ pub enum Error {
         sense_key: u8,
     },
     /// SCSI command timed out.
-    ScsiTimeout {
-        opcode: u8,
-    },
+    ScsiTimeout { opcode: u8 },
 
     /// Underlying I/O error.
-    IoError {
-        source: std::io::Error,
-    },
+    IoError { source: std::io::Error },
     /// Write operation failed.
     WriteError,
 
     /// Failed to read disc sector.
-    DiscRead {
-        sector: u64,
-    },
+    DiscRead { sector: u64 },
     /// MPLS playlist parsing failed.
     MplsParse,
     /// CLPI clip info parsing failed.
     ClpiParse,
     /// File not found on the UDF filesystem.
-    UdfNotFound {
-        path: String,
-    },
+    UdfNotFound { path: String },
     /// Disc contains no playable titles.
     DiscNoTitles,
     /// Title index out of range.
-    DiscTitleRange {
-        index: usize,
-        count: usize,
-    },
+    DiscTitleRange { index: usize, count: usize },
     /// Title has no sector extents to read.
     DiscNoExtents,
     /// DVD IFO file parsing failed.
@@ -175,27 +158,21 @@ pub enum Error {
     AacsDataKey,
     /// Failed to derive the Volume Unique Key.
     AacsVukDerive,
+    /// Decryption failed — missing or invalid keys.
+    DecryptFailed { reason: String },
 
     /// Failed to connect to the KEYDB server.
-    KeydbConnect {
-        host: String,
-    },
+    KeydbConnect { host: String },
     /// KEYDB server returned an HTTP error.
-    KeydbHttp {
-        status: u16,
-    },
+    KeydbHttp { status: u16 },
     /// Downloaded KEYDB file is invalid (no entries found).
     KeydbInvalid,
     /// Failed to write KEYDB to disk.
-    KeydbWrite {
-        path: String,
-    },
+    KeydbWrite { path: String },
     /// Failed to parse KEYDB file.
     KeydbParse,
     /// Failed to load KEYDB from disk.
-    KeydbLoad {
-        path: String,
-    },
+    KeydbLoad { path: String },
 
     /// Lookahead buffer exhausted before codec headers found.
     MuxLookahead,
@@ -240,6 +217,7 @@ impl Error {
             Error::AacsVidMac => E_AACS_VID_MAC,
             Error::AacsDataKey => E_AACS_DATA_KEY,
             Error::AacsVukDerive => E_AACS_VUK_DERIVE,
+            Error::DecryptFailed { .. } => E_DECRYPT_FAILED,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
@@ -318,6 +296,7 @@ impl std::fmt::Display for Error {
             Error::KeydbHttp { status } => write!(f, "E{}: {}", self.code(), status),
             Error::KeydbWrite { path } => write!(f, "E{}: {}", self.code(), path),
             Error::KeydbLoad { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::DecryptFailed { reason } => write!(f, "E{}: {}", self.code(), reason),
             // Simple codes — no extra data
             _ => write!(f, "E{}", self.code()),
         }
