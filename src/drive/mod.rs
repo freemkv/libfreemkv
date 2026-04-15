@@ -39,6 +39,14 @@ pub enum DriveStatus {
     Unknown,
 }
 
+// SCSI opcodes used in drive control
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_START_STOP_UNIT: u8 = 0x1B;
+const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
+const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
+const SCSI_MODE_SENSE: u8 = 0x5A;
+const SCSI_REPORT_KEY: u8 = 0xA4;
+
 /// Recovery state after a read error — stay at min speed for N bytes.
 const RECOVERY_WINDOW: u64 = 500 * 1024 * 1024; // 500 MB
 
@@ -104,7 +112,7 @@ impl Drive {
     }
 
     pub fn wait_ready(&mut self) -> Result<()> {
-        let tur = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut tried_reset = false;
 
         for _ in 0..60 {
@@ -142,7 +150,7 @@ impl Drive {
     /// Uses GET EVENT STATUS NOTIFICATION which works regardless of firmware state.
     pub fn drive_status(&mut self) -> DriveStatus {
         // GET EVENT STATUS NOTIFICATION: polled, media event class (0x10)
-        let cdb = [0x4Au8, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00];
+        let cdb = [SCSI_GET_EVENT_STATUS, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00];
         let mut buf = [0u8; 8];
         match self.scsi.as_mut().execute(
             &cdb,
@@ -164,7 +172,7 @@ impl Drive {
             }
             _ => {
                 // Fallback: try TUR
-                let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
                 let mut empty = [0u8; 0];
                 match self.scsi.as_mut().execute(
                     &tur,
@@ -193,17 +201,17 @@ impl Drive {
     /// any step, even if the drive reports "tray open" (that's a valid state).
     pub fn reset(&mut self) -> Result<()> {
         let mut buf = [0u8; 0];
-        let tur = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
 
         // 1. Unlock + stop/start
         self.unlock_tray();
-        let stop = [0x1Bu8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let stop = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x00, 0x00];
         let _ =
             self.scsi
                 .as_mut()
                 .execute(&stop, crate::scsi::DataDirection::None, &mut buf, 5_000);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let start = [0x1Bu8, 0x00, 0x00, 0x00, 0x01, 0x00];
+        let start = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x01, 0x00];
         let _ =
             self.scsi
                 .as_mut()
@@ -223,7 +231,7 @@ impl Drive {
         // After eject, TUR returning "Not Ready — tray open" (sense key 2)
         // counts as success: the drive is functional, just needs disc reinserted.
         self.unlock_tray();
-        let eject = [0x1Bu8, 0x00, 0x00, 0x00, 0x02, 0x00];
+        let eject = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x02, 0x00];
         let _ =
             self.scsi
                 .as_mut()
@@ -335,7 +343,7 @@ impl Drive {
     /// Read REPORT KEY RPC state (region playback control).
     pub fn report_key_rpc_state(&mut self) -> Option<Vec<u8>> {
         let cdb = [
-            0xA4u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00,
+            SCSI_REPORT_KEY, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00,
         ];
         let mut buf = vec![0u8; 8];
         let r = self
@@ -357,7 +365,7 @@ impl Drive {
 
     /// Read MODE SENSE page data.
     pub fn mode_sense_page(&mut self, page: u8) -> Option<Vec<u8>> {
-        let cdb = [0x5Au8, 0x00, page, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00];
+        let cdb = [SCSI_MODE_SENSE, 0x00, page, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00];
         let mut buf = vec![0u8; 252];
         let r = self
             .scsi
@@ -516,7 +524,7 @@ impl Drive {
 
     /// Lock the tray so the disc cannot be ejected during a rip.
     pub fn lock_tray(&mut self) {
-        let prevent = [0x1Eu8, 0x00, 0x00, 0x00, 0x01, 0x00];
+        let prevent = [SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, 0x00, 0x00, 0x00, 0x01, 0x00];
         let mut buf = [0u8; 0];
         let _ =
             self.scsi
@@ -526,7 +534,7 @@ impl Drive {
 
     /// Unlock the tray so the user can manually eject the disc.
     pub fn unlock_tray(&mut self) {
-        let allow = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let allow = [SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut buf = [0u8; 0];
         let _ =
             self.scsi
@@ -537,7 +545,7 @@ impl Drive {
     /// Eject the disc tray. Unlocks first, then ejects.
     pub fn eject(&mut self) -> Result<()> {
         self.unlock_tray();
-        let eject_cdb = [0x1Bu8, 0, 0, 0, 0x02, 0];
+        let eject_cdb = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0];
         let mut buf = [0u8; 0];
         self.scsi.as_mut().execute(
             &eject_cdb,

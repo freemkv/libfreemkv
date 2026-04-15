@@ -40,6 +40,13 @@ struct sg_io_hdr {
     info: u32,
 }
 
+// Compile-time validation: sg_io_hdr must match the kernel's layout.
+// 64 bytes on 64-bit, 44 bytes on 32-bit (pointer-size dependent).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 88);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
+
 pub struct SgIoTransport {
     fd: i32,
 }

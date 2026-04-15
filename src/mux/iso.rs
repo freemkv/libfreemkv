@@ -33,7 +33,14 @@ impl IsoSectorReader {
         let file = File::open(Path::new(path))
             .map_err(|e| io::Error::new(e.kind(), format!("iso://{path}: {e}")))?;
         let size = file.metadata()?.len();
-        let capacity = (size / SECTOR_SIZE) as u32;
+        let sectors = size / SECTOR_SIZE;
+        if sectors > u32::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("iso://{path}: image too large ({} TB, max ~8 TB)", size / (1024 * 1024 * 1024 * 1024)),
+            ));
+        }
+        let capacity = sectors as u32;
         Ok(Self { file, capacity })
     }
 
