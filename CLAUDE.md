@@ -25,3 +25,9 @@ The library contains ZERO user-facing English text. All errors use numeric codes
 - Always use `/dev/sg*` not `/dev/sr*` for SCSI.
 - `--raw` only skips decryption. Init/probe/speed still run.
 - Each function does one thing. One runner orchestrates the sequence.
+
+## Public repo rules
+
+- **No internal docs.** Audit reports, test plans, roadmaps, TODOs go in freemkv-private, never here.
+- **No Co-Authored-By** in commit messages. One contributor: MattJackson.
+- **No private references.** No Gitea URLs, no /data/code paths, no internal IPs in code.
