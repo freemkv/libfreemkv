@@ -212,9 +212,9 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
             let reader = BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::open(reader)?))
         }
-        StreamUrl::Network { ref addr } => {
-            validate_network_addr(addr)?;
-            Ok(Box::new(NetworkStream::listen(addr)?))
+        StreamUrl::Network { .. } => {
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "network:// requires PES pipeline — use input() instead of open_input()"))
         }
         StreamUrl::Stdio => {
             Ok(Box::new(StdioStream::input()))
@@ -282,9 +282,9 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
             };
             Ok(Box::new(MkvStream::new(writer).meta(meta).max_buffer(lookahead)))
         }
-        StreamUrl::Network { ref addr } => {
-            validate_network_addr(addr)?;
-            Ok(Box::new(NetworkStream::connect(addr)?.meta(meta)))
+        StreamUrl::Network { .. } => {
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "network:// output requires PES pipeline — use pipe() instead of open_output()"))
         }
         StreamUrl::Unknown { ref raw } => {
             Err(io::Error::new(io::ErrorKind::InvalidInput,
