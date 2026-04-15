@@ -7,11 +7,19 @@ use super::codec::{self, CodecParser};
 use super::lookahead::{LookaheadBuffer, LookaheadState, DEFAULT_LOOKAHEAD_SIZE};
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::ts::TsDemuxer;
-use super::{ebml, IOStream, ReadSeek, WriteSeek};
+use super::{ebml, IOStream, WriteSeek};
+use std::io::Seek;
 
 type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>)>;
+
+/// Skip `n` bytes on a forward-only reader (no Seek required).
+fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
+    io::copy(&mut r.take(n), &mut io::sink())?;
+    Ok(())
+}
+
 use crate::disc::*;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 
 /// Lookahead buffer for codec header detection (5 MB default).
 const DEFAULT_MAX_BUFFER: usize = DEFAULT_LOOKAHEAD_SIZE;
@@ -35,7 +43,7 @@ struct WriteState {
 }
 
 struct ReadState {
-    reader: Box<dyn ReadSeek>,
+    reader: Box<dyn Read>,
     buf: Vec<u8>,
     pos: usize,
     len: usize,
@@ -129,9 +137,7 @@ impl MkvStream {
     }
 
     /// Open an MKV file for reading.
-    pub fn open(mut reader: impl Read + Seek + 'static) -> io::Result<Self> {
-        let file_size = reader.seek(SeekFrom::End(0))?;
-        reader.seek(SeekFrom::Start(0))?;
+    pub fn open(mut reader: impl Read + 'static) -> io::Result<Self> {
         let (disc_title, codec_privates) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
@@ -146,7 +152,7 @@ impl MkvStream {
             }),
             max_buffer: 0,
             finished: false,
-            file_size: Some(file_size),
+            file_size: None,
         })
     }
 }
@@ -196,9 +202,7 @@ impl crate::pes::Stream for MkvStream {
                     }));
                 }
                 _ => {
-                    // Skip unknown element
-                    let mut skip = vec![0u8; size as usize];
-                    let _ = rs.reader.read_exact(&mut skip);
+                    skip_bytes(&mut rs.reader, size)?;
                     continue;
                 }
             }
@@ -396,7 +400,7 @@ impl Read for MkvStream {
                 }
                 _ => {
                     if size != u64::MAX && size > 0 {
-                        rs.reader.seek(SeekFrom::Current(size as i64))?;
+                        skip_bytes(&mut rs.reader, size)?;
                     }
                 }
             }
@@ -484,7 +488,7 @@ fn write_pes(
 
 /// Returns (DiscTitle, codec_privates: Vec<(track_number, codec_private_bytes)>)
 fn parse_mkv_header(
-    r: &mut (impl Read + Seek),
+    r: &mut impl Read,
 ) -> MkvHeaderResult {
     let mut title = String::new();
     let mut duration_ms = 0.0f64;
@@ -502,7 +506,7 @@ fn parse_mkv_header(
             "EBML header too large",
         ));
     }
-    r.seek(SeekFrom::Current(size as i64))?;
+    skip_bytes(r, size as u64)?;
 
     let (id, _, _) = ebml::read_element_header(r)?;
     if id != ebml::SEGMENT {
@@ -522,24 +526,24 @@ fn parse_mkv_header(
 
         match id {
             ebml::INFO => {
-                let end = r.stream_position()? + size;
-                while r.stream_position()? < end {
-                    let (cid, cs, _) = ebml::read_element_header(r)?;
+                let mut remaining = size;
+                while remaining > 0 {
+                    let (cid, cs, hlen) = ebml::read_element_header(r)?;
+                    remaining = remaining.saturating_sub(hlen as u64 + cs);
                     match cid {
                         ebml::TIMESTAMP_SCALE => ts_scale = ebml::read_uint_val(r, cs as usize)?,
                         ebml::DURATION => duration_ms = ebml::read_float_val(r, cs as usize)?,
                         ebml::TITLE => title = ebml::read_string_val(r, cs as usize)?,
-                        _ => {
-                            r.seek(SeekFrom::Current(cs as i64))?;
-                        }
+                        _ => { skip_bytes(r, cs)?; }
                     }
                 }
                 got_info = true;
             }
             ebml::TRACKS => {
-                let end = r.stream_position()? + size;
-                while r.stream_position()? < end {
-                    let (cid, cs, _) = ebml::read_element_header(r)?;
+                let mut remaining = size;
+                while remaining > 0 {
+                    let (cid, cs, hlen) = ebml::read_element_header(r)?;
+                    remaining = remaining.saturating_sub(hlen as u64 + cs);
                     if cid == ebml::TRACK_ENTRY {
                         let (stream, tnum, cp) = parse_track(r, cs)?;
                         if let Some(s) = stream {
@@ -549,14 +553,14 @@ fn parse_mkv_header(
                             codec_privates.push((tnum, cp));
                         }
                     } else {
-                        r.seek(SeekFrom::Current(cs as i64))?;
+                        skip_bytes(r, cs)?;
                     }
                 }
                 got_tracks = true;
             }
             ebml::CLUSTER => break,
             _ if size != u64::MAX => {
-                r.seek(SeekFrom::Current(size as i64))?;
+                skip_bytes(r, size as u64)?;
             }
             _ => break,
         }
@@ -573,17 +577,18 @@ fn parse_mkv_header(
 
 /// Returns (stream, track_number, codec_private_bytes)
 fn parse_track(
-    r: &mut (impl Read + Seek),
+    r: &mut impl Read,
     size: u64,
 ) -> io::Result<(Option<crate::disc::Stream>, u16, Option<Vec<u8>>)> {
-    let end = r.stream_position()? + size;
     let (mut ttype, mut tnum) = (0u64, 0u16);
     let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
     let (mut ph, mut sr, mut ch, mut forced) = (0u32, 0.0f64, 0u8, false);
     let mut codec_priv: Option<Vec<u8>> = None;
 
-    while r.stream_position()? < end {
-        let (cid, cs, _) = ebml::read_element_header(r)?;
+    let mut remaining = size;
+    while remaining > 0 {
+        let (cid, cs, hlen) = ebml::read_element_header(r)?;
+        remaining = remaining.saturating_sub(hlen as u64 + cs);
         match cid {
             ebml::TRACK_NUMBER => tnum = ebml::read_uint_val(r, cs as usize)? as u16,
             ebml::TRACK_TYPE => ttype = ebml::read_uint_val(r, cs as usize)?,
@@ -593,32 +598,30 @@ fn parse_track(
             ebml::TRACK_NAME => name = ebml::read_string_val(r, cs as usize)?,
             ebml::FLAG_FORCED => forced = ebml::read_uint_val(r, cs as usize)? != 0,
             ebml::VIDEO => {
-                let ve = r.stream_position()? + cs;
-                while r.stream_position()? < ve {
-                    let (vid, vs, _) = ebml::read_element_header(r)?;
+                let mut vrem = cs;
+                while vrem > 0 {
+                    let (vid, vs, vhlen) = ebml::read_element_header(r)?;
+                    vrem = vrem.saturating_sub(vhlen as u64 + vs);
                     if vid == ebml::PIXEL_HEIGHT {
                         ph = ebml::read_uint_val(r, vs as usize)? as u32;
                     } else {
-                        r.seek(SeekFrom::Current(vs as i64))?;
+                        skip_bytes(r, vs)?;
                     }
                 }
             }
             ebml::AUDIO => {
-                let ae = r.stream_position()? + cs;
-                while r.stream_position()? < ae {
-                    let (aid, as_, _) = ebml::read_element_header(r)?;
+                let mut arem = cs;
+                while arem > 0 {
+                    let (aid, as_, ahlen) = ebml::read_element_header(r)?;
+                    arem = arem.saturating_sub(ahlen as u64 + as_);
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
                         ebml::CHANNELS => ch = ebml::read_uint_val(r, as_ as usize)? as u8,
-                        _ => {
-                            r.seek(SeekFrom::Current(as_ as i64))?;
-                        }
+                        _ => { skip_bytes(r, as_)?; }
                     }
                 }
             }
-            _ => {
-                r.seek(SeekFrom::Current(cs as i64))?;
-            }
+            _ => { skip_bytes(r, cs)?; }
         }
     }
 

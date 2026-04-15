@@ -75,9 +75,6 @@ pub trait IOStream: Read + Write {
     }
 }
 
-// Combined traits for internal trait objects.
-pub(crate) trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
-
+// WriteSeek — used internally by MKV muxer (container format requires seeking).
 pub trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}

@@ -3,9 +3,9 @@
 //! Write: prepends FMKV metadata header, then passes through BD-TS bytes.
 //! Read: extracts metadata header (or scans PMT), then yields BD-TS bytes.
 
-use super::{meta, ts, IOStream, ReadSeek};
+use super::{meta, ts, IOStream};
 use crate::disc::{DiscTitle, Stream as DiscStream};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 
 type PesSetup = (Vec<u16>, Vec<(u16, Box<dyn super::codec::CodecParser>)>, Vec<(u16, usize)>);
 
@@ -18,8 +18,23 @@ enum Mode {
         header_written: bool,
     },
     Read {
-        reader: Box<dyn ReadSeek>,
+        reader: Box<dyn Read>,
     },
+}
+
+/// Read as many bytes as possible into buf (multiple read calls if needed).
+/// Bounded by buf.len() — caller controls max bytes read.
+fn read_fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match r.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 /// BD transport stream with embedded metadata.
@@ -82,69 +97,56 @@ impl M2tsStream {
         self
     }
 
-    /// Open an m2ts file for reading.
+    /// Open an M2TS stream for reading. Takes any Read source — file, pipe, socket.
     ///
-    /// Tries FMKV metadata header first. Falls back to PMT scan + PTS duration.
-    pub fn open(mut reader: impl Read + Seek + 'static) -> io::Result<Self> {
-        // Get total file size for progress tracking
-        let file_size = reader.seek(SeekFrom::End(0))?;
-        reader.seek(SeekFrom::Start(0))?;
+    /// Tries FMKV metadata header first. Falls back to PMT scan of first 1 MB.
+    pub fn open(mut reader: impl Read + 'static) -> io::Result<Self> {
+        // Read first chunk — enough for FMKV header or PMT scan
+        let mut head = vec![0u8; SCAN_SIZE];
+        let head_len = read_fill(&mut reader, &mut head)?;
+        head.truncate(head_len);
 
-        // Try FMKV metadata header — save position so we can seek back on failure
-        let start = reader.stream_position()?;
-        if let Ok(Some(m)) = meta::read_header(&mut reader) {
-            let header_end = reader.stream_position()?;
-            let content_size = file_size.saturating_sub(header_end);
-            let codec_privates = m.codec_privates();
+        // Try FMKV metadata header from the buffered head
+        let mut cursor = io::Cursor::new(&head);
+        if let Ok(Some(m)) = meta::read_header(&mut cursor) {
+            let header_end = cursor.position() as usize;
             let title = m.to_title();
             let (pids, parsers, pid_to_track) = Self::setup_pes(&title.streams);
+            // Chain: remaining head bytes + rest of reader
+            let remaining_head = &head[header_end..];
+            let chain: Box<dyn Read> = Box::new(io::Cursor::new(remaining_head.to_vec()).chain(reader));
             return Ok(Self {
-                disc_title: title,
-                mode: Mode::Read {
-                    reader: Box::new(reader),
-                },
+                disc_title: title.clone(),
+                mode: Mode::Read { reader: chain },
                 finished: false,
-                content_size: Some(content_size),
+                content_size: None,
                 demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
                 parsers,
                 pending_frames: std::collections::VecDeque::new(),
                 pid_to_track,
                 pes_eof: false,
-                stored_codec_privates: codec_privates,
+                stored_codec_privates: title.codec_privates,
             });
         }
 
-        // No FMKV header — seek back and try PMT scan
-        reader.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; SCAN_SIZE];
-        let n = reader.read(&mut buf)?;
-
-        let streams = ts::scan_streams(&buf[..n])
+        // No FMKV header — scan head for PMT
+        let streams = ts::scan_streams(&head)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no streams found"))?;
-
-        let video_pid = streams.iter().find_map(|s| match s {
-            DiscStream::Video(v) => Some(v.pid),
-            _ => None,
-        });
-        let duration = video_pid
-            .and_then(|pid| ts::scan_duration(&mut reader, pid))
-            .unwrap_or(0.0);
-
-        reader.seek(SeekFrom::Start(0))?;
 
         let (pids, parsers, pid_to_track) = Self::setup_pes(&streams);
 
+        // Chain: full head (it's all TS data) + rest of reader
+        let chain: Box<dyn Read> = Box::new(io::Cursor::new(head).chain(reader));
+
         Ok(Self {
             disc_title: DiscTitle {
-                duration_secs: duration,
+                duration_secs: 0.0, // unknown without seeking
                 streams,
                 ..DiscTitle::empty()
             },
-            mode: Mode::Read {
-                reader: Box::new(reader),
-            },
+            mode: Mode::Read { reader: chain },
             finished: false,
-            content_size: Some(file_size),
+            content_size: None,
             demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
             parsers,
             pending_frames: std::collections::VecDeque::new(),
