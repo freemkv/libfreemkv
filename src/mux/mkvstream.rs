@@ -207,6 +207,22 @@ impl crate::pes::Stream for MkvStream {
     fn finish(&mut self) -> io::Result<()> { Ok(()) }
 
     fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
+
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        let track_num = (track + 1) as u16; // MKV tracks are 1-based
+        if let Mode::Read(ref rs) = self.mode {
+            rs.codec_privates
+                .iter()
+                .find(|(tn, _)| *tn == track_num)
+                .map(|(_, data)| data.clone())
+        } else {
+            None
+        }
+    }
+
+    fn headers_ready(&self) -> bool {
+        true // MKV has all headers upfront in the EBML header
+    }
 }
 
 impl IOStream for MkvStream {

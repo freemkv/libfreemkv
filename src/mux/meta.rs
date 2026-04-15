@@ -46,6 +46,9 @@ pub enum MetaStream {
         label: String,
         #[serde(default)]
         secondary: bool,
+        /// Base64-encoded codec initialization data (HEVCDecoderConfigurationRecord, etc.)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec_private: Option<String>,
     },
     #[serde(rename = "audio")]
     Audio {
@@ -74,6 +77,20 @@ pub enum MetaStream {
 }
 
 impl M2tsMeta {
+    /// Build metadata from a disc Title with optional codec_private per stream.
+    pub fn from_title_with_privates(title: &DiscTitle, codec_privates: &[Option<Vec<u8>>]) -> Self {
+        let mut meta = Self::from_title(title);
+        for (i, s) in meta.streams.iter_mut().enumerate() {
+            if let MetaStream::Video { codec_private, .. } = s {
+                if let Some(Some(cp)) = codec_privates.get(i) {
+                    use base64::Engine;
+                    *codec_private = Some(base64::engine::general_purpose::STANDARD.encode(cp));
+                }
+            }
+        }
+        meta
+    }
+
     /// Build metadata from a disc Title.
     pub fn from_title(title: &DiscTitle) -> Self {
         let streams = title
@@ -88,6 +105,7 @@ impl M2tsMeta {
                     hdr: v.hdr.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
+                    codec_private: None,
                 },
                 Stream::Audio(a) => MetaStream::Audio {
                     pid: a.pid,
@@ -129,6 +147,7 @@ impl M2tsMeta {
                     hdr,
                     label,
                     secondary,
+                    codec_private: _,
                 } => Stream::Video(VideoStream {
                     pid: *pid,
                     codec: codec.parse().unwrap(),
@@ -182,6 +201,21 @@ impl M2tsMeta {
             extents: Vec::new(),
             content_format: crate::disc::ContentFormat::BdTs,
         }
+    }
+
+    /// Extract codec_private data per stream (from FMKV header).
+    /// Returns a Vec matching stream order — None for streams without codec_private.
+    pub fn codec_privates(&self) -> Vec<Option<Vec<u8>>> {
+        self.streams.iter().map(|s| {
+            if let MetaStream::Video { codec_private: Some(ref b64), .. } = s {
+{
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                }
+            } else {
+                None
+            }
+        }).collect()
     }
 }
 

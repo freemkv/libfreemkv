@@ -13,17 +13,28 @@ pub struct M2tsOutputStream {
 }
 
 impl M2tsOutputStream {
-    pub fn create(path: &str, title: &DiscTitle) -> io::Result<Self> {
+    pub fn create(
+        path: &str,
+        title: &DiscTitle,
+        codec_privates: &[Option<Vec<u8>>],
+    ) -> io::Result<Self> {
         let file = std::fs::File::create(path)
             .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path, e)))?;
         let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        // Write FMKV metadata header so M2tsStream::open can read it back
+        // Write FMKV metadata header with codec_privates so M2tsStream::open can read them back
         if !title.streams.is_empty() {
-            let m = super::meta::M2tsMeta::from_title(title);
+            let m = super::meta::M2tsMeta::from_title_with_privates(title, codec_privates);
             super::meta::write_header(&mut writer, &m)?;
         }
         let pids = extract_pids(title);
-        Ok(Self { muxer: TsMuxer::new(writer, &pids), title: title.clone() })
+        let mut muxer = TsMuxer::new(writer, &pids);
+        // Pass codec_privates to TsMuxer for Annex B parameter set injection
+        for (i, cp) in codec_privates.iter().enumerate() {
+            if let Some(data) = cp {
+                muxer.set_codec_private(i, data.clone());
+            }
+        }
+        Ok(Self { muxer, title: title.clone() })
     }
 }
 
