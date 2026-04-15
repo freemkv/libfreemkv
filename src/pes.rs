@@ -20,6 +20,32 @@ pub struct PesFrame {
 }
 
 impl PesFrame {
+    /// Serialize to bytes: track(1) | pts(8) | keyframe(1) | len(4) | data
+    pub fn serialize(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        w.write_all(&[self.track as u8])?;
+        w.write_all(&self.pts.to_le_bytes())?;
+        w.write_all(&[if self.keyframe { 1 } else { 0 }])?;
+        w.write_all(&(self.data.len() as u32).to_le_bytes())?;
+        w.write_all(&self.data)
+    }
+
+    /// Deserialize from bytes. Returns None at EOF.
+    pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
+        let mut header = [0u8; 14]; // 1 + 8 + 1 + 4
+        match r.read_exact(&mut header) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let track = header[0] as usize;
+        let pts = i64::from_le_bytes(header[1..9].try_into().unwrap());
+        let keyframe = header[9] != 0;
+        let len = u32::from_le_bytes(header[10..14].try_into().unwrap()) as usize;
+        let mut data = vec![0u8; len];
+        r.read_exact(&mut data)?;
+        Ok(Some(Self { track, pts, keyframe, data }))
+    }
+
     /// Create from a codec::Frame with a track index.
     pub fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
         Self {

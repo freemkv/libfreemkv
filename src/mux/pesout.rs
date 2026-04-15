@@ -48,7 +48,7 @@ impl crate::pes::Stream for NullOutputStream {
     fn info(&self) -> &DiscTitle { &self.title }
 }
 
-// ── Stdio ───────────────────────────────────────────────────────────────────
+// ── Stdio — serializes PES frames directly ──────────────────────────────────
 
 pub struct StdioOutputStream {
     writer: io::BufWriter<io::Stdout>,
@@ -66,16 +66,16 @@ impl crate::pes::Stream for StdioOutputStream {
         Err(io::Error::new(io::ErrorKind::Unsupported, "stdio output is write-only"))
     }
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        self.writer.write_all(&frame.data)
+        frame.serialize(&mut self.writer)
     }
     fn finish(&mut self) -> io::Result<()> { self.writer.flush() }
     fn info(&self) -> &DiscTitle { &self.title }
 }
 
-// ── Network ─────────────────────────────────────────────────────────────────
+// ── Network — serializes PES frames over TCP ────────────────────────────────
 
 pub struct NetworkOutputStream {
-    muxer: TsMuxer<io::BufWriter<std::net::TcpStream>>,
+    writer: io::BufWriter<std::net::TcpStream>,
     title: DiscTitle,
 }
 
@@ -83,8 +83,7 @@ impl NetworkOutputStream {
     pub fn connect(addr: &str, title: &DiscTitle) -> io::Result<Self> {
         let stream = std::net::TcpStream::connect(addr)?;
         let writer = io::BufWriter::with_capacity(256 * 1024, stream);
-        let pids = extract_pids(title);
-        Ok(Self { muxer: TsMuxer::new(writer, &pids), title: title.clone() })
+        Ok(Self { writer, title: title.clone() })
     }
 }
 
@@ -93,9 +92,9 @@ impl crate::pes::Stream for NetworkOutputStream {
         Err(io::Error::new(io::ErrorKind::Unsupported, "network output is write-only"))
     }
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        self.muxer.write_frame(frame.track, frame.pts, &frame.data)
+        frame.serialize(&mut self.writer)
     }
-    fn finish(&mut self) -> io::Result<()> { self.muxer.finish_ref() }
+    fn finish(&mut self) -> io::Result<()> { self.writer.flush() }
     fn info(&self) -> &DiscTitle { &self.title }
 }
 

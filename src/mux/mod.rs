@@ -31,6 +31,7 @@ pub mod mkv;
 pub mod mkvout;
 pub mod pesout;
 pub mod tsmux;
+pub mod tsreader;
 mod mkvstream;
 pub mod network;
 pub mod null;
