@@ -370,7 +370,6 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
 pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,
-    codec_privates: &[Option<Vec<u8>>],
 ) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
@@ -380,11 +379,11 @@ pub fn output(
                 .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
             let writer: Box<dyn super::WriteSeek> =
                 Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
-            Ok(Box::new(super::mkvout::MkvOutputStream::create(writer, title, codec_privates)?))
+            Ok(Box::new(super::mkvout::MkvOutputStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title, codec_privates)?))
+            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title)?))
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;

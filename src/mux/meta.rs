@@ -5,7 +5,7 @@
 
 use crate::disc::{AudioStream, ColorSpace, DiscTitle, Stream, SubtitleStream, VideoStream};
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 
 /// Magic bytes: "FMKV" + version 1 + 2 reserved bytes.
 const MAGIC: [u8; 8] = [b'F', b'M', b'K', b'V', 0x00, 0x01, 0x00, 0x00];
@@ -77,26 +77,14 @@ pub enum MetaStream {
 }
 
 impl M2tsMeta {
-    /// Build metadata from a disc Title with optional codec_private per stream.
-    pub fn from_title_with_privates(title: &DiscTitle, codec_privates: &[Option<Vec<u8>>]) -> Self {
-        let mut meta = Self::from_title(title);
-        for (i, s) in meta.streams.iter_mut().enumerate() {
-            if let MetaStream::Video { codec_private, .. } = s {
-                if let Some(Some(cp)) = codec_privates.get(i) {
-                    use base64::Engine;
-                    *codec_private = Some(base64::engine::general_purpose::STANDARD.encode(cp));
-                }
-            }
-        }
-        meta
-    }
-
-    /// Build metadata from a disc Title.
+    /// Build metadata from a DiscTitle. Codec privates come from title.codec_privates.
     pub fn from_title(title: &DiscTitle) -> Self {
+        use base64::Engine;
         let streams = title
             .streams
             .iter()
-            .map(|s| match s {
+            .enumerate()
+            .map(|(i, s)| match s {
                 Stream::Video(v) => MetaStream::Video {
                     pid: v.pid,
                     codec: v.codec.id().into(),
@@ -105,7 +93,9 @@ impl M2tsMeta {
                     hdr: v.hdr.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
-                    codec_private: None,
+                    codec_private: title.codec_privates.get(i)
+                        .and_then(|cp| cp.as_ref())
+                        .map(|cp| base64::engine::general_purpose::STANDARD.encode(cp)),
                 },
                 Stream::Audio(a) => MetaStream::Audio {
                     pid: a.pid,
@@ -200,6 +190,7 @@ impl M2tsMeta {
             chapters: Vec::new(),
             extents: Vec::new(),
             content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: self.codec_privates(),
         }
     }
 
@@ -237,26 +228,20 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
     Ok(())
 }
 
-/// Try to read a metadata header from the start of an m2ts file.
-/// Returns None for bare m2ts files (no header).
-/// On success, leaves reader positioned at the first TS packet.
-/// On failure, seeks back to the start.
-pub fn read_header<R: Read + Seek>(r: &mut R) -> io::Result<Option<M2tsMeta>> {
-    let start = r.stream_position()?;
+/// Try to read an FMKV metadata header.
+/// Returns None if magic bytes don't match. Consumes header bytes on success.
+/// Caller handles seek-back on failure if needed (e.g. for fallback PMT scan).
+pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
+    const MAX_JSON_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     let mut magic = [0u8; 8];
     if r.read_exact(&mut magic).is_err() {
-        r.seek(SeekFrom::Start(start))?;
         return Ok(None);
     }
 
     if magic[..4] != MAGIC[..4] {
-        // Not a freemkv m2ts — seek back
-        r.seek(SeekFrom::Start(start))?;
         return Ok(None);
     }
-
-    const MAX_JSON_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -272,42 +257,6 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> io::Result<Option<M2tsMeta>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // Skip padding to next 192-byte boundary
-    let raw_len = 8 + 4 + json_len;
-    let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
-    let padding = padded_len - raw_len;
-    if padding > 0 {
-        r.seek(SeekFrom::Current(padding as i64))?;
-    }
-
-    Ok(Some(meta))
-}
-
-/// Read a metadata header from a forward-only stream (no Seek required).
-/// Returns None if the magic bytes don't match. Consumes the header bytes.
-pub fn read_header_from_stream(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
-    let mut magic = [0u8; 8];
-    r.read_exact(&mut magic)?;
-
-    if magic[..4] != MAGIC[..4] {
-        return Ok(None);
-    }
-
-    const MAX_JSON_SIZE: usize = 10 * 1024 * 1024;
-
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let json_len = u32::from_be_bytes(len_buf) as usize;
-    if json_len > MAX_JSON_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "FMKV JSON too large"));
-    }
-
-    let mut json_buf = vec![0u8; json_len];
-    r.read_exact(&mut json_buf)?;
-
-    let meta: M2tsMeta = serde_json::from_slice(&json_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    // Skip padding
     let raw_len = 8 + 4 + json_len;
     let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
     let padding = padded_len - raw_len;

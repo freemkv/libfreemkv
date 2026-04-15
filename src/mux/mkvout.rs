@@ -15,13 +15,10 @@ pub struct MkvOutputStream {
 }
 
 impl MkvOutputStream {
-    /// Create an MKV output stream.
-    /// `codec_privates` provides initialization data per track (from InputStream).
-    /// Tracks without codec_private get None.
+    /// Create an MKV output stream. Codec privates come from title.codec_privates.
     pub fn create(
         writer: Box<dyn WriteSeek>,
         title: &DiscTitle,
-        codec_privates: &[Option<Vec<u8>>],
     ) -> io::Result<Self> {
         let mut tracks = Vec::new();
         for (idx, s) in title.streams.iter().enumerate() {
@@ -30,7 +27,7 @@ impl MkvOutputStream {
                 crate::disc::Stream::Audio(a) => MkvTrack::audio(a),
                 crate::disc::Stream::Subtitle(s) => MkvTrack::subtitle(s),
             };
-            if let Some(cp) = codec_privates.get(idx).and_then(|c| c.as_ref()) {
+            if let Some(cp) = title.codec_privates.get(idx).and_then(|c| c.as_ref()) {
                 track.codec_private = Some(cp.clone());
             }
             tracks.push(track);

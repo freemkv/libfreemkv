@@ -13,23 +13,17 @@ pub struct M2tsOutputStream {
 }
 
 impl M2tsOutputStream {
-    pub fn create(
-        path: &str,
-        title: &DiscTitle,
-        codec_privates: &[Option<Vec<u8>>],
-    ) -> io::Result<Self> {
+    pub fn create(path: &str, title: &DiscTitle) -> io::Result<Self> {
         let file = std::fs::File::create(path)
             .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path, e)))?;
         let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        // Write FMKV metadata header with codec_privates so M2tsStream::open can read them back
         if !title.streams.is_empty() {
-            let m = super::meta::M2tsMeta::from_title_with_privates(title, codec_privates);
+            let m = super::meta::M2tsMeta::from_title(title);
             super::meta::write_header(&mut writer, &m)?;
         }
         let pids = extract_pids(title);
         let mut muxer = TsMuxer::new(writer, &pids);
-        // Pass codec_privates to TsMuxer for Annex B parameter set injection
-        for (i, cp) in codec_privates.iter().enumerate() {
+        for (i, cp) in title.codec_privates.iter().enumerate() {
             if let Some(data) = cp {
                 muxer.set_codec_private(i, data.clone());
             }
@@ -45,7 +39,7 @@ impl crate::pes::Stream for M2tsOutputStream {
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         self.muxer.write_frame(frame.track, frame.pts, &frame.data)
     }
-    fn finish(&mut self) -> io::Result<()> { self.muxer.finish_ref() }
+    fn finish(&mut self) -> io::Result<()> { self.muxer.finish() }
     fn info(&self) -> &DiscTitle { &self.title }
 }
 
@@ -99,7 +93,6 @@ impl NetworkOutputStream {
     pub fn connect(addr: &str, title: &DiscTitle) -> io::Result<Self> {
         let stream = std::net::TcpStream::connect(addr)?;
         let mut writer = io::BufWriter::with_capacity(256 * 1024, stream);
-        // Send FMKV metadata header immediately so receiver can read it
         if !title.streams.is_empty() {
             let m = super::meta::M2tsMeta::from_title(title);
             super::meta::write_header(&mut writer, &m)?;

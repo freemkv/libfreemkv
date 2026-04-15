@@ -58,8 +58,8 @@ impl NetworkStream {
         stream.set_nodelay(true)?;
         let mut reader = BufReader::with_capacity(NET_BUF_SIZE, stream);
 
-        // Read FMKV metadata header (inline, since TcpStream doesn't impl Seek)
-        let disc_title = meta::read_header_from_stream(&mut reader)?
+        // Read FMKV metadata header
+        let disc_title = meta::read_header(&mut reader)?
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -149,6 +149,7 @@ mod tests {
             chapters: Vec::new(),
             extents: Vec::new(),
             content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
         }
     }
 
