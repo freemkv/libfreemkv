@@ -29,8 +29,10 @@ impl Disc {
         for hc in &keydb.host_certs {
             match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
-                    let volume_id =
-                        aacs::handshake::read_volume_id(session, &mut auth).unwrap_or([0u8; 16]);
+                    let volume_id = match aacs::handshake::read_volume_id(session, &mut auth) {
+                        Ok(vid) => vid,
+                        Err(_) => return None, // handshake succeeded but can't read VID
+                    };
                     let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
                         .ok()
                         .map(|(rdk, _)| rdk);
@@ -46,10 +48,8 @@ impl Disc {
                 }
             }
         }
-        last_error.map(|_e| HandshakeResult {
-            volume_id: [0u8; 16],
-            read_data_key: None,
-        })
+        // All host certs failed — return None, not a fake success
+        None
     }
 
     /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
