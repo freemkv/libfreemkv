@@ -43,8 +43,9 @@ pub struct DiscStream {
     pub errors: u64,
     eof: bool,
 
-    // PES output (for InputStream impl)
-    demuxer: Option<super::ts::TsDemuxer>,
+    // PES output
+    ts_demuxer: Option<super::ts::TsDemuxer>,
+    ps_demuxer: Option<super::ps::PsDemuxer>,
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
@@ -131,6 +132,12 @@ impl DiscStream {
         let mut stream = Self::title(drive, title);
         stream.decrypt_keys = keys;
 
+        // DVD: use program stream demuxer instead of transport stream
+        if disc.content_format == crate::disc::ContentFormat::MpegPs {
+            stream.ts_demuxer = None;
+            stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
+        }
+
         Ok(DiscOpenResult { stream, disc })
     }
 
@@ -190,7 +197,8 @@ impl DiscStream {
             batch_sectors: max_batch,
             errors: 0,
             eof: false,
-            demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
+            ts_demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
+            ps_demuxer: None, // set by caller for DVD content
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
@@ -367,23 +375,40 @@ impl crate::pes::Stream for DiscStream {
                 return Err(io::Error::other(e.to_string()));
             }
 
-            // Demux into PES packets, parse into frames
-            if let Some(ref mut demuxer) = self.demuxer {
+            // Demux into packets, parse into frames
+            if let Some(ref mut demuxer) = self.ts_demuxer {
+                // BD: transport stream demux
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for pes in &packets {
-                    if let Some((pid_idx, _)) = self.pid_to_track.iter().enumerate()
-                        .find(|(_, (pid, _))| *pid == pes.pid)
-                    {
-                        let track_idx = self.pid_to_track[pid_idx].1;
-                        if let Some((_, parser)) = self.parsers.iter_mut()
-                            .find(|(pid, _)| *pid == pes.pid)
-                        {
+                    if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
+                        if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
                             for frame in parser.parse(pes) {
                                 self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(track_idx, frame)
+                                    crate::pes::PesFrame::from_codec_frame(*track, frame)
                                 );
                             }
                         }
+                    }
+                }
+            } else if let Some(ref mut demuxer) = self.ps_demuxer {
+                // DVD: program stream demux
+                let packets = demuxer.feed(&self.read_buf[..bytes]);
+                for ps in &packets {
+                    // Map PS stream_id to track index
+                    let track = match ps.stream_id {
+                        0xE0..=0xEF => 0, // video
+                        0xC0..=0xDF => 1, // audio
+                        0xBD => ps.sub_stream_id.map(|s| (s & 0x1F) as usize + 1).unwrap_or(1),
+                        _ => continue,
+                    };
+                    if track < self.title.streams.len() {
+                        let pts_ns = ps.pts.map(|p| (p as i64) * 100_000 / 9).unwrap_or(0);
+                        self.pending_frames.push_back(crate::pes::PesFrame {
+                            track,
+                            pts: pts_ns,
+                            keyframe: true, // PS doesn't have keyframe flag easily
+                            data: ps.data.clone(),
+                        });
                     }
                 }
             }

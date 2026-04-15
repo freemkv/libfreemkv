@@ -214,12 +214,10 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "network:// input requires PES deserialization (TODO)"))
+            Ok(Box::new(NetworkStream::listen(addr)?))
         }
         StreamUrl::Stdio => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "stdio:// input requires PES deserialization (TODO)"))
+            Ok(Box::new(StdioStream::input()))
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
@@ -354,13 +352,12 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::open(reader)?))
         }
-        StreamUrl::Network { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "network:// input requires PES deserialization (TODO)"))
+        StreamUrl::Network { ref addr } => {
+            validate_network_addr(addr)?;
+            Ok(Box::new(NetworkStream::listen(addr)?))
         }
         StreamUrl::Stdio => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "stdio:// input requires PES deserialization (TODO)"))
+            Ok(Box::new(StdioStream::input()))
         }
         StreamUrl::Unknown { ref raw } => {
             Err(io::Error::new(io::ErrorKind::InvalidInput,

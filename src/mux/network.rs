@@ -33,7 +33,6 @@ pub struct NetworkStream {
     disc_title: DiscTitle,
     mode: Mode,
     finished: bool,
-    ts_reader: Option<super::tsreader::TsDemuxReader<BufReader<TcpStream>>>,
 }
 
 impl NetworkStream {
@@ -48,7 +47,6 @@ impl NetworkStream {
                 header_written: false,
             },
             finished: false,
-            ts_reader: None,
         })
     }
 
@@ -76,14 +74,34 @@ impl NetworkStream {
             })?
             .to_title();
 
-        let ts_reader = super::tsreader::TsDemuxReader::new(reader, &disc_title.streams);
         Ok(Self {
             disc_title,
-            mode: Mode::Read { reader: BufReader::new(TcpStream::connect("0.0.0.0:0").unwrap()) }, // placeholder
+            mode: Mode::Read { reader },
             finished: false,
-            ts_reader: Some(ts_reader),
         })
     }
+}
+
+impl crate::pes::Stream for NetworkStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        match &mut self.mode {
+            Mode::Read { reader } => crate::pes::PesFrame::deserialize(reader),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for writing")),
+        }
+    }
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Write { writer, .. } => frame.serialize(writer),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for reading")),
+        }
+    }
+    fn finish(&mut self) -> io::Result<()> {
+        if let Mode::Write { writer, .. } = &mut self.mode {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+    fn info(&self) -> &DiscTitle { &self.disc_title }
 }
 
 impl IOStream for NetworkStream {
