@@ -28,6 +28,7 @@ pub mod lookahead;
 mod m2ts;
 pub mod meta;
 pub mod mkv;
+pub mod mkvout;
 mod mkvstream;
 pub mod network;
 pub mod null;
