@@ -40,6 +40,26 @@ impl StdioStream {
     }
 }
 
+impl crate::pes::Stream for StdioStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        match &mut self.reader {
+            Some(r) => crate::pes::PesFrame::deserialize(r),
+            None => Err(io::Error::new(io::ErrorKind::Unsupported, "stdio opened for writing")),
+        }
+    }
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        match &mut self.writer {
+            Some(w) => frame.serialize(w),
+            None => Err(io::Error::new(io::ErrorKind::Unsupported, "stdio opened for reading")),
+        }
+    }
+    fn finish(&mut self) -> io::Result<()> {
+        if let Some(w) = &mut self.writer { w.flush()?; }
+        Ok(())
+    }
+    fn info(&self) -> &DiscTitle { &self.disc_title }
+}
+
 impl IOStream for StdioStream {
     fn info(&self) -> &DiscTitle {
         &self.disc_title
