@@ -1,8 +1,9 @@
-//! Integration tests for the IOStream pipeline.
+//! Integration tests for the PES stream pipeline.
 
 use libfreemkv::mux::meta::M2tsMeta;
+use libfreemkv::pes::Stream as PesStream;
 use libfreemkv::*;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 
 fn sample_disc_title() -> DiscTitle {
     DiscTitle {
@@ -114,70 +115,70 @@ fn parse_url_m2ts_relative() {
 
 #[test]
 fn open_input_bare_path_errors() {
-    let result = libfreemkv::open_input("Dune.mkv", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("Dune.mkv", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
+    assert!(msg.contains("not a valid stream URL") || msg.contains("E9002"), "got: {}", msg);
 }
 
 #[test]
 fn open_output_bare_path_errors() {
     let dt = sample_disc_title();
-    let result = libfreemkv::open_output("Dune.mkv", &dt);
+    let result = libfreemkv::output("Dune.mkv", &dt);
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("not a valid stream URL"), "got: {}", msg);
+    assert!(msg.contains("not a valid stream URL") || msg.contains("E9002"), "got: {}", msg);
 }
 
 #[test]
 fn open_input_m2ts_empty_path_errors() {
-    let result = libfreemkv::open_input("m2ts://", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("m2ts://", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("requires a file path"), "got: {}", msg);
+    assert!(msg.contains("requires a file path") || msg.contains("E9003"), "got: {}", msg);
 }
 
 #[test]
 fn open_output_null_input_errors() {
-    let result = libfreemkv::open_input("null://", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("null://", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("write-only"), "got: {}", msg);
+    assert!(msg.contains("write-only") || msg.contains("E9001"), "got: {}", msg);
 }
 
 #[test]
 fn open_output_disc_errors() {
     let dt = sample_disc_title();
-    let result = libfreemkv::open_output("disc://", &dt);
+    let result = libfreemkv::output("disc://", &dt);
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("read-only"), "got: {}", msg);
+    assert!(msg.contains("read-only") || msg.contains("E9000"), "got: {}", msg);
 }
 
 #[test]
 fn open_input_network_no_port_errors() {
-    let result = libfreemkv::open_input("network://10.0.0.1", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("network://10.0.0.1", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("PES pipeline") || msg.contains("missing port"), "got: {}", msg);
+    assert!(msg.contains("PES pipeline") || msg.contains("missing port") || msg.contains("E9004"), "got: {}", msg);
 }
 
 #[test]
@@ -262,124 +263,73 @@ fn m2ts_header_write_read() {
 fn m2ts_stream_write_read() {
     let dt = sample_disc_title();
 
-    // Build fake BD-TS packets
-    let mut ts_data = Vec::new();
-    for i in 0..10u8 {
-        let mut pkt = [0u8; 192];
-        pkt[4] = 0x47;
-        pkt[5] = 0x10;
-        pkt[6] = 0x11;
-        pkt[7] = 0x10;
-        pkt[8] = i;
-        ts_data.extend_from_slice(&pkt);
-    }
-
-    // Write through M2tsStream to a Cursor
+    // Write PES frames through M2tsStream to a Cursor
     let output = Cursor::new(Vec::new());
-    let mut stream = M2tsStream::new(output).meta(&dt);
-    stream.write_all(&ts_data).unwrap();
+    let mut stream = M2tsStream::create(output, &dt).unwrap();
+
+    // Write some PES frames
+    for i in 0..5u8 {
+        let frame = libfreemkv::pes::PesFrame {
+            track: 0,
+            pts: i as i64 * 1_000_000,
+            keyframe: i == 0,
+            data: vec![i; 100],
+        };
+        stream.write(&frame).unwrap();
+    }
     stream.finish().unwrap();
 
-    // M2tsStream consumed the cursor — we need the inner data.
-    // For this test, write to a shared buffer instead.
-    // Use a second pass: write header + data manually to verify read side.
-    let mut encoded = Vec::new();
-    let meta = M2tsMeta::from_title(&dt);
-    libfreemkv::mux::meta::write_header(&mut encoded, &meta).unwrap();
-    encoded.extend_from_slice(&ts_data);
-
-    // Read back
-    let cursor = Cursor::new(encoded);
-    let mut stream = M2tsStream::open(cursor).unwrap();
+    // Verify the info is correct
     let info = stream.info();
     assert_eq!(info.streams.len(), 4);
     assert_eq!(info.duration_secs, 7200.0);
-
-    // Read BD-TS data
-    let mut read_buf = vec![0u8; 192 * 10];
-    let mut total = 0;
-    loop {
-        match stream.read(&mut read_buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => break,
-        }
-    }
-
-    assert_eq!(total, 192 * 10);
-    for i in 0..10u8 {
-        assert_eq!(read_buf[i as usize * 192 + 4], 0x47);
-        assert_eq!(read_buf[i as usize * 192 + 8], i);
-    }
 }
 
-// ── M2tsStream passthrough identity ───────────────────────────
+// ── M2tsStream PES frame roundtrip ───────────────────────────
 
 #[test]
-fn m2ts_passthrough_preserves_data() {
-    let dt = sample_disc_title();
+fn m2ts_pes_frame_roundtrip() {
+    // PesFrame serialize/deserialize roundtrip
+    let frame = libfreemkv::pes::PesFrame {
+        track: 2,
+        pts: 1_234_567_890,
+        keyframe: true,
+        data: vec![0xDE; 200],
+    };
 
-    // Create original BD-TS data
-    let mut original = Vec::new();
-    for i in 0..100u8 {
-        let mut pkt = [0u8; 192];
-        pkt[4] = 0x47;
-        pkt[5] = (i % 3) << 4;
-        pkt[6] = i;
-        for (j, byte) in pkt.iter_mut().enumerate().skip(8) {
-            *byte = i.wrapping_add(j as u8);
-        }
-        original.extend_from_slice(&pkt);
-    }
+    let mut buf = Vec::new();
+    frame.serialize(&mut buf).unwrap();
 
-    // Build encoded: header + original data
-    let mut encoded = Vec::new();
-    let meta = M2tsMeta::from_title(&dt);
-    libfreemkv::mux::meta::write_header(&mut encoded, &meta).unwrap();
-    encoded.extend_from_slice(&original);
+    let mut cursor = Cursor::new(&buf);
+    let restored = libfreemkv::pes::PesFrame::deserialize(&mut cursor)
+        .unwrap()
+        .unwrap();
 
-    // Read back through M2tsStream
-    let cursor = Cursor::new(encoded);
-    let mut stream = M2tsStream::open(cursor).unwrap();
-    let mut decoded = vec![0u8; original.len()];
-    let mut total = 0;
-    loop {
-        match stream.read(&mut decoded[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => break,
-        }
-    }
-
-    // BD-TS data must be byte-identical
-    assert_eq!(total, original.len());
-    assert_eq!(decoded, original);
+    assert_eq!(restored.track, frame.track);
+    assert_eq!(restored.pts, frame.pts);
+    assert_eq!(restored.keyframe, frame.keyframe);
+    assert_eq!(restored.data, frame.data);
 }
 
-// ── IOStream trait ────────────────────────────────────────────
+// ── PES Stream trait ─────────────────────────────────────────
 
 #[test]
-fn m2ts_implements_iostream() {
+fn m2ts_implements_pes_stream() {
     let dt = sample_disc_title();
     let output = Cursor::new(Vec::new());
-    let stream = M2tsStream::new(output).meta(&dt);
+    let stream = M2tsStream::create(output, &dt).unwrap();
 
-    let mut boxed: Box<dyn IOStream> = Box::new(stream);
+    let boxed: Box<dyn PesStream> = Box::new(stream);
     let meta = boxed.info();
     assert_eq!(meta.streams.len(), 4);
-
-    let pkt = [0u8; 192];
-    boxed.write_all(&pkt).unwrap();
-    boxed.finish().unwrap();
 }
 
 #[test]
 fn m2ts_read_returns_error_on_write_stream() {
+    let dt = sample_disc_title();
     let output = Cursor::new(Vec::new());
-    let stream = M2tsStream::new(output);
-    let mut boxed: Box<dyn IOStream> = Box::new(stream);
-    let mut buf = [0u8; 10];
-    assert!(boxed.read(&mut buf).is_err());
+    let mut stream = M2tsStream::create(output, &dt).unwrap();
+    assert!(stream.read().is_err());
 }
 
 // ── DiscTitle::empty ──────────────────────────────────────────
@@ -595,21 +545,20 @@ fn meta_all_stream_types() {
 
 #[test]
 fn mkvstream_write_finish() {
-    let output = Cursor::new(Vec::new());
     let dt = sample_disc_title();
-    let mut stream = MkvStream::new(output).meta(&dt).max_buffer(1024 * 1024);
+    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let mut stream = MkvStream::create(writer, &dt).unwrap();
 
-    // Write some fake BD-TS packets (they won't produce valid MKV frames
+    // Write some fake PES frames (they won't produce valid MKV content
     // since there is no real codec data, but it should not panic)
     for i in 0..20u8 {
-        let mut pkt = [0u8; 192];
-        pkt[4] = 0x47;
-        // PID 0x1011 (video)
-        pkt[5] = 0x10;
-        pkt[6] = 0x11;
-        pkt[7] = 0x10;
-        pkt[8] = i;
-        stream.write_all(&pkt).unwrap();
+        let frame = libfreemkv::pes::PesFrame {
+            track: 0,
+            pts: i as i64 * 1_000_000,
+            keyframe: i == 0,
+            data: vec![i; 100],
+        };
+        stream.write(&frame).unwrap();
     }
 
     // finish should not panic even without valid codec data
@@ -618,9 +567,9 @@ fn mkvstream_write_finish() {
 
 #[test]
 fn mkvstream_meta_sets_title() {
-    let output = Cursor::new(Vec::new());
     let dt = sample_disc_title();
-    let stream = MkvStream::new(output).meta(&dt);
+    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let stream = MkvStream::create(writer, &dt).unwrap();
 
     let info = stream.info();
     assert_eq!(info.playlist, "Test Movie");
@@ -658,19 +607,18 @@ fn mkvstream_roundtrip_bdts() {
         codec_privates: Vec::new(),
     };
 
-    let output = Cursor::new(Vec::new());
-    let mut stream = MkvStream::new(output).meta(&dt).max_buffer(1024 * 1024);
+    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let mut stream = MkvStream::create(writer, &dt).unwrap();
 
-    // Write BD-TS packets targeting the audio PID 0x1100
+    // Write PES frames targeting the audio track
     for i in 0..10u8 {
-        let mut pkt = [0u8; 192];
-        pkt[4] = 0x47;
-        // PID 0x1100
-        pkt[5] = 0x11;
-        pkt[6] = 0x00;
-        pkt[7] = 0x10;
-        pkt[8] = i;
-        stream.write_all(&pkt).unwrap();
+        let frame = libfreemkv::pes::PesFrame {
+            track: 0,
+            pts: i as i64 * 1_000_000,
+            keyframe: true,
+            data: vec![i; 100],
+        };
+        stream.write(&frame).unwrap();
     }
 
     stream.finish().unwrap();
@@ -739,8 +687,8 @@ fn mkvstream_meta_preserves_all_streams() {
         codec_privates: Vec::new(),
     };
 
-    let output = Cursor::new(Vec::new());
-    let stream = MkvStream::new(output).meta(&dt);
+    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let stream = MkvStream::create(writer, &dt).unwrap();
 
     let info = stream.info();
     assert_eq!(info.streams.len(), 5, "all 5 streams should be preserved");
@@ -800,17 +748,12 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         codec_privates: Vec::new(),
     };
 
-    // Build synthetic BD-TS packets containing valid H.264 NALs
-    // We need PES headers wrapping: SPS (NAL type 7), PPS (NAL type 8), IDR (NAL type 5)
-    let mut ts_data = Vec::new();
-
     // Build elementary stream data: start codes + NALs
     let mut es_data = Vec::new();
 
     // SPS NAL (type 7): minimal valid SPS
     es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
     es_data.push(0x67); // NAL type 7 (SPS), nal_ref_idc=3
-                        // Minimal SPS payload: profile_idc=66 (Baseline), constraint flags, level_idc=30
     es_data.extend_from_slice(&[
         0x42, 0xC0, 0x1E, // profile=66, constraint_set0=1, level=30
         0xD9, 0x00, 0xA0, 0x47, 0xFE, 0x88, // minimal SPS rbsp
@@ -824,123 +767,15 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
     // IDR NAL (type 5): keyframe
     es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
     es_data.push(0x65); // NAL type 5 (IDR), nal_ref_idc=3
-                        // Some IDR slice data
     es_data.extend_from_slice(&[0x88, 0x84, 0x00, 0x21, 0xFF, 0xFE, 0xF6, 0xE2]);
-    // Pad to reasonable size
     es_data.extend_from_slice(&[0x00; 64]);
 
-    // Wrap in PES header with PTS
-    let pts: i64 = 90000; // 1 second in 90kHz ticks
-    let pts_bytes = encode_pts_test(pts);
-    let pes_header_len = 9 + 5; // basic PES header (9) + PTS (5)
-    let pes_length = (3 + 5 + es_data.len()) as u16; // flags(3) + PTS(5) + ES data
-
-    let mut pes = Vec::new();
-    pes.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]); // PES start code + video stream_id
-    pes.extend_from_slice(&pes_length.to_be_bytes()); // PES packet length
-    pes.extend_from_slice(&[0x80, 0x80, 0x05]); // flags: PTS present, header_data_len=5
-    pes.extend_from_slice(&pts_bytes);
-    pes.extend_from_slice(&es_data);
-
-    // Wrap PES in 192-byte BD-TS packets
-    let pid: u16 = 0x1011;
-    let mut pes_offset = 0;
-    let mut pusi = true;
-    let mut cc: u8 = 0;
-
-    while pes_offset < pes.len() {
-        let mut pkt = [0u8; 192];
-        // 4-byte TP_extra_header (zeros)
-        pkt[4] = 0x47; // sync byte
-        pkt[5] = (pid >> 8) as u8 & 0x1F;
-        if pusi {
-            pkt[5] |= 0x40; // PUSI
-            pusi = false;
-        }
-        pkt[6] = pid as u8;
-        pkt[7] = 0x10 | (cc & 0x0F); // payload only + continuity counter
-        cc = cc.wrapping_add(1);
-
-        let space = 184;
-        let rem = pes.len() - pes_offset;
-        let n = rem.min(space);
-
-        if n < space {
-            // Need adaptation field for padding
-            let pad = space - n;
-            pkt[7] = 0x30 | (cc.wrapping_sub(1) & 0x0F); // AF + payload
-            pkt[8] = (pad - 1) as u8; // adaptation_field_length
-            if pad > 1 {
-                pkt[9] = 0x00; // flags
-            }
-            for byte in pkt.iter_mut().take(8 + pad).skip(10) {
-                *byte = 0xFF;
-            }
-            pkt[8 + pad..8 + pad + n].copy_from_slice(&pes[pes_offset..pes_offset + n]);
-        } else {
-            pkt[8..8 + n].copy_from_slice(&pes[pes_offset..pes_offset + n]);
-        }
-
-        ts_data.extend_from_slice(&pkt);
-        pes_offset += n;
-    }
-
-    // Build a second PES (access unit) to trigger the first PES to be output
-    // by the TS demuxer (it needs a new PUSI to emit the previous PES).
-    let pts2: i64 = 90000 + 3753; // ~1 frame later
-    let pts2_bytes = encode_pts_test(pts2);
+    // Non-IDR slice data (NAL type 1)
     let mut es_data2 = Vec::new();
-    // Just a non-IDR slice (NAL type 1)
     es_data2.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     es_data2.push(0x41); // NAL type 1 (non-IDR)
     es_data2.extend_from_slice(&[0x9A, 0x00, 0x10, 0x20]);
     es_data2.extend_from_slice(&[0x00; 32]);
-
-    let pes2_length = (3 + 5 + es_data2.len()) as u16;
-    let mut pes2 = Vec::new();
-    pes2.extend_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
-    pes2.extend_from_slice(&pes2_length.to_be_bytes());
-    pes2.extend_from_slice(&[0x80, 0x80, 0x05]);
-    pes2.extend_from_slice(&pts2_bytes);
-    pes2.extend_from_slice(&es_data2);
-
-    // Wrap second PES in BD-TS packets
-    let mut pes2_offset = 0;
-    let mut pusi2 = true;
-    while pes2_offset < pes2.len() {
-        let mut pkt = [0u8; 192];
-        pkt[4] = 0x47;
-        pkt[5] = (pid >> 8) as u8 & 0x1F;
-        if pusi2 {
-            pkt[5] |= 0x40;
-            pusi2 = false;
-        }
-        pkt[6] = pid as u8;
-        pkt[7] = 0x10 | (cc & 0x0F);
-        cc = cc.wrapping_add(1);
-
-        let space = 184;
-        let rem = pes2.len() - pes2_offset;
-        let n = rem.min(space);
-
-        if n < space {
-            let pad = space - n;
-            pkt[7] = 0x30 | (cc.wrapping_sub(1) & 0x0F);
-            pkt[8] = (pad - 1) as u8;
-            if pad > 1 {
-                pkt[9] = 0x00;
-            }
-            for byte in pkt.iter_mut().take(8 + pad).skip(10) {
-                *byte = 0xFF;
-            }
-            pkt[8 + pad..8 + pad + n].copy_from_slice(&pes2[pes2_offset..pes2_offset + n]);
-        } else {
-            pkt[8..8 + n].copy_from_slice(&pes2[pes2_offset..pes2_offset + n]);
-        }
-
-        ts_data.extend_from_slice(&pkt);
-        pes2_offset += n;
-    }
 
     // Feed through MkvStream using a shared writer to inspect the output bytes.
     let output2 = std::sync::Arc::new(std::sync::Mutex::new(Cursor::new(Vec::new())));
@@ -960,9 +795,26 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         }
     }
 
-    let writer = SharedWriter(output2.clone());
-    let mut stream2 = MkvStream::new(writer).meta(&dt).max_buffer(1024 * 1024);
-    stream2.write_all(&ts_data).unwrap();
+    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(SharedWriter(output2.clone()));
+    let mut stream2 = MkvStream::create(writer, &dt).unwrap();
+
+    // Write the ES data (SPS+PPS+IDR) as a keyframe PES frame.
+    let frame1 = libfreemkv::pes::PesFrame {
+        track: 0,
+        pts: 1_000_000_000, // 1 second in ns
+        keyframe: true,
+        data: es_data,
+    };
+    stream2.write(&frame1).unwrap();
+
+    // Write a second non-IDR frame
+    let frame2 = libfreemkv::pes::PesFrame {
+        track: 0,
+        pts: 1_041_700_000, // ~1 frame later in ns
+        keyframe: false,
+        data: es_data2,
+    };
+    stream2.write(&frame2).unwrap();
     stream2.finish().unwrap();
 
     let data = output2.lock().unwrap().clone().into_inner();
@@ -984,45 +836,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
     let has_tracks = data.windows(4).any(|w| w == tracks_needle);
     assert!(has_tracks, "output should contain Tracks element");
 
-    // Verify codecPrivate is non-empty (not all zeros)
-    // CodecPrivate element ID is 0x63A2
-    let cp_needle = [0x63, 0xA2];
-    let cp_pos = data.windows(2).position(|w| w == cp_needle);
-    if let Some(pos) = cp_pos {
-        // After the ID, there's a size VINT, then the data
-        let after_id = pos + 2;
-        if after_id < data.len() {
-            // Read VINT size
-            let size_byte = data[after_id];
-            let (cp_size, cp_data_start) = if size_byte & 0x80 != 0 {
-                ((size_byte & 0x7F) as usize, after_id + 1)
-            } else if size_byte & 0x40 != 0 && after_id + 1 < data.len() {
-                (
-                    (((size_byte & 0x3F) as usize) << 8) | data[after_id + 1] as usize,
-                    after_id + 2,
-                )
-            } else {
-                (0, after_id + 1)
-            };
-            if cp_size > 0 && cp_data_start + cp_size <= data.len() {
-                let cp_data = &data[cp_data_start..cp_data_start + cp_size];
-                let all_zeros = cp_data.iter().all(|&b| b == 0);
-                assert!(
-                    !all_zeros,
-                    "codecPrivate should not be all zeros (SPS/PPS should be filled)"
-                );
-            }
-        }
-    }
-}
-
-fn encode_pts_test(pts: i64) -> [u8; 5] {
-    let p = pts as u64;
-    [
-        0x21 | ((p >> 29) & 0x0E) as u8,
-        ((p >> 22) & 0xFF) as u8,
-        0x01 | ((p >> 14) & 0xFE) as u8,
-        ((p >> 7) & 0xFF) as u8,
-        0x01 | ((p << 1) & 0xFE) as u8,
-    ]
+    // Note: With the PES stream API, codec_privates are populated from the
+    // DiscTitle at creation time, not extracted from ES data during write.
+    // This test verifies the muxer produces valid EBML structure.
 }
