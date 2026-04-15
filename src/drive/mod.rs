@@ -437,77 +437,60 @@ impl Drive {
                     self.recovery_bytes_remaining =
                         self.recovery_bytes_remaining.saturating_sub(bytes_read);
                     if self.recovery_bytes_remaining == 0 {
-                        eprintln!("[drive] recovery window complete — resuming full speed");
                         self.set_speed(0xFFFF);
                     }
                 }
                 return Ok(result.bytes_transferred);
             }
-            Err(e) => {
-                eprintln!("[drive] read error at LBA {} count {} — {}", lba, count, e);
-            }
+            Err(_) => {}
         }
 
         // Phase 1: gentle — sleep 30s, retry. 5 times.
-        // No intervention, just patience.
         self.set_speed(0);
 
-        for attempt in 1..=5 {
-            eprintln!("[drive] phase 1 retry {}/5 at LBA {} — sleep 30s", attempt, lba);
+        for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             match self.scsi.as_mut().execute(
                 &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
             ) {
                 Ok(result) => {
-                    eprintln!("[drive] phase 1 retry {}/5 OK at LBA {}", attempt, lba);
                     self.recovery_bytes_remaining = RECOVERY_WINDOW;
                     return Ok(result.bytes_transferred);
                 }
-                Err(e) => {
-                    eprintln!("[drive] phase 1 retry {}/5 FAILED at LBA {} — {}", attempt, lba, e);
-                }
+                Err(_) => {}
             }
         }
 
-        // Phase 2: fresh start — close, reset, open, init. Like restarting the app.
-        eprintln!("[drive] phase 2: fresh start at LBA {}", lba);
+        // Phase 2: fresh start — close, reset, open, init.
         let device = std::path::PathBuf::from(&self.device_path);
         std::thread::sleep(std::time::Duration::from_secs(5));
         let _ = crate::scsi::reset(&device);
         std::thread::sleep(std::time::Duration::from_secs(5));
         self.scsi = match crate::scsi::open(&device) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("[drive] reopen failed: {}", e);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         let _ = self.init();
         let _ = self.wait_ready();
         self.set_speed(0);
 
         // Phase 3: gentle again on fresh connection — sleep 30s, retry. 5 times.
-        for attempt in 1..=5 {
-            eprintln!("[drive] phase 3 retry {}/5 at LBA {} — sleep 30s", attempt, lba);
+        for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             match self.scsi.as_mut().execute(
                 &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
             ) {
                 Ok(result) => {
-                    eprintln!("[drive] phase 3 retry {}/5 OK at LBA {}", attempt, lba);
                     self.recovery_bytes_remaining = RECOVERY_WINDOW;
                     return Ok(result.bytes_transferred);
                 }
-                Err(e) => {
-                    eprintln!("[drive] phase 3 retry {}/5 FAILED at LBA {} — {}", attempt, lba, e);
-                }
+                Err(_) => {}
             }
         }
 
-        // Both phases failed. Give up.
-        eprintln!("[drive] FAILED LBA {} count {} — all recovery exhausted", lba, count);
+        // Both phases failed.
         self.recovery_bytes_remaining = RECOVERY_WINDOW;
         Err(Error::DiscRead { sector: lba as u64 })
     }
