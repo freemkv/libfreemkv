@@ -72,7 +72,11 @@ impl<W: Write> TsMuxer<W> {
         };
 
         // Build PES packet: header + data
-        let pts_90k = (pts_ns * 9 / 100_000) as u64;
+        let pts_90k = if pts_ns >= 0 {
+            (pts_ns as u64).saturating_mul(9) / 100_000
+        } else {
+            0
+        };
         let pes_header = build_pes_header(pid, pts_90k, es_data.len());
         let pes_packet = [&pes_header[..], &es_data[..]].concat();
 
@@ -108,14 +112,17 @@ impl<W: Write> TsMuxer<W> {
                 self.writer.write_all(&tp_extra)?;
                 self.writer.write_all(&ts_header)?;
 
+                // Write adaptation field: length byte + flags byte + 0xFF padding
+                // stuff_len == 1: AF length = 0 (just the length byte, no flags)
+                // stuff_len >= 2: AF length = stuff_len-1, flags = 0, rest 0xFF
+                static STUFF_FF: [u8; 184] = [0xFF; 184];
                 if stuff_len == 1 {
                     self.writer.write_all(&[0u8])?; // adaptation_field_length = 0
                 } else {
-                    self.writer.write_all(&[(stuff_len - 1) as u8])?; // length
+                    self.writer.write_all(&[(stuff_len - 1) as u8])?; // AF length
                     self.writer.write_all(&[0u8])?; // flags
                     if stuff_len > 2 {
-                        let padding = vec![0xFF; stuff_len - 2];
-                        self.writer.write_all(&padding)?;
+                        self.writer.write_all(&STUFF_FF[..stuff_len - 2])?;
                     }
                 }
                 self.writer.write_all(&pes_packet[offset..offset + payload_len])?;
@@ -159,12 +166,12 @@ fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
     header.push(0x01);
     header.push(stream_id);
 
-    // PES packet length (0 = unbounded for video)
-    if stream_id == 0xE0 {
+    // PES packet length (0 = unbounded for video or if too large for u16)
+    if stream_id == 0xE0 || pes_data_len > 65535 {
         header.push(0x00);
         header.push(0x00);
     } else {
-        let len = (pes_data_len & 0xFFFF) as u16;
+        let len = pes_data_len as u16;
         header.push((len >> 8) as u8);
         header.push(len as u8);
     }

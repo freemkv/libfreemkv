@@ -180,6 +180,9 @@ pub fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
     if data.len() < from + 3 {
         return None;
     }
+    // Range excludes last 2 bytes since we read 3 bytes at each position.
+    // data.len()-2 as exclusive upper bound means last checked index is data.len()-3,
+    // which accesses data[len-3], data[len-2], data[len-1] — all valid.
     (from..data.len() - 2).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 

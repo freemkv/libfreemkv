@@ -183,6 +183,11 @@ impl crate::pes::Stream for MkvStream {
                     let pts_ms = rs.cluster_ts_ms + rel_ts as i64;
                     let track_idx = (track as usize).saturating_sub(1); // MKV tracks are 1-based
 
+                    // Skip blocks for non-existent tracks
+                    if track_idx >= self.disc_title.streams.len() {
+                        continue;
+                    }
+
                     return Ok(Some(crate::pes::PesFrame {
                         track: track_idx,
                         pts: pts_ms * 1_000_000, // ms → ns
@@ -689,7 +694,13 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
     if d[0] & 0x40 != 0 && d.len() >= 2 {
         return ((((d[0] & 0x3F) as u64) << 8) | d[1] as u64, 2);
     }
-    (0, 1)
+    if d[0] & 0x20 != 0 && d.len() >= 3 {
+        return ((((d[0] & 0x1F) as u64) << 16) | ((d[1] as u64) << 8) | d[2] as u64, 3);
+    }
+    if d[0] & 0x10 != 0 && d.len() >= 4 {
+        return ((((d[0] & 0x0F) as u64) << 24) | ((d[1] as u64) << 16) | ((d[2] as u64) << 8) | d[3] as u64, 4);
+    }
+    (0, 1) // Unsupported 5+ byte VINT — treat as track 0
 }
 
 /// Convert HEVCDecoderConfigurationRecord (hvcC) to Annex B NAL units.

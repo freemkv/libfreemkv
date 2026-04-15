@@ -31,9 +31,11 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-/// Convert 90kHz PTS to nanoseconds.
+/// Convert 90kHz PTS to nanoseconds (round to nearest).
 pub fn pts_to_ns(pts: i64) -> i64 {
-    pts * 100_000 / 9
+    // pts * 1_000_000_000 / 90_000 = pts * 100_000 / 9
+    // Add half-divisor for rounding: (pts * 100_000 + 4) / 9
+    (pts * 100_000 + 4) / 9
 }
 
 /// Trait for codec-specific elementary stream parsers.
