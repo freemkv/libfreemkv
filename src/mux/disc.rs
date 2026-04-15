@@ -401,7 +401,7 @@ impl crate::pes::Stream for DiscStream {
                         _ => continue,
                     };
                     if track < self.title.streams.len() {
-                        let pts_ns = ps.pts.map(|p| (p as i64) * 100_000 / 9).unwrap_or(0);
+                        let pts_ns = ps.pts.map(|p| (p as i64) * 1_000_000_000 / 90_000).unwrap_or(0);
                         self.pending_frames.push_back(crate::pes::PesFrame {
                             track,
                             pts: pts_ns,

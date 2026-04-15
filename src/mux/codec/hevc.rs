@@ -52,8 +52,9 @@ impl CodecParser for HevcParser {
         let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
+        let mut frame_data = Vec::new();
 
-        // Scan NAL units
+        // Single-pass NAL scan: extract params, detect keyframes, build length-prefixed output
         let mut pos = 0;
         while let Some(sc_pos) = find_start_code(data, pos) {
             if let Some(nal_start) = skip_start_code(data, sc_pos) {
@@ -68,45 +69,22 @@ impl CodecParser for HevcParser {
                     let nal_type = (data[nal_start] >> 1) & 0x3F;
 
                     match nal_type {
-                        NAL_VPS => self.vps = Some(data[nal_start..end].to_vec()),
-                        NAL_SPS => self.sps = Some(data[nal_start..end].to_vec()),
-                        NAL_PPS => self.pps = Some(data[nal_start..end].to_vec()),
+                        NAL_VPS => { self.vps = Some(data[nal_start..end].to_vec()); }
+                        NAL_SPS => { self.sps = Some(data[nal_start..end].to_vec()); }
+                        NAL_PPS => { self.pps = Some(data[nal_start..end].to_vec()); }
+                        NAL_AUD => {} // Skip access unit delimiters
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;
+                            let nal = &data[nal_start..end];
+                            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                            frame_data.extend_from_slice(nal);
                         }
-                        _ => {}
-                    }
-                }
-                pos = next;
-            } else {
-                break;
-            }
-        }
-
-        // Convert Annex B to length-prefixed NALUs.
-        // Skip VPS/SPS/PPS/AUD — they're in codecPrivate.
-        let mut frame_data = Vec::new();
-        let mut pos = 0;
-        while let Some(sc_pos) = find_start_code(&pes.data, pos) {
-            if let Some(nal_start) = skip_start_code(&pes.data, sc_pos) {
-                let next = find_start_code(&pes.data, nal_start).unwrap_or(pes.data.len());
-                let mut end = next;
-                while end > nal_start && pes.data[end - 1] == 0x00 {
-                    end -= 1;
-                }
-
-                if nal_start < pes.data.len() {
-                    let nal_type = (pes.data[nal_start] >> 1) & 0x3F;
-                    // Skip parameter sets and AUD
-                    if nal_type != NAL_VPS
-                        && nal_type != NAL_SPS
-                        && nal_type != NAL_PPS
-                        && nal_type != NAL_AUD
-                    {
-                        let nal = &pes.data[nal_start..end];
-                        let len = nal.len() as u32;
-                        frame_data.extend_from_slice(&len.to_be_bytes());
-                        frame_data.extend_from_slice(nal);
+                        _ => {
+                            // All other NAL types (slices, SEI, DV RPU, etc.) pass through
+                            let nal = &data[nal_start..end];
+                            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                            frame_data.extend_from_slice(nal);
+                        }
                     }
                 }
                 pos = next;

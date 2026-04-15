@@ -177,6 +177,9 @@ impl TsDemuxer {
             let payload_start = if adaptation == 0x03 || adaptation == 0x02 {
                 // Adaptation field present
                 let af_len = ts[4] as usize;
+                if af_len > 183 {
+                    continue; // Malformed: AF length exceeds TS payload
+                }
                 5 + af_len
             } else {
                 4
@@ -208,9 +211,15 @@ impl TsDemuxer {
             }
         }
 
-        // Save leftover bytes for next call
+        // Save leftover bytes for next call (cap at one packet to prevent unbounded growth)
         if offset < work.len() {
-            self.remainder.extend_from_slice(&work[offset..]);
+            let leftover = &work[offset..];
+            if leftover.len() < BD_TS_PACKET_SIZE {
+                self.remainder.extend_from_slice(leftover);
+            } else {
+                // More than one full packet leftover — something is wrong, discard
+                self.remainder.clear();
+            }
         }
 
         completed
@@ -257,30 +266,38 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     let pts_dts_flags = (data[7] >> 6) & 0x03;
     let header_data_len = data[8] as usize;
-    let data_start = 9 + header_data_len;
+    let data_start = (9 + header_data_len).min(data.len());
 
     let mut pts = None;
     let mut dts = None;
 
-    if pts_dts_flags >= 2 && data.len() >= 14 {
-        pts = Some(parse_timestamp(&data[9..14]));
+    if pts_dts_flags >= 2 && header_data_len >= 5 && data.len() >= 14 {
+        pts = parse_timestamp(&data[9..14]);
     }
-    if pts_dts_flags == 3 && data.len() >= 19 {
-        dts = Some(parse_timestamp(&data[14..19]));
+    if pts_dts_flags == 3 && header_data_len >= 10 && data.len() >= 19 {
+        dts = parse_timestamp(&data[14..19]);
     }
 
     (pts, dts, data_start)
 }
 
 /// Parse a 5-byte PTS/DTS timestamp (33 bits in 90kHz).
-fn parse_timestamp(data: &[u8]) -> i64 {
+/// Validates marker bits per MPEG-2 spec. Returns None on invalid encoding.
+fn parse_timestamp(data: &[u8]) -> Option<i64> {
+    if data.len() < 5 {
+        return None;
+    }
+    // Validate marker bits: byte 2 bit 0 and byte 4 bit 0 must be 1
+    if (data[2] & 0x01) == 0 || (data[4] & 0x01) == 0 {
+        return None;
+    }
     let b0 = data[0] as i64;
     let b1 = data[1] as i64;
     let b2 = data[2] as i64;
     let b3 = data[3] as i64;
     let b4 = data[4] as i64;
 
-    ((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1
+    Some(((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1)
 }
 
 // ============================================================
@@ -312,6 +329,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     let section_len = (((data[pat_start + 1] & 0x0F) as usize) << 8)
                         | data[pat_start + 2] as usize;
                     let entries_start = pat_start + 8;
+                    if section_len < 4 { offset += BD_TS_PACKET_SIZE; continue; }
                     let entries_end = pat_start + 3 + section_len - 4;
                     let mut e = entries_start;
                     while e + 4 <= data.len() && e < entries_end {
@@ -507,7 +525,7 @@ pub fn scan_first_pts(data: &[u8], target_pid: u16) -> Option<i64> {
                 if payload.len() >= 14 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1 {
                     let pts_dts_flags = (payload[7] >> 6) & 0x03;
                     if pts_dts_flags >= 2 {
-                        return Some(parse_timestamp(&payload[9..14]));
+                        return parse_timestamp(&payload[9..14]);
                     }
                 }
             }
@@ -537,7 +555,7 @@ pub fn scan_last_pts(data: &[u8], target_pid: u16) -> Option<i64> {
                 if payload.len() >= 14 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1 {
                     let pts_dts_flags = (payload[7] >> 6) & 0x03;
                     if pts_dts_flags >= 2 {
-                        last_pts = Some(parse_timestamp(&payload[9..14]));
+                        last_pts = parse_timestamp(&payload[9..14]);
                     }
                 }
             }
@@ -589,14 +607,18 @@ mod tests {
     fn test_parse_timestamp() {
         // Example: PTS = 0 → encoded as 21 00 01 00 01
         let data = [0x21, 0x00, 0x01, 0x00, 0x01];
-        assert_eq!(parse_timestamp(&data), 0);
+        assert_eq!(parse_timestamp(&data), Some(0));
 
         // Example: PTS = 90000 (1 second at 90kHz)
         // Manual encoding: 33 bits = 0x00015F90
         // This is just a sanity check that the parser doesn't crash
         let data2 = [0x21, 0x00, 0x07, 0xE9, 0x01]; // approximate
         let pts = parse_timestamp(&data2);
-        assert!(pts >= 0);
+        assert!(pts.is_some() && pts.unwrap() >= 0);
+
+        // Invalid marker bits → returns None
+        let bad = [0x00, 0x00, 0x00, 0x00, 0x00]; // marker bits wrong
+        assert_eq!(parse_timestamp(&bad), None);
     }
 
     #[test]

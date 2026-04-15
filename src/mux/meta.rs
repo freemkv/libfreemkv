@@ -150,10 +150,10 @@ impl M2tsMeta {
                     codec_private: _,
                 } => Stream::Video(VideoStream {
                     pid: *pid,
-                    codec: codec.parse().unwrap(),
-                    resolution: resolution.parse().unwrap(),
-                    frame_rate: frame_rate.parse().unwrap(),
-                    hdr: hdr.parse().unwrap(),
+                    codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
+                    resolution: resolution.parse().unwrap_or(crate::disc::Resolution::Unknown),
+                    frame_rate: frame_rate.parse().unwrap_or(crate::disc::FrameRate::Unknown),
+                    hdr: hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr),
                     color_space: ColorSpace::Bt709,
                     secondary: *secondary,
                     label: label.clone(),
@@ -168,10 +168,10 @@ impl M2tsMeta {
                     secondary,
                 } => Stream::Audio(AudioStream {
                     pid: *pid,
-                    codec: codec.parse().unwrap(),
-                    channels: channels.parse().unwrap(),
+                    codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
+                    channels: channels.parse().unwrap_or(crate::disc::AudioChannels::Unknown),
                     language: language.clone(),
-                    sample_rate: sample_rate.parse().unwrap(),
+                    sample_rate: sample_rate.parse().unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
                     label: label.clone(),
                 }),
@@ -182,7 +182,7 @@ impl M2tsMeta {
                     forced,
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
-                    codec: codec.parse().unwrap(),
+                    codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
                     language: language.clone(),
                     forced: *forced,
                     codec_data: None,
@@ -256,9 +256,14 @@ pub fn read_header<R: Read + Seek>(r: &mut R) -> io::Result<Option<M2tsMeta>> {
         return Ok(None);
     }
 
+    const MAX_JSON_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let json_len = u32::from_be_bytes(len_buf) as usize;
+    if json_len > MAX_JSON_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "FMKV JSON too large"));
+    }
 
     let mut json_buf = vec![0u8; json_len];
     r.read_exact(&mut json_buf)?;
@@ -287,9 +292,14 @@ pub fn read_header_from_stream(r: &mut impl Read) -> io::Result<Option<M2tsMeta>
         return Ok(None);
     }
 
+    const MAX_JSON_SIZE: usize = 10 * 1024 * 1024;
+
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let json_len = u32::from_be_bytes(len_buf) as usize;
+    if json_len > MAX_JSON_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "FMKV JSON too large"));
+    }
 
     let mut json_buf = vec![0u8; json_len];
     r.read_exact(&mut json_buf)?;

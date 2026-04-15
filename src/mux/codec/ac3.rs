@@ -99,7 +99,9 @@ fn find_ac3_sync(data: &[u8]) -> Option<usize> {
 /// bsid is at byte 5, bits 7..3.
 /// AC-3: bsid <= 10, E-AC-3: bsid >= 11 (typically 16).
 pub fn get_bsid(data: &[u8]) -> u8 {
-    debug_assert!(data.len() >= 6);
+    if data.len() < 6 {
+        return 0;
+    }
     (data[5] >> 3) & 0x1F
 }
 
@@ -107,7 +109,9 @@ pub fn get_bsid(data: &[u8]) -> u8 {
 /// frmsiz is at bits [2:0] of byte 2 concatenated with byte 3.
 /// Frame size = (frmsiz + 1) * 2 bytes.
 pub fn eac3_frame_size(data: &[u8]) -> usize {
-    debug_assert!(data.len() >= 4);
+    if data.len() < 4 {
+        return 0;
+    }
     let frmsiz = ((data[2] as usize & 0x07) << 8) | (data[3] as usize);
     (frmsiz + 1) * 2
 }

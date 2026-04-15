@@ -82,7 +82,9 @@ pub fn find_dts_hd_ext_sync(data: &[u8]) -> Option<usize> {
 /// The size field is at bytes 6-8 of the extension:
 ///   ((ext[6] & 0x1F) << 11) | (ext[7] << 3) | (ext[8] >> 5) + 1
 pub fn dts_hd_ext_frame_size(ext: &[u8]) -> usize {
-    debug_assert!(ext.len() >= 9);
+    if ext.len() < 9 {
+        return 0;
+    }
     let raw =
         ((ext[6] as usize & 0x1F) << 11) | ((ext[7] as usize) << 3) | ((ext[8] as usize) >> 5);
     raw + 1
