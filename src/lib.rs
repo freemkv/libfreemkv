@@ -9,17 +9,23 @@
 //! use libfreemkv::{Drive, Disc, ScanOptions, find_drive};
 //!
 //! let mut drive = find_drive().expect("no optical drive found");
+//! drive.wait_ready().unwrap();
+//! drive.init().unwrap();
 //! let disc = Disc::scan(&mut drive, &ScanOptions::default()).unwrap();
 //!
 //! for title in &disc.titles {
 //!     println!("{} -- {} streams", title.duration_display(), title.streams.len());
 //! }
 //!
-//! // Read content (decrypted automatically if AACS keys available)
-//! let mut reader = disc.open_title(&mut drive, 0).unwrap();
-//! while let Some(unit) = reader.read_unit().unwrap() {
-//!     // 6144 bytes of decrypted content per unit
+//! // Stream via PES pipeline
+//! let opts = libfreemkv::InputOptions::default();
+//! let mut input = libfreemkv::input("disc://", &opts).unwrap();
+//! let title = input.info().clone();
+//! let mut output = libfreemkv::output("mkv://Movie.mkv", &title).unwrap();
+//! while let Ok(Some(frame)) = input.read() {
+//!     output.write(&frame).unwrap();
 //! }
+//! output.finish().unwrap();
 //! ```
 //!
 //! # Architecture
@@ -103,14 +109,12 @@ pub use disc::{
     ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 pub use mux::DiscStream;
-pub use mux::IOStream;
-pub use mux::IsoStream;
 pub use mux::M2tsStream;
 pub use mux::MkvStream;
 pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
-pub use mux::{input, output, open_input, open_output, parse_url, InputOptions, StreamUrl};
+pub use mux::{input, output, parse_url, InputOptions, StreamUrl};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;

@@ -18,33 +18,37 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.6"
+libfreemkv = "0.10"
 ```
 
 ## Quick Start
 
 ```rust
-use libfreemkv::{DriveSession, Disc, ScanOptions};
+use libfreemkv::{Drive, Disc, ScanOptions};
 use std::path::Path;
 
 // Open drive — profiles are bundled, auto-identified
-let mut session = DriveSession::open(Path::new("/dev/sr0"))?;
-session.wait_ready()?;            // wait for disc
-session.init()?;                   // unlock + firmware upload
-session.probe_disc()?;             // probe disc surface for optimal speeds
+let mut drive = Drive::open(Path::new("/dev/sg4"))?;
+drive.wait_ready()?;              // wait for disc
+drive.init()?;                     // unlock + firmware upload
+drive.probe_disc()?;               // probe disc surface for optimal speeds
 
 // Scan disc — UDF, playlists, streams, AACS (all automatic)
-let disc = Disc::scan(&mut session, &ScanOptions::default())?;
+let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
 
 for title in &disc.titles {
     println!("{} — {} streams", title.duration_display(), title.streams.len());
 }
 
-// Read content (decrypted transparently if AACS keys available)
-let mut reader = disc.open_title(&mut session, 0)?;
-while let Some(unit) = reader.read_unit()? {
-    // 6144 bytes of content per aligned unit
+// Stream pipeline — read PES frames from any source, write to any output
+let opts = libfreemkv::InputOptions::default();
+let mut input = libfreemkv::input("iso://Disc.iso", &opts)?;
+let title = input.info().clone();
+let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
+while let Ok(Some(frame)) = input.read() {
+    output.write(&frame)?;
 }
+output.finish()?;
 ```
 
 ## What It Does
@@ -63,32 +67,44 @@ while let Some(unit) = reader.read_unit()? {
 | Stream | Input | Output | Transport |
 |--------|-------|--------|-----------|
 | DiscStream | Yes | -- | Optical drive via SCSI |
-| IsoStream | Yes | -- | Blu-ray ISO image file |
+| IsoStream | Yes | Yes | Blu-ray ISO image file |
 | MkvStream | Yes | Yes | Matroska container |
 | M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
 | NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
 | StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
 | NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-All streams implement the `IOStream` trait. `open_input()` and `open_output()` resolve URL strings to stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
+Streams implement `IOStream` (byte-level) and `pes::Stream` (frame-level). `input()` / `output()` resolve URL strings to PES stream instances. `open_input()` / `open_output()` resolve to byte-level IOStream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
 
 ## Architecture
 
 ```text
-DriveSession           — open any drive, identify, init (optional), read sectors
-  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS)
+Drive                  — open, identify, init, unlock, read (with recovery)
+  ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS), SPTI (Windows)
   ├── DriveProfile     — per-drive unlock parameters (bundled)
   └── PlatformDriver   — MediaTek (supported), Renesas (planned)
 
-Disc                   — scan titles, streams, AACS state
+Disc                   — scan titles, streams, AACS/CSS state
   ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions
   ├── MPLS parser      — playlists → titles + clips + streams
   ├── CLPI parser      — clip info → EP map → sector extents
+  ├── IFO parser       — DVD title sets, PGC chains, cell addresses
   ├── Labels           — 5 BD-J format parsers (detect + parse)
   ├── AACS             — key resolution + content decryption
+  ├── CSS              — DVD CSS cipher (table-driven, no keys needed)
   └── KEYDB            — download + verify + save
+
+Streams                — unified PES pipeline
+  ├── pes::Stream      — read()/write() PES frames
+  ├── DiscStream       — sectors → decrypt → TS demux → PES
+  ├── IsoStream        — ISO file → decrypt → TS demux → PES
+  ├── MkvStream        — MKV mux/demux
+  ├── M2tsStream       — BD transport stream
+  ├── NetworkStream    — TCP with FMKV metadata header
+  ├── StdioStream      — stdin/stdout pipe
+  └── NullStream       — discard sink
 ```
 
 See [docs/](docs/) for detailed technical documentation on each module.

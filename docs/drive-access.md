@@ -5,51 +5,55 @@ optical drives.
 
 ---
 
-## DriveSession
+## Drive
 
-`DriveSession` is the primary API. It owns the SCSI transport, the matched
+`Drive` is the primary API. It owns the SCSI transport, the matched
 drive profile, and the chipset-specific platform driver.
 
 ### Opening a Drive
 
 ```rust
-// Full open: identify → match profile → unlock
-let mut session = DriveSession::open(Path::new("/dev/sr0"))?;
-
-// No-unlock open: identify → match profile only
-let mut session = DriveSession::open_no_unlock(Path::new("/dev/sr0"))?;
-
-// Explicit profile (skip auto-detection)
-let mut session = DriveSession::open_with_profile(Path::new("/dev/sr0"), profile)?;
+let mut drive = Drive::open(Path::new("/dev/sg4"))?;
 ```
 
-**`open()`** performs the full sequence: open device, send INQUIRY, match
-profile, instantiate platform driver, and unlock. Unlock failures are silently
-ignored (unencrypted discs do not need it). After `open()`, both raw sector
-reads and standard READ(10) work immediately.
+`open()` performs: open device → send INQUIRY → match profile → instantiate
+platform driver. The drive is ready for `wait_ready()` and `init()`.
 
-**`open_no_unlock()`** skips the unlock step. This is required when AACS bus
-authentication must happen before unlock. The handshake uses standard SCSI
-commands that work without raw mode. After authentication completes, the caller
-can invoke `session.unlock()` manually.
-
-**`open_with_profile()`** bypasses profile auto-detection. Useful for testing
-or when a custom profile is loaded from an external source.
-
-### Session Operations
+### Drive Operations
 
 | Method | Description |
 |--------|-------------|
-| `unlock()` | Activate raw disc access mode via platform driver |
-| `is_unlocked()` | Check if raw mode is active |
-| `calibrate()` | Build speed lookup table for the current disc |
-| `read_sectors(lba, count, buf)` | Raw sector read (requires unlock + calibrate) |
-| `read_disc(lba, count, buf)` | Standard READ(10) with 5s timeout |
-| `status()` | Query drive status and feature flags |
-| `read_config()` | Read drive configuration block (1888 bytes) |
-| `read_register(index)` | Read 16-byte hardware register |
-| `probe(sub_cmd, addr, len)` | Generic READ BUFFER with caller parameters |
-| `scsi_execute(cdb, dir, buf, timeout)` | Send an arbitrary SCSI CDB |
+| `wait_ready()` | Wait for disc insertion (30s timeout, TUR polling) |
+| `init()` | Firmware upload + unlock + speed calibration |
+| `probe_disc()` | Probe disc surface for optimal speeds |
+| `read(lba, count, buf)` | Read sectors with built-in error recovery |
+| `reset()` | Close/reopen device, TUR, escalate if needed |
+| `lock_tray()` | Prevent tray ejection during rip |
+| `unlock_tray()` | Allow tray ejection (also runs on Drop) |
+| `eject()` | Eject disc tray |
+| `drive_status()` | Query physical state (disc present, tray open, etc.) |
+| `has_profile()` | Whether a bundled profile matched |
+| `close()` | Consume Drive, cleanup (also runs via Drop) |
+
+### init() Sequence
+
+`init()` orchestrates the full drive unlock:
+
+1. Platform driver `run_init()` — sends vendor-specific SCSI commands
+2. If firmware upload needed: upload, wait 10s for drive reset, retry
+3. Speed calibration after unlock
+4. Max 3 attempts before giving up
+
+### read() with Recovery
+
+`Drive::read()` is the single read method. On error:
+
+1. Set minimum speed immediately
+2. Reset device (close/reopen/TUR)
+3. Wait 2s for drive to settle
+4. Retry at min speed, min batch (3 sectors)
+5. If still failing: skip sectors, zero-fill, log
+6. Stay at min speed for 500 MB after error (recovery window)
 
 ---
 
@@ -58,7 +62,7 @@ or when a custom profile is loaded from an external source.
 ### Trait
 
 ```rust
-pub trait ScsiTransport {
+pub trait ScsiTransport: Send {
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -66,20 +70,24 @@ pub trait ScsiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult>;
+
+    fn reset(&mut self, device: &str) -> Result<()>;
 }
 ```
 
 All drive communication goes through this trait. The library never opens file
 descriptors or calls ioctls outside of a `ScsiTransport` implementation.
 
-### Linux: SG_IO
+### Platform Backends
 
-The `SgIoTransport` implementation:
+| Platform | Implementation | Device |
+|----------|---------------|--------|
+| Linux | `SgIoTransport` — `ioctl(fd, SG_IO, &hdr)` | `/dev/sg*` |
+| macOS | `MacScsiTransport` — IOKit SCSITask | IOKit service |
+| Windows | `WindowsScsiTransport` — SPTI | `\\.\CdRomN` |
 
-1. Opens the device path with `O_RDWR | O_NONBLOCK`.
-2. Constructs an `sg_io_hdr` struct with the CDB, data buffer, and timeout.
-3. Calls `ioctl(fd, SG_IO, &hdr)`.
-4. Returns `ScsiResult` with status, bytes transferred, and sense data.
+The Linux backend opens with `O_RDWR | O_NONBLOCK`, constructs `sg_io_hdr`,
+and returns `ScsiResult` with status, bytes transferred, and sense data.
 
 On non-zero SCSI status, the transport parses sense key, ASC, and ASCQ from the
 sense buffer and returns `Error::ScsiError`.
@@ -119,8 +127,8 @@ date for drives where Feature 010C is unavailable.
 
 ## Drive Profiles
 
-Profiles are JSON objects compiled into the binary (`profiles.json`,
-206 entries). Each profile contains:
+Profiles are JSON objects compiled into the binary (`profiles.json`).
+Each profile contains:
 
 | Field | Purpose |
 |-------|---------|
@@ -148,7 +156,7 @@ let profiles = profile::load_all(Path::new("/path/to/profiles.json"))?;
 
 ### MediaTek MT1959
 
-Covers all LG, ASUS, and hp optical drives. Two sub-variants share identical
+Covers all LG, ASUS, and HP optical drives. Two sub-variants share identical
 logic with different SCSI parameters:
 
 | Variant | READ BUFFER mode | Buffer ID |
@@ -156,7 +164,7 @@ logic with different SCSI parameters:
 | MT1959-A | 0x01 | 0x44 |
 | MT1959-B | 0x02 | 0x77 |
 
-The Platform trait maps to 10 command handlers:
+The Platform trait maps to command handlers:
 
 | Handler | Function | Description |
 |---------|----------|-------------|
@@ -183,64 +191,32 @@ Optical drive firmware restricts what applications can read from disc. Without
 unlock:
 
 - **READ(10) works for unencrypted filesystem data.** UDF structures, MPLS
-  playlists, and CLPI clip info are readable without unlock. The `read_disc()`
-  method uses standard READ(10) and works on any drive.
+  playlists, and CLPI clip info are readable without unlock. Standard READ(10)
+  works on any drive.
 
 - **READ(10) fails for encrypted content sectors.** The drive firmware returns
   SCSI errors (sense key 0x05, illegal request) when an application attempts to
   read sectors containing encrypted m2ts content without prior AACS
   authentication via the bus key.
 
-- **The kernel sr driver blocks block-device reads.** On Linux, the kernel's
-  SCSI CD-ROM driver (`sr`) refuses to expose encrypted disc content through
-  `/dev/sr0` as a block device. Even if you open the block device directly,
-  reads to encrypted regions fail.
-
 - **Raw mode bypasses firmware restrictions.** After unlock, the drive accepts
   READ(10) with the raw read flag (CDB byte 1 = 0x08) for all sectors,
-  regardless of encryption status. This is how raw sector ripping works.
+  regardless of encryption status.
 
-### open() vs open_no_unlock()
+### AACS Before Unlock
 
 AACS bus authentication uses standard MMC REPORT KEY / SEND KEY commands.
-These must execute before unlock because:
-
-1. The AACS handshake establishes a bus key via ECDH.
-2. The bus key encrypts the Volume ID and Read Data Key responses.
-3. The Volume ID is needed to derive the Volume Unique Key (VUK).
-4. The VUK is needed to decrypt unit keys from `Unit_Key_RO.inf`.
-
-If `open()` unlocks first, some drives reject the subsequent AACS commands.
-The correct sequence for encrypted discs is:
-
-```rust
-// 1. Open without unlock
-let mut session = DriveSession::open_no_unlock(device)?;
-
-// 2. AACS handshake (uses standard SCSI, no unlock needed)
-let auth = aacs_handshake::aacs_authenticate(&mut session, &key, &cert)?;
-let vid = aacs_handshake::read_volume_id(&mut session, &mut auth)?;
-
-// 3. Now unlock for raw reads
-session.unlock()?;
-session.calibrate()?;
-
-// 4. Read and decrypt content
-session.read_sectors(lba, count, &mut buf)?;
-```
-
-In practice, `Disc::scan()` handles this internally. The default `open()` call
-unlocks immediately and is correct for most use cases -- the scan re-opens a
-second session with `open_no_unlock()` for the AACS handshake when needed.
+On some drives these must execute before unlock. The `Disc::scan()` handles
+this internally — it manages the handshake/unlock ordering automatically.
 
 ---
 
 ## Speed Control
 
-After `calibrate()`, the platform driver maintains a 64-entry speed lookup table
-built by probing the disc surface. On each `read_sectors()` call, the driver:
+After `probe_disc()`, the platform driver maintains a speed lookup table
+built by probing the disc surface. On each `read()` call, the driver:
 
-1. Looks up the optimal speed for the target LBA in the table.
+1. Looks up the optimal speed for the target LBA.
 2. Issues SET CD SPEED (0xBB) if the speed differs from current.
 3. Performs the READ(10).
 

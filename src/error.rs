@@ -15,32 +15,40 @@
 //! | E6xxx | Disc format errors |
 //! | E7xxx | AACS errors |
 //! | E8xxx | Keydb errors |
-//! | E9xxx | Mux errors |
+//! | E9xxx | Stream/mux errors |
 
 // ── Error codes ─────────────────────────────────────────────────────────────
 
+// Device (1xxx)
 pub const E_DEVICE_NOT_FOUND: u16 = 1000;
 pub const E_DEVICE_PERMISSION: u16 = 1001;
+pub const E_DEVICE_NOT_READY: u16 = 1002;
+pub const E_DEVICE_RESET_FAILED: u16 = 1003;
+
+// Profile (2xxx)
 pub const E_UNSUPPORTED_DRIVE: u16 = 2000;
-pub const E_PROFILE_NOT_FOUND: u16 = 2001;
 pub const E_PROFILE_PARSE: u16 = 2002;
+
+// Unlock (3xxx)
 pub const E_UNLOCK_FAILED: u16 = 3000;
 pub const E_SIGNATURE_MISMATCH: u16 = 3001;
-pub const E_NOT_UNLOCKED: u16 = 3002;
-pub const E_NOT_CALIBRATED: u16 = 3003;
+
+// SCSI (4xxx)
 pub const E_SCSI_ERROR: u16 = 4000;
-pub const E_SCSI_TIMEOUT: u16 = 4001;
+
+// I/O (5xxx)
 pub const E_IO_ERROR: u16 = 5000;
-pub const E_WRITE_ERROR: u16 = 5001;
+
 // Disc format (6xxx)
 pub const E_DISC_READ: u16 = 6000;
 pub const E_MPLS_PARSE: u16 = 6001;
 pub const E_CLPI_PARSE: u16 = 6002;
 pub const E_UDF_NOT_FOUND: u16 = 6003;
-pub const E_DISC_NO_TITLES: u16 = 6004;
 pub const E_DISC_TITLE_RANGE: u16 = 6005;
-pub const E_DISC_NO_EXTENTS: u16 = 6006;
 pub const E_IFO_PARSE: u16 = 6007;
+pub const E_MKV_INVALID: u16 = 6008;
+pub const E_NO_STREAMS: u16 = 6009;
+
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
 pub const E_AACS_CERT_SHORT: u16 = 7001;
@@ -54,8 +62,8 @@ pub const E_AACS_KEY_VERIFY: u16 = 7008;
 pub const E_AACS_VID_READ: u16 = 7009;
 pub const E_AACS_VID_MAC: u16 = 7010;
 pub const E_AACS_DATA_KEY: u16 = 7011;
-pub const E_AACS_VUK_DERIVE: u16 = 7012;
 pub const E_DECRYPT_FAILED: u16 = 7013;
+
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
 pub const E_KEYDB_HTTP: u16 = 8001;
@@ -63,121 +71,94 @@ pub const E_KEYDB_INVALID: u16 = 8002;
 pub const E_KEYDB_WRITE: u16 = 8003;
 pub const E_KEYDB_PARSE: u16 = 8004;
 pub const E_KEYDB_LOAD: u16 = 8005;
-// Mux (9xxx)
-pub const E_MUX_LOOKAHEAD: u16 = 9000;
-pub const E_MUX_WRITE: u16 = 9001;
+
+// Stream/mux (9xxx)
+pub const E_STREAM_READ_ONLY: u16 = 9000;
+pub const E_STREAM_WRITE_ONLY: u16 = 9001;
+pub const E_STREAM_URL_INVALID: u16 = 9002;
+pub const E_STREAM_URL_MISSING_PATH: u16 = 9003;
+pub const E_STREAM_URL_MISSING_PORT: u16 = 9004;
+pub const E_PES_FRAME_TOO_LARGE: u16 = 9005;
+pub const E_PES_INVALID_MAGIC: u16 = 9006;
+pub const E_ISO_TOO_LARGE: u16 = 9007;
+pub const E_NO_METADATA: u16 = 9008;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
 /// Structured error with numeric code and context data. No English text.
 #[derive(Debug)]
 pub enum Error {
-    /// Device not found at the given path.
+    // Device (1xxx)
     DeviceNotFound { path: String },
-    /// Insufficient permissions to open the device.
     DevicePermission { path: String },
+    DeviceNotReady { path: String },
+    DeviceResetFailed { path: String },
 
-    /// Drive model is not in the profile database.
+    // Profile (2xxx)
     UnsupportedDrive {
         vendor_id: String,
         product_id: String,
         product_revision: String,
     },
-    /// No matching firmware profile found for this drive revision.
-    ProfileNotFound {
-        vendor_id: String,
-        product_revision: String,
-        vendor_specific: String,
-    },
-    /// Failed to parse the bundled profile database.
     ProfileParse,
 
-    /// Drive unlock (firmware upload) failed.
+    // Unlock (3xxx)
     UnlockFailed,
-    /// Firmware signature verification failed.
     SignatureMismatch { expected: [u8; 4], got: [u8; 4] },
-    /// Operation requires an unlocked drive.
-    NotUnlocked,
-    /// Operation requires a calibrated drive.
-    NotCalibrated,
 
-    /// SCSI command returned an error status.
+    // SCSI (4xxx)
     ScsiError {
         opcode: u8,
         status: u8,
         sense_key: u8,
     },
-    /// SCSI command timed out.
-    ScsiTimeout { opcode: u8 },
 
-    /// Underlying I/O error.
+    // I/O (5xxx)
     IoError { source: std::io::Error },
-    /// Write operation failed.
-    WriteError,
 
-    /// Failed to read disc sector.
+    // Disc format (6xxx)
     DiscRead { sector: u64 },
-    /// MPLS playlist parsing failed.
     MplsParse,
-    /// CLPI clip info parsing failed.
     ClpiParse,
-    /// File not found on the UDF filesystem.
     UdfNotFound { path: String },
-    /// Disc contains no playable titles.
-    DiscNoTitles,
-    /// Title index out of range.
     DiscTitleRange { index: usize, count: usize },
-    /// Title has no sector extents to read.
-    DiscNoExtents,
-    /// DVD IFO file parsing failed.
     IfoParse,
+    MkvInvalid,
+    NoStreams,
 
-    /// No AACS decryption keys available for this disc.
+    // AACS (7xxx)
     AacsNoKeys,
-    /// Host certificate too short.
     AacsCertShort,
-    /// Failed to allocate AGID for AACS handshake.
     AacsAgidAlloc,
-    /// Drive rejected the host certificate.
     AacsCertRejected,
-    /// Failed to read drive certificate.
     AacsCertRead,
-    /// Drive certificate verification failed.
     AacsCertVerify,
-    /// Failed to read host key from drive.
     AacsKeyRead,
-    /// Drive rejected the host key.
     AacsKeyRejected,
-    /// Host key verification failed.
     AacsKeyVerify,
-    /// Failed to read Volume ID.
     AacsVidRead,
-    /// Volume ID MAC verification failed.
     AacsVidMac,
-    /// Failed to derive the data key.
     AacsDataKey,
-    /// Failed to derive the Volume Unique Key.
-    AacsVukDerive,
-    /// Decryption failed — missing or invalid keys.
-    DecryptFailed { reason: String },
+    DecryptFailed,
 
-    /// Failed to connect to the KEYDB server.
+    // Keydb (8xxx)
     KeydbConnect { host: String },
-    /// KEYDB server returned an HTTP error.
     KeydbHttp { status: u16 },
-    /// Downloaded KEYDB file is invalid (no entries found).
     KeydbInvalid,
-    /// Failed to write KEYDB to disk.
     KeydbWrite { path: String },
-    /// Failed to parse KEYDB file.
     KeydbParse,
-    /// Failed to load KEYDB from disk.
     KeydbLoad { path: String },
 
-    /// Lookahead buffer exhausted before codec headers found.
-    MuxLookahead,
-    /// Muxer write failed.
-    MuxWrite,
+    // Stream/mux (9xxx)
+    StreamReadOnly,
+    StreamWriteOnly,
+    StreamUrlInvalid { url: String },
+    StreamUrlMissingPath { scheme: String },
+    StreamUrlMissingPort { addr: String },
+    PesFrameTooLarge { size: usize },
+    PesInvalidMagic,
+    IsoTooLarge { path: String },
+    NoMetadata,
 }
 
 impl Error {
@@ -185,25 +166,22 @@ impl Error {
         match self {
             Error::DeviceNotFound { .. } => E_DEVICE_NOT_FOUND,
             Error::DevicePermission { .. } => E_DEVICE_PERMISSION,
+            Error::DeviceNotReady { .. } => E_DEVICE_NOT_READY,
+            Error::DeviceResetFailed { .. } => E_DEVICE_RESET_FAILED,
             Error::UnsupportedDrive { .. } => E_UNSUPPORTED_DRIVE,
-            Error::ProfileNotFound { .. } => E_PROFILE_NOT_FOUND,
             Error::ProfileParse => E_PROFILE_PARSE,
             Error::UnlockFailed => E_UNLOCK_FAILED,
             Error::SignatureMismatch { .. } => E_SIGNATURE_MISMATCH,
-            Error::NotUnlocked => E_NOT_UNLOCKED,
-            Error::NotCalibrated => E_NOT_CALIBRATED,
             Error::ScsiError { .. } => E_SCSI_ERROR,
-            Error::ScsiTimeout { .. } => E_SCSI_TIMEOUT,
             Error::IoError { .. } => E_IO_ERROR,
-            Error::WriteError => E_WRITE_ERROR,
             Error::DiscRead { .. } => E_DISC_READ,
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
-            Error::DiscNoTitles => E_DISC_NO_TITLES,
             Error::DiscTitleRange { .. } => E_DISC_TITLE_RANGE,
-            Error::DiscNoExtents => E_DISC_NO_EXTENTS,
             Error::IfoParse => E_IFO_PARSE,
+            Error::MkvInvalid => E_MKV_INVALID,
+            Error::NoStreams => E_NO_STREAMS,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
             Error::AacsAgidAlloc => E_AACS_AGID_ALLOC,
@@ -216,16 +194,22 @@ impl Error {
             Error::AacsVidRead => E_AACS_VID_READ,
             Error::AacsVidMac => E_AACS_VID_MAC,
             Error::AacsDataKey => E_AACS_DATA_KEY,
-            Error::AacsVukDerive => E_AACS_VUK_DERIVE,
-            Error::DecryptFailed { .. } => E_DECRYPT_FAILED,
+            Error::DecryptFailed => E_DECRYPT_FAILED,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
             Error::KeydbWrite { .. } => E_KEYDB_WRITE,
             Error::KeydbParse => E_KEYDB_PARSE,
             Error::KeydbLoad { .. } => E_KEYDB_LOAD,
-            Error::MuxLookahead => E_MUX_LOOKAHEAD,
-            Error::MuxWrite => E_MUX_WRITE,
+            Error::StreamReadOnly => E_STREAM_READ_ONLY,
+            Error::StreamWriteOnly => E_STREAM_WRITE_ONLY,
+            Error::StreamUrlInvalid { .. } => E_STREAM_URL_INVALID,
+            Error::StreamUrlMissingPath { .. } => E_STREAM_URL_MISSING_PATH,
+            Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
+            Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
+            Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
+            Error::IsoTooLarge { .. } => E_ISO_TOO_LARGE,
+            Error::NoMetadata => E_NO_METADATA,
         }
     }
 }
@@ -236,68 +220,38 @@ impl std::fmt::Display for Error {
         match self {
             Error::DeviceNotFound { path } => write!(f, "E{}: {}", self.code(), path),
             Error::DevicePermission { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::DeviceNotReady { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::DeviceResetFailed { path } => write!(f, "E{}: {}", self.code(), path),
             Error::UnsupportedDrive {
                 vendor_id,
                 product_id,
                 product_revision,
             } => write!(
-                f,
-                "E{}: {} {} {}",
-                self.code(),
-                vendor_id.trim(),
-                product_id.trim(),
-                product_revision.trim()
-            ),
-            Error::ProfileNotFound {
-                vendor_id,
-                product_revision,
-                vendor_specific,
-            } => write!(
-                f,
-                "E{}: {} {} {}",
-                self.code(),
-                vendor_id.trim(),
-                product_revision.trim(),
-                vendor_specific.trim()
+                f, "E{}: {} {} {}",
+                self.code(), vendor_id.trim(), product_id.trim(), product_revision.trim()
             ),
             Error::SignatureMismatch { expected, got } => write!(
-                f,
-                "E{}: {:02x}{:02x}{:02x}{:02x}!={:02x}{:02x}{:02x}{:02x}",
+                f, "E{}: {:02x}{:02x}{:02x}{:02x}!={:02x}{:02x}{:02x}{:02x}",
                 self.code(),
-                expected[0],
-                expected[1],
-                expected[2],
-                expected[3],
-                got[0],
-                got[1],
-                got[2],
-                got[3]
+                expected[0], expected[1], expected[2], expected[3],
+                got[0], got[1], got[2], got[3]
             ),
-            Error::ScsiError {
-                opcode,
-                status,
-                sense_key,
-            } => write!(
-                f,
-                "E{}: 0x{:02x}/0x{:02x}/0x{:02x}",
-                self.code(),
-                opcode,
-                status,
-                sense_key
-            ),
-            Error::ScsiTimeout { opcode } => write!(f, "E{}: 0x{:02x}", self.code(), opcode),
+            Error::ScsiError { opcode, status, sense_key } => {
+                write!(f, "E{}: 0x{:02x}/0x{:02x}/0x{:02x}", self.code(), opcode, status, sense_key)
+            }
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
             Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
-            Error::DiscTitleRange { index, count } => {
-                write!(f, "E{}: {}/{}", self.code(), index, count)
-            }
+            Error::DiscTitleRange { index, count } => write!(f, "E{}: {}/{}", self.code(), index, count),
             Error::KeydbConnect { host } => write!(f, "E{}: {}", self.code(), host),
             Error::KeydbHttp { status } => write!(f, "E{}: {}", self.code(), status),
             Error::KeydbWrite { path } => write!(f, "E{}: {}", self.code(), path),
             Error::KeydbLoad { path } => write!(f, "E{}: {}", self.code(), path),
-            Error::DecryptFailed { reason } => write!(f, "E{}: {}", self.code(), reason),
-            // Simple codes — no extra data
+            Error::StreamUrlInvalid { url } => write!(f, "E{}: {}", self.code(), url),
+            Error::StreamUrlMissingPath { scheme } => write!(f, "E{}: {}", self.code(), scheme),
+            Error::StreamUrlMissingPort { addr } => write!(f, "E{}: {}", self.code(), addr),
+            Error::PesFrameTooLarge { size } => write!(f, "E{}: {}", self.code(), size),
+            Error::IsoTooLarge { path } => write!(f, "E{}: {}", self.code(), path),
             _ => write!(f, "E{}", self.code()),
         }
     }
@@ -315,6 +269,28 @@ impl std::error::Error for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::IoError { source: e }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        let code = e.code();
+        let msg = e.to_string();
+        // Map our error categories to io::ErrorKind
+        let kind = match code {
+            1000..=1999 => std::io::ErrorKind::NotFound,
+            2000..=2999 => std::io::ErrorKind::Unsupported,
+            3000..=3999 => std::io::ErrorKind::PermissionDenied,
+            4000..=4999 => std::io::ErrorKind::Other,
+            5000..=5999 => std::io::ErrorKind::Other,
+            6000..=6999 => std::io::ErrorKind::InvalidData,
+            7000..=7999 => std::io::ErrorKind::PermissionDenied,
+            8000..=8999 => std::io::ErrorKind::Other,
+            9000..=9001 => std::io::ErrorKind::Unsupported,
+            9002..=9009 => std::io::ErrorKind::InvalidInput,
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, msg)
     }
 }
 

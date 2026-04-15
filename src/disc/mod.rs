@@ -15,7 +15,6 @@ mod encrypt;
 use crate::drive::Drive;
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
-use crate::speed::DriveSpeed;
 use crate::udf;
 
 use encrypt::HandshakeResult;
@@ -918,73 +917,6 @@ impl ScanOptions {
     }
 }
 
-/// A disc with an active drive session -- the main API.
-///
-/// Owns both the disc metadata and the drive connection.
-/// Created by `Disc::open()`. Provides `rip()` to read title data.
-pub struct OpenDisc {
-    pub disc: Disc,
-    pub session: Drive,
-}
-
-impl OpenDisc {
-    /// Open a drive, wait for disc, initialize, probe, and scan.
-    /// This is the single entry point -- one call does everything.
-    ///
-    pub fn open(device: &str, keydb_path: Option<&str>) -> Result<Self> {
-        use std::path::Path;
-
-        let mut session = Drive::open(Path::new(device))?;
-        session.wait_ready()?;
-
-        // Init (unlock + firmware) -- non-fatal if fails
-        let _ = session.init();
-        let _ = session.probe_disc();
-
-        let opts = if let Some(kp) = keydb_path {
-            ScanOptions::with_keydb(kp)
-        } else {
-            ScanOptions::default()
-        };
-
-        let disc = Disc::scan(&mut session, &opts)?;
-        Ok(Self { disc, session })
-    }
-
-    /// Rip a title to any output stream.
-    ///
-    /// Reads sectors from disc, decrypts AACS, handles errors/retries,
-    /// and writes decrypted BD-TS bytes to the output.
-    /// Knows nothing about the output format -- just calls `write_all()`.
-    ///
-    pub fn rip(&mut self, title_idx: usize, mut output: impl std::io::Write) -> Result<()> {
-        let mut reader = self.disc.open_title(&mut self.session, title_idx)?;
-
-        loop {
-            match reader.read_batch() {
-                Ok(Some(batch)) => {
-                    output.write_all(batch).map_err(|_| Error::WriteError)?;
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    // ContentReader handles retries internally
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Total bytes for a title (for progress tracking).
-    pub fn title_size(&self, title_idx: usize) -> u64 {
-        self.disc
-            .titles
-            .get(title_idx)
-            .map(|t| t.size_bytes)
-            .unwrap_or(0)
-    }
-}
-
 impl Disc {
     /// Disc capacity in GB
     pub fn capacity_gb(&self) -> f64 {
@@ -1148,40 +1080,6 @@ impl Disc {
     }
 }
 
-// ─── Decrypted reader ──────────────────────────────────────────────────────
-
-/// A reader that reads m2ts content, decrypting transparently if needed.
-///
-/// Adaptive read strategy:
-///   - Starts at max batch size (510 sectors ≈ 1MB) and full disc speed
-///   - On read error: halves batch size, brief pause for drive recovery
-///   - On repeated errors: reduces disc spin speed (scratched region)
-///   - On success streak: ramps batch back up, then restores disc speed
-///   - At minimum batch + still failing: retries once, then skips + zero-fills
-pub struct ContentReader<'a> {
-    session: &'a mut Drive,
-    decrypt_keys: crate::decrypt::DecryptKeys,
-    extents: Vec<Extent>,
-    current_extent: usize,
-    current_offset: u32,
-    unit_key_idx: usize,
-    read_buf: Vec<u8>,
-    buf_pos: usize,
-    buf_len: usize,
-    /// Current batch size in sectors (adapts on errors)
-    batch_sectors: u16,
-    /// Maximum batch size detected from kernel limits
-    max_batch_sectors: u16,
-    /// Consecutive successful batch reads
-    ok_streak: u32,
-    /// Consecutive errors at current position
-    error_streak: u32,
-    /// Current speed tier index (0 = max, higher = slower)
-    /// Last time maintain_speed was called
-    /// Total read errors encountered
-    pub errors: u32,
-}
-
 impl Disc {
     /// Get the resolved decryption keys for this disc.
     /// Used by disc-to-ISO and other full-disc operations.
@@ -1200,58 +1098,98 @@ impl Disc {
         }
     }
 
-    /// Open a title for reading. Decryption is automatic -- if the disc
-    /// is encrypted and keys were found during scan(), content is decrypted
-    /// on the fly. Unencrypted discs pass through unchanged.
+    /// Raw sector copy — write the entire disc image to a file.
     ///
-    pub fn open_title<'a>(
-        &'a self,
-        session: &'a mut Drive,
-        title_idx: usize,
-    ) -> Result<ContentReader<'a>> {
-        let title = self.titles.get(title_idx).ok_or(Error::DiscTitleRange {
-            index: title_idx,
-            count: self.titles.len(),
-        })?;
+    /// This is NOT a stream operation. It copies sectors 0→capacity byte-for-byte,
+    /// producing a valid ISO/UDF image. The disc's filesystem structure is preserved.
+    ///
+    /// If `decrypt` is true and keys are available, sectors are decrypted on the fly.
+    /// If `resume` is true and the file already exists, resumes from the last safe position.
+    ///
+    /// `on_progress` is called periodically with (bytes_done, total_bytes).
+    pub fn copy(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &std::path::Path,
+        decrypt: bool,
+        resume: bool,
+        on_progress: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
 
-        // Let the drive manage its own read speed after init.
-        // SET_CD_SPEED is only used reactively by the error handler to slow
-        // down on read errors, then let the drive recover.
+        let total_bytes = self.capacity_sectors as u64 * 2048;
+        let keys = if decrypt { self.decrypt_keys() } else { crate::decrypt::DecryptKeys::None };
 
-        // Detect kernel max transfer size for this device
-        let max_batch = detect_max_batch_sectors(session.device_path());
-
-        let decrypt_keys = if let Some(ref aacs) = self.aacs {
-            crate::decrypt::DecryptKeys::Aacs {
-                unit_keys: aacs.unit_keys.clone(),
-                read_data_key: aacs.read_data_key,
-            }
-        } else if let Some(ref css) = self.css {
-            crate::decrypt::DecryptKeys::Css {
-                title_key: css.title_key,
+        // Resume: check existing file
+        let (start_lba, file) = if resume {
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.len() > 0 => {
+                    let safe_sectors = (meta.len() / 2048).saturating_sub(5) as u32;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    let resume_pos = safe_sectors as u64 * 2048;
+                    f.set_len(resume_pos)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    f.seek(SeekFrom::End(0))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    (safe_sectors, f)
+                }
+                _ => {
+                    let f = std::fs::File::create(path)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    (0u32, f)
+                }
             }
         } else {
-            crate::decrypt::DecryptKeys::None
+            let f = std::fs::File::create(path)
+                .map_err(|e| Error::IoError { source: e })?;
+            (0u32, f)
         };
 
-        Ok(ContentReader {
-            session,
-            decrypt_keys,
-            extents: title.extents.clone(),
-            current_extent: 0,
-            current_offset: 0,
-            unit_key_idx: 0,
-            read_buf: Vec::with_capacity(max_batch as usize * 2048),
-            buf_pos: 0,
-            buf_len: 0,
-            batch_sectors: max_batch,
-            max_batch_sectors: max_batch,
-            ok_streak: 0,
-            error_streak: 0,
-            errors: 0,
-        })
+        let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let batch: u16 = 64; // 128 KB per read
+        let mut lba = start_lba;
+        let mut bytes_done = start_lba as u64 * 2048;
+        let mut buf = vec![0u8; batch as usize * 2048];
+
+        while lba < self.capacity_sectors {
+            let remaining = self.capacity_sectors - lba;
+            let count = remaining.min(batch as u32) as u16;
+            let bytes = count as usize * 2048;
+
+            reader
+                .read_sectors(lba, count, &mut buf[..bytes])
+                .map_err(|e| Error::IoError {
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+
+            // Decrypt if requested
+            if decrypt {
+                crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
+            }
+
+            writer
+                .write_all(&buf[..bytes])
+                .map_err(|e| Error::IoError { source: e })?;
+
+            lba += count as u32;
+            bytes_done += bytes as u64;
+
+            if let Some(ref cb) = on_progress {
+                cb(bytes_done, total_bytes);
+            }
+        }
+
+        writer.flush().map_err(|e| Error::IoError { source: e })?;
+        Ok(())
     }
 }
+
+const MAX_BATCH_SECTORS: u16 = 510;
+const DEFAULT_BATCH_SECTORS: u16 = 60;
+const MIN_BATCH_SECTORS: u16 = 3;
 
 /// Detect the maximum transfer size in sectors for a device.
 /// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
@@ -1291,190 +1229,6 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
     }
     // Fallback: safe default well under typical kernel limits
     DEFAULT_BATCH_SECTORS
-}
-
-/// Read strategy constants
-pub(crate) const MAX_BATCH_SECTORS: u16 = 510; // absolute max (170 aligned units ≈ 1MB)
-pub(crate) const DEFAULT_BATCH_SECTORS: u16 = 60; // fallback: typical kernel limit (120KB = 60 sectors)
-pub(crate) const MIN_BATCH_SECTORS: u16 = 3; // 1 aligned unit = 6KB (error recovery)
-pub(crate) const RAMP_BATCH_AFTER: u32 = 5; // successes before doubling batch size
-pub(crate) const RAMP_SPEED_AFTER: u32 = 50; // successes at max batch before restoring speed
-pub(crate) const SLOW_SPEED_AFTER: u32 = 3; // consecutive errors before reducing disc speed
-
-impl<'a> ContentReader<'a> {
-    /// Total bytes across all extents (for progress display).
-    pub fn total_bytes(&self) -> u64 {
-        self.extents
-            .iter()
-            .map(|e| e.sector_count as u64 * 2048)
-            .sum()
-    }
-
-    /// Read the next aligned unit (6144 bytes).
-    /// Automatically decrypted if AACS keys are available.
-    /// Returns None when all extents are exhausted.
-    pub fn read_unit(&mut self) -> Result<Option<Vec<u8>>> {
-        // Refill buffer if empty
-        if self.buf_pos >= self.buf_len && !self.fill_buffer()? {
-            return Ok(None);
-        }
-
-        // Extract one aligned unit from buffer
-        let start = self.buf_pos * crate::aacs::ALIGNED_UNIT_LEN;
-        let end = start + crate::aacs::ALIGNED_UNIT_LEN;
-        let mut unit = self.read_buf[start..end].to_vec();
-
-        // Decrypt if needed
-        self.decrypt_unit(&mut unit)?;
-        self.buf_pos += 1;
-        Ok(Some(unit))
-    }
-
-    /// Read the next batch of aligned units, decrypted in-place.
-    /// Returns the decrypted data as a single contiguous slice.
-    /// More efficient than read_unit() -- one write_all() per batch instead of per unit.
-    /// Returns None when all extents are exhausted.
-    pub fn read_batch(&mut self) -> Result<Option<&[u8]>> {
-        if !self.fill_buffer()? {
-            return Ok(None);
-        }
-
-        // Decrypt all units in the buffer in-place
-        let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
-        let total_bytes = self.buf_len * unit_len;
-        crate::decrypt::decrypt_sectors(
-            &mut self.read_buf[..total_bytes],
-            &self.decrypt_keys,
-            self.unit_key_idx,
-        )?;
-        self.buf_pos = self.buf_len;
-        Ok(Some(&self.read_buf[..total_bytes]))
-    }
-
-    /// Decrypt a single aligned unit in-place if needed.
-    fn decrypt_unit(&self, unit: &mut [u8]) -> Result<()> {
-        crate::decrypt::decrypt_sectors(unit, &self.decrypt_keys, self.unit_key_idx)
-    }
-
-    /// Read sectors via standard READ(10) 0x00.
-    /// calibration primers. Standard reads are faster on most drives.
-    fn read_sectors(&mut self, lba: u32, count: u16) -> Result<()> {
-        self.session.read(lba, count, &mut self.read_buf)?;
-        Ok(())
-    }
-
-    /// Read a batch of sectors into the internal buffer.
-    ///
-    /// Error handling:
-    ///   - First error: re-init drive (may have re-locked), halve batch
-    ///   - Repeated errors: reduce speed, keep halving batch
-    ///   - At minimum batch: retry once, then skip + zero-fill
-    ///   - After sustained success: ramp batch back up, restore max speed
-    fn fill_buffer(&mut self) -> Result<bool> {
-        loop {
-            if self.current_extent >= self.extents.len() {
-                return Ok(false);
-            }
-
-            let ext_start = self.extents[self.current_extent].start_lba;
-            let ext_sectors = self.extents[self.current_extent].sector_count;
-            let remaining = ext_sectors.saturating_sub(self.current_offset);
-
-            // Align to 3 sectors (one aligned unit)
-            let sectors_to_read = remaining.min(self.batch_sectors as u32) as u16;
-            let sectors_to_read = sectors_to_read - (sectors_to_read % 3);
-            if sectors_to_read == 0 {
-                self.current_extent += 1;
-                self.current_offset = 0;
-                continue;
-            }
-
-            let lba = ext_start + self.current_offset;
-            let byte_count = sectors_to_read as usize * 2048;
-            self.read_buf.resize(byte_count, 0);
-
-            match self.read_sectors(lba, sectors_to_read) {
-                Ok(_) => {
-                    self.buf_len = sectors_to_read as usize / 3;
-                    self.buf_pos = 0;
-                    self.current_offset += sectors_to_read as u32;
-                    self.error_streak = 0;
-
-                    if self.current_offset >= ext_sectors {
-                        self.current_extent += 1;
-                        self.current_offset = 0;
-                    }
-
-                    // Ramp up batch size after consecutive successes
-                    self.ok_streak += 1;
-                    if self.batch_sectors < self.max_batch_sectors
-                        && self.ok_streak >= RAMP_BATCH_AFTER
-                    {
-                        self.batch_sectors = (self.batch_sectors * 2).min(self.max_batch_sectors);
-                        self.ok_streak = 0;
-                    }
-
-                    // Restore max speed after sustained success at full batch
-                    if self.batch_sectors == self.max_batch_sectors
-                        && self.ok_streak >= RAMP_SPEED_AFTER
-                    {
-                        self.session.set_speed(0xFFFF);
-                        self.ok_streak = 0;
-                    }
-
-                    return Ok(true);
-                }
-                Err(_) => {
-                    self.errors += 1;
-                    self.error_streak += 1;
-                    self.ok_streak = 0;
-
-                    // First error: re-init (drive may have re-locked)
-                    if self.error_streak == 1 {
-                        let _ = self.session.init();
-                        let _ = self.session.probe_disc();
-                    }
-
-                    // Repeated errors: slow down
-                    if self.error_streak >= SLOW_SPEED_AFTER {
-                        self.session.set_speed(DriveSpeed::BD2x.to_kbps());
-                        self.error_streak = 0;
-                    }
-
-                    if self.batch_sectors > MIN_BATCH_SECTORS {
-                        self.batch_sectors = (self.batch_sectors / 2).max(MIN_BATCH_SECTORS);
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    } else {
-                        // At minimum batch -- retry once with longer pause
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        self.read_buf.resize(MIN_BATCH_SECTORS as usize * 2048, 0);
-                        if self.read_sectors(lba, MIN_BATCH_SECTORS).is_ok() {
-                            self.buf_len = 1;
-                            self.buf_pos = 0;
-                            self.error_streak = 0;
-                            self.current_offset += MIN_BATCH_SECTORS as u32;
-                            if self.current_offset >= ext_sectors {
-                                self.current_extent += 1;
-                                self.current_offset = 0;
-                            }
-                            return Ok(true);
-                        }
-                        // Still failing -- skip this unit (zero-fill)
-                        self.current_offset += 3;
-                        if self.current_offset >= ext_sectors {
-                            self.current_extent += 1;
-                            self.current_offset = 0;
-                        }
-                        self.read_buf.resize(crate::aacs::ALIGNED_UNIT_LEN, 0);
-                        self.read_buf.fill(0);
-                        self.buf_len = 1;
-                        self.buf_pos = 0;
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ─── Format helpers ────────────────────────────────────────────────────────

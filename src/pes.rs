@@ -23,16 +23,12 @@ impl PesFrame {
     /// Serialize to bytes: track(1) | pts(8) | keyframe(1) | len(4) | data
     pub fn serialize(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         if self.track > 255 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "track index exceeds 255",
-            ));
+            return Err(crate::error::Error::PesInvalidMagic.into());
         }
         if self.data.len() > u32::MAX as usize {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame data exceeds 4 GB",
-            ));
+            return Err(crate::error::Error::PesFrameTooLarge {
+                size: self.data.len(),
+            }.into());
         }
         w.write_all(&[self.track as u8])?;
         w.write_all(&self.pts.to_le_bytes())?;
@@ -59,10 +55,7 @@ impl PesFrame {
         let keyframe = header[9] != 0;
         let len = u32::from_le_bytes([header[10], header[11], header[12], header[13]]) as usize;
         if len > MAX_FRAME_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("frame size {} exceeds maximum {}", len, MAX_FRAME_SIZE),
-            ));
+            return Err(crate::error::Error::PesFrameTooLarge { size: len }.into());
         }
         let mut data = vec![0u8; len];
         r.read_exact(&mut data)?;
@@ -99,4 +92,59 @@ pub trait Stream {
 
     /// True when codec_private is available for all video tracks.
     fn headers_ready(&self) -> bool { true }
+}
+
+/// Wraps any output stream and counts bytes written.
+///
+/// Progress tracking is a CLI concern — streams don't know their size.
+/// Wrap the output with CountingStream, then query bytes_written().
+///
+/// ```text
+/// let mut output = CountingStream::new(libfreemkv::output(dest, &title)?);
+/// while let Ok(Some(frame)) = input.read() {
+///     output.write(&frame)?;
+///     let pct = output.bytes_written() as f64 / total as f64;
+/// }
+/// ```
+pub struct CountingStream {
+    inner: Box<dyn Stream>,
+    written: u64,
+}
+
+impl CountingStream {
+    pub fn new(inner: Box<dyn Stream>) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    /// Total bytes of PES frame data written through this stream.
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl Stream for CountingStream {
+    fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+        self.inner.read()
+    }
+
+    fn write(&mut self, frame: &PesFrame) -> std::io::Result<()> {
+        self.written += frame.data.len() as u64;
+        self.inner.write(frame)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.inner.finish()
+    }
+
+    fn info(&self) -> &crate::disc::DiscTitle {
+        self.inner.info()
+    }
+
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        self.inner.codec_private(track)
+    }
+
+    fn headers_ready(&self) -> bool {
+        self.inner.headers_ready()
+    }
 }

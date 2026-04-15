@@ -171,10 +171,7 @@ pub fn read_id(r: &mut impl Read) -> io::Result<(u32, usize)> {
             4,
         ))
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid EBML ID",
-        ))
+        Err(crate::error::Error::MkvInvalid.into())
     }
 }
 
@@ -325,10 +322,7 @@ pub fn read_vint(r: &mut impl Read) -> io::Result<(u64, usize)> {
         r.read_exact(&mut b)?;
         return Ok(((((b0 & 0x3F) as u64) << 8) | b[0] as u64, 2));
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "unsupported VINT width",
-    ))
+    Err(crate::error::Error::MkvInvalid.into())
 }
 
 // ============================================================

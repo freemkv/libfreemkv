@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.10.1 (2026-04-15)
+
+### Architecture: streams are PES, disc.copy() for sector dumps
+- **One stream per format, bidirectional PES** — MkvStream, M2tsStream, NetworkStream, StdioStream, NullStream each handle read and write
+- **IsoStream merged into DiscStream** — one type for physical drives and ISO files, different SectorReader
+- **Disc::copy()** — raw sector dump for disc→ISO, not a stream operation
+- **IOStream deleted** — no more byte-level Read/Write on streams
+- **ContentReader/OpenDisc deleted** — replaced by DiscStream + PES pipeline
+- **CountingStream** — wrapper for progress tracking, no state in streams
+
+### Error codes only — zero English in library
+- All `io::Error::new(kind, "english")` replaced with `Error` enum variants
+- New error variants: StreamReadOnly, StreamWriteOnly, StreamUrlInvalid, MkvInvalid, NoStreams, etc.
+- `From<Error> for io::Error` — clean conversion at system boundaries
+- Removed unused error variants: WriteError, ProfileNotFound, NotUnlocked, NotCalibrated, ScsiTimeout, etc.
+
+### Deleted dead code
+- `mkvout.rs`, `pesout.rs`, `isowriter.rs` — merged into parent stream types
+- `lookahead.rs` usage in MkvStream — replaced by PES direct write
+- ContentReader, OpenDisc, open_title() — replaced by PES pipeline
+- `open_input()`, `open_output()` — replaced by `input()`, `output()`
+
+## 0.10.0 (2026-04-15)
+
+### PES pipeline
+- **Unified Stream trait** — `read()` returns PES frames, `write()` accepts them. One trait for all streams.
+- **All streams produce/consume PES frames** — DiscStream, IsoStream, MkvStream, M2tsStream, NetworkStream, StdioStream, NullStream
+- **DVD PS demux** — MPEG-2 Program Stream demuxer produces PES frames
+- **MKV input stream** — MKV demux produces PES frames
+- **Network/stdio PES** — PES serialization over TCP and pipes
+- **FileSectorReader** — ISO files implement SectorReader for unified disc/ISO handling
+
+### PES pipeline audit (20 fixes)
+- PES serialize: track/length validation, OOM cap (256 MB), stuffing compliance
+- TsDemuxer: AF length validation, find_start_code verified
+- PTS: marker bit validation, ns→90kHz saturating_mul, round-to-nearest
+- AC3/DTS: debug_assert promoted to runtime check
+- MKV: block_vint 3-4 byte support, track bounds check
+- FMKV: JSON 10 MB cap, PAT section_len underflow guard
+
+### codec_privates refactor
+- **codec_privates on DiscTitle** — no separate parameter passing, no `_with_X` method variants
+- **Streams-not-files** — MkvStream and M2tsStream take `impl Read`, not `File`/`Seek`
+- **M2TS roundtrip fix** — TsMuxer Annex B conversion + codec_private in FMKV header
+- **MKV remux fix** — MkvStream returns codec_privates from EBML header
+- **Network codec_private fix** — FMKV header carries base64 codec_privates
+
+### Cleanup
+- Remove Seek/File dependencies from stream interfaces
+- Remove eprintln from library code
+- Fix all clippy warnings
+- 342 tests pass
+
+## 0.9.0 (2026-04-14)
+
+### Drive recovery + decrypt architecture
+- **Drive::read()** — single read method with built-in error recovery (min speed → reset → retry)
+- **Decrypt in streams** — streams handle their own decryption via `decrypt_sectors()`. Pipeline just moves bytes.
+- **keys() on IOStream** — streams report their own decrypt keys
+- **InputOptions** — `--raw` wired through to streams, skips decrypt only
+- **decrypt_sectors returns Result** — fail instead of silent corruption
+- **Handshake fix** — no longer returns fake success on failure
+- **Drive::read_capacity()** — for raw sector dump (disc→ISO)
+- **Reset on open** — SgIoTransport resets device on every open
+- **Simplified DiscStream** — removed on_error/on_success/Recovery enum
+
+### Platform
+- **Rust 1.86 MSRV** pinned in Cargo.toml and CI
+- **macOS build fix** — MacScsiTransport marked Send
+- **is_multiple_of** — replaced nightly API with stable equivalent
+
+### API changes
+- **Drive object** — typed DriveSession API
+- **Typed StreamUrl** — URL parsing returns enum, not strings
+- **DriveStatus API** — reset(), wait_ready with fallback
+- **Granular SCSI queries** — individual methods on DriveSession for capture
+- **Profile module public** — for external tools (bdemu)
+- **Tray lock/unlock** — exposed on Drive
+
 ## 0.8.0 (2026-04-11)
 
 ### DVD support
