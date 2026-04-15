@@ -697,12 +697,12 @@ mod tests {
         let mut pgc = vec![0u8; 0xEA];
         pgc[0x02] = 1; // 1 program
         pgc[0x03] = 2; // 2 cells
-        // 1h 59m 30s at 29.97fps, 0 frames
+                       // 1h 59m 30s at 29.97fps, 0 frames
         pgc[0x04] = 0x01; // hours BCD
         pgc[0x05] = 0x59; // minutes BCD
         pgc[0x06] = 0x30; // seconds BCD
         pgc[0x07] = 0b11_000000; // 29.97fps, 0 frames
-        // Cell playback info offset at PGC+0xE8
+                                 // Cell playback info offset at PGC+0xE8
         let cell_offset: u16 = 0xEA; // right after minimum header
         pgc[0xE8] = (cell_offset >> 8) as u8;
         pgc[0xE9] = cell_offset as u8;
@@ -710,17 +710,32 @@ mod tests {
         pgc.resize(pgc.len() + 48, 0);
         // Cell 0: sectors 100-200
         let co = 0xEA;
-        pgc[co + 8] = 0; pgc[co + 9] = 0; pgc[co + 10] = 0; pgc[co + 11] = 100; // first sector
-        pgc[co + 20] = 0; pgc[co + 21] = 0; pgc[co + 22] = 0; pgc[co + 23] = 200; // last sector
-        // Cell 1: sectors 300-400
+        pgc[co + 8] = 0;
+        pgc[co + 9] = 0;
+        pgc[co + 10] = 0;
+        pgc[co + 11] = 100; // first sector
+        pgc[co + 20] = 0;
+        pgc[co + 21] = 0;
+        pgc[co + 22] = 0;
+        pgc[co + 23] = 200; // last sector
+                            // Cell 1: sectors 300-400
         let co = 0xEA + 24;
-        pgc[co + 8] = 0; pgc[co + 9] = 0; pgc[co + 10] = 1; pgc[co + 11] = 44; // first sector = 300
-        pgc[co + 20] = 0; pgc[co + 21] = 0; pgc[co + 22] = 1; pgc[co + 23] = 144; // last sector = 400
+        pgc[co + 8] = 0;
+        pgc[co + 9] = 0;
+        pgc[co + 10] = 1;
+        pgc[co + 11] = 44; // first sector = 300
+        pgc[co + 20] = 0;
+        pgc[co + 21] = 0;
+        pgc[co + 22] = 1;
+        pgc[co + 23] = 144; // last sector = 400
 
         let title = parse_pgc(&pgc, 0, 5).unwrap();
         let expected = 1.0 * 3600.0 + 59.0 * 60.0 + 30.0;
-        assert!((title.duration_secs - expected).abs() < 0.1,
-            "expected ~{expected}s, got {}s", title.duration_secs);
+        assert!(
+            (title.duration_secs - expected).abs() < 0.1,
+            "expected ~{expected}s, got {}s",
+            title.duration_secs
+        );
         assert_eq!(title.chapters, 5);
         assert_eq!(title.cells.len(), 2);
         assert_eq!(title.cells[0].first_sector, 100);

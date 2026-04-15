@@ -69,10 +69,14 @@ impl<R: Read> TsDemuxReader<R> {
 
             let packets = self.demuxer.feed(&self.buf[..n]);
             for pes in &packets {
-                if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
-                    if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
+                {
+                    if let Some((_, parser)) =
+                        self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
+                    {
                         for frame in parser.parse(pes) {
-                            self.pending.push_back(PesFrame::from_codec_frame(*track, frame));
+                            self.pending
+                                .push_back(PesFrame::from_codec_frame(*track, frame));
                         }
                     }
                 }
@@ -86,10 +90,13 @@ impl<R: Read> TsDemuxReader<R> {
 
     /// Codec private data for a track.
     pub fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        let pid = self.pid_to_track.iter()
+        let pid = self
+            .pid_to_track
+            .iter()
             .find(|(_, idx)| *idx == track)
             .map(|(pid, _)| *pid)?;
-        self.parsers.iter()
+        self.parsers
+            .iter()
             .find(|(p, _)| *p == pid)
             .and_then(|(_, parser)| parser.codec_private())
     }

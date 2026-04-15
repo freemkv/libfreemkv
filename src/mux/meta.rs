@@ -93,7 +93,9 @@ impl M2tsMeta {
                     hdr: v.hdr.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
-                    codec_private: title.codec_privates.get(i)
+                    codec_private: title
+                        .codec_privates
+                        .get(i)
                         .and_then(|cp| cp.as_ref())
                         .map(|cp| base64::engine::general_purpose::STANDARD.encode(cp)),
                 },
@@ -141,8 +143,12 @@ impl M2tsMeta {
                 } => Stream::Video(VideoStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
-                    resolution: resolution.parse().unwrap_or(crate::disc::Resolution::Unknown),
-                    frame_rate: frame_rate.parse().unwrap_or(crate::disc::FrameRate::Unknown),
+                    resolution: resolution
+                        .parse()
+                        .unwrap_or(crate::disc::Resolution::Unknown),
+                    frame_rate: frame_rate
+                        .parse()
+                        .unwrap_or(crate::disc::FrameRate::Unknown),
                     hdr: hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr),
                     color_space: ColorSpace::Bt709,
                     secondary: *secondary,
@@ -159,9 +165,13 @@ impl M2tsMeta {
                 } => Stream::Audio(AudioStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
-                    channels: channels.parse().unwrap_or(crate::disc::AudioChannels::Unknown),
+                    channels: channels
+                        .parse()
+                        .unwrap_or(crate::disc::AudioChannels::Unknown),
                     language: language.clone(),
-                    sample_rate: sample_rate.parse().unwrap_or(crate::disc::SampleRate::Unknown),
+                    sample_rate: sample_rate
+                        .parse()
+                        .unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
                     label: label.clone(),
                 }),
@@ -197,16 +207,23 @@ impl M2tsMeta {
     /// Extract codec_private data per stream (from FMKV header).
     /// Returns a Vec matching stream order — None for streams without codec_private.
     pub fn codec_privates(&self) -> Vec<Option<Vec<u8>>> {
-        self.streams.iter().map(|s| {
-            if let MetaStream::Video { codec_private: Some(ref b64), .. } = s {
-{
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+        self.streams
+            .iter()
+            .map(|s| {
+                if let MetaStream::Video {
+                    codec_private: Some(ref b64),
+                    ..
+                } = s
+                {
+                    {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                    }
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
-        }).collect()
+            })
+            .collect()
     }
 }
 

@@ -50,7 +50,9 @@ fn main() {
             eprintln!("\n  SLOW READ: LBA {} took {}ms (ok={})", lba, read_ms, ok);
         }
 
-        if !ok { buf[..n].fill(0); }
+        if !ok {
+            buf[..n].fill(0);
+        }
         w.write_all(&buf[..n]).unwrap();
         lba += count as u32;
         bytes += n as u64;
@@ -60,11 +62,22 @@ fn main() {
             let speed = delta as f64 / last.elapsed().as_secs_f64() / 1_048_576.0;
             let avg = bytes as f64 / start.elapsed().as_secs_f64() / 1_048_576.0;
             let pct = bytes as f64 / (cap as f64 * 2048.0) * 100.0;
-            eprint!("\r  {:.1}% LBA {} | {:.0} MB/s (avg {:.0}) | {:.1} GB    ", pct, lba, speed, avg, bytes as f64 / 1e9);
+            eprint!(
+                "\r  {:.1}% LBA {} | {:.0} MB/s (avg {:.0}) | {:.1} GB    ",
+                pct,
+                lba,
+                speed,
+                avg,
+                bytes as f64 / 1e9
+            );
             last_bytes = bytes;
             last = Instant::now();
         }
     }
     w.flush().unwrap();
-    eprintln!("\nDone: {:.1} GB in {:.0}s", bytes as f64 / 1e9, start.elapsed().as_secs_f64());
+    eprintln!(
+        "\nDone: {:.1} GB in {:.0}s",
+        bytes as f64 / 1e9,
+        start.elapsed().as_secs_f64()
+    );
 }

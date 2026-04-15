@@ -416,7 +416,11 @@ fn batch_count_u16_overflow_regression() {
     // 47513600 = 725 * 65536, lower 16 bits = 0
     let remaining: u32 = 47533152 - 19552; // = 47513600
     assert_eq!(remaining, 47513600);
-    assert_eq!(remaining % 65536, 0, "remaining should be multiple of 65536");
+    assert_eq!(
+        remaining % 65536,
+        0,
+        "remaining should be multiple of 65536"
+    );
 
     // Buggy version produces 0 → infinite loop
     assert_eq!(buggy_batch_count(remaining, 60), 0);

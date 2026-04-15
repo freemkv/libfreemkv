@@ -13,7 +13,9 @@ pub trait SectorReader: Send {
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize>;
 
     /// Total capacity in sectors, if known.
-    fn capacity(&self) -> u32 { 0 }
+    fn capacity(&self) -> u32 {
+        0
+    }
 }
 
 /// SectorReader backed by a file (ISO image).
@@ -47,9 +49,11 @@ impl SectorReader for FileSectorReader {
         use std::io::{Read, Seek, SeekFrom};
         let offset = lba as u64 * 2048;
         let bytes = count as usize * 2048;
-        self.file.seek(SeekFrom::Start(offset))
+        self.file
+            .seek(SeekFrom::Start(offset))
             .map_err(|e| crate::error::Error::IoError { source: e })?;
-        self.file.read_exact(&mut buf[..bytes])
+        self.file
+            .read_exact(&mut buf[..bytes])
             .map_err(|e| crate::error::Error::IoError { source: e })?;
         Ok(bytes)
     }

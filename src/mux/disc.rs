@@ -5,9 +5,7 @@
 //!
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
-use crate::disc::{
-    detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions,
-};
+use crate::disc::{detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions};
 use crate::sector::SectorReader;
 use std::io;
 
@@ -99,8 +97,8 @@ impl DiscStream {
         let mut reader = super::iso::IsoSectorReader::open(path)?;
         let capacity = reader.capacity();
 
-        let disc = Disc::scan_image(&mut reader, capacity, opts)
-            .map_err(|e| -> io::Error { e.into() })?;
+        let disc =
+            Disc::scan_image(&mut reader, capacity, opts).map_err(|e| -> io::Error { e.into() })?;
 
         if disc.titles.is_empty() {
             return Err(crate::error::Error::NoStreams.into());
@@ -110,7 +108,8 @@ impl DiscStream {
             return Err(crate::error::Error::DiscTitleRange {
                 index: idx,
                 count: disc.titles.len(),
-            }.into());
+            }
+            .into());
         }
 
         let title = disc.titles[idx].clone();
@@ -210,7 +209,10 @@ impl DiscStream {
         let bytes = sectors as usize * 2048;
         self.read_buf.resize(bytes, 0);
 
-        match self.reader.read_sectors(lba, sectors, &mut self.read_buf[..bytes]) {
+        match self
+            .reader
+            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])
+        {
             Ok(_) => {
                 self.buf_valid = bytes;
                 self.current_offset += sectors as u32;
@@ -241,11 +243,15 @@ impl crate::pes::Stream for DiscStream {
                 // Flush demuxer — last PES packet may still be in the assembler
                 if let Some(ref mut demuxer) = self.ts_demuxer {
                     for pes in &demuxer.flush() {
-                        if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
-                            if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                        if let Some((_, track)) =
+                            self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
+                        {
+                            if let Some((_, parser)) =
+                                self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
+                            {
                                 for frame in parser.parse(pes) {
                                     self.pending_frames.push_back(
-                                        crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                        crate::pes::PesFrame::from_codec_frame(*track, frame),
                                     );
                                 }
                             }
@@ -258,11 +264,17 @@ impl crate::pes::Stream for DiscStream {
                         let track = match ps.stream_id {
                             0xE0..=0xEF => 0,
                             0xC0..=0xDF => 1,
-                            0xBD => ps.sub_stream_id.map(|s| (s & 0x1F) as usize + 1).unwrap_or(1),
+                            0xBD => ps
+                                .sub_stream_id
+                                .map(|s| (s & 0x1F) as usize + 1)
+                                .unwrap_or(1),
                             _ => continue,
                         };
                         if track < self.title.streams.len() {
-                            let pts_ns = ps.pts.map(|p| (p as i64) * 1_000_000_000 / 90_000).unwrap_or(0);
+                            let pts_ns = ps
+                                .pts
+                                .map(|p| (p as i64) * 1_000_000_000 / 90_000)
+                                .unwrap_or(0);
                             self.pending_frames.push_back(crate::pes::PesFrame {
                                 track,
                                 pts: pts_ns,
@@ -276,22 +288,24 @@ impl crate::pes::Stream for DiscStream {
             }
 
             let bytes = self.buf_valid;
-            if let Err(e) = crate::decrypt::decrypt_sectors(
-                &mut self.read_buf[..bytes],
-                &self.decrypt_keys,
-                0,
-            ) {
+            if let Err(e) =
+                crate::decrypt::decrypt_sectors(&mut self.read_buf[..bytes], &self.decrypt_keys, 0)
+            {
                 return Err(e.into());
             }
 
             if let Some(ref mut demuxer) = self.ts_demuxer {
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for pes in &packets {
-                    if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
-                        if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                    if let Some((_, track)) =
+                        self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
+                    {
+                        if let Some((_, parser)) =
+                            self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
+                        {
                             for frame in parser.parse(pes) {
                                 self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                    crate::pes::PesFrame::from_codec_frame(*track, frame),
                                 );
                             }
                         }
@@ -303,11 +317,17 @@ impl crate::pes::Stream for DiscStream {
                     let track = match ps.stream_id {
                         0xE0..=0xEF => 0,
                         0xC0..=0xDF => 1,
-                        0xBD => ps.sub_stream_id.map(|s| (s & 0x1F) as usize + 1).unwrap_or(1),
+                        0xBD => ps
+                            .sub_stream_id
+                            .map(|s| (s & 0x1F) as usize + 1)
+                            .unwrap_or(1),
                         _ => continue,
                     };
                     if track < self.title.streams.len() {
-                        let pts_ns = ps.pts.map(|p| (p as i64) * 1_000_000_000 / 90_000).unwrap_or(0);
+                        let pts_ns = ps
+                            .pts
+                            .map(|p| (p as i64) * 1_000_000_000 / 90_000)
+                            .unwrap_or(0);
                         self.pending_frames.push_back(crate::pes::PesFrame {
                             track,
                             pts: pts_ns,
@@ -330,15 +350,22 @@ impl crate::pes::Stream for DiscStream {
         Err(crate::error::Error::StreamReadOnly.into())
     }
 
-    fn finish(&mut self) -> io::Result<()> { Ok(()) }
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 
-    fn info(&self) -> &DiscTitle { &self.title }
+    fn info(&self) -> &DiscTitle {
+        &self.title
+    }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        let pid = self.pid_to_track.iter()
+        let pid = self
+            .pid_to_track
+            .iter()
             .find(|(_, idx)| *idx == track)
             .map(|(pid, _)| *pid)?;
-        self.parsers.iter()
+        self.parsers
+            .iter()
             .find(|(p, _)| *p == pid)
             .and_then(|(_, parser)| parser.codec_private())
     }

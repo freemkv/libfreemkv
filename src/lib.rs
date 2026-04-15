@@ -104,8 +104,8 @@ pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use Drive, not Platform directly
 pub use decrypt::{decrypt_sectors, DecryptKeys};
 pub use disc::{
-    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat,
-    Disc, DiscFormat, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
+    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
+    DiscFormat, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
     ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 pub use mux::DiscStream;

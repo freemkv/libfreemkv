@@ -84,13 +84,19 @@ impl crate::pes::Stream for StdioStream {
         }
     }
     fn finish(&mut self) -> io::Result<()> {
-        if let Some(w) = &mut self.writer { w.flush()?; }
+        if let Some(w) = &mut self.writer {
+            w.flush()?;
+        }
         Ok(())
     }
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
-        self.stored_codec_privates.get(track).and_then(|c| c.clone())
+        self.stored_codec_privates
+            .get(track)
+            .and_then(|c| c.clone())
     }
 
     fn headers_ready(&self) -> bool {

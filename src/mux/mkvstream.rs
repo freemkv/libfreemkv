@@ -40,10 +40,7 @@ pub struct MkvStream {
 impl MkvStream {
     /// Create for writing PES frames → MKV container.
     /// Codec privates come from title.codec_privates (populated by input stream).
-    pub fn create(
-        writer: Box<dyn WriteSeek>,
-        title: &DiscTitle,
-    ) -> io::Result<Self> {
+    pub fn create(writer: Box<dyn WriteSeek>, title: &DiscTitle) -> io::Result<Self> {
         let mut tracks = Vec::new();
         for (idx, s) in title.streams.iter().enumerate() {
             let mut track = match s {
@@ -106,10 +103,14 @@ impl crate::pes::Stream for MkvStream {
                 }
                 ebml::SIMPLE_BLOCK => {
                     let block = ebml::read_binary_val(&mut rs.reader, size as usize)?;
-                    if block.len() < 4 { continue; }
+                    if block.len() < 4 {
+                        continue;
+                    }
 
                     let (track, vl) = block_vint(&block);
-                    if vl + 3 > block.len() { continue; }
+                    if vl + 3 > block.len() {
+                        continue;
+                    }
 
                     let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
                     let keyframe = block[vl + 2] & 0x80 != 0;
@@ -139,7 +140,9 @@ impl crate::pes::Stream for MkvStream {
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write { muxer: Some(ref mut m) } => m.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data),
+            Mode::Write {
+                muxer: Some(ref mut m),
+            } => m.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data),
             Mode::Write { muxer: None } => Ok(()),
             Mode::Read(_) => Err(crate::error::Error::StreamReadOnly.into()),
         }
@@ -154,7 +157,9 @@ impl crate::pes::Stream for MkvStream {
         Ok(())
     }
 
-    fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
+    fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         let track_num = (track + 1) as u16; // MKV tracks are 1-based
@@ -176,9 +181,7 @@ impl crate::pes::Stream for MkvStream {
 // ── MKV header parsing (read side) ────────────────────────────
 
 /// Returns (DiscTitle, codec_privates: Vec<(track_number, codec_private_bytes)>)
-fn parse_mkv_header(
-    r: &mut impl Read,
-) -> MkvHeaderResult {
+fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
     let mut title = String::new();
     let mut duration_ms = 0.0f64;
     let mut ts_scale: u64 = 1_000_000;
@@ -220,7 +223,9 @@ fn parse_mkv_header(
                         ebml::TIMESTAMP_SCALE => ts_scale = ebml::read_uint_val(r, cs as usize)?,
                         ebml::DURATION => duration_ms = ebml::read_float_val(r, cs as usize)?,
                         ebml::TITLE => title = ebml::read_string_val(r, cs as usize)?,
-                        _ => { skip_bytes(r, cs)?; }
+                        _ => {
+                            skip_bytes(r, cs)?;
+                        }
                     }
                 }
                 got_info = true;
@@ -303,11 +308,15 @@ fn parse_track(
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
                         ebml::CHANNELS => ch = ebml::read_uint_val(r, as_ as usize)? as u8,
-                        _ => { skip_bytes(r, as_)?; }
+                        _ => {
+                            skip_bytes(r, as_)?;
+                        }
                     }
                 }
             }
-            _ => { skip_bytes(r, cs)?; }
+            _ => {
+                skip_bytes(r, cs)?;
+            }
         }
     }
 
@@ -334,7 +343,11 @@ fn parse_track(
     };
 
     // Map MKV track numbers to BD-TS PIDs
-    let ts_pid = if tnum == 1 { 0x1011 } else { 0x1100 + (tnum - 2) };
+    let ts_pid = if tnum == 1 {
+        0x1011
+    } else {
+        0x1100 + (tnum - 2)
+    };
 
     let stream = match ttype {
         1 => {
@@ -382,10 +395,19 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
         return ((((d[0] & 0x3F) as u64) << 8) | d[1] as u64, 2);
     }
     if d[0] & 0x20 != 0 && d.len() >= 3 {
-        return ((((d[0] & 0x1F) as u64) << 16) | ((d[1] as u64) << 8) | d[2] as u64, 3);
+        return (
+            (((d[0] & 0x1F) as u64) << 16) | ((d[1] as u64) << 8) | d[2] as u64,
+            3,
+        );
     }
     if d[0] & 0x10 != 0 && d.len() >= 4 {
-        return ((((d[0] & 0x0F) as u64) << 24) | ((d[1] as u64) << 16) | ((d[2] as u64) << 8) | d[3] as u64, 4);
+        return (
+            (((d[0] & 0x0F) as u64) << 24)
+                | ((d[1] as u64) << 16)
+                | ((d[2] as u64) << 8)
+                | d[3] as u64,
+            4,
+        );
     }
     (0, 1) // Unsupported 5+ byte VINT — treat as track 0
 }

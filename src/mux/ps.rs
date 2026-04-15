@@ -163,7 +163,6 @@ impl PsDemuxer {
 
         packets
     }
-
 }
 
 /// Check whether a start code byte is a valid PES stream ID that carries payload.

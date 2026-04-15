@@ -79,7 +79,11 @@ impl crate::pes::Stream for NetworkStream {
     }
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write { writer, ref mut header_written, .. } => {
+            Mode::Write {
+                writer,
+                ref mut header_written,
+                ..
+            } => {
                 if !*header_written {
                     if !self.disc_title.streams.is_empty() {
                         let m = meta::M2tsMeta::from_title(&self.disc_title);
@@ -99,7 +103,9 @@ impl crate::pes::Stream for NetworkStream {
         }
         Ok(())
     }
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
 }
 
 // NetworkStream is PES-only — no IOStream/Read/Write byte interface.
@@ -174,7 +180,12 @@ mod tests {
 
         let dt = sample_title();
         let mut writer = NetworkStream::connect(&addr).unwrap().meta(&dt);
-        let frame = pes::PesFrame { track: 0, pts: 90000, keyframe: true, data: vec![0x47; 192] };
+        let frame = pes::PesFrame {
+            track: 0,
+            pts: 90000,
+            keyframe: true,
+            data: vec![0x47; 192],
+        };
         pes::Stream::write(&mut writer, &frame).unwrap();
         pes::Stream::finish(&mut writer).unwrap();
 

@@ -89,10 +89,18 @@ pub const E_NO_METADATA: u16 = 9008;
 #[derive(Debug)]
 pub enum Error {
     // Device (1xxx)
-    DeviceNotFound { path: String },
-    DevicePermission { path: String },
-    DeviceNotReady { path: String },
-    DeviceResetFailed { path: String },
+    DeviceNotFound {
+        path: String,
+    },
+    DevicePermission {
+        path: String,
+    },
+    DeviceNotReady {
+        path: String,
+    },
+    DeviceResetFailed {
+        path: String,
+    },
 
     // Profile (2xxx)
     UnsupportedDrive {
@@ -104,7 +112,10 @@ pub enum Error {
 
     // Unlock (3xxx)
     UnlockFailed,
-    SignatureMismatch { expected: [u8; 4], got: [u8; 4] },
+    SignatureMismatch {
+        expected: [u8; 4],
+        got: [u8; 4],
+    },
 
     // SCSI (4xxx)
     ScsiError {
@@ -114,14 +125,23 @@ pub enum Error {
     },
 
     // I/O (5xxx)
-    IoError { source: std::io::Error },
+    IoError {
+        source: std::io::Error,
+    },
 
     // Disc format (6xxx)
-    DiscRead { sector: u64 },
+    DiscRead {
+        sector: u64,
+    },
     MplsParse,
     ClpiParse,
-    UdfNotFound { path: String },
-    DiscTitleRange { index: usize, count: usize },
+    UdfNotFound {
+        path: String,
+    },
+    DiscTitleRange {
+        index: usize,
+        count: usize,
+    },
     IfoParse,
     MkvInvalid,
     NoStreams,
@@ -142,22 +162,40 @@ pub enum Error {
     DecryptFailed,
 
     // Keydb (8xxx)
-    KeydbConnect { host: String },
-    KeydbHttp { status: u16 },
+    KeydbConnect {
+        host: String,
+    },
+    KeydbHttp {
+        status: u16,
+    },
     KeydbInvalid,
-    KeydbWrite { path: String },
+    KeydbWrite {
+        path: String,
+    },
     KeydbParse,
-    KeydbLoad { path: String },
+    KeydbLoad {
+        path: String,
+    },
 
     // Stream/mux (9xxx)
     StreamReadOnly,
     StreamWriteOnly,
-    StreamUrlInvalid { url: String },
-    StreamUrlMissingPath { scheme: String },
-    StreamUrlMissingPort { addr: String },
-    PesFrameTooLarge { size: usize },
+    StreamUrlInvalid {
+        url: String,
+    },
+    StreamUrlMissingPath {
+        scheme: String,
+    },
+    StreamUrlMissingPort {
+        addr: String,
+    },
+    PesFrameTooLarge {
+        size: usize,
+    },
     PesInvalidMagic,
-    IsoTooLarge { path: String },
+    IsoTooLarge {
+        path: String,
+    },
     NoMetadata,
 }
 
@@ -227,22 +265,46 @@ impl std::fmt::Display for Error {
                 product_id,
                 product_revision,
             } => write!(
-                f, "E{}: {} {} {}",
-                self.code(), vendor_id.trim(), product_id.trim(), product_revision.trim()
+                f,
+                "E{}: {} {} {}",
+                self.code(),
+                vendor_id.trim(),
+                product_id.trim(),
+                product_revision.trim()
             ),
             Error::SignatureMismatch { expected, got } => write!(
-                f, "E{}: {:02x}{:02x}{:02x}{:02x}!={:02x}{:02x}{:02x}{:02x}",
+                f,
+                "E{}: {:02x}{:02x}{:02x}{:02x}!={:02x}{:02x}{:02x}{:02x}",
                 self.code(),
-                expected[0], expected[1], expected[2], expected[3],
-                got[0], got[1], got[2], got[3]
+                expected[0],
+                expected[1],
+                expected[2],
+                expected[3],
+                got[0],
+                got[1],
+                got[2],
+                got[3]
             ),
-            Error::ScsiError { opcode, status, sense_key } => {
-                write!(f, "E{}: 0x{:02x}/0x{:02x}/0x{:02x}", self.code(), opcode, status, sense_key)
+            Error::ScsiError {
+                opcode,
+                status,
+                sense_key,
+            } => {
+                write!(
+                    f,
+                    "E{}: 0x{:02x}/0x{:02x}/0x{:02x}",
+                    self.code(),
+                    opcode,
+                    status,
+                    sense_key
+                )
             }
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
             Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
-            Error::DiscTitleRange { index, count } => write!(f, "E{}: {}/{}", self.code(), index, count),
+            Error::DiscTitleRange { index, count } => {
+                write!(f, "E{}: {}/{}", self.code(), index, count)
+            }
             Error::KeydbConnect { host } => write!(f, "E{}: {}", self.code(), host),
             Error::KeydbHttp { status } => write!(f, "E{}: {}", self.code(), status),
             Error::KeydbWrite { path } => write!(f, "E{}: {}", self.code(), path),

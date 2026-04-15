@@ -26,7 +26,6 @@ pub struct Event {
 #[derive(Debug)]
 pub enum EventKind {
     // ── Init sequence events ────────────────────────────────────────
-
     /// Drive opened successfully.
     DriveOpened { device: String },
 
@@ -43,7 +42,6 @@ pub enum EventKind {
     ScanComplete { titles: usize },
 
     // ── Read events ─────────────────────────────────────────────────
-
     /// Bytes successfully read and written to output.
     BytesRead {
         /// Bytes written so far.

@@ -111,7 +111,7 @@ impl Disc {
                     chapters: Vec::new(),
                     extents,
                     content_format: ContentFormat::MpegPs,
-            codec_privates: Vec::new(),
+                    codec_privates: Vec::new(),
                 });
             }
         }
