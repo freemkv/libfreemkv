@@ -1113,6 +1113,7 @@ impl Disc {
         path: &std::path::Path,
         decrypt: bool,
         resume: bool,
+        batch_sectors: Option<u16>,
         on_progress: Option<&dyn Fn(u64, u64)>,
     ) -> Result<()> {
         use std::io::{Seek, SeekFrom, Write};
@@ -1149,7 +1150,7 @@ impl Disc {
         };
 
         let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        let batch: u16 = 64; // 128 KB per read
+        let batch: u16 = batch_sectors.unwrap_or(DEFAULT_BATCH_SECTORS);
         let mut lba = start_lba;
         let mut bytes_done = start_lba as u64 * 2048;
         let mut buf = vec![0u8; batch as usize * 2048];
@@ -1158,6 +1159,7 @@ impl Disc {
             let remaining = self.capacity_sectors - lba;
             let count = remaining.min(batch as u32) as u16;
             let bytes = count as usize * 2048;
+
 
             reader
                 .read_sectors(lba, count, &mut buf[..bytes])

@@ -488,25 +488,19 @@ fn parse_pgcit(
 
 /// Parse a single PGC (Program Chain) to extract duration and cells.
 fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> {
-    // PGC needs at least 0xE6 bytes for the cell info offsets
-    if pgc_offset + 0xE6 > data.len() {
+    // PGC needs at least 0xE8 bytes for the cell playback info offset
+    if pgc_offset + 0xEA > data.len() {
         return Err(Error::IfoParse);
     }
 
-    // Playback time at offset 2-5 (4 BCD bytes)
-    let time_bytes = sub_slice(data, pgc_offset + 2, 4)?;
+    // PGC layout:
+    //   0x00-0x01: misc flags
+    //   0x02:      nr_of_programs
+    //   0x03:      nr_of_cells
+    //   0x04-0x07: playback_time (4 BCD bytes)
+    let num_cells = byte_at(data, pgc_offset + 0x03)? as usize;
+    let time_bytes = sub_slice(data, pgc_offset + 0x04, 4)?;
     let duration_secs = bcd_to_secs(time_bytes);
-
-    // Number of cells: the user spec says byte 0x03, but in the standard IFO
-    // format bytes 0x02-0x05 are the BCD playback time. The real cell count
-    // lives at PGC offset 0x07. We read from 0x03 as primary (per spec) and
-    // fall back to 0x07 if that yields zero.
-    let num_cells_primary = byte_at(data, pgc_offset + 0x03)? as usize;
-    let num_cells = if num_cells_primary == 0 {
-        byte_at(data, pgc_offset + 0x07).unwrap_or(0) as usize
-    } else {
-        num_cells_primary
-    };
 
     // Cell playback info table offset (relative to PGC start)
     let cell_playback_offset = be_u16(data, pgc_offset + 0xE8)? as usize;
@@ -536,9 +530,10 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         let cell_base = pgc_offset + cell_playback_offset;
         let mut total = 0.0;
         for i in 0..cells.len() {
+            // Cell playback info: 24 bytes per cell, BCD time at offset 4-7
             let co = cell_base + i * 24;
-            if co + 4 <= data.len() {
-                total += bcd_to_secs(&data[co..co + 4]);
+            if co + 8 <= data.len() {
+                total += bcd_to_secs(&data[co + 4..co + 8]);
             }
         }
         total
@@ -693,6 +688,45 @@ mod tests {
             title_sets: vec![ts],
         };
         assert_eq!(info.title_sets.len(), 1);
+    }
+
+    #[test]
+    fn pgc_parses_duration_from_correct_offset() {
+        // Build a minimal PGC: 0xEA bytes minimum
+        // PGC layout: 0x02 = nr_programs, 0x03 = nr_cells, 0x04-0x07 = BCD time
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1; // 1 program
+        pgc[0x03] = 2; // 2 cells
+        // 1h 59m 30s at 29.97fps, 0 frames
+        pgc[0x04] = 0x01; // hours BCD
+        pgc[0x05] = 0x59; // minutes BCD
+        pgc[0x06] = 0x30; // seconds BCD
+        pgc[0x07] = 0b11_000000; // 29.97fps, 0 frames
+        // Cell playback info offset at PGC+0xE8
+        let cell_offset: u16 = 0xEA; // right after minimum header
+        pgc[0xE8] = (cell_offset >> 8) as u8;
+        pgc[0xE9] = cell_offset as u8;
+        // Add 2 cells (24 bytes each)
+        pgc.resize(pgc.len() + 48, 0);
+        // Cell 0: sectors 100-200
+        let co = 0xEA;
+        pgc[co + 8] = 0; pgc[co + 9] = 0; pgc[co + 10] = 0; pgc[co + 11] = 100; // first sector
+        pgc[co + 20] = 0; pgc[co + 21] = 0; pgc[co + 22] = 0; pgc[co + 23] = 200; // last sector
+        // Cell 1: sectors 300-400
+        let co = 0xEA + 24;
+        pgc[co + 8] = 0; pgc[co + 9] = 0; pgc[co + 10] = 1; pgc[co + 11] = 44; // first sector = 300
+        pgc[co + 20] = 0; pgc[co + 21] = 0; pgc[co + 22] = 1; pgc[co + 23] = 144; // last sector = 400
+
+        let title = parse_pgc(&pgc, 0, 5).unwrap();
+        let expected = 1.0 * 3600.0 + 59.0 * 60.0 + 30.0;
+        assert!((title.duration_secs - expected).abs() < 0.1,
+            "expected ~{expected}s, got {}s", title.duration_secs);
+        assert_eq!(title.chapters, 5);
+        assert_eq!(title.cells.len(), 2);
+        assert_eq!(title.cells[0].first_sector, 100);
+        assert_eq!(title.cells[0].last_sector, 200);
+        assert_eq!(title.cells[1].first_sector, 300);
+        assert_eq!(title.cells[1].last_sector, 400);
     }
 
     #[test]
