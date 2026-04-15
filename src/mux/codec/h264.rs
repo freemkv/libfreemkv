@@ -111,12 +111,12 @@ impl CodecParser for H264Parser {
         // pictureParameterSetNALUnit = pps
 
         let mut record = vec![
-            1,        // configurationVersion
-            sps[1],   // profile
-            sps[2],   // compatibility
-            sps[3],   // level
-            0xFF,     // 6 bits reserved (111111) + 2 bits lengthSizeMinusOne (11 = 3)
-            0xE1,     // 3 bits reserved (111) + 5 bits numSPS (1)
+            1,      // configurationVersion
+            sps[1], // profile
+            sps[2], // compatibility
+            sps[3], // level
+            0xFF,   // 6 bits reserved (111111) + 2 bits lengthSizeMinusOne (11 = 3)
+            0xE1,   // 3 bits reserved (111) + 5 bits numSPS (1)
             (sps.len() >> 8) as u8,
             sps.len() as u8,
         ];

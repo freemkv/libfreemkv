@@ -82,7 +82,6 @@ impl PsDemuxer {
         let mut pos = 0;
 
         while let Some(sc) = find_start_code(&self.buffer, pos) {
-
             if sc + 3 >= self.buffer.len() {
                 // Not enough bytes to read the start code ID.
                 break;

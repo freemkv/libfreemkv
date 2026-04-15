@@ -35,7 +35,7 @@ impl MkvTrack {
             Codec::Mpeg2 => "V_MPEG2",
             _ => "V_MPEG2",
         };
-        let (w, h) = parse_resolution(&v.resolution);
+        let (w, h) = v.resolution.pixels();
         Self {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
@@ -61,8 +61,8 @@ impl MkvTrack {
             Codec::Lpcm => "A_PCM/INT/BIG",
             _ => "A_AC3",
         };
-        let sr = parse_sample_rate(&a.sample_rate);
-        let ch = parse_channels(&a.channels);
+        let sr = a.sample_rate.hz();
+        let ch = a.channels.count();
         Self {
             track_type: ebml::TRACK_TYPE_AUDIO,
             codec_id,
@@ -414,45 +414,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
 // Helpers
 // ============================================================
 
-fn parse_resolution(s: &str) -> (u32, u32) {
-    if s.contains("2160") {
-        (3840, 2160)
-    } else if s.contains("1080") {
-        (1920, 1080)
-    } else if s.contains("720") {
-        (1280, 720)
-    } else if s.contains("576") {
-        (720, 576)
-    } else if s.contains("480") {
-        (720, 480)
-    } else {
-        (1920, 1080)
-    }
-}
-
-fn parse_sample_rate(s: &str) -> f64 {
-    if s.contains("192") {
-        192_000.0
-    } else if s.contains("96") {
-        96000.0
-    } else {
-        48000.0
-    }
-}
-
-fn parse_channels(s: &str) -> u8 {
-    if s.contains("7.1") {
-        8
-    } else if s.contains("5.1") {
-        6
-    } else if s.contains("stereo") || s.contains("2.0") {
-        2
-    } else if s.contains("mono") {
-        1
-    } else {
-        6
-    }
-}
+// Old parse_resolution/parse_sample_rate/parse_channels removed —
+// Resolution::pixels(), SampleRate::hz(), AudioChannels::count() replace them.
 
 #[cfg(test)]
 mod tests {

@@ -188,9 +188,13 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
     // Try each processing key against each UV/cvalue pair
     for pk in processing_keys {
         for i in 0..num_uvs {
-            if (i + 1) * 16 > cvalues.len() { continue; }
+            if (i + 1) * 16 > cvalues.len() {
+                continue;
+            }
             let record_start = i * 5;
-            if record_start + 5 > uvs.len() { continue; }
+            if record_start + 5 > uvs.len() {
+                continue;
+            }
             let _u_mask_shift = uvs[record_start];
             let uv = &uvs[record_start + 1..record_start + 5];
             let cv = &cvalues[i * 16..(i + 1) * 16];
@@ -448,9 +452,7 @@ const MKB_PACK_SIZE: usize = 32772;
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs.
-pub fn read_mkb_from_drive(
-    session: &mut crate::drive::Drive,
-) -> crate::error::Result<Vec<u8>> {
+pub fn read_mkb_from_drive(session: &mut crate::drive::Drive) -> crate::error::Result<Vec<u8>> {
     use crate::scsi::{DataDirection, SCSI_READ_DISC_STRUCTURE};
 
     let cdb = [

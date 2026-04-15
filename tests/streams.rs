@@ -15,8 +15,8 @@ fn sample_disc_title() -> DiscTitle {
             Stream::Video(VideoStream {
                 pid: 0x1011,
                 codec: Codec::Hevc,
-                resolution: "2160p".into(),
-                frame_rate: "23.976".into(),
+                resolution: Resolution::R2160p,
+                frame_rate: FrameRate::F23_976,
                 hdr: HdrFormat::Hdr10,
                 color_space: ColorSpace::Bt709,
                 secondary: false,
@@ -25,18 +25,18 @@ fn sample_disc_title() -> DiscTitle {
             Stream::Audio(AudioStream {
                 pid: 0x1100,
                 codec: Codec::TrueHd,
-                channels: "7.1".into(),
+                channels: AudioChannels::Surround71,
                 language: "eng".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: false,
                 label: "English Atmos".into(),
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1101,
                 codec: Codec::Ac3,
-                channels: "5.1".into(),
+                channels: AudioChannels::Surround51,
                 language: "fra".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: false,
                 label: "French".into(),
             }),
@@ -201,7 +201,7 @@ fn m2ts_meta_roundtrip() {
     // Check video
     if let Stream::Video(v) = &restored.streams[0] {
         assert_eq!(v.codec, Codec::Hevc);
-        assert_eq!(v.resolution, "2160p");
+        assert_eq!(v.resolution, Resolution::R2160p);
         assert_eq!(v.label, "Main");
     } else {
         panic!("expected video");
@@ -413,8 +413,8 @@ fn meta_codec_roundtrip() {
         streams.push(Stream::Video(VideoStream {
             pid: (0x1011 + i) as u16,
             codec,
-            resolution: "1080p".into(),
-            frame_rate: "23.976".into(),
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F23_976,
             hdr: HdrFormat::Sdr,
             color_space: ColorSpace::Bt709,
             secondary: false,
@@ -425,9 +425,9 @@ fn meta_codec_roundtrip() {
         streams.push(Stream::Audio(AudioStream {
             pid: (0x1100 + i) as u16,
             codec,
-            channels: "5.1".into(),
+            channels: AudioChannels::Surround51,
             language: "eng".into(),
-            sample_rate: "48kHz".into(),
+            sample_rate: SampleRate::S48,
             secondary: false,
             label: String::new(),
         }));
@@ -509,8 +509,8 @@ fn meta_all_stream_types() {
             Stream::Video(VideoStream {
                 pid: 0x1011,
                 codec: Codec::Hevc,
-                resolution: "2160p".into(),
-                frame_rate: "23.976".into(),
+                resolution: Resolution::R2160p,
+                frame_rate: FrameRate::F23_976,
                 hdr: HdrFormat::Hdr10,
                 color_space: ColorSpace::Bt709,
                 secondary: false,
@@ -519,9 +519,9 @@ fn meta_all_stream_types() {
             Stream::Audio(AudioStream {
                 pid: 0x1100,
                 codec: Codec::TrueHd,
-                channels: "7.1".into(),
+                channels: AudioChannels::Surround71,
                 language: "eng".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: false,
                 label: "Primary Audio".into(),
             }),
@@ -535,9 +535,9 @@ fn meta_all_stream_types() {
             Stream::Audio(AudioStream {
                 pid: 0x1110,
                 codec: Codec::Ac3,
-                channels: "stereo".into(),
+                channels: AudioChannels::Stereo,
                 language: "eng".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: true,
                 label: "Commentary".into(),
             }),
@@ -553,7 +553,7 @@ fn meta_all_stream_types() {
     // Video preserved
     if let Stream::Video(v) = &restored.streams[0] {
         assert_eq!(v.codec, Codec::Hevc);
-        assert_eq!(v.resolution, "2160p");
+        assert_eq!(v.resolution, Resolution::R2160p);
         assert_eq!(v.label, "Primary");
         assert!(!v.secondary);
     } else {
@@ -563,7 +563,7 @@ fn meta_all_stream_types() {
     // Primary audio preserved
     if let Stream::Audio(a) = &restored.streams[1] {
         assert_eq!(a.codec, Codec::TrueHd);
-        assert_eq!(a.channels, "7.1");
+        assert_eq!(a.channels, AudioChannels::Surround71);
         assert!(!a.secondary);
     } else {
         panic!("expected audio");
@@ -642,9 +642,9 @@ fn mkvstream_roundtrip_bdts() {
         streams: vec![Stream::Audio(AudioStream {
             pid: 0x1100,
             codec: Codec::Ac3,
-            channels: "5.1".into(),
+            channels: AudioChannels::Surround51,
             language: "eng".into(),
-            sample_rate: "48kHz".into(),
+            sample_rate: SampleRate::S48,
             secondary: false,
             label: "English".into(),
         })],
@@ -688,8 +688,8 @@ fn mkvstream_meta_preserves_all_streams() {
             Stream::Video(VideoStream {
                 pid: 0x1011,
                 codec: Codec::H264,
-                resolution: "1080p".into(),
-                frame_rate: "23.976".into(),
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F23_976,
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
                 secondary: false,
@@ -698,18 +698,18 @@ fn mkvstream_meta_preserves_all_streams() {
             Stream::Audio(AudioStream {
                 pid: 0x1100,
                 codec: Codec::Ac3,
-                channels: "5.1".into(),
+                channels: AudioChannels::Surround51,
                 language: "eng".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: false,
                 label: "English".into(),
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1101,
                 codec: Codec::DtsHdMa,
-                channels: "7.1".into(),
+                channels: AudioChannels::Surround71,
                 language: "fra".into(),
-                sample_rate: "48kHz".into(),
+                sample_rate: SampleRate::S48,
                 secondary: false,
                 label: "French".into(),
             }),
@@ -781,8 +781,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         streams: vec![Stream::Video(VideoStream {
             pid: 0x1011,
             codec: Codec::H264,
-            resolution: "1080p".into(),
-            frame_rate: "23.976".into(),
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F23_976,
             hdr: HdrFormat::Sdr,
             color_space: ColorSpace::Bt709,
             secondary: false,
@@ -803,7 +803,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
     // SPS NAL (type 7): minimal valid SPS
     es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
     es_data.push(0x67); // NAL type 7 (SPS), nal_ref_idc=3
-    // Minimal SPS payload: profile_idc=66 (Baseline), constraint flags, level_idc=30
+                        // Minimal SPS payload: profile_idc=66 (Baseline), constraint flags, level_idc=30
     es_data.extend_from_slice(&[
         0x42, 0xC0, 0x1E, // profile=66, constraint_set0=1, level=30
         0xD9, 0x00, 0xA0, 0x47, 0xFE, 0x88, // minimal SPS rbsp
@@ -817,7 +817,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
     // IDR NAL (type 5): keyframe
     es_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
     es_data.push(0x65); // NAL type 5 (IDR), nal_ref_idc=3
-    // Some IDR slice data
+                        // Some IDR slice data
     es_data.extend_from_slice(&[0x88, 0x84, 0x00, 0x21, 0xFF, 0xFE, 0xF6, 0xE2]);
     // Pad to reasonable size
     es_data.extend_from_slice(&[0x00; 64]);
@@ -961,7 +961,11 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
     let data = output2.lock().unwrap().clone().into_inner();
 
     // Verify output starts with EBML magic (0x1A45DFA3)
-    assert!(data.len() >= 4, "MKV output too small: {} bytes", data.len());
+    assert!(
+        data.len() >= 4,
+        "MKV output too small: {} bytes",
+        data.len()
+    );
     assert_eq!(
         &data[0..4],
         &[0x1A, 0x45, 0xDF, 0xA3],
@@ -970,17 +974,13 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     // Verify output contains a Tracks element (0x1654AE6B)
     let tracks_needle = [0x16, 0x54, 0xAE, 0x6B];
-    let has_tracks = data
-        .windows(4)
-        .any(|w| w == tracks_needle);
+    let has_tracks = data.windows(4).any(|w| w == tracks_needle);
     assert!(has_tracks, "output should contain Tracks element");
 
     // Verify codecPrivate is non-empty (not all zeros)
     // CodecPrivate element ID is 0x63A2
     let cp_needle = [0x63, 0xA2];
-    let cp_pos = data
-        .windows(2)
-        .position(|w| w == cp_needle);
+    let cp_pos = data.windows(2).position(|w| w == cp_needle);
     if let Some(pos) = cp_pos {
         // After the ID, there's a size VINT, then the data
         let after_id = pos + 2;

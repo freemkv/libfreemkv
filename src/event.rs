@@ -25,6 +25,25 @@ pub struct Event {
 /// Types of events the lib can fire.
 #[derive(Debug)]
 pub enum EventKind {
+    // ── Init sequence events ────────────────────────────────────────
+
+    /// Drive opened successfully.
+    DriveOpened { device: String },
+
+    /// Drive is ready (disc spun up).
+    DriveReady,
+
+    /// Firmware init completed.
+    InitComplete { success: bool },
+
+    /// Disc probe completed.
+    ProbeComplete { success: bool },
+
+    /// Disc scan completed.
+    ScanComplete { titles: usize },
+
+    // ── Read events ─────────────────────────────────────────────────
+
     /// Bytes successfully read and written to output.
     BytesRead {
         /// Bytes written so far.

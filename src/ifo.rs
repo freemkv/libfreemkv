@@ -7,6 +7,7 @@
 //! The parser reads IFO files via UDF and extracts enough information
 //! to build DiscTitle structs (parallel to MPLS for Blu-ray).
 
+use crate::disc::{Codec, Resolution};
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
@@ -61,8 +62,8 @@ pub struct DvdCell {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DvdVideoAttr {
-    pub codec: String,
-    pub resolution: String,
+    pub codec: Codec,
+    pub resolution: Resolution,
     pub aspect: String,
     pub standard: String,
 }
@@ -70,7 +71,7 @@ pub struct DvdVideoAttr {
 /// DVD audio stream attributes.
 #[derive(Debug, Clone)]
 pub struct DvdAudioAttr {
-    pub codec: String,
+    pub codec: Codec,
     pub channels: u8,
     pub sample_rate: u32,
     pub language: String,
@@ -349,41 +350,15 @@ fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
         _ => "4:3",
     };
 
-    let resolution = match (b0 >> 4) & 0x03 {
-        0 => {
-            if standard == "PAL" {
-                "720x576"
-            } else {
-                "720x480"
-            }
-        }
-        1 => {
-            if standard == "PAL" {
-                "704x576"
-            } else {
-                "704x480"
-            }
-        }
-        2 => {
-            if standard == "PAL" {
-                "352x576"
-            } else {
-                "352x480"
-            }
-        }
-        3 => {
-            if standard == "PAL" {
-                "352x288"
-            } else {
-                "352x240"
-            }
-        }
-        _ => "720x480",
+    let resolution = if standard == "PAL" {
+        Resolution::R576i
+    } else {
+        Resolution::R480i
     };
 
     Ok(DvdVideoAttr {
-        codec: "mpeg2".to_string(),
-        resolution: resolution.to_string(),
+        codec: Codec::Mpeg2,
+        resolution,
         aspect: aspect.to_string(),
         standard: standard.to_string(),
     })
@@ -396,12 +371,12 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
 
     let coding_mode = (b0 >> 5) & 0x07;
     let codec = match coding_mode {
-        0 => "ac3",
-        2 => "mpeg1",
-        3 => "mpeg2",
-        4 => "lpcm",
-        6 => "dts",
-        _ => "unknown",
+        0 => Codec::Ac3,
+        2 => Codec::Mpeg1,
+        3 => Codec::Mp2,
+        4 => Codec::Lpcm,
+        6 => Codec::Dts,
+        _ => Codec::Unknown(coding_mode),
     };
 
     let sample_rate_flag = (b0 >> 3) & 0x03;
@@ -434,7 +409,7 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
     };
 
     Ok(DvdAudioAttr {
-        codec: codec.to_string(),
+        codec,
         channels,
         sample_rate,
         language,
@@ -688,15 +663,15 @@ mod tests {
         assert_eq!(title.cells.len(), 1);
 
         let video = DvdVideoAttr {
-            codec: "mpeg2".to_string(),
-            resolution: "720x480".to_string(),
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
             aspect: "16:9".to_string(),
             standard: "NTSC".to_string(),
         };
-        assert_eq!(video.codec, "mpeg2");
+        assert_eq!(video.codec, Codec::Mpeg2);
 
         let audio = DvdAudioAttr {
-            codec: "ac3".to_string(),
+            codec: Codec::Ac3,
             channels: 6,
             sample_rate: 48000,
             language: "en".to_string(),
@@ -730,8 +705,8 @@ mod tests {
         let attr = parse_video_attr(&data).unwrap();
         assert_eq!(attr.standard, "NTSC");
         assert_eq!(attr.aspect, "16:9");
-        assert_eq!(attr.resolution, "720x480");
-        assert_eq!(attr.codec, "mpeg2");
+        assert_eq!(attr.resolution, Resolution::R480i);
+        assert_eq!(attr.codec, Codec::Mpeg2);
     }
 
     #[test]
@@ -743,7 +718,7 @@ mod tests {
         let attr = parse_video_attr(&data).unwrap();
         assert_eq!(attr.standard, "PAL");
         assert_eq!(attr.aspect, "4:3");
-        assert_eq!(attr.resolution, "720x576");
+        assert_eq!(attr.resolution, Resolution::R576i);
     }
 
     #[test]
@@ -759,7 +734,7 @@ mod tests {
         data[3] = b'n';
 
         let attr = parse_audio_attr(&data, 0).unwrap();
-        assert_eq!(attr.codec, "ac3");
+        assert_eq!(attr.codec, Codec::Ac3);
         assert_eq!(attr.sample_rate, 48000);
         assert_eq!(attr.channels, 6);
         assert_eq!(attr.language, "en");
@@ -777,7 +752,7 @@ mod tests {
         data[3] = b'r';
 
         let attr = parse_audio_attr(&data, 0).unwrap();
-        assert_eq!(attr.codec, "dts");
+        assert_eq!(attr.codec, Codec::Dts);
         assert_eq!(attr.sample_rate, 96000);
         assert_eq!(attr.channels, 2);
         assert_eq!(attr.language, "fr");

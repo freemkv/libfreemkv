@@ -412,7 +412,7 @@ impl<W: Write + Seek> IsoWriter<W> {
             icb[ad_offset..ad_offset + 4].copy_from_slice(&(extent_len as u32).to_le_bytes());
             icb[ad_offset + 4..ad_offset + 8].copy_from_slice(&sector_pos.to_le_bytes());
             ad_offset += 8; // each short_ad is 8 bytes
-            let extent_sectors = ((extent_len + SECTOR_SIZE - 1) / SECTOR_SIZE) as u32;
+            let extent_sectors = extent_len.div_ceil(SECTOR_SIZE) as u32;
             sector_pos += extent_sectors;
             remaining -= extent_len;
         }

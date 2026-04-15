@@ -10,6 +10,11 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
+        // Skip stale device nodes — sysfs entry must exist
+        let sysfs = format!("/sys/class/scsi_generic/sg{i}/device/model");
+        if !std::path::Path::new(&sysfs).exists() {
+            continue;
+        }
         if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
             if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
                 if !id.raw_inquiry.is_empty() && (id.raw_inquiry[0] & 0x1F) == 0x05 {
@@ -21,6 +26,7 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     drives
 }
 
+#[allow(dead_code)]
 pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
     if path.contains("/sg") {
         if !std::path::Path::new(path).exists() {
@@ -39,9 +45,8 @@ pub fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
                 && sg_id.product_id == sr_id.product_id
                 && sg_id.serial_number == sr_id.serial_number
             {
-                let warning = format!(
-                    "{path} is a block device (sr) — using {sg_path} (sg) for raw access"
-                );
+                let warning =
+                    format!("{path} is a block device (sr) — using {sg_path} (sg) for raw access");
                 return Ok((sg_path, Some(warning)));
             }
         }

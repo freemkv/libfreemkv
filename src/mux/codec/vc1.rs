@@ -172,7 +172,8 @@ fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn find_next_sc(data: &[u8], from: usize) -> Option<usize> {
-    (from..data.len().saturating_sub(2)).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
+    (from..data.len().saturating_sub(2))
+        .find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 #[cfg(test)]

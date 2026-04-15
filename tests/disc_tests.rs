@@ -143,9 +143,15 @@ fn scan_options_with_keydb_pathbuf() {
 
 // ── detect_format integration tests ───────────────────────────────────────
 
-use libfreemkv::{Codec, ColorSpace, ContentFormat, HdrFormat, Stream, VideoStream};
+use libfreemkv::{
+    Codec, ColorSpace, ContentFormat, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+};
 
-fn title_with_video(codec: Codec, resolution: &str, content_format: ContentFormat) -> DiscTitle {
+fn title_with_video(
+    codec: Codec,
+    resolution: Resolution,
+    content_format: ContentFormat,
+) -> DiscTitle {
     DiscTitle {
         playlist: "00800.mpls".into(),
         playlist_id: 800,
@@ -155,8 +161,8 @@ fn title_with_video(codec: Codec, resolution: &str, content_format: ContentForma
         streams: vec![Stream::Video(VideoStream {
             pid: 0x1011,
             codec,
-            resolution: resolution.into(),
-            frame_rate: "23.976".into(),
+            resolution,
+            frame_rate: FrameRate::F23_976,
             hdr: HdrFormat::Sdr,
             color_space: ColorSpace::Bt709,
             secondary: false,
@@ -191,13 +197,13 @@ fn disc_title_duration_display_edge_cases() {
 
 #[test]
 fn content_format_default_bdts() {
-    let t = title_with_video(Codec::H264, "1080p", ContentFormat::BdTs);
+    let t = title_with_video(Codec::H264, Resolution::R1080p, ContentFormat::BdTs);
     assert_eq!(t.content_format, ContentFormat::BdTs);
 }
 
 #[test]
 fn content_format_dvd_mpegps() {
-    let t = title_with_video(Codec::Mpeg2, "480i", ContentFormat::MpegPs);
+    let t = title_with_video(Codec::Mpeg2, Resolution::R480i, ContentFormat::MpegPs);
     assert_eq!(t.content_format, ContentFormat::MpegPs);
 }
 
@@ -366,6 +372,125 @@ fn resolve_encryption_no_aacs_dir() {
         "disc without /AACS should not be encrypted"
     );
     assert!(disc.aacs.is_none(), "aacs should be None without /AACS dir");
+}
+
+// ── Batch count arithmetic tests ──────────────────────────────────────────
+// Regression tests for the u16 truncation bug: when (remaining as u16) was
+// used instead of remaining.min(batch as u32) as u16, any remaining count
+// that was a multiple of 65536 would truncate to 0, causing an infinite loop.
+
+/// Simulates the fixed batch count calculation from pipe.rs / drive.rs
+fn safe_batch_count(remaining: u32, batch_sectors: u16) -> u16 {
+    remaining.min(batch_sectors as u32) as u16
+}
+
+/// Simulates the BUGGY calculation that caused the infinite loop
+fn buggy_batch_count(remaining: u32, batch_sectors: u16) -> u16 {
+    (remaining as u16).min(batch_sectors)
+}
+
+#[test]
+fn batch_count_normal() {
+    // Normal case: remaining > batch_sectors
+    assert_eq!(safe_batch_count(1000, 60), 60);
+    assert_eq!(safe_batch_count(47533152, 60), 60);
+}
+
+#[test]
+fn batch_count_last_batch() {
+    // Last batch: remaining < batch_sectors
+    assert_eq!(safe_batch_count(30, 60), 30);
+    assert_eq!(safe_batch_count(1, 60), 1);
+}
+
+#[test]
+fn batch_count_exact_boundary() {
+    // Exact boundary: remaining == batch_sectors
+    assert_eq!(safe_batch_count(60, 60), 60);
+}
+
+#[test]
+fn batch_count_u16_overflow_regression() {
+    // THE BUG: remaining is a multiple of 65536 → truncates to 0
+    // 47513600 = 725 * 65536, lower 16 bits = 0
+    let remaining: u32 = 47533152 - 19552; // = 47513600
+    assert_eq!(remaining, 47513600);
+    assert_eq!(remaining % 65536, 0, "remaining should be multiple of 65536");
+
+    // Buggy version produces 0 → infinite loop
+    assert_eq!(buggy_batch_count(remaining, 60), 0);
+
+    // Fixed version produces 60
+    assert_eq!(safe_batch_count(remaining, 60), 60);
+}
+
+#[test]
+fn batch_count_other_u16_overflow_values() {
+    // Other multiples of 65536
+    assert_eq!(safe_batch_count(65536, 60), 60);
+    assert_eq!(safe_batch_count(131072, 60), 60);
+    assert_eq!(safe_batch_count(65536 * 100, 60), 60);
+
+    // Verify buggy version fails on all of these
+    assert_eq!(buggy_batch_count(65536, 60), 0);
+    assert_eq!(buggy_batch_count(131072, 60), 0);
+    assert_eq!(buggy_batch_count(65536 * 100, 60), 0);
+}
+
+#[test]
+fn batch_count_near_u16_boundary() {
+    // Values just below and above 65536
+    assert_eq!(safe_batch_count(65535, 60), 60);
+    assert_eq!(safe_batch_count(65536, 60), 60);
+    assert_eq!(safe_batch_count(65537, 60), 60);
+
+    // Buggy: 65535 as u16 = 65535, min(60) = 60 (OK by accident)
+    assert_eq!(buggy_batch_count(65535, 60), 60);
+    // Buggy: 65536 as u16 = 0, min(60) = 0 (BUG)
+    assert_eq!(buggy_batch_count(65536, 60), 0);
+    // Buggy: 65537 as u16 = 1, min(60) = 1 (wrong but doesn't loop)
+    assert_eq!(buggy_batch_count(65537, 60), 1);
+}
+
+#[test]
+fn batch_count_real_disc_sizes() {
+    let batch: u16 = 60;
+
+    // DVD-5: ~2,295,104 sectors
+    assert_eq!(safe_batch_count(2295104, batch), 60);
+
+    // BD-25: ~12,219,392 sectors
+    assert_eq!(safe_batch_count(12219392, batch), 60);
+
+    // BD-50: ~24,438,784 sectors
+    assert_eq!(safe_batch_count(24438784, batch), 60);
+
+    // UHD BD-66: ~33,554,432 sectors
+    assert_eq!(safe_batch_count(33554432, batch), 60);
+
+    // UHD BD-100: ~47,533,152 sectors
+    assert_eq!(safe_batch_count(47533152, batch), 60);
+
+    // Last few sectors of each
+    assert_eq!(safe_batch_count(52, batch), 52);
+    assert_eq!(safe_batch_count(3, batch), 3);
+}
+
+#[test]
+fn batch_count_zero_remaining() {
+    // Zero remaining should produce 0 (loop exits before this)
+    assert_eq!(safe_batch_count(0, 60), 0);
+}
+
+#[test]
+fn batch_count_max_batch_sizes() {
+    // Test with different batch sizes used by detect_max_batch_sectors
+    for &batch in &[3u16, 6, 9, 30, 60, 120, 240, 510] {
+        // Large remaining should always return batch
+        assert_eq!(safe_batch_count(47533152, batch), batch);
+        // Small remaining should return remaining
+        assert_eq!(safe_batch_count(1, batch), 1);
+    }
 }
 
 #[test]
