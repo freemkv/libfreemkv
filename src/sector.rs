@@ -27,7 +27,14 @@ impl FileSectorReader {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let capacity = (len / 2048) as u32;
+        let sectors = len / 2048;
+        if sectors > u32::MAX as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path}: image too large, max ~8 TB"),
+            ));
+        }
+        let capacity = sectors as u32;
         Ok(Self {
             file: std::io::BufReader::with_capacity(4 * 1024 * 1024, file),
             capacity,

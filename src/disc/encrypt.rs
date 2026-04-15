@@ -25,7 +25,8 @@ impl Disc {
         let keydb_path = opts.resolve_keydb()?;
         let keydb = KeyDb::load(&keydb_path).ok()?;
 
-        for hc in &keydb.host_certs {
+        const MAX_CERT_ATTEMPTS: usize = 16;
+        for hc in keydb.host_certs.iter().take(MAX_CERT_ATTEMPTS) {
             match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
                     let volume_id = match aacs::handshake::read_volume_id(session, &mut auth) {
