@@ -75,9 +75,17 @@ impl DiscStream {
 
         let mut stream = Self::from_reader(Box::new(drive), title, keys, max_batch);
 
-        if content_format == crate::disc::ContentFormat::MpegPs {
-            stream.ts_demuxer = None;
-            stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
+        // Set demuxer based on content format
+        match content_format {
+            crate::disc::ContentFormat::MpegPs => {
+                stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
+            }
+            crate::disc::ContentFormat::BdTs => {
+                let pids: Vec<u16> = stream.pid_to_track.iter().map(|(pid, _)| *pid).collect();
+                if !pids.is_empty() {
+                    stream.ts_demuxer = Some(super::ts::TsDemuxer::new(&pids));
+                }
+            }
         }
         Ok((stream, disc))
     }
@@ -110,6 +118,18 @@ impl DiscStream {
         let batch: u16 = 64;
 
         let mut stream = Self::from_reader(Box::new(reader), title, keys, batch);
+        // Set demuxer based on content format
+        match disc.content_format {
+            crate::disc::ContentFormat::MpegPs => {
+                stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
+            }
+            crate::disc::ContentFormat::BdTs => {
+                let pids: Vec<u16> = stream.pid_to_track.iter().map(|(pid, _)| *pid).collect();
+                if !pids.is_empty() {
+                    stream.ts_demuxer = Some(super::ts::TsDemuxer::new(&pids));
+                }
+            }
+        }
         stream.disc = Some(disc);
         Ok(stream)
     }
@@ -150,7 +170,9 @@ impl DiscStream {
             batch_sectors,
             errors: 0,
             eof: false,
-            ts_demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
+            // Demuxer set by caller — open_drive() checks content_format,
+            // open_iso() always uses TS (Blu-ray ISO).
+            ts_demuxer: None,
             ps_demuxer: None,
             parsers,
             pending_frames: std::collections::VecDeque::new(),
@@ -216,7 +238,41 @@ impl crate::pes::Stream for DiscStream {
         loop {
             if !self.fill_extents() {
                 self.eof = true;
-                return Ok(None);
+                // Flush demuxer — last PES packet may still be in the assembler
+                if let Some(ref mut demuxer) = self.ts_demuxer {
+                    for pes in &demuxer.flush() {
+                        if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
+                            if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                                for frame in parser.parse(pes) {
+                                    self.pending_frames.push_back(
+                                        crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // PS demuxer flush (DVD)
+                if let Some(ref mut demuxer) = self.ps_demuxer {
+                    for ps in &demuxer.flush() {
+                        let track = match ps.stream_id {
+                            0xE0..=0xEF => 0,
+                            0xC0..=0xDF => 1,
+                            0xBD => ps.sub_stream_id.map(|s| (s & 0x1F) as usize + 1).unwrap_or(1),
+                            _ => continue,
+                        };
+                        if track < self.title.streams.len() {
+                            let pts_ns = ps.pts.map(|p| (p as i64) * 1_000_000_000 / 90_000).unwrap_or(0);
+                            self.pending_frames.push_back(crate::pes::PesFrame {
+                                track,
+                                pts: pts_ns,
+                                keyframe: true,
+                                data: ps.data.clone(),
+                            });
+                        }
+                    }
+                }
+                return Ok(self.pending_frames.pop_front());
             }
 
             let bytes = self.buf_valid;

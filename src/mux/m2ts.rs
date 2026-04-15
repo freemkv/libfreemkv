@@ -172,7 +172,21 @@ impl crate::pes::Stream for M2tsStream {
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 self.pes_eof = true;
-                return Ok(None);
+                // Flush demuxer — last PES packet may still be in the assembler
+                if let Some(ref mut demuxer) = self.demuxer {
+                    for pes in &demuxer.flush() {
+                        if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
+                            if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                                for frame in parser.parse(pes) {
+                                    self.pending_frames.push_back(
+                                        crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(self.pending_frames.pop_front());
             }
 
             if let Some(ref mut demuxer) = self.demuxer {
