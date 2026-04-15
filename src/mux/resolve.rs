@@ -340,15 +340,16 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            // TODO: M2tsStream InputStream (TS demux → PES)
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "m2ts:// PES input not yet implemented"))
+            let file = std::fs::File::open(path)
+                .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e)))?;
+            let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
+            Ok(Box::new(M2tsStream::open(reader)?))
         }
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            // TODO: MkvStream InputStream (MKV demux → PES)
+            // MKV as PES input requires EBML → PES frame extraction (TODO)
             Err(io::Error::new(io::ErrorKind::Unsupported,
-                "mkv:// PES input not yet implemented"))
+                "mkv:// as input not yet supported — use m2ts:// or iso:// as source"))
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;
