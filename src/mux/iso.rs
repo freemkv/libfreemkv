@@ -77,6 +77,11 @@ pub struct IsoStream {
     // Write side
     iso_writer: Option<IsoWriter<io::BufWriter<File>>>,
     write_started: bool,
+    // PES output (for InputStream impl)
+    demuxer: Option<super::ts::TsDemuxer>,
+    parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
+    pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
+    pid_to_track: Vec<(u16, usize)>,
 }
 
 impl IsoStream {
@@ -116,6 +121,21 @@ impl IsoStream {
             .collect();
         let sectors_remaining = extents.first().map(|e| e.1).unwrap_or(0);
 
+        // Set up PES demux from title stream PIDs
+        let mut pids = Vec::new();
+        let mut parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)> = Vec::new();
+        let mut pid_to_track = Vec::new();
+        for (i, s) in disc_title.streams.iter().enumerate() {
+            let (pid, codec) = match s {
+                crate::disc::Stream::Video(v) => (v.pid, v.codec),
+                crate::disc::Stream::Audio(a) => (a.pid, a.codec),
+                crate::disc::Stream::Subtitle(s) => (s.pid, s.codec),
+            };
+            pids.push(pid);
+            pid_to_track.push((pid, i));
+            parsers.push((pid, super::codec::parser_for_codec(codec)));
+        }
+
         Ok(IsoStream {
             disc_title,
             disc: Some(disc),
@@ -130,6 +150,10 @@ impl IsoStream {
             decrypt_keys,
             iso_writer: None,
             write_started: false,
+            demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
+            parsers,
+            pending_frames: std::collections::VecDeque::new(),
+            pid_to_track,
         })
     }
 
@@ -154,6 +178,10 @@ impl IsoStream {
             eof: false,
             iso_writer: Some(iso_writer),
             write_started: false,
+            demuxer: None,
+            parsers: Vec::new(),
+            pending_frames: std::collections::VecDeque::new(),
+            pid_to_track: Vec::new(),
         })
     }
 
@@ -225,6 +253,76 @@ impl IsoStream {
     /// Skip decryption — return raw encrypted bytes.
     pub fn set_raw(&mut self) {
         self.decrypt_keys = DecryptKeys::None;
+    }
+}
+
+impl crate::pes::InputStream for IsoStream {
+    fn next_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        // Return buffered frame
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(Some(frame));
+        }
+
+        if self.eof {
+            return Ok(None);
+        }
+
+        // Read until we produce at least one frame
+        loop {
+            if !self.read_next_batch()? {
+                self.eof = true;
+                return Ok(None);
+            }
+
+            // Data in batch_buf is already decrypted by fill_next_batch
+            if let Some(ref mut demuxer) = self.demuxer {
+                let packets = demuxer.feed(&self.batch_buf[..self.buf_len]);
+                for pes in &packets {
+                    if let Some((pid_idx, _)) = self.pid_to_track.iter().enumerate()
+                        .find(|(_, (pid, _))| *pid == pes.pid)
+                    {
+                        let track_idx = self.pid_to_track[pid_idx].1;
+                        if let Some((_, parser)) = self.parsers.iter_mut()
+                            .find(|(pid, _)| *pid == pes.pid)
+                        {
+                            for frame in parser.parse(pes) {
+                                self.pending_frames.push_back(
+                                    crate::pes::PesFrame::from_codec_frame(track_idx, frame)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(frame) = self.pending_frames.pop_front() {
+                return Ok(Some(frame));
+            }
+        }
+    }
+
+    fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
+
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        let pid = self.pid_to_track.iter()
+            .find(|(_, idx)| *idx == track)
+            .map(|(pid, _)| *pid)?;
+        self.parsers.iter()
+            .find(|(p, _)| *p == pid)
+            .and_then(|(_, parser)| parser.codec_private())
+    }
+
+    fn headers_ready(&self) -> bool {
+        for (idx, s) in self.disc_title.streams.iter().enumerate() {
+            if let crate::disc::Stream::Video(v) = s {
+                if !v.secondary && self.codec_private(idx).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 

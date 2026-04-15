@@ -39,6 +39,13 @@ pub trait InputStream {
 
     /// Stream metadata (tracks, duration, etc).
     fn info(&self) -> &crate::disc::DiscTitle;
+
+    /// Codec initialization data for a track (SPS/PPS for HEVC, etc).
+    /// Returns None until enough frames have been parsed.
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>>;
+
+    /// True when codec_private is available for all video tracks.
+    fn headers_ready(&self) -> bool;
 }
 
 /// Output stream — consumes PES frames to any destination.

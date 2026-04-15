@@ -402,6 +402,26 @@ impl crate::pes::InputStream for DiscStream {
     fn info(&self) -> &DiscTitle {
         &self.title
     }
+
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
+        let pid = self.pid_to_track.iter()
+            .find(|(_, idx)| *idx == track)
+            .map(|(pid, _)| *pid)?;
+        self.parsers.iter()
+            .find(|(p, _)| *p == pid)
+            .and_then(|(_, parser)| parser.codec_private())
+    }
+
+    fn headers_ready(&self) -> bool {
+        for (idx, s) in self.title.streams.iter().enumerate() {
+            if let crate::disc::Stream::Video(v) = s {
+                if !v.secondary && self.codec_private(idx).is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 impl Read for DiscStream {
