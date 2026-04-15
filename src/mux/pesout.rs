@@ -16,7 +16,12 @@ impl M2tsOutputStream {
     pub fn create(path: &str, title: &DiscTitle) -> io::Result<Self> {
         let file = std::fs::File::create(path)
             .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path, e)))?;
-        let writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+        // Write FMKV metadata header so M2tsStream::open can read it back
+        if !title.streams.is_empty() {
+            let m = super::meta::M2tsMeta::from_title(title);
+            super::meta::write_header(&mut writer, &m)?;
+        }
         let pids = extract_pids(title);
         Ok(Self { muxer: TsMuxer::new(writer, &pids), title: title.clone() })
     }
@@ -82,7 +87,13 @@ pub struct NetworkOutputStream {
 impl NetworkOutputStream {
     pub fn connect(addr: &str, title: &DiscTitle) -> io::Result<Self> {
         let stream = std::net::TcpStream::connect(addr)?;
-        let writer = io::BufWriter::with_capacity(256 * 1024, stream);
+        let mut writer = io::BufWriter::with_capacity(256 * 1024, stream);
+        // Send FMKV metadata header immediately so receiver can read it
+        if !title.streams.is_empty() {
+            let m = super::meta::M2tsMeta::from_title(title);
+            super::meta::write_header(&mut writer, &m)?;
+            writer.flush()?;
+        }
         Ok(Self { writer, title: title.clone() })
     }
 }
