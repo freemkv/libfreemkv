@@ -10,6 +10,7 @@ use crate::css;
 /// Resolved decryption state from disc scanning.
 /// Passed to `decrypt_sectors()` — the caller doesn't need to know
 /// which encryption scheme is in use.
+#[derive(Clone)]
 pub enum DecryptKeys {
     /// No encryption on this disc.
     None,
@@ -19,9 +20,7 @@ pub enum DecryptKeys {
         read_data_key: Option<[u8; 16]>,
     },
     /// CSS (DVD). Title key for sector descrambling.
-    Css {
-        title_key: [u8; 5],
-    },
+    Css { title_key: [u8; 5] },
 }
 
 impl DecryptKeys {
@@ -38,14 +37,32 @@ impl DecryptKeys {
 /// For None: no-op.
 ///
 /// `unit_key_idx` selects which AACS unit key to use (0 for most discs).
-pub fn decrypt_sectors(buf: &mut [u8], keys: &DecryptKeys, unit_key_idx: usize) {
+///
+/// Returns `Err` if decryption was expected but keys are missing or invalid.
+/// Never produces silently corrupted output.
+pub fn decrypt_sectors(
+    buf: &mut [u8],
+    keys: &DecryptKeys,
+    unit_key_idx: usize,
+) -> Result<(), crate::error::Error> {
     match keys {
         DecryptKeys::None => {}
-        DecryptKeys::Aacs { unit_keys, read_data_key } => {
-            let uk = unit_keys
-                .get(unit_key_idx)
-                .map(|(_, k)| *k)
-                .unwrap_or([0u8; 16]);
+        DecryptKeys::Aacs {
+            unit_keys,
+            read_data_key,
+        } => {
+            let uk = match unit_keys.get(unit_key_idx) {
+                Some((_, k)) => *k,
+                None => {
+                    return Err(crate::error::Error::DecryptFailed {
+                        reason: format!(
+                            "unit_key_idx {} out of range (have {} keys)",
+                            unit_key_idx,
+                            unit_keys.len()
+                        ),
+                    });
+                }
+            };
             let rdk = read_data_key.as_ref();
             let unit_len = aacs::ALIGNED_UNIT_LEN;
 
@@ -61,4 +78,5 @@ pub fn decrypt_sectors(buf: &mut [u8], keys: &DecryptKeys, unit_key_idx: usize) 
             }
         }
     }
+    Ok(())
 }

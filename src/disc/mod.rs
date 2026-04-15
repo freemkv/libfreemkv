@@ -148,10 +148,10 @@ pub struct VideoStream {
     pub pid: u16,
     /// Codec (HEVC, H.264, VC-1, MPEG-2)
     pub codec: Codec,
-    /// Resolution (e.g. "2160p", "1080p", "1080i")
-    pub resolution: String,
-    /// Frame rate (e.g. "23.976", "25")
-    pub frame_rate: String,
+    /// Resolution
+    pub resolution: Resolution,
+    /// Frame rate
+    pub frame_rate: FrameRate,
     /// HDR format
     pub hdr: HdrFormat,
     /// Color space
@@ -169,12 +169,12 @@ pub struct AudioStream {
     pub pid: u16,
     /// Codec (TrueHD, DTS-HD MA, DD, LPCM, etc.)
     pub codec: Codec,
-    /// Channel layout (e.g. "5.1", "7.1", "stereo", "mono")
-    pub channels: String,
+    /// Channel layout
+    pub channels: AudioChannels,
     /// ISO 639-2 language code (e.g. "eng", "fra")
     pub language: String,
-    /// Sample rate (e.g. "48kHz", "96kHz")
-    pub sample_rate: String,
+    /// Sample rate
+    pub sample_rate: SampleRate,
     /// Whether this is a secondary stream (commentary)
     pub secondary: bool,
     /// Extra label
@@ -204,6 +204,8 @@ pub enum Codec {
     H264,
     Vc1,
     Mpeg2,
+    Mpeg1,
+    Av1,
     // Audio
     TrueHd,
     DtsHdMa,
@@ -212,11 +214,108 @@ pub enum Codec {
     Ac3,
     Ac3Plus,
     Lpcm,
+    Aac,
+    Mp2,
+    Mp3,
+    Flac,
+    Opus,
     // Subtitle
     Pgs,
     DvdSub,
+    Srt,
+    Ssa,
     // Unknown
     Unknown(u8),
+}
+
+/// Video resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// 480i (720x480 interlaced) — NTSC DVD
+    R480i,
+    /// 480p (720x480 progressive)
+    R480p,
+    /// 576i (720x576 interlaced) — PAL DVD
+    R576i,
+    /// 576p (720x576 progressive)
+    R576p,
+    /// 720p (1280x720 progressive) — some Blu-rays
+    R720p,
+    /// 1080i (1920x1080 interlaced) — broadcast, some BD
+    R1080i,
+    /// 1080p (1920x1080 progressive) — standard Blu-ray
+    R1080p,
+    /// 2160p (3840x2160 progressive) — 4K UHD Blu-ray
+    R2160p,
+    /// 4320p (7680x4320 progressive) — 8K, future-proof
+    R4320p,
+    /// Unknown resolution
+    Unknown,
+}
+
+/// Video frame rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameRate {
+    /// 23.976 fps — film-based BD/UHD (NTSC pulldown)
+    F23_976,
+    /// 24.000 fps — true film rate
+    F24,
+    /// 25.000 fps — PAL standard
+    F25,
+    /// 29.970 fps — NTSC standard
+    F29_97,
+    /// 30.000 fps
+    F30,
+    /// 50.000 fps — PAL high frame rate
+    F50,
+    /// 59.940 fps — NTSC high frame rate
+    F59_94,
+    /// 60.000 fps
+    F60,
+    /// Unknown frame rate
+    Unknown,
+}
+
+/// Audio channel layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioChannels {
+    /// 1.0 mono
+    Mono,
+    /// 2.0 stereo
+    Stereo,
+    /// 2.1 (stereo + LFE)
+    Stereo21,
+    /// 4.0 quadraphonic
+    Quad,
+    /// 5.0 surround (no LFE)
+    Surround50,
+    /// 5.1 surround — standard BD/DVD surround
+    Surround51,
+    /// 6.1 surround (DTS-ES, Dolby EX)
+    Surround61,
+    /// 7.1 surround — UHD Atmos beds, DTS:X
+    Surround71,
+    /// Unknown channel layout
+    Unknown,
+}
+
+/// Audio sample rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleRate {
+    /// 44.1 kHz — CD audio (rare on disc)
+    S44_1,
+    /// 48 kHz — standard BD/DVD/UHD audio
+    S48,
+    /// 96 kHz — high-res BD audio
+    S96,
+    /// 192 kHz — highest BD audio (LPCM)
+    S192,
+    /// 48/96 kHz combo (secondary audio resampled)
+    S48_96,
+    /// 48/192 kHz combo (secondary audio resampled)
+    S48_192,
+    /// Unknown sample rate
+    Unknown,
 }
 
 /// HDR format.
@@ -224,7 +323,9 @@ pub enum Codec {
 pub enum HdrFormat {
     Sdr,
     Hdr10,
+    Hdr10Plus,
     DolbyVision,
+    Hlg,
 }
 
 /// Color space.
@@ -254,24 +355,50 @@ pub struct Extent {
 // ─── Display helpers ────────────────────────────────────────────────────────
 
 impl Codec {
+    /// Human-readable display name.
     pub fn name(&self) -> &'static str {
-        match self {
-            Codec::Hevc => "HEVC",
-            Codec::H264 => "H.264",
-            Codec::Vc1 => "VC-1",
-            Codec::Mpeg2 => "MPEG-2",
-            Codec::TrueHd => "TrueHD",
-            Codec::DtsHdMa => "DTS-HD MA",
-            Codec::DtsHdHr => "DTS-HD HR",
-            Codec::Dts => "DTS",
-            Codec::Ac3 => "AC-3",
-            Codec::Ac3Plus => "AC-3+",
-            Codec::Lpcm => "LPCM",
-            Codec::Pgs => "PGS",
-            Codec::DvdSub => "DVD Subtitle",
-            Codec::Unknown(_) => "Unknown",
+        for (_, name, v) in Self::ALL_CODECS {
+            if v == self {
+                return name;
+            }
         }
+        "Unknown"
     }
+
+    /// Compact identifier for serialization (lowercase, no spaces).
+    pub fn id(&self) -> &'static str {
+        for (id, _, v) in Self::ALL_CODECS {
+            if v == self {
+                return id;
+            }
+        }
+        "unknown"
+    }
+
+    const ALL_CODECS: &[(&'static str, &'static str, Codec)] = &[
+        ("hevc", "HEVC", Codec::Hevc),
+        ("h264", "H.264", Codec::H264),
+        ("vc1", "VC-1", Codec::Vc1),
+        ("mpeg2", "MPEG-2", Codec::Mpeg2),
+        ("mpeg1", "MPEG-1", Codec::Mpeg1),
+        ("av1", "AV1", Codec::Av1),
+        ("truehd", "TrueHD", Codec::TrueHd),
+        ("dtshd_ma", "DTS-HD MA", Codec::DtsHdMa),
+        ("dtshd_hr", "DTS-HD HR", Codec::DtsHdHr),
+        ("dts", "DTS", Codec::Dts),
+        ("ac3", "AC-3", Codec::Ac3),
+        ("eac3", "EAC-3", Codec::Ac3Plus),
+        ("lpcm", "LPCM", Codec::Lpcm),
+        ("aac", "AAC", Codec::Aac),
+        ("mp2", "MP2", Codec::Mp2),
+        ("mp3", "MP3", Codec::Mp3),
+        ("flac", "FLAC", Codec::Flac),
+        ("opus", "Opus", Codec::Opus),
+        ("pgs", "PGS", Codec::Pgs),
+        ("dvdsub", "DVD Subtitle", Codec::DvdSub),
+        ("srt", "SRT", Codec::Srt),
+        ("ssa", "SSA", Codec::Ssa),
+    ];
 
     fn from_coding_type(ct: u8) -> Self {
         match ct {
@@ -293,13 +420,232 @@ impl Codec {
     }
 }
 
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl Resolution {
+    /// Parse from MPLS video_format byte.
+    pub fn from_video_format(vf: u8) -> Self {
+        match vf {
+            1 => Resolution::R480i,
+            2 => Resolution::R576i,
+            3 => Resolution::R480p,
+            4 => Resolution::R1080i,
+            5 => Resolution::R720p,
+            6 => Resolution::R1080p,
+            7 => Resolution::R576p,
+            8 => Resolution::R2160p,
+            _ => Resolution::Unknown,
+        }
+    }
+
+    /// Pixel dimensions (width, height).
+    pub fn pixels(&self) -> (u32, u32) {
+        match self {
+            Resolution::R480i | Resolution::R480p => (720, 480),
+            Resolution::R576i | Resolution::R576p => (720, 576),
+            Resolution::R720p => (1280, 720),
+            Resolution::R1080i | Resolution::R1080p => (1920, 1080),
+            Resolution::R2160p => (3840, 2160),
+            Resolution::R4320p => (7680, 4320),
+            Resolution::Unknown => (1920, 1080),
+        }
+    }
+
+    /// True if this is a UHD (4K+) resolution.
+    pub fn is_uhd(&self) -> bool {
+        matches!(self, Resolution::R2160p | Resolution::R4320p)
+    }
+
+    /// True if this is an HD (720p+) resolution.
+    pub fn is_hd(&self) -> bool {
+        !matches!(
+            self,
+            Resolution::R480i
+                | Resolution::R480p
+                | Resolution::R576i
+                | Resolution::R576p
+                | Resolution::Unknown
+        )
+    }
+
+    /// True if this is an SD (480/576) resolution.
+    pub fn is_sd(&self) -> bool {
+        matches!(
+            self,
+            Resolution::R480i | Resolution::R480p | Resolution::R576i | Resolution::R576p
+        )
+    }
+
+    /// Parse from pixel height (e.g. from MKV track).
+    pub fn from_height(h: u32) -> Self {
+        match h {
+            0..=480 => Resolution::R480p,
+            481..=576 => Resolution::R576p,
+            577..=720 => Resolution::R720p,
+            721..=1080 => Resolution::R1080p,
+            1081..=2160 => Resolution::R2160p,
+            _ => Resolution::R4320p,
+        }
+    }
+}
+
+// Display for Resolution is generated by enum_str! macro
+
+impl FrameRate {
+    /// Parse from MPLS video_rate byte.
+    pub fn from_video_rate(vr: u8) -> Self {
+        match vr {
+            1 => FrameRate::F23_976,
+            2 => FrameRate::F24,
+            3 => FrameRate::F25,
+            4 => FrameRate::F29_97,
+            5 => FrameRate::F30,
+            6 => FrameRate::F50,
+            7 => FrameRate::F59_94,
+            8 => FrameRate::F60,
+            _ => FrameRate::Unknown,
+        }
+    }
+
+    /// Frame rate as (numerator, denominator) for precise representation.
+    pub fn as_fraction(&self) -> (u32, u32) {
+        match self {
+            FrameRate::F23_976 => (24000, 1001),
+            FrameRate::F24 => (24, 1),
+            FrameRate::F25 => (25, 1),
+            FrameRate::F29_97 => (30000, 1001),
+            FrameRate::F30 => (30, 1),
+            FrameRate::F50 => (50, 1),
+            FrameRate::F59_94 => (60000, 1001),
+            FrameRate::F60 => (60, 1),
+            FrameRate::Unknown => (0, 1),
+        }
+    }
+}
+
+// Display for FrameRate is generated by enum_str! macro
+
+impl AudioChannels {
+    /// Parse from MPLS audio_format byte.
+    pub fn from_audio_format(af: u8) -> Self {
+        match af {
+            1 => AudioChannels::Mono,
+            3 => AudioChannels::Stereo,
+            6 => AudioChannels::Surround51,
+            12 => AudioChannels::Surround71,
+            _ if af > 0 => AudioChannels::Unknown,
+            _ => AudioChannels::Unknown,
+        }
+    }
+
+    /// Channel count as a number.
+    pub fn count(&self) -> u8 {
+        match self {
+            AudioChannels::Mono => 1,
+            AudioChannels::Stereo => 2,
+            AudioChannels::Stereo21 => 3,
+            AudioChannels::Quad => 4,
+            AudioChannels::Surround50 => 5,
+            AudioChannels::Surround51 => 6,
+            AudioChannels::Surround61 => 7,
+            AudioChannels::Surround71 => 8,
+            AudioChannels::Unknown => 6,
+        }
+    }
+
+    /// Parse from channel count number.
+    pub fn from_count(n: u8) -> Self {
+        match n {
+            1 => AudioChannels::Mono,
+            2 => AudioChannels::Stereo,
+            3 => AudioChannels::Stereo21,
+            4 => AudioChannels::Quad,
+            5 => AudioChannels::Surround50,
+            6 => AudioChannels::Surround51,
+            7 => AudioChannels::Surround61,
+            8 => AudioChannels::Surround71,
+            _ => AudioChannels::Unknown,
+        }
+    }
+}
+
+// Display for AudioChannels is generated by enum_str! macro
+
+impl SampleRate {
+    /// Parse from MPLS audio_rate byte.
+    pub fn from_audio_rate(ar: u8) -> Self {
+        match ar {
+            1 => SampleRate::S48,
+            4 => SampleRate::S96,
+            5 => SampleRate::S192,
+            12 => SampleRate::S48_192,
+            14 => SampleRate::S48_96,
+            _ => SampleRate::Unknown,
+        }
+    }
+
+    /// Sample rate in Hz (primary rate for combo rates).
+    pub fn hz(&self) -> f64 {
+        match self {
+            SampleRate::S44_1 => 44100.0,
+            SampleRate::S48 | SampleRate::S48_96 | SampleRate::S48_192 => 48000.0,
+            SampleRate::S96 => 96000.0,
+            SampleRate::S192 => 192000.0,
+            SampleRate::Unknown => 48000.0,
+        }
+    }
+
+    /// Parse from Hz value.
+    pub fn from_hz(hz: u32) -> Self {
+        match hz {
+            44100 => SampleRate::S44_1,
+            48000 => SampleRate::S48,
+            96000 => SampleRate::S96,
+            192000 => SampleRate::S192,
+            _ => SampleRate::Unknown,
+        }
+    }
+}
+
+// Display for SampleRate is generated by enum_str! macro
+
 impl HdrFormat {
     pub fn name(&self) -> &'static str {
         match self {
             HdrFormat::Sdr => "SDR",
             HdrFormat::Hdr10 => "HDR10",
+            HdrFormat::Hdr10Plus => "HDR10+",
             HdrFormat::DolbyVision => "Dolby Vision",
+            HdrFormat::Hlg => "HLG",
         }
+    }
+
+    const ALL_HDR: &[(&'static str, HdrFormat)] = &[
+        ("sdr", HdrFormat::Sdr),
+        ("hdr10", HdrFormat::Hdr10),
+        ("hdr10+", HdrFormat::Hdr10Plus),
+        ("dv", HdrFormat::DolbyVision),
+        ("hlg", HdrFormat::Hlg),
+    ];
+
+    /// Compact identifier for serialization.
+    pub fn id(&self) -> &'static str {
+        for (id, v) in Self::ALL_HDR {
+            if v == self {
+                return id;
+            }
+        }
+        "sdr"
+    }
+}
+
+impl std::fmt::Display for HdrFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -310,6 +656,131 @@ impl ColorSpace {
             ColorSpace::Bt2020 => "BT.2020",
             ColorSpace::Unknown => "",
         }
+    }
+}
+
+impl std::fmt::Display for ColorSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+// ─── FromStr impls — single source of truth via ALL_* arrays ───────────────
+//
+// Each enum defines a const array of (str, variant) pairs. Display, FromStr,
+// and id() all derive from this one table — no string appears twice.
+
+macro_rules! enum_str {
+    ($name:ident, $default:expr, [ $( ($s:expr, $v:expr) ),* $(,)? ]) => {
+        impl $name {
+            const ALL: &[(&'static str, $name)] = &[ $( ($s, $v), )* ];
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for (s, v) in $name::ALL {
+                    if v == self { return f.write_str(s); }
+                }
+                f.write_str("")
+            }
+        }
+        impl std::str::FromStr for $name {
+            type Err = ();
+            fn from_str(s: &str) -> std::result::Result<Self, ()> {
+                for (k, v) in $name::ALL {
+                    if *k == s { return Ok(*v); }
+                }
+                Ok($default)
+            }
+        }
+    };
+}
+
+enum_str!(
+    Resolution,
+    Resolution::Unknown,
+    [
+        ("480i", Resolution::R480i),
+        ("480p", Resolution::R480p),
+        ("576i", Resolution::R576i),
+        ("576p", Resolution::R576p),
+        ("720p", Resolution::R720p),
+        ("1080i", Resolution::R1080i),
+        ("1080p", Resolution::R1080p),
+        ("2160p", Resolution::R2160p),
+        ("4320p", Resolution::R4320p),
+    ]
+);
+
+enum_str!(
+    FrameRate,
+    FrameRate::Unknown,
+    [
+        ("23.976", FrameRate::F23_976),
+        ("24", FrameRate::F24),
+        ("25", FrameRate::F25),
+        ("29.97", FrameRate::F29_97),
+        ("30", FrameRate::F30),
+        ("50", FrameRate::F50),
+        ("59.94", FrameRate::F59_94),
+        ("60", FrameRate::F60),
+    ]
+);
+
+enum_str!(
+    AudioChannels,
+    AudioChannels::Unknown,
+    [
+        ("mono", AudioChannels::Mono),
+        ("stereo", AudioChannels::Stereo),
+        ("2.1", AudioChannels::Stereo21),
+        ("4.0", AudioChannels::Quad),
+        ("5.0", AudioChannels::Surround50),
+        ("5.1", AudioChannels::Surround51),
+        ("6.1", AudioChannels::Surround61),
+        ("7.1", AudioChannels::Surround71),
+    ]
+);
+
+enum_str!(
+    SampleRate,
+    SampleRate::Unknown,
+    [
+        ("44.1kHz", SampleRate::S44_1),
+        ("48kHz", SampleRate::S48),
+        ("96kHz", SampleRate::S96),
+        ("192kHz", SampleRate::S192),
+        ("48/96kHz", SampleRate::S48_96),
+        ("48/192kHz", SampleRate::S48_192),
+    ]
+);
+
+impl std::str::FromStr for Codec {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        for (id, _, v) in Codec::ALL_CODECS {
+            if *id == s {
+                return Ok(*v);
+            }
+        }
+        Ok(Codec::Unknown(0))
+    }
+}
+
+impl std::str::FromStr for HdrFormat {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        for (id, v) in HdrFormat::ALL_HDR {
+            if *id == s {
+                return Ok(*v);
+            }
+        }
+        // Also accept display names
+        for (_id, v) in HdrFormat::ALL_HDR {
+            if HdrFormat::name(v) == s {
+                return Ok(*v);
+            }
+        }
+        Ok(HdrFormat::Sdr)
     }
 }
 
@@ -633,13 +1104,13 @@ impl Disc {
         for title in titles.iter().take(3) {
             for stream in &title.streams {
                 if let Stream::Video(v) = stream {
-                    if v.resolution.contains("2160") {
+                    if v.resolution.is_uhd() {
                         return DiscFormat::Uhd;
                     }
-                    if v.resolution.contains("1080") || v.resolution.contains("720") {
+                    if v.resolution.is_hd() {
                         return DiscFormat::BluRay;
                     }
-                    if v.resolution.contains("480") || v.resolution.contains("576") {
+                    if v.resolution.is_sd() {
                         return DiscFormat::Dvd;
                     }
                 }
@@ -782,7 +1253,7 @@ impl Disc {
 /// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
 /// For sg devices, resolves the corresponding block device via sysfs.
 /// Returns a value aligned to 3 sectors (one aligned unit).
-pub(crate) fn detect_max_batch_sectors(device_path: &str) -> u16 {
+pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
     let dev_name = device_path.rsplit('/').next().unwrap_or("");
     if dev_name.is_empty() {
         return DEFAULT_BATCH_SECTORS;
@@ -850,7 +1321,7 @@ impl<'a> ContentReader<'a> {
         let mut unit = self.read_buf[start..end].to_vec();
 
         // Decrypt if needed
-        self.decrypt_unit(&mut unit);
+        self.decrypt_unit(&mut unit)?;
         self.buf_pos += 1;
         Ok(Some(unit))
     }
@@ -871,14 +1342,14 @@ impl<'a> ContentReader<'a> {
             &mut self.read_buf[..total_bytes],
             &self.decrypt_keys,
             self.unit_key_idx,
-        );
+        )?;
         self.buf_pos = self.buf_len;
         Ok(Some(&self.read_buf[..total_bytes]))
     }
 
     /// Decrypt a single aligned unit in-place if needed.
-    fn decrypt_unit(&self, unit: &mut [u8]) {
-        crate::decrypt::decrypt_sectors(unit, &self.decrypt_keys, self.unit_key_idx);
+    fn decrypt_unit(&self, unit: &mut [u8]) -> Result<()> {
+        crate::decrypt::decrypt_sectors(unit, &self.decrypt_keys, self.unit_key_idx)
     }
 
     /// Read sectors via standard READ(10) 0x00.
@@ -1004,60 +1475,14 @@ impl<'a> ContentReader<'a> {
 
 // ─── Format helpers ────────────────────────────────────────────────────────
 
-fn format_resolution(video_format: u8, _video_rate: u8) -> String {
-    match video_format {
-        1 => "480i".into(),
-        2 => "576i".into(),
-        3 => "480p".into(),
-        4 => "1080i".into(),
-        5 => "720p".into(),
-        6 => "1080p".into(),
-        7 => "576p".into(),
-        8 => "2160p".into(),
-        _ => String::new(),
-    }
-}
-
-fn format_framerate(video_rate: u8) -> String {
-    match video_rate {
-        1 => "23.976".into(),
-        2 => "24".into(),
-        3 => "25".into(),
-        4 => "29.97".into(),
-        6 => "50".into(),
-        7 => "59.94".into(),
-        _ => String::new(),
-    }
-}
-
-fn format_channels(audio_format: u8) -> String {
-    match audio_format {
-        1 => "mono".into(),
-        3 => "stereo".into(),
-        6 => "5.1".into(),
-        12 => "7.1".into(),
-        _ if audio_format > 0 => format!("{audio_format}ch"),
-        _ => String::new(),
-    }
-}
-
-fn format_samplerate(audio_rate: u8) -> String {
-    match audio_rate {
-        1 => "48kHz".into(),
-        4 => "96kHz".into(),
-        5 => "192kHz".into(),
-        12 => "48/192kHz".into(),
-        14 => "48/96kHz".into(),
-        _ => String::new(),
-    }
-}
+// Old format_* functions replaced by Resolution/FrameRate/AudioChannels/SampleRate enums
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Helper: build a DiscTitle with a single video stream at the given resolution.
-    fn title_with_video(codec: Codec, resolution: &str) -> DiscTitle {
+    fn title_with_video(codec: Codec, resolution: Resolution) -> DiscTitle {
         DiscTitle {
             playlist: "00800.mpls".into(),
             playlist_id: 800,
@@ -1067,8 +1492,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 pid: 0x1011,
                 codec,
-                resolution: resolution.into(),
-                frame_rate: "23.976".into(),
+                resolution,
+                frame_rate: FrameRate::F23_976,
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
                 secondary: false,
@@ -1082,19 +1507,19 @@ mod tests {
 
     #[test]
     fn detect_format_uhd() {
-        let titles = vec![title_with_video(Codec::Hevc, "2160p")];
+        let titles = vec![title_with_video(Codec::Hevc, Resolution::R2160p)];
         assert_eq!(Disc::detect_format(&titles), DiscFormat::Uhd);
     }
 
     #[test]
     fn detect_format_bluray() {
-        let titles = vec![title_with_video(Codec::H264, "1080p")];
+        let titles = vec![title_with_video(Codec::H264, Resolution::R1080p)];
         assert_eq!(Disc::detect_format(&titles), DiscFormat::BluRay);
     }
 
     #[test]
     fn detect_format_dvd() {
-        let titles = vec![title_with_video(Codec::Mpeg2, "480i")];
+        let titles = vec![title_with_video(Codec::Mpeg2, Resolution::R480i)];
         assert_eq!(Disc::detect_format(&titles), DiscFormat::Dvd);
     }
 
@@ -1106,7 +1531,7 @@ mod tests {
 
     #[test]
     fn content_format_default_bdts() {
-        let t = title_with_video(Codec::H264, "1080p");
+        let t = title_with_video(Codec::H264, Resolution::R1080p);
         assert_eq!(t.content_format, ContentFormat::BdTs);
     }
 
@@ -1114,7 +1539,7 @@ mod tests {
     fn content_format_dvd_mpegps() {
         let t = DiscTitle {
             content_format: ContentFormat::MpegPs,
-            ..title_with_video(Codec::Mpeg2, "480i")
+            ..title_with_video(Codec::Mpeg2, Resolution::R480i)
         };
         assert_eq!(t.content_format, ContentFormat::MpegPs);
     }
