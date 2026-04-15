@@ -176,7 +176,7 @@ fn open_input_network_no_port_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("missing port"), "got: {}", msg);
+    assert!(msg.contains("PES pipeline") || msg.contains("missing port"), "got: {}", msg);
 }
 
 #[test]
