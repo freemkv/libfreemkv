@@ -67,8 +67,8 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     }
 
     // Vendor-specific READ_BUFFER queries
-    let rb_f1 = session.read_buffer(0x02, 0xF1, 48);    // Pioneer
-    let rb_mode6 = session.read_buffer(0x06, 0x00, 32);  // MTK
+    let rb_f1 = session.read_buffer(0x02, 0xF1, 48); // Pioneer
+    let rb_mode6 = session.read_buffer(0x06, 0x00, 32); // MTK
 
     // Standard queries
     let rpc_state = session.report_key_rpc_state();
@@ -87,18 +87,30 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
 
 /// Mask a string for privacy (letters->A, digits->0).
 pub fn mask_string(s: &str) -> String {
-    s.chars().map(|c| {
-        if c.is_ascii_alphabetic() { 'A' }
-        else if c.is_ascii_digit() { '0' }
-        else { c }
-    }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                'A'
+            } else if c.is_ascii_digit() {
+                '0'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Mask bytes for privacy.
 pub fn mask_bytes(data: &[u8]) -> Vec<u8> {
-    data.iter().map(|&b| {
-        if b.is_ascii_alphabetic() { b'A' }
-        else if b.is_ascii_digit() { b'0' }
-        else { b }
-    }).collect()
+    data.iter()
+        .map(|&b| {
+            if b.is_ascii_alphabetic() {
+                b'A'
+            } else if b.is_ascii_digit() {
+                b'0'
+            } else {
+                b
+            }
+        })
+        .collect()
 }

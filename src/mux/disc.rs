@@ -333,8 +333,8 @@ impl IOStream for DiscStream {
     }
 }
 
-impl crate::pes::InputStream for DiscStream {
-    fn next_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+impl crate::pes::Stream for DiscStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         // Return buffered frame if available
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
@@ -397,6 +397,15 @@ impl crate::pes::InputStream for DiscStream {
             }
             // No frames produced — read more data
         }
+    }
+
+    fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "disc is read-only"))
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.drive.unlock_tray();
+        Ok(())
     }
 
     fn info(&self) -> &DiscTitle {

@@ -178,7 +178,7 @@ impl Mt1959 {
 
     fn run_init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         let mut unlocked = false;
-        for _attempt in 0..6 {
+        for _attempt in 0..3 {
             match self.do_unlock(scsi) {
                 Ok(_) => {
                     unlocked = true;
@@ -188,15 +188,17 @@ impl Mt1959 {
                     return Err(Error::UnlockFailed);
                 }
                 Err(_) => {
-                    let ok = if self.mode == MODE_A {
+                    let loaded = if self.mode == MODE_A {
                         variant_a::load_firmware(self, scsi).is_ok()
                     } else {
                         variant_b::load_firmware(self, scsi).is_ok()
                     };
-                    if ok {
-                        unlocked = true;
-                        break;
+                    if !loaded {
+                        continue;
                     }
+                    // Firmware upload resets the drive. Give it time to
+                    // fully recover before retrying unlock.
+                    std::thread::sleep(std::time::Duration::from_secs(10));
                 }
             }
         }
@@ -319,7 +321,9 @@ impl PlatformDriver for Mt1959 {
 
     fn probe_disc(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if !self.unlocked {
-            self.run_init(scsi)?;
+            // Don't retry init here — if init() failed, probing can't work either.
+            // Retrying causes repeated USB bus resets on BU40N.
+            return Ok(());
         }
         if self.probed {
             return Ok(());

@@ -20,20 +20,13 @@ impl Disc {
         let mut title_number: u16 = 0;
 
         for ts in &dvd_info.title_sets {
-            // Map DvdVideoAttr to Stream::Video
-            let video_codec = match ts.video.codec.as_str() {
-                "mpeg2" => Codec::Mpeg2,
-                "mpeg1" => Codec::Mpeg2, // treat MPEG-1 as MPEG-2 for container purposes
-                _ => Codec::Mpeg2,
-            };
-
             let video_stream = Stream::Video(VideoStream {
                 pid: 0xE0, // DVD video PID (standard MPEG PS video stream)
-                codec: video_codec,
-                resolution: ts.video.resolution.clone(),
+                codec: ts.video.codec,
+                resolution: ts.video.resolution,
                 frame_rate: match ts.video.standard.as_str() {
-                    "PAL" => "25".to_string(),
-                    _ => "29.97".to_string(),
+                    "PAL" => FrameRate::F25,
+                    _ => FrameRate::F29_97,
                 },
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
@@ -47,31 +40,13 @@ impl Disc {
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let codec = match a.codec.as_str() {
-                        "ac3" => Codec::Ac3,
-                        "dts" => Codec::Dts,
-                        "lpcm" => Codec::Lpcm,
-                        "mpeg1" | "mpeg2" => Codec::Mpeg2,
-                        _ => Codec::Unknown(0),
-                    };
-                    let channels = match a.channels {
-                        1 => "mono".to_string(),
-                        2 => "stereo".to_string(),
-                        6 => "5.1".to_string(),
-                        8 => "7.1".to_string(),
-                        n => format!("{n}ch"),
-                    };
-                    let sample_rate = match a.sample_rate {
-                        48000 => "48kHz".to_string(),
-                        96000 => "96kHz".to_string(),
-                        sr => format!("{}kHz", sr / 1000),
-                    };
+                    let codec = a.codec;
                     Stream::Audio(AudioStream {
                         pid: 0xBD00 + i as u16, // DVD private stream 1 sub-IDs
                         codec,
-                        channels,
+                        channels: AudioChannels::from_count(a.channels),
                         language: a.language.clone(),
-                        sample_rate,
+                        sample_rate: SampleRate::from_hz(a.sample_rate),
                         secondary: false,
                         label: String::new(),
                     })

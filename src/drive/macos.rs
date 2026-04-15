@@ -7,7 +7,9 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
     let mut drives = Vec::new();
     for i in 0..16 {
         let path = format!("/dev/disk{}", i);
-        if !std::path::Path::new(&path).exists() { continue; }
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
         match crate::scsi::open(std::path::Path::new(&path)) {
             Ok(mut transport) => {
                 if let Ok(id) = DriveId::from_drive(transport.as_mut()) {

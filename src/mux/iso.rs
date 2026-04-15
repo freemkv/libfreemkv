@@ -256,8 +256,8 @@ impl IsoStream {
     }
 }
 
-impl crate::pes::InputStream for IsoStream {
-    fn next_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+impl crate::pes::Stream for IsoStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         // Return buffered frame
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
@@ -300,6 +300,12 @@ impl crate::pes::InputStream for IsoStream {
             }
         }
     }
+
+    fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "ISO is read-only for PES"))
+    }
+
+    fn finish(&mut self) -> io::Result<()> { Ok(()) }
 
     fn info(&self) -> &crate::disc::DiscTitle {
         &self.disc_title

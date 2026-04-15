@@ -1,11 +1,10 @@
-//! PES frame — the universal intermediate format.
+//! Stream — read PES frames in, write PES frames out.
 //!
-//! Every input stream produces PES frames. Every output stream consumes them.
-//! The pipeline just moves frames: input.next_frame() → output.write_frame().
+//! A stream is a stream. You read() from it or write() to it.
+//! The stream handles its own format internally.
 //!
-//! A PES frame is one unit of elementary stream data: a video frame,
-//! an audio frame, a subtitle packet. It carries a track ID, timestamp,
-//! and the raw codec data.
+//! disc.read()  → PES frame (sectors → decrypt → demux internally)
+//! mkv.write(frame) → MKV file (mux internally)
 
 /// One frame of elementary stream data.
 #[derive(Debug, Clone)]
@@ -32,27 +31,23 @@ impl PesFrame {
     }
 }
 
-/// Input stream — produces PES frames from any source.
-pub trait InputStream {
-    /// Get the next frame. Returns None at end of stream.
-    fn next_frame(&mut self) -> std::io::Result<Option<PesFrame>>;
+/// A stream. Read from it or write to it. Not both.
+pub trait Stream {
+    /// Read the next frame. Returns None at end of stream.
+    fn read(&mut self) -> std::io::Result<Option<PesFrame>>;
 
-    /// Stream metadata (tracks, duration, etc).
-    fn info(&self) -> &crate::disc::DiscTitle;
-
-    /// Codec initialization data for a track (SPS/PPS for HEVC, etc).
-    /// Returns None until enough frames have been parsed.
-    fn codec_private(&self, track: usize) -> Option<Vec<u8>>;
-
-    /// True when codec_private is available for all video tracks.
-    fn headers_ready(&self) -> bool;
-}
-
-/// Output stream — consumes PES frames to any destination.
-pub trait OutputStream {
-    /// Write one frame.
-    fn write_frame(&mut self, frame: &PesFrame) -> std::io::Result<()>;
+    /// Write a frame.
+    fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
 
     /// Finalize (flush, write index, close).
     fn finish(&mut self) -> std::io::Result<()>;
+
+    /// Stream metadata.
+    fn info(&self) -> &crate::disc::DiscTitle;
+
+    /// Codec initialization data for a track (SPS/PPS, etc).
+    fn codec_private(&self, _track: usize) -> Option<Vec<u8>> { None }
+
+    /// True when codec_private is available for all video tracks.
+    fn headers_ready(&self) -> bool { true }
 }

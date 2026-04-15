@@ -305,7 +305,7 @@ pub struct InputOptions {
 // ── PES-based open ──────────────────────────────────────────────────────────
 
 /// Open a PES input stream (produces PES frames).
-pub fn open_pes_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::InputStream>> {
+pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Iso { ref path } => {
@@ -369,11 +369,11 @@ pub fn open_pes_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crat
 }
 
 /// Open a PES output stream (consumes PES frames).
-pub fn open_pes_output(
+pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,
     codec_privates: &[Option<Vec<u8>>],
-) -> io::Result<Box<dyn crate::pes::OutputStream>> {
+) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Mkv { ref path } => {
@@ -393,10 +393,10 @@ pub fn open_pes_output(
             Ok(Box::new(super::pesout::NetworkOutputStream::connect(addr, title)?))
         }
         StreamUrl::Stdio => {
-            Ok(Box::new(super::pesout::StdioOutputStream::new()))
+            Ok(Box::new(super::pesout::StdioOutputStream::new(title)))
         }
         StreamUrl::Null => {
-            Ok(Box::new(super::pesout::NullOutputStream))
+            Ok(Box::new(super::pesout::NullOutputStream::new(title)))
         }
         StreamUrl::Disc { .. } => {
             Err(io::Error::new(io::ErrorKind::Unsupported, "disc:// is read-only"))

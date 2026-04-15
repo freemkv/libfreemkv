@@ -187,6 +187,50 @@ impl UdfFs {
         Ok(merged)
     }
 
+    /// All sector ranges that contain data (metadata + all files including STREAM).
+    /// For full disc-to-ISO dumps — reads only allocated sectors, skips gaps.
+    pub fn all_sector_ranges(&self, reader: &mut dyn SectorReader) -> Result<Vec<(u32, u32)>> {
+        let mut ranges = Vec::new();
+
+        // UDF structure sectors
+        let meta_end = self.metadata_start + self.metadata_sectors;
+        ranges.push((0, meta_end));
+
+        // Walk entire tree including STREAM directories
+        self.collect_all_file_ranges(reader, &self.root, &mut ranges)?;
+
+        // Merge overlapping/adjacent ranges and sort
+        ranges.sort_by_key(|r| r.0);
+        let merged = merge_ranges(&ranges);
+        Ok(merged)
+    }
+
+    fn collect_all_file_ranges(
+        &self,
+        reader: &mut dyn SectorReader,
+        entry: &DirEntry,
+        ranges: &mut Vec<(u32, u32)>,
+    ) -> Result<()> {
+        for child in &entry.entries {
+            if child.is_dir {
+                self.collect_all_file_ranges(reader, child, ranges)?;
+            } else {
+                // Include the ICB sector
+                ranges.push((self.meta_to_abs(child.meta_lba), 1));
+
+                // Include ALL file data extents (large m2ts files have many)
+                if let Ok(extents) = self.read_icb_extents(reader, child.meta_lba) {
+                    for (data_lba, data_len) in extents {
+                        let abs_start = self.partition_start + data_lba;
+                        let sector_count = (data_len as u64).div_ceil(2048) as u32;
+                        ranges.push((abs_start, sector_count));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn collect_file_ranges(
         &self,
         reader: &mut dyn SectorReader,

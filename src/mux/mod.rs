@@ -45,7 +45,7 @@ pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use null::NullStream;
-pub use resolve::{open_input, open_output, open_pes_input, open_pes_output, parse_url, InputOptions, StreamUrl};
+pub use resolve::{input, output, open_input, open_output, parse_url, InputOptions, StreamUrl};
 pub use stdio::StdioStream;
 
 use crate::disc::DiscTitle;

@@ -1050,10 +1050,7 @@ pub fn read_volume_id(session: &mut Drive, auth: &mut AacsAuth) -> Result<[u8; 1
 }
 
 /// Read data keys after successful authentication (for AACS 2.0 bus encryption).
-pub fn read_data_keys(
-    session: &mut Drive,
-    auth: &mut AacsAuth,
-) -> Result<([u8; 16], [u8; 16])> {
+pub fn read_data_keys(session: &mut Drive, auth: &mut AacsAuth) -> Result<([u8; 16], [u8; 16])> {
     // REPORT DISC STRUCTURE format 0x84
     let cdb = cdb_report_disc_structure(auth.agid, 0x84, 36);
     let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsDataKey)?;

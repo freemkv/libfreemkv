@@ -3,9 +3,7 @@
 //! Format: [8B magic] [4B json_len] [JSON] [padding to 192B boundary] [BD-TS data...]
 //! Other tools skip the header during TS sync recovery (scan for 0x47).
 
-use crate::disc::{
-    AudioStream, Codec, ColorSpace, DiscTitle, HdrFormat, Stream, SubtitleStream, VideoStream,
-};
+use crate::disc::{AudioStream, ColorSpace, DiscTitle, Stream, SubtitleStream, VideoStream};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -84,25 +82,25 @@ impl M2tsMeta {
             .map(|s| match s {
                 Stream::Video(v) => MetaStream::Video {
                     pid: v.pid,
-                    codec: codec_to_str(v.codec),
-                    resolution: v.resolution.clone(),
-                    frame_rate: v.frame_rate.clone(),
-                    hdr: hdr_to_str(v.hdr),
+                    codec: v.codec.id().into(),
+                    resolution: v.resolution.to_string(),
+                    frame_rate: v.frame_rate.to_string(),
+                    hdr: v.hdr.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
                 },
                 Stream::Audio(a) => MetaStream::Audio {
                     pid: a.pid,
-                    codec: codec_to_str(a.codec),
-                    channels: a.channels.clone(),
+                    codec: a.codec.id().into(),
+                    channels: a.channels.to_string(),
                     language: a.language.clone(),
-                    sample_rate: a.sample_rate.clone(),
+                    sample_rate: a.sample_rate.to_string(),
                     label: a.label.clone(),
                     secondary: a.secondary,
                 },
                 Stream::Subtitle(s) => MetaStream::Subtitle {
                     pid: s.pid,
-                    codec: codec_to_str(s.codec),
+                    codec: s.codec.id().into(),
                     language: s.language.clone(),
                     forced: s.forced,
                 },
@@ -133,10 +131,10 @@ impl M2tsMeta {
                     secondary,
                 } => Stream::Video(VideoStream {
                     pid: *pid,
-                    codec: str_to_codec(codec),
-                    resolution: resolution.clone(),
-                    frame_rate: frame_rate.clone(),
-                    hdr: str_to_hdr(hdr),
+                    codec: codec.parse().unwrap(),
+                    resolution: resolution.parse().unwrap(),
+                    frame_rate: frame_rate.parse().unwrap(),
+                    hdr: hdr.parse().unwrap(),
                     color_space: ColorSpace::Bt709,
                     secondary: *secondary,
                     label: label.clone(),
@@ -151,10 +149,10 @@ impl M2tsMeta {
                     secondary,
                 } => Stream::Audio(AudioStream {
                     pid: *pid,
-                    codec: str_to_codec(codec),
-                    channels: channels.clone(),
+                    codec: codec.parse().unwrap(),
+                    channels: channels.parse().unwrap(),
                     language: language.clone(),
-                    sample_rate: sample_rate.clone(),
+                    sample_rate: sample_rate.parse().unwrap(),
                     secondary: *secondary,
                     label: label.clone(),
                 }),
@@ -165,7 +163,7 @@ impl M2tsMeta {
                     forced,
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
-                    codec: str_to_codec(codec),
+                    codec: codec.parse().unwrap(),
                     language: language.clone(),
                     forced: *forced,
                     codec_data: None,
@@ -277,58 +275,5 @@ pub fn read_header_from_stream(r: &mut impl Read) -> io::Result<Option<M2tsMeta>
     Ok(Some(meta))
 }
 
-// Codec string conversion (compact, no English — just codec identifiers)
-fn codec_to_str(c: Codec) -> String {
-    match c {
-        Codec::Hevc => "hevc",
-        Codec::H264 => "h264",
-        Codec::Vc1 => "vc1",
-        Codec::Mpeg2 => "mpeg2",
-        Codec::TrueHd => "truehd",
-        Codec::DtsHdMa => "dtshd_ma",
-        Codec::DtsHdHr => "dtshd_hr",
-        Codec::Dts => "dts",
-        Codec::Ac3 => "ac3",
-        Codec::Ac3Plus => "eac3",
-        Codec::Lpcm => "lpcm",
-        Codec::Pgs => "pgs",
-        Codec::DvdSub => "dvdsub",
-        Codec::Unknown(_) => "unknown",
-    }
-    .into()
-}
-
-fn str_to_codec(s: &str) -> Codec {
-    match s {
-        "hevc" => Codec::Hevc,
-        "h264" => Codec::H264,
-        "vc1" => Codec::Vc1,
-        "mpeg2" => Codec::Mpeg2,
-        "truehd" => Codec::TrueHd,
-        "dtshd_ma" => Codec::DtsHdMa,
-        "dtshd_hr" => Codec::DtsHdHr,
-        "dts" => Codec::Dts,
-        "ac3" => Codec::Ac3,
-        "eac3" => Codec::Ac3Plus,
-        "lpcm" => Codec::Lpcm,
-        "pgs" => Codec::Pgs,
-        _ => Codec::Unknown(0),
-    }
-}
-
-fn hdr_to_str(h: HdrFormat) -> String {
-    match h {
-        HdrFormat::Sdr => "sdr",
-        HdrFormat::Hdr10 => "hdr10",
-        HdrFormat::DolbyVision => "dv",
-    }
-    .into()
-}
-
-fn str_to_hdr(s: &str) -> HdrFormat {
-    match s {
-        "hdr10" => HdrFormat::Hdr10,
-        "dv" => HdrFormat::DolbyVision,
-        _ => HdrFormat::Sdr,
-    }
-}
+// Serialization uses Codec::id() / HdrFormat::id() and Display impls.
+// Deserialization uses FromStr impls (.parse()) on each enum.

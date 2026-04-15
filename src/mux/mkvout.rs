@@ -6,11 +6,12 @@
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::WriteSeek;
 use crate::disc::DiscTitle;
-use crate::pes::{OutputStream, PesFrame};
+use crate::pes::PesFrame;
 use std::io;
 
 pub struct MkvOutputStream {
     muxer: Option<MkvMuxer<Box<dyn WriteSeek>>>,
+    title: DiscTitle,
 }
 
 impl MkvOutputStream {
@@ -43,12 +44,16 @@ impl MkvOutputStream {
             &title.chapters,
         )?;
 
-        Ok(Self { muxer: Some(muxer) })
+        Ok(Self { muxer: Some(muxer), title: title.clone() })
     }
 }
 
-impl OutputStream for MkvOutputStream {
-    fn write_frame(&mut self, frame: &PesFrame) -> io::Result<()> {
+impl crate::pes::Stream for MkvOutputStream {
+    fn read(&mut self) -> io::Result<Option<PesFrame>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "MKV output is write-only"))
+    }
+
+    fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
         if let Some(ref mut muxer) = self.muxer {
             muxer.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data)
         } else {
@@ -63,4 +68,6 @@ impl OutputStream for MkvOutputStream {
             Ok(())
         }
     }
+
+    fn info(&self) -> &DiscTitle { &self.title }
 }

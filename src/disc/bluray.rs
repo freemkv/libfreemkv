@@ -104,8 +104,8 @@ impl Disc {
                     1 | 6 | 7 => Some(Stream::Video(VideoStream {
                         pid: s.pid,
                         codec,
-                        resolution: format_resolution(s.video_format, s.video_rate),
-                        frame_rate: format_framerate(s.video_rate),
+                        resolution: Resolution::from_video_format(s.video_format),
+                        frame_rate: FrameRate::from_video_rate(s.video_rate),
                         hdr: match s.dynamic_range {
                             1 => HdrFormat::Hdr10,
                             2 => HdrFormat::DolbyVision,
@@ -137,9 +137,9 @@ impl Disc {
                             Some(Stream::Audio(AudioStream {
                                 pid: s.pid,
                                 codec,
-                                channels: format_channels(s.audio_format),
+                                channels: AudioChannels::from_audio_format(s.audio_format),
                                 language: s.language.clone(),
-                                sample_rate: format_samplerate(s.audio_rate),
+                                sample_rate: SampleRate::from_audio_rate(s.audio_rate),
                                 secondary: s.stream_type == 5,
                                 label: String::new(),
                             }))

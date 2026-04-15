@@ -148,7 +148,8 @@ impl Read for NetworkStream {
 mod tests {
     use super::*;
     use crate::disc::{
-        AudioStream, Codec, ColorSpace, ContentFormat, HdrFormat, Stream, VideoStream,
+        AudioChannels, AudioStream, Codec, ColorSpace, ContentFormat, FrameRate, HdrFormat,
+        Resolution, SampleRate, Stream, VideoStream,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -165,8 +166,8 @@ mod tests {
                 Stream::Video(VideoStream {
                     pid: 0x1011,
                     codec: Codec::Hevc,
-                    resolution: "2160p".into(),
-                    frame_rate: "23.976".into(),
+                    resolution: Resolution::R2160p,
+                    frame_rate: FrameRate::F23_976,
                     hdr: HdrFormat::Hdr10,
                     color_space: ColorSpace::Bt2020,
                     secondary: false,
@@ -175,9 +176,9 @@ mod tests {
                 Stream::Audio(AudioStream {
                     pid: 0x1100,
                     codec: Codec::TrueHd,
-                    channels: "7.1".into(),
+                    channels: AudioChannels::Surround71,
                     language: "eng".into(),
-                    sample_rate: "48kHz".into(),
+                    sample_rate: SampleRate::S48,
                     secondary: false,
                     label: "English".into(),
                 }),
