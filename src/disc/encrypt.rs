@@ -25,7 +25,6 @@ impl Disc {
         let keydb_path = opts.resolve_keydb()?;
         let keydb = KeyDb::load(&keydb_path).ok()?;
 
-        let mut last_error = None;
         for hc in &keydb.host_certs {
             match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
@@ -41,9 +40,7 @@ impl Disc {
                         read_data_key,
                     });
                 }
-                Err(e) => {
-                    // Try next host cert
-                    last_error = Some(e);
+                Err(_) => {
                     continue;
                 }
             }
