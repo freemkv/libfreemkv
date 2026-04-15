@@ -38,6 +38,11 @@ struct ReadState {
     pos: usize,
     len: usize,
     cluster_ts_ms: i64,
+    /// Codec private data per track (track_number, hvcC/avcC bytes).
+    /// Emitted as Annex B NALs before first frame of each video track.
+    codec_privates: Vec<(u16, Vec<u8>)>,
+    /// Tracks that have already had their codec_private emitted.
+    initialized_tracks: Vec<u16>,
 }
 
 enum Mode {
@@ -125,7 +130,7 @@ impl MkvStream {
     pub fn open(mut reader: impl Read + Seek + 'static) -> io::Result<Self> {
         let file_size = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
-        let disc_title = parse_mkv_header(&mut reader)?;
+        let (disc_title, codec_privates) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
             mode: Mode::Read(ReadState {
@@ -134,6 +139,8 @@ impl MkvStream {
                 pos: 0,
                 len: 0,
                 cluster_ts_ms: 0,
+                codec_privates,
+                initialized_tracks: Vec::new(),
             }),
             max_buffer: 0,
             finished: false,
@@ -280,9 +287,22 @@ impl Read for MkvStream {
                     let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
                     let frame = &block[vl + 3..];
                     let pts_ms = rs.cluster_ts_ms + rel_ts as i64;
+                    let tnum = track as u16;
 
                     rs.buf.clear();
-                    frame_to_ts(&mut rs.buf, track as u16, pts_ms, frame);
+
+                    // First frame of a track: emit codec_private as Annex B NALs
+                    if !rs.initialized_tracks.contains(&tnum) {
+                        rs.initialized_tracks.push(tnum);
+                        if let Some((_, cp)) = rs.codec_privates.iter().find(|(t, _)| *t == tnum) {
+                            let annex_b = hvcc_to_annex_b(cp);
+                            if !annex_b.is_empty() {
+                                frame_to_ts(&mut rs.buf, tnum, pts_ms, &annex_b);
+                            }
+                        }
+                    }
+
+                    frame_to_ts(&mut rs.buf, tnum, pts_ms, frame);
                     rs.pos = 0;
                     rs.len = rs.buf.len();
 
@@ -351,7 +371,11 @@ fn begin_streaming(ws: &mut WriteState, dt: &DiscTitle) -> io::Result<()> {
             }
         }
     }
+    // Transfer remainder bytes from old demuxer to new one.
+    // Preserves 192-byte packet alignment across the reset.
+    let remainder = ws.demuxer.take_remainder();
     ws.demuxer = TsDemuxer::new(&pids);
+    ws.demuxer.set_remainder(remainder);
     Ok(())
 }
 
@@ -377,11 +401,15 @@ fn write_pes(
 
 // ── MKV header parsing (read side) ────────────────────────────
 
-fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
+/// Returns (DiscTitle, codec_privates: Vec<(track_number, codec_private_bytes)>)
+fn parse_mkv_header(
+    r: &mut (impl Read + Seek),
+) -> io::Result<(DiscTitle, Vec<(u16, Vec<u8>)>)> {
     let mut title = String::new();
     let mut duration_ms = 0.0f64;
     let mut ts_scale: u64 = 1_000_000;
     let mut streams: Vec<crate::disc::Stream> = Vec::new();
+    let mut codec_privates: Vec<(u16, Vec<u8>)> = Vec::new();
 
     let (id, size, _) = ebml::read_element_header(r)?;
     if id != ebml::EBML {
@@ -432,8 +460,12 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
                 while r.stream_position()? < end {
                     let (cid, cs, _) = ebml::read_element_header(r)?;
                     if cid == ebml::TRACK_ENTRY {
-                        if let Some(s) = parse_track(r, cs)? {
+                        let (stream, tnum, cp) = parse_track(r, cs)?;
+                        if let Some(s) = stream {
                             streams.push(s);
+                        }
+                        if let Some(cp) = cp {
+                            codec_privates.push((tnum, cp));
                         }
                     } else {
                         r.seek(SeekFrom::Current(cs as i64))?;
@@ -449,19 +481,25 @@ fn parse_mkv_header(r: &mut (impl Read + Seek)) -> io::Result<DiscTitle> {
         }
     }
 
-    Ok(DiscTitle {
+    let disc_title = DiscTitle {
         playlist: title,
         duration_secs: duration_ms * (ts_scale as f64) / 1_000_000_000.0,
         streams,
         ..DiscTitle::empty()
-    })
+    };
+    Ok((disc_title, codec_privates))
 }
 
-fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate::disc::Stream>> {
+/// Returns (stream, track_number, codec_private_bytes)
+fn parse_track(
+    r: &mut (impl Read + Seek),
+    size: u64,
+) -> io::Result<(Option<crate::disc::Stream>, u16, Option<Vec<u8>>)> {
     let end = r.stream_position()? + size;
     let (mut ttype, mut tnum) = (0u64, 0u16);
     let (mut codec_id, mut lang, mut name) = (String::new(), String::from("und"), String::new());
     let (mut ph, mut sr, mut ch, mut forced) = (0u32, 0.0f64, 0u8, false);
+    let mut codec_priv: Option<Vec<u8>> = None;
 
     while r.stream_position()? < end {
         let (cid, cs, _) = ebml::read_element_header(r)?;
@@ -469,6 +507,7 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
             ebml::TRACK_NUMBER => tnum = ebml::read_uint_val(r, cs as usize)? as u16,
             ebml::TRACK_TYPE => ttype = ebml::read_uint_val(r, cs as usize)?,
             ebml::CODEC_ID => codec_id = ebml::read_string_val(r, cs as usize)?,
+            ebml::CODEC_PRIVATE => codec_priv = Some(ebml::read_binary_val(r, cs as usize)?),
             ebml::LANGUAGE => lang = ebml::read_string_val(r, cs as usize)?,
             ebml::TRACK_NAME => name = ebml::read_string_val(r, cs as usize)?,
             ebml::FLAG_FORCED => forced = ebml::read_uint_val(r, cs as usize)? != 0,
@@ -516,30 +555,33 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
         "S_VOBSUB" => Codec::DvdSub,
         _ => Codec::Unknown(0),
     };
-    let res = format!("{ph}p");
-    let chs: String = match ch {
-        8 => "7.1",
-        6 => "5.1",
-        2 => "stereo",
-        1 => "mono",
-        _ => "5.1",
-    }
-    .into();
-    let srs: String = if sr >= 96000.0 { "96kHz" } else { "48kHz" }.into();
+    let res = Resolution::from_height(ph);
+    let chs = AudioChannels::from_count(ch);
+    let srs = if sr >= 96000.0 {
+        SampleRate::S96
+    } else {
+        SampleRate::S48
+    };
 
-    Ok(match ttype {
-        1 => Some(crate::disc::Stream::Video(VideoStream {
-            pid: tnum,
-            codec,
-            resolution: res,
-            frame_rate: String::new(),
-            hdr: HdrFormat::Sdr,
-            color_space: ColorSpace::Bt709,
-            secondary: false,
-            label: name,
-        })),
+    // Map MKV track numbers to BD-TS PIDs (same mapping as frame_to_ts)
+    let ts_pid = if tnum == 1 { 0x1011 } else { 0x1100 + (tnum - 2) };
+
+    let stream = match ttype {
+        1 => {
+            let is_secondary = name.contains("Dolby Vision EL") || name.contains("DV EL");
+            Some(crate::disc::Stream::Video(VideoStream {
+                pid: ts_pid,
+                codec,
+                resolution: res,
+                frame_rate: FrameRate::Unknown,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                secondary: is_secondary,
+                label: name,
+            }))
+        }
         2 => Some(crate::disc::Stream::Audio(AudioStream {
-            pid: tnum,
+            pid: ts_pid,
             codec,
             channels: chs,
             language: lang,
@@ -548,14 +590,15 @@ fn parse_track(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<crate
             label: name,
         })),
         17 => Some(crate::disc::Stream::Subtitle(SubtitleStream {
-            pid: tnum,
+            pid: ts_pid,
             codec,
             language: lang,
             forced,
             codec_data: None,
         })),
         _ => None,
-    })
+    };
+    Ok((stream, tnum, codec_priv))
 }
 
 // ── BD-TS frame wrapping (read side) ──────────────────────────
@@ -573,20 +616,81 @@ fn block_vint(d: &[u8]) -> (u64, usize) {
     (0, 1)
 }
 
+/// Convert HEVCDecoderConfigurationRecord (hvcC) to Annex B NAL units.
+/// Extracts VPS, SPS, PPS arrays and prefixes each with 0x00000001.
+fn hvcc_to_annex_b(hvcc: &[u8]) -> Vec<u8> {
+    // hvcC format (ISO 14496-15):
+    //   byte 0: configurationVersion (1)
+    //   bytes 1-21: profile/level info
+    //   byte 22: numOfArrays
+    //   For each array:
+    //     byte 0: array_completeness(1) + reserved(1) + NAL_unit_type(6)
+    //     bytes 1-2: numNalus (big-endian u16)
+    //     For each NAL:
+    //       bytes 0-1: nalUnitLength (big-endian u16)
+    //       bytes 2..: NAL data
+    if hvcc.len() < 23 {
+        return Vec::new();
+    }
+    let num_arrays = hvcc[22] as usize;
+    let mut pos = 23;
+    let mut out = Vec::new();
+
+    for _ in 0..num_arrays {
+        if pos + 3 > hvcc.len() {
+            break;
+        }
+        pos += 1; // skip array_completeness + NAL type byte
+        let num_nalus = u16::from_be_bytes([hvcc[pos], hvcc[pos + 1]]) as usize;
+        pos += 2;
+        for _ in 0..num_nalus {
+            if pos + 2 > hvcc.len() {
+                break;
+            }
+            let nal_len = u16::from_be_bytes([hvcc[pos], hvcc[pos + 1]]) as usize;
+            pos += 2;
+            if pos + nal_len > hvcc.len() {
+                break;
+            }
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(&hvcc[pos..pos + nal_len]);
+            pos += nal_len;
+        }
+    }
+    out
+}
+
 fn frame_to_ts(out: &mut Vec<u8>, track: u16, pts_ms: i64, data: &[u8]) {
     let pid = if track == 1 {
         0x1011
     } else {
         0x1100 + (track - 2)
     };
-    let stream_id: u8 = if track == 1 { 0xE0 } else { 0xBD };
+    let is_video = track <= 1 || pid == 0x1011;
+    let stream_id: u8 = if is_video { 0xE0 } else { 0xBD };
     let pts = encode_pts(pts_ms * 90);
     let hdr = [0x00, 0x00, 0x01, stream_id, 0x00, 0x00, 0x80, 0x80, 0x05];
 
     let mut pes = Vec::with_capacity(hdr.len() + pts.len() + data.len());
     pes.extend_from_slice(&hdr);
     pes.extend_from_slice(&pts);
-    pes.extend_from_slice(data);
+
+    // Video: convert MKV length-prefixed NALs to Annex B start codes
+    if is_video && data.len() > 4 {
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            let nal_len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            pos += 4;
+            if nal_len == 0 || pos + nal_len > data.len() {
+                break;
+            }
+            pes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            pes.extend_from_slice(&data[pos..pos + nal_len]);
+            pos += nal_len;
+        }
+    } else {
+        pes.extend_from_slice(data);
+    }
 
     let mut off = 0;
     let mut pusi = true;
