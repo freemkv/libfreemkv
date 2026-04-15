@@ -7,6 +7,8 @@ use super::{meta, ts, IOStream, ReadSeek};
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+type PesSetup = (Vec<u16>, Vec<(u16, Box<dyn super::codec::CodecParser>)>, Vec<(u16, usize)>);
+
 /// Size of initial scan buffer for PMT/stream detection.
 const SCAN_SIZE: usize = 1024 * 1024;
 
@@ -32,7 +34,6 @@ pub struct M2tsStream {
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
-    pes_buf: Vec<u8>,
     pes_eof: bool,
 }
 
@@ -51,12 +52,11 @@ impl M2tsStream {
             parsers: Vec::new(),
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track: Vec::new(),
-            pes_buf: Vec::new(),
             pes_eof: false,
         }
     }
 
-    fn setup_pes(streams: &[DiscStream]) -> (Vec<u16>, Vec<(u16, Box<dyn super::codec::CodecParser>)>, Vec<(u16, usize)>) {
+    fn setup_pes(streams: &[DiscStream]) -> PesSetup {
         let mut pids = Vec::new();
         let mut parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)> = Vec::new();
         let mut pid_to_track = Vec::new();
@@ -104,7 +104,6 @@ impl M2tsStream {
                 parsers,
                 pending_frames: std::collections::VecDeque::new(),
                 pid_to_track,
-                pes_buf: vec![0u8; 192 * 1024],
                 pes_eof: false,
             });
         }
@@ -144,7 +143,6 @@ impl M2tsStream {
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
-            pes_buf: vec![0u8; 192 * 1024],
             pes_eof: false,
         })
     }

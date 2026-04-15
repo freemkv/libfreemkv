@@ -428,21 +428,18 @@ impl Drive {
         ];
 
         // Normal read
-        match self.scsi.as_mut().execute(
+        if let Ok(result) = self.scsi.as_mut().execute(
             &cdb, crate::scsi::DataDirection::FromDevice, buf, timeout_ms,
         ) {
-            Ok(result) => {
-                if self.recovery_bytes_remaining > 0 {
-                    let bytes_read = count as u64 * 2048;
-                    self.recovery_bytes_remaining =
-                        self.recovery_bytes_remaining.saturating_sub(bytes_read);
-                    if self.recovery_bytes_remaining == 0 {
-                        self.set_speed(0xFFFF);
-                    }
+            if self.recovery_bytes_remaining > 0 {
+                let bytes_read = count as u64 * 2048;
+                self.recovery_bytes_remaining =
+                    self.recovery_bytes_remaining.saturating_sub(bytes_read);
+                if self.recovery_bytes_remaining == 0 {
+                    self.set_speed(0xFFFF);
                 }
-                return Ok(result.bytes_transferred);
             }
-            Err(_) => {}
+            return Ok(result.bytes_transferred);
         }
 
         // Phase 1: gentle — sleep 30s, retry. 5 times.
@@ -451,14 +448,11 @@ impl Drive {
         for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
-            match self.scsi.as_mut().execute(
+            if let Ok(result) = self.scsi.as_mut().execute(
                 &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
             ) {
-                Ok(result) => {
-                    self.recovery_bytes_remaining = RECOVERY_WINDOW;
-                    return Ok(result.bytes_transferred);
-                }
-                Err(_) => {}
+                self.recovery_bytes_remaining = RECOVERY_WINDOW;
+                return Ok(result.bytes_transferred);
             }
         }
 
@@ -467,10 +461,7 @@ impl Drive {
         std::thread::sleep(std::time::Duration::from_secs(5));
         let _ = crate::scsi::reset(&device);
         std::thread::sleep(std::time::Duration::from_secs(5));
-        self.scsi = match crate::scsi::open(&device) {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
+        self.scsi = crate::scsi::open(&device)?;
         let _ = self.init();
         let _ = self.wait_ready();
         self.set_speed(0);
@@ -479,14 +470,11 @@ impl Drive {
         for _ in 0..5 {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
-            match self.scsi.as_mut().execute(
+            if let Ok(result) = self.scsi.as_mut().execute(
                 &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
             ) {
-                Ok(result) => {
-                    self.recovery_bytes_remaining = RECOVERY_WINDOW;
-                    return Ok(result.bytes_transferred);
-                }
-                Err(_) => {}
+                self.recovery_bytes_remaining = RECOVERY_WINDOW;
+                return Ok(result.bytes_transferred);
             }
         }
 

@@ -82,26 +82,26 @@ impl SgIoTransport {
     ///
     /// ## Sequence
     ///
-    /// 1. **open**      — allocates kernel SG state for this fd
-    /// 2. **close**     — triggers kernel cleanup: aborts any pending SG_IO
-    ///                    commands associated with this fd. The key operation —
-    ///                    the kernel's sg_release() cancels queued commands.
-    /// 3. **sleep 2s**  — the drive firmware needs time to finish/abort whatever
-    ///                    it was doing when the previous process died. Without
-    ///                    this, the next command may block on drive-internal state.
-    /// 4. **open**      — fresh fd with no stale commands in the kernel queue
-    /// 5. **unlock**    — ALLOW MEDIUM REMOVAL (CDB 0x1E, prevent=0). Clears
-    ///                    any tray lock left by a killed process that never
-    ///                    ran its Drop/cleanup.
-    /// 6. **TUR**       — TEST UNIT READY (CDB 0x00) with 3s timeout. If the
-    ///                    drive responds, it's in a good state.
-    /// 7. **escalate**  — if TUR fails:
-    ///                    a. SG_SCSI_RESET (device level) — kernel sends a SCSI
-    ///                       bus reset to the device, clearing all firmware state.
-    ///                    b. STOP + START UNIT (CDB 0x1B) — power-cycles the
-    ///                       drive's logical unit, like pressing the eject button
-    ///                       and reinserting.
-    /// 8. **close**     — release the fd. Drive is clean, nobody holds it.
+    /// 1. **open** — allocates kernel SG state for this fd
+    /// 2. **close** — triggers kernel cleanup: aborts any pending SG_IO
+    ///    commands associated with this fd. The key operation —
+    ///    the kernel's sg_release() cancels queued commands.
+    /// 3. **sleep 2s** — the drive firmware needs time to finish/abort whatever
+    ///    it was doing when the previous process died. Without
+    ///    this, the next command may block on drive-internal state.
+    /// 4. **open** — fresh fd with no stale commands in the kernel queue
+    /// 5. **unlock** — ALLOW MEDIUM REMOVAL (CDB 0x1E, prevent=0). Clears
+    ///    any tray lock left by a killed process that never
+    ///    ran its Drop/cleanup.
+    /// 6. **TUR** — TEST UNIT READY (CDB 0x00) with 3s timeout. If the
+    ///    drive responds, it's in a good state.
+    /// 7. **escalate** — if TUR fails:
+    ///    - SG_SCSI_RESET (device level) — kernel sends a SCSI
+    ///      bus reset to the device, clearing all firmware state.
+    ///    - STOP + START UNIT (CDB 0x1B) — power-cycles the
+    ///      drive's logical unit, like pressing the eject button
+    ///      and reinserting.
+    /// 8. **close** — release the fd. Drive is clean, nobody holds it.
     pub fn reset(device: &Path) -> Result<()> {
         let c_path = Self::to_c_path(device);
 

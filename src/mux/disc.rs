@@ -166,7 +166,6 @@ impl DiscStream {
     }
 
     /// Set SCSI read timeout (default 30s).
-
     fn new(drive: Drive, title: DiscTitle, mode: ReadMode, max_batch: u16) -> Self {
         // Set up PES demux from title stream PIDs
         let mut pids = Vec::new();

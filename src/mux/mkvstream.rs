@@ -8,6 +8,8 @@ use super::lookahead::{LookaheadBuffer, LookaheadState, DEFAULT_LOOKAHEAD_SIZE};
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::ts::TsDemuxer;
 use super::{ebml, IOStream, ReadSeek, WriteSeek};
+
+type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>)>;
 use crate::disc::*;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -462,7 +464,7 @@ fn write_pes(
 /// Returns (DiscTitle, codec_privates: Vec<(track_number, codec_private_bytes)>)
 fn parse_mkv_header(
     r: &mut (impl Read + Seek),
-) -> io::Result<(DiscTitle, Vec<(u16, Vec<u8>)>)> {
+) -> MkvHeaderResult {
     let mut title = String::new();
     let mut duration_ms = 0.0f64;
     let mut ts_scale: u64 = 1_000_000;

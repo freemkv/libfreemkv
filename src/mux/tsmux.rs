@@ -8,8 +8,6 @@ use std::io::{self, Write};
 
 const SYNC_BYTE: u8 = 0x47;
 const TS_PAYLOAD: usize = 184;
-const TS_PACKET: usize = 188;
-const BD_TS_PACKET: usize = 192;
 
 pub struct TsMuxer<W: Write> {
     writer: W,
@@ -112,14 +110,10 @@ impl<W: Write> TsMuxer<W> {
 /// Build a PES packet header for a BD stream.
 fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
     // Determine stream_id from PID range
-    let stream_id: u8 = if pid >= 0x1011 && pid <= 0x101F {
+    let stream_id: u8 = if (0x1011..=0x101F).contains(&pid) {
         0xE0 // video
-    } else if pid >= 0x1100 && pid <= 0x111F {
-        0xBD // audio (private stream 1)
-    } else if pid >= 0x1200 && pid <= 0x121F {
-        0xBD // PGS subtitle
     } else {
-        0xBD // default
+        0xBD // audio, PGS subtitle, or default (private stream 1)
     };
 
     let pes_data_len = data_len + 8; // 3 header bytes + 5 PTS bytes + data
