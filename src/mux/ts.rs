@@ -104,6 +104,18 @@ pub struct TsDemuxer {
 }
 
 impl TsDemuxer {
+    /// Take the remainder bytes (leftover from last feed() that didn't
+    /// align to a 192-byte packet boundary).
+    pub fn take_remainder(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.remainder)
+    }
+
+    /// Set the remainder bytes. Used to transfer alignment state from
+    /// one demuxer to another without losing sync.
+    pub fn set_remainder(&mut self, data: Vec<u8>) {
+        self.remainder = data;
+    }
+
     /// Create a new demuxer tracking the given PIDs.
     pub fn new(pids: &[u16]) -> Self {
         let mut pid_index = [-1i16; 8192];
@@ -363,8 +375,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     0x1B => Some(Stream::Video(VideoStream {
                         pid: es_pid,
                         codec: Codec::H264,
-                        resolution: "1080p".into(),
-                        frame_rate: String::new(),
+                        resolution: Resolution::R1080p,
+                        frame_rate: FrameRate::Unknown,
                         hdr: HdrFormat::Sdr,
                         color_space: ColorSpace::Bt709,
                         secondary: false,
@@ -373,8 +385,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     0x24 => Some(Stream::Video(VideoStream {
                         pid: es_pid,
                         codec: Codec::Hevc,
-                        resolution: "2160p".into(),
-                        frame_rate: String::new(),
+                        resolution: Resolution::R2160p,
+                        frame_rate: FrameRate::Unknown,
                         hdr: HdrFormat::Sdr,
                         color_space: ColorSpace::Bt709,
                         secondary: false,
@@ -383,8 +395,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     0xEA => Some(Stream::Video(VideoStream {
                         pid: es_pid,
                         codec: Codec::Vc1,
-                        resolution: "1080p".into(),
-                        frame_rate: String::new(),
+                        resolution: Resolution::R1080p,
+                        frame_rate: FrameRate::Unknown,
                         hdr: HdrFormat::Sdr,
                         color_space: ColorSpace::Bt709,
                         secondary: false,
@@ -393,8 +405,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     0x02 => Some(Stream::Video(VideoStream {
                         pid: es_pid,
                         codec: Codec::Mpeg2,
-                        resolution: "1080i".into(),
-                        frame_rate: String::new(),
+                        resolution: Resolution::R1080i,
+                        frame_rate: FrameRate::Unknown,
                         hdr: HdrFormat::Sdr,
                         color_space: ColorSpace::Bt709,
                         secondary: false,
@@ -403,45 +415,45 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     0x81 => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
                         codec: Codec::Ac3,
-                        channels: "5.1".into(),
+                        channels: AudioChannels::Surround51,
                         language: "und".into(),
-                        sample_rate: "48kHz".into(),
+                        sample_rate: SampleRate::S48,
                         secondary: false,
                         label: String::new(),
                     })),
                     0x83 => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
                         codec: Codec::TrueHd,
-                        channels: "5.1".into(),
+                        channels: AudioChannels::Surround51,
                         language: "und".into(),
-                        sample_rate: "48kHz".into(),
+                        sample_rate: SampleRate::S48,
                         secondary: false,
                         label: String::new(),
                     })),
                     0x84 | 0xA1 => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
                         codec: Codec::Ac3Plus,
-                        channels: "5.1".into(),
+                        channels: AudioChannels::Surround51,
                         language: "und".into(),
-                        sample_rate: "48kHz".into(),
+                        sample_rate: SampleRate::S48,
                         secondary: false,
                         label: String::new(),
                     })),
                     0x85 | 0x86 => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
                         codec: Codec::DtsHdMa,
-                        channels: "5.1".into(),
+                        channels: AudioChannels::Surround51,
                         language: "und".into(),
-                        sample_rate: "48kHz".into(),
+                        sample_rate: SampleRate::S48,
                         secondary: false,
                         label: String::new(),
                     })),
                     0x82 => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
                         codec: Codec::Dts,
-                        channels: "5.1".into(),
+                        channels: AudioChannels::Surround51,
                         language: "und".into(),
-                        sample_rate: "48kHz".into(),
+                        sample_rate: SampleRate::S48,
                         secondary: false,
                         label: String::new(),
                     })),
