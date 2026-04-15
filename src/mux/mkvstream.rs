@@ -506,7 +506,7 @@ fn parse_mkv_header(
             "EBML header too large",
         ));
     }
-    skip_bytes(r, size as u64)?;
+    skip_bytes(r, size)?;
 
     let (id, _, _) = ebml::read_element_header(r)?;
     if id != ebml::SEGMENT {
@@ -560,7 +560,7 @@ fn parse_mkv_header(
             }
             ebml::CLUSTER => break,
             _ if size != u64::MAX => {
-                skip_bytes(r, size as u64)?;
+                skip_bytes(r, size)?;
             }
             _ => break,
         }
