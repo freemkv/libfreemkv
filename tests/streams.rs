@@ -121,7 +121,11 @@ fn open_input_bare_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("not a valid stream URL") || msg.contains("E9002"), "got: {}", msg);
+    assert!(
+        msg.contains("not a valid stream URL") || msg.contains("E9002"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -133,7 +137,11 @@ fn open_output_bare_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("not a valid stream URL") || msg.contains("E9002"), "got: {}", msg);
+    assert!(
+        msg.contains("not a valid stream URL") || msg.contains("E9002"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -144,7 +152,11 @@ fn open_input_m2ts_empty_path_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("requires a file path") || msg.contains("E9003"), "got: {}", msg);
+    assert!(
+        msg.contains("requires a file path") || msg.contains("E9003"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -155,7 +167,11 @@ fn open_output_null_input_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("write-only") || msg.contains("E9001"), "got: {}", msg);
+    assert!(
+        msg.contains("write-only") || msg.contains("E9001"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -167,7 +183,11 @@ fn open_output_disc_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("read-only") || msg.contains("E9000"), "got: {}", msg);
+    assert!(
+        msg.contains("read-only") || msg.contains("E9000"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -178,7 +198,11 @@ fn open_input_network_no_port_errors() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("expected error"),
     };
-    assert!(msg.contains("PES pipeline") || msg.contains("missing port") || msg.contains("E9004"), "got: {}", msg);
+    assert!(
+        msg.contains("PES pipeline") || msg.contains("missing port") || msg.contains("E9004"),
+        "got: {}",
+        msg
+    );
 }
 
 #[test]

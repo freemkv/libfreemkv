@@ -17,8 +17,16 @@ impl NullStream {
 }
 
 impl crate::pes::Stream for NullStream {
-    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> { Ok(None) }
-    fn write(&mut self, _: &crate::pes::PesFrame) -> io::Result<()> { Ok(()) }
-    fn finish(&mut self) -> io::Result<()> { Ok(()) }
-    fn info(&self) -> &DiscTitle { &self.disc_title }
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        Ok(None)
+    }
+    fn write(&mut self, _: &crate::pes::PesFrame) -> io::Result<()> {
+        Ok(())
+    }
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn info(&self) -> &DiscTitle {
+        &self.disc_title
+    }
 }

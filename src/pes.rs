@@ -28,7 +28,8 @@ impl PesFrame {
         if self.data.len() > u32::MAX as usize {
             return Err(crate::error::Error::PesFrameTooLarge {
                 size: self.data.len(),
-            }.into());
+            }
+            .into());
         }
         w.write_all(&[self.track as u8])?;
         w.write_all(&self.pts.to_le_bytes())?;
@@ -49,8 +50,7 @@ impl PesFrame {
         }
         let track = header[0] as usize;
         let pts = i64::from_le_bytes([
-            header[1], header[2], header[3], header[4],
-            header[5], header[6], header[7], header[8],
+            header[1], header[2], header[3], header[4], header[5], header[6], header[7], header[8],
         ]);
         let keyframe = header[9] != 0;
         let len = u32::from_le_bytes([header[10], header[11], header[12], header[13]]) as usize;
@@ -59,7 +59,12 @@ impl PesFrame {
         }
         let mut data = vec![0u8; len];
         r.read_exact(&mut data)?;
-        Ok(Some(Self { track, pts, keyframe, data }))
+        Ok(Some(Self {
+            track,
+            pts,
+            keyframe,
+            data,
+        }))
     }
 
     /// Create from a codec::Frame with a track index.
@@ -88,10 +93,14 @@ pub trait Stream {
     fn info(&self) -> &crate::disc::DiscTitle;
 
     /// Codec initialization data for a track (SPS/PPS, etc).
-    fn codec_private(&self, _track: usize) -> Option<Vec<u8>> { None }
+    fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
+        None
+    }
 
     /// True when codec_private is available for all video tracks.
-    fn headers_ready(&self) -> bool { true }
+    fn headers_ready(&self) -> bool {
+        true
+    }
 }
 
 /// Wraps any output stream and counts bytes written.

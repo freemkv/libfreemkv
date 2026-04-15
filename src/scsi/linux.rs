@@ -166,7 +166,10 @@ impl SgIoTransport {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
             Error::DevicePermission {
-                path: format!("{}: permission denied (try running as root)", device.display()),
+                path: format!(
+                    "{}: permission denied (try running as root)",
+                    device.display()
+                ),
             }
         } else {
             Error::DeviceNotFound {
@@ -225,10 +228,7 @@ impl SgIoTransport {
             if let Ok(mut entries) = std::fs::read_dir(&sg_dir) {
                 if let Some(Ok(entry)) = entries.next() {
                     let sg_name = entry.file_name();
-                    return std::path::PathBuf::from(format!(
-                        "/dev/{}",
-                        sg_name.to_string_lossy()
-                    ));
+                    return std::path::PathBuf::from(format!("/dev/{}", sg_name.to_string_lossy()));
                 }
             }
         }

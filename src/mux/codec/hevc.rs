@@ -69,9 +69,15 @@ impl CodecParser for HevcParser {
                     let nal_type = (data[nal_start] >> 1) & 0x3F;
 
                     match nal_type {
-                        NAL_VPS => { self.vps = Some(data[nal_start..end].to_vec()); }
-                        NAL_SPS => { self.sps = Some(data[nal_start..end].to_vec()); }
-                        NAL_PPS => { self.pps = Some(data[nal_start..end].to_vec()); }
+                        NAL_VPS => {
+                            self.vps = Some(data[nal_start..end].to_vec());
+                        }
+                        NAL_SPS => {
+                            self.sps = Some(data[nal_start..end].to_vec());
+                        }
+                        NAL_PPS => {
+                            self.pps = Some(data[nal_start..end].to_vec());
+                        }
                         NAL_AUD => {} // Skip access unit delimiters
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;

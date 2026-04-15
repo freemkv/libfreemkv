@@ -1119,7 +1119,11 @@ impl Disc {
         use std::io::{Seek, SeekFrom, Write};
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
-        let keys = if decrypt { self.decrypt_keys() } else { crate::decrypt::DecryptKeys::None };
+        let keys = if decrypt {
+            self.decrypt_keys()
+        } else {
+            crate::decrypt::DecryptKeys::None
+        };
 
         // Resume: check existing file
         let (start_lba, file) = if resume {
@@ -1138,14 +1142,13 @@ impl Disc {
                     (safe_sectors, f)
                 }
                 _ => {
-                    let f = std::fs::File::create(path)
-                        .map_err(|e| Error::IoError { source: e })?;
+                    let f =
+                        std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
                     (0u32, f)
                 }
             }
         } else {
-            let f = std::fs::File::create(path)
-                .map_err(|e| Error::IoError { source: e })?;
+            let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
             (0u32, f)
         };
 
@@ -1159,7 +1162,6 @@ impl Disc {
             let remaining = self.capacity_sectors - lba;
             let count = remaining.min(batch as u32) as u16;
             let bytes = count as usize * 2048;
-
 
             reader
                 .read_sectors(lba, count, &mut buf[..bytes])

@@ -26,7 +26,8 @@ impl IsoSectorReader {
         if sectors > u32::MAX as u64 {
             return Err(crate::error::Error::IsoTooLarge {
                 path: path.to_string(),
-            }.into());
+            }
+            .into());
         }
         let capacity = sectors as u32;
         Ok(Self { file, capacity })

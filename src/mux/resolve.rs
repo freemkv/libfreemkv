@@ -128,12 +128,14 @@ fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(crate::error::Error::StreamUrlMissingPath {
             scheme: scheme.to_string(),
-        }.into());
+        }
+        .into());
     }
     if path.file_name().is_none() {
         return Err(crate::error::Error::StreamUrlInvalid {
             url: format!("{scheme}://{}", path.display()),
-        }.into());
+        }
+        .into());
     }
     Ok(())
 }
@@ -143,12 +145,14 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
     if addr.is_empty() {
         return Err(crate::error::Error::StreamUrlMissingPath {
             scheme: "network".to_string(),
-        }.into());
+        }
+        .into());
     }
     if !addr.contains(':') {
         return Err(crate::error::Error::StreamUrlMissingPort {
             addr: addr.to_string(),
-        }.into());
+        }
+        .into());
     }
     Ok(())
 }
@@ -169,10 +173,15 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Disc { device } => {
             // Open drive, init, scan — caller manages the drive
             let mut drive = match device {
-                Some(ref d) => crate::drive::Drive::open(d)
-                    .map_err(|e| -> io::Error { e.into() })?,
-                None => crate::drive::find_drive()
-                    .ok_or_else(|| -> io::Error { crate::error::Error::DeviceNotFound { path: String::new() }.into() })?,
+                Some(ref d) => {
+                    crate::drive::Drive::open(d).map_err(|e| -> io::Error { e.into() })?
+                }
+                None => crate::drive::find_drive().ok_or_else(|| -> io::Error {
+                    crate::error::Error::DeviceNotFound {
+                        path: String::new(),
+                    }
+                    .into()
+                })?,
             };
             let _ = drive.wait_ready();
             let _ = drive.init();
@@ -181,7 +190,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 drive,
                 opts.keydb_path.as_deref(),
                 opts.title_index.unwrap_or(0),
-            ).map_err(|e| -> io::Error { e.into() })?;
+            )
+            .map_err(|e| -> io::Error { e.into() })?;
             if opts.raw {
                 stream.set_raw();
             }
@@ -193,7 +203,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 Some(p) => crate::disc::ScanOptions::with_keydb(p),
                 None => crate::disc::ScanOptions::default(),
             };
-            let mut stream = DiscStream::open_iso(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
+            let mut stream =
+                DiscStream::open_iso(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
             if opts.raw {
                 stream.set_raw();
             }
@@ -201,15 +212,17 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::open(path)
-                .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e)))?;
+            let file = std::fs::File::open(path).map_err(|e| {
+                io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e))
+            })?;
             let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::open(reader)?))
         }
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            let file = std::fs::File::open(path)
-                .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
+            let file = std::fs::File::open(path).map_err(|e| {
+                io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e))
+            })?;
             let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::open(reader)?))
         }
@@ -217,16 +230,10 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::listen(addr)?))
         }
-        StreamUrl::Stdio => {
-            Ok(Box::new(StdioStream::input()))
-        }
-        StreamUrl::Null => {
-            Err(crate::error::Error::StreamWriteOnly.into())
-        }
+        StreamUrl::Stdio => Ok(Box::new(StdioStream::input())),
+        StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
-            Err(crate::error::Error::StreamUrlInvalid {
-                url: raw.clone(),
-            }.into())
+            Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
     }
 }
@@ -240,16 +247,18 @@ pub fn output(
     match parsed {
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            let file = std::fs::File::create(path)
-                .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
+            let file = std::fs::File::create(path).map_err(|e| {
+                io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e))
+            })?;
             let writer: Box<dyn super::WriteSeek> =
                 Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
             Ok(Box::new(MkvStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::create(path)
-                .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e)))?;
+            let file = std::fs::File::create(path).map_err(|e| {
+                io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e))
+            })?;
             let writer = std::io::BufWriter::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
@@ -257,22 +266,12 @@ pub fn output(
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
         }
-        StreamUrl::Stdio => {
-            Ok(Box::new(StdioStream::output(title)))
-        }
-        StreamUrl::Null => {
-            Ok(Box::new(NullStream::new(title)))
-        }
-        StreamUrl::Disc { .. } => {
-            Err(crate::error::Error::StreamReadOnly.into())
-        }
-        StreamUrl::Iso { .. } => {
-            Err(crate::error::Error::StreamReadOnly.into())
-        }
+        StreamUrl::Stdio => Ok(Box::new(StdioStream::output(title))),
+        StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
+        StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        StreamUrl::Iso { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         StreamUrl::Unknown { ref raw } => {
-            Err(crate::error::Error::StreamUrlInvalid {
-                url: raw.clone(),
-            }.into())
+            Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
     }
 }

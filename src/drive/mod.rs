@@ -150,7 +150,18 @@ impl Drive {
     /// Uses GET EVENT STATUS NOTIFICATION which works regardless of firmware state.
     pub fn drive_status(&mut self) -> DriveStatus {
         // GET EVENT STATUS NOTIFICATION: polled, media event class (0x10)
-        let cdb = [SCSI_GET_EVENT_STATUS, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x08, 0x00];
+        let cdb = [
+            SCSI_GET_EVENT_STATUS,
+            0x01,
+            0x00,
+            0x00,
+            0x10,
+            0x00,
+            0x00,
+            0x00,
+            0x08,
+            0x00,
+        ];
         let mut buf = [0u8; 8];
         match self.scsi.as_mut().execute(
             &cdb,
@@ -343,7 +354,18 @@ impl Drive {
     /// Read REPORT KEY RPC state (region playback control).
     pub fn report_key_rpc_state(&mut self) -> Option<Vec<u8>> {
         let cdb = [
-            SCSI_REPORT_KEY, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00,
+            SCSI_REPORT_KEY,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x08,
+            0x08,
+            0x00,
         ];
         let mut buf = vec![0u8; 8];
         let r = self
@@ -365,7 +387,18 @@ impl Drive {
 
     /// Read MODE SENSE page data.
     pub fn mode_sense_page(&mut self, page: u8) -> Option<Vec<u8>> {
-        let cdb = [SCSI_MODE_SENSE, 0x00, page, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x00];
+        let cdb = [
+            SCSI_MODE_SENSE,
+            0x00,
+            page,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0xFC,
+            0x00,
+        ];
         let mut buf = vec![0u8; 252];
         let r = self
             .scsi
@@ -421,7 +454,11 @@ impl Drive {
     /// Returns Err only after all attempts exhausted — user should clean
     /// the disc and resume.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        let timeout_ms = if self.recovery_bytes_remaining > 0 { 30_000 } else { 10_000 };
+        let timeout_ms = if self.recovery_bytes_remaining > 0 {
+            30_000
+        } else {
+            10_000
+        };
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,
@@ -437,7 +474,10 @@ impl Drive {
 
         // Normal read
         if let Ok(result) = self.scsi.as_mut().execute(
-            &cdb, crate::scsi::DataDirection::FromDevice, buf, timeout_ms,
+            &cdb,
+            crate::scsi::DataDirection::FromDevice,
+            buf,
+            timeout_ms,
         ) {
             if self.recovery_bytes_remaining > 0 {
                 let bytes_read = count as u64 * 2048;
@@ -457,7 +497,10 @@ impl Drive {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             if let Ok(result) = self.scsi.as_mut().execute(
-                &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                buf,
+                30_000,
             ) {
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
@@ -479,7 +522,10 @@ impl Drive {
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             if let Ok(result) = self.scsi.as_mut().execute(
-                &cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000,
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                buf,
+                30_000,
             ) {
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
@@ -524,7 +570,14 @@ impl Drive {
 
     /// Lock the tray so the disc cannot be ejected during a rip.
     pub fn lock_tray(&mut self) {
-        let prevent = [SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, 0x00, 0x00, 0x00, 0x01, 0x00];
+        let prevent = [
+            SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+        ];
         let mut buf = [0u8; 0];
         let _ =
             self.scsi
@@ -534,7 +587,14 @@ impl Drive {
 
     /// Unlock the tray so the user can manually eject the disc.
     pub fn unlock_tray(&mut self) {
-        let allow = [SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let allow = [
+            SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
         let mut buf = [0u8; 0];
         let _ =
             self.scsi

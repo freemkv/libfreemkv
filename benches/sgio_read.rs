@@ -34,8 +34,10 @@ fn main() {
     let file = std::fs::File::create("/dev/null").unwrap();
     let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
 
-    eprintln!("Reading 1000 batches ({:.1} MB) with write + progress...",
-        1000.0 * batch as f64 * 2048.0 / 1_048_576.0);
+    eprintln!(
+        "Reading 1000 batches ({:.1} MB) with write + progress...",
+        1000.0 * batch as f64 * 2048.0 / 1_048_576.0
+    );
 
     let start = Instant::now();
     let mut ok = 0u32;
@@ -51,7 +53,9 @@ fn main() {
             }
             Err(e) => {
                 fail += 1;
-                if fail <= 5 { eprintln!("  FAIL LBA {}: {}", lba, e); }
+                if fail <= 5 {
+                    eprintln!("  FAIL LBA {}: {}", lba, e);
+                }
                 buf.fill(0);
                 writer.write_all(&buf).unwrap();
             }
@@ -67,5 +71,12 @@ fn main() {
 
     let elapsed = start.elapsed().as_secs_f64();
     let mb = ok as f64 * batch as f64 * 2048.0 / 1_048_576.0;
-    eprintln!("\n{} ok, {} fail, {:.1} MB in {:.1}s = {:.1} MB/s", ok, fail, mb, elapsed, mb / elapsed);
+    eprintln!(
+        "\n{} ok, {} fail, {:.1} MB in {:.1}s = {:.1} MB/s",
+        ok,
+        fail,
+        mb,
+        elapsed,
+        mb / elapsed
+    );
 }

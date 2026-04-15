@@ -12,9 +12,9 @@ const TS_PAYLOAD: usize = 184;
 pub struct TsMuxer<W: Write> {
     writer: W,
     pids: Vec<u16>,
-    continuity: Vec<u8>,        // per-PID continuity counter (0-15)
+    continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
-    params_written: Vec<bool>,  // per-track: have we written parameter sets?
+    params_written: Vec<bool>,            // per-track: have we written parameter sets?
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -40,12 +40,7 @@ impl<W: Write> TsMuxer<W> {
     /// Write a PES frame as BD-TS packets.
     /// Video frame data is expected as length-prefixed NALUs (MKV/PES format)
     /// and is converted to Annex B for transport stream.
-    pub fn write_frame(
-        &mut self,
-        track: usize,
-        pts_ns: i64,
-        data: &[u8],
-    ) -> io::Result<()> {
+    pub fn write_frame(&mut self, track: usize, pts_ns: i64, data: &[u8]) -> io::Result<()> {
         if track >= self.pids.len() {
             return Ok(()); // unknown track, skip
         }
@@ -125,11 +120,13 @@ impl<W: Write> TsMuxer<W> {
                         self.writer.write_all(&STUFF_FF[..stuff_len - 2])?;
                     }
                 }
-                self.writer.write_all(&pes_packet[offset..offset + payload_len])?;
+                self.writer
+                    .write_all(&pes_packet[offset..offset + payload_len])?;
             } else {
                 self.writer.write_all(&tp_extra)?;
                 self.writer.write_all(&ts_header)?;
-                self.writer.write_all(&pes_packet[offset..offset + payload_len])?;
+                self.writer
+                    .write_all(&pes_packet[offset..offset + payload_len])?;
             }
 
             offset += payload_len;
@@ -202,24 +199,34 @@ fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
     let mut offset = 23;
 
     for _ in 0..num_arrays {
-        if offset + 3 > hvcc.len() { break; }
+        if offset + 3 > hvcc.len() {
+            break;
+        }
         // array: 1 byte (completeness + NAL type), 2 bytes (numNalus)
         let _nal_type = hvcc[offset] & 0x3F;
         let num_nalus = u16::from_be_bytes([hvcc[offset + 1], hvcc[offset + 2]]) as usize;
         offset += 3;
 
         for _ in 0..num_nalus {
-            if offset + 2 > hvcc.len() { break; }
+            if offset + 2 > hvcc.len() {
+                break;
+            }
             let nal_len = u16::from_be_bytes([hvcc[offset], hvcc[offset + 1]]) as usize;
             offset += 2;
-            if offset + nal_len > hvcc.len() { break; }
+            if offset + nal_len > hvcc.len() {
+                break;
+            }
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             out.extend_from_slice(&hvcc[offset..offset + nal_len]);
             offset += nal_len;
         }
     }
 
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Convert length-prefixed NALUs (4-byte BE length + NAL) to Annex B

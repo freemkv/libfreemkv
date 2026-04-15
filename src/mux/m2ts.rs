@@ -7,7 +7,11 @@ use super::{meta, ts};
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use std::io::{self, Read, Write};
 
-type PesSetup = (Vec<u16>, Vec<(u16, Box<dyn super::codec::CodecParser>)>, Vec<(u16, usize)>);
+type PesSetup = (
+    Vec<u16>,
+    Vec<(u16, Box<dyn super::codec::CodecParser>)>,
+    Vec<(u16, usize)>,
+);
 
 /// Size of initial scan buffer for PMT/stream detection.
 const SCAN_SIZE: usize = 1024 * 1024;
@@ -59,11 +63,15 @@ impl M2tsStream {
             let m = meta::M2tsMeta::from_title(title);
             meta::write_header(&mut writer, &m)?;
         }
-        let pids: Vec<u16> = title.streams.iter().map(|s| match s {
-            DiscStream::Video(v) => v.pid,
-            DiscStream::Audio(a) => a.pid,
-            DiscStream::Subtitle(s) => s.pid,
-        }).collect();
+        let pids: Vec<u16> = title
+            .streams
+            .iter()
+            .map(|s| match s {
+                DiscStream::Video(v) => v.pid,
+                DiscStream::Audio(a) => a.pid,
+                DiscStream::Subtitle(s) => s.pid,
+            })
+            .collect();
         let boxed: Box<dyn Write> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
         for (i, cp) in title.codec_privates.iter().enumerate() {
@@ -117,11 +125,16 @@ impl M2tsStream {
             let (pids, parsers, pid_to_track) = Self::setup_pes(&title.streams);
             // Chain: remaining head bytes + rest of reader
             let remaining_head = &head[header_end..];
-            let chain: Box<dyn Read> = Box::new(io::Cursor::new(remaining_head.to_vec()).chain(reader));
+            let chain: Box<dyn Read> =
+                Box::new(io::Cursor::new(remaining_head.to_vec()).chain(reader));
             return Ok(Self {
                 disc_title: title.clone(),
                 mode: Mode::Read { reader: chain },
-                demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
+                demuxer: if pids.is_empty() {
+                    None
+                } else {
+                    Some(ts::TsDemuxer::new(&pids))
+                },
                 parsers,
                 pending_frames: std::collections::VecDeque::new(),
                 pid_to_track,
@@ -146,7 +159,11 @@ impl M2tsStream {
                 ..DiscTitle::empty()
             },
             mode: Mode::Read { reader: chain },
-            demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
+            demuxer: if pids.is_empty() {
+                None
+            } else {
+                Some(ts::TsDemuxer::new(&pids))
+            },
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
@@ -161,7 +178,9 @@ impl crate::pes::Stream for M2tsStream {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
         }
-        if self.pes_eof { return Ok(None); }
+        if self.pes_eof {
+            return Ok(None);
+        }
 
         loop {
             let reader = match &mut self.mode {
@@ -175,11 +194,15 @@ impl crate::pes::Stream for M2tsStream {
                 // Flush demuxer — last PES packet may still be in the assembler
                 if let Some(ref mut demuxer) = self.demuxer {
                     for pes in &demuxer.flush() {
-                        if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
-                            if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                        if let Some((_, track)) =
+                            self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
+                        {
+                            if let Some((_, parser)) =
+                                self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
+                            {
                                 for frame in parser.parse(pes) {
                                     self.pending_frames.push_back(
-                                        crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                        crate::pes::PesFrame::from_codec_frame(*track, frame),
                                     );
                                 }
                             }
@@ -192,11 +215,15 @@ impl crate::pes::Stream for M2tsStream {
             if let Some(ref mut demuxer) = self.demuxer {
                 let packets = demuxer.feed(&buf[..n]);
                 for pes in &packets {
-                    if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
-                        if let Some((_, parser)) = self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid) {
+                    if let Some((_, track)) =
+                        self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid)
+                    {
+                        if let Some((_, parser)) =
+                            self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
+                        {
                             for frame in parser.parse(pes) {
                                 self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(*track, frame)
+                                    crate::pes::PesFrame::from_codec_frame(*track, frame),
                                 );
                             }
                         }
@@ -224,7 +251,9 @@ impl crate::pes::Stream for M2tsStream {
         }
     }
 
-    fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
+    fn info(&self) -> &crate::disc::DiscTitle {
+        &self.disc_title
+    }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         // First check stored codec_privates from FMKV header
@@ -232,10 +261,13 @@ impl crate::pes::Stream for M2tsStream {
             return Some(cp.clone());
         }
         // Fall back to parser-extracted codec_private
-        let pid = self.pid_to_track.iter()
+        let pid = self
+            .pid_to_track
+            .iter()
             .find(|(_, idx)| *idx == track)
             .map(|(pid, _)| *pid)?;
-        self.parsers.iter()
+        self.parsers
+            .iter()
             .find(|(p, _)| *p == pid)
             .and_then(|(_, parser)| parser.codec_private())
     }
@@ -251,4 +283,3 @@ impl crate::pes::Stream for M2tsStream {
         true
     }
 }
-

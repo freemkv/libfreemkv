@@ -329,7 +329,10 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                     let section_len = (((data[pat_start + 1] & 0x0F) as usize) << 8)
                         | data[pat_start + 2] as usize;
                     let entries_start = pat_start + 8;
-                    if section_len < 4 { offset += BD_TS_PACKET_SIZE; continue; }
+                    if section_len < 4 {
+                        offset += BD_TS_PACKET_SIZE;
+                        continue;
+                    }
                     let entries_end = pat_start + 3 + section_len - 4;
                     let mut e = entries_start;
                     while e + 4 <= data.len() && e < entries_end {
