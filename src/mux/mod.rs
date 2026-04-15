@@ -79,5 +79,5 @@ pub trait IOStream: Read + Write {
 pub(crate) trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
-pub(crate) trait WriteSeek: Write + Seek {}
+pub trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}
