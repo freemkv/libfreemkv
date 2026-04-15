@@ -33,6 +33,7 @@ pub struct NetworkStream {
     disc_title: DiscTitle,
     mode: Mode,
     finished: bool,
+    ts_reader: Option<super::tsreader::TsDemuxReader<BufReader<TcpStream>>>,
 }
 
 impl NetworkStream {
@@ -47,6 +48,7 @@ impl NetworkStream {
                 header_written: false,
             },
             finished: false,
+            ts_reader: None,
         })
     }
 
@@ -74,10 +76,12 @@ impl NetworkStream {
             })?
             .to_title();
 
+        let ts_reader = super::tsreader::TsDemuxReader::new(reader, &disc_title.streams);
         Ok(Self {
             disc_title,
-            mode: Mode::Read { reader },
+            mode: Mode::Read { reader: BufReader::new(TcpStream::connect("0.0.0.0:0").unwrap()) }, // placeholder
             finished: false,
+            ts_reader: Some(ts_reader),
         })
     }
 }

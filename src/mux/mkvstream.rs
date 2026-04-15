@@ -149,6 +149,64 @@ impl MkvStream {
     }
 }
 
+impl crate::pes::Stream for MkvStream {
+    fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        let rs = match self.mode {
+            Mode::Read(ref mut rs) => rs,
+            Mode::Write(_) => return Err(io::Error::new(io::ErrorKind::Unsupported, "write-only")),
+        };
+
+        loop {
+            let (id, size, _) = match ebml::read_element_header(&mut rs.reader) {
+                Ok(h) => h,
+                Err(_) => return Ok(None),
+            };
+
+            match id {
+                ebml::CLUSTER => continue,
+                ebml::CLUSTER_TIMESTAMP => {
+                    rs.cluster_ts_ms = ebml::read_uint_val(&mut rs.reader, size as usize)? as i64;
+                    continue;
+                }
+                ebml::SIMPLE_BLOCK => {
+                    let block = ebml::read_binary_val(&mut rs.reader, size as usize)?;
+                    if block.len() < 4 { continue; }
+
+                    let (track, vl) = block_vint(&block);
+                    if vl + 3 > block.len() { continue; }
+
+                    let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
+                    let keyframe = block[vl + 2] & 0x80 != 0;
+                    let data = block[vl + 3..].to_vec();
+                    let pts_ms = rs.cluster_ts_ms + rel_ts as i64;
+                    let track_idx = (track as usize).saturating_sub(1); // MKV tracks are 1-based
+
+                    return Ok(Some(crate::pes::PesFrame {
+                        track: track_idx,
+                        pts: pts_ms * 1_000_000, // ms → ns
+                        keyframe,
+                        data,
+                    }));
+                }
+                _ => {
+                    // Skip unknown element
+                    let mut skip = vec![0u8; size as usize];
+                    let _ = rs.reader.read_exact(&mut skip);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "use MkvOutputStream for writing"))
+    }
+
+    fn finish(&mut self) -> io::Result<()> { Ok(()) }
+
+    fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
+}
+
 impl IOStream for MkvStream {
     fn info(&self) -> &DiscTitle {
         &self.disc_title

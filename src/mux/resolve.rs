@@ -214,10 +214,12 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;
-            Ok(Box::new(NetworkStream::listen(addr)?))
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "network:// input requires PES deserialization (TODO)"))
         }
         StreamUrl::Stdio => {
-            Ok(Box::new(StdioStream::input()))
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "stdio:// input requires PES deserialization (TODO)"))
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
@@ -347,20 +349,18 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            // MKV as PES input requires EBML → PES frame extraction (TODO)
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "mkv:// as input not yet supported — use m2ts:// or iso:// as source"))
+            let file = std::fs::File::open(path)
+                .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
+            let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
+            Ok(Box::new(MkvStream::open(reader)?))
         }
-        StreamUrl::Network { ref addr } => {
-            validate_network_addr(addr)?;
-            // TODO: NetworkStream InputStream (TCP → TS demux → PES)
+        StreamUrl::Network { .. } => {
             Err(io::Error::new(io::ErrorKind::Unsupported,
-                "network:// PES input not yet implemented"))
+                "network:// input requires PES deserialization (TODO)"))
         }
         StreamUrl::Stdio => {
-            // TODO: StdioStream InputStream
             Err(io::Error::new(io::ErrorKind::Unsupported,
-                "stdio:// PES input not yet implemented"))
+                "stdio:// input requires PES deserialization (TODO)"))
         }
         StreamUrl::Unknown { ref raw } => {
             Err(io::Error::new(io::ErrorKind::InvalidInput,
