@@ -13,9 +13,9 @@ AACS keys are derived internally, and all SCSI communication is handled in-proce
 
 1. **CLI is dumb.** All drive communication, disc parsing, AACS decryption, and
    format handling live in the library. CLI binaries are thin wrappers that call
-   `DriveSession::open()` and `Disc::scan()`.
+   `Drive::open()` and `Disc::scan()`.
 
-2. **No external files.** 206 drive profiles are compiled into the binary via
+2. **No external files.** Bundled drive profiles are compiled into the binary via
    `include_str!`. No configuration directory, no runtime file lookups for drive
    support.
 
@@ -23,11 +23,15 @@ AACS keys are derived internally, and all SCSI communication is handled in-proce
    available. Callers read cleartext sectors without knowing whether the disc
    was encrypted.
 
-4. **Structured errors, no English.** Every error has a numeric code (E1000-E7000).
+4. **Structured errors, no English.** Every error has a numeric code (E1000-E8000).
    The library never formats user-facing messages -- applications do that.
 
 5. **Library-agnostic.** No concept of "supported" vs "unsupported" drives at a
    policy level. If a profile exists, the library uses it.
+
+6. **Streams are dumb pipes.** Streams read/write PES frames. They don't know
+   about encryption, transport format, or source type. Decrypt is a stream-internal
+   concern; the pipeline just moves frames.
 
 ---
 
@@ -37,26 +41,39 @@ AACS keys are derived internally, and all SCSI communication is handled in-proce
 libfreemkv (lib.rs)
 │
 ├── Drive Access
-│   ├── drive         DriveSession — open, identify, unlock, read
-│   ├── scsi          ScsiTransport trait + SG_IO implementation
+│   ├── drive         Drive — open, identify, init, unlock, read (with recovery)
+│   ├── scsi          ScsiTransport trait + platform backends (SG_IO, IOKit, SPTI)
 │   ├── platform/     Platform trait — per-chipset command handlers
-│   │   └── mt1959    MediaTek MT1959 driver (LG, ASUS, hp)
+│   │   └── mt1959    MediaTek MT1959 driver (LG, ASUS, HP)
 │   ├── profile       DriveProfile loading, matching, bundled JSON
 │   ├── identity      DriveId from INQUIRY + GET_CONFIG 010C
-│   └── speed         DriveSpeed enum, SET CD SPEED CDB builder
+│   ├── speed         DriveSpeed enum, SET CD SPEED CDB builder
+│   └── event         Event system for drive status callbacks
 │
 ├── Disc Scanning
 │   ├── disc          Disc::scan() — titles, streams, extents, AACS setup
 │   ├── udf           UDF 2.50 filesystem reader (metadata partitions)
 │   ├── mpls          MPLS playlist parser — clips, streams, STN table
 │   ├── clpi          CLPI clip info parser — EP map, sector extents
-│   └── jar           BD-J JAR label extraction (audio/subtitle names)
+│   ├── ifo           DVD IFO parser — title sets, PGC chains, cell addresses
+│   └── labels/       BD-J label extraction (5 formats: Paramount, Criterion, Pixelogic, CTRM, Deluxe)
 │
 ├── Encryption
-│   ├── aacs          KEYDB parsing, VUK lookup, MKB processing, unit decryption
-│   └── aacs_handshake  ECDH bus authentication, Volume ID, Read Data Key
+│   ├── aacs/         AACS handshake, KEYDB, VUK lookup, MKB, unit decryption
+│   ├── css           DVD CSS cipher — table-driven, no external keys needed
+│   └── decrypt       decrypt_sectors() — unified AACS/CSS/None dispatcher
 │
-└── error             Error enum with numeric codes E1000-E7000
+├── Streaming
+│   ├── mux/          Stream implementations (Disc, ISO, MKV, M2TS, Network, Stdio, Null)
+│   ├── pes           PES frame types, Stream trait (read/write frames)
+│   └── sector        SectorReader trait — abstracts disc vs ISO vs file
+│
+├── Support
+│   ├── keydb         KEYDB.cfg download, parse, verify, save
+│   ├── error         Error enum with numeric codes E1000-E8000
+│   └── profile       Bundled drive profiles
+│
+└── lib.rs            Public API re-exports
 ```
 
 ---
@@ -64,27 +81,28 @@ libfreemkv (lib.rs)
 ## Drive Access Flow
 
 ```
-DriveSession::open("/dev/sr0")
+Drive::open(Path::new("/dev/sg4"))
   │
-  ├─ scsi::open()           Open /dev/sr0 via SG_IO
+  ├─ scsi::open()           Open /dev/sg4 via SG_IO
   ├─ DriveId::from_drive()  INQUIRY + GET_CONFIG 010C
-  ├─ profile::find_by_drive_id()  Match against 206 bundled profiles
+  ├─ profile::find_by_drive_id()  Match against bundled profiles
   ├─ Platform::new()        Instantiate chipset driver (Mt1959)
-  └─ Platform::unlock()     Activate raw disc access mode
+  └─ Drive ready for init/unlock/read
 ```
 
-After open, the session provides:
-- `read_sectors(lba, count, buf)` -- raw sector reads (through platform driver)
-- `read_disc(lba, count, buf)` -- standard READ(10) for filesystem data
-- `scsi_execute(cdb, dir, buf, timeout)` -- arbitrary SCSI commands
-- `status()`, `calibrate()`, `read_config()`, `read_register()`
+After open:
+- `init()` -- unlock + firmware upload + speed calibration
+- `probe_disc()` -- probe disc surface for optimal speeds
+- `read(lba, count, buf)` -- single read method with built-in error recovery
+- `wait_ready()` -- wait for disc insertion
+- `eject()` -- eject tray
 
 ---
 
 ## Disc Scanning Flow
 
 ```
-Disc::scan(&mut session, &ScanOptions)
+Disc::scan(&mut drive, &ScanOptions)
   │
   ├─ READ CAPACITY          Get disc size in sectors
   ├─ udf::read_filesystem() Parse UDF 2.50 (AVDP → VDS → metadata → FSD → root)
@@ -92,14 +110,24 @@ Disc::scan(&mut session, &ScanOptions)
   │   ├─ mpls::parse()      Extract play items, STN streams
   │   └─ For each clip:
   │       └─ clpi::parse()  EP map → sector extents for the clip's time range
+  ├─ labels::detect()       Parse BD-J JARs for stream labels
   ├─ Detect AACS            Check for /AACS directory on disc
   └─ Disc::setup_aacs()     Handshake + KEYDB → VUK → unit keys (if encrypted)
 ```
 
+For DVD:
+```
+Disc::scan_dvd(&mut drive, &ScanOptions)
+  │
+  ├─ ifo::parse()           Parse VIDEO_TS.IFO — title sets, PGC chains
+  ├─ CSS detection          Check disc structure flag
+  └─ CSS key cracking       Table-driven, no KEYDB needed
+```
+
 The result is a `Disc` with:
-- `titles: Vec<Title>` -- sorted by duration, each with streams and sector extents
-- `aacs: Option<AacsState>` -- decryption keys if available
-- `encrypted: bool` -- whether the disc uses AACS
+- `titles: Vec<DiscTitle>` -- sorted by duration, each with streams, sector extents, codec_privates
+- `decrypt_keys()` -- DecryptKeys for content decryption
+- `encrypted: bool` -- whether the disc uses AACS/CSS
 
 ---
 
@@ -114,13 +142,14 @@ Four key resolution paths, tried in order:
 | 3 | Processing Keys + MKB → Media Key → VUK | Medium |
 | 4 | Device Keys + MKB subset-difference tree → VUK | Slow |
 
-The AACS handshake (`aacs_handshake`) performs ECDH key agreement over the
+The AACS handshake (`aacs/handshake`) performs ECDH key agreement over the
 AACS 1.0 160-bit elliptic curve to obtain:
 - **Volume ID** -- needed for VUK derivation (paths 2-4)
 - **Read Data Key** -- needed for AACS 2.0 (UHD) bus decryption
 
 Content decryption uses AES-128-CBC on 6144-byte aligned units. The
-`ContentReader` handles this transparently.
+`ContentReader` handles this transparently. Streams that read sectors
+(DiscStream, IsoStream) decrypt internally — the pipeline sees clean bytes.
 
 ---
 
@@ -138,6 +167,7 @@ is baked into the library.
 | E5xxx | I/O errors | `IoError` (wraps `std::io::Error`) |
 | E6xxx | Disc format errors | `DiscError` (UDF, MPLS, CLPI parse failures) |
 | E7xxx | AACS errors | `AacsError` (key resolution, handshake, decryption) |
+| E8xxx | KEYDB errors | `KeydbError` (download, parse, save) |
 
 ---
 
@@ -145,9 +175,9 @@ is baked into the library.
 
 | Platform | Transport | Status |
 |----------|-----------|--------|
-| Linux | SG_IO ioctl on `/dev/sr*` | Implemented |
-| macOS | IOKit SCSI passthrough | Planned |
-| Windows | SPTI (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) | Planned |
+| Linux | SG_IO ioctl on `/dev/sg*` | Supported |
+| macOS | IOKit SCSITask | Supported |
+| Windows | SPTI (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) | Supported |
 
 The `ScsiTransport` trait abstracts the platform. Adding a new platform requires
 implementing `execute()` for that OS and wiring it into `scsi::open()`.
@@ -158,11 +188,11 @@ implementing `execute()` for that OS and wiring it into `scsi::open()`.
 
 | Chipset | Drives | Status |
 |---------|--------|--------|
-| MediaTek MT1959 | LG, ASUS, hp | Implemented (206 profiles) |
+| MediaTek MT1959 | LG, ASUS, HP | Supported (bundled profiles) |
 | Renesas RS8xxx/RS9xxx | Pioneer, some HL-DT-ST | Planned |
 
 The `Platform` trait abstracts chipset-specific commands. Each chipset implements
-10 handlers (unlock, config, register, calibrate, keepalive, status, probe,
+handlers (unlock, config, register, calibrate, keepalive, status, probe,
 read_sectors, timing). All handlers are accessed via SCSI READ BUFFER with
 chipset-specific mode and buffer ID bytes.
 
@@ -174,7 +204,5 @@ chipset-specific mode and buffer ID bytes.
 cargo build --release
 ```
 
-Linux builds produce a static library and two binaries (`freemkv-info`,
-`freemkv-test`). The `libc` dependency is Linux-only. On non-Linux platforms,
-the library compiles but `scsi::open()` returns a platform-not-supported error
-until the IOKit/SPTI backends are implemented.
+Produces a Rust library crate. The `libc` dependency is unix-only (gated).
+All three platforms build and pass CI.

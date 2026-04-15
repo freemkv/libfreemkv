@@ -54,13 +54,7 @@ pub fn decrypt_sectors(
             let uk = match unit_keys.get(unit_key_idx) {
                 Some((_, k)) => *k,
                 None => {
-                    return Err(crate::error::Error::DecryptFailed {
-                        reason: format!(
-                            "unit_key_idx {} out of range (have {} keys)",
-                            unit_key_idx,
-                            unit_keys.len()
-                        ),
-                    });
+                    return Err(crate::error::Error::DecryptFailed);
                 }
             };
             let rdk = read_data_key.as_ref();

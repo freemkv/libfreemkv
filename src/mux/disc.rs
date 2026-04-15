@@ -1,42 +1,36 @@
-//! DiscStream — read sectors from an optical disc drive.
+//! DiscStream — read any disc (physical drive or ISO file) → PES frames.
 //!
-//! `DiscStream::open()` does the full init sequence:
-//!   drive open → wait_ready → init → probe_disc → scan
+//! One stream type for all disc sources. The source is a SectorReader —
+//! Drive (hardware) or IsoSectorReader (file). DiscStream doesn't care.
 //!
-//! Then reads title extents or full-disc sequentially.
-//! No decryption — that's a caller concern.
+//! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
-use super::IOStream;
 use crate::disc::{
     detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions,
 };
-use crate::drive::Drive;
-use crate::error::{Error, Result};
-use crate::event::{Event, EventKind};
-use std::io::{self, Read, Write};
-use std::path::Path;
+use crate::sector::SectorReader;
+use std::io;
 
-/// Optical disc stream. Read-only — yields raw sector bytes.
+/// Disc stream. Reads sectors from any source → PES frames.
 ///
-/// Created from an initialized Drive + title extents or full-disc mode.
-/// Error recovery (batch reduction, retry, zero-fill) is handled internally.
+/// Sources: physical drive, ISO file, or any SectorReader.
+/// Decrypt, demux, and codec parsing happen internally.
 pub struct DiscStream {
-    drive: Drive,
+    reader: Box<dyn SectorReader>,
     title: DiscTitle,
+    disc: Option<Disc>,
     decrypt_keys: crate::decrypt::DecryptKeys,
 
-    // What to read
-    mode: ReadMode,
+    // Extents to read
+    extents: Vec<Extent>,
 
     // Position
-    current_lba: u32,
     current_extent: usize,
     current_offset: u32,
 
     // Buffer
     read_buf: Vec<u8>,
     buf_valid: usize,
-    buf_cursor: usize,
 
     // Batch size for reads
     batch_sectors: u16,
@@ -51,77 +45,24 @@ pub struct DiscStream {
     pid_to_track: Vec<(u16, usize)>,
 }
 
-enum ReadMode {
-    /// Read title extents (for MKV, M2TS, etc.)
-    Extents(Vec<Extent>),
-    /// Read LBA 0 to capacity (for ISO)
-    Sequential { capacity: u32 },
-}
-
-/// Result of opening a DiscStream.
-pub struct DiscOpenResult {
-    pub stream: DiscStream,
-    pub disc: Disc,
-}
-
 impl DiscStream {
-    /// Open a disc drive, init, scan, and prepare to read a title.
-    ///
-    /// Steps (each does one thing):
-    ///   1. Drive::open (or find_drive)
-    ///   2. wait_ready
-    ///   3. init (non-fatal)
-    ///   4. probe_disc (non-fatal)
-    ///   5. Disc::scan
-    ///
-    /// Pass an event callback for status reporting, or None.
-    pub fn open(
-        device: Option<&Path>,
+    /// Open from a physical drive. Caller must have already called
+    /// drive.wait_ready(), drive.init(), drive.probe_disc().
+    /// Drive is moved into the stream — caller manages lock/unlock before/after.
+    pub fn open_drive(
+        drive: crate::drive::Drive,
         keydb_path: Option<&str>,
         title_index: usize,
-        on_event: Option<&dyn Fn(Event)>,
-    ) -> Result<DiscOpenResult> {
-        let emit = |kind: EventKind| {
-            if let Some(cb) = &on_event {
-                cb(Event { kind });
-            }
-        };
-
-        // 1. Open
-        let mut drive = match device {
-            Some(d) => Drive::open(d)?,
-            None => crate::drive::find_drive().ok_or_else(|| Error::DeviceNotFound {
-                path: String::new(),
-            })?,
-        };
-        emit(EventKind::DriveOpened {
-            device: drive.device_path().to_string(),
-        });
-
-        // 2. Wait
-        let _ = drive.wait_ready();
-        emit(EventKind::DriveReady);
-
-        // 3. Init
-        let init_ok = drive.init().is_ok();
-        emit(EventKind::InitComplete { success: init_ok });
-
-        // 4. Probe
-        let probe_ok = drive.probe_disc().is_ok();
-        emit(EventKind::ProbeComplete { success: probe_ok });
-
-        // 5. Scan
+    ) -> crate::error::Result<(Self, Disc)> {
         let scan_opts = match keydb_path {
             Some(kp) => ScanOptions::with_keydb(kp),
             None => ScanOptions::default(),
         };
+        let mut drive = drive;
         let disc = Disc::scan(&mut drive, &scan_opts)?;
-        emit(EventKind::ScanComplete {
-            titles: disc.titles.len(),
-        });
 
         if title_index >= disc.titles.len() {
-            return Err(Error::DiscTitleRange {
+            return Err(crate::error::Error::DiscTitleRange {
                 index: title_index,
                 count: disc.titles.len(),
             });
@@ -129,45 +70,59 @@ impl DiscStream {
 
         let title = disc.titles[title_index].clone();
         let keys = disc.decrypt_keys();
-        let mut stream = Self::title(drive, title);
-        stream.decrypt_keys = keys;
+        let max_batch = detect_max_batch_sectors(drive.device_path());
+        let content_format = disc.content_format;
 
-        // DVD: use program stream demuxer instead of transport stream
-        if disc.content_format == crate::disc::ContentFormat::MpegPs {
+        let mut stream = Self::from_reader(Box::new(drive), title, keys, max_batch);
+
+        if content_format == crate::disc::ContentFormat::MpegPs {
             stream.ts_demuxer = None;
             stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
         }
-
-        Ok(DiscOpenResult { stream, disc })
+        Ok((stream, disc))
     }
 
-    /// Create a stream that reads a title's extents.
-    /// Use this when you already have an initialized Drive.
-    pub fn title(drive: Drive, title: DiscTitle) -> Self {
-        let max_batch = detect_max_batch_sectors(drive.device_path());
+    /// Open from an ISO file.
+    pub fn open_iso(
+        path: &str,
+        title_index: Option<usize>,
+        opts: &ScanOptions,
+    ) -> io::Result<Self> {
+        let mut reader = super::iso::IsoSectorReader::open(path)?;
+        let capacity = reader.capacity();
+
+        let disc = Disc::scan_image(&mut reader, capacity, opts)
+            .map_err(|e| -> io::Error { e.into() })?;
+
+        if disc.titles.is_empty() {
+            return Err(crate::error::Error::NoStreams.into());
+        }
+        let idx = title_index.unwrap_or(0);
+        if idx >= disc.titles.len() {
+            return Err(crate::error::Error::DiscTitleRange {
+                index: idx,
+                count: disc.titles.len(),
+            }.into());
+        }
+
+        let title = disc.titles[idx].clone();
+        let keys = disc.decrypt_keys();
+        let batch: u16 = 64;
+
+        let mut stream = Self::from_reader(Box::new(reader), title, keys, batch);
+        stream.disc = Some(disc);
+        Ok(stream)
+    }
+
+    /// Create from any SectorReader + title + keys.
+    pub fn from_reader(
+        reader: Box<dyn SectorReader>,
+        title: DiscTitle,
+        decrypt_keys: crate::decrypt::DecryptKeys,
+        batch_sectors: u16,
+    ) -> Self {
         let extents = title.extents.clone();
-        Self::new(drive, title, ReadMode::Extents(extents), max_batch)
-    }
 
-    /// Create a stream that reads the full disc sequentially (for ISO).
-    pub fn full_disc(drive: Drive, title: DiscTitle, capacity: u32) -> Self {
-        let max_batch = detect_max_batch_sectors(drive.device_path());
-        Self::new(drive, title, ReadMode::Sequential { capacity }, max_batch)
-    }
-
-    /// Resume a full disc read from a given LBA (for ISO resume).
-    /// Use after checking an existing partial file:
-    ///   start_lba = (file_size / 2048) - safety_margin
-    pub fn full_disc_resume(drive: Drive, title: DiscTitle, capacity: u32, start_lba: u32) -> Self {
-        let max_batch = detect_max_batch_sectors(drive.device_path());
-        let mut stream = Self::new(drive, title, ReadMode::Sequential { capacity }, max_batch);
-        stream.current_lba = start_lba;
-        stream
-    }
-
-    /// Set SCSI read timeout (default 30s).
-    fn new(drive: Drive, title: DiscTitle, mode: ReadMode, max_batch: u16) -> Self {
-        // Set up PES demux from title stream PIDs
         let mut pids = Vec::new();
         let mut parsers = Vec::new();
         let mut pid_to_track = Vec::new();
@@ -183,21 +138,20 @@ impl DiscStream {
         }
 
         Self {
-            drive,
+            reader,
             title,
-            decrypt_keys: crate::decrypt::DecryptKeys::None,
-            mode,
-            current_lba: 0,
+            disc: None,
+            decrypt_keys,
+            extents,
             current_extent: 0,
             current_offset: 0,
-            read_buf: Vec::with_capacity(max_batch as usize * 2048),
+            read_buf: Vec::with_capacity(batch_sectors as usize * 2048),
             buf_valid: 0,
-            buf_cursor: 0,
-            batch_sectors: max_batch,
+            batch_sectors,
             errors: 0,
             eof: false,
             ts_demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
-            ps_demuxer: None, // set by caller for DVD content
+            ps_demuxer: None,
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
@@ -209,43 +163,17 @@ impl DiscStream {
         self.decrypt_keys = crate::decrypt::DecryptKeys::None;
     }
 
-    /// Lock the tray.
-    pub fn lock_tray(&mut self) {
-        self.drive.lock_tray();
-    }
-
-    /// Unlock the tray.
-    pub fn unlock_tray(&mut self) {
-        self.drive.unlock_tray();
-    }
-
-    /// Recover the drive (for batch: switch to another title).
-    pub fn into_drive(self) -> Drive {
-        self.drive
-    }
-
-    // ── Fill ─────────────────────────────────────────────────────────────
-
-    fn fill(&mut self) -> bool {
-        match &self.mode {
-            ReadMode::Extents(_) => self.fill_extents(),
-            ReadMode::Sequential { .. } => self.fill_sequential(),
-        }
+    /// Get the scanned Disc (for listing all titles).
+    pub fn disc(&self) -> Option<&Disc> {
+        self.disc.as_ref()
     }
 
     fn fill_extents(&mut self) -> bool {
-        let (ext_start, ext_sectors) = match &self.mode {
-            ReadMode::Extents(exts) => {
-                if self.current_extent >= exts.len() {
-                    return false;
-                }
-                (
-                    exts[self.current_extent].start_lba,
-                    exts[self.current_extent].sector_count,
-                )
-            }
-            _ => unreachable!(),
-        };
+        if self.current_extent >= self.extents.len() {
+            return false;
+        }
+        let ext_start = self.extents[self.current_extent].start_lba;
+        let ext_sectors = self.extents[self.current_extent].sector_count;
 
         let remaining = ext_sectors.saturating_sub(self.current_offset);
         let sectors = remaining.min(self.batch_sectors as u32) as u16;
@@ -253,22 +181,16 @@ impl DiscStream {
         if sectors == 0 {
             self.current_extent += 1;
             self.current_offset = 0;
-            return self.fill_extents(); // next extent
+            return self.fill_extents();
         }
 
         let lba = ext_start + self.current_offset;
         let bytes = sectors as usize * 2048;
         self.read_buf.resize(bytes, 0);
 
-        // Drive handles all error recovery internally.
-        match self.drive.read(
-            lba,
-            sectors,
-            &mut self.read_buf[..bytes],
-        ) {
+        match self.reader.read_sectors(lba, sectors, &mut self.read_buf[..bytes]) {
             Ok(_) => {
                 self.buf_valid = bytes;
-                self.buf_cursor = 0;
                 self.current_offset += sectors as u32;
                 if self.current_offset >= ext_sectors {
                     self.current_extent += 1;
@@ -276,73 +198,13 @@ impl DiscStream {
                 }
                 true
             }
-            Err(_) => false, // drive gone — EOF
+            Err(_) => false,
         }
-    }
-
-    fn fill_sequential(&mut self) -> bool {
-        let capacity = match &self.mode {
-            ReadMode::Sequential { capacity } => *capacity,
-            _ => unreachable!(),
-        };
-
-        if self.current_lba >= capacity {
-            return false;
-        }
-
-        let remaining = capacity - self.current_lba;
-        let count = remaining.min(self.batch_sectors as u32) as u16;
-        let bytes = count as usize * 2048;
-        self.read_buf.resize(bytes, 0);
-
-        // Drive handles all error recovery internally —
-        // retries, speed changes, zero-fill on unreadable sectors.
-        match self.drive.read(
-            self.current_lba,
-            count,
-            &mut self.read_buf[..bytes],
-        ) {
-            Ok(_) => {
-                self.buf_valid = bytes;
-                self.buf_cursor = 0;
-                self.current_lba += count as u32;
-                true
-            }
-            Err(_) => false, // drive gone — EOF
-        }
-    }
-
-}
-
-// ── IOStream ─────────────────────────────────────────────────────────────────
-
-impl IOStream for DiscStream {
-    fn info(&self) -> &DiscTitle {
-        &self.title
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.drive.unlock_tray();
-        Ok(())
-    }
-
-    fn total_bytes(&self) -> Option<u64> {
-        match &self.mode {
-            ReadMode::Extents(extents) => {
-                Some(extents.iter().map(|e| e.sector_count as u64 * 2048).sum())
-            }
-            ReadMode::Sequential { capacity } => Some(*capacity as u64 * 2048),
-        }
-    }
-
-    fn keys(&self) -> crate::decrypt::DecryptKeys {
-        self.decrypt_keys.clone()
     }
 }
 
 impl crate::pes::Stream for DiscStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
-        // Return buffered frame if available
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(Some(frame));
         }
@@ -351,32 +213,22 @@ impl crate::pes::Stream for DiscStream {
             return Ok(None);
         }
 
-        // Read sectors until we produce at least one frame
         loop {
-            // Fill the read buffer with next batch of sectors
-            let got_data = match &self.mode {
-                ReadMode::Extents(_) => self.fill_extents(),
-                ReadMode::Sequential { .. } => self.fill_sequential(),
-            };
-
-            if !got_data {
+            if !self.fill_extents() {
                 self.eof = true;
                 return Ok(None);
             }
 
-            // Decrypt
             let bytes = self.buf_valid;
             if let Err(e) = crate::decrypt::decrypt_sectors(
                 &mut self.read_buf[..bytes],
                 &self.decrypt_keys,
                 0,
             ) {
-                return Err(io::Error::other(e.to_string()));
+                return Err(e.into());
             }
 
-            // Demux into packets, parse into frames
             if let Some(ref mut demuxer) = self.ts_demuxer {
-                // BD: transport stream demux
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for pes in &packets {
                     if let Some((_, track)) = self.pid_to_track.iter().find(|(pid, _)| *pid == pes.pid) {
@@ -390,13 +242,11 @@ impl crate::pes::Stream for DiscStream {
                     }
                 }
             } else if let Some(ref mut demuxer) = self.ps_demuxer {
-                // DVD: program stream demux
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for ps in &packets {
-                    // Map PS stream_id to track index
                     let track = match ps.stream_id {
-                        0xE0..=0xEF => 0, // video
-                        0xC0..=0xDF => 1, // audio
+                        0xE0..=0xEF => 0,
+                        0xC0..=0xDF => 1,
                         0xBD => ps.sub_stream_id.map(|s| (s & 0x1F) as usize + 1).unwrap_or(1),
                         _ => continue,
                     };
@@ -405,36 +255,28 @@ impl crate::pes::Stream for DiscStream {
                         self.pending_frames.push_back(crate::pes::PesFrame {
                             track,
                             pts: pts_ns,
-                            keyframe: true, // PS doesn't have keyframe flag easily
+                            keyframe: true,
                             data: ps.data.clone(),
                         });
                     }
                 }
             }
 
-            // Reset buffer for next read
             self.buf_valid = 0;
-            self.buf_cursor = 0;
 
             if let Some(frame) = self.pending_frames.pop_front() {
                 return Ok(Some(frame));
             }
-            // No frames produced — read more data
         }
     }
 
     fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "disc is read-only"))
+        Err(crate::error::Error::StreamReadOnly.into())
     }
 
-    fn finish(&mut self) -> io::Result<()> {
-        self.drive.unlock_tray();
-        Ok(())
-    }
+    fn finish(&mut self) -> io::Result<()> { Ok(()) }
 
-    fn info(&self) -> &DiscTitle {
-        &self.title
-    }
+    fn info(&self) -> &DiscTitle { &self.title }
 
     fn codec_private(&self, track: usize) -> Option<Vec<u8>> {
         let pid = self.pid_to_track.iter()
@@ -454,44 +296,5 @@ impl crate::pes::Stream for DiscStream {
             }
         }
         true
-    }
-}
-
-impl Read for DiscStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Drain current buffer
-        if self.buf_cursor < self.buf_valid {
-            let n = (self.buf_valid - self.buf_cursor).min(buf.len());
-            buf[..n].copy_from_slice(&self.read_buf[self.buf_cursor..self.buf_cursor + n]);
-            self.buf_cursor += n;
-            return Ok(n);
-        }
-
-        if self.eof {
-            return Ok(0);
-        }
-
-        // Fill next batch
-        if self.fill() {
-            let n = self.buf_valid.min(buf.len());
-            buf[..n].copy_from_slice(&self.read_buf[..n]);
-            self.buf_cursor = n;
-            Ok(n)
-        } else {
-            self.eof = true;
-            Ok(0)
-        }
-    }
-}
-
-impl Write for DiscStream {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "disc is read-only",
-        ))
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }

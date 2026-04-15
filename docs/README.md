@@ -11,11 +11,12 @@ Technical documentation for [libfreemkv](https://github.com/freemkv/libfreemkv),
 | Document | What it covers |
 |----------|---------------|
 | [Architecture](architecture.md) | Module map, design principles, error codes, platform support |
-| [Drive Access](drive-access.md) | DriveSession, SCSI transport, profiles, unlock, why raw mode is needed |
+| [Drive Access](drive-access.md) | Drive, SCSI transport, profiles, unlock, why raw mode is needed |
 | [AACS Encryption](aacs.md) | Key resolution (4 paths), content decryption, bus encryption, SCSI handshake |
 | [UDF Filesystem](udf.md) | UDF 2.50 with metadata partitions, pointer chain, how files are read from disc |
 | [MPLS Playlists](mpls.md) | Playlist format, play items, STN stream table, coding types |
 | [CLPI Clip Info](clpi.md) | EP map (coarse + fine entries), timestamp-to-sector mapping, extent calculation |
+| [API Design](api-design.md) | Stream API design, PES pipeline, input/output resolution |
 
 ## Reading Order
 

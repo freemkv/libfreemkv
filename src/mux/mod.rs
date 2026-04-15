@@ -1,37 +1,29 @@
 //! Stream-based I/O pipeline.
 //!
-//! All formats are streams. Two URLs, left reads, right writes:
+//! All formats are PES streams. Read from a format → PES frames.
+//! Write PES frames → a format.
 //!
 //! ```text
-//! freemkv disc:// mkv://Dune.mkv
-//! freemkv m2ts://Dune.m2ts mkv://Dune.mkv
-//! freemkv disc:// network://10.1.7.11:9000
-//! freemkv disc:// stdio://
-//! freemkv stdio:// mkv://Dune.mkv
-//! ```
-//!
-//! Streams implement `IOStream` for uniform handling:
-//!
-//! ```text
-//! let mut input = open_input("disc://", &opts)?;
-//! let mut output = open_output("mkv://Dune.mkv", input.info())?;
-//! io::copy(&mut *input, &mut *output)?;
+//! let mut input = input("iso://Disc.iso", &opts)?;
+//! let title = input.info().clone();
+//! let mut output = output("mkv://Dune.mkv", &title)?;
+//! while let Ok(Some(frame)) = input.read() {
+//!     output.write(&frame)?;
+//! }
 //! output.finish()?;
 //! ```
+//!
+//! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
 
 pub mod codec;
 pub mod disc;
 pub mod ebml;
 pub mod iso;
-mod isowriter;
-pub mod lookahead;
-mod m2ts;
-pub mod meta;
 pub mod mkv;
-pub mod mkvout;
-pub mod pesout;
 pub mod tsmux;
 pub mod tsreader;
+mod m2ts;
+pub mod meta;
 mod mkvstream;
 pub mod network;
 pub mod null;
@@ -40,40 +32,16 @@ pub mod resolve;
 pub mod stdio;
 pub mod ts;
 
-pub use disc::{DiscOpenResult, DiscStream};
-pub use iso::{IsoSectorReader, IsoStream};
+pub use disc::DiscStream;
+pub use iso::IsoSectorReader;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use null::NullStream;
-pub use resolve::{input, output, open_input, open_output, parse_url, InputOptions, StreamUrl};
+pub use resolve::{input, output, parse_url, InputOptions, StreamUrl};
 pub use stdio::StdioStream;
 
-use crate::disc::DiscTitle;
-use std::io::{self, Read, Seek, Write};
-
-/// Common interface for all stream types.
-///
-/// A stream can be opened for reading or created for writing.
-/// Calling the unsupported direction returns an error.
-pub trait IOStream: Read + Write {
-    /// Get stream metadata.
-    fn info(&self) -> &DiscTitle;
-
-    /// Finalize the stream (flush, write index/cues, close).
-    fn finish(&mut self) -> io::Result<()>;
-
-    /// Total content size in bytes, if known. Used for progress display.
-    fn total_bytes(&self) -> Option<u64> {
-        None
-    }
-
-    /// Decryption keys for this stream. Default: no encryption.
-    /// Overridden by DiscStream and IsoStream for AACS/CSS.
-    fn keys(&self) -> crate::decrypt::DecryptKeys {
-        crate::decrypt::DecryptKeys::None
-    }
-}
+use std::io::{Seek, Write};
 
 // WriteSeek — used internally by MKV muxer (container format requires seeking).
 pub trait WriteSeek: Write + Seek {}

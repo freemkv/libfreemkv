@@ -141,8 +141,8 @@ impl Drive {
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        Err(Error::DeviceNotFound {
-            path: format!("{}: drive not ready after 30s", self.device_path),
+        Err(Error::DeviceNotReady {
+            path: self.device_path.clone(),
         })
     }
 
@@ -264,8 +264,8 @@ impl Drive {
             }
         }
 
-        Err(Error::DeviceNotFound {
-            path: format!("{}: drive reset failed", self.device_path),
+        Err(Error::DeviceResetFailed {
+            path: self.device_path.clone(),
         })
     }
 

@@ -189,12 +189,14 @@ In practice, AACS 2.0 UHD discs work through the backward-compatible AACS 1.0 ha
 AACS decryption is transparent to the application. The `Disc::scan()` method handles everything automatically:
 
 ```rust
-use libfreemkv::{DriveSession, Disc};
+use libfreemkv::{Drive, Disc};
 use libfreemkv::disc::ScanOptions;
 use std::path::Path;
 
-let mut session = DriveSession::open(Path::new("/dev/sr0")).unwrap();
-let disc = Disc::scan(&mut session, &ScanOptions::default()).unwrap();
+let mut drive = Drive::open(Path::new("/dev/sg4")).unwrap();
+drive.wait_ready().unwrap();
+drive.init().unwrap();
+let disc = Disc::scan(&mut drive, &ScanOptions::default()).unwrap();
 
 // Check encryption state
 if disc.encrypted {

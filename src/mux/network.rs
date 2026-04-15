@@ -60,12 +60,7 @@ impl NetworkStream {
 
         // Read FMKV metadata header
         let disc_title = meta::read_header(&mut reader)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "no FMKV metadata header from sender",
-                )
-            })?
+            .ok_or_else(|| -> io::Error { crate::error::Error::NoMetadata.into() })?
             .to_title();
 
         Ok(Self {
@@ -79,7 +74,7 @@ impl crate::pes::Stream for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
             Mode::Read { reader } => crate::pes::PesFrame::deserialize(reader),
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for writing")),
+            _ => Err(crate::error::Error::StreamWriteOnly.into()),
         }
     }
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
@@ -94,7 +89,7 @@ impl crate::pes::Stream for NetworkStream {
                 }
                 frame.serialize(writer)
             }
-            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "network opened for reading")),
+            _ => Err(crate::error::Error::StreamReadOnly.into()),
         }
     }
     fn finish(&mut self) -> io::Result<()> {

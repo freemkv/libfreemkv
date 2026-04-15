@@ -12,81 +12,109 @@
 
 ```rust
 // Open drive — explicit steps, app prints between them
-let mut session = DriveSession::open(path)?;
-session.wait_ready()?;
-session.init()?;
-session.probe_disc()?;
+let mut drive = Drive::open(path)?;
+drive.wait_ready()?;
+drive.init()?;
+drive.probe_disc()?;
 
 // Scan disc
-let disc = Disc::scan(&mut session, &ScanOptions::default())?;
+let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
 
 // Browse
-disc.titles      // Vec<Title>
+disc.titles      // Vec<DiscTitle>
 disc.format      // BD / UHD / DVD
 disc.capacity_gb()
-
-// Rip with events
-disc.rip(&mut session, 0, output, |event| {
-    match event.kind {
-        EventKind::BytesRead { bytes, total } => ...,
-        EventKind::ReadError { sector, error } => ...,
-        EventKind::Retry { attempt } => ...,
-        EventKind::SpeedChange { speed_kbs } => ...,
-        EventKind::Complete { bytes, errors } => ...,
-    }
-})?;
-
-// Rip without events
-disc.rip(&mut session, 0, output, event::ignore)?;
 ```
 
-## Stream Chains
+## PES Pipeline (primary API)
 
-Each stream wraps the next. Builder pattern, no `.build()`.
+The PES pipeline is the main way to move content. All streams produce/consume
+PES frames. The pipeline just reads frames and writes frames.
 
-### Raw m2ts
 ```rust
-disc.rip(&mut session, 0, File::create("movie.m2ts")?, event::ignore)?;
+// URL-based — any source to any destination
+let opts = InputOptions::default();
+let mut input = libfreemkv::input("disc:///dev/sg4", &opts)?;
+let title = input.info().clone();
+let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
+
+while let Ok(Some(frame)) = input.read() {
+    output.write(&frame)?;
+}
+output.finish()?;
 ```
 
-### MKV
+The `pes::Stream` trait:
+
 ```rust
-let output = MkvStream::new(File::create("movie.mkv")?)
-    .title(&disc.titles[0])
-    .max_buffer(10 * 1024 * 1024);
-
-disc.rip(&mut session, 0, output, |e| { ... })?;
+pub trait Stream {
+    fn read(&mut self) -> io::Result<Option<PesFrame>>;
+    fn write(&mut self, frame: &PesFrame) -> io::Result<()>;
+    fn finish(&mut self) -> io::Result<()>;
+    fn info(&self) -> &DiscTitle;
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>>;
+    fn headers_ready(&self) -> bool;
+}
 ```
 
-### MKV with progress (CLI)
+## IOStream (byte-level API)
+
+For raw byte copies (disc→ISO, resume, benchmarks). Lower level than PES.
+
 ```rust
-let output = ProgressStream::new(
-    MkvStream::new(File::create("movie.mkv")?)
-        .title(&disc.titles[0])
-        .max_buffer(10 * 1024 * 1024),
-    total_bytes,
-    |pct, speed| eprint!("\r  {}%  {:.1} MB/s", pct, speed),
-);
-
-disc.rip(&mut session, 0, output, |e| { ... })?;
+let opts = InputOptions::default();
+let mut input = open_input("iso://Disc.iso", &opts)?;
+let mut output = open_output("mkv://Movie.mkv", input.info())?;
+io::copy(&mut *input, &mut *output)?;
+output.finish()?;
 ```
 
-### Future: transcode
+## Streams
+
+All streams implement `IOStream` (byte-level) and/or `pes::Stream` (frame-level).
+URL-based resolvers open any stream by string.
+
+| Stream | Input | Output | URL | Transport |
+|--------|-------|--------|-----|-----------|
+| DiscStream | Yes | -- | `disc://` `disc:///dev/sg4` | Optical drive via SCSI |
+| IsoStream | Yes | Yes | `iso://path.iso` | Blu-ray ISO image |
+| MkvStream | Yes | Yes | `mkv://path` | Matroska container |
+| M2tsStream | Yes | Yes | `m2ts://path` | BD-TS with FMKV metadata header |
+| NetworkStream | Yes (listen) | Yes (connect) | `network://host:port` | TCP with FMKV metadata header |
+| StdioStream | Yes (stdin) | Yes (stdout) | `stdio://` | Raw byte pipe |
+| NullStream | -- | Yes | `null://` | Discard sink (byte counter) |
+
+All URLs require a `scheme://path` format. Bare paths are rejected.
+
 ```rust
-let output = ProgressStream::new(
-    TranscodeStream::new(
-        MkvStream::new(File::create("movie.mkv")?)
-            .title(&disc.titles[0])
-            .max_buffer(50 * 1024 * 1024),
-    )
-        .codec(H265)
-        .quality(22),
-    total_bytes,
-    |pct, speed| eprint!("\r  {}%  {:.1} MB/s", pct, speed),
-);
+// PES pipeline (frame-level)
+let input = libfreemkv::input("disc:///dev/sg4", &opts)?;    // DiscStream
+let input = libfreemkv::input("iso://Dune.iso", &opts)?;     // IsoStream
+let output = libfreemkv::output("mkv://Dune.mkv", &title)?;  // MkvOutputStream
+let output = libfreemkv::output("m2ts://Dune.m2ts", &title)?; // M2tsOutputStream
+let output = libfreemkv::output("network://10.1.7.11:9000", &title)?; // NetworkOutputStream
+let output = libfreemkv::output("null://", &title)?;          // NullOutputStream
 
-disc.rip(&mut session, 0, output, |e| { ... })?;
+// IOStream (byte-level)
+let input = open_input("disc://", &opts)?;                    // DiscStream
+let input = open_input("iso://Dune.iso", &opts)?;             // IsoStream
+let output = open_output("iso://Copy.iso", &meta)?;           // IsoStream (write)
+let output = open_output("mkv://Dune.mkv", &meta)?;           // MkvStream
+let output = open_output("m2ts://Dune.m2ts", &meta)?;         // M2tsStream
+let output = open_output("null://", &meta)?;                  // NullStream
 ```
+
+### FMKV Metadata Header
+
+M2tsStream and NetworkStream embed a JSON metadata header before the BD-TS data:
+
+```
+[8B magic "FMKV\0\0\0\0"][4B JSON length][JSON metadata][padding to 192B boundary][BD-TS data...]
+```
+
+The header carries title name, duration, codec_privates, and full stream layout
+(PIDs, codecs, languages, labels). This allows the receiving end to set up
+demuxing and track metadata without scanning the TS.
 
 ## Events
 
@@ -107,105 +135,8 @@ pub enum EventKind {
 }
 ```
 
-Events report what happened. App decides what to do. GUI shows a dialog. CLI prints a line. Server logs to file.
-
-## Error Codes
-
-Lib errors are codes, not messages. Like HTTP status codes.
-
-```rust
-pub enum Error {
-    // Drive
-    DriveNotFound,
-    DriveOpenFailed,
-    DriveNotReady,
-    
-    // Unlock
-    UnlockFailed,
-    NoProfile,
-    
-    // AACS
-    AacsNoKeys,
-    AacsCertVerifyFailed,
-    AacsAgidAllocFailed,
-    AacsHandshakeFailed,
-    AacsVidMacFailed,
-    
-    // Disc
-    DiscReadError { sector: u64 },
-    MplsParseError,
-    ClpiParseError,
-    UdfFileNotFound { path: String },
-    
-    // Mux
-    LookaheadOverflow,
-    MuxWriteError,
-    
-    // SCSI
-    ScsiError { sense: u8 },
-}
-```
-
-App maps codes to localized strings. Lib never contains display text.
-
-## Streams
-
-All streams implement the `IOStream` trait (Read + Write). URL-based resolver opens any stream by string.
-
-| Stream | Input | Output | URL | Transport |
-|--------|-------|--------|-----|-----------|
-| DiscStream | Yes | -- | `disc://` `disc:///dev/sg4` | Optical drive via SCSI |
-| IsoStream | Yes | -- | `iso://path.iso` | Blu-ray ISO image |
-| MkvStream | Yes | Yes | `mkv://path` | Matroska container |
-| M2tsStream | Yes | Yes | `m2ts://path` | BD-TS with FMKV metadata header |
-| NetworkStream | Yes (listen) | Yes (connect) | `network://host:port` | TCP with FMKV metadata header |
-| StdioStream | Yes (stdin) | Yes (stdout) | `stdio://` | Raw byte pipe |
-| NullStream | -- | Yes | `null://` | Discard sink (byte counter) |
-
-All URLs require a `scheme://path` format. Bare paths are rejected.
-
-```rust
-// URL-based opening
-let input = open_input("disc://", &opts)?;                   // DiscStream (auto-detect)
-let input = open_input("disc:///dev/sg4", &opts)?;           // DiscStream (specific device)
-let input = open_input("iso://Dune.iso", &opts)?;            // IsoStream
-let input = open_input("m2ts:///tmp/Dune.m2ts", &opts)?;     // M2tsStream
-let input = open_input("mkv://Dune.mkv", &opts)?;            // MkvStream
-let input = open_input("network://0.0.0.0:9000", &opts)?;    // NetworkStream (listen)
-let input = open_input("stdio://", &opts)?;                   // StdioStream (stdin)
-
-let output = open_output("mkv://Dune.mkv", &meta)?;          // MkvStream
-let output = open_output("m2ts://Dune.m2ts", &meta)?;        // M2tsStream
-let output = open_output("network://10.1.7.11:9000", &meta)?;// NetworkStream (connect)
-let output = open_output("stdio://", &meta)?;                 // StdioStream (stdout)
-let output = open_output("null://", &meta)?;                  // NullStream
-
-// Direct construction (for advanced use)
-let mkv = MkvStream::new(writer).meta(&title).max_buffer(10 * 1024 * 1024);
-let m2ts = M2tsStream::new(writer).meta(&title);
-let net = NetworkStream::connect("10.1.7.11:9000")?.meta(&title);
-let null = NullStream::new().meta(&title);
-```
-
-### FMKV Metadata Header
-
-M2tsStream and NetworkStream embed a JSON metadata header before the BD-TS data:
-
-```
-[8B magic "FMKV\0\0\0\0"][4B JSON length][JSON metadata][padding to 192B boundary][BD-TS data...]
-```
-
-The header carries title name, duration, and full stream layout (PIDs, codecs, languages, labels). This allows the receiving end to set up demuxing and track metadata without scanning the TS.
-
-### MkvStream Internals
-
-LookaheadBuffer (default 5MB, configurable):
-1. Phase 1: buffer incoming data, scan for codec setup (SPS/PPS)
-2. Found it? Write MKV header, flush buffer, switch to streaming
-3. Buffer full? Error — app handles it
-4. Phase 2: parse TS → frames → MKV clusters, direct to output
-
-Reading: extracts MKV frames, wraps back into BD-TS PES packets.
+Events report what happened. App decides what to do. GUI shows a dialog. CLI
+prints a line. Server logs to file.
 
 ## File Layout
 
@@ -214,38 +145,57 @@ libfreemkv/src/
 ├── lib.rs              Public exports
 ├── error.rs            Error codes (no English)
 ├── event.rs            Event types for callbacks
-├── drive.rs            DriveSession (open, init, read)
-├── disc.rs             Disc (scan, rip, titles)
-├── scsi/               SCSI transport (Linux, macOS)
+├── drive/              Drive (open, init, read with recovery)
+│   ├── mod.rs          Drive struct, init, read, reset, eject
+│   ├── capture.rs      Drive profile capture for contribution
+│   ├── linux.rs        Linux drive discovery
+│   ├── macos.rs        macOS drive discovery
+│   └── windows.rs      Windows drive discovery
+├── disc/               Disc (scan, titles, AACS setup)
+├── scsi/               SCSI transport (Linux SG_IO, macOS IOKit, Windows SPTI)
 ├── platform/           Drive unlock (MT1959 A/B)
-├── aacs/               AACS decryption
-├── udf.rs              UDF filesystem parser
-├── mpls.rs             Playlist parser
-├── clpi.rs             Clip info parser
+├── aacs/               AACS decryption (handshake, keys, keydb, decrypt)
+├── css/                DVD CSS cipher
+├── decrypt.rs          Unified decrypt dispatcher (AACS/CSS/None)
+├── pes.rs              PES frame types, Stream trait
+├── sector.rs           SectorReader trait
+├── udf.rs              UDF 2.50 filesystem parser
+├── mpls.rs             MPLS playlist parser
+├── clpi.rs             CLPI clip info parser
+├── ifo.rs              DVD IFO parser
+├── labels/             BD-J label extraction (5 format parsers)
+├── keydb.rs            KEYDB download, parse, save
+├── identity.rs         DriveId from INQUIRY
+├── profile.rs          Bundled drive profiles
+├── speed.rs            DriveSpeed enum
 ├── mux/
 │   ├── mod.rs          IOStream trait, public exports
-│   ├── resolve.rs      URL parser + open_input/open_output
-│   ├── meta.rs         M2tsMeta (FMKV header format)
-│   ├── disc.rs         DiscStream (optical drive)
-│   ├── mkvstream.rs    MkvStream (bidirectional Matroska)
-│   ├── m2ts.rs         M2tsStream (BD-TS + FMKV header)
+│   ├── resolve.rs      URL parser + open_input/open_output + input/output
+│   ├── meta.rs         FMKV header format
+│   ├── disc.rs         DiscStream (optical drive → PES)
+│   ├── iso.rs          IsoStream (ISO image read/write)
+│   ├── isowriter.rs    ISO image writer (UDF, AVDP, multi-extent)
+│   ├── mkvstream.rs    MkvStream (bidirectional Matroska, IOStream)
+│   ├── mkvout.rs       MkvOutputStream (PES → MKV)
+│   ├── m2ts.rs         M2tsStream (BD-TS, IOStream)
+│   ├── pesout.rs       PES output streams (M2ts, Network, Stdio, Null)
 │   ├── network.rs      NetworkStream (TCP + FMKV header)
 │   ├── stdio.rs        StdioStream (stdin/stdout pipe)
-│   ├── iso.rs          IsoStream (Blu-ray ISO image)
 │   ├── null.rs         NullStream (discard + byte counter)
 │   ├── lookahead.rs    LookaheadBuffer (codec header scanning)
 │   ├── ts.rs           BD-TS demuxer + PAT/PMT scanner
+│   ├── tsreader.rs     TS reader utilities
+│   ├── tsmux.rs        TS muxer (PES → BD-TS packets)
+│   ├── ps.rs           MPEG-2 PS demuxer (DVD)
 │   ├── ebml.rs         EBML read/write primitives
 │   ├── mkv.rs          MKV muxer (tracks, clusters, cues)
-│   └── codec/          Frame parsers (H.264, HEVC, VC-1, AC3, DTS, TrueHD, PGS, LPCM)
+│   └── codec/          Frame parsers (H.264, HEVC, MPEG-2, VC-1, AC3, EAC3, DTS, TrueHD, LPCM, PGS)
 └── ...
 
 freemkv/src/
 ├── main.rs             CLI dispatcher (URL routing)
-├── pipe.rs             Generic source → dest copy
-├── rip.rs              Rip with progress display
-├── remux.rs            Remux with progress display
-├── disc_info.rs        Disc info display
+├── pipe.rs             PES pipeline — source → dest copy
+├── disc_info.rs        Disc/file info display
 ├── info.rs             Drive info + profile submission
 ├── strings.rs          i18n string table
 ├── output.rs           Verbosity-filtered output

@@ -1,36 +1,30 @@
-//! Stream URL resolver — parses URL strings into IOStream instances.
+//! Stream URL resolver — parses URL strings into PES stream instances.
 //!
 //! Format: `scheme://path`
 //!
 //! | Scheme | Input | Output | Path |
 //! |--------|-------|--------|------|
 //! | disc:// | Yes | -- | empty (auto-detect) or /dev/sgN |
-//! | m2ts:// | Yes | Yes | file path (required) |
+//! | iso://  | Yes | -- | file path (required) |
 //! | mkv://  | Yes | Yes | file path (required) |
+//! | m2ts:// | Yes | Yes | file path (required) |
 //! | network:// | Yes (listen) | Yes (connect) | host:port (required) |
 //! | stdio:// | Yes (stdin) | Yes (stdout) | empty |
-//! | iso://   | Yes | -- | file path (required) |
 //! | null:// | -- | Yes | empty |
 //!
 //! Bare paths without a scheme are rejected.
+//! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
 
 use super::disc::DiscStream;
-use super::iso::IsoStream;
 use super::network::NetworkStream;
 use super::null::NullStream;
 use super::stdio::StdioStream;
-use super::{IOStream, M2tsStream, MkvStream};
-use crate::disc::DiscTitle;
-use std::io::{self, BufReader, BufWriter};
+use super::{M2tsStream, MkvStream};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// I/O buffer size for file streams.
 const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
-
-/// Default MKV lookahead buffer size.
-/// Dynamically increased for UHD content (many streams delay video codec headers).
-const MKV_LOOKAHEAD_DEFAULT: usize = 10 * 1024 * 1024;
-const MKV_LOOKAHEAD_UHD: usize = 100 * 1024 * 1024;
 
 /// Parsed stream URL.
 pub enum StreamUrl {
@@ -88,17 +82,6 @@ impl StreamUrl {
 }
 
 /// Parse a URL string into a typed StreamUrl.
-///
-/// All URLs must use the `scheme://path` format. Bare paths are not supported.
-///
-/// ```text
-/// disc://              → Disc { device: None }
-/// disc:///dev/sg4      → Disc { device: Some("/dev/sg4") }
-/// m2ts:///tmp/Dune.m2ts → M2ts { path: "/tmp/Dune.m2ts" }
-/// mkv://Dune.mkv       → Mkv { path: "Dune.mkv" }
-/// network://10.0.0.1:9000 → Network { addr: "10.0.0.1:9000" }
-/// null://              → Null
-/// ```
 pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("disc://") {
         return if rest.is_empty() {
@@ -143,19 +126,14 @@ pub fn parse_url(url: &str) -> StreamUrl {
 /// Validate that a file path is non-empty and has a filename component.
 fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
     if path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{scheme}:// requires a file path (e.g. {scheme}://movie.{scheme})"),
-        ));
+        return Err(crate::error::Error::StreamUrlMissingPath {
+            scheme: scheme.to_string(),
+        }.into());
     }
     if path.file_name().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{scheme}://{} is not a valid file path — must include a filename",
-                path.display()
-            ),
-        ));
+        return Err(crate::error::Error::StreamUrlInvalid {
+            url: format!("{scheme}://{}", path.display()),
+        }.into());
     }
     Ok(())
 }
@@ -163,134 +141,16 @@ fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
 /// Validate that a network address has host:port format.
 fn validate_network_addr(addr: &str) -> io::Result<()> {
     if addr.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "network:// requires host:port (e.g. network://0.0.0.0:9000)",
-        ));
+        return Err(crate::error::Error::StreamUrlMissingPath {
+            scheme: "network".to_string(),
+        }.into());
     }
     if !addr.contains(':') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("network://{addr} missing port — use network://{addr}:PORT"),
-        ));
+        return Err(crate::error::Error::StreamUrlMissingPort {
+            addr: addr.to_string(),
+        }.into());
     }
     Ok(())
-}
-
-/// Open a stream URL for reading (source).
-pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream>> {
-    let parsed = parse_url(url);
-
-    match parsed {
-        StreamUrl::Disc { device } => {
-            let result = DiscStream::open(
-                device.as_deref(),
-                opts.keydb_path.as_deref(),
-                opts.title_index.unwrap_or(0),
-                None,
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut stream = result.stream;
-            if opts.raw {
-                stream.set_raw();
-            }
-            Ok(Box::new(stream))
-        }
-        StreamUrl::M2ts { ref path } => {
-            validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::open(path)
-                .map_err(|e| io::Error::new(e.kind(),
-                    format!("m2ts://{}: {}", path.display(), e)))?;
-            let reader = BufReader::with_capacity(IO_BUF_SIZE, file);
-            Ok(Box::new(M2tsStream::open(reader)?))
-        }
-        StreamUrl::Mkv { ref path } => {
-            validate_file_path(path, "mkv")?;
-            let file = std::fs::File::open(path)
-                .map_err(|e| io::Error::new(e.kind(),
-                    format!("mkv://{}: {}", path.display(), e)))?;
-            let reader = BufReader::with_capacity(IO_BUF_SIZE, file);
-            Ok(Box::new(MkvStream::open(reader)?))
-        }
-        StreamUrl::Network { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "network:// requires PES pipeline — use input() instead of open_input()"))
-        }
-        StreamUrl::Stdio => {
-            Ok(Box::new(StdioStream::input()))
-        }
-        StreamUrl::Iso { ref path } => {
-            validate_file_path(path, "iso")?;
-            let scan_opts = match &opts.keydb_path {
-                Some(p) => crate::disc::ScanOptions::with_keydb(p),
-                None => crate::disc::ScanOptions::default(),
-            };
-            let mut stream = IsoStream::open(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
-            if opts.raw {
-                stream.set_raw();
-            }
-            Ok(Box::new(stream))
-        }
-        StreamUrl::Null => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "null:// is write-only — cannot use as input"))
-        }
-        StreamUrl::Unknown { ref raw } => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, disc://, m2ts://movie.m2ts)", raw)))
-        }
-    }
-}
-
-/// Open a stream URL for writing (destination).
-pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>> {
-    let parsed = parse_url(url);
-
-    match parsed {
-        StreamUrl::Disc { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "disc:// is read-only — cannot use as output"))
-        }
-        StreamUrl::Iso { ref path } => {
-            validate_file_path(path, "iso")?;
-            Ok(Box::new(IsoStream::create(&path.to_string_lossy())?.meta(meta)))
-        }
-        StreamUrl::Null => {
-            Ok(Box::new(NullStream::new().meta(meta)))
-        }
-        StreamUrl::Stdio => {
-            Ok(Box::new(StdioStream::output().meta(meta)))
-        }
-        StreamUrl::M2ts { ref path } => {
-            validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::create(path)
-                .map_err(|e| io::Error::new(e.kind(),
-                    format!("m2ts://{}: {}", path.display(), e)))?;
-            let writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
-            Ok(Box::new(M2tsStream::new(writer).meta(meta)))
-        }
-        StreamUrl::Mkv { ref path } => {
-            validate_file_path(path, "mkv")?;
-            let file = std::fs::File::create(path)
-                .map_err(|e| io::Error::new(e.kind(),
-                    format!("mkv://{}: {}", path.display(), e)))?;
-            let writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
-            let lookahead = if meta.streams.len() > 15 {
-                MKV_LOOKAHEAD_UHD
-            } else {
-                MKV_LOOKAHEAD_DEFAULT
-            };
-            Ok(Box::new(MkvStream::new(writer).meta(meta).max_buffer(lookahead)))
-        }
-        StreamUrl::Network { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "network:// output requires PES pipeline — use pipe() instead of open_output()"))
-        }
-        StreamUrl::Unknown { ref raw } => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, m2ts://movie.m2ts, null://)", raw)))
-        }
-    }
 }
 
 /// Options for opening an input stream.
@@ -302,41 +162,42 @@ pub struct InputOptions {
     pub raw: bool,
 }
 
-// ── PES-based open ──────────────────────────────────────────────────────────
-
 /// Open a PES input stream (produces PES frames).
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
+        StreamUrl::Disc { device } => {
+            // Open drive, init, scan — caller manages the drive
+            let mut drive = match device {
+                Some(ref d) => crate::drive::Drive::open(d)
+                    .map_err(|e| -> io::Error { e.into() })?,
+                None => crate::drive::find_drive()
+                    .ok_or_else(|| -> io::Error { crate::error::Error::DeviceNotFound { path: String::new() }.into() })?,
+            };
+            let _ = drive.wait_ready();
+            let _ = drive.init();
+            let _ = drive.probe_disc();
+            let (mut stream, _disc) = DiscStream::open_drive(
+                drive,
+                opts.keydb_path.as_deref(),
+                opts.title_index.unwrap_or(0),
+            ).map_err(|e| -> io::Error { e.into() })?;
+            if opts.raw {
+                stream.set_raw();
+            }
+            Ok(Box::new(stream))
+        }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
             let scan_opts = match &opts.keydb_path {
                 Some(p) => crate::disc::ScanOptions::with_keydb(p),
                 None => crate::disc::ScanOptions::default(),
             };
-            let mut stream = IsoStream::open(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
+            let mut stream = DiscStream::open_iso(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
             if opts.raw {
                 stream.set_raw();
             }
             Ok(Box::new(stream))
-        }
-        StreamUrl::Disc { device } => {
-            let result = DiscStream::open(
-                device.as_deref(),
-                opts.keydb_path.as_deref(),
-                opts.title_index.unwrap_or(0),
-                None,
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut stream = result.stream;
-            if opts.raw {
-                stream.set_raw();
-            }
-            Ok(Box::new(stream))
-        }
-        StreamUrl::Null => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "null:// is write-only — cannot use as input"))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
@@ -359,9 +220,13 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Stdio => {
             Ok(Box::new(StdioStream::input()))
         }
+        StreamUrl::Null => {
+            Err(crate::error::Error::StreamWriteOnly.into())
+        }
         StreamUrl::Unknown { ref raw } => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, disc://, m2ts://movie.m2ts)", raw)))
+            Err(crate::error::Error::StreamUrlInvalid {
+                url: raw.clone(),
+            }.into())
         }
     }
 }
@@ -379,32 +244,35 @@ pub fn output(
                 .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
             let writer: Box<dyn super::WriteSeek> =
                 Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
-            Ok(Box::new(super::mkvout::MkvOutputStream::create(writer, title)?))
+            Ok(Box::new(MkvStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title)?))
+            let file = std::fs::File::create(path)
+                .map_err(|e| io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e)))?;
+            let writer = std::io::BufWriter::with_capacity(IO_BUF_SIZE, file);
+            Ok(Box::new(M2tsStream::create(writer, title)?))
         }
         StreamUrl::Network { ref addr } => {
             validate_network_addr(addr)?;
-            Ok(Box::new(super::pesout::NetworkOutputStream::connect(addr, title)?))
+            Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
         }
         StreamUrl::Stdio => {
-            Ok(Box::new(super::pesout::StdioOutputStream::new(title)))
+            Ok(Box::new(StdioStream::output(title)))
         }
         StreamUrl::Null => {
-            Ok(Box::new(super::pesout::NullOutputStream::new(title)))
+            Ok(Box::new(NullStream::new(title)))
         }
         StreamUrl::Disc { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "disc:// is read-only"))
+            Err(crate::error::Error::StreamReadOnly.into())
         }
         StreamUrl::Iso { .. } => {
-            Err(io::Error::new(io::ErrorKind::Unsupported,
-                "ISO output from PES not supported — use disc.copy() for raw ISO"))
+            Err(crate::error::Error::StreamReadOnly.into())
         }
         StreamUrl::Unknown { ref raw } => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("'{}' is not a valid stream URL", raw)))
+            Err(crate::error::Error::StreamUrlInvalid {
+                url: raw.clone(),
+            }.into())
         }
     }
 }

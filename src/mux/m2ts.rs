@@ -1,9 +1,9 @@
 //! M2tsStream — BD transport stream with embedded metadata header.
 //!
-//! Write: prepends FMKV metadata header, then passes through BD-TS bytes.
-//! Read: extracts metadata header (or scans PMT), then yields BD-TS bytes.
+//! Write: prepends FMKV metadata header, then muxes PES frames into BD-TS.
+//! Read: extracts metadata header (or scans PMT), then demuxes BD-TS into PES frames.
 
-use super::{meta, ts, IOStream};
+use super::{meta, ts};
 use crate::disc::{DiscTitle, Stream as DiscStream};
 use std::io::{self, Read, Write};
 
@@ -14,8 +14,7 @@ const SCAN_SIZE: usize = 1024 * 1024;
 
 enum Mode {
     Write {
-        writer: Box<dyn Write>,
-        header_written: bool,
+        muxer: super::tsmux::TsMuxer<Box<dyn Write>>,
     },
     Read {
         reader: Box<dyn Read>,
@@ -41,9 +40,6 @@ fn read_fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 pub struct M2tsStream {
     disc_title: DiscTitle,
     mode: Mode,
-    finished: bool,
-    /// Content size in bytes (file size minus header), set for read mode.
-    content_size: Option<u64>,
     // PES support
     demuxer: Option<ts::TsDemuxer>,
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
@@ -55,23 +51,36 @@ pub struct M2tsStream {
 }
 
 impl M2tsStream {
-    /// Create for writing. Metadata header is written on first write().
-    pub fn new(writer: impl Write + 'static) -> Self {
-        Self {
-            disc_title: DiscTitle::empty(),
-            mode: Mode::Write {
-                writer: Box::new(writer),
-                header_written: false,
-            },
-            finished: false,
-            content_size: None,
+    /// Create for writing PES frames → BD-TS output.
+    /// Writes FMKV metadata header, then muxes PES frames into BD transport stream.
+    pub fn create(mut writer: impl Write + 'static, title: &DiscTitle) -> io::Result<Self> {
+        // Write FMKV metadata header
+        if !title.streams.is_empty() {
+            let m = meta::M2tsMeta::from_title(title);
+            meta::write_header(&mut writer, &m)?;
+        }
+        let pids: Vec<u16> = title.streams.iter().map(|s| match s {
+            DiscStream::Video(v) => v.pid,
+            DiscStream::Audio(a) => a.pid,
+            DiscStream::Subtitle(s) => s.pid,
+        }).collect();
+        let boxed: Box<dyn Write> = Box::new(writer);
+        let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
+        for (i, cp) in title.codec_privates.iter().enumerate() {
+            if let Some(data) = cp {
+                muxer.set_codec_private(i, data.clone());
+            }
+        }
+        Ok(Self {
+            disc_title: title.clone(),
+            mode: Mode::Write { muxer },
             demuxer: None,
             parsers: Vec::new(),
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track: Vec::new(),
             pes_eof: false,
             stored_codec_privates: Vec::new(),
-        }
+        })
     }
 
     fn setup_pes(streams: &[DiscStream]) -> PesSetup {
@@ -89,12 +98,6 @@ impl M2tsStream {
             parsers.push((pid, super::codec::parser_for_codec(codec)));
         }
         (pids, parsers, pid_to_track)
-    }
-
-    /// Set stream metadata. Returns self for chaining.
-    pub fn meta(mut self, dt: &DiscTitle) -> Self {
-        self.disc_title = dt.clone();
-        self
     }
 
     /// Open an M2TS stream for reading. Takes any Read source — file, pipe, socket.
@@ -118,8 +121,6 @@ impl M2tsStream {
             return Ok(Self {
                 disc_title: title.clone(),
                 mode: Mode::Read { reader: chain },
-                finished: false,
-                content_size: None,
                 demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
                 parsers,
                 pending_frames: std::collections::VecDeque::new(),
@@ -131,7 +132,7 @@ impl M2tsStream {
 
         // No FMKV header — scan head for PMT
         let streams = ts::scan_streams(&head)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no streams found"))?;
+            .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
 
         let (pids, parsers, pid_to_track) = Self::setup_pes(&streams);
 
@@ -145,8 +146,6 @@ impl M2tsStream {
                 ..DiscTitle::empty()
             },
             mode: Mode::Read { reader: chain },
-            finished: false,
-            content_size: None,
             demuxer: if pids.is_empty() { None } else { Some(ts::TsDemuxer::new(&pids)) },
             parsers,
             pending_frames: std::collections::VecDeque::new(),
@@ -167,7 +166,7 @@ impl crate::pes::Stream for M2tsStream {
         loop {
             let reader = match &mut self.mode {
                 Mode::Read { reader } => reader,
-                _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "not in read mode")),
+                _ => return Err(crate::error::Error::StreamWriteOnly.into()),
             };
             let mut buf = vec![0u8; 192 * 1024];
             let n = reader.read(&mut buf)?;
@@ -197,11 +196,19 @@ impl crate::pes::Stream for M2tsStream {
         }
     }
 
-    fn write(&mut self, _frame: &crate::pes::PesFrame) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "use M2tsOutputStream for writing"))
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Write { muxer } => muxer.write_frame(frame.track, frame.pts, &frame.data),
+            Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        }
     }
 
-    fn finish(&mut self) -> io::Result<()> { Ok(()) }
+    fn finish(&mut self) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Write { muxer } => muxer.finish(),
+            Mode::Read { .. } => Ok(()),
+        }
+    }
 
     fn info(&self) -> &crate::disc::DiscTitle { &self.disc_title }
 
@@ -231,68 +238,3 @@ impl crate::pes::Stream for M2tsStream {
     }
 }
 
-impl IOStream for M2tsStream {
-    fn info(&self) -> &DiscTitle {
-        &self.disc_title
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        if let Mode::Write { ref mut writer, .. } = self.mode {
-            writer.flush()
-        } else {
-            Ok(())
-        }
-    }
-
-    fn total_bytes(&self) -> Option<u64> {
-        self.content_size
-    }
-}
-
-impl Write for M2tsStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.mode {
-            Mode::Write {
-                ref mut writer,
-                ref mut header_written,
-            } => {
-                if !*header_written {
-                    if !self.disc_title.streams.is_empty() {
-                        let m = meta::M2tsMeta::from_title(&self.disc_title);
-                        meta::write_header(&mut *writer, &m)?;
-                    }
-                    *header_written = true;
-                }
-                writer.write(buf)
-            }
-            Mode::Read { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stream opened for reading",
-            )),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if let Mode::Write { ref mut writer, .. } = self.mode {
-            writer.flush()
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl Read for M2tsStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.mode {
-            Mode::Read { ref mut reader } => reader.read(buf),
-            Mode::Write { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "stream opened for writing",
-            )),
-        }
-    }
-}

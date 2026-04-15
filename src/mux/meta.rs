@@ -247,7 +247,7 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     r.read_exact(&mut len_buf)?;
     let json_len = u32::from_be_bytes(len_buf) as usize;
     if json_len > MAX_JSON_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "FMKV JSON too large"));
+        return Err(crate::error::Error::NoMetadata.into());
     }
 
     let mut json_buf = vec![0u8; json_len];
