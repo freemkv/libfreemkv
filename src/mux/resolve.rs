@@ -301,3 +301,113 @@ pub struct InputOptions {
     /// Skip decryption — return raw encrypted bytes.
     pub raw: bool,
 }
+
+// ── PES-based open ──────────────────────────────────────────────────────────
+
+/// Open a PES input stream (produces PES frames).
+pub fn open_pes_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::InputStream>> {
+    let parsed = parse_url(url);
+    match parsed {
+        StreamUrl::Iso { ref path } => {
+            validate_file_path(path, "iso")?;
+            let scan_opts = match &opts.keydb_path {
+                Some(p) => crate::disc::ScanOptions::with_keydb(p),
+                None => crate::disc::ScanOptions::default(),
+            };
+            let mut stream = IsoStream::open(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
+            if opts.raw {
+                stream.set_raw();
+            }
+            Ok(Box::new(stream))
+        }
+        StreamUrl::Disc { device } => {
+            let result = DiscStream::open(
+                device.as_deref(),
+                opts.keydb_path.as_deref(),
+                opts.title_index.unwrap_or(0),
+                None,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut stream = result.stream;
+            if opts.raw {
+                stream.set_raw();
+            }
+            Ok(Box::new(stream))
+        }
+        StreamUrl::Null => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "null:// is write-only — cannot use as input"))
+        }
+        StreamUrl::M2ts { ref path } => {
+            validate_file_path(path, "m2ts")?;
+            // TODO: M2tsStream InputStream (TS demux → PES)
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "m2ts:// PES input not yet implemented"))
+        }
+        StreamUrl::Mkv { ref path } => {
+            validate_file_path(path, "mkv")?;
+            // TODO: MkvStream InputStream (MKV demux → PES)
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "mkv:// PES input not yet implemented"))
+        }
+        StreamUrl::Network { ref addr } => {
+            validate_network_addr(addr)?;
+            // TODO: NetworkStream InputStream (TCP → TS demux → PES)
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "network:// PES input not yet implemented"))
+        }
+        StreamUrl::Stdio => {
+            // TODO: StdioStream InputStream
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "stdio:// PES input not yet implemented"))
+        }
+        StreamUrl::Unknown { ref raw } => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("'{}' is not a valid stream URL — use scheme://path (e.g. mkv://movie.mkv, disc://, m2ts://movie.m2ts)", raw)))
+        }
+    }
+}
+
+/// Open a PES output stream (consumes PES frames).
+pub fn open_pes_output(
+    url: &str,
+    title: &crate::disc::DiscTitle,
+    codec_privates: &[Option<Vec<u8>>],
+) -> io::Result<Box<dyn crate::pes::OutputStream>> {
+    let parsed = parse_url(url);
+    match parsed {
+        StreamUrl::Mkv { ref path } => {
+            validate_file_path(path, "mkv")?;
+            let file = std::fs::File::create(path)
+                .map_err(|e| io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e)))?;
+            let writer: Box<dyn super::WriteSeek> =
+                Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
+            Ok(Box::new(super::mkvout::MkvOutputStream::create(writer, title, codec_privates)?))
+        }
+        StreamUrl::M2ts { ref path } => {
+            validate_file_path(path, "m2ts")?;
+            Ok(Box::new(super::pesout::M2tsOutputStream::create(&path.to_string_lossy(), title)?))
+        }
+        StreamUrl::Network { ref addr } => {
+            validate_network_addr(addr)?;
+            Ok(Box::new(super::pesout::NetworkOutputStream::connect(addr, title)?))
+        }
+        StreamUrl::Stdio => {
+            Ok(Box::new(super::pesout::StdioOutputStream::new()))
+        }
+        StreamUrl::Null => {
+            Ok(Box::new(super::pesout::NullOutputStream))
+        }
+        StreamUrl::Disc { .. } => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "disc:// is read-only"))
+        }
+        StreamUrl::Iso { .. } => {
+            Err(io::Error::new(io::ErrorKind::Unsupported,
+                "ISO output from PES not supported — use disc.copy() for raw ISO"))
+        }
+        StreamUrl::Unknown { ref raw } => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("'{}' is not a valid stream URL", raw)))
+        }
+    }
+}

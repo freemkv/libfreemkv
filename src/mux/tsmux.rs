@@ -1,0 +1,160 @@
+//! BD Transport Stream muxer — PES frames → 192-byte BD-TS packets.
+//!
+//! Takes PES frames and writes them as BD-TS (Blu-ray transport stream)
+//! packets. Each frame is wrapped in a PES header, split into TS packets,
+//! and prepended with the 4-byte TP_extra_header.
+
+use std::io::{self, Write};
+
+const SYNC_BYTE: u8 = 0x47;
+const TS_PAYLOAD: usize = 184;
+const TS_PACKET: usize = 188;
+const BD_TS_PACKET: usize = 192;
+
+pub struct TsMuxer<W: Write> {
+    writer: W,
+    pids: Vec<u16>,
+    continuity: Vec<u8>, // per-PID continuity counter (0-15)
+}
+
+impl<W: Write> TsMuxer<W> {
+    pub fn new(writer: W, pids: &[u16]) -> Self {
+        let continuity = vec![0u8; pids.len()];
+        Self {
+            writer,
+            pids: pids.to_vec(),
+            continuity,
+        }
+    }
+
+    /// Write a PES frame as BD-TS packets.
+    pub fn write_frame(
+        &mut self,
+        track: usize,
+        pts_ns: i64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        if track >= self.pids.len() {
+            return Ok(()); // unknown track, skip
+        }
+        let pid = self.pids[track];
+
+        // Build PES packet: header + data
+        let pts_90k = (pts_ns * 9 / 100_000) as u64;
+        let pes_header = build_pes_header(pid, pts_90k, data.len());
+        let pes_packet = [&pes_header[..], data].concat();
+
+        // Split into TS packets
+        let mut offset = 0;
+        let mut first = true;
+        while offset < pes_packet.len() {
+            let remaining = pes_packet.len() - offset;
+            let payload_len = remaining.min(TS_PAYLOAD);
+            let need_stuffing = payload_len < TS_PAYLOAD;
+
+            // TP_extra_header (4 bytes — arrival time, set to 0)
+            let tp_extra = [0u8; 4];
+
+            // TS header (4 bytes)
+            let cc = self.continuity[track];
+            self.continuity[track] = (cc + 1) & 0x0F;
+
+            let mut ts_header = [0u8; 4];
+            ts_header[0] = SYNC_BYTE;
+            ts_header[1] = ((pid >> 8) as u8) & 0x1F;
+            if first {
+                ts_header[1] |= 0x40; // PUSI
+            }
+            ts_header[2] = pid as u8;
+            ts_header[3] = 0x10 | cc; // no adaptation, has payload
+
+            if need_stuffing {
+                // Adaptation field for stuffing
+                let stuff_len = TS_PAYLOAD - payload_len;
+                ts_header[3] = 0x30 | cc; // adaptation + payload
+
+                self.writer.write_all(&tp_extra)?;
+                self.writer.write_all(&ts_header)?;
+
+                if stuff_len == 1 {
+                    self.writer.write_all(&[0u8])?; // adaptation_field_length = 0
+                } else {
+                    self.writer.write_all(&[(stuff_len - 1) as u8])?; // length
+                    self.writer.write_all(&[0u8])?; // flags
+                    if stuff_len > 2 {
+                        let padding = vec![0xFF; stuff_len - 2];
+                        self.writer.write_all(&padding)?;
+                    }
+                }
+                self.writer.write_all(&pes_packet[offset..offset + payload_len])?;
+            } else {
+                self.writer.write_all(&tp_extra)?;
+                self.writer.write_all(&ts_header)?;
+                self.writer.write_all(&pes_packet[offset..offset + payload_len])?;
+            }
+
+            offset += payload_len;
+            first = false;
+        }
+
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    pub fn finish_ref(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Build a PES packet header for a BD stream.
+fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
+    // Determine stream_id from PID range
+    let stream_id: u8 = if pid >= 0x1011 && pid <= 0x101F {
+        0xE0 // video
+    } else if pid >= 0x1100 && pid <= 0x111F {
+        0xBD // audio (private stream 1)
+    } else if pid >= 0x1200 && pid <= 0x121F {
+        0xBD // PGS subtitle
+    } else {
+        0xBD // default
+    };
+
+    let pes_data_len = data_len + 8; // 3 header bytes + 5 PTS bytes + data
+    let mut header = Vec::with_capacity(14);
+
+    // Start code: 00 00 01 stream_id
+    header.push(0x00);
+    header.push(0x00);
+    header.push(0x01);
+    header.push(stream_id);
+
+    // PES packet length (0 = unbounded for video)
+    if stream_id == 0xE0 {
+        header.push(0x00);
+        header.push(0x00);
+    } else {
+        let len = (pes_data_len & 0xFFFF) as u16;
+        header.push((len >> 8) as u8);
+        header.push(len as u8);
+    }
+
+    // Flags: 10xx xxxx — MPEG-2, PTS present
+    header.push(0x80); // marker bits
+    header.push(0x80); // PTS present
+
+    // PES header data length
+    header.push(5); // 5 bytes of PTS
+
+    // PTS (5 bytes, 33-bit timestamp with markers)
+    let pts = pts_90k & 0x1_FFFF_FFFF;
+    header.push(0x21 | (((pts >> 29) & 0x0E) as u8));
+    header.push(((pts >> 22) & 0xFF) as u8);
+    header.push(0x01 | (((pts >> 14) & 0xFE) as u8));
+    header.push(((pts >> 7) & 0xFF) as u8);
+    header.push(0x01 | (((pts << 1) & 0xFE) as u8));
+
+    header
+}

@@ -29,6 +29,8 @@ mod m2ts;
 pub mod meta;
 pub mod mkv;
 pub mod mkvout;
+pub mod pesout;
+pub mod tsmux;
 mod mkvstream;
 pub mod network;
 pub mod null;
@@ -43,7 +45,7 @@ pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use null::NullStream;
-pub use resolve::{open_input, open_output, parse_url, InputOptions, StreamUrl};
+pub use resolve::{open_input, open_output, open_pes_input, open_pes_output, parse_url, InputOptions, StreamUrl};
 pub use stdio::StdioStream;
 
 use crate::disc::DiscTitle;
