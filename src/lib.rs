@@ -79,26 +79,29 @@ pub mod keydb;
 pub(crate) mod labels;
 pub(crate) mod mpls;
 pub mod mux;
+pub mod pes;
 pub(crate) mod platform;
 pub mod profile;
 pub mod scsi;
-pub(crate) mod sector;
+pub mod sector;
 pub(crate) mod speed;
 pub(crate) mod udf;
 
+pub use drive::capture::{
+    capture_drive_data, mask_bytes, mask_string, CapturedFeature, DriveCapture,
+};
 pub use drive::{find_drive, find_drives, Drive, DriveStatus};
-pub use drive::capture::{DriveCapture, CapturedFeature, capture_drive_data, mask_string, mask_bytes};
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use Drive, not Platform directly
+pub use decrypt::{decrypt_sectors, DecryptKeys};
 pub use disc::{
-    AacsState, AudioStream, Clip, Codec, ColorSpace, ContentFormat, ContentReader, Disc,
-    DiscFormat, DiscTitle, Extent, HdrFormat, KeySource, ScanOptions, Stream, SubtitleStream,
-    VideoStream,
+    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat,
+    Disc, DiscFormat, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
+    ScanOptions, Stream, SubtitleStream, VideoStream,
 };
-pub use mux::DiscOptions;
 pub use mux::DiscStream;
 pub use mux::IOStream;
 pub use mux::IsoStream;
@@ -108,7 +111,6 @@ pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::{open_input, open_output, parse_url, InputOptions, StreamUrl};
-pub use decrypt::{DecryptKeys, decrypt_sectors};
 pub use scsi::ScsiTransport;
 pub use sector::SectorReader;
 pub use speed::DriveSpeed;
