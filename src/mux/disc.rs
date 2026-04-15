@@ -42,6 +42,12 @@ pub struct DiscStream {
     batch_sectors: u16,
     pub errors: u64,
     eof: bool,
+
+    // PES output (for InputStream impl)
+    demuxer: Option<super::ts::TsDemuxer>,
+    parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
+    pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
+    pid_to_track: Vec<(u16, usize)>,
 }
 
 enum ReadMode {
@@ -155,6 +161,21 @@ impl DiscStream {
     /// Set SCSI read timeout (default 30s).
 
     fn new(drive: Drive, title: DiscTitle, mode: ReadMode, max_batch: u16) -> Self {
+        // Set up PES demux from title stream PIDs
+        let mut pids = Vec::new();
+        let mut parsers = Vec::new();
+        let mut pid_to_track = Vec::new();
+        for (idx, s) in title.streams.iter().enumerate() {
+            let (pid, codec) = match s {
+                crate::disc::Stream::Video(v) => (v.pid, v.codec),
+                crate::disc::Stream::Audio(a) => (a.pid, a.codec),
+                crate::disc::Stream::Subtitle(s) => (s.pid, s.codec),
+            };
+            pids.push(pid);
+            pid_to_track.push((pid, idx));
+            parsers.push((pid, super::codec::parser_for_codec(codec)));
+        }
+
         Self {
             drive,
             title,
@@ -169,6 +190,10 @@ impl DiscStream {
             batch_sectors: max_batch,
             errors: 0,
             eof: false,
+            demuxer: if pids.is_empty() { None } else { Some(super::ts::TsDemuxer::new(&pids)) },
+            parsers,
+            pending_frames: std::collections::VecDeque::new(),
+            pid_to_track,
         }
     }
 
@@ -305,6 +330,77 @@ impl IOStream for DiscStream {
 
     fn keys(&self) -> crate::decrypt::DecryptKeys {
         self.decrypt_keys.clone()
+    }
+}
+
+impl crate::pes::InputStream for DiscStream {
+    fn next_frame(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        // Return buffered frame if available
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(Some(frame));
+        }
+
+        if self.eof {
+            return Ok(None);
+        }
+
+        // Read sectors until we produce at least one frame
+        loop {
+            // Fill the read buffer with next batch of sectors
+            let got_data = match &self.mode {
+                ReadMode::Extents(_) => self.fill_extents(),
+                ReadMode::Sequential { .. } => self.fill_sequential(),
+            };
+
+            if !got_data {
+                self.eof = true;
+                return Ok(None);
+            }
+
+            // Decrypt
+            let bytes = self.buf_valid;
+            if let Err(e) = crate::decrypt::decrypt_sectors(
+                &mut self.read_buf[..bytes],
+                &self.decrypt_keys,
+                0,
+            ) {
+                return Err(io::Error::other(e.to_string()));
+            }
+
+            // Demux into PES packets, parse into frames
+            if let Some(ref mut demuxer) = self.demuxer {
+                let packets = demuxer.feed(&self.read_buf[..bytes]);
+                for pes in &packets {
+                    if let Some((pid_idx, _)) = self.pid_to_track.iter().enumerate()
+                        .find(|(_, (pid, _))| *pid == pes.pid)
+                    {
+                        let track_idx = self.pid_to_track[pid_idx].1;
+                        if let Some((_, parser)) = self.parsers.iter_mut()
+                            .find(|(pid, _)| *pid == pes.pid)
+                        {
+                            for frame in parser.parse(pes) {
+                                self.pending_frames.push_back(
+                                    crate::pes::PesFrame::from_codec_frame(track_idx, frame)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reset buffer for next read
+            self.buf_valid = 0;
+            self.buf_cursor = 0;
+
+            if let Some(frame) = self.pending_frames.pop_front() {
+                return Ok(Some(frame));
+            }
+            // No frames produced — read more data
+        }
+    }
+
+    fn info(&self) -> &DiscTitle {
+        &self.title
     }
 }
 

@@ -4,13 +4,13 @@
 //! The pipeline just moves frames: input.next_frame() → output.write_frame().
 //!
 //! A PES frame is one unit of elementary stream data: a video frame,
-//! an audio frame, a subtitle packet. It has a track ID, timestamp,
+//! an audio frame, a subtitle packet. It carries a track ID, timestamp,
 //! and the raw codec data.
 
 /// One frame of elementary stream data.
 #[derive(Debug, Clone)]
 pub struct PesFrame {
-    /// Track index (0-based, matches StreamInfo track order).
+    /// Track index (0-based, matches stream info track order).
     pub track: usize,
     /// Presentation timestamp in nanoseconds.
     pub pts: i64,
@@ -18,6 +18,18 @@ pub struct PesFrame {
     pub keyframe: bool,
     /// Raw elementary stream data (NAL units, audio samples, etc).
     pub data: Vec<u8>,
+}
+
+impl PesFrame {
+    /// Create from a codec::Frame with a track index.
+    pub fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
+        Self {
+            track,
+            pts: frame.pts_ns,
+            keyframe: frame.keyframe,
+            data: frame.data,
+        }
+    }
 }
 
 /// Input stream — produces PES frames from any source.
