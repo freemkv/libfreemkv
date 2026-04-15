@@ -172,6 +172,11 @@ impl DiscStream {
         }
     }
 
+    /// Skip decryption — return raw encrypted bytes.
+    pub fn set_raw(&mut self) {
+        self.decrypt_keys = crate::decrypt::DecryptKeys::None;
+    }
+
     /// Lock the tray.
     pub fn lock_tray(&mut self) {
         self.drive.lock_tray();

@@ -220,6 +220,11 @@ impl IsoStream {
 
         Ok(true)
     }
+
+    /// Skip decryption — return raw encrypted bytes.
+    pub fn set_raw(&mut self) {
+        self.decrypt_keys = DecryptKeys::None;
+    }
 }
 
 impl IOStream for IsoStream {

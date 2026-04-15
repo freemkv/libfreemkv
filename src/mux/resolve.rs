@@ -14,7 +14,7 @@
 //!
 //! Bare paths without a scheme are rejected.
 
-use super::disc::{DiscOptions, DiscStream};
+use super::disc::DiscStream;
 use super::iso::IsoStream;
 use super::network::NetworkStream;
 use super::null::NullStream;
@@ -104,17 +104,25 @@ pub fn parse_url(url: &str) -> StreamUrl {
         return if rest.is_empty() {
             StreamUrl::Disc { device: None }
         } else {
-            StreamUrl::Disc { device: Some(PathBuf::from(rest)) }
+            StreamUrl::Disc {
+                device: Some(PathBuf::from(rest)),
+            }
         };
     }
     if let Some(rest) = url.strip_prefix("m2ts://") {
-        return StreamUrl::M2ts { path: PathBuf::from(rest) };
+        return StreamUrl::M2ts {
+            path: PathBuf::from(rest),
+        };
     }
     if let Some(rest) = url.strip_prefix("mkv://") {
-        return StreamUrl::Mkv { path: PathBuf::from(rest) };
+        return StreamUrl::Mkv {
+            path: PathBuf::from(rest),
+        };
     }
     if let Some(rest) = url.strip_prefix("network://") {
-        return StreamUrl::Network { addr: rest.to_string() };
+        return StreamUrl::Network {
+            addr: rest.to_string(),
+        };
     }
     if url == "null://" || url.starts_with("null://") {
         return StreamUrl::Null;
@@ -123,9 +131,13 @@ pub fn parse_url(url: &str) -> StreamUrl {
         return StreamUrl::Stdio;
     }
     if let Some(rest) = url.strip_prefix("iso://") {
-        return StreamUrl::Iso { path: PathBuf::from(rest) };
+        return StreamUrl::Iso {
+            path: PathBuf::from(rest),
+        };
     }
-    StreamUrl::Unknown { raw: url.to_string() }
+    StreamUrl::Unknown {
+        raw: url.to_string(),
+    }
 }
 
 /// Validate that a file path is non-empty and has a filename component.
@@ -139,7 +151,10 @@ fn validate_file_path(path: &Path, scheme: &str) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{scheme}://{} is not a valid file path — must include a filename", path.display()),
+            format!(
+                "{scheme}://{} is not a valid file path — must include a filename",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -168,13 +183,17 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
 
     match parsed {
         StreamUrl::Disc { device } => {
-            let disc_opts = DiscOptions {
-                device,
-                keydb_path: opts.keydb_path.as_ref().map(|p| p.into()),
-                title_index: opts.title_index,
-            };
-            let stream = DiscStream::open(disc_opts)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let result = DiscStream::open(
+                device.as_deref(),
+                opts.keydb_path.as_deref(),
+                opts.title_index.unwrap_or(0),
+                None,
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut stream = result.stream;
+            if opts.raw {
+                stream.set_raw();
+            }
             Ok(Box::new(stream))
         }
         StreamUrl::M2ts { ref path } => {
@@ -206,7 +225,11 @@ pub fn open_input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn IOStream
                 Some(p) => crate::disc::ScanOptions::with_keydb(p),
                 None => crate::disc::ScanOptions::default(),
             };
-            Ok(Box::new(IsoStream::open(&path.to_string_lossy(), opts.title_index, &scan_opts)?))
+            let mut stream = IsoStream::open(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
+            if opts.raw {
+                stream.set_raw();
+            }
+            Ok(Box::new(stream))
         }
         StreamUrl::Null => {
             Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -275,4 +298,6 @@ pub fn open_output(url: &str, meta: &DiscTitle) -> io::Result<Box<dyn IOStream>>
 pub struct InputOptions {
     pub keydb_path: Option<String>,
     pub title_index: Option<usize>,
+    /// Skip decryption — return raw encrypted bytes.
+    pub raw: bool,
 }
