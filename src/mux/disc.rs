@@ -270,17 +270,29 @@ impl crate::pes::Stream for DiscStream {
                                 .unwrap_or(1),
                             _ => continue,
                         };
-                        if track < self.title.streams.len() {
-                            let pts_ns = ps
-                                .pts
-                                .map(|p| (p as i64) * 1_000_000_000 / 90_000)
-                                .unwrap_or(0);
-                            self.pending_frames.push_back(crate::pes::PesFrame {
-                                track,
-                                pts: pts_ns,
-                                keyframe: true,
-                                data: ps.data.clone(),
-                            });
+                        if track >= self.title.streams.len() {
+                            continue;
+                        }
+                        let pid = self
+                            .pid_to_track
+                            .iter()
+                            .find(|(_, idx)| *idx == track)
+                            .map(|(p, _)| *p)
+                            .unwrap_or(0);
+                        let pes = super::ts::PesPacket {
+                            pid,
+                            pts: ps.pts.map(|p| p as i64),
+                            dts: ps.dts.map(|d| d as i64),
+                            data: ps.data.clone(),
+                        };
+                        if let Some((_, parser)) =
+                            self.parsers.iter_mut().find(|(p, _)| *p == pid)
+                        {
+                            for frame in parser.parse(&pes) {
+                                self.pending_frames.push_back(
+                                    crate::pes::PesFrame::from_codec_frame(track, frame),
+                                );
+                            }
                         }
                     }
                 }
@@ -323,17 +335,33 @@ impl crate::pes::Stream for DiscStream {
                             .unwrap_or(1),
                         _ => continue,
                     };
-                    if track < self.title.streams.len() {
-                        let pts_ns = ps
-                            .pts
-                            .map(|p| (p as i64) * 1_000_000_000 / 90_000)
-                            .unwrap_or(0);
-                        self.pending_frames.push_back(crate::pes::PesFrame {
-                            track,
-                            pts: pts_ns,
-                            keyframe: true,
-                            data: ps.data.clone(),
-                        });
+                    if track >= self.title.streams.len() {
+                        continue;
+                    }
+
+                    // Convert PsPacket to PesPacket for codec parser (same as BD-TS path)
+                    let pid = self
+                        .pid_to_track
+                        .iter()
+                        .find(|(_, idx)| *idx == track)
+                        .map(|(p, _)| *p)
+                        .unwrap_or(0);
+
+                    let pes = super::ts::PesPacket {
+                        pid,
+                        pts: ps.pts.map(|p| p as i64),
+                        dts: ps.dts.map(|d| d as i64),
+                        data: ps.data.clone(),
+                    };
+
+                    if let Some((_, parser)) =
+                        self.parsers.iter_mut().find(|(p, _)| *p == pid)
+                    {
+                        for frame in parser.parse(&pes) {
+                            self.pending_frames.push_back(
+                                crate::pes::PesFrame::from_codec_frame(track, frame),
+                            );
+                        }
                     }
                 }
             }
