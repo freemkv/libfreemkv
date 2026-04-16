@@ -1,14 +1,18 @@
 //! Dolby TrueHD / Atmos elementary stream parser.
 //!
-//! TrueHD major sync: 0xF8726FBA at a 4-byte aligned position.
-//! Access units consist of a major sync followed by minor syncs.
-//! An embedded AC3 core is in substream 0 for backward compatibility.
-//! All access units are keyframes.
-//! Each PES packet = one access unit.
+//! TrueHD access units are 2560-byte fixed-size units (40 per major sync).
+//! Each unit starts with a 4-byte header: [length_hi, length_lo, timestamp_hi, timestamp_lo].
+//! Major sync: 0xF8726FBA appears within a unit.
+//! Buffers across PES boundaries for complete unit delivery.
 
 use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
-pub struct TrueHdParser;
+/// TrueHD access unit size (fixed).
+const TRUEHD_UNIT_SIZE: usize = 2560;
+
+pub struct TrueHdParser {
+    buf: Vec<u8>,
+}
 
 impl Default for TrueHdParser {
     fn default() -> Self {
@@ -18,7 +22,9 @@ impl Default for TrueHdParser {
 
 impl TrueHdParser {
     pub fn new() -> Self {
-        Self
+        Self {
+            buf: Vec::with_capacity(TRUEHD_UNIT_SIZE * 4),
+        }
     }
 }
 
@@ -28,11 +34,41 @@ impl CodecParser for TrueHdParser {
             return Vec::new();
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
-        vec![Frame {
-            pts_ns,
-            keyframe: true,
-            data: pes.data.clone(),
-        }]
+
+        self.buf.extend_from_slice(&pes.data);
+
+        let mut frames = Vec::new();
+
+        // TrueHD units are variable-length but each starts with a 2-byte
+        // big-endian length field (in 16-bit words, includes the 4-byte header).
+        // Extract complete units from the buffer.
+        while self.buf.len() >= 4 {
+            let unit_words = ((self.buf[0] as usize) << 8) | self.buf[1] as usize;
+            if unit_words == 0 {
+                // Padding — skip 2 bytes
+                self.buf.drain(..2);
+                continue;
+            }
+            let unit_bytes = unit_words * 2;
+            if unit_bytes > 65536 {
+                // Invalid — skip 2 bytes to resync
+                self.buf.drain(..2);
+                continue;
+            }
+            if self.buf.len() < unit_bytes {
+                // Incomplete unit — wait for more data
+                break;
+            }
+
+            frames.push(Frame {
+                pts_ns,
+                keyframe: true,
+                data: self.buf[..unit_bytes].to_vec(),
+            });
+            self.buf.drain(..unit_bytes);
+        }
+
+        frames
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -54,35 +90,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_basic_frame() {
-        let mut parser = TrueHdParser::new();
-        // TrueHD major sync: F8 72 6F BA (at 4-byte aligned position) + payload
-        let data = vec![0xF8, 0x72, 0x6F, 0xBA, 0x01, 0x02, 0x03, 0x04];
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, data);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
-    }
-
-    #[test]
-    fn all_keyframes() {
-        let mut parser = TrueHdParser::new();
-        for i in 0..3 {
-            let data = vec![0xF8, 0x72, 0x6F, 0xBA, i];
-            let pes = make_pes(data, Some(90000 * i as i64));
-            let frames = parser.parse(&pes);
-            assert_eq!(frames.len(), 1);
-            assert!(frames[0].keyframe, "TrueHD frame should always be keyframe");
-        }
-    }
-
-    #[test]
-    fn codec_private_none() {
-        let parser = TrueHdParser::new();
-        assert!(parser.codec_private().is_none());
+    fn make_truehd_unit(size_bytes: usize) -> Vec<u8> {
+        let words = size_bytes / 2;
+        let mut data = vec![0u8; size_bytes];
+        data[0] = (words >> 8) as u8;
+        data[1] = (words & 0xFF) as u8;
+        data
     }
 
     #[test]
@@ -90,5 +103,48 @@ mod tests {
         let mut parser = TrueHdParser::new();
         let pes = make_pes(Vec::new(), Some(0));
         assert!(parser.parse(&pes).is_empty());
+    }
+
+    #[test]
+    fn parse_single_unit() {
+        let mut parser = TrueHdParser::new();
+        let unit = make_truehd_unit(200);
+        let pes = make_pes(unit, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), 200);
+    }
+
+    #[test]
+    fn parse_unit_spanning_two_pes() {
+        let mut parser = TrueHdParser::new();
+        let unit = make_truehd_unit(200);
+        let mid = 100;
+
+        let pes1 = make_pes(unit[..mid].to_vec(), Some(90000));
+        assert!(parser.parse(&pes1).is_empty());
+
+        let pes2 = make_pes(unit[mid..].to_vec(), Some(93000));
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), 200);
+    }
+
+    #[test]
+    fn parse_multiple_units_in_one_pes() {
+        let mut parser = TrueHdParser::new();
+        let mut data = make_truehd_unit(100);
+        data.extend_from_slice(&make_truehd_unit(120));
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data.len(), 100);
+        assert_eq!(frames[1].data.len(), 120);
+    }
+
+    #[test]
+    fn codec_private_none() {
+        let parser = TrueHdParser::new();
+        assert!(parser.codec_private().is_none());
     }
 }
