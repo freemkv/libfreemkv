@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.5 (2026-04-16)
+
+### Audio parser buffering
+- **AC3** — buffer across PES boundaries with frame size from fscod/frmsizecod table. Eliminates all AC3 decode errors on BD and UHD.
+- **DTS** — buffer with core sync detection + frame size from header. DTS-HD extension frames handled correctly.
+- **TrueHD** — buffer with unit length field parsing. Incomplete units held for next PES.
+- All audio parsers now emit complete frames only. When PES boundaries align (normal case), buffering is a no-op.
+
 ## 0.10.4 (2026-04-16)
 
 ### CSS decryption — full key hierarchy
