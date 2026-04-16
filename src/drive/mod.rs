@@ -111,6 +111,11 @@ impl Drive {
         self.profile.is_some()
     }
 
+    /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
+    pub fn scsi_mut(&mut self) -> &mut dyn ScsiTransport {
+        self.scsi.as_mut()
+    }
+
     pub fn wait_ready(&mut self) -> Result<()> {
         let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut tried_reset = false;

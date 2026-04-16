@@ -10,6 +10,7 @@
 //! css::descramble_sector(&key, &mut sector);
 //! ```
 
+pub mod auth;
 pub mod crack;
 pub mod lfsr;
 pub(crate) mod tables;
