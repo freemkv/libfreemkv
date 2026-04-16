@@ -50,6 +50,8 @@ const ASPECT_RATIOS: [(u8, u8); 5] = [
 pub struct Mpeg2Parser {
     /// Raw bytes of the last seen sequence header (+ sequence extension if found).
     seq_header: Option<Vec<u8>>,
+    /// Whether we've captured the sequence extension (B5) already.
+    has_extension: bool,
 }
 
 impl Default for Mpeg2Parser {
@@ -60,7 +62,7 @@ impl Default for Mpeg2Parser {
 
 impl Mpeg2Parser {
     pub fn new() -> Self {
-        Self { seq_header: None }
+        Self { seq_header: None, has_extension: false }
     }
 
     /// Extract resolution from a captured sequence header.
@@ -105,23 +107,64 @@ impl CodecParser for Mpeg2Parser {
 
             match code {
                 SEQ_HEADER_CODE => {
-                    // Capture sequence header: from start code to next start code
-                    // (or to the sequence extension if present).
+                    // MPEG-2 sequence header: 00 00 01 B3 + variable data.
+                    // Base header: 8 bytes after start code = 12 bytes total.
+                    // Then possibly 64 intra quantizer values (bit-packed from bit 63).
+                    // Then possibly 64 non-intra quantizer values.
+                    // Then extensions (00 00 01 B5).
+                    //
+                    // Capture to the next start code within this PES data.
+                    // If no next start code exists (extension in next PES), capture
+                    // just the sequence header without extensions.
                     let hdr_start = sc;
-                    let hdr_end = find_start_code(data, sc + 4).unwrap_or(data.len());
+                    let next_sc = find_start_code(data, sc + 4);
+                    let hdr_end = match next_sc {
+                        Some(next) if next + 3 < data.len() => {
+                            let mut end = next;
+                            // Include B5 extensions
+                            while end + 3 < data.len() && data[end + 3] == SEQ_EXT_CODE {
+                                end = find_start_code(data, end + 4).unwrap_or(data.len());
+                            }
+                            end
+                        }
+                        _ => {
+                            // No next start code in this PES — calculate exact header size.
+                            // Bit 62: load_intra_quantiser_matrix
+                            // Bit 62+1+512: load_non_intra_quantiser_matrix (if intra present)
+                            // Bit 62+1: load_non_intra_quantiser_matrix (if intra absent)
+                            if sc + 12 > data.len() {
+                                data.len()
+                            } else {
+                                let mut bits = 63u32; // bits consumed so far
+                                let intra = (data[sc + 11] & 0x02) != 0;
+                                if intra { bits += 64 * 8; }
+                                // Non-intra flag is at current bit position
+                                let byte_pos = (bits / 8) as usize;
+                                let bit_pos = 7 - (bits % 8) as u8;
+                                if sc + 4 + byte_pos < data.len() {
+                                    let non_intra = (data[sc + 4 + byte_pos] >> bit_pos) & 1 != 0;
+                                    bits += 1;
+                                    if non_intra { bits += 64 * 8; }
+                                }
+                                let total_bytes = 4 + ((bits + 7) / 8) as usize;
+                                (sc + total_bytes).min(data.len())
+                            }
+                        }
+                    };
 
-                    let mut seq_data = data[hdr_start..hdr_end].to_vec();
-
-                    // Check if sequence extension follows immediately.
-                    if hdr_end + 3 < data.len() && data[hdr_end + 3] == SEQ_EXT_CODE {
-                        let ext_end = find_start_code(data, hdr_end + 4).unwrap_or(data.len());
-                        seq_data.extend_from_slice(&data[hdr_end..ext_end]);
-                    }
-
-                    self.seq_header = Some(seq_data);
-                    // Sequence header implies I-frame follows.
+                    self.seq_header = Some(data[hdr_start..hdr_end].to_vec());
                     keyframe = true;
-                    pos = sc + 4;
+                    pos = if next_sc.is_some() { hdr_end } else { sc + 4 };
+                }
+                SEQ_EXT_CODE if self.seq_header.is_some() && !self.has_extension => {
+                    // Sequence extension appears after seq header (may be in next PES).
+                    // Append it to the stored seq_header.
+                    let ext_end = find_start_code(data, sc + 4).unwrap_or(data.len());
+                    if let Some(ref mut hdr) = self.seq_header {
+                        hdr.extend_from_slice(&data[sc..ext_end]);
+                    }
+                    self.has_extension = true;
+                    pos = ext_end;
                 }
                 PICTURE_CODE => {
                     // Picture header: bytes after start code contain temporal_reference

@@ -67,7 +67,7 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
         lfsr0 = (lfsr0 >> 8) | ((o_lfsr0 as u32) << 24);
 
         combined += TAB5[o_lfsr1 as usize] as u32 + TAB4[o_lfsr0 as usize] as u32;
-        *byte = TAB1[*byte as usize] ^ (combined & 0xFF) as u8;
+        *byte ^= (combined & 0xFF) as u8;
         combined >>= 8;
     }
 
