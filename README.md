@@ -4,7 +4,7 @@
 
 # libfreemkv
 
-Rust library for 4K UHD / Blu-ray optical drives. Drive access, disc scanning, stream labels, AACS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
+Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
 
 **12+ MB/s** sustained read speeds on BD. Full init: unlock, firmware upload, speed calibration — all from pure Rust.
 
