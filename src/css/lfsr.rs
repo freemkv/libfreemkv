@@ -10,7 +10,7 @@
 //! Algorithm: Frank A. Stevenson's divide-and-conquer attack (1999).
 //! Tables: CSS specification constants.
 
-use super::tables::{TAB1, TAB2, TAB3, TAB4};
+use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
 /// Descramble a CSS-encrypted DVD sector in place.
 ///
@@ -57,20 +57,17 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     let mut combined: u32 = 0;
 
     // Generate 1920 keystream bytes (for sector bytes 128..2048)
+    // Per libdvdcss css_unscramble: TAB1 permutation on ciphertext, no invert on LFSR0
     for byte in sector.iter_mut().take(2048).skip(128) {
-        // Clock LFSR1
         let o_lfsr1 = TAB2[lfsr1_hi as usize] ^ TAB3[lfsr1_lo as usize];
         lfsr1_hi = lfsr1_lo >> 1;
         lfsr1_lo = ((lfsr1_lo & 1) << 8) ^ o_lfsr1 as u32;
-        let o_lfsr1_perm = TAB4[o_lfsr1 as usize];
 
-        // Clock LFSR0
         let o_lfsr0 = (((((((lfsr0 >> 8) ^ lfsr0) >> 1) ^ lfsr0) >> 3) ^ lfsr0) >> 7) as u8;
         lfsr0 = (lfsr0 >> 8) | ((o_lfsr0 as u32) << 24);
 
-        // Combine with addition and carry
-        combined += (o_lfsr0 ^ 0xFF) as u32 + o_lfsr1_perm as u32;
-        *byte ^= (combined & 0xFF) as u8;
+        combined += TAB5[o_lfsr1 as usize] as u32 + TAB4[o_lfsr0 as usize] as u32;
+        *byte = TAB1[*byte as usize] ^ (combined & 0xFF) as u8;
         combined >>= 8;
     }
 
@@ -106,12 +103,12 @@ pub(crate) fn decrypt_key(invert: u8, p_key: &[u8; 5], p_crypted: &[u8]) -> [u8;
         let o_lfsr1 = TAB2[lfsr1_hi as usize] ^ TAB3[lfsr1_lo as usize];
         lfsr1_hi = lfsr1_lo >> 1;
         lfsr1_lo = ((lfsr1_lo & 1) << 8) ^ o_lfsr1 as u32;
-        let o_lfsr1_perm = TAB4[o_lfsr1 as usize];
 
         let o_lfsr0 = (((((((lfsr0 >> 8) ^ lfsr0) >> 1) ^ lfsr0) >> 3) ^ lfsr0) >> 7) as u8;
         lfsr0 = (lfsr0 >> 8) | ((o_lfsr0 as u32) << 24);
 
-        combined += (o_lfsr0 ^ invert) as u32 + o_lfsr1_perm as u32;
+        // TAB5 for LFSR1 output, TAB4 for LFSR0^invert (per libdvdcss css_DecryptKey)
+        combined += TAB5[o_lfsr1 as usize] as u32 + TAB4[(o_lfsr0 ^ invert) as usize] as u32;
         *byte = (combined & 0xFF) as u8;
         combined >>= 8;
     }
@@ -237,58 +234,27 @@ mod tests {
     /// twice with the same key and restored scramble flag should roundtrip,
     /// since XOR is its own inverse.
     #[test]
-    fn css_descramble_produces_valid_mpeg2() {
+    fn css_descramble_modifies_encrypted_region() {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
 
-        // Build a sector with MPEG-2 pack header and PES header
-        let mut sector = vec![0x00u8; 2048];
-        // Pack header at byte 0
-        sector[0] = 0x00;
-        sector[1] = 0x00;
-        sector[2] = 0x01;
-        sector[3] = 0xBA;
-        // Scramble flag at byte 0x14
-        sector[0x14] = 0x30;
-        // Sector seed at bytes 0x54-0x58
+        let mut sector = vec![0xAAu8; 2048];
+        sector[0x14] = 0x30; // scramble flag
         sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
-        // PES header at byte 128
-        sector[0x80] = 0x00;
-        sector[0x81] = 0x00;
-        sector[0x82] = 0x01;
-        sector[0x83] = 0xE0;
-        // Fill some content in the encrypted region
-        for (i, byte) in sector.iter_mut().enumerate().take(2048).skip(0x84) {
-            *byte = (i & 0xFF) as u8;
-        }
 
         let original = sector.clone();
-
-        // First descramble: "encrypts" by XORing keystream
         descramble_sector(&title_key, &mut sector);
-        // Flag should be cleared
-        assert_eq!(
-            sector[0x14] & 0x30,
-            0x00,
-            "scramble flag not cleared after first descramble"
-        );
-        // Encrypted region should differ
-        assert_ne!(
-            &sector[0x80..0x84],
-            &original[0x80..0x84],
-            "encrypted region unchanged after descramble"
-        );
 
-        // Restore the scramble flag and sector seed for second pass
-        sector[0x14] = 0x30;
-
-        // Second descramble: XOR again = roundtrip
-        descramble_sector(&title_key, &mut sector);
-        // Now the encrypted region should match original
-        assert_eq!(
-            &sector[0x80..2048],
-            &original[0x80..2048],
-            "double descramble did not roundtrip"
-        );
+        // Flag cleared
+        assert_eq!(sector[0x14] & 0x30, 0x00);
+        // Header (0..128) unchanged except flag byte
+        for i in 0..128 {
+            if i == 0x14 {
+                continue;
+            }
+            assert_eq!(sector[i], original[i], "header byte {} changed", i);
+        }
+        // Encrypted region modified
+        assert_ne!(&sector[128..256], &original[128..256]);
     }
 
     /// Test 4: css_tab1_relationship

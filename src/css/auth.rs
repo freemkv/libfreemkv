@@ -1,23 +1,52 @@
-//! CSS drive authentication — SCSI handshake to unlock scrambled sector reads.
-//!
-//! Pure SCSI (REPORT KEY / SEND KEY). Works on all platforms via ScsiTransport.
-//!
-//! The CSS auth uses a challenge-response with a 6-round substitution-permutation
-//! cipher (CSSCryptKey). This is DIFFERENT from the content descrambling cipher.
+//! CSS drive authentication — full key hierarchy.
 //!
 //! Protocol:
-//!   1. Allocate AGID
-//!   2. Host sends challenge, drive returns Key1
-//!   3. Host brute-forces variant (0-31) by checking which produces Key1
-//!   4. Drive sends challenge, host computes Key2 using found variant
-//!   5. Host sends Key2, drive verifies — authentication complete
+//!   1. Bus authentication (challenge-response) → bus key
+//!   2. Read disc key block (READ DVD STRUCTURE) → XOR with bus key → decrypt with player keys → disc key
+//!   3. Read title key (REPORT KEY format 0x04) → XOR with bus key → decrypt with disc key → title key
 //!
-//! Based on Stevenson 1999 analysis and libdvdcss CSSAuth()/CSSCryptKey().
+//! Based on libdvdcss (VideoLAN) and Stevenson 1999 analysis.
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
 
-// ── Tables from csstables.h (libdvdcss) ────────────────────────────────────
+// ── Player keys (from libdvdcss, Stevenson's PlayerKey cracker) ───────────
+
+const PLAYER_KEYS: [[u8; 5]; 31] = [
+    [0x01, 0xaf, 0xe3, 0x12, 0x80],
+    [0x12, 0x11, 0xca, 0x04, 0x3b],
+    [0x14, 0x0c, 0x9e, 0xd0, 0x09],
+    [0x14, 0x71, 0x35, 0xba, 0xe2],
+    [0x1a, 0xa4, 0x33, 0x21, 0xa6],
+    [0x26, 0xec, 0xc4, 0xa7, 0x4e],
+    [0x2c, 0xb2, 0xc1, 0x09, 0xee],
+    [0x2f, 0x25, 0x9e, 0x96, 0xdd],
+    [0x33, 0x2f, 0x49, 0x6c, 0xe0],
+    [0x35, 0x5b, 0xc1, 0x31, 0x0f],
+    [0x36, 0x67, 0xb2, 0xe3, 0x85],
+    [0x39, 0x3d, 0xf1, 0xf1, 0xbd],
+    [0x3b, 0x31, 0x34, 0x0d, 0x91],
+    [0x45, 0xed, 0x28, 0xeb, 0xd3],
+    [0x48, 0xb7, 0x6c, 0xce, 0x69],
+    [0x4b, 0x65, 0x0d, 0xc1, 0xee],
+    [0x4c, 0xbb, 0xf5, 0x5b, 0x23],
+    [0x51, 0x67, 0x67, 0xc5, 0xe0],
+    [0x53, 0x94, 0xe1, 0x75, 0xbf],
+    [0x57, 0x2c, 0x8b, 0x31, 0xae],
+    [0x63, 0xdb, 0x4c, 0x5b, 0x4a],
+    [0x7b, 0x1e, 0x5e, 0x2b, 0x57],
+    [0x85, 0xf3, 0x85, 0xa0, 0xe0],
+    [0xab, 0x1e, 0xe7, 0x7b, 0x72],
+    [0xab, 0x36, 0xe3, 0xeb, 0x76],
+    [0xb1, 0xb8, 0xf9, 0x38, 0x03],
+    [0xb8, 0x5d, 0xd8, 0x53, 0xbd],
+    [0xbf, 0x92, 0xc3, 0xb0, 0xe2],
+    [0xcf, 0x1a, 0xb2, 0xf8, 0x0a],
+    [0xec, 0xa0, 0xcf, 0xb3, 0xff],
+    [0xfc, 0x95, 0xa9, 0x87, 0x35],
+];
+
+// ── CryptKey tables ───────────────────────────────────────────────────────
 
 const CRYPT_TAB0: [u8; 256] = [
     0xB7, 0xF4, 0x82, 0x57, 0xDA, 0x4D, 0xDB, 0xE2, 0x2F, 0x52, 0x1A, 0xA8, 0x68, 0x5A, 0x8A, 0xFF,
@@ -123,17 +152,56 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
     ],
 ];
 
-// ── Public API ──────────────────────────────────────────────────────────────
+// ── SCSI constants ────────────────────────────────────────────────────────
 
-/// Perform CSS authentication with the drive.
+const SCSI_READ_DVD_STRUCTURE: u8 = 0xAD;
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+/// Perform CSS bus authentication only.
 pub fn authenticate(drive: &mut Drive) -> Result<()> {
+    let (_, _) = bus_auth(drive)?;
+    Ok(())
+}
+
+/// Full CSS key extraction: bus auth → disc key → title key.
+pub fn authenticate_and_read_title_key(drive: &mut Drive, lba: u32) -> Result<[u8; 5]> {
+    // Session 1: bus auth → disc key (AGID consumed by READ_DVD_STRUCTURE)
+    let (agid, bus_key) = bus_auth(drive)?;
+    let disc_key = read_disc_key(drive, agid, &bus_key)?;
+
+    // Session 2: fresh bus auth → title key (needs separate AGID)
+    let (agid2, bus_key2) = bus_auth(drive)?;
+    let encrypted_title = read_raw_title_key(drive, agid2, lba)?;
+
+    // Decrypt title key: XOR with bus key, then decrypt with disc key
+    let mut title_key = [0u8; 5];
+    for i in 0..5 {
+        title_key[i] = encrypted_title[i] ^ bus_key2[i];
+    }
+
+    if title_key == [0u8; 5] {
+        return Ok(title_key);
+    }
+
+    let title_key = super::lfsr::decrypt_key(0xFF, &disc_key, &title_key);
+    Ok(title_key)
+}
+
+// ── Step 1: Bus Authentication ────────────────────────────────────────────
+
+fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
     let scsi = drive.scsi_mut();
 
-    // Invalidate all AGIDs
+    // Invalidate all AGIDs via REPORT KEY format 0x3F
     for agid in 0..4u8 {
-        let mut buf = [0u8; 4];
+        let mut cdb = [0u8; 12];
+        cdb[0] = crate::scsi::SCSI_REPORT_KEY;
+        // alloc_len = 0 (no data transfer)
+        cdb[10] = (agid << 6) | 0x3F;
+        let mut buf = [0u8; 8];
         let _ = scsi.execute(
-            &report_key_cdb(agid, 0x3F, 0),
+            &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
             5_000,
@@ -151,12 +219,11 @@ pub fn authenticate(drive: &mut Drive) -> Result<()> {
     .map_err(|_| Error::CssAuthFailed)?;
     let agid = (buf[7] >> 6) & 0x03;
 
-    // Step 1: Send host challenge
+    // Host sends challenge
     let host_challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let mut hc_buf = [0u8; 16];
     hc_buf[0] = 0x00;
     hc_buf[1] = 0x0E;
-    // Byte-reverse on wire
     for i in 0..10 {
         hc_buf[4 + i] = host_challenge[9 - i];
     }
@@ -168,7 +235,7 @@ pub fn authenticate(drive: &mut Drive) -> Result<()> {
     )
     .map_err(|_| Error::CssAuthFailed)?;
 
-    // Step 2: Get Key1 from drive
+    // Get Key1 from drive
     let mut dk_buf = [0u8; 12];
     scsi.execute(
         &report_key_cdb(agid, 0x02, 12),
@@ -179,21 +246,20 @@ pub fn authenticate(drive: &mut Drive) -> Result<()> {
     .map_err(|_| Error::CssAuthFailed)?;
     let mut key1 = [0u8; 5];
     for i in 0..5 {
-        key1[i] = dk_buf[4 + (4 - i)]; // byte-reverse
+        key1[i] = dk_buf[4 + (4 - i)];
     }
 
-    // Step 3: Brute-force variant (0-31)
+    // Brute-force variant (0-31)
     let mut variant: Option<u8> = None;
     for v in 0..32u8 {
-        let check = crypt_key(0, v, &host_challenge);
-        if check == key1 {
+        if crypt_key(0, v, &host_challenge) == key1 {
             variant = Some(v);
             break;
         }
     }
     let variant = variant.ok_or(Error::CssAuthFailed)?;
 
-    // Step 4: Get drive challenge
+    // Get drive challenge
     let mut dc_buf = [0u8; 16];
     scsi.execute(
         &report_key_cdb(agid, 0x01, 16),
@@ -204,41 +270,194 @@ pub fn authenticate(drive: &mut Drive) -> Result<()> {
     .map_err(|_| Error::CssAuthFailed)?;
     let mut drive_challenge = [0u8; 10];
     for i in 0..10 {
-        drive_challenge[i] = dc_buf[4 + (9 - i)]; // byte-reverse
+        drive_challenge[i] = dc_buf[4 + (9 - i)];
     }
 
-    // Step 5: Compute Key2 and send it
+    // Compute Key2 and send it
     let key2 = crypt_key(1, variant, &drive_challenge);
     let mut hk_buf = [0u8; 12];
     hk_buf[0] = 0x00;
     hk_buf[1] = 0x0A;
     for i in 0..5 {
-        hk_buf[4 + i] = key2[4 - i]; // byte-reverse
+        hk_buf[4 + i] = key2[4 - i];
     }
     scsi.execute(
-        &send_key_cdb(agid, 0x03, 12), // format 0x03 for Key2
+        &send_key_cdb(agid, 0x03, 12),
         crate::scsi::DataDirection::ToDevice,
         &mut hk_buf,
         5_000,
     )
     .map_err(|_| Error::CssAuthFailed)?;
 
-    Ok(())
+    // Bus key = CryptKey(2, variant, key1 || key2)
+    let mut combined = [0u8; 10];
+    combined[..5].copy_from_slice(&key1);
+    combined[5..].copy_from_slice(&key2);
+    let bus_key = crypt_key(2, variant, &combined);
+
+    Ok((agid, bus_key))
 }
 
-// ── CSSCryptKey — the bus key challenge-response cipher ─────────────────────
+// ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
-/// Compute CSS bus key challenge response.
-/// key_type: 0=Key1, 1=Key2, 2=bus_key
+fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 5]> {
+    let scsi = drive.scsi_mut();
+
+    // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
+    let alloc_len: u16 = 2048 + 4;
+    let mut cdb = [0u8; 12];
+    cdb[0] = SCSI_READ_DVD_STRUCTURE;
+    // bytes 2-5: address = 0
+    cdb[6] = 0; // layer
+    cdb[7] = 0x02; // format = disc key
+    cdb[8] = (alloc_len >> 8) as u8;
+    cdb[9] = alloc_len as u8;
+    cdb[10] = agid << 6;
+
+    let mut buf = vec![0u8; alloc_len as usize];
+    let dvd_result = scsi.execute(
+        &cdb,
+        crate::scsi::DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    );
+    dvd_result.map_err(|_| Error::CssAuthFailed)?;
+
+    // Disc key block starts at offset 4 (skip 4-byte header)
+    let disc_key_block = &mut buf[4..4 + 2048];
+
+
+    // XOR with reversed bus key (per libdvdcss)
+    for (i, byte) in disc_key_block.iter_mut().enumerate() {
+        *byte ^= bus_key[4 - (i % 5)];
+    }
+
+
+    // Try each player key against each of 408 disc key entries.
+    // Each entry in the block is the disc key encrypted with a specific player key.
+    // We try all known player keys and verify by checking that two different
+    // entries produce the same disc key.
+    let mut candidates: Vec<([u8; 5], usize, usize)> = Vec::new(); // (disc_key, pk_idx, pos)
+
+    for (pk_idx, player_key) in PLAYER_KEYS.iter().enumerate() {
+        for pos in 0..408 {
+            let offset = pos * 5;
+            if offset + 5 > disc_key_block.len() {
+                break;
+            }
+            let mut enc = [0u8; 5];
+            enc.copy_from_slice(&disc_key_block[offset..offset + 5]);
+            let candidate = super::lfsr::decrypt_key(0x00, player_key, &enc);
+
+            // Check if any previous candidate matches (same disc key from different entry/pk)
+            for &(ref prev, _, _) in &candidates {
+                if *prev == candidate {
+                    return Ok(candidate);
+                }
+            }
+            candidates.push((candidate, pk_idx, pos));
+        }
+    }
+
+    Err(Error::CssAuthFailed)
+}
+
+// ── Step 3: Title Key ─────────────────────────────────────────────────────
+
+/// Read the raw (bus-encrypted) title key bytes from the drive.
+fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<[u8; 5]> {
+    let scsi = drive.scsi_mut();
+    let mut cdb = [0u8; 12];
+    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
+    cdb[2] = (lba >> 24) as u8;
+    cdb[3] = (lba >> 16) as u8;
+    cdb[4] = (lba >> 8) as u8;
+    cdb[5] = lba as u8;
+    cdb[8] = 0x00;
+    cdb[9] = 0x0C;
+    cdb[10] = (agid << 6) | 0x04;
+
+    let mut buf = [0u8; 12];
+    let result = scsi.execute(
+        &cdb,
+        crate::scsi::DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    );
+    result.map_err(|_| Error::CssAuthFailed)?;
+
+    let mut key = [0u8; 5];
+    for i in 0..5 {
+        key[i] = buf[5 + (4 - i)];
+    }
+    Ok(key)
+}
+
+fn read_title_key(
+    drive: &mut Drive,
+    agid: u8,
+    lba: u32,
+    bus_key: &[u8; 5],
+    disc_key: &[u8; 5],
+) -> Result<[u8; 5]> {
+    let scsi = drive.scsi_mut();
+
+    let mut cdb = [0u8; 12];
+    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
+    cdb[2] = (lba >> 24) as u8;
+    cdb[3] = (lba >> 16) as u8;
+    cdb[4] = (lba >> 8) as u8;
+    cdb[5] = lba as u8;
+    cdb[8] = 0x00;
+    cdb[9] = 0x0C;
+    cdb[10] = (agid << 6) | 0x04;
+
+    let mut buf = [0u8; 12];
+    let tk_result = scsi.execute(
+        &cdb,
+        crate::scsi::DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    );
+    tk_result.map_err(|_| Error::CssAuthFailed)?;
+
+
+    // Title key at bytes 5..10, byte-reversed
+    let mut title_key = [0u8; 5];
+    for i in 0..5 {
+        title_key[i] = buf[5 + (4 - i)];
+    }
+
+    // XOR with reversed bus key (same pattern as disc key block)
+    for i in 0..5 {
+        title_key[i] ^= bus_key[4 - i];
+    }
+
+    // Check for null key (title not encrypted)
+    if title_key == [0u8; 5] {
+        return Ok(title_key);
+    }
+
+    // Decrypt with disc key (invert=0xFF for title keys)
+    let title_key = super::lfsr::decrypt_key(0xFF, disc_key, &title_key);
+
+    Ok(title_key)
+}
+
+// ── CSSCryptKey ───────────────────────────────────────────────────────────
+
+/// Exposed for testing only.
+pub fn test_crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
+    crypt_key(key_type, variant, challenge)
+}
+
 fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
-    // Permute challenge
     let perm = &PERM_CHALLENGE[key_type];
     let mut scratch = [0u8; 10];
     for i in 0..10 {
         scratch[i] = challenge[perm[i]];
     }
 
-    // Resolve CSS variant
     let css_variant = match key_type {
         0 => variant as usize,
         1 => PERM_VARIANT[0][variant as usize] as usize,
@@ -247,7 +466,6 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
 
     let cse = VARIANTS[css_variant] ^ CRYPT_TAB2[css_variant];
 
-    // LFSR init from upper 5 challenge bytes + secret
     let mut tmp1 = [0u8; 5];
     for i in 0..5 {
         tmp1[i] = scratch[5 + i] ^ SECRET[i] ^ CRYPT_TAB2[i];
@@ -261,7 +479,6 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
 
     let mut lfsr1: u32 = ((tmp1[3] as u32) << 9) | 0x100 | (tmp1[4] as u32);
 
-    // Generate 30 pseudo-random bytes
     let mut bits = [0u8; 30];
     let mut carry: u32 = 0;
     for idx in (0..30).rev() {
@@ -280,24 +497,22 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
         bits[idx] = val;
     }
 
-    // Six substitution-permutation rounds (NOT all identical — rounds 3,4 use CRYPT_TAB0)
-    // Matches libdvdcss CryptKey() exactly.
     let mut tmp1 = [scratch[0], scratch[1], scratch[2], scratch[3], scratch[4]];
     let mut tmp2 = [0u8; 5];
 
-    // Round 1: bits[25..29] ^ scratch -> tmp1
+    // Round 1: bits[25..29] ^ scratch -> tmp1 (term from original scratch)
     {
         let mut term: u8 = 0;
         for i in (0..5usize).rev() {
             let idx = (bits[25 + i] ^ tmp1[i]) as usize;
             let idx2 = (CRYPT_TAB1[idx] ^ (!CRYPT_TAB2[idx]) ^ cse) as usize;
             tmp1[i] = CRYPT_TAB2[idx2] ^ CRYPT_TAB3[idx2] ^ term;
-            term = scratch[i];
+            term = scratch[i]; // original challenge, NOT modified tmp1
         }
         tmp1[4] ^= tmp1[0];
     }
 
-    // Round 2: bits[20..24] ^ tmp1 -> tmp2
+    // Round 2
     {
         let mut term: u8 = 0;
         for i in (0..5usize).rev() {
@@ -309,7 +524,7 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
         tmp2[4] ^= tmp2[0];
     }
 
-    // Round 3: bits[15..19] ^ tmp2 -> tmp1 (uses CRYPT_TAB0!)
+    // Round 3 (uses CRYPT_TAB0)
     {
         let mut term: u8 = 0;
         for i in (0..5usize).rev() {
@@ -322,7 +537,7 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
         tmp1[4] ^= tmp1[0];
     }
 
-    // Round 4: bits[10..14] ^ tmp1 -> tmp2 (uses CRYPT_TAB0!)
+    // Round 4 (uses CRYPT_TAB0)
     {
         let mut term: u8 = 0;
         for i in (0..5usize).rev() {
@@ -335,7 +550,7 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
         tmp2[4] ^= tmp2[0];
     }
 
-    // Round 5: bits[5..9] ^ tmp2 -> tmp1
+    // Round 5
     {
         let mut term: u8 = 0;
         for i in (0..5usize).rev() {
@@ -347,7 +562,7 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
         tmp1[4] ^= tmp1[0];
     }
 
-    // Round 6: bits[0..4] ^ tmp1 -> key (output)
+    // Round 6
     let mut key = [0u8; 5];
     {
         let mut term: u8 = 0;
@@ -362,7 +577,7 @@ fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
     key
 }
 
-// ── SCSI CDB builders ──────────────────────────────────────────────────────
+// ── SCSI CDB builders ────────────────────────────────────────────────────
 
 fn report_key_cdb(agid: u8, format: u8, alloc_len: u16) -> [u8; 12] {
     let mut cdb = [0u8; 12];
@@ -382,7 +597,7 @@ fn send_key_cdb(agid: u8, format: u8, param_len: u16) -> [u8; 12] {
     cdb
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -401,25 +616,25 @@ mod tests {
     #[test]
     fn crypt_key_varies_by_variant() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let r0 = crypt_key(0, 0, &challenge);
-        let r1 = crypt_key(0, 1, &challenge);
-        assert_ne!(r0, r1);
+        assert_ne!(crypt_key(0, 0, &challenge), crypt_key(0, 1, &challenge));
     }
 
     #[test]
     fn crypt_key_varies_by_type() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let r0 = crypt_key(0, 5, &challenge);
-        let r1 = crypt_key(1, 5, &challenge);
-        assert_ne!(r0, r1);
+        assert_ne!(crypt_key(0, 5, &challenge), crypt_key(1, 5, &challenge));
     }
 
     #[test]
     fn crypt_key_nonzero() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         for v in 0..32u8 {
-            let r = crypt_key(0, v, &challenge);
-            assert_ne!(r, [0u8; 5], "zero result for variant {}", v);
+            assert_ne!(crypt_key(0, v, &challenge), [0u8; 5]);
         }
+    }
+
+    #[test]
+    fn player_keys_count() {
+        assert_eq!(PLAYER_KEYS.len(), 31);
     }
 }

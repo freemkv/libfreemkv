@@ -946,11 +946,42 @@ impl Disc {
         // AACS handshake (Blu-ray/UHD)
         let handshake = Self::do_handshake(session, opts);
 
-        // CSS authentication (DVD) — must happen before scan reads VOB sectors.
-        // Harmless on BD (AGID alloc fails, no effect).
-        let _ = crate::css::auth::authenticate(session);
+        // Request max read speed — removes riplock on DVD
+        // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
+        session.set_speed(0xFFFF);
 
-        Self::scan_with(session, capacity, handshake, opts)
+        let mut disc = Self::scan_with(session, capacity, handshake, opts)?;
+
+        // CSS key extraction for DVDs (bus auth → disc key → title key).
+        // Must be a single auth session — can't call authenticate() separately.
+        if disc.css.is_none()
+            && disc.content_format == ContentFormat::MpegPs
+            && !disc.titles.is_empty()
+        {
+            let lba = disc.titles[0]
+                .extents
+                .iter()
+                .find_map(|ext| {
+                    let mut buf = vec![0u8; 2048];
+                    if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok() {
+                        if crate::css::is_scrambled(&buf) {
+                            return Some(ext.start_lba);
+                        }
+                    }
+                    None
+                });
+
+            if let Some(lba) = lba {
+                if let Ok(title_key) =
+                    crate::css::auth::authenticate_and_read_title_key(session, lba)
+                {
+                    disc.css = Some(crate::css::CssState { title_key });
+                    disc.encrypted = true;
+                }
+            }
+        }
+
+        Ok(disc)
     }
 
     /// Scan a disc image (ISO or any SectorReader). No SCSI, no handshake.

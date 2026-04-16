@@ -99,7 +99,7 @@ impl PesAssembler {
 /// BD Transport Stream demuxer.
 pub struct TsDemuxer {
     assemblers: Vec<PesAssembler>,
-    pid_index: [i16; 8192], // PID → index into assemblers, -1 = not tracked
+    pid_index: Vec<i16>, // PID → index into assemblers, -1 = not tracked
     remainder: Vec<u8>,     // leftover bytes from previous feed() call
 }
 
@@ -118,7 +118,9 @@ impl TsDemuxer {
 
     /// Create a new demuxer tracking the given PIDs.
     pub fn new(pids: &[u16]) -> Self {
-        let mut pid_index = [-1i16; 8192];
+        let max_pid = pids.iter().copied().max().unwrap_or(0) as usize;
+        let table_size = (max_pid + 1).max(8192);
+        let mut pid_index = vec![-1i16; table_size];
         let mut assemblers = Vec::with_capacity(pids.len());
         for (i, &pid) in pids.iter().enumerate() {
             pid_index[pid as usize] = i as i16;
@@ -167,7 +169,11 @@ impl TsDemuxer {
             let adaptation = (ts[3] >> 4) & 0x03;
 
             // Check if we're tracking this PID
-            let idx = self.pid_index[pid as usize];
+            let idx = if (pid as usize) < self.pid_index.len() {
+                self.pid_index[pid as usize]
+            } else {
+                -1
+            };
             if idx < 0 {
                 continue;
             }

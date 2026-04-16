@@ -28,29 +28,33 @@ pub struct CssState {
 /// Crack the CSS title key by reading encrypted sectors and applying
 /// a known-plaintext attack on MPEG-2 headers.
 ///
-/// Reads a few sectors from the first extent, finds one with the
-/// scramble flag set, and cracks the key.
+/// Crack the CSS title key by scanning scrambled sectors across extents.
+///
+/// The Stevenson attack needs a sector where a PES header starts at byte
+/// 0x80 (start of the encrypted region). This only happens when a new PES
+/// packet begins at exactly sector offset 128, which is uncommon. We scan
+/// up to 500 scrambled sectors across all extents to find a crackable one.
 pub fn crack_key(reader: &mut dyn SectorReader, extents: &[Extent]) -> Option<CssState> {
-    if extents.is_empty() {
-        return None;
-    }
+    let mut tried = 0u32;
+    let max_tries = 500;
 
-    let ext = &extents[0];
-    let mut sectors = Vec::new();
-
-    // Read first 10 sectors from the main extent
-    let count = ext.sector_count.min(10);
-    for i in 0..count {
-        let mut buf = vec![0u8; 2048];
-        if reader.read_sectors(ext.start_lba + i, 1, &mut buf).is_ok() {
-            sectors.push(buf);
+    for ext in extents {
+        // Sample sectors spread across the extent
+        let step = (ext.sector_count / 100).max(1);
+        let mut i = 0;
+        while i < ext.sector_count && tried < max_tries {
+            let mut buf = vec![0u8; 2048];
+            if reader.read_sectors(ext.start_lba + i, 1, &mut buf).is_ok() && is_scrambled(&buf) {
+                if let Some(key) = crack::crack_title_key(&buf) {
+                    return Some(CssState { title_key: key });
+                }
+                tried += 1;
+            }
+            i += step;
         }
     }
 
-    // Try cracking from the collected sectors
-    let key = crack::crack_from_sectors(&sectors)?;
-
-    Some(CssState { title_key: key })
+    None
 }
 
 /// Descramble a single CSS-encrypted sector in place.
