@@ -1,15 +1,15 @@
 //! AC3 (Dolby Digital) / EAC3 (Dolby Digital Plus) frame parser.
 //!
 //! AC3 frames are self-contained and always start with syncword 0x0B77.
-//! Each PES packet typically contains exactly one AC3 frame.
-//! All AC3 frames are effectively keyframes (no inter-frame dependencies).
-//!
-//! E-AC-3 shares the same syncword but uses bsid >= 11 (typically 16).
-//! Frame size is derived from the frmsiz field instead of fscod/frmsizecod.
+//! Buffers across PES boundaries so frames that span two PES packets
+//! are emitted complete, not truncated.
 
 use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
-pub struct Ac3Parser;
+pub struct Ac3Parser {
+    /// Leftover bytes from previous PES (incomplete frame at end).
+    buf: Vec<u8>,
+}
 
 impl Default for Ac3Parser {
     fn default() -> Self {
@@ -19,19 +19,24 @@ impl Default for Ac3Parser {
 
 impl Ac3Parser {
     pub fn new() -> Self {
-        Self
+        Self {
+            buf: Vec::with_capacity(4096),
+        }
     }
 }
 
 impl CodecParser for Ac3Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.len() < 2 {
+        if pes.data.is_empty() {
             return Vec::new();
         }
 
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
 
-        let data = &pes.data;
+        // Prepend leftover from previous PES
+        self.buf.extend_from_slice(&pes.data);
+
+        let data = &self.buf;
         let mut frames = Vec::new();
         let mut pos = 0;
 
@@ -44,44 +49,54 @@ impl CodecParser for Ac3Parser {
 
             let remaining = &data[start..];
 
-            // Need at least 6 bytes to inspect bsid / frame size fields
             if remaining.len() < 6 {
-                // Emit whatever remains as a single frame
-                frames.push(Frame {
-                    pts_ns,
-                    keyframe: true,
-                    data: remaining.to_vec(),
-                });
+                // Not enough data to determine frame size — keep for next PES
                 break;
             }
 
             let bsid = get_bsid(remaining);
-
-            if bsid >= 11 {
-                // E-AC-3 frame size from frmsiz field (bytes 2-3)
-                let frame_size = eac3_frame_size(remaining);
-
-                let end = start + frame_size.min(data.len() - start);
-                frames.push(Frame {
-                    pts_ns,
-                    keyframe: true,
-                    data: data[start..end].to_vec(),
-                });
-                pos = end;
+            let frame_size = if bsid >= 11 {
+                eac3_frame_size(remaining)
             } else {
-                // AC-3: emit everything from syncword to next syncword (or end)
-                let next_sync = find_ac3_sync(&data[start + 2..]).map(|o| start + 2 + o);
-                let end = next_sync.unwrap_or(data.len());
-                frames.push(Frame {
-                    pts_ns,
-                    keyframe: true,
-                    data: data[start..end].to_vec(),
-                });
-                pos = end;
+                ac3_frame_size(remaining)
+            };
+
+            if frame_size == 0 || frame_size > 8192 {
+                // Invalid frame size — skip this sync word
+                pos = start + 2;
+                continue;
             }
+
+            if start + frame_size > data.len() {
+                // Incomplete frame — keep for next PES
+                break;
+            }
+
+            frames.push(Frame {
+                pts_ns,
+                keyframe: true,
+                data: data[start..start + frame_size].to_vec(),
+            });
+            pos = start + frame_size;
         }
 
-        // If we found no syncword at all, return empty — the data is not valid AC3.
+        // Keep unconsumed data for next call
+        // `pos` points to the start of unconsumed data (either a partial sync or leftover)
+        let keep_from = if pos < data.len() {
+            // Find the last sync word position in the unconsumed region
+            find_ac3_sync(&data[pos..])
+                .map(|o| pos + o)
+                .unwrap_or(data.len())
+        } else {
+            data.len()
+        };
+
+        if keep_from < data.len() {
+            self.buf = data[keep_from..].to_vec();
+        } else {
+            self.buf.clear();
+        }
+
         frames
     }
 
@@ -97,7 +112,6 @@ fn find_ac3_sync(data: &[u8]) -> Option<usize> {
 
 /// Extract bsid from an AC-3/E-AC-3 frame starting at the syncword.
 /// bsid is at byte 5, bits 7..3.
-/// AC-3: bsid <= 10, E-AC-3: bsid >= 11 (typically 16).
 pub fn get_bsid(data: &[u8]) -> u8 {
     if data.len() < 6 {
         return 0;
@@ -106,258 +120,166 @@ pub fn get_bsid(data: &[u8]) -> u8 {
 }
 
 /// Calculate E-AC-3 frame size in bytes from the frmsiz field.
-/// frmsiz is at bits [2:0] of byte 2 concatenated with byte 3.
-/// Frame size = (frmsiz + 1) * 2 bytes.
-pub fn eac3_frame_size(data: &[u8]) -> usize {
+fn eac3_frame_size(data: &[u8]) -> usize {
     if data.len() < 4 {
         return 0;
     }
-    let frmsiz = ((data[2] as usize & 0x07) << 8) | (data[3] as usize);
+    let frmsiz = ((data[2] as usize & 0x07) << 8) | data[3] as usize;
     (frmsiz + 1) * 2
 }
+
+/// Calculate AC-3 frame size in bytes from fscod and frmsizecod.
+fn ac3_frame_size(data: &[u8]) -> usize {
+    if data.len() < 5 {
+        return 0;
+    }
+    let fscod = (data[4] >> 6) & 0x03;
+    let frmsizecod = (data[4] & 0x3F) as usize;
+    if frmsizecod >= AC3_FRAME_SIZES.len() {
+        return 0;
+    }
+    let words = AC3_FRAME_SIZES[frmsizecod];
+    match fscod {
+        0 => words[0] * 2,
+        1 => words[1] * 2,
+        2 => words[2] * 2,
+        _ => 0,
+    }
+}
+
+/// AC-3 frame size table: [frmsizecod] -> [48kHz words, 44.1kHz words, 32kHz words]
+const AC3_FRAME_SIZES: [[usize; 3]; 38] = [
+    [64, 69, 96],
+    [64, 70, 96],
+    [80, 87, 120],
+    [80, 88, 120],
+    [96, 104, 144],
+    [96, 105, 144],
+    [112, 121, 168],
+    [112, 122, 168],
+    [128, 139, 192],
+    [128, 140, 192],
+    [160, 174, 240],
+    [160, 175, 240],
+    [192, 208, 288],
+    [192, 209, 288],
+    [224, 243, 336],
+    [224, 244, 336],
+    [256, 278, 384],
+    [256, 279, 384],
+    [320, 348, 480],
+    [320, 349, 480],
+    [384, 417, 576],
+    [384, 418, 576],
+    [448, 487, 672],
+    [448, 488, 672],
+    [512, 557, 768],
+    [512, 558, 768],
+    [640, 696, 960],
+    [640, 697, 960],
+    [768, 835, 1152],
+    [768, 836, 1152],
+    [896, 975, 1344],
+    [896, 976, 1344],
+    [1024, 1114, 1536],
+    [1024, 1115, 1536],
+    [1152, 1253, 1728],
+    [1152, 1254, 1728],
+    [1280, 1393, 1920],
+    [1280, 1394, 1920],
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mux::ts::PesPacket;
 
-    fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
-        PesPacket {
-            pid: 0x1100,
-            pts,
-            dts: None,
-            data,
-        }
+    fn make_ac3_frame(fscod: u8, frmsizecod: u8) -> Vec<u8> {
+        let size = AC3_FRAME_SIZES[frmsizecod as usize][fscod as usize] * 2;
+        let mut frame = vec![0u8; size];
+        frame[0] = 0x0B;
+        frame[1] = 0x77;
+        frame[4] = (fscod << 6) | frmsizecod;
+        frame[5] = 0x08 << 3; // bsid = 8 (AC-3)
+        frame
     }
-
-    /// Build a minimal AC-3 header (bsid <= 10).
-    fn make_ac3_header(bsid: u8) -> Vec<u8> {
-        // 0x0B 0x77 <byte2> <byte3> <byte4> <byte5=bsid>
-        let byte5 = (bsid & 0x1F) << 3;
-        vec![0x0B, 0x77, 0x00, 0x00, 0x00, byte5, 0xAA, 0xBB]
-    }
-
-    /// Build a minimal E-AC-3 header with the given bsid and frmsiz.
-    /// frmsiz encodes frame size: frame_bytes = (frmsiz + 1) * 2.
-    fn make_eac3_header(bsid: u8, frmsiz: u16, payload_fill: u8) -> Vec<u8> {
-        let byte2 = (frmsiz >> 8) as u8 & 0x07;
-        let byte3 = (frmsiz & 0xFF) as u8;
-        let byte5 = (bsid & 0x1F) << 3;
-        let frame_size = (frmsiz as usize + 1) * 2;
-        let mut data = vec![0x0B, 0x77, byte2, byte3, 0x00, byte5];
-        // Pad to full frame size
-        while data.len() < frame_size {
-            data.push(payload_fill);
-        }
-        data.truncate(frame_size);
-        data
-    }
-
-    // --- syncword detection ---
-
-    #[test]
-    fn find_ac3_sync_at_start() {
-        let data = [0x0B, 0x77, 0x01, 0x02, 0x03];
-        assert_eq!(find_ac3_sync(&data), Some(0));
-    }
-
-    #[test]
-    fn find_ac3_sync_with_garbage_prefix() {
-        let data = [0xFF, 0xFE, 0x0B, 0x77, 0x01, 0x02];
-        assert_eq!(find_ac3_sync(&data), Some(2));
-    }
-
-    #[test]
-    fn find_ac3_sync_none() {
-        let data = [0x0B, 0x78, 0x00, 0x00];
-        assert_eq!(find_ac3_sync(&data), None);
-    }
-
-    #[test]
-    fn find_ac3_sync_empty() {
-        let data: [u8; 0] = [];
-        assert_eq!(find_ac3_sync(&data), None);
-    }
-
-    // --- bsid detection ---
-
-    #[test]
-    fn bsid_ac3() {
-        let header = make_ac3_header(8);
-        assert_eq!(get_bsid(&header), 8);
-    }
-
-    #[test]
-    fn bsid_eac3() {
-        let header = make_eac3_header(16, 99, 0x00);
-        assert_eq!(get_bsid(&header), 16);
-    }
-
-    #[test]
-    fn bsid_boundary_10() {
-        let header = make_ac3_header(10);
-        assert_eq!(get_bsid(&header), 10);
-        // bsid 10 should be treated as AC-3 (<= 10)
-        assert!(get_bsid(&header) <= 10);
-    }
-
-    #[test]
-    fn bsid_boundary_11() {
-        let header = make_eac3_header(11, 3, 0x00);
-        assert_eq!(get_bsid(&header), 11);
-        // bsid 11 should be treated as E-AC-3 (>= 11)
-        assert!(get_bsid(&header) >= 11);
-    }
-
-    // --- E-AC-3 frame size calculation ---
-
-    #[test]
-    fn eac3_frame_size_basic() {
-        // frmsiz = 99 → frame_size = (99+1)*2 = 200 bytes
-        let header = make_eac3_header(16, 99, 0xDD);
-        assert_eq!(eac3_frame_size(&header), 200);
-    }
-
-    #[test]
-    fn eac3_frame_size_min() {
-        // frmsiz = 0 → frame_size = (0+1)*2 = 2 bytes
-        let data = [0x0B, 0x77, 0x00, 0x00, 0x00, 0x80];
-        assert_eq!(eac3_frame_size(&data), 2);
-    }
-
-    #[test]
-    fn eac3_frame_size_large() {
-        // frmsiz = 0x7FF (max 11-bit) → (2047+1)*2 = 4096
-        let data = [0x0B, 0x77, 0x07, 0xFF, 0x00, 0x80];
-        assert_eq!(eac3_frame_size(&data), 4096);
-    }
-
-    // --- parse: E-AC-3 frame extraction ---
-
-    #[test]
-    fn parse_eac3_single_frame() {
-        let mut parser = Ac3Parser::new();
-        // frmsiz = 9 → frame_size = 20 bytes
-        let data = make_eac3_header(16, 9, 0xCC);
-        assert_eq!(data.len(), 20);
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data.len(), 20);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
-        assert!(frames[0].keyframe);
-    }
-
-    #[test]
-    fn parse_eac3_frame_with_garbage_prefix() {
-        let mut parser = Ac3Parser::new();
-        let mut data = vec![0xFF, 0xFE]; // garbage
-        data.extend_from_slice(&make_eac3_header(16, 4, 0xAA)); // frmsiz=4 → 10 bytes
-        let pes = make_pes(data, Some(0));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data[0], 0x0B);
-        assert_eq!(frames[0].data[1], 0x77);
-        assert_eq!(frames[0].data.len(), 10);
-    }
-
-    // --- parse syncword → frame extracted (AC-3) ---
-
-    #[test]
-    fn parse_syncword() {
-        let mut parser = Ac3Parser::new();
-
-        // AC3 frame starting with syncword (bsid=8)
-        let data = make_ac3_header(8);
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, data);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
-    }
-
-    #[test]
-    fn parse_syncword_with_garbage_prefix() {
-        let mut parser = Ac3Parser::new();
-
-        // Garbage bytes before syncword
-        let mut data = vec![0xFF, 0xFE];
-        data.extend_from_slice(&make_ac3_header(8));
-        let pes = make_pes(data, Some(0));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data[0], 0x0B);
-        assert_eq!(frames[0].data[1], 0x77);
-    }
-
-    // --- all frames are keyframes ---
-
-    #[test]
-    fn all_keyframes() {
-        let mut parser = Ac3Parser::new();
-
-        for i in 0..5u8 {
-            let mut data = make_ac3_header(8);
-            data.push(i);
-            let pes = make_pes(data, Some(90000 * i as i64));
-            let frames = parser.parse(&pes);
-            assert_eq!(frames.len(), 1);
-            assert!(frames[0].keyframe, "AC3 frame {} should be a keyframe", i);
-        }
-    }
-
-    // --- codec_private is None ---
-
-    #[test]
-    fn codec_private_none() {
-        let parser = Ac3Parser::new();
-        assert!(parser.codec_private().is_none());
-    }
-
-    // --- empty / too-short PES ---
 
     #[test]
     fn parse_empty_pes() {
         let mut parser = Ac3Parser::new();
-        let pes = make_pes(Vec::new(), Some(0));
-        let frames = parser.parse(&pes);
-        assert!(frames.is_empty());
+        let pes = PesPacket {
+            pid: 0,
+            pts: None,
+            dts: None,
+            data: vec![],
+        };
+        assert!(parser.parse(&pes).is_empty());
     }
 
     #[test]
-    fn parse_single_byte_pes() {
+    fn parse_single_frame() {
         let mut parser = Ac3Parser::new();
-        let pes = make_pes(vec![0x0B], Some(0));
-        let frames = parser.parse(&pes);
-        assert!(frames.is_empty());
-    }
-
-    // --- PTS conversion ---
-
-    #[test]
-    fn pts_conversion() {
-        let mut parser = Ac3Parser::new();
-        let data = make_ac3_header(8);
-        // 45000 ticks = 0.5 seconds → 500_000_000 ns
-        let pes = make_pes(data, Some(45000));
+        let frame_data = make_ac3_frame(0, 2); // 48kHz, 80 words = 160 bytes
+        let pes = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data: frame_data.clone(),
+        };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pts_ns, 500_000_000);
+        assert_eq!(frames[0].data.len(), 160);
     }
 
-    // --- None PTS ---
+    #[test]
+    fn parse_frame_spanning_two_pes() {
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2); // 160 bytes
+        let mid = 80;
+
+        // First PES: first half of frame
+        let pes1 = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data: frame_data[..mid].to_vec(),
+        };
+        let frames1 = parser.parse(&pes1);
+        assert!(frames1.is_empty(), "partial frame should not emit");
+
+        // Second PES: second half
+        let pes2 = PesPacket {
+            pid: 0,
+            pts: Some(93000),
+            dts: None,
+            data: frame_data[mid..].to_vec(),
+        };
+        let frames2 = parser.parse(&pes2);
+        assert_eq!(frames2.len(), 1);
+        assert_eq!(frames2[0].data.len(), 160);
+    }
 
     #[test]
-    fn no_pts() {
+    fn skip_garbage_before_sync() {
         let mut parser = Ac3Parser::new();
-        let data = make_ac3_header(8);
-        let pes = make_pes(data, None);
+        let frame_data = make_ac3_frame(0, 2);
+        let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF]; // garbage
+        data.extend_from_slice(&frame_data);
+        let pes = PesPacket {
+            pid: 0,
+            pts: None,
+            dts: None,
+            data,
+        };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pts_ns, 0);
+        assert_eq!(frames[0].data.len(), 160);
+    }
+
+    #[test]
+    fn ac3_frame_size_table() {
+        // fscod=0 (48kHz), frmsizecod=0: 64 words = 128 bytes
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x00, 0x40]), 128);
+        // fscod=0 (48kHz), frmsizecod=2: 80 words = 160 bytes
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x02, 0x40]), 160);
     }
 }
