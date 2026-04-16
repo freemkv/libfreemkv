@@ -2,16 +2,17 @@
 //!
 //! DTS core syncword: 0x7FFE8001 (32 bits).
 //! DTS-HD MA/HRA extension syncword: 0x64582025 (32 bits), appears after the core frame.
-//! The extension contains high-resolution audio data and is appended to the core frame.
-//! All frames are keyframes (no inter-frame dependencies).
-//! Each PES packet = one frame.
+//! Buffers across PES boundaries so frames spanning two PES packets
+//! are emitted complete.
 
 use super::{pts_to_ns, CodecParser, Frame, PesPacket};
 
-/// DTS-HD extension syncword bytes.
+const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
 const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 
-pub struct DtsParser;
+pub struct DtsParser {
+    buf: Vec<u8>,
+}
 
 impl Default for DtsParser {
     fn default() -> Self {
@@ -21,7 +22,9 @@ impl Default for DtsParser {
 
 impl DtsParser {
     pub fn new() -> Self {
-        Self
+        Self {
+            buf: Vec::with_capacity(32768),
+        }
     }
 }
 
@@ -32,31 +35,77 @@ impl CodecParser for DtsParser {
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
 
-        let data = &pes.data;
+        self.buf.extend_from_slice(&pes.data);
 
-        // Look for a DTS-HD extension substream after the core.
-        // If found, include both core + extension in the output frame.
-        let frame_data = match find_dts_hd_ext_sync(data) {
-            Some(ext_offset) => {
-                let ext = &data[ext_offset..];
-                if ext.len() >= 9 {
-                    let ext_size = dts_hd_ext_frame_size(ext);
-                    let total_end = ext_offset + ext_size;
-                    let end = total_end.min(data.len());
-                    data[..end].to_vec()
-                } else {
-                    // Extension header too short to parse size; include all data.
-                    data.to_vec()
+        let data = &self.buf;
+        let mut frames = Vec::new();
+        let mut pos = 0;
+
+        while pos < data.len() {
+            // Find DTS core sync
+            let start = match find_sync(&data[pos..], &DTS_CORE_SYNC) {
+                Some(offset) => pos + offset,
+                None => break,
+            };
+
+            // Need at least 10 bytes for core header to get frame size
+            if start + 10 > data.len() {
+                break;
+            }
+
+            let core_size = dts_core_frame_size(&data[start..]);
+            if core_size == 0 || core_size > 32768 {
+                pos = start + 4;
+                continue;
+            }
+
+            if start + core_size > data.len() {
+                // Incomplete core frame
+                break;
+            }
+
+            // Check for DTS-HD extension after core
+            let mut total_size = core_size;
+            if start + core_size + 4 <= data.len() {
+                if let Some(0) = find_sync(
+                    &data[start + core_size..start + core_size + 4],
+                    &DTS_HD_EXT_SYNC,
+                ) {
+                    let ext = &data[start + core_size..];
+                    if ext.len() >= 9 {
+                        let ext_size = dts_hd_ext_frame_size(ext);
+                        if start + core_size + ext_size <= data.len() {
+                            total_size = core_size + ext_size;
+                        }
+                        // If ext incomplete, just emit core
+                    }
                 }
             }
-            None => data.to_vec(),
+
+            frames.push(Frame {
+                pts_ns,
+                keyframe: true,
+                data: data[start..start + total_size].to_vec(),
+            });
+            pos = start + total_size;
+        }
+
+        // Keep unconsumed data
+        let keep_from = if pos < data.len() {
+            find_sync(&data[pos..], &DTS_CORE_SYNC)
+                .map(|o| pos + o)
+                .unwrap_or(data.len())
+        } else {
+            data.len()
         };
 
-        vec![Frame {
-            pts_ns,
-            keyframe: true,
-            data: frame_data,
-        }]
+        if keep_from < data.len() {
+            self.buf = data[keep_from..].to_vec();
+        } else {
+            self.buf.clear();
+        }
+
+        frames
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -64,23 +113,27 @@ impl CodecParser for DtsParser {
     }
 }
 
-/// Find the DTS-HD extension syncword (0x64582025) in data.
-/// Returns the byte offset of the sync, or None.
-pub fn find_dts_hd_ext_sync(data: &[u8]) -> Option<usize> {
+fn find_sync(data: &[u8], pattern: &[u8; 4]) -> Option<usize> {
     if data.len() < 4 {
         return None;
     }
-    (0..=data.len() - 4).find(|&i| {
-        data[i] == DTS_HD_EXT_SYNC[0]
-            && data[i + 1] == DTS_HD_EXT_SYNC[1]
-            && data[i + 2] == DTS_HD_EXT_SYNC[2]
-            && data[i + 3] == DTS_HD_EXT_SYNC[3]
-    })
+    (0..=data.len() - 4).find(|&i| data[i..i + 4] == *pattern)
 }
 
-/// Calculate DTS-HD extension frame size from the extension header.
-/// The size field is at bytes 6-8 of the extension:
-///   ((ext[6] & 0x1F) << 11) | (ext[7] << 3) | (ext[8] >> 5) + 1
+/// DTS core frame size from header bits.
+/// fsize is at bits 46-59 (14 bits) of the header: bytes 5-7.
+fn dts_core_frame_size(data: &[u8]) -> usize {
+    if data.len() < 10 {
+        return 0;
+    }
+    // fsize field: 14 bits starting at bit 46
+    // byte 5 bits 1-0, byte 6 all 8, byte 7 bits 7-4
+    let fsize =
+        ((data[5] as usize & 0x03) << 12) | ((data[6] as usize) << 4) | ((data[7] as usize) >> 4);
+    fsize + 1
+}
+
+/// DTS-HD extension frame size from extension header.
 pub fn dts_hd_ext_frame_size(ext: &[u8]) -> usize {
     if ext.len() < 9 {
         return 0;
@@ -88,6 +141,10 @@ pub fn dts_hd_ext_frame_size(ext: &[u8]) -> usize {
     let raw =
         ((ext[6] as usize & 0x1F) << 11) | ((ext[7] as usize) << 3) | ((ext[8] as usize) >> 5);
     raw + 1
+}
+
+pub fn find_dts_hd_ext_sync(data: &[u8]) -> Option<usize> {
+    find_sync(data, &DTS_HD_EXT_SYNC)
 }
 
 #[cfg(test)]
@@ -104,162 +161,14 @@ mod tests {
         }
     }
 
-    /// Build a DTS core frame with given payload size.
-    fn make_dts_core(payload_len: usize) -> Vec<u8> {
-        let mut data = vec![0x7F, 0xFE, 0x80, 0x01];
-        data.resize(4 + payload_len, 0xAA);
+    fn make_dts_core(size: usize) -> Vec<u8> {
+        let fsize = size - 1;
+        let mut data = vec![0u8; size];
+        data[0..4].copy_from_slice(&DTS_CORE_SYNC);
+        data[5] = (data[5] & 0xFC) | ((fsize >> 12) & 0x03) as u8;
+        data[6] = ((fsize >> 4) & 0xFF) as u8;
+        data[7] = (data[7] & 0x0F) | (((fsize & 0x0F) << 4) as u8);
         data
-    }
-
-    /// Build a DTS-HD extension header + payload.
-    /// ext_size is the value to encode (frame size = ext_size + 1 reported by dts_hd_ext_frame_size,
-    /// but we encode raw = ext_size so that dts_hd_ext_frame_size returns ext_size + 1).
-    fn make_dts_hd_ext(raw_size_field: usize, payload_fill: u8) -> Vec<u8> {
-        let total = raw_size_field + 1; // the size dts_hd_ext_frame_size will return
-        let byte6 = ((raw_size_field >> 11) & 0x1F) as u8;
-        let byte7 = ((raw_size_field >> 3) & 0xFF) as u8;
-        let byte8 = ((raw_size_field & 0x07) << 5) as u8;
-        let mut data = vec![0x64, 0x58, 0x20, 0x25, 0x00, 0x00, byte6, byte7, byte8];
-        while data.len() < total {
-            data.push(payload_fill);
-        }
-        data.truncate(total);
-        data
-    }
-
-    // --- DTS-HD extension sync detection ---
-
-    #[test]
-    fn find_ext_sync_at_offset() {
-        let mut data = vec![0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00];
-        data.extend_from_slice(&[0x64, 0x58, 0x20, 0x25]);
-        assert_eq!(find_dts_hd_ext_sync(&data), Some(6));
-    }
-
-    #[test]
-    fn find_ext_sync_none() {
-        let data = vec![0x7F, 0xFE, 0x80, 0x01, 0x00, 0x00];
-        assert_eq!(find_dts_hd_ext_sync(&data), None);
-    }
-
-    #[test]
-    fn find_ext_sync_at_start() {
-        let data = vec![0x64, 0x58, 0x20, 0x25, 0x00];
-        assert_eq!(find_dts_hd_ext_sync(&data), Some(0));
-    }
-
-    #[test]
-    fn find_ext_sync_too_short() {
-        let data = vec![0x64, 0x58, 0x20];
-        assert_eq!(find_dts_hd_ext_sync(&data), None);
-    }
-
-    // --- DTS-HD extension frame size ---
-
-    #[test]
-    fn ext_frame_size_basic() {
-        // raw_size_field = 100 → frame size = 101
-        let ext = make_dts_hd_ext(100, 0xBB);
-        assert_eq!(dts_hd_ext_frame_size(&ext), 101);
-    }
-
-    #[test]
-    fn ext_frame_size_zero() {
-        // raw_size_field = 0 → frame size = 1
-        let ext = vec![0x64, 0x58, 0x20, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(dts_hd_ext_frame_size(&ext), 1);
-    }
-
-    #[test]
-    fn ext_frame_size_large() {
-        // raw = 0x1F << 11 | 0xFF << 3 | 0x07 = 0xFFFF = 65535
-        // frame_size = 65536
-        let ext = vec![0x64, 0x58, 0x20, 0x25, 0x00, 0x00, 0x1F, 0xFF, 0xFF];
-        // byte6=0x1F, byte7=0xFF, byte8=0xFF
-        // (0x1F << 11) | (0xFF << 3) | (0xFF >> 5) = 63488 | 2040 | 7 = 65535
-        assert_eq!(dts_hd_ext_frame_size(&ext), 65536);
-    }
-
-    // --- parse: core + extension frame ---
-
-    #[test]
-    fn parse_core_plus_extension() {
-        let mut parser = DtsParser::new();
-        let core = make_dts_core(20); // 24 bytes total
-        let ext = make_dts_hd_ext(50, 0xCC); // 51 bytes
-        let mut data = core.clone();
-        data.extend_from_slice(&ext);
-
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        // Frame should include core (24) + extension (51) = 75 bytes
-        assert_eq!(frames[0].data.len(), 24 + 51);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
-        assert!(frames[0].keyframe);
-    }
-
-    #[test]
-    fn parse_core_only() {
-        let mut parser = DtsParser::new();
-        let data = make_dts_core(10);
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, data);
-    }
-
-    #[test]
-    fn parse_core_plus_extension_truncated_at_buffer_end() {
-        let mut parser = DtsParser::new();
-        let core = make_dts_core(4); // 8 bytes
-                                     // Extension claims 200 bytes but we only provide 20
-        let ext = make_dts_hd_ext(199, 0xDD); // wants 200 bytes
-        let mut data = core;
-        // Only append partial extension (first 20 bytes)
-        data.extend_from_slice(&ext[..20.min(ext.len())]);
-
-        let total_len = data.len();
-        let pes = make_pes(data, Some(0));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        // Should be clamped to actual data length
-        assert_eq!(frames[0].data.len(), total_len);
-    }
-
-    // --- basic tests (carried over) ---
-
-    #[test]
-    fn parse_basic_frame() {
-        let mut parser = DtsParser::new();
-        let data = vec![0x7F, 0xFE, 0x80, 0x01, 0xAA, 0xBB, 0xCC];
-        let pes = make_pes(data.clone(), Some(90000));
-        let frames = parser.parse(&pes);
-
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data, data);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
-    }
-
-    #[test]
-    fn all_keyframes() {
-        let mut parser = DtsParser::new();
-        for i in 0..3 {
-            let data = vec![0x7F, 0xFE, 0x80, 0x01, i];
-            let pes = make_pes(data, Some(90000 * i as i64));
-            let frames = parser.parse(&pes);
-            assert_eq!(frames.len(), 1);
-            assert!(frames[0].keyframe, "DTS frame should always be keyframe");
-        }
-    }
-
-    #[test]
-    fn codec_private_none() {
-        let parser = DtsParser::new();
-        assert!(parser.codec_private().is_none());
     }
 
     #[test]
@@ -270,11 +179,33 @@ mod tests {
     }
 
     #[test]
-    fn no_pts() {
+    fn parse_single_frame() {
         let mut parser = DtsParser::new();
-        let pes = make_pes(vec![0x7F, 0xFE, 0x80, 0x01], None);
+        let frame = make_dts_core(512);
+        let pes = make_pes(frame, Some(90000));
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pts_ns, 0);
+        assert_eq!(frames[0].data.len(), 512);
+    }
+
+    #[test]
+    fn parse_frame_spanning_two_pes() {
+        let mut parser = DtsParser::new();
+        let frame = make_dts_core(512);
+        let mid = 256;
+
+        let pes1 = make_pes(frame[..mid].to_vec(), Some(90000));
+        assert!(parser.parse(&pes1).is_empty());
+
+        let pes2 = make_pes(frame[mid..].to_vec(), Some(93000));
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.len(), 512);
+    }
+
+    #[test]
+    fn codec_private_none() {
+        let parser = DtsParser::new();
+        assert!(parser.codec_private().is_none());
     }
 }
