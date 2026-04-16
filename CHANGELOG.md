@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.6 (2026-04-16)
+
+### Docker compatibility
+- **Drive discovery** — removed sysfs check that blocked detection inside Docker containers. Device nodes are sufficient; INQUIRY command validates the device is an optical drive.
+
 ## 0.10.5 (2026-04-16)
 
 ### Audio parser buffering
