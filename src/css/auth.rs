@@ -326,12 +326,10 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
     // Disc key block starts at offset 4 (skip 4-byte header)
     let disc_key_block = &mut buf[4..4 + 2048];
 
-
     // XOR with reversed bus key (per libdvdcss)
     for (i, byte) in disc_key_block.iter_mut().enumerate() {
         *byte ^= bus_key[4 - (i % 5)];
     }
-
 
     // Try each player key against each of 408 disc key entries.
     // Each entry in the block is the disc key encrypted with a specific player key.
@@ -420,7 +418,6 @@ fn read_title_key(
         5_000,
     );
     tk_result.map_err(|_| Error::CssAuthFailed)?;
-
 
     // Title key at bytes 5..10, byte-reversed
     let mut title_key = [0u8; 5];

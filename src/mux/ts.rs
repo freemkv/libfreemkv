@@ -100,7 +100,7 @@ impl PesAssembler {
 pub struct TsDemuxer {
     assemblers: Vec<PesAssembler>,
     pid_index: Vec<i16>, // PID → index into assemblers, -1 = not tracked
-    remainder: Vec<u8>,     // leftover bytes from previous feed() call
+    remainder: Vec<u8>,  // leftover bytes from previous feed() call
 }
 
 impl TsDemuxer {

@@ -62,7 +62,10 @@ impl Default for Mpeg2Parser {
 
 impl Mpeg2Parser {
     pub fn new() -> Self {
-        Self { seq_header: None, has_extension: false }
+        Self {
+            seq_header: None,
+            has_extension: false,
+        }
     }
 
     /// Extract resolution from a captured sequence header.
@@ -137,14 +140,18 @@ impl CodecParser for Mpeg2Parser {
                             } else {
                                 let mut bits = 63u32; // bits consumed so far
                                 let intra = (data[sc + 11] & 0x02) != 0;
-                                if intra { bits += 64 * 8; }
+                                if intra {
+                                    bits += 64 * 8;
+                                }
                                 // Non-intra flag is at current bit position
                                 let byte_pos = (bits / 8) as usize;
                                 let bit_pos = 7 - (bits % 8) as u8;
                                 if sc + 4 + byte_pos < data.len() {
                                     let non_intra = (data[sc + 4 + byte_pos] >> bit_pos) & 1 != 0;
                                     bits += 1;
-                                    if non_intra { bits += 64 * 8; }
+                                    if non_intra {
+                                        bits += 64 * 8;
+                                    }
                                 }
                                 let total_bytes = 4 + ((bits + 7) / 8) as usize;
                                 (sc + total_bytes).min(data.len())
