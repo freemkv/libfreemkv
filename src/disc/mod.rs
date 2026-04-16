@@ -942,7 +942,14 @@ impl Disc {
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         // READ CAPACITY may fail in LibreDrive mode — proceed with 0 and estimate later
         let capacity = Self::read_capacity(session).unwrap_or(0);
+
+        // AACS handshake (Blu-ray/UHD)
         let handshake = Self::do_handshake(session, opts);
+
+        // CSS authentication (DVD) — must happen before scan reads VOB sectors.
+        // Harmless on BD (AGID alloc fails, no effect).
+        let _ = crate::css::auth::authenticate(session);
+
         Self::scan_with(session, capacity, handshake, opts)
     }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.3 (2026-04-16)
+
+### DVD CSS authentication
+- **CSS drive authentication** — full SCSI REPORT KEY / SEND KEY handshake with 6-round substitution-permutation cipher (CSSCryptKey). Brute-forces variant from 32 possibilities. Drive serves scrambled sectors after auth completes.
+- **CSS auth runs before scan** — chicken-and-egg fix: auth must happen before reading VOB sectors for title key cracking, not after.
+- **Remove debug output** — strip temporary eprintln from drive reads and CSS auth.
+
 ## 0.10.2 (2026-04-15)
 
 ### Fixes

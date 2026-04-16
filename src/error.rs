@@ -63,6 +63,7 @@ pub const E_AACS_VID_READ: u16 = 7009;
 pub const E_AACS_VID_MAC: u16 = 7010;
 pub const E_AACS_DATA_KEY: u16 = 7011;
 pub const E_DECRYPT_FAILED: u16 = 7013;
+pub const E_CSS_AUTH_FAILED: u16 = 7014;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -160,6 +161,7 @@ pub enum Error {
     AacsVidMac,
     AacsDataKey,
     DecryptFailed,
+    CssAuthFailed,
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -233,6 +235,7 @@ impl Error {
             Error::AacsVidMac => E_AACS_VID_MAC,
             Error::AacsDataKey => E_AACS_DATA_KEY,
             Error::DecryptFailed => E_DECRYPT_FAILED,
+            Error::CssAuthFailed => E_CSS_AUTH_FAILED,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
