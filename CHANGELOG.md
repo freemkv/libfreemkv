@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.4 (2026-04-16)
+
+### CSS decryption — full key hierarchy
+- **Bus auth → disc key → title key** — complete CSS key chain. Bus authentication with CSSCryptKey challenge-response, disc key decryption using 31 player keys via READ DVD STRUCTURE, title key extraction via REPORT KEY format 0x04.
+- **CSS descramble cipher** — correct LFSR keystream generation with TAB5 for LFSR1 output and TAB4 for LFSR0 output. Per-sector key derivation from title key XOR sector seed.
+- **Stevenson plaintext attack** — expanded pattern set (padding, video, audio, nav pack headers), scans up to 50K scrambled sectors for ISO key recovery.
+- **Disc::copy() CSS decrypt** — sector-level decryption during disc→ISO copy produces clean ISOs with zero scramble flags.
+
+### MPEG-2 PS demuxer fixes
+- **DVD PS path routes through codec parsers** — was bypassing parser.parse(), producing raw PES frames without codec_private extraction or keyframe detection.
+- **MPEG-2 sequence header extraction** — calculates exact header size including quantizer matrices (intra/non-intra flags), captures sequence extension from subsequent PES packets.
+- **TsDemuxer dynamic PID table** — Vec instead of fixed [i16; 8192] for DVD PIDs that may exceed 8192.
+
 ## 0.10.3 (2026-04-16)
 
 ### DVD CSS authentication
