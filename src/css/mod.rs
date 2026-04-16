@@ -32,15 +32,13 @@ pub struct CssState {
 ///
 /// The Stevenson attack needs a sector where a PES header starts at byte
 /// 0x80 (start of the encrypted region). This only happens when a new PES
-/// packet begins at exactly sector offset 128, which is uncommon. We scan
-/// up to 500 scrambled sectors across all extents to find a crackable one.
+/// packet begins at exactly sector offset 128. We scan up to 50000
+/// scrambled sectors sequentially across all extents.
 pub fn crack_key(reader: &mut dyn SectorReader, extents: &[Extent]) -> Option<CssState> {
     let mut tried = 0u32;
-    let max_tries = 500;
+    let max_tries = 50_000;
 
     for ext in extents {
-        // Sample sectors spread across the extent
-        let step = (ext.sector_count / 100).max(1);
         let mut i = 0;
         while i < ext.sector_count && tried < max_tries {
             let mut buf = vec![0u8; 2048];
@@ -50,7 +48,10 @@ pub fn crack_key(reader: &mut dyn SectorReader, extents: &[Extent]) -> Option<Cs
                 }
                 tried += 1;
             }
-            i += step;
+            i += 1;
+        }
+        if tried >= max_tries {
+            break;
         }
     }
 

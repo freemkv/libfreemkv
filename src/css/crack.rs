@@ -197,33 +197,40 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     //
     // We try multiple stream IDs and use zeros for unknown bytes (most common).
 
-    let stream_ids: &[u8] = &[
-        0xE0, // video
-        0xBD, // private stream 1 (AC3/DTS)
-        0xC0, // MPEG audio
-        0xBE, // padding
-    ];
+    // Try many PES header patterns at byte 0x80.
+    // Structure: 00 00 01 [stream_id] [len_hi] [len_lo] [flags1] [flags2] [hdr_len] [data]
+    let mut patterns: Vec<[u8; 10]> = Vec::with_capacity(128);
 
-    for &sid in stream_ids {
-        // Build candidate plaintext (10 bytes)
-        // Bytes 0-2: PES start code 00 00 01
-        // Byte 3: stream ID
-        // Bytes 4-9: we try with zeros first (common for padding streams)
-        //            and with typical PES header bytes
-        let patterns: &[[u8; 10]] = &[
-            [0x00, 0x00, 0x01, sid, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21],
-            [0x00, 0x00, 0x01, sid, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00],
-            [0x00, 0x00, 0x01, sid, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        ];
+    // Padding stream (0xBE): payload is 0xFF bytes, various lengths
+    for len_hi in 0u8..8 {
+        for len_lo_top in [0x00u8, 0x80, 0xFF] {
+            patterns.push([0x00, 0x00, 0x01, 0xBE, len_hi, len_lo_top, 0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+    }
 
-        for pattern in patterns {
-            if let Some(key) = recover_title_key(sector, pattern) {
-                // Verify: the key should produce valid MPEG-2 when used to descramble
-                let mut test = sector.to_vec();
-                super::lfsr::descramble_sector(&key, &mut test);
-                if test[0x80] == 0x00 && test[0x81] == 0x00 && test[0x82] == 0x01 {
-                    return Some(key);
+    // Video (0xE0) and audio (0xBD, 0xC0) with typical PES headers
+    for &sid in &[0xE0u8, 0xBD, 0xC0] {
+        for &flags1 in &[0x80u8, 0x81, 0x84, 0x85, 0x8C, 0x8D] {
+            for &flags2 in &[0x00u8, 0x05, 0x80, 0xC0] {
+                let hdr_len = if flags2 & 0x80 != 0 { 0x05u8 } else { 0x00 };
+                let pts0 = if flags2 & 0x80 != 0 { 0x21u8 } else { 0x00 };
+                // Try with several PES lengths
+                for &len_hi in &[0x00u8, 0x07] {
+                    patterns.push([0x00, 0x00, 0x01, sid, len_hi, 0x00, flags1, flags2, hdr_len, pts0]);
                 }
+            }
+        }
+    }
+
+    // Navigation pack system header (0xBB)
+    patterns.push([0x00, 0x00, 0x01, 0xBB, 0x00, 0x12, 0x80, 0xC4, 0xE1, 0x04]);
+
+    for pattern in &patterns {
+        if let Some(key) = recover_title_key(sector, pattern) {
+            let mut test = sector.to_vec();
+            super::lfsr::descramble_sector(&key, &mut test);
+            if test[0x80] == 0x00 && test[0x81] == 0x00 && test[0x82] == 0x01 {
+                return Some(key);
             }
         }
     }
