@@ -10,11 +10,6 @@ pub fn find_drives() -> Vec<(String, DriveId)> {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
-        // Skip stale device nodes — sysfs entry must exist
-        let sysfs = format!("/sys/class/scsi_generic/sg{i}/device/model");
-        if !std::path::Path::new(&sysfs).exists() {
-            continue;
-        }
         if let Ok(mut transport) = crate::scsi::open(std::path::Path::new(&path)) {
             if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
                 if !id.raw_inquiry.is_empty() && (id.raw_inquiry[0] & 0x1F) == 0x05 {
