@@ -958,18 +958,15 @@ impl Disc {
             && disc.content_format == ContentFormat::MpegPs
             && !disc.titles.is_empty()
         {
-            let lba = disc.titles[0]
-                .extents
-                .iter()
-                .find_map(|ext| {
-                    let mut buf = vec![0u8; 2048];
-                    if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok() {
-                        if crate::css::is_scrambled(&buf) {
-                            return Some(ext.start_lba);
-                        }
+            let lba = disc.titles[0].extents.iter().find_map(|ext| {
+                let mut buf = vec![0u8; 2048];
+                if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok() {
+                    if crate::css::is_scrambled(&buf) {
+                        return Some(ext.start_lba);
                     }
-                    None
-                });
+                }
+                None
+            });
 
             if let Some(lba) = lba {
                 if let Ok(title_key) =

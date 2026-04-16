@@ -285,8 +285,7 @@ impl crate::pes::Stream for DiscStream {
                             dts: ps.dts.map(|d| d as i64),
                             data: ps.data.clone(),
                         };
-                        if let Some((_, parser)) =
-                            self.parsers.iter_mut().find(|(p, _)| *p == pid)
+                        if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid)
                         {
                             for frame in parser.parse(&pes) {
                                 self.pending_frames.push_back(
@@ -354,13 +353,10 @@ impl crate::pes::Stream for DiscStream {
                         data: ps.data.clone(),
                     };
 
-                    if let Some((_, parser)) =
-                        self.parsers.iter_mut().find(|(p, _)| *p == pid)
-                    {
+                    if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
                         for frame in parser.parse(&pes) {
-                            self.pending_frames.push_back(
-                                crate::pes::PesFrame::from_codec_frame(track, frame),
-                            );
+                            self.pending_frames
+                                .push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
                         }
                     }
                 }

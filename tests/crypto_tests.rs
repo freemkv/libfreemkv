@@ -27,7 +27,9 @@ fn css_descramble_sector_roundtrip_via_public_api() {
     assert_eq!(sector[0x14] & 0x30, 0x00, "flag not cleared");
     // Header preserved (except flag byte)
     for i in 0..128 {
-        if i == 0x14 { continue; }
+        if i == 0x14 {
+            continue;
+        }
         assert_eq!(sector[i], original[i], "header byte {} changed", i);
     }
     // Encrypted region modified
@@ -504,17 +506,33 @@ fn css_roundtrip_with_snapshot() {
     // Determinism: same input → same output
     let mut sector2 = original.clone();
     css::lfsr::descramble_sector(&title_key, &mut sector2);
-    assert_eq!(&sector[0x80..2048], &sector2[0x80..2048], "not deterministic");
+    assert_eq!(
+        &sector[0x80..2048],
+        &sector2[0x80..2048],
+        "not deterministic"
+    );
 }
 
 /// Multiple key/seed combinations produce different outputs.
 #[test]
 fn css_roundtrip_multiple_keys() {
     let cases: &[([u8; 5], [u8; 5])] = &[
-        ([0x00, 0x00, 0x00, 0x00, 0x00], [0x00, 0x00, 0x00, 0x00, 0x00]),
-        ([0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
-        ([0x01, 0x02, 0x03, 0x04, 0x05], [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]),
-        ([0xAB, 0xCD, 0xEF, 0x01, 0x23], [0x12, 0x34, 0x56, 0x78, 0x9A]),
+        (
+            [0x00, 0x00, 0x00, 0x00, 0x00],
+            [0x00, 0x00, 0x00, 0x00, 0x00],
+        ),
+        (
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            [0x01, 0x02, 0x03, 0x04, 0x05],
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+        ),
+        (
+            [0xAB, 0xCD, 0xEF, 0x01, 0x23],
+            [0x12, 0x34, 0x56, 0x78, 0x9A],
+        ),
     ];
 
     let mut results = Vec::new();
@@ -529,8 +547,12 @@ fn css_roundtrip_multiple_keys() {
     }
     // Different keys/seeds should produce different outputs
     for i in 0..results.len() {
-        for j in (i+1)..results.len() {
-            assert_ne!(results[i], results[j], "cases {} and {} produced same output", i, j);
+        for j in (i + 1)..results.len() {
+            assert_ne!(
+                results[i], results[j],
+                "cases {} and {} produced same output",
+                i, j
+            );
         }
     }
 }

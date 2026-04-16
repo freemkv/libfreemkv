@@ -204,7 +204,9 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     // Padding stream (0xBE): payload is 0xFF bytes, various lengths
     for len_hi in 0u8..8 {
         for len_lo_top in [0x00u8, 0x80, 0xFF] {
-            patterns.push([0x00, 0x00, 0x01, 0xBE, len_hi, len_lo_top, 0xFF, 0xFF, 0xFF, 0xFF]);
+            patterns.push([
+                0x00, 0x00, 0x01, 0xBE, len_hi, len_lo_top, 0xFF, 0xFF, 0xFF, 0xFF,
+            ]);
         }
     }
 
@@ -216,7 +218,9 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
                 let pts0 = if flags2 & 0x80 != 0 { 0x21u8 } else { 0x00 };
                 // Try with several PES lengths
                 for &len_hi in &[0x00u8, 0x07] {
-                    patterns.push([0x00, 0x00, 0x01, sid, len_hi, 0x00, flags1, flags2, hdr_len, pts0]);
+                    patterns.push([
+                        0x00, 0x00, 0x01, sid, len_hi, 0x00, flags1, flags2, hdr_len, pts0,
+                    ]);
                 }
             }
         }
