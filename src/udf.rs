@@ -61,6 +61,11 @@ impl UdfFs {
         self.metadata_start
     }
 
+    /// Metadata partition size in sectors.
+    pub(crate) fn metadata_sectors(&self) -> u32 {
+        self.metadata_sectors
+    }
+
     /// Find a directory by path (e.g. "/BDMV/PLAYLIST").
     /// Path matching is case-insensitive.
     pub fn find_dir(&self, path: &str) -> Option<&DirEntry> {
@@ -832,6 +837,96 @@ fn parse_dstring(data: &[u8]) -> String {
 
 /// Read a single 2048-byte sector from the drive.
 /// Uses standard READ(10) — no unlock required.
+/// Buffered sector reader — reduces SCSI round-trips by pre-fetching blocks.
+/// Each SCSI command has ~500ms overhead on USB drives, so reading 32 sectors
+/// at once (one command) is 32x faster than 32 individual reads.
+pub(crate) struct BufferedSectorReader<'a> {
+    inner: &'a mut dyn SectorReader,
+    cache_start: u32,
+    cache: Vec<u8>,
+    cache_sectors: u32,
+    batch: u16,
+}
+
+impl<'a> BufferedSectorReader<'a> {
+    pub(crate) fn new(inner: &'a mut dyn SectorReader, batch: u16) -> Self {
+        Self {
+            inner,
+            cache_start: u32::MAX,
+            cache: Vec::new(),
+            cache_sectors: 0,
+            batch,
+        }
+    }
+}
+
+impl BufferedSectorReader<'_> {
+    /// Pre-read a range of sectors into the cache.
+    /// Used to bulk-load the UDF metadata partition so subsequent reads are instant.
+    pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) {
+        // Read in chunks of 30 sectors (within USB SCSI limits)
+        let total = count as usize * 2048;
+        self.cache.resize(total, 0);
+        let mut offset = 0u32;
+        while offset < count {
+            let batch = (count - offset).min(self.batch as u32) as u16;
+            let buf_off = offset as usize * 2048;
+            if self
+                .inner
+                .read_sectors(
+                    start_lba + offset,
+                    batch,
+                    &mut self.cache[buf_off..buf_off + batch as usize * 2048],
+                )
+                .is_err()
+            {
+                break;
+            }
+            offset += batch as u32;
+        }
+        self.cache_start = start_lba;
+        self.cache_sectors = offset;
+    }
+}
+
+impl SectorReader for BufferedSectorReader<'_> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+    ) -> std::result::Result<usize, crate::error::Error> {
+        if count == 1 {
+            // Single sector — use cache
+            if lba >= self.cache_start && lba < self.cache_start + self.cache_sectors {
+                let offset = (lba - self.cache_start) as usize * 2048;
+                buf[..2048].copy_from_slice(&self.cache[offset..offset + 2048]);
+                return Ok(2048);
+            }
+            let block = self.batch;
+            self.cache.resize(block as usize * 2048, 0);
+            match self.inner.read_sectors(lba, block, &mut self.cache) {
+                Ok(_) => {
+                    self.cache_start = lba;
+                    self.cache_sectors = block as u32;
+                }
+                Err(_) => {
+                    // Near end of disc or error — single sector fallback
+                    self.cache.resize(2048, 0);
+                    self.inner.read_sectors(lba, 1, &mut self.cache)?;
+                    self.cache_start = lba;
+                    self.cache_sectors = 1;
+                }
+            }
+            buf[..2048].copy_from_slice(&self.cache[..2048]);
+            Ok(2048)
+        } else {
+            // Multi-sector read — pass through
+            self.inner.read_sectors(lba, count, buf)
+        }
+    }
+}
+
 fn read_sector(reader: &mut dyn SectorReader, lba: u32, buf: &mut [u8]) -> Result<()> {
     reader.read_sectors(lba, 1, buf)?;
     Ok(())
