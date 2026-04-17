@@ -170,32 +170,13 @@ pub struct InputOptions {
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
-        StreamUrl::Disc { device } => {
-            // Open drive, init, scan — caller manages the drive
-            let mut drive = match device {
-                Some(ref d) => {
-                    crate::drive::Drive::open(d).map_err(|e| -> io::Error { e.into() })?
-                }
-                None => crate::drive::find_drive().ok_or_else(|| -> io::Error {
-                    crate::error::Error::DeviceNotFound {
-                        path: String::new(),
-                    }
-                    .into()
-                })?,
-            };
-            let _ = drive.wait_ready();
-            let _ = drive.init();
-            let _ = drive.probe_disc();
-            let (mut stream, _disc) = DiscStream::open_drive(
-                drive,
-                opts.keydb_path.as_deref(),
-                opts.title_index.unwrap_or(0),
-            )
-            .map_err(|e| -> io::Error { e.into() })?;
-            if opts.raw {
-                stream.set_raw();
-            }
-            Ok(Box::new(stream))
+        StreamUrl::Disc { .. } => {
+            // Disc sources should use DiscStream::new() directly.
+            // The caller opens the drive, inits, scans, then creates the stream.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Use Drive::open() + Disc::scan() + DiscStream::new() for disc sources",
+            ))
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
@@ -203,8 +184,25 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 Some(p) => crate::disc::ScanOptions::with_keydb(p),
                 None => crate::disc::ScanOptions::default(),
             };
-            let mut stream =
-                DiscStream::open_iso(&path.to_string_lossy(), opts.title_index, &scan_opts)?;
+            let mut reader = super::iso::IsoSectorReader::open(&path.to_string_lossy())?;
+            let capacity = reader.capacity();
+            let disc = crate::disc::Disc::scan_image(&mut reader, capacity, &scan_opts)
+                .map_err(|e| -> io::Error { e.into() })?;
+            if disc.titles.is_empty() {
+                return Err(crate::error::Error::NoStreams.into());
+            }
+            let idx = opts.title_index.unwrap_or(0);
+            if idx >= disc.titles.len() {
+                return Err(crate::error::Error::DiscTitleRange {
+                    index: idx,
+                    count: disc.titles.len(),
+                }
+                .into());
+            }
+            let title = disc.titles[idx].clone();
+            let keys = disc.decrypt_keys();
+            let format = disc.content_format;
+            let mut stream = DiscStream::new(Box::new(reader), title, keys, 64, format);
             if opts.raw {
                 stream.set_raw();
             }
