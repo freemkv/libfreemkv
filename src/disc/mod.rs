@@ -917,10 +917,75 @@ impl ScanOptions {
     }
 }
 
+/// Quick disc identification — name, format, capacity. No title/stream parsing.
+#[derive(Debug)]
+pub struct DiscId {
+    /// UDF Volume Identifier (always present, e.g. "V_FOR_VENDETTA")
+    pub volume_id: String,
+    /// Disc title from META/DL/bdmt_eng.xml (e.g. "V for Vendetta")
+    pub meta_title: Option<String>,
+    /// Disc format (BD, UHD, DVD) — UHD vs BD requires full scan to confirm
+    pub format: DiscFormat,
+    /// Disc capacity in sectors
+    pub capacity_sectors: u32,
+    /// Whether AACS directory exists (disc is likely encrypted)
+    pub encrypted: bool,
+    /// Number of layers
+    pub layers: u8,
+}
+
+impl DiscId {
+    /// Best available name: meta_title, then formatted volume_id.
+    pub fn name(&self) -> &str {
+        self.meta_title
+            .as_deref()
+            .unwrap_or(&self.volume_id)
+    }
+}
+
 impl Disc {
+    /// Fast disc identification — reads only UDF metadata for name and format.
+    /// No AACS handshake, no playlist parsing, no CLPI, no labels.
+    /// Typically completes in 2-3 seconds on USB drives.
+    pub fn identify(session: &mut Drive) -> Result<DiscId> {
+        let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
+
+        let meta_title = Self::read_meta_title(&mut buffered, &udf_fs);
+        let format = if udf_fs.find_dir("/BDMV").is_some() {
+            DiscFormat::BluRay // full scan distinguishes UHD vs BD
+        } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
+            DiscFormat::Dvd
+        } else {
+            DiscFormat::Unknown
+        };
+        let encrypted =
+            udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
+        let layers = if capacity > 24_000_000 { 2 } else { 1 };
+
+        Ok(DiscId {
+            volume_id: udf_fs.volume_id,
+            meta_title,
+            format,
+            capacity_sectors: capacity,
+            encrypted,
+            layers,
+        })
+    }
+
     /// Disc capacity in GB
     pub fn capacity_gb(&self) -> f64 {
         self.capacity_sectors as f64 * 2048.0 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Read UDF filesystem and set up buffered reader with metadata prefetched.
+    /// Shared setup for both identify() and scan().
+    fn read_udf(session: &mut Drive) -> Result<(u32, udf::BufferedSectorReader<'_>, udf::UdfFs)> {
+        let capacity = Self::read_capacity(session).unwrap_or(0);
+        let batch = detect_max_batch_sectors(session.device_path());
+        let mut buffered = udf::BufferedSectorReader::new(session, batch);
+        let udf_fs = udf::read_filesystem(&mut buffered)?;
+        buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
+        Ok((capacity, buffered, udf_fs))
     }
 
     /// Scan a disc -- parse filesystem, playlists, streams, and set up AACS decryption.
@@ -931,18 +996,14 @@ impl Disc {
     ///   - content can be read and decrypted transparently
     ///
     /// Scan a disc. One pipeline, one order:
-    ///   1. Read capacity
-    ///   2. Read UDF filesystem
-    ///   3. Resolve AACS keys (all via UDF, no SCSI commands)
-    ///   4. Parse playlists + streams
-    ///   5. Apply labels
+    ///   1. Read capacity + UDF filesystem
+    ///   2. AACS handshake + key resolution
+    ///   3. Parse playlists + streams
+    ///   4. Apply labels
     ///
     /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // READ CAPACITY may fail in LibreDrive mode — proceed with 0 and estimate later
-        let capacity = Self::read_capacity(session).unwrap_or(0);
-
         // AACS handshake (Blu-ray/UHD)
         let handshake = Self::do_handshake(session, opts);
 
@@ -950,12 +1011,14 @@ impl Disc {
         // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
 
-        // Buffer sector reads — USB drives have ~500ms per SCSI command,
-        // so prefetching reduces hundreds of commands to dozens.
-        let batch = detect_max_batch_sectors(session.device_path());
-        let mut buffered = udf::BufferedSectorReader::new(session, batch);
-        let udf_fs = udf::read_filesystem(&mut buffered)?;
-        buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
+        // Read UDF filesystem with buffered sector reader
+        let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
+
+        // Pre-read all small file sectors (AACS, MPLS, CLPI, META, *.bdmv).
+        // Without this, each read_file() triggers individual SCSI commands at 500ms each.
+        if let Ok(ranges) = udf_fs.metadata_sector_ranges(&mut buffered) {
+            buffered.prefetch_ranges(&ranges);
+        }
 
         let mut disc = Self::scan_with(&mut buffered, capacity, handshake, opts, udf_fs)?;
 
