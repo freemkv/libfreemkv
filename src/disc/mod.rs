@@ -874,7 +874,8 @@ impl KeySource {
 
 /// Standard KEYDB.cfg search locations (compatible with libaacs).
 const KEYDB_SEARCH_PATHS: &[&str] = &[
-    ".config/aacs/KEYDB.cfg", // relative to $HOME
+    ".config/aacs/KEYDB.cfg",      // libaacs standard path
+    ".config/freemkv/keydb.cfg",   // freemkv download path
 ];
 const KEYDB_SYSTEM_PATH: &str = "/etc/aacs/KEYDB.cfg";
 
