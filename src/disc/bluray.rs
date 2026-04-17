@@ -12,8 +12,19 @@ impl Disc {
         reader: &mut dyn SectorReader,
         udf_fs: &udf::UdfFs,
     ) -> Vec<DiscTitle> {
+        let t0 = std::time::Instant::now();
         let mut titles = Vec::new();
         if let Some(playlist_dir) = udf_fs.find_dir("/BDMV/PLAYLIST") {
+            let mpls_count = playlist_dir
+                .entries
+                .iter()
+                .filter(|e| !e.is_dir && e.name.to_lowercase().ends_with(".mpls"))
+                .count();
+            eprintln!(
+                "[titles {:.1}s] {} MPLS files",
+                t0.elapsed().as_secs_f64(),
+                mpls_count
+            );
             for entry in &playlist_dir.entries {
                 if !entry.is_dir && entry.name.to_lowercase().ends_with(".mpls") {
                     let path = format!("/BDMV/PLAYLIST/{}", entry.name);
@@ -21,12 +32,23 @@ impl Disc {
                         if let Some(title) =
                             Self::parse_playlist(reader, udf_fs, &entry.name, &mpls_data)
                         {
+                            eprintln!(
+                                "[titles {:.1}s] {} -> title ({:.0}s)",
+                                t0.elapsed().as_secs_f64(),
+                                entry.name,
+                                title.duration_secs
+                            );
                             titles.push(title);
                         }
                     }
                 }
             }
         }
+        eprintln!(
+            "[titles {:.1}s] done: {} titles",
+            t0.elapsed().as_secs_f64(),
+            titles.len()
+        );
         titles
     }
 
