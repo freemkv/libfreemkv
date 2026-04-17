@@ -120,6 +120,14 @@ Each directory read involves two sector reads: one for the ICB, then one or more
 
 `read_file()` reads a file by navigating the directory tree, reading the file's ICB to get its data extent, then reading the data sector by sector from the **physical partition** (partition_start + LBA, not metadata_start).
 
+## Buffered Sector Reads
+
+USB optical drives have ~500ms round-trip latency per SCSI command. Since `read_filesystem()` and `read_file()` issue one SCSI READ per sector, a full disc scan can require hundreds of commands -- taking 10+ minutes on USB.
+
+`Disc::scan()` wraps the drive in a `BufferedSectorReader` before reading. On a single-sector read, the buffer prefetches a batch of sectors (sized from the kernel's `max_hw_sectors_kb` for the device) and caches them. Subsequent reads to nearby LBAs return from cache with zero SCSI overhead. After parsing the UDF directory structure, the entire metadata partition is pre-read into the cache, so all ICB lookups during title scanning and encryption resolution are instant.
+
+The buffer is transparent -- `read_filesystem()`, `read_file()`, and all downstream code still call `read_sectors(lba, 1, buf)` as before. The batching happens inside the `SectorReader` implementation.
+
 ### UDF Filename Encoding
 
 UDF filenames use a compression ID as the first byte:
