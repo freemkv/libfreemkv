@@ -105,7 +105,7 @@ pub use profile::DriveProfile;
 pub use decrypt::{decrypt_sectors, DecryptKeys};
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
-    DiscFormat, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
+    DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
     ScanOptions, Stream, SubtitleStream, VideoStream,
 };
 pub use mux::DiscStream;

@@ -846,6 +846,8 @@ pub(crate) struct BufferedSectorReader<'a> {
     cache: Vec<u8>,
     cache_sectors: u32,
     batch: u16,
+    /// Pre-fetched sector data from bulk reads (sector ranges for AACS, MPLS, CLPI, etc.)
+    prefetched: std::collections::HashMap<u32, Vec<u8>>,
 }
 
 impl<'a> BufferedSectorReader<'a> {
@@ -856,15 +858,15 @@ impl<'a> BufferedSectorReader<'a> {
             cache: Vec::new(),
             cache_sectors: 0,
             batch,
+            prefetched: std::collections::HashMap::new(),
         }
     }
 }
 
 impl BufferedSectorReader<'_> {
-    /// Pre-read a range of sectors into the cache.
+    /// Pre-read a contiguous range of sectors into the sliding cache.
     /// Used to bulk-load the UDF metadata partition so subsequent reads are instant.
     pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) {
-        // Read in chunks of 30 sectors (within USB SCSI limits)
         let total = count as usize * 2048;
         self.cache.resize(total, 0);
         let mut offset = 0u32;
@@ -887,6 +889,33 @@ impl BufferedSectorReader<'_> {
         self.cache_start = start_lba;
         self.cache_sectors = offset;
     }
+
+    /// Pre-read multiple sector ranges into the permanent cache.
+    /// Each range is read in batch-sized chunks and stored per-sector in a HashMap.
+    /// Used to bulk-load all small files (AACS, MPLS, CLPI, META) before scanning.
+    pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) {
+        let mut tmp = vec![0u8; self.batch as usize * 2048];
+        for &(start, count) in ranges {
+            let mut offset = 0u32;
+            while offset < count {
+                let batch = (count - offset).min(self.batch as u32) as u16;
+                let bytes = batch as usize * 2048;
+                if self
+                    .inner
+                    .read_sectors(start + offset, batch, &mut tmp[..bytes])
+                    .is_err()
+                {
+                    break;
+                }
+                for i in 0..batch as u32 {
+                    let s = i as usize * 2048;
+                    self.prefetched
+                        .insert(start + offset + i, tmp[s..s + 2048].to_vec());
+                }
+                offset += batch as u32;
+            }
+        }
+    }
 }
 
 impl SectorReader for BufferedSectorReader<'_> {
@@ -897,7 +926,12 @@ impl SectorReader for BufferedSectorReader<'_> {
         buf: &mut [u8],
     ) -> std::result::Result<usize, crate::error::Error> {
         if count == 1 {
-            // Single sector — use cache
+            // Check permanent prefetch cache first (HashMap)
+            if let Some(data) = self.prefetched.get(&lba) {
+                buf[..2048].copy_from_slice(data);
+                return Ok(2048);
+            }
+            // Check sliding cache
             if lba >= self.cache_start && lba < self.cache_start + self.cache_sectors {
                 let offset = (lba - self.cache_start) as usize * 2048;
                 buf[..2048].copy_from_slice(&self.cache[offset..offset + 2048]);
