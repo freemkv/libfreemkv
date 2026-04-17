@@ -44,101 +44,17 @@ pub struct DiscStream {
 }
 
 impl DiscStream {
-    /// Open from a physical drive. Caller must have already called
-    /// drive.wait_ready(), drive.init(), drive.probe_disc().
-    /// Drive is moved into the stream — caller manages lock/unlock before/after.
-    pub fn open_drive(
-        drive: crate::drive::Drive,
-        keydb_path: Option<&str>,
-        title_index: usize,
-    ) -> crate::error::Result<(Self, Disc)> {
-        let scan_opts = match keydb_path {
-            Some(kp) => ScanOptions::with_keydb(kp),
-            None => ScanOptions::default(),
-        };
-        let mut drive = drive;
-        let disc = Disc::scan(&mut drive, &scan_opts)?;
-
-        if title_index >= disc.titles.len() {
-            return Err(crate::error::Error::DiscTitleRange {
-                index: title_index,
-                count: disc.titles.len(),
-            });
-        }
-
-        let title = disc.titles[title_index].clone();
-        let keys = disc.decrypt_keys();
-        let max_batch = detect_max_batch_sectors(drive.device_path());
-        let content_format = disc.content_format;
-
-        let mut stream = Self::from_reader(Box::new(drive), title, keys, max_batch);
-
-        // Set demuxer based on content format
-        match content_format {
-            crate::disc::ContentFormat::MpegPs => {
-                stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
-            }
-            crate::disc::ContentFormat::BdTs => {
-                let pids: Vec<u16> = stream.pid_to_track.iter().map(|(pid, _)| *pid).collect();
-                if !pids.is_empty() {
-                    stream.ts_demuxer = Some(super::ts::TsDemuxer::new(&pids));
-                }
-            }
-        }
-        Ok((stream, disc))
-    }
-
-    /// Open from an ISO file.
-    pub fn open_iso(
-        path: &str,
-        title_index: Option<usize>,
-        opts: &ScanOptions,
-    ) -> io::Result<Self> {
-        let mut reader = super::iso::IsoSectorReader::open(path)?;
-        let capacity = reader.capacity();
-
-        let disc =
-            Disc::scan_image(&mut reader, capacity, opts).map_err(|e| -> io::Error { e.into() })?;
-
-        if disc.titles.is_empty() {
-            return Err(crate::error::Error::NoStreams.into());
-        }
-        let idx = title_index.unwrap_or(0);
-        if idx >= disc.titles.len() {
-            return Err(crate::error::Error::DiscTitleRange {
-                index: idx,
-                count: disc.titles.len(),
-            }
-            .into());
-        }
-
-        let title = disc.titles[idx].clone();
-        let keys = disc.decrypt_keys();
-        let batch: u16 = 64;
-
-        let mut stream = Self::from_reader(Box::new(reader), title, keys, batch);
-        // Set demuxer based on content format
-        match disc.content_format {
-            crate::disc::ContentFormat::MpegPs => {
-                stream.ps_demuxer = Some(super::ps::PsDemuxer::new());
-            }
-            crate::disc::ContentFormat::BdTs => {
-                let pids: Vec<u16> = stream.pid_to_track.iter().map(|(pid, _)| *pid).collect();
-                if !pids.is_empty() {
-                    stream.ts_demuxer = Some(super::ts::TsDemuxer::new(&pids));
-                }
-            }
-        }
-        stream.disc = Some(disc);
-        Ok(stream)
-    }
-
-    /// Create from any SectorReader + title + keys.
-    pub fn from_reader(
+    /// Create a disc stream from any sector reader.
+    ///
+    /// Works with physical drives and ISO files — both implement SectorReader.
+    /// The caller opens the source, scans for titles/keys, and passes them in.
+    /// The stream handles demuxing, decryption, and codec parsing internally.
+    pub fn new(
         reader: Box<dyn SectorReader>,
         title: DiscTitle,
         decrypt_keys: crate::decrypt::DecryptKeys,
         batch_sectors: u16,
+        content_format: crate::disc::ContentFormat,
     ) -> Self {
         let extents = title.extents.clone();
 
@@ -156,6 +72,20 @@ impl DiscStream {
             parsers.push((pid, super::codec::parser_for_codec(codec)));
         }
 
+        let mut ts_demuxer = None;
+        let mut ps_demuxer = None;
+        match content_format {
+            crate::disc::ContentFormat::MpegPs => {
+                ps_demuxer = Some(super::ps::PsDemuxer::new());
+            }
+            crate::disc::ContentFormat::BdTs => {
+                let ts_pids: Vec<u16> = pids.clone();
+                if !ts_pids.is_empty() {
+                    ts_demuxer = Some(super::ts::TsDemuxer::new(&ts_pids));
+                }
+            }
+        }
+
         Self {
             reader,
             title,
@@ -169,10 +99,8 @@ impl DiscStream {
             batch_sectors,
             errors: 0,
             eof: false,
-            // Demuxer set by caller — open_drive() checks content_format,
-            // open_iso() always uses TS (Blu-ray ISO).
-            ts_demuxer: None,
-            ps_demuxer: None,
+            ts_demuxer,
+            ps_demuxer,
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.7 (2026-04-17)
+
+### DiscStream::new()
+- Replaced open_drive(), open_iso(), from_reader() with single new() constructor
+- Stream accepts ContentFormat and sets up demuxer internally
+- Removed disc:// case from input() — callers use primitives directly
+
 ## 0.10.6 (2026-04-16)
 
 ### Docker compatibility
