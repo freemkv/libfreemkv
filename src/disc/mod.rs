@@ -940,37 +940,24 @@ impl Disc {
     /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        let t0 = std::time::Instant::now();
         // READ CAPACITY may fail in LibreDrive mode — proceed with 0 and estimate later
         let capacity = Self::read_capacity(session).unwrap_or(0);
-        eprintln!(
-            "[scan {:.1}s] capacity={}",
-            t0.elapsed().as_secs_f64(),
-            capacity
-        );
 
         // AACS handshake (Blu-ray/UHD)
         let handshake = Self::do_handshake(session, opts);
-        eprintln!("[scan {:.1}s] handshake done", t0.elapsed().as_secs_f64());
 
         // Request max read speed — removes riplock on DVD
         // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
-        eprintln!("[scan {:.1}s] speed set", t0.elapsed().as_secs_f64());
 
+        // Buffer sector reads — USB drives have ~500ms per SCSI command,
+        // so prefetching reduces hundreds of commands to dozens.
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
-        eprintln!(
-            "[scan {:.1}s] UDF parsed, prefetching metadata ({} sectors)...",
-            t0.elapsed().as_secs_f64(),
-            udf_fs.metadata_sectors()
-        );
         buffered.prefetch(udf_fs.metadata_start(), udf_fs.metadata_sectors());
-        eprintln!("[scan {:.1}s] metadata cached", t0.elapsed().as_secs_f64());
 
         let mut disc = Self::scan_with(&mut buffered, capacity, handshake, opts, udf_fs)?;
-        eprintln!("[scan {:.1}s] scan_with done", t0.elapsed().as_secs_f64());
 
         // CSS key extraction for DVDs (bus auth → disc key → title key).
         // Must be a single auth session — can't call authenticate() separately.
@@ -1020,17 +1007,11 @@ impl Disc {
         opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
-        let t0 = std::time::Instant::now();
-
         // 2. Resolve encryption (AACS, CSS, or none)
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
         let aacs = if encrypted {
-            eprintln!(
-                "[scan_with {:.1}s] resolving encryption...",
-                t0.elapsed().as_secs_f64()
-            );
             if let Some(keydb_path) = opts.resolve_keydb() {
                 Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref()).ok()
             } else {
@@ -1039,10 +1020,6 @@ impl Disc {
         } else {
             None
         };
-        eprintln!(
-            "[scan_with {:.1}s] encryption done",
-            t0.elapsed().as_secs_f64()
-        );
 
         // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
@@ -1058,11 +1035,6 @@ impl Disc {
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
-        eprintln!(
-            "[scan_with {:.1}s] titles done: {}",
-            t0.elapsed().as_secs_f64(),
-            titles.len()
-        );
         titles.sort_by(|a, b| {
             b.duration_secs
                 .partial_cmp(&a.duration_secs)
@@ -1071,12 +1043,7 @@ impl Disc {
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
-        eprintln!(
-            "[scan_with {:.1}s] meta_title done",
-            t0.elapsed().as_secs_f64()
-        );
         crate::labels::apply(reader, &udf_fs, &mut titles);
-        eprintln!("[scan_with {:.1}s] labels done", t0.elapsed().as_secs_f64());
 
         // 5. Derive format, layers, region
         let format = Self::detect_format(&titles);
