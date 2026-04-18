@@ -117,9 +117,9 @@ impl DiscStream {
         self.disc.as_ref()
     }
 
-    fn fill_extents(&mut self) -> bool {
+    fn fill_extents(&mut self) -> io::Result<bool> {
         if self.current_extent >= self.extents.len() {
-            return false;
+            return Ok(false);
         }
         let ext_start = self.extents[self.current_extent].start_lba;
         let ext_sectors = self.extents[self.current_extent].sector_count;
@@ -137,21 +137,15 @@ impl DiscStream {
         let bytes = sectors as usize * 2048;
         self.read_buf.resize(bytes, 0);
 
-        match self
-            .reader
-            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])
-        {
-            Ok(_) => {
-                self.buf_valid = bytes;
-                self.current_offset += sectors as u32;
-                if self.current_offset >= ext_sectors {
-                    self.current_extent += 1;
-                    self.current_offset = 0;
-                }
-                true
-            }
-            Err(_) => false,
+        self.reader
+            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])?;
+        self.buf_valid = bytes;
+        self.current_offset += sectors as u32;
+        if self.current_offset >= ext_sectors {
+            self.current_extent += 1;
+            self.current_offset = 0;
         }
+        Ok(true)
     }
 }
 
@@ -166,7 +160,7 @@ impl crate::pes::Stream for DiscStream {
         }
 
         loop {
-            if !self.fill_extents() {
+            if !self.fill_extents()? {
                 self.eof = true;
                 // Flush demuxer — last PES packet may still be in the assembler
                 if let Some(ref mut demuxer) = self.ts_demuxer {

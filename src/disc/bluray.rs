@@ -66,17 +66,18 @@ impl Disc {
                     pkt_count = clip_info.source_packet_count;
                     total_size += pkt_count as u64 * 192;
 
-                    // Get m2ts file start LBA and compute extent from packet count.
-                    // BD-ROM m2ts files are contiguous on disc (mastering requirement).
+                    // Get m2ts file extents from UDF allocation descriptors.
+                    // Dual-layer discs split files across layers — UDF knows the real layout.
                     let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
-                    let file_lba = udf_fs.file_start_lba(reader, &m2ts_path).unwrap_or(0);
-                    let total_bytes = pkt_count as u64 * 192;
-                    let total_sectors = total_bytes.div_ceil(2048) as u32;
-                    if total_sectors > 0 && file_lba > 0 {
-                        extents.push(Extent {
-                            start_lba: file_lba,
-                            sector_count: total_sectors,
-                        });
+                    if let Ok(file_exts) = udf_fs.file_extents(reader, &m2ts_path) {
+                        for (lba, sectors) in file_exts {
+                            if sectors > 0 && lba > 0 {
+                                extents.push(Extent {
+                                    start_lba: lba,
+                                    sector_count: sectors,
+                                });
+                            }
+                        }
                     }
                 }
             }
