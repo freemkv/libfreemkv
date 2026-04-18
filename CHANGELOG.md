@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.5 (2026-04-18)
+
+### MKV container fixes — Jellyfin/player compatibility
+- **Timestamp normalization** — MKV and M2TS output starts at 0.000s instead of raw disc PTS offset. Fixes playback failures in Jellyfin and other players.
+- **DefaultDuration** — correct frame rate written to MKV track header. Fixes wrong avg_frame_rate (was 293/12, now 24000/1001).
+- **HDR Colour metadata** — MatrixCoefficients, TransferCharacteristics, Primaries, Range written to MKV video track. Enables HDR tone mapping in players.
+- **DisplayWidth/DisplayHeight** — aspect ratio fields in MKV video track.
+- **Chapters (Blu-ray)** — accept mark_type 0 as chapter entry (was filtering to type 1 only, which no disc uses).
+- **Chapters (DVD)** — extract chapter timestamps from PGC program map + cell durations.
+- **Default disposition** — only first video and first audio track marked default. Fixes wrong auto-selection in players.
+
 ## 0.11.3 (2026-04-18)
 
 ### Unified versioning

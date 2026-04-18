@@ -42,12 +42,22 @@ impl MkvStream {
     /// Codec privates come from title.codec_privates (populated by input stream).
     pub fn create(writer: Box<dyn WriteSeek>, title: &DiscTitle) -> io::Result<Self> {
         let mut tracks = Vec::new();
+        let mut has_default_video = false;
+        let mut has_default_audio = false;
         for (idx, s) in title.streams.iter().enumerate() {
             let mut track = match s {
                 crate::disc::Stream::Video(v) => MkvTrack::video(v),
                 crate::disc::Stream::Audio(a) => MkvTrack::audio(a),
                 crate::disc::Stream::Subtitle(s) => MkvTrack::subtitle(s),
             };
+            // Only first video and first audio are default
+            if track.is_default {
+                match track.track_type {
+                    1 if !has_default_video => has_default_video = true,
+                    2 if !has_default_audio => has_default_audio = true,
+                    _ => track.is_default = false,
+                }
+            }
             if let Some(cp) = title.codec_privates.get(idx).and_then(|c| c.as_ref()) {
                 track.codec_private = Some(cp.clone());
             }
