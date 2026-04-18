@@ -15,6 +15,7 @@ pub struct TsMuxer<W: Write> {
     continuity: Vec<u8>,                  // per-PID continuity counter (0-15)
     codec_privates: Vec<Option<Vec<u8>>>, // per-track codec_private (for video parameter sets)
     params_written: Vec<bool>,            // per-track: have we written parameter sets?
+    base_pts_ns: Option<i64>,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -26,6 +27,7 @@ impl<W: Write> TsMuxer<W> {
             continuity: vec![0u8; n],
             codec_privates: vec![None; n],
             params_written: vec![false; n],
+            base_pts_ns: None,
         }
     }
 
@@ -44,6 +46,9 @@ impl<W: Write> TsMuxer<W> {
         if track >= self.pids.len() {
             return Ok(()); // unknown track, skip
         }
+        let base = *self.base_pts_ns.get_or_insert(pts_ns);
+        let pts_ns = pts_ns - base;
+
         let pid = self.pids[track];
         let is_video = (0x1011..=0x101F).contains(&pid);
 

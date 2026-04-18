@@ -47,6 +47,8 @@ pub struct DvdTitle {
     pub duration_secs: f64,
     /// Cell sector ranges
     pub cells: Vec<DvdCell>,
+    /// Chapter start times in seconds (derived from program map + cell times)
+    pub chapter_times: Vec<f64>,
     /// Subtitle palette from PGC: 16 entries of [padding, Y, Cb, Cr].
     pub palette: Option<Vec<[u8; 4]>>,
 }
@@ -541,6 +543,37 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         duration_secs
     };
 
+    // Extract chapter times from program map + cell durations
+    // PGC program map offset at 0xE6, maps program_number → first cell_number
+    let chapter_times = {
+        let pgm_map_offset = be_u16(data, pgc_offset + 0xE6).unwrap_or(0) as usize;
+        let nr_of_programs = byte_at(data, pgc_offset + 0x02).unwrap_or(0) as usize;
+        let mut times = Vec::new();
+        if pgm_map_offset > 0 && nr_of_programs > 0 && cell_playback_offset > 0 {
+            let pgm_base = pgc_offset + pgm_map_offset;
+            // Collect cell durations
+            let mut cell_durations = Vec::with_capacity(num_cells);
+            let cell_base = pgc_offset + cell_playback_offset;
+            for i in 0..num_cells {
+                let co = cell_base + i * 24;
+                if co + 8 <= data.len() {
+                    cell_durations.push(bcd_to_secs(&data[co + 4..co + 8]));
+                } else {
+                    cell_durations.push(0.0);
+                }
+            }
+            // Program map: each byte is the first cell number (1-based) for that program
+            for p in 0..nr_of_programs {
+                if pgm_base + p >= data.len() { break; }
+                let first_cell = data[pgm_base + p] as usize;
+                // Chapter time = sum of cell durations before this program's first cell
+                let time: f64 = cell_durations[..first_cell.saturating_sub(1)].iter().sum();
+                times.push(time);
+            }
+        }
+        times
+    };
+
     // Extract subtitle palette at PGC offset 0xA4: 16 colors × 4 bytes [padding, Y, Cb, Cr]
     let palette = if pgc_offset + 0xA4 + 64 <= data.len() {
         let mut colors = Vec::with_capacity(16);
@@ -562,6 +595,7 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
         chapters,
         duration_secs,
         cells,
+        chapter_times,
         palette,
     })
 }
@@ -651,6 +685,7 @@ mod tests {
             chapters: 5,
             duration_secs: 3600.0,
             cells: vec![cell.clone()],
+            chapter_times: Vec::new(),
             palette: None,
         };
         assert_eq!(title.chapters, 5);

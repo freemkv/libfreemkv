@@ -101,6 +101,16 @@ impl Disc {
                 streams.extend(audio_streams.iter().cloned());
                 streams.extend(subtitle_streams);
 
+                let chapters: Vec<Chapter> = dvd_title
+                    .chapter_times
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &t)| Chapter {
+                        time_secs: t,
+                        name: format!("Chapter {}", i + 1),
+                    })
+                    .collect();
+
                 titles.push(DiscTitle {
                     playlist: format!("VTS_{:02}_{}.VOB", ts.vts_number, title_number),
                     playlist_id: title_number,
@@ -108,7 +118,7 @@ impl Disc {
                     size_bytes,
                     clips: Vec::new(),
                     streams,
-                    chapters: Vec::new(),
+                    chapters,
                     extents,
                     content_format: ContentFormat::MpegPs,
                     codec_privates: Vec::new(),

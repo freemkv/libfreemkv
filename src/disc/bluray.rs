@@ -159,12 +159,12 @@ impl Disc {
             })
             .collect();
 
-        // Convert marks to chapters (filter mark_type == 1 = chapter entry)
+        // Convert marks to chapters (mark_type 0 or 1 = chapter entry, 2 = link)
         let first_in_time = parsed.play_items.first().map(|pi| pi.in_time).unwrap_or(0);
         let chapters: Vec<Chapter> = parsed
             .marks
             .iter()
-            .filter(|m| m.mark_type == 1)
+            .filter(|m| m.mark_type <= 1)
             .enumerate()
             .map(|(i, m)| {
                 let time_secs = (m.timestamp as f64 - first_in_time as f64) / 45000.0;

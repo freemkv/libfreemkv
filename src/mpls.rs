@@ -256,7 +256,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
     // Parse PlayListMark section
     let mut marks = Vec::new();
-    if mark_start > 0 && mark_start + 4 < data.len() {
+    if mark_start > 0 && mark_start + 4 <= data.len() {
         let ms = &data[mark_start..];
         if ms.len() >= 6 {
             let num_marks = u16::from_be_bytes([ms[4], ms[5]]) as usize;

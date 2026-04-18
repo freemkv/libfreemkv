@@ -5,7 +5,7 @@
 //! cues and seek head are finalized at the end.
 
 use super::ebml;
-use crate::disc::{AudioStream, Chapter, Codec, SubtitleStream, VideoStream};
+use crate::disc::{AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream};
 use std::io::{self, Seek, SeekFrom, Write};
 
 /// MKV track definition (built from disc stream metadata).
@@ -20,6 +20,14 @@ pub struct MkvTrack {
     // Video-specific
     pub pixel_width: u32,
     pub pixel_height: u32,
+    pub default_duration_ns: u64, // nanoseconds per frame (0 = unknown)
+    pub display_width: u32,       // display aspect ratio width (0 = same as pixel)
+    pub display_height: u32,      // display aspect ratio height (0 = same as pixel)
+    // HDR colour metadata
+    pub colour_matrix: u8,         // MatrixCoefficients (9=bt2020nc)
+    pub colour_transfer: u8,       // TransferCharacteristics (16=smpte2084/PQ)
+    pub colour_primaries: u8,      // Primaries (9=bt2020)
+    pub colour_range: u8,          // Range (1=tv/limited)
     // Audio-specific
     pub sample_rate: f64,
     pub channels: u8,
@@ -36,16 +44,40 @@ impl MkvTrack {
             _ => "V_MPEG2",
         };
         let (w, h) = v.resolution.pixels();
+        let (num, den) = v.frame_rate.as_fraction();
+        let default_duration_ns = if num > 0 {
+            (1_000_000_000u64 * den as u64) / num as u64
+        } else {
+            0
+        };
+        let (matrix, transfer, primaries, range) = match v.color_space {
+            ColorSpace::Bt2020 => (9, 16, 9, 1), // bt2020nc, PQ, bt2020, limited
+            ColorSpace::Bt709 => (1, 1, 1, 1),    // bt709
+            ColorSpace::Unknown => (0, 0, 0, 0),
+        };
+        // Override transfer for non-PQ HDR
+        let transfer = match v.hdr {
+            HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => 16, // PQ
+            HdrFormat::Hlg => 18,
+            _ => transfer,
+        };
         Self {
             track_type: ebml::TRACK_TYPE_VIDEO,
             codec_id,
             language: "und".into(),
             name: v.label.clone(),
-            codec_private: None, // filled later by parser
+            codec_private: None,
             is_default: !v.secondary,
             is_forced: false,
             pixel_width: w,
             pixel_height: h,
+            default_duration_ns,
+            display_width: w,
+            display_height: h,
+            colour_matrix: matrix,
+            colour_transfer: transfer,
+            colour_primaries: primaries,
+            colour_range: range,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -73,6 +105,13 @@ impl MkvTrack {
             is_forced: false,
             pixel_width: 0,
             pixel_height: 0,
+            default_duration_ns: 0,
+            display_width: 0,
+            display_height: 0,
+            colour_matrix: 0,
+            colour_transfer: 0,
+            colour_primaries: 0,
+            colour_range: 0,
             sample_rate: sr,
             channels: ch,
             bit_depth: 0,
@@ -94,6 +133,13 @@ impl MkvTrack {
             is_forced: s.forced,
             pixel_width: 0,
             pixel_height: 0,
+            default_duration_ns: 0,
+            display_width: 0,
+            display_height: 0,
+            colour_matrix: 0,
+            colour_transfer: 0,
+            colour_primaries: 0,
+            colour_range: 0,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -116,6 +162,7 @@ pub struct MkvMuxer<W: Write + Seek> {
     cluster_pos: u64,
     cluster_size_pos: u64,
     cluster_ts_ms: i64,
+    base_pts_ms: Option<i64>,
     cues: Vec<CuePoint>,
     frame_count: u64,
     /// File positions of codecPrivate placeholders (track_idx → offset, max_size).
@@ -216,11 +263,29 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 codec_private_filled.push(true);
             }
 
+            // DefaultDuration — frame duration in nanoseconds
+            if track.default_duration_ns > 0 {
+                ebml::write_uint(&mut writer, ebml::DEFAULT_DURATION, track.default_duration_ns)?;
+            }
+
             // Video-specific
             if track.track_type == ebml::TRACK_TYPE_VIDEO && track.pixel_width > 0 {
                 let vid_pos = ebml::start_master(&mut writer, ebml::VIDEO)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_WIDTH, track.pixel_width as u64)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
+                if track.display_width > 0 && track.display_height > 0 {
+                    ebml::write_uint(&mut writer, ebml::DISPLAY_WIDTH, track.display_width as u64)?;
+                    ebml::write_uint(&mut writer, ebml::DISPLAY_HEIGHT, track.display_height as u64)?;
+                }
+                // Colour metadata (HDR)
+                if track.colour_matrix > 0 || track.colour_transfer > 0 {
+                    let col_pos = ebml::start_master(&mut writer, ebml::COLOUR)?;
+                    ebml::write_uint(&mut writer, ebml::MATRIX_COEFFICIENTS, track.colour_matrix as u64)?;
+                    ebml::write_uint(&mut writer, ebml::TRANSFER_CHARACTERISTICS, track.colour_transfer as u64)?;
+                    ebml::write_uint(&mut writer, ebml::PRIMARIES, track.colour_primaries as u64)?;
+                    ebml::write_uint(&mut writer, ebml::RANGE, track.colour_range as u64)?;
+                    ebml::end_master(&mut writer, col_pos)?;
+                }
                 ebml::end_master(&mut writer, vid_pos)?;
             }
 
@@ -265,6 +330,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             cluster_pos: 0,
             cluster_size_pos: 0,
             cluster_ts_ms: 0,
+            base_pts_ms: None,
             cues: Vec::new(),
             frame_count: 0,
             codec_private_slots,
@@ -280,7 +346,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         keyframe: bool,
         data: &[u8],
     ) -> io::Result<()> {
-        let pts_ms = pts_ns / 1_000_000;
+        let raw_ms = pts_ns / 1_000_000;
+        let base = *self.base_pts_ms.get_or_insert(raw_ms);
+        let pts_ms = raw_ms - base;
 
         // Start new cluster if needed
         if !self.cluster_open || (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS {
@@ -450,6 +518,13 @@ mod tests {
             is_forced: false,
             pixel_width: 1920,
             pixel_height: 1080,
+            default_duration_ns: 41708333,
+            display_width: 1920,
+            display_height: 1080,
+            colour_matrix: 0,
+            colour_transfer: 0,
+            colour_primaries: 0,
+            colour_range: 0,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -467,6 +542,13 @@ mod tests {
             is_forced: false,
             pixel_width: 0,
             pixel_height: 0,
+            default_duration_ns: 0,
+            display_width: 0,
+            display_height: 0,
+            colour_matrix: 0,
+            colour_transfer: 0,
+            colour_primaries: 0,
+            colour_range: 0,
             sample_rate: 48000.0,
             channels: 6,
             bit_depth: 0,
@@ -760,3 +842,4 @@ mod tests {
         );
     }
 }
+
