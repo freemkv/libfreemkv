@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.3 (2026-04-18)
+
+### Unified versioning
+- All freemkv repos now share the same version number. No functional changes from 0.10.10.
+
 ## 0.10.10 (2026-04-18)
 
 ### Dual-layer disc fix
