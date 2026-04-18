@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.10.10 (2026-04-18)
+
+### Dual-layer disc fix
+- **UDF extent allocation** — use actual UDF allocation descriptors (`file_extents()`) instead of assuming m2ts files are contiguous from `file_start_lba`. Dual-layer UHD discs split large files across many extents (~1 GB each). The old single-extent assumption truncated rips at ~37% on affected discs.
+- **Read error propagation** — `fill_extents()` returns `io::Result<bool>` so SCSI read errors propagate to the caller instead of being silently treated as EOF.
+
+## 0.10.9 (2026-04-17)
+
+### Fast disc identification
+- **Disc::identify()** — reads UDF filesystem only (name, format, layers, encrypted). ~3s on USB vs 18s for full scan. No AACS handshake or playlist parsing.
+- **KEYDB path fix** — added `~/.config/freemkv/keydb.cfg` to search paths. Fixes silent rip hang when KEYDB exists but isn't found by `resolve_keydb()`.
+
+## 0.10.8 (2026-04-17)
+
+### Buffered UDF reads
+- **BufferedSectorReader** — prefetches batch sectors on single-sector reads. USB drives have ~500ms per SCSI command; this eliminates scan hangs.
+- **Metadata partition pre-read** — loads entire UDF metadata partition into memory after initial parse.
+- Scan time reduced from 10+ minutes to ~18 seconds on USB.
+
 ## 0.10.7 (2026-04-17)
 
 ### DiscStream::new()
