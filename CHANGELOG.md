@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.6 (2026-04-18)
+
+### TrueHD fix
+- **Strip BD-TS access unit header** — TrueHD parser was passing the 4-byte BD-TS access unit header into MKV. MKV expects raw MLP frames. The header bytes corrupted TrueHD sync, causing decode failures in all players. Affects BD and UHD discs with TrueHD/Atmos audio.
+
 ## 0.11.5 (2026-04-18)
 
 ### MKV container fixes — Jellyfin/player compatibility
