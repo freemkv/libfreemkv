@@ -39,10 +39,15 @@ impl CodecParser for TrueHdParser {
 
         let mut frames = Vec::new();
 
-        // TrueHD units are variable-length but each starts with a 2-byte
-        // big-endian length field (in 16-bit words, includes the 4-byte header).
-        // Extract complete units from the buffer.
-        while self.buf.len() >= 4 {
+        // BD-TS TrueHD access units:
+        //   [0..1] length in 16-bit words (includes the 4-byte header)
+        //   [2..3] timestamp (ignored — we use PES PTS)
+        //   [4..]  MLP payload (raw TrueHD data for MKV)
+        //
+        // MKV stores raw MLP frames without the 4-byte access unit header.
+        const AU_HEADER: usize = 4;
+
+        while self.buf.len() >= AU_HEADER {
             let unit_words = ((self.buf[0] as usize) << 8) | self.buf[1] as usize;
             if unit_words == 0 {
                 // Padding — skip 2 bytes
@@ -50,7 +55,7 @@ impl CodecParser for TrueHdParser {
                 continue;
             }
             let unit_bytes = unit_words * 2;
-            if unit_bytes > 65536 {
+            if unit_bytes > 65536 || unit_bytes < AU_HEADER {
                 // Invalid — skip 2 bytes to resync
                 self.buf.drain(..2);
                 continue;
@@ -60,10 +65,11 @@ impl CodecParser for TrueHdParser {
                 break;
             }
 
+            // Strip the 4-byte access unit header, pass only MLP payload
             frames.push(Frame {
                 pts_ns,
                 keyframe: true,
-                data: self.buf[..unit_bytes].to_vec(),
+                data: self.buf[AU_HEADER..unit_bytes].to_vec(),
             });
             self.buf.drain(..unit_bytes);
         }
@@ -93,8 +99,15 @@ mod tests {
     fn make_truehd_unit(size_bytes: usize) -> Vec<u8> {
         let words = size_bytes / 2;
         let mut data = vec![0u8; size_bytes];
+        // 4-byte header: [length_hi, length_lo, ts_hi, ts_lo]
         data[0] = (words >> 8) as u8;
         data[1] = (words & 0xFF) as u8;
+        data[2] = 0; // timestamp
+        data[3] = 0;
+        // Fill payload with non-zero to distinguish from header
+        for b in data[4..].iter_mut() {
+            *b = 0xAA;
+        }
         data
     }
 
@@ -106,13 +119,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_single_unit() {
+    fn parse_single_unit_strips_header() {
         let mut parser = TrueHdParser::new();
         let unit = make_truehd_unit(200);
         let pes = make_pes(unit, Some(90000));
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data.len(), 200);
+        // Output should be 200 - 4 = 196 bytes (header stripped)
+        assert_eq!(frames[0].data.len(), 196);
+        assert_eq!(frames[0].data[0], 0xAA); // payload, not header
     }
 
     #[test]
@@ -127,7 +142,7 @@ mod tests {
         let pes2 = make_pes(unit[mid..].to_vec(), Some(93000));
         let frames = parser.parse(&pes2);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].data.len(), 200);
+        assert_eq!(frames[0].data.len(), 196); // 200 - 4 header
     }
 
     #[test]
@@ -138,8 +153,8 @@ mod tests {
         let pes = make_pes(data, Some(90000));
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].data.len(), 100);
-        assert_eq!(frames[1].data.len(), 120);
+        assert_eq!(frames[0].data.len(), 96);  // 100 - 4
+        assert_eq!(frames[1].data.len(), 116); // 120 - 4
     }
 
     #[test]
