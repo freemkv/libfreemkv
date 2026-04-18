@@ -1,6 +1,6 @@
 # libfreemkv — Feature List
 
-## v0.10.4 (current)
+## v0.10.10 (current)
 
 ### Done
 - [x] Drive access: open, identify, unlock, firmware upload, speed calibration, eject
