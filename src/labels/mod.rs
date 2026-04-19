@@ -138,6 +138,98 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
     }
 }
 
+/// Fill in default labels for any streams that don't have one.
+/// Runs after BD-J label extraction — fills gaps with codec + channel descriptions.
+/// This is the central place for all fallback label generation.
+pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
+    use crate::disc::{AudioChannels, Codec, HdrFormat, Stream};
+
+    for title in titles.iter_mut() {
+        for stream in &mut title.streams {
+            match stream {
+                Stream::Audio(a) if a.label.is_empty() => {
+                    a.label = generate_audio_label(&a.codec, &a.channels, a.secondary);
+                }
+                Stream::Video(v) if v.label.is_empty() && v.secondary => {
+                    // Label secondary video streams (DV EL, PiP)
+                    v.label = "Dolby Vision EL".to_string();
+                }
+                Stream::Video(v) if v.label.is_empty() => {
+                    // Primary video: codec + resolution + HDR
+                    let mut parts = vec![v.codec.name().to_string()];
+                    let (w, _) = v.resolution.pixels();
+                    if w >= 3840 {
+                        parts.push("4K".into());
+                    } else if w >= 1920 {
+                        parts.push("1080p".into());
+                    } else if w >= 1280 {
+                        parts.push("720p".into());
+                    }
+                    if v.hdr != HdrFormat::Sdr {
+                        parts.push(v.hdr.name().to_string());
+                    }
+                    v.label = parts.join(" ");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn generate_audio_label(
+    codec: &crate::disc::Codec,
+    channels: &crate::disc::AudioChannels,
+    secondary: bool,
+) -> String {
+    use crate::disc::{AudioChannels, Codec};
+
+    let codec_name = match codec {
+        Codec::TrueHd => match channels {
+            AudioChannels::Surround71 => "Dolby TrueHD Atmos 7.1",
+            AudioChannels::Surround51 => "Dolby TrueHD 5.1",
+            _ => "Dolby TrueHD",
+        },
+        Codec::Ac3 => "Dolby Digital",
+        Codec::Ac3Plus => "Dolby Digital Plus",
+        Codec::DtsHdMa => "DTS-HD Master Audio",
+        Codec::DtsHdHr => "DTS-HD High Resolution",
+        Codec::Dts => "DTS",
+        Codec::Lpcm => "LPCM",
+        Codec::Aac => "AAC",
+        Codec::Mp2 => "MPEG Audio",
+        Codec::Mp3 => "MP3",
+        Codec::Flac => "FLAC",
+        Codec::Opus => "Opus",
+        _ => return String::new(),
+    };
+
+    // TrueHD already includes channel info for 7.1/5.1
+    let has_channels = matches!(
+        codec,
+        Codec::TrueHd if matches!(channels, AudioChannels::Surround71 | AudioChannels::Surround51)
+    );
+
+    let channel_str = if has_channels {
+        String::new()
+    } else {
+        match channels {
+            AudioChannels::Mono => " 1.0".into(),
+            AudioChannels::Stereo => " 2.0".into(),
+            AudioChannels::Stereo21 => " 2.1".into(),
+            AudioChannels::Quad => " 4.0".into(),
+            AudioChannels::Surround50 => " 5.0".into(),
+            AudioChannels::Surround51 => " 5.1".into(),
+            AudioChannels::Surround61 => " 6.1".into(),
+            AudioChannels::Surround71 => " 7.1".into(),
+            AudioChannels::Unknown => String::new(),
+        }
+    };
+
+    let suffix = if secondary { " (Secondary)" } else { "" };
+
+    format!("{}{}{}", codec_name, channel_str, suffix)
+}
+
 fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
     for (_name, detect, parse) in PARSERS {
         if detect(udf) {
