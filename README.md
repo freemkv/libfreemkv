@@ -18,7 +18,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.10"
+libfreemkv = "0.11"
 ```
 
 ## Quick Start
@@ -134,7 +134,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 
 ## Contributing
 
-Run `freemkv drive-info --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to contribute your drive's profile.
+Run `freemkv info disc:// --share` with the [freemkv CLI](https://github.com/freemkv/freemkv) to contribute your drive's profile.
 
 ## License
 
