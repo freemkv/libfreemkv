@@ -1,9 +1,19 @@
 # Changelog
 
+## 0.11.7 (2026-04-19)
+
+### TrueHD parser rewrite
+- **12-bit length mask** — access unit length is lower 12 bits of first 2 bytes, not full 16. Upper 4 bits are parity nibble. Wrong mask caused misaligned frame splits.
+- **AC-3 frame skipping** — BD-TS TrueHD PES contains interleaved AC-3 frames (same PID). Parser now detects AC-3 sync word (0x0B77) and skips those frames.
+- **Cross-PES buffering** — access units that span PES packet boundaries are correctly reassembled.
+- **Per-unit timestamps** — each access unit gets incrementing PTS (1/1200th second apart) instead of all units in one PES sharing the same timestamp.
+- **Major sync detection** — keyframe flag set when access unit contains MLP major sync (0xF8726FBA).
+- Result: zero TrueHD decode errors on UHD and BD (was ~19 per 30 seconds).
+
 ## 0.11.6 (2026-04-18)
 
-### TrueHD fix
-- **Strip BD-TS access unit header** — TrueHD parser was passing the 4-byte BD-TS access unit header into MKV. MKV expects raw MLP frames. The header bytes corrupted TrueHD sync, causing decode failures in all players. Affects BD and UHD discs with TrueHD/Atmos audio.
+### TrueHD fix (incomplete)
+- Initial attempt at TrueHD header stripping — wrong approach, superseded by 0.11.7.
 
 ## 0.11.5 (2026-04-18)
 
