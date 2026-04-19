@@ -5,60 +5,8 @@
 //! cues and seek head are finalized at the end.
 
 use super::ebml;
-use crate::disc::{
-    AudioChannels, AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
-};
+use crate::disc::{AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream};
 use std::io::{self, Seek, SeekFrom, Write};
-
-/// Generate a descriptive audio track label from codec and channel layout.
-/// Used when the disc doesn't provide BD-J/CLPI labels.
-fn generate_audio_label(codec: &Codec, channels: &AudioChannels, secondary: bool) -> String {
-    let codec_name = match codec {
-        Codec::TrueHd => match channels {
-            AudioChannels::Surround71 => "Dolby TrueHD Atmos 7.1",
-            AudioChannels::Surround51 => "Dolby TrueHD 5.1",
-            _ => "Dolby TrueHD",
-        },
-        Codec::Ac3 => "Dolby Digital",
-        Codec::Ac3Plus => "Dolby Digital Plus",
-        Codec::DtsHdMa => "DTS-HD Master Audio",
-        Codec::DtsHdHr => "DTS-HD High Resolution",
-        Codec::Dts => "DTS",
-        Codec::Lpcm => "LPCM",
-        Codec::Aac => "AAC",
-        Codec::Mp2 => "MPEG Audio",
-        Codec::Mp3 => "MP3",
-        Codec::Flac => "FLAC",
-        Codec::Opus => "Opus",
-        _ => return String::new(),
-    };
-
-    // TrueHD already includes channel info in its name for 7.1/5.1
-    let has_channels = matches!(
-        codec,
-        Codec::TrueHd if matches!(channels, AudioChannels::Surround71 | AudioChannels::Surround51)
-    );
-
-    let channel_str = if has_channels {
-        String::new()
-    } else {
-        match channels {
-            AudioChannels::Mono => " 1.0".into(),
-            AudioChannels::Stereo => " 2.0".into(),
-            AudioChannels::Stereo21 => " 2.1".into(),
-            AudioChannels::Quad => " 4.0".into(),
-            AudioChannels::Surround50 => " 5.0".into(),
-            AudioChannels::Surround51 => " 5.1".into(),
-            AudioChannels::Surround61 => " 6.1".into(),
-            AudioChannels::Surround71 => " 7.1".into(),
-            AudioChannels::Unknown => String::new(),
-        }
-    };
-
-    let suffix = if secondary { " (Secondary)" } else { "" };
-
-    format!("{}{}{}", codec_name, channel_str, suffix)
-}
 
 /// MKV track definition (built from disc stream metadata).
 pub struct MkvTrack {
@@ -148,12 +96,7 @@ impl MkvTrack {
         let sr = a.sample_rate.hz();
         let ch = a.channels.count();
 
-        // Use disc label if available, otherwise generate from codec + channels
-        let name = if a.label.is_empty() {
-            generate_audio_label(&a.codec, &a.channels, a.secondary)
-        } else {
-            a.label.clone()
-        };
+        let name = a.label.clone();
 
         Self {
             track_type: ebml::TRACK_TYPE_AUDIO,

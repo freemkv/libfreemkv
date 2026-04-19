@@ -1108,6 +1108,7 @@ impl Disc {
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
         crate::labels::apply(reader, &udf_fs, &mut titles);
+        crate::labels::fill_defaults(&mut titles);
 
         // 5. Derive format, layers, region
         let format = Self::detect_format(&titles);
