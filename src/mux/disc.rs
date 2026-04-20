@@ -119,6 +119,55 @@ impl DiscStream {
         self.disc.as_ref()
     }
 
+    /// Binary search to isolate failing sectors within a batch.
+    /// Reads good regions in sub-batches, handles bad sectors individually.
+    fn read_with_binary_search(&mut self, lba: u32, count: u16) -> io::Result<()> {
+        if count <= 1 {
+            // Single sector — read with full recovery (Tier 2)
+            let offset = self.buf_valid;
+            match self.reader.read_sectors(lba, 1, &mut self.read_buf[offset..offset + 2048]) {
+                Ok(_) => {
+                    self.buf_valid += 2048;
+                }
+                Err(e) => {
+                    if self.skip_errors {
+                        self.read_buf[offset..offset + 2048].fill(0);
+                        self.buf_valid += 2048;
+                        self.errors += 1;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Try this sub-batch as a whole first
+        let bytes = count as usize * 2048;
+        let offset = self.buf_valid;
+        if self
+            .reader
+            .read_sectors_recover(lba, count, &mut self.read_buf[offset..offset + bytes], false)
+            .is_ok()
+        {
+            // Sub-batch succeeded with fast read — all good
+            self.buf_valid += bytes;
+            return Ok(());
+        }
+
+        // Sub-batch failed — split in half and recurse
+        let half = count / 2;
+        let half = half - (half % 3).min(half); // align to 3-sector BD-TS boundary
+        let half = half.max(1);
+        let remainder = count - half;
+
+        self.read_with_binary_search(lba, half)?;
+        if remainder > 0 {
+            self.read_with_binary_search(lba + half as u32, remainder)?;
+        }
+        Ok(())
+    }
+
     fn fill_extents(&mut self) -> io::Result<bool> {
         if self.current_extent >= self.extents.len() {
             return Ok(false);
@@ -139,28 +188,18 @@ impl DiscStream {
         let bytes = sectors as usize * 2048;
         self.read_buf.resize(bytes, 0);
 
-        match self.reader.read_sectors(lba, sectors, &mut self.read_buf[..bytes]) {
-            Ok(_) => {
-                self.buf_valid = bytes;
-            }
-            Err(e) if self.skip_errors => {
-                // Skip mode: try each sector individually, zero-fill failures
-                self.buf_valid = 0;
-                for i in 0..sectors {
-                    let offset = i as usize * 2048;
-                    let sector_lba = lba + i as u32;
-                    if self
-                        .reader
-                        .read_sectors(sector_lba, 1, &mut self.read_buf[offset..offset + 2048])
-                        .is_err()
-                    {
-                        self.read_buf[offset..offset + 2048].fill(0);
-                        self.errors += 1;
-                    }
-                    self.buf_valid += 2048;
-                }
-            }
-            Err(e) => return Err(e.into()),
+        if self
+            .reader
+            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])
+            .is_ok()
+        {
+            // Fast path: batch succeeded
+            self.buf_valid = bytes;
+        } else {
+            // Tier 1: Binary search to isolate the failing sector(s),
+            // then read good regions in batches and bad sectors individually.
+            self.buf_valid = 0;
+            self.read_with_binary_search(lba, sectors)?;
         }
         self.current_offset += sectors as u32;
         if self.current_offset >= ext_sectors {
