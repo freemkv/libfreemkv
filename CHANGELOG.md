@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.11 (2026-04-20)
+
+### Binary search error recovery
+- **fill_extents binary search** — when a batch read fails, binary search to isolate the failing sector(s). Good sectors read in sub-batches at full speed. Only truly bad sectors get individual recovery. 60-sector batch with 1 bad sector: ~5 seconds instead of 10+ minutes.
+
 ## 0.11.10 (2026-04-20)
 
 ### Skip errors + clean verify API
