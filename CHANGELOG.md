@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.8 (2026-04-20)
+
+### Disc verify
+- **verify::verify_title()** — sector-by-sector health check. Classifies sectors as Good/Slow/Recovered/Bad. Progress callback, chapter mapping, sector ranges.
+
 ## 0.11.7 (2026-04-19)
 
 ### TrueHD parser rewrite
