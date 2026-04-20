@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.10 (2026-04-20)
+
+### Skip errors + clean verify API
+- **DiscStream.skip_errors** — when true, zero-fills unreadable sectors and continues instead of aborting. Caller sets based on user preference.
+- **read_sectors_recover(recovery: bool)** — single API for recovery vs fast reads. Replaces separate read_sectors_fast method.
+
 ## 0.11.9 (2026-04-20)
 
 ### Fast verify reads
