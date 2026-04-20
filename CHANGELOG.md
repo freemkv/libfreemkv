@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.9 (2026-04-20)
+
+### Fast verify reads
+- **read_sectors_fast()** — single-attempt 5s timeout SCSI read for verify. No recovery loop. Bad sectors detected in seconds instead of 10+ minutes.
+- **SectorReader trait** — added read_sectors_fast() with default fallback to read_sectors().
+
 ## 0.11.8 (2026-04-20)
 
 ### Disc verify

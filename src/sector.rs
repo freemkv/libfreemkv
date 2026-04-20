@@ -12,6 +12,12 @@ pub trait SectorReader: Send {
     /// `buf` must be at least `count * 2048` bytes.
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize>;
 
+    /// Fast single-attempt read — no recovery, short timeout.
+    /// Default implementation calls read_sectors (ISO files don't need fast mode).
+    fn read_sectors_fast(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+        self.read_sectors(lba, count, buf)
+    }
+
     /// Total capacity in sectors, if known.
     fn capacity(&self) -> u32 {
         0
