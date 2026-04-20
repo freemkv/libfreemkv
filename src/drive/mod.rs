@@ -16,6 +16,7 @@ mod macos;
 mod windows;
 
 use crate::error::{Error, Result};
+use crate::event::{Event, EventKind};
 use crate::identity::DriveId;
 use crate::platform::mt1959::Mt1959;
 use crate::platform::PlatformDriver;
@@ -23,6 +24,8 @@ use crate::profile::{self, DriveProfile};
 use crate::scsi::ScsiTransport;
 use crate::sector::SectorReader;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Physical state of the drive tray and disc.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,8 +62,11 @@ pub struct Drive {
     pub drive_id: DriveId,
     device_path: String,
     /// Bytes remaining in the min-speed recovery window.
-    /// After a read error, we stay at min speed for RECOVERY_WINDOW bytes.
     recovery_bytes_remaining: u64,
+    /// Halt flag — when set, Drive::read() bails at the next check point.
+    halt: Arc<AtomicBool>,
+    /// Event handler — fires during read recovery.
+    event_fn: Option<Box<dyn Fn(Event) + Send>>,
 }
 
 impl Drive {
@@ -87,7 +93,39 @@ impl Drive {
             drive_id,
             device_path: device.to_string_lossy().to_string(),
             recovery_bytes_remaining: 0,
+            halt: Arc::new(AtomicBool::new(false)),
+            event_fn: None,
         })
+    }
+
+    /// Get a clone of the halt flag. Set to true to interrupt Drive::read().
+    pub fn halt_flag(&self) -> Arc<AtomicBool> {
+        self.halt.clone()
+    }
+
+    /// Halt the drive — Drive::read() will bail at the next check point.
+    pub fn halt(&self) {
+        self.halt.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the halt flag for the next operation.
+    pub fn clear_halt(&self) {
+        self.halt.store(false, Ordering::Relaxed);
+    }
+
+    /// Set an event handler for read recovery events.
+    pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
+        self.event_fn = Some(Box::new(f));
+    }
+
+    fn emit(&self, kind: EventKind) {
+        if let Some(ref f) = self.event_fn {
+            f(Event { kind });
+        }
+    }
+
+    fn is_halted(&self) -> bool {
+        self.halt.load(Ordering::Relaxed)
     }
 
     /// Close the drive cleanly. Unlocks tray, flushes SCSI state, closes fd.
@@ -489,16 +527,27 @@ impl Drive {
                 self.recovery_bytes_remaining =
                     self.recovery_bytes_remaining.saturating_sub(bytes_read);
                 if self.recovery_bytes_remaining == 0 {
+                    self.emit(EventKind::SpeedChange { speed_kbs: 0xFFFF });
                     self.set_speed(0xFFFF);
                 }
             }
             return Ok(result.bytes_transferred);
         }
 
-        // Phase 1: gentle — sleep 30s, retry. 5 times.
+        // Read failed — enter recovery
+        self.emit(EventKind::ReadError {
+            sector: lba as u64,
+            error: Error::DiscRead { sector: lba as u64 },
+        });
+        self.emit(EventKind::SpeedChange { speed_kbs: 0 });
         self.set_speed(0);
 
-        for _ in 0..5 {
+        // Phase 1: gentle — sleep 30s, retry. 5 times.
+        for attempt in 1..=5u32 {
+            if self.is_halted() {
+                return Err(Error::Halted);
+            }
+            self.emit(EventKind::Retry { attempt });
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             if let Ok(result) = self.scsi.as_mut().execute(
@@ -507,9 +556,14 @@ impl Drive {
                 buf,
                 30_000,
             ) {
+                self.emit(EventKind::SectorRecovered { sector: lba as u64 });
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
             }
+        }
+
+        if self.is_halted() {
+            return Err(Error::Halted);
         }
 
         // Phase 2: fresh start — close, reset, open, init.
@@ -522,8 +576,16 @@ impl Drive {
         let _ = self.wait_ready();
         self.set_speed(0);
 
+        if self.is_halted() {
+            return Err(Error::Halted);
+        }
+
         // Phase 3: gentle again on fresh connection — sleep 30s, retry. 5 times.
-        for _ in 0..5 {
+        for attempt in 6..=10u32 {
+            if self.is_halted() {
+                return Err(Error::Halted);
+            }
+            self.emit(EventKind::Retry { attempt });
             std::thread::sleep(std::time::Duration::from_secs(30));
 
             if let Ok(result) = self.scsi.as_mut().execute(
@@ -532,6 +594,7 @@ impl Drive {
                 buf,
                 30_000,
             ) {
+                self.emit(EventKind::SectorRecovered { sector: lba as u64 });
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
             }
