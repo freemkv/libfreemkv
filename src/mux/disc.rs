@@ -6,6 +6,7 @@
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
 use crate::disc::{detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions};
+use crate::event::{Event, EventKind};
 use crate::sector::SectorReader;
 use std::io;
 
@@ -34,6 +35,7 @@ pub struct DiscStream {
     batch_sectors: u16,
     pub errors: u64,
     pub skip_errors: bool,
+    event_fn: Option<Box<dyn Fn(Event) + Send>>,
     eof: bool,
 
     // PES output
@@ -100,12 +102,24 @@ impl DiscStream {
             batch_sectors,
             errors: 0,
             skip_errors: false,
+            event_fn: None,
             eof: false,
             ts_demuxer,
             ps_demuxer,
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
+        }
+    }
+
+    /// Set event handler for sector-level events (binary search, skip, recover).
+    pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
+        self.event_fn = Some(Box::new(f));
+    }
+
+    fn emit(&self, kind: EventKind) {
+        if let Some(ref f) = self.event_fn {
+            f(Event { kind });
         }
     }
 
@@ -120,29 +134,39 @@ impl DiscStream {
     }
 
     /// Binary search to isolate failing sectors within a batch.
-    /// Reads good regions in sub-batches, handles bad sectors individually.
+    /// Good sub-batches read fast. Bad sectors get 3 retries × 5s — max 15s per sector.
+    /// No full Drive::read() recovery — that only runs on the initial batch attempt.
     fn read_with_binary_search(&mut self, lba: u32, count: u16) -> io::Result<()> {
         if count <= 1 {
-            // Single sector — read with full recovery (Tier 2)
+            // Single sector — light recovery: 3 attempts, 5s sleep between
             let offset = self.buf_valid;
-            match self.reader.read_sectors(lba, 1, &mut self.read_buf[offset..offset + 2048]) {
-                Ok(_) => {
-                    self.buf_valid += 2048;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
-                Err(e) => {
-                    if self.skip_errors {
-                        self.read_buf[offset..offset + 2048].fill(0);
-                        self.buf_valid += 2048;
-                        self.errors += 1;
-                    } else {
-                        return Err(e.into());
-                    }
+                if self
+                    .reader
+                    .read_sectors_recover(lba, 1, &mut self.read_buf[offset..offset + 2048], false)
+                    .is_ok()
+                {
+                    self.emit(EventKind::SectorRecovered { sector: lba as u64 });
+                    self.buf_valid += 2048;
+                    return Ok(());
                 }
             }
-            return Ok(());
+            // 3 attempts failed
+            if self.skip_errors {
+                self.emit(EventKind::SectorSkipped { sector: lba as u64 });
+                self.read_buf[offset..offset + 2048].fill(0);
+                self.buf_valid += 2048;
+                self.errors += 1;
+                return Ok(());
+            } else {
+                return Err(crate::error::Error::DiscRead { sector: lba as u64 }.into());
+            }
         }
 
-        // Try this sub-batch as a whole first
+        // Try this sub-batch as a whole (fast read, no recovery)
         let bytes = count as usize * 2048;
         let offset = self.buf_valid;
         if self
@@ -150,14 +174,18 @@ impl DiscStream {
             .read_sectors_recover(lba, count, &mut self.read_buf[offset..offset + bytes], false)
             .is_ok()
         {
-            // Sub-batch succeeded with fast read — all good
             self.buf_valid += bytes;
             return Ok(());
         }
 
         // Sub-batch failed — split in half and recurse
+        self.emit(EventKind::BinarySearch {
+            sector: lba as u64,
+            batch_size: count,
+        });
+
         let half = count / 2;
-        let half = half - (half % 3).min(half); // align to 3-sector BD-TS boundary
+        let half = half - (half % 3).min(half);
         let half = half.max(1);
         let remainder = count - half;
 

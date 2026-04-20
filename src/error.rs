@@ -41,6 +41,7 @@ pub const E_IO_ERROR: u16 = 5000;
 
 // Disc format (6xxx)
 pub const E_DISC_READ: u16 = 6000;
+pub const E_HALTED: u16 = 6010;
 pub const E_MPLS_PARSE: u16 = 6001;
 pub const E_CLPI_PARSE: u16 = 6002;
 pub const E_UDF_NOT_FOUND: u16 = 6003;
@@ -134,6 +135,8 @@ pub enum Error {
     DiscRead {
         sector: u64,
     },
+    /// Drive was halted by caller.
+    Halted,
     MplsParse,
     ClpiParse,
     UdfNotFound {
@@ -215,6 +218,7 @@ impl Error {
             Error::ScsiError { .. } => E_SCSI_ERROR,
             Error::IoError { .. } => E_IO_ERROR,
             Error::DiscRead { .. } => E_DISC_READ,
+            Error::Halted => E_HALTED,
             Error::MplsParse => E_MPLS_PARSE,
             Error::ClpiParse => E_CLPI_PARSE,
             Error::UdfNotFound { .. } => E_UDF_NOT_FOUND,
@@ -304,6 +308,7 @@ impl std::fmt::Display for Error {
             }
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
             Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
+            Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
             Error::DiscTitleRange { index, count } => {
                 write!(f, "E{}: {}/{}", self.code(), index, count)
