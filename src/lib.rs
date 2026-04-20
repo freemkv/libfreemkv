@@ -90,6 +90,7 @@ pub(crate) mod platform;
 pub mod profile;
 pub mod scsi;
 pub mod sector;
+pub mod verify;
 pub(crate) mod speed;
 pub(crate) mod udf;
 
