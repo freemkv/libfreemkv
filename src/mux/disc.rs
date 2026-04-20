@@ -33,6 +33,7 @@ pub struct DiscStream {
     // Batch size for reads
     batch_sectors: u16,
     pub errors: u64,
+    pub skip_errors: bool,
     eof: bool,
 
     // PES output
@@ -98,6 +99,7 @@ impl DiscStream {
             buf_valid: 0,
             batch_sectors,
             errors: 0,
+            skip_errors: false,
             eof: false,
             ts_demuxer,
             ps_demuxer,
@@ -137,9 +139,29 @@ impl DiscStream {
         let bytes = sectors as usize * 2048;
         self.read_buf.resize(bytes, 0);
 
-        self.reader
-            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])?;
-        self.buf_valid = bytes;
+        match self.reader.read_sectors(lba, sectors, &mut self.read_buf[..bytes]) {
+            Ok(_) => {
+                self.buf_valid = bytes;
+            }
+            Err(e) if self.skip_errors => {
+                // Skip mode: try each sector individually, zero-fill failures
+                self.buf_valid = 0;
+                for i in 0..sectors {
+                    let offset = i as usize * 2048;
+                    let sector_lba = lba + i as u32;
+                    if self
+                        .reader
+                        .read_sectors(sector_lba, 1, &mut self.read_buf[offset..offset + 2048])
+                        .is_err()
+                    {
+                        self.read_buf[offset..offset + 2048].fill(0);
+                        self.errors += 1;
+                    }
+                    self.buf_valid += 2048;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
         self.current_offset += sectors as u32;
         if self.current_offset >= ext_sectors {
             self.current_extent += 1;
