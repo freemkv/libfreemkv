@@ -105,7 +105,7 @@ pub fn verify_title(
 
             let batch_start = Instant::now();
             let batch_ok = reader
-                .read_sectors(lba, count, &mut buf[..bytes])
+                .read_sectors_fast(lba, count, &mut buf[..bytes])
                 .is_ok();
             let batch_ms = batch_start.elapsed().as_millis();
 
@@ -144,7 +144,7 @@ pub fn verify_title(
 
                     let s1 = Instant::now();
                     let first_ok = reader
-                        .read_sectors(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048])
+                        .read_sectors_fast(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048])
                         .is_ok();
                     let s1_ms = s1.elapsed().as_millis();
 
@@ -155,10 +155,10 @@ pub fn verify_title(
                         slow += 1;
                         SectorStatus::Slow
                     } else {
-                        // Retry once more
+                        // Retry once more after brief pause
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         if reader
-                            .read_sectors(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048])
+                            .read_sectors_fast(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048])
                             .is_ok()
                         {
                             recovered += 1;
