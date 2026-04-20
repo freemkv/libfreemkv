@@ -10,11 +10,15 @@ use crate::error::Result;
 pub trait SectorReader: Send {
     /// Read `count` sectors starting at `lba` into `buf`.
     /// `buf` must be at least `count * 2048` bytes.
+    /// Full recovery enabled (retry + reset on failure).
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize>;
 
-    /// Fast single-attempt read — no recovery, short timeout.
-    /// Default implementation calls read_sectors (ISO files don't need fast mode).
-    fn read_sectors_fast(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+    /// Read with explicit recovery flag.
+    /// true = full retry/reset loop (for ripping). false = single attempt, fast fail (for verify).
+    /// Default: delegates to read_sectors (recovery=true behavior).
+    fn read_sectors_recover(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        // Default ignores flag — file-backed readers don't have recovery
+        let _ = recovery;
         self.read_sectors(lba, count, buf)
     }
 
