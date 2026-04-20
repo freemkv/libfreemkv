@@ -670,8 +670,12 @@ impl SectorReader for Drive {
         self.read(lba, count, buf)
     }
 
-    fn read_sectors_fast(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        self.read_fast(lba, count, buf)
+    fn read_sectors_recover(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        if recovery {
+            self.read(lba, count, buf)
+        } else {
+            self.read_fast(lba, count, buf)
+        }
     }
 }
 
