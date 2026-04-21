@@ -218,14 +218,14 @@ impl DiscStream {
 
         if self
             .reader
-            .read_sectors(lba, sectors, &mut self.read_buf[..bytes])
+            .read_sectors_recover(lba, sectors, &mut self.read_buf[..bytes], false)
             .is_ok()
         {
             // Fast path: batch succeeded
             self.buf_valid = bytes;
         } else {
-            // Tier 1: Binary search to isolate the failing sector(s),
-            // then read good regions in batches and bad sectors individually.
+            // Batch failed fast — binary search to isolate bad sectors.
+            // Light recovery only (3x5s per sector, no full Drive::read).
             self.buf_valid = 0;
             self.read_with_binary_search(lba, sectors)?;
         }
