@@ -153,7 +153,7 @@ impl CodecParser for Mpeg2Parser {
                                         bits += 64 * 8;
                                     }
                                 }
-                                let total_bytes = 4 + ((bits + 7) / 8) as usize;
+                                let total_bytes = 4 + bits.div_ceil(8) as usize;
                                 (sc + total_bytes).min(data.len())
                             }
                         }

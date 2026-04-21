@@ -90,9 +90,9 @@ pub(crate) mod platform;
 pub mod profile;
 pub mod scsi;
 pub mod sector;
-pub mod verify;
 pub(crate) mod speed;
 pub(crate) mod udf;
+pub mod verify;
 
 pub use drive::capture::{
     capture_drive_data, mask_bytes, mask_string, CapturedFeature, DriveCapture,

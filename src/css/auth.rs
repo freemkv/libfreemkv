@@ -348,7 +348,7 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
             let candidate = super::lfsr::decrypt_key(0x00, player_key, &enc);
 
             // Check if any previous candidate matches (same disc key from different entry/pk)
-            for &(ref prev, _, _) in &candidates {
+            for (prev, _, _) in &candidates {
                 if *prev == candidate {
                     return Ok(candidate);
                 }
@@ -391,6 +391,7 @@ fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<[u8; 5]> 
     Ok(key)
 }
 
+#[allow(dead_code)]
 fn read_title_key(
     drive: &mut Drive,
     agid: u8,

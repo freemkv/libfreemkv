@@ -564,7 +564,9 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
             }
             // Program map: each byte is the first cell number (1-based) for that program
             for p in 0..nr_of_programs {
-                if pgm_base + p >= data.len() { break; }
+                if pgm_base + p >= data.len() {
+                    break;
+                }
                 let first_cell = data[pgm_base + p] as usize;
                 // Chapter time = sum of cell durations before this program's first cell
                 let time: f64 = cell_durations[..first_cell.saturating_sub(1)].iter().sum();

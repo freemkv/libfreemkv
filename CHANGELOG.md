@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.15 (2026-04-21)
+
+### Lint cleanup
+- Fix all `cargo fmt` and `cargo clippy -D warnings` across codebase.
+- Remove unused imports (Codec, HdrFormat, ScanOptions, detect_max_batch_sectors, Extent).
+- Fix CSS tuple pattern deref, collapsible if-statement, div_ceil reimplementation.
+
 ## 0.11.14 (2026-04-21)
 
 ### Audit fixes: read recovery, verify, SCSI

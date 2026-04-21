@@ -16,7 +16,13 @@ pub trait SectorReader: Send {
     /// Read with explicit recovery flag.
     /// true = full retry/reset loop (for ripping). false = single attempt, fast fail (for verify).
     /// Default: delegates to read_sectors (recovery=true behavior).
-    fn read_sectors_recover(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+    fn read_sectors_recover(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
         // Default ignores flag — file-backed readers don't have recovery
         let _ = recovery;
         self.read_sectors(lba, count, buf)

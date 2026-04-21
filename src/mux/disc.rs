@@ -5,7 +5,7 @@
 //!
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
-use crate::disc::{detect_max_batch_sectors, Disc, DiscTitle, Extent, ScanOptions};
+use crate::disc::{Disc, DiscTitle, Extent};
 use crate::event::{Event, EventKind};
 use crate::sector::SectorReader;
 use std::io;
@@ -171,7 +171,12 @@ impl DiscStream {
         let offset = self.buf_valid;
         if self
             .reader
-            .read_sectors_recover(lba, count, &mut self.read_buf[offset..offset + bytes], false)
+            .read_sectors_recover(
+                lba,
+                count,
+                &mut self.read_buf[offset..offset + bytes],
+                false,
+            )
             .is_ok()
         {
             self.buf_valid += bytes;

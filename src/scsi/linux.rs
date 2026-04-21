@@ -246,7 +246,6 @@ impl SgIoTransport {
 
         device.to_path_buf()
     }
-
 }
 
 impl Drop for SgIoTransport {
@@ -335,8 +334,8 @@ impl ScsiTransport for SgIoTransport {
 
         // Wait for completion with enforceable timeout.
         // Retry on EINTR (signal interrupted poll) with remaining time.
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         let pr = loop {
             let remaining = deadline
                 .saturating_duration_since(std::time::Instant::now())
