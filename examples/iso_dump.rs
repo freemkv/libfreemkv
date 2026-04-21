@@ -42,7 +42,7 @@ fn main() {
         // Tiny yield between reads — test if pacing prevents firmware throttle
         std::thread::yield_now();
         let t0 = Instant::now();
-        let ok = drive.read(lba, count, &mut buf[..n]).is_ok();
+        let ok = drive.read(lba, count, &mut buf[..n], true).is_ok();
         let read_ms = t0.elapsed().as_millis();
 
         // Flag slow reads
