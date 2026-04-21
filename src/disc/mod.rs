@@ -874,8 +874,8 @@ impl KeySource {
 
 /// Standard KEYDB.cfg search locations (compatible with libaacs).
 const KEYDB_SEARCH_PATHS: &[&str] = &[
-    ".config/aacs/KEYDB.cfg",      // libaacs standard path
-    ".config/freemkv/keydb.cfg",   // freemkv download path
+    ".config/aacs/KEYDB.cfg",    // libaacs standard path
+    ".config/freemkv/keydb.cfg", // freemkv download path
 ];
 const KEYDB_SYSTEM_PATH: &str = "/etc/aacs/KEYDB.cfg";
 
@@ -938,9 +938,7 @@ pub struct DiscId {
 impl DiscId {
     /// Best available name: meta_title, then formatted volume_id.
     pub fn name(&self) -> &str {
-        self.meta_title
-            .as_deref()
-            .unwrap_or(&self.volume_id)
+        self.meta_title.as_deref().unwrap_or(&self.volume_id)
     }
 }
 
@@ -1031,10 +1029,10 @@ impl Disc {
         {
             let lba = disc.titles[0].extents.iter().find_map(|ext| {
                 let mut buf = vec![0u8; 2048];
-                if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok() {
-                    if crate::css::is_scrambled(&buf) {
-                        return Some(ext.start_lba);
-                    }
+                if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok()
+                    && crate::css::is_scrambled(&buf)
+                {
+                    return Some(ext.start_lba);
                 }
                 None
             });

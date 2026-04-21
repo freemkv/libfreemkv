@@ -81,20 +81,13 @@ pub enum EventKind {
     },
 
     /// Binary search isolated and recovered a marginal sector.
-    SectorRecovered {
-        sector: u64,
-    },
+    SectorRecovered { sector: u64 },
 
     /// Sector unreadable, zero-filled (skip mode).
-    SectorSkipped {
-        sector: u64,
-    },
+    SectorSkipped { sector: u64 },
 
     /// Binary search activated — batch failed, isolating bad sector.
-    BinarySearch {
-        sector: u64,
-        batch_size: u16,
-    },
+    BinarySearch { sector: u64, batch_size: u16 },
 
     /// Operation complete.
     Complete {

@@ -1,6 +1,6 @@
 //! Disc sector verification — read every sector and classify health.
 
-use crate::disc::{Chapter, DiscTitle, Extent};
+use crate::disc::{Chapter, DiscTitle};
 use crate::sector::SectorReader;
 use std::time::Instant;
 
@@ -55,7 +55,12 @@ impl VerifyResult {
     }
 
     /// Map a bad sector range to a chapter timestamp.
-    pub fn chapter_at_offset(chapters: &[Chapter], byte_offset: u64, duration_secs: f64, total_bytes: u64) -> Option<(usize, f64)> {
+    pub fn chapter_at_offset(
+        chapters: &[Chapter],
+        byte_offset: u64,
+        duration_secs: f64,
+        total_bytes: u64,
+    ) -> Option<(usize, f64)> {
         if total_bytes == 0 || chapters.is_empty() {
             return None;
         }
@@ -150,7 +155,12 @@ pub fn verify_title(
 
                     let s1 = Instant::now();
                     let first_ok = reader
-                        .read_sectors_recover(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048], false)
+                        .read_sectors_recover(
+                            sector_lba,
+                            1,
+                            &mut buf[sector_offset..sector_offset + 2048],
+                            false,
+                        )
                         .is_ok();
                     let s1_ms = s1.elapsed().as_millis();
 
@@ -164,7 +174,12 @@ pub fn verify_title(
                         // Retry once more after brief pause
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         if reader
-                            .read_sectors_recover(sector_lba, 1, &mut buf[sector_offset..sector_offset + 2048], false)
+                            .read_sectors_recover(
+                                sector_lba,
+                                1,
+                                &mut buf[sector_offset..sector_offset + 2048],
+                                false,
+                            )
                             .is_ok()
                         {
                             recovered += 1;
@@ -178,9 +193,7 @@ pub fn verify_title(
                     if status != SectorStatus::Good {
                         // Merge with previous range if contiguous and same status
                         if let Some(last) = ranges.last_mut() {
-                            if last.status == status
-                                && last.start_lba + last.count == sector_lba
-                            {
+                            if last.status == status && last.start_lba + last.count == sector_lba {
                                 last.count += 1;
                             } else {
                                 ranges.push(SectorRange {

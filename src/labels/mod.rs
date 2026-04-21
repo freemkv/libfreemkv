@@ -142,7 +142,7 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
 /// Runs after BD-J label extraction — fills gaps with codec + channel descriptions.
 /// This is the central place for all fallback label generation.
 pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
-    use crate::disc::{Codec, HdrFormat, Stream};
+    use crate::disc::Stream;
 
     for title in titles.iter_mut() {
         for stream in &mut title.streams {
@@ -151,7 +151,8 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
                     a.label = generate_audio_label(&a.codec, &a.channels, a.secondary);
                 }
                 Stream::Video(v) if v.label.is_empty() => {
-                    v.label = generate_video_label(&v.codec, v.resolution.pixels(), &v.hdr, v.secondary);
+                    v.label =
+                        generate_video_label(&v.codec, v.resolution.pixels(), &v.hdr, v.secondary);
                 }
                 Stream::Subtitle(s) if s.forced => {
                     // Ensure forced subs are labeled even if BD-J didn't set a name

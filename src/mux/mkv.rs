@@ -5,7 +5,9 @@
 //! cues and seek head are finalized at the end.
 
 use super::ebml;
-use crate::disc::{AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream};
+use crate::disc::{
+    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
+};
 use std::io::{self, Seek, SeekFrom, Write};
 
 /// MKV track definition (built from disc stream metadata).
@@ -24,10 +26,10 @@ pub struct MkvTrack {
     pub display_width: u32,       // display aspect ratio width (0 = same as pixel)
     pub display_height: u32,      // display aspect ratio height (0 = same as pixel)
     // HDR colour metadata
-    pub colour_matrix: u8,         // MatrixCoefficients (9=bt2020nc)
-    pub colour_transfer: u8,       // TransferCharacteristics (16=smpte2084/PQ)
-    pub colour_primaries: u8,      // Primaries (9=bt2020)
-    pub colour_range: u8,          // Range (1=tv/limited)
+    pub colour_matrix: u8,    // MatrixCoefficients (9=bt2020nc)
+    pub colour_transfer: u8,  // TransferCharacteristics (16=smpte2084/PQ)
+    pub colour_primaries: u8, // Primaries (9=bt2020)
+    pub colour_range: u8,     // Range (1=tv/limited)
     // Audio-specific
     pub sample_rate: f64,
     pub channels: u8,
@@ -52,7 +54,7 @@ impl MkvTrack {
         };
         let (matrix, transfer, primaries, range) = match v.color_space {
             ColorSpace::Bt2020 => (9, 16, 9, 1), // bt2020nc, PQ, bt2020, limited
-            ColorSpace::Bt709 => (1, 1, 1, 1),    // bt709
+            ColorSpace::Bt709 => (1, 1, 1, 1),   // bt709
             ColorSpace::Unknown => (0, 0, 0, 0),
         };
         // Override transfer for non-PQ HDR
@@ -268,7 +270,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
             // DefaultDuration — frame duration in nanoseconds
             if track.default_duration_ns > 0 {
-                ebml::write_uint(&mut writer, ebml::DEFAULT_DURATION, track.default_duration_ns)?;
+                ebml::write_uint(
+                    &mut writer,
+                    ebml::DEFAULT_DURATION,
+                    track.default_duration_ns,
+                )?;
             }
 
             // Video-specific
@@ -278,13 +284,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
                 if track.display_width > 0 && track.display_height > 0 {
                     ebml::write_uint(&mut writer, ebml::DISPLAY_WIDTH, track.display_width as u64)?;
-                    ebml::write_uint(&mut writer, ebml::DISPLAY_HEIGHT, track.display_height as u64)?;
+                    ebml::write_uint(
+                        &mut writer,
+                        ebml::DISPLAY_HEIGHT,
+                        track.display_height as u64,
+                    )?;
                 }
                 // Colour metadata (HDR)
                 if track.colour_matrix > 0 || track.colour_transfer > 0 {
                     let col_pos = ebml::start_master(&mut writer, ebml::COLOUR)?;
-                    ebml::write_uint(&mut writer, ebml::MATRIX_COEFFICIENTS, track.colour_matrix as u64)?;
-                    ebml::write_uint(&mut writer, ebml::TRANSFER_CHARACTERISTICS, track.colour_transfer as u64)?;
+                    ebml::write_uint(
+                        &mut writer,
+                        ebml::MATRIX_COEFFICIENTS,
+                        track.colour_matrix as u64,
+                    )?;
+                    ebml::write_uint(
+                        &mut writer,
+                        ebml::TRANSFER_CHARACTERISTICS,
+                        track.colour_transfer as u64,
+                    )?;
                     ebml::write_uint(&mut writer, ebml::PRIMARIES, track.colour_primaries as u64)?;
                     ebml::write_uint(&mut writer, ebml::RANGE, track.colour_range as u64)?;
                     ebml::end_master(&mut writer, col_pos)?;
@@ -845,4 +863,3 @@ mod tests {
         );
     }
 }
-
