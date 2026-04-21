@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.13 (2026-04-21)
+
+### Fix: all rip reads use fast timeout
+- Initial batch read changed from full Drive::read() recovery to fast 5s timeout. Binary search starts immediately on failure instead of after 10 minutes of retries.
+- Max 15 seconds per bad sector (3 x 5s attempts). Max 23 seconds per batch with 1 bad sector.
+
 ## 0.11.12 (2026-04-21)
 
 ### Drive halt + sector events + light recovery
