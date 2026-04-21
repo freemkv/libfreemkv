@@ -42,7 +42,7 @@ libfreemkv (lib.rs)
 │
 ├── Drive Access
 │   ├── drive         Drive — open, identify, init, unlock, read (with recovery)
-│   ├── scsi          ScsiTransport trait + platform backends (SG_IO, IOKit, SPTI)
+│   ├── scsi          ScsiTransport trait + platform backends (sg async, IOKit, SPTI)
 │   ├── platform/     Platform trait — per-chipset command handlers
 │   │   └── mt1959    MediaTek MT1959 driver (LG, ASUS, HP)
 │   ├── profile       DriveProfile loading, matching, bundled JSON
@@ -83,7 +83,7 @@ libfreemkv (lib.rs)
 ```
 Drive::open(Path::new("/dev/sg4"))
   │
-  ├─ scsi::open()           Open /dev/sg4 via SG_IO
+  ├─ scsi::open()           Open /dev/sg4 (async write/poll/read)
   ├─ DriveId::from_drive()  INQUIRY + GET_CONFIG 010C
   ├─ profile::find_by_drive_id()  Match against bundled profiles
   ├─ Platform::new()        Instantiate chipset driver (Mt1959)
@@ -175,7 +175,7 @@ is baked into the library.
 
 | Platform | Transport | Status |
 |----------|-----------|--------|
-| Linux | SG_IO ioctl on `/dev/sg*` | Supported |
+| Linux | async sg write/poll/read on `/dev/sg*` | Supported |
 | macOS | IOKit SCSITask | Supported |
 | Windows | SPTI (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) | Supported |
 

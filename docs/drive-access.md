@@ -46,14 +46,20 @@ platform driver. The drive is ready for `wait_ready()` and `init()`.
 
 ### read() with Recovery
 
-`Drive::read()` is the single read method. On error:
+`Drive::read(lba, count, buf, recovery)` is the single read method. The
+`recovery` parameter controls whether to attempt multi-phase recovery on
+failure or return immediately (used by DiscStream's binary search for
+single-sector probes).
 
-1. Set minimum speed immediately
-2. Reset device (close/reopen/TUR)
-3. Wait 2s for drive to settle
-4. Retry at min speed, min batch (3 sectors)
-5. If still failing: skip sectors, zero-fill, log
-6. Stay at min speed for 500 MB after error (recovery window)
+On error with `recovery = true`:
+
+1. **Phase 1 — gentle retry (5 attempts):** set min speed, sleep 30s, retry.
+   Each retry has a hard wall-clock timeout via async SG_IO.
+2. **Phase 2 — fresh start:** close transport, reset device, reopen, reinit.
+3. **Phase 3 — gentle retry on fresh connection (5 attempts).**
+4. If all fail: return `Err(DiscRead)`. DiscStream handles it (binary search,
+   skip, zero-fill).
+5. Stay at min speed for 500 MB after any recovery (recovery window).
 
 ---
 
@@ -70,8 +76,6 @@ pub trait ScsiTransport: Send {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult>;
-
-    fn reset(&mut self, device: &str) -> Result<()>;
 }
 ```
 
@@ -82,15 +86,18 @@ descriptors or calls ioctls outside of a `ScsiTransport` implementation.
 
 | Platform | Implementation | Device |
 |----------|---------------|--------|
-| Linux | `SgIoTransport` — `ioctl(fd, SG_IO, &hdr)` | `/dev/sg*` |
+| Linux | `SgIoTransport` — async `write`/`poll`/`read` on `/dev/sg*` | `/dev/sg*` |
 | macOS | `MacScsiTransport` — IOKit SCSITask | IOKit service |
 | Windows | `WindowsScsiTransport` — SPTI | `\\.\CdRomN` |
 
-The Linux backend opens with `O_RDWR | O_NONBLOCK`, constructs `sg_io_hdr`,
-and returns `ScsiResult` with status, bytes transferred, and sense data.
+The Linux backend uses the sg driver's asynchronous interface: `write()` submits
+the command, `poll()` waits with an enforceable wall-clock timeout, `read()`
+retrieves the result. If `poll()` times out, the fd is abandoned (closed in a
+background thread) and a fresh fd opened — the kernel's USB error recovery
+cannot block us. Opens with `O_RDWR | O_NONBLOCK`.
 
-On non-zero SCSI status, the transport parses sense key, ASC, and ASCQ from the
-sense buffer and returns `Error::ScsiError`.
+On non-zero SCSI status, the transport parses sense key from the sense buffer
+and returns `Error::ScsiError`.
 
 ### CDB Builders
 
