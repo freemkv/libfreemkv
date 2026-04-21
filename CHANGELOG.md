@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.12 (2026-04-21)
+
+### Drive halt + sector events + light recovery
+- **Drive.halt()** — AtomicBool flag checked between retry phases. Max 30s to stop.
+- **Drive.on_event()** — callback for ReadError, Retry, SpeedChange, SectorRecovered events.
+- **Error::Halted (E6010)** — distinct from DiscRead, indicates intentional stop.
+- **Binary search light recovery** — single sectors get 3 attempts x 5s (15s max) instead of full 10-min Drive::read() recovery. Marginal disc zones complete in minutes not hours.
+- **DiscStream.on_event()** — BinarySearch, SectorRecovered, SectorSkipped events.
+
 ## 0.11.11 (2026-04-20)
 
 ### Binary search error recovery
