@@ -39,7 +39,13 @@ impl IsoSectorReader {
 }
 
 impl SectorReader for IsoSectorReader {
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
         let bytes = count as usize * SECTOR_SIZE as usize;
         self.file
             .seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE))
@@ -71,11 +77,11 @@ mod tests {
         assert_eq!(reader.capacity(), 4);
 
         let mut buf = [0u8; 2048];
-        reader.read_sectors(0, 1, &mut buf).unwrap();
+        reader.read_sectors(0, 1, &mut buf, true).unwrap();
         assert_eq!(buf[0], 1);
         assert_eq!(buf[2047], 100);
 
-        reader.read_sectors(2, 1, &mut buf).unwrap();
+        reader.read_sectors(2, 1, &mut buf, true).unwrap();
         assert_eq!(buf[0], 3);
         assert_eq!(buf[2047], 102);
 

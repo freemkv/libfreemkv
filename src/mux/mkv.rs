@@ -182,16 +182,6 @@ const CLUSTER_DURATION_MS: i64 = 5000;
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
     pub fn new(
-        writer: W,
-        tracks: &[MkvTrack],
-        title: Option<&str>,
-        duration_secs: f64,
-    ) -> io::Result<Self> {
-        Self::new_with_chapters(writer, tracks, title, duration_secs, &[])
-    }
-
-    /// Create a new MKV muxer with chapters: writes EBML header, Segment start, Info, Tracks, Chapters.
-    pub fn new_with_chapters(
         mut writer: W,
         tracks: &[MkvTrack],
         title: Option<&str>,
@@ -580,7 +570,7 @@ mod tests {
     fn mkv_writes_ebml_header() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
-        let muxer = MkvMuxer::new(buf, &tracks, Some("Test"), 120.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, Some("Test"), 120.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
         // EBML header element ID: 0x1A45DFA3
         assert!(data.len() >= 4);
@@ -591,7 +581,7 @@ mod tests {
     fn mkv_writes_segment() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 0.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
         // Segment element ID: 0x18538067
         assert!(
@@ -604,7 +594,7 @@ mod tests {
     fn mkv_write_frame_creates_cluster() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
-        let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         muxer
             .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF])
             .unwrap();
@@ -643,7 +633,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let writer = SharedWriter(shared.clone());
         let tracks = [make_video_track()];
-        let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0).unwrap();
+        let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0, &[]).unwrap();
         muxer.write_frame(0, 0, true, &[0x01, 0x02, 0x03]).unwrap();
         muxer.finish().unwrap();
 
@@ -658,7 +648,7 @@ mod tests {
     fn mkv_multiple_tracks() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track(), make_audio_track()];
-        let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0).unwrap();
+        let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0, &[]).unwrap();
         // Write frames to both tracks
         muxer.write_frame(0, 0, true, &[0x00, 0x00, 0x01]).unwrap();
         muxer.write_frame(1, 0, false, &[0x0B, 0x77, 0x00]).unwrap();
@@ -677,7 +667,7 @@ mod tests {
     fn mkv_keyframe_flag() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
-        let mut muxer = MkvMuxer::new(buf, &tracks, None, 10.0).unwrap();
+        let mut muxer = MkvMuxer::new(buf, &tracks, None, 10.0, &[]).unwrap();
 
         // Record position before first frame
         let pos_before_kf = muxer.writer.position();
@@ -751,9 +741,7 @@ mod tests {
                 name: "Chapter 3".into(),
             },
         ];
-        let muxer =
-            MkvMuxer::new_with_chapters(buf, &tracks, Some("Chapter Test"), 900.0, &chapters)
-                .unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, Some("Chapter Test"), 900.0, &chapters).unwrap();
         let data = muxer.writer.into_inner();
 
         // Chapters element ID: 0x1043A770
@@ -777,7 +765,7 @@ mod tests {
     fn mkv_no_chapters_when_empty() {
         let buf = Cursor::new(Vec::new());
         let tracks = [make_video_track()];
-        let muxer = MkvMuxer::new(buf, &tracks, Some("No Chapters"), 60.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, Some("No Chapters"), 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
         assert!(
             find_id(&data, ebml::CHAPTERS).is_none(),
@@ -796,7 +784,7 @@ mod tests {
 
         let buf = Cursor::new(Vec::new());
         let tracks = [video, audio1, audio2];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
         // FlagDefault ID is 0x88. When is_default is true, FlagDefault is NOT written
@@ -828,7 +816,7 @@ mod tests {
 
         let buf = Cursor::new(Vec::new());
         let tracks = [video, forced_sub];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
         // FlagForced ID: 0x55AA (2-byte ID)
@@ -853,7 +841,7 @@ mod tests {
 
         let buf = Cursor::new(Vec::new());
         let tracks = [video, sub];
-        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0).unwrap();
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
         // FlagForced should NOT be written for non-forced tracks

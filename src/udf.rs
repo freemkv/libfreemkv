@@ -879,6 +879,7 @@ impl BufferedSectorReader<'_> {
                     start_lba + offset,
                     batch,
                     &mut self.cache[buf_off..buf_off + batch as usize * 2048],
+                    true,
                 )
                 .is_err()
             {
@@ -902,7 +903,7 @@ impl BufferedSectorReader<'_> {
                 let bytes = batch as usize * 2048;
                 if self
                     .inner
-                    .read_sectors(start + offset, batch, &mut tmp[..bytes])
+                    .read_sectors(start + offset, batch, &mut tmp[..bytes], true)
                     .is_err()
                 {
                     break;
@@ -924,6 +925,7 @@ impl SectorReader for BufferedSectorReader<'_> {
         lba: u32,
         count: u16,
         buf: &mut [u8],
+        _recovery: bool,
     ) -> std::result::Result<usize, crate::error::Error> {
         if count == 1 {
             // Check permanent prefetch cache first (HashMap)
@@ -939,7 +941,7 @@ impl SectorReader for BufferedSectorReader<'_> {
             }
             let block = self.batch;
             self.cache.resize(block as usize * 2048, 0);
-            match self.inner.read_sectors(lba, block, &mut self.cache) {
+            match self.inner.read_sectors(lba, block, &mut self.cache, true) {
                 Ok(_) => {
                     self.cache_start = lba;
                     self.cache_sectors = block as u32;
@@ -947,7 +949,7 @@ impl SectorReader for BufferedSectorReader<'_> {
                 Err(_) => {
                     // Near end of disc or error — single sector fallback
                     self.cache.resize(2048, 0);
-                    self.inner.read_sectors(lba, 1, &mut self.cache)?;
+                    self.inner.read_sectors(lba, 1, &mut self.cache, true)?;
                     self.cache_start = lba;
                     self.cache_sectors = 1;
                 }
@@ -956,12 +958,12 @@ impl SectorReader for BufferedSectorReader<'_> {
             Ok(2048)
         } else {
             // Multi-sector read — pass through
-            self.inner.read_sectors(lba, count, buf)
+            self.inner.read_sectors(lba, count, buf, true)
         }
     }
 }
 
 fn read_sector(reader: &mut dyn SectorReader, lba: u32, buf: &mut [u8]) -> Result<()> {
-    reader.read_sectors(lba, 1, buf)?;
+    reader.read_sectors(lba, 1, buf, true)?;
     Ok(())
 }

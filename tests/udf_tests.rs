@@ -39,7 +39,7 @@ impl MockSectorReader {
 }
 
 impl SectorReader for MockSectorReader {
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
+    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _recovery: bool) -> Result<usize> {
         let total = count as usize * SECTOR_SIZE;
         assert!(buf.len() >= total, "buffer too small");
         for i in 0..count as u32 {
@@ -215,7 +215,7 @@ fn mock_sector_reader_roundtrip() {
 
     // Read it back
     let mut buf = vec![0u8; SECTOR_SIZE];
-    let n = reader.read_sectors(100, 1, &mut buf).unwrap();
+    let n = reader.read_sectors(100, 1, &mut buf, true).unwrap();
     assert_eq!(n, SECTOR_SIZE);
     assert_eq!(buf[0], 0xAB);
     assert_eq!(buf[1], 0xCD);
@@ -223,7 +223,7 @@ fn mock_sector_reader_roundtrip() {
 
     // Reading an unmapped sector returns zeros
     let mut buf2 = vec![0xFFu8; SECTOR_SIZE];
-    let n2 = reader.read_sectors(999, 1, &mut buf2).unwrap();
+    let n2 = reader.read_sectors(999, 1, &mut buf2, true).unwrap();
     assert_eq!(n2, SECTOR_SIZE);
     assert_eq!(buf2[0], 0);
     assert_eq!(buf2[2047], 0);
@@ -243,7 +243,7 @@ fn mock_sector_reader_multi_sector() {
 
     // Read 2 consecutive sectors
     let mut buf = vec![0u8; SECTOR_SIZE * 2];
-    let n = reader.read_sectors(10, 2, &mut buf).unwrap();
+    let n = reader.read_sectors(10, 2, &mut buf, true).unwrap();
     assert_eq!(n, SECTOR_SIZE * 2);
     assert_eq!(buf[0], 10);
     assert_eq!(buf[SECTOR_SIZE], 11);
@@ -463,7 +463,7 @@ fn sector_reader_is_object_safe() {
 
     let dyn_reader: &mut dyn SectorReader = &mut reader;
     let mut buf = vec![0u8; SECTOR_SIZE];
-    let n = dyn_reader.read_sectors(0, 1, &mut buf).unwrap();
+    let n = dyn_reader.read_sectors(0, 1, &mut buf, true).unwrap();
     assert_eq!(n, SECTOR_SIZE);
     assert_eq!(buf[0], 42);
 }

@@ -79,18 +79,10 @@ impl CodecParser for PassthroughParser {
     }
 }
 
-/// Create the appropriate parser for a codec.
-pub fn parser_for_codec(codec: Codec) -> Box<dyn CodecParser> {
-    parser_for_codec_with_data(codec, None)
-}
-
 /// Create the appropriate parser for a codec, with optional codec private data.
 ///
 /// For DvdSub, `codec_data` should be the pre-formatted VobSub .idx palette header.
-pub fn parser_for_codec_with_data(
-    codec: Codec,
-    codec_data: Option<Vec<u8>>,
-) -> Box<dyn CodecParser> {
+pub fn parser_for_codec(codec: Codec, codec_data: Option<Vec<u8>>) -> Box<dyn CodecParser> {
     match codec {
         Codec::H264 => Box::new(h264::H264Parser::new()),
         Codec::Hevc => Box::new(hevc::HevcParser::new()),
@@ -101,7 +93,7 @@ pub fn parser_for_codec_with_data(
         Codec::TrueHd => Box::new(truehd::TrueHdParser::new()),
         Codec::Pgs => Box::new(pgs::PgsParser::new()),
         Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
-        Codec::DvdSub => Box::new(dvdsub::DvdSubParser::with_codec_data(codec_data)),
+        Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new(codec_data)),
         _ => Box::new(PassthroughParser::new(true)),
     }
 }

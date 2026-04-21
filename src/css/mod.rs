@@ -42,7 +42,11 @@ pub fn crack_key(reader: &mut dyn SectorReader, extents: &[Extent]) -> Option<Cs
         let mut i = 0;
         while i < ext.sector_count && tried < max_tries {
             let mut buf = vec![0u8; 2048];
-            if reader.read_sectors(ext.start_lba + i, 1, &mut buf).is_ok() && is_scrambled(&buf) {
+            if reader
+                .read_sectors(ext.start_lba + i, 1, &mut buf, true)
+                .is_ok()
+                && is_scrambled(&buf)
+            {
                 if let Some(key) = crack::crack_title_key(&buf) {
                     return Some(CssState { title_key: key });
                 }
