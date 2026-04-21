@@ -204,12 +204,17 @@ impl DiscStream {
         let ext_sectors = self.extents[self.current_extent].sector_count;
 
         let remaining = ext_sectors.saturating_sub(self.current_offset);
-        let sectors = remaining.min(self.batch_sectors as u32) as u16;
-        let sectors = sectors - (sectors % 3);
-        if sectors == 0 {
+        if remaining == 0 {
             self.current_extent += 1;
             self.current_offset = 0;
             return self.fill_extents();
+        }
+        let mut sectors = remaining.min(self.batch_sectors as u32) as u16;
+        // Align to 3-sector AACS units when possible, but never drop
+        // trailing sectors at extent boundaries. decrypt_sectors() safely
+        // skips partial units (chunks shorter than ALIGNED_UNIT_LEN).
+        if sectors >= 3 {
+            sectors -= sectors % 3;
         }
 
         let lba = ext_start + self.current_offset;

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.14 (2026-04-21)
+
+### Audit fixes: read recovery, verify, SCSI
+- **Fix: trailing sectors at extent boundaries** — extents with sector_count not divisible by 3 no longer drop 1-2 trailing sectors. decrypt_sectors() safely skips partial AACS units.
+- **Fix: verify_title stop support** — progress callback now returns bool. Return false to stop verification early instead of running to completion.
+- **Fix: O_CLOEXEC on all SCSI fd opens** — prevents fd leak to child processes.
+- **Fix: SCSI sense descriptor format** — correctly detect response code 0x72/0x73 (descriptor format) and extract sense key from byte 1 instead of byte 2.
+- **Fix: DecryptFailed on missing unit key** — decrypt_sectors() returns Err(DecryptFailed) instead of silently using a zero key.
+
 ## 0.11.13 (2026-04-21)
 
 ### Fix: all rip reads use fast timeout
