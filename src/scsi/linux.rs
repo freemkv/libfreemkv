@@ -1,4 +1,11 @@
-//! Linux SCSI transport via SG_IO ioctl.
+//! Linux SCSI transport via async sg write/poll/read.
+//!
+//! Uses the sg driver's asynchronous interface instead of the blocking
+//! SG_IO ioctl. Commands are submitted via write(), waited on via
+//! poll() with a hard timeout, and completed via read(). If poll()
+//! times out, the fd is abandoned (closed in a background thread) and
+//! a fresh fd is opened. This gives us true user-controlled timeouts
+//! that the kernel's USB error recovery cannot override.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -10,7 +17,6 @@ const SG_SCSI_RESET_DEVICE: i32 = 1;
 const SG_DXFER_NONE: i32 = -1;
 const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_FROM_DEV: i32 = -3;
-const SG_FLAG_DIRECT_IO: u32 = 1;
 const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
 
 #[repr(C)]
@@ -49,6 +55,7 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 
 pub struct SgIoTransport {
     fd: i32,
+    device_path: std::path::PathBuf,
 }
 
 impl SgIoTransport {
@@ -67,7 +74,10 @@ impl SgIoTransport {
         if fd < 0 {
             return Self::open_error(&device);
         }
-        Ok(SgIoTransport { fd })
+        Ok(SgIoTransport {
+            fd,
+            device_path: device,
+        })
     }
 
     /// Reset the drive to a known good state — equivalent to unplug/replug.
@@ -179,7 +189,8 @@ impl SgIoTransport {
     }
 
     /// Send a raw SCSI command on an fd. Used by reset() before the
-    /// transport is constructed.
+    /// transport is constructed. Uses synchronous SG_IO — fine for
+    /// short commands (TUR, PREVENT MEDIUM REMOVAL, START/STOP).
     fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> std::result::Result<(), ()> {
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
@@ -235,17 +246,35 @@ impl SgIoTransport {
 
         device.to_path_buf()
     }
+
 }
 
 impl Drop for SgIoTransport {
     fn drop(&mut self) {
-        // Unlock tray before closing — don't leave it locked
-        let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
-        unsafe { libc::close(self.fd) };
+        if self.fd >= 0 {
+            // Unlock tray before closing — don't leave it locked
+            let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
+            unsafe { libc::close(self.fd) };
+        }
     }
 }
 
 impl ScsiTransport for SgIoTransport {
+    /// Execute a SCSI command with an enforceable timeout.
+    ///
+    /// Uses the sg driver's async write/poll/read interface:
+    /// 1. write() submits the command — returns immediately
+    /// 2. poll() waits for completion — respects our timeout exactly
+    /// 3. read() retrieves the result — copies data to caller's buffer
+    ///
+    /// If poll() times out, the pending command is abandoned: the old fd
+    /// is closed in a background thread (may block while kernel finishes
+    /// the USB transfer) and a fresh fd is opened. The caller sees a
+    /// normal SCSI error and can retry.
+    ///
+    /// Without SG_FLAG_DIRECT_IO, the kernel uses internal buffers for
+    /// DMA and copies to userspace during read(). On timeout (no read),
+    /// the caller's buffer is untouched — safe to return immediately.
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -253,6 +282,12 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        if self.fd < 0 {
+            return Err(Error::DeviceNotFound {
+                path: self.device_path.display().to_string(),
+            });
+        }
+
         let mut sense = [0u8; 32];
 
         let dxfer_direction = match direction {
@@ -281,18 +316,84 @@ impl ScsiTransport for SgIoTransport {
         hdr.cmdp = cdb.as_ptr();
         hdr.sbp = sense.as_mut_ptr();
         hdr.timeout = timeout_ms;
-        if dxfer_direction == SG_DXFER_FROM_DEV
-            && data.len() >= 4096
-            && (data.as_ptr() as usize) % 4096 == 0
-        {
-            hdr.flags = SG_FLAG_DIRECT_IO | SG_FLAG_Q_AT_HEAD;
-        } else {
-            hdr.flags = SG_FLAG_Q_AT_HEAD;
+        hdr.flags = SG_FLAG_Q_AT_HEAD;
+
+        // Submit command asynchronously via write()
+        let hdr_size = std::mem::size_of::<sg_io_hdr>();
+        let wr = unsafe {
+            libc::write(
+                self.fd,
+                &hdr as *const sg_io_hdr as *const libc::c_void,
+                hdr_size,
+            )
+        };
+        if wr < 0 {
+            return Err(Error::IoError {
+                source: std::io::Error::last_os_error(),
+            });
         }
 
-        let ret = unsafe { libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+        // Wait for completion with enforceable timeout.
+        // Retry on EINTR (signal interrupted poll) with remaining time.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms as u64);
+        let pr = loop {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as i32;
+            if remaining <= 0 {
+                break 0; // expired
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, remaining) };
+            if ret >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break ret;
+            }
+        };
 
-        if ret < 0 {
+        if pr <= 0 {
+            // Timeout (0) or fatal poll error (-1).
+            // Command is still pending in the kernel. Abandon this fd and
+            // open a fresh one. The old fd is closed in a background thread
+            // because close() blocks until the kernel completes/aborts the
+            // pending command.
+            let old_fd = self.fd;
+            self.fd = -1;
+
+            std::thread::spawn(move || {
+                unsafe { libc::close(old_fd) };
+            });
+
+            let c_path = Self::to_c_path(&self.device_path);
+            let new_fd = unsafe {
+                libc::open(
+                    c_path.as_ptr() as *const libc::c_char,
+                    libc::O_RDWR | libc::O_NONBLOCK,
+                )
+            };
+            self.fd = if new_fd >= 0 { new_fd } else { -1 };
+
+            return Err(Error::ScsiError {
+                opcode: cdb[0],
+                status: 0xFF,
+                sense_key: 0,
+            });
+        }
+
+        // Read response — copies data from kernel buffer to caller's buffer
+        let rd = unsafe {
+            libc::read(
+                self.fd,
+                &mut hdr as *mut sg_io_hdr as *mut libc::c_void,
+                hdr_size,
+            )
+        };
+        if rd < 0 {
             return Err(Error::IoError {
                 source: std::io::Error::last_os_error(),
             });
