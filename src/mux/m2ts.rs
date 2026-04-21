@@ -103,7 +103,7 @@ impl M2tsStream {
             };
             pids.push(pid);
             pid_to_track.push((pid, i));
-            parsers.push((pid, super::codec::parser_for_codec(codec)));
+            parsers.push((pid, super::codec::parser_for_codec(codec, None)));
         }
         (pids, parsers, pid_to_track)
     }

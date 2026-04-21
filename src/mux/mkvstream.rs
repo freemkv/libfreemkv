@@ -64,7 +64,7 @@ impl MkvStream {
             tracks.push(track);
         }
 
-        let muxer = MkvMuxer::new_with_chapters(
+        let muxer = MkvMuxer::new(
             writer,
             &tracks,
             Some(&title.playlist),

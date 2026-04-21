@@ -710,11 +710,7 @@ impl Drop for Drive {
 }
 
 impl SectorReader for Drive {
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        self.read(lba, count, buf, true)
-    }
-
-    fn read_sectors_recover(
+    fn read_sectors(
         &mut self,
         lba: u32,
         count: u16,

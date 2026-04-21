@@ -14,19 +14,8 @@ pub struct DvdSubParser {
     codec_data: Option<Vec<u8>>,
 }
 
-impl Default for DvdSubParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DvdSubParser {
-    pub fn new() -> Self {
-        Self { codec_data: None }
-    }
-
-    /// Create a parser with pre-formatted codec private data (palette header).
-    pub fn with_codec_data(codec_data: Option<Vec<u8>>) -> Self {
+    pub fn new(codec_data: Option<Vec<u8>>) -> Self {
         Self { codec_data }
     }
 }
@@ -109,7 +98,7 @@ mod tests {
 
     #[test]
     fn passthrough_data() {
-        let mut parser = DvdSubParser::new();
+        let mut parser = DvdSubParser::new(None);
         let sub_data = vec![0x00, 0x0A, 0x00, 0x08, 0x01, 0xFF, 0x02, 0x03, 0x04, 0x05];
         let pes = make_pes(sub_data.clone(), Some(90000));
         let frames = parser.parse(&pes);
@@ -124,7 +113,7 @@ mod tests {
 
     #[test]
     fn always_keyframe() {
-        let mut parser = DvdSubParser::new();
+        let mut parser = DvdSubParser::new(None);
         for i in 0..3u8 {
             let data = vec![0x00, i, 0x00, i + 1];
             let pes = make_pes(data, Some(90000 * i as i64));
@@ -139,21 +128,21 @@ mod tests {
 
     #[test]
     fn empty_pes_returns_no_frames() {
-        let mut parser = DvdSubParser::new();
+        let mut parser = DvdSubParser::new(None);
         let pes = make_pes(Vec::new(), Some(0));
         assert!(parser.parse(&pes).is_empty());
     }
 
     #[test]
     fn codec_private_none_by_default() {
-        let parser = DvdSubParser::new();
+        let parser = DvdSubParser::new(None);
         assert!(parser.codec_private().is_none());
     }
 
     #[test]
     fn codec_private_returns_palette_when_set() {
         let palette_data = b"palette: 000000, ffffff\n".to_vec();
-        let parser = DvdSubParser::with_codec_data(Some(palette_data.clone()));
+        let parser = DvdSubParser::new(Some(palette_data.clone()));
         let cp = parser.codec_private();
         assert!(cp.is_some());
         assert_eq!(cp.unwrap(), palette_data);
@@ -161,7 +150,7 @@ mod tests {
 
     #[test]
     fn no_pts_defaults_to_zero() {
-        let mut parser = DvdSubParser::new();
+        let mut parser = DvdSubParser::new(None);
         let pes = make_pes(vec![0x01, 0x02], None);
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);

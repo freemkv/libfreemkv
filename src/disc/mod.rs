@@ -1029,7 +1029,9 @@ impl Disc {
         {
             let lba = disc.titles[0].extents.iter().find_map(|ext| {
                 let mut buf = vec![0u8; 2048];
-                if session.read_sectors(ext.start_lba, 1, &mut buf).is_ok()
+                if session
+                    .read_sectors(ext.start_lba, 1, &mut buf, true)
+                    .is_ok()
                     && crate::css::is_scrambled(&buf)
                 {
                     return Some(ext.start_lba);
@@ -1268,7 +1270,7 @@ impl Disc {
             let bytes = count as usize * 2048;
 
             reader
-                .read_sectors(lba, count, &mut buf[..bytes])
+                .read_sectors(lba, count, &mut buf[..bytes], true)
                 .map_err(|e| Error::IoError {
                     source: std::io::Error::other(e.to_string()),
                 })?;

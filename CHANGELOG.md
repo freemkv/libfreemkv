@@ -1,11 +1,18 @@
 # Changelog
 
+## 0.11.16 (2026-04-21)
+
+### API cleanup — one method per action
+- **SectorReader::read_sectors(lba, count, buf, recovery)** — single method with `recovery: bool`. Removes `read_sectors_recover()`.
+- **parser_for_codec(codec, codec_data)** — single constructor. Removes `parser_for_codec_with_data()`.
+- **DvdSubParser::new(codec_data)** — single constructor. Removes `with_codec_data()`.
+- **MkvMuxer::new(writer, tracks, title, duration, chapters)** — single constructor. Removes `new_with_chapters()`.
+
 ## 0.11.15 (2026-04-21)
 
 ### Lint cleanup
 - Fix all `cargo fmt` and `cargo clippy -D warnings` across codebase.
-- Remove unused imports (Codec, HdrFormat, ScanOptions, detect_max_batch_sectors, Extent).
-- Fix CSS tuple pattern deref, collapsible if-statement, div_ceil reimplementation.
+- Remove unused imports, dead code, collapsible if-statements, div_ceil reimplementation.
 
 ## 0.11.14 (2026-04-21)
 

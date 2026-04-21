@@ -72,7 +72,7 @@ impl DiscStream {
             };
             pids.push(pid);
             pid_to_track.push((pid, idx));
-            parsers.push((pid, super::codec::parser_for_codec(codec)));
+            parsers.push((pid, super::codec::parser_for_codec(codec, None)));
         }
 
         let mut ts_demuxer = None;
@@ -146,7 +146,7 @@ impl DiscStream {
                 }
                 if self
                     .reader
-                    .read_sectors_recover(lba, 1, &mut self.read_buf[offset..offset + 2048], false)
+                    .read_sectors(lba, 1, &mut self.read_buf[offset..offset + 2048], false)
                     .is_ok()
                 {
                     self.emit(EventKind::SectorRecovered { sector: lba as u64 });
@@ -171,7 +171,7 @@ impl DiscStream {
         let offset = self.buf_valid;
         if self
             .reader
-            .read_sectors_recover(
+            .read_sectors(
                 lba,
                 count,
                 &mut self.read_buf[offset..offset + bytes],
@@ -228,7 +228,7 @@ impl DiscStream {
 
         if self
             .reader
-            .read_sectors_recover(lba, sectors, &mut self.read_buf[..bytes], false)
+            .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false)
             .is_ok()
         {
             // Fast path: batch succeeded

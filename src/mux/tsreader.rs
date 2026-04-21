@@ -37,7 +37,7 @@ impl<R: Read> TsDemuxReader<R> {
             };
             pids.push(pid);
             pid_to_track.push((pid, i));
-            parsers.push((pid, codec::parser_for_codec(c)));
+            parsers.push((pid, codec::parser_for_codec(c, None)));
         }
 
         Self {
