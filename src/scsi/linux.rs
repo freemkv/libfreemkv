@@ -68,7 +68,7 @@ impl SgIoTransport {
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -126,7 +126,7 @@ impl SgIoTransport {
         let probe_fd = unsafe {
             libc::open(
                 c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if probe_fd >= 0 {
@@ -140,7 +140,7 @@ impl SgIoTransport {
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -373,7 +373,7 @@ impl ScsiTransport for SgIoTransport {
             let new_fd = unsafe {
                 libc::open(
                     c_path.as_ptr() as *const libc::c_char,
-                    libc::O_RDWR | libc::O_NONBLOCK,
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
                 )
             };
             self.fd = if new_fd >= 0 { new_fd } else { -1 };
@@ -402,8 +402,15 @@ impl ScsiTransport for SgIoTransport {
         let bytes_transferred = (data.len() as i32).saturating_sub(hdr.resid).max(0) as usize;
 
         if hdr.status != 0 {
-            let sense_key = if hdr.sb_len_wr > 2 {
-                sense[2] & 0x0F
+            let sense_key = if hdr.sb_len_wr >= 3 {
+                let response_code = sense[0] & 0x7F;
+                if response_code == 0x72 || response_code == 0x73 {
+                    // Descriptor format sense: sense key at byte 1
+                    sense[1] & 0x0F
+                } else {
+                    // Fixed format sense (0x70/0x71): sense key at byte 2
+                    sense[2] & 0x0F
+                }
             } else {
                 0
             };

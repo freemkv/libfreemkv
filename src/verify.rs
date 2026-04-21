@@ -73,10 +73,12 @@ impl VerifyResult {
 }
 
 /// Progress callback: (sectors_done, total_sectors, current_status)
-pub type ProgressFn = Box<dyn FnMut(u64, u64, SectorStatus)>;
+/// Return false to stop verification early.
+pub type ProgressFn = Box<dyn FnMut(u64, u64, SectorStatus) -> bool>;
 
 /// Verify all sectors in a title's extents.
 /// Reads in batches for speed, falls back to single-sector on failure.
+/// The progress callback returns false to request early stop.
 pub fn verify_title(
     reader: &mut dyn SectorReader,
     title: &DiscTitle,
@@ -90,12 +92,13 @@ pub fn verify_title(
     let mut bad: u64 = 0;
     let mut ranges: Vec<SectorRange> = Vec::new();
     let mut sectors_done: u64 = 0;
+    let mut _stopped = false;
     let mut byte_offset: u64 = 0;
 
     let total_sectors: u64 = title.extents.iter().map(|e| e.sector_count as u64).sum();
     let mut buf = vec![0u8; batch_sectors as usize * 2048];
 
-    for ext in &title.extents {
+    'outer: for ext in &title.extents {
         let mut offset: u32 = 0;
         while offset < ext.sector_count {
             let remaining = ext.sector_count - offset;
@@ -133,7 +136,10 @@ pub fn verify_title(
 
                 sectors_done += count as u64;
                 if let Some(ref mut cb) = on_progress {
-                    cb(sectors_done, total_sectors, status);
+                    if !cb(sectors_done, total_sectors, status) {
+                        _stopped = true;
+                        break 'outer;
+                    }
                 }
             } else {
                 // Batch failed — test each sector individually
@@ -196,7 +202,10 @@ pub fn verify_title(
 
                     sectors_done += 1;
                     if let Some(ref mut cb) = on_progress {
-                        cb(sectors_done, total_sectors, status);
+                        if !cb(sectors_done, total_sectors, status) {
+                            _stopped = true;
+                            break 'outer;
+                        }
                     }
                 }
             }
