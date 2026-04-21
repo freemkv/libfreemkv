@@ -496,8 +496,10 @@ impl Drive {
     ///
     /// Returns Err only after all attempts exhausted — user should clean
     /// the disc and resume.
-    pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        let timeout_ms = if self.recovery_bytes_remaining > 0 {
+    pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        let timeout_ms = if !recovery {
+            5_000
+        } else if self.recovery_bytes_remaining > 0 {
             30_000
         } else {
             10_000
@@ -534,7 +536,12 @@ impl Drive {
             return Ok(result.bytes_transferred);
         }
 
-        // Read failed — enter recovery
+        // Read failed
+        if !recovery {
+            return Err(Error::DiscRead { sector: lba as u64 });
+        }
+
+        // Enter recovery
         self.emit(EventKind::ReadError {
             sector: lba as u64,
             error: Error::DiscRead { sector: lba as u64 },
@@ -603,32 +610,6 @@ impl Drive {
         // Both phases failed.
         self.recovery_bytes_remaining = RECOVERY_WINDOW;
         Err(Error::DiscRead { sector: lba as u64 })
-    }
-
-    /// Fast single-attempt read for verification — no recovery, short timeout.
-    /// Returns Ok on success, Err on any failure. Does not retry.
-    pub fn read_fast(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        let cdb = [
-            crate::scsi::SCSI_READ_10,
-            0x00,
-            (lba >> 24) as u8,
-            (lba >> 16) as u8,
-            (lba >> 8) as u8,
-            lba as u8,
-            0x00,
-            (count >> 8) as u8,
-            count as u8,
-            0x00,
-        ];
-        match self.scsi.as_mut().execute(
-            &cdb,
-            crate::scsi::DataDirection::FromDevice,
-            buf,
-            5_000, // 5 second timeout — enough for healthy reads, fast fail for bad sectors
-        ) {
-            Ok(result) => Ok(result.bytes_transferred),
-            Err(_) => Err(Error::DiscRead { sector: lba as u64 }),
-        }
     }
 
     /// Read the disc capacity in sectors (2048 bytes each).
@@ -730,15 +711,11 @@ impl Drop for Drive {
 
 impl SectorReader for Drive {
     fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8]) -> Result<usize> {
-        self.read(lba, count, buf)
+        self.read(lba, count, buf, true)
     }
 
     fn read_sectors_recover(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
-        if recovery {
-            self.read(lba, count, buf)
-        } else {
-            self.read_fast(lba, count, buf)
-        }
+        self.read(lba, count, buf, recovery)
     }
 }
 
