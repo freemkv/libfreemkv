@@ -497,8 +497,15 @@ impl Drive {
     /// Returns Err only after all attempts exhausted — user should clean
     /// the disc and resume.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        // Non-recovery mode is the Disc::copy fast pass — intent is "fail
+        // fast, let skip_forward advance past bad regions." A 5s budget let
+        // the drive grind L-EC on structure-protected / marginal sectors for
+        // nearly the full interval per 64 KB block, pinning throughput at
+        // ~13 KB/s on difficult discs. 1500ms kills slow reads early so
+        // skip_forward can double its stride; recoverable sectors are picked
+        // up on Disc::patch where recovery=true and the timeout is 30s.
         let timeout_ms = if !recovery {
-            5_000
+            1_500
         } else if self.recovery_bytes_remaining > 0 {
             30_000
         } else {
