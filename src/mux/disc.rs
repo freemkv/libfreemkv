@@ -6,9 +6,98 @@
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
 use crate::disc::{Disc, DiscTitle, Extent};
-use crate::event::{Event, EventKind};
+use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::sector::SectorReader;
 use std::io;
+
+/// Ramp back up to the preferred batch size after this many sectors
+/// of clean reading at the current (reduced) size. 100 MiB = 51,200 sectors.
+///
+/// Chosen so that an isolated transient failure doesn't lock the rip at
+/// size 1: once past the bad zone, we probe up after ~100 ms of good reads.
+/// And so that noisy zones with occasional successes can't trigger a
+/// premature probe — we need a sustained clean run.
+const PROBE_THRESHOLD_SECTORS: u32 = 100 * 1024 * 1024 / 2048;
+
+/// Halve a batch size, keeping 3-sector alignment when >= 6
+/// (3-sector alignment = one AACS unit). At sizes < 6 we descend
+/// through 3 → 1 without intermediate unaligned sizes.
+fn halve_batch_size(size: u16) -> u16 {
+    let h = (size / 2).max(1);
+    if h >= 6 {
+        h - (h % 3)
+    } else {
+        h
+    }
+}
+
+/// Double a batch size toward a preferred max, keeping 3-sector alignment
+/// when the result is >= 6.
+fn double_batch_size(size: u16, preferred: u16) -> u16 {
+    let d = size.saturating_mul(2).min(preferred);
+    if d >= 6 {
+        d - (d % 3)
+    } else {
+        d
+    }
+}
+
+/// Adaptive batch sizer. Shrinks on read failure, grows after a sustained
+/// clean streak. Amortizes the cost of entering a bad zone — descent happens
+/// once, not once per bad sector.
+#[derive(Debug)]
+struct AdaptiveBatch {
+    preferred: u16,
+    current: u16,
+    streak_sectors: u32,
+}
+
+impl AdaptiveBatch {
+    fn new(preferred: u16) -> Self {
+        Self {
+            preferred,
+            current: preferred,
+            streak_sectors: 0,
+        }
+    }
+
+    fn current(&self) -> u16 {
+        self.current
+    }
+
+    /// Record a successful read of `sectors`. Returns an event if the
+    /// sizer probed up to a larger batch size.
+    fn on_success(&mut self, sectors: u16) -> Option<EventKind> {
+        self.streak_sectors = self.streak_sectors.saturating_add(sectors as u32);
+        if self.current < self.preferred && self.streak_sectors >= PROBE_THRESHOLD_SECTORS {
+            let new_size = double_batch_size(self.current, self.preferred);
+            if new_size != self.current {
+                self.current = new_size;
+                self.streak_sectors = 0;
+                return Some(EventKind::BatchSizeChanged {
+                    new_size,
+                    reason: BatchSizeReason::Probed,
+                });
+            }
+        }
+        None
+    }
+
+    /// Record a read failure. Returns an event if the sizer shrank.
+    /// Does nothing at size 1 (caller handles skip/error).
+    fn on_failure(&mut self) -> Option<EventKind> {
+        self.streak_sectors = 0;
+        if self.current <= 1 {
+            return None;
+        }
+        let new_size = halve_batch_size(self.current);
+        self.current = new_size;
+        Some(EventKind::BatchSizeChanged {
+            new_size,
+            reason: BatchSizeReason::Shrunk,
+        })
+    }
+}
 
 /// Disc stream. Reads sectors from any source → PES frames.
 ///
@@ -31,8 +120,9 @@ pub struct DiscStream {
     read_buf: Vec<u8>,
     buf_valid: usize,
 
-    // Batch size for reads
-    batch_sectors: u16,
+    // Adaptive batch sizer — preferred comes from the caller
+    // (detect_max_batch_sectors), shrinks/grows based on read outcomes.
+    adaptive: AdaptiveBatch,
     pub errors: u64,
     pub skip_errors: bool,
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
@@ -99,7 +189,7 @@ impl DiscStream {
             current_offset: 0,
             read_buf: Vec::with_capacity(batch_sectors as usize * 2048),
             buf_valid: 0,
-            batch_sectors,
+            adaptive: AdaptiveBatch::new(batch_sectors),
             errors: 0,
             skip_errors: false,
             event_fn: None,
@@ -133,74 +223,6 @@ impl DiscStream {
         self.disc.as_ref()
     }
 
-    /// Binary search to isolate failing sectors within a batch.
-    /// Good sub-batches read fast. Bad sectors get 3 retries × 5s — max 15s per sector.
-    /// No full Drive::read() recovery — that only runs on the initial batch attempt.
-    fn read_with_binary_search(&mut self, lba: u32, count: u16) -> io::Result<()> {
-        if count <= 1 {
-            // Single sector — light recovery: 3 attempts, 5s sleep between
-            let offset = self.buf_valid;
-            for attempt in 0..3u32 {
-                if attempt > 0 {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                }
-                if self
-                    .reader
-                    .read_sectors(lba, 1, &mut self.read_buf[offset..offset + 2048], false)
-                    .is_ok()
-                {
-                    self.emit(EventKind::SectorRecovered { sector: lba as u64 });
-                    self.buf_valid += 2048;
-                    return Ok(());
-                }
-            }
-            // 3 attempts failed
-            if self.skip_errors {
-                self.emit(EventKind::SectorSkipped { sector: lba as u64 });
-                self.read_buf[offset..offset + 2048].fill(0);
-                self.buf_valid += 2048;
-                self.errors += 1;
-                return Ok(());
-            } else {
-                return Err(crate::error::Error::DiscRead { sector: lba as u64 }.into());
-            }
-        }
-
-        // Try this sub-batch as a whole (fast read, no recovery)
-        let bytes = count as usize * 2048;
-        let offset = self.buf_valid;
-        if self
-            .reader
-            .read_sectors(
-                lba,
-                count,
-                &mut self.read_buf[offset..offset + bytes],
-                false,
-            )
-            .is_ok()
-        {
-            self.buf_valid += bytes;
-            return Ok(());
-        }
-
-        // Sub-batch failed — split in half and recurse
-        self.emit(EventKind::BinarySearch {
-            sector: lba as u64,
-            batch_size: count,
-        });
-
-        let half = count / 2;
-        let half = half - (half % 3).min(half);
-        let half = half.max(1);
-        let remainder = count - half;
-
-        self.read_with_binary_search(lba, half)?;
-        if remainder > 0 {
-            self.read_with_binary_search(lba + half as u32, remainder)?;
-        }
-        Ok(())
-    }
-
     fn fill_extents(&mut self) -> io::Result<bool> {
         if self.current_extent >= self.extents.len() {
             return Ok(false);
@@ -214,32 +236,57 @@ impl DiscStream {
             self.current_offset = 0;
             return self.fill_extents();
         }
-        let mut sectors = remaining.min(self.batch_sectors as u32) as u16;
-        // Align to 3-sector AACS units when possible, but never drop
-        // trailing sectors at extent boundaries. decrypt_sectors() safely
-        // skips partial units (chunks shorter than ALIGNED_UNIT_LEN).
-        if sectors >= 3 {
-            sectors -= sectors % 3;
-        }
 
         let lba = ext_start + self.current_offset;
-        let bytes = sectors as usize * 2048;
-        self.read_buf.resize(bytes, 0);
 
-        if self
-            .reader
-            .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false)
-            .is_ok()
-        {
-            // Fast path: batch succeeded
-            self.buf_valid = bytes;
-        } else {
-            // Batch failed fast — binary search to isolate bad sectors.
-            // Light recovery only (3x5s per sector, no full Drive::read).
-            self.buf_valid = 0;
-            self.read_with_binary_search(lba, sectors)?;
+        // Adaptive sizer: start at current (preferred until a failure), shrink
+        // on failure, advance on success. One 5s read attempt per try — no
+        // retry loops, no sleeps. On size-1 failure, skip or error.
+        loop {
+            let mut sectors = remaining.min(self.adaptive.current() as u32) as u16;
+            // Align to 3-sector AACS units when possible. Partial units at
+            // extent boundaries are safely handled by decrypt_sectors().
+            if sectors >= 3 {
+                sectors -= sectors % 3;
+            }
+            let bytes = sectors as usize * 2048;
+            self.read_buf.resize(bytes, 0);
+
+            let ok = self
+                .reader
+                .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false)
+                .is_ok();
+
+            if ok {
+                if let Some(ev) = self.adaptive.on_success(sectors) {
+                    self.emit(ev);
+                }
+                self.buf_valid = bytes;
+                self.current_offset += sectors as u32;
+                break;
+            }
+
+            if sectors == 1 {
+                // Bottomed out. Skip this sector or bail.
+                if self.skip_errors {
+                    self.read_buf.resize(2048, 0);
+                    self.read_buf[..2048].fill(0);
+                    self.buf_valid = 2048;
+                    self.errors += 1;
+                    self.emit(EventKind::SectorSkipped { sector: lba as u64 });
+                    self.current_offset += 1;
+                    break;
+                } else {
+                    return Err(crate::error::Error::DiscRead { sector: lba as u64 }.into());
+                }
+            }
+
+            // Shrink and retry at the same LBA with a smaller batch.
+            if let Some(ev) = self.adaptive.on_failure() {
+                self.emit(ev);
+            }
         }
-        self.current_offset += sectors as u32;
+
         if self.current_offset >= ext_sectors {
             self.current_extent += 1;
             self.current_offset = 0;
