@@ -51,6 +51,31 @@ while let Ok(Some(frame)) = input.read() {
 output.finish()?;
 ```
 
+### Multi-pass recovery rip
+
+For damaged discs, the library offers a two-stage rip model: fast sweep with zero-fill and a ddrescue-format mapfile, then targeted retry of bad ranges. See [`docs/rip-recovery.md`](docs/rip-recovery.md) for the full architecture.
+
+```rust
+use libfreemkv::disc::{CopyOptions, PatchOptions};
+
+// Pass 1: disc → ISO. Fast 64 KB reads, skip-forward on failure,
+// zero-fill bad blocks, write a sidecar .mapfile.
+let mut result = disc.copy(
+    &mut drive,
+    Path::new("disc.iso"),
+    &CopyOptions { skip_on_error: true, skip_forward: true, ..Default::default() },
+)?;
+
+// Pass 2..N: retry bad ranges with full drive recovery.
+// Idempotent — call as many times as you want.
+while result.bytes_unreadable + result.bytes_pending > 0 {
+    let pr = disc.patch(&mut drive, Path::new("disc.iso"), &PatchOptions::default())?;
+    if pr.bytes_recovered_this_pass == 0 { break; }
+}
+
+// Then mux from the ISO via the normal stream pipeline (no drive involvement).
+```
+
 ## What It Does
 
 - **Drive access** — open, identify, unlock, firmware upload, speed calibration, eject
