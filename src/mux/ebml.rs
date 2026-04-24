@@ -87,11 +87,6 @@ pub fn write_uint(w: &mut impl Write, id: u32, val: u64) -> io::Result<()> {
     }
 }
 
-/// Write a complete EBML signed integer element.
-pub fn write_int(w: &mut impl Write, id: u32, val: i64) -> io::Result<()> {
-    write_uint(w, id, val as u64)
-}
-
 /// Write a complete EBML float element (8-byte double).
 pub fn write_float(w: &mut impl Write, id: u32, val: f64) -> io::Result<()> {
     write_id(w, id)?;
@@ -309,22 +304,6 @@ pub fn read_binary_val(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read a VINT (track number) from a SimpleBlock. Returns (value, bytes_consumed).
-pub fn read_vint(r: &mut impl Read) -> io::Result<(u64, usize)> {
-    let mut first = [0u8; 1];
-    r.read_exact(&mut first)?;
-    let b0 = first[0];
-    if b0 & 0x80 != 0 {
-        return Ok(((b0 & 0x7F) as u64, 1));
-    }
-    if b0 & 0x40 != 0 {
-        let mut b = [0u8; 1];
-        r.read_exact(&mut b)?;
-        return Ok(((((b0 & 0x3F) as u64) << 8) | b[0] as u64, 2));
-    }
-    Err(crate::error::Error::MkvInvalid.into())
-}
-
 // ============================================================
 // Matroska Element IDs
 // ============================================================
@@ -341,12 +320,6 @@ pub const EBML_DOC_TYPE_READ_VERSION: u32 = 0x4285;
 
 // Segment
 pub const SEGMENT: u32 = 0x1853_8067;
-
-// Seek Head
-pub const SEEK_HEAD: u32 = 0x114D_9B74;
-pub const SEEK: u32 = 0x4DBB;
-pub const SEEK_ID: u32 = 0x53AB;
-pub const SEEK_POSITION: u32 = 0x53AC;
 
 // Segment Info
 pub const INFO: u32 = 0x1549_A966;

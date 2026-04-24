@@ -19,8 +19,7 @@ pub struct IsoSectorReader {
 
 impl IsoSectorReader {
     pub fn open(path: &str) -> std::io::Result<Self> {
-        let file = File::open(Path::new(path))
-            .map_err(|e| std::io::Error::new(e.kind(), format!("iso://{path}: {e}")))?;
+        let file = File::open(Path::new(path))?;
         let size = file.metadata()?.len();
         let sectors = size / SECTOR_SIZE;
         if sectors > u32::MAX as u64 {

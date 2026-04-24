@@ -149,10 +149,13 @@ impl Mapfile {
                 .next()
                 .and_then(SectorStatus::from_char)
                 .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("bad status char in mapfile: {}", fields[2]),
-                    )
+                    // No English text — the variant carries a stable
+                    // language-neutral kind identifier (`status_char`).
+                    let e: io::Error = crate::error::Error::MapfileInvalid {
+                        kind: "status_char",
+                    }
+                    .into();
+                    e
                 })?;
             entries.push(MapEntry { pos, size, status });
         }
@@ -318,8 +321,12 @@ impl Mapfile {
 
 fn parse_hex(s: &str) -> io::Result<u64> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad hex {s}: {e}")))
+    u64::from_str_radix(s, 16).map_err(|_| {
+        // Underlying ParseIntError dropped — its Display is OS-locale text.
+        // The typed variant carries `kind = "hex"` which is stable.
+        let e: io::Error = crate::error::Error::MapfileInvalid { kind: "hex" }.into();
+        e
+    })
 }
 
 #[cfg(test)]

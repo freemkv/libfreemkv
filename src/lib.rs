@@ -94,21 +94,65 @@ pub(crate) mod speed;
 pub(crate) mod udf;
 pub mod verify;
 
+// ─── Drive lifecycle ────────────────────────────────────────────────────────
+//
+// `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive`
+// owns the SCSI session; `DriveCapture` etc. let advanced callers introspect
+// drive identity / profile data for sharing.
 pub use drive::capture::{
     CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
 pub use drive::{Drive, DriveStatus, find_drive, find_drives};
+
+// ─── Errors ─────────────────────────────────────────────────────────────────
+//
+// All fallible APIs return `Result<T, Error>`. `Error` is a typed enum with a
+// numeric `code()`; **no English text in the library** — applications map
+// codes to localized messages. See `error.rs` for the full taxonomy.
 pub use error::{Error, Result};
+
+// ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
-// Platform trait is pub(crate) -- callers use Drive, not Platform directly
+// Platform trait is pub(crate) — callers use Drive, not Platform directly.
+
+// ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
+//
+// `Disc::scan()` resolves keys and stores them on `Disc`; in most flows you
+// don't touch `DecryptKeys` directly — `DiscStream::new(reader, title, keys, …)`
+// accepts whatever `Disc::decrypt_keys()` returned. `decrypt_sectors()` is
+// for callers that operate on raw sector buffers (e.g. ISO patching).
 pub use decrypt::{DecryptKeys, decrypt_sectors};
+
+// ─── Disc structure ─────────────────────────────────────────────────────────
+//
+// `Disc::scan()` produces a fully-populated `Disc` (titles, streams, AACS
+// state). `Disc::identify()` is the fast path — UDF only, no playlist parse,
+// for displaying disc name + format quickly while a full scan runs in the
+// background. The codec / channel / resolution enums are the canonical
+// structured representation; never compare against display strings.
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
-    DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
-    ScanOptions, Stream, SubtitleStream, VideoStream,
+    DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, LabelPurpose,
+    LabelQualifier, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
 };
+
+// ─── Streams ────────────────────────────────────────────────────────────────
+//
+// All stream types implement `pes::Stream` — read PES frames from a source,
+// write PES frames to a sink. Pick the right type at construction:
+//
+// - `DiscStream` — physical drive or ISO (any `SectorReader`). Always read.
+// - `MkvStream`  — Matroska container. Read on `open()`, write on `create()`.
+// - `M2tsStream` — Blu-ray Transport Stream. Read on `open()`, write on `create()`.
+// - `NetworkStream` — TCP. Read on `listen()`, write on `connect()`.
+// - `NullStream` — write-only black-hole sink. Useful for benchmarks.
+// - `StdioStream` — pipe to/from stdin/stdout. Read or write.
+//
+// Most consumers use the URL resolvers (`input()` / `output()`) which pick
+// the right type from a scheme:// URL. Direct construction is for callers
+// that need to wire custom readers (e.g. autorip's drive-session reuse).
 pub use mux::DiscStream;
 pub use mux::M2tsStream;
 pub use mux::MkvStream;
@@ -116,6 +160,13 @@ pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
+
+// ─── Lower-level surfaces ───────────────────────────────────────────────────
+//
+// `ScsiTransport` is the platform-abstraction trait Drive uses; expose for
+// out-of-tree platform backends. `SectorReader` lets callers feed any byte
+// source (test harness, network image, SMB share) into the disc scan
+// pipeline; `FileSectorReader` is the standard ISO-on-disk implementation.
 pub use scsi::ScsiTransport;
 pub use sector::{FileSectorReader, SectorReader};
 pub use speed::DriveSpeed;

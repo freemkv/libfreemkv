@@ -1,5 +1,148 @@
 # Changelog
 
+## 0.13.0 (2026-04-24)
+
+### Zero English in library — typed variants for every error path
+
+Audit pass against the `CLAUDE.md` rule (no English text in library code).
+Found nine call sites that violated the contract by stuffing English into
+`io::Error::new(kind, "…")` or by abusing `Error::DeviceNotFound { path }`
+as a free-form description field. Each is now a typed variant with
+structured fields; the CLI / autorip translates to localized text.
+
+New `Error` variants and codes:
+
+- `ScsiInterfaceUnavailable { path }` — `E1004` (macOS
+  `SCSITaskDeviceInterface` couldn't be obtained)
+- `DeviceLocked { path, kr }` — `E1005` (replaces an English
+  "exclusive access denied. Try: diskutil unmountDisk" message)
+- `IoKitPluginFailed { path, kr }` — `E1006`
+- `UnsupportedPlatform { target }` — `E2003` (built on an OS without an
+  SCSI backend)
+- `PlatformNotImplemented { platform }` — `E2004` (replaces the
+  `product_revision: "Renesas not yet implemented"` string-stuffing in
+  `drive::mod`)
+- `MapfileInvalid { kind }` — `E6011` (ddrescue mapfile parse, with a
+  stable `&'static str` kind: `"status_char"` or `"hex"`)
+- `DiscUrlNotDirect` — `E9009` (replaces the full English sentence
+  `"Use Drive::open() + Disc::scan() + DiscStream::new() for disc sources"`
+  that `mux::input(disc://…)` returned to callers)
+
+Migrated call sites:
+
+- `mux/resolve.rs` — disc URL → `DiscUrlNotDirect`; the four
+  `format!("m2ts://…")` / `format!("mkv://…")` IO error wraps now
+  propagate the inner `io::Error` unchanged (the URL-prefix wrap added
+  no semantic information).
+- `mux/iso.rs` — same `format!("iso://…")` wrap dropped.
+- `sector.rs` — image-too-large now uses the existing `IsoTooLarge`
+  variant instead of `format!("…image too large, max ~8 TB")`.
+- `disc/mapfile.rs` — bad-status-char and bad-hex parser errors now use
+  `MapfileInvalid { kind }`.
+- `scsi/mod.rs` — unsupported-platform path uses `UnsupportedPlatform`.
+- `scsi/macos.rs` — IOKit plugin failure → `IoKitPluginFailed`,
+  `SCSITaskDeviceInterface` missing → `ScsiInterfaceUnavailable`,
+  exclusive-access denied → `DeviceLocked` with the IOReturn code as a
+  structured `kr` field. The `find_scsi_service` four-stage failure path
+  is now a single `DeviceNotFound { path }` (none of the prior
+  per-stage English descriptions were user-actionable individually).
+- `drive/mod.rs` — Renesas platform → `PlatformNotImplemented`.
+
+### Stripped English from `labels` module
+
+`labels::apply()` previously pushed `"Commentary"`, `"Descriptive Audio"`,
+`"Score"`, `"IME"`, and `" (Secondary)"` directly into
+`AudioStream.label`. Those English strings then leaked into MKV titles
+and into autorip's UI. The data was already structured upstream
+(`LabelPurpose` enum on `StreamLabel`); the lib was downcasting it for
+the caller's convenience.
+
+- `AudioStream` gains `purpose: LabelPurpose` (re-exported from
+  `crate::disc` next to the struct, alongside `LabelQualifier`).
+- `SubtitleStream` gains `qualifier: LabelQualifier`.
+- `apply()` writes structured fields, never English. `label` keeps
+  codec-formatting only (`"Dolby TrueHD 5.1"`).
+- `generate_audio_label` drops the `" (Secondary)"` suffix; `secondary`
+  is already a `bool` field, callers render it.
+- `generate_video_label` drops the `"Secondary Video"` fallback.
+  `"Dolby Vision EL"` kept (brand identifier, not translatable).
+
+### API hygiene
+
+- **mux module visibility tightened**. `pub mod ebml`, `m2ts`, `mkv`,
+  `network`, `null`, `ps`, `stdio`, `ts`, `tsmux` are now `pub(crate)`.
+  Their *types* are still re-exported from `lib.rs` — the modules
+  themselves were leaking low-level EBML primitives, TS muxer
+  internals, and network/stdio implementations that no external caller
+  used. `mux::codec`, `mux::disc`, `mux::iso`, `mux::resolve`, and
+  `mux::meta` stay public (genuine APIs).
+- **Stream trait rustdoc**. The keystone PES `Stream` trait (in
+  `pes.rs`) had per-method docs but no trait-level doc. Now explains
+  read-vs-write split, error contracts, the role of `info()` /
+  `codec_private()` / `headers_ready()`.
+- **lib.rs re-export sections**. Eight grouped sections with a
+  paragraph each (Drive lifecycle, Errors, Decryption, Disc structure,
+  Streams, Lower-level surfaces) so `cargo doc` tells callers when to
+  reach for what.
+- **Dropped `ScanOptions::with_keydb()`**. The `_with_X` constructor
+  pattern was banned by `CLAUDE.md` (one method per action). Use the
+  struct literal: `ScanOptions { keydb_path: Some(p.into()) }`. Five
+  external call sites (autorip ×3, freemkv CLI ×3) and three test
+  fixtures migrated.
+- **`pid_index` allocation documented**. The `TsDemuxer::new` flat
+  lookup table was flagged by audit as "unbounded for adversarial
+  PIDs"; on closer reading it's bounded by `u16::MAX × 2 bytes ≈ 128 KB`.
+  Doc comment now states the bound explicitly so future contributors
+  don't re-flag it.
+
+### Dead-code sweep
+
+Pre-PES-rewrite leftovers that were `pub` but unreachable:
+
+- Deleted `mux/lookahead.rs` entirely (orphan file — never had a `mod`
+  declaration; only used by its own tests).
+- Deleted `mux/tsreader.rs` (`TsDemuxReader` struct + four methods,
+  used nowhere).
+- Deleted `mux::ebml::write_int`, `read_vint`, `SEEK_HEAD`, `SEEK`,
+  `SEEK_ID`, `SEEK_POSITION` (unused).
+- Deleted `mux::ts::scan_first_pts`, `scan_last_pts`, `scan_duration`,
+  `SCAN_HEAD_SIZE`, `SCAN_TAIL_SIZE`, `take_remainder`, `set_remainder`
+  (unused since the v0.10 PES rewrite).
+- Deleted `MkvMuxer::codec_private_slots` /
+  `codec_private_filled` fields and `fill_codec_private` method —
+  deferred-codecPrivate path was never exercised once codec_privates
+  flowed through `DiscTitle`.
+
+`cargo clippy --all-targets -- -D warnings` is clean.
+
+### Tests
+
+- New `error::tests` module — code distinctness, Display has no English
+  words, `io::ErrorKind` mapping for every new variant.
+- 233 lib tests (was 230), all green.
+
+### Breaking changes
+
+Source-compatible for callers who use `Error` opaquely (handle
+`Result<T, Error>` and `error.code()` only). The following are breaking:
+
+- `ScanOptions::with_keydb()` removed — use struct literal.
+- `mux::ebml`, `mux::mkv`, `mux::ts`, etc. modules no longer accessible
+  externally — use the re-exported types from the crate root instead.
+- `AudioStream` and `SubtitleStream` gained required fields (`purpose`,
+  `qualifier`). Construction-by-struct-literal must include them.
+- `Error::UnsupportedDrive { product_revision: "Renesas not yet
+  implemented" }` no longer produced — match `PlatformNotImplemented`.
+
+### Magic-number policy
+
+Per the v0.13 audit directive: new code in this release uses named
+documented constants (e.g. `POLL_INTERVAL_SECS` in autorip, the wedge
+signature literals in `ripper.rs`, the `BD_TS_PID_SPACE` floor in
+`ts.rs`'s table allocation). A comprehensive retrofit of pre-existing
+magic numbers across the older codebase is queued as follow-up work for
+0.13.1+ — too large to absorb into this release without scope creep.
+
 ## 0.12.0 (2026-04-24)
 
 ### Rust 2024 edition migration

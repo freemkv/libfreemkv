@@ -44,9 +44,15 @@ fn main() {
     let mut fail = 0u32;
     let mut bytes: u64 = 0;
 
+    // Recovery flag: true matches pre-0.11.13 bench behavior — full SCSI
+    // ECC retry loop on errors (slower, what the rip path used before the
+    // adaptive batch sizer landed). Flip to `false` for the fast-fail path
+    // that current rips use; benches are configurable via this constant.
+    const READ_WITH_RECOVERY: bool = true;
+
     for i in 0..1000u32 {
         let lba = i * batch as u32;
-        match drive.read(lba, batch, &mut buf) {
+        match drive.read(lba, batch, &mut buf, READ_WITH_RECOVERY) {
             Ok(_) => {
                 writer.write_all(&buf).unwrap();
                 ok += 1;

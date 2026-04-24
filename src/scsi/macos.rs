@@ -212,8 +212,9 @@ impl MacScsiTransport {
         unsafe { IOObjectRelease(service) };
 
         if kr != K_IO_RETURN_SUCCESS || plugin.is_null() {
-            return Err(Error::DeviceNotFound {
-                path: format!("{}: IOKit plugin creation failed (0x{:08x})", dev_str, kr),
+            return Err(Error::IoKitPluginFailed {
+                path: dev_str.to_string(),
+                kr: kr as u32,
             });
         }
 
@@ -231,8 +232,8 @@ impl MacScsiTransport {
         com_release(plugin);
 
         if hr != 0 || device_iface.is_null() {
-            return Err(Error::DeviceNotFound {
-                path: format!("{}: SCSITaskDeviceInterface not available", dev_str),
+            return Err(Error::ScsiInterfaceUnavailable {
+                path: dev_str.to_string(),
             });
         }
 
@@ -244,11 +245,12 @@ impl MacScsiTransport {
         };
         if kr != K_IO_RETURN_SUCCESS {
             com_release(device_iface);
-            return Err(Error::DevicePermission {
-                path: format!(
-                    "{}: exclusive access denied (0x{:08x}). Try: diskutil unmountDisk {}",
-                    dev_str, kr, dev_str
-                ),
+            // No "Try: diskutil unmountDisk" hint — that's the CLI's job.
+            // The typed variant carries device path + IOReturn so the
+            // caller can render the right message in the right language.
+            return Err(Error::DeviceLocked {
+                path: dev_str.to_string(),
+                kr: kr as u32,
             });
         }
 
@@ -404,13 +406,23 @@ impl ScsiTransport for MacScsiTransport {
 /// BSD name → IOKit service for the SCSI device.
 ///
 /// Walk: IOMedia (BSD name match) → parent chain → SCSIPeripheralDeviceNub.
+///
+/// All failure paths surface as `Error::DeviceNotFound { path: bsd_name }` —
+/// the four internal stages (IOMasterPort / IOBSDNameMatching / IOMedia
+/// lookup / walk_to_authoring_device) collapse into one observable error
+/// because none of them are user-actionable individually. Pre-0.13 each
+/// stage stuffed an English description into `path:` ("…IOMasterPort
+/// failed", "…SCSITaskDeviceInterface not available", etc.) which broke
+/// the library's "no English text" rule.
 fn find_scsi_service(bsd_name: &str) -> Result<IOObject> {
+    let not_found = || Error::DeviceNotFound {
+        path: bsd_name.to_string(),
+    };
+
     let mut master: MachPort = 0;
     let kr = unsafe { IOMasterPort(0, &mut master) };
     if kr != K_IO_RETURN_SUCCESS {
-        return Err(Error::DeviceNotFound {
-            path: format!("{}: IOMasterPort failed", bsd_name),
-        });
+        return Err(not_found());
     }
 
     // IOBSDNameMatching creates a dictionary matching { "BSD Name" = bsd_name }
@@ -418,17 +430,13 @@ fn find_scsi_service(bsd_name: &str) -> Result<IOObject> {
     bsd_c.push(0);
     let matching = unsafe { IOBSDNameMatching(master, 0, bsd_c.as_ptr()) };
     if matching.is_null() {
-        return Err(Error::DeviceNotFound {
-            path: format!("{}: IOBSDNameMatching failed", bsd_name),
-        });
+        return Err(not_found());
     }
 
     // Find the single IOMedia service (consumes the matching dict)
     let media = unsafe { IOServiceGetMatchingService(master, matching) };
     if media == 0 {
-        return Err(Error::DeviceNotFound {
-            path: format!("{}: no IOMedia found", bsd_name),
-        });
+        return Err(not_found());
     }
 
     // Walk up the IOService plane to find the authoring device.
@@ -441,9 +449,7 @@ fn find_scsi_service(bsd_name: &str) -> Result<IOObject> {
     let service = walk_to_authoring_device(media);
     unsafe { IOObjectRelease(media) };
 
-    service.ok_or_else(|| Error::DeviceNotFound {
-        path: format!("{}: no SCSI authoring device in IORegistry", bsd_name),
-    })
+    service.ok_or_else(not_found)
 }
 
 /// Walk up the IOService plane from an IOMedia to the SCSI authoring device.

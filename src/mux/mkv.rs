@@ -8,7 +8,7 @@ use super::ebml;
 use crate::disc::{
     AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
 };
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Seek, Write};
 
 /// MKV track definition (built from disc stream metadata).
 pub struct MkvTrack {
@@ -170,10 +170,6 @@ pub struct MkvMuxer<W: Write + Seek> {
     base_pts_ms: Option<i64>,
     cues: Vec<CuePoint>,
     frame_count: u64,
-    /// File positions of codecPrivate placeholders (track_idx → offset, max_size).
-    /// Used to seek back and fill in SPS/PPS after first keyframe.
-    codec_private_slots: Vec<Option<(u64, usize)>>,
-    codec_private_filled: Vec<bool>,
 }
 
 /// New cluster every 5 seconds.
@@ -219,8 +215,6 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::end_master(&mut writer, info_pos)?;
 
         // Tracks
-        let mut codec_private_slots: Vec<Option<(u64, usize)>> = Vec::new();
-        let mut codec_private_filled: Vec<bool> = Vec::new();
         let tracks_pos = ebml::start_master(&mut writer, ebml::TRACKS)?;
         for (i, track) in tracks.iter().enumerate() {
             let entry_pos = ebml::start_master(&mut writer, ebml::TRACK_ENTRY)?;
@@ -243,20 +237,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
             if let Some(ref cp) = track.codec_private {
                 ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, cp)?;
-                codec_private_slots.push(None); // already filled
-                codec_private_filled.push(true);
-            } else if track.track_type == ebml::TRACK_TYPE_VIDEO {
-                // Reserve space for codecPrivate — will be filled after first keyframe
-                // Reserve 256 bytes (enough for SPS+PPS or VPS+SPS+PPS)
-                let cp_pos = writer.stream_position()?;
-                let placeholder = vec![0u8; 256];
-                ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, &placeholder)?;
-                codec_private_slots.push(Some((cp_pos, 256)));
-                codec_private_filled.push(false);
-            } else {
-                codec_private_slots.push(None);
-                codec_private_filled.push(true);
             }
+            // Pre-0.13 a deferred codecPrivate path existed for video tracks
+            // (placeholder reserve + later seek-back fill via
+            // `fill_codec_private`). The PES pipeline hands codec_private
+            // up-front via the DiscTitle, so the deferred path was never
+            // exercised — removed in the 0.13 dead-code sweep.
 
             // DefaultDuration — frame duration in nanoseconds
             if track.default_duration_ns > 0 {
@@ -344,8 +330,6 @@ impl<W: Write + Seek> MkvMuxer<W> {
             base_pts_ms: None,
             cues: Vec::new(),
             frame_count: 0,
-            codec_private_slots,
-            codec_private_filled,
         })
     }
 
@@ -412,30 +396,6 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
 
         self.writer.flush()?;
-        Ok(())
-    }
-
-    /// Fill in a deferred codecPrivate for a track.
-    /// Seeks back to the placeholder, writes the actual data, restores position.
-    pub fn fill_codec_private(&mut self, track_idx: usize, data: &[u8]) -> io::Result<()> {
-        if track_idx >= self.codec_private_filled.len() || self.codec_private_filled[track_idx] {
-            return Ok(());
-        }
-        if let Some((pos, max_size)) = self.codec_private_slots[track_idx] {
-            if data.len() > max_size {
-                // Data too large for reserved space — can't fill in place
-                // This shouldn't happen with 256 bytes reserved
-                return Ok(());
-            }
-            let current = self.writer.stream_position()?;
-            self.writer.seek(SeekFrom::Start(pos))?;
-            // Rewrite: element ID + size + data + zero-pad remainder
-            let mut padded = data.to_vec();
-            padded.resize(max_size, 0);
-            ebml::write_binary(&mut self.writer, ebml::CODEC_PRIVATE, &padded)?;
-            self.writer.seek(SeekFrom::Start(current))?;
-            self.codec_private_filled[track_idx] = true;
-        }
         Ok(())
     }
 
@@ -810,6 +770,7 @@ mod tests {
             codec: Codec::Pgs,
             language: "eng".into(),
             forced: true,
+            qualifier: crate::disc::LabelQualifier::Forced,
             codec_data: None,
         });
         assert!(forced_sub.is_forced);
@@ -835,6 +796,7 @@ mod tests {
             codec: Codec::Pgs,
             language: "eng".into(),
             forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
             codec_data: None,
         });
         assert!(!sub.is_forced);

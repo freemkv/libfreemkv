@@ -15,12 +15,6 @@ const TS_PACKET_SIZE: usize = 188;
 /// TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
 
-/// Size of head buffer for PTS/stream scanning (1 MB).
-const SCAN_HEAD_SIZE: usize = 1024 * 1024;
-
-/// Size of tail buffer for last-PTS scanning (2 MB).
-const SCAN_TAIL_SIZE: usize = 2 * 1024 * 1024;
-
 /// A reassembled PES packet with timestamp info.
 #[derive(Debug)]
 pub struct PesPacket {
@@ -104,19 +98,16 @@ pub struct TsDemuxer {
 }
 
 impl TsDemuxer {
-    /// Take the remainder bytes (leftover from last feed() that didn't
-    /// align to a 192-byte packet boundary).
-    pub fn take_remainder(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.remainder)
-    }
-
-    /// Set the remainder bytes. Used to transfer alignment state from
-    /// one demuxer to another without losing sync.
-    pub fn set_remainder(&mut self, data: Vec<u8>) {
-        self.remainder = data;
-    }
-
     /// Create a new demuxer tracking the given PIDs.
+    ///
+    /// Allocates a flat lookup table of `i16` slots — one per possible PID
+    /// up to `max(8192, max_pid + 1)`. The 8192 floor matches the BD-TS
+    /// 13-bit PID space (0..0x1FFF); the variable upper bound exists for
+    /// DVD program streams which may use 16-bit stream IDs above 8191.
+    /// Worst-case allocation is `u16::MAX × 2 bytes ≈ 128 KB` — bounded by
+    /// the type, so adversarial input can't drive this beyond predictable
+    /// limits. Empty `pids` yields max_pid 0; the floor still produces a
+    /// valid (wholly-unused) table.
     pub fn new(pids: &[u16]) -> Self {
         let max_pid = pids.iter().copied().max().unwrap_or(0) as usize;
         let table_size = (max_pid + 1).max(8192);
@@ -446,6 +437,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
                     0x83 => Some(Stream::Audio(AudioStream {
@@ -455,6 +447,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
                     0x84 | 0xA1 => Some(Stream::Audio(AudioStream {
@@ -464,6 +457,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
                     0x85 | 0x86 => Some(Stream::Audio(AudioStream {
@@ -473,6 +467,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
                     0x82 => Some(Stream::Audio(AudioStream {
@@ -482,6 +477,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
                     0x90 => Some(Stream::Subtitle(SubtitleStream {
@@ -489,6 +485,7 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         codec: Codec::Pgs,
                         language: "und".into(),
                         forced: false,
+                        qualifier: crate::disc::LabelQualifier::None,
                         codec_data: None,
                     })),
                     _ => None,
@@ -508,103 +505,6 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         None
     } else {
         Some(streams)
-    }
-}
-
-// ============================================================
-// PTS scanning utilities (for duration detection)
-// ============================================================
-
-/// Find the first PTS for a given PID in BD-TS data.
-pub fn scan_first_pts(data: &[u8], target_pid: u16) -> Option<i64> {
-    let mut offset = 0;
-    while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE {
-            offset += 1;
-            continue;
-        }
-        let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
-        let pusi = data[offset + 5] & 0x40 != 0;
-        if pid == target_pid && pusi {
-            let ts = &data[offset + 4..offset + BD_TS_PACKET_SIZE];
-            let afc = (ts[3] >> 4) & 0x03;
-            let payload_start = if afc == 3 { 5 + ts[4] as usize } else { 4 };
-            if payload_start < TS_PACKET_SIZE {
-                let payload = &ts[payload_start..];
-                if payload.len() >= 14 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1 {
-                    let pts_dts_flags = (payload[7] >> 6) & 0x03;
-                    if pts_dts_flags >= 2 {
-                        return parse_timestamp(&payload[9..14]);
-                    }
-                }
-            }
-        }
-        offset += BD_TS_PACKET_SIZE;
-    }
-    None
-}
-
-/// Find the last PTS for a given PID in BD-TS data.
-pub fn scan_last_pts(data: &[u8], target_pid: u16) -> Option<i64> {
-    let mut last_pts = None;
-    let mut offset = 0;
-    while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE {
-            offset += 1;
-            continue;
-        }
-        let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
-        let pusi = data[offset + 5] & 0x40 != 0;
-        if pid == target_pid && pusi {
-            let ts = &data[offset + 4..offset + BD_TS_PACKET_SIZE];
-            let afc = (ts[3] >> 4) & 0x03;
-            let payload_start = if afc == 3 { 5 + ts[4] as usize } else { 4 };
-            if payload_start < TS_PACKET_SIZE {
-                let payload = &ts[payload_start..];
-                if payload.len() >= 14 && payload[0] == 0 && payload[1] == 0 && payload[2] == 1 {
-                    let pts_dts_flags = (payload[7] >> 6) & 0x03;
-                    if pts_dts_flags >= 2 {
-                        last_pts = parse_timestamp(&payload[9..14]);
-                    }
-                }
-            }
-        }
-        offset += BD_TS_PACKET_SIZE;
-    }
-    last_pts
-}
-
-/// Scan an m2ts file for duration by reading first and last PTS.
-/// Returns duration in seconds, or None if PTS cannot be found.
-/// The reader position is restored after scanning.
-pub fn scan_duration<R: std::io::Read + std::io::Seek>(r: &mut R, video_pid: u16) -> Option<f64> {
-    use std::io::SeekFrom;
-
-    let start_pos = r.stream_position().ok()?;
-
-    // Read first 1MB for first PTS
-    let mut head_buf = vec![0u8; SCAN_HEAD_SIZE];
-    r.seek(SeekFrom::Start(0)).ok()?;
-    let head_n = r.read(&mut head_buf).ok()?;
-    let first_pts = scan_first_pts(&head_buf[..head_n], video_pid)?;
-
-    // Read last 2MB for last PTS (aligned to 192-byte boundary)
-    let file_size = r.seek(SeekFrom::End(0)).ok()?;
-    let tail_size: u64 = SCAN_TAIL_SIZE as u64;
-    let raw_pos = file_size.saturating_sub(tail_size);
-    let seek_pos = (raw_pos / BD_TS_PACKET_SIZE as u64) * BD_TS_PACKET_SIZE as u64;
-    r.seek(SeekFrom::Start(seek_pos)).ok()?;
-    let mut tail_buf = vec![0u8; tail_size as usize];
-    let tail_n = r.read(&mut tail_buf).ok()?;
-    let last_pts = scan_last_pts(&tail_buf[..tail_n], video_pid)?;
-
-    // Restore reader position
-    let _ = r.seek(SeekFrom::Start(start_pos));
-
-    if last_pts > first_pts {
-        Some((last_pts - first_pts) as f64 / 90000.0)
-    } else {
-        None
     }
 }
 

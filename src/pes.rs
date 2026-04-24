@@ -78,26 +78,63 @@ impl PesFrame {
     }
 }
 
-/// A stream. Read from it or write to it. Not both.
+/// A PES frame source or sink. Each implementor is **either** read-only or
+/// write-only — never both.
+///
+/// Implementors fall into two camps:
+///
+/// - **Read sources**: `DiscStream` (drive or ISO), `M2tsStream` (when
+///   constructed from an existing file), `MkvStream` (demux), `NetworkStream`
+///   (TCP listener), `StdioStream::input()`. These return frames from
+///   `read()` and surface `StreamWriteOnly` (E9001) from `write()`.
+/// - **Write sinks**: `MkvStream::create`, `M2tsStream::create`,
+///   `NetworkStream::connect`, `StdioStream::output()`, `NullStream`.
+///   These accept frames in `write()` and surface `StreamReadOnly` (E9000)
+///   from `read()`. Always call `finish()` when done — that's where MKV
+///   writes its `Cues` index and `M2tsStream` flushes the TS muxer.
+///
+/// Direction is established at construction; mixing produces an error code,
+/// not a panic. Most consumers don't construct streams directly — call
+/// `mux::input(url, opts)` / `mux::output(url, title)` and let URL parsing
+/// pick the right type.
+///
+/// `info()` returns the stream's `DiscTitle` metadata (track list, codec
+/// info, duration). For sources it's parsed from the input; for sinks it's
+/// the metadata supplied at creation. Stable across all reads.
+///
+/// `codec_private(track)` exposes per-track initialization data
+/// (H.264 SPS/PPS, HEVC VPS/SPS/PPS, AC-3 fscod, etc.) that some output
+/// formats need before any frame can be written. `headers_ready()` returns
+/// false until enough input frames have been seen to populate every video
+/// track's codec-private blob — callers buffer frames they read until
+/// `headers_ready()` returns true.
 pub trait Stream {
-    /// Read the next frame. Returns None at end of stream.
+    /// Read the next frame, or `Ok(None)` at end of stream. Returns
+    /// `StreamWriteOnly` (E9001) on a write-only sink.
     fn read(&mut self) -> std::io::Result<Option<PesFrame>>;
 
-    /// Write a frame.
+    /// Write a frame to the sink. Returns `StreamReadOnly` (E9000) on a
+    /// read-only source.
     fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
 
-    /// Finalize (flush, write index, close).
+    /// Finalize the stream: flush buffered frames, write any container
+    /// index (MKV `Cues`), close the underlying file/socket. Idempotent
+    /// for read-only streams (no-op).
     fn finish(&mut self) -> std::io::Result<()>;
 
-    /// Stream metadata.
+    /// Stream metadata. Stable across reads — implementors must return a
+    /// consistent reference for the lifetime of the stream.
     fn info(&self) -> &crate::disc::DiscTitle;
 
-    /// Codec initialization data for a track (SPS/PPS, etc).
+    /// Codec initialization data for a track (SPS/PPS, AC-3 fscod, etc.).
+    /// `None` for tracks that don't need codec_private (raw passthrough).
     fn codec_private(&self, _track: usize) -> Option<Vec<u8>> {
         None
     }
 
-    /// True when codec_private is available for all video tracks.
+    /// True when `codec_private` is available for every video track —
+    /// callers buffer input frames until this flips, since some output
+    /// formats (MKV) can't write frames without codec init data.
     fn headers_ready(&self) -> bool {
         true
     }

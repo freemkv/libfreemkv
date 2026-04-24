@@ -30,6 +30,7 @@ fn sample_disc_title() -> DiscTitle {
                 language: "eng".into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "English Atmos".into(),
             }),
             Stream::Audio(AudioStream {
@@ -39,6 +40,7 @@ fn sample_disc_title() -> DiscTitle {
                 language: "fra".into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "French".into(),
             }),
             Stream::Subtitle(SubtitleStream {
@@ -46,6 +48,7 @@ fn sample_disc_title() -> DiscTitle {
                 codec: Codec::Pgs,
                 language: "eng".into(),
                 forced: false,
+                qualifier: libfreemkv::LabelQualifier::None,
                 codec_data: None,
             }),
         ],
@@ -404,6 +407,7 @@ fn meta_codec_roundtrip() {
             language: "eng".into(),
             sample_rate: SampleRate::S48,
             secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
             label: String::new(),
         }));
     }
@@ -413,6 +417,7 @@ fn meta_codec_roundtrip() {
             codec,
             language: "eng".into(),
             forced: false,
+            qualifier: libfreemkv::LabelQualifier::None,
             codec_data: None,
         }));
     }
@@ -501,6 +506,7 @@ fn meta_all_stream_types() {
                 language: "eng".into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "Primary Audio".into(),
             }),
             Stream::Subtitle(SubtitleStream {
@@ -508,6 +514,7 @@ fn meta_all_stream_types() {
                 codec: Codec::Pgs,
                 language: "fra".into(),
                 forced: true,
+                qualifier: libfreemkv::LabelQualifier::None,
                 codec_data: None,
             }),
             Stream::Audio(AudioStream {
@@ -517,6 +524,7 @@ fn meta_all_stream_types() {
                 language: "eng".into(),
                 sample_rate: SampleRate::S48,
                 secondary: true,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "Commentary".into(),
             }),
         ],
@@ -623,6 +631,7 @@ fn mkvstream_roundtrip_bdts() {
             language: "eng".into(),
             sample_rate: SampleRate::S48,
             secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
             label: "English".into(),
         })],
         chapters: Vec::new(),
@@ -679,6 +688,7 @@ fn mkvstream_meta_preserves_all_streams() {
                 language: "eng".into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "English".into(),
             }),
             Stream::Audio(AudioStream {
@@ -688,6 +698,7 @@ fn mkvstream_meta_preserves_all_streams() {
                 language: "fra".into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
+                purpose: libfreemkv::LabelPurpose::Normal,
                 label: "French".into(),
             }),
             Stream::Subtitle(SubtitleStream {
@@ -695,6 +706,7 @@ fn mkvstream_meta_preserves_all_streams() {
                 codec: Codec::Pgs,
                 language: "eng".into(),
                 forced: false,
+                qualifier: libfreemkv::LabelQualifier::None,
                 codec_data: None,
             }),
             Stream::Subtitle(SubtitleStream {
@@ -702,6 +714,7 @@ fn mkvstream_meta_preserves_all_streams() {
                 codec: Codec::Pgs,
                 language: "fra".into(),
                 forced: true,
+                qualifier: libfreemkv::LabelQualifier::None,
                 codec_data: None,
             }),
         ],

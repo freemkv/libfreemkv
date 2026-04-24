@@ -815,10 +815,8 @@ fn create_driver(
     match platform {
         profile::Platform::Mt1959A => Ok(Box::new(Mt1959::new(profile.clone(), false))),
         profile::Platform::Mt1959B => Ok(Box::new(Mt1959::new(profile.clone(), true))),
-        profile::Platform::Renesas => Err(Error::UnsupportedDrive {
-            vendor_id: profile.identity.vendor_id.trim().to_string(),
-            product_id: String::new(),
-            product_revision: "Renesas not yet implemented".to_string(),
+        profile::Platform::Renesas => Err(Error::PlatformNotImplemented {
+            platform: "renesas".to_string(),
         }),
     }
 }

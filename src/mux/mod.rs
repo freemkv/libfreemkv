@@ -15,22 +15,32 @@
 //!
 //! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
 
+// Public modules — types here are intentionally part of the consumable API.
 pub mod codec;
 pub mod disc;
-pub mod ebml;
 pub mod iso;
-mod m2ts;
-pub mod meta;
-pub mod mkv;
-mod mkvstream;
-pub mod network;
-pub mod null;
-pub mod ps;
 pub mod resolve;
-pub mod stdio;
-pub mod ts;
-pub mod tsmux;
-pub mod tsreader;
+
+// Internal modules — implementation details. Their *types* are re-exported
+// where appropriate (`MkvStream`, `M2tsStream`, etc. surface from `lib.rs`),
+// but the module paths themselves are not part of the API. Pre-0.13 these
+// were `pub`, leaking low-level EBML primitives, TS muxer internals, and
+// network/stdio implementations that no external caller had business
+// reaching for.
+pub(crate) mod ebml;
+pub(crate) mod m2ts;
+/// FMKV metadata header (used by `M2tsStream` / `NetworkStream` / `StdioStream`
+/// to round-trip codec_privates that don't fit inside the underlying format).
+/// Exposed for integration tests that exercise the wire format directly.
+pub mod meta;
+pub(crate) mod mkv;
+pub(crate) mod mkvstream;
+pub(crate) mod network;
+pub(crate) mod null;
+pub(crate) mod ps;
+pub(crate) mod stdio;
+pub(crate) mod ts;
+pub(crate) mod tsmux;
 
 pub use disc::DiscStream;
 pub use iso::IsoSectorReader;
@@ -43,6 +53,13 @@ pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};
 
-// WriteSeek — used internally by MKV muxer (container format requires seeking).
+/// Combined `Write + Seek` for sinks accepted by the MKV muxer.
+///
+/// Matroska's `SeekHead`, `Cues`, and `Cluster` size fields are written with
+/// placeholder values during streaming and updated in-place at finalization,
+/// so the output sink must support seeking. Provided as a single trait
+/// alias so callers don't have to repeat `Write + Seek` everywhere; the
+/// blanket impl below opts every `T: Write + Seek` in automatically
+/// (`File`, `BufWriter<File>`, `Cursor<Vec<u8>>`).
 pub trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}

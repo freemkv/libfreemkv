@@ -82,8 +82,8 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        Err(Error::DeviceNotFound {
-            path: format!("{}: unsupported platform", device.display()),
+        Err(Error::UnsupportedPlatform {
+            target: std::env::consts::OS.to_string(),
         })
     }
 }

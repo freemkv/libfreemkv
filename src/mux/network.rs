@@ -144,6 +144,7 @@ mod tests {
                     language: "eng".into(),
                     sample_rate: SampleRate::S48,
                     secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
                     label: "English".into(),
                 }),
             ],

@@ -171,17 +171,18 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
     let parsed = parse_url(url);
     match parsed {
         StreamUrl::Disc { .. } => {
-            // Disc sources should use DiscStream::new() directly.
-            // The caller opens the drive, inits, scans, then creates the stream.
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Use Drive::open() + Disc::scan() + DiscStream::new() for disc sources",
-            ))
+            // Disc sources require live SCSI state — caller must use
+            // `Drive::open() + Disc::scan() + DiscStream::new()` directly.
+            // Surfaced as a typed error (no English commentary in the
+            // library; the CLI/UI explains the right entry point).
+            Err(crate::error::Error::DiscUrlNotDirect.into())
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
             let scan_opts = match &opts.keydb_path {
-                Some(p) => crate::disc::ScanOptions::with_keydb(p),
+                Some(p) => crate::disc::ScanOptions {
+                    keydb_path: Some(p.into()),
+                },
                 None => crate::disc::ScanOptions::default(),
             };
             let mut reader = super::iso::IsoSectorReader::open(&path.to_string_lossy())?;
@@ -210,17 +211,13 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::open(path).map_err(|e| {
-                io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e))
-            })?;
+            let file = std::fs::File::open(path)?;
             let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::open(reader)?))
         }
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            let file = std::fs::File::open(path).map_err(|e| {
-                io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e))
-            })?;
+            let file = std::fs::File::open(path)?;
             let reader = std::io::BufReader::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(MkvStream::open(reader)?))
         }
@@ -245,18 +242,14 @@ pub fn output(
     match parsed {
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
-            let file = std::fs::File::create(path).map_err(|e| {
-                io::Error::new(e.kind(), format!("mkv://{}: {}", path.display(), e))
-            })?;
+            let file = std::fs::File::create(path)?;
             let writer: Box<dyn super::WriteSeek> =
                 Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
             Ok(Box::new(MkvStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
-            let file = std::fs::File::create(path).map_err(|e| {
-                io::Error::new(e.kind(), format!("m2ts://{}: {}", path.display(), e))
-            })?;
+            let file = std::fs::File::create(path)?;
             let writer = std::io::BufWriter::with_capacity(IO_BUF_SIZE, file);
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
