@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.1 (2026-04-24)
+
+### `scsi::reset()` now has a hard wallclock timeout
+
+Production incident on a wedged BU40N USB drive: autorip's poll loop
+called `scsi::reset()` and the call hung for 60+ seconds before the
+operator manually intervened. Root cause: the Linux `SG_SCSI_RESET`
+ioctl can block indefinitely when the kernel SCSI subsystem is waiting
+on a bus-wedged device that will never ack — there's no kernel-side
+timeout on this ioctl. Without an outer wallclock bound the caller's
+thread is stuck in the kernel until the device unwedges (which, for a
+permanently-dead USB target, may be never).
+
+`scsi::reset()` is now a wrapper that runs the platform-specific reset
+on a detached worker thread and bounds the caller's wait via
+`mpsc::recv_timeout(DEFAULT_RESET_TIMEOUT_SECS)` (30 s). Returns
+`DeviceResetFailed` on timeout. The worker thread keeps running until
+the kernel eventually unblocks (we can't cancel a Linux ioctl from
+userspace) — this leaks one OS thread per hard wedge, an acceptable
+cost for a daemon that recovers vs. one that hangs.
+
+- New `pub const DEFAULT_RESET_TIMEOUT_SECS: u64 = 30;`
+- New `pub fn reset_with_timeout(device, Duration) -> Result<()>` for
+  callers that want a different bound.
+- Existing `pub fn reset(device) -> Result<()>` keeps the same
+  signature; behaviour change is the timeout, not the API.
+
+### Follow-up flagged
+
+`SG_SCSI_RESET` only resets at the SCSI layer. For USB-attached drives
+(the BU40N case), the wedge is often in the USB Mass Storage layer
+*below* SCSI — `SG_SCSI_RESET` doesn't help. The proper escalation is
+`USBDEVFS_RESET` (the `usbreset.c` ioctl), which re-enumerates the
+device at the USB layer. Tracked for 0.13.2: a `scsi::usb_reset(path)`
+that resolves sg → USB device and issues `USBDEVFS_RESET`. That would
+have recovered tonight's BU40N without operator intervention.
+
 ## 0.13.0 (2026-04-24)
 
 ### Zero English in library — typed variants for every error path
