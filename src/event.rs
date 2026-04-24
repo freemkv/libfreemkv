@@ -80,14 +80,21 @@ pub enum EventKind {
         sector_count: u64,
     },
 
-    /// Binary search isolated and recovered a marginal sector.
+    /// Sector recovered after a retry (Drive::read multi-phase recovery).
     SectorRecovered { sector: u64 },
 
     /// Sector unreadable, zero-filled (skip mode).
     SectorSkipped { sector: u64 },
 
-    /// Binary search activated — batch failed, isolating bad sector.
-    BinarySearch { sector: u64, batch_size: u16 },
+    /// Adaptive batch sizer changed the read size.
+    ///
+    /// Fires on shrink (read failed at larger size) and on probe-up
+    /// (enough clean reads to try larger again). Consumers use this to
+    /// display a "recovering" state distinct from "ripping normally".
+    BatchSizeChanged {
+        new_size: u16,
+        reason: BatchSizeReason,
+    },
 
     /// Operation complete.
     Complete {
@@ -96,6 +103,15 @@ pub enum EventKind {
         /// Total read errors encountered.
         errors: u32,
     },
+}
+
+/// Why the adaptive batch sizer changed size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSizeReason {
+    /// Read failed; sizer halved the batch.
+    Shrunk,
+    /// Clean-read streak threshold hit; sizer doubled toward preferred.
+    Probed,
 }
 
 /// A no-op event handler. Ignores all events.

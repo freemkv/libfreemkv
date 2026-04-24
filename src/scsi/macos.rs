@@ -455,8 +455,9 @@ fn walk_to_authoring_device(start: IOObject) -> Option<IOObject> {
     // Walk up to 10 levels (more than enough)
     for _ in 0..10 {
         let mut parent: IOObject = 0;
-        let kr =
-            unsafe { IORegistryEntryGetParentEntry(current, b"IOService\0".as_ptr(), &mut parent) };
+        let kr = unsafe {
+            IORegistryEntryGetParentEntry(current, c"IOService".as_ptr() as *const u8, &mut parent)
+        };
 
         if current != start {
             unsafe { IOObjectRelease(current) };

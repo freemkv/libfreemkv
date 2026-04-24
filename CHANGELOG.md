@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.17 (2026-04-23)
+
+### Adaptive batch sizer in DiscStream — no more per-sector descent
+
+Rip recovery rewritten. The old binary-search-per-bad-sector model paid the full descent (batch → half → quarter → … → single) for every bad sector in a region. On a damaged disc with 600 consecutive bad sectors this took 12+ hours. The new algorithm pays the descent once, remembers the working size, and ramps back up only after a sustained clean streak.
+
+- **`BatchSizeChanged { new_size, reason }` event** — fires on shrink (read failed) and probe-up (clean streak threshold hit). Consumers use this to distinguish a "recovering" rip from a normal one.
+- **Removed `BinarySearch` and `SectorRecovered` emissions from DiscStream** — no longer produced by the rip path. `SectorRecovered` still fires from `Drive::read`'s multi-phase recovery (unused by rips today, but kept for scan/other callers).
+- **Removed `read_with_binary_search` and the 3×5s light-recovery loop** — no retry loops, no sleeps. One 5s attempt per read. On size-1 failure, skip (zero-fill) or error.
+- **Probe-up threshold: 100 MiB (51,200 sectors) of clean reading at current size** before doubling toward preferred. Ramp 1 → preferred on good reading takes ~100 seconds for a typical BD — trivial vs. rip duration, conservative enough that a single lucky sector in a marginal zone can't trigger a premature probe.
+- **Bad-region math**: ~600 consecutive bad sectors now complete in ~50 min (600 × 5s) instead of ~12h. The descent is O(log preferred) one time, not per sector.
+
+### macOS
+
+- Fix new clippy lint (`manual_c_str_literals`) in `scsi/macos.rs`.
+
 ## 0.11.16 (2026-04-21)
 
 ### API cleanup — one method per action
