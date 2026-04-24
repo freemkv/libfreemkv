@@ -20,6 +20,11 @@ use crate::udf;
 
 use encrypt::HandshakeResult;
 
+// Re-export label classification enums alongside AudioStream / SubtitleStream
+// so the public surface keeps the structured metadata together. Callers map
+// these to display text in their own locale.
+pub use crate::labels::{LabelPurpose, LabelQualifier};
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// A scanned Blu-ray disc.
@@ -180,7 +185,11 @@ pub struct AudioStream {
     pub sample_rate: SampleRate,
     /// Whether this is a secondary stream (commentary)
     pub secondary: bool,
-    /// Extra label
+    /// Stream purpose (commentary / descriptive / score / IME / normal).
+    /// Callers translate this to display text in their own locale.
+    pub purpose: LabelPurpose,
+    /// Codec / variant text (e.g. "Dolby TrueHD 5.1", "(US)").
+    /// NEVER contains English purpose words — see `purpose` for that.
     pub label: String,
 }
 
@@ -195,6 +204,9 @@ pub struct SubtitleStream {
     pub language: String,
     /// Whether this is a forced subtitle
     pub forced: bool,
+    /// Subtitle qualifier (SDH / descriptive service / forced / none).
+    /// Callers translate this to display text in their own locale.
+    pub qualifier: LabelQualifier,
     /// Pre-formatted codec private data (e.g. VobSub .idx palette header)
     pub codec_data: Option<Vec<u8>>,
 }
@@ -889,13 +901,6 @@ pub struct ScanOptions {
 }
 
 impl ScanOptions {
-    /// Create options with a specific KEYDB path.
-    pub fn with_keydb(path: impl Into<std::path::PathBuf>) -> Self {
-        ScanOptions {
-            keydb_path: Some(path.into()),
-        }
-    }
-
     /// Resolve KEYDB path: explicit path first, then standard locations.
     fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
         if let Some(p) = &self.keydb_path {

@@ -17,6 +17,10 @@ use crate::disc::{DiscTitle, Stream};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 
+// Re-exported via crate::disc — the public API surfaces these next to
+// AudioStream/SubtitleStream so callers can map purpose/qualifier to display
+// text in their own locale.
+
 /// A stream label extracted from disc config files.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -46,7 +50,6 @@ pub enum StreamLabelType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum LabelPurpose {
     Normal,
     Commentary,
@@ -99,16 +102,12 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
                     if let Some(label) = labels.iter().find(|l| {
                         l.stream_type == StreamLabelType::Audio && l.stream_number == audio_idx
                     }) {
+                        // Structured fields — callers translate purpose to UI text.
+                        a.purpose = label.purpose;
+
+                        // a.label only carries codec/variant info. NEVER any
+                        // English purpose text — the CLI handles that via i18n.
                         let mut parts = Vec::new();
-                        match label.purpose {
-                            LabelPurpose::Commentary => parts.push("Commentary".to_string()),
-                            LabelPurpose::Descriptive => {
-                                parts.push("Descriptive Audio".to_string())
-                            }
-                            LabelPurpose::Score => parts.push("Score".to_string()),
-                            LabelPurpose::Ime => parts.push("IME".to_string()),
-                            LabelPurpose::Normal => {}
-                        }
                         if !label.variant.is_empty() {
                             parts.push(format!("({})", label.variant));
                         }
@@ -117,7 +116,10 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
                         }
                         if !parts.is_empty() {
                             a.label = parts.join(" ");
-                        } else if !label.name.is_empty() {
+                        } else if !label.name.is_empty() && label.purpose == LabelPurpose::Normal {
+                            // Only fall back to the parser-supplied display
+                            // name when there's no purpose to flag — the CLI
+                            // handles purpose rendering itself.
                             a.label = label.name.clone();
                         }
                     }
@@ -127,6 +129,7 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
                     if let Some(label) = labels.iter().find(|l| {
                         l.stream_type == StreamLabelType::Subtitle && l.stream_number == sub_idx
                     }) {
+                        s.qualifier = label.qualifier;
                         if label.qualifier == LabelQualifier::Forced {
                             s.forced = true;
                         }
@@ -173,9 +176,12 @@ fn generate_video_label(
     use crate::disc::HdrFormat;
 
     if secondary {
+        // "Dolby Vision EL" is a brand identifier, not English prose, so the
+        // library may emit it. Other "secondary video" wording is a CLI
+        // concern — the library just leaves the label empty.
         return match hdr {
             HdrFormat::DolbyVision => "Dolby Vision EL".to_string(),
-            _ => "Secondary Video".to_string(),
+            _ => String::new(),
         };
     }
 
@@ -217,11 +223,12 @@ fn generate_video_label(
 fn generate_audio_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
-    secondary: bool,
+    _secondary: bool,
 ) -> String {
     use crate::disc::{AudioChannels, Codec};
 
-    // Full marketing names for disc audio codecs
+    // Full marketing names for disc audio codecs.
+    // These are codec brand identifiers, not user-facing English prose.
     let codec_name = match codec {
         Codec::TrueHd => "Dolby TrueHD",
         Codec::Ac3 => "Dolby Digital",
@@ -251,12 +258,12 @@ fn generate_audio_label(
         AudioChannels::Unknown => "",
     };
 
-    let suffix = if secondary { " (Secondary)" } else { "" };
-
+    // The "(Secondary)" suffix is a CLI/UI concern — callers display it from
+    // the AudioStream::secondary bool, not the library.
     if channel_str.is_empty() {
-        format!("{}{}", codec_name, suffix)
+        codec_name.to_string()
     } else {
-        format!("{} {}{}", codec_name, channel_str, suffix)
+        format!("{} {}", codec_name, channel_str)
     }
 }
 

@@ -48,6 +48,7 @@ impl Disc {
                         language: a.language.clone(),
                         sample_rate: SampleRate::from_hz(a.sample_rate),
                         secondary: false,
+                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })
                 })
@@ -92,6 +93,7 @@ impl Disc {
                             codec: Codec::DvdSub,
                             language: s.language.clone(),
                             forced: false,
+                            qualifier: crate::disc::LabelQualifier::None,
                             codec_data: codec_data.clone(),
                         })
                     })

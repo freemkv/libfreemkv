@@ -24,10 +24,15 @@ pub const E_DEVICE_NOT_FOUND: u16 = 1000;
 pub const E_DEVICE_PERMISSION: u16 = 1001;
 pub const E_DEVICE_NOT_READY: u16 = 1002;
 pub const E_DEVICE_RESET_FAILED: u16 = 1003;
+pub const E_SCSI_INTERFACE_UNAVAILABLE: u16 = 1004;
+pub const E_DEVICE_LOCKED: u16 = 1005;
+pub const E_IOKIT_PLUGIN_FAILED: u16 = 1006;
 
 // Profile (2xxx)
 pub const E_UNSUPPORTED_DRIVE: u16 = 2000;
 pub const E_PROFILE_PARSE: u16 = 2002;
+pub const E_UNSUPPORTED_PLATFORM: u16 = 2003;
+pub const E_PLATFORM_NOT_IMPLEMENTED: u16 = 2004;
 
 // Unlock (3xxx)
 pub const E_UNLOCK_FAILED: u16 = 3000;
@@ -49,6 +54,7 @@ pub const E_DISC_TITLE_RANGE: u16 = 6005;
 pub const E_IFO_PARSE: u16 = 6007;
 pub const E_MKV_INVALID: u16 = 6008;
 pub const E_NO_STREAMS: u16 = 6009;
+pub const E_MAPFILE_INVALID: u16 = 6011;
 
 // AACS (7xxx)
 pub const E_AACS_NO_KEYS: u16 = 7000;
@@ -84,6 +90,7 @@ pub const E_PES_FRAME_TOO_LARGE: u16 = 9005;
 pub const E_PES_INVALID_MAGIC: u16 = 9006;
 pub const E_ISO_TOO_LARGE: u16 = 9007;
 pub const E_NO_METADATA: u16 = 9008;
+pub const E_DISC_URL_NOT_DIRECT: u16 = 9009;
 
 // ── Error enum ──────────────────────────────────────────────────────────────
 
@@ -103,6 +110,24 @@ pub enum Error {
     DeviceResetFailed {
         path: String,
     },
+    /// Platform-specific SCSI interface couldn't be obtained from the OS
+    /// (macOS: `SCSITaskDeviceInterface` unavailable). The `path` field
+    /// carries the device path; no English commentary on the failure mode.
+    ScsiInterfaceUnavailable {
+        path: String,
+    },
+    /// Device is held by another process / kernel state. `kr` is the
+    /// platform return code (macOS IOReturn, Linux errno-equivalent).
+    DeviceLocked {
+        path: String,
+        kr: u32,
+    },
+    /// macOS IOKit plugin couldn't be created for this device. `kr` is
+    /// the IOReturn code from `IOCreatePlugInInterfaceForService`.
+    IoKitPluginFailed {
+        path: String,
+        kr: u32,
+    },
 
     // Profile (2xxx)
     UnsupportedDrive {
@@ -111,6 +136,16 @@ pub enum Error {
         product_revision: String,
     },
     ProfileParse,
+    /// SCSI transport was requested on an OS without a backend
+    /// implementation. `target` is the `std::env::consts::OS` value.
+    UnsupportedPlatform {
+        target: String,
+    },
+    /// Drive matched a known platform that we haven't implemented yet
+    /// (e.g. Renesas firmware). `platform` is a stable identifier.
+    PlatformNotImplemented {
+        platform: String,
+    },
 
     // Unlock (3xxx)
     UnlockFailed,
@@ -149,6 +184,12 @@ pub enum Error {
     IfoParse,
     MkvInvalid,
     NoStreams,
+    /// ddrescue mapfile parse failed. `kind` is a stable, language-neutral
+    /// identifier (e.g. `"status_char"`, `"hex"`); not a translatable
+    /// English message.
+    MapfileInvalid {
+        kind: &'static str,
+    },
 
     // AACS (7xxx)
     AacsNoKeys,
@@ -202,6 +243,10 @@ pub enum Error {
         path: String,
     },
     NoMetadata,
+    /// `disc://` URLs aren't openable through `input()` — callers must use
+    /// `Drive::open() + Disc::scan() + DiscStream::new()` directly. This
+    /// is a structural API constraint, not a parse failure.
+    DiscUrlNotDirect,
 }
 
 impl Error {
@@ -211,8 +256,13 @@ impl Error {
             Error::DevicePermission { .. } => E_DEVICE_PERMISSION,
             Error::DeviceNotReady { .. } => E_DEVICE_NOT_READY,
             Error::DeviceResetFailed { .. } => E_DEVICE_RESET_FAILED,
+            Error::ScsiInterfaceUnavailable { .. } => E_SCSI_INTERFACE_UNAVAILABLE,
+            Error::DeviceLocked { .. } => E_DEVICE_LOCKED,
+            Error::IoKitPluginFailed { .. } => E_IOKIT_PLUGIN_FAILED,
             Error::UnsupportedDrive { .. } => E_UNSUPPORTED_DRIVE,
             Error::ProfileParse => E_PROFILE_PARSE,
+            Error::UnsupportedPlatform { .. } => E_UNSUPPORTED_PLATFORM,
+            Error::PlatformNotImplemented { .. } => E_PLATFORM_NOT_IMPLEMENTED,
             Error::UnlockFailed => E_UNLOCK_FAILED,
             Error::SignatureMismatch { .. } => E_SIGNATURE_MISMATCH,
             Error::ScsiError { .. } => E_SCSI_ERROR,
@@ -226,6 +276,7 @@ impl Error {
             Error::IfoParse => E_IFO_PARSE,
             Error::MkvInvalid => E_MKV_INVALID,
             Error::NoStreams => E_NO_STREAMS,
+            Error::MapfileInvalid { .. } => E_MAPFILE_INVALID,
             Error::AacsNoKeys => E_AACS_NO_KEYS,
             Error::AacsCertShort => E_AACS_CERT_SHORT,
             Error::AacsAgidAlloc => E_AACS_AGID_ALLOC,
@@ -255,6 +306,7 @@ impl Error {
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::IsoTooLarge { .. } => E_ISO_TOO_LARGE,
             Error::NoMetadata => E_NO_METADATA,
+            Error::DiscUrlNotDirect => E_DISC_URL_NOT_DIRECT,
         }
     }
 }
@@ -267,6 +319,22 @@ impl std::fmt::Display for Error {
             Error::DevicePermission { path } => write!(f, "E{}: {}", self.code(), path),
             Error::DeviceNotReady { path } => write!(f, "E{}: {}", self.code(), path),
             Error::DeviceResetFailed { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::ScsiInterfaceUnavailable { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::DeviceLocked { path, kr } => {
+                write!(f, "E{}: {} 0x{:08x}", self.code(), path, kr)
+            }
+            Error::IoKitPluginFailed { path, kr } => {
+                write!(f, "E{}: {} 0x{:08x}", self.code(), path, kr)
+            }
+            Error::UnsupportedPlatform { target } => {
+                write!(f, "E{}: {}", self.code(), target)
+            }
+            Error::PlatformNotImplemented { platform } => {
+                write!(f, "E{}: {}", self.code(), platform)
+            }
+            Error::MapfileInvalid { kind } => {
+                write!(f, "E{}: {}", self.code(), kind)
+            }
             Error::UnsupportedDrive {
                 vendor_id,
                 product_id,
@@ -357,7 +425,10 @@ impl From<Error> for std::io::Error {
             7000..=7999 => std::io::ErrorKind::PermissionDenied,
             8000..=8999 => std::io::ErrorKind::Other,
             9000..=9001 => std::io::ErrorKind::Unsupported,
-            9002..=9009 => std::io::ErrorKind::InvalidInput,
+            9002..=9008 => std::io::ErrorKind::InvalidInput,
+            // 9009 DiscUrlNotDirect: structurally unsupported entry point,
+            // not a parse failure — caller used the wrong API.
+            9009 => std::io::ErrorKind::Unsupported,
             _ => std::io::ErrorKind::Other,
         };
         std::io::Error::new(kind, msg)
@@ -366,3 +437,141 @@ impl From<Error> for std::io::Error {
 
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    //! Smoke tests for the error code → variant mapping. Each new variant
+    //! added in 0.13.0 (English-elimination work) gets a code() check + a
+    //! Display sanity-check (no English words) + an io::ErrorKind mapping
+    //! check. Without these, future drift between the const codes and the
+    //! match arms in `code()` / the From impl could silently miscategorize.
+    use super::*;
+
+    #[test]
+    fn new_variants_have_distinct_codes() {
+        let codes = [
+            Error::ScsiInterfaceUnavailable { path: "p".into() }.code(),
+            Error::DeviceLocked {
+                path: "p".into(),
+                kr: 0,
+            }
+            .code(),
+            Error::IoKitPluginFailed {
+                path: "p".into(),
+                kr: 0,
+            }
+            .code(),
+            Error::UnsupportedPlatform { target: "x".into() }.code(),
+            Error::PlatformNotImplemented {
+                platform: "renesas".into(),
+            }
+            .code(),
+            Error::MapfileInvalid { kind: "hex" }.code(),
+            Error::DiscUrlNotDirect.code(),
+        ];
+        let mut sorted = codes.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            codes.len(),
+            "two new variants share a code — check error.rs constants"
+        );
+    }
+
+    #[test]
+    fn display_emits_no_english_words() {
+        // Every variant's Display must be `E{code}: {data}` — no English.
+        // Sample a few of the new variants and a few existing ones to
+        // catch accidental string-stuffing in future edits.
+        let cases: &[(Error, u16)] = &[
+            (
+                Error::ScsiInterfaceUnavailable {
+                    path: "/dev/sg4".into(),
+                },
+                E_SCSI_INTERFACE_UNAVAILABLE,
+            ),
+            (
+                Error::DeviceLocked {
+                    path: "/dev/sg4".into(),
+                    kr: 0xE00002C5,
+                },
+                E_DEVICE_LOCKED,
+            ),
+            (
+                Error::UnsupportedPlatform {
+                    target: "freebsd".into(),
+                },
+                E_UNSUPPORTED_PLATFORM,
+            ),
+            (
+                Error::PlatformNotImplemented {
+                    platform: "renesas".into(),
+                },
+                E_PLATFORM_NOT_IMPLEMENTED,
+            ),
+            (Error::MapfileInvalid { kind: "hex" }, E_MAPFILE_INVALID),
+            (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
+        ];
+        for (e, want_code) in cases {
+            let s = e.to_string();
+            assert!(
+                s.starts_with(&format!("E{}", want_code)),
+                "{:?} display does not lead with code: {}",
+                e,
+                s
+            );
+            // Crude English filter — `Display` should never emit ASCII words
+            // longer than 4 chars (codes/paths/identifiers like `/dev/sg4`,
+            // `renesas`, `freebsd` all pass; "exclusive access denied" would
+            // not).
+            for word in s.split(|c: char| !c.is_ascii_alphabetic()) {
+                assert!(
+                    word.len() <= 8
+                        || word.eq_ignore_ascii_case("renesas")
+                        || word.eq_ignore_ascii_case("freebsd"),
+                    "Display contains suspicious English-looking word `{word}` in `{s}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iokind_mapping_for_new_variants() {
+        use std::io::ErrorKind;
+        let mapped = |e: Error| -> ErrorKind {
+            let io: std::io::Error = e.into();
+            io.kind()
+        };
+        // 1xxx range → NotFound
+        assert_eq!(
+            mapped(Error::ScsiInterfaceUnavailable { path: "p".into() }),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            mapped(Error::DeviceLocked {
+                path: "p".into(),
+                kr: 0
+            }),
+            ErrorKind::NotFound
+        );
+        // 2xxx range → Unsupported
+        assert_eq!(
+            mapped(Error::UnsupportedPlatform { target: "x".into() }),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            mapped(Error::PlatformNotImplemented {
+                platform: "x".into()
+            }),
+            ErrorKind::Unsupported
+        );
+        // 6xxx range → InvalidData
+        assert_eq!(
+            mapped(Error::MapfileInvalid { kind: "hex" }),
+            ErrorKind::InvalidData
+        );
+        // 9009 special-cased to Unsupported
+        assert_eq!(mapped(Error::DiscUrlNotDirect), ErrorKind::Unsupported);
+    }
+}

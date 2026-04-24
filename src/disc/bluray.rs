@@ -132,6 +132,7 @@ impl Disc {
                                 codec,
                                 language: s.language.clone(),
                                 forced: false,
+                                qualifier: crate::disc::LabelQualifier::None,
                                 codec_data: None,
                             }))
                         } else {
@@ -142,6 +143,7 @@ impl Disc {
                                 language: s.language.clone(),
                                 sample_rate: SampleRate::from_audio_rate(s.audio_rate),
                                 secondary: s.stream_type == 5,
+                                purpose: crate::disc::LabelPurpose::Normal,
                                 label: String::new(),
                             }))
                         }
@@ -151,6 +153,7 @@ impl Disc {
                         codec,
                         language: s.language.clone(),
                         forced: false,
+                        qualifier: crate::disc::LabelQualifier::None,
                         codec_data: None,
                     })),
                     // Stream type 4 = IG, unknown types -- skip

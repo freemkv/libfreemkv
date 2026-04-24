@@ -173,6 +173,7 @@ impl M2tsMeta {
                         .parse()
                         .unwrap_or(crate::disc::SampleRate::Unknown),
                     secondary: *secondary,
+                    purpose: crate::disc::LabelPurpose::Normal,
                     label: label.clone(),
                 }),
                 MetaStream::Subtitle {
@@ -185,6 +186,7 @@ impl M2tsMeta {
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
                     language: language.clone(),
                     forced: *forced,
+                    qualifier: crate::disc::LabelQualifier::None,
                     codec_data: None,
                 }),
             })

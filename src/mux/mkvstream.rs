@@ -380,6 +380,7 @@ fn parse_track(
             language: lang,
             sample_rate: srs,
             secondary: false,
+            purpose: crate::disc::LabelPurpose::Normal,
             label: name,
         })),
         17 => Some(crate::disc::Stream::Subtitle(SubtitleStream {
@@ -387,6 +388,7 @@ fn parse_track(
             codec,
             language: lang,
             forced,
+            qualifier: crate::disc::LabelQualifier::None,
             codec_data: None,
         })),
         _ => None,

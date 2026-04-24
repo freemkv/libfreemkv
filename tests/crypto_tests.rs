@@ -361,7 +361,9 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
         plaintext[off] = 0x47;
         off += 192;
     }
-    // Fill the rest with a recognisable pattern (prime modulus avoids artefacts)
+    // Fill the rest with a recognisable pattern (prime modulus avoids artefacts).
+    // Index-arithmetic — clearer with a counted loop than an enumerate chain.
+    #[allow(clippy::needless_range_loop)]
     for i in 16..aacs::ALIGNED_UNIT_LEN {
         if plaintext[i] == 0 {
             plaintext[i] = (i % 251) as u8;
@@ -462,6 +464,7 @@ fn aacs_bus_decrypt_cross_validation() {
     ];
 
     let mut plaintext = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..aacs::ALIGNED_UNIT_LEN {
         plaintext[i] = ((i * 3 + 17) & 0xFF) as u8;
     }
@@ -494,6 +497,7 @@ fn css_roundtrip_with_snapshot() {
     let mut sector = vec![0x00u8; 2048];
     sector[0x14] = 0x30;
     sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+    #[allow(clippy::needless_range_loop)]
     for i in 0x80..2048 {
         sector[i] = ((i * 7 + 3) & 0xFF) as u8;
     }
@@ -661,6 +665,7 @@ fn css_recover_title_key_with_exact_plaintext() {
     sector[0x54..0x59].copy_from_slice(&seed);
     let pes_header: [u8; 10] = [0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
     sector[0x80..0x8A].copy_from_slice(&pes_header);
+    #[allow(clippy::needless_range_loop)]
     for i in 0x8A..2048 {
         sector[i] = ((i * 13 + 7) & 0xFF) as u8;
     }

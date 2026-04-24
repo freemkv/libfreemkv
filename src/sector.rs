@@ -39,10 +39,12 @@ impl FileSectorReader {
         let len = file.metadata()?.len();
         let sectors = len / 2048;
         if sectors > u32::MAX as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{path}: image too large, max ~8 TB"),
-            ));
+            // ~8 TB hard cap (u32::MAX × 2048 bytes). Path lives in the
+            // typed Error variant — no English in the message.
+            return Err(crate::error::Error::IsoTooLarge {
+                path: path.to_string(),
+            }
+            .into());
         }
         let capacity = sectors as u32;
         Ok(Self {
