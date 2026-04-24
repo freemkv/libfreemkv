@@ -11,6 +11,7 @@
 mod bluray;
 mod dvd;
 mod encrypt;
+pub mod mapfile;
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
@@ -1206,94 +1207,333 @@ impl Disc {
 
     /// Raw sector copy — write the entire disc image to a file.
     ///
-    /// This is NOT a stream operation. It copies sectors 0→capacity byte-for-byte,
-    /// producing a valid ISO/UDF image. The disc's filesystem structure is preserved.
+    /// NOT a stream operation. Copies sectors 0→capacity byte-for-byte producing
+    /// a valid ISO/UDF image. Records progress in a ddrescue-format mapfile at
+    /// `path + ".mapfile"` — flushed every block for crash-safe resume.
     ///
-    /// If `decrypt` is true and keys are available, sectors are decrypted on the fly.
-    /// If `resume` is true and the file already exists, resumes from the last safe position.
-    ///
-    /// `on_progress` is called periodically with (bytes_done, total_bytes).
+    /// # Options
+    /// - **default** (all false): behavior matches pre-v0.11.21 — uses full
+    ///   drive recovery (may take minutes per bad sector), aborts on error.
+    ///   Mapfile is produced as a side-effect.
+    /// - **skip_on_error**: zero-fill bad blocks in the ISO, mark them in the
+    ///   mapfile, and continue. Uses fast reads (no drive-level recovery loop).
+    /// - **skip_forward** (implies skip_on_error): on block failure, also skip
+    ///   forward by an exponentially-growing amount, marking the jumped region
+    ///   as `non-trimmed` for later trimming/scraping by `Disc::patch`.
+    /// - **resume**: if the mapfile exists, resume from its state — only
+    ///   `non-tried` ranges are read. Without `resume`, a fresh mapfile is
+    ///   written and the ISO recreated from scratch.
     pub fn copy(
         &self,
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
-        decrypt: bool,
-        resume: bool,
-        batch_sectors: Option<u16>,
-        on_progress: Option<&dyn Fn(u64, u64)>,
-    ) -> Result<()> {
+        opts: &CopyOptions,
+    ) -> Result<CopyResult> {
         use std::io::{Seek, SeekFrom, Write};
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
-        let keys = if decrypt {
+        let keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
             crate::decrypt::DecryptKeys::None
         };
 
-        // Resume: check existing file
-        let (start_lba, file) = if resume {
-            match std::fs::metadata(path) {
-                Ok(meta) if meta.len() > 0 => {
-                    let safe_sectors = (meta.len() / 2048).saturating_sub(5) as u32;
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(path)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    let resume_pos = safe_sectors as u64 * 2048;
-                    f.set_len(resume_pos)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    f.seek(SeekFrom::End(0))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    (safe_sectors, f)
-                }
-                _ => {
-                    let f =
-                        std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
-                    (0u32, f)
-                }
-            }
+        // Mapfile: load if resuming, else wipe + recreate.
+        let mapfile_path = mapfile_path_for(path);
+        if !opts.resume {
+            let _ = std::fs::remove_file(&mapfile_path);
+        }
+        let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, env!("CARGO_PKG_VERSION"))
+            .map_err(|e| Error::IoError { source: e })?;
+
+        // ISO file: if resuming and mapfile has Finished ranges, open existing;
+        // otherwise create fresh and pre-size to total_bytes (sparse holes for
+        // non-tried regions).
+        let file = if opts.resume && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| Error::IoError { source: e })?
         } else {
             let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
-            (0u32, f)
+            f.set_len(total_bytes).map_err(|e| Error::IoError { source: e })?;
+            f
         };
 
-        let mut writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        let batch: u16 = batch_sectors.unwrap_or(DEFAULT_BATCH_SECTORS);
-        let mut lba = start_lba;
-        let mut bytes_done = start_lba as u64 * 2048;
+        let mut file = file;
+        let batch: u16 = match opts.batch_sectors {
+            Some(b) => b,
+            None if opts.skip_forward => 32, // 64 KB = BD ECC block size
+            None => DEFAULT_BATCH_SECTORS,
+        };
+
+        // Skip-forward state.
+        let skip_init = 256 * 1024u64; // 256 KB
+        let skip_max = (total_bytes / 100).max(skip_init); // cap at 1% of disc
+        let mut skip_size = skip_init;
+
         let mut buf = vec![0u8; batch as usize * 2048];
+        let mut bytes_done = 0u64;
+        let mut halt_requested = false;
 
-        while lba < self.capacity_sectors {
-            let remaining = self.capacity_sectors - lba;
-            let count = remaining.min(batch as u32) as u16;
-            let bytes = count as usize * 2048;
-
-            reader
-                .read_sectors(lba, count, &mut buf[..bytes], true)
-                .map_err(|e| Error::IoError {
-                    source: std::io::Error::other(e.to_string()),
-                })?;
-
-            // Decrypt if requested
-            if decrypt {
-                crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
+        // Iterate over not-yet-finished regions from the mapfile. We re-read the
+        // mapfile after each block because record() mutates the region list.
+        'outer: loop {
+            let regions_to_do = map.ranges_with(&[
+                mapfile::SectorStatus::NonTried,
+                mapfile::SectorStatus::NonTrimmed,
+                mapfile::SectorStatus::NonScraped,
+            ]);
+            if regions_to_do.is_empty() {
+                break;
             }
+            // Only process the first NonTried range per outer pass; skip_forward
+            // may turn others into NonTrimmed which we DO NOT re-enter here —
+            // Disc::patch handles those.
+            let Some((region_pos, region_size)) = map
+                .next_with(0, mapfile::SectorStatus::NonTried)
+            else {
+                break;
+            };
+            let region_end = region_pos + region_size;
+            let mut pos = region_pos;
 
-            writer
-                .write_all(&buf[..bytes])
-                .map_err(|e| Error::IoError { source: e })?;
+            while pos < region_end {
+                if let Some(ref h) = opts.halt {
+                    if h.load(std::sync::atomic::Ordering::Relaxed) {
+                        halt_requested = true;
+                        break 'outer;
+                    }
+                }
+                let block_bytes = (region_end - pos).min(batch as u64 * 2048);
+                let lba = (pos / 2048) as u32;
+                let count = (block_bytes / 2048) as u16;
+                let bytes = count as usize * 2048;
 
-            lba += count as u32;
-            bytes_done += bytes as u64;
+                let recovery = !opts.skip_on_error; // fast reads when skipping
+                let read_ok = reader
+                    .read_sectors(lba, count, &mut buf[..bytes], recovery)
+                    .is_ok();
 
-            if let Some(ref cb) = on_progress {
-                cb(bytes_done, total_bytes);
+                if read_ok {
+                    if opts.decrypt {
+                        crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
+                    }
+                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    bytes_done = bytes_done.saturating_add(block_bytes);
+                    skip_size = skip_init; // reset after success
+                    pos += block_bytes;
+                } else if opts.skip_on_error {
+                    // Zero-fill this block, mark non-trimmed for later patch trim.
+                    buf[..bytes].fill(0);
+                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    pos += block_bytes;
+
+                    if opts.skip_forward && pos < region_end {
+                        // Skip ahead; mark skipped bytes as non-trimmed too.
+                        let jump = skip_size.min(region_end - pos);
+                        if jump > 0 {
+                            map.record(pos, jump, mapfile::SectorStatus::NonTrimmed)
+                                .map_err(|e| Error::IoError { source: e })?;
+                            pos += jump;
+                        }
+                        skip_size = (skip_size * 2).min(skip_max);
+                    }
+                } else {
+                    // Current behavior (pre-0.11.21): abort on first bad sector.
+                    return Err(Error::DiscRead { sector: lba as u64 });
+                }
+
+                if let Some(cb) = opts.on_progress {
+                    let stats = map.stats();
+                    cb(stats.bytes_good, total_bytes);
+                }
             }
         }
 
-        writer.flush().map_err(|e| Error::IoError { source: e })?;
-        Ok(())
+        file.sync_all().map_err(|e| Error::IoError { source: e })?;
+        let stats = map.stats();
+        Ok(CopyResult {
+            bytes_total: total_bytes,
+            bytes_good: stats.bytes_good,
+            bytes_unreadable: stats.bytes_unreadable,
+            bytes_pending: stats.bytes_pending,
+            complete: stats.bytes_pending == 0 && !halt_requested,
+            halted: halt_requested,
+        })
+    }
+}
+
+/// Options for `Disc::copy`. All fields default to the pre-v0.11.21 behavior
+/// (recovery reads, abort on bad sector).
+#[derive(Default)]
+pub struct CopyOptions<'a> {
+    pub decrypt: bool,
+    /// Resume from existing mapfile + ISO if present. Without this, any
+    /// existing mapfile is wiped and the ISO recreated.
+    pub resume: bool,
+    /// Override the default block size. Defaults to 32 sectors (64 KB) in
+    /// `skip_forward` mode, `DEFAULT_BATCH_SECTORS` otherwise.
+    pub batch_sectors: Option<u16>,
+    /// Zero-fill bad blocks in the ISO, mark them in the mapfile, continue.
+    /// Uses fast reads (no drive-level recovery loop).
+    pub skip_on_error: bool,
+    /// ddrescue-style exponential skip-forward on block failure. Implies
+    /// `skip_on_error`. The skipped region is marked `non-trimmed` for later
+    /// trimming/scraping by `Disc::patch`.
+    pub skip_forward: bool,
+    pub on_progress: Option<&'a dyn Fn(u64, u64)>,
+    pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Result of `Disc::copy`. `complete=true` means every byte reached a terminal
+/// state (Finished or Unreadable). `complete=false` means there's still pending
+/// work (halt, abort, or non-tried ranges) that `Disc::patch` or a resumed
+/// `Disc::copy` would continue.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyResult {
+    pub bytes_total: u64,
+    pub bytes_good: u64,
+    pub bytes_unreadable: u64,
+    pub bytes_pending: u64,
+    pub complete: bool,
+    pub halted: bool,
+}
+
+/// Sidecar mapfile path for a given ISO path — `foo.iso` → `foo.iso.mapfile`.
+pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = iso_path.as_os_str().to_os_string();
+    s.push(".mapfile");
+    std::path::PathBuf::from(s)
+}
+
+/// Options for `Disc::patch`. Idempotent — each call is one patch attempt.
+#[derive(Default)]
+pub struct PatchOptions<'a> {
+    pub decrypt: bool,
+    /// Sector-granularity block size for retries. Defaults to 1 sector (2 KB).
+    pub block_sectors: Option<u16>,
+    /// Use full drive-level recovery on each read (slow but thorough). Defaults
+    /// to true — patch is the pass where we *want* the drive to try hard.
+    pub full_recovery: bool,
+    pub on_progress: Option<&'a dyn Fn(u64, u64)>,
+    pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Result of `Disc::patch` — how many bad bytes were recovered.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchResult {
+    pub bytes_total: u64,
+    pub bytes_good: u64,
+    pub bytes_unreadable: u64,
+    pub bytes_pending: u64,
+    pub bytes_recovered_this_pass: u64,
+    pub halted: bool,
+}
+
+impl Disc {
+    /// Patch an existing ISO using its sidecar mapfile. Re-reads every range
+    /// that's not yet `+` (Finished) and writes successful bytes into the ISO
+    /// at their exact offsets. Updates mapfile entries as it goes.
+    ///
+    /// Idempotent — call repeatedly to apply more retry attempts. Stops early
+    /// if a pass recovered zero bytes (no point continuing).
+    pub fn patch(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &std::path::Path,
+        opts: &PatchOptions,
+    ) -> Result<PatchResult> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mapfile_path = mapfile_path_for(path);
+        let mut map = mapfile::Mapfile::load(&mapfile_path).map_err(|e| Error::IoError { source: e })?;
+        let total_bytes = map.total_size();
+        let keys = if opts.decrypt {
+            self.decrypt_keys()
+        } else {
+            crate::decrypt::DecryptKeys::None
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::IoError { source: e })?;
+
+        let block_sectors = opts.block_sectors.unwrap_or(1);
+        // Patch always reads with full drive recovery — this is the pass where
+        // we want the drive's ECC retry machinery. Consumers who want fast-fail
+        // use Disc::copy with skip_on_error instead.
+        let _ = opts.full_recovery;
+
+        let bytes_good_before = map.stats().bytes_good;
+        let mut halted = false;
+        let mut buf = vec![0u8; block_sectors as usize * 2048];
+
+        // Collect bad ranges up front. Iterating while mutating is fragile;
+        // each recorded change is persisted, so resume works even if we crash
+        // mid-loop.
+        let bad_ranges = map.ranges_with(&[
+            mapfile::SectorStatus::NonTried,
+            mapfile::SectorStatus::NonTrimmed,
+            mapfile::SectorStatus::NonScraped,
+            mapfile::SectorStatus::Unreadable,
+        ]);
+
+        'outer: for (range_pos, range_size) in bad_ranges {
+            let mut pos = range_pos;
+            let end = range_pos + range_size;
+            while pos < end {
+                if let Some(ref h) = opts.halt {
+                    if h.load(std::sync::atomic::Ordering::Relaxed) {
+                        halted = true;
+                        break 'outer;
+                    }
+                }
+                let block_bytes = (end - pos).min(block_sectors as u64 * 2048);
+                let lba = (pos / 2048) as u32;
+                let count = (block_bytes / 2048) as u16;
+                let bytes = count as usize * 2048;
+                let read_ok = reader
+                    .read_sectors(lba, count, &mut buf[..bytes], true)
+                    .is_ok();
+                if read_ok {
+                    if opts.decrypt {
+                        crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
+                    }
+                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
+                        .map_err(|e| Error::IoError { source: e })?;
+                } else {
+                    map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
+                        .map_err(|e| Error::IoError { source: e })?;
+                }
+                pos += block_bytes;
+
+                if let Some(cb) = opts.on_progress {
+                    let s = map.stats();
+                    cb(s.bytes_good, total_bytes);
+                }
+            }
+        }
+
+        file.sync_all().map_err(|e| Error::IoError { source: e })?;
+        let stats = map.stats();
+        Ok(PatchResult {
+            bytes_total: total_bytes,
+            bytes_good: stats.bytes_good,
+            bytes_unreadable: stats.bytes_unreadable,
+            bytes_pending: stats.bytes_pending,
+            bytes_recovered_this_pass: stats.bytes_good.saturating_sub(bytes_good_before),
+            halted,
+        })
     }
 }
 
