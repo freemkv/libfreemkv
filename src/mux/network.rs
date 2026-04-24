@@ -81,7 +81,7 @@ impl crate::pes::Stream for NetworkStream {
         match &mut self.mode {
             Mode::Write {
                 writer,
-                ref mut header_written,
+                header_written,
                 ..
             } => {
                 if !*header_written {

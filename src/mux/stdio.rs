@@ -70,7 +70,7 @@ impl crate::pes::Stream for StdioStream {
     }
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.writer {
-            Some(ref mut w) => {
+            Some(w) => {
                 if !self.header_written {
                     if !self.disc_title.streams.is_empty() {
                         let m = meta::M2tsMeta::from_title(&self.disc_title);

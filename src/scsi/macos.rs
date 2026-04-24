@@ -63,7 +63,8 @@ struct SCSITaskSGElement {
 
 // ── External IOKit / CoreFoundation functions ───────────────────────────────
 
-extern "C" {
+// Rust 2024: FFI blocks declaring extern fns must be `unsafe extern`.
+unsafe extern "C" {
     fn IOMasterPort(bootstrap: u32, master: *mut MachPort) -> IOReturn;
     fn IOBSDNameMatching(
         master: MachPort,
@@ -97,10 +98,18 @@ extern "C" {
 // IOSCSIArchitectureModelFamily/UserClientLib/SCSITaskLib.h
 
 /// Read a function pointer from a COM vtable at the given index.
+///
+/// # Safety
+/// `iface` must be a valid COM interface pointer (*mut *mut c_void), and
+/// `index` must be a valid vtable slot for the target type `T`.
 unsafe fn vtable_fn<T>(iface: ComRef, index: usize) -> T {
-    let vtable = *iface as *const *const std::ffi::c_void;
-    let fn_ptr = *vtable.add(index);
-    std::mem::transmute_copy(&fn_ptr)
+    // Rust 2024: `unsafe fn` bodies are no longer implicitly unsafe.
+    // Each unsafe op needs its own `unsafe { }` block.
+    unsafe {
+        let vtable = *iface as *const *const std::ffi::c_void;
+        let fn_ptr = *vtable.add(index);
+        std::mem::transmute_copy(&fn_ptr)
+    }
 }
 
 /// Call Release (vtable index 3) on any COM interface.

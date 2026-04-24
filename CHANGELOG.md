@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.0 (2026-04-24)
+
+### Rust 2024 edition migration
+- Bumped `edition = "2024"`. Required code changes:
+  - FFI declarations in `src/scsi/macos.rs` wrapped in `unsafe extern "C" { … }` per the 2024 FFI safety rules.
+  - `unsafe_op_in_unsafe_fn` lint: `vtable_fn()` body now has an explicit `unsafe { … }` block rather than relying on implicit unsafe of the containing `unsafe fn`.
+  - Match-ergonomics: removed redundant `ref`/`ref mut` bindings in `mux/meta.rs`, `mux/mkvstream.rs`, `mux/network.rs`, `mux/stdio.rs` — 2024 tightens "cannot explicitly borrow within an implicitly-borrowing pattern."
+- No behavior change. MSRV stays at 1.86.
+
+### Minor / version sync
+- Part of the 0.12.0 ecosystem release. The autorip-side fixes (progress regressions, UI redesign, regression-guard tests) drove the minor bump.
+
 ## 0.11.22 (2026-04-24)
 
 ### Version sync — no functional changes

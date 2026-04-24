@@ -1,7 +1,7 @@
 [package]
 name = "libfreemkv"
-version = "0.11.22"
-edition = "2021"
+version = "0.12.0"
+edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
 description = "Open source raw disc access library for optical drives"
