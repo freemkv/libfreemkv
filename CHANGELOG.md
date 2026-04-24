@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.18 (2026-04-24)
+
+### DiscStream halt flag — Stop works during dense bad-sector regions
+
+`DiscStream::fill_extents` loops internally when the demuxer hasn't accumulated enough data to emit a PES frame — during a dense bad-sector run, that loop can spend many minutes shrinking batch sizes and zero-filling sectors without ever returning to the outer read() call. Without an internal halt check, the caller's Stop request goes unserviced until the demuxer eventually emits a frame, which may be very far away.
+
+- **`DiscStream::set_halt(Arc<AtomicBool>)`** — share a halt flag with the stream. Typically wired to `Drive::halt_flag()` so Stop propagates across both the drive's recovery phases and the stream's sector processing.
+- **`fill_extents()` checks the halt flag** at the top of every retry iteration (before each attempt at every size level). Raising the flag aborts within one read round-trip — at most the current SCSI command's timeout.
+- Returns `Err(Error::Halted)` (E6010) so the outer rip pipeline terminates cleanly.
+
+No behavior change for callers that don't call `set_halt`. Unblocks the architectural fix for the "Stop doesn't stop" bug observed on a damaged UHD disc where the stream was stuck in a 12+ hour bad-sector grind.
+
 ## 0.11.17 (2026-04-23)
 
 ### Adaptive batch sizer in DiscStream — no more per-sector descent

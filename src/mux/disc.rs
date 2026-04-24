@@ -9,6 +9,8 @@ use crate::disc::{Disc, DiscTitle, Extent};
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::sector::SectorReader;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Ramp back up to the preferred batch size after this many sectors
 /// of clean reading at the current (reduced) size. 100 MiB = 51,200 sectors.
@@ -125,6 +127,11 @@ pub struct DiscStream {
     adaptive: AdaptiveBatch,
     pub errors: u64,
     pub skip_errors: bool,
+    /// When set and the flag is raised, fill_extents returns Err(Halted) at the
+    /// next retry boundary. Unlike skip_errors, this propagates the error up so
+    /// the rip terminates cleanly. Share the Arc with Drive::halt_flag() to get
+    /// unified Stop behavior across drive reads and sector processing.
+    halt: Option<Arc<AtomicBool>>,
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
     eof: bool,
 
@@ -192,6 +199,7 @@ impl DiscStream {
             adaptive: AdaptiveBatch::new(batch_sectors),
             errors: 0,
             skip_errors: false,
+            halt: None,
             event_fn: None,
             eof: false,
             ts_demuxer,
@@ -205,6 +213,22 @@ impl DiscStream {
     /// Set event handler for sector-level events (binary search, skip, recover).
     pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
         self.event_fn = Some(Box::new(f));
+    }
+
+    /// Share a halt flag — typically from `Drive::halt_flag()`. When raised,
+    /// the next read-retry boundary inside fill_extents returns Err(Halted)
+    /// instead of continuing. Required for Stop to work during dense bad-sector
+    /// regions (where read() loops internally waiting for enough clean data to
+    /// emit a frame and would otherwise never check an external stop signal).
+    pub fn set_halt(&mut self, flag: Arc<AtomicBool>) {
+        self.halt = Some(flag);
+    }
+
+    fn is_halted(&self) -> bool {
+        self.halt
+            .as_ref()
+            .map(|h| h.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     fn emit(&self, kind: EventKind) {
@@ -242,7 +266,15 @@ impl DiscStream {
         // Adaptive sizer: start at current (preferred until a failure), shrink
         // on failure, advance on success. One 5s read attempt per try — no
         // retry loops, no sleeps. On size-1 failure, skip or error.
+        //
+        // Halt is checked at the top of every iteration — in a dense bad zone
+        // this loop can spend minutes shrinking and skipping sectors; without
+        // the check, Stop wouldn't take effect until the outer PES read() loop
+        // finally emits a frame, which may never happen.
         loop {
+            if self.is_halted() {
+                return Err(crate::error::Error::Halted.into());
+            }
             let mut sectors = remaining.min(self.adaptive.current() as u32) as u16;
             // Align to 3-sector AACS units when possible. Partial units at
             // extent boundaries are safely handled by decrypt_sectors().
