@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.21 (2026-04-24)
+
+### Multi-pass rip architecture — disc → ISO → patch → ISO
+
+New primitives for two-stage rip: fast forward pass with zero-fill on failures, then targeted retries of bad ranges. Keeps the library API stream-based; the multi-pass model lives entirely in caller-orchestrated function composition.
+
+- **New `Disc::copy(reader, path, &CopyOptions)`** replaces the positional-arg version. Always produces a ddrescue-format mapfile at `path + ".mapfile"` as a side-effect. With `skip_on_error=true` + `skip_forward=true`, does ddrescue-style fast sweep: 64 KB block reads, exponential skip-forward (256 KB → cap at 1% of disc) on failure, zero-fill bad blocks, record ranges in the mapfile. With defaults (both false), matches pre-0.11.21 behavior — uses drive-level recovery, aborts on bad sector. Mapfile is produced either way.
+- **New `Disc::patch(reader, path, &PatchOptions)`** — idempotent retry pass. Reads the mapfile, re-reads every non-`+` range with full drive recovery enabled, writes successful bytes back into the ISO at exact offsets, updates mapfile. Call N times for N retry attempts.
+- **New `disc::mapfile` module** — ddrescue-compatible plain-text format. Crash-safe (flushes on every `record()`), greppable, human-editable, tool-interoperable. Status chars match ddrescue: `?` non-tried · `*` non-trimmed · `/` non-scraped · `-` unreadable · `+` finished.
+- **Re-exports:** `FileSectorReader` from the crate root for ISO readers.
+
+### Breaking changes
+- `Disc::copy`'s signature changes from positional args (`decrypt, resume, batch, on_progress`) to `CopyOptions`. Previous callers must migrate. `freemkv` CLI updated in lockstep.
+
+### Version sync
+- Part of the 0.11.21 ecosystem release (libfreemkv + freemkv + bdemu + autorip all on 0.11.21).
+
 ## 0.11.18 (2026-04-24)
 
 ### DiscStream halt flag — Stop works during dense bad-sector regions

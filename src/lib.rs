@@ -117,6 +117,6 @@ pub use mux::NullStream;
 pub use mux::StdioStream;
 pub use mux::{input, output, parse_url, InputOptions, StreamUrl};
 pub use scsi::ScsiTransport;
-pub use sector::SectorReader;
+pub use sector::{FileSectorReader, SectorReader};
 pub use speed::DriveSpeed;
 pub use udf::{read_filesystem, UdfFs};
