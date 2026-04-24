@@ -128,6 +128,23 @@ impl Drive {
         self.halt.load(Ordering::Relaxed)
     }
 
+    /// Sleep for `total`, but wake within ~100 ms if the halt flag fires.
+    /// Returns `true` if halted during sleep. Used by the recovery path
+    /// where a single 30 s sleep would otherwise swallow a Stop request
+    /// and make the UI feel frozen.
+    fn halt_aware_sleep(&self, total: std::time::Duration) -> bool {
+        let slice = std::time::Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + total;
+        while std::time::Instant::now() < deadline {
+            if self.is_halted() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::sleep(remaining.min(slice));
+        }
+        self.is_halted()
+    }
+
     /// Close the drive cleanly. Unlocks tray, flushes SCSI state, closes fd.
     /// Also runs automatically on Drop as a safety net.
     pub fn close(self) {
@@ -562,7 +579,9 @@ impl Drive {
                 return Err(Error::Halted);
             }
             self.emit(EventKind::Retry { attempt });
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            if self.halt_aware_sleep(std::time::Duration::from_secs(30)) {
+                return Err(Error::Halted);
+            }
 
             if let Ok(result) = self.scsi.as_mut().execute(
                 &cdb,
@@ -582,9 +601,13 @@ impl Drive {
 
         // Phase 2: fresh start — close, reset, open, init.
         let device = std::path::PathBuf::from(&self.device_path);
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        if self.halt_aware_sleep(std::time::Duration::from_secs(5)) {
+            return Err(Error::Halted);
+        }
         let _ = crate::scsi::reset(&device);
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        if self.halt_aware_sleep(std::time::Duration::from_secs(5)) {
+            return Err(Error::Halted);
+        }
         self.scsi = crate::scsi::open(&device)?;
         let _ = self.init();
         let _ = self.wait_ready();
@@ -600,7 +623,9 @@ impl Drive {
                 return Err(Error::Halted);
             }
             self.emit(EventKind::Retry { attempt });
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            if self.halt_aware_sleep(std::time::Duration::from_secs(30)) {
+                return Err(Error::Halted);
+            }
 
             if let Ok(result) = self.scsi.as_mut().execute(
                 &cdb,
