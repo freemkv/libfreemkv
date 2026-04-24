@@ -4,7 +4,7 @@
 //! Buffers across PES boundaries so frames that span two PES packets
 //! are emitted complete, not truncated.
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 pub struct Ac3Parser {
     /// Leftover bytes from previous PES (incomplete frame at end).

@@ -227,11 +227,7 @@ fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Convert length-prefixed NALUs (4-byte BE length + NAL) to Annex B

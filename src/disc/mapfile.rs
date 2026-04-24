@@ -170,7 +170,9 @@ impl Mapfile {
     pub fn open_or_create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         match Self::load(path) {
             Ok(mf) => Ok(mf),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Self::create(path, total_size, version),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Self::create(path, total_size, version)
+            }
             Err(e) => Err(e),
         }
     }
@@ -290,12 +292,22 @@ impl Mapfile {
         {
             let file = std::fs::File::create(&tmp)?;
             let mut w = std::io::BufWriter::new(file);
-            writeln!(w, "# Rescue Logfile. Created by libfreemkv v{}", self.version)?;
+            writeln!(
+                w,
+                "# Rescue Logfile. Created by libfreemkv v{}",
+                self.version
+            )?;
             writeln!(w, "# Current pos / status / pass / pass_time")?;
             writeln!(w, "0x000000000  ?  1  0")?;
             writeln!(w, "#      pos        size  status")?;
             for e in &self.entries {
-                writeln!(w, "0x{:09x}  0x{:09x}    {}", e.pos, e.size, e.status.to_char())?;
+                writeln!(
+                    w,
+                    "0x{:09x}  0x{:09x}    {}",
+                    e.pos,
+                    e.size,
+                    e.status.to_char()
+                )?;
             }
             w.flush()?;
         }
@@ -347,9 +359,18 @@ mod tests {
         mf.record(200, 100, SectorStatus::Finished).unwrap();
         let es = mf.entries();
         assert_eq!(es.len(), 3);
-        assert_eq!((es[0].pos, es[0].size, es[0].status), (0, 200, SectorStatus::NonTried));
-        assert_eq!((es[1].pos, es[1].size, es[1].status), (200, 100, SectorStatus::Finished));
-        assert_eq!((es[2].pos, es[2].size, es[2].status), (300, 700, SectorStatus::NonTried));
+        assert_eq!(
+            (es[0].pos, es[0].size, es[0].status),
+            (0, 200, SectorStatus::NonTried)
+        );
+        assert_eq!(
+            (es[1].pos, es[1].size, es[1].status),
+            (200, 100, SectorStatus::Finished)
+        );
+        assert_eq!(
+            (es[2].pos, es[2].size, es[2].status),
+            (300, 700, SectorStatus::NonTried)
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -363,7 +384,10 @@ mod tests {
         // Entries: [0..100 NonTried, 100..300 Finished (merged), 300..1000 NonTried]
         let es = mf.entries();
         assert_eq!(es.len(), 3);
-        assert_eq!((es[1].pos, es[1].size, es[1].status), (100, 200, SectorStatus::Finished));
+        assert_eq!(
+            (es[1].pos, es[1].size, es[1].status),
+            (100, 200, SectorStatus::Finished)
+        );
         let _ = std::fs::remove_file(&p);
     }
 

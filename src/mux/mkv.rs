@@ -699,7 +699,7 @@ mod tests {
             // Track VINT: 1 byte (track 1 = 0x81)
             let track_vint_pos = after_id + size_len;
             let track_vint_len = 1; // track 1 encoded as 0x81
-                                    // 2-byte relative timestamp
+            // 2-byte relative timestamp
             let ts_pos = track_vint_pos + track_vint_len;
             // flags byte
             let flags_pos = ts_pos + 2;

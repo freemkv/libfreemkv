@@ -1243,20 +1243,26 @@ impl Disc {
         if !opts.resume {
             let _ = std::fs::remove_file(&mapfile_path);
         }
-        let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, env!("CARGO_PKG_VERSION"))
-            .map_err(|e| Error::IoError { source: e })?;
+        let mut map =
+            mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| Error::IoError { source: e })?;
 
         // ISO file: if resuming and mapfile has Finished ranges, open existing;
         // otherwise create fresh and pre-size to total_bytes (sparse holes for
         // non-tried regions).
-        let file = if opts.resume && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        let file = if opts.resume
+            && std::fs::metadata(path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(path)
                 .map_err(|e| Error::IoError { source: e })?
         } else {
             let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
-            f.set_len(total_bytes).map_err(|e| Error::IoError { source: e })?;
+            f.set_len(total_bytes)
+                .map_err(|e| Error::IoError { source: e })?;
             f
         };
 
@@ -1290,8 +1296,7 @@ impl Disc {
             // Only process the first NonTried range per outer pass; skip_forward
             // may turn others into NonTrimmed which we DO NOT re-enter here —
             // Disc::patch handles those.
-            let Some((region_pos, region_size)) = map
-                .next_with(0, mapfile::SectorStatus::NonTried)
+            let Some((region_pos, region_size)) = map.next_with(0, mapfile::SectorStatus::NonTried)
             else {
                 break;
             };
@@ -1319,8 +1324,10 @@ impl Disc {
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                     }
-                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes])
+                        .map_err(|e| Error::IoError { source: e })?;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                         .map_err(|e| Error::IoError { source: e })?;
                     bytes_done = bytes_done.saturating_add(block_bytes);
@@ -1329,8 +1336,10 @@ impl Disc {
                 } else if opts.skip_on_error {
                     // Zero-fill this block, mark non-trimmed for later patch trim.
                     buf[..bytes].fill(0);
-                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes])
+                        .map_err(|e| Error::IoError { source: e })?;
                     map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
                         .map_err(|e| Error::IoError { source: e })?;
                     pos += block_bytes;
@@ -1453,7 +1462,8 @@ impl Disc {
         use std::io::{Seek, SeekFrom, Write};
 
         let mapfile_path = mapfile_path_for(path);
-        let mut map = mapfile::Mapfile::load(&mapfile_path).map_err(|e| Error::IoError { source: e })?;
+        let mut map =
+            mapfile::Mapfile::load(&mapfile_path).map_err(|e| Error::IoError { source: e })?;
         let total_bytes = map.total_size();
         let keys = if opts.decrypt {
             self.decrypt_keys()
@@ -1507,8 +1517,10 @@ impl Disc {
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                     }
-                    file.seek(SeekFrom::Start(pos)).map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..bytes]).map_err(|e| Error::IoError { source: e })?;
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..bytes])
+                        .map_err(|e| Error::IoError { source: e })?;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                         .map_err(|e| Error::IoError { source: e })?;
                 } else {

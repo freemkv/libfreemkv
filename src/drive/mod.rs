@@ -18,14 +18,14 @@ mod windows;
 use crate::error::{Error, Result};
 use crate::event::{Event, EventKind};
 use crate::identity::DriveId;
-use crate::platform::mt1959::Mt1959;
 use crate::platform::PlatformDriver;
+use crate::platform::mt1959::Mt1959;
 use crate::profile::{self, DriveProfile};
 use crate::scsi::ScsiTransport;
 use crate::sector::SectorReader;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Physical state of the drive tray and disc.
 #[derive(Debug, Clone, Copy, PartialEq)]

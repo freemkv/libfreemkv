@@ -441,7 +441,7 @@ mod tests {
     fn test_write_uint() {
         let mut buf = Vec::new();
         write_uint(&mut buf, 0x4286, 1).unwrap(); // EBML_VERSION = 1
-                                                  // ID: 42 86, Size: 81 (1 byte), Data: 01
+        // ID: 42 86, Size: 81 (1 byte), Data: 01
         assert_eq!(buf, [0x42, 0x86, 0x81, 0x01]);
     }
 

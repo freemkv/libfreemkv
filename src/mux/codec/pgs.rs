@@ -4,7 +4,7 @@
 //! Each PES packet contains one or more segments.
 //! All segments are keyframes (no inter-segment dependencies).
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 pub struct PgsParser;
 

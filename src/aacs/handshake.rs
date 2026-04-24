@@ -674,8 +674,8 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
 
 /// AES-128-CMAC over 16 bytes of data.
 fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
     let cipher = Aes128::new(GenericArray::from_slice(key));
 

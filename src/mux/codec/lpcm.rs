@@ -13,7 +13,7 @@
 //! For MKV: codec ID "A_PCM/INT/BIG" (BD) or "A_PCM/INT/LIT" (DVD).
 //! All frames are keyframes (uncompressed audio).
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// BD LPCM header size in bytes.
 const BD_LPCM_HEADER_SIZE: usize = 4;

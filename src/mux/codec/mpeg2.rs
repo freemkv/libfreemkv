@@ -9,7 +9,7 @@
 //! - Sequence extension: 00 00 01 B5
 //! - Picture header: 00 00 01 00
 
-use super::{pts_to_ns, CodecParser, Frame};
+use super::{CodecParser, Frame, pts_to_ns};
 use crate::mux::ts::PesPacket;
 
 /// Sequence header start code suffix.
@@ -415,7 +415,7 @@ mod tests {
         // Sequence extension: 00 00 01 B5 [ext data]
         data.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE]);
         data.extend_from_slice(&[0x14, 0x8A, 0x00, 0x01, 0x00, 0x00]); // ext payload
-                                                                       // Picture header follows.
+        // Picture header follows.
         data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
         data.extend_from_slice(&[0xFF; 4]);
 

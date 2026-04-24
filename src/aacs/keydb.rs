@@ -361,11 +361,7 @@ mod tests {
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
     fn keydb_path() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.exists() { Some(path) } else { None }
     }
 
     #[test]

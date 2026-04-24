@@ -4,7 +4,7 @@
 //! Write: PES frames in → MKV mux → Matroska container.
 
 use super::mkv::{MkvMuxer, MkvTrack};
-use super::{ebml, WriteSeek};
+use super::{WriteSeek, ebml};
 
 type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>)>;
 

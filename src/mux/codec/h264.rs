@@ -4,7 +4,7 @@
 //! Detects keyframes (IDR slices).
 //! Each PES packet = one access unit = one frame.
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// H.264 NAL unit types we care about.
 const NAL_SLICE_IDR: u8 = 5;
@@ -263,7 +263,7 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x67); // SPS
         data.extend_from_slice(&[0x42, 0x00, 0x1E, 0xAB, 0xCD]); // profile=0x42, compat=0x00, level=0x1E
-                                                                 // PPS: 00 00 01 [68 <payload>]
+        // PPS: 00 00 01 [68 <payload>]
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x68); // PPS
         data.extend_from_slice(&[0xCE, 0x01]);

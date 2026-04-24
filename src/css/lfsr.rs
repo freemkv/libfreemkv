@@ -149,7 +149,7 @@ mod tests {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];
         let mut sector = vec![0xAA; 2048];
         sector[0x14] = 0x30; // scramble flag set
-                             // Set a sector seed
+        // Set a sector seed
         sector[0x54..0x59].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
         let original = sector.clone();
         descramble_sector(&key, &mut sector);

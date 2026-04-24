@@ -4,7 +4,7 @@
 //! When both exist, language_streams.txt provides structured types while
 //! menu_base.prop provides stream number → button name mapping.
 
-use super::{vocab, LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use std::collections::HashMap;

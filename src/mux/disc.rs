@@ -9,8 +9,8 @@ use crate::disc::{Disc, DiscTitle, Extent};
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::sector::SectorReader;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Ramp back up to the preferred batch size after this many sectors
 /// of clean reading at the current (reduced) size. 100 MiB = 51,200 sectors.
@@ -26,22 +26,14 @@ const PROBE_THRESHOLD_SECTORS: u32 = 100 * 1024 * 1024 / 2048;
 /// through 3 → 1 without intermediate unaligned sizes.
 fn halve_batch_size(size: u16) -> u16 {
     let h = (size / 2).max(1);
-    if h >= 6 {
-        h - (h % 3)
-    } else {
-        h
-    }
+    if h >= 6 { h - (h % 3) } else { h }
 }
 
 /// Double a batch size toward a preferred max, keeping 3-sector alignment
 /// when the result is >= 6.
 fn double_batch_size(size: u16, preferred: u16) -> u16 {
     let d = size.saturating_mul(2).min(preferred);
-    if d >= 6 {
-        d - (d % 3)
-    } else {
-        d
-    }
+    if d >= 6 { d - (d % 3) } else { d }
 }
 
 /// Adaptive batch sizer. Shrinks on read failure, grows after a sustained

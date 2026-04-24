@@ -5,7 +5,7 @@
 //!
 //! Token format: `{lang}_{codec?}_{purpose?}_{region?}_`
 
-use super::{vocab, LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 
