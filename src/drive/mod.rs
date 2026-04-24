@@ -128,21 +128,32 @@ impl Drive {
         self.halt.load(Ordering::Relaxed)
     }
 
-    /// Sleep for `total`, but wake within ~100 ms if the halt flag fires.
-    /// Returns `true` if halted during sleep. Used by the recovery path
-    /// where a single 30 s sleep would otherwise swallow a Stop request
-    /// and make the UI feel frozen.
-    fn halt_aware_sleep(&self, total: std::time::Duration) -> bool {
-        let slice = std::time::Duration::from_millis(100);
-        let deadline = std::time::Instant::now() + total;
-        while std::time::Instant::now() < deadline {
-            if self.is_halted() {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            std::thread::sleep(remaining.min(slice));
+    /// Halt-aware sleep. Returns `Err(Halted)` if the flag fires before or
+    /// during the wait. The only sleep the drive's recovery path is allowed
+    /// to use — makes it impossible to accidentally block through a Stop.
+    fn checked_sleep(&self, total: std::time::Duration) -> Result<()> {
+        sleep_until_halted(&self.halt, total)
+    }
+
+    /// Halt-aware SCSI execute. Returns `Err(Halted)` if the flag is set
+    /// before the command dispatches or by the time it completes. The only
+    /// path to talk to the drive in the recovery hot loop; keeps Drive::read
+    /// free of explicit halt checks.
+    fn checked_exec(
+        &mut self,
+        cdb: &[u8],
+        dir: crate::scsi::DataDirection,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<crate::scsi::ScsiResult> {
+        if self.is_halted() {
+            return Err(Error::Halted);
         }
-        self.is_halted()
+        let r = self.scsi.as_mut().execute(cdb, dir, buf, timeout_ms)?;
+        if self.is_halted() {
+            return Err(Error::Halted);
+        }
+        Ok(r)
     }
 
     /// Close the drive cleanly. Unlocks tray, flushes SCSI state, closes fd.
@@ -541,26 +552,31 @@ impl Drive {
             0x00,
         ];
 
-        // Normal read
-        if let Ok(result) = self.scsi.as_mut().execute(
+        // Normal read. Fast path: drive returns data, we return it.
+        // checked_exec short-circuits to Err(Halted) if Stop was requested;
+        // read() never touches the halt flag directly.
+        match self.checked_exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             buf,
             timeout_ms,
         ) {
-            if self.recovery_bytes_remaining > 0 {
-                let bytes_read = count as u64 * 2048;
-                self.recovery_bytes_remaining =
-                    self.recovery_bytes_remaining.saturating_sub(bytes_read);
-                if self.recovery_bytes_remaining == 0 {
-                    self.emit(EventKind::SpeedChange { speed_kbs: 0xFFFF });
-                    self.set_speed(0xFFFF);
+            Ok(result) => {
+                if self.recovery_bytes_remaining > 0 {
+                    let bytes_read = count as u64 * 2048;
+                    self.recovery_bytes_remaining =
+                        self.recovery_bytes_remaining.saturating_sub(bytes_read);
+                    if self.recovery_bytes_remaining == 0 {
+                        self.emit(EventKind::SpeedChange { speed_kbs: 0xFFFF });
+                        self.set_speed(0xFFFF);
+                    }
                 }
+                return Ok(result.bytes_transferred);
             }
-            return Ok(result.bytes_transferred);
+            Err(Error::Halted) => return Err(Error::Halted),
+            Err(_) => { /* fall through to recovery */ }
         }
 
-        // Read failed
         if !recovery {
             return Err(Error::DiscRead { sector: lba as u64 });
         }
@@ -573,66 +589,36 @@ impl Drive {
         self.emit(EventKind::SpeedChange { speed_kbs: 0 });
         self.set_speed(0);
 
-        // Phase 1: gentle — sleep 30s, retry. 5 times.
+        // Phase 1: gentle — sleep 30 s, retry. 5 times.
         for attempt in 1..=5u32 {
-            if self.is_halted() {
-                return Err(Error::Halted);
-            }
             self.emit(EventKind::Retry { attempt });
-            if self.halt_aware_sleep(std::time::Duration::from_secs(30)) {
-                return Err(Error::Halted);
-            }
-
-            if let Ok(result) = self.scsi.as_mut().execute(
-                &cdb,
-                crate::scsi::DataDirection::FromDevice,
-                buf,
-                30_000,
-            ) {
+            self.checked_sleep(std::time::Duration::from_secs(30))?;
+            if let Ok(result) =
+                self.checked_exec(&cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)
+            {
                 self.emit(EventKind::SectorRecovered { sector: lba as u64 });
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
             }
         }
 
-        if self.is_halted() {
-            return Err(Error::Halted);
-        }
-
         // Phase 2: fresh start — close, reset, open, init.
         let device = std::path::PathBuf::from(&self.device_path);
-        if self.halt_aware_sleep(std::time::Duration::from_secs(5)) {
-            return Err(Error::Halted);
-        }
+        self.checked_sleep(std::time::Duration::from_secs(5))?;
         let _ = crate::scsi::reset(&device);
-        if self.halt_aware_sleep(std::time::Duration::from_secs(5)) {
-            return Err(Error::Halted);
-        }
+        self.checked_sleep(std::time::Duration::from_secs(5))?;
         self.scsi = crate::scsi::open(&device)?;
         let _ = self.init();
         let _ = self.wait_ready();
         self.set_speed(0);
 
-        if self.is_halted() {
-            return Err(Error::Halted);
-        }
-
-        // Phase 3: gentle again on fresh connection — sleep 30s, retry. 5 times.
+        // Phase 3: gentle again on fresh connection — sleep 30 s, retry. 5 times.
         for attempt in 6..=10u32 {
-            if self.is_halted() {
-                return Err(Error::Halted);
-            }
             self.emit(EventKind::Retry { attempt });
-            if self.halt_aware_sleep(std::time::Duration::from_secs(30)) {
-                return Err(Error::Halted);
-            }
-
-            if let Ok(result) = self.scsi.as_mut().execute(
-                &cdb,
-                crate::scsi::DataDirection::FromDevice,
-                buf,
-                30_000,
-            ) {
+            self.checked_sleep(std::time::Duration::from_secs(30))?;
+            if let Ok(result) =
+                self.checked_exec(&cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)
+            {
                 self.emit(EventKind::SectorRecovered { sector: lba as u64 });
                 self.recovery_bytes_remaining = RECOVERY_WINDOW;
                 return Ok(result.bytes_transferred);
@@ -753,6 +739,27 @@ impl SectorReader for Drive {
     }
 }
 
+/// Halt-aware sleep primitive. Returns `Err(Halted)` if the flag is set
+/// before or during the wait. Extracted as a free function so it can be
+/// unit-tested without constructing a full `Drive`.
+///
+/// Wakes within ~100 ms of a halt, regardless of the requested duration.
+fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if halt.load(Ordering::Relaxed) {
+            return Err(Error::Halted);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        let remaining = deadline - now;
+        std::thread::sleep(remaining.min(SLICE));
+    }
+}
+
 /// Find all optical drives connected to this system.
 /// Returns opened Drive objects ready for use.
 pub fn find_drives() -> Vec<Drive> {
@@ -813,5 +820,55 @@ fn create_driver(
             product_id: String::new(),
             product_revision: "Renesas not yet implemented".to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn sleep_until_halted_completes_when_not_halted() {
+        let flag = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let r = sleep_until_halted(&flag, Duration::from_millis(150));
+        assert!(r.is_ok());
+        assert!(t0.elapsed() >= Duration::from_millis(140));
+    }
+
+    #[test]
+    fn sleep_until_halted_returns_immediately_if_preflagged() {
+        let flag = AtomicBool::new(true);
+        let t0 = Instant::now();
+        let r = sleep_until_halted(&flag, Duration::from_secs(10));
+        assert!(matches!(r, Err(Error::Halted)));
+        // Must wake within one slice (100 ms) — the whole point of the
+        // primitive is that a 30 s sleep doesn't block Stop.
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn sleep_until_halted_wakes_mid_sleep() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            f2.store(true, Ordering::Relaxed);
+        });
+        let r = sleep_until_halted(&flag, Duration::from_secs(10));
+        assert!(matches!(r, Err(Error::Halted)));
+        let waited = t0.elapsed();
+        // Flag flipped at ~150 ms; we wake within one 100 ms slice → <300 ms.
+        assert!(waited < Duration::from_millis(350), "waited {waited:?}");
+        assert!(waited >= Duration::from_millis(140), "waited {waited:?}");
+    }
+
+    #[test]
+    fn sleep_until_halted_zero_duration_is_noop_when_not_halted() {
+        let flag = AtomicBool::new(false);
+        let r = sleep_until_halted(&flag, Duration::ZERO);
+        assert!(r.is_ok());
     }
 }
