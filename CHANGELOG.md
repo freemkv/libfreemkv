@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.22 (2026-04-24)
+
+### Version sync — no functional changes
+Part of the 0.11.22 ecosystem release. autorip 0.11.22 ships full multi-pass UI (bad-range viz, live mapfile stats, Recovery settings); the library API is unchanged from 0.11.21.
+
 ## 0.11.21 (2026-04-24)
 
 ### Multi-pass rip architecture — disc → ISO → patch → ISO
