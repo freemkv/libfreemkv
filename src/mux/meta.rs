@@ -211,7 +211,7 @@ impl M2tsMeta {
             .iter()
             .map(|s| {
                 if let MetaStream::Video {
-                    codec_private: Some(ref b64),
+                    codec_private: Some(b64),
                     ..
                 } = s
                 {

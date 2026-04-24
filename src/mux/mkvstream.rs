@@ -150,9 +150,9 @@ impl crate::pes::Stream for MkvStream {
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write {
-                muxer: Some(ref mut m),
-            } => m.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data),
+            Mode::Write { muxer: Some(m) } => {
+                m.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data)
+            }
             Mode::Write { muxer: None } => Ok(()),
             Mode::Read(_) => Err(crate::error::Error::StreamReadOnly.into()),
         }
