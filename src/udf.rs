@@ -101,7 +101,7 @@ impl UdfFs {
             None => {
                 return Err(Error::UdfNotFound {
                     path: path.to_string(),
-                })
+                });
             }
         };
         let entry = current
@@ -136,7 +136,7 @@ impl UdfFs {
             None => {
                 return Err(Error::UdfNotFound {
                     path: path.to_string(),
-                })
+                });
             }
         };
         let entry = current
@@ -375,7 +375,7 @@ impl UdfFs {
             None => {
                 return Err(Error::UdfNotFound {
                     path: path.to_string(),
-                })
+                });
             }
         };
         let entry = current

@@ -73,8 +73,8 @@ fn css_is_scrambled_detection() {
 /// then decrypt with decrypt_unit() and verify the plaintext matches.
 #[test]
 fn aacs_decrypt_unit_roundtrip() {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
     let unit_key = [0xAAu8; 16];
     let aacs_iv: [u8; 16] = [
@@ -207,8 +207,8 @@ fn aacs_disc_hash_deterministic() {
 /// decrypt_unit_key recovers the original.
 #[test]
 fn aacs_decrypt_unit_key_roundtrip() {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 
     let vuk = [
         0x11u8, 0x14, 0x36, 0x0B, 0x10, 0xEE, 0x6E, 0xAC, 0x78, 0xAA, 0x4A, 0xC0, 0xB7, 0x52, 0xEA,
@@ -309,8 +309,8 @@ fn aacs_decrypt_unit_unencrypted_passthrough() {
 
 /// Independent AES-128-ECB encrypt (uses `aes` crate directly, NOT our library).
 fn ref_aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut block = GenericArray::clone_from_slice(data);
     cipher.encrypt_block(&mut block);
@@ -321,8 +321,8 @@ fn ref_aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 
 /// Independent AES-128-CBC encrypt (uses `aes` crate directly, NOT our library).
 fn ref_aes_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
-    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut prev = *iv;
     let num_blocks = data.len() / 16;
@@ -703,7 +703,7 @@ fn aacs_parse_unit_key_ro_minimal() {
     data[0..4].copy_from_slice(&uk_pos.to_be_bytes());
     // app_type
     data[16] = 1; // BD-ROM
-                  // num_bdmv_dir
+    // num_bdmv_dir
     data[17] = 1;
     // flags
     data[18] = 0;

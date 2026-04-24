@@ -661,18 +661,14 @@ pub fn resolve_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::super::decrypt::{aes_ecb_encrypt, ALIGNED_UNIT_LEN};
+    use super::super::decrypt::{ALIGNED_UNIT_LEN, aes_ecb_encrypt};
     use super::super::keydb::{DiscEntry, KeyDb};
     use super::*;
 
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
     fn keydb_path() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.exists() { Some(path) } else { None }
     }
 
     #[test]
@@ -850,7 +846,7 @@ mod tests {
         data[23] = 1; // top_menu = CPS unit 1
         data[24] = 0;
         data[25] = 1; // num_titles = 1
-                      // Title 0 entry: 2 bytes pad + CPS unit
+        // Title 0 entry: 2 bytes pad + CPS unit
         data[28] = 0;
         data[29] = 1; // CPS unit 1
 

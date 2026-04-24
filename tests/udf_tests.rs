@@ -1,7 +1,7 @@
 //! UDF parser tests using a MockSectorReader.
 
 use libfreemkv::error::Result;
-use libfreemkv::{read_filesystem, SectorReader};
+use libfreemkv::{SectorReader, read_filesystem};
 use std::collections::HashMap;
 
 const SECTOR_SIZE: usize = 2048;
@@ -39,7 +39,13 @@ impl MockSectorReader {
 }
 
 impl SectorReader for MockSectorReader {
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _recovery: bool) -> Result<usize> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
         let total = count as usize * SECTOR_SIZE;
         assert!(buf.len() >= total, "buffer too small");
         for i in 0..count as u32 {

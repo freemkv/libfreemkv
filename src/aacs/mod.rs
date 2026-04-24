@@ -21,12 +21,12 @@ pub mod keys;
 // Explicit re-exports — only items needed by external consumers and sibling crate modules.
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
 pub use decrypt::{
-    decrypt_bus, decrypt_unit, decrypt_unit_full, decrypt_unit_try_keys, is_unit_encrypted,
-    ALIGNED_UNIT_LEN,
+    ALIGNED_UNIT_LEN, decrypt_bus, decrypt_unit, decrypt_unit_full, decrypt_unit_try_keys,
+    is_unit_encrypted,
 };
 pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::{
-    decrypt_unit_key, derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash,
-    disc_hash_hex, mkb_version, parse_content_cert, parse_unit_key_ro, read_mkb_from_drive,
-    resolve_keys, ContentCert, ResolvedKeys, UnitKeyFile,
+    ContentCert, ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_from_dk,
+    derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex, mkb_version,
+    parse_content_cert, parse_unit_key_ro, read_mkb_from_drive, resolve_keys,
 };

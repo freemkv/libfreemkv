@@ -7,7 +7,7 @@
 //! For MKV: codec ID "S_VOBSUB".
 //! All frames are keyframes (each is a complete bitmap).
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 pub struct DvdSubParser {
     /// Pre-formatted VobSub .idx palette header for codec_private.

@@ -11,7 +11,7 @@
 //! AC-3 frames (interleaved, same PID): start with sync word 0x0B77.
 //! We skip AC-3 frames and only emit TrueHD access units.
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// Duration of one TrueHD access unit in nanoseconds (1/1200 second).
 const AU_DURATION_NS: i64 = 833_333;

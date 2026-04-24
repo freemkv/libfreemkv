@@ -5,7 +5,7 @@
 //! Frame start = Frame header start code (0x0D).
 //! I-frames (keyframes) are identified from the frame header.
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SC_SEQUENCE_HEADER: u8 = 0x0F;
 const SC_ENTRY_POINT: u8 = 0x0E;

@@ -5,7 +5,7 @@
 //! Buffers across PES boundaries so frames spanning two PES packets
 //! are emitted complete.
 
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
 const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];

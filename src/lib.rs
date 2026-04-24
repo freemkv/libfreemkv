@@ -95,15 +95,15 @@ pub(crate) mod udf;
 pub mod verify;
 
 pub use drive::capture::{
-    capture_drive_data, mask_bytes, mask_string, CapturedFeature, DriveCapture,
+    CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
-pub use drive::{find_drive, find_drives, Drive, DriveStatus};
+pub use drive::{Drive, DriveStatus, find_drive, find_drives};
 pub use error::{Error, Result};
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) -- callers use Drive, not Platform directly
-pub use decrypt::{decrypt_sectors, DecryptKeys};
+pub use decrypt::{DecryptKeys, decrypt_sectors};
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, Disc,
     DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, Resolution, SampleRate,
@@ -115,8 +115,8 @@ pub use mux::MkvStream;
 pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
-pub use mux::{input, output, parse_url, InputOptions, StreamUrl};
+pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 pub use scsi::ScsiTransport;
 pub use sector::{FileSectorReader, SectorReader};
 pub use speed::DriveSpeed;
-pub use udf::{read_filesystem, UdfFs};
+pub use udf::{UdfFs, read_filesystem};

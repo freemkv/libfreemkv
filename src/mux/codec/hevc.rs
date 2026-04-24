@@ -5,7 +5,7 @@
 //! Each PES packet = one access unit = one frame.
 
 use super::h264::{find_start_code, skip_start_code};
-use super::{pts_to_ns, CodecParser, Frame, PesPacket};
+use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 // HEVC NAL unit types
 const NAL_VPS: u8 = 32;
@@ -122,7 +122,7 @@ impl CodecParser for HevcParser {
 
         // Minimal HEVCDecoderConfigurationRecord header
         record.push(1); // configurationVersion
-                        // General profile space, tier flag, profile IDC from SPS
+        // General profile space, tier flag, profile IDC from SPS
         if sps.len() > 3 {
             record.push(sps[1]); // general_profile_space + general_tier_flag + general_profile_idc
         } else {
@@ -154,7 +154,7 @@ impl CodecParser for HevcParser {
         record.push(0xFC);
         // chromaFormat (6 + 2 bits)
         record.push(0xFC | 1); // 4:2:0
-                               // bitDepthLumaMinus8 (5 + 3 bits)
+        // bitDepthLumaMinus8 (5 + 3 bits)
         record.push(0xF8);
         // bitDepthChromaMinus8 (5 + 3 bits)
         record.push(0xF8);
@@ -162,7 +162,7 @@ impl CodecParser for HevcParser {
         record.extend_from_slice(&[0, 0]);
         // constantFrameRate + numTemporalLayers + temporalIdNested + lengthSizeMinusOne
         record.push(0x03); // lengthSizeMinusOne = 3 (4 bytes)
-                           // numOfArrays
+        // numOfArrays
         record.push(3); // VPS, SPS, PPS
 
         // VPS array

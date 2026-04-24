@@ -1,7 +1,7 @@
 //! AACS content decryption — AES primitives, unit decryption, bus encryption.
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 
 // ── AACS constants ──────────────────────────────────────────────────────────
 

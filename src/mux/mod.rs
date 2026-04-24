@@ -38,7 +38,7 @@ pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use null::NullStream;
-pub use resolve::{input, output, parse_url, InputOptions, StreamUrl};
+pub use resolve::{InputOptions, StreamUrl, input, output, parse_url};
 pub use stdio::StdioStream;
 
 use std::io::{Seek, Write};

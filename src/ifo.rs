@@ -734,12 +734,12 @@ mod tests {
         let mut pgc = vec![0u8; 0xEA];
         pgc[0x02] = 1; // 1 program
         pgc[0x03] = 2; // 2 cells
-                       // 1h 59m 30s at 29.97fps, 0 frames
+        // 1h 59m 30s at 29.97fps, 0 frames
         pgc[0x04] = 0x01; // hours BCD
         pgc[0x05] = 0x59; // minutes BCD
         pgc[0x06] = 0x30; // seconds BCD
         pgc[0x07] = 0b11_000000; // 29.97fps, 0 frames
-                                 // Cell playback info offset at PGC+0xE8
+        // Cell playback info offset at PGC+0xE8
         let cell_offset: u16 = 0xEA; // right after minimum header
         pgc[0xE8] = (cell_offset >> 8) as u8;
         pgc[0xE9] = cell_offset as u8;
@@ -755,7 +755,7 @@ mod tests {
         pgc[co + 21] = 0;
         pgc[co + 22] = 0;
         pgc[co + 23] = 200; // last sector
-                            // Cell 1: sectors 300-400
+        // Cell 1: sectors 300-400
         let co = 0xEA + 24;
         pgc[co + 8] = 0;
         pgc[co + 9] = 0;
