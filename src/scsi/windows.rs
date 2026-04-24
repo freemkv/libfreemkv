@@ -56,7 +56,7 @@ struct SptwbDirect {
 
 // ── Windows FFI ────────────────────────────────────────────────────────────
 
-extern "system" {
+unsafe extern "system" {
     fn CreateFileW(
         lpFileName: *const u16,
         dwDesiredAccess: u32,
