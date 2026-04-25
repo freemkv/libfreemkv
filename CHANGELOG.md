@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.13.11 (2026-04-25)
+
+### Fix: revert SgIoTransport timeout path to keep transport alive
+
+v0.13.10 changed `SgIoTransport::execute` to set `fd = -1` on a poll
+timeout (no reopen on the main thread, since that would serialize
+against the spawned close()). The intent was to escape the 60-s
+blocking reopen.
+
+The cost was too high: a single transient poll timeout permanently
+killed the transport. Live test on Dune 2 (post-replug):
+- Pass 1 ran for **45 ms** then returned with 0 GB good and 80 GB
+  pending.
+- The first SCSI READ timed out, fd went to -1, every subsequent
+  read returned `DeviceNotFound` instantly, Disc::copy raced through
+  the entire disc skip-forwarding in milliseconds.
+- Pass 2 inherited the dead Drive and was equally useless.
+
+Revert: spawn close + reopen on main thread (the v0.13.5/8
+behavior). Yes the main-thread open() may block up to ~60 s while
+the kernel completes the abandoned command — but the v0.13.9
+`Disc::copy` stall guard already caps catastrophic stalls at 120 s
+of `bytes_good` non-advance. Net: per-timeout cost is ~60 s, but
+Pass 1 cleanly bails out within 120 s of any wedge, and Pass 2 has
+a working Drive to retry NonTrimmed ranges with `recovery=true` +
+30 s timeouts.
+
+The integration test for the stall guard
+(`test_disc_copy_stall_detection_triggers_skip_forward`) continues
+to pass — the guard fires regardless of which transport-recovery
+strategy is in play.
+
 ## 0.13.10 (2026-04-25)
 
 ### Version sync — no functional changes
