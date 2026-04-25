@@ -185,28 +185,6 @@ impl SptiTransport {
         std::thread::sleep(std::time::Duration::from_secs(2));
         Ok(())
     }
-
-    /// USB-layer reset on Windows. Returns `DeviceNotFound` —
-    /// **intentional**, not a stub.
-    ///
-    /// Why: `reset()` above already issues `IOCTL_STORAGE_RESET_DEVICE`
-    /// which goes through `storport.sys`. On Windows that single IOCTL
-    /// covers both the SCSI layer **and** the USB Mass Storage layer
-    /// for storport-attached devices — functionally equivalent to
-    /// Linux's `SG_SCSI_RESET` + `USBDEVFS_RESET` combined into one
-    /// call. So Windows doesn't need a separate USB-layer step in the
-    /// recovery escalation; `drive_has_disc`'s second stage gracefully
-    /// falls through (it treats `DeviceNotFound` as "not applicable
-    /// for this platform / this drive type").
-    ///
-    /// If a future case is found where storport's reset doesn't reach
-    /// the USB layer (e.g. raw Win USB devices that bypass storport),
-    /// this can become a real `IOCTL_USB_HUB_CYCLE_PORT_EX` impl.
-    pub fn usb_reset(device: &Path) -> Result<()> {
-        Err(Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })
-    }
 }
 
 /// Enumerate optical drives on Windows via `find_drives()` (CdRom0..15
@@ -224,9 +202,8 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         .collect()
 }
 
-/// TEST UNIT READY probe on Windows. Wedge recovery on this platform
-/// goes through `IOCTL_STORAGE_RESET_DEVICE` (already in `reset()`);
-/// USB-layer cycle-port is stubbed — see `usb_reset` above.
+/// TEST UNIT READY probe on Windows. No in-library recovery — see the
+/// Linux `drive_has_disc` doc block for the rationale.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     let mut transport = SptiTransport::open(path)?;
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];

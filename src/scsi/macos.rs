@@ -277,146 +277,7 @@ impl MacScsiTransport {
         std::thread::sleep(std::time::Duration::from_secs(2));
         Ok(())
     }
-
-    /// USB-layer reset on macOS via `IOUSBDeviceInterface::ResetDevice`.
-    ///
-    /// Mirrors the Linux `USBDEVFS_RESET` path: walk from the BSD-named
-    /// SCSI service up the IORegistry plane to the parent `IOUSBDevice`,
-    /// query its `IOUSBDeviceInterface`, call `ResetDevice()`. Software
-    /// equivalent of unplug-replug — the only thing that recovers a
-    /// kernel-level USB Mass Storage wedge on macOS.
-    ///
-    /// Returns `DeviceNotFound` when the device isn't USB-attached
-    /// (Thunderbolt/SATA/internal SuperDrive over PCIe — they don't
-    /// have an `IOUSBDevice` ancestor) so the caller's escalation can
-    /// fall through cleanly. `DeviceResetFailed` on actual reset
-    /// failures.
-    pub fn usb_reset(device: &Path) -> Result<()> {
-        let bsd_name =
-            device
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::DeviceNotFound {
-                    path: device.display().to_string(),
-                })?;
-
-        let service = find_scsi_service(bsd_name)?;
-        let usb_service = walk_to_usb_device(service);
-        unsafe { IOObjectRelease(service) };
-        let usb_service = usb_service.ok_or_else(|| Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })?;
-
-        // Get IOUSBDeviceInterface from the USB device service.
-        let mut plugin: ComRef = std::ptr::null_mut();
-        let mut score: i32 = 0;
-        let kr = unsafe {
-            IOCreatePlugInInterfaceForService(
-                usb_service,
-                &K_IO_USB_DEVICE_USER_CLIENT_TYPE_ID,
-                &K_IO_CFPLUGIN_INTERFACE_ID,
-                &mut plugin,
-                &mut score,
-            )
-        };
-        unsafe { IOObjectRelease(usb_service) };
-        if kr != K_IO_RETURN_SUCCESS || plugin.is_null() {
-            return Err(Error::DeviceResetFailed {
-                path: device.display().to_string(),
-            });
-        }
-
-        // QueryInterface for IOUSBDeviceInterface.
-        let mut device_iface: ComRef = std::ptr::null_mut();
-        let hr = unsafe {
-            type QiFn = unsafe extern "C" fn(ComRef, *const [u8; 16], *mut ComRef) -> i32;
-            let qi: QiFn = vtable_fn(plugin, 1);
-            qi(plugin, &K_IO_USB_DEVICE_INTERFACE_ID, &mut device_iface)
-        };
-        com_release(plugin);
-        if hr != 0 || device_iface.is_null() {
-            return Err(Error::DeviceResetFailed {
-                path: device.display().to_string(),
-            });
-        }
-
-        // Call ResetDevice() — vtable index 11 in IOUSBDeviceInterface.
-        // Verified against IOUSBLib.h headers (Apple OSS).
-        let kr = unsafe {
-            type ResetFn = unsafe extern "C" fn(ComRef) -> IOReturn;
-            let f: ResetFn = vtable_fn(device_iface, K_IO_USB_DEVICE_RESET_VTABLE_INDEX);
-            f(device_iface)
-        };
-        com_release(device_iface);
-
-        if kr != K_IO_RETURN_SUCCESS {
-            Err(Error::DeviceResetFailed {
-                path: device.display().to_string(),
-            })
-        } else {
-            Ok(())
-        }
-    }
 }
-
-/// `kIOUSBDeviceUserClientTypeID` — IOKit plugin type for accessing a
-/// USB device through user-space (the gateway to `IOUSBDeviceInterface`).
-const K_IO_USB_DEVICE_USER_CLIENT_TYPE_ID: [u8; 16] = [
-    0x9D, 0xC7, 0xB7, 0x80, 0x9E, 0xC0, 0x11, 0xD4, 0xA5, 0x4F, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
-];
-
-/// `kIOUSBDeviceInterfaceID` — `IOUSBDeviceInterface` (revision 0).
-/// Sufficient for `ResetDevice()` which has been at vtable index 11
-/// since the original interface revision.
-const K_IO_USB_DEVICE_INTERFACE_ID: [u8; 16] = [
-    0x5C, 0x81, 0x87, 0xD0, 0x9E, 0xF3, 0x11, 0xD4, 0x8B, 0x45, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61,
-];
-
-/// Vtable index of `IOUSBDeviceInterface::ResetDevice`. Per IOUSBLib.h:
-/// the interface inherits from IOCFPlugInInterface which occupies slots
-/// 0..2 (QueryInterface, AddRef, Release), then IOUSBDeviceInterface
-/// methods start at slot 3. ResetDevice is the 9th IOUSBDevice-specific
-/// method → slot 3 + 8 = 11.
-const K_IO_USB_DEVICE_RESET_VTABLE_INDEX: usize = 11;
-
-/// Walk up the IORegistry plane from a SCSI peripheral service to the
-/// parent `IOUSBDevice` (if any). Mirrors the Linux sysfs walk in
-/// `linux::SgIoTransport::resolve_usb_device`. Returns the IOService
-/// for the USB device (caller owns the reference; release with
-/// `IOObjectRelease`), or `None` for non-USB-attached drives.
-fn walk_to_usb_device(start: IOObject) -> Option<IOObject> {
-    let mut current = start;
-    // Retain the start so we can release uniformly each loop iteration.
-    unsafe {
-        let kr = IOObjectRetain(current);
-        if kr != K_IO_RETURN_SUCCESS {
-            return None;
-        }
-    }
-    for _ in 0..K_USB_PARENT_WALK_LIMIT {
-        if unsafe { IOObjectConformsTo(current, c"IOUSBDevice".as_ptr() as *const u8) } != 0 {
-            return Some(current);
-        }
-        let mut parent: IOObject = 0;
-        let kr = unsafe {
-            IORegistryEntryGetParentEntry(current, c"IOService".as_ptr() as *const u8, &mut parent)
-        };
-        unsafe { IOObjectRelease(current) };
-        if kr != K_IO_RETURN_SUCCESS || parent == 0 {
-            return None;
-        }
-        current = parent;
-    }
-    unsafe { IOObjectRelease(current) };
-    None
-}
-
-/// Maximum IORegistry parent-chain depth searched for a USB ancestor.
-/// Real chains for USB-attached optical drives are 6-10 entries deep
-/// (IOMedia → BlockStorageDriver → SCSIPeripheralDeviceNub →
-/// SCSIProtocolEmulator → IOUSBInterface → IOUSBDevice → ...). 32 is
-/// generous; if we don't find it by then, the device isn't USB.
-const K_USB_PARENT_WALK_LIMIT: u32 = 32;
 
 /// Enumerate optical drives on macOS. Mirrors `drive::macos::find_drives`
 /// (which iterates `/dev/disk0..15` + INQUIRY + filters peripheral
@@ -467,57 +328,28 @@ const K_INQUIRY_TYPE_MASK: u8 = 0x1F;
 /// SCSI peripheral type 5 = "CD-ROM device" (covers DVD, BD-ROM, BD-RE).
 const K_SCSI_TYPE_OPTICAL: u8 = 0x05;
 
-/// TEST UNIT READY probe on macOS. Same shape as the Linux impl —
-/// open transport, run TUR, classify response. The macOS path doesn't
-/// surface the Linux `0xff`-status wedge pattern (IOKit returns its
-/// own error codes), so wedge-detection here is sense-key based: a
-/// transport-level error during TUR escalates to SCSI reset → USB
-/// reset. Most macOS drives auto-recover at the SCSI-reset stage.
+/// TEST UNIT READY probe on macOS. Any non-"not ready" error bubbles up
+/// to the caller — in-library wedge recovery was rolled back in 0.13.4
+/// after USB-layer resets failed to recover the LG BU40N on Linux; the
+/// macOS impl mirrors that choice for symmetry. See the Linux
+/// `drive_has_disc` in `scsi/linux.rs` for the full rationale.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
-    match probe_tur(path) {
-        Ok(present) => Ok(present),
+    let mut transport = MacScsiTransport::open(path)?;
+    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+    let mut buf = [0u8; 0];
+    match transport.execute(
+        &cdb,
+        crate::scsi::DataDirection::None,
+        &mut buf,
+        crate::scsi::TUR_TIMEOUT_MS,
+    ) {
+        Ok(_) => Ok(true),
         Err(Error::ScsiError { sense_key, .. }) if sense_key == K_SENSE_KEY_NOT_READY => Ok(false),
-        Err(_) => recover_then_probe(path),
+        Err(e) => Err(e),
     }
 }
 
 const K_SENSE_KEY_NOT_READY: u8 = 2;
-
-fn probe_tur(path: &Path) -> Result<bool> {
-    let mut transport = MacScsiTransport::open(path)?;
-    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let mut buf = [0u8; 0];
-    transport
-        .execute(
-            &cdb,
-            crate::scsi::DataDirection::None,
-            &mut buf,
-            crate::scsi::TUR_TIMEOUT_MS,
-        )
-        .map(|_| true)
-}
-
-fn recover_then_probe(path: &Path) -> Result<bool> {
-    let _ = super::reset(path);
-    if let Ok(present) = probe_tur(path) {
-        return Ok(present);
-    }
-    if super::usb_reset(path).is_ok() {
-        std::thread::sleep(std::time::Duration::from_secs(K_USB_RESET_SETTLE_SECS));
-        if let Ok(present) = probe_tur(path) {
-            return Ok(present);
-        }
-    }
-    Err(Error::DeviceResetFailed {
-        path: path.display().to_string(),
-    })
-}
-
-const K_USB_RESET_SETTLE_SECS: u64 = 2;
-
-unsafe extern "C" {
-    fn IOObjectRetain(object: IOObject) -> IOReturn;
-}
 
 impl Drop for MacScsiTransport {
     fn drop(&mut self) {
