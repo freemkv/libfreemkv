@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.8 (2026-04-25)
+
+### Version sync — no functional changes
+
+Sync bump for the ecosystem. 0.13.8 carries autorip-side fixes:
+post-stop "error" leak (halt-aware Err handling in Pass 1/2+),
+60 s drain timeout, and a structural spawn_rip_thread helper.
+
 ## 0.13.7 (2026-04-25)
 
 ### Version sync — no functional changes
