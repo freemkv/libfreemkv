@@ -115,6 +115,9 @@ impl Drive {
         self.event_fn = Some(Box::new(f));
     }
 
+    #[allow(dead_code)] // public on_event registration kept; Drive currently
+    // has no internal emission sites after the 0.13.6 recovery strip.
+    // DiscStream is the BytesRead source. Plan to drop on_event in 0.14.
     fn emit(&self, kind: EventKind) {
         if let Some(ref f) = self.event_fn {
             f(Event { kind });
