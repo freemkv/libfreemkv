@@ -321,37 +321,42 @@ impl ScsiTransport for SgIoTransport {
 
         if pr <= 0 {
             // Timeout (0) or fatal poll error (-1).
-            // Command is still pending in the kernel. Abandon the fd by
-            // spawning a background close (which will block until the
-            // kernel completes/aborts the pending command), and mark
-            // this transport invalid by setting `self.fd = -1`.
+            // Command is still pending in the kernel. Spawn a background
+            // close of the old fd (which blocks until the kernel
+            // completes/aborts the pending command) and open a fresh fd
+            // on the main thread. The main-thread open() can serialize
+            // against the in-flight close via the kernel's per-device
+            // state lock — so this call may block up to ~60 s while
+            // the kernel finishes the abandoned command. That's the
+            // cost of keeping the Drive alive across a timeout. The
+            // Disc::copy stall guard (v0.13.9, default 120 s of
+            // bytes_good non-advance) is the upper bound that prevents
+            // a catastrophic grind on a wedged read region.
             //
-            // Why we no longer reopen on the main thread: opening the
-            // SAME /dev/sg* device while the prior fd is mid-close
-            // serializes via the kernel's per-device state lock, so
-            // `libc::open()` on the main thread blocks for the same
-            // duration that close() does — defeating the userspace
-            // timeout. Observed in v0.13.8 live test on Dune 2: each
-            // timed-out read added 60+ s to the next iteration of
-            // Disc::copy, leaving the rip stuck without surfacing an
-            // error or wedging the drive.
-            //
-            // Net effect of the fix: a single read timeout invalidates
-            // the SgIoTransport. The Drive is now "dead" until the
-            // consumer (autorip's rip thread) catches the failure and
-            // reopens. Disc::copy's `skip_on_error=true` path will see
-            // the Err and skip-forward, advancing pos, and the next
-            // read on this fd returns Err(DeviceNotFound) immediately —
-            // which Disc::copy continues to skip-forward through until
-            // the NonTried region is exhausted. Pass 1 then ends with
-            // bytes_pending > 0 and the rip thread reopens the Drive
-            // for Pass 2 (Disc::patch with recovery=true and 30 s
-            // timeouts).
+            // History:
+            //  - 0.13.5 and earlier: same as this — but with no upper
+            //    bound, hence 45-min hangs.
+            //  - 0.13.10: tried "set fd=-1, no reopen" — too aggressive,
+            //    one transient timeout killed the whole transport, Pass
+            //    1 finished in 45 ms with everything NonTrimmed.
+            //  - 0.13.11 (this): same close+reopen as 0.13.5/8 BUT with
+            //    the v0.13.9 stall guard ensuring Disc::copy bails out
+            //    cleanly within 120 s of zero forward progress.
             let old_fd = self.fd;
             self.fd = -1;
+
             std::thread::spawn(move || {
                 unsafe { libc::close(old_fd) };
             });
+
+            let c_path = Self::to_c_path(&self.device_path);
+            let new_fd = unsafe {
+                libc::open(
+                    c_path.as_ptr() as *const libc::c_char,
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            self.fd = if new_fd >= 0 { new_fd } else { -1 };
 
             return Err(Error::ScsiError {
                 opcode: cdb[0],
