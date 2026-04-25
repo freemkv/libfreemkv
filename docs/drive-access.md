@@ -26,8 +26,8 @@ platform driver. The drive is ready for `wait_ready()` and `init()`.
 | `wait_ready()` | Wait for disc insertion (30s timeout, TUR polling) |
 | `init()` | Firmware upload + unlock + speed calibration |
 | `probe_disc()` | Probe disc surface for optimal speeds |
-| `read(lba, count, buf)` | Read sectors with built-in error recovery |
-| `reset()` | Close/reopen device, TUR, escalate if needed |
+| `read(lba, count, buf, recovery)` | Read sectors. Single-shot — no inline retries or reset. |
+| `reset()` | Eject-cycle escape hatch. Caller-invoked only; not on the read path. |
 | `lock_tray()` | Prevent tray ejection during rip |
 | `unlock_tray()` | Allow tray ejection (also runs on Drop) |
 | `eject()` | Eject disc tray |
@@ -44,22 +44,33 @@ platform driver. The drive is ready for `wait_ready()` and `init()`.
 3. Speed calibration after unlock
 4. Max 3 attempts before giving up
 
-### read() with Recovery
+### read() — single-shot
 
-`Drive::read(lba, count, buf, recovery)` is the single read method. The
-`recovery` parameter controls whether to attempt multi-phase recovery on
-failure or return immediately (used by DiscStream's binary search for
-single-sector probes).
+`Drive::read(lba, count, buf, recovery)` is the single read method. It issues
+exactly one READ(10) CDB and returns the result. The `recovery` parameter only
+selects the per-CDB timeout:
 
-On error with `recovery = true`:
+| `recovery` | Timeout  | Used by                                  |
+|------------|----------|------------------------------------------|
+| `false`    | 1.5 s    | `Disc::copy` fast skip-forward sweep, `DiscStream::fill_extents` |
+| `true`     | 30 s     | `Disc::patch` multi-pass over the mapfile |
 
-1. **Phase 1 — gentle retry (5 attempts):** set min speed, sleep 30s, retry.
-   Each retry has a hard wall-clock timeout via async SG_IO.
-2. **Phase 2 — fresh start:** close transport, reset device, reopen, reinit.
-3. **Phase 3 — gentle retry on fresh connection (5 attempts).**
-4. If all fail: return `Err(DiscRead)`. DiscStream handles it (binary search,
-   skip, zero-fill).
-5. Stay at min speed for 500 MB after any recovery (recovery window).
+On any SCSI failure or timeout, `read` returns `Err(DiscRead)` immediately.
+There are no inline retries, no SCSI reset, no Phase 1/2/3 escalation.
+
+Recovery is layered above `Drive::read`:
+
+- **Layer 1 — `Disc::patch`** loops over the ddrescue mapfile and re-issues
+  `read(.., recovery=true)` against each non-`+` range.
+- **Layer 3 — `DiscStream::fill_extents`** halves the request size on
+  failure, retries at the same LBA, and probes back up on a clean-read
+  streak.
+
+Inline recovery (5× gentle retry → close + reset + reopen → 5× more) was
+removed in 0.13.6. See `freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`
+for rationale: the inline reset wedged drive firmware on the LG BU40N (Initio
+USB-SATA bridge) without ever recovering a sector. See
+[`rip-recovery.md`](rip-recovery.md) for the full three-layer model.
 
 ---
 
@@ -98,6 +109,17 @@ cannot block us. Opens with `O_RDWR | O_NONBLOCK`.
 
 On non-zero SCSI status, the transport parses sense key from the sense buffer
 and returns `Error::ScsiError`.
+
+`SgIoTransport::reset` (Linux) does pure userspace state cleanup: an open +
+close pair to make the kernel cancel any SG_IO commands queued against a
+previous fd, a 2 s sleep to let the kernel finish that cancellation, then a
+fresh fd to send ALLOW MEDIUM REMOVAL to clear any stale tray lock. It does
+NOT issue `SG_SCSI_RESET` or escalate via STOP+START UNIT. Both were tried
+in 0.13.0–0.13.5 against the LG BU40N (Initio USB-SATA bridge); both failed
+to recover wedged drives and made the wedge worse. The macOS reset (which
+had been a no-op) was removed entirely in 0.13.6, and the top-level
+`scsi::reset()` / `reset_with_timeout()` / `reset_blocking()` wrappers were
+removed at the same time (no callers).
 
 ### CDB Builders
 
