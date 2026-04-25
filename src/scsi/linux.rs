@@ -418,15 +418,11 @@ const SENSE_KEY_NOT_READY: u8 = 2;
 /// realistic homelab (typical PERC + USB optical = ≤8 nodes).
 const SG_FALLBACK_MAX: u8 = 16;
 
-/// SCSI INQUIRY response field offsets (SPC-4, 6-byte standard CDB
-/// returning 96 bytes). Used to populate `DriveInfo` fields without
-/// magic-number arithmetic at the call site.
-const INQUIRY_VENDOR_OFFSET: usize = 8;
-const INQUIRY_VENDOR_LEN: usize = 8;
-const INQUIRY_MODEL_OFFSET: usize = 16;
-const INQUIRY_MODEL_LEN: usize = 16;
-const INQUIRY_FIRMWARE_OFFSET: usize = 32;
-const INQUIRY_FIRMWARE_LEN: usize = 4;
+// SCSI INQUIRY field-offset constants previously lived here. They were
+// used by an in-process SCSI INQUIRY parse path that 0.13.6 retired in
+// favour of reading the kernel-cached sysfs identity (vendor/model/rev
+// under /sys/class/scsi_generic/sgN/device/). Removed to keep clippy
+// -D warnings clean.
 
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let mut out = Vec::new();
