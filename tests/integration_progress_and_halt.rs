@@ -9,8 +9,8 @@ use libfreemkv::{
     SectorReader,
 };
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SECTOR_SIZE: usize = 2048;
@@ -337,4 +337,168 @@ fn test_file_sector_reader_round_trip() {
         .expect("read all sectors");
     assert_eq!(n, N_SECTORS * SECTOR_SIZE);
     assert_eq!(all, data, "bulk read mismatch");
+}
+
+// ── 6. Disc::copy stall detection triggers skip-forward (TDD red) ─────────
+//
+// Regression guard for the Dell-host hang where `read_sectors` blocked inside
+// a kernel-level USB stall and `Disc::copy` sat frozen for 10+ minutes with
+// no progress and no error. The fix introduces `CopyOptions::stall_secs:
+// Option<u64>` — when elapsed-since-last-`bytes_good`-advance exceeds the
+// threshold, `Disc::copy` treats the current block as a read failure and
+// triggers the skip-forward path so the rip can advance.
+//
+// THIS TEST IS EXPECTED TO FAIL UNTIL THE PARALLEL FIX LANDS.
+// - Until `stall_secs` exists on `CopyOptions`, the test will not compile.
+// - Once the field exists but the stall guard isn't wired, the spawned copy
+//   thread will never exit (test fails on the 5s join bound).
+// - Once the guard is wired, copy returns within ~stall_secs with
+//   `complete=false` and `bytes_pending>0`.
+
+/// Reader that returns Ok for sectors `< block_after`, then returns Err for
+/// any sector `>= block_after` after a small per-call delay. Models the
+/// realistic Dell-host symptom: reads keep returning Err (skip-forward fires)
+/// but no `bytes_good` ever accrues; without a stall guard, Pass 1 grinds
+/// silently for tens of minutes.
+struct StallingSectorReader {
+    capacity: u32,
+    block_after: u32,
+    /// Per-call delay for sectors >= block_after (simulates slow reads).
+    err_delay_ms: u64,
+    release: Arc<AtomicBool>,
+    /// Retained so callers can release the reader; unused now that the
+    /// reader returns Err instead of blocking, but kept so the test's
+    /// existing release plumbing compiles.
+    park: Arc<(Mutex<()>, std::sync::Condvar)>,
+}
+
+impl StallingSectorReader {
+    fn new(capacity: u32, block_after: u32) -> Self {
+        Self {
+            capacity,
+            block_after,
+            err_delay_ms: 100,
+            release: Arc::new(AtomicBool::new(false)),
+            park: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+        }
+    }
+
+    fn release_handle(&self) -> (Arc<AtomicBool>, Arc<(Mutex<()>, std::sync::Condvar)>) {
+        (self.release.clone(), self.park.clone())
+    }
+}
+
+impl SectorReader for StallingSectorReader {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        if lba >= self.block_after {
+            // Realistic stall model: read takes err_delay_ms then returns
+            // Err. With skip_on_error+skip_forward, Disc::copy will keep
+            // skip-forwarding through this region — no bytes_good accrues.
+            // The stall guard fires when bytes_good is unchanged for
+            // stall_secs.
+            std::thread::sleep(Duration::from_millis(self.err_delay_ms));
+            return Err(libfreemkv::error::Error::DiscRead { sector: lba as u64 });
+        }
+        let bytes = count as usize * SECTOR_SIZE;
+        buf[..bytes].fill(0);
+        Ok(bytes)
+    }
+
+    fn capacity(&self) -> u32 {
+        self.capacity
+    }
+}
+
+#[test]
+fn test_disc_copy_stall_detection_triggers_skip_forward() {
+    // 1024 sectors total. Reader serves the first 64 sectors instantly, then
+    // every later read blocks forever. With stall_secs=2, copy should bail
+    // out of the stalled block within ~2s and either skip forward or finish
+    // with bytes_pending > 0 / complete=false.
+    let capacity_sectors: u32 = 1024;
+    let block_after: u32 = 64;
+
+    let reader = StallingSectorReader::new(capacity_sectors, block_after);
+    let (release_flag, park) = reader.release_handle();
+    let mut reader = reader;
+
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let iso_path_for_thread = iso_path.clone();
+
+    let join = std::thread::spawn(move || {
+        let opts = CopyOptions {
+            decrypt: false,
+            skip_on_error: true,
+            skip_forward: true,
+            // ASSUMPTION: parallel fix adds `pub stall_secs: Option<u64>` to
+            // CopyOptions. If the field name differs, update here.
+            stall_secs: Some(2),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let res = disc.copy(&mut reader, &iso_path_for_thread, &opts);
+        (res, t0.elapsed())
+    });
+
+    // Bound the join to ~5s. With stall_secs=2 the copy should exit well
+    // within this window. If it doesn't, the stall guard isn't working.
+    let started = Instant::now();
+    let mut joined = None;
+    while started.elapsed() < Duration::from_millis(5000) {
+        if join.is_finished() {
+            joined = Some(join.join().expect("thread join"));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Whether or not the join succeeded, release the parked reader thread so
+    // it can exit (its &mut reader is owned by the spawned thread; releasing
+    // lets that thread unwind cleanly).
+    release_flag.store(true, Ordering::Relaxed);
+    park.1.notify_all();
+
+    let (result, elapsed) = match joined {
+        Some(v) => v,
+        None => {
+            // Wait a bit longer for the thread to drain after release so we
+            // don't leave it dangling, then fail the test.
+            std::thread::sleep(Duration::from_millis(500));
+            panic!(
+                "Disc::copy did not return within 5s of stall_secs=2 — \
+                 stall guard not wired (TDD red until fix lands)"
+            );
+        }
+    };
+
+    // Cleanup
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
+
+    let copy_result = result.expect("copy returns Ok with stall handling");
+
+    assert!(
+        elapsed < Duration::from_millis(5000),
+        "copy elapsed {elapsed:?} exceeded 5s bound (stall_secs=2)"
+    );
+    assert!(
+        copy_result.bytes_pending > 0,
+        "expected bytes_pending > 0 after stall-triggered skip; got {}",
+        copy_result.bytes_pending
+    );
+    assert!(
+        !copy_result.complete,
+        "expected complete=false after stall-triggered skip"
+    );
 }

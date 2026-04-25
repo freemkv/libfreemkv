@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.13.9 (2026-04-25)
+
+### Fix: Disc::copy silent stall + SgIoTransport reopen-after-timeout serialization
+
+Two correlated fixes for a hang observed live on the LG BU40N during a
+v0.13.8 rip of Dune: Part Two. At ~30 % progress through Pass 1
+(disc → ISO), `bytes_good` froze for 10+ minutes with `errs=0`,
+no error surfaced, drive not wedged.
+
+Root cause: `SgIoTransport::execute` (linux.rs) attempted to recover from
+a `poll()` timeout by spawning a background `close()` of the old fd and
+opening a fresh `/dev/sg*` fd on the main thread. On Linux, opening the
+SAME device while a prior fd is mid-close serializes via the kernel's
+per-device state lock — so the fresh `open()` blocks for as long as the
+close does (until the kernel completes the in-flight CDB). This undid
+the userspace 1.5 s timeout: each timed-out read added 60+ s to the
+next iteration. From `Disc::copy`'s perspective, reads kept returning
+Err slowly, the skip-forward path advanced `pos` but never `bytes_good`.
+
+Fixes:
+- `SgIoTransport::execute` no longer reopens on timeout. Spawns the
+  close, sets `self.fd = -1`, returns Err immediately. Subsequent
+  calls fail with `DeviceNotFound` (already gated at line 248).
+  Caller (Drive) is invalidated until reopened. Pass 2's
+  `Disc::patch` would need a fresh Drive; that's a v0.14 follow-up.
+- `Disc::copy` adds a stall guard. New `CopyOptions::stall_secs:
+  Option<u64>` (default 120 s). If `bytes_good` doesn't advance for
+  the threshold, breaks the outer loop with `complete: false,
+  bytes_pending > 0` so the caller's retry path picks up.
+
+Tests: new `test_disc_copy_stall_detection_triggers_skip_forward` in
+`tests/integration_progress_and_halt.rs` proves the guard fires within
+the configured threshold.
+
+Other:
+- Cosmetic: warning text "rip thread did not drain within 35s" updated
+  to 60s (matches the v0.13.8 timeout bump).
+
 ## 0.13.8 (2026-04-25)
 
 ### Version sync — no functional changes
