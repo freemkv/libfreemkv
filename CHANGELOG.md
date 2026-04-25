@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.10 (2026-04-25)
+
+### Version sync — no functional changes
+
+Sync bump for the autorip-side fix in 0.13.10 (Pass 1 batch reporting).
+
 ## 0.13.9 (2026-04-25)
 
 ### Fix: Disc::copy silent stall + SgIoTransport reopen-after-timeout serialization
