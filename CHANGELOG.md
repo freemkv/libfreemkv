@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.7 (2026-04-25)
+
+### Version sync — no functional changes
+
+Sync bump for the ecosystem. All four freemkv crates (libfreemkv,
+freemkv CLI, bdemu, autorip) always share a version number; 0.13.7
+carries an autorip-side fix (HTTP-spawned rip/scan threads now
+register for stop-drain).
+
 ## 0.13.6 (2026-04-25)
 
 ### Inline retry/reset stripped from `Drive::read`; `BytesRead` now emitted
