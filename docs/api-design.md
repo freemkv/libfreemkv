@@ -126,14 +126,44 @@ pub struct Event {
 }
 
 pub enum EventKind {
+    // Init / scan
+    DriveOpened { device: String },
+    DriveReady,
+    InitComplete { success: bool },
+    ProbeComplete { success: bool },
+    ScanComplete { titles: usize },
+
+    // Read pipeline
     BytesRead { bytes: u64, total: u64 },
     ReadError { sector: u64, error: Error },
-    Retry { attempt: u32 },
     SpeedChange { speed_kbs: u16 },
     ExtentStart { index: usize, start_sector: u64, sector_count: u64 },
+    SectorSkipped { sector: u64 },
+    BatchSizeChanged { new_size: u16, reason: BatchSizeReason },
     Complete { bytes: u64, errors: u32 },
+
+    // Kept for forward-compat; not emitted in 0.13.6+
+    Retry { attempt: u32 },
+    SectorRecovered { sector: u64 },
 }
 ```
+
+Emission notes:
+
+- `BytesRead { bytes, total }` is emitted from `DiscStream::fill_extents`
+  after each successful sector read. `bytes` is the cumulative running
+  total; `total` is the precomputed extent sum (0 if unknown).
+- `SpeedChange` is emitted from the public `Drive::set_speed` API path.
+  It is no longer emitted from a recovery hot loop (recovery loop removed
+  in 0.13.6).
+- `BatchSizeChanged` fires from the `DiscStream` adaptive sizer on shrink
+  (read failed at a larger size) and on probe-up (clean-read streak hit
+  the threshold). Consumers use it to display a "recovering" state
+  distinct from "ripping normally".
+- `Retry` and `SectorRecovered` are NOT emitted in 0.13.6+. They were
+  tied to the inline `Drive::read` recovery phases that were removed; the
+  variants are kept for forward compatibility so consumers' match arms
+  don't need conditional compilation.
 
 Events report what happened. App decides what to do. GUI shows a dialog. CLI
 prints a line. Server logs to file.
@@ -145,8 +175,8 @@ libfreemkv/src/
 ├── lib.rs              Public exports
 ├── error.rs            Error codes (no English)
 ├── event.rs            Event types for callbacks
-├── drive/              Drive (open, init, read with recovery)
-│   ├── mod.rs          Drive struct, init, read, reset, eject
+├── drive/              Drive (open, init, single-shot read)
+│   ├── mod.rs          Drive struct, init, read (single-shot), reset, eject
 │   ├── capture.rs      Drive profile capture for contribution
 │   ├── linux.rs        Linux drive discovery
 │   ├── macos.rs        macOS drive discovery

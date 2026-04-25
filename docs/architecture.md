@@ -41,7 +41,7 @@ AACS keys are derived internally, and all SCSI communication is handled in-proce
 libfreemkv (lib.rs)
 │
 ├── Drive Access
-│   ├── drive         Drive — open, identify, init, unlock, read (with recovery)
+│   ├── drive         Drive — open, identify, init, unlock, single-shot read
 │   ├── scsi          ScsiTransport trait + platform backends (sg async, IOKit, SPTI)
 │   ├── platform/     Platform trait — per-chipset command handlers
 │   │   └── mt1959    MediaTek MT1959 driver (LG, ASUS, HP)
@@ -93,9 +93,16 @@ Drive::open(Path::new("/dev/sg4"))
 After open:
 - `init()` -- unlock + firmware upload + speed calibration
 - `probe_disc()` -- probe disc surface for optimal speeds
-- `read(lba, count, buf)` -- single read method with built-in error recovery
+- `read(lba, count, buf, recovery)` -- single-shot read; `recovery` only selects the per-CDB timeout (1.5 s vs. 30 s)
 - `wait_ready()` -- wait for disc insertion
 - `eject()` -- eject tray
+
+Recovery is layered above `Drive::read`, not inside it. Layer 1
+(`Disc::patch`) handles bad-range retry by replaying the ddrescue mapfile.
+Layer 3 (`DiscStream::fill_extents` adaptive batch sizer) handles in-loop
+request-size adaptation. Inline recovery (gentle retry → SCSI reset → retry)
+was removed in 0.13.6 — see [`rip-recovery.md`](rip-recovery.md) and
+`freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`.
 
 ---
 
