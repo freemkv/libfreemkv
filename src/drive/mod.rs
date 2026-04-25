@@ -8,12 +8,15 @@
 
 pub mod capture;
 
+// Per-platform discovery helpers (the `pub(crate)` `find_drives` /
+// equivalents). Crate-public so `scsi/{linux,macos,windows}.rs` can
+// reuse the existing enumeration logic when shaping `DriveInfo`.
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 use crate::error::{Error, Result};
 use crate::event::{Event, EventKind};

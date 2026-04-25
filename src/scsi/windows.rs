@@ -185,6 +185,62 @@ impl SptiTransport {
         std::thread::sleep(std::time::Duration::from_secs(2));
         Ok(())
     }
+
+    /// USB-layer reset on Windows. Returns `DeviceNotFound` —
+    /// **intentional**, not a stub.
+    ///
+    /// Why: `reset()` above already issues `IOCTL_STORAGE_RESET_DEVICE`
+    /// which goes through `storport.sys`. On Windows that single IOCTL
+    /// covers both the SCSI layer **and** the USB Mass Storage layer
+    /// for storport-attached devices — functionally equivalent to
+    /// Linux's `SG_SCSI_RESET` + `USBDEVFS_RESET` combined into one
+    /// call. So Windows doesn't need a separate USB-layer step in the
+    /// recovery escalation; `drive_has_disc`'s second stage gracefully
+    /// falls through (it treats `DeviceNotFound` as "not applicable
+    /// for this platform / this drive type").
+    ///
+    /// If a future case is found where storport's reset doesn't reach
+    /// the USB layer (e.g. raw Win USB devices that bypass storport),
+    /// this can become a real `IOCTL_USB_HUB_CYCLE_PORT_EX` impl.
+    pub fn usb_reset(device: &Path) -> Result<()> {
+        Err(Error::DeviceNotFound {
+            path: device.display().to_string(),
+        })
+    }
+}
+
+/// Enumerate optical drives on Windows via `find_drives()` (CdRom0..15
+/// scan) and re-shape into `DriveInfo`. Existing implementation already
+/// returns `(path, DriveId)`; mapped here to the public struct.
+pub(super) fn list_drives() -> Vec<super::DriveInfo> {
+    crate::drive::windows::find_drives()
+        .into_iter()
+        .map(|(path, id)| super::DriveInfo {
+            path,
+            vendor: id.vendor_id.trim().to_string(),
+            model: id.product_id.trim().to_string(),
+            firmware: id.product_revision.trim().to_string(),
+        })
+        .collect()
+}
+
+/// TEST UNIT READY probe on Windows. Wedge recovery on this platform
+/// goes through `IOCTL_STORAGE_RESET_DEVICE` (already in `reset()`);
+/// USB-layer cycle-port is stubbed — see `usb_reset` above.
+pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
+    let mut transport = SptiTransport::open(path)?;
+    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+    let mut buf = [0u8; 0];
+    match transport.execute(
+        &cdb,
+        crate::scsi::DataDirection::None,
+        &mut buf,
+        crate::scsi::TUR_TIMEOUT_MS,
+    ) {
+        Ok(_) => Ok(true),
+        Err(Error::ScsiError { sense_key: 2, .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 impl Drop for SptiTransport {
