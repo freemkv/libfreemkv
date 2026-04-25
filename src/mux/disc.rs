@@ -157,8 +157,7 @@ impl DiscStream {
         content_format: crate::disc::ContentFormat,
     ) -> Self {
         let extents = title.extents.clone();
-        let bytes_total_extents: u64 =
-            extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
+        let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
         let mut pids = Vec::new();
         let mut parsers = Vec::new();

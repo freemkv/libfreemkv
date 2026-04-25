@@ -199,7 +199,10 @@ fn test_disc_copy_progress_callback_fires() {
     let n = calls.load(Ordering::Relaxed);
     let last = last_bytes.load(Ordering::Relaxed);
     assert!(n > 0, "on_progress should fire at least once, got {n}");
-    assert!(last > 0, "final progress bytes should be non-zero, got {last}");
+    assert!(
+        last > 0,
+        "final progress bytes should be non-zero, got {last}"
+    );
 }
 
 // ── 3. Halt aborts disc copy promptly ─────────────────────────────────────
