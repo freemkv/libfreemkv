@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.13.4 (2026-04-25)
+
+### Wedge recovery rolled back + sysfs identity fallback
+
+**What changed.** The in-library USB / SCSI wedge-recovery escalation
+added in 0.13.1 – 0.13.3 has been removed. `drive_has_disc` now returns
+the raw TUR result (or the `0xFF` poll-timeout wedge error) directly to
+the caller. `scsi::usb_reset()` / `usb_reset_with_timeout()` /
+`DEFAULT_USB_RESET_TIMEOUT_SECS` and the per-platform
+`SgIoTransport::usb_reset` / `MacScsiTransport::usb_reset` /
+`SptiTransport::usb_reset` are gone. All three platform backends pass
+transport errors through verbatim, keeping the public
+`list_drives` + `drive_has_disc` contract symmetric
+(Linux / macOS / Windows).
+
+**Why.** Production testing against the LG BU40N USB BD-RE (the drive
+that drove the whole 0.13.1–0.13.3 recovery push) showed:
+- `SG_SCSI_RESET`, `STOP UNIT` + `START UNIT`, and `USBDEVFS_RESET`
+  all succeed at the USB transport layer (kernel logs
+  `usb 3-2: reset high-speed USB device`, device re-authorises).
+- But the drive firmware *below* the USB bridge stays locked: no
+  LUN enumerates on the fresh `scsi_host`, TUR never succeeds,
+  `/dev/sg*` never reappears.
+- Also tried (outside the lib): `/sys/bus/usb/devices/<port>/authorized`
+  toggle, `usb-storage` driver unbind/rebind, forced SCSI host rescan.
+  All same outcome.
+
+Only physical unplug-replug (or host reboot) clears this wedge class.
+The library was logging 2-minute-per-tick escalation cycles for nothing,
+and consumers had no way to surface "drive needs physical intervention"
+to users because the escalation was masking the real failure. Upper
+layers (autorip, CLI) now see the wedge error directly and prompt the
+user.
+
+A breadcrumb in `scsi/linux.rs::drive_has_disc` catalogues every
+recovery method tried and points to git tag `v0.13.3` for the full
+implementation, in case a future hardware class is found where
+USB-layer recovery actually works.
+
+**New: sysfs-cached identity fallback (Linux).** `list_drives` now
+populates empty INQUIRY vendor/model/firmware fields from
+`/sys/class/scsi_generic/sgN/device/{vendor,model,rev}` — the kernel
+runs its own INQUIRY at device probe time and stashes the answer there,
+so even a mid-wedge INQUIRY still yields the UI a human-readable
+identity. The drive surface on screen doesn't suddenly go blank the
+moment the drive firmware locks up.
+
 ## 0.13.3 (2026-04-24)
 
 ### Bug fix — `drive_has_disc` wedge recovery was dead code for TUR errors

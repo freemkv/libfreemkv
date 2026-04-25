@@ -19,15 +19,6 @@ const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_FROM_DEV: i32 = -3;
 const SG_FLAG_Q_AT_HEAD: u32 = 0x10;
 
-/// `USBDEVFS_RESET = _IO('U', 20)` — re-enumerates the USB device,
-/// equivalent to a software unplug-replug. Resets at the USB layer
-/// *below* SCSI, which is what's needed when the USB Mass Storage
-/// interface itself wedges (the wedge mode `SG_SCSI_RESET` can't
-/// recover, since SCSI commands never make it through the broken USB
-/// link to the device). 30-line `usbreset.c` everyone passes around
-/// uses this same ioctl.
-const USBDEVFS_RESET: u32 = 0x5514;
-
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sg_io_hdr {
@@ -179,106 +170,6 @@ impl SgIoTransport {
         // Step 8: close — drive is clean
         unsafe { libc::close(fd) };
         Ok(())
-    }
-
-    /// USB-layer reset. Resolves the sg device → underlying USB device
-    /// (`/dev/bus/usb/BBB/DDD`) and issues `USBDEVFS_RESET`, the same
-    /// ioctl `usbreset.c` uses. Software equivalent of unplug-replug.
-    ///
-    /// Returns `DeviceNotFound` if the sg device isn't USB-attached
-    /// (SATA/PERC etc.) so callers can detect the fall-through case and
-    /// know not to retry — USB reset is meaningless for non-USB drives.
-    /// Returns `DeviceResetFailed` for actual ioctl failures.
-    ///
-    /// Step-by-step:
-    /// 1. `/dev/sg4` → device name `sg4`
-    /// 2. Canonicalize `/sys/class/scsi_generic/sg4/device` to follow
-    ///    the kernel's symlink chain into `/sys/devices/pci…/usb1/1-2/…`
-    /// 3. Walk parents until we find a directory that has both
-    ///    `busnum` and `devnum` files — that's the USB device node
-    /// 4. Read `busnum` + `devnum`, format `/dev/bus/usb/{busnum:03}/{devnum:03}`
-    /// 5. open(O_WRONLY), ioctl(USBDEVFS_RESET), close
-    pub fn usb_reset(device: &Path) -> Result<()> {
-        let usb_path = Self::resolve_usb_device(device)?;
-        let c_path = Self::to_c_path(&usb_path);
-
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr() as *const libc::c_char,
-                libc::O_WRONLY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(Error::DeviceResetFailed {
-                path: usb_path.display().to_string(),
-            });
-        }
-
-        // USBDEVFS_RESET — kernel does its own bounded wait here (the
-        // USB stack waits for the device to come back, typically ≤1 s).
-        // Unlike SG_SCSI_RESET this rarely hangs because the kernel USB
-        // layer has its own timeouts on the device-side handshake.
-        let r = unsafe { libc::ioctl(fd, USBDEVFS_RESET as _) };
-        unsafe { libc::close(fd) };
-
-        if r < 0 {
-            Err(Error::DeviceResetFailed {
-                path: usb_path.display().to_string(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Resolve `/dev/sgN` → `/dev/bus/usb/BBB/DDD` for USB-attached SCSI
-    /// devices. Returns `DeviceNotFound` (not a reset failure) when the
-    /// sg device isn't USB-attached, so callers can distinguish "this
-    /// drive isn't a USB drive" from "USB reset attempted but failed".
-    fn resolve_usb_device(device: &Path) -> Result<std::path::PathBuf> {
-        let dev_name =
-            device
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::DeviceNotFound {
-                    path: device.display().to_string(),
-                })?;
-
-        let sysfs_link = format!("/sys/class/scsi_generic/{dev_name}/device");
-        let canonical = std::fs::canonicalize(&sysfs_link).map_err(|_| Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })?;
-
-        // Walk up the parent chain looking for a directory that
-        // contains both `busnum` and `devnum`. That marks the USB
-        // device entry in sysfs (e.g. /sys/devices/.../usb1/1-2/).
-        let mut cur = canonical.as_path();
-        while let Some(parent) = cur.parent() {
-            let busnum_p = parent.join("busnum");
-            let devnum_p = parent.join("devnum");
-            if busnum_p.exists() && devnum_p.exists() {
-                let busnum: u32 = std::fs::read_to_string(&busnum_p)
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .ok_or_else(|| Error::DeviceNotFound {
-                        path: device.display().to_string(),
-                    })?;
-                let devnum: u32 = std::fs::read_to_string(&devnum_p)
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .ok_or_else(|| Error::DeviceNotFound {
-                        path: device.display().to_string(),
-                    })?;
-                return Ok(std::path::PathBuf::from(format!(
-                    "/dev/bus/usb/{busnum:03}/{devnum:03}"
-                )));
-            }
-            cur = parent;
-        }
-
-        // No USB ancestor found — SATA / RAID / non-USB SCSI device.
-        Err(Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })
     }
 
     fn open_error<T>(device: &Path) -> Result<T> {
@@ -581,31 +472,67 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
+
+        // Read sysfs-cached identity first. The kernel runs its own INQUIRY
+        // at device probe time and stashes vendor/model/rev under
+        // `/sys/class/scsi_generic/sgN/device/`. Those values survive even
+        // when the drive firmware is wedged below the USB bridge (our own
+        // INQUIRY times out but sysfs still has the pre-wedge answer), so
+        // the UI always has a human-readable identity to show.
+        let (sysfs_vendor, sysfs_model, sysfs_firmware) = sysfs_identity(&name);
+
         // INQUIRY-only probe — open transport, run INQUIRY, drop. No
         // identify, no init, no firmware reset preamble's secondary
         // commands beyond what `SgIoTransport::open` already does (one
         // SCSI bus reset on the kernel SG fd, ~2 s).
-        let mut transport = match SgIoTransport::open(std::path::Path::new(&path)) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let info = match super::inquiry(&mut transport) {
-            Ok(r) => super::DriveInfo {
-                path: path.clone(),
-                vendor: r.vendor_id,
-                model: r.model,
-                firmware: r.firmware,
+        let info = match SgIoTransport::open(std::path::Path::new(&path)) {
+            Ok(mut transport) => match super::inquiry(&mut transport) {
+                Ok(r) => super::DriveInfo {
+                    path: path.clone(),
+                    vendor: pick_identity(r.vendor_id, &sysfs_vendor),
+                    model: pick_identity(r.model, &sysfs_model),
+                    firmware: pick_identity(r.firmware, &sysfs_firmware),
+                },
+                Err(_) => super::DriveInfo {
+                    path: path.clone(),
+                    vendor: sysfs_vendor,
+                    model: sysfs_model,
+                    firmware: sysfs_firmware,
+                },
             },
             Err(_) => super::DriveInfo {
                 path: path.clone(),
-                vendor: String::new(),
-                model: String::new(),
-                firmware: String::new(),
+                vendor: sysfs_vendor,
+                model: sysfs_model,
+                firmware: sysfs_firmware,
             },
         };
         out.push(info);
     }
     out
+}
+
+/// Prefer the live INQUIRY answer over the sysfs-cached one, but fall
+/// back to sysfs when the live answer is empty (wedge / bridge bug).
+fn pick_identity(live: String, sysfs: &str) -> String {
+    let trimmed = live.trim();
+    if trimmed.is_empty() {
+        sysfs.to_string()
+    } else {
+        live
+    }
+}
+
+/// Read the kernel's cached INQUIRY identity strings for `sgN` from
+/// `/sys/class/scsi_generic/sgN/device/{vendor,model,rev}`. Empty strings
+/// when sysfs is unavailable (minimal container, non-Linux filesystem).
+fn sysfs_identity(name: &str) -> (String, String, String) {
+    let read = |field: &str| -> String {
+        std::fs::read_to_string(format!("/sys/class/scsi_generic/{name}/device/{field}"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    (read("vendor"), read("model"), read("rev"))
 }
 
 /// Enumerate `sg*` names via `/sys/class/scsi_generic/`, filtered to
@@ -641,19 +568,36 @@ fn enumerate_sg_names() -> Vec<String> {
     names
 }
 
+/// `drive_has_disc` = single TEST UNIT READY. Any error (including our
+/// synthesised wedge signature, `ScsiError { status: 0xFF }`, when
+/// `execute()` times out) bubbles straight up to the caller.
+///
+/// ## No in-library wedge recovery — and why
+///
+/// Versions 0.13.1 – 0.13.3 layered `scsi::reset()` + `scsi::usb_reset()`
+/// (`USBDEVFS_RESET`) escalation inside `drive_has_disc`. Production
+/// testing on the LG BU40N USB BD-RE showed all three userspace recovery
+/// ladders succeed at the USB transport level (the kernel logs
+/// `usb 3-2: reset high-speed USB device`, the device re-authorises
+/// and re-attaches on a fresh `scsi_host`) **but the drive firmware
+/// below the USB bridge stays locked** — no LUN ever enumerates, TUR
+/// never succeeds, /dev/sg* never reappears. Physical power-cycle
+/// (unplug-replug or host reboot) is the only recovery.
+///
+/// Methods tried and discarded:
+///  - `SG_SCSI_RESET` (device-level SCSI bus reset)
+///  - `STOP UNIT` / `START UNIT` CDB pair
+///  - `USBDEVFS_RESET` ioctl on `/dev/bus/usb/BBB/DDD`
+///  - `/sys/bus/usb/devices/<port>/authorized` 0→1 toggle
+///  - `/sys/bus/usb/drivers/usb-storage/{unbind,bind}` driver rebind
+///  - Forced `echo "- - -" > /sys/class/scsi_host/hostN/scan`
+///
+/// Rolled back in 0.13.4. Callers (autorip, CLI) surface the error
+/// directly and prompt the user to physically reconnect the drive.
+/// If a future hardware class is found where USB-layer recovery
+/// actually works, the escalation belongs here, gated on the wedge
+/// signature — see git tag `v0.13.3` for the full implementation.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
-    match probe_tur(path) {
-        Ok(present) => Ok(present),
-        Err(e) if is_wedge_signature(&e) => recover_then_probe(path, e),
-        Err(e) => Err(e),
-    }
-}
-
-/// Single TEST UNIT READY — the cheapest way to ask "is there a disc?".
-/// Returns `Ok(true)` on a sense-clean OK, `Ok(false)` on sense-key 2
-/// ("not ready, medium not present"), and `Err` for any other failure
-/// (the wedge case lands here too — caller's escalation handles it).
-fn probe_tur(path: &Path) -> Result<bool> {
     let mut transport = SgIoTransport::open(path)?;
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
     let mut buf = [0u8; 0];
@@ -671,52 +615,3 @@ fn probe_tur(path: &Path) -> Result<bool> {
         Err(e) => Err(e),
     }
 }
-
-/// Two-stage wedge recovery: SCSI reset → USB reset → retry probe.
-/// Caller has already classified the original error as a wedge.
-fn recover_then_probe(path: &Path, original: Error) -> Result<bool> {
-    // Stage 1: SCSI bus reset. Bounded by `DEFAULT_RESET_TIMEOUT_SECS`.
-    let _ = super::reset(path);
-    if let Ok(present) = probe_tur(path) {
-        return Ok(present);
-    }
-    // Stage 2: USB-layer re-enumeration (USBDEVFS_RESET). Software
-    // equivalent of unplug-replug; the only thing that recovers a
-    // kernel-level USB Mass Storage wedge.
-    if super::usb_reset(path).is_ok() {
-        std::thread::sleep(std::time::Duration::from_secs(USB_RESET_SETTLE_SECS));
-        if let Ok(present) = probe_tur(path) {
-            return Ok(present);
-        }
-    }
-    // Both stages exhausted — surface the original error so the caller
-    // can choose to back off / mark this drive stay-clear.
-    Err(original)
-}
-
-/// Wedge signature: `Error::ScsiError` with status byte 0xFF, for any
-/// opcode. 0xFF isn't a real SCSI status — our own `execute()` path
-/// synthesises it when poll() times out waiting for the kernel to
-/// deliver a response. That timeout is the ground-truth signature of
-/// the USB Mass Storage layer wedging; opcode-in-flight is incidental.
-fn is_wedge_signature(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::ScsiError {
-            status: WEDGE_STATUS_BYTE,
-            ..
-        }
-    )
-}
-
-/// Synthesised SCSI status byte returned by our own transport when
-/// poll() on the SG fd times out — the wedge signature. Real SCSI
-/// statuses are GOOD (0x00), CHECK_CONDITION (0x02), BUSY (0x08), etc.;
-/// 0xFF is reserved/invalid in the spec, so we can't collide with a
-/// real device response. Applies to any opcode (TUR, INQUIRY, READ, …).
-const WEDGE_STATUS_BYTE: u8 = 0xFF;
-
-/// Settle time after `USBDEVFS_RESET` returns. The kernel re-enumerates
-/// the device over ~1-2 s; sleeping briefly avoids racing the next
-/// `Drive::open` against an interim sysfs-vanished state.
-const USB_RESET_SETTLE_SECS: u64 = 2;

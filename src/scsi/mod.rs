@@ -196,94 +196,24 @@ fn reset_blocking(device: &Path) -> Result<()> {
     }
 }
 
-/// Default upper bound on `scsi::usb_reset()`. Kernel USB stack
-/// typically completes a port reset in under a second; 5 s is generous
-/// while still catching a hang in the driver.
-pub(crate) const DEFAULT_USB_RESET_TIMEOUT_SECS: u64 = 5;
-
-/// USB-layer reset for USB-attached SCSI devices.
-///
-/// `pub(crate)` — outside callers reach recovery through the
-/// higher-level `drive_has_disc` (poll-loop entry point) which folds
-/// in the SCSI→USB escalation internally. See module-level docs for
-/// the architectural reasoning.
-///
-/// **When to call this.** `scsi::reset()` resets at the SCSI layer; if
-/// the wedge is at the USB Mass Storage interface *below* SCSI (the
-/// classic mode where INQUIRY returns status `0xFF` because the kernel
-/// got nothing back), SCSI commands never reach the device and SCSI
-/// reset is meaningless. USB reset re-enumerates the device at the USB
-/// layer — software equivalent of unplug-replug.
-///
-/// **Linux**: resolves `/dev/sgN` → `/dev/bus/usb/BBB/DDD` via sysfs,
-/// then `USBDEVFS_RESET` ioctl. Same mechanism as the well-known
-/// `usbreset.c` snippet.
-///
-/// **macOS**, **Windows**: returns `DeviceNotFound` for now (stub).
-/// Real impls tracked for 0.13.3.
-///
-/// **Returns** `DeviceNotFound` when the sg device isn't USB-attached
-/// (SATA / RAID / NVMe-passthrough sg nodes) so callers can detect the
-/// fall-through case and know not to retry — USB reset is meaningless
-/// for those drives.
-///
-/// Wraps the platform call in a thread + `recv_timeout` for the same
-/// reason as `reset()` — kernel ioctls can hang and we don't want the
-/// caller's poll loop wedged on it.
-pub(crate) fn usb_reset(device: &Path) -> Result<()> {
-    usb_reset_with_timeout(
-        device,
-        std::time::Duration::from_secs(DEFAULT_USB_RESET_TIMEOUT_SECS),
-    )
-}
-
-/// USB reset with a caller-specified timeout. See [`usb_reset`].
-pub(crate) fn usb_reset_with_timeout(device: &Path, timeout: std::time::Duration) -> Result<()> {
-    let device_owned = device.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::Builder::new()
-        .name("usb-reset".into())
-        .spawn(move || {
-            let r = usb_reset_blocking(&device_owned);
-            let _ = tx.send(r);
-        })
-        .map_err(|_| Error::DeviceResetFailed {
-            path: device.display().to_string(),
-        })?;
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Err(Error::DeviceResetFailed {
-            path: device.display().to_string(),
-        }),
-    }
-}
-
-fn usb_reset_blocking(device: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::SgIoTransport::usb_reset(device)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        macos::MacScsiTransport::usb_reset(device)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        windows::SptiTransport::usb_reset(device)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = device;
-        Err(Error::DeviceNotFound {
-            path: device.display().to_string(),
-        })
-    }
-}
+// ── USB-layer recovery: rolled back in 0.13.4 ───────────────────────────────
+//
+// 0.13.1 – 0.13.3 exposed `scsi::usb_reset()` (`USBDEVFS_RESET` on Linux,
+// `IOUSBDeviceInterface::ResetDevice` on macOS) and chained it into
+// `drive_has_disc` recovery. Production testing on the LG BU40N USB BD-RE
+// confirmed the USB stack resets succeed — dmesg logs
+// `usb 3-2: reset high-speed USB device` and the device re-authorises —
+// but the drive firmware below the USB bridge stays locked: LUN never
+// re-enumerates, TUR still times out, the drive is unusable until
+// physical unplug-replug or host reboot. Additional approaches tried
+// and discarded: `authorized` 0→1 toggle, usb-storage driver
+// unbind/rebind, forced SCSI host rescan, `STOP` + `START UNIT`.
+//
+// The APIs were removed so no caller can be misled into thinking a
+// software-only recovery exists for this class of wedge. If a future
+// hardware class surfaces where USB-layer recovery actually helps, the
+// code should live here again, gated on a wedge signature — see git
+// tag `v0.13.3` for the full implementation.
 
 // ── Lightweight discovery + presence probes ─────────────────────────────────
 //
