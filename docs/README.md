@@ -12,6 +12,7 @@ Technical documentation for [libfreemkv](https://github.com/freemkv/libfreemkv),
 |----------|---------------|
 | [Architecture](architecture.md) | Module map, design principles, error codes, platform support |
 | [Drive Access](drive-access.md) | Drive, SCSI transport, profiles, unlock, why raw mode is needed |
+| [Rip Recovery](rip-recovery.md) | Three-layer recovery model: Disc::patch, single-shot Drive::read, DiscStream batch halving |
 | [AACS Encryption](aacs.md) | Key resolution (4 paths), content decryption, bus encryption, SCSI handshake |
 | [UDF Filesystem](udf.md) | UDF 2.50 with metadata partitions, pointer chain, how files are read from disc |
 | [MPLS Playlists](mpls.md) | Playlist format, play items, STN stream table, coding types |

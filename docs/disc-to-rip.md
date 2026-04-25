@@ -77,7 +77,9 @@ Insert disc
 10. Stream content (mux/disc.rs → DiscStream)
      │  Read sectors → decrypt → TS demux → PES frames
      │  Or: read sectors → decrypt → raw bytes (for ISO output)
-     │  Drive::read() handles error recovery (min speed → reset → retry)
+     │  Drive::read() is single-shot. DiscStream::fill_extents adapts the
+     │  batch size on failure (halve / probe-up). Bad-range retry is layer
+     │  1 above this — Disc::patch re-runs against the mapfile.
      │
      ▼
   PES frames → output stream (MKV, M2TS, network, etc.)
@@ -110,7 +112,7 @@ output.finish()?;
 
 | Module | Doc | Purpose |
 |--------|-----|---------|
-| drive/ | [drive-access.md](drive-access.md) | Open, identify, init, unlock, read (with recovery) |
+| drive/ | [drive-access.md](drive-access.md) | Open, identify, init, unlock, single-shot read |
 | scsi/ | [drive-access.md](drive-access.md) | Platform SCSI transport (Linux, macOS, Windows) |
 | udf.rs | [udf.md](udf.md) | UDF 2.50 filesystem |
 | mpls.rs | [mpls.md](mpls.md) | MPLS playlists + STN streams |
