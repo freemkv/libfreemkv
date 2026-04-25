@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.13.3 (2026-04-24)
+
+### Bug fix — `drive_has_disc` wedge recovery was dead code for TUR errors
+
+The wedge-signature predicate introduced in 0.13.2 gated on
+`opcode == SCSI_INQUIRY (0x12)` — a holdover from when enumerate-time
+INQUIRY was the only path wedges surfaced on. `drive_has_disc` issues
+`TEST UNIT READY (0x00)`, so its wedge errors (`E4000: 0x00/0xff/0x00`)
+never matched the predicate and the SCSI-reset + USB-reset escalation
+never fired. Production result: the BU40N USB BD-RE stayed wedged
+indefinitely, with autorip logging `recovery exhausted` on the raw
+pass-through error while no recovery had actually been attempted.
+
+Fix: drop the opcode constraint. Status byte `0xFF` is synthesised by
+our own `execute()` path when `poll()` on the SG fd times out; it's
+the ground-truth wedge marker regardless of which opcode was in flight.
+Doc comments on `is_wedge_signature` and `WEDGE_STATUS_BYTE` updated
+accordingly. Linux-only — macOS / Windows use sense-key-based wedge
+detection and are unaffected.
+
 ## 0.13.2 (2026-04-24)
 
 ### Public discovery + presence APIs; SCSI/USB primitives no longer
