@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.5 (2026-04-25)
+
+### Version sync — no functional changes
+Sync bump for the ecosystem. All four freemkv crates (libfreemkv,
+freemkv CLI, bdemu, autorip) always share a version number; 0.13.5
+carries autorip-side fixes (stop-is-reset, startup staging sweep).
+
 ## 0.13.4 (2026-04-25)
 
 ### Wedge recovery rolled back + sysfs identity fallback
