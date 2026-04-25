@@ -127,6 +127,14 @@ pub struct DiscStream {
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
     eof: bool,
 
+    // Cumulative bytes successfully read from the source. Drives
+    // EventKind::BytesRead emission and autorip's per-device progress.
+    bytes_read_total: u64,
+    // Pre-computed total of all extents in bytes (or 0 if extents are
+    // empty). Carried in EventKind::BytesRead.total so consumers can show
+    // a percent without a separate API call.
+    bytes_total_extents: u64,
+
     // PES output
     ts_demuxer: Option<super::ts::TsDemuxer>,
     ps_demuxer: Option<super::ps::PsDemuxer>,
@@ -149,6 +157,8 @@ impl DiscStream {
         content_format: crate::disc::ContentFormat,
     ) -> Self {
         let extents = title.extents.clone();
+        let bytes_total_extents: u64 =
+            extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
         let mut pids = Vec::new();
         let mut parsers = Vec::new();
@@ -194,6 +204,8 @@ impl DiscStream {
             halt: None,
             event_fn: None,
             eof: false,
+            bytes_read_total: 0,
+            bytes_total_extents,
             ts_demuxer,
             ps_demuxer,
             parsers,
@@ -287,6 +299,11 @@ impl DiscStream {
                 }
                 self.buf_valid = bytes;
                 self.current_offset += sectors as u32;
+                self.bytes_read_total = self.bytes_read_total.saturating_add(bytes as u64);
+                self.emit(EventKind::BytesRead {
+                    bytes: self.bytes_read_total,
+                    total: self.bytes_total_extents,
+                });
                 break;
             }
 

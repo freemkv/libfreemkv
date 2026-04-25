@@ -98,103 +98,13 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
     }
 }
 
-/// Default upper bound on `scsi::reset()`. The platform-specific reset
-/// sequence does ~15 s of bounded sleeps + ioctls in the happy path, so
-/// 30 s is roughly 2× the worst-case happy time — long enough that a
-/// healthy-but-slow drive isn't false-positively timed out, short enough
-/// that a kernel-wedged ioctl doesn't take down the caller's poll loop
-/// for minutes.
-pub(crate) const DEFAULT_RESET_TIMEOUT_SECS: u64 = 30;
-
-/// Reset a SCSI device to a known good state, with a hard wallclock
-/// bound (`DEFAULT_RESET_TIMEOUT_SECS`). On Linux: open/close fd cycle +
-/// TUR + SG_SCSI_RESET escalation.
-///
-/// **Why the timeout matters.** SG_SCSI_RESET is an ioctl that can block
-/// indefinitely on a kernel-wedged USB target (the kernel waits for the
-/// SCSI subsystem to ack the reset, which never comes from a dead-bus
-/// device). Without an outer bound, the call hangs the caller's thread
-/// forever — observed in production on a wedged BU40N where the autorip
-/// poll loop sat in the ioctl for 60+ s. The bounded version returns
-/// `DeviceResetFailed` after `DEFAULT_RESET_TIMEOUT_SECS`; the inner
-/// thread keeps running until the kernel eventually unblocks it (we
-/// can't cancel a Linux ioctl from userspace), so this leaks one OS
-/// thread per wedge — acceptable cost for a daemon that recovers
-/// instead of hanging.
-///
-/// `pub(crate)` — outside callers use the higher-level `drive_has_disc`
-/// (which folds in recovery escalation) or `Drive::reset` (instance-level).
-/// Direct primitive exposure removed in 0.13.2 to enforce the
-/// architectural rule that no consumer crate issues SCSI commands.
-pub(crate) fn reset(device: &Path) -> Result<()> {
-    reset_with_timeout(
-        device,
-        std::time::Duration::from_secs(DEFAULT_RESET_TIMEOUT_SECS),
-    )
-}
-
-/// Reset with a caller-specified timeout. See [`reset`] for the full
-/// rationale on why an outer wallclock bound is required.
-pub(crate) fn reset_with_timeout(device: &Path, timeout: std::time::Duration) -> Result<()> {
-    let device_owned = device.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    // Detach a worker thread for the actual reset. We never `join` it —
-    // if the kernel ioctl is wedged, the join would block forever, which
-    // is the very thing we're protecting the caller from. The thread will
-    // exit on its own when the kernel eventually returns from the ioctl
-    // (or never, if the device is permanently dead — process exit cleans
-    // it up).
-    std::thread::Builder::new()
-        .name("scsi-reset".into())
-        .spawn(move || {
-            let r = reset_blocking(&device_owned);
-            let _ = tx.send(r);
-        })
-        .map_err(|_| Error::DeviceResetFailed {
-            path: device.display().to_string(),
-        })?;
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::DeviceResetFailed {
-            path: device.display().to_string(),
-        }),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            // The worker thread panicked before sending. Surface as a
-            // reset failure rather than a generic error.
-            Err(Error::DeviceResetFailed {
-                path: device.display().to_string(),
-            })
-        }
-    }
-}
-
-/// Inner reset — runs on the worker thread. May block indefinitely if
-/// the kernel's SCSI subsystem is wedged. Callers must use the bounded
-/// `reset()` wrapper above; this raw function isn't exposed.
-fn reset_blocking(device: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::SgIoTransport::reset(device)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        macos::MacScsiTransport::reset(device)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        windows::SptiTransport::reset(device)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = device;
-        Ok(())
-    }
-}
+// Note: a top-level `scsi::reset()` used to live here, wrapping a
+// platform reset in a thread+recv_timeout so a kernel-wedged ioctl
+// couldn't hang the caller. Removed in 0.13.6 along with the
+// SG_SCSI_RESET / STOP+START UNIT escalation that needed it. The
+// remaining platform reset (Linux: SgIoTransport::reset, called only
+// from SgIoTransport::open) does pure userspace state cleanup with
+// bounded sleeps — no escape-hatch wrapper required.
 
 // ── USB-layer recovery: rolled back in 0.13.4 ───────────────────────────────
 //

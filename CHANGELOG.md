@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.13.6 (2026-04-25)
+
+### Inline retry/reset stripped from `Drive::read`; `BytesRead` now emitted
+
+Two related changes that close the loop on the BU40N wedge work from
+0.13.1–0.13.4 and on the long-standing autorip "0 KB/s, 0%" UI bug.
+
+**`Drive::read` is now single-shot.** The phase 1 / 2 / 3 retry loop
+(reset → reopen → repeat) inside `Drive::read` is gone (~80 lines
+deleted). `recovery=true` only bumps the per-CDB timeout to 30 s;
+`recovery=false` keeps the 1.5 s timeout. On a failed read the
+function returns `Err(DiscRead)` immediately. Per the BU40N
+post-mortem, every USB / SCSI reset path tested in 0.13.1–0.13.3
+resets the bridge but not the drive firmware, and the inline
+reset+reopen *was* the wedge primitive itself — issuing it from
+inside `Drive::read` produced multi-minute hangs and made the wedge
+class harder to surface to the user. The correct retry layer is
+`Disc::patch`'s outer multi-pass loop, which is unaffected. A stuck
+drive now surfaces as a clean `DiscRead` to the caller, who can
+prompt physical replug.
+
+**SCSI reset surface trimmed.** `SgIoTransport::reset` (Linux) drops
+the `SG_SCSI_RESET` ioctl and the STOP / START UNIT escalation; it
+keeps the kernel `SG_IO` state flush plus `ALLOW MEDIUM REMOVAL`.
+`MacScsiTransport::reset` is removed entirely (was open + drop +
+sleep, no SCSI). The top-level `scsi::reset` /
+`scsi::reset_with_timeout` / `scsi::reset_blocking` family is
+removed — no callers remain after the `Drive::read` strip.
+
+**`EventKind::BytesRead` now emitted.** The variant was declared in
+0.13.0 but never fired. `DiscStream::fill_extents` now emits
+`BytesRead { bytes_read_total, total_extents_bytes }` after every
+successful sector read, so consumers in direct (no-mapfile) mode can
+drive a real-time progress bar without polling `output.bytes_written`.
+Multi-pass mode continues to use `Disc::copy`'s `on_progress`
+callback unchanged. Drives the autorip per-device live progress UI.
+
+`Drive::checked_sleep` is removed (only used by the recovery loop);
+`Drive::sleep_until_halted` is `#[cfg(test)]`-only; `Drive::emit` is
+retained because `BytesRead` uses it.
+
+### Tests
+- New `tests/integration_progress_and_halt.rs` (5 tests): `BytesRead`
+  emission, `Disc::copy` `on_progress` regression guard, halt aborts
+  copy, Drop safety, `FileSectorReader` round-trip.
+- 233 unit tests + 5 integration tests pass.
+
+### Net diff
+~80 lines deleted, ~20 added.
+
+### Version sync
+0.13.6 ecosystem release (libfreemkv + freemkv + bdemu + autorip all
+on 0.13.6).
+
 ## 0.13.5 (2026-04-25)
 
 ### Version sync — no functional changes

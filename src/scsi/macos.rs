@@ -260,23 +260,7 @@ impl MacScsiTransport {
         })
     }
 
-    /// Reset the drive to a known good state.
-    /// On macOS, we open the device, release exclusive access, wait for
-    /// the system to reclaim it, then the next open() re-acquires.
-    /// IOKit's USB layer handles device-level resets internally when the
-    /// exclusive access is released and re-acquired.
-    ///
-    /// NOTE: untested — macOS reset may need IOUSBDeviceInterface::ResetDevice()
-    /// for USB drives. This is a best-effort implementation.
-    pub fn reset(device: &Path) -> Result<()> {
-        // Opening and immediately dropping triggers release of exclusive access
-        // which forces IOKit to reset the device state.
-        if let Ok(transport) = Self::open(device) {
-            drop(transport); // Drop releases exclusive access + closes plugin
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        Ok(())
-    }
+    // `reset()` removed in 0.13.6 — see scsi/mod.rs for rationale.
 }
 
 /// Enumerate optical drives on macOS. Mirrors `drive::macos::find_drives`
