@@ -53,9 +53,6 @@ const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_MODE_SENSE: u8 = 0x5A;
 const SCSI_REPORT_KEY: u8 = 0xA4;
 
-/// Recovery state after a read error — stay at min speed for N bytes.
-const RECOVERY_WINDOW: u64 = 500 * 1024 * 1024; // 500 MB
-
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct Drive {
     scsi: Box<dyn ScsiTransport>,
@@ -64,11 +61,9 @@ pub struct Drive {
     pub platform: Option<profile::Platform>,
     pub drive_id: DriveId,
     device_path: String,
-    /// Bytes remaining in the min-speed recovery window.
-    recovery_bytes_remaining: u64,
     /// Halt flag — when set, Drive::read() bails at the next check point.
     halt: Arc<AtomicBool>,
-    /// Event handler — fires during read recovery.
+    /// Event handler — fires for read errors and library-level state changes.
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
 }
 
@@ -95,7 +90,6 @@ impl Drive {
             profile,
             drive_id,
             device_path: device.to_string_lossy().to_string(),
-            recovery_bytes_remaining: 0,
             halt: Arc::new(AtomicBool::new(false)),
             event_fn: None,
         })
@@ -129,13 +123,6 @@ impl Drive {
 
     fn is_halted(&self) -> bool {
         self.halt.load(Ordering::Relaxed)
-    }
-
-    /// Halt-aware sleep. Returns `Err(Halted)` if the flag fires before or
-    /// during the wait. The only sleep the drive's recovery path is allowed
-    /// to use — makes it impossible to accidentally block through a Stop.
-    fn checked_sleep(&self, total: std::time::Duration) -> Result<()> {
-        sleep_until_halted(&self.halt, total)
     }
 
     /// Halt-aware SCSI execute. Returns `Err(Halted)` if the flag is set
@@ -519,29 +506,25 @@ impl Drive {
         }
     }
 
-    /// Read sectors from the disc with automatic error recovery.
+    /// Read sectors from the disc. Single-shot — no inline retries, no
+    /// SCSI reset.
     ///
-    /// On failure: drops to min speed, waits with escalating patience
-    /// (5s, 10s, 15s, 30s, 60s), resets drive between attempts.
-    /// After recovery, stays at min speed for 500 MB before ramping up.
+    /// `recovery=true` bumps the per-CDB timeout to 30 s for the
+    /// `Disc::patch` pass; `recovery=false` uses 1.5 s for `Disc::copy`'s
+    /// fast skip-forward sweep. On any failure returns `Err(DiscRead)`
+    /// immediately. The orchestration layer (`Disc::patch`'s outer loop
+    /// for the patch pass, `DiscStream`'s adaptive batch halving for the
+    /// stream path) handles retries.
     ///
-    /// Returns Err only after all attempts exhausted — user should clean
-    /// the disc and resume.
+    /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
+    /// removed in 0.13.6. Per
+    /// `freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`,
+    /// the inline reset on the LG BU40N (Initio bridge) wedged drive
+    /// firmware without ever recovering a sector. The remaining recovery
+    /// layers (Disc::patch multi-pass, DiscStream batch halving) do not
+    /// touch the wedge-prone reset path.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
-        // Non-recovery mode is the Disc::copy fast pass — intent is "fail
-        // fast, let skip_forward advance past bad regions." A 5s budget let
-        // the drive grind L-EC on structure-protected / marginal sectors for
-        // nearly the full interval per 64 KB block, pinning throughput at
-        // ~13 KB/s on difficult discs. 1500ms kills slow reads early so
-        // skip_forward can double its stride; recoverable sectors are picked
-        // up on Disc::patch where recovery=true and the timeout is 30s.
-        let timeout_ms = if !recovery {
-            1_500
-        } else if self.recovery_bytes_remaining > 0 {
-            30_000
-        } else {
-            10_000
-        };
+        let timeout_ms = if recovery { 30_000 } else { 1_500 };
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,
@@ -555,82 +538,16 @@ impl Drive {
             0x00,
         ];
 
-        // Normal read. Fast path: drive returns data, we return it.
-        // checked_exec short-circuits to Err(Halted) if Stop was requested;
-        // read() never touches the halt flag directly.
         match self.checked_exec(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             buf,
             timeout_ms,
         ) {
-            Ok(result) => {
-                if self.recovery_bytes_remaining > 0 {
-                    let bytes_read = count as u64 * 2048;
-                    self.recovery_bytes_remaining =
-                        self.recovery_bytes_remaining.saturating_sub(bytes_read);
-                    if self.recovery_bytes_remaining == 0 {
-                        self.emit(EventKind::SpeedChange { speed_kbs: 0xFFFF });
-                        self.set_speed(0xFFFF);
-                    }
-                }
-                return Ok(result.bytes_transferred);
-            }
-            Err(Error::Halted) => return Err(Error::Halted),
-            Err(_) => { /* fall through to recovery */ }
+            Ok(result) => Ok(result.bytes_transferred),
+            Err(Error::Halted) => Err(Error::Halted),
+            Err(_) => Err(Error::DiscRead { sector: lba as u64 }),
         }
-
-        if !recovery {
-            return Err(Error::DiscRead { sector: lba as u64 });
-        }
-
-        // Enter recovery
-        self.emit(EventKind::ReadError {
-            sector: lba as u64,
-            error: Error::DiscRead { sector: lba as u64 },
-        });
-        self.emit(EventKind::SpeedChange { speed_kbs: 0 });
-        self.set_speed(0);
-
-        // Phase 1: gentle — sleep 30 s, retry. 5 times.
-        for attempt in 1..=5u32 {
-            self.emit(EventKind::Retry { attempt });
-            self.checked_sleep(std::time::Duration::from_secs(30))?;
-            if let Ok(result) =
-                self.checked_exec(&cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)
-            {
-                self.emit(EventKind::SectorRecovered { sector: lba as u64 });
-                self.recovery_bytes_remaining = RECOVERY_WINDOW;
-                return Ok(result.bytes_transferred);
-            }
-        }
-
-        // Phase 2: fresh start — close, reset, open, init.
-        let device = std::path::PathBuf::from(&self.device_path);
-        self.checked_sleep(std::time::Duration::from_secs(5))?;
-        let _ = crate::scsi::reset(&device);
-        self.checked_sleep(std::time::Duration::from_secs(5))?;
-        self.scsi = crate::scsi::open(&device)?;
-        let _ = self.init();
-        let _ = self.wait_ready();
-        self.set_speed(0);
-
-        // Phase 3: gentle again on fresh connection — sleep 30 s, retry. 5 times.
-        for attempt in 6..=10u32 {
-            self.emit(EventKind::Retry { attempt });
-            self.checked_sleep(std::time::Duration::from_secs(30))?;
-            if let Ok(result) =
-                self.checked_exec(&cdb, crate::scsi::DataDirection::FromDevice, buf, 30_000)
-            {
-                self.emit(EventKind::SectorRecovered { sector: lba as u64 });
-                self.recovery_bytes_remaining = RECOVERY_WINDOW;
-                return Ok(result.bytes_transferred);
-            }
-        }
-
-        // Both phases failed.
-        self.recovery_bytes_remaining = RECOVERY_WINDOW;
-        Err(Error::DiscRead { sector: lba as u64 })
     }
 
     /// Read the disc capacity in sectors (2048 bytes each).
@@ -742,11 +659,26 @@ impl SectorReader for Drive {
     }
 }
 
-/// Halt-aware sleep primitive. Returns `Err(Halted)` if the flag is set
-/// before or during the wait. Extracted as a free function so it can be
-/// unit-tested without constructing a full `Drive`.
-///
-/// Wakes within ~100 ms of a halt, regardless of the requested duration.
+/// Find all optical drives connected to this system.
+/// Returns opened Drive objects ready for use.
+pub fn find_drives() -> Vec<Drive> {
+    discover_drives()
+        .into_iter()
+        .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
+        .collect()
+}
+
+/// Find the first optical drive.
+/// Returns an opened Drive ready for use.
+pub fn find_drive() -> Option<Drive> {
+    find_drives().into_iter().next()
+}
+
+/// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping
+/// to true. Kept for the unit tests that cover the slicing behaviour;
+/// production code paths no longer sleep on the recovery hot path
+/// (recovery loop removed in 0.13.6).
+#[cfg(test)]
 fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<()> {
     const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
     let deadline = std::time::Instant::now() + total;
@@ -761,21 +693,6 @@ fn sleep_until_halted(halt: &AtomicBool, total: std::time::Duration) -> Result<(
         let remaining = deadline - now;
         std::thread::sleep(remaining.min(SLICE));
     }
-}
-
-/// Find all optical drives connected to this system.
-/// Returns opened Drive objects ready for use.
-pub fn find_drives() -> Vec<Drive> {
-    discover_drives()
-        .into_iter()
-        .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
-        .collect()
-}
-
-/// Find the first optical drive.
-/// Returns an opened Drive ready for use.
-pub fn find_drive() -> Option<Drive> {
-    find_drives().into_iter().next()
 }
 
 /// Internal: discover drive paths + IDs without opening full Drive objects.

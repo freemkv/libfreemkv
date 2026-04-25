@@ -12,8 +12,6 @@ use crate::error::{Error, Result};
 use std::path::Path;
 
 const SG_IO: u32 = 0x2285;
-const SG_SCSI_RESET: u32 = 0x2284;
-const SG_SCSI_RESET_DEVICE: i32 = 1;
 const SG_DXFER_NONE: i32 = -1;
 const SG_DXFER_TO_DEV: i32 = -2;
 const SG_DXFER_FROM_DEV: i32 = -3;
@@ -80,49 +78,32 @@ impl SgIoTransport {
         })
     }
 
-    /// Reset the drive to a known good state — equivalent to unplug/replug.
-    /// After reset, the drive is clean and no fd is held open.
+    /// Clean up kernel SG_IO state and unlock the tray. NOT a hardware
+    /// reset — purely software cleanup before this process opens the
+    /// device for real work.
     ///
-    /// ## Why each step exists
+    /// When a previous process is killed (SIGKILL) mid-SG_IO, the kernel
+    /// may hold queued commands against the dead fd, and `Drop` never
+    /// ran so the tray may still be locked via PREVENT MEDIUM REMOVAL.
+    /// This routine handles both: open + close flushes the kernel SG
+    /// queue (sg_release cancels commands tied to the fd), the 2 s sleep
+    /// gives the kernel time to finish that cleanup, then a fresh fd
+    /// sends ALLOW MEDIUM REMOVAL to clear any stale tray lock.
     ///
-    /// When a process is killed (SIGKILL/kill -9) mid-SG_IO ioctl, two things
-    /// go wrong: (1) the kernel's SG driver may have stale pending commands
-    /// queued for the dead process's fd, and (2) the drive firmware may still
-    /// be mid-operation (seeking, reading, processing a vendor command).
-    ///
-    /// A new process opening the same /dev/sg* device gets a fresh fd, but the
-    /// kernel doesn't automatically abort the dead process's commands — the
-    /// drive can appear hung on the first SCSI command.
-    ///
-    /// Additionally, killed processes skip Drop, so the tray may be locked
-    /// via PREVENT MEDIUM REMOVAL with no process alive to unlock it.
-    ///
-    /// ## Sequence
-    ///
-    /// 1. **open** — allocates kernel SG state for this fd
-    /// 2. **close** — triggers kernel cleanup: aborts any pending SG_IO
-    ///    commands associated with this fd. The key operation —
-    ///    the kernel's sg_release() cancels queued commands.
-    /// 3. **sleep 2s** — the drive firmware needs time to finish/abort whatever
-    ///    it was doing when the previous process died. Without
-    ///    this, the next command may block on drive-internal state.
-    /// 4. **open** — fresh fd with no stale commands in the kernel queue
-    /// 5. **unlock** — ALLOW MEDIUM REMOVAL (CDB 0x1E, prevent=0). Clears
-    ///    any tray lock left by a killed process that never
-    ///    ran its Drop/cleanup.
-    /// 6. **TUR** — TEST UNIT READY (CDB 0x00) with 3s timeout. If the
-    ///    drive responds, it's in a good state.
-    /// 7. **escalate** — if TUR fails:
-    ///    - SG_SCSI_RESET (device level) — kernel sends a SCSI
-    ///      bus reset to the device, clearing all firmware state.
-    ///    - STOP + START UNIT (CDB 0x1B) — power-cycles the
-    ///      drive's logical unit, like pressing the eject button
-    ///      and reinserting.
-    /// 8. **close** — release the fd. Drive is clean, nobody holds it.
+    /// We do NOT verify the drive with TUR or escalate to SG_SCSI_RESET /
+    /// STOP+START UNIT. Both escalations were tried in 0.13.0–0.13.5
+    /// against the LG BU40N (Initio USB-SATA bridge); both failed to
+    /// recover wedged drives and made the wedge worse — see
+    /// freemkv-private/postmortems/2026-04-25-bu40n-wedge-recovery.md.
+    /// If the drive is genuinely unresponsive, the next workload command
+    /// fails naturally and the caller surfaces a "physical reconnect
+    /// required" prompt. Software has no path back from a wedged Initio
+    /// bridge — only physical replug clears it.
     pub fn reset(device: &Path) -> Result<()> {
         let c_path = Self::to_c_path(device);
 
-        // Step 1-2: open + close — flush stale kernel SG_IO state
+        // open + close — make the kernel cancel any SG_IO commands queued
+        // against a previous fd that didn't close cleanly.
         let probe_fd = unsafe {
             libc::open(
                 c_path.as_ptr() as *const libc::c_char,
@@ -133,10 +114,10 @@ impl SgIoTransport {
             unsafe { libc::close(probe_fd) };
         }
 
-        // Step 3: let drive settle
+        // Let the kernel finish that cancellation before we reopen.
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // Step 4: open clean fd
+        // Fresh fd just to send the unlock command, then close.
         let fd = unsafe {
             libc::open(
                 c_path.as_ptr() as *const libc::c_char,
@@ -147,27 +128,10 @@ impl SgIoTransport {
             return Self::open_error(device);
         }
 
-        // Step 5: unlock tray
+        // ALLOW MEDIUM REMOVAL — clear any tray lock left by a killed
+        // process whose Drop never ran. Best-effort; ignore result.
         let _ = Self::raw_command(fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
 
-        // Step 6: TUR — if drive responds, we're done
-        if Self::raw_command(fd, &[0, 0, 0, 0, 0, 0], 3_000).is_err() {
-            // Step 7: escalate — SG_SCSI_RESET
-            let mut reset_type: i32 = SG_SCSI_RESET_DEVICE;
-            unsafe { libc::ioctl(fd, SG_SCSI_RESET as _, &mut reset_type) };
-            std::thread::sleep(std::time::Duration::from_secs(3));
-
-            if Self::raw_command(fd, &[0, 0, 0, 0, 0, 0], 3_000).is_err() {
-                // STOP + START
-                let _ = Self::raw_command(fd, &[0x1B, 0, 0, 0, 0x00, 0], 3_000);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let _ = Self::raw_command(fd, &[0x1B, 0, 0, 0, 0x01, 0], 3_000);
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let _ = Self::raw_command(fd, &[0, 0, 0, 0, 0, 0], 3_000);
-            }
-        }
-
-        // Step 8: close — drive is clean
         unsafe { libc::close(fd) };
         Ok(())
     }

@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
-      - run: cargo test
+      - run: cargo test --tests
 
   check-macos:
     runs-on: macos-latest

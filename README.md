@@ -18,7 +18,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.11"
+libfreemkv = "0.13"
 ```
 
 ## Quick Start
@@ -84,7 +84,7 @@ while result.bytes_unreadable + result.bytes_pending > 0 {
 - **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
 - **AACS decryption** — transparent key resolution and content decrypt (1.0 + 2.0 bus decryption)
 - **KEYDB updates** — download, verify, save from any HTTP URL (zero deps, raw TCP)
-- **Content reading** — adaptive batch reads with automatic decryption and error recovery
+- **Content reading** — adaptive batch reads with automatic decryption
 - **Stream I/O** — unified stream pipeline for reading and writing any format
 
 ### Streams
@@ -92,21 +92,21 @@ while result.bytes_unreadable + result.bytes_pending > 0 {
 | Stream | Input | Output | Transport |
 |--------|-------|--------|-----------|
 | DiscStream | Yes | -- | Optical drive via SCSI |
-| IsoStream | Yes | Yes | Blu-ray ISO image file |
+| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written via `Disc::copy()`) |
 | MkvStream | Yes | Yes | Matroska container |
 | M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
 | NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
 | StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
 | NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-Streams implement `IOStream` (byte-level) and `pes::Stream` (frame-level). `input()` / `output()` resolve URL strings to PES stream instances. `open_input()` / `open_output()` resolve to byte-level IOStream instances. All URLs use the `scheme://path` format — bare paths are rejected.
+Streams implement `pes::Stream` (frame-level). `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
 
 ## Architecture
 
 ```text
-Drive                  — open, identify, init, unlock, read (with recovery)
+Drive                  — open, identify, init, unlock, single-shot read
   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS), SPTI (Windows)
   ├── DriveProfile     — per-drive unlock parameters (bundled)
   └── PlatformDriver   — MediaTek (supported), Renesas (planned)
