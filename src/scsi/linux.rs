@@ -694,25 +694,26 @@ fn recover_then_probe(path: &Path, original: Error) -> Result<bool> {
     Err(original)
 }
 
-/// Wedge signature: `Error::ScsiError` with INQUIRY opcode (0x12) and
-/// status byte 0xFF. 0xFF isn't a valid SCSI status — the kernel synthesises
-/// it when the device gives no answer, which is the real-world signature
-/// of a USB Mass Storage layer wedge.
+/// Wedge signature: `Error::ScsiError` with status byte 0xFF, for any
+/// opcode. 0xFF isn't a real SCSI status — our own `execute()` path
+/// synthesises it when poll() times out waiting for the kernel to
+/// deliver a response. That timeout is the ground-truth signature of
+/// the USB Mass Storage layer wedging; opcode-in-flight is incidental.
 fn is_wedge_signature(err: &Error) -> bool {
     matches!(
         err,
         Error::ScsiError {
-            opcode: crate::scsi::SCSI_INQUIRY,
             status: WEDGE_STATUS_BYTE,
             ..
         }
     )
 }
 
-/// Synthesised SCSI status byte returned by the Linux SG driver when
-/// the kernel got no useful response from the device — the wedge
-/// signature. Real SCSI statuses are GOOD (0x00), CHECK_CONDITION (0x02),
-/// BUSY (0x08), etc.; 0xFF is reserved/invalid in the spec.
+/// Synthesised SCSI status byte returned by our own transport when
+/// poll() on the SG fd times out — the wedge signature. Real SCSI
+/// statuses are GOOD (0x00), CHECK_CONDITION (0x02), BUSY (0x08), etc.;
+/// 0xFF is reserved/invalid in the spec, so we can't collide with a
+/// real device response. Applies to any opcode (TUR, INQUIRY, READ, …).
 const WEDGE_STATUS_BYTE: u8 = 0xFF;
 
 /// Settle time after `USBDEVFS_RESET` returns. The kernel re-enumerates
