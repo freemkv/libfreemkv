@@ -167,7 +167,7 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 // out-of-tree platform backends. `SectorReader` lets callers feed any byte
 // source (test harness, network image, SMB share) into the disc scan
 // pipeline; `FileSectorReader` is the standard ISO-on-disk implementation.
-pub use scsi::ScsiTransport;
+pub use scsi::{DriveInfo, ScsiTransport, drive_has_disc, list_drives};
 pub use sector::{FileSectorReader, SectorReader};
 pub use speed::DriveSpeed;
 pub use udf::{UdfFs, read_filesystem};

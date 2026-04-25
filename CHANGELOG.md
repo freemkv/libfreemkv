@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.13.2 (2026-04-24)
+
+### Public discovery + presence APIs; SCSI/USB primitives no longer
+### exposed to consumer crates
+
+The autorip / freemkv-CLI side of the ecosystem was reimplementing
+hardware discovery (sysfs walking, SCSI type-5 filtering, sg-path
+construction) and SCSI recovery primitives in their own crates — a
+direct violation of the architectural rule that ALL hardware-aware
+code lives in libfreemkv. 0.13.2 closes that gap with two cheap public
+probes that absorb everything consumers were doing themselves, plus
+visibility tightening to make future violations a compile error.
+
+#### New public APIs
+
+- `pub struct DriveInfo { path, vendor, model, firmware }` — a single
+  enumerated optical drive's identity. Returned by `list_drives()`,
+  populated from a single SCSI INQUIRY at enumeration time. No
+  firmware reset, no `init`.
+- `pub fn list_drives() -> Vec<DriveInfo>` — one-shot enumeration
+  across Linux/macOS/Windows. Linux walks `/sys/class/scsi_generic/`
+  with the SCSI type-5 filter and `/dev/sg0..15` fallback; macOS
+  walks `/dev/disk0..15` with the INQUIRY peripheral-type-5 filter;
+  Windows iterates `CdRom0..15`. Cheap (~10 ms / drive); cache the
+  result and refresh on udev events.
+- `pub fn drive_has_disc(path: &Path) -> Result<bool>` — single TEST
+  UNIT READY. Returns `Ok(true)` when ready / `Ok(false)` on sense-key 2
+  ("medium not present") / `Err` only after recovery has been exhausted.
+  **Internal wedge recovery is hidden from callers** — when the kernel
+  returns the wedge-signature pattern (status 0xFF, no sense), this
+  function transparently escalates: SCSI bus reset → if still wedged →
+  USB device reset → retry TUR. Consumers never see the escalation.
+
+#### USB-layer reset, multi-platform
+
+`USBDEVFS_RESET` (Linux) is the only thing that recovers a kernel-
+level USB Mass Storage wedge — software equivalent of unplug-replug.
+Now wired for all three OSes:
+
+- **Linux**: `USBDEVFS_RESET` ioctl on `/dev/bus/usb/BBB/DDD`. Resolves
+  sg → USB device via sysfs walk (`busnum`/`devnum` parents).
+- **macOS**: `IOUSBDeviceInterface::ResetDevice()`. Walks IORegistry
+  parents from the SCSI service to the USB device, queries the IOKit
+  USB plugin, calls ResetDevice.
+- **Windows**: existing `IOCTL_STORAGE_RESET_DEVICE` covers both SCSI
+  and USB layers via storport, so `usb_reset` returns `DeviceNotFound`
+  by design — the recovery escalation in `drive_has_disc` falls
+  through cleanly. (See the `windows::usb_reset` doc comment for
+  why a separate cycle-port IOCTL isn't needed on Windows.)
+
+All wrapped in a thread + `mpsc::recv_timeout` so a kernel ioctl that
+hangs forever can't lock up the caller (the inner thread leaks one OS
+thread per hard wedge — acceptable for a daemon that recovers vs. one
+that wedges the whole poll loop).
+
+#### Visibility tightening (architectural enforcement)
+
+These were `pub` in 0.13.1; consumer crates could (and did) call them
+directly, leaking SCSI knowledge across the lib boundary:
+
+- `scsi::reset` → `pub(crate)`
+- `scsi::reset_with_timeout` → `pub(crate)`
+- `scsi::usb_reset` → `pub(crate)`
+- `scsi::usb_reset_with_timeout` → `pub(crate)`
+- `DEFAULT_RESET_TIMEOUT_SECS` / `DEFAULT_USB_RESET_TIMEOUT_SECS` →
+  `pub(crate)`
+
+Consumers now reach recovery exclusively through `drive_has_disc`,
+which folds the escalation in. **Compile-time guarantee** that no
+future autorip/CLI/bdemu commit can reintroduce direct SCSI access.
+
+#### Why this design
+
+`Drive::open(path)` runs a ~2 s firmware-reset preamble + identify
+sequence; suitable for ripping but wasteful for a poll loop probing
+"is there a disc?". Pre-0.13.2 autorip called `Drive::open` 4 × every
+5 s = ~17 000 speculative SCSI sessions/day, hammering the drives
+between actual rips. The wedge in production at 23:51 UTC was
+triggered by exactly this hot-loop pattern. With `drive_has_disc`,
+the same poll cadence costs ~50 ms / drive (one TUR) — 40× cheaper
+and side-effect-free on a healthy drive.
+
+#### Tests
+
+- 233 lib tests pass (no change in count; APIs covered indirectly via
+  the existing transport tests + a new `device_key` test on the
+  autorip side).
+- `cargo clippy --all-targets -D warnings` clean across Linux/macOS.
+
 ## 0.13.1 (2026-04-24)
 
 ### `scsi::reset()` now has a hard wallclock timeout

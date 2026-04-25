@@ -18,6 +18,10 @@ use std::path::Path;
 
 // ── SCSI opcodes (SPC-4, MMC-6) ────────────────────────────────────────────
 
+/// SPC-4 TEST UNIT READY — six-byte CDB, no data transfer. Used by
+/// [`drive_has_disc`] as the cheapest "is the drive responsive / does
+/// it have media?" probe.
+pub const SCSI_TEST_UNIT_READY: u8 = 0x00;
 pub const SCSI_INQUIRY: u8 = 0x12;
 pub const SCSI_READ_CAPACITY: u8 = 0x25;
 pub const SCSI_READ_10: u8 = 0x28;
@@ -32,6 +36,12 @@ pub const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
 
 /// AACS key class for REPORT KEY / SEND KEY commands.
 pub const AACS_KEY_CLASS: u8 = 0x02;
+
+/// Timeout for TEST UNIT READY probes used by [`drive_has_disc`].
+/// TUR is the cheapest SCSI op (no data transfer); 5 s is generous
+/// for any healthy bus and short enough that a hung device can't stall
+/// a poll-loop tick.
+pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -94,7 +104,7 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
 /// healthy-but-slow drive isn't false-positively timed out, short enough
 /// that a kernel-wedged ioctl doesn't take down the caller's poll loop
 /// for minutes.
-pub const DEFAULT_RESET_TIMEOUT_SECS: u64 = 30;
+pub(crate) const DEFAULT_RESET_TIMEOUT_SECS: u64 = 30;
 
 /// Reset a SCSI device to a known good state, with a hard wallclock
 /// bound (`DEFAULT_RESET_TIMEOUT_SECS`). On Linux: open/close fd cycle +
@@ -111,13 +121,21 @@ pub const DEFAULT_RESET_TIMEOUT_SECS: u64 = 30;
 /// can't cancel a Linux ioctl from userspace), so this leaks one OS
 /// thread per wedge — acceptable cost for a daemon that recovers
 /// instead of hanging.
-pub fn reset(device: &Path) -> Result<()> {
-    reset_with_timeout(device, std::time::Duration::from_secs(DEFAULT_RESET_TIMEOUT_SECS))
+///
+/// `pub(crate)` — outside callers use the higher-level `drive_has_disc`
+/// (which folds in recovery escalation) or `Drive::reset` (instance-level).
+/// Direct primitive exposure removed in 0.13.2 to enforce the
+/// architectural rule that no consumer crate issues SCSI commands.
+pub(crate) fn reset(device: &Path) -> Result<()> {
+    reset_with_timeout(
+        device,
+        std::time::Duration::from_secs(DEFAULT_RESET_TIMEOUT_SECS),
+    )
 }
 
 /// Reset with a caller-specified timeout. See [`reset`] for the full
 /// rationale on why an outer wallclock bound is required.
-pub fn reset_with_timeout(device: &Path, timeout: std::time::Duration) -> Result<()> {
+pub(crate) fn reset_with_timeout(device: &Path, timeout: std::time::Duration) -> Result<()> {
     let device_owned = device.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -175,6 +193,203 @@ fn reset_blocking(device: &Path) -> Result<()> {
     {
         let _ = device;
         Ok(())
+    }
+}
+
+/// Default upper bound on `scsi::usb_reset()`. Kernel USB stack
+/// typically completes a port reset in under a second; 5 s is generous
+/// while still catching a hang in the driver.
+pub(crate) const DEFAULT_USB_RESET_TIMEOUT_SECS: u64 = 5;
+
+/// USB-layer reset for USB-attached SCSI devices.
+///
+/// `pub(crate)` — outside callers reach recovery through the
+/// higher-level `drive_has_disc` (poll-loop entry point) which folds
+/// in the SCSI→USB escalation internally. See module-level docs for
+/// the architectural reasoning.
+///
+/// **When to call this.** `scsi::reset()` resets at the SCSI layer; if
+/// the wedge is at the USB Mass Storage interface *below* SCSI (the
+/// classic mode where INQUIRY returns status `0xFF` because the kernel
+/// got nothing back), SCSI commands never reach the device and SCSI
+/// reset is meaningless. USB reset re-enumerates the device at the USB
+/// layer — software equivalent of unplug-replug.
+///
+/// **Linux**: resolves `/dev/sgN` → `/dev/bus/usb/BBB/DDD` via sysfs,
+/// then `USBDEVFS_RESET` ioctl. Same mechanism as the well-known
+/// `usbreset.c` snippet.
+///
+/// **macOS**, **Windows**: returns `DeviceNotFound` for now (stub).
+/// Real impls tracked for 0.13.3.
+///
+/// **Returns** `DeviceNotFound` when the sg device isn't USB-attached
+/// (SATA / RAID / NVMe-passthrough sg nodes) so callers can detect the
+/// fall-through case and know not to retry — USB reset is meaningless
+/// for those drives.
+///
+/// Wraps the platform call in a thread + `recv_timeout` for the same
+/// reason as `reset()` — kernel ioctls can hang and we don't want the
+/// caller's poll loop wedged on it.
+pub(crate) fn usb_reset(device: &Path) -> Result<()> {
+    usb_reset_with_timeout(
+        device,
+        std::time::Duration::from_secs(DEFAULT_USB_RESET_TIMEOUT_SECS),
+    )
+}
+
+/// USB reset with a caller-specified timeout. See [`usb_reset`].
+pub(crate) fn usb_reset_with_timeout(device: &Path, timeout: std::time::Duration) -> Result<()> {
+    let device_owned = device.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("usb-reset".into())
+        .spawn(move || {
+            let r = usb_reset_blocking(&device_owned);
+            let _ = tx.send(r);
+        })
+        .map_err(|_| Error::DeviceResetFailed {
+            path: device.display().to_string(),
+        })?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(Error::DeviceResetFailed {
+            path: device.display().to_string(),
+        }),
+    }
+}
+
+fn usb_reset_blocking(device: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::SgIoTransport::usb_reset(device)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::MacScsiTransport::usb_reset(device)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::SptiTransport::usb_reset(device)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = device;
+        Err(Error::DeviceNotFound {
+            path: device.display().to_string(),
+        })
+    }
+}
+
+// ── Lightweight discovery + presence probes ─────────────────────────────────
+//
+// These two are the *only* hardware-touching APIs autorip + freemkv CLI use
+// outside the rip path itself. They're intentionally cheap:
+//
+// - `list_drives()` is a one-shot enumeration: filesystem walk for sg/cdrom
+//   nodes, type-5 filter, single INQUIRY per candidate. No firmware, no
+//   reset-on-open, no init. Caller caches the result.
+// - `drive_has_disc(path)` is a single TEST UNIT READY (six-byte CDB, no
+//   data transfer) with internal wedge-recovery escalation. Callers in a
+//   poll loop don't need any other primitive to detect "disc inserted /
+//   removed" — and they never see the SCSI-vs-USB-reset escalation.
+//
+// `Drive::open` + `drive.init()` + `Disc::scan` remain heavy and on-demand;
+// callers only invoke them once they've decided to actually rip / verify a
+// specific drive.
+
+/// One optical drive on the system. Returned by [`list_drives`]. The
+/// fields are populated from a single INQUIRY at enumeration time —
+/// no firmware reset, no init.
+#[derive(Debug, Clone)]
+pub struct DriveInfo {
+    /// Platform device path: `/dev/sgN` (Linux), `/dev/diskN` (macOS),
+    /// `\\.\CdRomN` (Windows).
+    pub path: String,
+    /// SCSI INQUIRY vendor identifier (e.g. `"HL-DT-ST"`).
+    pub vendor: String,
+    /// SCSI INQUIRY product identifier (e.g. `"BD-RE BU40N"`).
+    pub model: String,
+    /// SCSI INQUIRY firmware revision (e.g. `"1.04"`).
+    pub firmware: String,
+}
+
+/// Enumerate optical drives present on the system.
+///
+/// **What it does**: per-platform sysfs / IOKit / setupapi walk for SCSI
+/// devices, filtered to type 5 (CD/DVD/BD), with a single INQUIRY each
+/// for vendor/model/firmware. No firmware reset, no `Drive::init`, no
+/// disc scan. Suitable for an autorip-style poll loop or a CLI's
+/// drive-list command.
+///
+/// **What it doesn't do**: probe disc presence (use [`drive_has_disc`]),
+/// open a `Drive` for ripping (use [`crate::Drive::open`]), or load
+/// drive profiles. Those are heavier operations callers invoke once
+/// they've selected a drive.
+pub fn list_drives() -> Vec<DriveInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::list_drives()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_drives()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::list_drives()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+/// True if the drive at `path` currently has a disc inserted.
+///
+/// Issues a single TEST UNIT READY (cheapest SCSI op, no data transfer).
+/// Sense-key 2 ("not ready, medium not present") → `Ok(false)`; any
+/// other ready/not-ready response → `Ok(true)` or interpreted ready
+/// state. Suitable for poll-loop tick (~50 ms / drive on a healthy bus).
+///
+/// **Internal wedge recovery.** When the kernel's response indicates a
+/// wedged target — the `0xff` status pattern that means "no answer from
+/// the device" — this function transparently escalates: SCSI bus reset
+/// → if still wedged → USB device reset (`USBDEVFS_RESET` on Linux) →
+/// retry TUR. Callers never see wedge errors and never need to know
+/// about the escalation; if even the recovery path can't get a response,
+/// `Err(DeviceResetFailed)` surfaces. **No SCSI primitive is exposed to
+/// outside crates** — autorip / freemkv CLI / bdemu use this single
+/// function for the entire "is there a disc?" decision.
+pub fn drive_has_disc(path: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::drive_has_disc(path)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::drive_has_disc(path)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        windows::drive_has_disc(path)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = path;
+        Err(Error::UnsupportedPlatform {
+            target: std::env::consts::OS.to_string(),
+        })
     }
 }
 
