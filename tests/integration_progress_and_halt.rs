@@ -175,17 +175,25 @@ fn test_disc_copy_progress_callback_fires() {
 
     let calls = Arc::new(AtomicU64::new(0));
     let last_bytes = Arc::new(AtomicU64::new(0));
-    let calls_cb = calls.clone();
-    let last_bytes_cb = last_bytes.clone();
 
-    let progress = move |bytes: u64, _pos: u64, _total: u64| {
-        calls_cb.fetch_add(1, Ordering::Relaxed);
-        last_bytes_cb.store(bytes, Ordering::Relaxed);
+    struct CountingReporter {
+        calls: Arc<AtomicU64>,
+        last_bytes: Arc<AtomicU64>,
+    }
+    impl libfreemkv::progress::Progress for CountingReporter {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.last_bytes.store(p.bytes_good_total, Ordering::Relaxed);
+        }
+    }
+    let reporter = CountingReporter {
+        calls: calls.clone(),
+        last_bytes: last_bytes.clone(),
     };
 
     let opts = CopyOptions {
         decrypt: false,
-        on_progress: Some(&progress),
+        progress: Some(&reporter),
         ..Default::default()
     };
 

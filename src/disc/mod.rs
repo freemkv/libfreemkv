@@ -1418,9 +1418,15 @@ impl Disc {
                     );
                 }
 
-                if let Some(cb) = opts.on_progress {
+                if let Some(reporter) = opts.progress {
                     let stats = map.stats();
-                    cb(stats.bytes_good, pos, total_bytes);
+                    reporter.report(&crate::progress::PassProgress {
+                        kind: crate::progress::PassKind::Sweep,
+                        work_done: pos,
+                        work_total: total_bytes,
+                        bytes_good_total: stats.bytes_good,
+                        bytes_total_disc: total_bytes,
+                    });
                 }
             }
         }
@@ -1470,13 +1476,11 @@ pub struct CopyOptions<'a> {
     /// `skip_on_error`. The skipped region is marked `non-trimmed` for later
     /// trimming/scraping by `Disc::patch`.
     pub skip_forward: bool,
-    /// Callback fired per inner-loop iteration with
-    /// `(bytes_good, pos, total_bytes)`. `pos` is the current sweep
-    /// position — true Pass 1 progress, including skipped-forward NonTrimmed
-    /// ranges. `bytes_good` is the count of `Finished` (clean) sectors,
-    /// which doesn't advance through bad zones. UI should display `pos`
-    /// for "swept" progress and `bytes_good` for "real data recovered".
-    pub on_progress: Option<&'a dyn Fn(u64, u64, u64)>,
+    /// Per-iteration progress reporter. v0.13.16 architecture: the library
+    /// emits a single `PassProgress` shape via the `Progress` trait;
+    /// consumers compute their own derived percentages / ETAs from it. No
+    /// more positional `(bytes_good, pos, total)` callbacks.
+    pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1520,10 +1524,8 @@ pub struct PatchOptions<'a> {
     /// bad zone and won't recover during this attempt. `0` disables the
     /// guard (run to completion or halt).
     pub wedged_threshold: u64,
-    /// Callback fired per inner-loop iteration with
-    /// `(bytes_good, pos, total_bytes)`. `pos` is the current LBA-byte
-    /// position within the patch walk; for reverse passes it counts down.
-    pub on_progress: Option<&'a dyn Fn(u64, u64, u64)>,
+    /// Per-iteration progress reporter. See `CopyOptions::progress`.
+    pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1604,6 +1606,12 @@ impl Disc {
         if opts.reverse {
             bad_ranges.reverse();
         }
+        // work_total = sum of all bad-range bytes. on_progress's third arg
+        // is this value; the second arg (work_done) is incremented per block
+        // attempted. UI consumers (autorip) compute pass_progress_pct =
+        // work_done / work_total — true 0..100% per pass per RIP_DESIGN.md §16.
+        let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
+        let mut work_done: u64 = 0;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "patch_start",
@@ -1612,6 +1620,7 @@ impl Disc {
             reverse = opts.reverse,
             wedged_threshold = opts.wedged_threshold,
             num_ranges = bad_ranges.len(),
+            work_total,
             "Disc::patch entered"
         );
 
@@ -1694,9 +1703,30 @@ impl Disc {
                     break 'outer;
                 }
 
-                if let Some(cb) = opts.on_progress {
+                // Track work done in this pass for the per-pass progress bar.
+                // Each block iterated counts as work, regardless of read
+                // outcome — a failed retry is still progress through the
+                // bad-range walk.
+                work_done = work_done.saturating_add(block_bytes);
+
+                if let Some(reporter) = opts.progress {
                     let s = map.stats();
-                    cb(s.bytes_good, pos, total_bytes);
+                    let kind = if block_sectors == 1 {
+                        crate::progress::PassKind::Scrape {
+                            reverse: opts.reverse,
+                        }
+                    } else {
+                        crate::progress::PassKind::Trim {
+                            reverse: opts.reverse,
+                        }
+                    };
+                    reporter.report(&crate::progress::PassProgress {
+                        kind,
+                        work_done,
+                        work_total,
+                        bytes_good_total: s.bytes_good,
+                        bytes_total_disc: total_bytes,
+                    });
                 }
             }
         }
