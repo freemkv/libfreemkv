@@ -260,6 +260,18 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        let exec_t0 = std::time::Instant::now();
+        let opcode = cdb[0];
+        tracing::trace!(
+            target: "freemkv::scsi",
+            phase = "enter",
+            opcode = opcode,
+            timeout_ms,
+            data_len = data.len(),
+            fd = self.fd,
+            "SgIoTransport::execute"
+        );
+
         // Recover from a prior timeout: if a background reopen produced a
         // fresh fd, swap it in. If recovery is still pending (-1), the
         // background thread hasn't finished — return DeviceNotFound and let
@@ -269,8 +281,20 @@ impl ScsiTransport for SgIoTransport {
                 .fd_recovery
                 .swap(-1, std::sync::atomic::Ordering::Acquire);
             if recovered >= 0 {
+                tracing::trace!(
+                    target: "freemkv::scsi",
+                    phase = "recovery_swap_ok",
+                    new_fd = recovered,
+                    "fd_recovery delivered fresh fd"
+                );
                 self.fd = recovered;
             } else {
+                tracing::trace!(
+                    target: "freemkv::scsi",
+                    phase = "recovery_pending",
+                    elapsed_us = exec_t0.elapsed().as_micros() as u64,
+                    "fd_recovery still pending → DeviceNotFound"
+                );
                 return Err(Error::DeviceNotFound {
                     path: self.device_path.display().to_string(),
                 });
@@ -309,6 +333,7 @@ impl ScsiTransport for SgIoTransport {
 
         // Submit command asynchronously via write()
         let hdr_size = std::mem::size_of::<sg_io_hdr>();
+        let write_t0 = std::time::Instant::now();
         let wr = unsafe {
             libc::write(
                 self.fd,
@@ -316,16 +341,32 @@ impl ScsiTransport for SgIoTransport {
                 hdr_size,
             )
         };
+        let write_elapsed_us = write_t0.elapsed().as_micros() as u64;
         if wr < 0 {
-            return Err(Error::IoError {
-                source: std::io::Error::last_os_error(),
-            });
+            let errno = std::io::Error::last_os_error();
+            tracing::trace!(
+                target: "freemkv::scsi",
+                phase = "write_err",
+                opcode = opcode,
+                errno = errno.raw_os_error().unwrap_or(0),
+                write_elapsed_us,
+                "sg write() returned <0"
+            );
+            return Err(Error::IoError { source: errno });
         }
+        tracing::trace!(
+            target: "freemkv::scsi",
+            phase = "write_ok",
+            opcode = opcode,
+            wr,
+            write_elapsed_us,
+            "sg write() submitted"
+        );
 
         // Wait for completion with enforceable timeout.
         // Retry on EINTR (signal interrupted poll) with remaining time.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let poll_t0 = std::time::Instant::now();
+        let deadline = poll_t0 + std::time::Duration::from_millis(timeout_ms as u64);
         let pr = loop {
             let remaining = deadline
                 .saturating_duration_since(std::time::Instant::now())
@@ -344,6 +385,16 @@ impl ScsiTransport for SgIoTransport {
                 break ret;
             }
         };
+        let poll_elapsed_ms = poll_t0.elapsed().as_millis() as u64;
+        tracing::trace!(
+            target: "freemkv::scsi",
+            phase = "poll_done",
+            opcode = opcode,
+            pr,
+            poll_elapsed_ms,
+            timeout_ms,
+            "poll() returned"
+        );
 
         if pr <= 0 {
             // Timeout (0) or fatal poll error (-1). Command is still pending
@@ -355,17 +406,38 @@ impl ScsiTransport for SgIoTransport {
             self.fd = -1;
             let c_path = Self::to_c_path(&self.device_path);
             let recovery = self.fd_recovery.clone();
+            tracing::trace!(
+                target: "freemkv::scsi",
+                phase = "timeout_spawn_recovery",
+                opcode = opcode,
+                old_fd,
+                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+                "poll timeout — spawning bg close+open"
+            );
             std::thread::spawn(move || {
                 // Close blocks until the kernel finishes/aborts the
                 // abandoned command. Then we open a fresh fd. Both happen
                 // off the main thread.
+                let close_t0 = std::time::Instant::now();
                 unsafe { libc::close(old_fd) };
+                let close_ms = close_t0.elapsed().as_millis() as u64;
+                let open_t0 = std::time::Instant::now();
                 let new_fd = unsafe {
                     libc::open(
                         c_path.as_ptr() as *const libc::c_char,
                         libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
                     )
                 };
+                let open_ms = open_t0.elapsed().as_millis() as u64;
+                tracing::trace!(
+                    target: "freemkv::scsi",
+                    phase = "bg_recovery_done",
+                    old_fd,
+                    new_fd,
+                    close_ms,
+                    open_ms,
+                    "bg recovery thread completed close+open"
+                );
                 if new_fd >= 0 {
                     let prev = recovery.swap(new_fd, std::sync::atomic::Ordering::Release);
                     if prev >= 0 {
@@ -386,6 +458,7 @@ impl ScsiTransport for SgIoTransport {
         }
 
         // Read response — copies data from kernel buffer to caller's buffer
+        let read_t0 = std::time::Instant::now();
         let rd = unsafe {
             libc::read(
                 self.fd,
@@ -393,7 +466,16 @@ impl ScsiTransport for SgIoTransport {
                 hdr_size,
             )
         };
+        let read_elapsed_us = read_t0.elapsed().as_micros() as u64;
         if rd < 0 {
+            tracing::trace!(
+                target: "freemkv::scsi",
+                phase = "read_err",
+                opcode = opcode,
+                read_elapsed_us,
+                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+                "sg read() returned <0"
+            );
             return Err(Error::IoError {
                 source: std::io::Error::last_os_error(),
             });
@@ -414,6 +496,15 @@ impl ScsiTransport for SgIoTransport {
             } else {
                 0
             };
+            tracing::trace!(
+                target: "freemkv::scsi",
+                phase = "scsi_err",
+                opcode = opcode,
+                status = hdr.status,
+                sense_key,
+                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+                "SCSI status non-zero"
+            );
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
@@ -421,6 +512,14 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
+        tracing::trace!(
+            target: "freemkv::scsi",
+            phase = "ok",
+            opcode = opcode,
+            bytes_transferred,
+            exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+            "execute() success"
+        );
         Ok(ScsiResult {
             status: hdr.status,
             bytes_transferred,
