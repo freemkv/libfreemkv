@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.13.12 (2026-04-25)
+
+### Fix: delete stall guard from `Disc::copy` (RIP_DESIGN.md §6 Fix 1)
+
+The v0.13.9 stall guard at `disc/mod.rs` exited Pass 1 early when
+`bytes_good` was flat for `stall_secs` (default 120s). This violated the
+ddrescue model: Pass 1 must sweep end-to-end, marking failed reads
+NonTrimmed for Pass 2 retry. The guard caused Pass 1 to bail at 30% on
+Dune 2 with 56 GB still NonTried, leaving Pass 2 nothing useful to do.
+
+- Deleted the stall-guard state vars and the `if cur_good != ...
+  break 'outer;` block.
+- Deleted `CopyOptions::stall_secs` field — no longer wired.
+- Replaced the broken regression test
+  `test_disc_copy_stall_detection_triggers_skip_forward` with
+  `test_disc_copy_completes_full_disc_with_failing_reader` (asserts Pass 1
+  walks to end-of-disc with everything NonTrimmed when reads keep failing)
+  and added `test_disc_copy_halts_promptly_on_failing_reader` (halt flag
+  honored within 2s mid-skip-forward).
+
+### Fix: async SCSI transport recovery (RIP_DESIGN.md §6 Fix 2 / §7)
+
+`SgIoTransport::execute` (Linux) previously did close-in-background +
+synchronous open-on-main-thread on poll timeout. The kernel serialized
+the main-thread `open()` against the in-flight `close()` of the same
+`/dev/sg*`, blocking the rip thread up to ~60s per timeout.
+
+- Added `fd_recovery: Arc<AtomicI32>` field. On poll timeout, both
+  `close(old_fd)` AND `open(new_fd)` run in a background thread; the new
+  fd is published to `fd_recovery`. Returns Err immediately. Main thread
+  is never blocked beyond the `poll()` budget (~1.5 s).
+- Top of `execute()`: if `self.fd < 0`, swap from `fd_recovery`. If
+  recovery is also pending, return `DeviceNotFound` and let the caller's
+  retry loop come back later.
+- Drop drains any pending `fd_recovery` so the fd doesn't leak.
+- Stripped the v0.13.9 stall-guard narrative comment that justified
+  the deleted behavior.
+
+### Fix: cross-platform SCSI parity — Windows + macOS recovery (RIP_DESIGN.md §15.1)
+
+Per the platform parity rule (no stubs), Windows and macOS now have the
+same observable recovery contract as Linux:
+
+- `SptiTransport` (Windows): added `try_recover()` that calls
+  `CloseHandle` + `CreateFileW` synchronously after a failed
+  `DeviceIoControl`. Stripped English error string ("run as
+  administrator") from `open()`. Fixed the ms→s timeout truncation
+  (1500ms now rounds up to 2s, was 1s).
+- `MacScsiTransport` (macOS): added `try_recover()` that releases the
+  IOKit interface (`RELEASE_EXCLUSIVE` + `com_release`) and re-acquires
+  via the new `acquire_device_iface()` helper. Stores `bsd_name` so
+  recovery can re-call `find_scsi_service`.
+- All three platforms: top of `execute()` returns `DeviceNotFound`
+  immediately if a prior `try_recover()` left the transport in an
+  invalid state. Drop guards null'd-out interfaces.
+- Send is auto-derived on all three (i32 fd / isize HANDLE / IOKit
+  interface ref are Send-safe); explicit comments document the
+  intentional implicit Send and the absence of Sync.
+
+### Fix: instrument `Disc::patch` — diagnostic counters (RIP_DESIGN.md §6 Fix 4)
+
+`PatchResult` now reports `blocks_attempted`, `blocks_read_ok`,
+`blocks_read_failed`. Pass 2's "100 minutes recovered 0 bytes" mystery
+(Dune 2) becomes diagnosable from these counters: distinguish "drive
+returned Ok but write/record dropped data" from "every read was Err for
+the entire range" without instrumenting from outside the lib.
+
+### Fix: honor `PatchOptions::full_recovery`
+
+The field was previously read into `let _ = opts.full_recovery;` and
+ignored — `read_sectors(..., true)` was hardcoded. Now routed to
+`read_sectors(..., opts.full_recovery)`. Behavior unchanged for
+default callers (which pass `true`).
+
+### Doc: `CopyOptions::batch_sectors` accuracy
+
+Doc comment said "Defaults to 32 sectors (64 KB)". Updated to describe
+the actual production path: callers should resolve via
+`detect_max_batch_sectors(device_path)` (kernel-reported sysfs value,
+typically 60 sectors / ~120 KB on the BU40N). The 32-sector internal
+fallback is only reached when `batch_sectors=None AND skip_forward=true`.
+
 ## 0.13.11 (2026-04-25)
 
 ### Fix: revert SgIoTransport timeout path to keep transport alive
