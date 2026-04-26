@@ -1420,7 +1420,7 @@ impl Disc {
 
                 if let Some(cb) = opts.on_progress {
                     let stats = map.stats();
-                    cb(stats.bytes_good, total_bytes);
+                    cb(stats.bytes_good, pos, total_bytes);
                 }
             }
         }
@@ -1470,7 +1470,13 @@ pub struct CopyOptions<'a> {
     /// `skip_on_error`. The skipped region is marked `non-trimmed` for later
     /// trimming/scraping by `Disc::patch`.
     pub skip_forward: bool,
-    pub on_progress: Option<&'a dyn Fn(u64, u64)>,
+    /// Callback fired per inner-loop iteration with
+    /// `(bytes_good, pos, total_bytes)`. `pos` is the current sweep
+    /// position — true Pass 1 progress, including skipped-forward NonTrimmed
+    /// ranges. `bytes_good` is the count of `Finished` (clean) sectors,
+    /// which doesn't advance through bad zones. UI should display `pos`
+    /// for "swept" progress and `bytes_good` for "real data recovered".
+    pub on_progress: Option<&'a dyn Fn(u64, u64, u64)>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1504,7 +1510,20 @@ pub struct PatchOptions<'a> {
     /// Use full drive-level recovery on each read (slow but thorough). Defaults
     /// to true — patch is the pass where we *want* the drive to try hard.
     pub full_recovery: bool,
-    pub on_progress: Option<&'a dyn Fn(u64, u64)>,
+    /// Walk bad ranges in reverse order, and within each range walk sectors
+    /// from high to low LBA. Useful for drives that wedge after a forward
+    /// read of a bad sector — approaching the post-bad-zone from end-of-disc
+    /// reads good sectors before the drive sees a bad one.
+    pub reverse: bool,
+    /// Bail out early if this many consecutive read failures occur with zero
+    /// successful reads in the same pass — i.e. the drive is wedged on the
+    /// bad zone and won't recover during this attempt. `0` disables the
+    /// guard (run to completion or halt).
+    pub wedged_threshold: u64,
+    /// Callback fired per inner-loop iteration with
+    /// `(bytes_good, pos, total_bytes)`. `pos` is the current LBA-byte
+    /// position within the patch walk; for reverse passes it counts down.
+    pub on_progress: Option<&'a dyn Fn(u64, u64, u64)>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1524,6 +1543,10 @@ pub struct PatchResult {
     pub blocks_read_ok: u64,
     /// Reads that returned Err and were marked `Unreadable`.
     pub blocks_read_failed: u64,
+    /// Pass exited early because `wedged_threshold` consecutive failures
+    /// occurred with zero successful reads — drive appears wedged on the
+    /// bad zone for this pass.
+    pub wedged_exit: bool,
 }
 
 impl Disc {
@@ -1561,32 +1584,64 @@ impl Disc {
 
         let bytes_good_before = map.stats().bytes_good;
         let mut halted = false;
+        let mut wedged_exit = false;
         let mut blocks_attempted: u64 = 0;
         let mut blocks_read_ok: u64 = 0;
         let mut blocks_read_failed: u64 = 0;
+        let mut consecutive_failures: u64 = 0;
         let mut buf = vec![0u8; block_sectors as usize * 2048];
 
         // Collect bad ranges up front. Iterating while mutating is fragile;
         // each recorded change is persisted, so resume works even if we crash
         // mid-loop.
-        let bad_ranges = map.ranges_with(&[
+        let mut bad_ranges = map.ranges_with(&[
             mapfile::SectorStatus::NonTried,
             mapfile::SectorStatus::NonTrimmed,
             mapfile::SectorStatus::NonScraped,
             mapfile::SectorStatus::Unreadable,
         ]);
+        // Reverse mode: walk ranges from highest LBA to lowest.
+        if opts.reverse {
+            bad_ranges.reverse();
+        }
+        tracing::trace!(
+            target: "freemkv::disc",
+            phase = "patch_start",
+            block_sectors,
+            recovery,
+            reverse = opts.reverse,
+            wedged_threshold = opts.wedged_threshold,
+            num_ranges = bad_ranges.len(),
+            "Disc::patch entered"
+        );
 
         'outer: for (range_pos, range_size) in bad_ranges {
-            let mut pos = range_pos;
             let end = range_pos + range_size;
-            while pos < end {
+            // In reverse mode, walk this range from end - block_bytes back to range_pos.
+            // Each iteration emits the block ending at `block_end` (so reads land on
+            // increasing LBAs internally; we just choose blocks back-to-front).
+            let mut block_end = if opts.reverse { end } else { range_pos };
+            loop {
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
                         halted = true;
                         break 'outer;
                     }
                 }
-                let block_bytes = (end - pos).min(block_sectors as u64 * 2048);
+                // Compute block boundaries based on direction.
+                let (pos, block_bytes) = if opts.reverse {
+                    if block_end <= range_pos {
+                        break;
+                    }
+                    let span = (block_end - range_pos).min(block_sectors as u64 * 2048);
+                    (block_end - span, span)
+                } else {
+                    if block_end >= end {
+                        break;
+                    }
+                    let span = (end - block_end).min(block_sectors as u64 * 2048);
+                    (block_end, span)
+                };
                 let lba = (pos / 2048) as u32;
                 let count = (block_bytes / 2048) as u16;
                 let bytes = count as usize * 2048;
@@ -1596,6 +1651,7 @@ impl Disc {
                     .is_ok();
                 if read_ok {
                     blocks_read_ok += 1;
+                    consecutive_failures = 0;
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                     }
@@ -1607,20 +1663,57 @@ impl Disc {
                         .map_err(|e| Error::IoError { source: e })?;
                 } else {
                     blocks_read_failed += 1;
+                    consecutive_failures += 1;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
                         .map_err(|e| Error::IoError { source: e })?;
                 }
-                pos += block_bytes;
+                // Advance block_end in chosen direction.
+                if opts.reverse {
+                    block_end = block_end.saturating_sub(block_bytes);
+                } else {
+                    block_end += block_bytes;
+                }
+
+                // Wedged-drive early-exit: many consecutive failures with zero
+                // recovered bytes this pass means the drive is stuck and won't
+                // produce data this pass. Save the wallclock budget for productive
+                // grinding; future passes (with smaller block size, reverse, or
+                // after settle) may still recover.
+                if opts.wedged_threshold > 0
+                    && consecutive_failures >= opts.wedged_threshold
+                    && blocks_read_ok == 0
+                {
+                    tracing::trace!(
+                        target: "freemkv::disc",
+                        phase = "patch_wedged_exit",
+                        consecutive_failures,
+                        blocks_read_failed,
+                        "Disc::patch giving up — drive appears wedged"
+                    );
+                    wedged_exit = true;
+                    break 'outer;
+                }
 
                 if let Some(cb) = opts.on_progress {
                     let s = map.stats();
-                    cb(s.bytes_good, total_bytes);
+                    cb(s.bytes_good, pos, total_bytes);
                 }
             }
         }
 
         file.sync_all().map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
+        tracing::trace!(
+            target: "freemkv::disc",
+            phase = "patch_done",
+            blocks_attempted,
+            blocks_read_ok,
+            blocks_read_failed,
+            wedged_exit,
+            halted,
+            bytes_recovered = stats.bytes_good.saturating_sub(bytes_good_before),
+            "Disc::patch returning"
+        );
         Ok(PatchResult {
             bytes_total: total_bytes,
             bytes_good: stats.bytes_good,
@@ -1631,6 +1724,7 @@ impl Disc {
             blocks_attempted,
             blocks_read_ok,
             blocks_read_failed,
+            wedged_exit,
         })
     }
 }

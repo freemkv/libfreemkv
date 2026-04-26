@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.13.15 (2026-04-26)
+
+### Breaking: `on_progress` callback gains `pos` parameter
+
+Both `CopyOptions::on_progress` and `PatchOptions::on_progress` now take
+`Fn(bytes_good: u64, pos: u64, total_bytes: u64)`. The new `pos` parameter
+is the current sweep / retry position. Pass 1 callers should display
+`pos / total_bytes` for the "% swept" UI bar — `bytes_good` only counts
+clean reads (Finished sectors) and freezes during skip-forward bad zones,
+which made every previous version's UI look hung at the bad-zone boundary.
+This was the v0.13.9 stall-guard origin bug.
+
+Live trace from v0.13.14: Pass 1 hit a Dune 2 bad zone at 24 GB and
+appeared "stuck" for 14 minutes per autorip's UI (`bytes_good = 23.97 GB`
+unchanged). Disc trace events showed `pos` actually advanced from 25.8 GB
+to 70 GB during that window — Pass 1 was 83 % through the disc, marking
+the post-bad-zone NonTrimmed via skip-forward exactly as designed. The
+display lied. Now consumers can show the truth.
+
+### Feature: `PatchOptions::reverse` for reverse-direction retry passes
+
+When set, `Disc::patch` walks bad ranges from highest LBA to lowest, and
+within each range reads sectors back-to-front. Hypothesis (per the live
+v0.13.14 test): drives that wedge after a forward read of a bad sector
+read fine when approached from end-of-disc backward — most of the
+post-bad-zone NonTrimmed range is actually clean data the drive could
+have read on Pass 1 had it not been wedged. autorip alternates F/R
+across retry passes (Pass 2 = reverse half-batch, Pass 3 = forward
+quarter-batch, ...).
+
+### Feature: `PatchOptions::wedged_threshold` early-exit
+
+When > 0, `Disc::patch` exits early if it sees this many consecutive
+read failures with zero successful reads in the same pass. Saves the
+wallclock budget for productive grinding when the drive has clearly
+wedged on the bad zone for this pass — a future pass with a different
+direction or block size may still recover. Reported via new
+`PatchResult::wedged_exit: bool`.
+
+### Trace: `patch_start` and `patch_done` events
+
+`freemkv::disc` target now emits `patch_start` (block_sectors, recovery,
+reverse, wedged_threshold, num_ranges) and `patch_done`
+(blocks_attempted, blocks_read_ok, blocks_read_failed, wedged_exit,
+halted, bytes_recovered) at Disc::patch boundaries.
+
 ## 0.13.14 (2026-04-25)
 
 ### Sync release — no functional changes in libfreemkv
