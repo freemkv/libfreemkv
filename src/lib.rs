@@ -88,6 +88,7 @@ pub mod mux;
 pub mod pes;
 pub(crate) mod platform;
 pub mod profile;
+pub mod progress;
 pub mod scsi;
 pub mod sector;
 pub(crate) mod speed;

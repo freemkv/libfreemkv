@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.13.16 (2026-04-26)
+
+### Architecture: single `Progress` trait + `PassProgress` struct
+
+Pre-0.13.16 the rip API leaked internal mapfile concepts (`pos`,
+`bytes_good`, `work_done`, `bytes_pending`, `Finished`/`NonTrimmed`)
+into per-pass positional callbacks. Consumers reinvented the math each
+time, and the v0.13.15 UI bug surfaced exactly because of this — autorip's
+web JS computed `progress_pct` from `bytes_good` while the backend
+computed from `pos`, silent drift, frozen UI bar.
+
+This release replaces both `Disc::copy::on_progress` and
+`Disc::patch::on_progress` `Fn(u64, u64, u64)` callbacks with a single
+`Progress` trait and `PassProgress` struct (new `progress` module).
+
+```rust
+pub struct PassProgress {
+    pub kind: PassKind,            // Sweep | Trim {reverse} | Scrape {reverse} | Mux
+    pub work_done: u64,
+    pub work_total: u64,
+    pub bytes_good_total: u64,
+    pub bytes_total_disc: u64,
+}
+
+pub trait Progress {
+    fn report(&self, p: &PassProgress);
+}
+
+impl<F: Fn(&PassProgress)> Progress for F { ... }
+```
+
+Both `CopyOptions::on_progress` and `PatchOptions::on_progress` are
+renamed to `progress: Option<&dyn Progress>`. Closure callers update
+trivially; struct callers gain a clean named-field shape with no
+positional-arg confusion.
+
+`PassKind` carries the semantic (sweep vs trim vs scrape vs mux) so
+consumers can label phases without reinventing detection logic. The
+`Mux` variant is reserved for v0.13.17 when the mux pipeline emits
+progress; not yet emitted by libfreemkv code.
+
+`Disc::patch` reports `Trim {reverse}` for retry passes with
+`block_sectors >= 2` and `Scrape {reverse}` when `block_sectors == 1`
+(the per-sector final pass). Direction comes through `reverse: bool`.
+
 ## 0.13.15 (2026-04-26)
 
 ### Breaking: `on_progress` callback gains `pos` parameter
