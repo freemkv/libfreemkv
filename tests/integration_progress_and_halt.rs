@@ -355,20 +355,28 @@ fn test_file_sector_reader_round_trip() {
 //   - halted = false (no user stop)
 //   - ISO file is `total_bytes` size on disk (sparse zeros)
 
-/// Reader that returns Err for every read. Models the worst case where the
-/// drive can read nothing on this disc — Pass 1 must still walk to end of disc.
+/// Reader that returns Err for every read. Optionally signals a halt
+/// flag on the first read so tests can exercise the halt-during-skip-forward
+/// path deterministically (no wallclock dependency).
 struct FailingSectorReader {
     capacity: u32,
-    /// Per-call delay so the test exercises the skip-forward path realistically
-    /// without burning real wallclock.
-    err_delay_ms: u64,
+    /// If set, signals halt on the first `read_sectors` call. Cleared after
+    /// the first signal so subsequent reads are plain Err.
+    halt_on_first_read: Option<Arc<AtomicBool>>,
 }
 
 impl FailingSectorReader {
     fn new(capacity: u32) -> Self {
         Self {
             capacity,
-            err_delay_ms: 0,
+            halt_on_first_read: None,
+        }
+    }
+
+    fn with_halt_on_first_read(capacity: u32, halt: Arc<AtomicBool>) -> Self {
+        Self {
+            capacity,
+            halt_on_first_read: Some(halt),
         }
     }
 }
@@ -381,8 +389,8 @@ impl SectorReader for FailingSectorReader {
         _buf: &mut [u8],
         _recovery: bool,
     ) -> Result<usize> {
-        if self.err_delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(self.err_delay_ms));
+        if let Some(h) = self.halt_on_first_read.take() {
+            h.store(true, Ordering::Relaxed);
         }
         Err(libfreemkv::error::Error::DiscRead { sector: lba as u64 })
     }
@@ -469,33 +477,29 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     // the CopyResult.
 }
 
-// ── 7. Halt during Pass 1 of an all-failing-read sweep returns promptly ───
+// ── 7. Halt during Pass 1 skip-forward path returns promptly (deterministic) ─
 //
 // Per RIP_DESIGN.md §3: halt is the only legitimate early exit from Pass 1.
 // Even when every read is failing (skip-forward path), a halt must be
 // honored within a small bounded time.
+//
+// Deterministic fixture: the reader signals halt on its FIRST read. The
+// inner copy loop's halt check fires on the next iteration, breaking out
+// of 'outer. This avoids any wallclock race on fast CI runners (where a
+// 2 GB synthetic disc can sweep skip-forward in <100 ms).
 
 #[test]
 fn test_disc_copy_halts_promptly_on_failing_reader() {
-    let capacity_sectors: u32 = 1024 * 1024; // 2 GB synthetic disc — plenty of work
-    let mut reader = FailingSectorReader {
-        capacity: capacity_sectors,
-        err_delay_ms: 1, // small per-read delay so halt has something to interrupt
-    };
+    let capacity_sectors: u32 = 1024 * 1024; // 2 GB synthetic disc
+
+    let halt = Arc::new(AtomicBool::new(false));
+    let mut reader =
+        FailingSectorReader::with_halt_on_first_read(capacity_sectors, halt.clone());
     let disc = synthetic_disc(capacity_sectors);
 
     let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
     let iso_path = tmp.path().to_path_buf();
     drop(tmp);
-
-    let halt = Arc::new(AtomicBool::new(false));
-    let halt_setter = halt.clone();
-
-    // Trigger halt after 200 ms.
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        halt_setter.store(true, Ordering::Relaxed);
-    });
 
     let opts = CopyOptions {
         decrypt: false,
@@ -522,6 +526,10 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     assert!(result.halted, "result.halted must be true");
     assert!(
         !result.complete,
-        "halted run cannot be complete (bytes_pending > 0 likely)"
+        "halted run cannot be complete (bytes_pending > 0 expected)"
+    );
+    assert!(
+        result.bytes_pending > 0,
+        "halt fired before sweep completed; bytes_pending must be > 0"
     );
 }
