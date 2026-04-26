@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.17 (2026-04-26)
+
+### Sync release — no functional changes
+
+Bumped to satisfy the unified-versioning rule. Actual fix is in autorip
+(hot-plug rescan in the drive poll loop — autorip now picks up
+unplug/replug events without a container restart).
+
 ## 0.13.16 (2026-04-26)
 
 ### Architecture: single `Progress` trait + `PassProgress` struct
