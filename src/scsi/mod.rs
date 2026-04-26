@@ -43,6 +43,38 @@ pub const AACS_KEY_CLASS: u8 = 0x02;
 /// a poll-loop tick.
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
+/// Timeout for content READ commands (READ_10 / READ_12) on the fast
+/// path — the [`disc::Disc::copy`] sweep that bisects-on-failure.
+///
+/// 10 s is calibrated from live empirical data on an LG BU40N + Initio
+/// 1618L bridge ripping a UHD with marginal sectors:
+///
+///   - Sustained sequential reads:    3 – 7 ms
+///   - Cold-start seek + read:        up to ~1500 ms
+///   - Successful ECC recovery:       1.6 – 2.6 sec
+///   - Confirmed unreadable sector:   3.6 – 8.8 sec (kernel timeout)
+///
+/// 10 s catches every legitimate slow read with comfortable margin and
+/// short-circuits truly bad sectors at ~10 s rather than letting the
+/// kernel mid-layer escalate for 30 s+. See run log in
+/// `freemkv-private/docs/TEST_PLAN.md` and the audit at
+/// `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`.
+///
+/// Pre-0.13.21 this was 1.5 s, which forced the kernel mid-layer to
+/// time out *normal* reads (cold-start often takes ~1.5 s) and run its
+/// full ABORT TASK / LUN RESET / BUS RESET escalation while userspace
+/// kept submitting fresh reads. The Initio bridge couldn't drain the
+/// resulting command queue and entered a wedge state that only physical
+/// replug recovered — proven by the v0.13.18 + v0.13.20 live tests.
+pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
+
+/// Timeout for content READ commands on the recovery path —
+/// [`disc::Disc::patch`]'s targeted retries on bad ranges. Doubles
+/// the fast-path budget so a sector that fails at 30 s gets one more
+/// honest attempt. Matches sg_dd's default per-command timeout
+/// (`DEF_TIMEOUT = 60000`).
+pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
+
 // ── Sense-key parsing ───────────────────────────────────────────────────────
 
 /// Extract the SPC-4 sense key from a sense buffer.

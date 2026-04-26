@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.13.21 (2026-04-26)
+
+### Fix: Disc::copy bisect-on-fail (replaces skip-forward)
+
+Empirical live-hardware testing on the LG BU40N (see
+`freemkv-private/docs/audits/2026-04-26-test-plan-audit.md` and the
+TEST_PLAN.md run log) revealed that the drive often **fails
+multi-sector READ commands** in damaged regions but **succeeds when
+asked one sector at a time**. The old skip-forward strategy responded
+to multi-sector failures by jumping up to 1 % of the disc forward,
+marking everything in between as bad — losing **clean territory**
+sandwiched between bad sectors.
+
+`Disc::copy` now bisects on read failure: split the failed block in
+half, retry each half, recurse down to single-sector reads. Sectors
+the drive can read individually are recovered in Pass 1; only sectors
+that fail at bpt=1 are marked NonTrimmed for the patch passes.
+
+Empirical results on Dune 2 UHD on the BU40N:
+- Old algorithm: 25 GB read in Pass 1, then ~6 GB skip-forwarded;
+  retry passes failed to recover most of the skipped zone.
+- New algorithm: ~99 % of disc recovered in Pass 1; only the truly
+  unreadable cluster (~14 % of a 2 MB hot zone) marked NonTrimmed.
+
+Implementation: stack-based DFS in the inner read loop. log₂(batch)
+levels max — for the default 60-sector batch, 6 levels. Multi-pass
+machinery is untouched: Pass 2 .. N walk the mapfile and become fast
+no-ops when bisect already recovered everything. New integration test
+`test_disc_copy_bisect_recovers_via_single_sector_reads` validates
+the behavior against a synthetic BU40N-pattern reader.
+
+### Fix: READ_TIMEOUT_MS bumped 1.5 s → 10 s (caller-side)
+
+The 0.13.20 SCSI rewrite gave the kernel mid-layer the ability to run
+its own ABORT/RESET escalation. But callers (`Drive::read` for the
+fast path) still passed `timeout_ms=1500`. Cold-start seek on the
+BU40N can take ~1.5 s, which means **normal reads were being
+cancelled at the boundary**, triggering the kernel mid-layer's
+escalation, which the Initio bridge couldn't drain — resulting in the
+firmware-level wedge that only physical replug recovers.
+
+Live-hardware probe data:
+- Sustained sequential read: 3–7 ms
+- Cold-start seek + read: up to ~1500 ms
+- Successful ECC recovery: 1.6–2.6 s
+- Confirmed unreadable: 3.6–8.8 s (kernel timeout)
+
+10 s is calibrated to cover every legitimate read with margin while
+still short-circuiting truly bad sectors before the kernel runs full
+LUN/BUS/HOST reset. `READ_RECOVERY_TIMEOUT_MS` (60 s) unchanged.
+
 ## 0.13.20 (2026-04-26)
 
 ### Architecture: SCSI transport — sync blocking SG_IO

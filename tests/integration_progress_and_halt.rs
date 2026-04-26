@@ -537,3 +537,92 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
         "halt fired before sweep completed; bytes_pending must be > 0"
     );
 }
+
+// ── 8. Bisect-on-fail recovers data the drive can read individually ──────
+//
+// Empirically observed on the LG BU40N: in damaged regions the drive fails
+// multi-sector READ commands but reads each sector cleanly when asked one
+// at a time. Disc::copy's bisect-on-fail must recover those sectors
+// without bailing or skip-forwarding past clean territory.
+//
+// Fixture: a reader that returns Err for any read with count > 1, and Ok
+// for count == 1. With bisect-on-fail, we must observe a 100 % bytes_good
+// outcome — every sector recovered via the bisection.
+
+struct BlockSizeFailingReader {
+    capacity: u32,
+}
+
+impl SectorReader for BlockSizeFailingReader {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        if count == 1 {
+            // Single-sector reads succeed — fill the sector with a marker.
+            for chunk in buf.chunks_mut(SECTOR_SIZE) {
+                chunk.fill((lba & 0xff) as u8);
+            }
+            Ok(buf.len())
+        } else {
+            Err(libfreemkv::error::Error::DiscRead { sector: lba as u64 })
+        }
+    }
+
+    fn capacity(&self) -> u32 {
+        self.capacity
+    }
+}
+
+#[test]
+fn test_disc_copy_bisect_recovers_via_single_sector_reads() {
+    // 256 sectors = 0.5 MB. Reader fails any multi-sector read but
+    // succeeds on bpt=1. Bisection must descend log2(batch) levels and
+    // recover every sector. This is the BU40N bad-zone pattern in
+    // miniature.
+    let capacity_sectors: u32 = 256;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+
+    let mut reader = BlockSizeFailingReader {
+        capacity: capacity_sectors,
+    };
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let opts = CopyOptions {
+        decrypt: false,
+        skip_on_error: true,
+        skip_forward: true,
+        ..Default::default()
+    };
+
+    let result = disc
+        .copy(&mut reader, &iso_path, &opts)
+        .expect("copy returns Ok");
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
+
+    // Bisect must recover every sector — the drive could read each one
+    // individually, and our algorithm must descend to that.
+    assert_eq!(
+        result.bytes_good, total_bytes,
+        "bisect-on-fail must recover every sector via single-sector reads. \
+         Got bytes_good={} of total {}",
+        result.bytes_good, total_bytes
+    );
+    assert_eq!(
+        result.bytes_pending, 0,
+        "no sectors should be left NonTrimmed after a successful bisect"
+    );
+    assert!(
+        result.complete,
+        "complete=true expected when every sector recovered"
+    );
+}

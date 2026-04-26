@@ -417,12 +417,16 @@ impl Drive {
     /// Read sectors from the disc. Single-shot — no inline retries, no
     /// SCSI reset.
     ///
-    /// `recovery=true` bumps the per-CDB timeout to 30 s for the
-    /// `Disc::patch` pass; `recovery=false` uses 1.5 s for `Disc::copy`'s
-    /// fast skip-forward sweep. On any failure returns `Err(DiscRead)`
-    /// immediately. The orchestration layer (`Disc::patch`'s outer loop
-    /// for the patch pass, `DiscStream`'s adaptive batch halving for the
-    /// stream path) handles retries.
+    /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s,
+    /// matches sg_dd) for the `Disc::patch` pass; `recovery=false` uses
+    /// [`crate::scsi::READ_TIMEOUT_MS`] (30 s, matches the kernel's
+    /// `/sys/block/sr*/device/timeout` default) for `Disc::copy`'s fast
+    /// skip-forward sweep. Both budgets are generous enough that the drive
+    /// can finish ECC recovery on a marginal sector — pre-0.13.21 this was
+    /// 1.5 s on the fast path which forced the kernel mid-layer to time
+    /// out and escalate while we waited anyway. On any failure returns
+    /// `Err(DiscRead)` immediately; orchestration (`Disc::patch` multi-pass,
+    /// `DiscStream` adaptive batch halving) handles retry policy.
     ///
     /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
     /// removed in 0.13.6. Per
@@ -432,7 +436,11 @@ impl Drive {
     /// layers (Disc::patch multi-pass, DiscStream batch halving) do not
     /// touch the wedge-prone reset path.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
-        let timeout_ms = if recovery { 30_000 } else { 1_500 };
+        let timeout_ms = if recovery {
+            crate::scsi::READ_RECOVERY_TIMEOUT_MS
+        } else {
+            crate::scsi::READ_TIMEOUT_MS
+        };
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,

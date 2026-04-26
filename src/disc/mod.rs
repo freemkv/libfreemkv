@@ -1278,11 +1278,6 @@ impl Disc {
             None => DEFAULT_BATCH_SECTORS,
         };
 
-        // Skip-forward state.
-        let skip_init = 256 * 1024u64; // 256 KB
-        let skip_max = (total_bytes / 100).max(skip_init); // cap at 1% of disc
-        let mut skip_size = skip_init;
-
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
@@ -1296,8 +1291,6 @@ impl Disc {
             phase = "copy_start",
             total_bytes,
             batch,
-            skip_init,
-            skip_max,
             "Disc::copy entered"
         );
 
@@ -1344,58 +1337,88 @@ impl Disc {
                     }
                 }
                 let block_bytes = (region_end - pos).min(batch as u64 * 2048);
-                let lba = (pos / 2048) as u32;
-                let count = (block_bytes / 2048) as u16;
-                let bytes = count as usize * 2048;
+                let block_lba = (pos / 2048) as u32;
+                let block_count = (block_bytes / 2048) as u16;
+                let recovery = !opts.skip_on_error;
 
-                let recovery = !opts.skip_on_error; // fast reads when skipping
-                iter_count += 1;
-                let read_t0 = std::time::Instant::now();
-                let read_ok = reader
-                    .read_sectors(lba, count, &mut buf[..bytes], recovery)
-                    .is_ok();
-                let read_elapsed_ms = read_t0.elapsed().as_millis() as u64;
-
-                if read_ok {
-                    read_ok_count += 1;
-                    if opts.decrypt {
-                        crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
-                    }
-                    file.seek(SeekFrom::Start(pos))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..bytes])
-                        .map_err(|e| Error::IoError { source: e })?;
-                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    bytes_done = bytes_done.saturating_add(block_bytes);
-                    skip_size = skip_init; // reset after success
-                    pos += block_bytes;
-                } else if opts.skip_on_error {
-                    read_err_count += 1;
-                    // Zero-fill this block, mark non-trimmed for later patch trim.
-                    buf[..bytes].fill(0);
-                    file.seek(SeekFrom::Start(pos))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..bytes])
-                        .map_err(|e| Error::IoError { source: e })?;
-                    map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    pos += block_bytes;
-
-                    if opts.skip_forward && pos < region_end {
-                        // Skip ahead; mark skipped bytes as non-trimmed too.
-                        let jump = skip_size.min(region_end - pos);
-                        if jump > 0 {
-                            map.record(pos, jump, mapfile::SectorStatus::NonTrimmed)
-                                .map_err(|e| Error::IoError { source: e })?;
-                            pos += jump;
+                // Bisect-on-fail (0.13.21): try the full block first; on read
+                // failure, recursively split into halves down to single-sector
+                // reads. Recovers data the drive can read individually but
+                // fails as a multi-sector block — empirically the BU40N's
+                // bad-zone pattern (see freemkv-private/docs/TEST_PLAN.md).
+                //
+                // Pre-0.13.21 we skip-forwarded by an exponentially-growing
+                // jump (capped at 1% of disc), which marked vast tracts of
+                // *clean* territory as bad just because it sat past one bad
+                // block. With bisection we descend only into the ~14% of
+                // bisection leaves that are truly unreadable; the other ~86%
+                // recover at smaller block sizes within the same pass.
+                let mut work: Vec<(u32, u16)> = vec![(block_lba, block_count)];
+                while let Some((sub_lba, sub_count)) = work.pop() {
+                    if let Some(ref h) = opts.halt {
+                        if h.load(std::sync::atomic::Ordering::Relaxed) {
+                            halt_requested = true;
+                            break 'outer;
                         }
-                        skip_size = (skip_size * 2).min(skip_max);
                     }
-                } else {
-                    // Current behavior (pre-0.11.21): abort on first bad sector.
-                    return Err(Error::DiscRead { sector: lba as u64 });
+                    iter_count += 1;
+                    let sub_bytes = sub_count as usize * 2048;
+                    let sub_pos = sub_lba as u64 * 2048;
+                    let read_t0 = std::time::Instant::now();
+                    let read_ok = reader
+                        .read_sectors(sub_lba, sub_count, &mut buf[..sub_bytes], recovery)
+                        .is_ok();
+                    let read_elapsed_ms = read_t0.elapsed().as_millis() as u64;
+
+                    if read_ok {
+                        read_ok_count += 1;
+                        if opts.decrypt {
+                            crate::decrypt::decrypt_sectors(&mut buf[..sub_bytes], &keys, 0)?;
+                        }
+                        file.seek(SeekFrom::Start(sub_pos))
+                            .map_err(|e| Error::IoError { source: e })?;
+                        file.write_all(&buf[..sub_bytes])
+                            .map_err(|e| Error::IoError { source: e })?;
+                        map.record(sub_pos, sub_bytes as u64, mapfile::SectorStatus::Finished)
+                            .map_err(|e| Error::IoError { source: e })?;
+                        bytes_done = bytes_done.saturating_add(sub_bytes as u64);
+                    } else if opts.skip_on_error && sub_count > 1 {
+                        // Bisect: split this sub-block in half. LIFO push
+                        // (second half first) so the first half is processed
+                        // next — keeps reads roughly in-order, helping the
+                        // drive's read-ahead cache.
+                        let half = sub_count / 2;
+                        work.push((sub_lba + half as u32, sub_count - half));
+                        work.push((sub_lba, half));
+                        tracing::trace!(
+                            target: "freemkv::disc",
+                            phase = "bisect",
+                            sub_lba,
+                            sub_count,
+                            half,
+                            read_elapsed_ms,
+                            "bisecting failed block"
+                        );
+                    } else if opts.skip_on_error {
+                        // Single-sector failure — truly unreadable.
+                        // Zero-fill, mark NonTrimmed for the patch passes.
+                        read_err_count += 1;
+                        buf[..sub_bytes].fill(0);
+                        file.seek(SeekFrom::Start(sub_pos))
+                            .map_err(|e| Error::IoError { source: e })?;
+                        file.write_all(&buf[..sub_bytes])
+                            .map_err(|e| Error::IoError { source: e })?;
+                        map.record(sub_pos, sub_bytes as u64, mapfile::SectorStatus::NonTrimmed)
+                            .map_err(|e| Error::IoError { source: e })?;
+                    } else {
+                        // skip_on_error=false: abort on first bad sector
+                        // (Disc::copy's strict mode, used by some callers).
+                        return Err(Error::DiscRead {
+                            sector: sub_lba as u64,
+                        });
+                    }
                 }
+                pos += block_bytes;
 
                 // Throttled iter telemetry — every 100 inner iterations.
                 if iter_count - last_log_iter >= 100 {
@@ -1407,10 +1430,8 @@ impl Disc {
                         iter_count,
                         read_ok_count,
                         read_err_count,
-                        last_read_ms = read_elapsed_ms,
                         pos,
                         region_end,
-                        skip_size,
                         bytes_good = stats.bytes_good,
                         bytes_pending = stats.bytes_pending,
                         copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
