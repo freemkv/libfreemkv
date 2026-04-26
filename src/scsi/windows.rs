@@ -85,7 +85,15 @@ unsafe extern "system" {
 
 pub struct SptiTransport {
     handle: isize,
+    /// Wide-encoded device path used by `try_recover()` to reopen the
+    /// handle after a failed DeviceIoControl. Saved from `open()` so we
+    /// don't have to re-resolve the device path on recovery.
+    wide_path: Vec<u16>,
 }
+
+// SptiTransport contains an isize HANDLE and a Vec<u16>; both Send. The
+// auto-derived Send is intentional. Sync is NOT — handle mutation in
+// execute() requires &mut, enforced by the trait object dispatch.
 
 /// Normalize a device path to Windows \\.\X: format.
 ///
@@ -129,12 +137,48 @@ impl SptiTransport {
         };
 
         if handle == INVALID_HANDLE_VALUE {
-            return Err(Error::DeviceNotFound {
-                path: format!("{}: cannot open device (run as administrator)", dev_str),
+            // Map last-os-error → Error variant; don't embed English hints
+            // in the path field (the CLI handles localization).
+            let err = std::io::Error::last_os_error();
+            return Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
+                Error::DevicePermission {
+                    path: dev_str.to_string(),
+                }
+            } else {
+                Error::DeviceNotFound {
+                    path: dev_str.to_string(),
+                }
             });
         }
 
-        Ok(SptiTransport { handle })
+        Ok(SptiTransport {
+            handle,
+            wide_path: wide,
+        })
+    }
+
+    /// Recover the handle after a failed DeviceIoControl. Closes the bad
+    /// handle and opens a fresh one synchronously (CloseHandle/CreateFileW
+    /// are fast on Windows — no in-flight CDB to drain like Linux SG_IO).
+    /// On success, `self.handle` is replaced and the next `execute()` call
+    /// uses the new handle. On failure, `self.handle` is set to
+    /// INVALID_HANDLE_VALUE and subsequent calls return `DeviceNotFound`.
+    fn try_recover(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.handle) };
+        }
+        let new_handle = unsafe {
+            CreateFileW(
+                self.wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null(),
+            )
+        };
+        self.handle = new_handle;
     }
 
     /// Reset the drive to a known good state.
@@ -222,8 +266,10 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
 
 impl Drop for SptiTransport {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.handle);
+        if self.handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.handle);
+            }
         }
     }
 }
@@ -236,6 +282,15 @@ impl ScsiTransport for SptiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        // Per RIP_DESIGN.md §15.1: parity with Linux's recovery contract.
+        // If a prior call invalidated the handle and try_recover() also
+        // failed, fail fast.
+        if self.handle == INVALID_HANDLE_VALUE {
+            return Err(Error::DeviceNotFound {
+                path: String::new(),
+            });
+        }
+
         // Zero the data buffer for reads to prevent returning uninitialized data
         // if the driver doesn't fully update DataTransferLength.
         if direction == DataDirection::FromDevice {
@@ -254,7 +309,11 @@ impl ScsiTransport for SptiTransport {
             DataDirection::ToDevice => SCSI_IOCTL_DATA_OUT,
         };
         sptwb.spt.DataTransferLength = data.len() as u32;
-        sptwb.spt.TimeOutValue = (timeout_ms / 1000).max(1) as u32;
+        // Round up to the next whole second so a 1500ms request gets at
+        // least 2s, not 1s. SPTI's TimeOutValue is u32 seconds with no
+        // sub-second resolution; biasing toward "more time" is safer than
+        // truncating (truncation broke 1500ms fast-reads on Drive::read).
+        sptwb.spt.TimeOutValue = ((timeout_ms + 999) / 1000).max(1);
         sptwb.spt.DataBuffer = if data.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -280,6 +339,12 @@ impl ScsiTransport for SptiTransport {
         };
 
         if ok == 0 {
+            // Driver-level failure (timeout, handle gone, etc.). Recover
+            // the handle so the caller's retry loop can resume — same
+            // observable contract as Linux's async fd recovery, but
+            // synchronous because Windows's CloseHandle/CreateFileW don't
+            // block on in-flight CDBs.
+            self.try_recover();
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: 0xFF,

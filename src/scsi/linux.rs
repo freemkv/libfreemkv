@@ -54,7 +54,17 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 pub struct SgIoTransport {
     fd: i32,
     device_path: std::path::PathBuf,
+    /// Background-recovered fd. After a poll timeout `execute()` spawns a
+    /// thread that closes `self.fd` and opens a fresh fd; the new fd is
+    /// stored here. The next call to `execute()` swaps it into `self.fd`.
+    /// `-1` means no recovery is ready (or the recovery open failed). See
+    /// RIP_DESIGN.md §7 for the design rationale.
+    fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
+
+// SgIoTransport's contained types (i32, PathBuf, Arc<AtomicI32>) are all
+// Send; the auto-derived Send is intentional. Sync is NOT — callers must
+// hold &mut for execute(), which the trait object dispatch enforces.
 
 impl SgIoTransport {
     /// Open a SCSI device for use. Resets the drive first to ensure
@@ -75,6 +85,7 @@ impl SgIoTransport {
         Ok(SgIoTransport {
             fd,
             device_path: device,
+            fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
         })
     }
 
@@ -140,10 +151,7 @@ impl SgIoTransport {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
             Error::DevicePermission {
-                path: format!(
-                    "{}: permission denied (try running as root)",
-                    device.display()
-                ),
+                path: device.display().to_string(),
             }
         } else {
             Error::DeviceNotFound {
@@ -219,6 +227,13 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
             unsafe { libc::close(self.fd) };
         }
+        // Drain any background-recovered fd so it doesn't leak.
+        let recovered = self
+            .fd_recovery
+            .swap(-1, std::sync::atomic::Ordering::Acquire);
+        if recovered >= 0 {
+            unsafe { libc::close(recovered) };
+        }
     }
 }
 
@@ -245,10 +260,21 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        // Recover from a prior timeout: if a background reopen produced a
+        // fresh fd, swap it in. If recovery is still pending (-1), the
+        // background thread hasn't finished — return DeviceNotFound and let
+        // the caller's retry loop come back later.
         if self.fd < 0 {
-            return Err(Error::DeviceNotFound {
-                path: self.device_path.display().to_string(),
-            });
+            let recovered = self
+                .fd_recovery
+                .swap(-1, std::sync::atomic::Ordering::Acquire);
+            if recovered >= 0 {
+                self.fd = recovered;
+            } else {
+                return Err(Error::DeviceNotFound {
+                    path: self.device_path.display().to_string(),
+                });
+            }
         }
 
         let mut sense = [0u8; 32];
@@ -320,43 +346,37 @@ impl ScsiTransport for SgIoTransport {
         };
 
         if pr <= 0 {
-            // Timeout (0) or fatal poll error (-1).
-            // Command is still pending in the kernel. Spawn a background
-            // close of the old fd (which blocks until the kernel
-            // completes/aborts the pending command) and open a fresh fd
-            // on the main thread. The main-thread open() can serialize
-            // against the in-flight close via the kernel's per-device
-            // state lock — so this call may block up to ~60 s while
-            // the kernel finishes the abandoned command. That's the
-            // cost of keeping the Drive alive across a timeout. The
-            // Disc::copy stall guard (v0.13.9, default 120 s of
-            // bytes_good non-advance) is the upper bound that prevents
-            // a catastrophic grind on a wedged read region.
-            //
-            // History:
-            //  - 0.13.5 and earlier: same as this — but with no upper
-            //    bound, hence 45-min hangs.
-            //  - 0.13.10: tried "set fd=-1, no reopen" — too aggressive,
-            //    one transient timeout killed the whole transport, Pass
-            //    1 finished in 45 ms with everything NonTrimmed.
-            //  - 0.13.11 (this): same close+reopen as 0.13.5/8 BUT with
-            //    the v0.13.9 stall guard ensuring Disc::copy bails out
-            //    cleanly within 120 s of zero forward progress.
+            // Timeout (0) or fatal poll error (-1). Command is still pending
+            // in the kernel. Per RIP_DESIGN.md §4(b)/§7: close + reopen run
+            // in a background thread so the main thread is never blocked
+            // beyond the poll() budget. The recovered fd is published to
+            // `fd_recovery`; the next call to execute() picks it up.
             let old_fd = self.fd;
             self.fd = -1;
-
-            std::thread::spawn(move || {
-                unsafe { libc::close(old_fd) };
-            });
-
             let c_path = Self::to_c_path(&self.device_path);
-            let new_fd = unsafe {
-                libc::open(
-                    c_path.as_ptr() as *const libc::c_char,
-                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            self.fd = if new_fd >= 0 { new_fd } else { -1 };
+            let recovery = self.fd_recovery.clone();
+            std::thread::spawn(move || {
+                // Close blocks until the kernel finishes/aborts the
+                // abandoned command. Then we open a fresh fd. Both happen
+                // off the main thread.
+                unsafe { libc::close(old_fd) };
+                let new_fd = unsafe {
+                    libc::open(
+                        c_path.as_ptr() as *const libc::c_char,
+                        libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                if new_fd >= 0 {
+                    let prev = recovery.swap(new_fd, std::sync::atomic::Ordering::Release);
+                    if prev >= 0 {
+                        // Stale recovery fd from a prior unclaimed attempt;
+                        // close it so it doesn't leak.
+                        unsafe { libc::close(prev) };
+                    }
+                } else {
+                    recovery.store(-1, std::sync::atomic::Ordering::Release);
+                }
+            });
 
             return Err(Error::ScsiError {
                 opcode: cdb[0],

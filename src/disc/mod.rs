@@ -1286,9 +1286,6 @@ impl Disc {
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
-        let stall_threshold = std::time::Duration::from_secs(opts.stall_secs.unwrap_or(120));
-        let mut last_good_advance = std::time::Instant::now();
-        let mut last_observed_good: u64 = 0;
 
         // Iterate over not-yet-finished regions from the mapfile. We re-read the
         // mapfile after each block because record() mutates the region list.
@@ -1317,30 +1314,6 @@ impl Disc {
                         halt_requested = true;
                         break 'outer;
                     }
-                }
-                // Stall guard. The signal is "bytes_good (Finished sectors)
-                // hasn't advanced for stall_threshold." pos may still be
-                // advancing via the skip_on_error branch; that's not real
-                // progress because skip-forward only marks ranges
-                // NonTrimmed for Pass 2 to retry. If we go stall_threshold
-                // without ANY successful read, the drive is grinding
-                // unproductively (or kernel is silently stalling reads
-                // past their per-CDB timeout — observed live on Dell with
-                // SgIoTransport's reopen-after-timeout serializing
-                // against close). Bail Pass 1; Pass 2 (Disc::patch with
-                // recovery=true, 30 s timeouts) will retry the
-                // NonTrimmed ranges.
-                let cur_good = map.stats().bytes_good;
-                if cur_good != last_observed_good {
-                    last_observed_good = cur_good;
-                    last_good_advance = std::time::Instant::now();
-                } else if last_good_advance.elapsed() > stall_threshold {
-                    // Stall: bail Pass 1. Return cleanly with
-                    // bytes_pending > 0 and complete = false so the
-                    // caller's retry path (Disc::patch with
-                    // recovery=true, 30s timeouts) gets a shot at the
-                    // NonTrimmed ranges.
-                    break 'outer;
                 }
                 let block_bytes = (region_end - pos).min(batch as u64 * 2048);
                 let lba = (pos / 2048) as u32;
@@ -1419,8 +1392,10 @@ pub struct CopyOptions<'a> {
     /// Resume from existing mapfile + ISO if present. Without this, any
     /// existing mapfile is wiped and the ISO recreated.
     pub resume: bool,
-    /// Override the default block size. Defaults to 32 sectors (64 KB) in
-    /// `skip_forward` mode, `DEFAULT_BATCH_SECTORS` otherwise.
+    /// Override the default block size in sectors. Callers should resolve
+    /// this with `detect_max_batch_sectors(device_path)` for live drives.
+    /// When `None`, falls back to 32 sectors (64 KB BD ECC block) in
+    /// `skip_forward` mode or `DEFAULT_BATCH_SECTORS=60` otherwise.
     pub batch_sectors: Option<u16>,
     /// Zero-fill bad blocks in the ISO, mark them in the mapfile, continue.
     /// Uses fast reads (no drive-level recovery loop).
@@ -1431,15 +1406,6 @@ pub struct CopyOptions<'a> {
     pub skip_forward: bool,
     pub on_progress: Option<&'a dyn Fn(u64, u64)>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Wall-clock stall threshold in seconds. If the inner copy loop runs
-    /// this long without `pos` advancing, the current block is treated as
-    /// a read failure (skip-forward in `skip_on_error` mode, else
-    /// `Err(DiscRead)`). Defaults to 120 s. Defensive guard for
-    /// kernel-level hangs that bypass the per-CDB SCSI timeout — e.g. the
-    /// v0.13.8 case where SgIoTransport's reopen-after-timeout serialized
-    /// against the in-flight close, blocking the main thread for tens of
-    /// seconds per read.
-    pub stall_secs: Option<u64>,
 }
 
 /// Result of `Disc::copy`. `complete=true` means every byte reached a terminal
@@ -1476,7 +1442,8 @@ pub struct PatchOptions<'a> {
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Result of `Disc::patch` — how many bad bytes were recovered.
+/// Result of `Disc::patch` — how many bad bytes were recovered, plus
+/// per-block counters for diagnosing why a pass made or didn't make progress.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchResult {
     pub bytes_total: u64,
@@ -1485,6 +1452,12 @@ pub struct PatchResult {
     pub bytes_pending: u64,
     pub bytes_recovered_this_pass: u64,
     pub halted: bool,
+    /// Total inner-loop iterations this pass (one per block attempted).
+    pub blocks_attempted: u64,
+    /// Reads that returned Ok and were promoted to `Finished`.
+    pub blocks_read_ok: u64,
+    /// Reads that returned Err and were marked `Unreadable`.
+    pub blocks_read_failed: u64,
 }
 
 impl Disc {
@@ -1518,13 +1491,13 @@ impl Disc {
             .map_err(|e| Error::IoError { source: e })?;
 
         let block_sectors = opts.block_sectors.unwrap_or(1);
-        // Patch always reads with full drive recovery — this is the pass where
-        // we want the drive's ECC retry machinery. Consumers who want fast-fail
-        // use Disc::copy with skip_on_error instead.
-        let _ = opts.full_recovery;
+        let recovery = opts.full_recovery;
 
         let bytes_good_before = map.stats().bytes_good;
         let mut halted = false;
+        let mut blocks_attempted: u64 = 0;
+        let mut blocks_read_ok: u64 = 0;
+        let mut blocks_read_failed: u64 = 0;
         let mut buf = vec![0u8; block_sectors as usize * 2048];
 
         // Collect bad ranges up front. Iterating while mutating is fragile;
@@ -1551,10 +1524,12 @@ impl Disc {
                 let lba = (pos / 2048) as u32;
                 let count = (block_bytes / 2048) as u16;
                 let bytes = count as usize * 2048;
+                blocks_attempted += 1;
                 let read_ok = reader
-                    .read_sectors(lba, count, &mut buf[..bytes], true)
+                    .read_sectors(lba, count, &mut buf[..bytes], recovery)
                     .is_ok();
                 if read_ok {
+                    blocks_read_ok += 1;
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                     }
@@ -1565,6 +1540,7 @@ impl Disc {
                     map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                         .map_err(|e| Error::IoError { source: e })?;
                 } else {
+                    blocks_read_failed += 1;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
                         .map_err(|e| Error::IoError { source: e })?;
                 }
@@ -1586,6 +1562,9 @@ impl Disc {
             bytes_pending: stats.bytes_pending,
             bytes_recovered_this_pass: stats.bytes_good.saturating_sub(bytes_good_before),
             halted,
+            blocks_attempted,
+            blocks_read_ok,
+            blocks_read_failed,
         })
     }
 }
