@@ -43,6 +43,36 @@ pub const AACS_KEY_CLASS: u8 = 0x02;
 /// a poll-loop tick.
 pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 
+// ── Sense-key parsing ───────────────────────────────────────────────────────
+
+/// Extract the SPC-4 sense key from a sense buffer.
+///
+/// Handles both response-code formats:
+///   - Descriptor format (0x72 / 0x73): sense key in the low nibble of byte 1.
+///   - Fixed format (0x70 / 0x71): sense key in the low nibble of byte 2.
+///
+/// `sb_len_wr` is the number of bytes the transport actually wrote into
+/// `sense`. When < 3 (or `sense.len() < 3`) we can't safely read either
+/// the format byte or the key byte — return 0 (NO SENSE) per SPC-4 §4.5.3.
+///
+/// Pure function. Same parse runs on every platform backend so
+/// callers don't have to special-case Linux SG_IO vs macOS IOKit vs
+/// Windows SPTI sense layouts.
+pub(crate) fn parse_sense_key(sense: &[u8], sb_len_wr: u8) -> u8 {
+    if (sb_len_wr as usize) < 3 || sense.len() < 3 {
+        return 0;
+    }
+    let response_code = sense[0] & 0x7F;
+    if response_code == 0x72 || response_code == 0x73 {
+        sense[1] & 0x0F
+    } else {
+        // Fixed format (0x70/0x71) and any unknown code fall through here;
+        // SPC-4 says implementations MUST tolerate unknown response codes
+        // and treat them as fixed — matches what reference projects do.
+        sense[2] & 0x0F
+    }
+}
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -325,4 +355,110 @@ pub fn build_read10_raw(lba: u32, count: u16) -> [u8; 10] {
         count as u8,
         0x00,
     ]
+}
+
+#[cfg(test)]
+mod parse_sense_tests {
+    //! Unit tests for `parse_sense_key`. Covers both SPC-4 sense data
+    //! formats (descriptor / fixed) and the short-buffer fallback. The
+    //! same helper runs on every platform backend so a regression here
+    //! would silently miscategorize SCSI errors on Linux, macOS, and
+    //! Windows simultaneously.
+    use super::parse_sense_key;
+
+    /// Helper: build a 32-byte sense buffer whose first three bytes are
+    /// the given prefix; the rest are zeroes (sense data area).
+    fn buf(b0: u8, b1: u8, b2: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[0] = b0;
+        s[1] = b1;
+        s[2] = b2;
+        s
+    }
+
+    #[test]
+    fn descriptor_format_72_picks_byte_1() {
+        // Response code 0x72 (current, descriptor): sense key is the
+        // low nibble of byte 1. Byte 2 here is 0x77 to prove it is NOT
+        // the byte the parser reads.
+        let s = buf(0x72, 0x05, 0x77); // ILLEGAL REQUEST
+        assert_eq!(parse_sense_key(&s, 8), 5);
+    }
+
+    #[test]
+    fn descriptor_format_73_picks_byte_1() {
+        // Response code 0x73 (deferred, descriptor): same parse rule
+        // as 0x72.
+        let s = buf(0x73, 0x06, 0xFF); // UNIT ATTENTION
+        assert_eq!(parse_sense_key(&s, 8), 6);
+    }
+
+    #[test]
+    fn fixed_format_70_picks_byte_2() {
+        // Response code 0x70 (current, fixed): sense key is the low
+        // nibble of byte 2. Byte 1 is 0x77 to prove it is NOT read.
+        let s = buf(0x70, 0x77, 0x05); // ILLEGAL REQUEST
+        assert_eq!(parse_sense_key(&s, 18), 5);
+    }
+
+    #[test]
+    fn fixed_format_71_picks_byte_2() {
+        // Response code 0x71 (deferred, fixed): same parse as 0x70.
+        let s = buf(0x71, 0x77, 0x02); // NOT READY
+        assert_eq!(parse_sense_key(&s, 18), 2);
+    }
+
+    #[test]
+    fn high_bit_in_byte_0_is_masked() {
+        // SPC-4 sets the top bit of byte 0 ("INFORMATION VALID" / "VALID")
+        // independently of the response code. parse_sense_key must mask
+        // it off before classifying the format.
+        let s = buf(0xF2, 0x05, 0x77);
+        assert_eq!(parse_sense_key(&s, 8), 5, "VALID-bit must not leak into format detection");
+        let s = buf(0xF0, 0x77, 0x02);
+        assert_eq!(parse_sense_key(&s, 18), 2);
+    }
+
+    #[test]
+    fn high_nibble_in_key_byte_is_masked() {
+        // Sense key is byte_n & 0x0F (low nibble). Top nibble holds
+        // FILEMARK / EOM / ILI / SDAT_OVFL flags, which must not bleed
+        // into the key value.
+        let s = buf(0x70, 0x00, 0xE5); // 0xE0 flags + key 5
+        assert_eq!(parse_sense_key(&s, 18), 5);
+    }
+
+    #[test]
+    fn sb_len_wr_zero_returns_no_sense() {
+        // Transport set status non-zero but wrote zero sense bytes —
+        // SPC-4 §4.5.3 says treat as NO SENSE (key 0).
+        let s = buf(0x72, 0x05, 0x05);
+        assert_eq!(parse_sense_key(&s, 0), 0);
+    }
+
+    #[test]
+    fn sb_len_wr_below_three_returns_no_sense() {
+        // Less than three bytes in the buffer means we can't safely
+        // read either format byte 0 or key byte 2 — return 0.
+        let s = buf(0x72, 0x05, 0x05);
+        assert_eq!(parse_sense_key(&s, 1), 0);
+        assert_eq!(parse_sense_key(&s, 2), 0);
+    }
+
+    #[test]
+    fn slice_below_three_returns_no_sense() {
+        // Defense-in-depth: even if a caller passes a too-short slice
+        // with a falsely-large sb_len_wr, we don't panic and we return 0.
+        let s = [0x72u8, 0x05];
+        assert_eq!(parse_sense_key(&s, 8), 0);
+    }
+
+    #[test]
+    fn unknown_response_code_falls_through_to_fixed() {
+        // SPC-4 mandates implementations tolerate unknown response
+        // codes and treat them as fixed format. Vendor-specific codes
+        // in the 0x74..0x7E range surface here.
+        let s = buf(0x7A, 0x77, 0x03); // MEDIUM ERROR via "fixed"
+        assert_eq!(parse_sense_key(&s, 18), 3);
+    }
 }

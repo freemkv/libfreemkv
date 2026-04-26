@@ -103,7 +103,7 @@ pub mod verify;
 pub use drive::capture::{
     CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string,
 };
-pub use drive::{Drive, DriveStatus, find_drive, find_drives};
+pub use drive::{Drive, DriveStatus, find_drive};
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 //

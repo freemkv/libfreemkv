@@ -177,31 +177,16 @@ impl Drive {
 
     pub fn wait_ready(&mut self) -> Result<()> {
         let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let mut tried_reset = false;
 
         for _ in 0..60 {
             let mut buf = [0u8; 0];
-            match self.scsi.as_mut().execute(
-                &tur,
-                crate::scsi::DataDirection::None,
-                &mut buf,
-                5_000,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(Error::ScsiError { sense_key: 5, .. }) if !tried_reset => {
-                    // Illegal Request on TUR — drive may be stuck from a previous session.
-                    // Try reset() which attempts multiple recovery approaches.
-                    tried_reset = true;
-                    if self.reset().is_ok() {
-                        return Ok(());
-                    }
-                    // If reset failed but disc is present, proceed anyway —
-                    // the scan path will handle errors individually.
-                    if self.drive_status() == DriveStatus::DiscPresent {
-                        return Ok(());
-                    }
-                }
-                Err(_) => {}
+            if self
+                .scsi
+                .as_mut()
+                .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
+                .is_ok()
+            {
+                return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
@@ -262,86 +247,6 @@ impl Drive {
                 }
             }
         }
-    }
-
-    /// Attempt to reset the drive to a clean state.
-    ///
-    /// Escalates through increasingly aggressive recovery:
-    /// 1. Unlock tray + stop/start — handles normal stuck states
-    /// 2. Eject cycle — clears LibreDrive firmware stuck state (proven on BU40N)
-    /// 3. Re-init — firmware re-upload if profile available
-    ///
-    /// Note: step 2 physically ejects the tray. On slimline drives the user
-    /// must push it back in manually. Returns Ok(()) if TUR succeeds after
-    /// any step, even if the drive reports "tray open" (that's a valid state).
-    pub fn reset(&mut self) -> Result<()> {
-        let mut buf = [0u8; 0];
-        let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-        // 1. Unlock + stop/start
-        self.unlock_tray();
-        let stop = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let _ =
-            self.scsi
-                .as_mut()
-                .execute(&stop, crate::scsi::DataDirection::None, &mut buf, 5_000);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let start = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x01, 0x00];
-        let _ =
-            self.scsi
-                .as_mut()
-                .execute(&start, crate::scsi::DataDirection::None, &mut buf, 5_000);
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-
-        if self
-            .scsi
-            .as_mut()
-            .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
-            .is_ok()
-        {
-            return Ok(());
-        }
-
-        // 2. Eject cycle — clears MT1959 LibreDrive stuck state.
-        // After eject, TUR returning "Not Ready — tray open" (sense key 2)
-        // counts as success: the drive is functional, just needs disc reinserted.
-        self.unlock_tray();
-        let eject = [SCSI_START_STOP_UNIT, 0x00, 0x00, 0x00, 0x02, 0x00];
-        let _ =
-            self.scsi
-                .as_mut()
-                .execute(&eject, crate::scsi::DataDirection::None, &mut buf, 30_000);
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-
-        match self
-            .scsi
-            .as_mut()
-            .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
-        {
-            Ok(_) => return Ok(()),
-            Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()), // tray open = valid
-            _ => {}
-        }
-
-        // 3. If still stuck and we have a profile, try re-init
-        if self.driver.is_some() {
-            self.init()?;
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-            match self.scsi.as_mut().execute(
-                &tur,
-                crate::scsi::DataDirection::None,
-                &mut buf,
-                5_000,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(Error::ScsiError { sense_key: 2, .. }) => return Ok(()),
-                _ => {}
-            }
-        }
-
-        Err(Error::DeviceResetFailed {
-            path: self.device_path.clone(),
-        })
     }
 
     pub fn platform_name(&self) -> &str {
@@ -662,19 +567,15 @@ impl SectorReader for Drive {
     }
 }
 
-/// Find all optical drives connected to this system.
-/// Returns opened Drive objects ready for use.
-pub fn find_drives() -> Vec<Drive> {
+/// Find the first optical drive on this system and open it.
+///
+/// For just listing drives without opening (e.g. UI sidebar), use
+/// `scsi::list_drives()` — that returns `DriveInfo` (path + identity)
+/// without the cost of running every drive's profile + identity probe.
+pub fn find_drive() -> Option<Drive> {
     discover_drives()
         .into_iter()
-        .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
-        .collect()
-}
-
-/// Find the first optical drive.
-/// Returns an opened Drive ready for use.
-pub fn find_drive() -> Option<Drive> {
-    find_drives().into_iter().next()
+        .find_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
 }
 
 /// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping

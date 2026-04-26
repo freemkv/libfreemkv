@@ -175,9 +175,6 @@ const VTIDX_EXECUTE_SYNC: usize = 15;
 pub struct MacScsiTransport {
     device_iface: ComRef,
     exclusive: bool,
-    /// BSD name (e.g. "disk2") retained for `try_recover()` after a
-    /// task-level failure. Without it we can't re-call `find_scsi_service`.
-    bsd_name: String,
 }
 
 // IOKit COM interface pointers are Mach port references — safe to send between threads.
@@ -203,13 +200,11 @@ impl MacScsiTransport {
         Ok(MacScsiTransport {
             device_iface,
             exclusive: true,
-            bsd_name: bsd_name.to_string(),
         })
     }
 
     /// Resolve the BSD name → IOKit SCSITaskDeviceInterface with exclusive
-    /// access. Shared between `open()` and `try_recover()`. Returns the
-    /// COM ref the caller must release.
+    /// access. Returns the COM ref the caller must release.
     fn acquire_device_iface(bsd_name: &str) -> Result<ComRef> {
         let service = find_scsi_service(bsd_name)?;
 
@@ -270,42 +265,11 @@ impl MacScsiTransport {
         Ok(device_iface)
     }
 
-    /// Recover the IOKit interface after a task-level failure. Releases
-    /// the current device_iface and re-acquires fresh state via
-    /// `acquire_device_iface`. Same observable contract as the Linux fd
-    /// recovery: after `try_recover()`, the next `execute()` either uses a
-    /// fresh interface or returns `DeviceNotFound` if recovery failed.
-    ///
-    /// Synchronous because IOKit `RELEASE_EXCLUSIVE` + `com_release` don't
-    /// block on in-flight CDBs the way Linux SG_IO `close` does.
-    fn try_recover(&mut self) {
-        if !self.device_iface.is_null() {
-            if self.exclusive {
-                unsafe {
-                    type Fn = unsafe extern "C" fn(ComRef) -> IOReturn;
-                    let f: Fn = vtable_fn(self.device_iface, VTIDX_RELEASE_EXCLUSIVE);
-                    f(self.device_iface);
-                }
-                self.exclusive = false;
-            }
-            com_release(self.device_iface);
-            self.device_iface = std::ptr::null_mut();
-        }
-        match Self::acquire_device_iface(&self.bsd_name) {
-            Ok(new_iface) => {
-                self.device_iface = new_iface;
-                self.exclusive = true;
-            }
-            Err(_) => {
-                // Leave device_iface null; next execute() returns
-                // DeviceNotFound. Caller's retry path will reopen Drive.
-                self.device_iface = std::ptr::null_mut();
-                self.exclusive = false;
-            }
-        }
-    }
-
     // `reset()` removed in 0.13.6 — see scsi/mod.rs for rationale.
+    // `try_recover()` removed in 0.13.20 — userspace handle-recovery on
+    // task failure was the same anti-pattern stripped from Linux SG_IO
+    // (see freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md).
+    // Errors bubble up; caller decides whether to reopen the Drive.
 }
 
 /// Enumerate optical drives on macOS. Mirrors `drive::macos::find_drives`
@@ -404,15 +368,6 @@ impl ScsiTransport for MacScsiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
-        // Per RIP_DESIGN.md §15.1: parity with Linux/Windows recovery
-        // contract. If a prior execute() invalidated the interface and
-        // try_recover() also failed, fail fast.
-        if self.device_iface.is_null() {
-            return Err(Error::DeviceNotFound {
-                path: self.bsd_name.clone(),
-            });
-        }
-
         // Create a SCSI task
         let task: ComRef = unsafe {
             type Fn = unsafe extern "C" fn(ComRef) -> ComRef;
@@ -420,7 +375,6 @@ impl ScsiTransport for MacScsiTransport {
             f(self.device_iface)
         };
         if task.is_null() {
-            self.try_recover();
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: 0xFF,
@@ -491,9 +445,8 @@ impl ScsiTransport for MacScsiTransport {
         com_release(task);
 
         if kr != K_IO_RETURN_SUCCESS {
-            // Task-level failure (timeout / IOKit error). Recover the
-            // interface so the caller's retry path can resume.
-            self.try_recover();
+            // Task-level failure (timeout / IOKit error). Bubble it up;
+            // the kernel mid-layer has already done what it can.
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: 0xFF,
@@ -502,7 +455,10 @@ impl ScsiTransport for MacScsiTransport {
         }
 
         if task_status != K_SCSI_TASK_STATUS_GOOD as u32 {
-            let sense_key = if sense[2] != 0 { sense[2] & 0x0F } else { 0 };
+            // IOKit doesn't surface a "bytes written into sense buffer"
+            // count the way SG_IO does — pass the buffer's full length
+            // and let parse_sense_key inspect byte 0's response code.
+            let sense_key = super::parse_sense_key(&sense, sense.len() as u8);
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: task_status as u8,

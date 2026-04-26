@@ -1,11 +1,23 @@
-//! Linux SCSI transport via async sg write/poll/read.
+//! Linux SCSI transport via synchronous blocking SG_IO ioctl.
 //!
-//! Uses the sg driver's asynchronous interface instead of the blocking
-//! SG_IO ioctl. Commands are submitted via write(), waited on via
-//! poll() with a hard timeout, and completed via read(). If poll()
-//! times out, the fd is abandoned (closed in a background thread) and
-//! a fresh fd is opened. This gives us true user-controlled timeouts
-//! that the kernel's USB error recovery cannot override.
+//! `execute()` is one syscall: `ioctl(fd, SG_IO, &hdr)` blocks until the
+//! kernel completes the command (success, error, or its own timeout).
+//! No userspace abort, no fd close+reopen, no SG_SCSI_RESET escalation —
+//! the kernel SCSI mid-layer's `scsi_eh.rst` ladder
+//! (ABORT TASK → LUN RESET → BUS RESET → HOST RESET) runs internally
+//! when `hdr.timeout` expires, and by the time the ioctl returns the
+//! kernel has already done what it can.
+//!
+//! This matches what every reference project does: MakeMKV (8 s sync
+//! ioctl), sg_dd (60 s sync ioctl), the kernel default for SCSI block
+//! devices (30 s `/sys/.../timeout`). See
+//! `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`
+//! for the full primary-source audit.
+//!
+//! Pre-0.13.20 we ran an async `write() + poll(1.5s) + close-on-timeout +
+//! bg reopen` pattern. That abandoned slow-but-alive commands faster than
+//! the drive could drain its internal queue, deepening the wedge
+//! pattern on the LG BU40N. Reverted in 0.13.20.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
@@ -45,7 +57,7 @@ struct sg_io_hdr {
 }
 
 // Compile-time validation: sg_io_hdr must match the kernel's layout.
-// 64 bytes on 64-bit, 44 bytes on 32-bit (pointer-size dependent).
+// 88 bytes on 64-bit, 64 bytes on 32-bit (pointer-size dependent).
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 88);
 #[cfg(target_pointer_width = "32")]
@@ -54,21 +66,12 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 pub struct SgIoTransport {
     fd: i32,
     device_path: std::path::PathBuf,
-    /// Background-recovered fd. After a poll timeout `execute()` spawns a
-    /// thread that closes `self.fd` and opens a fresh fd; the new fd is
-    /// stored here. The next call to `execute()` swaps it into `self.fd`.
-    /// `-1` means no recovery is ready (or the recovery open failed). See
-    /// RIP_DESIGN.md §7 for the design rationale.
-    fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
-// SgIoTransport's contained types (i32, PathBuf, Arc<AtomicI32>) are all
-// Send; the auto-derived Send is intentional. Sync is NOT — callers must
-// hold &mut for execute(), which the trait object dispatch enforces.
-
 impl SgIoTransport {
-    /// Open a SCSI device for use. Resets the drive first to ensure
-    /// a known good state, then opens a fresh fd for commands.
+    /// Open a SCSI device for use. Software-clean the kernel SG queue
+    /// (`reset()`) before opening so a previous killed process's queued
+    /// commands don't bleed into ours.
     pub fn open(device: &Path) -> Result<Self> {
         let device = Self::resolve_to_sg(device);
         Self::reset(&device)?;
@@ -85,7 +88,6 @@ impl SgIoTransport {
         Ok(SgIoTransport {
             fd,
             device_path: device,
-            fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
         })
     }
 
@@ -105,7 +107,7 @@ impl SgIoTransport {
     /// STOP+START UNIT. Both escalations were tried in 0.13.0–0.13.5
     /// against the LG BU40N (Initio USB-SATA bridge); both failed to
     /// recover wedged drives and made the wedge worse — see
-    /// freemkv-private/postmortems/2026-04-25-bu40n-wedge-recovery.md.
+    /// `freemkv-private/postmortems/2026-04-25-bu40n-wedge-recovery.md`.
     /// If the drive is genuinely unresponsive, the next workload command
     /// fails naturally and the caller surfaces a "physical reconnect
     /// required" prompt. Software has no path back from a wedged Initio
@@ -161,8 +163,7 @@ impl SgIoTransport {
     }
 
     /// Send a raw SCSI command on an fd. Used by reset() before the
-    /// transport is constructed. Uses synchronous SG_IO — fine for
-    /// short commands (TUR, PREVENT MEDIUM REMOVAL, START/STOP).
+    /// transport is constructed.
     fn raw_command(fd: i32, cdb: &[u8], timeout_ms: u32) -> std::result::Result<(), ()> {
         let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
@@ -178,7 +179,7 @@ impl SgIoTransport {
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
-        if ret < 0 || hdr.status != 0 {
+        if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || hdr.driver_status != 0 {
             Err(())
         } else {
             Ok(())
@@ -223,36 +224,32 @@ impl SgIoTransport {
 impl Drop for SgIoTransport {
     fn drop(&mut self) {
         if self.fd >= 0 {
-            // Unlock tray before closing — don't leave it locked
+            // Unlock tray before closing — don't leave it locked.
             let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
             unsafe { libc::close(self.fd) };
-        }
-        // Drain any background-recovered fd so it doesn't leak.
-        let recovered = self
-            .fd_recovery
-            .swap(-1, std::sync::atomic::Ordering::Acquire);
-        if recovered >= 0 {
-            unsafe { libc::close(recovered) };
         }
     }
 }
 
 impl ScsiTransport for SgIoTransport {
-    /// Execute a SCSI command with an enforceable timeout.
+    /// Execute a SCSI command via synchronous blocking SG_IO.
     ///
-    /// Uses the sg driver's async write/poll/read interface:
-    /// 1. write() submits the command — returns immediately
-    /// 2. poll() waits for completion — respects our timeout exactly
-    /// 3. read() retrieves the result — copies data to caller's buffer
+    /// One syscall: `ioctl(fd, SG_IO, &hdr)`. The kernel honors
+    /// `hdr.timeout` and runs its own ABORT TASK → LUN RESET → BUS
+    /// RESET → HOST RESET escalation if the device times out (per
+    /// `Documentation/scsi/scsi_eh.rst`). By the time this returns,
+    /// the kernel has done its recovery work.
     ///
-    /// If poll() times out, the pending command is abandoned: the old fd
-    /// is closed in a background thread (may block while kernel finishes
-    /// the USB transfer) and a fresh fd is opened. The caller sees a
-    /// normal SCSI error and can retry.
+    /// Errors we surface to caller (any of these = command failed):
     ///
-    /// Without SG_FLAG_DIRECT_IO, the kernel uses internal buffers for
-    /// DMA and copies to userspace during read(). On timeout (no read),
-    /// the caller's buffer is untouched — safe to return immediately.
+    ///   - ioctl returned -1 → `Error::IoError` (kernel-level failure)
+    ///   - `hdr.host_status` != 0 → `Error::ScsiError` with status=0xFF
+    ///     (transport-level: timeout, bridge wedge, etc.)
+    ///   - `hdr.driver_status` != 0 → `Error::ScsiError` with status=0xFF
+    ///   - `hdr.status` != 0 → `Error::ScsiError` with parsed sense key
+    ///
+    /// Caller's `data` buffer is mutated only on success; partial
+    /// transfers are reported via `bytes_transferred = data.len() - resid`.
     fn execute(
         &mut self,
         cdb: &[u8],
@@ -272,43 +269,6 @@ impl ScsiTransport for SgIoTransport {
             "SgIoTransport::execute"
         );
 
-        // Recover from a prior timeout: if a background reopen produced a
-        // fresh fd, swap it in. If recovery is still pending (-1), the
-        // background thread hasn't finished — return DeviceNotFound and let
-        // the caller's retry loop come back later.
-        if self.fd < 0 {
-            let recovered = self
-                .fd_recovery
-                .swap(-1, std::sync::atomic::Ordering::Acquire);
-            if recovered >= 0 {
-                tracing::trace!(
-                    target: "freemkv::scsi",
-                    phase = "recovery_swap_ok",
-                    new_fd = recovered,
-                    "fd_recovery delivered fresh fd"
-                );
-                self.fd = recovered;
-            } else {
-                tracing::trace!(
-                    target: "freemkv::scsi",
-                    phase = "recovery_pending",
-                    elapsed_us = exec_t0.elapsed().as_micros() as u64,
-                    "fd_recovery still pending → DeviceNotFound"
-                );
-                return Err(Error::DeviceNotFound {
-                    path: self.device_path.display().to_string(),
-                });
-            }
-        }
-
-        let mut sense = [0u8; 32];
-
-        let dxfer_direction = match direction {
-            DataDirection::None => SG_DXFER_NONE,
-            DataDirection::FromDevice => SG_DXFER_FROM_DEV,
-            DataDirection::ToDevice => SG_DXFER_TO_DEV,
-        };
-
         if data.len() > u32::MAX as usize {
             return Err(Error::ScsiError {
                 opcode: cdb[0],
@@ -317,8 +277,14 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
+        let dxfer_direction = match direction {
+            DataDirection::None => SG_DXFER_NONE,
+            DataDirection::FromDevice => SG_DXFER_FROM_DEV,
+            DataDirection::ToDevice => SG_DXFER_TO_DEV,
+        };
         let cmd_len = cdb.len().min(16) as u8;
 
+        let mut sense = [0u8; 32];
         let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
         hdr.interface_id = b'S' as i32;
         hdr.dxfer_direction = dxfer_direction;
@@ -331,125 +297,43 @@ impl ScsiTransport for SgIoTransport {
         hdr.timeout = timeout_ms;
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
-        // Submit command asynchronously via write()
-        let hdr_size = std::mem::size_of::<sg_io_hdr>();
-        let write_t0 = std::time::Instant::now();
-        let wr = unsafe {
-            libc::write(
-                self.fd,
-                &hdr as *const sg_io_hdr as *const libc::c_void,
-                hdr_size,
-            )
-        };
-        let write_elapsed_us = write_t0.elapsed().as_micros() as u64;
-        if wr < 0 {
+        // The single blocking syscall. Returns when the device responds,
+        // when the kernel's timeout fires, or when the kernel's error
+        // recovery completes its escalation. On a healthy read this is
+        // <100 ms; on a slow-recovery bad sector it can be tens of
+        // seconds; on a hung drive it returns at `timeout_ms` with
+        // `host_status` flagged.
+        let ret = unsafe { libc::ioctl(self.fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+        let exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64;
+
+        if ret < 0 {
             let errno = std::io::Error::last_os_error();
             tracing::trace!(
                 target: "freemkv::scsi",
-                phase = "write_err",
+                phase = "ioctl_err",
                 opcode = opcode,
                 errno = errno.raw_os_error().unwrap_or(0),
-                write_elapsed_us,
-                "sg write() returned <0"
+                exec_elapsed_ms,
+                "ioctl(SG_IO) returned <0"
             );
             return Err(Error::IoError { source: errno });
         }
-        tracing::trace!(
-            target: "freemkv::scsi",
-            phase = "write_ok",
-            opcode = opcode,
-            wr,
-            write_elapsed_us,
-            "sg write() submitted"
-        );
 
-        // Wait for completion with enforceable timeout.
-        // Retry on EINTR (signal interrupted poll) with remaining time.
-        let poll_t0 = std::time::Instant::now();
-        let deadline = poll_t0 + std::time::Duration::from_millis(timeout_ms as u64);
-        let pr = loop {
-            let remaining = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as i32;
-            if remaining <= 0 {
-                break 0; // expired
-            }
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ret = unsafe { libc::poll(&mut pfd, 1, remaining) };
-            if ret >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                break ret;
-            }
-        };
-        let poll_elapsed_ms = poll_t0.elapsed().as_millis() as u64;
-        tracing::trace!(
-            target: "freemkv::scsi",
-            phase = "poll_done",
-            opcode = opcode,
-            pr,
-            poll_elapsed_ms,
-            timeout_ms,
-            "poll() returned"
-        );
-
-        if pr <= 0 {
-            // Timeout (0) or fatal poll error (-1). Command is still pending
-            // in the kernel. Per RIP_DESIGN.md §4(b)/§7: close + reopen run
-            // in a background thread so the main thread is never blocked
-            // beyond the poll() budget. The recovered fd is published to
-            // `fd_recovery`; the next call to execute() picks it up.
-            let old_fd = self.fd;
-            self.fd = -1;
-            let c_path = Self::to_c_path(&self.device_path);
-            let recovery = self.fd_recovery.clone();
+        // Transport-level failure (kernel timeout, USB bridge wedge,
+        // bus error). `hdr.status` may still be zero — the SCSI device
+        // never got to send a status byte. Surface as 0xFF so callers
+        // (e.g. `drive_has_disc`) can detect the wedge signature.
+        if hdr.host_status != 0 || hdr.driver_status != 0 {
             tracing::trace!(
                 target: "freemkv::scsi",
-                phase = "timeout_spawn_recovery",
+                phase = "transport_err",
                 opcode = opcode,
-                old_fd,
-                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
-                "poll timeout — spawning bg close+open"
+                host_status = hdr.host_status,
+                driver_status = hdr.driver_status,
+                status = hdr.status,
+                exec_elapsed_ms,
+                "transport-level failure (timeout / bridge wedge)"
             );
-            std::thread::spawn(move || {
-                // Close blocks until the kernel finishes/aborts the
-                // abandoned command. Then we open a fresh fd. Both happen
-                // off the main thread.
-                let close_t0 = std::time::Instant::now();
-                unsafe { libc::close(old_fd) };
-                let close_ms = close_t0.elapsed().as_millis() as u64;
-                let open_t0 = std::time::Instant::now();
-                let new_fd = unsafe {
-                    libc::open(
-                        c_path.as_ptr() as *const libc::c_char,
-                        libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                    )
-                };
-                let open_ms = open_t0.elapsed().as_millis() as u64;
-                tracing::trace!(
-                    target: "freemkv::scsi",
-                    phase = "bg_recovery_done",
-                    old_fd,
-                    new_fd,
-                    close_ms,
-                    open_ms,
-                    "bg recovery thread completed close+open"
-                );
-                if new_fd >= 0 {
-                    let prev = recovery.swap(new_fd, std::sync::atomic::Ordering::Release);
-                    if prev >= 0 {
-                        // Stale recovery fd from a prior unclaimed attempt;
-                        // close it so it doesn't leak.
-                        unsafe { libc::close(prev) };
-                    }
-                } else {
-                    recovery.store(-1, std::sync::atomic::Ordering::Release);
-                }
-            });
-
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: 0xFF,
@@ -457,52 +341,17 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
-        // Read response — copies data from kernel buffer to caller's buffer
-        let read_t0 = std::time::Instant::now();
-        let rd = unsafe {
-            libc::read(
-                self.fd,
-                &mut hdr as *mut sg_io_hdr as *mut libc::c_void,
-                hdr_size,
-            )
-        };
-        let read_elapsed_us = read_t0.elapsed().as_micros() as u64;
-        if rd < 0 {
-            tracing::trace!(
-                target: "freemkv::scsi",
-                phase = "read_err",
-                opcode = opcode,
-                read_elapsed_us,
-                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
-                "sg read() returned <0"
-            );
-            return Err(Error::IoError {
-                source: std::io::Error::last_os_error(),
-            });
-        }
-
-        let bytes_transferred = (data.len() as i32).saturating_sub(hdr.resid).max(0) as usize;
-
+        // SCSI-level failure: device responded, returned non-zero status.
+        // Parse sense key for the caller.
         if hdr.status != 0 {
-            let sense_key = if hdr.sb_len_wr >= 3 {
-                let response_code = sense[0] & 0x7F;
-                if response_code == 0x72 || response_code == 0x73 {
-                    // Descriptor format sense: sense key at byte 1
-                    sense[1] & 0x0F
-                } else {
-                    // Fixed format sense (0x70/0x71): sense key at byte 2
-                    sense[2] & 0x0F
-                }
-            } else {
-                0
-            };
+            let sense_key = super::parse_sense_key(&sense, hdr.sb_len_wr);
             tracing::trace!(
                 target: "freemkv::scsi",
                 phase = "scsi_err",
                 opcode = opcode,
                 status = hdr.status,
                 sense_key,
-                exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+                exec_elapsed_ms,
                 "SCSI status non-zero"
             );
             return Err(Error::ScsiError {
@@ -512,12 +361,13 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
+        let bytes_transferred = (data.len() as i32).saturating_sub(hdr.resid).max(0) as usize;
         tracing::trace!(
             target: "freemkv::scsi",
             phase = "ok",
             opcode = opcode,
             bytes_transferred,
-            exec_elapsed_ms = exec_t0.elapsed().as_millis() as u64,
+            exec_elapsed_ms,
             "execute() success"
         );
         Ok(ScsiResult {
@@ -535,10 +385,10 @@ impl ScsiTransport for SgIoTransport {
 // `/dev/sg0..15` probe when sysfs is unreadable (minimal containers).
 //
 // `drive_has_disc` issues a single TEST UNIT READY. On the wedge signature
-// (kernel returns status `0xff` with no sense) it escalates: SCSI bus reset
-// → if still wedged → USB device reset (`USBDEVFS_RESET`) → retry TUR.
-// Callers never see the escalation; if it fails too, surface
-// `DeviceResetFailed` so the caller can back off.
+// (kernel returns status `0xff` with no sense — synthesised by `execute()`
+// from a non-zero `host_status`) the error bubbles directly to the caller;
+// no in-library reset escalation. See the rationale block on
+// `drive_has_disc` below.
 
 /// SCSI peripheral type 5 = "CD-ROM device" (covers DVD, BD-ROM, BD-RE, etc.).
 /// Stored in `/sys/class/scsi_generic/sgN/device/type` as ASCII decimal.
@@ -553,12 +403,6 @@ const SENSE_KEY_NOT_READY: u8 = 2;
 /// Linux assigns `/dev/sgN` sequentially per host adapter; 16 covers any
 /// realistic homelab (typical PERC + USB optical = ≤8 nodes).
 const SG_FALLBACK_MAX: u8 = 16;
-
-// SCSI INQUIRY field-offset constants previously lived here. They were
-// used by an in-process SCSI INQUIRY parse path that 0.13.6 retired in
-// favour of reading the kernel-cached sysfs identity (vendor/model/rev
-// under /sys/class/scsi_generic/sgN/device/). Removed to keep clippy
-// -D warnings clean.
 
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let mut out = Vec::new();
@@ -579,8 +423,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
 
         // INQUIRY-only probe — open transport, run INQUIRY, drop. No
         // identify, no init, no firmware reset preamble's secondary
-        // commands beyond what `SgIoTransport::open` already does (one
-        // SCSI bus reset on the kernel SG fd, ~2 s).
+        // commands beyond what `SgIoTransport::open` already does.
         let info = match SgIoTransport::open(std::path::Path::new(&path)) {
             Ok(mut transport) => match super::inquiry(&mut transport) {
                 Ok(r) => super::DriveInfo {
@@ -664,13 +507,13 @@ fn enumerate_sg_names() -> Vec<String> {
     names
 }
 
-/// `drive_has_disc` = single TEST UNIT READY. Any error (including our
-/// synthesised wedge signature, `ScsiError { status: 0xFF }`, when
-/// `execute()` times out) bubbles straight up to the caller.
+/// `drive_has_disc` = single TEST UNIT READY. Any error (including the
+/// wedge signature `ScsiError { status: 0xFF }` synthesised by `execute()`
+/// when `host_status` is set) bubbles straight up to the caller.
 ///
 /// ## No in-library wedge recovery — and why
 ///
-/// Versions 0.13.1 – 0.13.3 layered `scsi::reset()` + `scsi::usb_reset()`
+/// Versions 0.13.1–0.13.3 layered `scsi::reset()` + `scsi::usb_reset()`
 /// (`USBDEVFS_RESET`) escalation inside `drive_has_disc`. Production
 /// testing on the LG BU40N USB BD-RE showed all three userspace recovery
 /// ladders succeed at the USB transport level (the kernel logs

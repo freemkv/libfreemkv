@@ -85,15 +85,11 @@ unsafe extern "system" {
 
 pub struct SptiTransport {
     handle: isize,
-    /// Wide-encoded device path used by `try_recover()` to reopen the
-    /// handle after a failed DeviceIoControl. Saved from `open()` so we
-    /// don't have to re-resolve the device path on recovery.
-    wide_path: Vec<u16>,
 }
 
-// SptiTransport contains an isize HANDLE and a Vec<u16>; both Send. The
-// auto-derived Send is intentional. Sync is NOT — handle mutation in
-// execute() requires &mut, enforced by the trait object dispatch.
+// SptiTransport's only field is the isize HANDLE — Send is auto-derived
+// and intentional. Sync is NOT: handle mutation in execute() requires
+// &mut, enforced by the trait object dispatch.
 
 /// Normalize a device path to Windows \\.\X: format.
 ///
@@ -151,34 +147,7 @@ impl SptiTransport {
             });
         }
 
-        Ok(SptiTransport {
-            handle,
-            wide_path: wide,
-        })
-    }
-
-    /// Recover the handle after a failed DeviceIoControl. Closes the bad
-    /// handle and opens a fresh one synchronously (CloseHandle/CreateFileW
-    /// are fast on Windows — no in-flight CDB to drain like Linux SG_IO).
-    /// On success, `self.handle` is replaced and the next `execute()` call
-    /// uses the new handle. On failure, `self.handle` is set to
-    /// INVALID_HANDLE_VALUE and subsequent calls return `DeviceNotFound`.
-    fn try_recover(&mut self) {
-        if self.handle != INVALID_HANDLE_VALUE {
-            unsafe { CloseHandle(self.handle) };
-        }
-        let new_handle = unsafe {
-            CreateFileW(
-                self.wide_path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null(),
-            )
-        };
-        self.handle = new_handle;
+        Ok(SptiTransport { handle })
     }
 
     /// Reset the drive to a known good state.
@@ -282,15 +251,6 @@ impl ScsiTransport for SptiTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
-        // Per RIP_DESIGN.md §15.1: parity with Linux's recovery contract.
-        // If a prior call invalidated the handle and try_recover() also
-        // failed, fail fast.
-        if self.handle == INVALID_HANDLE_VALUE {
-            return Err(Error::DeviceNotFound {
-                path: String::new(),
-            });
-        }
-
         // Zero the data buffer for reads to prevent returning uninitialized data
         // if the driver doesn't fully update DataTransferLength.
         if direction == DataDirection::FromDevice {
@@ -339,12 +299,13 @@ impl ScsiTransport for SptiTransport {
         };
 
         if ok == 0 {
-            // Driver-level failure (timeout, handle gone, etc.). Recover
-            // the handle so the caller's retry loop can resume — same
-            // observable contract as Linux's async fd recovery, but
-            // synchronous because Windows's CloseHandle/CreateFileW don't
-            // block on in-flight CDBs.
-            self.try_recover();
+            // Driver-level failure (timeout, handle gone, etc.). Bubble
+            // up; in-library handle recovery was removed in 0.13.20 along
+            // with Linux's async fd-recovery and macOS's `try_recover` —
+            // the kernel mid-layer already did its escalation by the time
+            // DeviceIoControl returned, and re-issuing reset/reopen here
+            // is at best redundant and at worst deepens the wedge. Caller
+            // surfaces the failure to UX.
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: 0xFF,
@@ -353,11 +314,11 @@ impl ScsiTransport for SptiTransport {
         }
 
         if sptwb.spt.ScsiStatus != 0 {
-            let sense_key = if sptwb.sense[2] != 0 {
-                sptwb.sense[2] & 0x0F
-            } else {
-                0
-            };
+            // SPTI doesn't surface a "bytes written into sense buffer"
+            // count separate from SenseInfoLength (input). Pass the full
+            // K_SENSE_SIZE; parse_sense_key keys off byte 0's response
+            // code to handle descriptor (0x72/0x73) vs fixed (0x70/0x71).
+            let sense_key = super::parse_sense_key(&sptwb.sense, K_SENSE_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: sptwb.spt.ScsiStatus,

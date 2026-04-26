@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.13.20 (2026-04-26)
+
+### Architecture: SCSI transport — sync blocking SG_IO
+
+`scsi/linux.rs` rewritten from async `write/poll/read + 1.5 s timeout
++ close-on-timeout in bg thread` to a single synchronous blocking
+`ioctl(fd, SG_IO, &hdr)`. The old pattern abandoned slow-but-alive
+commands faster than the drive could drain its internal queue,
+deepening the BU40N wedge. Per the audit at
+`freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`,
+no reference project (MakeMKV / sg_dd / ddrescue) does what we did —
+all use sync blocking SG_IO with 8-60 s timeouts and let the kernel's
+mid-layer (`scsi_eh.rst`) run ABORT TASK / LUN RESET / BUS RESET /
+HOST RESET escalation internally.
+
+What changed:
+- `SgIoTransport::execute()` is one syscall now. Caller-supplied
+  `timeout_ms` is honored by the kernel, which does its own
+  ABORT/RESET escalation if the device times out.
+- Errors check `host_status` and `driver_status` (both 0xFF-synthesised
+  for the caller) in addition to `status` — transport-level failures
+  no longer slip through as Ok.
+- Sense-key parser handles both descriptor format (0x72/0x73, key at
+  byte 1) and fixed format (0x70/0x71, key at byte 2).
+- Deleted the `fd_recovery: Arc<AtomicI32>` field, the bg close+open
+  thread, and the stale-fd swap dance. `scsi/linux.rs` shrank from
+  ~720 to ~520 lines.
+- Module doc rewritten to reflect the new architecture.
+
+### Architecture: parity strip on macOS + Windows
+
+`scsi/macos.rs` and `scsi/windows.rs` had `try_recover()` —
+userspace handle-recovery on task failure. Same anti-pattern as the
+Linux fd-recovery dance, removed for the same reason: the kernel
+mid-layer already runs its own escalation. Errors bubble up directly.
+
+Cleanups:
+- `MacScsiTransport`: `try_recover()` deleted, `bsd_name` field
+  deleted (was only used by try_recover), fail-fast device_iface guard
+  deleted (no longer null'd mid-session).
+- `SptiTransport`: `try_recover()` deleted, `wide_path` field deleted,
+  INVALID_HANDLE guard deleted.
+
+### API cleanup: drop `Drive::reset` and `find_drives`
+
+Two duplicates removed from the public surface:
+
+- `Drive::reset()` — escalating recovery (STOP/START unit + eject +
+  reinit). Per the audit, userspace shouldn't escalate; the kernel
+  already does. Only one internal caller (`wait_ready` line 195),
+  which now just keeps polling TUR for 60 iterations. No external
+  consumer used it.
+- `pub fn find_drives() -> Vec<Drive>` — opened N drives just to throw
+  most away. Only caller was `find_drive()` itself, which now uses
+  `discover_drives()` directly. No external consumer used it. For
+  lightweight enumeration (UI sidebar etc.) use `scsi::list_drives()`.
+
+`lib.rs` re-export of `find_drives` removed.
+
+## 0.13.19 (2026-04-26 — held, never released)
+
+Held in development; folded into 0.13.20.
+
 ## 0.13.18 (2026-04-26)
 
 ### Sync release — no functional changes
