@@ -8,13 +8,12 @@ fn main() {
     let device = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with('-'))
-        .unwrap_or_else(|| {
-            let drives = libfreemkv::find_drives();
-            if drives.is_empty() {
+        .unwrap_or_else(|| match libfreemkv::find_drive() {
+            Some(d) => d.device_path().to_string(),
+            None => {
                 eprintln!("No drives found");
                 std::process::exit(1);
             }
-            drives[0].device_path().to_string()
         });
 
     let mut drive = Drive::open(Path::new(&device)).unwrap_or_else(|e| {
