@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.18 (2026-04-26)
+
+### Sync release — no functional changes
+
+Bumped to satisfy the unified-versioning rule. Actual fix is in autorip
+(`web.rs` two-bar UI — separates per-pass and total progress bars +
+their own text rows so the rip dashboard is readable again).
+
 ## 0.13.17 (2026-04-26)
 
 ### Sync release — no functional changes
