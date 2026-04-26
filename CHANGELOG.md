@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.14 (2026-04-25)
+
+### Sync release — no functional changes in libfreemkv
+
+Bumped solely to satisfy the unified-versioning rule. The actual fix in
+this release is in autorip: the tracing subscriber now enables
+`freemkv::scsi=trace,freemkv::disc=trace` so the v0.13.13 instrumentation
+events actually surface in `/api/debug`. Without that filter override the
+trace events were silently dropped by the default `libfreemkv=warn` rule.
+
 ## 0.13.13 (2026-04-25)
 
 ### Telemetry: instrument the rip pipeline for in-flight diagnosis
