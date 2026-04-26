@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.13.13 (2026-04-25)
+
+### Telemetry: instrument the rip pipeline for in-flight diagnosis
+
+v0.13.12 shipped Fix 1+2+4 + cross-platform parity but a live test on Dune 2
+showed Pass 1 sat for 14 minutes with `bytes_good=0` while the inner loop
+appeared to iterate (the throttled `on_progress` log fired every 78s). The
+async fd_recovery design at §7 said each `execute()` call should bound at
+~1.5 s on poll timeout, with subsequent calls returning `DeviceNotFound` in
+microseconds until recovery completes. Observed reality contradicts that:
+each iteration takes ~60 s, not microseconds. Without trace-level telemetry
+at the SCSI + Disc::copy boundaries we can't diagnose where the time goes.
+
+This release adds the telemetry. No behavior change; instrumentation only.
+
+- New dep: `tracing = "0.1"`. Per CLAUDE.md, debug/trace logging is permitted
+  in libfreemkv (the no-English rule applies to errors, not telemetry).
+  Consumers (autorip) wire a tracing subscriber and pipe events into the
+  JSONL debug log automatically.
+- `SgIoTransport::execute` (Linux): trace events at every state transition
+  (entry, recovery_swap_ok, recovery_pending, write_ok / write_err, poll_done,
+  timeout_spawn_recovery, scsi_err, read_err, ok). Each event includes the
+  opcode and elapsed timing. The bg recovery thread also traces close_ms +
+  open_ms so we can see if the kernel is hanging close+open.
+- `Disc::copy`: trace events at copy_start, outer_loop, region_enter, every
+  100 inner-loop iterations (iter_progress with pos / region_end / skip_size /
+  bytes_good / read_ok_count / read_err_count / last_read_ms /
+  copy_elapsed_ms), and copy_done.
+- All trace events use `target` strings `freemkv::scsi` and `freemkv::disc`
+  so consumers can filter by subsystem.
+
+### What this enables
+
+- A live rip will now produce a SCSI event stream visible at
+  `/api/debug?n=N&q=freemkv::scsi`. We can finally answer: "is the inner
+  loop iterating slowly because each call is slow, or fast with the bg
+  thread blocked?"
+- `bg_recovery_done` events with `close_ms` / `open_ms` reveal whether the
+  kernel really takes 60 s for close+open on a wedged Initio bridge.
+
 ## 0.13.12 (2026-04-25)
 
 ### Fix: delete stall guard from `Disc::copy` (RIP_DESIGN.md §6 Fix 1)

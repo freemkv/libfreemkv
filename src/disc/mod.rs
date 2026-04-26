@@ -1286,6 +1286,20 @@ impl Disc {
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
+        let copy_t0 = std::time::Instant::now();
+        let mut iter_count: u64 = 0;
+        let mut read_ok_count: u64 = 0;
+        let mut read_err_count: u64 = 0;
+        let mut last_log_iter: u64 = 0;
+        tracing::trace!(
+            target: "freemkv::disc",
+            phase = "copy_start",
+            total_bytes,
+            batch,
+            skip_init,
+            skip_max,
+            "Disc::copy entered"
+        );
 
         // Iterate over not-yet-finished regions from the mapfile. We re-read the
         // mapfile after each block because record() mutates the region list.
@@ -1295,6 +1309,12 @@ impl Disc {
                 mapfile::SectorStatus::NonTrimmed,
                 mapfile::SectorStatus::NonScraped,
             ]);
+            tracing::trace!(
+                target: "freemkv::disc",
+                phase = "outer_loop",
+                regions_remaining = regions_to_do.len(),
+                "Disc::copy outer iter"
+            );
             if regions_to_do.is_empty() {
                 break;
             }
@@ -1307,6 +1327,14 @@ impl Disc {
             };
             let region_end = region_pos + region_size;
             let mut pos = region_pos;
+            tracing::trace!(
+                target: "freemkv::disc",
+                phase = "region_enter",
+                region_pos,
+                region_size,
+                region_end,
+                "entering NonTried region"
+            );
 
             while pos < region_end {
                 if let Some(ref h) = opts.halt {
@@ -1321,11 +1349,15 @@ impl Disc {
                 let bytes = count as usize * 2048;
 
                 let recovery = !opts.skip_on_error; // fast reads when skipping
+                iter_count += 1;
+                let read_t0 = std::time::Instant::now();
                 let read_ok = reader
                     .read_sectors(lba, count, &mut buf[..bytes], recovery)
                     .is_ok();
+                let read_elapsed_ms = read_t0.elapsed().as_millis() as u64;
 
                 if read_ok {
+                    read_ok_count += 1;
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                     }
@@ -1339,6 +1371,7 @@ impl Disc {
                     skip_size = skip_init; // reset after success
                     pos += block_bytes;
                 } else if opts.skip_on_error {
+                    read_err_count += 1;
                     // Zero-fill this block, mark non-trimmed for later patch trim.
                     buf[..bytes].fill(0);
                     file.seek(SeekFrom::Start(pos))
@@ -1364,6 +1397,27 @@ impl Disc {
                     return Err(Error::DiscRead { sector: lba as u64 });
                 }
 
+                // Throttled iter telemetry — every 100 inner iterations.
+                if iter_count - last_log_iter >= 100 {
+                    last_log_iter = iter_count;
+                    let stats = map.stats();
+                    tracing::trace!(
+                        target: "freemkv::disc",
+                        phase = "iter_progress",
+                        iter_count,
+                        read_ok_count,
+                        read_err_count,
+                        last_read_ms = read_elapsed_ms,
+                        pos,
+                        region_end,
+                        skip_size,
+                        bytes_good = stats.bytes_good,
+                        bytes_pending = stats.bytes_pending,
+                        copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
+                        "Disc::copy inner iter"
+                    );
+                }
+
                 if let Some(cb) = opts.on_progress {
                     let stats = map.stats();
                     cb(stats.bytes_good, total_bytes);
@@ -1373,6 +1427,18 @@ impl Disc {
 
         file.sync_all().map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
+        tracing::trace!(
+            target: "freemkv::disc",
+            phase = "copy_done",
+            iter_count,
+            read_ok_count,
+            read_err_count,
+            bytes_good = stats.bytes_good,
+            bytes_pending = stats.bytes_pending,
+            halted = halt_requested,
+            copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
+            "Disc::copy returning"
+        );
         Ok(CopyResult {
             bytes_total: total_bytes,
             bytes_good: stats.bytes_good,

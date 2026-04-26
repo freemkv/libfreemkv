@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "0.13.12"
+version = "0.13.13"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -24,6 +24,10 @@ rand = "0.8"
 cmac = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22.1"
+# Trace-level instrumentation for Disc::copy + SgIoTransport::execute. Permitted
+# under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
+# wire a tracing subscriber and pipe events into the JSONL debug log.
+tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
