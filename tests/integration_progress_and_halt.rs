@@ -9,8 +9,8 @@ use libfreemkv::{
     SectorReader,
 };
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const SECTOR_SIZE: usize = 2048;
@@ -465,10 +465,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
         !result.complete,
         "complete=false because NonTrimmed regions remain (work for Pass 2)"
     );
-    assert!(
-        !result.halted,
-        "no halt was set; halted must be false"
-    );
+    assert!(!result.halted, "no halt was set; halted must be false");
 
     // ISO file should be the full disc size on disk (sparse zeros where
     // reads failed).
@@ -493,8 +490,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let capacity_sectors: u32 = 1024 * 1024; // 2 GB synthetic disc
 
     let halt = Arc::new(AtomicBool::new(false));
-    let mut reader =
-        FailingSectorReader::with_halt_on_first_read(capacity_sectors, halt.clone());
+    let mut reader = FailingSectorReader::with_halt_on_first_read(capacity_sectors, halt.clone());
     let disc = synthetic_disc(capacity_sectors);
 
     let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
