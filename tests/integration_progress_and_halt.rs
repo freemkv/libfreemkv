@@ -178,7 +178,7 @@ fn test_disc_copy_progress_callback_fires() {
     let calls_cb = calls.clone();
     let last_bytes_cb = last_bytes.clone();
 
-    let progress = move |bytes: u64, _total: u64| {
+    let progress = move |bytes: u64, _pos: u64, _total: u64| {
         calls_cb.fetch_add(1, Ordering::Relaxed);
         last_bytes_cb.store(bytes, Ordering::Relaxed);
     };
