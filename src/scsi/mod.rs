@@ -620,7 +620,11 @@ mod parse_sense_tests {
         // independently of the response code. parse_sense_key must mask
         // it off before classifying the format.
         let s = buf(0xF2, 0x05, 0x77);
-        assert_eq!(parse_sense_key(&s, 8), 5, "VALID-bit must not leak into format detection");
+        assert_eq!(
+            parse_sense_key(&s, 8),
+            5,
+            "VALID-bit must not leak into format detection"
+        );
         let s = buf(0xF0, 0x77, 0x02);
         assert_eq!(parse_sense_key(&s, 18), 2);
     }

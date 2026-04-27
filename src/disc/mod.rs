@@ -1393,11 +1393,7 @@ impl Disc {
                     // Fast path — full block read cleanly.
                     read_ok_count += 1;
                     if opts.decrypt {
-                        crate::decrypt::decrypt_sectors(
-                            &mut buf[..block_bytes_usz],
-                            &keys,
-                            0,
-                        )?;
+                        crate::decrypt::decrypt_sectors(&mut buf[..block_bytes_usz], &keys, 0)?;
                     }
                     file.seek(SeekFrom::Start(pos))
                         .map_err(|e| Error::IoError { source: e })?;
@@ -1496,11 +1492,7 @@ impl Disc {
                             read_ok_count += 1;
                             consecutive_good = consecutive_good.saturating_add(1);
                             if opts.decrypt {
-                                crate::decrypt::decrypt_sectors(
-                                    &mut buf[..one_bytes],
-                                    &keys,
-                                    0,
-                                )?;
+                                crate::decrypt::decrypt_sectors(&mut buf[..one_bytes], &keys, 0)?;
                             }
                             file.seek(SeekFrom::Start(s_pos))
                                 .map_err(|e| Error::IoError { source: e })?;

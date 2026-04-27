@@ -37,10 +37,10 @@
 
 use libfreemkv::error::Error;
 use libfreemkv::scsi::{
-    DataDirection, SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_TRANSPORT_FAILURE, ScsiResult,
-    ScsiSense, ScsiTransport, SENSE_KEY_ABORTED_COMMAND, SENSE_KEY_DATA_PROTECT,
-    SENSE_KEY_HARDWARE_ERROR, SENSE_KEY_ILLEGAL_REQUEST, SENSE_KEY_MEDIUM_ERROR,
-    SENSE_KEY_NOT_READY, SENSE_KEY_RECOVERED_ERROR, SENSE_KEY_UNIT_ATTENTION,
+    DataDirection, SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_TRANSPORT_FAILURE,
+    SENSE_KEY_ABORTED_COMMAND, SENSE_KEY_DATA_PROTECT, SENSE_KEY_HARDWARE_ERROR,
+    SENSE_KEY_ILLEGAL_REQUEST, SENSE_KEY_MEDIUM_ERROR, SENSE_KEY_NOT_READY,
+    SENSE_KEY_RECOVERED_ERROR, SENSE_KEY_UNIT_ATTENTION, ScsiResult, ScsiSense, ScsiTransport,
 };
 
 /// A scripted ScsiTransport. Each `execute()` consumes the next entry
@@ -60,10 +60,7 @@ enum MockOutcome {
     /// Healthy completion. `data` is what the transport wrote into the
     /// caller's data buffer (truncated to the buffer length); `resid`
     /// is reported back as `data.len() - bytes_transferred`.
-    Ok {
-        data: Vec<u8>,
-        resid: i32,
-    },
+    Ok { data: Vec<u8>, resid: i32 },
     /// Transport-level failure: `hdr.host_status = DID_TIME_OUT` on
     /// Linux, `kIOReturnError` on macOS, `DeviceIoControl` returning 0
     /// on Windows. Backends synthesise `SCSI_STATUS_TRANSPORT_FAILURE`
@@ -71,10 +68,7 @@ enum MockOutcome {
     TransportFailure,
     /// Drive replied with sense data (typically `SCSI_STATUS_CHECK_CONDITION`
     /// + a populated sense buffer).
-    ScsiFailure {
-        status: u8,
-        sense: ScsiSense,
-    },
+    ScsiFailure { status: u8, sense: ScsiSense },
 }
 
 impl MockTransport {
@@ -360,7 +354,10 @@ fn test_scsi_error_display_format_is_codes_only() {
         }),
     };
     let s = err.to_string();
-    assert!(s.starts_with("E4000:"), "ScsiError must lead with E4000: {s}");
+    assert!(
+        s.starts_with("E4000:"),
+        "ScsiError must lead with E4000: {s}"
+    );
     assert!(
         s.contains("0x12") && s.contains("0x02") && s.contains("0x05") && s.contains("0x24"),
         "ScsiError must show opcode/status/key/asc in hex: {s}"

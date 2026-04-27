@@ -389,13 +389,7 @@ impl std::fmt::Display for Error {
                     s.asc,
                     s.ascq,
                 ),
-                None => write!(
-                    f,
-                    "E{}: 0x{:02x}/0x{:02x}",
-                    self.code(),
-                    opcode,
-                    status,
-                ),
+                None => write!(f, "E{}: 0x{:02x}/0x{:02x}", self.code(), opcode, status,),
             },
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
             Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
@@ -469,9 +463,7 @@ impl Error {
     /// no sense data exists).
     pub fn scsi_sense(&self) -> Option<&crate::scsi::ScsiSense> {
         match self {
-            Error::ScsiError {
-                sense: Some(s), ..
-            } => Some(s),
+            Error::ScsiError { sense: Some(s), .. } => Some(s),
             _ => None,
         }
     }
