@@ -392,7 +392,7 @@ impl FailingSectorReader {
 impl SectorReader for FailingSectorReader {
     fn read_sectors(
         &mut self,
-        lba: u32,
+        _lba: u32,
         _count: u16,
         _buf: &mut [u8],
         _recovery: bool,
@@ -400,7 +400,20 @@ impl SectorReader for FailingSectorReader {
         if let Some(h) = self.halt_on_first_read.take() {
             h.store(true, Ordering::Relaxed);
         }
-        Err(libfreemkv::error::Error::DiscRead { sector: lba as u64 })
+        // Model what a real damaged-disc read returns: CHECK CONDITION +
+        // MEDIUM ERROR (sense_key 3, ASC 0x11 UNRECOVERED READ ERROR,
+        // ASCQ 0x05 L-EC UNCORRECTABLE). Disc::copy's hysteresis must
+        // engage on this — `Error::DiscRead` is libfreemkv's own
+        // post-classification signal, not what a real reader emits.
+        Err(libfreemkv::error::Error::ScsiError {
+            opcode: libfreemkv::scsi::SCSI_READ_10,
+            status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(libfreemkv::ScsiSense {
+                sense_key: libfreemkv::scsi::SENSE_KEY_MEDIUM_ERROR,
+                asc: 0x11,
+                ascq: 0x05,
+            }),
+        })
     }
 
     fn capacity(&self) -> u32 {
@@ -570,7 +583,18 @@ impl SectorReader for BlockSizeFailingReader {
             }
             Ok(buf.len())
         } else {
-            Err(libfreemkv::error::Error::DiscRead { sector: lba as u64 })
+            // Multi-sector reads fail with the BU40N's signature: CHECK
+            // CONDITION + MEDIUM ERROR. The hysteresis must dispatch on
+            // this as marginal-read and drop to bpt=1.
+            Err(libfreemkv::error::Error::ScsiError {
+                opcode: libfreemkv::scsi::SCSI_READ_10,
+                status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(libfreemkv::ScsiSense {
+                    sense_key: libfreemkv::scsi::SENSE_KEY_MEDIUM_ERROR,
+                    asc: 0x11,
+                    ascq: 0x00,
+                }),
+            })
         }
     }
 

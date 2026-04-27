@@ -228,7 +228,7 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
         crate::scsi::TUR_TIMEOUT_MS,
     ) {
         Ok(_) => Ok(true),
-        Err(Error::ScsiError { sense_key: 2, .. }) => Ok(false),
+        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -308,21 +308,25 @@ impl ScsiTransport for SptiTransport {
             // surfaces the failure to UX.
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
 
         if sptwb.spt.ScsiStatus != 0 {
             // SPTI doesn't surface a "bytes written into sense buffer"
             // count separate from SenseInfoLength (input). Pass the full
-            // K_SENSE_SIZE; parse_sense_key keys off byte 0's response
-            // code to handle descriptor (0x72/0x73) vs fixed (0x70/0x71).
-            let sense_key = super::parse_sense_key(&sptwb.sense, K_SENSE_SIZE as u8);
+            // K_SENSE_SIZE; parse_sense keys off byte 0's response code
+            // to handle descriptor (0x72/0x73) vs fixed (0x70/0x71).
+            //
+            // 0.13.23: carry the full SPC-4 sense triple in
+            // `Error::ScsiError::sense` so callers can route on
+            // `ScsiSense::is_medium_error()` etc.
+            let parsed = super::parse_sense(&sptwb.sense, K_SENSE_SIZE as u8);
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: sptwb.spt.ScsiStatus,
-                sense_key,
+                sense: Some(parsed),
             });
         }
 

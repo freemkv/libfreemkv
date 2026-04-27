@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.13.23 (2026-04-27)
+
+### Stop discarding the drive's SCSI sense data
+
+Through the entire 0.13.x line, every CHECK CONDITION reply from the
+drive (the standard way SCSI reports a sector failure) was being
+collapsed into a synthetic `status=0xFF, sense_key=0` "transport
+wedge" sentinel and the real sense data was thrown away. Live tracing
+on the BU40N reading Dune 2 on 2026-04-27 confirmed it: the drive was
+returning `host_status=0, driver_status=8, status=2, exec_elapsed_ms=1416`
+on every bad sector — a clean CHECK CONDITION carrying full sense
+data — and the library was misclassifying it as a wedge and bailing.
+
+Root cause: `scsi/linux.rs`'s wedge check was `host_status != 0 ||
+driver_status != 0`. SG's `DRIVER_SENSE` bit (0x08) is set on every
+CHECK CONDITION reply just to flag "sense buffer is populated" — it's
+not a transport failure on its own. Pre-0.13.23 we conflated the two
+and silently lost every drive-reported error reason. macOS and Windows
+backends had the same shape: they extracted `sense_key` only, dropping
+ASC/ASCQ.
+
+### What 0.13.23 changes (API)
+
+- **Linux**: mask `DRIVER_SENSE` before treating `driver_status` as a
+  transport-layer failure. Real transport failures (`host_status != 0`
+  or any non-SENSE bit set) still synthesise the `0xFF` sentinel.
+- **`Error::ScsiError`** carries `sense: Option<ScsiSense>` instead of
+  flat `sense_key`/`asc`/`ascq`. `sense=None` ⇔ transport failure (no
+  SCSI status delivered). `Some(ScsiSense {…})` ⇔ drive replied with
+  sense data. Removes the `0xFF`/`sense_key=0` magic-number coupling.
+- **`ScsiSense`** is a public type with predicate methods on it —
+  `is_marginal`, `is_medium_error`, `is_hardware_error`,
+  `is_unit_attention`, `is_data_protect`, `is_not_ready`,
+  `is_illegal_request`, `is_aborted_command`. Callers route on the
+  structured fields rather than raw key comparisons.
+- **`Error::scsi_sense()`** / **`Error::is_scsi_transport_failure()`** /
+  **`Error::is_marginal_read()`** convenience predicates on `Error`.
+  `is_marginal_read` is the high-level "should `Disc::copy` engage
+  hysteresis on this error?" check.
+- **SCSI protocol constants** (`SCSI_STATUS_GOOD`,
+  `SCSI_STATUS_CHECK_CONDITION`, `SCSI_STATUS_TRANSPORT_FAILURE`,
+  `SENSE_KEY_*`) moved from `error.rs` to `scsi/mod.rs` where they
+  belong alongside `SCSI_INQUIRY`, `SCSI_READ_10`, etc.
+- **macOS** + **Windows** backends parse the full sense triple too.
+  Same code path on every platform — a regression in `parse_sense`
+  would surface on all three OSes simultaneously.
+- **`parse_sense`** replaces `parse_sense_key` (returns the full
+  triple). Inline sense-format tests (descriptor 0x72/0x73 vs fixed
+  0x70/0x71, short-buffer, VALID-bit masking, unknown response codes)
+  now also exercise ASC/ASCQ extraction at the right offsets.
+
+### Disc::copy + Disc::patch sense-aware dispatch
+
+Both passes now bail immediately when a read fails with a sense class
+that retry can't help (HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION,
+NOT READY, ILLEGAL REQUEST, real transport failure, kernel `IoError`)
+rather than burning hysteresis cycles on a doomed loop. Marginal-read
+sense (MEDIUM ERROR, ABORTED COMMAND, RECOVERED ERROR, NO SENSE)
+engages hysteresis as before. New `phase=bail` trace event records
+the bail reason.
+
+`Disc::patch`'s `wedged_threshold` (50 consecutive failures) remains
+as defense-in-depth for chains of marginal failures, but a single
+non-marginal sense now short-circuits it.
+
+### Behavioural impact
+
+For damaged-disc rips on the BU40N this unblocks v0.13.22's
+hysteresis: pre-fix, the misclassified "wedge" caused `Disc::copy` to
+exit before hysteresis could engage, so `bytes_good` froze at the bad
+zone. Post-fix the drive's CHECK CONDITION replies flow through the
+normal path → hysteresis drops to bpt=1 → marginal sectors are
+recovered or marked Unreadable. Calibration data
+(`docs/audits/2026-04-26-bisect-on-fail-empirical-findings.md`) shows
+~86 % of marginal-region sectors recover at bpt=1 on this drive.
+
 ## 0.13.22 (2026-04-26)
 
 ### Replace bisect-on-fail with hysteresis state machine (Block ↔ Single)

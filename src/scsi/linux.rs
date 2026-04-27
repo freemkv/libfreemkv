@@ -243,10 +243,19 @@ impl ScsiTransport for SgIoTransport {
     /// Errors we surface to caller (any of these = command failed):
     ///
     ///   - ioctl returned -1 → `Error::IoError` (kernel-level failure)
-    ///   - `hdr.host_status` != 0 → `Error::ScsiError` with status=0xFF
-    ///     (transport-level: timeout, bridge wedge, etc.)
-    ///   - `hdr.driver_status` != 0 → `Error::ScsiError` with status=0xFF
-    ///   - `hdr.status` != 0 → `Error::ScsiError` with parsed sense key
+    ///   - `hdr.host_status` != 0 OR `(hdr.driver_status & ~DRIVER_SENSE)` != 0
+    ///     → `Error::ScsiError { status: 0xFF, sense_key: 0, asc: 0, ascq: 0 }`
+    ///     (real transport-layer failure: kernel timeout, bridge wedge, bus error)
+    ///   - `hdr.status` != 0 (typically `0x02` CHECK CONDITION) →
+    ///     `Error::ScsiError { status, sense_key, asc, ascq }` carrying the
+    ///     drive's full SPC-4 sense triple. Callers route on
+    ///     `is_medium_error()`, `is_unit_attention()`, etc.
+    ///
+    /// Note: SG's `DRIVER_SENSE` (0x08) bit indicates *sense data is
+    /// attached* — it's set on every CHECK CONDITION reply. It is **not**
+    /// a transport failure; pre-0.13.23 we conflated it with one and
+    /// silently lost every drive-reported error reason. The mask in the
+    /// transport-error check below is the fix.
     ///
     /// Caller's `data` buffer is mutated only on success; partial
     /// transfers are reported via `bytes_transferred = data.len() - resid`.
@@ -272,8 +281,8 @@ impl ScsiTransport for SgIoTransport {
         if data.len() > u32::MAX as usize {
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
 
@@ -323,7 +332,16 @@ impl ScsiTransport for SgIoTransport {
         // bus error). `hdr.status` may still be zero — the SCSI device
         // never got to send a status byte. Surface as 0xFF so callers
         // (e.g. `drive_has_disc`) can detect the wedge signature.
-        if hdr.host_status != 0 || hdr.driver_status != 0 {
+        //
+        // 0.13.23: mask out `DRIVER_SENSE` (0x08) before treating
+        // `driver_status` as a transport failure. That bit is set on
+        // *every* CHECK CONDITION reply just to flag "sense data is
+        // attached in `sbp`" — it's not an error of its own. Pre-fix
+        // we collapsed every drive-reported error into a synthetic
+        // 0xFF wedge signature and discarded the sense data, which
+        // killed the rip's classification logic on damaged discs.
+        let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
+        if hdr.host_status != 0 || driver_status_real != 0 {
             tracing::trace!(
                 target: "freemkv::scsi",
                 phase = "transport_err",
@@ -336,28 +354,32 @@ impl ScsiTransport for SgIoTransport {
             );
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
 
-        // SCSI-level failure: device responded, returned non-zero status.
-        // Parse sense key for the caller.
+        // SCSI-level failure: device responded, returned non-zero status
+        // (typically 0x02 CHECK CONDITION). Parse the full SPC-4 sense
+        // triple so callers can route on `ScsiSense::is_medium_error()`
+        // etc.
         if hdr.status != 0 {
-            let sense_key = super::parse_sense_key(&sense, hdr.sb_len_wr);
+            let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
             tracing::trace!(
                 target: "freemkv::scsi",
                 phase = "scsi_err",
                 opcode = opcode,
                 status = hdr.status,
-                sense_key,
+                sense_key = parsed.sense_key,
+                asc = parsed.asc,
+                ascq = parsed.ascq,
                 exec_elapsed_ms,
                 "SCSI status non-zero"
             );
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: hdr.status,
-                sense_key,
+                sense: Some(parsed),
             });
         }
 
@@ -393,11 +415,6 @@ impl ScsiTransport for SgIoTransport {
 /// SCSI peripheral type 5 = "CD-ROM device" (covers DVD, BD-ROM, BD-RE, etc.).
 /// Stored in `/sys/class/scsi_generic/sgN/device/type` as ASCII decimal.
 const SCSI_TYPE_OPTICAL: &str = "5";
-
-/// SCSI sense key 2 = "NOT READY". Sub-codes distinguish "medium not present"
-/// (no disc) from other not-ready states (loading, etc.); for poll-loop
-/// purposes any sense-key 2 means "no disc to act on".
-const SENSE_KEY_NOT_READY: u8 = 2;
 
 /// Maximum sg index probed in the fallback path when sysfs is unavailable.
 /// Linux assigns `/dev/sgN` sequentially per host adapter; 16 covers any
@@ -547,10 +564,7 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
         crate::scsi::TUR_TIMEOUT_MS,
     ) {
         Ok(_) => Ok(true),
-        Err(Error::ScsiError {
-            sense_key: SENSE_KEY_NOT_READY,
-            ..
-        }) => Ok(false),
+        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
         Err(e) => Err(e),
     }
 }
