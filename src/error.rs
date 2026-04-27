@@ -183,6 +183,8 @@ pub enum Error {
     // Disc format (6xxx)
     DiscRead {
         sector: u64,
+        status: Option<u8>,
+        sense: Option<crate::scsi::ScsiSense>,
     },
     /// Drive was halted by caller.
     Halted,
@@ -392,7 +394,31 @@ impl std::fmt::Display for Error {
                 None => write!(f, "E{}: 0x{:02x}/0x{:02x}", self.code(), opcode, status,),
             },
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
-            Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
+            Error::DiscRead {
+                sector,
+                status,
+                sense,
+            } => match (status, sense) {
+                (Some(st), Some(s)) => write!(
+                    f,
+                    "E{}: {} 0x{:02x}/0x{:02x}/0x{:02x}",
+                    self.code(),
+                    sector,
+                    st,
+                    s.sense_key,
+                    s.asc,
+                ),
+                (Some(st), None) => write!(f, "E{}: {} 0x{:02x}", self.code(), sector, st,),
+                (None, Some(s)) => write!(
+                    f,
+                    "E{}: {} 0x{:02x}/0x{:02x}",
+                    self.code(),
+                    sector,
+                    s.sense_key,
+                    s.asc,
+                ),
+                (None, None) => write!(f, "E{}: {}", self.code(), sector),
+            },
             Error::Halted => write!(f, "E{}", self.code()),
             Error::UdfNotFound { path } => write!(f, "E{}: {}", self.code(), path),
             Error::DiscTitleRange { index, count } => {

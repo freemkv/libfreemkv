@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.26 (2026-04-27)
+
+### Extend DiscRead with SCSI status/sense for 30% wedge diagnostics
+
+`Error::DiscRead` now carries `status` (SCSI status byte) and `sense`
+(ScsiSense with key/asc/ascq). Previously this info was discarded,
+showing only `E6000: {sector}`. Now shows:
+- `E6000: {sector} 0x{status}/0x{sense_key}/0x{asc}`
+- Enables recovery loop to distinguish recoverable errors from drive wedge
+- Enables programmatic handling: `if status == 0xFF { reset } else { retry }`
+
+### Error display shows up to 5 fields
+
+Display format changed from `E{sector}` to `E{code}: sector status/key/asc`.
+
+## 0.13.25 (2026-04-27)
+
+### Drop dead `Drive::device_path_owned()`
+
+The method was marked `// NOTE: Debug aid — remove after fd issue is
+resolved` and the fd issue closed in 0.13.6. Use `device_path()` (which
+returns `&str`) instead. Removing it clears a `cargo clippy -- -D
+warnings` red on Linux CI that the Mac toolchain doesn't catch.
+
+### Pre-commit gate uses CI's exact toolchain
+
+`freemkv-private/scripts/precommit.sh` (new) runs `cargo +1.86 fmt
+--check`, `cargo +1.86 clippy -- -D warnings`, and `cargo +1.86 test
+--tests` across all 5 freemkv crates. Mirrors each repo's
+`.github/workflows/ci.yml` step-for-step. Use it as a pre-commit hook
+or run by hand before pushing — green here means green CI.
+
+The Mac default toolchain is newer (1.94) and its clippy rejects
+slightly different sets of lints than 1.86 — running locally without
+pinning misses lints CI catches. The script forces 1.86 so drift
+between local and CI ends.
+
 ## 0.13.24 (2026-04-27)
 
 ### MapStats: split `bytes_pending` into `bytes_nontried` + `bytes_retryable`

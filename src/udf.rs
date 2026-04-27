@@ -278,10 +278,11 @@ impl UdfFs {
     /// The data_lba is partition-relative.
     fn read_icb_extent(&self, reader: &mut dyn SectorReader, meta_lba: u32) -> Result<(u32, u32)> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
-        extents
-            .first()
-            .copied()
-            .ok_or(Error::DiscRead { sector: 0 })
+        extents.first().copied().ok_or(Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        })
     }
 
     /// Read ALL allocation extents for a file from its ICB.
@@ -307,6 +308,8 @@ impl UdfFs {
                 if ad_offset + l_ad > icb.len() {
                     return Err(Error::DiscRead {
                         sector: self.meta_to_abs(meta_lba) as u64,
+                        status: None,
+                        sense: None,
                     });
                 }
                 (ad_offset, l_ad)
@@ -319,11 +322,19 @@ impl UdfFs {
                 if ad_offset + l_ad > icb.len() {
                     return Err(Error::DiscRead {
                         sector: self.meta_to_abs(meta_lba) as u64,
+                        status: None,
+                        sense: None,
                     });
                 }
                 (ad_offset, l_ad)
             }
-            _ => return Err(Error::DiscRead { sector: 0 }),
+            _ => {
+                return Err(Error::DiscRead {
+                    sector: 0,
+                    status: None,
+                    sense: None,
+                });
+            }
         };
 
         let mut extents = Vec::new();
@@ -414,7 +425,11 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
 
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
     if tag_id != 2 {
-        return Err(Error::DiscRead { sector: 0 });
+        return Err(Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        });
     }
 
     // Main VDS extent location: bytes [16:20] = LBA, [20:24] = length
@@ -455,14 +470,22 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
     }
 
     if partition_start == 0 {
-        return Err(Error::DiscRead { sector: 0 });
+        return Err(Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        });
     }
 
     // Step 3: Parse partition maps from LVD to find metadata partition
     // BD-ROM discs (UDF 2.50) use a metadata partition (Type 2 map with "*UDF Metadata Partition")
     // The metadata file is stored at lba=0 of the physical partition
     let metadata_start = if num_partition_maps >= 2 {
-        let lvd_sec = lvd_sector.ok_or(Error::DiscRead { sector: 0 })?;
+        let lvd_sec = lvd_sector.ok_or(Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        })?;
 
         // Read LVD to check partition map type
         let mut lvd = [0u8; 2048];
@@ -497,6 +520,8 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
                     if ad_off + 8 > meta_icb.len() {
                         return Err(Error::DiscRead {
                             sector: meta_file_lba as u64,
+                            status: None,
+                            sense: None,
                         });
                     }
                     let ad_len = u32::from_le_bytes([
@@ -536,7 +561,11 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
 
     let fsd_tag = u16::from_le_bytes([fsd[0], fsd[1]]);
     if fsd_tag != 256 {
-        return Err(Error::DiscRead { sector: 0 });
+        return Err(Error::DiscRead {
+            sector: 0,
+            status: None,
+            sense: None,
+        });
     }
 
     // Root Directory ICB: long_ad at FSD offset 400
@@ -585,6 +614,8 @@ fn read_directory(
             if ad_off + 8 > icb.len() {
                 return Err(Error::DiscRead {
                     sector: (meta_start + meta_lba) as u64,
+                    status: None,
+                    sense: None,
                 });
             }
             let len = u32::from_le_bytes([
@@ -607,6 +638,8 @@ fn read_directory(
             if ad_off + 8 > icb.len() {
                 return Err(Error::DiscRead {
                     sector: (meta_start + meta_lba) as u64,
+                    status: None,
+                    sense: None,
                 });
             }
             let len = u32::from_le_bytes([
