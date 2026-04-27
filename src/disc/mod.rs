@@ -13,7 +13,7 @@ mod dvd;
 mod encrypt;
 pub mod mapfile;
 
-use crate::drive::Drive;
+use crate::drive::{Drive, extract_scsi_context};
 use crate::error::{Error, Result};
 use crate::sector::SectorReader;
 use crate::udf;
@@ -1404,8 +1404,15 @@ impl Disc {
                     bytes_done = bytes_done.saturating_add(block_bytes);
                 } else if !opts.skip_on_error {
                     // Strict mode (skip_on_error=false): abort on first bad.
+                    let (status, sense) = block_result
+                        .err()
+                        .as_ref()
+                        .map(extract_scsi_context)
+                        .unwrap_or((0, None));
                     return Err(Error::DiscRead {
                         sector: block_lba as u64,
+                        status: Some(status),
+                        sense,
                     });
                 } else if !block_result
                     .as_ref()

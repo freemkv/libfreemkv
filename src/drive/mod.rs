@@ -1,10 +1,13 @@
 //! Drive session — open, identify, and read from optical drives.
 //!
-//! Three-step open:
-//!   1. `open()` — open device, identify drive. Always OEM.
-//!   2. `wait_ready()` — wait for disc to spin up. Call before reading.
-//!   3. `init()` — activate custom firmware. Removes riplock.
 //!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
+
+pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
+    match e {
+        Error::ScsiError { status, sense, .. } => (*status, *sense),
+        _ => (0, None),
+    }
+}
 
 pub mod capture;
 
@@ -158,11 +161,6 @@ impl Drive {
     /// Shared cleanup — called by Drop (and thus by close).
     fn cleanup(&mut self) {
         self.unlock_tray();
-    }
-
-    // NOTE: Debug aid — remove after fd issue is resolved
-    pub fn device_path_owned(&self) -> String {
-        self.device_path.clone()
     }
 
     /// Whether this drive has a known profile (unlock parameters available).
@@ -466,7 +464,14 @@ impl Drive {
         ) {
             Ok(result) => Ok(result.bytes_transferred),
             Err(Error::Halted) => Err(Error::Halted),
-            Err(_) => Err(Error::DiscRead { sector: lba as u64 }),
+            Err(e) => {
+                let (status, sense) = extract_scsi_context(&e);
+                Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(status),
+                    sense,
+                })
+            }
         }
     }
 
