@@ -241,7 +241,10 @@ impl Drive {
                     5_000,
                 ) {
                     Ok(_) => DriveStatus::DiscPresent,
-                    Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready() || s.is_unit_attention()) => {
+                    Err(ref e)
+                        if e.scsi_sense()
+                            .is_some_and(|s| s.is_not_ready() || s.is_unit_attention()) =>
+                    {
                         DriveStatus::NotReady
                     }
                     _ => DriveStatus::Unknown,

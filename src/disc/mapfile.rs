@@ -69,12 +69,28 @@ pub struct MapEntry {
 }
 
 /// Summary statistics over all entries.
+///
+/// `bytes_pending` aggregates `NonTried + NonTrimmed + NonScraped` for
+/// back-compat. `bytes_nontried` and `bytes_retryable` (= NonTrimmed +
+/// NonScraped) split that aggregate so UIs can distinguish *unread*
+/// territory (still ahead of Pass 1's read head) from *needs-retry*
+/// territory (Pass 1 already encountered, queued for Pass 2-N).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MapStats {
     pub bytes_total: u64,
     pub bytes_good: u64,
     pub bytes_unreadable: u64,
     pub bytes_pending: u64,
+    /// Sectors Pass 1 hasn't reached yet (`NonTried`). Subset of
+    /// `bytes_pending`.
+    pub bytes_nontried: u64,
+    /// Sectors flagged for Pass 2-N retry — `NonTrimmed` (multi-sector
+    /// read failed; needs split) + `NonScraped` (small-block read
+    /// partially recovered; remainder still pending). Subset of
+    /// `bytes_pending`. This is the right signal for a "MAYBE / will
+    /// retry" UI bucket; `bytes_pending` over-counts because it folds
+    /// in `bytes_nontried`.
+    pub bytes_retryable: u64,
 }
 
 /// Write-through mapfile. Every `record()` persists to disk immediately
@@ -275,8 +291,13 @@ impl Mapfile {
             match e.status {
                 SectorStatus::Finished => s.bytes_good += e.size,
                 SectorStatus::Unreadable => s.bytes_unreadable += e.size,
-                SectorStatus::NonTried | SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
-                    s.bytes_pending += e.size
+                SectorStatus::NonTried => {
+                    s.bytes_pending += e.size;
+                    s.bytes_nontried += e.size;
+                }
+                SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
+                    s.bytes_pending += e.size;
+                    s.bytes_retryable += e.size;
                 }
             }
         }

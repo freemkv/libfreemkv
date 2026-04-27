@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.13.24 (2026-04-27)
+
+### MapStats: split `bytes_pending` into `bytes_nontried` + `bytes_retryable`
+
+`MapStats.bytes_pending` aggregates `NonTried` (sectors Pass 1 hasn't
+reached) + `NonTrimmed` + `NonScraped` (sectors flagged for Pass 2-N
+retry). UIs that wanted a "MAYBE / will retry" bucket were stuck
+showing the entire unread disc as "Maybe" at pct=0.
+
+v0.13.24 keeps `bytes_pending` for back-compat and adds two granular
+fields:
+
+  - `bytes_nontried` — Pass 1 hasn't read these yet
+  - `bytes_retryable` — `NonTrimmed + NonScraped`, Pass 2-N will retry
+
+`bytes_pending == bytes_nontried + bytes_retryable` (invariant).
+
+### cargo fmt cleanup
+
+Picks up the `cargo fmt --check` lint failure that's been red on
+`main` since v0.13.18 (long format-string layouts the local rustfmt
+folded differently from CI's runner).
+
 ## 0.13.23 (2026-04-27)
 
 ### Stop discarding the drive's SCSI sense data

@@ -134,10 +134,10 @@ pub use decrypt::{DecryptKeys, decrypt_sectors};
 // background. The codec / channel / resolution enums are the canonical
 // structured representation; never compare against display strings.
 pub use disc::{
-    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat,
-    DamageSeverity, Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat,
-    KeySource, LabelPurpose, LabelQualifier, Resolution, SampleRate, ScanOptions, Stream,
-    SubtitleStream, VideoStream, classify_damage,
+    AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
+    Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, LabelPurpose,
+    LabelQualifier, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
+    classify_damage,
 };
 
 // ─── Streams ────────────────────────────────────────────────────────────────
