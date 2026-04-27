@@ -75,35 +75,206 @@ pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 /// (`DEF_TIMEOUT = 60000`).
 pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
 
-// ── Sense-key parsing ───────────────────────────────────────────────────────
+// ── SCSI status bytes (SPC-4 §4.5.5) ────────────────────────────────────────
 
-/// Extract the SPC-4 sense key from a sense buffer.
+/// Status byte 0x00 — `GOOD`. Command completed successfully.
+pub const SCSI_STATUS_GOOD: u8 = 0x00;
+/// Status byte 0x02 — `CHECK CONDITION`. Drive completed the command
+/// reply and attached sense data describing the failure.
+pub const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
+/// libfreemkv-synthesised sentinel: the transport never delivered a
+/// SCSI status byte (kernel timeout, USB bridge wedge, IOKit service
+/// failure). Distinct from any drive-returned value. Carriers
+/// [`Error::ScsiError`] with `sense = None`.
+pub const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
+
+// ── SPC-4 sense keys (§4.5.6 Table 28) ─────────────────────────────────────
+//
+// Broad failure category returned in a CHECK CONDITION reply's sense data.
+// Names match the SCSI spec; predicate methods on [`ScsiSense`] (e.g.
+// `is_medium_error`, `is_unit_attention`) read more fluently than raw
+// constant comparisons at call sites.
+
+pub const SENSE_KEY_NO_SENSE: u8 = 0x00;
+pub const SENSE_KEY_RECOVERED_ERROR: u8 = 0x01;
+pub const SENSE_KEY_NOT_READY: u8 = 0x02;
+pub const SENSE_KEY_MEDIUM_ERROR: u8 = 0x03;
+pub const SENSE_KEY_HARDWARE_ERROR: u8 = 0x04;
+pub const SENSE_KEY_ILLEGAL_REQUEST: u8 = 0x05;
+pub const SENSE_KEY_UNIT_ATTENTION: u8 = 0x06;
+pub const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
+pub const SENSE_KEY_BLANK_CHECK: u8 = 0x08;
+pub const SENSE_KEY_ABORTED_COMMAND: u8 = 0x0B;
+
+// ── Sense parsing ───────────────────────────────────────────────────────────
+
+/// Decoded SPC-4 sense triple — the precise reason a SCSI command failed.
 ///
-/// Handles both response-code formats:
-///   - Descriptor format (0x72 / 0x73): sense key in the low nibble of byte 1.
-///   - Fixed format (0x70 / 0x71): sense key in the low nibble of byte 2.
+/// Returned by [`parse_sense`] and embedded inside [`Error::ScsiError`]
+/// (`sense: Option<ScsiSense>`). Predicate methods (`is_medium_error`,
+/// `is_unit_attention`, `is_marginal`, …) read more fluently at call
+/// sites than raw `sense_key` comparisons.
 ///
-/// `sb_len_wr` is the number of bytes the transport actually wrote into
-/// `sense`. When < 3 (or `sense.len() < 3`) we can't safely read either
-/// the format byte or the key byte — return 0 (NO SENSE) per SPC-4 §4.5.3.
-///
-/// Pure function. Same parse runs on every platform backend so
-/// callers don't have to special-case Linux SG_IO vs macOS IOKit vs
-/// Windows SPTI sense layouts.
-pub(crate) fn parse_sense_key(sense: &[u8], sb_len_wr: u8) -> u8 {
-    if (sb_len_wr as usize) < 3 || sense.len() < 3 {
-        return 0;
+/// `Default::default()` and the [`ScsiSense::NONE`] constant both
+/// produce the all-zero "no sense info" triple. Per SPC-4 §4.5.3, an
+/// empty sense buffer is reported as NO SENSE (key 0); use the constant
+/// for explicit intent at construction sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScsiSense {
+    /// Sense key — broad failure category (SPC-4 §4.5.6 Table 28).
+    /// See the `SENSE_KEY_*` constants for named values.
+    pub sense_key: u8,
+    /// Additional Sense Code — narrows the cause within a sense key
+    /// (SPC-4 §4.5.6 Table 29). E.g. `0x11` = UNRECOVERED READ ERROR.
+    pub asc: u8,
+    /// Additional Sense Code Qualifier — finest-grain disambiguation.
+    /// E.g. `0x05` (with `asc=0x11`) = L-EC UNCORRECTABLE.
+    pub ascq: u8,
+}
+
+impl ScsiSense {
+    /// Sense reply with all-zero fields — explicit "no sense info"
+    /// constructor for sites where `Default::default()` would be opaque.
+    pub const NONE: ScsiSense = ScsiSense {
+        sense_key: 0,
+        asc: 0,
+        ascq: 0,
+    };
+
+    /// `true` when the sense key indicates a *marginal-read* failure —
+    /// the kind of error where the same read at smaller granularity
+    /// (or a brief retry) sometimes succeeds:
+    ///
+    ///   - `MEDIUM ERROR` (3) — canonical bad-sector signal
+    ///   - `ABORTED COMMAND` (B) — transient; retry usually works
+    ///   - `RECOVERED ERROR` (1) / `NO SENSE` (0) — drive is healthy and
+    ///     either recovered the data or has no specific fault to report
+    ///
+    /// `false` for HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, NOT
+    /// READY, ILLEGAL REQUEST, BLANK CHECK, and any unknown key. Used
+    /// by [`Error::is_marginal_read`] / `Disc::copy`'s hysteresis
+    /// dispatch.
+    pub fn is_marginal(&self) -> bool {
+        matches!(
+            self.sense_key,
+            SENSE_KEY_NO_SENSE
+                | SENSE_KEY_RECOVERED_ERROR
+                | SENSE_KEY_MEDIUM_ERROR
+                | SENSE_KEY_ABORTED_COMMAND
+        )
     }
-    let response_code = sense[0] & 0x7F;
-    if response_code == 0x72 || response_code == 0x73 {
-        sense[1] & 0x0F
-    } else {
-        // Fixed format (0x70/0x71) and any unknown code fall through here;
-        // SPC-4 says implementations MUST tolerate unknown response codes
-        // and treat them as fixed — matches what reference projects do.
-        sense[2] & 0x0F
+
+    /// `true` if `sense_key == MEDIUM ERROR (3)` — canonical "bad sector"
+    /// signal from the drive.
+    pub fn is_medium_error(&self) -> bool {
+        self.sense_key == SENSE_KEY_MEDIUM_ERROR
+    }
+
+    /// `true` if `sense_key == HARDWARE ERROR (4)` — drive itself is
+    /// failing. Not recoverable by retry.
+    pub fn is_hardware_error(&self) -> bool {
+        self.sense_key == SENSE_KEY_HARDWARE_ERROR
+    }
+
+    /// `true` if `sense_key == NOT READY (2)` — medium not present /
+    /// drive becoming ready / etc.
+    pub fn is_not_ready(&self) -> bool {
+        self.sense_key == SENSE_KEY_NOT_READY
+    }
+
+    /// `true` if `sense_key == UNIT ATTENTION (6)` — disc/drive state
+    /// changed since the prior command (media inserted/removed,
+    /// power-on reset, parameters changed). Caller should rescan rather
+    /// than retry the read.
+    pub fn is_unit_attention(&self) -> bool {
+        self.sense_key == SENSE_KEY_UNIT_ATTENTION
+    }
+
+    /// `true` if `sense_key == DATA PROTECT (7)` — read blocked by
+    /// AACS / region / write-protect. Retry won't help.
+    pub fn is_data_protect(&self) -> bool {
+        self.sense_key == SENSE_KEY_DATA_PROTECT
+    }
+
+    /// `true` if `sense_key == ILLEGAL REQUEST (5)` — typically a bug
+    /// in the CDB we sent (LBA out of range, reserved bit, etc.). Don't
+    /// retry.
+    pub fn is_illegal_request(&self) -> bool {
+        self.sense_key == SENSE_KEY_ILLEGAL_REQUEST
+    }
+
+    /// `true` if `sense_key == ABORTED COMMAND (B)` — transient; one
+    /// retry is usually safe.
+    pub fn is_aborted_command(&self) -> bool {
+        self.sense_key == SENSE_KEY_ABORTED_COMMAND
     }
 }
+
+/// Decode an SPC-4 sense buffer into the structured triple
+/// `(sense_key, asc, ascq)`.
+///
+/// Handles both response-code formats SPC-4 mandates:
+///
+///   - **Descriptor format** (response code `0x72` / `0x73`):
+///     - sense key = `sense[1] & 0x0F`
+///     - asc = `sense[2]`
+///     - ascq = `sense[3]`
+///   - **Fixed format** (response code `0x70` / `0x71` and any unknown
+///     code per SPC-4 §4.5.3):
+///     - sense key = `sense[2] & 0x0F`
+///     - asc = `sense[12]`
+///     - ascq = `sense[13]`
+///
+/// `sb_len_wr` is the number of bytes the transport actually wrote into
+/// `sense`. When the buffer is too short for the relevant fields we
+/// return [`ScsiSense::NONE`] for the missing pieces rather than reading
+/// uninitialised memory. The minimum useful sense reply per SPC-4 is 8
+/// bytes (descriptor) or 14 bytes (fixed, to reach ASC/ASCQ at offsets
+/// 12/13).
+///
+/// Pure function — same parse on every platform backend (Linux SG_IO,
+/// macOS IOKit, Windows SPTI) so a regression here would silently
+/// mis-route SCSI errors on all three OSes simultaneously.
+pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
+    let n = (sb_len_wr as usize).min(sense.len());
+    if n < 3 {
+        return ScsiSense::NONE;
+    }
+    let response_code = sense[0] & 0x7F;
+    let descriptor = response_code == 0x72 || response_code == 0x73;
+    if descriptor {
+        // Descriptor format: key/asc/ascq are at fixed offsets 1/2/3.
+        let asc = if n >= 3 { sense[2] } else { 0 };
+        let ascq = if n >= 4 { sense[3] } else { 0 };
+        ScsiSense {
+            sense_key: sense[1] & 0x0F,
+            asc,
+            ascq,
+        }
+    } else {
+        // Fixed format: key at byte 2, ASC/ASCQ at bytes 12/13.
+        let asc = if n >= 13 { sense[12] } else { 0 };
+        let ascq = if n >= 14 { sense[13] } else { 0 };
+        ScsiSense {
+            sense_key: sense[2] & 0x0F,
+            asc,
+            ascq,
+        }
+    }
+}
+
+// ── SG_IO driver_status bits ────────────────────────────────────────────────
+
+/// `DRIVER_SENSE` (0x08) — bit set in `driver_status` to indicate that
+/// sense data was attached to a CHECK CONDITION reply. **Not** a transport
+/// failure on its own. Mask this off before deciding whether `driver_status`
+/// represents a real bus/host problem.
+///
+/// Used by Linux SG_IO (`sg_io_hdr.driver_status`); macOS IOKit and
+/// Windows SPTI carry the equivalent signal in different fields and
+/// don't need the same masking — the misclassification was Linux-only.
+#[cfg(target_os = "linux")]
+pub(crate) const DRIVER_SENSE: u16 = 0x08;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -396,7 +567,10 @@ mod parse_sense_tests {
     //! same helper runs on every platform backend so a regression here
     //! would silently miscategorize SCSI errors on Linux, macOS, and
     //! Windows simultaneously.
-    use super::parse_sense_key;
+    use super::parse_sense;
+    fn parse_sense_key(sense: &[u8], sb_len_wr: u8) -> u8 {
+        parse_sense(sense, sb_len_wr).sense_key
+    }
 
     /// Helper: build a 32-byte sense buffer whose first three bytes are
     /// the given prefix; the rest are zeroes (sense data area).

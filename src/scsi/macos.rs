@@ -337,12 +337,10 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
         crate::scsi::TUR_TIMEOUT_MS,
     ) {
         Ok(_) => Ok(true),
-        Err(Error::ScsiError { sense_key, .. }) if sense_key == K_SENSE_KEY_NOT_READY => Ok(false),
+        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
         Err(e) => Err(e),
     }
 }
-
-const K_SENSE_KEY_NOT_READY: u8 = 2;
 
 impl Drop for MacScsiTransport {
     fn drop(&mut self) {
@@ -377,8 +375,8 @@ impl ScsiTransport for MacScsiTransport {
         if task.is_null() {
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
 
@@ -449,20 +447,25 @@ impl ScsiTransport for MacScsiTransport {
             // the kernel mid-layer has already done what it can.
             return Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
 
         if task_status != K_SCSI_TASK_STATUS_GOOD as u32 {
             // IOKit doesn't surface a "bytes written into sense buffer"
             // count the way SG_IO does — pass the buffer's full length
-            // and let parse_sense_key inspect byte 0's response code.
-            let sense_key = super::parse_sense_key(&sense, sense.len() as u8);
+            // and let parse_sense inspect byte 0's response code to pick
+            // descriptor-vs-fixed format.
+            //
+            // 0.13.23: carry the full SPC-4 sense triple in
+            // `Error::ScsiError::sense` so callers can route on
+            // `ScsiSense::is_medium_error()` etc.
+            let parsed = super::parse_sense(&sense, sense.len() as u8);
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: task_status as u8,
-                sense_key,
+                sense: Some(parsed),
             });
         }
 

@@ -155,10 +155,24 @@ pub enum Error {
     },
 
     // SCSI (4xxx)
+    /// SCSI command failed.
+    ///
+    /// `opcode` is the failing CDB byte 0. `status` is the raw SCSI
+    /// status byte: `0x02` = CHECK CONDITION (drive replied with sense
+    /// data), `0xFF` = libfreemkv-synthesised sentinel meaning "no SCSI
+    /// status delivered" (kernel timeout, USB bridge wedge, IOKit
+    /// service failure). `sense` carries the drive's SPC-4 sense triple
+    /// when the drive replied; `None` for transport-layer failures.
+    ///
+    /// Recommended dispatch (callers shouldn't pattern-match raw
+    /// fields):
+    ///   - [`Error::is_scsi_transport_failure`] — bail; bridge/transport wedge
+    ///   - [`Error::is_marginal_read`] — drive said this read was marginal; smaller block may recover
+    ///   - [`Error::scsi_sense`] — borrow the sense triple for finer routing ([`ScsiSense::is_medium_error`] etc.)
     ScsiError {
         opcode: u8,
         status: u8,
-        sense_key: u8,
+        sense: Option<crate::scsi::ScsiSense>,
     },
 
     // I/O (5xxx)
@@ -363,17 +377,26 @@ impl std::fmt::Display for Error {
             Error::ScsiError {
                 opcode,
                 status,
-                sense_key,
-            } => {
-                write!(
+                sense,
+            } => match sense {
+                Some(s) => write!(
                     f,
-                    "E{}: 0x{:02x}/0x{:02x}/0x{:02x}",
+                    "E{}: 0x{:02x}/0x{:02x}/0x{:02x}/0x{:02x}/0x{:02x}",
                     self.code(),
                     opcode,
                     status,
-                    sense_key
-                )
-            }
+                    s.sense_key,
+                    s.asc,
+                    s.ascq,
+                ),
+                None => write!(
+                    f,
+                    "E{}: 0x{:02x}/0x{:02x}",
+                    self.code(),
+                    opcode,
+                    status,
+                ),
+            },
             Error::IoError { source } => write!(f, "E{}: {}", self.code(), source),
             Error::DiscRead { sector } => write!(f, "E{}: {}", self.code(), sector),
             Error::Halted => write!(f, "E{}", self.code()),
@@ -437,6 +460,58 @@ impl From<Error> for std::io::Error {
 
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Borrow the drive-returned SPC-4 sense triple if this error is a
+    /// [`Error::ScsiError`] carrying sense data. `None` for any other
+    /// variant **and** for `ScsiError`s that represent a transport-layer
+    /// failure (where the device never delivered a SCSI status reply, so
+    /// no sense data exists).
+    pub fn scsi_sense(&self) -> Option<&crate::scsi::ScsiSense> {
+        match self {
+            Error::ScsiError {
+                sense: Some(s), ..
+            } => Some(s),
+            _ => None,
+        }
+    }
+
+    /// True if this is a [`Error::ScsiError`] representing a transport-layer
+    /// failure — kernel timeout, USB bridge wedge, IOKit service error.
+    /// The device never delivered a SCSI status reply, so there is no
+    /// sense data to inspect; retrying typically requires physical
+    /// intervention (replug).
+    pub fn is_scsi_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::ScsiError {
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                ..
+            }
+        )
+    }
+
+    /// True if the underlying SCSI failure is a *marginal read* — the
+    /// drive returned an error category in which smaller-granularity
+    /// retries can sometimes recover the data:
+    ///
+    ///   - MEDIUM ERROR (sense key 3) — canonical bad-sector signal
+    ///   - ABORTED COMMAND (sense key B) — transient; retry usually works
+    ///   - RECOVERED ERROR (sense key 1) / NO SENSE (sense key 0) — not
+    ///     classified as fatal; treat as recoverable
+    ///
+    /// Returns `false` for transport failures (no sense data delivered),
+    /// HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, NOT READY, ILLEGAL
+    /// REQUEST, BLANK CHECK, kernel `IoError`, and any non-SCSI variant.
+    /// Caller-agnostic predicate — describes a property of the *error*,
+    /// not what one specific call site should do with it. Used by
+    /// `Disc::copy`'s hysteresis dispatch.
+    pub fn is_marginal_read(&self) -> bool {
+        self.scsi_sense()
+            .map(crate::scsi::ScsiSense::is_marginal)
+            .unwrap_or(false)
+    }
+}
 
 #[cfg(test)]
 mod tests {

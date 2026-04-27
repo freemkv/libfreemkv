@@ -1,37 +1,55 @@
 //! Integration tests for the SCSI error-decoding contract.
 //!
 //! v0.13.20 rewrote `scsi/linux.rs` to a synchronous blocking SG_IO and
-//! consolidated sense-key parsing into the `parse_sense_key` helper that
-//! every platform backend now shares. The actual `ioctl(SG_IO, ...)` call
-//! is impossible to mock without a kernel — see
-//! `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`
-//! for why the audit recommends against libc shims here.
+//! consolidated sense parsing into the `parse_sense` helper that every
+//! platform backend now shares. v0.13.23 replaced the `Error::ScsiError`
+//! flat-fields shape with `{ opcode, status, sense: Option<ScsiSense> }`
+//! so callers can route on structured sense data (key + ASC + ASCQ) via
+//! [`Error::scsi_sense`] / [`Error::is_marginal_read`] /
+//! [`ScsiSense::is_*`].
 //!
-//! These tests pin the *contract* every backend must satisfy:
+//! The actual `ioctl(SG_IO, ...)` call is impossible to mock without a
+//! kernel — see
+//! `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`
+//! for why the audit recommends against libc shims here. These tests
+//! therefore pin the *contract* every backend must satisfy via a mock
+//! `ScsiTransport`:
 //!
 //!   1. Healthy result → `Ok(ScsiResult { bytes_transferred = data.len() - resid })`.
-//!   2. Transport-level failure (`host_status` or `driver_status` non-zero)
-//!      → `Error::ScsiError { status: 0xFF, sense_key: 0 }`. Used by
+//!   2. Transport-level failure (no SCSI status delivered: kernel
+//!      timeout, USB bridge wedge, IOKit service error) →
+//!      `Error::ScsiError { status: SCSI_STATUS_TRANSPORT_FAILURE, sense: None }`.
+//!      `Error::is_scsi_transport_failure()` returns `true`. Used by
 //!      `drive_has_disc` to detect the wedge signature.
-//!   3. SCSI-level failure (status non-zero, sense buffer populated) →
-//!      `Error::ScsiError { status, sense_key }` with the parsed key.
-//!   4. Sense-key parsing handles descriptor (0x72/0x73) and fixed
-//!      (0x70/0x71) response codes; missing sense data → key 0.
+//!   3. SCSI-level failure (drive replied CHECK CONDITION with sense) →
+//!      `Error::ScsiError { status: 0x02, sense: Some(ScsiSense {…}) }`
+//!      with the parsed key/ASC/ASCQ.
+//!   4. `Error::is_marginal_read()` is `true` for MEDIUM ERROR /
+//!      ABORTED COMMAND / RECOVERED ERROR / NO SENSE; `false` for
+//!      HARDWARE / DATA PROTECT / UNIT ATTENTION / NOT READY / ILLEGAL
+//!      REQUEST and for transport failures.
 //!
-//! The mock `ScsiTransport` here emulates exactly that layered shape.
 //! Inline `parse_sense_tests` in `src/scsi/mod.rs` cover the pure parse
-//! logic; this file covers the consumer side — a real transport feeding
-//! a real Error variant to a real call site (`scsi::inquiry`).
+//! logic (descriptor 0x72/0x73 vs fixed 0x70/0x71, short-buffer, VALID
+//! bit masking, unknown response codes, ASC/ASCQ offsets); this file
+//! covers the consumer side — a real transport feeding a real Error
+//! variant to a real call site (`scsi::inquiry`).
 
 use libfreemkv::error::Error;
-use libfreemkv::scsi::{DataDirection, ScsiResult, ScsiTransport};
+use libfreemkv::scsi::{
+    DataDirection, SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_TRANSPORT_FAILURE, ScsiResult,
+    ScsiSense, ScsiTransport, SENSE_KEY_ABORTED_COMMAND, SENSE_KEY_DATA_PROTECT,
+    SENSE_KEY_HARDWARE_ERROR, SENSE_KEY_ILLEGAL_REQUEST, SENSE_KEY_MEDIUM_ERROR,
+    SENSE_KEY_NOT_READY, SENSE_KEY_RECOVERED_ERROR, SENSE_KEY_UNIT_ATTENTION,
+};
 
 /// A scripted ScsiTransport. Each `execute()` consumes the next entry
 /// from `script` and returns the corresponding outcome.
 ///
 /// Outcomes mirror what each backend's `execute()` should produce after
-/// the v0.13.20 rewrite: pre-parsed sense_key and synthesized 0xFF
-/// status for transport-level failures.
+/// the v0.13.23 sense plumbing: `Option<ScsiSense>` carrying the full
+/// SPC-4 triple for drive-reported failures, `None` for transport-level
+/// failures.
 struct MockTransport {
     script: Vec<MockOutcome>,
     next: usize,
@@ -46,16 +64,16 @@ enum MockOutcome {
         data: Vec<u8>,
         resid: i32,
     },
-    /// Transport-level failure: e.g. `hdr.host_status = DID_TIME_OUT`
-    /// on Linux, or `kIOReturnError` on macOS, or `DeviceIoControl`
-    /// returning 0 on Windows. Backends synthesize 0xFF.
+    /// Transport-level failure: `hdr.host_status = DID_TIME_OUT` on
+    /// Linux, `kIOReturnError` on macOS, `DeviceIoControl` returning 0
+    /// on Windows. Backends synthesise `SCSI_STATUS_TRANSPORT_FAILURE`
+    /// with `sense = None`.
     TransportFailure,
-    /// SCSI-level failure: device responded with a non-zero status and
-    /// some sense data. `status` and `sense_key` are what the caller
-    /// must see on the `Error::ScsiError` variant.
+    /// Drive replied with sense data (typically `SCSI_STATUS_CHECK_CONDITION`
+    /// + a populated sense buffer).
     ScsiFailure {
         status: u8,
-        sense_key: u8,
+        sense: ScsiSense,
     },
 }
 
@@ -93,15 +111,28 @@ impl ScsiTransport for MockTransport {
             }
             MockOutcome::TransportFailure => Err(Error::ScsiError {
                 opcode: cdb[0],
-                status: 0xFF,
-                sense_key: 0,
+                status: SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             }),
-            MockOutcome::ScsiFailure { status, sense_key } => Err(Error::ScsiError {
+            MockOutcome::ScsiFailure { status, sense } => Err(Error::ScsiError {
                 opcode: cdb[0],
                 status,
-                sense_key,
+                sense: Some(sense),
             }),
         }
+    }
+}
+
+/// Helper — build a CHECK CONDITION outcome with a given sense key
+/// and zero ASC/ASCQ. Most consumer-side tests only care about the key.
+fn check_cond(sense_key: u8) -> MockOutcome {
+    MockOutcome::ScsiFailure {
+        status: SCSI_STATUS_CHECK_CONDITION,
+        sense: ScsiSense {
+            sense_key,
+            asc: 0,
+            ascq: 0,
+        },
     }
 }
 
@@ -127,111 +158,167 @@ fn test_healthy_inquiry_returns_ok_with_full_transfer() {
     assert_eq!(r.firmware, "1.00");
 }
 
-// ── 2. Transport-level failure (host_status or driver_status non-zero) ─────
-//
-// Linux: kernel sets `hdr.host_status = DID_TIME_OUT (0x03)` or
-//        `hdr.driver_status` non-zero on a USB bridge wedge. SgIoTransport
-//        synthesizes ScsiError { status: 0xFF, sense_key: 0 }.
-// macOS: IOKit `ExecuteTaskSync` returns non-zero IOReturn; same shape.
-// Windows: `DeviceIoControl` returns 0; same shape.
-//
-// Callers (drive_has_disc, etc.) match on status == 0xFF as the wedge
-// signature. This test pins that contract.
+// ── 2. Transport-level failure: no SCSI status, no sense data ─────────────
 
 #[test]
-fn test_transport_failure_surfaces_as_status_0xff_sense_key_0() {
+fn test_transport_failure_surfaces_with_sense_none() {
     let mut transport = MockTransport::new(vec![MockOutcome::TransportFailure]);
 
     let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+    assert!(
+        err.is_scsi_transport_failure(),
+        "TransportFailure must satisfy is_scsi_transport_failure()"
+    );
+    assert!(
+        err.scsi_sense().is_none(),
+        "transport failure has no sense data"
+    );
+    assert!(
+        !err.is_marginal_read(),
+        "transport failure must not be classified as marginal-read"
+    );
     match err {
-        Error::ScsiError {
-            status, sense_key, ..
-        } => {
-            assert_eq!(status, 0xFF, "transport failure must surface as 0xFF");
-            assert_eq!(sense_key, 0, "transport failure has no sense key");
+        Error::ScsiError { status, sense, .. } => {
+            assert_eq!(status, SCSI_STATUS_TRANSPORT_FAILURE);
+            assert!(sense.is_none());
         }
         other => panic!("expected ScsiError, got {other:?}"),
     }
 }
 
-// ── 3. SCSI-level failure with descriptor-format sense (0x72) ─────────────
+// ── 3. CHECK CONDITION + ILLEGAL REQUEST ──────────────────────────────────
 
 #[test]
-fn test_scsi_failure_descriptor_format_illegal_request() {
-    // A real device returning CHECK CONDITION (status 0x02) with
-    // descriptor-format sense indicating ILLEGAL REQUEST (key 5).
-    // The Linux backend's parse_sense_key reads byte 1; the caller sees
-    // sense_key = 5.
-    let mut transport = MockTransport::new(vec![MockOutcome::ScsiFailure {
-        status: 0x02,
-        sense_key: 5,
-    }]);
-
+fn test_check_cond_illegal_request_carries_sense() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_ILLEGAL_REQUEST)]);
     let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
-    match err {
-        Error::ScsiError {
-            opcode,
-            status,
-            sense_key,
-        } => {
-            assert_eq!(opcode, libfreemkv::scsi::SCSI_INQUIRY);
-            assert_eq!(status, 0x02);
-            assert_eq!(sense_key, 5);
-        }
-        other => panic!("expected ScsiError, got {other:?}"),
-    }
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert_eq!(sense.sense_key, SENSE_KEY_ILLEGAL_REQUEST);
+    assert!(sense.is_illegal_request());
+    assert!(!err.is_marginal_read(), "ILLEGAL REQUEST is not marginal");
+    assert!(!err.is_scsi_transport_failure());
 }
 
-// ── 4. SCSI-level failure with NOT READY sense ───────────────────────────
-//
-// `drive_has_disc` matches on sense_key 2 to mean "no disc inserted"
-// rather than a hard error. Pin that contract via the consumer.
+// ── 4. CHECK CONDITION + NOT READY (drive_has_disc relies on this) ────────
 
 #[test]
-fn test_scsi_failure_not_ready_key_2_propagates_intact() {
-    let mut transport = MockTransport::new(vec![MockOutcome::ScsiFailure {
-        status: 0x02,
-        sense_key: 2,
-    }]);
-
+fn test_check_cond_not_ready_predicate() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_NOT_READY)]);
     let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
-    match err {
-        Error::ScsiError {
-            status, sense_key, ..
-        } => {
-            assert_eq!(status, 0x02);
-            assert_eq!(sense_key, 2);
-        }
-        other => panic!("expected ScsiError, got {other:?}"),
-    }
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_not_ready(), "sense_key 2 ⇒ is_not_ready");
+    assert!(!err.is_marginal_read(), "NOT READY is not marginal");
 }
 
-// ── 5. SCSI-level failure with empty sense ───────────────────────────────
-//
-// Backends pass `sb_len_wr` to `parse_sense_key`; when zero, the helper
-// returns 0. From the caller's perspective this is `sense_key = 0`
-// (NO SENSE) on a non-zero status — surface that contract.
+// ── 5. CHECK CONDITION + MEDIUM ERROR (canonical marginal-read) ───────────
 
 #[test]
-fn test_scsi_failure_empty_sense_returns_key_0() {
-    let mut transport = MockTransport::new(vec![MockOutcome::ScsiFailure {
-        status: 0x02,
-        sense_key: 0,
-    }]);
-
+fn test_check_cond_medium_error_is_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_MEDIUM_ERROR)]);
     let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
-    match err {
-        Error::ScsiError {
-            status, sense_key, ..
-        } => {
-            assert_eq!(status, 0x02);
-            assert_eq!(sense_key, 0);
-        }
-        other => panic!("expected ScsiError, got {other:?}"),
-    }
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_medium_error());
+    assert!(sense.is_marginal());
+    assert!(
+        err.is_marginal_read(),
+        "MEDIUM ERROR is the canonical marginal-read signal"
+    );
 }
 
-// ── 6. Healthy short transfer (resid > 0) ────────────────────────────────
+// ── 6. CHECK CONDITION + ABORTED COMMAND (also marginal) ──────────────────
+
+#[test]
+fn test_check_cond_aborted_command_is_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_ABORTED_COMMAND)]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_aborted_command());
+    assert!(err.is_marginal_read(), "ABORTED COMMAND is marginal");
+}
+
+// ── 7. CHECK CONDITION + RECOVERED ERROR (drive recovered; marginal) ──────
+
+#[test]
+fn test_check_cond_recovered_error_is_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_RECOVERED_ERROR)]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+    assert!(
+        err.is_marginal_read(),
+        "RECOVERED ERROR is treated as marginal (drive recovered, retry-friendly class)"
+    );
+}
+
+// ── 8. CHECK CONDITION + HARDWARE ERROR (NOT marginal — bail) ─────────────
+
+#[test]
+fn test_check_cond_hardware_error_not_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_HARDWARE_ERROR)]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_hardware_error());
+    assert!(
+        !err.is_marginal_read(),
+        "HARDWARE ERROR must not be marginal — drive failing, retry can't help"
+    );
+}
+
+// ── 9. CHECK CONDITION + DATA PROTECT (NOT marginal — bail) ───────────────
+
+#[test]
+fn test_check_cond_data_protect_not_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_DATA_PROTECT)]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_data_protect());
+    assert!(
+        !err.is_marginal_read(),
+        "DATA PROTECT (AACS / region) must not be marginal — retry can't help"
+    );
+}
+
+// ── 10. CHECK CONDITION + UNIT ATTENTION (NOT marginal — caller rescans) ──
+
+#[test]
+fn test_check_cond_unit_attention_not_marginal() {
+    let mut transport = MockTransport::new(vec![check_cond(SENSE_KEY_UNIT_ATTENTION)]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+
+    let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
+    assert!(sense.is_unit_attention());
+    assert!(
+        !err.is_marginal_read(),
+        "UNIT ATTENTION must not be marginal — caller should rescan, not retry"
+    );
+}
+
+// ── 11. ASC/ASCQ propagate from sense buffer to ScsiError.sense ───────────
+
+#[test]
+fn test_asc_ascq_round_trip_through_error() {
+    let outcome = MockOutcome::ScsiFailure {
+        status: SCSI_STATUS_CHECK_CONDITION,
+        sense: ScsiSense {
+            sense_key: SENSE_KEY_MEDIUM_ERROR,
+            asc: 0x11,
+            ascq: 0x05, // L-EC UNCORRECTABLE
+        },
+    };
+    let mut transport = MockTransport::new(vec![outcome]);
+    let err = libfreemkv::scsi::inquiry(&mut transport).unwrap_err();
+
+    let sense = err.scsi_sense().expect("must carry sense");
+    assert_eq!(sense.sense_key, SENSE_KEY_MEDIUM_ERROR);
+    assert_eq!(sense.asc, 0x11);
+    assert_eq!(sense.ascq, 0x05);
+}
+
+// ── 12. Healthy short transfer (resid > 0) ────────────────────────────────
 
 #[test]
 fn test_healthy_short_transfer_reports_partial_bytes() {
@@ -243,9 +330,6 @@ fn test_healthy_short_transfer_reports_partial_bytes() {
         resid: 16,
     }]);
 
-    // Drive INQUIRY through the public helper to exercise the consumer
-    // path; INQUIRY itself doesn't act on bytes_transferred but the
-    // transport contract is what we care about.
     let cdb = [libfreemkv::scsi::SCSI_INQUIRY, 0, 0, 0, 0x60, 0];
     let mut buf = [0u8; 96];
     let r = transport
@@ -258,25 +342,28 @@ fn test_healthy_short_transfer_reports_partial_bytes() {
     );
 }
 
-// ── 7. Error::Display does not leak English in the SCSI variant ───────────
+// ── 13. Error::Display does not leak English in the SCSI variant ──────────
 //
 // Library rule (CLAUDE.md): no English in error display, only "E{code}"
-// + structured data. Existing error-mod tests cover the new variants;
-// this is a regression guard for the SCSI variant specifically because
-// it's the most-emitted error in the rip path.
+// + structured data. Regression guard for the SCSI variant specifically
+// because it's the most-emitted error in the rip path.
 
 #[test]
 fn test_scsi_error_display_format_is_codes_only() {
     let err = Error::ScsiError {
         opcode: 0x12,
-        status: 0x02,
-        sense_key: 5,
+        status: SCSI_STATUS_CHECK_CONDITION,
+        sense: Some(ScsiSense {
+            sense_key: SENSE_KEY_ILLEGAL_REQUEST,
+            asc: 0x24,
+            ascq: 0x00,
+        }),
     };
     let s = err.to_string();
     assert!(s.starts_with("E4000:"), "ScsiError must lead with E4000: {s}");
     assert!(
-        s.contains("0x12") && s.contains("0x02") && s.contains("0x05"),
-        "ScsiError must show opcode/status/sense_key in hex: {s}"
+        s.contains("0x12") && s.contains("0x02") && s.contains("0x05") && s.contains("0x24"),
+        "ScsiError must show opcode/status/key/asc in hex: {s}"
     );
     // Crude English filter — same as the inline error.rs::display test.
     for word in s.split(|c: char| !c.is_ascii_alphabetic()) {
@@ -285,4 +372,23 @@ fn test_scsi_error_display_format_is_codes_only() {
             "ScsiError display contains suspicious word `{word}`: {s}"
         );
     }
+}
+
+// ── 14. Transport-failure Display omits sense fields ──────────────────────
+
+#[test]
+fn test_scsi_transport_failure_display_short_form() {
+    let err = Error::ScsiError {
+        opcode: 0x28,
+        status: SCSI_STATUS_TRANSPORT_FAILURE,
+        sense: None,
+    };
+    let s = err.to_string();
+    assert!(s.starts_with("E4000:"));
+    assert!(s.contains("0x28") && s.contains("0xff"));
+    // No sense triple should appear in the no-sense form.
+    assert!(
+        !s.contains("0x00/0x00/0x00"),
+        "transport failure must not carry phantom sense: {s}"
+    );
 }

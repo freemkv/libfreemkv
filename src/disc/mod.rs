@@ -1382,16 +1382,14 @@ impl Disc {
                 let read_t0 = block_t0;
                 let block_bytes_usz = block_bytes as usize;
                 iter_count += 1;
-                let block_ok = reader
-                    .read_sectors(
-                        block_lba,
-                        block_count,
-                        &mut buf[..block_bytes_usz],
-                        recovery,
-                    )
-                    .is_ok();
+                let block_result = reader.read_sectors(
+                    block_lba,
+                    block_count,
+                    &mut buf[..block_bytes_usz],
+                    recovery,
+                );
 
-                if block_ok {
+                if block_result.is_ok() {
                     // Fast path — full block read cleanly.
                     read_ok_count += 1;
                     if opts.decrypt {
@@ -1413,6 +1411,31 @@ impl Disc {
                     return Err(Error::DiscRead {
                         sector: block_lba as u64,
                     });
+                } else if !block_result
+                    .as_ref()
+                    .err()
+                    .map(Error::is_marginal_read)
+                    .unwrap_or(false)
+                {
+                    // 0.13.23: SCSI sense-aware dispatch. Block read failed
+                    // with a sense class outside the marginal-read set
+                    // (real transport failure, HARDWARE ERROR, DATA
+                    // PROTECT, UNIT ATTENTION, NOT READY, ILLEGAL
+                    // REQUEST, kernel IoError). Bail with the full sense
+                    // triple preserved — caller (autorip) surfaces
+                    // "physical replug needed" / "drive failing" /
+                    // "media changed" / etc to the user. Hysteresis
+                    // would just hammer the same failure for thousands
+                    // of sectors at 1.4 sec each.
+                    let err = block_result.err().unwrap();
+                    tracing::trace!(
+                        target: "freemkv::disc",
+                        phase = "bail",
+                        lba = block_lba,
+                        error = %err,
+                        "block read failed with non-recoverable sense; bailing"
+                    );
+                    return Err(err);
                 } else {
                     // Block failed → drop to Single and read this range
                     // sector-by-sector. Stay in Single across subsequent
@@ -1445,9 +1468,30 @@ impl Disc {
                         let s_lba = block_lba + s as u32;
                         let s_pos = pos + (s as u64) * 2048;
                         let one_bytes = 2048usize;
-                        let one_ok = reader
-                            .read_sectors(s_lba, 1, &mut buf[..one_bytes], recovery)
-                            .is_ok();
+                        let one_result =
+                            reader.read_sectors(s_lba, 1, &mut buf[..one_bytes], recovery);
+                        // 0.13.23: same sense-aware dispatch inside Single
+                        // mode. If a single-sector read fails with a
+                        // non-marginal sense (transport / hardware /
+                        // DATA PROTECT / UNIT ATTENTION / NOT READY /
+                        // ILLEGAL REQUEST / kernel IoError), the drive
+                        // isn't going to start succeeding for the next
+                        // 60 sectors either — bail with full sense info
+                        // rather than chewing through bpt=1 timeouts.
+                        if let Err(ref e) = one_result {
+                            if !e.is_marginal_read() {
+                                let err = one_result.err().unwrap();
+                                tracing::trace!(
+                                    target: "freemkv::disc",
+                                    phase = "bail",
+                                    lba = s_lba,
+                                    error = %err,
+                                    "bpt=1 read failed with non-marginal sense; bailing"
+                                );
+                                return Err(err);
+                            }
+                        }
+                        let one_ok = one_result.is_ok();
                         if one_ok {
                             read_ok_count += 1;
                             consecutive_good = consecutive_good.saturating_add(1);
@@ -1769,9 +1813,30 @@ impl Disc {
                 let count = (block_bytes / 2048) as u16;
                 let bytes = count as usize * 2048;
                 blocks_attempted += 1;
-                let read_ok = reader
-                    .read_sectors(lba, count, &mut buf[..bytes], recovery)
-                    .is_ok();
+                let read_result = reader.read_sectors(lba, count, &mut buf[..bytes], recovery);
+                // 0.13.23: parity with Disc::copy — bail immediately on a
+                // non-marginal SCSI sense (transport failure, HARDWARE
+                // ERROR, DATA PROTECT, UNIT ATTENTION, NOT READY,
+                // ILLEGAL REQUEST, kernel IoError). The wedged_threshold
+                // counter is a defense-in-depth backstop for ~50
+                // consecutive marginal failures, but a single
+                // non-marginal error already proves the drive can't
+                // produce data this pass — don't waste 50× the timeout
+                // budget proving it again.
+                if let Err(ref e) = read_result {
+                    if !e.is_marginal_read() {
+                        let err = read_result.err().unwrap();
+                        tracing::trace!(
+                            target: "freemkv::disc",
+                            phase = "patch_bail",
+                            lba,
+                            error = %err,
+                            "patch read failed with non-marginal sense; bailing"
+                        );
+                        return Err(err);
+                    }
+                }
+                let read_ok = read_result.is_ok();
                 if read_ok {
                     blocks_read_ok += 1;
                     consecutive_failures = 0;

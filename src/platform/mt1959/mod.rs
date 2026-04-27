@@ -96,8 +96,8 @@ impl Mt1959 {
         if result.bytes_transferred != expected {
             return Err(Error::ScsiError {
                 opcode: SCSI_READ_BUFFER,
-                status: 0xFF,
-                sense_key: 0,
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
             });
         }
         Ok(result.bytes_transferred)
@@ -169,8 +169,8 @@ impl Mt1959 {
         }
         Err(Error::ScsiError {
             opcode: SCSI_READ_BUFFER,
-            status: 0xFF,
-            sense_key: 0,
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
         })
     }
 
@@ -275,8 +275,8 @@ impl Mt1959 {
             {
                 return Err(Error::ScsiError {
                     opcode: SCSI_READ_BUFFER,
-                    status: 0xFF,
-                    sense_key: 0,
+                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                    sense: None,
                 });
             }
             addr = addr.wrapping_add(PROBE_STEP);
