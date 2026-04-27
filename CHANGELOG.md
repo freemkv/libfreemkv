@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.13.22 (2026-04-26)
+
+### Replace bisect-on-fail with hysteresis state machine (Block ↔ Single)
+
+Live test on Dune 2 v0.13.21 showed bisect-on-fail recovered every
+recoverable sector, but spent ~30 sec per damaged 60-block (paying a
+~5 sec kernel timeout at every bisection level). Each level descended
+log₂(60) ≈ 6 times on the failing branch.
+
+Replaced with a two-state hysteresis machine in `Disc::copy`:
+
+```
+Block(batch):
+  read(batch) ok    → write, advance, stay Block
+  read(batch) fail  → switch to Single, retry SAME range at bpt=1
+
+Single:
+  read(1) ok    → write, consecutive_good++
+                  if consecutive_good >= BPT1_EXIT_THRESHOLD:
+                     switch to Block, reset counter
+  read(1) fail  → mark NonTrimmed, consecutive_good = 0
+```
+
+`BPT1_EXIT_THRESHOLD = 10_000` sectors (= 20 MB of clean data).
+Calibrated from the 2026-04-26 BU40N empirical run; tunable.
+
+Per-block cost on a 60-sector damaged block with 1 bad sector:
+- Bisect (v0.13.21): ~30 sec (5 s × 6 levels)
+- Hysteresis (v0.13.22): ~10 sec (5 s bpt=batch fail + 59 × 1 ms good
+  + 1 × 5 s bad)
+
+Plus inside a damaged cluster spanning many 60-blocks, hysteresis
+pays the bpt=batch fail cost ONCE on entry; bisection paid it every
+60 sectors. For Dune 2's ~1248-sector boundary cluster that's ~21
+fewer 5-sec waits = ~100 sec saved.
+
+Telemetry: new `phase=mode_change` trace event with `from`, `to`,
+`lba`, `consecutive_good`. Replaces v0.13.21's `phase=bisect`. The
+v0.13.21 worklist DFS is gone — single iterative `for s in 0..count`
+on the failure path.
+
+Test rename:
+`test_disc_copy_bisect_recovers_via_single_sector_reads` →
+`test_disc_copy_hysteresis_recovers_via_single_sector_reads`. Same
+synthetic BU40N-pattern reader; same 100% recovery expectation.
+
 ## 0.13.21 (2026-04-26)
 
 ### Fix: Disc::copy bisect-on-fail (replaces skip-forward)

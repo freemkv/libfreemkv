@@ -538,16 +538,18 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     );
 }
 
-// ── 8. Bisect-on-fail recovers data the drive can read individually ──────
+// ── 8. Hysteresis recovers data the drive can read individually ──────────
 //
 // Empirically observed on the LG BU40N: in damaged regions the drive fails
 // multi-sector READ commands but reads each sector cleanly when asked one
-// at a time. Disc::copy's bisect-on-fail must recover those sectors
-// without bailing or skip-forwarding past clean territory.
+// at a time. Disc::copy's hysteresis state machine (0.13.22, replaces the
+// 0.13.21 bisect-on-fail) drops to bpt=1 on the first multi-sector failure
+// and stays there until BPT1_EXIT_THRESHOLD consecutive good single-sector
+// reads, then returns to bpt=batch.
 //
 // Fixture: a reader that returns Err for any read with count > 1, and Ok
-// for count == 1. With bisect-on-fail, we must observe a 100 % bytes_good
-// outcome — every sector recovered via the bisection.
+// for count == 1. The full disc must recover via the bpt=1 path with
+// 100 % bytes_good outcome.
 
 struct BlockSizeFailingReader {
     capacity: u32,
@@ -578,11 +580,13 @@ impl SectorReader for BlockSizeFailingReader {
 }
 
 #[test]
-fn test_disc_copy_bisect_recovers_via_single_sector_reads() {
+fn test_disc_copy_hysteresis_recovers_via_single_sector_reads() {
     // 256 sectors = 0.5 MB. Reader fails any multi-sector read but
-    // succeeds on bpt=1. Bisection must descend log2(batch) levels and
-    // recover every sector. This is the BU40N bad-zone pattern in
-    // miniature.
+    // succeeds on bpt=1. The hysteresis path must drop to Single mode on
+    // the first multi-sector failure and recover every sector at bpt=1.
+    // Stays in Single mode until BPT1_EXIT_THRESHOLD reached (10 000
+    // sectors); since this disc is only 256 sectors we never re-enter
+    // Block mode, which is fine — every sector still recovers.
     let capacity_sectors: u32 = 256;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 

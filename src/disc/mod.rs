@@ -1286,11 +1286,26 @@ impl Disc {
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
+        // Hysteresis state (0.13.22): Block(batch) <-> Single(bpt=1).
+        // mode_single=false means we're in Block mode (default). On a
+        // multi-sector read failure we flip to Single, walk the failed
+        // range sector-by-sector, and stay in Single until we hit
+        // BPT1_EXIT_THRESHOLD consecutive good reads — then back to Block.
+        let mut mode_single = false;
+        let mut consecutive_good: u64 = 0;
+        // Wallclock cadence for the progress callback. Default outer-loop
+        // tick is per-block, which is once every few ms in clean territory
+        // but can be tens of seconds (or minutes) in dense single-mode
+        // recovery. Fire the callback on a wallclock interval too so the
+        // UI shows movement even mid-cluster.
+        let mut last_progress_t = std::time::Instant::now();
+        const PROGRESS_TICK: std::time::Duration = std::time::Duration::from_secs(2);
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
             total_bytes,
             batch,
+            bpt1_exit_threshold = BPT1_EXIT_THRESHOLD,
             "Disc::copy entered"
         );
 
@@ -1341,81 +1356,158 @@ impl Disc {
                 let block_count = (block_bytes / 2048) as u16;
                 let recovery = !opts.skip_on_error;
 
-                // Bisect-on-fail (0.13.21): try the full block first; on read
-                // failure, recursively split into halves down to single-sector
-                // reads. Recovers data the drive can read individually but
-                // fails as a multi-sector block — empirically the BU40N's
-                // bad-zone pattern (see freemkv-private/docs/TEST_PLAN.md).
+                // Hysteresis state machine (0.13.22, replaces v0.13.21
+                // bisect-on-fail): two states.
                 //
-                // Pre-0.13.21 we skip-forwarded by an exponentially-growing
-                // jump (capped at 1% of disc), which marked vast tracts of
-                // *clean* territory as bad just because it sat past one bad
-                // block. With bisection we descend only into the ~14% of
-                // bisection leaves that are truly unreadable; the other ~86%
-                // recover at smaller block sizes within the same pass.
-                let mut work: Vec<(u32, u16)> = vec![(block_lba, block_count)];
-                while let Some((sub_lba, sub_count)) = work.pop() {
-                    if let Some(ref h) = opts.halt {
-                        if h.load(std::sync::atomic::Ordering::Relaxed) {
-                            halt_requested = true;
-                            break 'outer;
-                        }
-                    }
-                    iter_count += 1;
-                    let sub_bytes = sub_count as usize * 2048;
-                    let sub_pos = sub_lba as u64 * 2048;
-                    let read_t0 = std::time::Instant::now();
-                    let read_ok = reader
-                        .read_sectors(sub_lba, sub_count, &mut buf[..sub_bytes], recovery)
-                        .is_ok();
-                    let read_elapsed_ms = read_t0.elapsed().as_millis() as u64;
+                //   Block(batch): try the full block. On success, write,
+                //     advance, stay in Block. On failure, switch to Single
+                //     and retry the same range one sector at a time.
+                //
+                //   Single: read at bpt=1. Each success increments
+                //     consecutive_good; once that reaches BPT1_EXIT_THRESHOLD
+                //     we switch back to Block. Each failure marks the sector
+                //     NonTrimmed and resets consecutive_good = 0.
+                //
+                // Why not bisection: the v0.13.21 bisect-on-fail descended
+                // log2(batch) levels on every multi-sector failure, paying
+                // a ~5 s kernel timeout at every level. For a 60-block with
+                // 1 bad sector the cost was ~30 s. Direct drop to bpt=1
+                // pays ~10 s for the same outcome. And once we're inside a
+                // bad cluster we stay there at bpt=1 instead of repeatedly
+                // re-trying bpt=batch (each fail = another ~5 s wasted).
+                //
+                // Empirical justification:
+                //   freemkv-private/docs/audits/2026-04-26-bisect-on-fail-empirical-findings.md
+                let block_t0 = std::time::Instant::now();
+                let read_t0 = block_t0;
+                let block_bytes_usz = block_bytes as usize;
+                iter_count += 1;
+                let block_ok = reader
+                    .read_sectors(
+                        block_lba,
+                        block_count,
+                        &mut buf[..block_bytes_usz],
+                        recovery,
+                    )
+                    .is_ok();
 
-                    if read_ok {
-                        read_ok_count += 1;
-                        if opts.decrypt {
-                            crate::decrypt::decrypt_sectors(&mut buf[..sub_bytes], &keys, 0)?;
-                        }
-                        file.seek(SeekFrom::Start(sub_pos))
-                            .map_err(|e| Error::IoError { source: e })?;
-                        file.write_all(&buf[..sub_bytes])
-                            .map_err(|e| Error::IoError { source: e })?;
-                        map.record(sub_pos, sub_bytes as u64, mapfile::SectorStatus::Finished)
-                            .map_err(|e| Error::IoError { source: e })?;
-                        bytes_done = bytes_done.saturating_add(sub_bytes as u64);
-                    } else if opts.skip_on_error && sub_count > 1 {
-                        // Bisect: split this sub-block in half. LIFO push
-                        // (second half first) so the first half is processed
-                        // next — keeps reads roughly in-order, helping the
-                        // drive's read-ahead cache.
-                        let half = sub_count / 2;
-                        work.push((sub_lba + half as u32, sub_count - half));
-                        work.push((sub_lba, half));
+                if block_ok {
+                    // Fast path — full block read cleanly.
+                    read_ok_count += 1;
+                    if opts.decrypt {
+                        crate::decrypt::decrypt_sectors(
+                            &mut buf[..block_bytes_usz],
+                            &keys,
+                            0,
+                        )?;
+                    }
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&buf[..block_bytes_usz])
+                        .map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    bytes_done = bytes_done.saturating_add(block_bytes);
+                } else if !opts.skip_on_error {
+                    // Strict mode (skip_on_error=false): abort on first bad.
+                    return Err(Error::DiscRead {
+                        sector: block_lba as u64,
+                    });
+                } else {
+                    // Block failed → drop to Single and read this range
+                    // sector-by-sector. Stay in Single across subsequent
+                    // outer-loop blocks until we hit
+                    // BPT1_EXIT_THRESHOLD consecutive good single-sector
+                    // reads, then return to Block mode.
+                    if !mode_single {
                         tracing::trace!(
                             target: "freemkv::disc",
-                            phase = "bisect",
-                            sub_lba,
-                            sub_count,
-                            half,
-                            read_elapsed_ms,
-                            "bisecting failed block"
+                            phase = "mode_change",
+                            from = "Block",
+                            to = "Single",
+                            lba = block_lba,
+                            block_elapsed_ms = read_t0.elapsed().as_millis() as u64,
+                            "block read failed; switching to bpt=1"
                         );
-                    } else if opts.skip_on_error {
-                        // Single-sector failure — truly unreadable.
-                        // Zero-fill, mark NonTrimmed for the patch passes.
-                        read_err_count += 1;
-                        buf[..sub_bytes].fill(0);
-                        file.seek(SeekFrom::Start(sub_pos))
-                            .map_err(|e| Error::IoError { source: e })?;
-                        file.write_all(&buf[..sub_bytes])
-                            .map_err(|e| Error::IoError { source: e })?;
-                        map.record(sub_pos, sub_bytes as u64, mapfile::SectorStatus::NonTrimmed)
-                            .map_err(|e| Error::IoError { source: e })?;
-                    } else {
-                        // skip_on_error=false: abort on first bad sector
-                        // (Disc::copy's strict mode, used by some callers).
-                        return Err(Error::DiscRead {
-                            sector: sub_lba as u64,
-                        });
+                        mode_single = true;
+                        consecutive_good = 0;
+                    }
+
+                    // Walk the failed block one sector at a time.
+                    for s in 0..block_count {
+                        if let Some(ref h) = opts.halt {
+                            if h.load(std::sync::atomic::Ordering::Relaxed) {
+                                halt_requested = true;
+                                break 'outer;
+                            }
+                        }
+                        iter_count += 1;
+                        let s_lba = block_lba + s as u32;
+                        let s_pos = pos + (s as u64) * 2048;
+                        let one_bytes = 2048usize;
+                        let one_ok = reader
+                            .read_sectors(s_lba, 1, &mut buf[..one_bytes], recovery)
+                            .is_ok();
+                        if one_ok {
+                            read_ok_count += 1;
+                            consecutive_good = consecutive_good.saturating_add(1);
+                            if opts.decrypt {
+                                crate::decrypt::decrypt_sectors(
+                                    &mut buf[..one_bytes],
+                                    &keys,
+                                    0,
+                                )?;
+                            }
+                            file.seek(SeekFrom::Start(s_pos))
+                                .map_err(|e| Error::IoError { source: e })?;
+                            file.write_all(&buf[..one_bytes])
+                                .map_err(|e| Error::IoError { source: e })?;
+                            map.record(s_pos, 2048, mapfile::SectorStatus::Finished)
+                                .map_err(|e| Error::IoError { source: e })?;
+                            bytes_done = bytes_done.saturating_add(2048);
+
+                            if consecutive_good >= BPT1_EXIT_THRESHOLD {
+                                tracing::trace!(
+                                    target: "freemkv::disc",
+                                    phase = "mode_change",
+                                    from = "Single",
+                                    to = "Block",
+                                    lba = s_lba + 1,
+                                    consecutive_good,
+                                    "exit threshold reached; returning to bpt=batch"
+                                );
+                                mode_single = false;
+                                consecutive_good = 0;
+                            }
+                        } else {
+                            read_err_count += 1;
+                            consecutive_good = 0;
+                            buf[..one_bytes].fill(0);
+                            file.seek(SeekFrom::Start(s_pos))
+                                .map_err(|e| Error::IoError { source: e })?;
+                            file.write_all(&buf[..one_bytes])
+                                .map_err(|e| Error::IoError { source: e })?;
+                            map.record(s_pos, 2048, mapfile::SectorStatus::NonTrimmed)
+                                .map_err(|e| Error::IoError { source: e })?;
+                        }
+
+                        // Wallclock-cadence progress callback during
+                        // single-mode grinding. Without this, the UI
+                        // appears frozen for tens of seconds while we
+                        // chew through bad sectors.
+                        if last_progress_t.elapsed() >= PROGRESS_TICK {
+                            last_progress_t = std::time::Instant::now();
+                            if let Some(reporter) = opts.progress {
+                                let stats = map.stats();
+                                reporter.report(&crate::progress::PassProgress {
+                                    kind: crate::progress::PassKind::Sweep,
+                                    work_done: pos + (s as u64 + 1) * 2048,
+                                    work_total: total_bytes,
+                                    bytes_good_total: stats.bytes_good,
+                                    bytes_total_disc: total_bytes,
+                                });
+                            }
+                        }
                     }
                 }
                 pos += block_bytes;
@@ -1448,6 +1540,7 @@ impl Disc {
                         bytes_good_total: stats.bytes_good,
                         bytes_total_disc: total_bytes,
                     });
+                    last_progress_t = std::time::Instant::now();
                 }
             }
         }
@@ -1783,6 +1876,80 @@ impl Disc {
 const MAX_BATCH_SECTORS: u16 = 510;
 const DEFAULT_BATCH_SECTORS: u16 = 60;
 const MIN_BATCH_SECTORS: u16 = 3;
+
+/// Number of consecutive good single-sector reads required to exit
+/// `Single` mode (bpt=1) and return to `Block` mode (bpt=batch). 10 000
+/// sectors ≈ 20 MB of clean data — long enough that we don't bounce in
+/// and out of bpt=1 inside a sparse-bad cluster, short enough that we
+/// don't waste much time reading clean territory at bpt=1 after the
+/// damaged region ends. Tunable; calibrated from the 2026-04-26 BU40N
+/// live test.
+const BPT1_EXIT_THRESHOLD: u64 = 10_000;
+
+/// Coarse damage tier for a finished or in-progress rip. Maps the
+/// observable signals (bad sector count + lost wallclock playback time)
+/// onto a small discrete classification so UIs can render a colored badge
+/// and operators can decide whether to rescan / replug / accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DamageSeverity {
+    /// No bad sectors at all.
+    Clean,
+    /// 1–50 bad sectors AND <1 sec lost. Likely unnoticeable.
+    Cosmetic,
+    /// 51–500 sectors OR 1–30 sec lost. Visible artifacts possible.
+    Moderate,
+    /// 500+ sectors OR 30+ sec lost. Significant damage; consider rescan
+    /// or different drive.
+    Serious,
+}
+
+/// Classify damage severity from raw counters. `bad_sectors` is the
+/// number of sectors marked unreadable (or NonTrimmed pending Pass 2);
+/// `lost_ms` is the cumulative wallclock playback time those sectors
+/// represent (computed from the title's bytes-per-sec).
+pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> DamageSeverity {
+    if bad_sectors == 0 {
+        return DamageSeverity::Clean;
+    }
+    if bad_sectors >= 500 || lost_ms >= 30_000.0 {
+        return DamageSeverity::Serious;
+    }
+    if bad_sectors >= 51 || lost_ms >= 1_000.0 {
+        return DamageSeverity::Moderate;
+    }
+    DamageSeverity::Cosmetic
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::*;
+    #[test]
+    fn clean_when_no_damage() {
+        assert_eq!(classify_damage(0, 0.0), DamageSeverity::Clean);
+    }
+    #[test]
+    fn cosmetic_for_a_handful() {
+        assert_eq!(classify_damage(1, 5.0), DamageSeverity::Cosmetic);
+        assert_eq!(classify_damage(50, 999.0), DamageSeverity::Cosmetic);
+    }
+    #[test]
+    fn moderate_threshold_by_sectors() {
+        assert_eq!(classify_damage(51, 0.0), DamageSeverity::Moderate);
+    }
+    #[test]
+    fn moderate_threshold_by_time() {
+        assert_eq!(classify_damage(10, 1_000.0), DamageSeverity::Moderate);
+    }
+    #[test]
+    fn serious_threshold_by_sectors() {
+        assert_eq!(classify_damage(500, 0.0), DamageSeverity::Serious);
+    }
+    #[test]
+    fn serious_threshold_by_time() {
+        assert_eq!(classify_damage(10, 30_000.0), DamageSeverity::Serious);
+    }
+}
 
 /// Detect the maximum transfer size in sectors for a device.
 /// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
