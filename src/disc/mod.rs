@@ -1284,22 +1284,14 @@ impl Disc {
         let copy_t0 = std::time::Instant::now();
         let mut iter_count: u64 = 0;
         let mut read_ok_count: u64 = 0;
-        let mut read_err_count: u64 = 0;
+        let read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
-        // Hysteresis state (0.13.22): Block(batch) <-> Single(bpt=1).
-        // mode_single=false means we're in Block mode (default). On a
-        // multi-sector read failure we flip to Single, walk the failed
-        // range sector-by-sector, and stay in Single until we hit
-        // BPT1_EXIT_THRESHOLD consecutive good reads — then back to Block.
-        let mut mode_single = false;
+        // Simple read strategy: start in block mode, drop to 1 sector on any
+        // failure, then after BPT1_EXIT_THRESHOLD consecutive good single-sector
+        // reads we try block mode again. This avoids hammering every sector
+        // in a big bad zone with a slow timeout at block size.
+        let mut use_single = false;
         let mut consecutive_good: u64 = 0;
-        // Wallclock cadence for the progress callback. Default outer-loop
-        // tick is per-block, which is once every few ms in clean territory
-        // but can be tens of seconds (or minutes) in dense single-mode
-        // recovery. Fire the callback on a wallclock interval too so the
-        // UI shows movement even mid-cluster.
-        let mut last_progress_t = std::time::Instant::now();
-        const PROGRESS_TICK: std::time::Duration = std::time::Duration::from_secs(2);
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
@@ -1345,68 +1337,62 @@ impl Disc {
             );
 
             while pos < region_end {
+                // Check halt
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
                         halt_requested = true;
                         break 'outer;
                     }
                 }
-                let block_bytes = (region_end - pos).min(batch as u64 * 2048);
+
+                // Decide read size: if use_single, read 1 sector; else use batch
+                let block_bytes = if use_single {
+                    (region_end - pos).min(2048) // 1 sector
+                } else {
+                    (region_end - pos).min(batch as u64 * 2048)
+                };
                 let block_lba = (pos / 2048) as u32;
                 let block_count = (block_bytes / 2048) as u16;
                 let recovery = !opts.skip_on_error;
 
-                // Hysteresis state machine (0.13.22, replaces v0.13.21
-                // bisect-on-fail): two states.
-                //
-                //   Block(batch): try the full block. On success, write,
-                //     advance, stay in Block. On failure, switch to Single
-                //     and retry the same range one sector at a time.
-                //
-                //   Single: read at bpt=1. Each success increments
-                //     consecutive_good; once that reaches BPT1_EXIT_THRESHOLD
-                //     we switch back to Block. Each failure marks the sector
-                //     NonTrimmed and resets consecutive_good = 0.
-                //
-                // Why not bisection: the v0.13.21 bisect-on-fail descended
-                // log2(batch) levels on every multi-sector failure, paying
-                // a ~5 s kernel timeout at every level. For a 60-block with
-                // 1 bad sector the cost was ~30 s. Direct drop to bpt=1
-                // pays ~10 s for the same outcome. And once we're inside a
-                // bad cluster we stay there at bpt=1 instead of repeatedly
-                // re-trying bpt=batch (each fail = another ~5 s wasted).
-                //
-                // Empirical justification:
-                //   freemkv-private/docs/audits/2026-04-26-bisect-on-fail-empirical-findings.md
-                let block_t0 = std::time::Instant::now();
-                let read_t0 = block_t0;
-                let block_bytes_usz = block_bytes as usize;
-                iter_count += 1;
-                let block_result = reader.read_sectors(
+                let read_result = reader.read_sectors(
                     block_lba,
                     block_count,
-                    &mut buf[..block_bytes_usz],
+                    &mut buf[..block_bytes as usize],
                     recovery,
                 );
 
-                if block_result.is_ok() {
-                    // Fast path — full block read cleanly.
+                if read_result.is_ok() {
+                    // Good read — write to file
                     read_ok_count += 1;
                     if opts.decrypt {
-                        crate::decrypt::decrypt_sectors(&mut buf[..block_bytes_usz], &keys, 0)?;
+                        crate::decrypt::decrypt_sectors(
+                            &mut buf[..block_bytes as usize],
+                            &keys,
+                            0,
+                        )?;
                     }
                     file.seek(SeekFrom::Start(pos))
                         .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..block_bytes_usz])
+                    file.write_all(&buf[..block_bytes as usize])
                         .map_err(|e| Error::IoError { source: e })?;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                         .map_err(|e| Error::IoError { source: e })?;
                     bytes_done = bytes_done.saturating_add(block_bytes);
+
+                    // If we're in single mode and hit threshold, try block mode again
+                    if use_single {
+                        consecutive_good = consecutive_good.saturating_add(1);
+                        if consecutive_good >= BPT1_EXIT_THRESHOLD {
+                            use_single = false;
+                            consecutive_good = 0;
+                        }
+                    }
                 } else if !opts.skip_on_error {
-                    // Strict mode (skip_on_error=false): abort on first bad.
-                    let (status, sense) = block_result
-                        .err()
+                    // Strict mode: abort
+                    let (status, sense) = read_result
                         .as_ref()
+                        .err()
                         .map(extract_scsi_context)
                         .unwrap_or((0, None));
                     return Err(Error::DiscRead {
@@ -1414,200 +1400,61 @@ impl Disc {
                         status: Some(status),
                         sense,
                     });
-                } else if block_result
-                    .as_ref()
-                    .err()
-                    .map(|e| {
-                        let sense = e.scsi_sense();
-                        let is_medium = sense.map(|s| s.is_medium_error()).unwrap_or(false);
-                        eprintln!(
-                            "BLOCK_ERROR: {:?} sense={:?} is_medium={}",
-                            e, sense, is_medium
-                        );
-                        is_medium
-                    })
-                    .unwrap_or(false)
-                {
-                    // 0.13.28: MEDIUM ERROR (bad sector) — skip this sector
-                    // and continue. Retry won't recover it. Fill in pass 2+.
-                    let err = block_result.err().unwrap();
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "skip_bad_sector",
-                        lba = block_lba,
-                        error = %err,
-                        "MEDIUM ERROR; skipping sector"
-                    );
-                    // Record as bad and zero-fill
-                    let zero = vec![0u8; block_bytes as usize];
-                    file.seek(SeekFrom::Start(pos))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&zero[..block_bytes as usize])
-                        .map_err(|e| Error::IoError { source: e })?;
-                    map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    bytes_done = bytes_done.saturating_add(block_bytes);
-                    mode_single = true; // stay in single for subsequent
-                } else if !block_result
-                    .as_ref()
-                    .err()
-                    .map(Error::is_marginal_read)
-                    .unwrap_or(false)
-                {
-                    // 0.13.23: SCSI sense-aware dispatch. Block read failed
-                    // with a sense class outside the marginal-read set
-                    // (real transport failure, HARDWARE ERROR, DATA
-                    // PROTECT, UNIT ATTENTION, NOT READY, ILLEGAL
-                    // REQUEST, kernel IoError). Bail with the full sense
-                    // triple preserved — caller (autorip) surfaces
-                    // "physical replug needed" / "drive failing" /
-                    // "media changed" / etc to the user. Hysteresis
-                    // would just hammer the same failure for thousands
-                    // of sectors at 1.4 sec each.
-                    let err = block_result.err().unwrap();
-                    tracing::trace!(
-                        target: "freemkv::disc",
-                        phase = "bail",
-                        lba = block_lba,
-                        error = %err,
-                        "block read failed with non-recoverable sense; bailing"
-                    );
-                    return Err(err);
-                } else {
-                    // Block failed → drop to Single and read this range
-                    // sector-by-sector. Stay in Single across subsequent
-                    // outer-loop blocks until we hit
-                    // BPT1_EXIT_THRESHOLD consecutive good single-sector
-                    // reads, then return to Block mode.
-                    if !mode_single {
-                        tracing::trace!(
-                            target: "freemkv::disc",
-                            phase = "mode_change",
-                            from = "Block",
-                            to = "Single",
-                            lba = block_lba,
-                            block_elapsed_ms = read_t0.elapsed().as_millis() as u64,
-                            "block read failed; switching to bpt=1"
-                        );
-                        mode_single = true;
-                        consecutive_good = 0;
+                } else if use_single {
+                    // Single sector mode — read failed, mark NonTrimmed
+                    let err = read_result.err().unwrap();
+                    if err.is_marginal_read()
+                        || err.scsi_sense().is_some_and(|s| s.is_medium_error())
+                    {
+                        // Disc-related error at 1 sector — bad sector, mark for pass 2
+                        let is_medium = err.scsi_sense().is_some_and(|s| s.is_medium_error());
+                        if is_medium {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "skip_bad_sector",
+                                lba = block_lba,
+                                error = %err,
+                                "MEDIUM ERROR at 1 sector; marking NonTrimmed"
+                            );
+                        }
+                        // Zero fill, mark NonTrimmed
+                        let zero = vec![0u8; block_bytes as usize];
+                        file.seek(SeekFrom::Start(pos))
+                            .map_err(|e| Error::IoError { source: e })?;
+                        file.write_all(&zero)
+                            .map_err(|e| Error::IoError { source: e })?;
+                        map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
+                            .map_err(|e| Error::IoError { source: e })?;
+                        bytes_done = bytes_done.saturating_add(block_bytes);
+                    } else {
+                        // Transport error at 1 sector — bail
+                        return Err(err);
                     }
-
-                    // Walk the failed block one sector at a time.
-                    for s in 0..block_count {
-                        if let Some(ref h) = opts.halt {
-                            if h.load(std::sync::atomic::Ordering::Relaxed) {
-                                halt_requested = true;
-                                break 'outer;
-                            }
-                        }
-                        iter_count += 1;
-                        let s_lba = block_lba + s as u32;
-                        let s_pos = pos + (s as u64) * 2048;
-                        let one_bytes = 2048usize;
-                        let one_result =
-                            reader.read_sectors(s_lba, 1, &mut buf[..one_bytes], recovery);
-                        // 0.13.23: same sense-aware dispatch inside Single
-                        // mode. If a single-sector read fails with a
-                        // non-marginal sense (transport / hardware /
-                        // DATA PROTECT / UNIT ATTENTION / NOT READY /
-                        // ILLEGAL REQUEST / kernel IoError), the drive
-                        // isn't going to start succeeding for the next
-                        // 60 sectors either — bail with full sense info
-                        // rather than chewing through bpt=1 timeouts.
-                        if let Err(ref e) = one_result {
-                            let is_medium =
-                                e.scsi_sense().map(|s| s.is_medium_error()).unwrap_or(false);
-                            if is_medium {
-                                // 0.13.28: MEDIUM ERROR in single mode — skip sector
-                                tracing::warn!(
-                                    target: "freemkv::disc",
-                                    phase = "skip_bad_sector",
-                                    lba = s_lba,
-                                    error = %e,
-                                    "MEDIUM ERROR in single mode; skipping"
-                                );
-                                let zero = vec![0u8; one_bytes];
-                                file.seek(SeekFrom::Start(s_pos))
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                file.write_all(&zero[..one_bytes])
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                map.record(s_pos, 2048, mapfile::SectorStatus::Unreadable)
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                bytes_done = bytes_done.saturating_add(2048);
-                                continue;
-                            } else if !e.is_marginal_read() {
-                                let err = one_result.err().unwrap();
-                                tracing::trace!(
-                                    target: "freemkv::disc",
-                                    phase = "bail",
-                                    lba = s_lba,
-                                    error = %err,
-                                    "bpt=1 read failed with non-marginal sense; bailing"
-                                );
-                                return Err(err);
-                            }
-                        }
-                        let one_ok = one_result.is_ok();
-                        if one_ok {
-                            read_ok_count += 1;
-                            consecutive_good = consecutive_good.saturating_add(1);
-                            if opts.decrypt {
-                                crate::decrypt::decrypt_sectors(&mut buf[..one_bytes], &keys, 0)?;
-                            }
-                            file.seek(SeekFrom::Start(s_pos))
-                                .map_err(|e| Error::IoError { source: e })?;
-                            file.write_all(&buf[..one_bytes])
-                                .map_err(|e| Error::IoError { source: e })?;
-                            map.record(s_pos, 2048, mapfile::SectorStatus::Finished)
-                                .map_err(|e| Error::IoError { source: e })?;
-                            bytes_done = bytes_done.saturating_add(2048);
-
-                            if consecutive_good >= BPT1_EXIT_THRESHOLD {
-                                tracing::trace!(
-                                    target: "freemkv::disc",
-                                    phase = "mode_change",
-                                    from = "Single",
-                                    to = "Block",
-                                    lba = s_lba + 1,
-                                    consecutive_good,
-                                    "exit threshold reached; returning to bpt=batch"
-                                );
-                                mode_single = false;
-                                consecutive_good = 0;
-                            }
-                        } else {
-                            read_err_count += 1;
-                            consecutive_good = 0;
-                            buf[..one_bytes].fill(0);
-                            file.seek(SeekFrom::Start(s_pos))
-                                .map_err(|e| Error::IoError { source: e })?;
-                            file.write_all(&buf[..one_bytes])
-                                .map_err(|e| Error::IoError { source: e })?;
-                            map.record(s_pos, 2048, mapfile::SectorStatus::NonTrimmed)
-                                .map_err(|e| Error::IoError { source: e })?;
-                        }
-
-                        // Wallclock-cadence progress callback during
-                        // single-mode grinding. Without this, the UI
-                        // appears frozen for tens of seconds while we
-                        // chew through bad sectors.
-                        if last_progress_t.elapsed() >= PROGRESS_TICK {
-                            last_progress_t = std::time::Instant::now();
-                            if let Some(reporter) = opts.progress {
-                                let stats = map.stats();
-                                reporter.report(&crate::progress::PassProgress {
-                                    kind: crate::progress::PassKind::Sweep,
-                                    work_done: pos + (s as u64 + 1) * 2048,
-                                    work_total: total_bytes,
-                                    bytes_good_total: stats.bytes_good,
-                                    bytes_total_disc: total_bytes,
-                                });
-                            }
-                        }
+                    // Stay in single mode for next reads
+                    use_single = true;
+                    consecutive_good = 0;
+                } else {
+                    // Batch mode failed — drop to 1 sector and retry
+                    let err = read_result.err().unwrap();
+                    if err.is_marginal_read()
+                        || err.scsi_sense().is_some_and(|s| s.is_medium_error())
+                    {
+                        // Disc-related error — try 1 sector instead
+                        use_single = true;
+                        consecutive_good = 0;
+                        // Don't advance pos — retry this location at 1 sector
+                        continue;
+                    } else {
+                        // Non-recoverable transport error — bail
+                        return Err(err);
                     }
                 }
+
+                // Advance position
                 pos += block_bytes;
+
+                // Progress callback throttling
+                iter_count += 1;
 
                 // Throttled iter telemetry — every 100 inner iterations.
                 if iter_count - last_log_iter >= 100 {
@@ -1637,7 +1484,6 @@ impl Disc {
                         bytes_good_total: stats.bytes_good,
                         bytes_total_disc: total_bytes,
                     });
-                    last_progress_t = std::time::Instant::now();
                 }
             }
         }
@@ -1802,6 +1648,7 @@ impl Disc {
         let mut blocks_read_ok: u64 = 0;
         let mut blocks_read_failed: u64 = 0;
         let mut consecutive_failures: u64 = 0;
+        let mut unreadable_count: u64 = 0;
         let mut buf = vec![0u8; block_sectors as usize * 2048];
 
         // Collect bad ranges up front. Iterating while mutating is fragile;
@@ -1905,6 +1752,7 @@ impl Disc {
                 } else {
                     blocks_read_failed += 1;
                     consecutive_failures += 1;
+                    unreadable_count += 1;
                     map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
                         .map_err(|e| Error::IoError { source: e })?;
                 }
@@ -1965,12 +1813,13 @@ impl Disc {
 
         file.sync_all().map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
-        tracing::trace!(
+        tracing::info!(
             target: "freemkv::disc",
             phase = "patch_done",
             blocks_attempted,
             blocks_read_ok,
             blocks_read_failed,
+            unreadable_count,
             wedged_exit,
             halted,
             bytes_recovered = stats.bytes_good.saturating_sub(bytes_good_before),
