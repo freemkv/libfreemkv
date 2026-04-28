@@ -386,7 +386,7 @@ impl ScsiTransport for SgIoTransport {
             });
 
             std::thread::spawn(move || {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
                 let new_fd = unsafe {
                     libc::open(
                         c_path.as_ptr() as *const libc::c_char,
