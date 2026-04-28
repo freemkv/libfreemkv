@@ -1414,6 +1414,32 @@ impl Disc {
                         status: Some(status),
                         sense,
                     });
+                } else if block_result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.scsi_sense().map(|s| s.is_medium_error()).unwrap_or(false))
+                    .unwrap_or(false)
+                {
+                    // 0.13.28: MEDIUM ERROR (bad sector) — skip this sector
+                    // and continue. Retry won't recover it. Fill in pass 2+.
+                    let err = block_result.err().unwrap();
+                    tracing::trace!(
+                        target: "freemkv::disc",
+                        phase = "skip_bad_sector",
+                        lba = block_lba,
+                        error = %err,
+                        "MEDIUM ERROR; skipping sector"
+                    );
+                    // Record as bad and zero-fill
+                    let zero = vec![0u8; block_bytes as usize];
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&zero[..block_bytes as usize])
+                        .map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    bytes_done = bytes_done.saturating_add(block_bytes);
+                    mode_single = true; // stay in single for subsequent
                 } else if !block_result
                     .as_ref()
                     .err()
@@ -1482,7 +1508,24 @@ impl Disc {
                         // 60 sectors either — bail with full sense info
                         // rather than chewing through bpt=1 timeouts.
                         if let Err(ref e) = one_result {
-                            if !e.is_marginal_read() {
+                            if e.scsi_sense().map(|s| s.is_medium_error()).unwrap_or(false) {
+                                // 0.13.28: MEDIUM ERROR in single mode — skip sector
+                                tracing::trace!(
+                                    target: "freemkv::disc",
+                                    phase = "skip_bad_sector",
+                                    lba = s_lba,
+                                    "MEDIUM ERROR in single mode; skipping"
+                                );
+                                let zero = vec![0u8; one_bytes];
+                                file.seek(SeekFrom::Start(s_pos))
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                file.write_all(&zero[..one_bytes])
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                map.record(s_pos, 2048, mapfile::SectorStatus::Unreadable)
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                bytes_done = bytes_done.saturating_add(2048);
+                                continue;
+                            } else if !e.is_marginal_read() {
                                 let err = one_result.err().unwrap();
                                 tracing::trace!(
                                     target: "freemkv::disc",
