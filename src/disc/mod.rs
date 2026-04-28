@@ -1284,7 +1284,7 @@ impl Disc {
         let copy_t0 = std::time::Instant::now();
         let mut iter_count: u64 = 0;
         let mut read_ok_count: u64 = 0;
-        let read_err_count: u64 = 0;
+        let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
         // Simple read strategy: start in block mode, drop to 1 sector on any
         // failure, then after BPT1_EXIT_THRESHOLD consecutive good single-sector
@@ -1403,6 +1403,7 @@ impl Disc {
                 } else if use_single {
                     // Single sector mode — read failed, mark NonTrimmed
                     let err = read_result.err().unwrap();
+                    read_err_count += 1;
                     if err.is_marginal_read()
                         || err.scsi_sense().is_some_and(|s| s.is_medium_error())
                     {
@@ -1436,6 +1437,7 @@ impl Disc {
                 } else {
                     // Batch mode failed — drop to 1 sector and retry
                     let err = read_result.err().unwrap();
+                    read_err_count += 1;
                     if err.is_marginal_read()
                         || err.scsi_sense().is_some_and(|s| s.is_medium_error())
                     {
