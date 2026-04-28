@@ -490,6 +490,7 @@ impl Error {
     pub fn scsi_sense(&self) -> Option<&crate::scsi::ScsiSense> {
         match self {
             Error::ScsiError { sense: Some(s), .. } => Some(s),
+            Error::DiscRead { sense: Some(s), .. } => Some(s),
             _ => None,
         }
     }
