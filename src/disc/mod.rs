@@ -1423,7 +1423,7 @@ impl Disc {
                     // 0.13.28: MEDIUM ERROR (bad sector) — skip this sector
                     // and continue. Retry won't recover it. Fill in pass 2+.
                     let err = block_result.err().unwrap();
-                    tracing::trace!(
+                    tracing::warn!(
                         target: "freemkv::disc",
                         phase = "skip_bad_sector",
                         lba = block_lba,
