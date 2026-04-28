@@ -1420,7 +1420,10 @@ impl Disc {
                     .map(|e| {
                         let sense = e.scsi_sense();
                         let is_medium = sense.map(|s| s.is_medium_error()).unwrap_or(false);
-                        tracing::warn!(target: "freemkv::disc", "block error {:?} sense={:?} is_medium={}", e, sense, is_medium);
+                        eprintln!(
+                            "BLOCK_ERROR: {:?} sense={:?} is_medium={}",
+                            e, sense, is_medium
+                        );
                         is_medium
                     })
                     .unwrap_or(false)
@@ -1513,7 +1516,8 @@ impl Disc {
                         // 60 sectors either — bail with full sense info
                         // rather than chewing through bpt=1 timeouts.
                         if let Err(ref e) = one_result {
-                            let is_medium = e.scsi_sense().map(|s| s.is_medium_error()).unwrap_or(false);
+                            let is_medium =
+                                e.scsi_sense().map(|s| s.is_medium_error()).unwrap_or(false);
                             if is_medium {
                                 // 0.13.28: MEDIUM ERROR in single mode — skip sector
                                 tracing::warn!(
