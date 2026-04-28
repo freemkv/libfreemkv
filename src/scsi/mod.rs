@@ -335,9 +335,9 @@ pub fn open(device: &Path) -> Result<Box<dyn ScsiTransport>> {
 // platform reset in a thread+recv_timeout so a kernel-wedged ioctl
 // couldn't hang the caller. Removed in 0.13.6 along with the
 // SG_SCSI_RESET / STOP+START UNIT escalation that needed it. The
-// remaining platform reset (Linux: SgIoTransport::reset, called only
-// from SgIoTransport::open) does pure userspace state cleanup with
-// bounded sleeps — no escape-hatch wrapper required.
+// remaining platform reset (Linux: SgIoTransport::reset, available
+// for explicit opt-in) does pure userspace state cleanup with bounded
+// sleeps — no escape-hatch wrapper required.
 
 // ── USB-layer recovery: rolled back in 0.13.4 ───────────────────────────────
 //

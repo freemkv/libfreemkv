@@ -70,12 +70,9 @@ pub struct SgIoTransport {
 }
 
 impl SgIoTransport {
-    /// Open a SCSI device for use. Software-clean the kernel SG queue
-    /// (`reset()`) before opening so a previous killed process's queued
-    /// commands don't bleed into ours.
+    /// Open a SCSI device for use.
     pub fn open(device: &Path) -> Result<Self> {
         let device = Self::resolve_to_sg(device);
-        Self::reset(&device)?;
         let c_path = Self::to_c_path(&device);
         let fd = unsafe {
             libc::open(
@@ -550,8 +547,8 @@ fn enumerate_sg_names() -> Vec<String> {
             let type_path = format!("/sys/class/scsi_generic/{name}/device/type");
             match std::fs::read_to_string(&type_path) {
                 Ok(s) if s.trim() == SCSI_TYPE_OPTICAL => names.push(name),
-                Ok(_) => {}                 // not optical
-                Err(_) => names.push(name), // sysfs unreadable — let INQUIRY decide
+                Ok(_) => {} // not optical
+                Err(_) => {}
             }
         }
     } else {
@@ -568,47 +565,64 @@ fn enumerate_sg_names() -> Vec<String> {
     names
 }
 
-/// `drive_has_disc` = single TEST UNIT READY. Any error (including the
-/// wedge signature `ScsiError { status: 0xFF }` synthesised by `execute()`
-/// when `host_status` is set) bubbles straight up to the caller.
-///
-/// ## No in-library wedge recovery — and why
-///
-/// Versions 0.13.1–0.13.3 layered `scsi::reset()` + `scsi::usb_reset()`
-/// (`USBDEVFS_RESET`) escalation inside `drive_has_disc`. Production
-/// testing on the LG BU40N USB BD-RE showed all three userspace recovery
-/// ladders succeed at the USB transport level (the kernel logs
-/// `usb 3-2: reset high-speed USB device`, the device re-authorises
-/// and re-attaches on a fresh `scsi_host`) **but the drive firmware
-/// below the USB bridge stays locked** — no LUN ever enumerates, TUR
-/// never succeeds, /dev/sg* never reappears. Physical power-cycle
-/// (unplug-replug or host reboot) is the only recovery.
-///
-/// Methods tried and discarded:
-///  - `SG_SCSI_RESET` (device-level SCSI bus reset)
-///  - `STOP UNIT` / `START UNIT` CDB pair
-///  - `USBDEVFS_RESET` ioctl on `/dev/bus/usb/BBB/DDD`
-///  - `/sys/bus/usb/devices/<port>/authorized` 0→1 toggle
-///  - `/sys/bus/usb/drivers/usb-storage/{unbind,bind}` driver rebind
-///  - Forced `echo "- - -" > /sys/class/scsi_host/hostN/scan`
-///
-/// Rolled back in 0.13.4. Callers (autorip, CLI) surface the error
-/// directly and prompt the user to physically reconnect the drive.
-/// If a future hardware class is found where USB-layer recovery
-/// actually works, the escalation belongs here, gated on the wedge
-/// signature — see git tag `v0.13.3` for the full implementation.
+/// Send TEST UNIT READY directly — no transport, no reset, no side effects.
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
-    let mut transport = SgIoTransport::open(path)?;
+    let device = SgIoTransport::resolve_to_sg(path);
+    let c_path = SgIoTransport::to_c_path(&device);
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr() as *const libc::c_char,
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return SgIoTransport::open_error(&device);
+    }
+
     let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let mut buf = [0u8; 0];
-    match transport.execute(
-        &cdb,
-        crate::scsi::DataDirection::None,
-        &mut buf,
-        crate::scsi::TUR_TIMEOUT_MS,
-    ) {
-        Ok(_) => Ok(true),
-        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
-        Err(e) => Err(e),
+    let mut sense = [0u8; 32];
+    let mut hdr: sg_io_hdr = unsafe { std::mem::zeroed() };
+    hdr.interface_id = b'S' as i32;
+    hdr.dxfer_direction = SG_DXFER_NONE;
+    hdr.cmd_len = cdb.len() as u8;
+    hdr.mx_sb_len = sense.len() as u8;
+    hdr.dxfer_len = 0;
+    hdr.dxferp = std::ptr::null_mut();
+    hdr.cmdp = cdb.as_ptr();
+    hdr.sbp = sense.as_mut_ptr();
+    hdr.timeout = crate::scsi::TUR_TIMEOUT_MS;
+    hdr.flags = SG_FLAG_Q_AT_HEAD;
+
+    let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+    unsafe { libc::close(fd) };
+
+    if ret < 0 {
+        return Err(Error::IoError {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+
+    let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
+    if hdr.host_status != 0 || driver_status_real != 0 {
+        return Err(Error::ScsiError {
+            opcode: cdb[0],
+            status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+    }
+
+    if hdr.status == 0 {
+        return Ok(true);
+    }
+
+    let parsed = super::parse_sense(&sense, hdr.sb_len_wr);
+    if parsed.is_not_ready() {
+        Ok(false)
+    } else {
+        Err(Error::ScsiError {
+            opcode: cdb[0],
+            status: hdr.status,
+            sense: Some(parsed),
+        })
     }
 }
