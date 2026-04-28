@@ -5,6 +5,7 @@
 pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
         Error::ScsiError { status, sense, .. } => (*status, *sense),
+        Error::DiscRead { status, sense, .. } => (status.unwrap_or(0), *sense),
         _ => (0, None),
     }
 }
