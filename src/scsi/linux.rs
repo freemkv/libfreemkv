@@ -66,6 +66,7 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 pub struct SgIoTransport {
     fd: i32,
     device_path: std::path::PathBuf,
+    fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl SgIoTransport {
@@ -88,6 +89,7 @@ impl SgIoTransport {
         Ok(SgIoTransport {
             fd,
             device_path: device,
+            fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
         })
     }
 
@@ -278,6 +280,22 @@ impl ScsiTransport for SgIoTransport {
             "SgIoTransport::execute"
         );
 
+        // Check if a background recovery has produced a new fd.
+        let recovered = self
+            .fd_recovery
+            .swap(-1, std::sync::atomic::Ordering::Acquire);
+        if recovered >= 0 {
+            // Close the old fd if it's still valid.
+            if self.fd >= 0 {
+                unsafe { libc::close(self.fd) };
+            }
+            self.fd = recovered;
+        } else if self.fd < 0 {
+            return Err(Error::DeviceNotFound {
+                path: self.device_path.display().to_string(),
+            });
+        }
+
         if data.len() > u32::MAX as usize {
             return Err(Error::ScsiError {
                 opcode: cdb[0],
@@ -352,6 +370,32 @@ impl ScsiTransport for SgIoTransport {
                 exec_elapsed_ms,
                 "transport-level failure (timeout / bridge wedge)"
             );
+
+            // Spawn recovery: close old fd, open new one in background.
+            // This prevents the main thread from blocking on close() while
+            // the kernel finishes the previous ioctl.
+            let old_fd = self.fd;
+            self.fd = -1;
+            let path = self.device_path.clone();
+            let recovery = self.fd_recovery.clone();
+
+            std::thread::spawn(move || {
+                if old_fd >= 0 {
+                    unsafe { libc::close(old_fd) };
+                }
+            });
+
+            std::thread::spawn(move || {
+                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                let new_fd = unsafe {
+                    libc::open(
+                        c_path.as_ptr() as *const libc::c_char,
+                        libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                    )
+                };
+                recovery.store(new_fd, std::sync::atomic::Ordering::Release);
+            });
+
             return Err(Error::ScsiError {
                 opcode: cdb[0],
                 status: super::SCSI_STATUS_TRANSPORT_FAILURE,
