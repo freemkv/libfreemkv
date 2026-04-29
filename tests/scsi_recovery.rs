@@ -39,7 +39,7 @@ fn test_sgio_transport_timeout_does_not_kill_transport() {
         assert!(result.is_err(), "expected Err on timeout, got {:?}", result);
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, libfreemkv::Error::ScsiError { status, .. } if *status == SCSI_STATUS_TRANSPORT_FAILURE),
+            matches!(&err, libfreemkv::Error::ScsiError { status, .. } if status == &SCSI_STATUS_TRANSPORT_FAILURE),
             "expected ScsiError(TRANSPORT_FAILURE), got {:?}",
             err
         );
@@ -97,7 +97,7 @@ fn test_drive_read_per_cdb_timeout_bounds_call() {
         let timeout_ms: u32 = 5_000;
 
         let start = std::time::Instant::now();
-        let _ = drive.read(0, &mut [0u8; 2048], Some(timeout_ms));
+        let _ = drive.read(0, 1, &mut [0u8; 2048], false);
         let elapsed = start.elapsed();
 
         let overhead = Duration::from_millis(500);
