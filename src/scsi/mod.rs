@@ -6,7 +6,7 @@
 //!   - `windows.rs` — SPTI (SCSI Pass-Through Interface)
 
 #[cfg(target_os = "linux")]
-pub(crate) mod linux;
+pub mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
