@@ -1441,10 +1441,16 @@ impl Disc {
                     if err.is_marginal_read()
                         || err.scsi_sense().is_some_and(|s| s.is_medium_error())
                     {
-                        // Disc-related error — try 1 sector instead
                         use_single = true;
                         consecutive_good = 0;
-                        // Don't advance pos — retry this location at 1 sector
+                        if err.scsi_sense().is_some_and(|s| s.is_medium_error())
+                            && opts
+                                .halt
+                                .as_ref()
+                                .is_none_or(|h| !h.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                        }
                         continue;
                     } else {
                         // Non-recoverable transport error — bail
