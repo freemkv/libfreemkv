@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.13.39 (2026-04-28)
+
+### Pass 1 pure ECC-block sweep, transport-failure abort, mapfile-based recovery
+
+This release reworks the sector-copy pipeline to handle unreliable USB-SATA
+bridges (notably the Initio INIC-1618L) that crash on MEDIUM ERROR retries.
+
+**Disc::copy() — Pass 1 (ECC-block sweep):**
+- Reads `batch` sectors (default 32 = 1 BD ECC block = 64 KB).
+- Success → mark Finished. MEDIUM ERROR → zero-fill, mark NonTrimmed, advance.
+- Transport failure (host_status=7) → abort immediately, return error.
+- No single-sector reads, no retry, no state machine in Pass 1.
+
+**Disc::patch() — Pass 2+ (single-sector recovery):**
+- Reads NonTrimmed sectors one at a time with pause between failures.
+- Succeeds → mark Finished. Fails → mark Unreadable (or leave for next pass).
+- Multi-pass: caller runs patch repeatedly until 0 recovered.
+
+**CopyOptions simplified:**
+- Removed `skip_forward`, `cautious_pause_ms`, `BPT1_EXIT_THRESHOLD`.
+- Fields: `decrypt`, `resume`, `batch_sectors`, `skip_on_error`, `progress`, `halt`.
+
+**Other fixes since 0.13.26:**
+- `open()` just opens the device — no side effects. `drive_has_disc()` is a
+  standalone TUR, not a probe sequence.
+- `enumerate_sg_names()` skips unreadable `/sys` type files.
+- SCSI sense data preserved in DiscRead errors (status + key + ASC/ASCQ).
+- MapStats splits `bytes_pending` into `nontried` / `retryable`.
+- Wallclock rip budget — halt after max(disc_runtime_secs, 3600).
+- Patch instrumentation: counters for reads_ok/err, writes_ok/err, finished/unreadable.
+- `as_encoded_bytes()` replaces `as_bytes()` for portable OsStr handling.
+- Removed inline retry/reset from Drive::read — orchestration layer handles recovery.
+- Removed all `freemkv-private` references from public code.
+
 ## 0.13.26 (2026-04-27)
 
 ### Extend DiscRead with SCSI status/sense for 30% wedge diagnostics
