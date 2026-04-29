@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "0.13.37"
+version = "0.13.38"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
