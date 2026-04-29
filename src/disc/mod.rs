@@ -1281,6 +1281,7 @@ impl Disc {
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
+        let mut consecutive_transport_failures: u32 = 0;
         let copy_t0 = std::time::Instant::now();
         let mut iter_count: u64 = 0;
         let mut read_ok_count: u64 = 0;
@@ -1361,6 +1362,7 @@ impl Disc {
 
                 if read_result.is_ok() {
                     read_ok_count += 1;
+                    consecutive_transport_failures = 0;
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(
                             &mut buf[..block_bytes as usize],
@@ -1390,18 +1392,32 @@ impl Disc {
                     let err = read_result.err().unwrap();
                     read_err_count += 1;
 
-                    if err.is_scsi_transport_failure() {
+                    let is_transport = err.is_scsi_transport_failure();
+
+                    if is_transport {
+                        consecutive_transport_failures += 1;
                         tracing::warn!(
                             target: "freemkv::disc",
                             phase = "transport_failure",
                             lba = block_lba,
-                            error = %err,
-                            "transport failure (bridge crash); aborting copy"
+                            consecutive = consecutive_transport_failures,
+                            "transport failure (bridge crash); skipping block"
                         );
-                        return Err(err);
+                        if consecutive_transport_failures >= 3 {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "transport_failure_abort",
+                                consecutive = consecutive_transport_failures,
+                                "3 consecutive transport failures; aborting copy"
+                            );
+                            return Err(err);
+                        }
+                    } else {
+                        consecutive_transport_failures = 0;
                     }
 
-                    if !err.is_marginal_read()
+                    if !is_transport
+                        && !err.is_marginal_read()
                         && err.scsi_sense().is_none_or(|s| !s.is_medium_error())
                     {
                         return Err(err);
