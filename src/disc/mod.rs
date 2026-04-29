@@ -1338,6 +1338,20 @@ impl Disc {
                 let block_count = (block_bytes / 2048) as u16;
                 let recovery = !opts.skip_on_error;
 
+                if read_ok_count + read_err_count < 3 {
+                    tracing::info!(
+                        target: "freemkv::disc",
+                        block_lba,
+                        block_count,
+                        block_bytes,
+                        recovery,
+                        skip_on_error = opts.skip_on_error,
+                        batch,
+                        total_bytes,
+                        "Disc::copy first reads"
+                    );
+                }
+
                 let read_result = reader.read_sectors(
                     block_lba,
                     block_count,
