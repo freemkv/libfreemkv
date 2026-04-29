@@ -1217,14 +1217,14 @@ impl Disc {
     /// `path + ".mapfile"` — flushed every block for crash-safe resume.
     ///
     /// # Options
-    /// - **default** (all false): behavior matches pre-v0.11.21 — uses full
-    ///   drive recovery (may take minutes per bad sector), aborts on error.
-    ///   Mapfile is produced as a side-effect.
-    /// - **skip_on_error**: zero-fill bad blocks in the ISO, mark them in the
-    ///   mapfile, and continue. Uses fast reads (no drive-level recovery loop).
-    /// - **skip_forward** (implies skip_on_error): on block failure, also skip
-    ///   forward by an exponentially-growing amount, marking the jumped region
-    ///   as `non-trimmed` for later trimming/scraping by `Disc::patch`.
+    /// - **default** (skip_on_error=false): uses full drive recovery (may take
+    ///   minutes per bad sector), aborts on error. Mapfile is produced as a
+    ///   side-effect.
+    /// - **skip_on_error**: zero-fill bad blocks in the ISO, mark them NonTrimmed
+    ///   in the mapfile, and continue. Reads in `batch`-sector chunks (32 sectors
+    ///   = 1 BD ECC block by default). Failed blocks are marked NonTrimmed for
+    ///   recovery by `Disc::patch`. No single-sector reads in this pass —
+    ///   Pass 1 is pure ECC-block sweep.
     /// - **resume**: if the mapfile exists, resume from its state — only
     ///   `non-tried` ranges are read. Without `resume`, a fresh mapfile is
     ///   written and the ISO recreated from scratch.
@@ -1274,7 +1274,7 @@ impl Disc {
         let mut file = file;
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
-            None if opts.skip_forward => 32, // 64 KB = BD ECC block size
+            None if opts.skip_on_error => 32,
             None => DEFAULT_BATCH_SECTORS,
         };
 
@@ -1286,23 +1286,15 @@ impl Disc {
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
-        // Simple read strategy: start in block mode, drop to 1 sector on any
-        // failure, then after BPT1_EXIT_THRESHOLD consecutive good single-sector
-        // reads we try block mode again. This avoids hammering every sector
-        // in a big bad zone with a slow timeout at block size.
-        let mut use_single = false;
-        let mut consecutive_good: u64 = 0;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
             total_bytes,
             batch,
-            bpt1_exit_threshold = BPT1_EXIT_THRESHOLD,
+            skip_on_error = opts.skip_on_error,
             "Disc::copy entered"
         );
 
-        // Iterate over not-yet-finished regions from the mapfile. We re-read the
-        // mapfile after each block because record() mutates the region list.
         'outer: loop {
             let regions_to_do = map.ranges_with(&[
                 mapfile::SectorStatus::NonTried,
@@ -1318,9 +1310,6 @@ impl Disc {
             if regions_to_do.is_empty() {
                 break;
             }
-            // Only process the first NonTried range per outer pass; skip_forward
-            // may turn others into NonTrimmed which we DO NOT re-enter here —
-            // Disc::patch handles those.
             let Some((region_pos, region_size)) = map.next_with(0, mapfile::SectorStatus::NonTried)
             else {
                 break;
@@ -1337,7 +1326,6 @@ impl Disc {
             );
 
             while pos < region_end {
-                // Check halt
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
                         halt_requested = true;
@@ -1345,12 +1333,7 @@ impl Disc {
                     }
                 }
 
-                // Decide read size: if use_single, read 1 sector; else use batch
-                let block_bytes = if use_single {
-                    (region_end - pos).min(2048) // 1 sector
-                } else {
-                    (region_end - pos).min(batch as u64 * 2048)
-                };
+                let block_bytes = (region_end - pos).min(batch as u64 * 2048);
                 let block_lba = (pos / 2048) as u32;
                 let block_count = (block_bytes / 2048) as u16;
                 let recovery = !opts.skip_on_error;
@@ -1363,7 +1346,6 @@ impl Disc {
                 );
 
                 if read_result.is_ok() {
-                    // Good read — write to file
                     read_ok_count += 1;
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(
@@ -1379,17 +1361,7 @@ impl Disc {
                     map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                         .map_err(|e| Error::IoError { source: e })?;
                     bytes_done = bytes_done.saturating_add(block_bytes);
-
-                    // If we're in single mode and hit threshold, try block mode again
-                    if use_single {
-                        consecutive_good = consecutive_good.saturating_add(1);
-                        if consecutive_good >= BPT1_EXIT_THRESHOLD {
-                            use_single = false;
-                            consecutive_good = 0;
-                        }
-                    }
                 } else if !opts.skip_on_error {
-                    // Strict mode: abort
                     let (status, sense) = read_result
                         .as_ref()
                         .err()
@@ -1400,71 +1372,49 @@ impl Disc {
                         status: Some(status),
                         sense,
                     });
-                } else if use_single {
-                    // Single sector mode — read failed, mark NonTrimmed
-                    let err = read_result.err().unwrap();
-                    read_err_count += 1;
-                    if err.is_marginal_read()
-                        || err.scsi_sense().is_some_and(|s| s.is_medium_error())
-                    {
-                        // Disc-related error at 1 sector — bad sector, mark for pass 2
-                        let is_medium = err.scsi_sense().is_some_and(|s| s.is_medium_error());
-                        if is_medium {
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "skip_bad_sector",
-                                lba = block_lba,
-                                error = %err,
-                                "MEDIUM ERROR at 1 sector; marking NonTrimmed"
-                            );
-                        }
-                        // Zero fill, mark NonTrimmed
-                        let zero = vec![0u8; block_bytes as usize];
-                        file.seek(SeekFrom::Start(pos))
-                            .map_err(|e| Error::IoError { source: e })?;
-                        file.write_all(&zero)
-                            .map_err(|e| Error::IoError { source: e })?;
-                        map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
-                            .map_err(|e| Error::IoError { source: e })?;
-                        bytes_done = bytes_done.saturating_add(block_bytes);
-                    } else {
-                        // Transport error at 1 sector — bail
-                        return Err(err);
-                    }
-                    // Stay in single mode for next reads
-                    use_single = true;
-                    consecutive_good = 0;
                 } else {
-                    // Batch mode failed — drop to 1 sector and retry
                     let err = read_result.err().unwrap();
                     read_err_count += 1;
-                    if err.is_marginal_read()
-                        || err.scsi_sense().is_some_and(|s| s.is_medium_error())
-                    {
-                        use_single = true;
-                        consecutive_good = 0;
-                        if err.scsi_sense().is_some_and(|s| s.is_medium_error())
-                            && opts
-                                .halt
-                                .as_ref()
-                                .is_none_or(|h| !h.load(std::sync::atomic::Ordering::Relaxed))
-                        {
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                        }
-                        continue;
-                    } else {
-                        // Non-recoverable transport error — bail
+
+                    if err.is_scsi_transport_failure() {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "transport_failure",
+                            lba = block_lba,
+                            error = %err,
+                            "transport failure (bridge crash); aborting copy"
+                        );
                         return Err(err);
                     }
+
+                    if !err.is_marginal_read()
+                        && err.scsi_sense().is_none_or(|s| !s.is_medium_error())
+                    {
+                        return Err(err);
+                    }
+
+                    // ECC block failed — zero-fill, mark NonTrimmed, advance.
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "skip_ecc_block",
+                        lba = block_lba,
+                        sectors = block_count,
+                        error = %err,
+                        "ECC block failed; marking NonTrimmed"
+                    );
+                    let zero = vec![0u8; block_bytes as usize];
+                    file.seek(SeekFrom::Start(pos))
+                        .map_err(|e| Error::IoError { source: e })?;
+                    file.write_all(&zero)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
+                        .map_err(|e| Error::IoError { source: e })?;
+                    bytes_done = bytes_done.saturating_add(block_bytes);
                 }
 
-                // Advance position
                 pos += block_bytes;
-
-                // Progress callback throttling
                 iter_count += 1;
 
-                // Throttled iter telemetry — every 100 inner iterations.
                 if iter_count - last_log_iter >= 100 {
                     last_log_iter = iter_count;
                     let stats = map.stats();
@@ -1532,15 +1482,11 @@ pub struct CopyOptions<'a> {
     /// Override the default block size in sectors. Callers should resolve
     /// this with `detect_max_batch_sectors(device_path)` for live drives.
     /// When `None`, falls back to 32 sectors (64 KB BD ECC block) in
-    /// `skip_forward` mode or `DEFAULT_BATCH_SECTORS=60` otherwise.
+    /// `skip_on_error` mode or `DEFAULT_BATCH_SECTORS=60` otherwise.
     pub batch_sectors: Option<u16>,
-    /// Zero-fill bad blocks in the ISO, mark them in the mapfile, continue.
-    /// Uses fast reads (no drive-level recovery loop).
+    /// Zero-fill bad blocks in the ISO, mark them NonTrimmed in the mapfile,
+    /// and continue. Failed ECC blocks are left for `Disc::patch` to recover.
     pub skip_on_error: bool,
-    /// ddrescue-style exponential skip-forward on block failure. Implies
-    /// `skip_on_error`. The skipped region is marked `non-trimmed` for later
-    /// trimming/scraping by `Disc::patch`.
-    pub skip_forward: bool,
     /// Per-iteration progress reporter. v0.13.16 architecture: the library
     /// emits a single `PassProgress` shape via the `Progress` trait;
     /// consumers compute their own derived percentages / ETAs from it. No
@@ -1851,15 +1797,6 @@ impl Disc {
 const MAX_BATCH_SECTORS: u16 = 510;
 const DEFAULT_BATCH_SECTORS: u16 = 60;
 const MIN_BATCH_SECTORS: u16 = 3;
-
-/// Number of consecutive good single-sector reads required to exit
-/// `Single` mode (bpt=1) and return to `Block` mode (bpt=batch). 10 000
-/// sectors ≈ 20 MB of clean data — long enough that we don't bounce in
-/// and out of bpt=1 inside a sparse-bad cluster, short enough that we
-/// don't waste much time reading clean territory at bpt=1 after the
-/// damaged region ends. Tunable; calibrated from the 2026-04-26 BU40N
-/// live test.
-const BPT1_EXIT_THRESHOLD: u64 = 10_000;
 
 /// Coarse damage tier for a finished or in-progress rip. Maps the
 /// observable signals (bad sector count + lost wallclock playback time)

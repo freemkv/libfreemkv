@@ -351,7 +351,7 @@ fn test_file_sector_reader_round_trip() {
 //
 // Per RIP_DESIGN.md §2.1 + §3: Disc::copy must reach the end of the disc
 // regardless of how many reads fail. The only legitimate early exit is the
-// halt flag. With `skip_on_error + skip_forward` and a reader that returns
+// halt flag. With `skip_on_error` and a reader that returns
 // Err for every read, Pass 1 must:
 //   - mark every sector NonTrimmed (so Pass 2 can retry them)
 //   - return cleanly (no panic, no hang)
@@ -424,7 +424,7 @@ impl SectorReader for FailingSectorReader {
 #[test]
 fn test_disc_copy_completes_full_disc_with_failing_reader() {
     // 1024 sectors = 2 MB. Reader fails every read. With skip_on_error +
-    // skip_forward, Pass 1 must mark every sector NonTrimmed and return
+    // skip_on_error, Pass 1 must mark every sector NonTrimmed and return
     // cleanly — no bail, no hang.
     let capacity_sectors: u32 = 1024;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
@@ -439,7 +439,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        skip_forward: true,
+
         ..Default::default()
     };
 
@@ -521,7 +521,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        skip_forward: true,
+
         halt: Some(halt),
         ..Default::default()
     };
@@ -553,16 +553,9 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
 
 // ── 8. Hysteresis recovers data the drive can read individually ──────────
 //
-// Empirically observed on the LG BU40N: in damaged regions the drive fails
-// multi-sector READ commands but reads each sector cleanly when asked one
-// at a time. Disc::copy's hysteresis state machine (0.13.22, replaces the
-// 0.13.21 bisect-on-fail) drops to bpt=1 on the first multi-sector failure
-// and stays there until BPT1_EXIT_THRESHOLD consecutive good single-sector
-// reads, then returns to bpt=batch.
-//
-// Fixture: a reader that returns Err for any read with count > 1, and Ok
-// for count == 1. The full disc must recover via the bpt=1 path with
-// 100 % bytes_good outcome.
+// Pass 1 reads in batch (32 sectors = 1 ECC block). Failed blocks are marked
+// NonTrimmed for Pass 2 recovery. This test verifies that a reader where every
+// multi-sector read fails produces all NonTrimmed output with zero bytes_good.
 
 struct BlockSizeFailingReader {
     capacity: u32,
@@ -577,15 +570,11 @@ impl SectorReader for BlockSizeFailingReader {
         _recovery: bool,
     ) -> Result<usize> {
         if count == 1 {
-            // Single-sector reads succeed — fill the sector with a marker.
             for chunk in buf.chunks_mut(SECTOR_SIZE) {
                 chunk.fill((lba & 0xff) as u8);
             }
             Ok(buf.len())
         } else {
-            // Multi-sector reads fail with the BU40N's signature: CHECK
-            // CONDITION + MEDIUM ERROR. The hysteresis must dispatch on
-            // this as marginal-read and drop to bpt=1.
             Err(libfreemkv::error::Error::ScsiError {
                 opcode: libfreemkv::scsi::SCSI_READ_10,
                 status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
@@ -604,13 +593,7 @@ impl SectorReader for BlockSizeFailingReader {
 }
 
 #[test]
-fn test_disc_copy_hysteresis_recovers_via_single_sector_reads() {
-    // 256 sectors = 0.5 MB. Reader fails any multi-sector read but
-    // succeeds on bpt=1. The hysteresis path must drop to Single mode on
-    // the first multi-sector failure and recover every sector at bpt=1.
-    // Stays in Single mode until BPT1_EXIT_THRESHOLD reached (10 000
-    // sectors); since this disc is only 256 sectors we never re-enter
-    // Block mode, which is fine — every sector still recovers.
+fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let capacity_sectors: u32 = 256;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
@@ -626,7 +609,6 @@ fn test_disc_copy_hysteresis_recovers_via_single_sector_reads() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        skip_forward: true,
         ..Default::default()
     };
 
@@ -637,20 +619,17 @@ fn test_disc_copy_hysteresis_recovers_via_single_sector_reads() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
-    // Bisect must recover every sector — the drive could read each one
-    // individually, and our algorithm must descend to that.
     assert_eq!(
-        result.bytes_good, total_bytes,
-        "bisect-on-fail must recover every sector via single-sector reads. \
-         Got bytes_good={} of total {}",
+        result.bytes_good, 0,
+        "Pass 1 should have 0 bytes_good when all batch reads fail. Got {} of {}",
         result.bytes_good, total_bytes
     );
-    assert_eq!(
-        result.bytes_pending, 0,
-        "no sectors should be left NonTrimmed after a successful bisect"
+    assert!(
+        result.bytes_pending > 0,
+        "all sectors should be NonTrimmed pending Pass 2"
     );
     assert!(
-        result.complete,
-        "complete=true expected when every sector recovered"
+        !result.complete,
+        "complete=false when sectors remain NonTrimmed"
     );
 }
