@@ -439,7 +439,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-
+        error_pause_ms: Some(0),
         ..Default::default()
     };
 
@@ -454,9 +454,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
     // Hard bound — even at 0 ms per read, 1024 sectors with skip-forward
-    // should complete in well under a second on any host. If this test runs
-    // for minutes, something has regressed (e.g. stall guard reintroduced
-    // with infinite-loop semantics, or Pass 1 is hanging on each read).
+    // should complete in well under a second on any host.
     assert!(
         elapsed < Duration::from_secs(5),
         "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 5 s"
@@ -521,7 +519,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-
+        error_pause_ms: Some(0),
         halt: Some(halt),
         ..Default::default()
     };
@@ -609,6 +607,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
+        error_pause_ms: Some(0),
         ..Default::default()
     };
 
@@ -619,14 +618,20 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
-    assert_eq!(
-        result.bytes_good, 0,
-        "Pass 1 should have 0 bytes_good when all batch reads fail. Got {} of {}",
-        result.bytes_good, total_bytes
+    // With graduated batch restore, Pass 1 drops to batch=1 after the
+    // first batch=32 failure, reads individually (count=1 succeeds for
+    // BlockSizeFailingReader), and recovers those sectors. After 200 OK
+    // at batch=1, it tries batch=2 which fails again. Net result: most
+    // sectors are recovered (Finished), only the batch>1 failures produce
+    // NonTrimmed blocks.
+    assert!(
+        result.bytes_good > 0,
+        "Pass 1 should recover batch=1-readable sectors. Got bytes_good={}",
+        result.bytes_good
     );
     assert!(
         result.bytes_pending > 0,
-        "all sectors should be NonTrimmed pending Pass 2"
+        "batch>1 failures should produce NonTrimmed pending Pass 2"
     );
     assert!(
         !result.complete,
