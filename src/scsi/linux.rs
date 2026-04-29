@@ -107,47 +107,6 @@ impl SgIoTransport {
     /// against the LG BU40N (Initio USB-SATA bridge); both failed to
     /// recover wedged drives and made the wedge worse — see
     /// `freemkv-private/postmortems/2026-04-25-bu40n-wedge-recovery.md`.
-    /// If the drive is genuinely unresponsive, the next workload command
-    /// fails naturally and the caller surfaces a "physical reconnect
-    /// required" prompt. Software has no path back from a wedged Initio
-    /// bridge — only physical replug clears it.
-    pub fn reset(device: &Path) -> Result<()> {
-        let c_path = Self::to_c_path(device);
-
-        // open + close — make the kernel cancel any SG_IO commands queued
-        // against a previous fd that didn't close cleanly.
-        let probe_fd = unsafe {
-            libc::open(
-                c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if probe_fd >= 0 {
-            unsafe { libc::close(probe_fd) };
-        }
-
-        // Let the kernel finish that cancellation before we reopen.
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        // Fresh fd just to send the unlock command, then close.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Self::open_error(device);
-        }
-
-        // ALLOW MEDIUM REMOVAL — clear any tray lock left by a killed
-        // process whose Drop never ran. Best-effort; ignore result.
-        let _ = Self::raw_command(fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
-
-        unsafe { libc::close(fd) };
-        Ok(())
-    }
-
     fn open_error<T>(device: &Path) -> Result<T> {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
