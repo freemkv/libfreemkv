@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.43 (2026-04-29)
+
+### Pass 1 transport-failure recovery loop
+
+- Transport failure (USB bridge crash) no longer kills the entire rip.
+- Autorip re-discovers the drive after USB re-enumeration and resumes
+  from the mapfile. Up to 10 attempts.
+- `Error::is_scsi_transport_failure()` now matches DiscRead with
+  status 0xFF (bridge crash) in addition to ScsiError.
+- DriveSession tracks device_path for re-discovery.
+
 ## 0.13.42 (2026-04-29)
 
 ### Fix: transport failure skips instead of aborting

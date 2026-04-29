@@ -507,6 +507,12 @@ impl Error {
                 status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
                 ..
             }
+        ) || matches!(
+            self,
+            Error::DiscRead {
+                status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                ..
+            }
         )
     }
 
