@@ -2,7 +2,7 @@
 //!
 //! Platform backends are in separate files:
 //!   - `linux.rs` — SG_IO ioctl
-//!   - `macos.rs` — IOKit SCSITaskDeviceInterface
+//!   - `macos.rs` — IOKit SCSITaskDeviceInterface (exclusive access)
 //!   - `windows.rs` — SPTI (SCSI Pass-Through Interface)
 
 #[cfg(target_os = "linux")]
