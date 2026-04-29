@@ -433,7 +433,7 @@ impl Drive {
     ///
     /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
     /// removed in 0.13.6. Per
-    /// `freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`,
+    /// the stop-wedge postmortem (2026-04-25),
     /// the inline reset on the LG BU40N (Initio bridge) wedged drive
     /// firmware without ever recovering a sector. The remaining recovery
     /// layers (Disc::patch multi-pass, DiscStream batch halving) do not

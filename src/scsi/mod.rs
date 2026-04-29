@@ -56,9 +56,8 @@ pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 ///
 /// 10 s catches every legitimate slow read with comfortable margin and
 /// short-circuits truly bad sectors at ~10 s rather than letting the
-/// kernel mid-layer escalate for 30 s+. See run log in
-/// `freemkv-private/docs/TEST_PLAN.md` and the audit at
-/// `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`.
+/// kernel mid-layer escalate for 30 s+. See the SCSI architecture audit
+/// (2026-04-26) for primary-source references.
 ///
 /// Pre-0.13.21 this was 1.5 s, which forced the kernel mid-layer to
 /// time out *normal* reads (cold-start often takes ~1.5 s) and run its

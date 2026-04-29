@@ -67,7 +67,7 @@ Recovery is layered above `Drive::read`:
   streak.
 
 Inline recovery (5× gentle retry → close + reset + reopen → 5× more) was
-removed in 0.13.6. See `freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`
+removed in 0.13.6. See the stop-wedge postmortem (2026-04-25)
 for rationale: the inline reset wedged drive firmware on the LG BU40N (Initio
 USB-SATA bridge) without ever recovering a sector. See
 [`rip-recovery.md`](rip-recovery.md) for the full three-layer model.

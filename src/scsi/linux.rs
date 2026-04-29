@@ -11,8 +11,8 @@
 //! This matches what every reference project does: MakeMKV (8 s sync
 //! ioctl), sg_dd (60 s sync ioctl), the kernel default for SCSI block
 //! devices (30 s `/sys/.../timeout`). See
-//! `freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md`
-//! for the full primary-source audit.
+//! the SCSI architecture audit (2026-04-26) for the full primary-source
+//! references.
 //!
 //! Pre-0.13.20 we ran an async `write() + poll(1.5s) + close-on-timeout +
 //! bg reopen` pattern. That abandoned slow-but-alive commands faster than
@@ -106,7 +106,7 @@ impl SgIoTransport {
     /// STOP+START UNIT. Both escalations were tried in 0.13.0–0.13.5
     /// against the LG BU40N (Initio USB-SATA bridge); both failed to
     /// recover wedged drives and made the wedge worse — see
-    /// `freemkv-private/postmortems/2026-04-25-bu40n-wedge-recovery.md`.
+    /// the BU40N wedge recovery postmortem (2026-04-25).
     fn open_error<T>(device: &Path) -> Result<T> {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {

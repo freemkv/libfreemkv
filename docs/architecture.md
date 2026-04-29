@@ -102,7 +102,7 @@ Recovery is layered above `Drive::read`, not inside it. Layer 1
 Layer 3 (`DiscStream::fill_extents` adaptive batch sizer) handles in-loop
 request-size adaptation. Inline recovery (gentle retry → SCSI reset → retry)
 was removed in 0.13.6 — see [`rip-recovery.md`](rip-recovery.md) and
-`freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`.
+the stop-wedge postmortem (2026-04-25).
 
 ---
 

@@ -133,8 +133,8 @@ implement retry logic.
 no eject cycle. The `recovery` flag controls only the per-CDB timeout
 (1.5 s vs. 30 s); on any failure it returns `Err(DiscRead)` immediately.
 Inline recovery (5× gentle retry → close + SCSI reset + reopen → 5× more)
-was removed in 0.13.6. See `freemkv-private/postmortems/2026-04-25-stop-wedge-and-zero-kbs.md`
-for rationale: the inline reset on the LG BU40N (Initio USB-SATA bridge)
+was removed in 0.13.6. See the stop-wedge postmortem (2026-04-25) for rationale:
+the inline reset on the LG BU40N (Initio USB-SATA bridge)
 wedged drive firmware below the bridge without ever recovering a sector,
 and the gentle-retry phase produced long stretches of 0 KB/s with no
 recoveries to show for it. Recovery responsibility is now layered: layer 1

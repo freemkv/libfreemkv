@@ -268,7 +268,7 @@ impl MacScsiTransport {
     // `reset()` removed in 0.13.6 — see scsi/mod.rs for rationale.
     // `try_recover()` removed in 0.13.20 — userspace handle-recovery on
     // task failure was the same anti-pattern stripped from Linux SG_IO
-    // (see freemkv-private/docs/audits/2026-04-26-scsi-architecture-research.md).
+    // (see internal architecture audit, 2026-04-26).
     // Errors bubble up; caller decides whether to reopen the Drive.
 }
 
