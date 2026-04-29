@@ -21,6 +21,7 @@ fn test_sgio_transport_timeout_does_not_kill_transport() {
 
     #[cfg(target_os = "linux")]
     {
+        use libfreemkv::scsi::ScsiTransport;
         use libfreemkv::scsi::linux::SgIoTransport;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicI32, Ordering};
