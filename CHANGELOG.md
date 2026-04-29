@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.39 (2026-04-28)
+## 0.13.40 (2026-04-28)
 
 ### Pass 1 pure ECC-block sweep, transport-failure abort, mapfile-based recovery
 
