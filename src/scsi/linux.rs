@@ -64,9 +64,9 @@ const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 88);
 const _: () = assert!(std::mem::size_of::<sg_io_hdr>() == 64);
 
 pub struct SgIoTransport {
-    fd: i32,
+    pub fd: i32,
     device_path: std::path::PathBuf,
-    fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    pub fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl SgIoTransport {
