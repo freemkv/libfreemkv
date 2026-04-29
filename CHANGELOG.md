@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.41 (2026-04-29)
+
+### Debug logging for sector-0 regression diagnosis
+
+- Add debug logging to Drive::read and Disc::copy first reads.
+- No functional changes.
+
 ## 0.13.40 (2026-04-28)
 
 ### Pass 1 pure ECC-block sweep, transport-failure abort, mapfile-based recovery

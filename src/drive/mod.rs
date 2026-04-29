@@ -444,6 +444,14 @@ impl Drive {
         } else {
             crate::scsi::READ_TIMEOUT_MS
         };
+        tracing::debug!(
+            target: "freemkv::drive",
+            lba,
+            count,
+            recovery,
+            timeout_ms,
+            "Drive::read enter"
+        );
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,
@@ -467,6 +475,14 @@ impl Drive {
             Err(Error::Halted) => Err(Error::Halted),
             Err(e) => {
                 let (status, sense) = extract_scsi_context(&e);
+                tracing::warn!(
+                    target: "freemkv::drive",
+                    lba,
+                    count,
+                    inner_error = %e,
+                    scsi_status = status,
+                    "Drive::read checked_exec failed"
+                );
                 Err(Error::DiscRead {
                     sector: lba as u64,
                     status: Some(status),
