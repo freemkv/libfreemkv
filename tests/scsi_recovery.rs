@@ -35,12 +35,12 @@ fn test_sgio_transport_timeout_does_not_kill_transport() {
 
         let start = std::time::Instant::now();
         let result = transport.execute(&cdb, DataDirection::FromDevice, &mut data, 1);
-        let elapsed = start.elapsed();
+        let _elapsed = start.elapsed();
 
         assert!(result.is_err(), "expected Err on timeout, got {:?}", result);
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, libfreemkv::Error::ScsiError { ref status, .. } if *status == SCSI_STATUS_TRANSPORT_FAILURE),
+            matches!(&err, libfreemkv::Error::ScsiError { status, .. } if *status == SCSI_STATUS_TRANSPORT_FAILURE),
             "expected ScsiError(TRANSPORT_FAILURE), got {:?}",
             err
         );
