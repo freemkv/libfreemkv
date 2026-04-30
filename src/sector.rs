@@ -24,6 +24,8 @@ pub trait SectorReader: Send {
     fn capacity(&self) -> u32 {
         0
     }
+
+    fn set_speed(&mut self, _kbs: u16) {}
 }
 
 /// SectorReader backed by a file (ISO image).

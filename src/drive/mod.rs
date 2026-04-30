@@ -599,6 +599,10 @@ impl SectorReader for Drive {
     ) -> Result<usize> {
         self.read(lba, count, buf, recovery)
     }
+
+    fn set_speed(&mut self, kbs: u16) {
+        Drive::set_speed(self, kbs);
+    }
 }
 
 /// Find the first optical drive on this system and open it.
