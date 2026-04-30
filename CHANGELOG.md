@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.16.1 (2026-04-30)
+
+### Unified progress display for sweep and patch
+
+- Patch passes now show `bytes_good / disc_total` as GB (grows when sectors are recovered), with pass progress `%` using `work_done / work_total` (always advances). `Xs unreadable` declines as data is recovered. Same UI for all pass types.
+
+## 0.16.0 (2026-04-30)
+
+### IOKit registry-based drive enumeration, BSD name matching, reverse patch default
+
+- **`shim_open_exclusive`** now matches the correct `IOBDServices` for the requested BSD name. Walks all IOBDServices entries in the IOKit registry, matches child IOMedia `"BSD Name"` property. Falls back to IOMedia parent walk, then first-match. Fixes multi-drive systems.
+- **`shim_list_drives`** (new): registry-based drive enumeration. Reads IOBDServices `"Device Characteristics"` for vendor/model/firmware and child IOMedia for BSD name. Zero SCSI, zero exclusive access, zero unmounts. Fixes the enumeration blast that unmounted every disk on the system.
+- **`list_drives()`** and **`find_drives()`** rewritten to use `shim_list_drives`. No longer iterates `/dev/disk0..15` opening exclusive SCSI on each.
+- **`patch_internal`** defaults `reverse: true`. Sweep jumps forward with escalating gaps, so NonTrimmed ranges have good data at their tail. Reverse patch hits good data first, converges on actual bad block boundaries.
+
+## 0.15.1 (2026-04-30)
+
+### Fix damage-jump detection, fix dispatch covers_disc check
+
+- Damage-jump tuning: `DAMAGE_WINDOW=16`, `DAMAGE_THRESHOLD_PCT=12%` (was 50/25%). Old params were too diluted by good reads between sparse failures; new params trigger on 2nd scattered failure.
+- `Disc::copy()` dispatch: `covers_disc` now checks `map.total_size() == disc_size` (byte-for-byte, not approximate). Fixes false sweep dispatch when mapfile exists but doesn't cover full disc.
+- Sweep resume: when dispatched from existing mapfile with NonTried, passes `resume: true`.
+
+## 0.15.0 (2026-04-30)
+
+### Multipass dispatch rewrite, speed control on damage zone entry/exit
+
+- `CopyOptions { decrypt, multipass, progress, halt }`. `Disc::copy()` auto-detects sweep vs patch from mapfile state: no mapfile → sweep, NonTried → sweep with resume, only NonTrimmed/NonScraped/Unreadable → patch, clean → no-op.
+- `Disc::mapfile_for()`: `/dev/null` output → `/tmp/<disc_name>.mapfile`, otherwise `mapfile_path_for(path)`.
+- Speed control: damage zone entry → `set_speed(0x0000)` (minimum), 16 consecutive good reads → `set_speed(0xFFFF)` (maximum). Drive manages optimal speed in clean sections.
+- `SET CD SPEED` SCSI command via `SectorReader::set_speed()` (default no-op, Drive impl sends SCSI).
+
+## 0.14.0 (2026-04-30)
+
+### Damage-jump algorithm replaces probe, bridge degradation detection
+
+- Damage-jump algorithm: when damage threshold exceeded in sliding window, jump ahead by `256×batch×multiplier` sectors. Doubles multiplier on each jump. Zero-fills gap as NonTrimmed.
+- `ecc_sectors()`: returns ECC block size per disc format (32 for UHD, 16 for BD, 16 for DVD).
+- Bridge degradation detection: NOT READY with sense key 2/ASC 0x04/ASCQ 0x3E triggers 10s cooldown, up to 5 times before treating as bad sector.
+
 ## 0.13.43 (2026-04-29)
 
 ### Pass 1 transport-failure recovery loop

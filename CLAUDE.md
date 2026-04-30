@@ -30,12 +30,15 @@ The library contains ZERO user-facing English text. All errors use numeric codes
 
 The macOS SCSI transport uses exclusive IOKit access, not hybrid MMC+pread.
 
-- **C shim** (`src/scsi/macos_shim.c`): `diskutil unmountDisk force` → find IOBDServices via `IOServiceMatching` → MMCDeviceInterface → SCSITaskDeviceInterface → `ObtainExclusiveAccess` → raw CDB dispatch via `CreateSCSITask` + `ExecuteTaskSync`.
+- **C shim** (`src/scsi/macos_shim.c`):
+  - `shim_open_exclusive(bsd_name)`: `diskutil unmountDisk force` on target device only → find `IOBDServices` matching BSD name via IOKit registry walk → MMCDeviceInterface → SCSITaskDeviceInterface → `ObtainExclusiveAccess` → raw CDB dispatch.
+  - `shim_list_drives()`: registry-based enumeration. Walks all `IOBDServices` entries, reads `"Device Characteristics"` for vendor/model/firmware, walks child chain to `IOMedia` for BSD name. Zero SCSI, zero exclusive access, zero unmounts.
+  - `shim_execute()` / `shim_close()`: raw CDB dispatch and cleanup.
 - **Build** (`build.rs`): compiles shim via `cc` into static lib, linked by Cargo. NOT the `cc` crate (produces object code that breaks IOKit exclusive access).
-- **Rust** (`src/scsi/macos.rs`): three FFI calls (`shim_open_exclusive`, `shim_close`, `shim_execute`). All CDBs go through single path — 1:1 with Linux SG_IO.
-- **Key**: must find IOBDServices directly (not walk up from IOMedia). Must unmount before exclusive access. Must release service immediately after creating plugin.
-- **IOBDServices parent chain**: IOMedia → IOBDBlockStorageDriver → IOBDServices → IOSCSIPeripheralDeviceType05. The block storage driver holds exclusive unless unmounted.
-- **Test disc**: DUNE_PART_TWO UHD, `/dev/disk6`, 41288704 sectors.
+- **Rust** (`src/scsi/macos.rs`): FFI to `shim_open_exclusive`, `shim_close`, `shim_execute`, `shim_list_drives`. `list_drives()` uses registry-based enumeration. `MacScsiTransport::open()` uses exclusive access only when ripping a specific device.
+- **IOBDServices parent chain**: IOSCSIPeripheralDeviceType05 → IOBDServices → IOBDBlockStorageDriver → IOMedia (has `"BSD Name"`). The shim walks this chain to match BSD name to IOBDServices.
+- **IOKit lookup order**: (1) iterate all IOBDServices → match child IOMedia BSD name, (2) fallback: find IOMedia by BSD name → walk parent chain to IOBDServices, (3) fallback: first IOBDServices (single-drive systems).
+- **Test disc**: DUNE_PART_TWO UHD, `/dev/disk6`, ~84.6 GB.
 
 ## Bad-sector handling (BU40N + Initio INIC-1618L)
 
@@ -47,14 +50,21 @@ Three failure modes on this USB bridge:
 ### Damage-jump algorithm (Pass 1 sweep)
 
 When `skip_on_error=true` (multipass mode):
-- Read each ECC block sequentially. Track a sliding window of the last 50 ECC block results.
+- Read each ECC block sequentially. Track a sliding window of the last 16 ECC block results.
 - On error: zero-fill, mark NonTrimmed, push `false` to window.
 - On success: write data, mark Finished, push `true` to window. Track consecutive good count.
-- When ≥25% of the 50-block window are failures → **jump** ahead by `256×batch×multiplier` sectors (8 MB base). Zero-fill the gap as NonTrimmed. Double the multiplier (8→16→32→64 MB...).
-- When 50 consecutive good reads → reset multiplier to 1.
+- When ≥12% of the 16-block window are failures → **jump** ahead by `256×batch×multiplier` sectors (8 MB base for UHD). Zero-fill the gap as NonTrimmed. Double the multiplier (8→16→32→64 MB...).
+- When 16 consecutive good reads → reset multiplier to 1, restore max read speed.
 - Only transport failures (bridge crash) abort the pass.
 
-Two tuning knobs: `DAMAGE_WINDOW` (50 ECC blocks) and `DAMAGE_THRESHOLD_PCT` (25%). If the jump is too aggressive or too timid, adjust these.
+Tuning knobs: `DAMAGE_WINDOW=16` and `DAMAGE_THRESHOLD_PCT=12%`. Calibrated from live BU40N data: old 50/25% was too diluted by good reads between sparse failures; 16/12% triggers on the 2nd scattered failure (2/16 = 12.5% ≥ 12%).
+
+### Patch (Pass 2+)
+
+- Default: **reverse** mode. Walks bad ranges from highest LBA to lowest, and within each range from end to start. Rationale: sweep jumps forward with escalating gaps, so NonTrimmed ranges have good data at their tail (where the jump landed). Reverse hits good data first, converges on actual bad block boundaries.
+- Single-sector reads with 60 s timeout (`READ_RECOVERY_TIMEOUT_MS`).
+- Non-marginal SCSI sense → immediate bail (no point retrying hard errors).
+- Wedged-drive exit: 50 consecutive failures with zero recovery.
 
 ## Public repo rules
 
