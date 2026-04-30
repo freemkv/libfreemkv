@@ -47,6 +47,9 @@ pub struct PassProgress {
     /// Cumulative bytes confirmed clean (`Finished` mapfile state) across
     /// every pass run on this rip. Doesn't change across pass boundaries.
     pub bytes_good_total: u64,
+    /// Cumulative bytes marked bad (`NonTrimmed` + `NonScraped` +
+    /// `Unreadable`) across every pass run on this rip.
+    pub bytes_bad_total: u64,
     /// Total disc capacity in bytes. Constant.
     pub bytes_total_disc: u64,
 }

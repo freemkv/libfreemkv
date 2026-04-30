@@ -1249,7 +1249,7 @@ impl Disc {
             let _ = std::fs::remove_file(&mapfile_path);
         }
         let mut map =
-            mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, env!("CARGO_PKG_VERSION"))
+            mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, concat!("libfreemkv v", env!("CARGO_PKG_VERSION")))
                 .map_err(|e| Error::IoError { source: e })?;
 
         // ISO file: if resuming and mapfile has Finished ranges, open existing;
@@ -1281,15 +1281,15 @@ impl Disc {
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
-        let mut current_batch = batch;
-        let mut consecutive_ok_since_error: u64 = 0;
-        let mut consecutive_errors: u64 = 0;
-        let mut skip_power: u32 = 0;
         let copy_t0 = std::time::Instant::now();
         let mut iter_count: u64 = 0;
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
+        let mut not_ready_retries: u32 = 0;
+        const NOT_READY_MAX_RETRIES: u32 = 3;
+        let mut error_count_in_zone: u64 = 0;
+        let mut probe_buf = vec![0u8; 2048];
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
@@ -1337,7 +1337,7 @@ impl Disc {
                     }
                 }
 
-                let block_bytes = (region_end - pos).min(current_batch as u64 * 2048);
+                let block_bytes = (region_end - pos).min(batch as u64 * 2048);
                 let block_lba = (pos / 2048) as u32;
                 let block_count = (block_bytes / 2048) as u16;
                 let recovery = !opts.skip_on_error;
@@ -1349,31 +1349,11 @@ impl Disc {
                     recovery,
                 );
 
+                let mut did_skip_ahead = false;
+
                 if read_result.is_ok() {
                     read_ok_count += 1;
-                    consecutive_ok_since_error += 1;
-                    consecutive_errors = 0;
-                    skip_power = 0;
-
-                    if current_batch < batch
-                        && consecutive_ok_since_error >= COPY_BATCH_RESTORE_STREAK
-                    {
-                        let next_batch = (current_batch * 2).min(batch);
-                        tracing::info!(
-                            target: "freemkv::disc",
-                            phase = "batch_restore",
-                            prev_batch = current_batch,
-                            batch = next_batch,
-                            lba = block_lba,
-                            streak = consecutive_ok_since_error,
-                            "graduated batch restore"
-                        );
-                        current_batch = next_batch;
-                        if (current_batch as usize * 2048) > buf.len() {
-                            buf.resize(current_batch as usize * 2048, 0);
-                        }
-                        consecutive_ok_since_error = 0;
-                    }
+                    error_count_in_zone = 0;
 
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(
@@ -1403,19 +1383,6 @@ impl Disc {
                 } else {
                     let err = read_result.err().unwrap();
                     read_err_count += 1;
-                    consecutive_ok_since_error = 0;
-                    consecutive_errors += 1;
-
-                    if current_batch > 1 {
-                        current_batch = 1;
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "batch_reduce",
-                            lba = block_lba,
-                            prev_batch = block_count,
-                            "dropping to single-sector reads after error"
-                        );
-                    }
 
                     if err.is_scsi_transport_failure() {
                         tracing::warn!(
@@ -1428,18 +1395,36 @@ impl Disc {
                         return Err(err);
                     }
 
-                    if !err.is_marginal_read()
-                        && err.scsi_sense().is_none_or(|s| !s.is_medium_error())
-                    {
-                        return Err(err);
+                    let sense = err.scsi_sense();
+                    let sense_key = sense.map(|s| s.sense_key).unwrap_or(0);
+                    let asc = sense.map(|s| s.asc).unwrap_or(0);
+                    let ascq = sense.map(|s| s.ascq).unwrap_or(0);
+
+                    if sense_key == crate::scsi::SENSE_KEY_NOT_READY && not_ready_retries < NOT_READY_MAX_RETRIES {
+                        not_ready_retries += 1;
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "not_ready_pause",
+                            lba = block_lba,
+                            sense_key,
+                            asc,
+                            ascq,
+                            retry = not_ready_retries,
+                            "NOT READY; pausing 3s then retrying"
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        continue;
                     }
+                    not_ready_retries = 0;
 
                     tracing::warn!(
                         target: "freemkv::disc",
                         phase = "skip_ecc_block",
                         lba = block_lba,
                         sectors = block_count,
-                        consecutive_errors,
+                        sense_key,
+                        asc,
+                        ascq,
                         error = %err,
                         "ECC block failed; marking NonTrimmed"
                     );
@@ -1452,46 +1437,55 @@ impl Disc {
                         .map_err(|e| Error::IoError { source: e })?;
                     bytes_done = bytes_done.saturating_add(block_bytes);
 
-                    let pause_ms = opts.error_pause_ms.unwrap_or(COPY_ERROR_PAUSE_MS);
-                    if pause_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(pause_ms));
-                    }
-
-                    if consecutive_errors >= COPY_SKIP_THRESHOLD {
-                        let skip_sectors =
-                            (COPY_SKIP_BASE_SECTORS << skip_power).min(COPY_SKIP_MAX_SECTORS);
-                        let available = region_end.saturating_sub(pos + block_bytes);
-                        let skip_bytes = (skip_sectors as u64 * 2048).min(available);
-                        if skip_bytes > 0 {
-                            let skip_lba = ((pos + block_bytes) / 2048) as u32;
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "skip_ahead",
-                                from_lba = skip_lba,
-                                skip_sectors,
-                                skip_power,
-                                consecutive_errors,
-                                "skipping ahead through bad zone"
-                            );
-                            let skip_zero = vec![0u8; skip_bytes as usize];
-                            file.seek(SeekFrom::Start(pos + block_bytes))
-                                .map_err(|e| Error::IoError { source: e })?;
-                            file.write_all(&skip_zero)
-                                .map_err(|e| Error::IoError { source: e })?;
-                            map.record(
-                                pos + block_bytes,
-                                skip_bytes,
-                                mapfile::SectorStatus::NonTrimmed,
-                            )
-                            .map_err(|e| Error::IoError { source: e })?;
-                            bytes_done = bytes_done.saturating_add(skip_bytes);
-                            pos += skip_bytes;
-                            skip_power = skip_power.saturating_add(1);
+                    error_count_in_zone += 1;
+                    if error_count_in_zone >= 4 {
+                        let probe_offset_sectors = 256 * batch as u64;
+                        let probe_lba = ((pos / 2048) + probe_offset_sectors) as u32;
+                        let probe_end_lba = (region_end / 2048) as u32;
+                        if probe_lba < probe_end_lba {
+                            match reader.read_sectors(probe_lba, 1, &mut probe_buf, false) {
+                                Ok(_) => {
+                                    let jump_pos = probe_lba as u64 * 2048;
+                                    let gap_start = pos + block_bytes;
+                                    let gap_bytes = jump_pos.saturating_sub(gap_start);
+                                    let jump_mb = gap_bytes / 1_048_576;
+                                    if gap_bytes > 0 {
+                                        tracing::warn!(
+                                            target: "freemkv::disc",
+                                            phase = "probe_jump",
+                                            from_lba = block_lba,
+                                            to_lba = probe_lba,
+                                            jump_mb,
+                                            errors = error_count_in_zone,
+                                            "probe found good media; jumping ahead"
+                                        );
+                                        let zero = vec![0u8; 65536];
+                                        let mut filled: u64 = 0;
+                                        while filled < gap_bytes {
+                                            let chunk = (gap_bytes - filled).min(zero.len() as u64);
+                                            file.seek(SeekFrom::Start(gap_start + filled))
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            file.write_all(&zero[..chunk as usize])
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            filled += chunk;
+                                        }
+                                        map.record(gap_start, gap_bytes, mapfile::SectorStatus::NonTrimmed)
+                                            .map_err(|e| Error::IoError { source: e })?;
+                                        bytes_done = bytes_done.saturating_add(gap_bytes);
+                                    }
+                                    pos = jump_pos;
+                                    did_skip_ahead = true;
+                                    error_count_in_zone = 0;
+                                }
+                                Err(_) => {}
+                            }
                         }
                     }
                 }
 
-                pos += block_bytes;
+                if !did_skip_ahead {
+                    pos += block_bytes;
+                }
                 iter_count += 1;
 
                 if iter_count - last_log_iter >= 100 {
@@ -1519,6 +1513,7 @@ impl Disc {
                         work_done: pos,
                         work_total: total_bytes,
                         bytes_good_total: stats.bytes_good,
+                        bytes_bad_total: stats.bytes_unreadable + stats.bytes_retryable,
                         bytes_total_disc: total_bytes,
                     });
                 }
@@ -1560,7 +1555,6 @@ pub struct CopyOptions<'a> {
     pub skip_on_error: bool,
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub error_pause_ms: Option<u64>,
 }
 
 /// Result of `Disc::copy`. `complete=true` means every byte reached a terminal
@@ -1827,6 +1821,7 @@ impl Disc {
                         work_done,
                         work_total,
                         bytes_good_total: s.bytes_good,
+                        bytes_bad_total: s.bytes_unreadable + s.bytes_retryable,
                         bytes_total_disc: total_bytes,
                     });
                 }
@@ -1865,12 +1860,6 @@ impl Disc {
 const MAX_BATCH_SECTORS: u16 = 510;
 const DEFAULT_BATCH_SECTORS: u16 = 60;
 const MIN_BATCH_SECTORS: u16 = 3;
-
-const COPY_ERROR_PAUSE_MS: u64 = 2000;
-const COPY_SKIP_THRESHOLD: u64 = 8;
-const COPY_SKIP_BASE_SECTORS: u32 = 32;
-const COPY_SKIP_MAX_SECTORS: u32 = 8192;
-const COPY_BATCH_RESTORE_STREAK: u64 = 200;
 
 /// Coarse damage tier for a finished or in-progress rip. Maps the
 /// observable signals (bad sector count + lost wallclock playback time)

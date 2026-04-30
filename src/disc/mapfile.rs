@@ -318,7 +318,7 @@ impl Mapfile {
             let mut w = std::io::BufWriter::new(file);
             writeln!(
                 w,
-                "# Rescue Logfile. Created by libfreemkv v{}",
+                "# Rescue Logfile. Created by {}",
                 self.version
             )?;
             writeln!(w, "# Current pos / status / pass / pass_time")?;
