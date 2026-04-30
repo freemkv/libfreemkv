@@ -62,52 +62,51 @@ Position and size are hex byte offsets into the ISO.
 
 ### `CopyOptions` and `PatchOptions`
 
-Defaults preserve pre-`0.11.21` behavior — abort on the first unreadable
-sector. Opt in to the recovery-friendly path:
+`Disc::copy()` auto-detects the pass from mapfile state:
 
 ```rust
 CopyOptions {
-    skip_on_error: true,   // zero-fill bad blocks, continue
-    skip_forward: true,    // exponential skip-forward after a failure
-    resume: true,          // pick up from an existing ISO + mapfile
-    decrypt: false,        // keep the ISO a raw disc image
-    ..Default::default()
+    decrypt: true,     // decrypt AACS/CSS sectors
+    multipass: true,   // enable mapfile + skip-on-error + damage-jump
+    progress: Some(&reporter),  // progress callback
+    halt: Some(flag),  // halt flag for graceful stop
 }
 ```
 
+Dispatch logic:
+- No mapfile → sweep (fresh Pass 1)
+- Mapfile with NonTried (`?`) → sweep with resume
+- Mapfile covering full disc, only NonTrimmed/NonScraped/Unreadable → patch
+- Mapfile clean → no-op
+
 ## Algorithm
 
-### Pass 1 — fast sweep (`Disc::copy`)
+### Pass 1 — fast sweep (`Disc::copy` → `sweep_internal`)
 
-1. Read 64 KB (32 sectors, one BD ECC block) at the current LBA via
-   `Drive::read(.., recovery=false)` — short 1.5 s timeout, single shot.
-2. On success: mark the range `+`, advance by one block.
-3. On failure (with `skip_on_error`): zero-fill the block in the ISO, mark
-   it `*`, advance.
-4. If `skip_forward` is set: after a failure, jump ahead by an exponentially
-   growing amount (256 KB initial, doubling on consecutive failures, capped at
-   1% of disc). The skipped bytes are also marked `*` — `patch` will visit
-   them later.
-5. Reset the skip size to 256 KB on the first success after a failure.
+1. Read one ECC block (32 sectors for UHD, 16 for BD/DVD) at the current LBA.
+2. On success: write data to ISO, mark `+`, advance.
+3. On failure (with `multipass`): zero-fill, mark `*`, advance.
+4. Track a sliding window of the last 16 ECC block results. When ≥12% are failures
+   → **damage-jump**: skip ahead by `256×batch×multiplier` sectors (8 MB base for
+   UHD). Double the multiplier on each jump (8→16→32→64 MB...). Zero-fill the gap as `*`.
+5. On 16 consecutive good reads: reset jump multiplier to 1, restore max read speed.
+6. Speed control: damage zone entry → minimum speed, exit → maximum speed.
+7. Only transport failures (USB bridge crash) abort the pass.
 
-Pass 1 completes when every byte has terminal status (`+`, `-`, or the caller
-bails via the halt flag).
+Pass 1 completes when every byte has been visited (either `+` or `*`).
 
-### Pass 2+ — patch (`Disc::patch`)
+### Pass 2+ — patch (`Disc::copy` → `patch_internal`)
 
-`Disc::patch` reads the mapfile and iterates every non-`+` range. For each:
+`Disc::patch` reads the mapfile and iterates every non-`+` range. Default: **reverse** mode
+(walks ranges from highest LBA to lowest, within each range from end to start).
 
-1. Issue a drive read via `Drive::read(.., recovery=true)` — long 30 s
-   timeout, still single shot. Drive firmware does its own ECC and retries
-   inside that window; userspace does not pile on additional retries here.
-2. On success: write the good bytes into the ISO at the exact byte offset,
-   mark `+`.
-3. On failure: mark `-`.
-4. Update the mapfile after every block — crash-safe resume.
-
-Idempotent. Call `patch` N times for N retry attempts; typically the caller
-stops early if a pass recovers zero bytes (structure-protected sectors will
-never yield).
+1. Issue a single-sector read with 60 s timeout (`recovery=true`). Drive firmware
+   does its own ECC recovery inside that window.
+2. On success: write the good bytes into the ISO, mark `+`.
+3. On failure with non-marginal SCSI sense: bail immediately (drive won't produce data).
+4. On failure with marginal sense: mark `-`, continue.
+5. Update the mapfile after every block — crash-safe resume.
+6. Wedged-drive exit: 50 consecutive failures with zero recovery → bail this pass.
 
 ### In-stream — adaptive batch halving (`DiscStream::fill_extents`)
 

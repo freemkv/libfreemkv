@@ -99,13 +99,23 @@ descriptors or calls ioctls outside of a `ScsiTransport` implementation.
 |----------|---------------|--------|
 | Linux | `SgIoTransport` — async `write`/`poll`/`read` on `/dev/sg*` | `/dev/sg*` |
 | macOS | `MacScsiTransport` — IOKit SCSITask | IOKit service |
-| Windows | `WindowsScsiTransport` — SPTI | `\\.\CdRomN` |
 
 The Linux backend uses the sg driver's asynchronous interface: `write()` submits
 the command, `poll()` waits with an enforceable wall-clock timeout, `read()`
 retrieves the result. If `poll()` times out, the fd is abandoned (closed in a
 background thread) and a fresh fd opened — the kernel's USB error recovery
 cannot block us. Opens with `O_RDWR | O_NONBLOCK`.
+
+The macOS backend uses a C shim (`macos_shim.c`) for IOKit exclusive access.
+The shim handles:
+1. `shim_open_exclusive(bsd_name)` — unmounts the target device via `diskutil`,
+   then walks the IOKit registry to find the `IOBDServices` matching the
+   requested BSD name (IOBDServices → IOBDBlockStorageDriver → IOMedia → "BSD Name"),
+   then creates MMCDeviceInterface → SCSITaskDeviceInterface → ObtainExclusiveAccess.
+2. `shim_list_drives()` — registry-based enumeration with zero SCSI, zero exclusive
+   access, zero unmounts. Reads IOBDServices "Device Characteristics" for
+   vendor/model/firmware and child IOMedia "BSD Name" for the device path.
+3. `shim_execute()` / `shim_close()` — raw CDB dispatch and cleanup.
 
 On non-zero SCSI status, the transport parses sense key from the sense buffer
 and returns `Error::ScsiError`.
