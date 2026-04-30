@@ -438,7 +438,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
 
     let opts = CopyOptions {
         decrypt: false,
-        skip_on_error: true,
+        multipass: true,
 
         ..Default::default()
     };
@@ -518,7 +518,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
 
     let opts = CopyOptions {
         decrypt: false,
-        skip_on_error: true,
+        multipass: true,
 
         halt: Some(halt),
         ..Default::default()
@@ -606,7 +606,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
 
     let opts = CopyOptions {
         decrypt: false,
-        skip_on_error: true,
+        multipass: true,
 
         ..Default::default()
     };

@@ -1210,29 +1210,114 @@ impl Disc {
         }
     }
 
-    /// Raw sector copy — write the entire disc image to a file.
+    /// Copy disc sectors to an ISO image file.
     ///
-    /// NOT a stream operation. Copies sectors 0→capacity byte-for-byte producing
-    /// a valid ISO/UDF image. Records progress in a ddrescue-format mapfile at
+    /// NOT a stream operation. Copies sectors byte-for-byte producing a valid
+    /// ISO/UDF image. Records progress in a ddrescue-format mapfile at
     /// `path + ".mapfile"` — flushed every block for crash-safe resume.
     ///
-    /// # Options
-    /// - **default** (skip_on_error=false): uses full drive recovery (may take
-    ///   minutes per bad sector), aborts on error. Mapfile is produced as a
-    ///   side-effect.
-    /// - **skip_on_error**: zero-fill bad blocks in the ISO, mark them NonTrimmed
-    ///   in the mapfile, and continue. Reads in `batch`-sector chunks (32 sectors
-    ///   = 1 BD ECC block by default). Failed blocks are marked NonTrimmed for
-    ///   recovery by `Disc::patch`. No single-sector reads in this pass —
-    ///   Pass 1 is pure ECC-block sweep.
-    /// - **resume**: if the mapfile exists, resume from its state — only
-    ///   `non-tried` ranges are read. Without `resume`, a fresh mapfile is
-    ///   written and the ISO recreated from scratch.
+    /// Auto-detects the pass based on mapfile state:
+    /// - **No mapfile** → Pass 1 (sweep): sequential read of the entire disc,
+    ///   ECC-aligned batches, damage-jump on contiguous failures, marks bad
+    ///   blocks as NonTrimmed. No drive-level recovery — fast.
+    /// - **Mapfile with bad ranges** → Pass N (patch): re-reads only bad ranges
+    ///   sector-by-sector with full drive-level recovery. Marks recovered
+    ///   sectors as Finished, failed as Unreadable (terminal).
+    /// - **Mapfile clean** → no-op: all sectors are Finished.
+    ///
+    /// Without `multipass`: aborts on the first read error (legacy single-pass).
     pub fn copy(
         &self,
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
         opts: &CopyOptions,
+    ) -> Result<CopyResult> {
+        if opts.multipass {
+            let mf_path = self.mapfile_for(path);
+            if mf_path.exists() {
+                let map = mapfile::Mapfile::load(&mf_path)
+                    .map_err(|e| Error::IoError { source: e })?;
+                let stats = map.stats();
+                let bad_bytes = stats.bytes_pending + stats.bytes_unreadable;
+                tracing::info!(
+                    "copy dispatch: {} good, {} nontried, {} pending, {} unreadable",
+                    stats.bytes_good,
+                    stats.bytes_nontried,
+                    stats.bytes_pending,
+                    stats.bytes_unreadable,
+                );
+                if bad_bytes == 0 {
+                    return Ok(CopyResult {
+                        bytes_total: map.total_size(),
+                        bytes_good: stats.bytes_good,
+                        bytes_unreadable: stats.bytes_unreadable,
+                        bytes_pending: 0,
+                        recovered_this_pass: 0,
+                        complete: true,
+                        halted: false,
+                    });
+                }
+                if stats.bytes_nontried > 0 {
+                    tracing::info!("copy dispatch: → sweep (NonTried regions remain)");
+                    return self.sweep_internal(reader, path, opts);
+                }
+                tracing::info!("copy dispatch: → patch (only NonTrimmed/NonScraped/Unreadable remain)");
+                return self.patch_internal(reader, path, opts);
+            }
+        }
+        self.sweep_internal(reader, path, opts)
+    }
+
+    fn sweep_internal(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &std::path::Path,
+        opts: &CopyOptions,
+    ) -> Result<CopyResult> {
+        let sweep_opts = SweepOptions {
+            decrypt: opts.decrypt,
+            resume: false,
+            batch_sectors: None,
+            skip_on_error: opts.multipass,
+            progress: opts.progress,
+            halt: opts.halt.clone(),
+        };
+        self.sweep(reader, path, &sweep_opts)
+    }
+
+    fn patch_internal(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &std::path::Path,
+        opts: &CopyOptions,
+    ) -> Result<CopyResult> {
+        let patch_opts = PatchOpts {
+            decrypt: opts.decrypt,
+            block_sectors: Some(1),
+            full_recovery: true,
+            reverse: false,
+            wedged_threshold: 50,
+            progress: opts.progress,
+            halt: opts.halt.clone(),
+        };
+        let pr = self.patch(reader, path, &patch_opts)?;
+        Ok(CopyResult {
+            bytes_total: pr.bytes_total,
+            bytes_good: pr.bytes_good,
+            bytes_unreadable: pr.bytes_unreadable,
+            bytes_pending: pr.bytes_pending,
+            recovered_this_pass: pr.bytes_recovered_this_pass,
+            complete: pr.bytes_pending == 0 && pr.bytes_unreadable > 0
+                || pr.bytes_pending == 0 && pr.bytes_unreadable == 0,
+            halted: pr.halted,
+        })
+    }
+
+    fn sweep(
+        &self,
+        reader: &mut dyn SectorReader,
+        path: &std::path::Path,
+        opts: &SweepOptions,
     ) -> Result<CopyResult> {
         use std::io::{Seek, SeekFrom, Write};
 
@@ -1244,7 +1329,7 @@ impl Disc {
         };
 
         // Mapfile: load if resuming, else wipe + recreate.
-        let mapfile_path = mapfile_path_for(path);
+        let mapfile_path = self.mapfile_for(path);
         if !opts.resume {
             let _ = std::fs::remove_file(&mapfile_path);
         }
@@ -1274,7 +1359,7 @@ impl Disc {
         let mut file = file;
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
-            None if opts.skip_on_error => 32,
+            None if opts.skip_on_error => ecc_sectors(self.format),
             None => DEFAULT_BATCH_SECTORS,
         };
 
@@ -1297,6 +1382,7 @@ impl Disc {
         let mut damage_window: Vec<bool> = Vec::with_capacity(DAMAGE_WINDOW);
         let mut jump_multiplier: u64 = 1;
         let mut consecutive_good: u64 = 0;
+        let mut in_damage_zone = false;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
@@ -1367,6 +1453,16 @@ impl Disc {
                     consecutive_good += 1;
                     if consecutive_good >= DAMAGE_WINDOW as u64 {
                         jump_multiplier = 1;
+                        if in_damage_zone {
+                            in_damage_zone = false;
+                            reader.set_speed(0xFFFF);
+                            tracing::debug!(
+                                target: "freemkv::disc",
+                                phase = "damage_exit",
+                                lba = block_lba,
+                                "Exited damage zone; restoring max read speed"
+                            );
+                        }
                     }
                     bridge_degradation_count = 0;
 
@@ -1488,6 +1584,16 @@ impl Disc {
                         let jump_lba = ((pos / 2048) + jump_sectors) as u32;
                         let region_end_lba = (region_end / 2048) as u32;
                         if jump_lba < region_end_lba {
+                            if !in_damage_zone {
+                                in_damage_zone = true;
+                                reader.set_speed(0x0000);
+                                tracing::debug!(
+                                    target: "freemkv::disc",
+                                    phase = "damage_enter",
+                                    lba = block_lba,
+                                    "Entered damage zone; dropping to minimum read speed"
+                                );
+                            }
                             let jump_pos = jump_lba as u64 * 2048;
                             let gap_start = pos + block_bytes;
                             let gap_bytes = jump_pos.saturating_sub(gap_start);
@@ -1580,16 +1686,33 @@ impl Disc {
             bytes_good: stats.bytes_good,
             bytes_unreadable: stats.bytes_unreadable,
             bytes_pending: stats.bytes_pending,
+            recovered_this_pass: 0,
             complete: stats.bytes_pending == 0 && !halt_requested,
             halted: halt_requested,
         })
     }
 }
 
-/// Options for `Disc::copy`. All fields default to the pre-v0.11.21 behavior
-/// (recovery reads, abort on bad sector).
 #[derive(Default)]
 pub struct CopyOptions<'a> {
+    pub decrypt: bool,
+    pub multipass: bool,
+    pub progress: Option<&'a dyn crate::progress::Progress>,
+    pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CopyResult {
+    pub bytes_total: u64,
+    pub bytes_good: u64,
+    pub bytes_unreadable: u64,
+    pub bytes_pending: u64,
+    pub recovered_this_pass: u64,
+    pub complete: bool,
+    pub halted: bool,
+}
+
+pub(crate) struct SweepOptions<'a> {
     pub decrypt: bool,
     pub resume: bool,
     pub batch_sectors: Option<u16>,
@@ -1598,89 +1721,59 @@ pub struct CopyOptions<'a> {
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Result of `Disc::copy`. `complete=true` means every byte reached a terminal
-/// state (Finished or Unreadable). `complete=false` means there's still pending
-/// work (halt, abort, or non-tried ranges) that `Disc::patch` or a resumed
-/// `Disc::copy` would continue.
-#[derive(Debug, Clone, Copy)]
-pub struct CopyResult {
-    pub bytes_total: u64,
-    pub bytes_good: u64,
-    pub bytes_unreadable: u64,
-    pub bytes_pending: u64,
-    pub complete: bool,
-    pub halted: bool,
-}
-
-/// Sidecar mapfile path for a given ISO path — `foo.iso` → `foo.iso.mapfile`.
-pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
-    let mut s = iso_path.as_os_str().to_os_string();
-    s.push(".mapfile");
-    std::path::PathBuf::from(s)
-}
-
-/// Options for `Disc::patch`. Idempotent — each call is one patch attempt.
-#[derive(Default)]
-pub struct PatchOptions<'a> {
+pub(crate) struct PatchOpts<'a> {
     pub decrypt: bool,
-    /// Sector-granularity block size for retries. Defaults to 1 sector (2 KB).
     pub block_sectors: Option<u16>,
-    /// Use full drive-level recovery on each read (slow but thorough). Defaults
-    /// to true — patch is the pass where we *want* the drive to try hard.
     pub full_recovery: bool,
-    /// Walk bad ranges in reverse order, and within each range walk sectors
-    /// from high to low LBA. Useful for drives that wedge after a forward
-    /// read of a bad sector — approaching the post-bad-zone from end-of-disc
-    /// reads good sectors before the drive sees a bad one.
     pub reverse: bool,
-    /// Bail out early if this many consecutive read failures occur with zero
-    /// successful reads in the same pass — i.e. the drive is wedged on the
-    /// bad zone and won't recover during this attempt. `0` disables the
-    /// guard (run to completion or halt).
     pub wedged_threshold: u64,
-    /// Per-iteration progress reporter. See `CopyOptions::progress`.
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Result of `Disc::patch` — how many bad bytes were recovered, plus
-/// per-block counters for diagnosing why a pass made or didn't make progress.
-#[derive(Debug, Clone, Copy)]
-pub struct PatchResult {
+pub(crate) struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,
     pub bytes_unreadable: u64,
     pub bytes_pending: u64,
     pub bytes_recovered_this_pass: u64,
     pub halted: bool,
-    /// Total inner-loop iterations this pass (one per block attempted).
     pub blocks_attempted: u64,
-    /// Reads that returned Ok and were promoted to `Finished`.
     pub blocks_read_ok: u64,
-    /// Reads that returned Err and were marked `Unreadable`.
     pub blocks_read_failed: u64,
-    /// Pass exited early because `wedged_threshold` consecutive failures
-    /// occurred with zero successful reads — drive appears wedged on the
-    /// bad zone for this pass.
     pub wedged_exit: bool,
 }
 
+pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = iso_path.as_os_str().to_os_string();
+    s.push(".mapfile");
+    std::path::PathBuf::from(s)
+}
+
 impl Disc {
-    /// Patch an existing ISO using its sidecar mapfile. Re-reads every range
-    /// that's not yet `+` (Finished) and writes successful bytes into the ISO
-    /// at their exact offsets. Updates mapfile entries as it goes.
-    ///
-    /// Idempotent — call repeatedly to apply more retry attempts. Stops early
-    /// if a pass recovered zero bytes (no point continuing).
-    pub fn patch(
+    fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if path.as_os_str() == "/dev/null" {
+            let name: String = self.meta_title.as_deref().unwrap_or(&self.volume_id)
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            std::path::PathBuf::from(format!("/tmp/{name}.mapfile"))
+        } else {
+            mapfile_path_for(path)
+        }
+    }
+}
+
+impl Disc {
+    fn patch(
         &self,
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
-        opts: &PatchOptions,
-    ) -> Result<PatchResult> {
+        opts: &PatchOpts,
+    ) -> Result<PatchOutcome> {
         use std::io::{Seek, SeekFrom, Write};
 
-        let mapfile_path = mapfile_path_for(path);
+        let mapfile_path = self.mapfile_for(path);
         let mut map =
             mapfile::Mapfile::load(&mapfile_path).map_err(|e| Error::IoError { source: e })?;
         let total_bytes = map.total_size();
@@ -1883,7 +1976,7 @@ impl Disc {
             bytes_recovered = stats.bytes_good.saturating_sub(bytes_good_before),
             "Disc::patch returning"
         );
-        Ok(PatchResult {
+        Ok(PatchOutcome {
             bytes_total: total_bytes,
             bytes_good: stats.bytes_good,
             bytes_unreadable: stats.bytes_unreadable,
@@ -1902,7 +1995,7 @@ const MAX_BATCH_SECTORS: u16 = 510;
 const DEFAULT_BATCH_SECTORS: u16 = 60;
 const MIN_BATCH_SECTORS: u16 = 3;
 
-pub fn ecc_sectors(format: DiscFormat) -> u16 {
+pub(crate) fn ecc_sectors(format: DiscFormat) -> u16 {
     match format {
         DiscFormat::Uhd | DiscFormat::BluRay => 32,
         DiscFormat::Dvd => 16,
