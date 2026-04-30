@@ -1238,17 +1238,22 @@ impl Disc {
                 let map = mapfile::Mapfile::load(&mf_path)
                     .map_err(|e| Error::IoError { source: e })?;
                 let stats = map.stats();
+                let disc_size = self.capacity_bytes;
+                let covers_disc = map.total_size() == disc_size;
                 let bad_bytes = stats.bytes_pending + stats.bytes_unreadable;
                 tracing::info!(
-                    "copy dispatch: {} good, {} nontried, {} pending, {} unreadable",
+                    "copy dispatch: disc={} map={} covers={} good={} nontried={} pending={} unreadable={}",
+                    disc_size,
+                    map.total_size(),
+                    covers_disc,
                     stats.bytes_good,
                     stats.bytes_nontried,
                     stats.bytes_pending,
                     stats.bytes_unreadable,
                 );
-                if bad_bytes == 0 {
+                if covers_disc && bad_bytes == 0 {
                     return Ok(CopyResult {
-                        bytes_total: map.total_size(),
+                        bytes_total: disc_size,
                         bytes_good: stats.bytes_good,
                         bytes_unreadable: stats.bytes_unreadable,
                         bytes_pending: 0,
@@ -1257,15 +1262,19 @@ impl Disc {
                         halted: false,
                     });
                 }
-                if stats.bytes_nontried > 0 {
-                    tracing::info!("copy dispatch: → sweep (NonTried regions remain)");
-                    return self.sweep_internal(reader, path, opts);
+                if !covers_disc || stats.bytes_nontried > 0 {
+                    tracing::info!(
+                        "copy dispatch: → sweep (covers_disc={}, nontried={})",
+                        covers_disc,
+                        stats.bytes_nontried,
+                    );
+                    return self.sweep_internal(reader, path, opts, true);
                 }
-                tracing::info!("copy dispatch: → patch (only NonTrimmed/NonScraped/Unreadable remain)");
+                tracing::info!("copy dispatch: → patch");
                 return self.patch_internal(reader, path, opts);
             }
         }
-        self.sweep_internal(reader, path, opts)
+        self.sweep_internal(reader, path, opts, false)
     }
 
     fn sweep_internal(
@@ -1273,10 +1282,11 @@ impl Disc {
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
         opts: &CopyOptions,
+        resume: bool,
     ) -> Result<CopyResult> {
         let sweep_opts = SweepOptions {
             decrypt: opts.decrypt,
-            resume: false,
+            resume,
             batch_sectors: None,
             skip_on_error: opts.multipass,
             progress: opts.progress,
@@ -1376,8 +1386,8 @@ impl Disc {
         let mut bridge_degradation_count: u32 = 0;
         const BRIDGE_DEGRADATION_MAX: u32 = 5;
         const BRIDGE_DEGRADATION_COOLDOWN_SECS: u64 = 10;
-        const DAMAGE_WINDOW: usize = 50;
-        const DAMAGE_THRESHOLD_PCT: usize = 25;
+        const DAMAGE_WINDOW: usize = 16;
+        const DAMAGE_THRESHOLD_PCT: usize = 12;
         const JUMP_SECTORS_FACTOR: u64 = 256;
         let mut damage_window: Vec<bool> = Vec::with_capacity(DAMAGE_WINDOW);
         let mut jump_multiplier: u64 = 1;
