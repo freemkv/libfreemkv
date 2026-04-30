@@ -1,26 +1,25 @@
 //! macOS drive discovery and device resolution.
+//!
+//! `find_drives` uses IOKit registry enumeration (via `scsi::list_drives`)
+//! to discover optical drives without exclusive access or unmounts. Only
+//! the returned paths are then opened for INQUIRY to build full `DriveId`.
 
 use crate::error::{Error, Result};
 use crate::identity::DriveId;
 
 pub fn find_drives() -> Vec<(String, DriveId)> {
     let mut drives = Vec::new();
-    for i in 0..16 {
-        let path = format!("/dev/disk{}", i);
-        if !std::path::Path::new(&path).exists() {
-            continue;
-        }
-        match crate::scsi::open(std::path::Path::new(&path)) {
+    let discovered = crate::scsi::list_drives();
+    for info in discovered {
+        let path = std::path::Path::new(&info.path);
+        match crate::scsi::open(path) {
             Ok(mut transport) => {
                 if let Ok(id) = DriveId::from_drive(transport.as_mut()) {
-                    if !id.raw_inquiry.is_empty() && (id.raw_inquiry[0] & 0x1F) == 0x05 {
-                        drives.push((path, id));
-                    }
+                    drives.push((info.path.clone(), id));
                 }
             }
             Err(_) => {
-                // Device exists but can't be opened (likely mounted).
-                // Use `diskutil unmountDisk /dev/diskN` to unmount before accessing.
+                continue;
             }
         }
     }

@@ -4,17 +4,30 @@
 //! through `SCSITaskDeviceInterface::ExecuteTaskSync` — 1:1 with the Linux
 //! SG_IO backend. The C shim (`macos_shim.c`) handles:
 //!
-//! 1. `diskutil unmountDisk force` so the kernel block-storage driver releases
-//! 2. Find `IOBDServices` directly via `IOServiceMatching` (not IOMedia walk)
+//! 1. `diskutil unmountDisk force` on the target device only
+//! 2. Find `IOBDServices` matching the requested BSD name (walks IOKit
+//!    registry: IOBDServices → IOBDBlockStorageDriver → IOMedia → BSD Name)
 //! 3. Create `MMCDeviceInterface` → `SCSITaskDeviceInterface`
 //! 4. `ObtainExclusiveAccess`
 //! 5. Raw CDB dispatch via `CreateSCSITask` + `ExecuteTaskSync`
+//!
+//! Drive enumeration (`list_drives`) uses the IOKit registry directly via
+//! `shim_list_drives` — no exclusive access, no SCSI commands, no unmounts.
 
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
 use std::path::Path;
 
 const K_SENSE_DATA_SIZE: usize = 32;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct ShimDriveInfo {
+    bsd_name: [u8; 32],
+    vendor: [u8; 32],
+    model: [u8; 48],
+    firmware: [u8; 16],
+}
 
 unsafe extern "C" {
     fn shim_open_exclusive(bsd_name: *const u8) -> i32;
@@ -30,6 +43,7 @@ unsafe extern "C" {
         task_status_out: *mut u8,
         transfer_count: *mut u64,
     ) -> i32;
+    fn shim_list_drives(out: *mut ShimDriveInfo, max_entries: i32) -> i32;
 }
 
 pub struct MacScsiTransport {
@@ -131,42 +145,39 @@ impl ScsiTransport for MacScsiTransport {
     }
 }
 
-// ── Drive enumeration ────────────────────────────────────────────────────
+// ── Drive enumeration (registry-based, no exclusive access) ──────────────
 
 pub(super) fn list_drives() -> Vec<super::DriveInfo> {
+    let mut buf = [ShimDriveInfo {
+        bsd_name: [0; 32],
+        vendor: [0; 32],
+        model: [0; 48],
+        firmware: [0; 16],
+    }; 8];
+
+    let count = unsafe { shim_list_drives(buf.as_mut_ptr(), buf.len() as i32) };
+
     let mut out = Vec::new();
-    for i in 0..K_DEV_DISK_MAX {
-        let path = format!("/dev/disk{i}");
-        if !std::path::Path::new(&path).exists() {
-            continue;
-        }
-        let mut transport = match MacScsiTransport::open(std::path::Path::new(&path)) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let inquiry = match super::inquiry(&mut transport) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if inquiry.raw.is_empty()
-            || (inquiry.raw[K_INQUIRY_TYPE_BYTE] & K_INQUIRY_TYPE_MASK) != K_SCSI_TYPE_OPTICAL
-        {
+    for i in 0..(count as usize).min(buf.len()) {
+        let info = &buf[i];
+        let bsd_name = cstr_to_str(&info.bsd_name);
+        if bsd_name.is_empty() {
             continue;
         }
         out.push(super::DriveInfo {
-            path,
-            vendor: inquiry.vendor_id,
-            model: inquiry.model,
-            firmware: inquiry.firmware,
+            path: format!("/dev/{bsd_name}"),
+            vendor: cstr_to_str(&info.vendor).to_string(),
+            model: cstr_to_str(&info.model).to_string(),
+            firmware: cstr_to_str(&info.firmware).to_string(),
         });
     }
     out
 }
 
-const K_DEV_DISK_MAX: u8 = 16;
-const K_INQUIRY_TYPE_BYTE: usize = 0;
-const K_INQUIRY_TYPE_MASK: u8 = 0x1F;
-const K_SCSI_TYPE_OPTICAL: u8 = 0x05;
+fn cstr_to_str(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
 
 pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     let mut transport = MacScsiTransport::open(path)?;

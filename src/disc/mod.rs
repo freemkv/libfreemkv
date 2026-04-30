@@ -1305,7 +1305,7 @@ impl Disc {
             decrypt: opts.decrypt,
             block_sectors: Some(1),
             full_recovery: true,
-            reverse: false,
+            reverse: true,
             wedged_threshold: 50,
             progress: opts.progress,
             halt: opts.halt.clone(),
