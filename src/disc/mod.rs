@@ -1288,8 +1288,15 @@ impl Disc {
         let mut last_log_iter: u64 = 0;
         let mut not_ready_retries: u32 = 0;
         const NOT_READY_MAX_RETRIES: u32 = 3;
-        let mut error_count_in_zone: u64 = 0;
-        let mut probe_buf = vec![0u8; 2048];
+        let mut bridge_degradation_count: u32 = 0;
+        const BRIDGE_DEGRADATION_MAX: u32 = 5;
+        const BRIDGE_DEGRADATION_COOLDOWN_SECS: u64 = 10;
+        const DAMAGE_WINDOW: usize = 50;
+        const DAMAGE_THRESHOLD_PCT: usize = 25;
+        const JUMP_SECTORS_FACTOR: u64 = 256;
+        let mut damage_window: Vec<bool> = Vec::with_capacity(DAMAGE_WINDOW);
+        let mut jump_multiplier: u64 = 1;
+        let mut consecutive_good: u64 = 0;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
@@ -1353,7 +1360,15 @@ impl Disc {
 
                 if read_result.is_ok() {
                     read_ok_count += 1;
-                    error_count_in_zone = 0;
+                    damage_window.push(true);
+                    if damage_window.len() > DAMAGE_WINDOW {
+                        damage_window.remove(0);
+                    }
+                    consecutive_good += 1;
+                    if consecutive_good >= DAMAGE_WINDOW as u64 {
+                        jump_multiplier = 1;
+                    }
+                    bridge_degradation_count = 0;
 
                     if opts.decrypt {
                         crate::decrypt::decrypt_sectors(
@@ -1383,6 +1398,7 @@ impl Disc {
                 } else {
                     let err = read_result.err().unwrap();
                     read_err_count += 1;
+                    consecutive_good = 0;
 
                     if err.is_scsi_transport_failure() {
                         tracing::warn!(
@@ -1393,6 +1409,28 @@ impl Disc {
                             "transport failure (bridge crash); aborting copy — caller should USB reset + resume"
                         );
                         return Err(err);
+                    }
+
+                    if err.is_bridge_degradation() {
+                        if bridge_degradation_count < BRIDGE_DEGRADATION_MAX {
+                            bridge_degradation_count += 1;
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "bridge_degradation",
+                                lba = block_lba,
+                                degradation_count = bridge_degradation_count,
+                                error = %err,
+                                "bridge degradation; cooling down 10s"
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(BRIDGE_DEGRADATION_COOLDOWN_SECS));
+                            continue;
+                        }
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "bridge_degradation_exhausted",
+                            lba = block_lba,
+                            "bridge degradation retries exhausted; treating as bad sector"
+                        );
                     }
 
                     let sense = err.scsi_sense();
@@ -1437,48 +1475,51 @@ impl Disc {
                         .map_err(|e| Error::IoError { source: e })?;
                     bytes_done = bytes_done.saturating_add(block_bytes);
 
-                    error_count_in_zone += 1;
-                    if error_count_in_zone >= 4 {
-                        let probe_offset_sectors = 256 * batch as u64;
-                        let probe_lba = ((pos / 2048) + probe_offset_sectors) as u32;
-                        let probe_end_lba = (region_end / 2048) as u32;
-                        if probe_lba < probe_end_lba {
-                            match reader.read_sectors(probe_lba, 1, &mut probe_buf, false) {
-                                Ok(_) => {
-                                    let jump_pos = probe_lba as u64 * 2048;
-                                    let gap_start = pos + block_bytes;
-                                    let gap_bytes = jump_pos.saturating_sub(gap_start);
-                                    let jump_mb = gap_bytes / 1_048_576;
-                                    if gap_bytes > 0 {
-                                        tracing::warn!(
-                                            target: "freemkv::disc",
-                                            phase = "probe_jump",
-                                            from_lba = block_lba,
-                                            to_lba = probe_lba,
-                                            jump_mb,
-                                            errors = error_count_in_zone,
-                                            "probe found good media; jumping ahead"
-                                        );
-                                        let zero = vec![0u8; 65536];
-                                        let mut filled: u64 = 0;
-                                        while filled < gap_bytes {
-                                            let chunk = (gap_bytes - filled).min(zero.len() as u64);
-                                            file.seek(SeekFrom::Start(gap_start + filled))
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            file.write_all(&zero[..chunk as usize])
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            filled += chunk;
-                                        }
-                                        map.record(gap_start, gap_bytes, mapfile::SectorStatus::NonTrimmed)
-                                            .map_err(|e| Error::IoError { source: e })?;
-                                        bytes_done = bytes_done.saturating_add(gap_bytes);
-                                    }
-                                    pos = jump_pos;
-                                    did_skip_ahead = true;
-                                    error_count_in_zone = 0;
+                    damage_window.push(false);
+                    if damage_window.len() > DAMAGE_WINDOW {
+                        damage_window.remove(0);
+                    }
+
+                    let bad_count = damage_window.iter().filter(|&&b| !b).count();
+                    if damage_window.len() >= DAMAGE_WINDOW
+                        && bad_count * 100 / damage_window.len() >= DAMAGE_THRESHOLD_PCT
+                    {
+                        let jump_sectors = JUMP_SECTORS_FACTOR * batch as u64 * jump_multiplier;
+                        let jump_lba = ((pos / 2048) + jump_sectors) as u32;
+                        let region_end_lba = (region_end / 2048) as u32;
+                        if jump_lba < region_end_lba {
+                            let jump_pos = jump_lba as u64 * 2048;
+                            let gap_start = pos + block_bytes;
+                            let gap_bytes = jump_pos.saturating_sub(gap_start);
+                            let jump_mb = gap_bytes / 1_048_576;
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "damage_jump",
+                                from_lba = block_lba,
+                                to_lba = jump_lba,
+                                jump_mb,
+                                bad_pct = bad_count * 100 / damage_window.len(),
+                                multiplier = jump_multiplier,
+                                "25%+ failures in last 50 blocks; jumping ahead"
+                            );
+                            if gap_bytes > 0 {
+                                let zero = vec![0u8; 65536];
+                                let mut filled: u64 = 0;
+                                while filled < gap_bytes {
+                                    let chunk = (gap_bytes - filled).min(zero.len() as u64);
+                                    file.seek(SeekFrom::Start(gap_start + filled))
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                    file.write_all(&zero[..chunk as usize])
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                    filled += chunk;
                                 }
-                                Err(_) => {}
+                                map.record(gap_start, gap_bytes, mapfile::SectorStatus::NonTrimmed)
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                bytes_done = bytes_done.saturating_add(gap_bytes);
                             }
+                            pos = jump_pos;
+                            jump_multiplier *= 2;
+                            did_skip_ahead = true;
                         }
                     }
                 }
@@ -1860,6 +1901,14 @@ impl Disc {
 const MAX_BATCH_SECTORS: u16 = 510;
 const DEFAULT_BATCH_SECTORS: u16 = 60;
 const MIN_BATCH_SECTORS: u16 = 3;
+
+pub fn ecc_sectors(format: DiscFormat) -> u16 {
+    match format {
+        DiscFormat::Uhd | DiscFormat::BluRay => 32,
+        DiscFormat::Dvd => 16,
+        DiscFormat::Unknown => 32,
+    }
+}
 
 /// Coarse damage tier for a finished or in-progress rip. Maps the
 /// observable signals (bad sector count + lost wallclock playback time)
