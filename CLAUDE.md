@@ -44,17 +44,17 @@ Three failure modes on this USB bridge:
 2. **Transport failure** (status=0xFF) — bridge crash, auto-recovers ~15s. Aborts copy.
 3. **INCOMPATIBLE FORMAT** (ASC=0x30) wedge — ALL sectors fail, requires power cycle.
 
-### Adaptive probe algorithm (Pass 1 sweep)
+### Damage-jump algorithm (Pass 1 sweep)
 
 When `skip_on_error=true` (multipass mode):
-- Read each ECC block sequentially. On success, reset consecutive error counter.
-- On error: zero-fill, mark NonTrimmed, increment consecutive error counter.
-- After 4 consecutive errors: **probe** 1 sector at 256×batch (8 MB) ahead.
-  - Probe succeeds: zero-fill the gap, mark it NonTrimmed, jump to probed position.
-  - Probe fails: stay put, accumulate 4 more errors, probe again.
+- Read each ECC block sequentially. Track a sliding window of the last 50 ECC block results.
+- On error: zero-fill, mark NonTrimmed, push `false` to window.
+- On success: write data, mark Finished, push `true` to window. Track consecutive good count.
+- When ≥25% of the 50-block window are failures → **jump** ahead by `256×batch×multiplier` sectors (8 MB base). Zero-fill the gap as NonTrimmed. Double the multiplier (8→16→32→64 MB...).
+- When 50 consecutive good reads → reset multiplier to 1.
 - Only transport failures (bridge crash) abort the pass.
 
-Design rationale: consecutive errors (not total) so isolated scattered bad blocks don't trigger probes. The 8 MB probe distance clears typical ~30 MB bad zones in 2-3 probes. Gaps are zero-filled and marked NonTrimmed for patch passes to recover later.
+Two tuning knobs: `DAMAGE_WINDOW` (50 ECC blocks) and `DAMAGE_THRESHOLD_PCT` (25%). If the jump is too aggressive or too timid, adjust these.
 
 ## Public repo rules
 

@@ -516,6 +516,23 @@ impl Error {
         )
     }
 
+    /// True if this error indicates bridge degradation — the SCSI status
+    /// is neither GOOD (0x00), CHECK CONDITION (0x02), nor transport failure
+    /// (0xFF). Observed on the Initio INIC-1618L USB bridge preceding a full
+    /// crash: the bridge firmware returns non-standard status bytes (e.g.
+    /// 0x04, 0x05) with empty sense data. The caller should cool down
+    /// (10 s pause) and retry rather than hammering the bridge.
+    pub fn is_bridge_degradation(&self) -> bool {
+        let status = match self {
+            Error::ScsiError { status, .. } => *status,
+            Error::DiscRead { status, .. } => status.unwrap_or(0),
+            _ => return false,
+        };
+        status != crate::scsi::SCSI_STATUS_GOOD
+            && status != crate::scsi::SCSI_STATUS_CHECK_CONDITION
+            && status != crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE
+    }
+
     /// True if the underlying SCSI failure is a *marginal read* — the
     /// drive returned an error category in which smaller-granularity
     /// retries can sometimes recover the data:
