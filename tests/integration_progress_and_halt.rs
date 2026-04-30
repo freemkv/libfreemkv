@@ -439,7 +439,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        error_pause_ms: Some(0),
+
         ..Default::default()
     };
 
@@ -519,7 +519,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        error_pause_ms: Some(0),
+
         halt: Some(halt),
         ..Default::default()
     };
@@ -607,7 +607,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let opts = CopyOptions {
         decrypt: false,
         skip_on_error: true,
-        error_pause_ms: Some(0),
+
         ..Default::default()
     };
 
@@ -618,20 +618,16 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
-    // With graduated batch restore, Pass 1 drops to batch=1 after the
-    // first batch=32 failure, reads individually (count=1 succeeds for
-    // BlockSizeFailingReader), and recovers those sectors. After 200 OK
-    // at batch=1, it tries batch=2 which fails again. Net result: most
-    // sectors are recovered (Finished), only the batch>1 failures produce
-    // NonTrimmed blocks.
-    assert!(
-        result.bytes_good > 0,
-        "Pass 1 should recover batch=1-readable sectors. Got bytes_good={}",
-        result.bytes_good
+    // Pass 1 reads every batch at bpt=32 (no batch reduction, no skip-ahead).
+    // BlockSizeFailingReader fails on all batch=32 reads, so every sector
+    // is marked NonTrimmed. bytes_good=0 is correct — Pass 2 recovers them.
+    assert_eq!(
+        result.bytes_good, 0,
+        "Pass 1 at bpt=32 should not recover any sectors when all batches fail"
     );
     assert!(
         result.bytes_pending > 0,
-        "batch>1 failures should produce NonTrimmed pending Pass 2"
+        "all sectors should be NonTrimmed pending Pass 2"
     );
     assert!(
         !result.complete,
