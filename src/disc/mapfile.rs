@@ -316,11 +316,7 @@ impl Mapfile {
         {
             let file = std::fs::File::create(&tmp)?;
             let mut w = std::io::BufWriter::new(file);
-            writeln!(
-                w,
-                "# Rescue Logfile. Created by {}",
-                self.version
-            )?;
+            writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
             writeln!(w, "# Current pos / status / pass / pass_time")?;
             writeln!(w, "0x000000000  ?  1  0")?;
             writeln!(w, "#      pos        size  status")?;

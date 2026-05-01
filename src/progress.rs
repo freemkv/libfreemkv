@@ -39,19 +39,22 @@ pub enum PassKind {
 #[derive(Debug, Clone, Copy)]
 pub struct PassProgress {
     pub kind: PassKind,
-    /// Bytes processed in this pass so far. Monotonically non-decreasing.
     pub work_done: u64,
-    /// Total bytes this pass will process. Constant for the duration of
-    /// the pass.
     pub work_total: u64,
-    /// Cumulative bytes confirmed clean (`Finished` mapfile state) across
-    /// every pass run on this rip. Doesn't change across pass boundaries.
     pub bytes_good_total: u64,
-    /// Cumulative bytes marked bad (`NonTrimmed` + `NonScraped` +
-    /// `Unreadable`) across every pass run on this rip.
-    pub bytes_bad_total: u64,
-    /// Total disc capacity in bytes. Constant.
+    pub bytes_unreadable_total: u64,
+    pub bytes_pending_total: u64,
     pub bytes_total_disc: u64,
+    pub disc_duration_secs: Option<f64>,
+    /// How many bytes of the worst-case damage (unreadable + pending) fall
+    /// within the main title's extents. Zero means none of the damage
+    /// affects the main movie — it's all in extras/menus.
+    pub bytes_bad_in_main_title: u64,
+    /// Main title duration in seconds. Same as disc_duration_secs when the
+    /// disc has one dominant title, but separate so consumers can show both.
+    pub main_title_duration_secs: Option<f64>,
+    /// Main title size in bytes (sum of extent sizes).
+    pub main_title_size_bytes: Option<u64>,
 }
 
 /// A consumer of pipeline progress events. Library code calls

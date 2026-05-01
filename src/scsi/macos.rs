@@ -158,8 +158,7 @@ pub(super) fn list_drives() -> Vec<super::DriveInfo> {
     let count = unsafe { shim_list_drives(buf.as_mut_ptr(), buf.len() as i32) };
 
     let mut out = Vec::new();
-    for i in 0..(count as usize).min(buf.len()) {
-        let info = &buf[i];
+    for info in buf.iter().take((count as usize).min(buf.len())) {
         let bsd_name = cstr_to_str(&info.bsd_name);
         if bsd_name.is_empty() {
             continue;
