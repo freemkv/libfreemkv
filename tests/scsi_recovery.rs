@@ -9,6 +9,7 @@
 //! These tests require a real /dev/sg* device and are therefore #[ignore].
 
 use std::path::Path;
+use std::time::Duration;
 
 #[test]
 #[ignore]
