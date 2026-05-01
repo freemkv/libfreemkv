@@ -593,7 +593,7 @@ impl SectorReader for BlockSizeFailingReader {
 #[test]
 fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let capacity_sectors: u32 = 256;
-    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let _total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
     let mut reader = BlockSizeFailingReader {
         capacity: capacity_sectors,
@@ -632,5 +632,166 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     assert!(
         !result.complete,
         "complete=false when sectors remain NonTrimmed"
+    );
+}
+
+// ── 9. PassProgress carries separate unreadable vs pending byte counts ─────
+//
+// The video-damage-time display needs bytes_unreadable_total (confirmed dead)
+// separate from bytes_pending_total (might still recover). This test verifies
+// that a Pass 2 with some confirmed failures produces correct field values.
+
+#[test]
+fn test_pass_progress_separates_unreadable_from_pending() {
+    let capacity_sectors: u32 = 128;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+
+    let mut reader = FailingSectorReader::new(capacity_sectors);
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+
+    let pass1 = disc.copy(&mut reader, &iso_path, &opts).expect("pass1 ok");
+
+    assert_eq!(pass1.bytes_good, 0, "pass1: no good sectors");
+    assert_eq!(pass1.bytes_unreadable, 0, "pass1: no confirmed unreadable");
+    assert_eq!(
+        pass1.bytes_pending, total_bytes,
+        "pass1: all sectors NonTrimmed"
+    );
+
+    let last_unreadable = Arc::new(AtomicU64::new(0));
+    let last_pending = Arc::new(AtomicU64::new(0));
+    let last_good = Arc::new(AtomicU64::new(0));
+    let last_dur = Arc::new(AtomicU64::new(0));
+
+    struct SnapshotReporter {
+        unreadable: Arc<AtomicU64>,
+        pending: Arc<AtomicU64>,
+        good: Arc<AtomicU64>,
+        dur: Arc<AtomicU64>,
+    }
+    impl libfreemkv::progress::Progress for SnapshotReporter {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) {
+            self.unreadable
+                .store(p.bytes_unreadable_total, Ordering::Relaxed);
+            self.pending.store(p.bytes_pending_total, Ordering::Relaxed);
+            self.good.store(p.bytes_good_total, Ordering::Relaxed);
+            if let Some(d) = p.disc_duration_secs {
+                self.dur.store((d * 1000.0) as u64, Ordering::Relaxed);
+            }
+        }
+    }
+    let reporter = SnapshotReporter {
+        unreadable: last_unreadable.clone(),
+        pending: last_pending.clone(),
+        good: last_good.clone(),
+        dur: last_dur.clone(),
+    };
+
+    let pass2_opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        progress: Some(&reporter),
+        ..Default::default()
+    };
+
+    let pass2 = disc
+        .copy(&mut reader, &iso_path, &pass2_opts)
+        .expect("pass2 ok");
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
+
+    assert_eq!(
+        pass2.bytes_good, 0,
+        "pass2: still no good sectors (reader always fails)"
+    );
+    assert!(
+        pass2.bytes_unreadable > 0,
+        "pass2: some sectors confirmed unreadable"
+    );
+    assert!(
+        pass2.bytes_pending < pass1.bytes_pending,
+        "pass2: fewer pending sectors than pass1"
+    );
+
+    let observed_unreadable = last_unreadable.load(Ordering::Relaxed);
+    let observed_pending = last_pending.load(Ordering::Relaxed);
+    assert!(
+        observed_unreadable > 0,
+        "progress should report confirmed unreadable bytes"
+    );
+    assert!(
+        observed_pending == 0 || observed_pending < total_bytes,
+        "pending should shrink as sectors are confirmed unreadable"
+    );
+
+    // Video damage time: unreadable / total * duration
+    // With no titles on synthetic disc, disc_duration_secs = None
+    assert_eq!(
+        last_dur.load(Ordering::Relaxed),
+        0,
+        "synthetic disc has no titles, duration should be None/0"
+    );
+}
+
+// ── 10. Damage time calculation (unit test) ────────────────────────────────
+//
+// Verifies the formula: damage_secs = bytes_unreadable / bytes_total * duration
+// This mirrors the CLI's print_disc_progress logic.
+
+#[test]
+fn test_damage_time_calculation() {
+    // 78.8 GB disc, 2h45m movie (9900s), 74 KB unreadable
+    let disc_bytes: u64 = 78_800_000_000;
+    let duration_secs: f64 = 9900.0;
+
+    let cases: Vec<(u64, &str)> = vec![
+        (74 * 1024, "~10ms"),          // 74 KB → ~9ms, negligible
+        (10 * 1024 * 1024, "~1.3s"),   // 10 MB → ~1.3s
+        (100 * 1024 * 1024, "~13s"),   // 100 MB → ~13s
+        (1024 * 1024 * 1024, "~134s"), // 1 GB → ~134s
+    ];
+
+    for (bad_bytes, label) in cases {
+        let damage_secs = bad_bytes as f64 / disc_bytes as f64 * duration_secs;
+        match label {
+            "~10ms" => assert!(damage_secs < 0.05, "{label}: {damage_secs:.3}s"),
+            "~1.3s" => assert!(
+                (damage_secs - 1.3).abs() < 0.2,
+                "{label}: {damage_secs:.2}s"
+            ),
+            "~13s" => assert!(
+                (damage_secs - 13.0).abs() < 1.0,
+                "{label}: {damage_secs:.1}s"
+            ),
+            "~134s" => assert!(
+                (damage_secs - 134.0).abs() < 2.0,
+                "{label}: {damage_secs:.0}s"
+            ),
+            _ => {}
+        }
+    }
+
+    // 0.25s threshold: how many bad bytes = 0.25s of damage?
+    let threshold_bytes = (0.25 / duration_secs * disc_bytes as f64) as u64;
+    assert!(
+        threshold_bytes > 0,
+        "0.25s damage threshold should be > 0 bytes"
+    );
+    // At 9900s / 78.8 GB ≈ 0.25s = ~2 MB
+    let expected_mb = threshold_bytes as f64 / (1024.0 * 1024.0);
+    assert!(
+        (expected_mb - 2.0).abs() < 0.5,
+        "0.25s ≈ {expected_mb:.2} MB (expected ~2 MB)"
     );
 }

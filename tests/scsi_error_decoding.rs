@@ -203,7 +203,10 @@ fn test_check_cond_not_ready_predicate() {
 
     let sense = err.scsi_sense().expect("CHECK CONDITION must carry sense");
     assert!(sense.is_not_ready(), "sense_key 2 ⇒ is_not_ready");
-    assert!(!err.is_marginal_read(), "NOT READY is not marginal");
+    assert!(
+        err.is_marginal_read(),
+        "NOT READY is marginal (BU40N returns this for bad sectors)"
+    );
 }
 
 // ── 5. CHECK CONDITION + MEDIUM ERROR (canonical marginal-read) ───────────

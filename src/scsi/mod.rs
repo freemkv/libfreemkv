@@ -145,12 +145,14 @@ impl ScsiSense {
     /// (or a brief retry) sometimes succeeds:
     ///
     ///   - `MEDIUM ERROR` (3) — canonical bad-sector signal
+    ///   - `NOT READY` (2) — on many drives (notably BU40N), this is the
+    ///     dominant response for unreadable sectors (ASC 04/3E, 04/01, etc.)
     ///   - `ABORTED COMMAND` (B) — transient; retry usually works
     ///   - `RECOVERED ERROR` (1) / `NO SENSE` (0) — drive is healthy and
     ///     either recovered the data or has no specific fault to report
     ///
-    /// `false` for HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, NOT
-    /// READY, ILLEGAL REQUEST, BLANK CHECK, and any unknown key. Used
+    /// `false` for HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION,
+    /// ILLEGAL REQUEST, BLANK CHECK, and any unknown key. Used
     /// by [`Error::is_marginal_read`] / `Disc::copy`'s hysteresis
     /// dispatch.
     pub fn is_marginal(&self) -> bool {
@@ -158,6 +160,7 @@ impl ScsiSense {
             self.sense_key,
             SENSE_KEY_NO_SENSE
                 | SENSE_KEY_RECOVERED_ERROR
+                | SENSE_KEY_NOT_READY
                 | SENSE_KEY_MEDIUM_ERROR
                 | SENSE_KEY_ABORTED_COMMAND
         )

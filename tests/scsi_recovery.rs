@@ -8,16 +8,14 @@
 //!
 //! These tests require a real /dev/sg* device and are therefore #[ignore].
 
-use libfreemkv::scsi::{DataDirection, SCSI_STATUS_TRANSPORT_FAILURE};
 use std::path::Path;
-use std::time::Duration;
 
 #[test]
 #[ignore]
 fn test_sgio_transport_timeout_does_not_kill_transport() {
     let device = "/dev/sg2";
     let device = std::env::var("FREEMKV_TEST_SG_DEVICE").unwrap_or(device.to_string());
-    let path = Path::new(&device);
+    let _path = Path::new(&device);
 
     #[cfg(target_os = "linux")]
     {
@@ -90,7 +88,7 @@ fn test_sgio_transport_timeout_does_not_kill_transport() {
 fn test_drive_read_per_cdb_timeout_bounds_call() {
     let device = "/dev/sg2";
     let device = std::env::var("FREEMKV_TEST_SG_DEVICE").unwrap_or(device.to_string());
-    let path = Path::new(&device);
+    let _path = Path::new(&device);
 
     #[cfg(target_os = "linux")]
     {

@@ -543,7 +543,7 @@ impl Error {
     ///     classified as fatal; treat as recoverable
     ///
     /// Returns `false` for transport failures (no sense data delivered),
-    /// HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, NOT READY, ILLEGAL
+    /// HARDWARE ERROR, DATA PROTECT, UNIT ATTENTION, ILLEGAL
     /// REQUEST, BLANK CHECK, kernel `IoError`, and any non-SCSI variant.
     /// Caller-agnostic predicate — describes a property of the *error*,
     /// not what one specific call site should do with it. Used by
