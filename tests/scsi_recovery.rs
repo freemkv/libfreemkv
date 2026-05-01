@@ -22,10 +22,11 @@ fn test_sgio_transport_timeout_does_not_kill_transport() {
     {
         use libfreemkv::scsi::ScsiTransport;
         use libfreemkv::scsi::linux::SgIoTransport;
+        use libfreemkv::scsi::{DataDirection, SCSI_STATUS_TRANSPORT_FAILURE};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicI32, Ordering};
 
-        let mut transport = SgIoTransport::open(path).expect("open device");
+        let mut transport = SgIoTransport::open(_path).expect("open device");
         let fd_before = transport.fd;
 
         // READ_10 with 1 ms timeout to force kernel timeout.
@@ -93,7 +94,7 @@ fn test_drive_read_per_cdb_timeout_bounds_call() {
 
     #[cfg(target_os = "linux")]
     {
-        let mut drive = libfreemkv::Drive::open(path).expect("open drive");
+        let mut drive = libfreemkv::Drive::open(_path).expect("open drive");
         let timeout_ms: u32 = 5_000;
 
         let start = std::time::Instant::now();
