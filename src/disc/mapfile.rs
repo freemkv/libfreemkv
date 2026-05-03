@@ -100,6 +100,9 @@ pub struct Mapfile {
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
+    /// Incrementally maintained stats — updated on every `record()` call
+    /// so `stats()` is O(1) instead of O(n).
+    stats: MapStats,
 }
 
 impl Mapfile {
@@ -116,6 +119,12 @@ impl Mapfile {
             }],
             total_size,
             version: version.to_string(),
+            stats: MapStats {
+                bytes_total: total_size,
+                bytes_pending: total_size,
+                bytes_nontried: total_size,
+                ..Default::default()
+            },
         };
         mf.write_to_disk()?;
         Ok(mf)
@@ -177,11 +186,13 @@ impl Mapfile {
         }
         entries.sort_by_key(|e| e.pos);
         let total_size = entries.last().map(|e| e.pos + e.size).unwrap_or(0);
+        let stats = Self::compute_stats(&entries, total_size);
         Ok(Self {
             path: path.to_path_buf(),
             entries,
             total_size,
             version,
+            stats,
         })
     }
 
@@ -244,6 +255,11 @@ impl Mapfile {
             merged.push(e);
         }
 
+        // Recompute stats from merged entries. record() is already O(n) due to
+        // drain-and-rebuild, so this is a constant-factor overhead. The critical
+        // win is that stats() is now O(1) — called millions of times in the hot
+        // path during sweep/patch, it just returns the cached value.
+        self.stats = Self::compute_stats(&merged, self.total_size);
         self.entries = merged;
         self.write_to_disk()?;
         Ok(())
@@ -283,11 +299,15 @@ impl Mapfile {
     }
 
     pub fn stats(&self) -> MapStats {
+        self.stats
+    }
+
+    fn compute_stats(entries: &[MapEntry], total_size: u64) -> MapStats {
         let mut s = MapStats {
-            bytes_total: self.total_size,
+            bytes_total: total_size,
             ..Default::default()
         };
-        for e in &self.entries {
+        for e in entries {
             match e.status {
                 SectorStatus::Finished => s.bytes_good += e.size,
                 SectorStatus::Unreadable => s.bytes_unreadable += e.size,
@@ -465,6 +485,63 @@ mod tests {
         mf.record(300, 50, SectorStatus::Unreadable).unwrap();
         let bad = mf.ranges_with(&[SectorStatus::Unreadable]);
         assert_eq!(bad, vec![(100, 50), (300, 50)]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn stats_consistent_after_overlapping_records() {
+        let p = tmpfile("stats_consistent_after_overlapping");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        // Record some finished, some unreadable, some nontrimmed
+        mf.record(0, 300, SectorStatus::Finished).unwrap();
+        mf.record(300, 200, SectorStatus::NonTrimmed).unwrap();
+        mf.record(500, 100, SectorStatus::Unreadable).unwrap();
+        mf.record(600, 400, SectorStatus::Finished).unwrap();
+
+        // Final entries: [0..300 Finished, 300..500 NonTrimmed, 500..600 Unreadable, 600..1000 Finished]
+        let s = mf.stats();
+        assert_eq!(s.bytes_good, 700); // 300 + 400
+        assert_eq!(s.bytes_unreadable, 100); // 100
+        assert_eq!(s.bytes_pending, 200); // NonTrimmed only (NonTried=0)
+        assert_eq!(s.bytes_nontried, 0);
+        assert_eq!(s.bytes_retryable, 200); // NonTrimmed
+        assert_eq!(s.bytes_total, 1000);
+
+        // Overwrite a NonTrimmed range with Finished
+        mf.record(300, 100, SectorStatus::Finished).unwrap();
+        // Entries: [0..400 Finished, 400..500 NonTrimmed, 500..600 Unreadable, 600..1000 Finished]
+        let s2 = mf.stats();
+        assert_eq!(s2.bytes_good, 800); // 400 + 400
+        assert_eq!(s2.bytes_unreadable, 100);
+        assert_eq!(s2.bytes_pending, 100); // NonTrimmed only
+        assert_eq!(s2.bytes_retryable, 100);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn stats_consistent_after_split_record() {
+        let p = tmpfile("stats_consistent_after_split");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        // Mark middle as NonTrimmed
+        mf.record(200, 400, SectorStatus::NonTrimmed).unwrap();
+        // Entries: [0..200 NonTried, 200..600 NonTrimmed, 600..1000 NonTried]
+        let s = mf.stats();
+        assert_eq!(s.bytes_pending, 1000); // NonTried(600) + NonTrimmed(400)
+        assert_eq!(s.bytes_retryable, 400); // NonTrimmed only
+        assert_eq!(s.bytes_nontried, 600); // 200 + 400
+
+        // Overwrite the NonTrimmed with Finished (splitting the remaining NonTried)
+        mf.record(200, 400, SectorStatus::Finished).unwrap();
+        // Entries: [0..200 NonTried, 200..600 Finished, 600..1000 NonTried]
+        let s2 = mf.stats();
+        assert_eq!(s2.bytes_good, 400);
+        assert_eq!(s2.bytes_pending, 600); // NonTried(200 + 400)
+        assert_eq!(s2.bytes_nontried, 600);
+        assert_eq!(s2.bytes_retryable, 0);
+
         let _ = std::fs::remove_file(&p);
     }
 }

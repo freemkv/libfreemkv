@@ -181,9 +181,10 @@ fn test_disc_copy_progress_callback_fires() {
         last_bytes: Arc<AtomicU64>,
     }
     impl libfreemkv::progress::Progress for CountingReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.last_bytes.store(p.bytes_good_total, Ordering::Relaxed);
+            true
         }
     }
     let reporter = CountingReporter {
@@ -680,7 +681,7 @@ fn test_pass_progress_separates_unreadable_from_pending() {
         dur: Arc<AtomicU64>,
     }
     impl libfreemkv::progress::Progress for SnapshotReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
             self.unreadable
                 .store(p.bytes_unreadable_total, Ordering::Relaxed);
             self.pending.store(p.bytes_pending_total, Ordering::Relaxed);
@@ -688,6 +689,7 @@ fn test_pass_progress_separates_unreadable_from_pending() {
             if let Some(d) = p.disc_duration_secs {
                 self.dur.store((d * 1000.0) as u64, Ordering::Relaxed);
             }
+            true
         }
     }
     let reporter = SnapshotReporter {

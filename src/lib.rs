@@ -95,6 +95,9 @@ pub(crate) mod speed;
 pub(crate) mod udf;
 pub mod verify;
 
+// Re-export verify types at the crate root for ergonomic imports.
+pub use verify::{SectorRange, SectorStatus, VerifyResult, verify_title};
+
 // ─── Drive lifecycle ────────────────────────────────────────────────────────
 //
 // `Drive::open(path)` → `wait_ready()` → `init()` → `Disc::scan()`. `Drive`
