@@ -367,6 +367,32 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
+/// Calculate how many bytes of bad/unreadable data fall within a title's extents.
+/// `pub(crate)` so autorip can use it for main-movie lost_ms computation.
+pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
+    if bad_ranges.is_empty() || title.extents.is_empty() {
+        return 0;
+    }
+    let t_start = title.extents.first().map(|e| (e.start_lba as u64) * 2048);
+    let t_end = title
+        .extents
+        .last()
+        .map(|e| ((e.start_lba as u64) + (e.sector_count as u64)) * 2048);
+    let (Some(ts), Some(te)) = (t_start, t_end) else {
+        return 0;
+    };
+    bad_ranges
+        .iter()
+        .map(|(pos, size)| {
+            let r_start = *pos;
+            let r_end = *pos + *size;
+            let overlap_start = r_start.max(ts);
+            let overlap_end = r_end.min(te);
+            overlap_end.saturating_sub(overlap_start)
+        })
+        .sum()
+}
+
 // ─── Display helpers ────────────────────────────────────────────────────────
 
 impl Codec {
@@ -1262,16 +1288,19 @@ impl Disc {
                         halted: false,
                     });
                 }
-                if !covers_disc || stats.bytes_nontried > 0 {
-                    tracing::info!(
-                        "copy dispatch: → sweep (covers_disc={}, nontried={})",
-                        covers_disc,
-                        stats.bytes_nontried,
-                    );
+                if !covers_disc {
+                    tracing::info!("copy dispatch: → sweep (covers_disc={})", covers_disc,);
                     return self.sweep_internal(reader, path, opts, true);
                 }
-                tracing::info!("copy dispatch: → patch");
-                return self.patch_internal(reader, path, opts);
+                if stats.bytes_retryable > 0 {
+                    tracing::info!(
+                        "copy dispatch: → patch (retryable={})",
+                        stats.bytes_retryable,
+                    );
+                    return self.patch_internal(reader, path, opts);
+                }
+                tracing::info!("copy dispatch: → sweep (resume)");
+                return self.sweep_internal(reader, path, opts, true);
             }
         }
         self.sweep_internal(reader, path, opts, false)
@@ -1311,6 +1340,17 @@ impl Disc {
             halt: opts.halt.clone(),
         };
         let pr = self.patch(reader, path, &patch_opts)?;
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "patch_done",
+            blocks_attempted = pr.blocks_attempted,
+            blocks_read_ok = pr.blocks_read_ok,
+            blocks_read_failed = pr.blocks_read_failed,
+            bytes_recovered = pr.bytes_recovered_this_pass,
+            halted = pr.halted,
+            wedged_exit = pr.wedged_exit,
+            "Patch completed"
+        );
         Ok(CopyResult {
             bytes_total: pr.bytes_total,
             bytes_good: pr.bytes_good,
@@ -1678,7 +1718,19 @@ impl Disc {
 
                 if let Some(reporter) = opts.progress {
                     let stats = map.stats();
-                    reporter.report(&crate::progress::PassProgress {
+                    let bad_ranges = map.ranges_with(&[
+                        mapfile::SectorStatus::NonTrimmed,
+                        mapfile::SectorStatus::Unreadable,
+                        mapfile::SectorStatus::NonScraped,
+                        mapfile::SectorStatus::NonTried,
+                    ]);
+                    let main_title_bad = self
+                        .titles
+                        .first()
+                        .map(|t| bytes_bad_in_title(t, &bad_ranges))
+                        .unwrap_or(0);
+                    let main_title = self.titles.first();
+                    let pp = crate::progress::PassProgress {
                         kind: crate::progress::PassKind::Sweep,
                         work_done: pos,
                         work_total: total_bytes,
@@ -1686,11 +1738,15 @@ impl Disc {
                         bytes_unreadable_total: stats.bytes_unreadable,
                         bytes_pending_total: stats.bytes_pending,
                         bytes_total_disc: total_bytes,
-                        disc_duration_secs: self.titles.first().map(|t| t.duration_secs),
-                        bytes_bad_in_main_title: 0,
-                        main_title_duration_secs: None,
-                        main_title_size_bytes: None,
-                    });
+                        disc_duration_secs: main_title.map(|t| t.duration_secs),
+                        bytes_bad_in_main_title: main_title_bad,
+                        main_title_duration_secs: main_title.map(|t| t.duration_secs),
+                        main_title_size_bytes: main_title.map(|t| t.size_bytes),
+                    };
+                    if !reporter.report(&pp) {
+                        halt_requested = true;
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -1795,6 +1851,7 @@ pub(crate) struct PatchOutcome {
     pub blocks_read_ok: u64,
     pub blocks_read_failed: u64,
     pub wedged_exit: bool,
+    pub wedged_threshold: u64,
 }
 
 pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
@@ -1804,7 +1861,11 @@ pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 impl Disc {
-    fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
+    /// Path to the mapfile for a given output path.
+    ///
+    /// For `/dev/null` output, returns `/tmp/{volume_id_or_title}.mapfile`.
+    /// For regular files, returns `{path}.mapfile`.
+    pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
         if path.as_os_str() == "/dev/null" {
             let name: String = self
                 .meta_title
@@ -1827,6 +1888,25 @@ impl Disc {
 }
 
 impl Disc {
+    /// Bytes of bad/unreadable data in a title's extents, from a mapfile.
+    ///
+    /// Consumers (CLI, autorip) call this after a rip pass to determine
+    /// how much damage affects a particular title — useful for showing
+    /// "42s lost (12s in main movie)" in the UI.
+    pub fn bytes_bad_in_title(&self, mapfile_path: &std::path::Path, title: &DiscTitle) -> u64 {
+        let map = match mapfile::Mapfile::load(mapfile_path) {
+            Ok(m) => m,
+            Err(_) => return 0,
+        };
+        let bad_ranges = map.ranges_with(&[
+            mapfile::SectorStatus::NonTrimmed,
+            mapfile::SectorStatus::Unreadable,
+            mapfile::SectorStatus::NonScraped,
+            mapfile::SectorStatus::NonTried,
+        ]);
+        bytes_bad_in_title(title, &bad_ranges)
+    }
+
     fn patch(
         &self,
         reader: &mut dyn SectorReader,
@@ -1862,6 +1942,7 @@ impl Disc {
         let recovery = opts.full_recovery;
 
         let bytes_good_before = map.stats().bytes_good;
+        let bytes_good_start = bytes_good_before;
         let mut halted = false;
         let mut wedged_exit = false;
         let mut blocks_attempted: u64 = 0;
@@ -1869,10 +1950,19 @@ impl Disc {
         let mut blocks_read_failed: u64 = 0;
         let mut consecutive_failures: u64 = 0;
         let mut unreadable_count: u64 = 0;
+        let mut bytes_good_last = bytes_good_before;
+        let mut stall_start = std::time::Instant::now();
+        let mut range_start;
+        let mut range_bytes_good;
+        const STALL_SECS: u64 = 60;
+        const MAX_RANGE_SECS: u64 = 180;
+        const MAX_SKIPS_PER_RANGE: u32 = 10;
+        let mut skip_count: u32;
         let mut buf = vec![0u8; block_sectors as usize * 2048];
 
-        const PASSN_DAMAGE_WINDOW: usize = 8;
-        const PASSN_DAMAGE_THRESHOLD_PCT: usize = 25;
+        // Pass 2 uses smaller sectors (1 vs 32) but same damage detection logic
+        const PASSN_DAMAGE_WINDOW: usize = 16;
+        const PASSN_DAMAGE_THRESHOLD_PCT: usize = 12;
         const PASSN_SKIP_SECTORS_BASE: u64 = 64;
         const PASSN_SKIP_SECTORS_CAP: u64 = 4096;
         const PASSN_ESCALATION_RESET_GOOD: u32 = 4;
@@ -1884,10 +1974,8 @@ impl Disc {
         reader.set_speed(0x0000);
 
         let mut bad_ranges = map.ranges_with(&[
-            mapfile::SectorStatus::NonTried,
             mapfile::SectorStatus::NonTrimmed,
             mapfile::SectorStatus::NonScraped,
-            mapfile::SectorStatus::Unreadable,
         ]);
         if opts.reverse {
             bad_ranges.reverse();
@@ -1903,21 +1991,80 @@ impl Disc {
             wedged_threshold = opts.wedged_threshold,
             num_ranges = bad_ranges.len(),
             work_total,
+            bytes_good_start,
             "Disc::patch entered"
         );
 
         'outer: for (range_pos, range_size) in bad_ranges {
+            tracing::info!(
+                target: "freemkv::disc",
+                phase = "patch_range_start",
+                range_lba = range_pos / 2048,
+                range_size_mb = range_size as f64 / 1_048_576.0,
+                "Starting patch range"
+            );
             let end = range_pos + range_size;
             let mut block_end = if opts.reverse { end } else { range_pos };
             damage_window.clear();
             consecutive_skips_without_recovery = 0;
             consecutive_good_since_skip = 0;
+            range_start = std::time::Instant::now();
+            range_bytes_good = bytes_good_before;
+            skip_count = 0;
             loop {
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
                         halted = true;
                         break 'outer;
                     }
+                }
+
+                // Test 1: Range timeout - max 3 minutes per range
+                if range_start.elapsed().as_secs() > MAX_RANGE_SECS {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "patch_range_timeout",
+                        range_lba = range_pos / 2048,
+                        elapsed_secs = range_start.elapsed().as_secs(),
+                        bytes_recovered = bytes_good_before - range_bytes_good,
+                        "Range timeout - no progress in {}s, aborting",
+                        MAX_RANGE_SECS
+                    );
+                    wedged_exit = true;
+                    break 'outer;
+                }
+
+                // Test 2: Range progress - must recover bytes in 60 seconds
+                let bytes_good_now = map.stats().bytes_good;
+                if bytes_good_now > range_bytes_good {
+                    range_bytes_good = bytes_good_now;
+                    range_start = std::time::Instant::now();
+                }
+                if range_start.elapsed().as_secs() > MAX_RANGE_SECS {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "patch_range_stall",
+                        range_lba = range_pos / 2048,
+                        elapsed_secs = range_start.elapsed().as_secs(),
+                        bytes_recovered = bytes_good_before - range_bytes_good,
+                        "Range stalled - no recovery in {}s, aborting",
+                        MAX_RANGE_SECS
+                    );
+                    wedged_exit = true;
+                    break 'outer;
+                }
+
+                // Test 3: Skip count - max 10 skips per range
+                if skip_count >= MAX_SKIPS_PER_RANGE {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "patch_skip_limit",
+                        range_lba = range_pos / 2048,
+                        skip_count,
+                        "Skip limit reached - too many damage jumps, aborting",
+                    );
+                    wedged_exit = true;
+                    break 'outer;
                 }
                 let (pos, block_bytes) = if opts.reverse {
                     if block_end <= range_pos {
@@ -1960,6 +2107,25 @@ impl Disc {
                             .map_err(|e| Error::IoError { source: e })?;
                         map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
                             .map_err(|e| Error::IoError { source: e })?;
+                        // Stall guard: watch bytes_good (real progress), not pos (advances on skips)
+                        let bytes_good_now = map.stats().bytes_good;
+                        if bytes_good_now > bytes_good_last {
+                            stall_start = std::time::Instant::now();
+                            bytes_good_last = bytes_good_now;
+                        }
+                        if stall_start.elapsed() > std::time::Duration::from_secs(STALL_SECS) {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "patch_stall",
+                                elapsed_secs = stall_start.elapsed().as_secs(),
+                                bytes_good = bytes_good_now,
+                                bytes_good_start,
+                                "Patch stalled - no recovery for {}s, exiting pass",
+                                STALL_SECS
+                            );
+                            wedged_exit = true;
+                            break 'outer;
+                        }
 
                         if let Some(skip_from) = last_skip_from.take() {
                             let backtrack_start = block_end;
@@ -2005,10 +2171,7 @@ impl Disc {
                                             )
                                             .map_err(|e| Error::IoError { source: e })?;
                                         }
-                                        Err(err) => {
-                                            if err.is_scsi_transport_failure() {
-                                                return Err(err);
-                                            }
+                                        Err(_err) => {
                                             blocks_read_failed += 1;
                                             map.record(
                                                 bt_pos,
@@ -2032,17 +2195,6 @@ impl Disc {
                         }
                     }
                     Err(err) => {
-                        if err.is_scsi_transport_failure() {
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "patch_transport_failure",
-                                lba,
-                                error = %err,
-                                "transport failure (bridge crash); aborting pass"
-                            );
-                            return Err(err);
-                        }
-
                         blocks_read_failed += 1;
                         consecutive_failures += 1;
                         consecutive_good_since_skip = 0;
@@ -2053,6 +2205,41 @@ impl Disc {
                         damage_window.push(false);
                         if damage_window.len() > PASSN_DAMAGE_WINDOW {
                             damage_window.remove(0);
+                        }
+
+                        // Stall guard: check on failures too, not just successes
+                        let bytes_good_now = map.stats().bytes_good;
+                        if bytes_good_now > bytes_good_last {
+                            stall_start = std::time::Instant::now();
+                            bytes_good_last = bytes_good_now;
+                        }
+                        if stall_start.elapsed() > std::time::Duration::from_secs(STALL_SECS) {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "patch_stall",
+                                elapsed_secs = stall_start.elapsed().as_secs(),
+                                consecutive_failures,
+                                bytes_good = bytes_good_now,
+                                bytes_good_start,
+                                "Patch stalled - no recovery for {}s, exiting pass",
+                                STALL_SECS
+                            );
+                            wedged_exit = true;
+                            break 'outer;
+                        }
+
+                        // Log every 10 failures or when approaching wedged threshold
+                        if consecutive_failures % 10 == 0
+                            || consecutive_failures >= opts.wedged_threshold
+                        {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "patch_failure_count",
+                                lba,
+                                consecutive_failures,
+                                wedged_threshold = opts.wedged_threshold,
+                                "Failure count"
+                            );
                         }
 
                         let pause_secs = if err.is_bridge_degradation() {
@@ -2116,6 +2303,7 @@ impl Disc {
                         last_skip_from = Some(block_end);
                         block_end = new_block_end;
                         consecutive_skips_without_recovery += 1;
+                        skip_count += 1;
                         did_skip = true;
                     }
                 }
@@ -2156,7 +2344,19 @@ impl Disc {
                             reverse: opts.reverse,
                         }
                     };
-                    reporter.report(&crate::progress::PassProgress {
+                    let bad_ranges = map.ranges_with(&[
+                        mapfile::SectorStatus::NonTrimmed,
+                        mapfile::SectorStatus::Unreadable,
+                        mapfile::SectorStatus::NonScraped,
+                        mapfile::SectorStatus::NonTried,
+                    ]);
+                    let main_title_bad = self
+                        .titles
+                        .first()
+                        .map(|t| bytes_bad_in_title(t, &bad_ranges))
+                        .unwrap_or(0);
+                    let main_title = self.titles.first();
+                    let pp = crate::progress::PassProgress {
                         kind,
                         work_done,
                         work_total,
@@ -2164,11 +2364,15 @@ impl Disc {
                         bytes_unreadable_total: s.bytes_unreadable,
                         bytes_pending_total: s.bytes_pending,
                         bytes_total_disc: total_bytes,
-                        disc_duration_secs: self.titles.first().map(|t| t.duration_secs),
-                        bytes_bad_in_main_title: 0,
-                        main_title_duration_secs: None,
-                        main_title_size_bytes: None,
-                    });
+                        disc_duration_secs: main_title.map(|t| t.duration_secs),
+                        bytes_bad_in_main_title: main_title_bad,
+                        main_title_duration_secs: main_title.map(|t| t.duration_secs),
+                        main_title_size_bytes: main_title.map(|t| t.size_bytes),
+                    };
+                    if !reporter.report(&pp) {
+                        halted = true;
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -2223,6 +2427,7 @@ impl Disc {
             blocks_read_ok,
             blocks_read_failed,
             wedged_exit,
+            wedged_threshold: opts.wedged_threshold,
         })
     }
 }

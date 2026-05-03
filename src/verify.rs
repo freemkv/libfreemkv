@@ -1,6 +1,7 @@
 //! Disc sector verification — read every sector and classify health.
 
 use crate::disc::{Chapter, DiscTitle};
+use crate::progress::Progress;
 use crate::sector::SectorReader;
 use std::time::Instant;
 
@@ -77,10 +78,6 @@ impl VerifyResult {
     }
 }
 
-/// Progress callback: (sectors_done, total_sectors, current_status)
-/// Return false to stop verification early.
-pub type ProgressFn = Box<dyn FnMut(u64, u64, SectorStatus) -> bool>;
-
 /// Verify all sectors in a title's extents.
 /// Reads in batches for speed, falls back to single-sector on failure.
 /// The progress callback returns false to request early stop.
@@ -88,7 +85,7 @@ pub fn verify_title(
     reader: &mut dyn SectorReader,
     title: &DiscTitle,
     batch_sectors: u16,
-    mut on_progress: Option<ProgressFn>,
+    on_progress: Option<&dyn Progress>,
 ) -> VerifyResult {
     let start = Instant::now();
     let mut good: u64 = 0;
@@ -97,7 +94,6 @@ pub fn verify_title(
     let mut bad: u64 = 0;
     let mut ranges: Vec<SectorRange> = Vec::new();
     let mut sectors_done: u64 = 0;
-    let mut _stopped = false;
     let mut byte_offset: u64 = 0;
 
     let total_sectors: u64 = title.extents.iter().map(|e| e.sector_count as u64).sum();
@@ -140,9 +136,21 @@ pub fn verify_title(
                 }
 
                 sectors_done += count as u64;
-                if let Some(ref mut cb) = on_progress {
-                    if !cb(sectors_done, total_sectors, status) {
-                        _stopped = true;
+                if let Some(cb) = on_progress {
+                    let pp = crate::progress::PassProgress {
+                        kind: crate::progress::PassKind::Verify,
+                        work_done: sectors_done,
+                        work_total: total_sectors,
+                        bytes_good_total: (good + slow + recovered) * 2048,
+                        bytes_unreadable_total: bad * 2048,
+                        bytes_pending_total: 0,
+                        bytes_total_disc: total_sectors * 2048,
+                        disc_duration_secs: Some(title.duration_secs),
+                        bytes_bad_in_main_title: 0,
+                        main_title_duration_secs: Some(title.duration_secs),
+                        main_title_size_bytes: Some(total_sectors * 2048),
+                    };
+                    if !cb.report(&pp) {
                         break 'outer;
                     }
                 }
@@ -214,9 +222,21 @@ pub fn verify_title(
                     }
 
                     sectors_done += 1;
-                    if let Some(ref mut cb) = on_progress {
-                        if !cb(sectors_done, total_sectors, status) {
-                            _stopped = true;
+                    if let Some(cb) = on_progress {
+                        let pp = crate::progress::PassProgress {
+                            kind: crate::progress::PassKind::Verify,
+                            work_done: sectors_done,
+                            work_total: total_sectors,
+                            bytes_good_total: (good + slow + recovered) * 2048,
+                            bytes_unreadable_total: bad * 2048,
+                            bytes_pending_total: 0,
+                            bytes_total_disc: total_sectors * 2048,
+                            disc_duration_secs: Some(title.duration_secs),
+                            bytes_bad_in_main_title: 0,
+                            main_title_duration_secs: Some(title.duration_secs),
+                            main_title_size_bytes: Some(total_sectors * 2048),
+                        };
+                        if !cb.report(&pp) {
                             break 'outer;
                         }
                     }

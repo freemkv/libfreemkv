@@ -1,7 +1,7 @@
 //! Pipeline-progress reporting for the rip pipeline.
 //!
 //! v0.13.16 architecture rule: ONE progress signal type. Every long-running
-//! pipeline operation (`Disc::copy`, `Disc::patch`, mux) emits the same
+//! pipeline operation (`Disc::copy`, `Disc::patch`, `verify_title`) emits the same
 //! `PassProgress` shape via the `Progress` trait. Consumers (autorip) compute
 //! a single `PipelineStats` derived view and never reach into per-pass
 //! internals.
@@ -28,6 +28,8 @@ pub enum PassKind {
     /// Demux ISO → output (MKV / M2TS / network). Single phase that runs
     /// after all rip passes complete.
     Mux,
+    /// Sector verification — reads every sector and classifies health.
+    Verify,
 }
 
 /// One progress sample from a pipeline phase.
@@ -36,6 +38,13 @@ pub enum PassKind {
 /// regardless of which kind of pass is running. `bytes_good_total` is the
 /// cumulative count of confirmed-clean bytes across the whole rip; useful
 /// for the "data recovered" stat the user sees.
+///
+/// For `PassKind::Verify`, the fields map as follows:
+/// - `work_done` = sectors read so far
+/// - `work_total` = total sectors in title
+/// - `bytes_good_total` = good + slow + recovered sectors × 2048
+/// - `bytes_unreadable_total` = bad sectors × 2048
+/// - `bytes_pending_total` = 0 (verify processes sequentially, nothing pending)
 #[derive(Debug, Clone, Copy)]
 pub struct PassProgress {
     pub kind: PassKind,
@@ -57,20 +66,60 @@ pub struct PassProgress {
     pub main_title_size_bytes: Option<u64>,
 }
 
+impl PassProgress {
+    /// Percentage of work completed for this pass (0..=100).
+    ///
+    /// Returns `100.0` if `work_total` is zero to avoid division by zero.
+    pub fn work_pct(&self) -> f64 {
+        if self.work_total == 0 {
+            return 100.0;
+        }
+        self.work_done as f64 / self.work_total as f64 * 100.0
+    }
+
+    /// Percentage of the disc that is confirmed clean (0..=100).
+    ///
+    /// Computed from `bytes_good_total / bytes_total_disc`.
+    pub fn good_pct(&self) -> f64 {
+        if self.bytes_total_disc == 0 {
+            return 100.0;
+        }
+        self.bytes_good_total as f64 / self.bytes_total_disc as f64 * 100.0
+    }
+
+    /// Percentage of the disc that is unreadable (0..=100).
+    pub fn bad_pct(&self) -> f64 {
+        if self.bytes_total_disc == 0 {
+            return 0.0;
+        }
+        self.bytes_unreadable_total as f64 / self.bytes_total_disc as f64 * 100.0
+    }
+
+    /// Percentage of the disc that is still pending (not yet attempted or needs retry).
+    pub fn pending_pct(&self) -> f64 {
+        if self.bytes_total_disc == 0 {
+            return 0.0;
+        }
+        self.bytes_pending_total as f64 / self.bytes_total_disc as f64 * 100.0
+    }
+}
+
 /// A consumer of pipeline progress events. Library code calls
 /// `Progress::report` once per inner-loop iteration (throttling is the
 /// consumer's job — `report` is cheap; the library doesn't gate it).
 ///
+/// Returns `true` to continue, `false` to request early stop.
+///
 /// No `Send`/`Sync` bound — `report` is always called from the same thread
-/// running the rip pipeline, so closures with non-`Sync` captures (e.g.
+/// running the pipeline, so closures with non-`Sync` captures (e.g.
 /// `RefCell<PassProgressState>`) work directly. Blanket impl below lets
 /// callers pass closures without explicit struct types.
 pub trait Progress {
-    fn report(&self, p: &PassProgress);
+    fn report(&self, p: &PassProgress) -> bool;
 }
 
-impl<F: Fn(&PassProgress)> Progress for F {
-    fn report(&self, p: &PassProgress) {
+impl<F: Fn(&PassProgress) -> bool> Progress for F {
+    fn report(&self, p: &PassProgress) -> bool {
         (self)(p)
     }
 }

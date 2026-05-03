@@ -53,7 +53,7 @@ static io_registry_entry_t find_iomedia_child(io_registry_entry_t parent) {
         char cls[128];
         kr = IOObjectGetClass(child, cls);
         if (kr == KERN_SUCCESS) {
-            if (strcmp(cls, "IOMedia") == 0) {
+            if (strcmp(cls, "IOMedia") == 0 || strcmp(cls, "IOBDMedia") == 0) {
                 IOObjectRelease(iter);
                 return child;
             }
@@ -214,8 +214,15 @@ int shim_open_exclusive(const char *bsd_name) {
         return 0;
     }
 
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "diskutil unmountDisk force %s 2>/dev/null", bsd_name);
+    // Use a shell wrapper so the device path is not subject to buffer limits.
+    // snprintf into 128 bytes could truncate long BSD names (e.g. disk12s3s1),
+    // producing a broken command. sh -c with $1 passes the arg via argv.
+    const char *shell_fmt = "sh -c 'diskutil unmountDisk force \"$1\" >/dev/null 2>&1' _ %s";
+    char cmd[512];
+    int written = snprintf(cmd, sizeof(cmd), shell_fmt, bsd_name);
+    if (written < 0 || (size_t)written >= sizeof(cmd)) {
+        return -1;
+    }
     system(cmd);
     usleep(500000);
 
@@ -256,7 +263,11 @@ int shim_open_exclusive(const char *bsd_name) {
         return -4;
     }
 
-    kr = (*g_handle.scsi)->ObtainExclusiveAccess(g_handle.scsi);
+    for (int retry = 0; retry < 10; retry++) {
+        kr = (*g_handle.scsi)->ObtainExclusiveAccess(g_handle.scsi);
+        if (kr == kIOReturnSuccess) break;
+        usleep(500000);
+    }
     if (kr != kIOReturnSuccess) {
         (*g_handle.scsi)->Release(g_handle.scsi);
         (*g_handle.mmc)->Release(g_handle.mmc);
