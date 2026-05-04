@@ -59,12 +59,17 @@ When `skip_on_error=true` (multipass mode):
 
 Tuning knobs: `DAMAGE_WINDOW=16` and `DAMAGE_THRESHOLD_PCT=12%`. Calibrated from live BU40N data: old 50/25% was too diluted by good reads between sparse failures; 16/12% triggers on the 2nd scattered failure (2/16 = 12.5% ≥ 12%).
 
-### Patch (Pass 2+)
+### Patch (Pass N) — `disc/mod.rs:1910`
 
 - Default: **reverse** mode. Walks bad ranges from highest LBA to lowest, and within each range from end to start. Rationale: sweep jumps forward with escalating gaps, so NonTrimmed ranges have good data at their tail (where the jump landed). Reverse hits good data first, converges on actual bad block boundaries.
 - Single-sector reads with 60 s timeout (`READ_RECOVERY_TIMEOUT_MS`).
-- Non-marginal SCSI sense → immediate bail (no point retrying hard errors).
-- Wedged-drive exit: 50 consecutive failures with zero recovery.
+- NOT_READY (sense=2, ASC ∈ {0x02, 0x03, 0x04}): 15 s pause, retry without immediate Unreadable mark.
+- Non-marginal SCSI sense → mark Unreadable and continue.
+- Skip escalation: damage window 16/12 %, skip `64 << escalation` sectors capped at 4096; max 10 skips per range, then mark range Unreadable.
+- Wedge exit: 50 consecutive failures **and** ≥ 2 ranges attempted (single-range stalls don't kill the pass).
+- Whole-pass watchdog: `STALL_SECS = 3600` on `bytes_good`. Per-range watchdog: `MAX_RANGE_SECS = 180`.
+
+Constants live at `disc/mod.rs:1974-1985` (PASSN_*, STALL_SECS, MAX_RANGE_SECS, MAX_SKIPS_PER_RANGE). The full algorithm is documented in `freemkv-private/memory/project_recovery_v0_16.md`.
 
 ## Public repo rules
 
