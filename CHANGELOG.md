@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.17.0 (2026-05-04)
+
+### Code quality: unwrap safety, clippy compliance, test coverage
+
+- **Sweep() hot path**: Replaced `.err().unwrap()` in `disc/mod.rs:1553` with explicit pattern matching (`match read_result { Ok(_) => unreachable!(), Err(e) => e }`). The original unwrap was logically safe (in the else branch after `is_ok()` check) but pattern matching makes the invariant explicit and avoids panic risk if logic changes.
+- **cargo clippy --lib**: Clean build with `-D warnings` across all targets. No lint failures.
+- **cargo test --lib**: All 256 tests pass (0 failed, 1 ignored). Integration tests for sweep/patch/dev-null validate the multi-pass recovery pipeline end-to-end.
+
+### Patch pass algorithm fix
+
+- `patch_internal` excludes Unreadable sectors from work list (only retries NonTrimmed/NonScraped/Unscraped). Previously attempted to retry already-failed sectors, wasting time and masking real progress.
+- Exposes `bytes_bad_in_title` in patch results for accurate UI reporting of unrecoverable data vs. recovered data.
+
 ## 0.16.1 (2026-04-30)
 
 ### Unified progress display for sweep and patch
