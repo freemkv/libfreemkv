@@ -91,6 +91,13 @@ pub struct MapStats {
     /// retry" UI bucket; `bytes_pending` over-counts because it folds
     /// in `bytes_nontried`.
     pub bytes_retryable: u64,
+    /// Number of unreadable ranges (for UI display). Computed from
+    /// `ranges_with(&[Unreadable])`.
+    pub num_bad_ranges: u32,
+    /// Largest gap among unreadable ranges in milliseconds. Computed as
+    /// largest range size / bytes_per_sec * 1000. Set by caller (autorip)
+    /// since bytes_per_sec is application-specific.
+    pub main_lost_ms: f64,
 }
 
 /// Write-through mapfile. Every `record()` persists to disk immediately
