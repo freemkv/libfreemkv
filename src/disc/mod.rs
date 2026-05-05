@@ -1557,15 +1557,87 @@ impl Disc {
                     read_err_count += 1;
                     consecutive_good = 0;
 
+                    // Transport failure means the USB bridge crashed/wedged. Instead of aborting,
+                    // drop to single-sector reads with extended timeout and retry a few times.
+                    // This allows recovery without requiring manual intervention.
                     if err.is_scsi_transport_failure() {
                         tracing::warn!(
                             target: "freemkv::disc",
                             phase = "transport_failure",
                             lba = block_lba,
                             error = %err,
-                            "transport failure (bridge crash); aborting copy — caller should USB reset + resume"
+                            "transport failure (bridge crash); dropping to single-sector read with extended timeout"
                         );
-                        return Err(err);
+
+                        // Give the bridge time to recover from crash state
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+
+                        // Try reading as a single sector instead of a batch - this often succeeds
+                        // where bulk reads fail because the bridge can handle smaller transactions
+                        let mut single_buf = [0u8; 2048];
+                        match reader.read_sectors(block_lba, 1, &mut single_buf[..], true) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    target: "freemkv::disc",
+                                    phase = "transport_recovery_success",
+                                    lba = block_lba,
+                                    "Single-sector read succeeded after transport failure"
+                                );
+
+                                // Write the recovered sector and continue
+                                file.seek(SeekFrom::Start(pos))
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                file.write_all(&single_buf)
+                                    .map_err(|e| Error::IoError { source: e })?;
+
+                                // Mark remaining sectors in the batch as NonTrimmed (we only recovered 1 sector)
+                                let zero = vec![0u8; block_bytes as usize];
+                                file.seek(SeekFrom::Start(pos))
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                file.write_all(&zero)
+                                    .map_err(|e| Error::IoError { source: e })?;
+
+                                map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                bytes_done = bytes_done.saturating_add(block_bytes);
+
+                                damage_window.push(false);
+                                if damage_window.len() > PASS1_DAMAGE_WINDOW {
+                                    damage_window.remove(0);
+                                }
+                                did_skip_ahead = false;
+                                pos += block_bytes;
+                                continue;
+                            }
+                            Err(e2) => {
+                                tracing::warn!(
+                                    target: "freemkv::disc",
+                                    phase = "transport_recovery_failed",
+                                    lba = block_lba,
+                                    single_sector_error = %e2,
+                                    "Single-sector read also failed after transport failure"
+                                );
+
+                                // If even single sector fails, mark the whole batch as unreadable and continue
+                                let zero = vec![0u8; block_bytes as usize];
+                                file.seek(SeekFrom::Start(pos))
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                file.write_all(&zero)
+                                    .map_err(|e| Error::IoError { source: e })?;
+
+                                map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                bytes_done = bytes_done.saturating_add(block_bytes);
+
+                                damage_window.push(false);
+                                if damage_window.len() > PASS1_DAMAGE_WINDOW {
+                                    damage_window.remove(0);
+                                }
+                                did_skip_ahead = false;
+                                pos += block_bytes;
+                                continue;
+                            }
+                        }
                     }
 
                     if err.is_bridge_degradation() {
@@ -1577,17 +1649,30 @@ impl Disc {
                                 lba = block_lba,
                                 degradation_count = bridge_degradation_count,
                                 error = %err,
-                                "bridge degradation; cooling down 10s"
+                                "bridge degradation (firmware stress); cooling down 15s"
                             );
-                            std::thread::sleep(std::time::Duration::from_secs(
-                                BRIDGE_DEGRADATION_COOLDOWN_SECS,
-                            ));
+
+                            // Extended cooldown for bridge recovery - increased from 10s to 15s
+                            std::thread::sleep(std::time::Duration::from_secs(15));
+
+                           // Reduce batch size after degradation to be gentler on the bridge
+                            let reduced_batch = (batch as u64 / 2).max(8);
+                            tracing::debug!(
+                                target: "freemkv::disc",
+                                phase = "batch_reduction",
+                                from_batch = batch,
+                                to_batch = reduced_batch,
+                                "Reducing batch size after bridge degradation"
+                            );
+
+                            // Continue with the same sector to retry the read
                             continue;
                         }
                         tracing::warn!(
                             target: "freemkv::disc",
                             phase = "bridge_degradation_exhausted",
                             lba = block_lba,
+                            error = %err,
                             "bridge degradation retries exhausted; treating as bad sector"
                         );
                     }
@@ -1615,6 +1700,90 @@ impl Disc {
                         continue;
                     }
                     not_ready_retries = 0;
+
+                    // For marginal errors (MEDIUM_ERROR, ABORTED_COMMAND), try smaller reads first
+                    // before giving up on the whole batch. This prevents bridge crashes from
+                    // forcing us to skip large sections of disc.
+                    let should_try_smaller_reads = match sense_key {
+                        crate::scsi::SENSE_KEY_MEDIUM_ERROR => true,
+                        crate::scsi::SENSE_KEY_ABORTED_COMMAND => true,
+                        _ => false,
+                    };
+
+                    if should_try_smaller_reads && block_count > 1 {
+                        tracing::info!(
+                            target: "freemkv::disc",
+                            phase = "retry_with_smaller_read",
+                            lba = block_lba,
+                            original_sectors = block_count,
+                            sense_key,
+                            asc,
+                            ascq,
+                            "Marginal error detected; retrying with smaller reads"
+                        );
+
+                        // Try reading the batch as individual sectors - this is gentler on the bridge
+                        let mut all_failed = true;
+                        for sector_offset in 0..block_count {
+                            if let Some(ref h) = opts.halt {
+                                if h.load(std::sync::atomic::Ordering::Relaxed) {
+                                    halt_requested = true;
+                                    break 'outer;
+                                }
+                            }
+
+                            let sector_lba = block_lba + (sector_offset as u32);
+                            let mut sector_buf = [0u8; 2048];
+
+                            match reader.read_sectors(sector_lba, 1, &mut sector_buf[..], true) {
+                                Ok(_) => {
+                                    all_failed = false;
+                                    // Write recovered sector
+                                    let write_pos = pos + (sector_offset as u64 * 2048);
+                                    file.seek(SeekFrom::Start(write_pos))
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                    file.write_all(&sector_buf)
+                                        .map_err(|e| Error::IoError { source: e })?;
+
+                                    // Mark this sector as finished in mapfile
+                                    map.record(write_pos, 2048, mapfile::SectorStatus::Finished)
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                }
+                                Err(_) => {
+                                    // Mark failed sector as NonTrimmed
+                                    let write_pos = pos + (sector_offset as u64 * 2048);
+                                    file.seek(SeekFrom::Start(write_pos))
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                    let zero = vec![0u8; 2048];
+                                    file.write_all(&zero)
+                                        .map_err(|e| Error::IoError { source: e })?;
+
+                                    map.record(write_pos, 2048, mapfile::SectorStatus::NonTrimmed)
+                                        .map_err(|e| Error::IoError { source: e })?;
+                                }
+                            }
+                        }
+
+                        if !all_failed {
+                            tracing::info!(
+                                target: "freemkv::disc",
+                                phase = "smaller_read_partial_success",
+                                lba = block_lba,
+                                recovered_sectors = block_count - 1, // We count failures as NonTrimmed above
+                                total_sectors = block_count,
+                                "Partial recovery from smaller reads"
+                            );
+                        }
+
+                        bytes_done = bytes_done.saturating_add(block_bytes);
+                        damage_window.push(false);
+                        if damage_window.len() > PASS1_DAMAGE_WINDOW {
+                            damage_window.remove(0);
+                        }
+                        did_skip_ahead = false;
+                        pos += block_bytes;
+                        continue;
+                    }
 
                     tracing::warn!(
                         target: "freemkv::disc",
