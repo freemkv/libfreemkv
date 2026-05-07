@@ -594,7 +594,7 @@ impl SectorReader for BlockSizeFailingReader {
 #[test]
 fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let capacity_sectors: u32 = 256;
-    let _total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
     let mut reader = BlockSizeFailingReader {
         capacity: capacity_sectors,
@@ -620,20 +620,18 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
     // Pass 1 reads every batch at bpt=32 (no batch reduction, no skip-ahead).
-    // BlockSizeFailingReader fails on all batch=32 reads, so every sector
-    // is marked NonTrimmed. bytes_good=0 is correct — Pass 2 recovers them.
+    // BlockSizeFailingReader fails on multi-sector reads but succeeds on single-sector.
+    // Bridge degradation handling retries failed batches as individual sectors,
+    // so all data is recovered as Finished. bytes_good == total_bytes is correct.
     assert_eq!(
-        result.bytes_good, 0,
-        "Pass 1 at bpt=32 should not recover any sectors when all batches fail"
+        result.bytes_good, total_bytes,
+        "Pass 1 at bpt=32 recovers all sectors via single-sector retry on MEDIUM_ERROR"
     );
-    assert!(
-        result.bytes_pending > 0,
-        "all sectors should be NonTrimmed pending Pass 2"
+    assert_eq!(
+        result.bytes_pending, 0,
+        "no pending sectors after full recovery"
     );
-    assert!(
-        !result.complete,
-        "complete=false when sectors remain NonTrimmed"
-    );
+    assert!(result.complete, "complete=true when all sectors recovered");
 }
 
 // ── 9. PassProgress carries separate unreadable vs pending byte counts ─────

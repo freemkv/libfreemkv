@@ -12,6 +12,7 @@ mod bluray;
 mod dvd;
 mod encrypt;
 pub mod mapfile;
+pub mod read_error;
 
 use crate::drive::{Drive, extract_scsi_context};
 use crate::error::{Error, Result};
@@ -1428,19 +1429,15 @@ impl Disc {
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
-        let mut not_ready_retries: u32 = 0;
-        const NOT_READY_MAX_RETRIES: u32 = 3;
-        let mut bridge_degradation_count: u32 = 0;
-        const BRIDGE_DEGRADATION_MAX: u32 = 5;
-        const BRIDGE_DEGRADATION_COOLDOWN_SECS: u64 = 10;
-        const PASS1_DAMAGE_WINDOW: usize = 16;
-        const PASS1_DAMAGE_THRESHOLD_PCT: usize = 12;
-        const PASS1_JUMP_SECTORS_FACTOR: u64 = 256;
-        const PASS1_ESCALATION_RESET_GOOD: u64 = PASS1_DAMAGE_WINDOW as u64;
-        let mut damage_window: Vec<bool> = Vec::with_capacity(PASS1_DAMAGE_WINDOW);
-        let mut jump_multiplier: u64 = 1;
-        let mut consecutive_good: u64 = 0;
+        // ALL read state lives in one place. The single error-handling
+        // entry point (`read_error::handle_read_error`) owns the
+        // counters, retry budgets, and damage-window updates.
+        let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
+        // Speed control derives from damage-zone state. We track the
+        // transition locally so we only call set_speed on edges, not
+        // every iteration.
         let mut in_damage_zone = false;
+        const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
@@ -1451,10 +1448,16 @@ impl Disc {
         );
 
         'outer: loop {
+            // Every pass retries every non-Finished range. Includes
+            // Unreadable so each pass gets its own shot at sectors prior
+            // passes gave up on — drive state may have changed (cooled
+            // down, bridge stabilized, etc.). Mapfile is binary in
+            // intent: Finished or not-yet-good.
             let regions_to_do = map.ranges_with(&[
                 mapfile::SectorStatus::NonTried,
                 mapfile::SectorStatus::NonTrimmed,
                 mapfile::SectorStatus::NonScraped,
+                mapfile::SectorStatus::Unreadable,
             ]);
             tracing::trace!(
                 target: "freemkv::disc",
@@ -1500,374 +1503,225 @@ impl Disc {
                     recovery,
                 );
 
-                let mut did_skip_ahead = false;
+                match read_result {
+                    Ok(_) => {
+                        // === SUCCESS PATH ===
+                        read_ok_count += 1;
+                        read_ctx.on_success();
 
-                if read_result.is_ok() {
-                    read_ok_count += 1;
-                    damage_window.push(true);
-                    if damage_window.len() > PASS1_DAMAGE_WINDOW {
-                        damage_window.remove(0);
-                    }
-                    consecutive_good += 1;
-                    if consecutive_good >= PASS1_ESCALATION_RESET_GOOD {
-                        jump_multiplier = 1;
-                        if in_damage_zone {
-                            in_damage_zone = false;
-                            reader.set_speed(0xFFFF);
-                            tracing::debug!(
-                                target: "freemkv::disc",
-                                phase = "damage_exit",
-                                lba = block_lba,
-                                "Exited damage zone; restoring max read speed"
-                            );
-                        }
-                    }
-                    bridge_degradation_count = 0;
-
-                    if opts.decrypt {
-                        crate::decrypt::decrypt_sectors(
-                            &mut buf[..block_bytes as usize],
-                            &keys,
-                            0,
-                        )?;
-                    }
-                    file.seek(SeekFrom::Start(pos))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&buf[..block_bytes as usize])
-                        .map_err(|e| Error::IoError { source: e })?;
-                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    bytes_done = bytes_done.saturating_add(block_bytes);
-                } else if !opts.skip_on_error {
-                    let (status, sense) = read_result
-                        .as_ref()
-                        .err()
-                        .map(extract_scsi_context)
-                        .unwrap_or((0, None));
-                    return Err(Error::DiscRead {
-                        sector: block_lba as u64,
-                        status: Some(status),
-                        sense,
-                    });
-                } else {
-                    let err = match read_result {
-                        Ok(_) => unreachable!(),
-                        Err(e) => e,
-                    };
-                    read_err_count += 1;
-                    consecutive_good = 0;
-
-                    // Transport failure means the USB bridge crashed/wedged. Instead of aborting,
-                    // drop to single-sector reads with extended timeout and retry a few times.
-                    // This allows recovery without requiring manual intervention.
-                    if err.is_scsi_transport_failure() {
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "transport_failure",
-                            lba = block_lba,
-                            error = %err,
-                            "transport failure (bridge crash); dropping to single-sector read with extended timeout"
-                        );
-
-                        // Give the bridge time to recover from crash state
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-
-                        // Try reading as a single sector instead of a batch - this often succeeds
-                        // where bulk reads fail because the bridge can handle smaller transactions
-                        let mut single_buf = [0u8; 2048];
-                        match reader.read_sectors(block_lba, 1, &mut single_buf[..], true) {
-                            Ok(_) => {
-                                tracing::info!(
+                        // Damage-zone exit: after enough consecutive good
+                        // reads, restore max speed and reset jump multiplier.
+                        if read_ctx.consecutive_good >= DAMAGE_ZONE_EXIT_THRESHOLD {
+                            read_ctx.jump_multiplier = 1;
+                            if in_damage_zone {
+                                in_damage_zone = false;
+                                reader.set_speed(0xFFFF);
+                                tracing::debug!(
                                     target: "freemkv::disc",
-                                    phase = "transport_recovery_success",
+                                    phase = "damage_exit",
                                     lba = block_lba,
-                                    "Single-sector read succeeded after transport failure"
+                                    "Exited damage zone; restoring max read speed"
                                 );
+                            }
+                        }
+                        read_ctx.bridge_degradation_count = 0;
 
-                                // Write the recovered sector and continue
-                                file.seek(SeekFrom::Start(pos))
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                file.write_all(&single_buf)
-                                    .map_err(|e| Error::IoError { source: e })?;
+                        if opts.decrypt {
+                            crate::decrypt::decrypt_sectors(
+                                &mut buf[..block_bytes as usize],
+                                &keys,
+                                0,
+                            )?;
+                        }
+                        file.seek(SeekFrom::Start(pos))
+                            .map_err(|e| Error::IoError { source: e })?;
+                        file.write_all(&buf[..block_bytes as usize])
+                            .map_err(|e| Error::IoError { source: e })?;
+                        map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
+                            .map_err(|e| Error::IoError { source: e })?;
+                        bytes_done = bytes_done.saturating_add(block_bytes);
+                        pos += block_bytes;
+                    }
+                    Err(err) if !opts.skip_on_error => {
+                        // Caller asked us not to skip. Surface the error verbatim.
+                        let (status, sense) = extract_scsi_context(&err);
+                        return Err(Error::DiscRead {
+                            sector: block_lba as u64,
+                            status: Some(status),
+                            sense,
+                        });
+                    }
+                    Err(err) => {
+                        // === ERROR PATH — single source of truth ===
+                        // ALL errors flow through handle_read_error. New
+                        // error class = one new arm in that function.
+                        // Logging, counter updates, retry budgets all live
+                        // there. The dispatch below is purely the I/O side
+                        // of each action.
+                        read_err_count += 1;
+                        let action = read_error::handle_read_error(&err, &mut read_ctx);
 
-                                // Mark remaining sectors in the batch as NonTrimmed (we only recovered 1 sector)
+                        match action {
+                            read_error::ReadAction::Retry { pause_secs } => {
+                                if pause_secs > 0 {
+                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
+                                }
+                                // Don't advance pos — same LBA next iteration.
+                            }
+                            read_error::ReadAction::Bisect => {
+                                // Re-issue the failed batch as single-sector reads.
+                                // ctx.bisecting=true so the inner failures don't
+                                // recursively request another bisect.
+                                read_ctx.bisecting = true;
+                                let saved_batch = read_ctx.batch;
+                                read_ctx.batch = 1;
+                                for sector_offset in 0..block_count {
+                                    if let Some(ref h) = opts.halt {
+                                        if h.load(std::sync::atomic::Ordering::Relaxed) {
+                                            halt_requested = true;
+                                            read_ctx.bisecting = false;
+                                            read_ctx.batch = saved_batch;
+                                            break 'outer;
+                                        }
+                                    }
+                                    let sector_lba = block_lba + (sector_offset as u32);
+                                    let mut sector_buf = [0u8; 2048];
+                                    let write_pos = pos + (sector_offset as u64 * 2048);
+                                    match reader.read_sectors(
+                                        sector_lba,
+                                        1,
+                                        &mut sector_buf[..],
+                                        true,
+                                    ) {
+                                        Ok(_) => {
+                                            read_ctx.on_success();
+                                            file.seek(SeekFrom::Start(write_pos))
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            file.write_all(&sector_buf)
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            map.record(
+                                                write_pos,
+                                                2048,
+                                                mapfile::SectorStatus::Finished,
+                                            )
+                                            .map_err(|e| Error::IoError { source: e })?;
+                                        }
+                                        Err(inner_err) => {
+                                            // Inner failure goes through the same handler — it'll
+                                            // see bisecting=true and won't recurse. We only honour
+                                            // the SkipBlock action here (the bisect by definition
+                                            // can't return another Bisect, and JumpAhead inside a
+                                            // single-sector retry doesn't make sense).
+                                            let _ = read_error::handle_read_error(
+                                                &inner_err,
+                                                &mut read_ctx,
+                                            );
+                                            let zero = [0u8; 2048];
+                                            file.seek(SeekFrom::Start(write_pos))
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            file.write_all(&zero)
+                                                .map_err(|e| Error::IoError { source: e })?;
+                                            map.record(
+                                                write_pos,
+                                                2048,
+                                                mapfile::SectorStatus::NonTrimmed,
+                                            )
+                                            .map_err(|e| Error::IoError { source: e })?;
+                                        }
+                                    }
+                                }
+                                read_ctx.bisecting = false;
+                                read_ctx.batch = saved_batch;
+                                bytes_done = bytes_done.saturating_add(block_bytes);
+                                pos += block_bytes;
+                            }
+                            read_error::ReadAction::SkipBlock { pause_secs } => {
                                 let zero = vec![0u8; block_bytes as usize];
                                 file.seek(SeekFrom::Start(pos))
                                     .map_err(|e| Error::IoError { source: e })?;
                                 file.write_all(&zero)
                                     .map_err(|e| Error::IoError { source: e })?;
-
+                                map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                bytes_done = bytes_done.saturating_add(block_bytes);
+                                if pause_secs > 0 {
+                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
+                                }
+                                pos += block_bytes;
+                            }
+                            read_error::ReadAction::JumpAhead {
+                                sectors,
+                                pause_secs,
+                            } => {
+                                // Mark the failed batch + the gap up to jump_pos NonTrimmed.
+                                let zero_batch = vec![0u8; block_bytes as usize];
+                                file.seek(SeekFrom::Start(pos))
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                file.write_all(&zero_batch)
+                                    .map_err(|e| Error::IoError { source: e })?;
                                 map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
                                     .map_err(|e| Error::IoError { source: e })?;
                                 bytes_done = bytes_done.saturating_add(block_bytes);
 
-                                damage_window.push(false);
-                                if damage_window.len() > PASS1_DAMAGE_WINDOW {
-                                    damage_window.remove(0);
+                                // Damage-zone enter: drop to minimum read speed.
+                                if !in_damage_zone {
+                                    in_damage_zone = true;
+                                    reader.set_speed(0x0000);
+                                    tracing::debug!(
+                                        target: "freemkv::disc",
+                                        phase = "damage_enter",
+                                        lba = block_lba,
+                                        "Entered damage zone; dropping to minimum read speed"
+                                    );
                                 }
-                                did_skip_ahead = false;
-                                pos += block_bytes;
-                                continue;
-                            }
-                            Err(e2) => {
+
+                                let jump_pos = (pos + block_bytes + sectors * 2048).min(region_end);
+                                let gap_start = pos + block_bytes;
+                                let gap_bytes = jump_pos.saturating_sub(gap_start);
+                                if gap_bytes > 0 {
+                                    let zero_gap = vec![0u8; 65536];
+                                    let mut filled: u64 = 0;
+                                    while filled < gap_bytes {
+                                        let chunk = (gap_bytes - filled).min(zero_gap.len() as u64);
+                                        file.seek(SeekFrom::Start(gap_start + filled))
+                                            .map_err(|e| Error::IoError { source: e })?;
+                                        file.write_all(&zero_gap[..chunk as usize])
+                                            .map_err(|e| Error::IoError { source: e })?;
+                                        filled += chunk;
+                                    }
+                                    map.record(
+                                        gap_start,
+                                        gap_bytes,
+                                        mapfile::SectorStatus::NonTrimmed,
+                                    )
+                                    .map_err(|e| Error::IoError { source: e })?;
+                                    bytes_done = bytes_done.saturating_add(gap_bytes);
+                                }
                                 tracing::warn!(
                                     target: "freemkv::disc",
-                                    phase = "transport_recovery_failed",
-                                    lba = block_lba,
-                                    single_sector_error = %e2,
-                                    "Single-sector read also failed after transport failure"
+                                    phase = "damage_jump",
+                                    from_lba = block_lba,
+                                    to_lba = (jump_pos / 2048) as u32,
+                                    jump_mb = gap_bytes / 1_048_576,
+                                    "damage-jump"
                                 );
-
-                                // If even single sector fails, mark the whole batch as unreadable and continue
-                                let zero = vec![0u8; block_bytes as usize];
-                                file.seek(SeekFrom::Start(pos))
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                file.write_all(&zero)
-                                    .map_err(|e| Error::IoError { source: e })?;
-
-                                map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                bytes_done = bytes_done.saturating_add(block_bytes);
-
-                                damage_window.push(false);
-                                if damage_window.len() > PASS1_DAMAGE_WINDOW {
-                                    damage_window.remove(0);
-                                }
-                                did_skip_ahead = false;
-                                pos += block_bytes;
-                                continue;
-                            }
-                        }
-                    }
-
-                    if err.is_bridge_degradation() {
-                        if bridge_degradation_count < BRIDGE_DEGRADATION_MAX {
-                            bridge_degradation_count += 1;
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "bridge_degradation",
-                                lba = block_lba,
-                                degradation_count = bridge_degradation_count,
-                                error = %err,
-                                "bridge degradation (firmware stress); cooling down 15s"
-                            );
-
-                            // Extended cooldown for bridge recovery - increased from 10s to 15s
-                            std::thread::sleep(std::time::Duration::from_secs(15));
-
-                           // Reduce batch size after degradation to be gentler on the bridge
-                            let reduced_batch = (batch as u64 / 2).max(8);
-                            tracing::debug!(
-                                target: "freemkv::disc",
-                                phase = "batch_reduction",
-                                from_batch = batch,
-                                to_batch = reduced_batch,
-                                "Reducing batch size after bridge degradation"
-                            );
-
-                            // Continue with the same sector to retry the read
-                            continue;
-                        }
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "bridge_degradation_exhausted",
-                            lba = block_lba,
-                            error = %err,
-                            "bridge degradation retries exhausted; treating as bad sector"
-                        );
-                    }
-
-                    let sense = err.scsi_sense();
-                    let sense_key = sense.map(|s| s.sense_key).unwrap_or(0);
-                    let asc = sense.map(|s| s.asc).unwrap_or(0);
-                    let ascq = sense.map(|s| s.ascq).unwrap_or(0);
-
-                    if sense_key == crate::scsi::SENSE_KEY_NOT_READY
-                        && not_ready_retries < NOT_READY_MAX_RETRIES
-                    {
-                        not_ready_retries += 1;
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "not_ready_pause",
-                            lba = block_lba,
-                            sense_key,
-                            asc,
-                            ascq,
-                            retry = not_ready_retries,
-                            "NOT READY; pausing 3s then retrying"
-                        );
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        continue;
-                    }
-                    not_ready_retries = 0;
-
-                    // For marginal errors (MEDIUM_ERROR, ABORTED_COMMAND), try smaller reads first
-                    // before giving up on the whole batch. This prevents bridge crashes from
-                    // forcing us to skip large sections of disc.
-                    let should_try_smaller_reads = match sense_key {
-                        crate::scsi::SENSE_KEY_MEDIUM_ERROR => true,
-                        crate::scsi::SENSE_KEY_ABORTED_COMMAND => true,
-                        _ => false,
-                    };
-
-                    if should_try_smaller_reads && block_count > 1 {
-                        tracing::info!(
-                            target: "freemkv::disc",
-                            phase = "retry_with_smaller_read",
-                            lba = block_lba,
-                            original_sectors = block_count,
-                            sense_key,
-                            asc,
-                            ascq,
-                            "Marginal error detected; retrying with smaller reads"
-                        );
-
-                        // Try reading the batch as individual sectors - this is gentler on the bridge
-                        let mut all_failed = true;
-                        for sector_offset in 0..block_count {
-                            if let Some(ref h) = opts.halt {
-                                if h.load(std::sync::atomic::Ordering::Relaxed) {
-                                    halt_requested = true;
-                                    break 'outer;
+                                pos = jump_pos;
+                                if pause_secs > 0 {
+                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
                                 }
                             }
-
-                            let sector_lba = block_lba + (sector_offset as u32);
-                            let mut sector_buf = [0u8; 2048];
-
-                            match reader.read_sectors(sector_lba, 1, &mut sector_buf[..], true) {
-                                Ok(_) => {
-                                    all_failed = false;
-                                    // Write recovered sector
-                                    let write_pos = pos + (sector_offset as u64 * 2048);
-                                    file.seek(SeekFrom::Start(write_pos))
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                    file.write_all(&sector_buf)
-                                        .map_err(|e| Error::IoError { source: e })?;
-
-                                    // Mark this sector as finished in mapfile
-                                    map.record(write_pos, 2048, mapfile::SectorStatus::Finished)
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                }
-                                Err(_) => {
-                                    // Mark failed sector as NonTrimmed
-                                    let write_pos = pos + (sector_offset as u64 * 2048);
-                                    file.seek(SeekFrom::Start(write_pos))
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                    let zero = vec![0u8; 2048];
-                                    file.write_all(&zero)
-                                        .map_err(|e| Error::IoError { source: e })?;
-
-                                    map.record(write_pos, 2048, mapfile::SectorStatus::NonTrimmed)
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                }
+                            read_error::ReadAction::AbortPass => {
+                                let (status, sense) = extract_scsi_context(&err);
+                                return Err(Error::DiscRead {
+                                    sector: block_lba as u64,
+                                    status: Some(status),
+                                    sense,
+                                });
                             }
-                        }
-
-                        if !all_failed {
-                            tracing::info!(
-                                target: "freemkv::disc",
-                                phase = "smaller_read_partial_success",
-                                lba = block_lba,
-                                recovered_sectors = block_count - 1, // We count failures as NonTrimmed above
-                                total_sectors = block_count,
-                                "Partial recovery from smaller reads"
-                            );
-                        }
-
-                        bytes_done = bytes_done.saturating_add(block_bytes);
-                        damage_window.push(false);
-                        if damage_window.len() > PASS1_DAMAGE_WINDOW {
-                            damage_window.remove(0);
-                        }
-                        did_skip_ahead = false;
-                        pos += block_bytes;
-                        continue;
-                    }
-
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "skip_ecc_block",
-                        lba = block_lba,
-                        sectors = block_count,
-                        sense_key,
-                        asc,
-                        ascq,
-                        error = %err,
-                        "ECC block failed; marking NonTrimmed"
-                    );
-                    let zero = vec![0u8; block_bytes as usize];
-                    file.seek(SeekFrom::Start(pos))
-                        .map_err(|e| Error::IoError { source: e })?;
-                    file.write_all(&zero)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
-                        .map_err(|e| Error::IoError { source: e })?;
-                    bytes_done = bytes_done.saturating_add(block_bytes);
-
-                    damage_window.push(false);
-                    if damage_window.len() > PASS1_DAMAGE_WINDOW {
-                        damage_window.remove(0);
-                    }
-
-                    let bad_count = damage_window.iter().filter(|&&b| !b).count();
-                    if damage_window.len() >= PASS1_DAMAGE_WINDOW
-                        && bad_count * 100 / damage_window.len() >= PASS1_DAMAGE_THRESHOLD_PCT
-                    {
-                        let jump_sectors =
-                            PASS1_JUMP_SECTORS_FACTOR * batch as u64 * jump_multiplier;
-                        let jump_lba = ((pos / 2048) + jump_sectors) as u32;
-                        let region_end_lba = (region_end / 2048) as u32;
-                        if jump_lba < region_end_lba {
-                            if !in_damage_zone {
-                                in_damage_zone = true;
-                                reader.set_speed(0x0000);
-                                tracing::debug!(
-                                    target: "freemkv::disc",
-                                    phase = "damage_enter",
-                                    lba = block_lba,
-                                    "Entered damage zone; dropping to minimum read speed"
-                                );
-                            }
-                            let jump_pos = jump_lba as u64 * 2048;
-                            let gap_start = pos + block_bytes;
-                            let gap_bytes = jump_pos.saturating_sub(gap_start);
-                            let jump_mb = gap_bytes / 1_048_576;
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "damage_jump",
-                                from_lba = block_lba,
-                                to_lba = jump_lba,
-                                jump_mb,
-                                bad_pct = bad_count * 100 / damage_window.len(),
-                                multiplier = jump_multiplier,
-                                "25%+ failures in last 50 blocks; jumping ahead"
-                            );
-                            if gap_bytes > 0 {
-                                let zero = vec![0u8; 65536];
-                                let mut filled: u64 = 0;
-                                while filled < gap_bytes {
-                                    let chunk = (gap_bytes - filled).min(zero.len() as u64);
-                                    file.seek(SeekFrom::Start(gap_start + filled))
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                    file.write_all(&zero[..chunk as usize])
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                    filled += chunk;
-                                }
-                                map.record(gap_start, gap_bytes, mapfile::SectorStatus::NonTrimmed)
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                bytes_done = bytes_done.saturating_add(gap_bytes);
-                            }
-                            pos = jump_pos;
-                            jump_multiplier *= 2;
-                            did_skip_ahead = true;
                         }
                     }
                 }
 
-                if !did_skip_ahead {
-                    pos += block_bytes;
-                }
                 iter_count += 1;
 
                 if iter_count - last_log_iter >= 100 {
@@ -2223,9 +2077,15 @@ impl Disc {
             }
         }
 
+        // Every retry pass acts on every non-Finished range. Including
+        // Unreadable means a sector that failed in pass N gets a fresh
+        // shot in pass N+1 — drive state evolves, the same read can
+        // succeed later. Each pass owns its own jumps/skips; if pass 5
+        // jumps over the same zone as pass 2, fine.
         let mut bad_ranges = map.ranges_with(&[
             mapfile::SectorStatus::NonTrimmed,
             mapfile::SectorStatus::NonScraped,
+            mapfile::SectorStatus::Unreadable,
         ]);
         if opts.reverse {
             bad_ranges.reverse();
@@ -2866,9 +2726,23 @@ impl Disc {
                 if damage_window.len() >= PASSN_DAMAGE_WINDOW
                     && bad_count * 100 / damage_window.len() >= PASSN_DAMAGE_THRESHOLD_PCT
                 {
-                    let skip_sectors = (PASSN_SKIP_SECTORS_BASE
-                        << consecutive_skips_without_recovery)
+                    // Size-aware cap: never skip more than 1/4 of the
+                    // remaining bad range. A 100-sector bad range is
+                    // really 25-bad + 50-good + 25-bad in disguise; a
+                    // hardcoded MB-scale skip would leap over the
+                    // entire thing and miss the good middle. Capping
+                    // at range_remaining/4 forces convergence on the
+                    // actual bad sub-zones.
+                    let range_remaining_bytes = if opts.reverse {
+                        block_end.saturating_sub(*range_pos)
+                    } else {
+                        end.saturating_sub(block_end)
+                    };
+                    let range_remaining_sectors = range_remaining_bytes / 2048;
+                    let range_quarter = (range_remaining_sectors / 4).max(1);
+                    let escalated = (PASSN_SKIP_SECTORS_BASE << consecutive_skips_without_recovery)
                         .min(PASSN_SKIP_SECTORS_CAP);
+                    let skip_sectors = escalated.min(range_quarter);
                     let skip_bytes = skip_sectors * 2048;
                     let new_block_end = if opts.reverse {
                         block_end.saturating_sub(skip_bytes).max(*range_pos)
