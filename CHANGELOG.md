@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.7 (2026-05-08)
+
+### Sync release — no functional libfreemkv changes
+
+Version bump to keep the four freemkv crates at unified versioning.
+autorip shipped UI smoothness + audit fixes today (v0.17.6, v0.17.7);
+libfreemkv carries no code changes, but is bumped + republished to
+crates.io so downstream `libfreemkv = "0.17"` consumers stay aligned
+on the latest patch version. See autorip CHANGELOG for the
+user-visible work in this release window.
+
 ## 0.17.5 (2026-05-08)
 
 ### Pass N recovery — kernel block-device fallback + per-range fixes
