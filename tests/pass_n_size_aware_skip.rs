@@ -12,9 +12,9 @@
 //! that boundary.
 
 use libfreemkv::disc::CopyOptions;
+use libfreemkv::disc::DiscRegion;
 use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
 use libfreemkv::error::Result;
-use libfreemkv::disc::DiscRegion;
 use libfreemkv::{ContentFormat, Disc, DiscFormat, SectorReader};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -45,7 +45,13 @@ impl PatternedSectorReader {
 }
 
 impl SectorReader for PatternedSectorReader {
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _recovery: bool) -> Result<usize> {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
         self.trace.lock().unwrap().push((lba, count));
         // Whole-batch fails if ANY sector in the batch is bad. (Models a
         // real drive: a multi-sector READ aborts on the first ECC failure.)
@@ -149,7 +155,10 @@ fn patch_recovers_good_middle_of_a_bad_range() {
     // Pre-populate: 0..100 already Finished from an imagined Pass 1,
     //               100..200 NonTrimmed (the range we want patch to retry),
     //               200..1024 already Finished.
-    let finished = [(0, 100 * 2048), (200 * 2048, (capacity_sectors as u64 - 200) * 2048)];
+    let finished = [
+        (0, 100 * 2048),
+        (200 * 2048, (capacity_sectors as u64 - 200) * 2048),
+    ];
     let nontrimmed = [(100 * 2048, 100 * 2048)];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
@@ -161,7 +170,9 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         multipass: true,
         ..Default::default()
     };
-    let pr = disc.copy(&mut reader, &iso_path, &opts).expect("copy returns Ok");
+    let pr = disc
+        .copy(&mut reader, &iso_path, &opts)
+        .expect("copy returns Ok");
 
     // Re-load mapfile and inspect.
     let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
@@ -230,7 +241,10 @@ fn patch_recovers_multiple_good_middles() {
     let iso_path = tmp.path().to_path_buf();
     drop(tmp);
 
-    let finished = [(0, 1000 * 2048), (1300 * 2048, (capacity_sectors as u64 - 1300) * 2048)];
+    let finished = [
+        (0, 1000 * 2048),
+        (1300 * 2048, (capacity_sectors as u64 - 1300) * 2048),
+    ];
     let nontrimmed = [(1000 * 2048, 300 * 2048)];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
@@ -239,7 +253,9 @@ fn patch_recovers_multiple_good_middles() {
         multipass: true,
         ..Default::default()
     };
-    let pr = disc.copy(&mut reader, &iso_path, &opts).expect("copy returns Ok");
+    let pr = disc
+        .copy(&mut reader, &iso_path, &opts)
+        .expect("copy returns Ok");
 
     let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
