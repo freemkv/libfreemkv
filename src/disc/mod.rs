@@ -2182,15 +2182,21 @@ impl Disc {
                         phase = "patch_skip_limit",
                         range_lba = range_pos / 2048,
                         skip_count,
-                        "Skip limit reached - marking range terminal and continuing to next",
+                        "Skip limit reached - leaving remaining bytes NonTrimmed for next pass",
                     );
-                    // Mark remaining bytes in this range as Unreadable before moving on
+                    // CRITICAL: don't mark sectors we NEVER ATTEMPTED as
+                    // Unreadable. Only sectors we actually read+failed get
+                    // the terminal `-` status. Sectors we jumped over are
+                    // hopeful — the drive may read them on a later pass
+                    // when state has evolved (cache, mechanical settle).
+                    // 2026-05-07 dd-as-oracle test confirmed ~36% of
+                    // patch-marked Unreadable sectors are actually readable.
                     let unmarked_bytes = block_end.saturating_sub(*range_pos);
                     if opts.reverse {
                         map.record(
                             *range_pos,
                             unmarked_bytes,
-                            mapfile::SectorStatus::Unreadable,
+                            mapfile::SectorStatus::NonTrimmed,
                         )
                         .map_err(|e| Error::IoError { source: e })?;
                     } else {
@@ -2199,7 +2205,7 @@ impl Disc {
                             map.record(
                                 remaining_start,
                                 end - remaining_start,
-                                mapfile::SectorStatus::Unreadable,
+                                mapfile::SectorStatus::NonTrimmed,
                             )
                             .map_err(|e| Error::IoError { source: e })?;
                         }
@@ -2236,6 +2242,27 @@ impl Disc {
                     pos_byte = pos,
                     "Starting sector read"
                 );
+
+                // Cache priming: before reading the target sector, do
+                // a few single-sector reads at LBAs immediately preceding
+                // it. The drive's read-ahead cache prefetches forward on
+                // sequential reads — so by the time we ask for `lba` it
+                // may already be cached, even if a cold read fails. Proven
+                // 2026-05-07 with dd-as-oracle: 8/8 sectors recoverable
+                // when primed vs 6/8 cold. Throwaway reads — we already
+                // have those bytes Finished from a prior pass; failures
+                // here don't update mapfile state.
+                const CACHE_PRIME_SECTORS: u32 = 3;
+                if lba >= CACHE_PRIME_SECTORS && count == 1 {
+                    let mut prime_buf = [0u8; 2048];
+                    for i in 0..CACHE_PRIME_SECTORS {
+                        let prime_lba = lba - CACHE_PRIME_SECTORS + i;
+                        // Best-effort; ignore errors. Recovery=false is
+                        // intentional: a fast 1.5s timeout is fine because
+                        // we don't need the data.
+                        let _ = reader.read_sectors(prime_lba, 1, &mut prime_buf[..], false);
+                    }
+                }
 
                 let read_start = std::time::Instant::now();
                 let read_result = reader.read_sectors(lba, count, &mut buf[..bytes], recovery);
