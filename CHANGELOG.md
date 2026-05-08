@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.17.5 (2026-05-08)
+
+### Pass N recovery — kernel block-device fallback + per-range fixes
+
+Live testing on direct-SATA BU40N + AACS-encrypted UHD disc revealed that
+the v0.17.3 single-shot SCSI READ path matched 0/22 of the small bad-sector
+LBAs that `dd if=/dev/sr0` recovers on the same drive. This release closes
+that gap and fixes several adjacent bugs that were silently capping
+recovery.
+
+- **`/dev/sr0` pread fallback in `Drive::read` (Linux)**: when a SCSI READ
+  via `/dev/sg*` returns Err, fall back to `posix_fadvise(POSIX_FADV_DONTNEED)
+  + pread()` against the corresponding block device. The kernel `sr_mod`
+  driver runs ~5 internal retries per command without the per-attempt
+  error-escalation overhead that userspace SG_IO retries pay, which is the
+  source of dd's recovery advantage. End-to-end byte-verification confirms
+  the fallback path returns real disc data (md5-equivalent to fresh dd from
+  the same drive session). The block fd is opened in `Drive::open` by
+  resolving `/sys/class/scsi_generic/sgN/device/block`; best-effort, with no
+  fallback if open fails.
+
+- **`Disc::patch` per-range watchdog fix**: when a range hit `MAX_RANGE_SECS`,
+  the old code did `wedged_exit = true; break 'outer;` — a single slow range
+  killed the entire patch. Now `break;` (skip this range, advance the outer
+  for loop). Pre-fix, patch was dying after 4 sectors of the first slow
+  range and never reaching the other 46.
+
+- **Per-sector range budget**: replaced flat `MAX_RANGE_SECS = 180` with
+  `range_budget_secs = (range_sectors × SECONDS_PER_SECTOR).min(RANGE_BUDGET_CAP_SECS)`.
+  Tiny ranges exit fast (1-sector range = 25 s); medium ranges get
+  proportional time (51-sector range ≈ 1275 s); large ranges still bounded
+  by the 1800 s cap so they cannot monopolise pass 1.
+
+- **`consecutive_failures` resets per range**: the wedge-exit detector
+  (`>= 50 consecutive failures`) is for "stuck on the same range"; pre-fix
+  the counter persisted across ranges, so 50 small post-bisection ranges
+  with one failure each falsely tripped the wedge mid-pass. Reset at every
+  range boundary.
+
+- **Reverted inline 5× retry in patch**: a brief experiment that was
+  measurably harmful — each "2 s" SCSI timeout paid ~1.5 s kernel SCSI
+  mid-layer error-escalation overhead, so 5× retry took ~17 s per LBA and
+  triggered the per-range watchdog in 4 sectors. Restored
+  `READ_RECOVERY_TIMEOUT_MS = 60_000` (the v0.17.3 baseline; the kernel-
+  auto-retry pattern is now provided by the `/dev/sr0` fallback above).
+
+### Empirical results (Dune Part Two UHD, BU40N direct SATA)
+
+- Pass 1: **94.6 MB recovered** (28% of formerly-bad data, 33 sr0 fallback
+  saves), **11 s of main-title content** restored. Patch completed all 47
+  retryable ranges naturally (was wedging at range 1 of 47 in v0.17.3).
+- Pass 2 cumulative: 95.2 MB (+0.6 MB; diminishing returns curve).
+- Remaining ~233 MB on the test disc appears physically unrecoverable on
+  this hardware (kernel auto-retry can't decode it either).
+
+### Behavioural notes
+
+- The `/dev/sr0` fallback is Linux only; macOS and Windows fall back to
+  the existing single-shot SCSI behaviour. The fallback is gated to
+  `recovery=true` reads (only fires from the patch path, not the sweep
+  path) to avoid page-cache pressure during multi-GB sequential ripping.
+
 ## 0.17.0 (2026-05-04)
 
 ### Code quality: unwrap safety, clippy compliance, test coverage
