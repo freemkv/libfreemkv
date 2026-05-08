@@ -68,10 +68,25 @@ pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 pub(crate) const READ_TIMEOUT_MS: u32 = 10_000;
 
 /// Timeout for content READ commands on the recovery path —
-/// [`disc::Disc::patch`]'s targeted retries on bad ranges. Doubles
-/// the fast-path budget so a sector that fails at 30 s gets one more
-/// honest attempt. Matches sg_dd's default per-command timeout
-/// (`DEF_TIMEOUT = 60000`).
+/// [`disc::Disc::patch`]'s targeted retries on bad ranges. Matches
+/// `sg_dd`'s 60 s ceiling: long enough that any sector the drive can
+/// recover at all gets the time to do so, short enough that an
+/// unresponsive bus is detected before the per-range watchdog fires.
+///
+/// In practice failed reads return in 1–4 s (the drive itself gives up
+/// on uncorrectable ECC before the timeout); the 60 s value is a
+/// safety ceiling, not a steady-state cost.
+///
+/// Historical note (2026-05-08): briefly lowered to 2 s with a 5×
+/// inline retry loop in `Disc::patch` to mimic the kernel `sr_mod`
+/// driver's auto-retry pattern. The synthetic logic worked but on the
+/// live drive each "2 s" read paid ~1.5 s of kernel SCSI mid-layer
+/// error escalation on top, so 5× retries took ~17 s per LBA and
+/// triggered MAX_RANGE_SECS after 4 sectors — pushing recovery to
+/// 0/22 ranges (worse than the 0/22 baseline of v0.17.3 single-shot
+/// at 60 s, since that at least visited every range). Reverted; the
+/// kernel-auto-retry approach is being pursued via a `/dev/sr0` pread
+/// fallback instead.
 pub(crate) const READ_RECOVERY_TIMEOUT_MS: u32 = 60_000;
 
 // ── SCSI status bytes (SPC-4 §4.5.5) ────────────────────────────────────────

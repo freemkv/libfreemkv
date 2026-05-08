@@ -1995,14 +1995,33 @@ impl Disc {
         let mut blocks_attempted: u64 = 0;
         let mut blocks_read_ok: u64 = 0;
         let mut blocks_read_failed: u64 = 0;
-        let mut consecutive_failures: u64 = 0;
+        // Reset to 0 at the start of every range; declared without init
+        // because the per-range reset (below) always runs before any read.
+        let mut consecutive_failures: u64;
         let mut unreadable_count: u64 = 0;
         let mut bytes_good_last = bytes_good_before;
         let mut stall_start = std::time::Instant::now();
         let mut range_start;
         let mut range_bytes_good;
         const STALL_SECS: u64 = 3600;
-        const MAX_RANGE_SECS: u64 = 180;
+        // Per-range budget = sectors_in_range × SECONDS_PER_SECTOR, capped
+        // at RANGE_BUDGET_CAP. Replaces the old flat 180 s/range — that
+        // was unfair to medium ranges (a 51-sector range got the same
+        // 180 s as a 1-sector range, so multi-sector ranges couldn't
+        // even attempt every sector inside their budget) and pointlessly
+        // generous to single-sector ranges (180 s when ~5 s would do).
+        // The cap keeps catastrophic ranges (10s of MB) bounded so they
+        // can't consume the entire patch run; multi-pass orchestration
+        // raises the cap on later passes for the genuinely-stuck ones.
+        // Empirical per-failed-sector cost on direct-SATA BU40N (2026-05-08):
+        // ~3 s SCSI READ failure + ~15 s sr0 pread fallback (kernel sr_mod
+        // does ~5 internal retries) ≈ 18-25 s total. SECONDS_PER_SECTOR=25
+        // lets a small range fully sample within budget instead of bailing
+        // after one slow read. Previous value of 5 was too tight: a
+        // 3-sector range got 15 s budget but the first failed read alone
+        // took ~20 s, so the watchdog fired before sector 2 could be tried.
+        const SECONDS_PER_SECTOR: u64 = 25;
+        const RANGE_BUDGET_CAP_SECS: u64 = 1800;
         const MAX_SKIPS_PER_RANGE: u32 = 10;
         let mut skip_count: u32;
         let mut buf = vec![0u8; block_sectors as usize * 2048];
@@ -2132,6 +2151,24 @@ impl Disc {
             range_start = std::time::Instant::now();
             range_bytes_good = bytes_good_before;
             skip_count = 0;
+            // Reset consecutive_failures at each range boundary. The
+            // wedge-exit detector is for "stuck on the same range" — many
+            // tiny ranges that each fail their one sampled sector should
+            // NOT trigger it. Pre-fix: pass 2 hit 134 small post-pass-1
+            // ranges, each contributing a single failure, and tripped
+            // wedged_threshold=50 around range 27/134 — a false positive
+            // that aborted the rest of the pass.
+            consecutive_failures = 0;
+            let range_sectors = *range_size / 2048;
+            let range_budget_secs = (range_sectors * SECONDS_PER_SECTOR).min(RANGE_BUDGET_CAP_SECS);
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "patch_range_budget",
+                range_lba = *range_pos / 2048,
+                range_sectors,
+                range_budget_secs,
+                "Per-range time budget computed"
+            );
             loop {
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2140,39 +2177,47 @@ impl Disc {
                     }
                 }
 
-                // Test 1: Range timeout - max 3 minutes per range
-                if range_start.elapsed().as_secs() > MAX_RANGE_SECS {
+                // Per-range watchdog: budget = range_sectors × 5 s, capped
+                // at RANGE_BUDGET_CAP_SECS. Tiny ranges exit fast (1-sector
+                // range = 5 s budget); medium ranges get proportional time
+                // (51-sector range = 255 s); huge ranges still bounded by
+                // the cap so they can't monopolise pass 1.
+                //
+                // Both the absolute-elapsed and no-progress checks share
+                // the same per-range budget. The progress check resets
+                // range_start on every byte gained, so a steadily-recovering
+                // range can run as long as it makes progress.
+                if range_start.elapsed().as_secs() > range_budget_secs {
                     tracing::warn!(
                         target: "freemkv::disc",
                         phase = "patch_range_timeout",
                         range_lba = range_pos / 2048,
+                        range_sectors,
                         elapsed_secs = range_start.elapsed().as_secs(),
-                        bytes_recovered = bytes_good_before - range_bytes_good,
-                        "Range timeout - no progress in {}s, aborting",
-                        MAX_RANGE_SECS
+                        budget_secs = range_budget_secs,
+                        bytes_recovered = range_bytes_good.saturating_sub(bytes_good_before),
+                        "Range timeout - moving to next range"
                     );
-                    wedged_exit = true;
-                    break 'outer;
+                    break;
                 }
 
-                // Test 2: Range progress - must recover bytes in 60 seconds
                 let bytes_good_now = map.stats().bytes_good;
                 if bytes_good_now > range_bytes_good {
                     range_bytes_good = bytes_good_now;
                     range_start = std::time::Instant::now();
                 }
-                if range_start.elapsed().as_secs() > MAX_RANGE_SECS {
+                if range_start.elapsed().as_secs() > range_budget_secs {
                     tracing::warn!(
                         target: "freemkv::disc",
                         phase = "patch_range_stall",
                         range_lba = range_pos / 2048,
+                        range_sectors,
                         elapsed_secs = range_start.elapsed().as_secs(),
-                        bytes_recovered = bytes_good_before - range_bytes_good,
-                        "Range stalled - no recovery in {}s, aborting",
-                        MAX_RANGE_SECS
+                        budget_secs = range_budget_secs,
+                        bytes_recovered = range_bytes_good.saturating_sub(bytes_good_before),
+                        "Range stalled - moving to next range"
                     );
-                    wedged_exit = true;
-                    break 'outer;
+                    break;
                 }
 
                 // Test 3: Skip count - max 10 skips per range
@@ -2264,6 +2309,16 @@ impl Disc {
                     }
                 }
 
+                // Single-shot read. Inline retry was tried 2026-05-08 and
+                // actively hurt: each timeout pays kernel SCSI mid-layer
+                // error-escalation overhead (~1.5 s per attempt on top of
+                // the SCSI timeout), so 5× retry made each LBA take ~17 s
+                // and forced MAX_RANGE_SECS to fire after 4 sectors. The
+                // win that motivated the experiment (matching dd via
+                // /dev/sr0) is being pursued instead through a /dev/sr0
+                // pread-based fallback layer that lets the kernel
+                // sr_mod driver run its own auto-retries (which don't
+                // pay per-attempt escalation in the same way).
                 let read_start = std::time::Instant::now();
                 let read_result = reader.read_sectors(lba, count, &mut buf[..bytes], recovery);
                 let read_duration_ms = read_start.elapsed().as_millis();

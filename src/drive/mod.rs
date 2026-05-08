@@ -69,6 +69,16 @@ pub struct Drive {
     halt: Arc<AtomicBool>,
     /// Event handler — fires for read errors and library-level state changes.
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
+    /// Linux only: raw fd for the corresponding block device (`/dev/sr*`)
+    /// used as a recovery fallback when SCSI READ via `/dev/sg*` returns
+    /// an error. The kernel `sr_mod` driver auto-retries failed reads
+    /// (~5× per command) — historically the reason `dd if=/dev/sr0`
+    /// recovers ~50% of bad sectors that single-shot `SG_IO` READ
+    /// misses on the same drive. `None` when the block device couldn't
+    /// be resolved or opened (no fallback in that case; SCSI read
+    /// errors propagate as before).
+    #[cfg(target_os = "linux")]
+    block_dev_fd: Option<std::os::unix::io::RawFd>,
 }
 
 impl Drive {
@@ -87,6 +97,9 @@ impl Drive {
             None => (None, None, None),
         };
 
+        #[cfg(target_os = "linux")]
+        let block_dev_fd = open_block_device_for_sg(device);
+
         Ok(Drive {
             scsi: transport,
             driver,
@@ -96,6 +109,8 @@ impl Drive {
             device_path: device.to_string_lossy().to_string(),
             halt: Arc::new(AtomicBool::new(false)),
             event_fn: None,
+            #[cfg(target_os = "linux")]
+            block_dev_fd,
         })
     }
 
@@ -483,6 +498,54 @@ impl Drive {
                     scsi_status = status,
                     "Drive::read checked_exec failed"
                 );
+
+                // /dev/sr0 pread fallback (Linux only). The kernel
+                // sr_mod driver auto-retries failed reads (~5× per
+                // command). Empirically (BU40N + Dune Part 2 UHD,
+                // 2026-05-08) dd via /dev/sr0 recovers ~50% of bad
+                // sectors that a single-shot SG_IO READ misses.
+                #[cfg(target_os = "linux")]
+                if recovery {
+                    if let Some(fd) = self.block_dev_fd {
+                        let len = count as usize * 2048;
+                        if buf.len() >= len {
+                            let offset = lba as i64 * 2048;
+                            // Drop kernel cache for this region so we get
+                            // a fresh device read, not stale page-cache
+                            // data from a prior successful neighbour read.
+                            let _ = unsafe {
+                                libc::posix_fadvise(
+                                    fd,
+                                    offset,
+                                    len as i64,
+                                    libc::POSIX_FADV_DONTNEED,
+                                )
+                            };
+                            let n = unsafe {
+                                libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, len, offset)
+                            };
+                            if n == len as isize {
+                                tracing::info!(
+                                    target: "freemkv::drive",
+                                    lba,
+                                    count,
+                                    bytes = len,
+                                    "Drive::read recovered via /dev/sr0 pread fallback"
+                                );
+                                return Ok(len);
+                            }
+                            tracing::debug!(
+                                target: "freemkv::drive",
+                                lba,
+                                count,
+                                pread_ret = n as i64,
+                                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                                "/dev/sr0 pread fallback also failed"
+                            );
+                        }
+                    }
+                }
+
                 Err(Error::DiscRead {
                     sector: lba as u64,
                     status: Some(status),
@@ -586,6 +649,61 @@ impl Drop for Drive {
     fn drop(&mut self) {
         self.cleanup();
         // SgIoTransport::drop() runs next, calling libc::close(fd)
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = self.block_dev_fd.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Resolve a `/dev/sg*` path to the corresponding `/dev/sr*` block
+/// device by walking sysfs, then open it for read (no `O_DIRECT` —
+/// `posix_fadvise(POSIX_FADV_DONTNEED)` flushes the cache before each
+/// pread, which avoids buffer-alignment requirements while still
+/// forcing fresh device reads).
+///
+/// Returns `None` on any error (sysfs not present, no matching block
+/// device, open failed). Callers treat that as "no fallback available"
+/// and propagate the original SCSI READ error.
+#[cfg(target_os = "linux")]
+fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> {
+    let basename = sg_path.file_name()?.to_str()?;
+    if !basename.starts_with("sg") {
+        return None;
+    }
+    let sysfs_dir = format!("/sys/class/scsi_generic/{}/device/block", basename);
+    let entries = std::fs::read_dir(&sysfs_dir).ok()?;
+    let block_name = entries
+        .flatten()
+        .find_map(|e| e.file_name().into_string().ok())?;
+    let block_path = format!("/dev/{}", block_name);
+
+    let mut bytes = block_path.as_bytes().to_vec();
+    bytes.push(0);
+    let fd = unsafe {
+        libc::open(
+            bytes.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        tracing::debug!(
+            target: "freemkv::drive",
+            sg = basename,
+            block_path,
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            "Failed to open block device for fallback; sr0 fallback disabled"
+        );
+        None
+    } else {
+        tracing::info!(
+            target: "freemkv::drive",
+            sg = basename,
+            block_path,
+            fd,
+            "Opened /dev/sr* as recovery fallback for failed SCSI reads"
+        );
+        Some(fd)
     }
 }
 
