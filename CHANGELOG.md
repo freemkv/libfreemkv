@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.17.10 (2026-05-09)
+
+### Bounded-cache writeback for big sequential writes
+
+Pass 1 sweep speed on a healthy disc previously dipped from ~15 MB/s
+to ~1 MB/s every ~30 s on a host with default Linux dirty-page
+settings. Cause: the kernel's `vm.dirty_ratio` (~20 % of RAM) lets
+hundreds of MB of dirty pages accumulate, then bursts a flush at
+99 % disk utilisation that blocks app writes for ~1 s. Confirmed
+empirically on the BU40N test bed: dirty pages grew 112 → 563 MB
+between bursts; lowering `vm.dirty_bytes` to 64 MB at the host
+sysctl level eliminated the dips.
+
+This release ships the equivalent inside libfreemkv so users don't
+need to tune the host kernel:
+
+- New `crate::io::Writer` — drop-in `File` wrapper implementing
+  `Write` + `Seek`. Wraps a per-platform `WritebackPipeline` that on
+  Linux schedules `sync_file_range(WRITE)` + lagging
+  `sync_file_range(WAIT_AFTER)` + `posix_fadvise(DONTNEED)` calls in
+  32 MB chunks, keeping dirty cache bounded at ~64 MB. macOS and
+  Windows ship a no-op stub — their default cache policies don't
+  exhibit the same pathology for our access pattern.
+- Disc::sweep wraps its output `File` in `Writer`. No changes to the
+  loop body — `Writer` forwards `seek`/`write_all` to `File` and
+  drives the pipeline transparently.
+- Module is purpose-built for any large sequential output (sweep,
+  patch, future mux) — they can adopt `crate::io::Writer` with a
+  one-line wrapper and inherit the same behaviour.
+
 ## 0.17.7 (2026-05-08)
 
 ### Sync release — no functional libfreemkv changes
