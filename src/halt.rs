@@ -34,6 +34,26 @@ impl Halt {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
+    /// Wrap an existing `Arc<AtomicBool>` as a `Halt`. Useful as a
+    /// bridge during the 0.18 deprecation window: callers that already
+    /// hold an `Arc<AtomicBool>` (e.g. `Drive::halt_flag()`, the
+    /// deprecated `DiscStream::set_halt`) can adopt the new token API
+    /// without changing the underlying flag.
+    ///
+    /// Cancelling either side flips the same bit — the wrapping `Halt`
+    /// and the original `Arc` are two views over one shared flag.
+    pub fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// Borrow the underlying `Arc<AtomicBool>`. Used at boundaries with
+    /// pre-`Halt` APIs that still take an `Arc<AtomicBool>` directly
+    /// (`CopyOptions::halt`, the deprecated `DiscStream::set_halt`).
+    /// Round 3 deletes those boundaries and this accessor with them.
+    pub fn as_arc(&self) -> &Arc<AtomicBool> {
+        &self.0
+    }
+
     /// Flip the shared flag to cancelled. Idempotent.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
@@ -109,5 +129,38 @@ mod tests {
         });
         handle.join().unwrap();
         assert!(h.is_cancelled());
+    }
+
+    #[test]
+    fn from_arc_shares_state() {
+        // The 0.18 deprecation-window bridge: a Halt built from an
+        // existing Arc<AtomicBool> must be a *view* over the same bit,
+        // not a fresh copy. Cancelling either side flips both.
+        let arc = Arc::new(AtomicBool::new(false));
+        let halt = Halt::from_arc(arc.clone());
+        assert!(!halt.is_cancelled());
+        assert!(!arc.load(Ordering::Relaxed));
+
+        // Cancel via the wrapping Halt; the original Arc observes it.
+        halt.cancel();
+        assert!(arc.load(Ordering::Relaxed));
+
+        // Conversely: flip the Arc directly; the Halt view observes it.
+        let arc2 = Arc::new(AtomicBool::new(false));
+        let halt2 = Halt::from_arc(arc2.clone());
+        arc2.store(true, Ordering::Relaxed);
+        assert!(halt2.is_cancelled());
+    }
+
+    #[test]
+    fn as_arc_returns_backing_flag() {
+        // `as_arc()` must hand back the *same* Arc, not a clone of a
+        // different bit. Verified by writing through the borrowed Arc
+        // and observing through the Halt.
+        let halt = Halt::new();
+        let arc = halt.as_arc().clone();
+        assert!(!halt.is_cancelled());
+        arc.store(true, Ordering::Relaxed);
+        assert!(halt.is_cancelled());
     }
 }
