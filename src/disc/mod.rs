@@ -13,6 +13,7 @@ mod dvd;
 mod encrypt;
 pub mod mapfile;
 pub mod read_error;
+mod sweep_pipeline;
 
 use crate::drive::{Drive, extract_scsi_context};
 use crate::error::{Error, Result};
@@ -1369,7 +1370,10 @@ impl Disc {
         path: &std::path::Path,
         opts: &SweepOptions,
     ) -> Result<CopyResult> {
-        use std::io::{Seek, SeekFrom, Write};
+        use sweep_pipeline::{
+            ConsumerInputs, ProgressSnapshot, WorkItem, send_or_abort, spawn_consumer,
+            try_recv_progress, try_request_stats,
+        };
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
         let keys = if opts.decrypt {
@@ -1383,7 +1387,7 @@ impl Disc {
         if !opts.resume {
             let _ = std::fs::remove_file(&mapfile_path);
         }
-        let mut map = mapfile::Mapfile::open_or_create(
+        let map = mapfile::Mapfile::open_or_create(
             &mapfile_path,
             total_bytes,
             concat!("libfreemkv v", env!("CARGO_PKG_VERSION")),
@@ -1414,16 +1418,30 @@ impl Disc {
             f
         };
 
-        // Wrap the raw `File` in our bounded-cache writer so the
-        // kernel's writeback queue drains continuously instead of
-        // accumulating hundreds of MB of dirty pages and then bursting
-        // a flush that blocks app writes (see `crate::io`).
-        let mut file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
+        // Wrap the raw `File` in our bounded-cache writer (drains
+        // dirty pages continuously instead of bursting; see
+        // `crate::io`). The Writer moves into the consumer thread.
+        let file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
             None if opts.skip_on_error => ecc_sectors(self.format),
             None => DEFAULT_BATCH_SECTORS,
         };
+
+        // Pre-compute the list of NonTried regions before handing the
+        // mapfile to the consumer thread. Each region is processed by
+        // the producer in order; the consumer mutates the mapfile per
+        // work-item. Any regions left as NonTrimmed/Unreadable after
+        // sweep finishes are the patch pass's job.
+        let regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
+
+        // Spawn the consumer. It owns Writer + Mapfile; the producer
+        // (this thread) keeps `reader`, `read_ctx`, halt + set_speed.
+        let (work_tx, prog_rx, consumer_handle) = spawn_consumer(ConsumerInputs {
+            file,
+            map,
+            is_regular,
+        });
 
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
@@ -1433,49 +1451,23 @@ impl Disc {
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
-        // ALL read state lives in one place. The single error-handling
-        // entry point (`read_error::handle_read_error`) owns the
-        // counters, retry budgets, and damage-window updates.
         let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
-        // Speed control derives from damage-zone state. We track the
-        // transition locally so we only call set_speed on edges, not
-        // every iteration.
         let mut in_damage_zone = false;
         const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
+        let mut cached_snapshot: Option<ProgressSnapshot> = None;
+        let mut producer_err: Option<Error> = None;
+
         tracing::trace!(
             target: "freemkv::disc",
             phase = "copy_start",
             total_bytes,
             batch,
             skip_on_error = opts.skip_on_error,
-            "Disc::copy entered"
+            regions = regions.len(),
+            "Disc::sweep entered (producer/consumer)"
         );
 
-        'outer: loop {
-            // Every pass retries every non-Finished range. Includes
-            // Unreadable so each pass gets its own shot at sectors prior
-            // passes gave up on — drive state may have changed (cooled
-            // down, bridge stabilized, etc.). Mapfile is binary in
-            // intent: Finished or not-yet-good.
-            let regions_to_do = map.ranges_with(&[
-                mapfile::SectorStatus::NonTried,
-                mapfile::SectorStatus::NonTrimmed,
-                mapfile::SectorStatus::NonScraped,
-                mapfile::SectorStatus::Unreadable,
-            ]);
-            tracing::trace!(
-                target: "freemkv::disc",
-                phase = "outer_loop",
-                regions_remaining = regions_to_do.len(),
-                "Disc::copy outer iter"
-            );
-            if regions_to_do.is_empty() {
-                break;
-            }
-            let Some((region_pos, region_size)) = map.next_with(0, mapfile::SectorStatus::NonTried)
-            else {
-                break;
-            };
+        'outer: for (region_pos, region_size) in regions {
             let region_end = region_pos + region_size;
             let mut pos = region_pos;
             tracing::trace!(
@@ -1509,12 +1501,9 @@ impl Disc {
 
                 match read_result {
                     Ok(_) => {
-                        // === SUCCESS PATH ===
                         read_ok_count += 1;
                         read_ctx.on_success();
 
-                        // Damage-zone exit: after enough consecutive good
-                        // reads, restore max speed and reset jump multiplier.
                         if read_ctx.consecutive_good >= DAMAGE_ZONE_EXIT_THRESHOLD {
                             read_ctx.jump_multiplier = 1;
                             if in_damage_zone {
@@ -1530,6 +1519,7 @@ impl Disc {
                         }
                         read_ctx.bridge_degradation_count = 0;
 
+                        // Decrypt on producer; consumer expects plaintext.
                         if opts.decrypt {
                             crate::decrypt::decrypt_sectors(
                                 &mut buf[..block_bytes as usize],
@@ -1537,31 +1527,30 @@ impl Disc {
                                 0,
                             )?;
                         }
-                        file.seek(SeekFrom::Start(pos))
-                            .map_err(|e| Error::IoError { source: e })?;
-                        file.write_all(&buf[..block_bytes as usize])
-                            .map_err(|e| Error::IoError { source: e })?;
-                        map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
-                            .map_err(|e| Error::IoError { source: e })?;
+
+                        // Move the batch into the channel via fresh
+                        // owned Vec. The producer's `buf` is reused
+                        // for the next read.
+                        let send_buf = buf[..block_bytes as usize].to_vec();
+                        if let Err(e) =
+                            send_or_abort(&work_tx, WorkItem::Good { pos, buf: send_buf })
+                        {
+                            producer_err = Some(e);
+                            break 'outer;
+                        }
                         bytes_done = bytes_done.saturating_add(block_bytes);
                         pos += block_bytes;
                     }
                     Err(err) if !opts.skip_on_error => {
-                        // Caller asked us not to skip. Surface the error verbatim.
                         let (status, sense) = extract_scsi_context(&err);
-                        return Err(Error::DiscRead {
+                        producer_err = Some(Error::DiscRead {
                             sector: block_lba as u64,
                             status: Some(status),
                             sense,
                         });
+                        break 'outer;
                     }
                     Err(err) => {
-                        // === ERROR PATH — single source of truth ===
-                        // ALL errors flow through handle_read_error. New
-                        // error class = one new arm in that function.
-                        // Logging, counter updates, retry budgets all live
-                        // there. The dispatch below is purely the I/O side
-                        // of each action.
                         read_err_count += 1;
                         let action = read_error::handle_read_error(&err, &mut read_ctx);
 
@@ -1570,22 +1559,18 @@ impl Disc {
                                 if pause_secs > 0 {
                                     std::thread::sleep(std::time::Duration::from_secs(pause_secs));
                                 }
-                                // Don't advance pos — same LBA next iteration.
                             }
                             read_error::ReadAction::Bisect => {
-                                // Re-issue the failed batch as single-sector reads.
-                                // ctx.bisecting=true so the inner failures don't
-                                // recursively request another bisect.
                                 read_ctx.bisecting = true;
                                 let saved_batch = read_ctx.batch;
                                 read_ctx.batch = 1;
+                                let mut bisect_aborted = false;
                                 for sector_offset in 0..block_count {
                                     if let Some(ref h) = opts.halt {
                                         if h.load(std::sync::atomic::Ordering::Relaxed) {
                                             halt_requested = true;
-                                            read_ctx.bisecting = false;
-                                            read_ctx.batch = saved_batch;
-                                            break 'outer;
+                                            bisect_aborted = true;
+                                            break;
                                         }
                                     }
                                     let sector_lba = block_lba + (sector_offset as u32);
@@ -1599,54 +1584,63 @@ impl Disc {
                                     ) {
                                         Ok(_) => {
                                             read_ctx.on_success();
-                                            file.seek(SeekFrom::Start(write_pos))
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            file.write_all(&sector_buf)
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            map.record(
-                                                write_pos,
-                                                2048,
-                                                mapfile::SectorStatus::Finished,
-                                            )
-                                            .map_err(|e| Error::IoError { source: e })?;
+                                            // Decrypt single sector before send. Pre-split
+                                            // bisect path silently skipped this — encrypted
+                                            // bytes were written for bisect-recovered sectors.
+                                            if opts.decrypt {
+                                                crate::decrypt::decrypt_sectors(
+                                                    &mut sector_buf,
+                                                    &keys,
+                                                    0,
+                                                )?;
+                                            }
+                                            if let Err(e) = send_or_abort(
+                                                &work_tx,
+                                                WorkItem::BisectGood {
+                                                    pos: write_pos,
+                                                    buf: Box::new(sector_buf),
+                                                },
+                                            ) {
+                                                producer_err = Some(e);
+                                                bisect_aborted = true;
+                                                break;
+                                            }
                                         }
                                         Err(inner_err) => {
-                                            // Inner failure goes through the same handler — it'll
-                                            // see bisecting=true and won't recurse. We only honour
-                                            // the SkipBlock action here (the bisect by definition
-                                            // can't return another Bisect, and JumpAhead inside a
-                                            // single-sector retry doesn't make sense).
                                             let _ = read_error::handle_read_error(
                                                 &inner_err,
                                                 &mut read_ctx,
                                             );
-                                            let zero = [0u8; 2048];
-                                            file.seek(SeekFrom::Start(write_pos))
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            file.write_all(&zero)
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            map.record(
-                                                write_pos,
-                                                2048,
-                                                mapfile::SectorStatus::NonTrimmed,
-                                            )
-                                            .map_err(|e| Error::IoError { source: e })?;
+                                            if let Err(e) = send_or_abort(
+                                                &work_tx,
+                                                WorkItem::BisectBad { pos: write_pos },
+                                            ) {
+                                                producer_err = Some(e);
+                                                bisect_aborted = true;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                                 read_ctx.bisecting = false;
                                 read_ctx.batch = saved_batch;
+                                if bisect_aborted {
+                                    break 'outer;
+                                }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
                                 pos += block_bytes;
                             }
                             read_error::ReadAction::SkipBlock { pause_secs } => {
-                                let zero = vec![0u8; block_bytes as usize];
-                                file.seek(SeekFrom::Start(pos))
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                file.write_all(&zero)
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
-                                    .map_err(|e| Error::IoError { source: e })?;
+                                if let Err(e) = send_or_abort(
+                                    &work_tx,
+                                    WorkItem::SkipFill {
+                                        pos,
+                                        len: block_bytes,
+                                    },
+                                ) {
+                                    producer_err = Some(e);
+                                    break 'outer;
+                                }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
                                 if pause_secs > 0 {
                                     std::thread::sleep(std::time::Duration::from_secs(pause_secs));
@@ -1657,17 +1651,18 @@ impl Disc {
                                 sectors,
                                 pause_secs,
                             } => {
-                                // Mark the failed batch + the gap up to jump_pos NonTrimmed.
-                                let zero_batch = vec![0u8; block_bytes as usize];
-                                file.seek(SeekFrom::Start(pos))
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                file.write_all(&zero_batch)
-                                    .map_err(|e| Error::IoError { source: e })?;
-                                map.record(pos, block_bytes, mapfile::SectorStatus::NonTrimmed)
-                                    .map_err(|e| Error::IoError { source: e })?;
+                                if let Err(e) = send_or_abort(
+                                    &work_tx,
+                                    WorkItem::SkipFill {
+                                        pos,
+                                        len: block_bytes,
+                                    },
+                                ) {
+                                    producer_err = Some(e);
+                                    break 'outer;
+                                }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
 
-                                // Damage-zone enter: drop to minimum read speed.
                                 if !in_damage_zone {
                                     in_damage_zone = true;
                                     reader.set_speed(0x0000);
@@ -1683,22 +1678,16 @@ impl Disc {
                                 let gap_start = pos + block_bytes;
                                 let gap_bytes = jump_pos.saturating_sub(gap_start);
                                 if gap_bytes > 0 {
-                                    let zero_gap = vec![0u8; 65536];
-                                    let mut filled: u64 = 0;
-                                    while filled < gap_bytes {
-                                        let chunk = (gap_bytes - filled).min(zero_gap.len() as u64);
-                                        file.seek(SeekFrom::Start(gap_start + filled))
-                                            .map_err(|e| Error::IoError { source: e })?;
-                                        file.write_all(&zero_gap[..chunk as usize])
-                                            .map_err(|e| Error::IoError { source: e })?;
-                                        filled += chunk;
+                                    if let Err(e) = send_or_abort(
+                                        &work_tx,
+                                        WorkItem::GapFill {
+                                            pos: gap_start,
+                                            len: gap_bytes,
+                                        },
+                                    ) {
+                                        producer_err = Some(e);
+                                        break 'outer;
                                     }
-                                    map.record(
-                                        gap_start,
-                                        gap_bytes,
-                                        mapfile::SectorStatus::NonTrimmed,
-                                    )
-                                    .map_err(|e| Error::IoError { source: e })?;
                                     bytes_done = bytes_done.saturating_add(gap_bytes);
                                 }
                                 tracing::warn!(
@@ -1716,11 +1705,12 @@ impl Disc {
                             }
                             read_error::ReadAction::AbortPass => {
                                 let (status, sense) = extract_scsi_context(&err);
-                                return Err(Error::DiscRead {
+                                producer_err = Some(Error::DiscRead {
                                     sector: block_lba as u64,
                                     status: Some(status),
                                     sense,
                                 });
+                                break 'outer;
                             }
                         }
                     }
@@ -1728,45 +1718,65 @@ impl Disc {
 
                 iter_count += 1;
 
+                // Drain any consumer-side stats snapshot.
+                if let Some(snap) = try_recv_progress(&prog_rx) {
+                    cached_snapshot = Some(snap);
+                }
+
                 if iter_count - last_log_iter >= 100 {
                     last_log_iter = iter_count;
-                    let stats = map.stats();
-                    tracing::trace!(
-                        target: "freemkv::disc",
-                        phase = "iter_progress",
-                        iter_count,
-                        read_ok_count,
-                        read_err_count,
-                        pos,
-                        region_end,
-                        bytes_good = stats.bytes_good,
-                        bytes_pending = stats.bytes_pending,
-                        copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
-                        "Disc::copy inner iter"
-                    );
+                    if let Some(ref snap) = cached_snapshot {
+                        tracing::trace!(
+                            target: "freemkv::disc",
+                            phase = "iter_progress",
+                            iter_count,
+                            read_ok_count,
+                            read_err_count,
+                            pos,
+                            region_end,
+                            bytes_good = snap.stats.bytes_good,
+                            bytes_pending = snap.stats.bytes_pending,
+                            copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
+                            "Disc::sweep inner iter"
+                        );
+                    }
+                    // Throttled stats refresh request.
+                    try_request_stats(&work_tx);
                 }
 
                 if let Some(reporter) = opts.progress {
-                    let stats = map.stats();
-                    let bad_ranges = map.ranges_with(&[
-                        mapfile::SectorStatus::NonTrimmed,
-                        mapfile::SectorStatus::Unreadable,
-                        mapfile::SectorStatus::NonScraped,
-                        mapfile::SectorStatus::NonTried,
-                    ]);
-                    let main_title_bad = self
-                        .titles
-                        .first()
-                        .map(|t| bytes_bad_in_title(t, &bad_ranges))
-                        .unwrap_or(0);
+                    // Use the latest consumer snapshot if we have
+                    // one; otherwise synthesise a producer-side
+                    // placeholder. On a fresh sweep, before the
+                    // first stats round-trip lands, this means
+                    // bytes_good ≈ bytes_done (producer's notion of
+                    // good-so-far) and the bad-range list is empty —
+                    // close enough for an early UI tick; the next
+                    // real snapshot replaces it.
                     let main_title = self.titles.first();
+                    let main_title_bad = match &cached_snapshot {
+                        Some(snap) => self
+                            .titles
+                            .first()
+                            .map(|t| bytes_bad_in_title(t, &snap.bad_ranges))
+                            .unwrap_or(0),
+                        None => 0,
+                    };
+                    let (bytes_good, bytes_unreadable, bytes_pending) = match &cached_snapshot {
+                        Some(snap) => (
+                            snap.stats.bytes_good,
+                            snap.stats.bytes_unreadable,
+                            snap.stats.bytes_pending,
+                        ),
+                        None => (bytes_done, 0u64, total_bytes.saturating_sub(bytes_done)),
+                    };
                     let pp = crate::progress::PassProgress {
                         kind: crate::progress::PassKind::Sweep,
                         work_done: pos,
                         work_total: total_bytes,
-                        bytes_good_total: stats.bytes_good,
-                        bytes_unreadable_total: stats.bytes_unreadable,
-                        bytes_pending_total: stats.bytes_pending,
+                        bytes_good_total: bytes_good,
+                        bytes_unreadable_total: bytes_unreadable,
+                        bytes_pending_total: bytes_pending,
                         bytes_total_disc: total_bytes,
                         disc_duration_secs: main_title.map(|t| t.duration_secs),
                         bytes_bad_in_main_title: main_title_bad,
@@ -1781,32 +1791,26 @@ impl Disc {
             }
         }
 
-        tracing::debug!(
-            target: "freemkv::disc",
-            phase = "sweep_sync",
-            file_len = file.metadata().map(|m| m.len()).unwrap_or(0),
-            "sweep: calling sync_all"
-        );
-        if let Err(e) = file.sync_all() {
-            if is_regular {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "sweep_sync_failed",
-                    error = %e,
-                    os_error = e.raw_os_error(),
-                    error_kind = ?e.kind(),
-                    "sweep: sync_all failed"
-                );
-                return Err(Error::IoError { source: e });
-            }
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "sweep_sync_skipped",
-                error = %e,
-                "sweep: sync_all failed for non-regular file; ignoring"
-            );
+        // Tell the consumer we're done. Even on producer error, send
+        // Finish so the consumer drains cleanly and we get a summary.
+        let _ = work_tx.send(WorkItem::Finish);
+        drop(work_tx);
+
+        let summary = consumer_handle.join().map_err(|_| Error::IoError {
+            source: std::io::Error::other("sweep consumer thread panicked"),
+        })?;
+
+        // Producer-side error wins over consumer-side (the read failure
+        // is what motivated quitting; the consumer's flush error, if
+        // any, is downstream).
+        if let Some(e) = producer_err {
+            return Err(e);
         }
-        let stats = map.stats();
+        if let Some(e) = summary.error {
+            return Err(e);
+        }
+
+        let stats = summary.stats;
         tracing::debug!(
             target: "freemkv::disc",
             phase = "sweep_done",
