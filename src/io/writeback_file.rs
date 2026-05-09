@@ -110,3 +110,20 @@ impl Seek for WritebackFile {
         Ok(p)
     }
 }
+
+impl Drop for WritebackFile {
+    fn drop(&mut self) {
+        // Run the pipeline's tail finalize so the last in-flight chunk
+        // gets its `WAIT_AFTER` + `posix_fadvise(DONTNEED)`. Without
+        // this, callers that drop a `WritebackFile` without calling
+        // `sync_all` (panic, early-return, idiomatic `let _ = w;`)
+        // leave the trailing chunk in cache; the kernel still flushes
+        // on close, but the bounded-cache invariant fails at the tail.
+        // We deliberately do *not* call `self.file.sync_all()` here —
+        // close already triggers a flush, and an `fsync` from `Drop`
+        // would silently swallow its `io::Error` anyway. `finalize` is
+        // idempotent so an explicit `sync_all` followed by drop is
+        // still safe.
+        self.pipeline.finalize();
+    }
+}

@@ -147,6 +147,10 @@ pub use decrypt::{DecryptKeys, decrypt_sectors};
 // for displaying disc name + format quickly while a full scan runs in the
 // background. The codec / channel / resolution enums are the canonical
 // structured representation; never compare against display strings.
+// Note: `disc::Stream` here is the codec enum (audio / video / sub kind)
+// — not the `pes::Stream` trait re-exported below as `PesStream`. Two
+// different concepts, the same short name; both stay because both are
+// load-bearing in their respective domains.
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
     Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, LabelPurpose,
@@ -171,7 +175,11 @@ pub use disc::{
 // that need to wire custom readers (e.g. autorip's drive-session reuse).
 // 0.18 trait split: `FrameSource` (read-only) and `FrameSink` (write-only)
 // supersede the unified `pes::Stream`. The old `Stream` re-export below
-// stays available for the deprecation window.
+// stays available for the deprecation window — re-exported as
+// `PesStream` to disambiguate from `disc::Stream` (the codec-kind enum
+// re-exported above), which would otherwise collide at the crate root.
+#[allow(deprecated)]
+pub use pes::Stream as PesStream;
 pub use pes::{FrameSink, FrameSource, PesFrame};
 
 pub use mux::DiscStream;

@@ -19,6 +19,11 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 pub(crate) struct WritebackPipeline {
+    /// Aliases the wrapping `WritebackFile::file`. Only valid for the
+    /// lifetime of that struct — moving the `File` independently
+    /// would silently UAF this fd. The pipeline is a private field of
+    /// `WritebackFile` and never exposed outside that wrapper, which
+    /// is what keeps the alias sound.
     fd: RawFd,
     chunk_bytes: u64,
     last_flush_pos: u64,
@@ -26,6 +31,10 @@ pub(crate) struct WritebackPipeline {
 }
 
 impl WritebackPipeline {
+    /// Construct a pipeline aliasing `file`'s file descriptor. The
+    /// returned `WritebackPipeline` MUST be dropped before `file`
+    /// itself, or kept inside the same struct that owns `file` — the
+    /// alias is unchecked.
     pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         Self {
             fd: file.as_raw_fd(),

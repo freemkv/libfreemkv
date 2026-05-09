@@ -8,7 +8,7 @@
 //! mux.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -18,10 +18,14 @@ use super::{SectorReader, SectorSink};
 /// SectorSource backed by a file (ISO image).
 ///
 /// Seeks to `lba * 2048`, reads `count * 2048` bytes per call. The
-/// underlying file is wrapped in a 4 MiB `BufReader` so adjacent
-/// small reads coalesce into single syscalls.
+/// file is held directly: every `read_sectors` call performs an
+/// absolute seek, so a wrapping `BufReader` would have its buffer
+/// invalidated on every call (its internal cursor moves with the
+/// `Seek` impl) — pure overhead. Callers that benefit from buffered
+/// reads should compose their own `BufReader` at the `read_sectors`
+/// granularity they care about.
 pub struct FileSectorSource {
-    file: BufReader<File>,
+    file: File,
     capacity: u32,
 }
 
@@ -30,21 +34,18 @@ impl FileSectorSource {
     /// from `metadata().len() / 2048`. Returns
     /// [`Error::IsoTooLarge`] if the file would exceed the 32-bit
     /// LBA address space (~8 TB).
-    pub fn open(path: &str) -> std::io::Result<Self> {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         let sectors = len / 2048;
         if sectors > u32::MAX as u64 {
             return Err(Error::IsoTooLarge {
-                path: path.to_string(),
+                path: path.to_string_lossy().into_owned(),
             }
             .into());
         }
         let capacity = sectors as u32;
-        Ok(Self {
-            file: BufReader::with_capacity(4 * 1024 * 1024, file),
-            capacity,
-        })
+        Ok(Self { file, capacity })
     }
 }
 
@@ -173,7 +174,7 @@ mod tests {
         sink.write_sectors(2, &payload).unwrap();
         Box::new(sink).finish().unwrap();
 
-        let mut src = FileSectorSource::open(path.to_str().unwrap()).unwrap();
+        let mut src = FileSectorSource::open(&path).unwrap();
         assert_eq!(src.capacity_sectors(), 4);
 
         let mut got = [0u8; 2048];
@@ -200,7 +201,7 @@ mod tests {
         sink.write_sectors(0, &payload).unwrap();
         Box::new(sink).finish().unwrap();
 
-        let mut src = FileSectorSource::open(path.to_str().unwrap()).unwrap();
+        let mut src = FileSectorSource::open(&path).unwrap();
         assert_eq!(src.capacity_sectors(), 8);
 
         let mut got = vec![0u8; 8 * 2048];
@@ -226,7 +227,7 @@ mod tests {
         sink.write_sectors(1, &pat_b).unwrap();
         Box::new(sink).finish().unwrap();
 
-        let mut src = FileSectorSource::open(path.to_str().unwrap()).unwrap();
+        let mut src = FileSectorSource::open(&path).unwrap();
         assert_eq!(src.capacity_sectors(), 4);
         let mut got = [0u8; 2048];
 

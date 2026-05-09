@@ -19,7 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Clones share the same underlying flag. `cancel()` is one-way; there is
 /// no `reset()` by design — construct a fresh `Halt` for a fresh
 /// operation.
-#[derive(Clone, Debug, Default)]
+///
+/// Construct with [`Halt::new`]. We intentionally don't derive
+/// `Default` — `Halt::new()` is more discoverable, matches the
+/// stdlib `Mutex::new` / `Arc::new` convention, and keeps the
+/// uncancelled-by-construction invariant in one named place.
+#[derive(Clone, Debug)]
 pub struct Halt(Arc<AtomicBool>);
 
 impl Halt {
@@ -99,9 +104,4 @@ mod tests {
         assert!(h.is_cancelled());
     }
 
-    #[test]
-    fn default_impl_is_uncancelled() {
-        let h = Halt::default();
-        assert!(!h.is_cancelled());
-    }
 }
