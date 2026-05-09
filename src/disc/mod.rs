@@ -1418,10 +1418,11 @@ impl Disc {
             f
         };
 
-        // Wrap the raw `File` in our bounded-cache writer (drains
-        // dirty pages continuously instead of bursting; see
-        // `crate::io`). The Writer moves into the consumer thread.
-        let file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
+        // Wrap the raw `File` in our bounded-cache `WritebackFile`
+        // (drains dirty pages continuously instead of bursting; see
+        // `crate::io`). The `WritebackFile` moves into the consumer
+        // thread.
+        let file = crate::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
             None if opts.skip_on_error => ecc_sectors(self.format),
@@ -1435,7 +1436,7 @@ impl Disc {
         // sweep finishes are the patch pass's job.
         let regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
 
-        // Spawn the consumer. It owns Writer + Mapfile; the producer
+        // Spawn the consumer. It owns WritebackFile + Mapfile; the producer
         // (this thread) keeps `reader`, `read_ctx`, halt + set_speed.
         let (work_tx, prog_rx, consumer_handle) = spawn_consumer(ConsumerInputs {
             file,
@@ -1978,14 +1979,11 @@ impl Disc {
         let is_regular = std::fs::metadata(path)
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|e| Error::IoError { source: e })?;
-        // Same bounded-cache writeback wrapper sweep uses, so patch's
+        // Same bounded-cache `WritebackFile` sweep uses, so patch's
         // recovery writes (sparse but can be many across a damaged region)
         // get the burst-flush protection on slow / NFS-backed staging.
-        let mut file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
+        let mut file =
+            crate::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
 
         // Log ISO file size at patch start for write monitoring
         if let Ok(metadata) = std::fs::metadata(path) {
