@@ -347,6 +347,7 @@ impl DiscStream {
     }
 }
 
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for DiscStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {

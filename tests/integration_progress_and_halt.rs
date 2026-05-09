@@ -1,6 +1,11 @@
 //! Integration tests for progress reporting, halt behavior, drop safety,
 //! and the file-backed sector reader round trip.
 
+// 0.18 trait split: this suite still drives the deprecated `pes::Stream`
+// trait directly. It will be migrated to `FrameSource`/`FrameSink` in the
+// follow-up that ports concrete impls.
+#![allow(deprecated)]
+
 use libfreemkv::disc::{CopyOptions, DiscRegion};
 use libfreemkv::error::Result;
 use libfreemkv::pes::Stream as PesStream;
