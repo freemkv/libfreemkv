@@ -369,6 +369,6 @@ mod tests {
         ctx.on_success();
         assert_eq!(ctx.consecutive_good, 1);
         assert_eq!(ctx.consecutive_failures, 0);
-        assert_eq!(*ctx.damage_window.last().unwrap(), true);
+        assert!(*ctx.damage_window.last().unwrap());
     }
 }
