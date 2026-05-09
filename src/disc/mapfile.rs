@@ -17,11 +17,22 @@
 //!
 //! Status chars: `?` non-tried · `*` non-trimmed · `/` non-scraped · `-` unreadable · `+` finished.
 //!
-//! The mapfile is flushed to disk on every `record()` call so a crashed
-//! rip loses at most one block of recorded state.
+//! The mapfile is flushed to disk at most once per `FLUSH_INTERVAL`
+//! during `record()` calls, plus on explicit `flush()` and on `Drop`.
+//! This bounds atomic-rename RPC rate on networked staging (e.g. NFS)
+//! where per-record persists otherwise serialize the rip pipeline.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Minimum interval between mapfile persists. `record()` updates in-memory
+/// state every call but only writes to disk when this interval has elapsed
+/// since the last persist (or when `flush()` is called explicitly, or on
+/// `Drop`). Bounds RPC rate on NFS staging where atomic-rename per record
+/// otherwise dominates throughput. On crash the worst-case progress loss
+/// is one interval's worth of records.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Status of a byte range in the mapfile. ddrescue-compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +111,11 @@ pub struct MapStats {
     pub main_lost_ms: f64,
 }
 
-/// Write-through mapfile. Every `record()` persists to disk immediately
-/// so a crash during rip loses at most one block.
+/// Time-batched mapfile. `record()` keeps in-memory state up-to-date on
+/// every call; persists to disk at most once per `FLUSH_INTERVAL`.
+/// Explicit `flush()` and `Drop` guarantee state is on disk after a sweep
+/// or patch finishes. On hard crash the worst-case loss is one flush
+/// interval of records — the file's payload bytes are unaffected.
 pub struct Mapfile {
     path: PathBuf,
     entries: Vec<MapEntry>,
@@ -110,6 +124,12 @@ pub struct Mapfile {
     /// Incrementally maintained stats — updated on every `record()` call
     /// so `stats()` is O(1) instead of O(n).
     stats: MapStats,
+    /// True when in-memory state has changed but `write_to_disk` has not
+    /// yet captured it.
+    dirty: bool,
+    /// Wall-clock timestamp of the last successful `write_to_disk` (or
+    /// the moment the mapfile was constructed, whichever is later).
+    last_flushed: Instant,
 }
 
 impl Mapfile {
@@ -117,7 +137,7 @@ impl Mapfile {
     /// Writes to disk immediately so a resume can pick up even if the caller
     /// never records anything.
     pub fn create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
-        let mf = Self {
+        let mut mf = Self {
             path: path.to_path_buf(),
             entries: vec![MapEntry {
                 pos: 0,
@@ -132,8 +152,13 @@ impl Mapfile {
                 bytes_nontried: total_size,
                 ..Default::default()
             },
+            dirty: false,
+            last_flushed: Instant::now(),
         };
+        // Eager initial persist so a resume can pick this up even if
+        // `record()` is never called.
         mf.write_to_disk()?;
+        mf.last_flushed = Instant::now();
         Ok(mf)
     }
 
@@ -200,6 +225,8 @@ impl Mapfile {
             total_size,
             version,
             stats,
+            dirty: false,
+            last_flushed: Instant::now(),
         })
     }
 
@@ -268,7 +295,24 @@ impl Mapfile {
         // path during sweep/patch, it just returns the cached value.
         self.stats = Self::compute_stats(&merged, self.total_size);
         self.entries = merged;
-        self.write_to_disk()?;
+        self.dirty = true;
+        if self.last_flushed.elapsed() >= FLUSH_INTERVAL {
+            self.write_to_disk()?;
+            self.dirty = false;
+            self.last_flushed = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Persist any pending in-memory changes to disk. No-op if clean.
+    /// Callers (sweep/patch finalisation) invoke this after their last
+    /// `record()` to guarantee state is durable before returning.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.dirty {
+            self.write_to_disk()?;
+            self.dirty = false;
+            self.last_flushed = Instant::now();
+        }
         Ok(())
     }
 
@@ -360,6 +404,16 @@ impl Mapfile {
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+}
+
+impl Drop for Mapfile {
+    /// Best-effort flush on drop so a sweep / patch that returns early
+    /// (or unwinds) doesn't lose its in-memory state. Errors here are
+    /// swallowed because Drop has no way to surface them; explicit
+    /// `flush()` on the success path gives callers proper error handling.
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -463,6 +517,8 @@ mod tests {
         let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
         mf.record(100, 200, SectorStatus::Finished).unwrap();
         mf.record(500, 100, SectorStatus::Unreadable).unwrap();
+        // record() batches; explicit flush before reading back from disk.
+        mf.flush().unwrap();
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
         let _ = std::fs::remove_file(&p);

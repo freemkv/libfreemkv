@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.17.12 (2026-05-09)
+
+### Mapfile time-batched persistence — unblock NFS staging
+
+Pre-0.17.12 every `Mapfile::record()` wrote the entire mapfile to disk
+via tempfile-create + buffered-write + atomic-rename. On local LVM
+that's effectively free (page cache + microsecond-scale renames). On
+NFS (autorip's intended staging path for centralised media) each
+record() became three RPCs through the unraid user share's shfs-fuse
+layer — measured end-to-end at multiple ms each. With ~170 record()
+calls per second of sustained sweep, the mapfile path alone burned
+multiple seconds of wall time per real-world second of work, dragging
+the rip from ~11 MB/s on local to ~1.5 MB/s on NFS.
+
+Fix: time-batch the persistence inside `Mapfile`.
+
+- `record()` always updates in-memory state and stats (so callers'
+  `stats()` reads stay coherent in the same process).
+- The `write_to_disk()` rename only fires when ≥ `FLUSH_INTERVAL`
+  (1 s) has elapsed since the last persist.
+- New `flush()` method forces an out-of-band persist; called by
+  `sweep_pipeline`'s consumer at end-of-sweep and by `Disc::patch` at
+  end-of-patch, after the file's `sync_all()`.
+- `Drop` impl best-effort flushes so an early-return / unwind doesn't
+  silently lose pending state.
+
+Crash-safety changes from "lose at most one block" to "lose at most
+1 s of recorded progress" — the ISO file's payload bytes are
+unaffected; only the mapfile's authority over which sectors are
+already-good is at risk, and a resume re-reads anything Pass 1 had
+already covered. Acceptable for a 7× throughput recovery on the
+target deployment.
+
+The internal `round_trip_load` test now calls `flush()` before
+`Mapfile::load` to read back what the in-memory state asserts.
+External patch / copy tests are unaffected: `patch` and
+`sweep_pipeline` flush at completion before returning, so any
+`Mapfile::load` at the call-site sees fully persisted state.
+
 ## 0.17.11 (2026-05-09)
 
 ### Sweep producer/consumer split — overlap drive read with file write
