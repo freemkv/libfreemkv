@@ -142,7 +142,8 @@ impl PatchSink {
         map: Mapfile,
         is_regular: bool,
     ) -> Result<(Self, Arc<Mutex<SharedPatchState>>)> {
-        let file = crate::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
+        let file =
+            crate::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
         let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map)));
         let shared_clone = shared.clone();
         Ok((
@@ -164,7 +165,10 @@ impl PatchSink {
         // so we propagate the poison panic. (Same posture as
         // `sweep_pipeline.rs` — it never recovers from a poisoned
         // mutex either.)
-        let mut guard = self.shared.lock().expect("PatchSink shared state mutex poisoned");
+        let mut guard = self
+            .shared
+            .lock()
+            .expect("PatchSink shared state mutex poisoned");
         *guard = SharedPatchState::from_map(&self.map);
     }
 }
@@ -224,9 +228,7 @@ impl Sink<PatchItem> for PatchSink {
                 "patch: sync_all failed for non-regular file; ignoring"
             );
         }
-        self.map
-            .flush()
-            .map_err(|e| Error::IoError { source: e })?;
+        self.map.flush().map_err(|e| Error::IoError { source: e })?;
         // Final republish so anyone reading the shared snapshot after
         // `Pipeline::finish` sees the post-flush state. (The producer
         // already has its own copy of the final `MapStats` in the
