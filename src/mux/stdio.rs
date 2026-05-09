@@ -105,3 +105,26 @@ impl crate::pes::Stream for StdioStream {
         self.header_read || self.writer.is_some()
     }
 }
+
+/// FrameSink sibling to the deprecated Stream impl; both coexist during the
+/// 0.18 deprecation window. Caller may pick either at the trait-object
+/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
+/// Use `StdioStream::output(title)` to construct the write half; calling
+/// `FrameSink::write` on a `StdioStream::input()` returns `StreamReadOnly`.
+#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
+impl crate::pes::FrameSink for StdioStream {
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        <Self as crate::pes::Stream>::write(self, frame)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
+        // Re-borrow inside the box, call Stream::finish, drop the box.
+        let mut s: Self = *self;
+        <Self as crate::pes::Stream>::finish(&mut s)
+    }
+
+    fn info(&self) -> &DiscTitle {
+        <Self as crate::pes::Stream>::info(self)
+    }
+}
