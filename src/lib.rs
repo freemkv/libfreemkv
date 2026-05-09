@@ -167,8 +167,8 @@ pub use decrypt::{DecryptKeys, decrypt_sectors};
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
     Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, LabelPurpose,
-    LabelQualifier, Resolution, SampleRate, ScanOptions, Stream, SubtitleStream, VideoStream,
-    classify_damage,
+    LabelQualifier, PatchOptions, PatchOutcome, Resolution, SampleRate, ScanOptions, Stream,
+    SubtitleStream, SweepOptions, VideoStream, classify_damage,
 };
 
 // ─── Streams ────────────────────────────────────────────────────────────────

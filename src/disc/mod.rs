@@ -1333,7 +1333,7 @@ impl Disc {
         path: &std::path::Path,
         opts: &CopyOptions,
     ) -> Result<CopyResult> {
-        let patch_opts = PatchOpts {
+        let patch_opts = PatchOptions {
             decrypt: opts.decrypt,
             block_sectors: Some(1),
             full_recovery: true,
@@ -1365,7 +1365,17 @@ impl Disc {
         })
     }
 
-    fn sweep(
+    /// Pass 1 of a multipass rip: walk the disc forward, write
+    /// every readable sector into `path`, and record the result
+    /// in the sidecar mapfile. With `skip_on_error: true`, a bad
+    /// sector zero-fills + marks `NonTrimmed` and the sweep keeps
+    /// going (jumping ahead through dense damage); without it,
+    /// the first read failure aborts.
+    ///
+    /// 0.18: this is one of the two flat verbs the library exposes
+    /// for rip orchestration. Multipass + retry decisions are the
+    /// caller's job — see [`PatchOptions`] for the retry primitive.
+    pub fn sweep(
         &self,
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
@@ -1864,7 +1874,8 @@ pub struct CopyResult {
     pub halted: bool,
 }
 
-pub(crate) struct SweepOptions<'a> {
+/// Options for [`Disc::sweep`] (Pass 1 / forward sequential pass).
+pub struct SweepOptions<'a> {
     pub decrypt: bool,
     pub resume: bool,
     pub batch_sectors: Option<u16>,
@@ -1873,7 +1884,8 @@ pub(crate) struct SweepOptions<'a> {
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-pub(crate) struct PatchOpts<'a> {
+/// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
+pub struct PatchOptions<'a> {
     pub decrypt: bool,
     pub block_sectors: Option<u16>,
     pub full_recovery: bool,
@@ -1883,8 +1895,8 @@ pub(crate) struct PatchOpts<'a> {
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct PatchOutcome {
+/// Result returned by [`Disc::patch`].
+pub struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,
     pub bytes_unreadable: u64,
@@ -1951,11 +1963,22 @@ impl Disc {
         bytes_bad_in_title(title, &bad_ranges)
     }
 
-    fn patch(
+    /// Pass 2..N of a multipass rip: re-read the bad ranges
+    /// recorded in the sidecar mapfile and try to recover them.
+    /// With `reverse: true` (the default for the recovery walker),
+    /// the bad-range walk runs end-to-start so escalating skips
+    /// converge on the actual bad sub-zones inside any
+    /// `NonTrimmed` block. Returns a [`PatchOutcome`] with
+    /// recovered byte counts and wedge-detection signals.
+    ///
+    /// 0.18: paired with [`Disc::sweep`] as the library's other flat
+    /// rip-phase verb. Caller drives the retry loop and the
+    /// sweep-vs-patch dispatch.
+    pub fn patch(
         &self,
         reader: &mut dyn SectorReader,
         path: &std::path::Path,
-        opts: &PatchOpts,
+        opts: &PatchOptions,
     ) -> Result<PatchOutcome> {
         use crate::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
         use crate::sector::{DecryptingSectorSource, SectorSource};
