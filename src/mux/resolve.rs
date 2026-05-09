@@ -167,6 +167,7 @@ pub struct InputOptions {
 }
 
 /// Open a PES input stream (produces PES frames).
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource in follow-up commit.
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
     match parsed {
@@ -234,6 +235,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
 }
 
 /// Open a PES output stream (consumes PES frames).
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSink in follow-up commit.
 pub fn output(
     url: &str,
     title: &crate::disc::DiscTitle,

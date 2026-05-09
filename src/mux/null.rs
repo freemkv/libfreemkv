@@ -16,6 +16,7 @@ impl NullStream {
     }
 }
 
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSink in follow-up commit.
 impl crate::pes::Stream for NullStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         Ok(None)

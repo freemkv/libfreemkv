@@ -92,6 +92,7 @@ impl MkvStream {
     }
 }
 
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         let rs = match self.mode {

@@ -169,6 +169,11 @@ pub use disc::{
 // Most consumers use the URL resolvers (`input()` / `output()`) which pick
 // the right type from a scheme:// URL. Direct construction is for callers
 // that need to wire custom readers (e.g. autorip's drive-session reuse).
+// 0.18 trait split: `FrameSource` (read-only) and `FrameSink` (write-only)
+// supersede the unified `pes::Stream`. The old `Stream` re-export below
+// stays available for the deprecation window.
+pub use pes::{FrameSink, FrameSource, PesFrame};
+
 pub use mux::DiscStream;
 pub use mux::M2tsStream;
 pub use mux::MkvStream;
