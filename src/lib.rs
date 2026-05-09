@@ -180,10 +180,18 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 // ─── Lower-level surfaces ───────────────────────────────────────────────────
 //
 // `ScsiTransport` is the platform-abstraction trait Drive uses; expose for
-// out-of-tree platform backends. `SectorReader` lets callers feed any byte
-// source (test harness, network image, SMB share) into the disc scan
-// pipeline; `FileSectorReader` is the standard ISO-on-disk implementation.
+// out-of-tree platform backends. `SectorSource` / `SectorSink` are the 0.18
+// direction-typed read/write traits; `FileSectorSource` and `FileSectorSink`
+// are the ISO-on-disk implementations. [`DecryptingSectorSource`] is the
+// single decrypt-on-read decorator (AACS / CSS / none) — wrap any
+// `SectorSource` to get plaintext sectors out. The legacy `SectorReader` /
+// `FileSectorReader` names stay re-exported through the 0.18 migration
+// window so existing call sites compile unchanged; a blanket impl makes
+// every `SectorReader` automatically usable as a `SectorSource`.
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, drive_has_disc, list_drives};
-pub use sector::{FileSectorReader, SectorReader};
+pub use sector::{
+    DecryptingSectorSource, FileSectorReader, FileSectorSink, FileSectorSource, SectorReader,
+    SectorSink, SectorSource,
+};
 pub use speed::DriveSpeed;
 pub use udf::{UdfFs, read_filesystem};
