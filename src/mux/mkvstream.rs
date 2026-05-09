@@ -18,7 +18,7 @@ use crate::disc::*;
 use std::io::{self, Read};
 
 struct ReadState {
-    reader: Box<dyn Read>,
+    reader: Box<dyn Read + Send>,
     cluster_ts_ms: i64,
     /// Codec private data per track (track_number, hvcC/avcC bytes).
     codec_privates: Vec<(u16, Vec<u8>)>,
@@ -26,7 +26,7 @@ struct ReadState {
 
 enum Mode {
     Write {
-        muxer: Option<MkvMuxer<Box<dyn WriteSeek>>>,
+        muxer: Option<MkvMuxer<Box<dyn WriteSeek + Send>>>,
     },
     Read(ReadState),
 }
@@ -40,7 +40,7 @@ pub struct MkvStream {
 impl MkvStream {
     /// Create for writing PES frames → MKV container.
     /// Codec privates come from title.codec_privates (populated by input stream).
-    pub fn create(writer: Box<dyn WriteSeek>, title: &DiscTitle) -> io::Result<Self> {
+    pub fn create(writer: Box<dyn WriteSeek + Send>, title: &DiscTitle) -> io::Result<Self> {
         let mut tracks = Vec::new();
         let mut has_default_video = false;
         let mut has_default_audio = false;
@@ -79,7 +79,7 @@ impl MkvStream {
     }
 
     /// Open an MKV file for reading → PES frames.
-    pub fn open(mut reader: impl Read + 'static) -> io::Result<Self> {
+    pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
         let (disc_title, codec_privates) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
@@ -186,6 +186,35 @@ impl crate::pes::Stream for MkvStream {
 
     fn headers_ready(&self) -> bool {
         true // MKV has all headers upfront in the EBML header
+    }
+}
+
+/// FrameSink sibling to the deprecated Stream impl; both coexist during the
+/// 0.18 deprecation window. Caller may pick either at the trait-object
+/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
+/// Use `MkvStream::create(writer, title)` to construct the write half;
+/// calling `FrameSink::write` on a `MkvStream::open(reader)` instance returns
+/// `StreamReadOnly`. `finish` is where the Cues index is written, so it must
+/// be called for the resulting MKV to be seekable.
+#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
+impl crate::pes::FrameSink for MkvStream {
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        <Self as crate::pes::Stream>::write(self, frame)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
+        // Re-borrow inside the box, call Stream::finish, drop the box.
+        // The inner `MkvMuxer` is owned via `Option`, and `Stream::finish`
+        // already takes it via `Option::take()` — moving `*self` out of the
+        // box hands it the same field by-value, so the muxer's own
+        // by-value `finish()` runs correctly.
+        let mut s: Self = *self;
+        <Self as crate::pes::Stream>::finish(&mut s)
+    }
+
+    fn info(&self) -> &crate::disc::DiscTitle {
+        <Self as crate::pes::Stream>::info(self)
     }
 }
 

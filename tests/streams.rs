@@ -307,12 +307,12 @@ fn m2ts_stream_write_read() {
             keyframe: i == 0,
             data: vec![i; 100],
         };
-        stream.write(&frame).unwrap();
+        PesStream::write(&mut stream, &frame).unwrap();
     }
-    stream.finish().unwrap();
+    PesStream::finish(&mut stream).unwrap();
 
     // Verify the info is correct
-    let info = stream.info();
+    let info = PesStream::info(&stream);
     assert_eq!(info.streams.len(), 4);
     assert_eq!(info.duration_secs, 7200.0);
 }
@@ -361,7 +361,7 @@ fn m2ts_read_returns_error_on_write_stream() {
     let dt = sample_disc_title();
     let output = Cursor::new(Vec::new());
     let mut stream = M2tsStream::create(output, &dt).unwrap();
-    assert!(stream.read().is_err());
+    assert!(PesStream::read(&mut stream).is_err());
 }
 
 // ── DiscTitle::empty ──────────────────────────────────────────
@@ -583,7 +583,7 @@ fn meta_all_stream_types() {
 #[test]
 fn mkvstream_write_finish() {
     let dt = sample_disc_title();
-    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let mut stream = MkvStream::create(writer, &dt).unwrap();
 
     // Write some fake PES frames (they won't produce valid MKV content
@@ -595,20 +595,20 @@ fn mkvstream_write_finish() {
             keyframe: i == 0,
             data: vec![i; 100],
         };
-        stream.write(&frame).unwrap();
+        PesStream::write(&mut stream, &frame).unwrap();
     }
 
     // finish should not panic even without valid codec data
-    stream.finish().unwrap();
+    PesStream::finish(&mut stream).unwrap();
 }
 
 #[test]
 fn mkvstream_meta_sets_title() {
     let dt = sample_disc_title();
-    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let stream = MkvStream::create(writer, &dt).unwrap();
 
-    let info = stream.info();
+    let info = PesStream::info(&stream);
     assert_eq!(info.playlist, "Test Movie");
     assert_eq!(info.duration_secs, 7200.0);
     assert_eq!(info.streams.len(), 4);
@@ -645,7 +645,7 @@ fn mkvstream_roundtrip_bdts() {
         codec_privates: Vec::new(),
     };
 
-    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let mut stream = MkvStream::create(writer, &dt).unwrap();
 
     // Write PES frames targeting the audio track
@@ -656,13 +656,13 @@ fn mkvstream_roundtrip_bdts() {
             keyframe: true,
             data: vec![i; 100],
         };
-        stream.write(&frame).unwrap();
+        PesStream::write(&mut stream, &frame).unwrap();
     }
 
-    stream.finish().unwrap();
+    PesStream::finish(&mut stream).unwrap();
 
     // Verify the info is correct
-    let info = stream.info();
+    let info = PesStream::info(&stream);
     assert_eq!(info.streams.len(), 1);
     assert_eq!(info.playlist, "Audio Only");
 }
@@ -729,10 +729,10 @@ fn mkvstream_meta_preserves_all_streams() {
         codec_privates: Vec::new(),
     };
 
-    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(Cursor::new(Vec::new()));
+    let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> = Box::new(Cursor::new(Vec::new()));
     let stream = MkvStream::create(writer, &dt).unwrap();
 
-    let info = stream.info();
+    let info = PesStream::info(&stream);
     assert_eq!(info.streams.len(), 5, "all 5 streams should be preserved");
     assert_eq!(info.playlist, "Stream Test");
     assert_eq!(info.duration_secs, 3600.0);
@@ -837,7 +837,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         }
     }
 
-    let writer: Box<dyn libfreemkv::mux::WriteSeek> = Box::new(SharedWriter(output2.clone()));
+    let writer: Box<dyn libfreemkv::mux::WriteSeek + Send> =
+        Box::new(SharedWriter(output2.clone()));
     let mut stream2 = MkvStream::create(writer, &dt).unwrap();
 
     // Write the ES data (SPS+PPS+IDR) as a keyframe PES frame.
@@ -847,7 +848,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         keyframe: true,
         data: es_data,
     };
-    stream2.write(&frame1).unwrap();
+    PesStream::write(&mut stream2, &frame1).unwrap();
 
     // Write a second non-IDR frame
     let frame2 = libfreemkv::pes::PesFrame {
@@ -856,8 +857,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         keyframe: false,
         data: es_data2,
     };
-    stream2.write(&frame2).unwrap();
-    stream2.finish().unwrap();
+    PesStream::write(&mut stream2, &frame2).unwrap();
+    PesStream::finish(&mut stream2).unwrap();
 
     let data = output2.lock().unwrap().clone().into_inner();
 

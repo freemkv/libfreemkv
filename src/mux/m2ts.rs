@@ -18,10 +18,10 @@ const SCAN_SIZE: usize = 1024 * 1024;
 
 enum Mode {
     Write {
-        muxer: super::tsmux::TsMuxer<Box<dyn Write>>,
+        muxer: super::tsmux::TsMuxer<Box<dyn Write + Send>>,
     },
     Read {
-        reader: Box<dyn Read>,
+        reader: Box<dyn Read + Send>,
     },
 }
 
@@ -57,7 +57,7 @@ pub struct M2tsStream {
 impl M2tsStream {
     /// Create for writing PES frames → BD-TS output.
     /// Writes FMKV metadata header, then muxes PES frames into BD transport stream.
-    pub fn create(mut writer: impl Write + 'static, title: &DiscTitle) -> io::Result<Self> {
+    pub fn create(mut writer: impl Write + Send + 'static, title: &DiscTitle) -> io::Result<Self> {
         // Write FMKV metadata header
         if !title.streams.is_empty() {
             let m = meta::M2tsMeta::from_title(title);
@@ -72,7 +72,7 @@ impl M2tsStream {
                 DiscStream::Subtitle(s) => s.pid,
             })
             .collect();
-        let boxed: Box<dyn Write> = Box::new(writer);
+        let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
         for (i, cp) in title.codec_privates.iter().enumerate() {
             if let Some(data) = cp {
@@ -111,7 +111,7 @@ impl M2tsStream {
     /// Open an M2TS stream for reading. Takes any Read source — file, pipe, socket.
     ///
     /// Tries FMKV metadata header first. Falls back to PMT scan of first 1 MB.
-    pub fn open(mut reader: impl Read + 'static) -> io::Result<Self> {
+    pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
         // Read first chunk — enough for FMKV header or PMT scan
         let mut head = vec![0u8; SCAN_SIZE];
         let head_len = read_fill(&mut reader, &mut head)?;
@@ -125,7 +125,7 @@ impl M2tsStream {
             let (pids, parsers, pid_to_track) = Self::setup_pes(&title.streams);
             // Chain: remaining head bytes + rest of reader
             let remaining_head = &head[header_end..];
-            let chain: Box<dyn Read> =
+            let chain: Box<dyn Read + Send> =
                 Box::new(io::Cursor::new(remaining_head.to_vec()).chain(reader));
             return Ok(Self {
                 disc_title: title.clone(),
@@ -150,7 +150,7 @@ impl M2tsStream {
         let (pids, parsers, pid_to_track) = Self::setup_pes(&streams);
 
         // Chain: full head (it's all TS data) + rest of reader
-        let chain: Box<dyn Read> = Box::new(io::Cursor::new(head).chain(reader));
+        let chain: Box<dyn Read + Send> = Box::new(io::Cursor::new(head).chain(reader));
 
         Ok(Self {
             disc_title: DiscTitle {
@@ -282,5 +282,29 @@ impl crate::pes::Stream for M2tsStream {
             }
         }
         true
+    }
+}
+
+/// FrameSink sibling to the deprecated Stream impl; both coexist during the
+/// 0.18 deprecation window. Caller may pick either at the trait-object
+/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
+/// Use `M2tsStream::create(writer, title)` to construct the write half;
+/// calling `FrameSink::write` on an `M2tsStream::open(reader)` instance
+/// returns `StreamReadOnly`.
+#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
+impl crate::pes::FrameSink for M2tsStream {
+    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        <Self as crate::pes::Stream>::write(self, frame)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
+        // Re-borrow inside the box, call Stream::finish, drop the box.
+        let mut s: Self = *self;
+        <Self as crate::pes::Stream>::finish(&mut s)
+    }
+
+    fn info(&self) -> &crate::disc::DiscTitle {
+        <Self as crate::pes::Stream>::info(self)
     }
 }
