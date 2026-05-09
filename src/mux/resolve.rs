@@ -249,10 +249,11 @@ pub fn output(
             // staging doesn't hit the dirty-page burst pathology that
             // sweep already side-steps. BufWriter sits on top to coalesce
             // mux's many small EBML element writes.
-            let writer: Box<dyn super::WriteSeek> = Box::new(std::io::BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                crate::io::WritebackFile::create(path)?,
-            ));
+            let writer: Box<dyn super::WriteSeek + Send> =
+                Box::new(std::io::BufWriter::with_capacity(
+                    IO_BUF_SIZE,
+                    crate::io::WritebackFile::create(path)?,
+                ));
             Ok(Box::new(MkvStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
