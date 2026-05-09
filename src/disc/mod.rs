@@ -12,6 +12,7 @@ mod bluray;
 mod dvd;
 mod encrypt;
 pub mod mapfile;
+mod patch;
 pub mod read_error;
 mod sweep;
 
@@ -1957,7 +1958,8 @@ impl Disc {
         path: &std::path::Path,
         opts: &PatchOpts,
     ) -> Result<PatchOutcome> {
-        use std::io::{Seek, SeekFrom, Write};
+        use crate::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
+        use patch::{PatchItem, PatchSink};
 
         const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 10;
         const POST_FAILURE_PAUSE_SECS: u64 = 1;
@@ -1976,7 +1978,7 @@ impl Disc {
         }
 
         let mapfile_path = self.mapfile_for(path);
-        let mut map =
+        let map =
             mapfile::Mapfile::load(&mapfile_path).map_err(|e| Error::IoError { source: e })?;
         let total_bytes = map.total_size();
         let keys = if opts.decrypt {
@@ -1988,11 +1990,69 @@ impl Disc {
         let is_regular = std::fs::metadata(path)
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
-        // Same bounded-cache `WritebackFile` sweep uses, so patch's
-        // recovery writes (sparse but can be many across a damaged region)
-        // get the burst-flush protection on slow / NFS-backed staging.
-        let mut file =
-            crate::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
+
+        // Snapshot fields we need from the mapfile *before* it moves into
+        // the consumer thread: bytes_good baseline, total entries, the
+        // initial `bad_ranges` work list, and the start-of-patch
+        // diagnostic dump. The shared state (`shared`) republishes these
+        // throughout the pass; the consumer owns the live `Mapfile`.
+        let bytes_good_before = map.stats().bytes_good;
+        let bytes_good_start = bytes_good_before;
+        let initial_stats = map.stats();
+        let initial_entries: Vec<_> = map.entries().to_vec();
+        // Every retry pass acts on every non-Finished range. Including
+        // Unreadable means a sector that failed in pass N gets a fresh
+        // shot in pass N+1 — drive state evolves, the same read can
+        // succeed later. Each pass owns its own jumps/skips; if pass 5
+        // jumps over the same zone as pass 2, fine.
+        let mut bad_ranges = map.ranges_with(&[
+            mapfile::SectorStatus::NonTrimmed,
+            mapfile::SectorStatus::NonScraped,
+            mapfile::SectorStatus::Unreadable,
+        ]);
+        if opts.reverse {
+            bad_ranges.reverse();
+        }
+        let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
+
+        // Spawn the consumer. The `WritebackFile` (same bounded-cache
+        // wrapper sweep uses, so patch's recovery writes — sparse but
+        // can be many across a damaged region — get the burst-flush
+        // protection on slow / NFS-backed staging) and the `Mapfile`
+        // both move into the sink. We hold an `Arc<Mutex<…>>` snapshot
+        // the sink republishes after every record so producer-side
+        // stall guards / progress callbacks can read consumer side-
+        // effects.
+        let (sink, shared) = PatchSink::new(path, map, is_regular)?;
+        // Why: WRITE_THROUGH_DEPTH (=1) — patch reads ONE sector per
+        // recovery decision and the producer's stall / damage-window
+        // logic checks consumer-published stats inline. Sweep's
+        // DEFAULT_PIPELINE_DEPTH (=4) would let several sectors of
+        // recovered bytes queue up between producer decisions and
+        // writes, which conflicts with the per-sector lockstep this
+        // loop was written against.
+        let pipe = Pipeline::<PatchItem, _>::spawn(WRITE_THROUGH_DEPTH, sink)?;
+
+        // Send a `PatchItem` and translate a `SendError` (consumer
+        // thread died / panicked) into a useful library error so the
+        // caller can propagate cleanly. Mirrors `sweep_pipeline.rs`'s
+        // `send_or_abort`.
+        let send_or_abort = |pipe: &Pipeline<PatchItem, _>, item: PatchItem| -> Result<()> {
+            pipe.send(item).map_err(|_| Error::IoError {
+                source: std::io::Error::other("patch consumer terminated unexpectedly"),
+            })
+        };
+
+        // Snapshot helper for producer-side stats reads. Holds the
+        // mutex briefly; we never read across operations so a fresh
+        // snapshot per call is fine.
+        let read_shared = |shared: &std::sync::Mutex<patch::SharedPatchState>| -> (
+            mapfile::MapStats,
+            Vec<(u64, u64)>,
+        ) {
+            let g = shared.lock().expect("PatchSink shared state mutex poisoned");
+            (g.stats, g.bad_ranges.clone())
+        };
 
         // Log ISO file size at patch start for write monitoring
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -2007,8 +2067,6 @@ impl Disc {
         let block_sectors = opts.block_sectors.unwrap_or(1);
         let recovery = opts.full_recovery;
 
-        let bytes_good_before = map.stats().bytes_good;
-        let bytes_good_start = bytes_good_before;
         let mut halted = false;
         let mut wedged_exit = false;
         let mut blocks_attempted: u64 = 0;
@@ -2068,24 +2126,23 @@ impl Disc {
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch_mapfile_snapshot",
-            total_entries = map.entries().len(),
+            total_entries = initial_entries.len(),
             bytes_good_before,
-            bytes_retryable = map.stats().bytes_retryable,
-            bytes_unreadable = map.stats().bytes_unreadable,
-            bytes_nontried = map.stats().bytes_nontried,
+            bytes_retryable = initial_stats.bytes_retryable,
+            bytes_unreadable = initial_stats.bytes_unreadable,
+            bytes_nontried = initial_stats.bytes_nontried,
             "Mapfile state snapshot at patch start"
         );
 
         // Log first 10 and last 10 entries for inspection
-        let entries = map.entries();
-        if !entries.is_empty() {
+        if !initial_entries.is_empty() {
             tracing::info!(
                 target: "freemkv::disc",
                 phase = "patch_mapfile_entries_start",
-                num_to_log = (entries.len().min(10)) as u32,
+                num_to_log = (initial_entries.len().min(10)) as u32,
                 "First 10 entries"
             );
-            for entry in entries.iter().take(10) {
+            for entry in initial_entries.iter().take(10) {
                 tracing::debug!(
                     target: "freemkv::disc",
                     phase = "patch_mapfile_entry_start",
@@ -2096,14 +2153,14 @@ impl Disc {
                 );
             }
         }
-        if entries.len() > 10 {
+        if initial_entries.len() > 10 {
             tracing::info!(
                 target: "freemkv::disc",
                 phase = "patch_mapfile_entries_end",
-                num_to_log = (entries.len().min(10)) as u32,
+                num_to_log = (initial_entries.len().min(10)) as u32,
                 "Last 10 entries"
             );
-            for entry in entries.iter().skip(entries.len() - 10) {
+            for entry in initial_entries.iter().skip(initial_entries.len() - 10) {
                 tracing::debug!(
                     target: "freemkv::disc",
                     phase = "patch_mapfile_entry_end",
@@ -2114,21 +2171,6 @@ impl Disc {
                 );
             }
         }
-
-        // Every retry pass acts on every non-Finished range. Including
-        // Unreadable means a sector that failed in pass N gets a fresh
-        // shot in pass N+1 — drive state evolves, the same read can
-        // succeed later. Each pass owns its own jumps/skips; if pass 5
-        // jumps over the same zone as pass 2, fine.
-        let mut bad_ranges = map.ranges_with(&[
-            mapfile::SectorStatus::NonTrimmed,
-            mapfile::SectorStatus::NonScraped,
-            mapfile::SectorStatus::Unreadable,
-        ]);
-        if opts.reverse {
-            bad_ranges.reverse();
-        }
-        let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
 
         tracing::info!(
             target: "freemkv::disc",
@@ -2220,7 +2262,7 @@ impl Disc {
                     break;
                 }
 
-                let bytes_good_now = map.stats().bytes_good;
+                let bytes_good_now = read_shared(&shared).0.bytes_good;
                 if bytes_good_now > range_bytes_good {
                     range_bytes_good = bytes_good_now;
                     range_start = std::time::Instant::now();
@@ -2257,21 +2299,23 @@ impl Disc {
                     // patch-marked Unreadable sectors are actually readable.
                     let unmarked_bytes = block_end.saturating_sub(*range_pos);
                     if opts.reverse {
-                        map.record(
-                            *range_pos,
-                            unmarked_bytes,
-                            mapfile::SectorStatus::NonTrimmed,
-                        )
-                        .map_err(|e| Error::IoError { source: e })?;
+                        send_or_abort(
+                            &pipe,
+                            PatchItem::NonTrimmed {
+                                pos: *range_pos,
+                                len: unmarked_bytes,
+                            },
+                        )?;
                     } else {
                         let remaining_start = *range_pos + (end - block_end);
                         if remaining_start < end {
-                            map.record(
-                                remaining_start,
-                                end - remaining_start,
-                                mapfile::SectorStatus::NonTrimmed,
-                            )
-                            .map_err(|e| Error::IoError { source: e })?;
+                            send_or_abort(
+                                &pipe,
+                                PatchItem::NonTrimmed {
+                                    pos: remaining_start,
+                                    len: end - remaining_start,
+                                },
+                            )?;
                         }
                     }
                     // Continue to next range (break inner loop only)
@@ -2372,8 +2416,6 @@ impl Disc {
                             crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
                         }
                         let write_start = std::time::Instant::now();
-                        file.seek(SeekFrom::Start(pos))
-                            .map_err(|e| Error::IoError { source: e })?;
                         tracing::debug!(
                             target: "freemkv::disc",
                             phase = "patch_write_start",
@@ -2381,8 +2423,18 @@ impl Disc {
                             bytes,
                             "Starting ISO write"
                         );
-                        file.write_all(&buf[..bytes])
-                            .map_err(|e| Error::IoError { source: e })?;
+                        // Hand the recovered bytes off to the consumer:
+                        // seek + write + mapfile.record(Finished) all
+                        // happen on the consumer thread, so the producer
+                        // can immediately move on to the next read while
+                        // these bytes are being committed.
+                        send_or_abort(
+                            &pipe,
+                            PatchItem::Recovered {
+                                pos,
+                                buf: buf[..bytes].to_vec(),
+                            },
+                        )?;
                         let write_duration_ms = write_start.elapsed().as_millis();
                         tracing::info!(
                             target: "freemkv::disc",
@@ -2392,21 +2444,21 @@ impl Disc {
                             write_duration_ms,
                             "ISO write succeeded"
                         );
-                        let mapfile_record_start = std::time::Instant::now();
-                        map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
-                            .map_err(|e| Error::IoError { source: e })?;
-                        let mapfile_record_duration_ms = mapfile_record_start.elapsed().as_millis();
                         tracing::info!(
                             target: "freemkv::disc",
                             phase = "patch_mapfile_record_ok",
                             pos,
                             block_bytes,
-                            mapfile_record_duration_ms,
-                            "Mapfile record written"
+                            "Mapfile record dispatched"
                         );
 
-                        // Stall guard: watch bytes_good (real progress), not pos (advances on skips)
-                        let bytes_good_now = map.stats().bytes_good;
+                        // Stall guard: watch bytes_good (real progress),
+                        // not pos (advances on skips). With the consumer
+                        // running in its own thread, this read can lag
+                        // by up to one item; the watchdog operates at
+                        // STALL_SECS=3600 granularity so single-item lag
+                        // is irrelevant.
+                        let bytes_good_now = read_shared(&shared).0.bytes_good;
                         if bytes_good_now > bytes_good_last {
                             stall_start = std::time::Instant::now();
                             bytes_good_last = bytes_good_now;
@@ -2458,25 +2510,23 @@ impl Disc {
                                                     0,
                                                 )?;
                                             }
-                                            file.seek(SeekFrom::Start(bt_pos))
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            file.write_all(&buf[..bt_bytes])
-                                                .map_err(|e| Error::IoError { source: e })?;
-                                            map.record(
-                                                bt_pos,
-                                                span,
-                                                mapfile::SectorStatus::Finished,
-                                            )
-                                            .map_err(|e| Error::IoError { source: e })?;
+                                            send_or_abort(
+                                                &pipe,
+                                                PatchItem::Recovered {
+                                                    pos: bt_pos,
+                                                    buf: buf[..bt_bytes].to_vec(),
+                                                },
+                                            )?;
                                         }
                                         Err(_err) => {
                                             blocks_read_failed += 1;
-                                            map.record(
-                                                bt_pos,
-                                                span,
-                                                mapfile::SectorStatus::Unreadable,
-                                            )
-                                            .map_err(|e| Error::IoError { source: e })?;
+                                            send_or_abort(
+                                                &pipe,
+                                                PatchItem::Unreadable {
+                                                    pos: bt_pos,
+                                                    len: span,
+                                                },
+                                            )?;
                                             tracing::info!(
                                                 target: "freemkv::disc",
                                                 phase = "patch_backtrack_stop",
@@ -2610,8 +2660,6 @@ impl Disc {
                                         )?;
                                     }
                                     let write_start = std::time::Instant::now();
-                                    file.seek(SeekFrom::Start(pos))
-                                        .map_err(|e| Error::IoError { source: e })?;
                                     tracing::debug!(
                                         target: "freemkv::disc",
                                         phase = "patch_write_start",
@@ -2619,8 +2667,13 @@ impl Disc {
                                         bytes,
                                         "Starting ISO write"
                                     );
-                                    file.write_all(&buf[..bytes])
-                                        .map_err(|e| Error::IoError { source: e })?;
+                                    send_or_abort(
+                                        &pipe,
+                                        PatchItem::Recovered {
+                                            pos,
+                                            buf: buf[..bytes].to_vec(),
+                                        },
+                                    )?;
                                     let write_duration_ms = write_start.elapsed().as_millis();
                                     tracing::info!(
                                         target: "freemkv::disc",
@@ -2630,22 +2683,16 @@ impl Disc {
                                         write_duration_ms,
                                         "ISO write succeeded"
                                     );
-                                    let mapfile_record_start = std::time::Instant::now();
-                                    map.record(pos, block_bytes, mapfile::SectorStatus::Finished)
-                                        .map_err(|e| Error::IoError { source: e })?;
-                                    let mapfile_record_duration_ms =
-                                        mapfile_record_start.elapsed().as_millis();
                                     tracing::info!(
                                         target: "freemkv::disc",
                                         phase = "patch_mapfile_record_ok",
                                         pos,
                                         block_bytes,
-                                        mapfile_record_duration_ms,
-                                        "Mapfile record written"
+                                        "Mapfile record dispatched"
                                     );
 
                                     // Stall guard after successful retry
-                                    let bytes_good_now = map.stats().bytes_good;
+                                    let bytes_good_now = read_shared(&shared).0.bytes_good;
                                     if bytes_good_now > bytes_good_last {
                                         stall_start = std::time::Instant::now();
                                         bytes_good_last = bytes_good_now;
@@ -2665,8 +2712,13 @@ impl Disc {
                         }
 
                         // All retries exhausted - mark as Unreadable
-                        map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
-                            .map_err(|e| Error::IoError { source: e })?;
+                        send_or_abort(
+                            &pipe,
+                            PatchItem::Unreadable {
+                                pos,
+                                len: block_bytes,
+                            },
+                        )?;
 
                         damage_window.push(false);
                         if damage_window.len() > PASSN_DAMAGE_WINDOW {
@@ -2674,7 +2726,7 @@ impl Disc {
                         }
 
                         // Stall guard: check on failures too, not just successes
-                        let bytes_good_now = map.stats().bytes_good;
+                        let bytes_good_now = read_shared(&shared).0.bytes_good;
                         if bytes_good_now > bytes_good_last {
                             stall_start = std::time::Instant::now();
                             bytes_good_last = bytes_good_now;
@@ -2779,19 +2831,25 @@ impl Disc {
                             }
                         }
 
-                        // Log mapfile record for Unreadable status
-                        let mapfile_record_start = std::time::Instant::now();
-                        map.record(pos, block_bytes, mapfile::SectorStatus::Unreadable)
-                            .map_err(|e| Error::IoError { source: e })?;
-                        let mapfile_record_duration_ms = mapfile_record_start.elapsed().as_millis();
+                        // Redundant second Unreadable mark — preserved
+                        // bit-for-bit from the pre-split loop (`record`
+                        // is idempotent for same-status replacement of
+                        // the same range). Routes through the consumer
+                        // like every other state change.
+                        send_or_abort(
+                            &pipe,
+                            PatchItem::Unreadable {
+                                pos,
+                                len: block_bytes,
+                            },
+                        )?;
                         tracing::info!(
                             target: "freemkv::disc",
                             phase = "patch_mapfile_record_unreadable",
                             pos,
                             block_bytes,
                             consecutive_failures,
-                            mapfile_record_duration_ms,
-                            "Mapfile record written as Unreadable"
+                            "Mapfile record dispatched as Unreadable"
                         );
 
                         let pause_secs = if err.is_bridge_degradation() {
@@ -2905,7 +2963,7 @@ impl Disc {
                 work_done = work_done.saturating_add(block_bytes);
 
                 if let Some(reporter) = opts.progress {
-                    let s = map.stats();
+                    let (s, bad_ranges_now) = read_shared(&shared);
                     let kind = if block_sectors == 1 {
                         crate::progress::PassKind::Scrape {
                             reverse: opts.reverse,
@@ -2915,16 +2973,10 @@ impl Disc {
                             reverse: opts.reverse,
                         }
                     };
-                    let bad_ranges = map.ranges_with(&[
-                        mapfile::SectorStatus::NonTrimmed,
-                        mapfile::SectorStatus::Unreadable,
-                        mapfile::SectorStatus::NonScraped,
-                        mapfile::SectorStatus::NonTried,
-                    ]);
                     let main_title_bad = self
                         .titles
                         .first()
-                        .map(|t| bytes_bad_in_title(t, &bad_ranges))
+                        .map(|t| bytes_bad_in_title(t, &bad_ranges_now))
                         .unwrap_or(0);
                     let main_title = self.titles.first();
                     let pp = crate::progress::PassProgress {
@@ -2948,26 +3000,13 @@ impl Disc {
             }
         }
 
-        if let Err(e) = file.sync_all() {
-            if is_regular {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "patch_sync_failed",
-                    error = %e,
-                    os_error = e.raw_os_error(),
-                    error_kind = ?e.kind(),
-                    "patch: sync_all failed"
-                );
-                return Err(Error::IoError { source: e });
-            }
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "patch_sync_skipped",
-                error = %e,
-                "patch: sync_all failed for non-regular file; ignoring"
-            );
-        }
-        map.flush().map_err(|e| Error::IoError { source: e })?;
+        // Drain the consumer thread: drop tx, wait for `close` to run
+        // sync_all + mapfile.flush, then take the final stats from the
+        // sink's summary. `close` failing on a regular-file sync_all is
+        // surfaced here as `Error::IoError`, matching pre-split
+        // behaviour.
+        let summary = pipe.finish()?;
+        let stats = summary.stats;
 
         // Log final ISO file size for write verification
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -2975,12 +3014,11 @@ impl Disc {
                 target: "freemkv::disc",
                 phase = "patch_iso_size_end",
                 iso_bytes = metadata.len(),
-                bytes_recovered = map.stats().bytes_good.saturating_sub(bytes_good_before),
+                bytes_recovered = stats.bytes_good.saturating_sub(bytes_good_before),
                 "ISO file size at patch end"
             );
         }
 
-        let stats = map.stats();
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch_done",

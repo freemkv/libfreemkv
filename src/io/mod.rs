@@ -21,11 +21,11 @@ pub mod pipeline;
 
 pub(crate) use writeback_file::WritebackFile;
 
-// Re-exports for the 0.18 redesign. Sweep is wired up in
-// `disc/sweep.rs`; patch and mux migrate in later 0.18 slices.
-// `WRITE_THROUGH_DEPTH` is patch-only and currently has no in-tree
-// caller — the targeted `#[allow]` keeps the re-export visible
-// without dragging the rest of the module under `dead_code`.
+// Re-exports for the 0.18 redesign. Sweep + patch are both wired up
+// (disc/sweep.rs, disc/patch.rs); mux migrates separately in autorip.
+// `WRITE_THROUGH_DEPTH` is patch-specific and has no other in-tree
+// caller — the targeted `#[allow]` keeps the re-export visible without
+// dragging the rest of the module under `dead_code`.
 #[allow(unused_imports)]
 pub use pipeline::WRITE_THROUGH_DEPTH;
 pub use pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink};

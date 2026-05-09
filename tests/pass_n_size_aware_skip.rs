@@ -286,3 +286,114 @@ fn patch_recovers_multiple_good_middles() {
         pr.bytes_total,
     );
 }
+
+/// 0.18 Pass N pipeline split: exercises the new producer/consumer
+/// path end-to-end on a synthetic patterned reader. Bad range layout
+/// is small (5 bad LBAs surrounded by good middle) so the producer
+/// emits a mix of `Recovered` and `Unreadable` items and the consumer
+/// thread must apply both kinds. Verifies:
+///
+/// - `bytes_good` advances (good sectors flow producer→consumer→file
+///   →mapfile with the data preserved).
+/// - The recovered LBAs end up Finished; the bad LBAs end up Unreadable.
+/// - Bytes written at the recovered offsets match what the producer
+///   read from the patterned source (proves the channel hand-off
+///   didn't drop or reorder buffers, and the consumer's seek+write
+///   landed at the right offsets).
+#[test]
+fn patch_pipeline_split_recovers_and_records_correctly() {
+    let capacity_sectors: u32 = 512;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+
+    // Layout: LBAs 200-204 inclusive are bad (5 sectors), 205-249 good.
+    // The pre-existing range is LBAs 200-249 NonTrimmed (100 KB).
+    let mut bad_lbas = HashSet::new();
+    for lba in 200..205 {
+        bad_lbas.insert(lba);
+    }
+
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let finished = [
+        (0, 200 * 2048),
+        (250 * 2048, (capacity_sectors as u64 - 250) * 2048),
+    ];
+    let nontrimmed = [(200 * 2048, 50 * 2048)];
+    prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
+
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    let pr = disc
+        .copy(&mut reader, &iso_path, &opts)
+        .expect("copy returns Ok");
+
+    // Bytes_good_total should advance — the good LBAs in the bad range
+    // (205-249, 45 sectors) are all reachable via per-sector retry.
+    // Initial bytes_good = 200 * 2048 + (512-250) * 2048 = 462 sectors.
+    // After patch, bytes_good should be ≥ 462 + 45 = 507 sectors worth.
+    let initial_good_sectors: u64 = 200 + (capacity_sectors as u64 - 250);
+    let min_expected_good_bytes = (initial_good_sectors + 30) * 2048;
+    assert!(
+        pr.bytes_good >= min_expected_good_bytes,
+        "patch should have recovered most good LBAs in the bad range via the pipeline. \
+         bytes_good={} (expected ≥ {}); bytes_total={}",
+        pr.bytes_good,
+        min_expected_good_bytes,
+        pr.bytes_total,
+    );
+
+    // Verify the mapfile records: every good LBA is Finished, every
+    // bad LBA is either Unreadable or NonTrimmed (not Finished).
+    let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
+    let map = Mapfile::load(&map_path).unwrap();
+    let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
+    let in_finished = |lba: u32| -> bool {
+        let pos = lba as u64 * 2048;
+        finished_ranges
+            .iter()
+            .any(|&(p, sz)| pos >= p && pos < p + sz)
+    };
+
+    for lba in 205..250 {
+        assert!(
+            in_finished(lba),
+            "good LBA {lba} should be Finished after pipeline patch run"
+        );
+    }
+    for lba in 200..205 {
+        assert!(
+            !in_finished(lba),
+            "bad LBA {lba} should NOT be Finished after pipeline patch run"
+        );
+    }
+
+    // Verify the consumer wrote the producer's bytes at the right
+    // offsets. PatternedSectorReader fills each sector with `(lba & 0xff)
+    // as u8` — picking LBA 220 (well inside the recovered region) gives
+    // a clean signature byte to check.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut iso = std::fs::File::open(&iso_path).unwrap();
+    iso.seek(SeekFrom::Start(220 * 2048)).unwrap();
+    let mut sector = [0u8; 2048];
+    iso.read_exact(&mut sector).unwrap();
+    let expected_byte = (220u32 & 0xff) as u8;
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(&map_path);
+
+    assert!(
+        sector.iter().all(|&b| b == expected_byte),
+        "consumer should have written PatternedSectorReader's pattern \
+         (byte {expected_byte:#x} for LBA 220) to the recovered offset; \
+         got first 8 bytes = {:?}",
+        &sector[..8]
+    );
+}

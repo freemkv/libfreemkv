@@ -29,10 +29,13 @@
 //!
 //! ## Dead-code suppression
 //!
-//! `WRITE_THROUGH_DEPTH` has no in-tree caller yet — patch is the
-//! intended consumer (write-through depth=1) and migrates in a later
-//! 0.18 slice. The constant ships now so the contract for that slice
-//! is fixed; the targeted `#[allow]` is removed when patch lands.
+//! Both `Disc::sweep` (`DEFAULT_PIPELINE_DEPTH`, `spawn_named`,
+//! `try_send`) and `Disc::patch` (`WRITE_THROUGH_DEPTH`, `Flow::Stop`)
+//! are now in-tree callers (0.18 round 2). The targeted `#[allow]`
+//! markers below cover the corners of the API not exercised by either
+//! call site (e.g. `Pipeline::spawn` without a name; `Flow::Stop`
+//! return path from sweep's sink — sweep always consumes the producer's
+//! full work-list). Drop the allows once mux migrates.
 
 use std::io;
 use std::sync::mpsc::{SyncSender, sync_channel};
