@@ -126,6 +126,19 @@ pub use error::{Error, Result};
 // component; poll `is_cancelled()` inside the loop body.
 pub use halt::Halt;
 
+// Generic bounded producer/consumer primitive used by sweep, patch, and
+// mux to overlap reads with writes via a dedicated consumer thread.
+// `Pipeline::spawn(depth, sink)` spawns the consumer; `pipe.send(item)`
+// pushes one item with back-pressure; `pipe.finish()` joins the
+// consumer and surfaces its `close()` output. Callers implement `Sink`
+// to define per-item behaviour and end-of-stream finalisation.
+//
+// `DEFAULT_PIPELINE_DEPTH` (=4) is the depth sweep + mux use; patch
+// uses `WRITE_THROUGH_DEPTH` (=1) so each read fully drains before the
+// next can enqueue. Returning `Flow::Stop` from `apply` ends the
+// consumer cleanly (still calls `close()`).
+pub use io::pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{Event, EventKind};
 pub use identity::DriveId;
