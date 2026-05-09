@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.17.13 (2026-05-09)
+
+### Use `crate::io::Writer` uniformly for all binary file output
+
+0.17.10 introduced the bounded-cache writeback wrapper (`sync_file_range`
++ `posix_fadvise(DONTNEED)` per chunk) and 0.17.11 wired it into
+`Disc::sweep`. The other two big-write paths in the crate were still
+opening raw `std::fs::File` and would have hit the same dirty-page
+burst pathology against slow / network-attached staging.
+
+This release threads `crate::io::Writer` through the remaining sites:
+
+- **`Disc::patch`** (`disc/mod.rs:1981`): the ISO file reopened for
+  Pass-N recovery now wraps in `Writer` before any seek / write.
+  Recovery writes are sparse, but the wrapper costs nothing when
+  there's no chunk crossing — and on heavily-damaged discs it
+  matters as patch accumulates GB of recovered data.
+- **MKV mux output** (`mux/resolve.rs:243`): `BufWriter::with_capacity`
+  now wraps `Writer::new(file)` instead of a raw `File`. UHD MKVs
+  routinely exceed 70 GB of sequential writes; pre-0.17.13 those
+  bursts went straight to the kernel writeback queue.
+- **M2TS mux output** (`mux/resolve.rs:251`): same change for
+  parity with the MKV path — anyone using `m2ts://` URLs gets it
+  too.
+
+No new public surface. `Writer::sync_all()` is called from `Disc::patch`
+and `sweep_pipeline`'s consumer at end of pass; mux exits via Drop on
+the wrapping `BufWriter`, which propagates flush down to `Writer`'s
+final `note_progress` (kernel finishes the in-flight chunk on file
+close — there's no explicit `sync_all` for mux today, same behaviour
+as before).
+
 ## 0.17.12 (2026-05-09)
 
 ### Mapfile time-batched persistence — unblock NFS staging
