@@ -1372,6 +1372,7 @@ impl Disc {
         opts: &SweepOptions,
     ) -> Result<CopyResult> {
         use crate::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
+        use crate::sector::{DecryptingSectorSource, SectorSource};
         use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
@@ -1380,6 +1381,15 @@ impl Disc {
         } else {
             crate::decrypt::DecryptKeys::None
         };
+
+        // Wrap the producer-side reader once so every read_sectors call
+        // yields plaintext. `DecryptKeys::None` makes the decorator a
+        // pass-through, so the wrapping is cheap when --raw / unencrypted
+        // discs are being swept and we keep the pipeline shape uniform.
+        // Replaces the inline `decrypt::decrypt_sectors` calls that used
+        // to live in this loop and in the bisect inner loop below.
+        let mut reader = DecryptingSectorSource::new(reader, keys);
+        let reader = &mut reader;
 
         // Mapfile: load if resuming, else wipe + recreate.
         let mapfile_path = self.mapfile_for(path);
@@ -1528,14 +1538,10 @@ impl Disc {
                         }
                         read_ctx.bridge_degradation_count = 0;
 
-                        // Decrypt on producer; consumer expects plaintext.
-                        if opts.decrypt {
-                            crate::decrypt::decrypt_sectors(
-                                &mut buf[..block_bytes as usize],
-                                &keys,
-                                0,
-                            )?;
-                        }
+                        // Plaintext: the wrapped reader (DecryptingSectorSource)
+                        // applied AACS / CSS in-place during read_sectors above.
+                        // The consumer thread sees decrypted bytes; the
+                        // pre-0.18 inline decrypt_sectors call lived here.
 
                         // Move the batch into the channel via fresh
                         // owned Vec. The producer's `buf` is reused
@@ -1591,16 +1597,9 @@ impl Disc {
                                     ) {
                                         Ok(_) => {
                                             read_ctx.on_success();
-                                            // Decrypt single sector before send. Pre-split
-                                            // bisect path silently skipped this — encrypted
-                                            // bytes were written for bisect-recovered sectors.
-                                            if opts.decrypt {
-                                                crate::decrypt::decrypt_sectors(
-                                                    &mut sector_buf,
-                                                    &keys,
-                                                    0,
-                                                )?;
-                                            }
+                                            // Plaintext via the wrapping
+                                            // DecryptingSectorSource — same
+                                            // decrypt path the batch read takes.
                                             if pipe
                                                 .send(WorkItem::BisectGood {
                                                     pos: write_pos,
@@ -1959,6 +1958,7 @@ impl Disc {
         opts: &PatchOpts,
     ) -> Result<PatchOutcome> {
         use crate::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
+        use crate::sector::{DecryptingSectorSource, SectorSource};
         use patch::{PatchItem, PatchSink};
 
         const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 10;
@@ -1986,6 +1986,15 @@ impl Disc {
         } else {
             crate::decrypt::DecryptKeys::None
         };
+
+        // Wrap the producer-side reader once so every read_sectors
+        // call (the main recovery read, the backtrack read, and the
+        // non-NOT_READY retry read) yields plaintext. Replaces three
+        // inline decrypt_sectors call sites that all keyed off the
+        // same `keys`. `DecryptKeys::None` keeps the unencrypted /
+        // --raw path a pass-through.
+        let mut reader = DecryptingSectorSource::new(reader, keys);
+        let reader = &mut reader;
 
         let is_regular = std::fs::metadata(path)
             .map(|m| m.file_type().is_file())
@@ -2412,9 +2421,9 @@ impl Disc {
                                 "Read succeeded"
                             );
                         }
-                        if opts.decrypt {
-                            crate::decrypt::decrypt_sectors(&mut buf[..bytes], &keys, 0)?;
-                        }
+                        // Plaintext: DecryptingSectorSource applied AACS / CSS
+                        // in-place during the read_sectors call above. The
+                        // pre-0.18 inline decrypt_sectors call lived here.
                         let write_start = std::time::Instant::now();
                         tracing::debug!(
                             target: "freemkv::disc",
@@ -2503,13 +2512,9 @@ impl Disc {
                                     ) {
                                         Ok(_) => {
                                             blocks_read_ok += 1;
-                                            if opts.decrypt {
-                                                crate::decrypt::decrypt_sectors(
-                                                    &mut buf[..bt_bytes],
-                                                    &keys,
-                                                    0,
-                                                )?;
-                                            }
+                                            // Plaintext via DecryptingSectorSource
+                                            // wrapping; same path the main read
+                                            // takes above.
                                             send_or_abort(
                                                 &pipe,
                                                 PatchItem::Recovered {
@@ -2652,13 +2657,8 @@ impl Disc {
                                         "Retry succeeded after non-NOT_READY error"
                                     );
 
-                                    if opts.decrypt {
-                                        crate::decrypt::decrypt_sectors(
-                                            &mut buf[..bytes],
-                                            &keys,
-                                            0,
-                                        )?;
-                                    }
+                                    // Plaintext via DecryptingSectorSource;
+                                    // same path the original read takes.
                                     let write_start = std::time::Instant::now();
                                     tracing::debug!(
                                         target: "freemkv::disc",
