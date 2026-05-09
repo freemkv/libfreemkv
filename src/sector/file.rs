@@ -3,12 +3,9 @@
 //!
 //! [`FileSectorSource`] is the read side (open-only). [`FileSectorSink`]
 //! is the write side (create or open-rw); writes go through
-//! [`crate::io::Writer`] so big sequential ISO writes share the
-//! same bounded-cache writeback pipeline used by sweep / patch /
-//! mux. `Writer` is the 0.17 name; the 0.18 redesign renames it
-//! to `WritebackFile` in a separate slice — this file deliberately
-//! imports through the `crate::io::Writer` path so the rename can
-//! be applied independently.
+//! [`crate::io::WritebackFile`] so big sequential ISO writes share
+//! the same bounded-cache writeback pipeline used by sweep / patch /
+//! mux.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -83,14 +80,14 @@ impl SectorReader for FileSectorSource {
 
 /// SectorSink backed by a file (ISO image).
 ///
-/// Writes go through [`crate::io::Writer`], which on Linux drives
+/// Writes go through [`crate::io::WritebackFile`], which on Linux drives
 /// continuous `sync_file_range` + `posix_fadvise(DONTNEED)` to keep
 /// the kernel dirty page cache bounded during multi-GB sequential
 /// writes. macOS / Windows fall through to a no-op pipeline.
 ///
 /// `finish` runs `sync_all` before dropping the underlying file.
 pub struct FileSectorSink {
-    inner: crate::io::Writer,
+    inner: crate::io::WritebackFile,
 }
 
 impl FileSectorSink {
@@ -106,7 +103,7 @@ impl FileSectorSink {
             .truncate(true)
             .open(path)?;
         Ok(Self {
-            inner: crate::io::Writer::new(file)?,
+            inner: crate::io::WritebackFile::new(file)?,
         })
     }
 
@@ -116,7 +113,7 @@ impl FileSectorSink {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(Self {
-            inner: crate::io::Writer::new(file)?,
+            inner: crate::io::WritebackFile::new(file)?,
         })
     }
 }
