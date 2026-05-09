@@ -324,7 +324,7 @@ fn test_file_sector_reader_round_trip() {
     tmp.write_all(&data).expect("write data");
     tmp.flush().expect("flush");
 
-    let path = tmp.path().to_str().expect("path utf-8").to_string();
+    let path = tmp.path().to_path_buf();
     let mut fsr = FileSectorReader::open(&path).expect("open FileSectorReader");
 
     assert_eq!(fsr.capacity(), N_SECTORS as u32, "capacity mismatch");

@@ -26,4 +26,4 @@ pub(crate) use writeback_file::WritebackFile;
 // `disc/sweep_pipeline.rs`; patch and mux have no pipeline). The next
 // 0.18 slice removes this allow as it wires up the first consumer.
 #[allow(unused_imports)]
-pub use pipeline::{Apply, DEFAULT_DEPTH, Pipeline, Sink};
+pub use pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
