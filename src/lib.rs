@@ -79,6 +79,7 @@ pub mod disc;
 pub mod drive;
 pub mod error;
 pub mod event;
+pub mod halt;
 pub(crate) mod identity;
 pub(crate) mod ifo;
 pub(crate) mod io;
@@ -115,6 +116,15 @@ pub use drive::{Drive, DriveStatus, find_drive};
 // numeric `code()`; **no English text in the library** — applications map
 // codes to localized messages. See `error.rs` for the full taxonomy.
 pub use error::{Error, Result};
+
+// ─── 0.18 primitives ────────────────────────────────────────────────────────
+//
+// One-bit cooperative cancellation token, shared by every long-running loop
+// in libfreemkv (sweep, patch, mux). Replaces the ad-hoc `Arc<AtomicBool>`
+// flags scattered across 0.17 (`DiscStream::set_halt`, autorip's
+// `HALT_FLAGS` registry). Clone it cheaply; pass it by value into each
+// component; poll `is_cancelled()` inside the loop body.
+pub use halt::Halt;
 
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{Event, EventKind};
