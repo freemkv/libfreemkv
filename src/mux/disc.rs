@@ -8,7 +8,7 @@
 use crate::disc::{Disc, DiscTitle, Extent};
 use crate::drive::extract_scsi_context;
 use crate::event::{BatchSizeReason, Event, EventKind};
-use crate::sector::SectorReader;
+use crate::sector::{DecryptingSectorSource, SectorReader, SectorSource};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,9 +99,19 @@ impl AdaptiveBatch {
 /// Sources: physical drive, ISO file, or any SectorReader.
 /// Decrypt, demux, and codec parsing happen internally.
 pub struct DiscStream {
-    reader: Box<dyn SectorReader>,
+    /// Underlying sector source wrapped in the 0.18
+    /// [`DecryptingSectorSource`] decorator. Every `read_sectors`
+    /// call yields plaintext, so `fill_extents` no longer needs an
+    /// inline `decrypt::decrypt_sectors` step. `DecryptKeys::None`
+    /// (raw / unencrypted disc) makes the decorator a pass-through.
+    reader: DecryptingSectorSource<Box<dyn SectorReader>>,
     title: DiscTitle,
     disc: Option<Disc>,
+    /// Mirror of the keys handed in at construction. The decorator
+    /// owns the cryptographic state; this field is kept for
+    /// metadata-side callers (`info()` and friends) that want to
+    /// know whether the disc was encrypted, without reaching through
+    /// the wrapper.
     decrypt_keys: crate::decrypt::DecryptKeys,
 
     // Extents to read
@@ -189,7 +199,11 @@ impl DiscStream {
         }
 
         Self {
-            reader,
+            // Wrap the input reader in DecryptingSectorSource so the
+            // internal fill_extents path sees plaintext bytes. For
+            // DecryptKeys::None (unencrypted / raw / test fixtures)
+            // the decorator is a pass-through.
+            reader: DecryptingSectorSource::new(reader, decrypt_keys.clone()),
             title,
             disc: None,
             decrypt_keys,
@@ -241,9 +255,12 @@ impl DiscStream {
         }
     }
 
-    /// Skip decryption — return raw encrypted bytes.
+    /// Skip decryption — return raw encrypted bytes. Updates both
+    /// the metadata-side key field and the wrapped reader's keys so
+    /// subsequent `read_sectors` calls become a pass-through.
     pub fn set_raw(&mut self) {
         self.decrypt_keys = crate::decrypt::DecryptKeys::None;
+        self.reader.set_keys(crate::decrypt::DecryptKeys::None);
     }
 
     /// Get the scanned Disc (for listing all titles).
@@ -420,11 +437,10 @@ impl crate::pes::Stream for DiscStream {
             }
 
             let bytes = self.buf_valid;
-            if let Err(e) =
-                crate::decrypt::decrypt_sectors(&mut self.read_buf[..bytes], &self.decrypt_keys, 0)
-            {
-                return Err(e.into());
-            }
+            // Plaintext: the wrapped reader (DecryptingSectorSource)
+            // applied AACS / CSS in-place during fill_extents'
+            // read_sectors call. The pre-0.18 inline decrypt step
+            // lived here.
 
             if let Some(ref mut demuxer) = self.ts_demuxer {
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
