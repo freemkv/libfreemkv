@@ -21,9 +21,9 @@ pub mod pipeline;
 
 pub(crate) use writeback_file::WritebackFile;
 
-// Re-exports for the 0.18 redesign. Currently flagged unused because
-// no in-tree call site has been migrated yet (sweep is still on
-// `disc/sweep_pipeline.rs`; patch and mux have no pipeline). The next
-// 0.18 slice removes this allow as it wires up the first consumer.
+// Re-exports for the 0.18 redesign. `Disc::patch` (0.18 round 2)
+// uses `Pipeline` + `Sink` + `Flow` + `WRITE_THROUGH_DEPTH`. Sweep
+// and mux still need to be migrated; until they are,
+// `DEFAULT_PIPELINE_DEPTH` is unused outside tests.
 #[allow(unused_imports)]
 pub use pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};

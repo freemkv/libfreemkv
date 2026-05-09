@@ -28,13 +28,11 @@
 //!
 //! ## Dead-code suppression
 //!
-//! The `Pipeline` / `Sink` / `Flow` / `DEFAULT_PIPELINE_DEPTH` /
-//! `WRITE_THROUGH_DEPTH` items are crate-internal API today (the
-//! parent `io` module is `pub(crate)`) but have no in-tree callers
-//! in this slice — sweep is still on `disc/sweep_pipeline.rs`, patch
-//! and mux still have no pipeline at all. Wiring them up is the
-//! next slice of the 0.18 redesign. The `#[allow]` below is removed
-//! once any of those three call sites lands on this primitive.
+//! `Disc::patch` is the first in-tree caller (0.18 round 2). Sweep
+//! and mux still have their own bespoke loops; once they land on
+//! `Pipeline` too, the `#[allow]` below can drop. Until then it
+//! covers the constants and trait machinery the patch caller doesn't
+//! exercise (e.g. `DEFAULT_PIPELINE_DEPTH`).
 
 #![allow(dead_code)]
 
