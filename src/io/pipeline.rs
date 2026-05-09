@@ -5,9 +5,10 @@
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
 //!
-//! Three call sites in libfreemkv have grown a producer/consumer split
-//! independently — sweep already has one (in `disc/sweep_pipeline.rs`),
-//! patch and mux do not. 0.18 collapses all three onto this primitive.
+//! Three call sites in libfreemkv want a producer/consumer split —
+//! sweep (migrated to `disc/sweep.rs::SweepSink`), patch, and mux.
+//! 0.18 collapses all three onto this primitive; sweep is in,
+//! patch and mux migrate in later 0.18 slices.
 //! See `freemkv-private/memory/0_18_redesign.md` for the full picture.
 //!
 //! ## Cancellation and error semantics
@@ -28,15 +29,10 @@
 //!
 //! ## Dead-code suppression
 //!
-//! The `Pipeline` / `Sink` / `Flow` / `DEFAULT_PIPELINE_DEPTH` /
-//! `WRITE_THROUGH_DEPTH` items are crate-internal API today (the
-//! parent `io` module is `pub(crate)`) but have no in-tree callers
-//! in this slice — sweep is still on `disc/sweep_pipeline.rs`, patch
-//! and mux still have no pipeline at all. Wiring them up is the
-//! next slice of the 0.18 redesign. The `#[allow]` below is removed
-//! once any of those three call sites lands on this primitive.
-
-#![allow(dead_code)]
+//! `WRITE_THROUGH_DEPTH` has no in-tree caller yet — patch is the
+//! intended consumer (write-through depth=1) and migrates in a later
+//! 0.18 slice. The constant ships now so the contract for that slice
+//! is fixed; the targeted `#[allow]` is removed when patch lands.
 
 use std::io;
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -50,8 +46,9 @@ use crate::error::Error;
 /// Empirically tuned for sweep and mux — both want enough slack that
 /// short consumer stalls don't immediately back up onto the producer,
 /// but not so much that a producer outpacing the consumer accumulates
-/// arbitrary buffered work. `4` matches the depth `disc/sweep_pipeline.rs`
-/// has used since 0.17.11. Patch should usually use
+/// arbitrary buffered work. `4` matches the depth sweep has used
+/// since 0.17.11 (originally in `disc/sweep_pipeline.rs`, now in
+/// `disc/sweep.rs::SweepSink`). Patch should usually use
 /// [`WRITE_THROUGH_DEPTH`] (`1`) instead — write-through gives clean
 /// back-pressure between every read attempt and the matching write,
 /// which matters when the consumer is updating the mapfile in lockstep.
@@ -61,13 +58,21 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// drains before the next can enqueue. Use this when the producer
 /// must observe consumer side-effects (e.g. mapfile state) before
 /// emitting the next item.
+#[allow(dead_code)]
 pub const WRITE_THROUGH_DEPTH: usize = 1;
 
 /// Outcome of [`Sink::apply`]: either keep feeding items
 /// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
 /// ([`Flow::Stop`]).
+///
+/// `Stop` has no in-tree caller in this slice — sweep never returns
+/// it (it always processes the producer's full work-list before the
+/// channel is dropped). Patch and mux are the intended consumers and
+/// migrate in later 0.18 slices. The variant ships now so the contract
+/// is fixed; the targeted `#[allow]` is removed when patch lands.
 pub enum Flow {
     Continue,
+    #[allow(dead_code)]
     Stop,
 }
 
@@ -106,14 +111,35 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// [`Sink`].
     ///
     /// The thread is named `freemkv-pipeline-consumer` so it shows up
-    /// distinctly in stack traces and `top -H`. Returns an
-    /// `Error::IoError` if the OS refuses the thread spawn (resource
-    /// exhaustion); callers already operate in fallible context, so
-    /// this is propagated rather than panicked.
+    /// distinctly in stack traces and `top -H`. Callers that want a
+    /// more specific name (e.g. `freemkv-sweep-consumer`) should use
+    /// [`Pipeline::spawn_named`] instead. Returns an `Error::IoError`
+    /// if the OS refuses the thread spawn (resource exhaustion);
+    /// callers already operate in fallible context, so this is
+    /// propagated rather than panicked.
+    ///
+    /// Sweep uses [`Pipeline::spawn_named`] directly so the consumer
+    /// thread shows up as `freemkv-sweep-consumer`; this function has
+    /// no in-tree caller yet. Patch and mux migrate in later 0.18
+    /// slices. The targeted `#[allow]` is removed when one of them
+    /// lands on the default name.
+    #[allow(dead_code)]
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
+        Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
+    }
+
+    /// Like [`Pipeline::spawn`] but lets the caller supply the
+    /// consumer thread's name. Useful when several pipelines run in
+    /// the same process and stack traces / `top -H` need to tell them
+    /// apart (e.g. `freemkv-sweep-consumer`, `freemkv-mux-consumer`).
+    pub fn spawn_named<S: Sink<I, Output = R>>(
+        name: &str,
+        depth: usize,
+        sink: S,
+    ) -> Result<Self, Error> {
         let (tx, rx) = sync_channel::<I>(depth);
         let handle = thread::Builder::new()
-            .name("freemkv-pipeline-consumer".into())
+            .name(name.into())
             .spawn(move || -> Result<R, Error> {
                 let mut sink = sink;
                 let mut first_err: Option<Error> = None;
@@ -160,6 +186,15 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// notification edge.
     pub fn send(&self, item: I) -> Result<(), I> {
         self.tx.send(item).map_err(|e| e.0)
+    }
+
+    /// Non-blocking variant of [`Pipeline::send`]. If the channel is
+    /// full or the consumer has hung up, the item is returned in
+    /// `Err`. Useful for best-effort signalling (e.g. sweep's
+    /// throttled `StatsRequest`) where dropping the message is
+    /// preferable to blocking the producer.
+    pub fn try_send(&self, item: I) -> Result<(), std::sync::mpsc::TrySendError<I>> {
+        self.tx.try_send(item)
     }
 
     /// Drop the producer-side channel and wait for the consumer
