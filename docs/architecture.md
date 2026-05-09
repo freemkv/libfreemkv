@@ -65,8 +65,12 @@ libfreemkv (lib.rs)
 │
 ├── Streaming
 │   ├── mux/          Stream implementations (Disc, ISO, MKV, M2TS, Network, Stdio, Null)
-│   ├── pes           PES frame types, Stream trait (read/write frames)
-│   └── sector        SectorReader trait — abstracts disc vs ISO vs file
+│   ├── pes           PES frame types; FrameSource / FrameSink direction-typed traits
+│   └── sector/       SectorSource / SectorSink traits, FileSector{Source,Sink}, DecryptingSectorSource
+│
+├── I/O Primitives
+│   ├── halt          Halt cancellation token (one Arc<AtomicBool>, cloneable)
+│   └── io/           Pipeline<I, R> + Sink trait + WritebackFile (bounded-cache writer)
 │
 ├── Support
 │   ├── keydb         KEYDB.cfg download, parse, verify, save

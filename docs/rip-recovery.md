@@ -12,21 +12,24 @@ reach into the others.
 
 | Layer | Where it lives | What it does |
 |-------|---------------|--------------|
-| 1 — Bad-range retry | `Disc::patch` (multi-pass over the mapfile) | Re-reads non-`+` ranges with the long timeout. Idempotent; call N times. |
+| 1 — Bad-range retry | `Disc::patch` (one pass over the mapfile per call) | Re-reads non-`+` ranges with the long timeout. Idempotent; caller invokes N times. |
 | 2 — Single-shot primitive | `Drive::read` in `src/drive/mod.rs` | One CDB, one timeout, one result. No inline retries, no SCSI reset. |
 | 3 — In-loop request adaptation | `DiscStream::fill_extents` adaptive batch sizer | Halves the batch on failure, retries at the same LBA, walks back up on a clean-read streak. |
 
-The caller orchestrates layer 1. Autorip's `rip_disc` loops `copy` then
-N × `patch` per the `MAX_RETRIES` config, then hands the ISO off to the
-existing mux pipeline. Layer 3 runs inside any consumer of `DiscStream`
-(direct PES pipeline, ISO playback, etc.) without caller involvement.
+The library exposes flat verbs; the caller drives the multipass loop. Autorip
+runs `Disc::sweep` once, then loops `Disc::patch` until either the mapfile is
+clean or the configured retry budget is exhausted, then hands the ISO off to
+the mux pipeline. The `freemkv` CLI does the same shape with a
+terminal-output progress sink. Layer 3 runs inside any consumer of
+`DiscStream` (direct PES pipeline, ISO playback, etc.) without caller
+involvement.
 
 Three primitives compose the disc-side flow:
 
 | Primitive                 | What it does                                                          |
 |---------------------------|-----------------------------------------------------------------------|
-| `Disc::copy`              | disc → ISO. Writes a sidecar `.mapfile`. Opt-in skip-forward on failure. |
-| `Disc::patch`             | Re-reads bad ranges from the drive. Idempotent; call N times.         |
+| `Disc::sweep`             | disc → ISO, one forward pass. Writes a sidecar `.mapfile`. Opt-in skip-on-error. |
+| `Disc::patch`             | Re-reads bad ranges from the drive. One pass per call; caller invokes N times. |
 | `DiscStream` (ISO source) | Reads sectors from the ISO, feeds decrypt → demux → codec → mux.      |
 
 ## Data model
@@ -60,28 +63,46 @@ Status characters match ddrescue:
 
 Position and size are hex byte offsets into the ISO.
 
-### `CopyOptions` and `PatchOptions`
+### `SweepOptions` and `PatchOptions`
 
-`Disc::copy()` auto-detects the pass from mapfile state:
+The library no longer dispatches between sweep and patch internally — the
+caller picks the verb explicitly per pass. The two option structs are flat
+and have no overlap:
 
 ```rust
-CopyOptions {
-    decrypt: true,     // decrypt AACS/CSS sectors
-    multipass: true,   // enable mapfile + skip-on-error + damage-jump
-    progress: Some(&reporter),  // progress callback
-    halt: Some(flag),  // halt flag for graceful stop
+SweepOptions {
+    decrypt: true,
+    resume: false,
+    batch_sectors: None,
+    skip_on_error: true,           // damage-jump + zero-fill on read failure
+    progress: Some(&reporter),
+    halt: Some(flag),
+}
+
+PatchOptions {
+    decrypt: true,
+    block_sectors: None,
+    full_recovery: true,
+    reverse: true,                 // walk bad ranges high → low LBA
+    wedged_threshold: 50,
+    progress: Some(&reporter),
+    halt: Some(flag),
 }
 ```
 
-Dispatch logic:
-- No mapfile → sweep (fresh Pass 1)
-- Mapfile with NonTried (`?`) → sweep with resume
-- Mapfile covering full disc, only NonTrimmed/NonScraped/Unreadable → patch
-- Mapfile clean → no-op
+Caller-orchestrated dispatch (the policy `Disc::copy` used to embed):
+
+- No mapfile → `sweep` (fresh Pass 1).
+- Mapfile with `?` ranges → `sweep` with `resume: true`.
+- Mapfile covers full disc, only `*` / `/` / `-` ranges → `patch`.
+- Mapfile clean → done; no further pass needed.
+
+Each consumer (autorip, `freemkv` CLI) implements the loop in roughly five
+lines of `Mapfile::stats()` checks.
 
 ## Algorithm
 
-### Pass 1 — fast sweep (`Disc::copy` → `sweep_internal`)
+### Pass 1 — fast sweep (`Disc::sweep`)
 
 1. Read one ECC block (32 sectors for UHD, 16 for BD/DVD) at the current LBA.
 2. On success: write data to ISO, mark `+`, advance.
@@ -95,7 +116,7 @@ Dispatch logic:
 
 Pass 1 completes when every byte has been visited (either `+` or `*`).
 
-### Pass 2+ — patch (`Disc::copy` → `patch_internal`)
+### Pass 2+ — patch (`Disc::patch`)
 
 `Disc::patch` reads the mapfile and iterates every non-`+` range. Default: **reverse** mode
 (walks ranges from highest LBA to lowest, within each range from end to start).
@@ -177,4 +198,4 @@ scrape vs. retry with direction reversal) if there's measured benefit.
 
 - [ddrescue manual, Algorithm chapter](https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html)
 - [ddrescue optical media notes](https://www.electric-spoon.com/doc/gddrescue/html/Optical-media.html)
-- Source: [`src/disc/mapfile.rs`](../src/disc/mapfile.rs), [`src/disc/mod.rs`](../src/disc/mod.rs) (`Disc::copy`, `Disc::patch`), [`src/drive/mod.rs`](../src/drive/mod.rs) (`Drive::read`), [`src/mux/disc.rs`](../src/mux/disc.rs) (`DiscStream::fill_extents`).
+- Source: [`src/disc/mapfile.rs`](../src/disc/mapfile.rs), [`src/disc/sweep.rs`](../src/disc/sweep.rs) (`Disc::sweep`), [`src/disc/patch.rs`](../src/disc/patch.rs) (`Disc::patch`), [`src/drive/mod.rs`](../src/drive/mod.rs) (`Drive::read`), [`src/mux/disc.rs`](../src/mux/disc.rs) (`DiscStream::fill_extents`).

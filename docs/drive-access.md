@@ -52,8 +52,8 @@ selects the per-CDB timeout:
 
 | `recovery` | Timeout  | Used by                                  |
 |------------|----------|------------------------------------------|
-| `false`    | 1.5 s    | `Disc::copy` fast skip-forward sweep, `DiscStream::fill_extents` |
-| `true`     | 30 s     | `Disc::patch` multi-pass over the mapfile |
+| `false`    | 1.5 s    | `Disc::sweep` fast skip-forward pass, `DiscStream::fill_extents` |
+| `true`     | 30 s     | `Disc::patch` retry pass over the mapfile |
 
 On any SCSI failure or timeout, `read` returns `Err(DiscRead)` immediately.
 There are no inline retries, no SCSI reset, no Phase 1/2/3 escalation.

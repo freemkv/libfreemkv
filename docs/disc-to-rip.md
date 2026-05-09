@@ -97,7 +97,9 @@ drive.probe_disc()?;
 // Scan disc (UDF + playlists + AACS — all automatic)
 let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
 
-// Stream pipeline — PES frames from any source to any output
+// Stream pipeline — PES frames from any source to any output.
+// 0.18: input() returns Box<dyn FrameSource>, output() returns Box<dyn FrameSink>;
+// direction is type-checked, so calling .write() on an input is a compile error.
 let opts = InputOptions::default();
 let mut input = libfreemkv::input("disc:///dev/sg4", &opts)?;
 let title = input.info().clone();
@@ -121,11 +123,13 @@ output.finish()?;
 | aacs/ | [aacs.md](aacs.md) | Key resolution + content decrypt + bus handshake |
 | css/ | -- | DVD CSS cipher |
 | decrypt.rs | -- | Unified decrypt dispatcher (AACS/CSS/None) |
-| disc/ | -- | High-level scan + read API |
+| disc/ | [rip-recovery.md](rip-recovery.md) | Disc::scan + Disc::sweep + Disc::patch + mapfile |
 | labels/ | -- | BD-J stream labels (5 format parsers) |
 | mux/ | -- | Stream implementations (7 stream types) |
-| pes.rs | -- | PES frame types + Stream trait |
-| sector.rs | -- | SectorReader trait |
+| pes.rs | -- | PES frame types + FrameSource / FrameSink traits |
+| sector/ | -- | SectorSource / SectorSink + DecryptingSectorSource decorator |
+| io/ | -- | Pipeline<I, R> + Sink trait + WritebackFile |
+| halt.rs | -- | Halt cancellation token |
 | keydb.rs | -- | KEYDB download, parse, save |
 | error.rs | -- | Error codes (E1xxx-E8xxx) |
 | event.rs | -- | Drive event system |
