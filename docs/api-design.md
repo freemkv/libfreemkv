@@ -44,35 +44,30 @@ while let Ok(Some(frame)) = input.read() {
 output.finish()?;
 ```
 
-The `pes::Stream` trait:
+The `FrameSource` and `FrameSink` traits — direction is type-checked, so
+calling `read()` on a write-only sink (or `write()` on a read-only source)
+is a compile error rather than a runtime fault:
 
 ```rust
-pub trait Stream {
-    fn read(&mut self) -> io::Result<Option<PesFrame>>;
-    fn write(&mut self, frame: &PesFrame) -> io::Result<()>;
-    fn finish(&mut self) -> io::Result<()>;
+pub trait FrameSource: Send {
+    fn read(&mut self) -> Result<Option<PesFrame>, Error>;
     fn info(&self) -> &DiscTitle;
-    fn codec_private(&self, track: usize) -> Option<Vec<u8>>;
-    fn headers_ready(&self) -> bool;
+    fn codec_private(&self, track: usize) -> Option<Vec<u8>> { None }
+    fn headers_ready(&self) -> bool { true }
 }
-```
 
-## IOStream (byte-level API)
-
-For raw byte copies (disc→ISO, resume, benchmarks). Lower level than PES.
-
-```rust
-let opts = InputOptions::default();
-let mut input = open_input("iso://Disc.iso", &opts)?;
-let mut output = open_output("mkv://Movie.mkv", input.info())?;
-io::copy(&mut *input, &mut *output)?;
-output.finish()?;
+pub trait FrameSink: Send {
+    fn write(&mut self, frame: &PesFrame) -> Result<(), Error>;
+    fn finish(self: Box<Self>) -> Result<(), Error>;
+    fn info(&self) -> &DiscTitle;
+}
 ```
 
 ## Streams
 
-All streams implement `IOStream` (byte-level) and/or `pes::Stream` (frame-level).
-URL-based resolvers open any stream by string.
+All streams implement `FrameSource` (read) and/or `FrameSink` (write); the
+directional split prevents runtime "wrong-direction" errors. URL-based
+resolvers open any stream by string.
 
 | Stream | Input | Output | URL | Transport |
 |--------|-------|--------|-----|-----------|
@@ -87,21 +82,14 @@ URL-based resolvers open any stream by string.
 All URLs require a `scheme://path` format. Bare paths are rejected.
 
 ```rust
-// PES pipeline (frame-level)
+// PES pipeline (frame-level) — input() returns Box<dyn FrameSource>,
+// output() returns Box<dyn FrameSink>.
 let input = libfreemkv::input("disc:///dev/sg4", &opts)?;    // DiscStream
 let input = libfreemkv::input("iso://Dune.iso", &opts)?;     // IsoStream
 let output = libfreemkv::output("mkv://Dune.mkv", &title)?;  // MkvOutputStream
 let output = libfreemkv::output("m2ts://Dune.m2ts", &title)?; // M2tsOutputStream
 let output = libfreemkv::output("network://10.1.7.11:9000", &title)?; // NetworkOutputStream
 let output = libfreemkv::output("null://", &title)?;          // NullOutputStream
-
-// IOStream (byte-level)
-let input = open_input("disc://", &opts)?;                    // DiscStream
-let input = open_input("iso://Dune.iso", &opts)?;             // IsoStream
-let output = open_output("iso://Copy.iso", &meta)?;           // IsoStream (write)
-let output = open_output("mkv://Dune.mkv", &meta)?;           // MkvStream
-let output = open_output("m2ts://Dune.m2ts", &meta)?;         // M2tsStream
-let output = open_output("null://", &meta)?;                  // NullStream
 ```
 
 ### FMKV Metadata Header
@@ -175,20 +163,34 @@ libfreemkv/src/
 ├── lib.rs              Public exports
 ├── error.rs            Error codes (no English)
 ├── event.rs            Event types for callbacks
+├── halt.rs             Halt cancellation token (Arc<AtomicBool> wrapper)
+├── io/                 Pipeline + WritebackFile primitives
+│   ├── mod.rs          Re-exports WritebackFile, Pipeline, Sink, Flow
+│   ├── pipeline.rs     Generic Pipeline<I, R> + Sink trait
+│   ├── writeback_file.rs  WritebackFile (was crate::io::Writer)
+│   └── writeback.rs    sync_file_range pipeline
 ├── drive/              Drive (open, init, single-shot read)
 │   ├── mod.rs          Drive struct, init, read (single-shot), reset, eject
 │   ├── capture.rs      Drive profile capture for contribution
 │   ├── linux.rs        Linux drive discovery
 │   ├── macos.rs        macOS drive discovery
 │   └── windows.rs      Windows drive discovery
-├── disc/               Disc (scan, titles, AACS setup)
+├── disc/               Disc (scan, titles, AACS setup, sweep, patch)
+│   ├── mod.rs          Disc struct, scan, titles, formats
+│   ├── sweep.rs        Disc::sweep (Pass 1 forward sweep)
+│   ├── patch.rs        Disc::patch (Pass N retry over mapfile)
+│   ├── mapfile.rs      ddrescue-format mapfile
+│   └── read_error.rs   ReadCtx / ReadAction state machine
 ├── scsi/               SCSI transport (Linux SG_IO, macOS IOKit, Windows SPTI)
 ├── platform/           Drive unlock (MT1959 A/B)
 ├── aacs/               AACS decryption (handshake, keys, keydb, decrypt)
 ├── css/                DVD CSS cipher
 ├── decrypt.rs          Unified decrypt dispatcher (AACS/CSS/None)
-├── pes.rs              PES frame types, Stream trait
-├── sector.rs           SectorReader trait
+├── pes.rs              PES frame types, FrameSource / FrameSink traits
+├── sector/             Sector I/O (was sector.rs in 0.17)
+│   ├── mod.rs          SectorSource, SectorSink traits
+│   ├── file.rs         FileSectorSource, FileSectorSink (ISO-backed)
+│   └── decrypting.rs   DecryptingSectorSource decorator
 ├── udf.rs              UDF 2.50 filesystem parser
 ├── mpls.rs             MPLS playlist parser
 ├── clpi.rs             CLPI clip info parser
@@ -199,15 +201,15 @@ libfreemkv/src/
 ├── profile.rs          Bundled drive profiles
 ├── speed.rs            DriveSpeed enum
 ├── mux/
-│   ├── mod.rs          IOStream trait, public exports
-│   ├── resolve.rs      URL parser + open_input/open_output + input/output
+│   ├── mod.rs          Public mux exports
+│   ├── resolve.rs      URL parser + input/output (Box<dyn FrameSource/Sink>)
 │   ├── meta.rs         FMKV header format
 │   ├── disc.rs         DiscStream (optical drive → PES)
-│   ├── iso.rs          IsoStream (ISO image read/write)
+│   ├── iso.rs          IsoStream (ISO image read)
 │   ├── isowriter.rs    ISO image writer (UDF, AVDP, multi-extent)
-│   ├── mkvstream.rs    MkvStream (bidirectional Matroska, IOStream)
+│   ├── mkvstream.rs    MkvStream (bidirectional Matroska)
 │   ├── mkvout.rs       MkvOutputStream (PES → MKV)
-│   ├── m2ts.rs         M2tsStream (BD-TS, IOStream)
+│   ├── m2ts.rs         M2tsStream (BD-TS)
 │   ├── pesout.rs       PES output streams (M2ts, Network, Stdio, Null)
 │   ├── network.rs      NetworkStream (TCP + FMKV header)
 │   ├── stdio.rs        StdioStream (stdin/stdout pipe)

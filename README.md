@@ -53,27 +53,48 @@ output.finish()?;
 
 ### Multi-pass recovery rip
 
-For damaged discs, the library offers a two-stage rip model: fast sweep with zero-fill and a ddrescue-format mapfile, then targeted retry of bad ranges. See [`docs/rip-recovery.md`](docs/rip-recovery.md) for the full architecture.
+For damaged discs the library exposes two flat verbs — `Disc::sweep` for the
+forward Pass 1 and `Disc::patch` for retrying bad ranges. The library never
+loops; the multipass policy is the caller's job. See
+[`docs/rip-recovery.md`](docs/rip-recovery.md) and the design notes in
+`freemkv-private/memory/0_18_redesign.md`.
 
 ```rust
-use libfreemkv::disc::{CopyOptions, PatchOptions};
+use libfreemkv::{SweepOptions, PatchOptions};
+use libfreemkv::disc::{mapfile, mapfile_path_for};
+use std::path::Path;
 
-// Pass 1: disc → ISO. Fast 64 KB reads, skip-forward on failure,
-// zero-fill bad blocks, write a sidecar .mapfile.
-let mut result = disc.copy(
-    &mut drive,
-    Path::new("disc.iso"),
-    &CopyOptions { skip_on_error: true, skip_forward: true, ..Default::default() },
-)?;
+let iso = Path::new("disc.iso");
 
-// Pass 2..N: retry bad ranges with full drive recovery.
-// Idempotent — call as many times as you want.
-while result.bytes_unreadable + result.bytes_pending > 0 {
-    let pr = disc.patch(&mut drive, Path::new("disc.iso"), &PatchOptions::default())?;
-    if pr.bytes_recovered_this_pass == 0 { break; }
+// Pass 1: disc → ISO. Skip-on-error, zero-fill, write the sidecar mapfile.
+disc.sweep(&mut drive, iso, &SweepOptions {
+    decrypt: true,
+    resume: false,
+    batch_sectors: None,
+    skip_on_error: true,
+    progress: None,
+    halt: None,
+})?;
+
+// Pass 2..N: retry every non-finished range. Idempotent.
+loop {
+    let map = mapfile::Mapfile::load(&mapfile_path_for(iso))?;
+    let stats = map.stats();
+    if stats.bytes_pending + stats.bytes_unreadable == 0 { break; }
+
+    let outcome = disc.patch(&mut drive, iso, &PatchOptions {
+        decrypt: true,
+        block_sectors: None,
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: None,
+        halt: None,
+    })?;
+    if outcome.bytes_recovered_this_pass == 0 { break; }
 }
 
-// Then mux from the ISO via the normal stream pipeline (no drive involvement).
+// Mux from the ISO via the normal stream pipeline (no drive involvement).
 ```
 
 ## What It Does
@@ -92,14 +113,14 @@ while result.bytes_unreadable + result.bytes_pending > 0 {
 | Stream | Input | Output | Transport |
 |--------|-------|--------|-----------|
 | DiscStream | Yes | -- | Optical drive via SCSI |
-| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written via `Disc::copy()`) |
+| IsoStream | Yes | -- | Blu-ray ISO image file (read via stream pipeline; written via `Disc::sweep()`) |
 | MkvStream | Yes | Yes | Matroska container |
 | M2tsStream | Yes | Yes | BD transport stream with FMKV metadata header |
 | NetworkStream | Yes (listen) | Yes (connect) | TCP with FMKV metadata header |
 | StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
 | NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-Streams implement `pes::Stream` (frame-level). `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
+Streams implement `FrameSource` (read) and/or `FrameSink` (write); direction is type-checked. `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
 AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
 
@@ -122,7 +143,8 @@ Disc                   — scan titles, streams, AACS/CSS state
   └── KEYDB            — download + verify + save
 
 Streams                — unified PES pipeline
-  ├── pes::Stream      — read()/write() PES frames
+  ├── FrameSource      — read() PES frames (direction-typed)
+  ├── FrameSink        — write() PES frames (direction-typed)
   ├── DiscStream       — sectors → decrypt → TS demux → PES
   ├── IsoStream        — ISO file → decrypt → TS demux → PES
   ├── MkvStream        — MKV mux/demux

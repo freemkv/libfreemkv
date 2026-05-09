@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.18.1 (2026-05-09)
+
+### I/O stack redesign — primitives over orchestration
+
+0.18 reshapes the read/write surface from "library does the multipass dance"
+to "library hands the caller flat verbs and a few composable primitives." All
+in-tree consumers (autorip, the `freemkv` CLI) drove their own multipass
+loops in 0.18 rounds 1-3; 0.18.1 lands the cleanup with the deprecated names
+still alive for one minor-version window.
+
+The 0.18 design notes are in
+`freemkv-private/memory/0_18_redesign.md` (private) — this entry sticks to
+what changed at the public surface.
+
+#### Flat verbs
+
+`Disc::sweep` is the forward Pass 1. `Disc::patch` is one retry pass over the
+mapfile. Neither knows about pass index, retry budget, or accept-loss policy
+— the caller invokes them in whatever sequence its use case dictates. The
+old multipass-aware `Disc::copy` dispatcher is deprecated and slated for
+deletion in 0.18.2; no in-tree caller still uses it.
+
+#### Trait splits — direction-typed at compile time
+
+- `pes::Stream` (combined read+write) is split into `FrameSource` and
+  `FrameSink`. Calling `read()` on a write-only sink is now a compile error,
+  not the runtime `E9001` (`StreamWriteOnly`) it used to be.
+- `SectorReader` is split into `SectorSource` (read) and `SectorSink`
+  (write). `Drive` impls `SectorSource` only; `FileSectorSource` /
+  `FileSectorSink` replace `FileSectorReader` for ISO-backed I/O.
+- A blanket impl bridges legacy `SectorReader` callers onto the new
+  `SectorSource` so existing code keeps compiling through the deprecation
+  window.
+
+#### New primitives
+
+- `Halt` — one cancellation token (cloneable, `Arc<AtomicBool>` under the
+  hood) replaces the three near-duplicate halt flags scattered through the
+  workspace. Threaded through every long-running loop.
+- `Pipeline<I, R>` + `Sink<I>` — generic producer/consumer primitive in
+  `crate::io`. Replaces the bespoke `disc/sweep_pipeline.rs` and now also
+  drives `Disc::patch` and the autorip mux loop. `DEFAULT_PIPELINE_DEPTH`
+  for streaming reads (`4`); `WRITE_THROUGH_DEPTH` for write-through patch
+  semantics (`1`).
+- `WritebackFile` — was `crate::io::Writer`. The renamed type makes its job
+  explicit: a `File` wrapper that runs continuous `sync_file_range` +
+  `posix_fadvise(DONTNEED)` to keep the kernel dirty-page cache bounded on
+  long sequential writes.
+- `DecryptingSectorSource<S>` — a single decorator wrapping any
+  `SectorSource` to yield plaintext sectors. One audit surface for AACS /
+  CSS / passthrough; the previous two-site decrypt (sweep producer +
+  `DiscStream` demux) is gone.
+
+#### Throughput
+
+The round-2 producer/consumer split is now applied uniformly to sweep,
+patch, and mux. Mux on NFS-staged UHD measured ~16 MB/s sustained on the
+test bed (was ~12 MB/s pre-round-2).
+
+#### Module reorg
+
+- `sector/` and `io/` are now module directories.
+- `disc/sweep.rs`, `disc/patch.rs`, and `disc/mapfile.rs` split out of the
+  monolithic `disc/mod.rs`.
+
+#### Renames (no behavior change)
+
+- `crate::io::Writer` → `crate::io::WritebackFile`.
+- `Apply` → `Flow` (`Sink::apply` return value).
+- `DEFAULT_DEPTH` → `DEFAULT_PIPELINE_DEPTH`.
+- `PatchOpts` → `PatchOptions`.
+
+#### Deprecated (alive in 0.18.1, deletion target 0.18.2)
+
+`Disc::copy`, `pes::Stream`, `SectorReader`, `FileSectorReader`,
+`CopyOptions`, `CopyResult`, `DiscStream::set_halt`. Each compiles with a
+deprecation warning; all in-tree call sites have migrated.
+
 ## 0.17.13 (2026-05-09)
 
 ### Use `crate::io::Writer` uniformly for all binary file output
