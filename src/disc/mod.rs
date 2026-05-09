@@ -1978,10 +1978,14 @@ impl Disc {
         let is_regular = std::fs::metadata(path)
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .map_err(|e| Error::IoError { source: e })?;
+        // Same bounded-cache writeback wrapper sweep uses, so patch's
+        // recovery writes (sparse but can be many across a damaged region)
+        // get the burst-flush protection on slow / NFS-backed staging.
+        let mut file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
 
         // Log ISO file size at patch start for write monitoring
         if let Ok(metadata) = std::fs::metadata(path) {

@@ -242,15 +242,23 @@ pub fn output(
     match parsed {
         StreamUrl::Mkv { ref path } => {
             validate_file_path(path, "mkv")?;
+            // Wrap the raw `File` in `crate::io::Writer` (bounded-cache
+            // writeback) so a UHD-scale MKV mux to slow / network-attached
+            // staging doesn't hit the dirty-page burst pathology that
+            // sweep already side-steps. BufWriter sits on top to coalesce
+            // mux's many small EBML element writes.
             let file = std::fs::File::create(path)?;
-            let writer: Box<dyn super::WriteSeek> =
-                Box::new(std::io::BufWriter::with_capacity(IO_BUF_SIZE, file));
+            let writer: Box<dyn super::WriteSeek> = Box::new(std::io::BufWriter::with_capacity(
+                IO_BUF_SIZE,
+                crate::io::Writer::new(file)?,
+            ));
             Ok(Box::new(MkvStream::create(writer, title)?))
         }
         StreamUrl::M2ts { ref path } => {
             validate_file_path(path, "m2ts")?;
             let file = std::fs::File::create(path)?;
-            let writer = std::io::BufWriter::with_capacity(IO_BUF_SIZE, file);
+            let writer =
+                std::io::BufWriter::with_capacity(IO_BUF_SIZE, crate::io::Writer::new(file)?);
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
         StreamUrl::Network { ref addr } => {
