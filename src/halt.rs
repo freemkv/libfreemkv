@@ -20,10 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// no `reset()` by design — construct a fresh `Halt` for a fresh
 /// operation.
 ///
-/// Construct with [`Halt::new`]. We intentionally don't derive
-/// `Default` — `Halt::new()` is more discoverable, matches the
-/// stdlib `Mutex::new` / `Arc::new` convention, and keeps the
-/// uncancelled-by-construction invariant in one named place.
+/// Construct with [`Halt::new`] (or [`Halt::default`]). The `Default`
+/// impl forwards to `new()` — both produce a fresh, uncancelled token.
+/// The pair exists because clippy's `new_without_default` lint requires
+/// `Default` whenever a public `new()` is present, even when the two
+/// would do exactly the same thing.
 #[derive(Clone, Debug)]
 pub struct Halt(Arc<AtomicBool>);
 
@@ -41,6 +42,12 @@ impl Halt {
     /// Read the shared flag.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for Halt {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -103,5 +110,4 @@ mod tests {
         handle.join().unwrap();
         assert!(h.is_cancelled());
     }
-
 }
