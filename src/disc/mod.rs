@@ -1414,7 +1414,11 @@ impl Disc {
             f
         };
 
-        let mut file = file;
+        // Wrap the raw `File` in our bounded-cache writer so the
+        // kernel's writeback queue drains continuously instead of
+        // accumulating hundreds of MB of dirty pages and then bursting
+        // a flush that blocks app writes (see `crate::io`).
+        let mut file = crate::io::Writer::new(file).map_err(|e| Error::IoError { source: e })?;
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
             None if opts.skip_on_error => ecc_sectors(self.format),
