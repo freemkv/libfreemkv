@@ -144,6 +144,54 @@ impl<T: SectorReader + ?Sized> SectorSource for T {
     }
 }
 
+// Forwarding impls so callers can wrap `&mut dyn SectorReader` /
+// `Box<dyn SectorReader>` in [`DecryptingSectorSource`] without
+// having to unbox or re-borrow inside the lib's hot paths. The
+// generic `&mut T` / `Box<T>` blankets would conflict with the
+// `SectorReader → SectorSource` blanket above (a downstream crate
+// could `impl SectorReader for &mut U`); the specific
+// `dyn SectorReader` instantiations are unambiguous because
+// `SectorReader` is the very trait whose `dyn` we're targeting.
+impl SectorSource for &mut (dyn SectorReader + '_) {
+    fn capacity_sectors(&self) -> u32 {
+        <dyn SectorReader as SectorReader>::capacity(*self)
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
+        <dyn SectorReader as SectorReader>::read_sectors(*self, lba, count, buf, recovery)
+    }
+
+    fn set_speed(&mut self, kbs: u16) {
+        <dyn SectorReader as SectorReader>::set_speed(*self, kbs)
+    }
+}
+
+impl SectorSource for Box<dyn SectorReader> {
+    fn capacity_sectors(&self) -> u32 {
+        <dyn SectorReader as SectorReader>::capacity(&**self)
+    }
+
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> Result<usize> {
+        <dyn SectorReader as SectorReader>::read_sectors(&mut **self, lba, count, buf, recovery)
+    }
+
+    fn set_speed(&mut self, kbs: u16) {
+        <dyn SectorReader as SectorReader>::set_speed(&mut **self, kbs)
+    }
+}
+
 pub use decrypting::DecryptingSectorSource;
 pub use file::{FileSectorSink, FileSectorSource};
 

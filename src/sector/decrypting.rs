@@ -53,6 +53,16 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         self
     }
 
+    /// Replace the configured keys without unwrapping the decorator.
+    /// Used by `DiscStream::set_raw()` to flip from encrypted-disc
+    /// decryption to a pass-through after the inner reader is already
+    /// owned by the wrapper. For new construction prefer [`new`].
+    ///
+    /// [`new`]: Self::new
+    pub fn set_keys(&mut self, keys: DecryptKeys) {
+        self.keys = keys;
+    }
+
     /// Borrow the inner source. Useful for tests and for adapters
     /// that want to introspect the underlying drive / file without
     /// unwrapping the decorator.
