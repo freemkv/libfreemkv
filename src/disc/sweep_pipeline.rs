@@ -199,7 +199,8 @@ fn consumer_loop(
         }
     }
 
-    // Final flush — drain the writeback pipeline + fsync the ISO.
+    // Final flush — drain the writeback pipeline + fsync the ISO,
+    // then persist any pending mapfile state.
     if first_error.is_none() {
         if let Err(e) = inputs.file.sync_all() {
             if inputs.is_regular {
@@ -207,6 +208,9 @@ fn consumer_loop(
             }
             // Non-regular outputs (/dev/null, pipes) always fail
             // sync_all; that's not a real error.
+        }
+        if let Err(e) = inputs.map.flush() {
+            first_error = Some(Error::IoError { source: e });
         }
     }
 

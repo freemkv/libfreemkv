@@ -2956,6 +2956,7 @@ impl Disc {
                 "patch: sync_all failed for non-regular file; ignoring"
             );
         }
+        map.flush().map_err(|e| Error::IoError { source: e })?;
 
         // Log final ISO file size for write verification
         if let Ok(metadata) = std::fs::metadata(path) {
