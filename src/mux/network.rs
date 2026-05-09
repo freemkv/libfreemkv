@@ -70,6 +70,7 @@ impl NetworkStream {
     }
 }
 
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
@@ -157,6 +158,7 @@ mod tests {
 
     #[test]
     #[ignore] // Requires TCP; may be flaky in CI environments
+    #[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
     fn network_pes_roundtrip() {
         use crate::pes;
 

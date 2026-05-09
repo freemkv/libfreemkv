@@ -60,6 +60,7 @@ impl StdioStream {
     }
 }
 
+#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for StdioStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         self.ensure_header_read()?;

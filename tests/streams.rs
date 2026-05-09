@@ -1,5 +1,10 @@
 //! Integration tests for the PES stream pipeline.
 
+// 0.18 trait split: this suite still drives the deprecated `pes::Stream`
+// trait directly. It will be migrated to `FrameSource`/`FrameSink` in the
+// follow-up that ports concrete impls.
+#![allow(deprecated)]
+
 use libfreemkv::mux::meta::M2tsMeta;
 use libfreemkv::pes::Stream as PesStream;
 use libfreemkv::*;
