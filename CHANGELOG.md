@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.17.11 (2026-05-09)
+
+### Sweep producer/consumer split — overlap drive read with file write
+
+Pre-0.17.11 the sweep loop ran strictly serialised: SCSI read → decrypt
+→ seek + write → mapfile.record → next read. The drive idled for the
+post-read work; throughput capped at the **sum** of both costs. On a
+healthy disc that's ~7-12 ms read + ~5-15 ms write/record per 64 KB
+batch — limiting sustained throughput to ~10-12 MB/s on the test bed
+(BU40N + UHD inner zone), well below the drive's ceiling of ~14-16 MB/s.
+
+This release decouples them with a producer / consumer split:
+
+- **Producer** (caller's thread): owns the `SectorReader`, the entire
+  `read_error` state machine (Retry, Bisect, SkipBlock, JumpAhead,
+  AbortPass), `set_speed` damage-zone transitions, halt check, and
+  decrypt. Hands plaintext bytes to the consumer.
+- **Consumer** (one spawned thread): owns the `crate::io::Writer` and
+  the `Mapfile`. Receives `WorkItem` messages and applies the file
+  write + mapfile record per item.
+- **Channel**: bounded `mpsc::sync_channel(4)` — natural back-pressure
+  via blocking `send` when consumer falls behind.
+
+While the consumer is writing batch N to disk and updating the mapfile,
+the producer is already reading batch N+1 from the drive. Steady-state
+throughput is now bound by the slower of the two pipelines (the drive,
+on a healthy disc) instead of their sum.
+
+Side effects of the refactor:
+
+- **Bisect path now decrypts.** Pre-0.17.11 the bisect inner loop wrote
+  raw cyphertext when `decrypt=true` and a single sector was recovered
+  via single-sector retry — a quiet correctness bug exercised only by
+  the (rare) batch-fail-then-bisect-succeed path on encrypted discs.
+  The new producer-side decrypt covers both the main success path and
+  the bisect inner success path.
+- All `read_error::ReadCtx` state stays single-threaded on the producer
+  (damage window, jump multiplier, consecutive-good count, etc.). No
+  locking added.
+- Mapfile remains single-writer (consumer-only). No locking.
+- Halt-flag responsiveness unchanged: producer breaks the loop on
+  signal, sends `Finish`, consumer drains its ≤4 in-flight items and
+  exits within ~1 batch (~12 ms typical).
+- BU40N + Initio bridge wedge concern unchanged: still one SCSI command
+  in flight, error-path timing identical, no new retry logic.
+
+New module: `src/disc/sweep_pipeline.rs` (`WorkItem`, `ProgressSnapshot`,
+`ConsumerInputs`, `spawn_consumer`, `consumer_loop`, send/recv helpers).
+Public API surface unchanged — `Disc::copy` / `CopyOptions` /
+`CopyResult` look identical to callers.
+
+Patch (Pass N) is **not** affected by this release. Patch is bound by
+drive recovery time (60 s timeouts on bad sectors), not the read↔write
+serialisation; a similar split there would yield negligible benefit.
+
 ## 0.17.10 (2026-05-09)
 
 ### Bounded-cache writeback for big sequential writes

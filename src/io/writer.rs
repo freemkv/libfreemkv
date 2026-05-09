@@ -12,7 +12,7 @@
 //!
 //! See `super::writeback::linux` for the pathology and the strategy.
 
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 
 use super::writeback::WritebackPipeline;
@@ -38,10 +38,6 @@ impl Writer {
             pipeline,
             pos,
         })
-    }
-
-    pub(crate) fn metadata(&self) -> io::Result<Metadata> {
-        self.file.metadata()
     }
 
     /// Drain in-flight writeback then issue a full fsync. Use this in
