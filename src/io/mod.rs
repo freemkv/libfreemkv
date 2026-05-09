@@ -9,8 +9,21 @@
 //! accumulate-then-burst flush behaviour. macOS and Windows use a
 //! no-op pipeline — their default cache policies have not been shown
 //! to exhibit the same pathology for this access pattern.
+//!
+//! `Pipeline` + `Sink` (0.18) is the generic producer/consumer primitive
+//! used by sweep, patch, and mux to overlap reads with writes via a
+//! bounded channel + dedicated consumer thread.
 
 mod writeback;
 mod writeback_file;
 
+pub mod pipeline;
+
 pub(crate) use writeback_file::WritebackFile;
+
+// Re-exports for the 0.18 redesign. Currently flagged unused because
+// no in-tree call site has been migrated yet (sweep is still on
+// `disc/sweep_pipeline.rs`; patch and mux have no pipeline). The next
+// 0.18 slice removes this allow as it wires up the first consumer.
+#[allow(unused_imports)]
+pub use pipeline::{Apply, DEFAULT_DEPTH, Pipeline, Sink};
