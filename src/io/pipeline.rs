@@ -15,7 +15,7 @@
 //! - Producer dropping the channel (via `Pipeline::finish` dropping
 //!   `tx`) signals end-of-stream; consumer flushes via `close()` and
 //!   returns its `Output`.
-//! - Consumer returning [`Apply::Stop`] also calls `close()` and
+//! - Consumer returning [`Flow::Stop`] also calls `close()` and
 //!   returns its `Output`. `send()` from the producer will then either
 //!   succeed (if the item already fit in the channel buffer) or fail
 //!   with `Err(item)` once the consumer has dropped its receiver.
@@ -28,13 +28,13 @@
 //!
 //! ## Dead-code suppression
 //!
-//! The `Pipeline` / `Sink` / `Apply` / `DEFAULT_DEPTH` items are
-//! crate-internal API today (the parent `io` module is
-//! `pub(crate)`) but have no in-tree callers in this slice — sweep
-//! is still on `disc/sweep_pipeline.rs`, patch and mux still have
-//! no pipeline at all. Wiring them up is the next slice of the
-//! 0.18 redesign. The `#[allow]` below is removed once any of
-//! those three call sites lands on this primitive.
+//! The `Pipeline` / `Sink` / `Flow` / `DEFAULT_PIPELINE_DEPTH` /
+//! `WRITE_THROUGH_DEPTH` items are crate-internal API today (the
+//! parent `io` module is `pub(crate)`) but have no in-tree callers
+//! in this slice — sweep is still on `disc/sweep_pipeline.rs`, patch
+//! and mux still have no pipeline at all. Wiring them up is the
+//! next slice of the 0.18 redesign. The `#[allow]` below is removed
+//! once any of those three call sites lands on this primitive.
 
 #![allow(dead_code)]
 
@@ -44,14 +44,29 @@ use std::thread::{self, JoinHandle};
 
 use crate::error::Error;
 
-/// Default channel depth for callers that don't have a specific
-/// reason to pick another value. Sweep and mux are both expected to
-/// use this; patch may want `1` (write-through).
-pub const DEFAULT_DEPTH: usize = 4;
+/// Default channel depth for callers without a specific reason to
+/// pick another value.
+///
+/// Empirically tuned for sweep and mux — both want enough slack that
+/// short consumer stalls don't immediately back up onto the producer,
+/// but not so much that a producer outpacing the consumer accumulates
+/// arbitrary buffered work. `4` matches the depth `disc/sweep_pipeline.rs`
+/// has used since 0.17.11. Patch should usually use
+/// [`WRITE_THROUGH_DEPTH`] (`1`) instead — write-through gives clean
+/// back-pressure between every read attempt and the matching write,
+/// which matters when the consumer is updating the mapfile in lockstep.
+pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 
-/// Outcome of [`Sink::apply`]: either keep feeding items, or stop the
-/// pipeline early and run `close()`.
-pub enum Apply {
+/// Channel depth for write-through pipelines. Each `send` fully
+/// drains before the next can enqueue. Use this when the producer
+/// must observe consumer side-effects (e.g. mapfile state) before
+/// emitting the next item.
+pub const WRITE_THROUGH_DEPTH: usize = 1;
+
+/// Outcome of [`Sink::apply`]: either keep feeding items
+/// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
+/// ([`Flow::Stop`]).
+pub enum Flow {
     Continue,
     Stop,
 }
@@ -64,16 +79,16 @@ pub trait Sink<I>: Send + 'static {
     /// [`Pipeline::finish`].
     type Output: Send + 'static;
 
-    /// Apply one item. Returning [`Apply::Continue`] keeps the
-    /// pipeline running; [`Apply::Stop`] ends it cleanly (still calls
+    /// Apply one item. Returning [`Flow::Continue`] keeps the
+    /// pipeline running; [`Flow::Stop`] ends it cleanly (still calls
     /// `close()`). An error short-circuits: `close()` is *not* called
     /// and the error is what `finish()` will return, but the consumer
     /// keeps draining the channel so the producer never blocks on a
     /// dead receiver.
-    fn apply(&mut self, item: I) -> Result<Apply, Error>;
+    fn apply(&mut self, item: I) -> Result<Flow, Error>;
 
     /// Called once at end-of-stream — either because the producer
-    /// dropped `tx` or because `apply` returned [`Apply::Stop`]. Use
+    /// dropped `tx` or because `apply` returned [`Flow::Stop`]. Use
     /// this to flush, fsync, finalise. Skipped if any prior `apply`
     /// returned `Err`.
     fn close(self) -> Result<Self::Output, Error>;
@@ -91,8 +106,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// [`Sink`].
     ///
     /// The thread is named `freemkv-pipeline-consumer` so it shows up
-    /// distinctly in stack traces and `top -H`.
-    pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Self {
+    /// distinctly in stack traces and `top -H`. Returns an
+    /// `Error::IoError` if the OS refuses the thread spawn (resource
+    /// exhaustion); callers already operate in fallible context, so
+    /// this is propagated rather than panicked.
+    pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         let (tx, rx) = sync_channel::<I>(depth);
         let handle = thread::Builder::new()
             .name("freemkv-pipeline-consumer".into())
@@ -109,8 +127,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                         continue;
                     }
                     match sink.apply(item) {
-                        Ok(Apply::Continue) => {}
-                        Ok(Apply::Stop) => {
+                        Ok(Flow::Continue) => {}
+                        Ok(Flow::Stop) => {
                             stopped = true;
                         }
                         Err(e) => {
@@ -124,15 +142,22 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     None => sink.close(),
                 }
             })
-            .expect("spawning a thread should not fail");
+            .map_err(|e| Error::IoError { source: e })?;
 
-        Pipeline { tx, handle }
+        Ok(Pipeline { tx, handle })
     }
 
     /// Push one item. Blocks if the channel is full — that's the
     /// back-pressure the whole primitive exists to provide. Returns
     /// the item back if the consumer thread is gone (panicked or
     /// already returned).
+    ///
+    /// After the consumer returns [`Flow::Stop`], `send` will silently
+    /// buffer items into the channel until the channel fills, then
+    /// return `Err(item)` once the consumer has dropped its receiver.
+    /// Producers that need to stop pushing on `Stop` should track an
+    /// independent signal (e.g. `Halt`) — `send` alone is not the
+    /// notification edge.
     pub fn send(&self, item: I) -> Result<(), I> {
         self.tx.send(item).map_err(|e| e.0)
     }
@@ -141,7 +166,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// thread to finish. Returns whatever the consumer's `close()`
     /// produced, or the first `apply` error, or — on consumer panic —
     /// an `Error::IoError` whose source is `io::Error::other(...)`
-    /// with a "panicked" message.
+    /// with a "pipeline consumer panicked: <payload>" message
+    /// (callers can match on the constant prefix).
     pub fn finish(self) -> Result<R, Error> {
         let Pipeline { tx, handle } = self;
         // Explicit drop, although the destructure already drops `tx`
@@ -149,9 +175,20 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         drop(tx);
         match handle.join() {
             Ok(result) => result,
-            Err(_) => Err(Error::IoError {
-                source: io::Error::other("pipeline consumer panicked"),
-            }),
+            Err(payload) => {
+                // Preserve the original panic message when the
+                // consumer's panic payload was a `&str` or `String`
+                // (the two stdlib formats that `panic!` produces).
+                // Anything else falls back to "(no message)".
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("(no message)");
+                Err(Error::IoError {
+                    source: io::Error::other(format!("pipeline consumer panicked: {msg}")),
+                })
+            }
         }
     }
 }
@@ -171,9 +208,9 @@ mod tests {
     impl Sink<u64> for SumSink {
         type Output = u64;
 
-        fn apply(&mut self, item: u64) -> Result<Apply, Error> {
+        fn apply(&mut self, item: u64) -> Result<Flow, Error> {
             self.total += item;
-            Ok(Apply::Continue)
+            Ok(Flow::Continue)
         }
 
         fn close(self) -> Result<u64, Error> {
@@ -183,7 +220,8 @@ mod tests {
 
     #[test]
     fn happy_path_sums_items() {
-        let pipe = Pipeline::spawn(DEFAULT_DEPTH, SumSink { total: 0 });
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 })
+            .expect("spawn should succeed");
         let mut expected = 0u64;
         for i in 0..100u64 {
             expected += i;
@@ -203,10 +241,10 @@ mod tests {
     impl Sink<()> for SlowSink {
         type Output = usize;
 
-        fn apply(&mut self, _item: ()) -> Result<Apply, Error> {
+        fn apply(&mut self, _item: ()) -> Result<Flow, Error> {
             std::thread::sleep(self.delay);
             self.count.fetch_add(1, Ordering::SeqCst);
-            Ok(Apply::Continue)
+            Ok(Flow::Continue)
         }
 
         fn close(self) -> Result<usize, Error> {
@@ -229,7 +267,7 @@ mod tests {
             delay: Duration::from_millis(50),
             count: count.clone(),
         };
-        let pipe = Pipeline::spawn(2, sink);
+        let pipe = Pipeline::spawn(2, sink).expect("spawn should succeed");
 
         let start = Instant::now();
         for _ in 0..5 {
@@ -257,12 +295,12 @@ mod tests {
     impl Sink<u64> for FailOnNthSink {
         type Output = ();
 
-        fn apply(&mut self, _item: u64) -> Result<Apply, Error> {
+        fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
             let i = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
             if i == self.n {
                 Err(Error::DecryptFailed)
             } else {
-                Ok(Apply::Continue)
+                Ok(Flow::Continue)
             }
         }
 
@@ -277,13 +315,14 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let close_called = Arc::new(AtomicUsize::new(0));
         let pipe = Pipeline::spawn(
-            DEFAULT_DEPTH,
+            DEFAULT_PIPELINE_DEPTH,
             FailOnNthSink {
                 n: 3,
                 seen: seen.clone(),
                 close_called: close_called.clone(),
             },
-        );
+        )
+        .expect("spawn should succeed");
 
         // Send 10 items. Subsequent sends after the 3rd error must
         // still succeed (the consumer is draining).
@@ -304,7 +343,7 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 3);
     }
 
-    /// Returns `Apply::Stop` on the Nth apply.
+    /// Returns `Flow::Stop` on the Nth apply.
     struct StopOnNthSink {
         n: usize,
         seen: Arc<AtomicUsize>,
@@ -314,12 +353,12 @@ mod tests {
     impl Sink<u64> for StopOnNthSink {
         type Output = usize;
 
-        fn apply(&mut self, _item: u64) -> Result<Apply, Error> {
+        fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
             let i = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
             if i >= self.n {
-                Ok(Apply::Stop)
+                Ok(Flow::Stop)
             } else {
-                Ok(Apply::Continue)
+                Ok(Flow::Continue)
             }
         }
 
@@ -334,13 +373,14 @@ mod tests {
         let seen = Arc::new(AtomicUsize::new(0));
         let close_called = Arc::new(AtomicUsize::new(0));
         let pipe = Pipeline::spawn(
-            DEFAULT_DEPTH,
+            DEFAULT_PIPELINE_DEPTH,
             StopOnNthSink {
                 n: 3,
                 seen: seen.clone(),
                 close_called: close_called.clone(),
             },
-        );
+        )
+        .expect("spawn should succeed");
 
         // Send 10 items. After Stop, subsequent sends may either
         // succeed (already buffered) or fail with Err(I) (channel
@@ -365,7 +405,7 @@ mod tests {
     impl Sink<u64> for PanickingSink {
         type Output = ();
 
-        fn apply(&mut self, _item: u64) -> Result<Apply, Error> {
+        fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
             panic!("synthetic test panic");
         }
 
@@ -381,7 +421,8 @@ mod tests {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        let pipe = Pipeline::spawn(DEFAULT_DEPTH, PanickingSink);
+        let pipe =
+            Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn should succeed");
         // First send may succeed (item buffered before panic) or fail
         // (channel closed after panic) — either is fine.
         let _ = pipe.send(1);
@@ -397,9 +438,18 @@ mod tests {
         match res {
             Err(Error::IoError { source }) => {
                 let msg = source.to_string();
+                // Constant prefix lets callers match without parsing
+                // the variable payload tail.
                 assert!(
-                    msg.contains("panicked"),
-                    "expected panic message, got: {msg}"
+                    msg.contains("pipeline consumer panicked"),
+                    "expected constant panic prefix, got: {msg}"
+                );
+                // The original `panic!` payload (a `&'static str`) must
+                // be preserved — without the downcast the message
+                // would just be the prefix.
+                assert!(
+                    msg.contains("synthetic test panic"),
+                    "expected original panic payload, got: {msg}"
                 );
             }
             other => panic!("expected Err(IoError), got {other:?}"),

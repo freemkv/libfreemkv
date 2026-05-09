@@ -78,47 +78,19 @@ impl PesFrame {
     }
 }
 
-/// A PES frame source or sink. Each implementor is **either** read-only or
-/// write-only — never both.
-///
-/// Implementors fall into two camps:
-///
-/// - **Read sources**: `DiscStream` (drive or ISO), `M2tsStream` (when
-///   constructed from an existing file), `MkvStream` (demux), `NetworkStream`
-///   (TCP listener), `StdioStream::input()`. These return frames from
-///   `read()` and surface `StreamWriteOnly` (E9001) from `write()`.
-/// - **Write sinks**: `MkvStream::create`, `M2tsStream::create`,
-///   `NetworkStream::connect`, `StdioStream::output()`, `NullStream`.
-///   These accept frames in `write()` and surface `StreamReadOnly` (E9000)
-///   from `read()`. Always call `finish()` when done — that's where MKV
-///   writes its `Cues` index and `M2tsStream` flushes the TS muxer.
-///
-/// Direction is established at construction; mixing produces an error code,
-/// not a panic. Most consumers don't construct streams directly — call
-/// `mux::input(url, opts)` / `mux::output(url, title)` and let URL parsing
-/// pick the right type.
-///
-/// `info()` returns the stream's `DiscTitle` metadata (track list, codec
-/// info, duration). For sources it's parsed from the input; for sinks it's
-/// the metadata supplied at creation. Stable across all reads.
-///
-/// `codec_private(track)` exposes per-track initialization data
-/// (H.264 SPS/PPS, HEVC VPS/SPS/PPS, AC-3 fscod, etc.) that some output
-/// formats need before any frame can be written. `headers_ready()` returns
-/// false until enough input frames have been seen to populate every video
-/// track's codec-private blob — callers buffer frames they read until
-/// `headers_ready()` returns true.
+/// Deprecated; use [`FrameSource`] for read-only sources or [`FrameSink`]
+/// for write-only sinks. The runtime direction-error semantics
+/// (`StreamReadOnly` / `StreamWriteOnly` from a wrong-direction call) are
+/// removed in 0.18 — direction is type-checked.
 #[deprecated(
-    since = "0.18.0-dev",
+    since = "0.18.0",
     note = "use FrameSource (read-only) or FrameSink (write-only) instead"
 )]
 pub trait Stream {
-    /// Read the next frame, or `Ok(None)` at end of stream. Returns
-    /// `StreamWriteOnly` (E9001) on a write-only sink.
+    /// Read the next frame, or `Ok(None)` at end of stream.
     fn read(&mut self) -> std::io::Result<Option<PesFrame>>;
 
-    /// Write a frame to the sink. Returns `StreamReadOnly` (E9000) on a
-    /// read-only source.
+    /// Write a frame to the sink.
     fn write(&mut self, frame: &PesFrame) -> std::io::Result<()>;
 
     /// Finalize the stream: flush buffered frames, write any container
@@ -207,10 +179,25 @@ pub trait FrameSink: Send {
     fn info(&self) -> &crate::disc::DiscTitle;
 }
 
-// Bridge: any type implementing the deprecated `Stream` trait is also a
-// `FrameSource`. This lets existing concrete `Stream` impls in `mux/*`
-// satisfy `FrameSource` bounds without per-type migration during the
-// 0.18 deprecation window.
+// Bridge: any **`Send`** type implementing the deprecated `Stream` trait
+// is also a `FrameSource`. This lets existing concrete `Stream` impls in
+// `mux/*` satisfy `FrameSource` bounds without per-type migration during
+// the 0.18 deprecation window.
+//
+// **Send caveat (read me before tightening `Stream` itself).** This
+// blanket carries a `T: Send` bound rather than promoting `Send` to a
+// supertrait of `Stream`, because not every concrete in-tree `Stream`
+// impl is `Send`: `MkvStream` and `M2tsStream` carry `Box<dyn Read>`
+// and `Box<dyn Write>` fields whose trait objects don't include `Send`.
+// Adding `Stream: Send` would force a wider audit (every `Box<dyn Read>`
+// becomes `Box<dyn Read + Send>`) than this commit is taking on, and
+// the type-level migration target is `FrameSource` / `FrameSink`
+// directly anyway. Consequence: coercing a non-Send `Box<dyn Stream>`
+// (the return shape of `crate::mux::input` / `output`) to
+// `Box<dyn FrameSource>` will fail with a `T: Send` trait-bound error.
+// The fix on the consumer side is to construct a Send-compliant
+// `FrameSource` / `FrameSink` directly rather than relying on this
+// bridge for non-Send streams.
 //
 // Note: `FrameSink` cannot be blanket-impl'd from `Stream` because
 // `Stream::finish` takes `&mut self` while `FrameSink::finish` takes
