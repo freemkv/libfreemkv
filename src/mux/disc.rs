@@ -526,3 +526,107 @@ impl crate::pes::Stream for DiscStream {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `DiscStream` is the only meaningful `FrameSource` impl in tree (every
+    //! other concrete `pes::Stream` impl in `mux/*` is a sink). The 0.18
+    //! round-1 blanket `impl<T: pes::Stream + Send> pes::FrameSource for T`
+    //! covers `DiscStream` for free as long as it is `Send`. These tests
+    //! lock that down: a static `Send` assertion plus a `Box<dyn FrameSource>`
+    //! round trip exercising every `FrameSource` method through the trait
+    //! object, so future Send-breaking edits to `DiscStream`'s interior
+    //! types fail at compile time and the trait-bridge dispatch is verified
+    //! at runtime.
+    #![allow(deprecated)] // exercising the 0.18 deprecation-window blanket bridge.
+    use super::*;
+    use crate::disc::{ContentFormat, DiscTitle};
+    use crate::pes::FrameSource;
+
+    /// Static-assert `DiscStream: Send`. The blanket
+    /// `impl<T: pes::Stream + Send> pes::FrameSource for T` only fires for
+    /// `Send` types — if a future field on `DiscStream` is non-`Send` (e.g.
+    /// a `Box<dyn Read>` instead of `Box<dyn SectorReader>`), this fails
+    /// at compile time, before the runtime trait-object test below.
+    fn _assert_disc_stream_is_send() {
+        fn requires_send<T: Send>() {}
+        requires_send::<DiscStream>();
+    }
+
+    /// Trivial `SectorReader` that yields zeroed sectors. Empty title means
+    /// the demuxer produces no PES frames, so `read()` walks the extents to
+    /// EOF and returns `Ok(None)`. That's enough to exercise the trait-object
+    /// dispatch — the goal here is the bridge, not the demuxer.
+    struct ZeroReader {
+        capacity: u32,
+    }
+
+    impl crate::sector::SectorReader for ZeroReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    fn synthetic_title(sector_count: u32) -> DiscTitle {
+        DiscTitle {
+            extents: vec![crate::disc::Extent {
+                start_lba: 0,
+                sector_count,
+            }],
+            ..DiscTitle::empty()
+        }
+    }
+
+    /// Smallest credible witness that `DiscStream` flows through the
+    /// `FrameSource` blanket impl: build a `Box<dyn FrameSource>`, drive
+    /// `read()` to EOF, exercise `info()` / `headers_ready()` /
+    /// `codec_private()` through the trait object. The trait-bridge
+    /// correctness is what's being verified — not demuxer behaviour.
+    #[test]
+    fn frame_source_via_dyn_object() {
+        let reader = ZeroReader { capacity: 8 };
+        let title = synthetic_title(8);
+        let stream = DiscStream::new(
+            Box::new(reader),
+            title,
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+        );
+
+        let mut src: Box<dyn FrameSource> = Box::new(stream);
+
+        // Empty-title fixture has no streams configured, so headers are
+        // trivially ready and codec_private() yields nothing on track 0.
+        assert!(src.headers_ready());
+        assert!(src.codec_private(0).is_none());
+        let _ = src.info();
+
+        // Drive read() to EOF through the trait object — empty-title fixture
+        // produces no frames, but the call still routes through the blanket
+        // dispatch into Stream::read.
+        let mut frames = 0usize;
+        loop {
+            match src.read().expect("read") {
+                Some(_) => frames += 1,
+                None => break,
+            }
+            if frames > 1024 {
+                panic!("unexpected unbounded frame stream from empty title");
+            }
+        }
+        assert_eq!(frames, 0);
+    }
+}
