@@ -9,7 +9,7 @@
 //! both costs.
 //!
 //! This module decouples them. A consumer thread owns the
-//! [`crate::io::Writer`] (the ISO file) and the
+//! [`crate::io::WritebackFile`] (the ISO file) and the
 //! [`super::mapfile::Mapfile`]. The producer thread (the caller of
 //! `Disc::sweep`) keeps the [`crate::sector::SectorReader`], the
 //! [`super::read_error`] state machine, and decrypt — so what enters
@@ -112,7 +112,7 @@ pub(super) struct ConsumerSummary {
 /// happens on the producer side before send, so the consumer never
 /// sees keys.
 pub(super) struct ConsumerInputs {
-    pub file: crate::io::Writer,
+    pub file: crate::io::WritebackFile,
     pub map: Mapfile,
     /// `sync_all`-on-failure-is-an-error iff the output is a regular
     /// file. `/dev/null` and pipes always fail `sync_all`; that's not
@@ -279,7 +279,7 @@ fn apply_item(
                 .file
                 .seek(SeekFrom::Start(pos))
                 .map_err(|e| Error::IoError { source: e })?;
-            // Subsequent writes are sequential; `crate::io::Writer`'s
+            // Subsequent writes are sequential; `crate::io::WritebackFile`'s
             // seek-elision keeps them on the writeback pipeline path.
             let mut filled = 0u64;
             while filled < len {
