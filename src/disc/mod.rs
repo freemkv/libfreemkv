@@ -13,7 +13,7 @@ mod dvd;
 mod encrypt;
 pub mod mapfile;
 pub mod read_error;
-mod sweep_pipeline;
+mod sweep;
 
 use crate::drive::{Drive, extract_scsi_context};
 use crate::error::{Error, Result};
@@ -1370,10 +1370,8 @@ impl Disc {
         path: &std::path::Path,
         opts: &SweepOptions,
     ) -> Result<CopyResult> {
-        use sweep_pipeline::{
-            ConsumerInputs, ProgressSnapshot, WorkItem, send_or_abort, spawn_consumer,
-            try_recv_progress, try_request_stats,
-        };
+        use crate::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
+        use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
         let keys = if opts.decrypt {
@@ -1438,11 +1436,20 @@ impl Disc {
 
         // Spawn the consumer. It owns WritebackFile + Mapfile; the producer
         // (this thread) keeps `reader`, `read_ctx`, halt + set_speed.
-        let (work_tx, prog_rx, consumer_handle) = spawn_consumer(ConsumerInputs {
-            file,
-            map,
-            is_regular,
-        });
+        // The thread name is preserved from the 0.17.x sweep_pipeline so it
+        // stays identifiable in stack traces / `top -H`.
+        let (sink, prog_rx) = SweepSink::new(file, map, is_regular);
+        let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
+            Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
+
+        // Translate `Pipeline::send` failure (consumer gone) into the
+        // same `Error` shape the 0.17.x `send_or_abort` produced, so
+        // the producer-error semantics are unchanged.
+        fn consumer_gone() -> Error {
+            Error::IoError {
+                source: std::io::Error::other("sweep consumer terminated unexpectedly"),
+            }
+        }
 
         let mut buf = vec![0u8; batch as usize * 2048];
         let mut bytes_done = 0u64;
@@ -1533,10 +1540,8 @@ impl Disc {
                         // owned Vec. The producer's `buf` is reused
                         // for the next read.
                         let send_buf = buf[..block_bytes as usize].to_vec();
-                        if let Err(e) =
-                            send_or_abort(&work_tx, WorkItem::Good { pos, buf: send_buf })
-                        {
-                            producer_err = Some(e);
+                        if pipe.send(WorkItem::Good { pos, buf: send_buf }).is_err() {
+                            producer_err = Some(consumer_gone());
                             break 'outer;
                         }
                         bytes_done = bytes_done.saturating_add(block_bytes);
@@ -1595,14 +1600,14 @@ impl Disc {
                                                     0,
                                                 )?;
                                             }
-                                            if let Err(e) = send_or_abort(
-                                                &work_tx,
-                                                WorkItem::BisectGood {
+                                            if pipe
+                                                .send(WorkItem::BisectGood {
                                                     pos: write_pos,
                                                     buf: Box::new(sector_buf),
-                                                },
-                                            ) {
-                                                producer_err = Some(e);
+                                                })
+                                                .is_err()
+                                            {
+                                                producer_err = Some(consumer_gone());
                                                 bisect_aborted = true;
                                                 break;
                                             }
@@ -1612,11 +1617,11 @@ impl Disc {
                                                 &inner_err,
                                                 &mut read_ctx,
                                             );
-                                            if let Err(e) = send_or_abort(
-                                                &work_tx,
-                                                WorkItem::BisectBad { pos: write_pos },
-                                            ) {
-                                                producer_err = Some(e);
+                                            if pipe
+                                                .send(WorkItem::BisectBad { pos: write_pos })
+                                                .is_err()
+                                            {
+                                                producer_err = Some(consumer_gone());
                                                 bisect_aborted = true;
                                                 break;
                                             }
@@ -1632,14 +1637,14 @@ impl Disc {
                                 pos += block_bytes;
                             }
                             read_error::ReadAction::SkipBlock { pause_secs } => {
-                                if let Err(e) = send_or_abort(
-                                    &work_tx,
-                                    WorkItem::SkipFill {
+                                if pipe
+                                    .send(WorkItem::SkipFill {
                                         pos,
                                         len: block_bytes,
-                                    },
-                                ) {
-                                    producer_err = Some(e);
+                                    })
+                                    .is_err()
+                                {
+                                    producer_err = Some(consumer_gone());
                                     break 'outer;
                                 }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
@@ -1652,14 +1657,14 @@ impl Disc {
                                 sectors,
                                 pause_secs,
                             } => {
-                                if let Err(e) = send_or_abort(
-                                    &work_tx,
-                                    WorkItem::SkipFill {
+                                if pipe
+                                    .send(WorkItem::SkipFill {
                                         pos,
                                         len: block_bytes,
-                                    },
-                                ) {
-                                    producer_err = Some(e);
+                                    })
+                                    .is_err()
+                                {
+                                    producer_err = Some(consumer_gone());
                                     break 'outer;
                                 }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
@@ -1679,14 +1684,14 @@ impl Disc {
                                 let gap_start = pos + block_bytes;
                                 let gap_bytes = jump_pos.saturating_sub(gap_start);
                                 if gap_bytes > 0 {
-                                    if let Err(e) = send_or_abort(
-                                        &work_tx,
-                                        WorkItem::GapFill {
+                                    if pipe
+                                        .send(WorkItem::GapFill {
                                             pos: gap_start,
                                             len: gap_bytes,
-                                        },
-                                    ) {
-                                        producer_err = Some(e);
+                                        })
+                                        .is_err()
+                                    {
+                                        producer_err = Some(consumer_gone());
                                         break 'outer;
                                     }
                                     bytes_done = bytes_done.saturating_add(gap_bytes);
@@ -1741,8 +1746,11 @@ impl Disc {
                             "Disc::sweep inner iter"
                         );
                     }
-                    // Throttled stats refresh request.
-                    try_request_stats(&work_tx);
+                    // Throttled stats refresh request — best-effort
+                    // try_send so a busy consumer doesn't stall the
+                    // producer; the cached snapshot stays current
+                    // enough for one more iteration.
+                    let _ = pipe.try_send(WorkItem::StatsRequest);
                 }
 
                 if let Some(reporter) = opts.progress {
@@ -1792,24 +1800,25 @@ impl Disc {
             }
         }
 
-        // Tell the consumer we're done. Even on producer error, send
-        // Finish so the consumer drains cleanly and we get a summary.
-        let _ = work_tx.send(WorkItem::Finish);
-        drop(work_tx);
-
-        let summary = consumer_handle.join().map_err(|_| Error::IoError {
-            source: std::io::Error::other("sweep consumer thread panicked"),
-        })?;
+        // Producer side is done. Drop the channel and let the
+        // consumer drain whatever's still in flight, then run its
+        // close() (drain writeback, fsync, mapfile.flush) and return
+        // the final stats. On consumer panic `pipe.finish` returns
+        // the wrapped panic message via Error::IoError — same shape
+        // the previous `consumer_handle.join().map_err(...)` produced.
+        let summary = pipe.finish();
 
         // Producer-side error wins over consumer-side (the read failure
         // is what motivated quitting; the consumer's flush error, if
         // any, is downstream).
         if let Some(e) = producer_err {
+            // Drop the consumer's result if we already have a producer
+            // error, but propagate consumer-panic on top of nothing
+            // since that's strictly informative.
+            let _ = summary;
             return Err(e);
         }
-        if let Some(e) = summary.error {
-            return Err(e);
-        }
+        let summary = summary?;
 
         let stats = summary.stats;
         tracing::debug!(
@@ -3464,5 +3473,48 @@ mod tests {
             "patch to /dev/null should succeed: {:?}",
             patch_result.err()
         );
+    }
+
+    /// Synthetic regression test for the 0.18 SweepSink + Pipeline
+    /// migration. ~100 batches of clean reads (6000 sectors at the
+    /// default 60-sector single-pass batch size); verifies all bytes
+    /// land in the ISO and the consumer's final stats match the input.
+    /// The throughput regression check (vs 0.17.13) is a separate
+    /// manual / live-drive concern; here we only assert correctness.
+    #[test]
+    fn sweep_pipeline_full_good_100_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("test.iso");
+        // 6000 sectors / 60-sector default batch = exactly 100
+        // produce/consume cycles through the pipeline.
+        let sectors: u32 = 6000;
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let disc = make_test_disc(sectors, "TPipeline100");
+        let opts = CopyOptions {
+            decrypt: false,
+            multipass: false,
+            progress: None,
+            halt: None,
+        };
+        let result = disc.copy(&mut reader, &iso_path, &opts);
+        let r = result.expect("100-batch clean sweep should succeed");
+        assert!(r.complete, "complete=true expected");
+        assert!(!r.halted, "halted=false expected");
+        assert_eq!(
+            r.bytes_good,
+            sectors as u64 * 2048,
+            "all sectors must be marked good after a 100% clean sweep"
+        );
+        assert_eq!(
+            r.bytes_pending, 0,
+            "no pending bytes expected after a clean sweep"
+        );
+        // The ISO file must end up the right size — the consumer
+        // wrote everything before fsync.
+        let meta = std::fs::metadata(&iso_path).unwrap();
+        assert_eq!(meta.len(), sectors as u64 * 2048);
     }
 }
