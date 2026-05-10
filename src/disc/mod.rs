@@ -1134,11 +1134,15 @@ impl Disc {
         } else {
             (Vec::new(), ContentFormat::BdTs)
         };
-        titles.sort_by(|a, b| {
-            b.duration_secs
-                .partial_cmp(&a.duration_secs)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Title ordering: titles[0] should be the canonical main feature.
+        //
+        // Naive "longest duration first" misranks branching UHDs (see
+        // `canonical_title_order` for the full rationale). Sort the
+        // titles so the consumer-side `-t 1` / autorip's main-feature
+        // picker / `disc.titles.first()` all converge on the actual
+        // movie instead of the virtual play-all composite.
+        let capacity_bytes = capacity as u64 * 2048;
+        titles.sort_by(|a, b| Self::canonical_title_order(a, b, capacity_bytes));
 
         // 4. Metadata + labels
         let meta_title = Self::read_meta_title(reader, &udf_fs);
@@ -1177,6 +1181,57 @@ impl Disc {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /// Detect disc format from the main title's video streams.
+    /// Total ordering used to sort `Disc::titles` so `titles[0]` is the
+    /// canonical main feature.
+    ///
+    /// **Why not just sort by duration descending?** Branching UHDs
+    /// (and some BD authoring) ship a "play-all" virtual playlist that
+    /// references the same source clips multiple times for seamless
+    /// alternate-angle / alternate-ending playback. Those playlists
+    /// report an inflated `duration_secs` (often 4+ hours) and an
+    /// inflated `size_bytes` greater than the disc's physical
+    /// capacity. Example seen in the wild — *The Amateur (2025)* UHD,
+    /// 58.5 GB BD-100 disc:
+    ///
+    /// | Title | Playlist     | Duration | Size    | Clips |
+    /// |-------|--------------|----------|---------|-------|
+    /// |   1   | 00020.mpls   | 4h 13m   | 92.4 GB |  253  |
+    /// |   2   | 00800.mpls   | 2h 02m   | 57.2 GB |    1  |
+    ///
+    /// Title 1's 92.4 GB cannot fit on a 58.5 GB disc unless the same
+    /// clip data is referenced multiple times — proof it's a virtual
+    /// composite. A duration-only sort would put it at `titles[0]`,
+    /// so `freemkv -t 1`, `disc.titles.first()`, and autorip's
+    /// main-feature picker all grab the 4-hour composite instead of
+    /// the 2-hour movie that actually matches TMDB.
+    ///
+    /// **Sort priority (titles[0] = most likely main feature):**
+    /// 1. Real titles (`size_bytes ≤ capacity_bytes`) before virtual
+    ///    composites. The capacity check is a hard "physically
+    ///    possible data on this disc" gate.
+    /// 2. Among real titles, fewer clips first. A 1-clip playlist is
+    ///    the canonical main feature; multi-clip playlists are either
+    ///    chapter-stitched (small count) or virtual composites
+    ///    (large count). Fewer wins.
+    /// 3. Tiebreak on longer duration first.
+    ///
+    /// **Effect on non-branching discs:** unchanged — the main movie
+    /// is already the longest 1-clip title.
+    /// **Effect on branching UHDs:** the virtual play-all playlist is
+    /// pushed to the back, the actual movie surfaces at index 0.
+    pub fn canonical_title_order(
+        a: &DiscTitle,
+        b: &DiscTitle,
+        capacity_bytes: u64,
+    ) -> std::cmp::Ordering {
+        let a_oversize = a.size_bytes > capacity_bytes;
+        let b_oversize = b.size_bytes > capacity_bytes;
+        a_oversize
+            .cmp(&b_oversize)
+            .then_with(|| a.clips.len().cmp(&b.clips.len()))
+            .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
+    }
+
     fn detect_format(titles: &[DiscTitle]) -> DiscFormat {
         for title in titles.iter().take(3) {
             for stream in &title.streams {
@@ -3231,6 +3286,76 @@ mod tests {
             content_format: ContentFormat::BdTs,
             codec_privates: Vec::new(),
         }
+    }
+
+    /// Build a DiscTitle with full control over the fields the title
+    /// sorter cares about. Used by the canonical-title-order tests.
+    fn title_with(playlist: &str, duration_secs: f64, size_bytes: u64, n_clips: usize) -> DiscTitle {
+        let mut t = title_with_video(Codec::Hevc, Resolution::R2160p);
+        t.playlist = playlist.into();
+        t.duration_secs = duration_secs;
+        t.size_bytes = size_bytes;
+        t.clips = (0..n_clips)
+            .map(|i| Clip {
+                clip_id: format!("{i:05}"),
+                in_time: 0,
+                out_time: 1,
+                duration_secs: 1.0,
+                source_packets: 0,
+            })
+            .collect();
+        t
+    }
+
+    /// Regression for branching-UHD title ordering. Mirrors the live
+    /// observed *The Amateur (2025)* layout: a 4h13m / 92.4 GB / 253-clip
+    /// virtual play-all playlist alongside the real 2h02m / 57.2 GB /
+    /// 1-clip main feature. Disc capacity 58.5 GB. After sorting,
+    /// titles[0] must be the main feature, not the virtual composite.
+    #[test]
+    fn canonical_order_pushes_oversize_play_all_behind_real_main() {
+        const CAPACITY: u64 = 58_500_000_000; // 58.5 GB
+        let mut titles = vec![
+            // Title 1 in the raw MPLS order — virtual play-all
+            title_with("00020.mpls", 4.0 * 3600.0 + 13.0 * 60.0, 92_400_000_000, 253),
+            // Title 2 — actual movie
+            title_with("00800.mpls", 2.0 * 3600.0 + 2.0 * 60.0, 57_200_000_000, 1),
+        ];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
+        assert_eq!(titles[0].playlist, "00800.mpls", "main feature should land at index 0");
+        assert_eq!(titles[1].playlist, "00020.mpls", "virtual play-all should be pushed back");
+    }
+
+    /// Non-branching disc: longest 1-clip title is the movie. Sort
+    /// must not change behaviour — the existing "duration descending"
+    /// expectation holds when no titles overflow capacity.
+    #[test]
+    fn canonical_order_preserves_natural_ranking_on_normal_disc() {
+        const CAPACITY: u64 = 60_000_000_000;
+        let mut titles = vec![
+            title_with("00100.mpls", 600.0, 5_000_000_000, 1),  // 10 min menu
+            title_with("00800.mpls", 7320.0, 55_000_000_000, 1), // 2h02m main feature
+            title_with("00200.mpls", 1800.0, 2_000_000_000, 1), // 30 min extra
+        ];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
+        assert_eq!(titles[0].playlist, "00800.mpls", "longest valid title still wins");
+        assert_eq!(titles[1].playlist, "00200.mpls");
+        assert_eq!(titles[2].playlist, "00100.mpls");
+    }
+
+    /// Tiebreak: equal duration + equal capacity-validity → fewer
+    /// clips wins. A chapter-stitched 3-clip movie should beat a
+    /// 50-clip virtual composite of the same duration.
+    #[test]
+    fn canonical_order_fewer_clips_wins_tiebreak() {
+        const CAPACITY: u64 = 100_000_000_000;
+        let mut titles = vec![
+            title_with("00050.mpls", 7200.0, 50_000_000_000, 50),
+            title_with("00800.mpls", 7200.0, 50_000_000_000, 3),
+        ];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
+        assert_eq!(titles[0].playlist, "00800.mpls");
+        assert_eq!(titles[1].playlist, "00050.mpls");
     }
 
     #[test]
