@@ -14,14 +14,18 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --locked -- -D warnings
+      # libfreemkv is a library — Cargo.lock is gitignored. --locked
+      # would always fail on a fresh runner because there's no committed
+      # lockfile to lock against. The binary crates (freemkv, autorip,
+      # bdemu) track Cargo.lock and DO use --locked.
+      - run: cargo clippy -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
-      - run: cargo test --locked --tests
+      - run: cargo test --tests
 
   check-macos:
     runs-on: macos-latest
