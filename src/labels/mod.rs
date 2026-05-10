@@ -9,6 +9,7 @@
 
 mod criterion;
 mod ctrm;
+mod dbp;
 mod paramount;
 mod pixelogic;
 pub mod vocab;
@@ -79,6 +80,12 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ("criterion", criterion::detect, criterion::parse),
     ("pixelogic", pixelogic::detect, pixelogic::parse),
     ("ctrm", ctrm::detect, ctrm::parse),
+    // dbp last: detects on any top-level .jar in /BDMV/JAR/ (every
+    // BD-J disc has one), so parse() does the real `com/dbp/` check
+    // and returns None on a mismatch. By placing dbp last, the
+    // earlier parsers' fast file-presence detects short-circuit and
+    // dbp only runs on discs that fell through everything else.
+    ("dbp", dbp::detect, dbp::parse),
     // ("deluxe",  deluxe::detect,     deluxe::parse),  // TODO: bytecode parser
 ];
 
