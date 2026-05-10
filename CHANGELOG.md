@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.18.4 (2026-05-09)
+
+### Build / CI hardening — no library code changes
+
+- All `cargo` invocations in `.github/workflows/*.yml` now use
+  `--locked`. Previously `cargo build` / `cargo test` could silently
+  re-resolve `Cargo.lock` if a lock-pinned version wasn't yet on
+  crates.io — masking dependency races between same-tag releases of
+  sibling crates. The 0.18.3 release hit this: autorip's docker image
+  built `libfreemkv v0.18.2` because libfreemkv 0.18.3 hadn't
+  published yet at the time autorip's CI ran, and cargo silently fell
+  back to the previous version. With `--locked`, that race now hard-
+  fails the build with a clear "package X is not in registry" error
+  and we retrigger after the upstream lands.
+
+- `cargo publish --locked` in the release workflow guards against
+  publishing a lockfile-mismatched release.
+
 ## 0.18.3 (2026-05-09)
 
 ### Behaviour change
