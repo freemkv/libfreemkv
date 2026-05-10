@@ -459,11 +459,17 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
-    // Hard bound — even at 0 ms per read, 1024 sectors with skip-forward
-    // should complete in well under a second on any host.
+    // Hard bound — Pass 1 must NOT infinite-loop on a fully-failing
+    // reader. The threshold accommodates the 2026-05-10 wedge-
+    // avoidance pause (PASS_1_FAIL_PAUSE_SECS = 5 s on each failed
+    // batch). With batch=32 and 1024 sectors that's up to ~5 batch
+    // failures + a few damage-jump pauses before fast-trigger jumps
+    // us past end-of-disc — well-bounded total, ~20-30 s typical.
+    // The point of this test is "finishes cleanly, not infinitely",
+    // not "completes in milliseconds."
     assert!(
-        elapsed < Duration::from_secs(5),
-        "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 5 s"
+        elapsed < Duration::from_secs(60),
+        "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 60 s (not infinite)"
     );
 
     // Per RIP_DESIGN.md §2.1: Pass 1 must reach end of disc regardless of
