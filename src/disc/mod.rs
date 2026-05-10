@@ -3290,7 +3290,12 @@ mod tests {
 
     /// Build a DiscTitle with full control over the fields the title
     /// sorter cares about. Used by the canonical-title-order tests.
-    fn title_with(playlist: &str, duration_secs: f64, size_bytes: u64, n_clips: usize) -> DiscTitle {
+    fn title_with(
+        playlist: &str,
+        duration_secs: f64,
+        size_bytes: u64,
+        n_clips: usize,
+    ) -> DiscTitle {
         let mut t = title_with_video(Codec::Hevc, Resolution::R2160p);
         t.playlist = playlist.into();
         t.duration_secs = duration_secs;
@@ -3317,13 +3322,24 @@ mod tests {
         const CAPACITY: u64 = 58_500_000_000; // 58.5 GB
         let mut titles = vec![
             // Title 1 in the raw MPLS order — virtual play-all
-            title_with("00020.mpls", 4.0 * 3600.0 + 13.0 * 60.0, 92_400_000_000, 253),
+            title_with(
+                "00020.mpls",
+                4.0 * 3600.0 + 13.0 * 60.0,
+                92_400_000_000,
+                253,
+            ),
             // Title 2 — actual movie
             title_with("00800.mpls", 2.0 * 3600.0 + 2.0 * 60.0, 57_200_000_000, 1),
         ];
         titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
-        assert_eq!(titles[0].playlist, "00800.mpls", "main feature should land at index 0");
-        assert_eq!(titles[1].playlist, "00020.mpls", "virtual play-all should be pushed back");
+        assert_eq!(
+            titles[0].playlist, "00800.mpls",
+            "main feature should land at index 0"
+        );
+        assert_eq!(
+            titles[1].playlist, "00020.mpls",
+            "virtual play-all should be pushed back"
+        );
     }
 
     /// Non-branching disc: longest 1-clip title is the movie. Sort
@@ -3333,12 +3349,15 @@ mod tests {
     fn canonical_order_preserves_natural_ranking_on_normal_disc() {
         const CAPACITY: u64 = 60_000_000_000;
         let mut titles = vec![
-            title_with("00100.mpls", 600.0, 5_000_000_000, 1),  // 10 min menu
+            title_with("00100.mpls", 600.0, 5_000_000_000, 1), // 10 min menu
             title_with("00800.mpls", 7320.0, 55_000_000_000, 1), // 2h02m main feature
             title_with("00200.mpls", 1800.0, 2_000_000_000, 1), // 30 min extra
         ];
         titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
-        assert_eq!(titles[0].playlist, "00800.mpls", "longest valid title still wins");
+        assert_eq!(
+            titles[0].playlist, "00800.mpls",
+            "longest valid title still wins"
+        );
         assert_eq!(titles[1].playlist, "00200.mpls");
         assert_eq!(titles[2].playlist, "00100.mpls");
     }
