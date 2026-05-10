@@ -1634,9 +1634,7 @@ impl Disc {
 
                         match action {
                             read_error::ReadAction::Retry { pause_secs } => {
-                                if pause_secs > 0 {
-                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
-                                }
+                                sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
                             }
                             read_error::ReadAction::Bisect => {
                                 read_ctx.bisecting = true;
@@ -1713,9 +1711,7 @@ impl Disc {
                                     break 'outer;
                                 }
                                 bytes_done = bytes_done.saturating_add(block_bytes);
-                                if pause_secs > 0 {
-                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
-                                }
+                                sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
                                 pos += block_bytes;
                             }
                             read_error::ReadAction::JumpAhead {
@@ -1770,9 +1766,7 @@ impl Disc {
                                     "damage-jump"
                                 );
                                 pos = jump_pos;
-                                if pause_secs > 0 {
-                                    std::thread::sleep(std::time::Duration::from_secs(pause_secs));
-                                }
+                                sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
                             }
                             read_error::ReadAction::AbortPass => {
                                 let (status, sense) = extract_scsi_context(&err);
@@ -1972,6 +1966,34 @@ pub struct PatchOutcome {
     pub blocks_read_failed: u64,
     pub wedged_exit: bool,
     pub wedged_threshold: u64,
+}
+
+/// Sleep `secs` seconds, but break early if `halt` flips to true.
+/// Used by Pass 1's wedge-avoidance inter-error pause so halt
+/// remains responsive regardless of how long the pause is.
+/// Polling granularity 100 ms — bounded latency on halt regardless
+/// of pause length.
+pub(crate) fn sleep_secs_or_halt(
+    secs: u64,
+    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    if secs == 0 {
+        return;
+    }
+    let Some(h) = halt else {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return;
+    };
+    let total = std::time::Duration::from_secs(secs);
+    let slice = std::time::Duration::from_millis(100);
+    let start = std::time::Instant::now();
+    while start.elapsed() < total {
+        if h.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let remaining = total.saturating_sub(start.elapsed());
+        std::thread::sleep(remaining.min(slice));
+    }
 }
 
 pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {

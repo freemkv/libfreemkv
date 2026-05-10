@@ -187,6 +187,24 @@ const NOT_READY_MAX_RETRIES: u32 = 3;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 15;
 const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
 
+/// Pass 1 inter-error pause. ZERO on the clean path (sweep zooms
+/// past damage windows) but applied to every failed read so the
+/// drive's firmware gets cool-down time between damage-cluster
+/// exposures. Wedge-avoidance change 2026-05-10: pre-fix `pause_secs
+/// = 0` on Pass 1 errors caused back-to-back exposures that
+/// accumulated firmware wedge state.
+const PASS_1_FAIL_PAUSE_SECS: u64 = 5;
+
+/// Base of the damage-jump distance formula: `jump_sectors =
+/// JUMP_BASE_SECTORS × batch × jump_multiplier`. Bumped 2026-05-10
+/// from 256 → 1024 (4×) so the first damage-jump at batch=32 covers
+/// 64 MB instead of 16 MB. Empirically the BU40N's damage clusters
+/// are 100+ MB wide; 16 MB jumps landed inside the cluster and the
+/// re-read added to the firmware wedge counter. 64 MB → 128 MB
+/// (after one doubling) clears almost any single-cluster damage in
+/// 2 jumps.
+const JUMP_BASE_SECTORS: u64 = 1024;
+
 // Firmware-wedge skip policy for Pass 1 sweep
 // ===========================================
 //
@@ -385,13 +403,31 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         bad_count * 100 / ctx.damage_window.len()
     };
 
-    // Pass 1's job is to get to the end of the disc fast. Inter-
-    // block pauses help the drive cool down on Pass N (gentle
-    // recovery on bad ranges) but on Pass 1 they just turn a 30 s
-    // damage zone into 30 minutes of dead-air sleep. Pass N
-    // (`bisect_on_marginal=true`) keeps the original cooldown logic.
+    // Inter-error pause on Pass 1 — wedge avoidance.
+    //
+    // Pre-2026-05-10 Pass 1 ran `pause_secs = 0` on all errors so
+    // sweep would zoom past damage zones in seconds instead of
+    // minutes. Empirically on the BU40N this caused firmware-wedge
+    // events: each read failure leaves residual state in the drive's
+    // firmware, and back-to-back errors without cooldown accumulate
+    // toward a wedge threshold. We hit wedge on Dune Pt 2 after 5
+    // errors in 43 s spread over a 140 MB damage cluster — even
+    // though wall-clock pacing was slow, the drive had no breathing
+    // room between exposures.
+    //
+    // New policy: Pass 1 keeps `pause = 0` on the CLEAN path
+    // (successful reads zoom past damage windows fine), but every
+    // failed read takes a PASS_1_FAIL_PAUSE_SECS pause before the
+    // next read. Cost: ~5 s extra per scattered failure, ~30-60 s
+    // total in a damage cluster — trivial compared to the alternative
+    // of crashing the whole rip at 48%. Long failure streaks still
+    // escalate via CONSECUTIVE_FAIL_LONG_PAUSE.
     let pause_secs = if !ctx.bisect_on_marginal {
-        0
+        if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
+            CONSECUTIVE_FAIL_LONG_PAUSE_SECS
+        } else {
+            PASS_1_FAIL_PAUSE_SECS
+        }
     } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
         CONSECUTIVE_FAIL_LONG_PAUSE_SECS
     } else {
@@ -403,6 +439,14 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    entire rest of the disc (observed 2026-05-07: a saturated
     //    multiplier produced a 56 GB jump). Saturating arithmetic on
     //    the sector calc as defence in depth.
+    //
+    //    Jump base bumped 2026-05-10 from 256 to 1024 sectors per
+    //    multiplier unit (= 64 MB first jump at batch=32, up from
+    //    16 MB). The smaller base routinely landed jumps back inside
+    //    damage clusters of 100+ MB, each landing adding to the
+    //    firmware's wedge counter. 64 MB initial + 128 MB second +
+    //    256 MB third clears almost any single-cluster damage
+    //    pattern we've seen in 2 jumps.
     //
     //    Two triggers, evaluated in order:
     //
@@ -416,13 +460,15 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //       sliding window of 16 outer reads. Pass N's only path,
     //       and Pass 1's fallback if the failures are scattered
     //       enough that we don't hit the consecutive threshold.
-    const MAX_JUMP_MULTIPLIER: u64 = 64; // 64 × 256 × batch sectors
+    const MAX_JUMP_MULTIPLIER: u64 = 64;
     let fast_trigger = !ctx.bisecting && ctx.consecutive_outer_failures >= ctx.fast_jump_threshold;
     let window_trigger =
         ctx.damage_window.len() >= ctx.damage_window_max && bad_pct >= ctx.damage_threshold_pct;
     if fast_trigger || window_trigger {
         let mult = ctx.jump_multiplier.min(MAX_JUMP_MULTIPLIER);
-        let sectors = 256u64.saturating_mul(ctx.batch as u64).saturating_mul(mult);
+        let sectors = JUMP_BASE_SECTORS
+            .saturating_mul(ctx.batch as u64)
+            .saturating_mul(mult);
         ctx.jump_multiplier = (ctx.jump_multiplier.saturating_mul(2)).min(MAX_JUMP_MULTIPLIER);
         // Reset the outer-failure counter so a long damaged region
         // doesn't keep firing fast-jump every read after the initial
@@ -695,14 +741,23 @@ mod tests {
     }
 
     #[test]
-    fn pass_1_does_not_pause_on_skip() {
-        // Pass 1 must zoom — a damage zone is Pass N's problem to
-        // recover from. Sleeping between failed batches turned a 30s
-        // damaged region into a 30-minute Pass-1 grind on real discs.
+    fn pass_1_pauses_briefly_on_skip_for_wedge_avoidance() {
+        // Pre-2026-05-10 Pass 1 ran pause_secs=0 on all errors (zoom
+        // past damage zones in seconds). That caused firmware wedges
+        // on the BU40N — back-to-back errors with no cooldown built
+        // up firmware state until the drive entered the wedge fast-
+        // fail mode. New policy: a brief inter-error pause (5 s) on
+        // Pass 1 to give the drive's firmware time to settle between
+        // damage-zone exposures. Successful reads remain zero-pause
+        // — only errors cost time, and only a few seconds per
+        // scattered failure. Trivial cost compared to crashing the
+        // whole rip at 48%.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
-            ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, 0),
+            ReadAction::SkipBlock { pause_secs } => {
+                assert_eq!(pause_secs, PASS_1_FAIL_PAUSE_SECS);
+            }
             other => panic!("expected SkipBlock, got {other:?}"),
         }
     }
