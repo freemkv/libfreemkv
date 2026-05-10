@@ -84,7 +84,7 @@ pub(crate) mod identity;
 pub(crate) mod ifo;
 pub(crate) mod io;
 pub mod keydb;
-pub(crate) mod labels;
+pub mod labels;
 pub(crate) mod mpls;
 pub mod mux;
 pub mod pes;
