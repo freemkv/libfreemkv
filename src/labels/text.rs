@@ -9,11 +9,6 @@
 //! more structured parse path (e.g. `class_reader` for .class) should
 //! prefer that — this helper is for genuinely unstructured input.
 
-// Staged for the pixelogic refactor: pixelogic still has its own
-// extract_strings copy; this is the shared replacement waiting for
-// the refactor. dead-code allow comes off when pixelogic switches.
-#![allow(dead_code)]
-
 /// Walk `data`, emit every maximal run of printable-ASCII bytes
 /// (`0x20..=0x7E`) whose length is at least `min_len`.
 ///
