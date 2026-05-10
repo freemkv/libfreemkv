@@ -7,6 +7,7 @@
 //!   3. Implement `pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
+pub(crate) mod class_reader;
 mod criterion;
 mod ctrm;
 mod dbp;

@@ -30,8 +30,10 @@ struct PatternedSectorReader {
     trace: Arc<Mutex<Vec<(u32, u16)>>>,
 }
 
+type ReadTrace = Arc<Mutex<Vec<(u32, u16)>>>;
+
 impl PatternedSectorReader {
-    fn new(capacity: u32, bad_lbas: HashSet<u32>) -> (Self, Arc<Mutex<Vec<(u32, u16)>>>) {
+    fn new(capacity: u32, bad_lbas: HashSet<u32>) -> (Self, ReadTrace) {
         let trace = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
