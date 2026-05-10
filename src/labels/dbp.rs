@@ -46,13 +46,7 @@ use std::collections::BTreeMap;
 /// returns None on a mismatch — so this parser only ever consumes
 /// time on discs that fell through every earlier parser.
 pub fn detect(udf: &UdfFs) -> bool {
-    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
-        return false;
-    };
-    jar_dir
-        .entries
-        .iter()
-        .any(|e| !e.is_dir && e.name.to_lowercase().ends_with(".jar"))
+    jar::has_any_top_level_jar(udf)
 }
 
 pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
@@ -129,7 +123,9 @@ fn collect_textfield(
 }
 
 fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLabel {
-    let language = vocab::lang(&label).unwrap_or_default().to_string();
+    let lang_info = vocab::lang(&label);
+    let language = lang_info.map(|l| l.code).unwrap_or("").to_string();
+    let variant = lang_info.map(|l| l.variant).unwrap_or("").to_string();
     let qualifier = vocab::qualifier(&label);
     let purpose = vocab::purpose(&label);
     StreamLabel {
@@ -140,7 +136,7 @@ fn make_label(num: u16, label: String, stream_type: StreamLabelType) -> StreamLa
         purpose,
         qualifier,
         codec_hint: String::new(),
-        variant: String::new(),
+        variant,
     }
 }
 
@@ -221,31 +217,37 @@ mod tests {
     }
 
     #[test]
-    fn make_label_compound_languages() {
-        assert_eq!(
-            make_label(1, "Brazilian Portuguese 5.1".into(), StreamLabelType::Audio).language,
-            "por"
+    fn make_label_compound_languages_populate_variant() {
+        let brazilian = make_label(1, "Brazilian Portuguese 5.1".into(), StreamLabelType::Audio);
+        assert_eq!(brazilian.language, "por");
+        assert_eq!(brazilian.variant, "Brazilian");
+
+        let castilian = make_label(1, "Castilian Spanish".into(), StreamLabelType::Audio);
+        assert_eq!(castilian.language, "spa");
+        assert_eq!(castilian.variant, "Castilian");
+
+        let canadian = make_label(
+            1,
+            "Canadian French Dolby Digital".into(),
+            StreamLabelType::Audio,
         );
-        assert_eq!(
-            make_label(1, "Castilian Spanish".into(), StreamLabelType::Audio).language,
-            "spa"
-        );
-        assert_eq!(
-            make_label(
-                1,
-                "Canadian French Dolby Digital".into(),
-                StreamLabelType::Audio
-            )
-            .language,
-            "fra"
-        );
+        assert_eq!(canadian.language, "fra");
+        assert_eq!(canadian.variant, "Canadian");
+    }
+
+    #[test]
+    fn make_label_bare_language_has_empty_variant() {
+        let l = make_label(1, "English Dolby Atmos".into(), StreamLabelType::Audio);
+        assert_eq!(l.language, "eng");
+        assert_eq!(l.variant, "");
     }
 
     #[test]
     fn make_label_unknown_language_is_empty() {
-        // vocab::lang returns None — make_label converts to "".
+        // vocab::lang returns None — make_label converts both fields to "".
         let l = make_label(1, "Klingon Dolby Atmos".into(), StreamLabelType::Audio);
         assert_eq!(l.language, "");
+        assert_eq!(l.variant, "");
     }
 
     #[test]

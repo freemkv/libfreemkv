@@ -62,13 +62,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     // Cheap pre-check at the dir level; the real signal is
     // `com/bydeluxe/` inside any top-level jar's central directory,
     // which `parse()` confirms when given a `SectorReader`.
-    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
-        return false;
-    };
-    jar_dir
-        .entries
-        .iter()
-        .any(|e| !e.is_dir && e.name.to_lowercase().ends_with(".jar"))
+    jar::has_any_top_level_jar(udf)
 }
 
 pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
