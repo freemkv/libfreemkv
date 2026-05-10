@@ -23,6 +23,21 @@ use zip::ZipArchive;
 /// etc.
 pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
 
+/// True if `/BDMV/JAR/` contains at least one top-level `.jar` file
+/// (not under a subdir). Used by `detect()` in parsers whose real
+/// signal lives inside a jar — they can't open the jar without a
+/// `SectorReader`, so they use this cheap pre-check and do the real
+/// `com/<vendor>/` discriminator in `parse()`.
+pub fn has_any_top_level_jar(udf: &UdfFs) -> bool {
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return false;
+    };
+    jar_dir
+        .entries
+        .iter()
+        .any(|e| !e.is_dir && e.name.to_lowercase().ends_with(".jar"))
+}
+
 /// Open every top-level `*.jar` entry in `/BDMV/JAR/` and yield each
 /// `(entry_name, Jar)` to `f`. Returns the first `Some(R)` the callback
 /// produces, or `None` if every jar was visited without a hit.

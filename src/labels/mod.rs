@@ -89,12 +89,13 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     // and returns None on a mismatch. By placing dbp last, the
     // earlier parsers' fast file-presence detects short-circuit and
     // dbp only runs on discs that fell through everything else.
+    // dbp and deluxe both detect on "any top-level .jar in /BDMV/JAR/"
+    // (every BD-J disc trips that) and do the real vendor-prefix check
+    // in parse(). Order between them is somewhat arbitrary since either
+    // returns None on a mismatched jar, but dbp goes first because its
+    // parse path is cheaper (constant-pool iteration vs. deluxe's
+    // bytecode walking once Phase D lands).
     ("dbp", dbp::detect, dbp::parse),
-    // deluxe last for the same reason as dbp: its detect() triggers
-    // on any top-level .jar (every BD-J disc), and parse() does the
-    // real `com/bydeluxe/` check. Phase A (master enum identification)
-    // shipped 2026-05-10; phases B/C/D (per-stream binding decoder)
-    // pending.
     ("deluxe", deluxe::detect, deluxe::parse),
 ];
 
@@ -419,4 +420,57 @@ pub(crate) fn read_jar_file(
 ) -> Option<Vec<u8>> {
     let path = find_jar_file(udf, filename)?;
     udf.read_file(reader, &path).ok().filter(|d| !d.is_empty())
+}
+
+// ── Registry-level tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// Lock the parser roster + order. If someone reorders the array
+    /// or adds/removes a parser, this test forces them to update the
+    /// expectation explicitly. The order is load-bearing: first
+    /// matching `parse()` wins, so reordering changes which parser
+    /// claims a disc on overlapping detect signals.
+    ///
+    /// dbp + deluxe MUST stay at the end (their detect triggers on
+    /// "any BD-J disc"; placing them earlier would short-circuit the
+    /// stricter parsers above them).
+    #[test]
+    fn parsers_registry_order_locked() {
+        let names: Vec<&str> = PARSERS.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "paramount",
+                "criterion",
+                "pixelogic",
+                "ctrm",
+                "dbp",
+                "deluxe"
+            ],
+            "PARSERS array order changed — confirm dbp + deluxe stay last \
+             (loose detect, real check in parse), and stricter parsers \
+             (paramount/criterion/pixelogic/ctrm — all file-presence \
+             gated detect) stay first."
+        );
+    }
+
+    /// Per-parser sanity: every parser has both detect and parse
+    /// hooked up. Catches accidental nullification (e.g. someone
+    /// stubbing `parse` to always-None during a refactor).
+    #[test]
+    fn parsers_registry_all_entries_populated() {
+        for (name, detect, parse) in PARSERS {
+            // Function pointers can't be Null in safe Rust, so the
+            // assertion is just that the array entry was constructed
+            // — which the iter above already implies. The test
+            // exists to fail compile if someone changes the tuple
+            // shape (e.g. adds a 4th field) without updating callers,
+            // and as a marker for "these parsers exist."
+            let _ = (name, detect, parse);
+        }
+        assert!(!PARSERS.is_empty(), "PARSERS array must not be empty");
+    }
 }

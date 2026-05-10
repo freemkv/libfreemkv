@@ -49,52 +49,79 @@ pub fn codec(code: &str) -> &str {
 
 // ── Language: English / multi-word names → ISO 639-2 ─────────────────────────
 
-/// Map a free-form language label fragment to an ISO 639-2 code.
+/// Result of [`lang`] — ISO code + human-readable regional variant.
+///
+/// `code` is ISO 639-2 (always 3 lowercase letters).
+/// `variant` is the regional dialect as a human-readable English word
+/// (`"Brazilian"`, `"Castilian"`, `"Canadian"`, `"Simplified"`, ...)
+/// or `""` when the input names just a bare language without
+/// dialect ("Spanish" → variant=""). The variant matches the
+/// convention pixelogic / ctrm / criterion already use for their
+/// `StreamLabel::variant` field: a short display token the UI can
+/// surface verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LangInfo {
+    pub code: &'static str,
+    pub variant: &'static str,
+}
+
+/// Map a free-form language label fragment to an ISO 639-2 code AND
+/// (where applicable) its regional variant.
 ///
 /// Handles both bare English names ("English", "Spanish") and the
 /// multi-word vendor variants we've seen in the corpus ("Brazilian
 /// Portuguese", "Castilian Spanish", "Canadian French"). Match is
 /// case-insensitive; longer compound phrases win over their bare
-/// counterparts (so "Brazilian Portuguese" → `por`, not consumed by
+/// counterparts (so "Brazilian Portuguese" returns
+/// `LangInfo { code: "por", variant: "Brazilian" }`, not consumed by
 /// the bare "Portuguese" entry).
+///
+/// Bare-name matches return `variant: ""`.
 ///
 /// Returns `None` for unrecognized input — callers decide whether to
 /// fall back to MPLS spec codes, pass through raw, or drop the stream.
 /// Never guesses.
-pub fn lang(text: &str) -> Option<&'static str> {
+///
+/// Why the variant: the prior `lang() -> Option<&str>` shape silently
+/// dropped regional dialect info. "Brazilian Portuguese 5.1" became
+/// `language="por", variant=""` — UI displayed plain "Portuguese"
+/// even though the disc had explicitly labeled this stream Brazilian.
+/// Capturing the variant here parallels how pixelogic and ctrm
+/// populate `StreamLabel::variant` from their own region tables.
+pub fn lang(text: &str) -> Option<LangInfo> {
     let lower = text.to_lowercase();
     // Multi-word compounds first — longest-match wins.
-    for (needle, code) in COMPOUND_LANGS {
+    for (needle, code, variant) in COMPOUND_LANGS {
         if lower.contains(needle) {
-            return Some(code);
+            return Some(LangInfo { code, variant });
         }
     }
     // Bare names: word-boundary match (avoid "english" inside "englishman"
     // or any other accidental substring).
     for (needle, code) in BARE_LANGS {
         if has_word(&lower, needle) {
-            return Some(code);
+            return Some(LangInfo { code, variant: "" });
         }
     }
     None
 }
 
-const COMPOUND_LANGS: &[(&str, &str)] = &[
-    ("brazilian portuguese", "por"),
-    ("euro portuguese", "por"),
-    ("european portuguese", "por"),
-    ("castilian spanish", "spa"),
-    ("latin american spanish", "spa"),
-    ("latin spanish", "spa"),
-    ("canadian french", "fra"),
-    ("parisian french", "fra"),
-    ("australian english", "eng"),
-    ("austrailian english", "eng"), // disc-corpus typo, keep matching
-    ("british english", "eng"),
-    ("simplified chinese", "zho"),
-    ("traditional chinese", "zho"),
-    ("mandarin chinese", "zho"),
-    ("cantonese chinese", "zho"),
+const COMPOUND_LANGS: &[(&str, &str, &str)] = &[
+    ("brazilian portuguese", "por", "Brazilian"),
+    ("euro portuguese", "por", "European"),
+    ("european portuguese", "por", "European"),
+    ("castilian spanish", "spa", "Castilian"),
+    ("latin american spanish", "spa", "Latin American"),
+    ("latin spanish", "spa", "Latin American"),
+    ("canadian french", "fra", "Canadian"),
+    ("parisian french", "fra", "Parisian"),
+    ("australian english", "eng", "Australian"),
+    ("austrailian english", "eng", "Australian"), // disc-corpus typo, keep matching
+    ("british english", "eng", "British"),
+    ("simplified chinese", "zho", "Simplified"),
+    ("traditional chinese", "zho", "Traditional"),
+    ("mandarin chinese", "zho", "Mandarin"),
+    ("cantonese chinese", "zho", "Cantonese"),
 ];
 
 const BARE_LANGS: &[(&str, &str)] = &[
@@ -265,24 +292,45 @@ mod tests {
         assert_eq!(codec(""), "");
     }
 
+    fn li(code: &'static str, variant: &'static str) -> LangInfo {
+        LangInfo { code, variant }
+    }
+
     #[test]
-    fn lang_bare_names() {
-        assert_eq!(lang("English"), Some("eng"));
-        assert_eq!(lang("english"), Some("eng"));
-        assert_eq!(lang("Spanish 5.1 Dolby Digital"), Some("spa"));
-        assert_eq!(lang("japanese"), Some("jpn"));
-        assert_eq!(lang("Italian"), Some("ita"));
+    fn lang_bare_names_have_empty_variant() {
+        assert_eq!(lang("English"), Some(li("eng", "")));
+        assert_eq!(lang("english"), Some(li("eng", "")));
+        assert_eq!(lang("Spanish 5.1 Dolby Digital"), Some(li("spa", "")));
+        assert_eq!(lang("japanese"), Some(li("jpn", "")));
+        assert_eq!(lang("Italian"), Some(li("ita", "")));
+    }
+
+    #[test]
+    fn lang_compounds_carry_variant() {
+        assert_eq!(
+            lang("Brazilian Portuguese 5.1"),
+            Some(li("por", "Brazilian"))
+        );
+        assert_eq!(lang("Castilian Spanish"), Some(li("spa", "Castilian")));
+        assert_eq!(
+            lang("Canadian French Dolby Digital"),
+            Some(li("fra", "Canadian"))
+        );
+        assert_eq!(
+            lang("Latin American Spanish"),
+            Some(li("spa", "Latin American"))
+        );
+        assert_eq!(lang("Simplified Chinese"), Some(li("zho", "Simplified")));
+        assert_eq!(lang("British English"), Some(li("eng", "British")));
     }
 
     #[test]
     fn lang_compounds_win_over_bare() {
-        // Brazilian Portuguese should map to por via the compound rule,
-        // not be intercepted by bare "portuguese" (also por, but the
-        // matcher must walk compounds first to be correct in principle).
-        assert_eq!(lang("Brazilian Portuguese 5.1"), Some("por"));
-        assert_eq!(lang("Castilian Spanish"), Some("spa"));
-        assert_eq!(lang("Canadian French Dolby Digital"), Some("fra"));
-        assert_eq!(lang("Latin American Spanish"), Some("spa"));
+        // Brazilian Portuguese must map to (por, Brazilian) via the
+        // compound rule, not be intercepted by bare "portuguese"
+        // (which would yield (por, "") and lose the variant).
+        assert_eq!(lang("Brazilian Portuguese").unwrap().variant, "Brazilian");
+        assert_eq!(lang("Canadian French").unwrap().variant, "Canadian");
     }
 
     #[test]
