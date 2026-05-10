@@ -11,8 +11,10 @@ pub(crate) mod class_reader;
 mod criterion;
 mod ctrm;
 mod dbp;
+pub(crate) mod jar;
 mod paramount;
 mod pixelogic;
+pub(crate) mod text;
 pub mod vocab;
 
 use crate::disc::{DiscTitle, Stream};
