@@ -289,21 +289,37 @@ fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
 #[doc(hidden)]
 pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
     let inventory = jar_inventory(udf);
+    // Record every parser whose discriminator matched — even if its
+    // parse step then returned None — so the analyzer can distinguish
+    // "no parser recognized this disc" from "parser recognized it but
+    // couldn't read the file" (e.g. content past a truncated capture)
+    // or "parser ran but produced no labels."
+    let mut parsers_detected: Vec<&'static str> = Vec::new();
     for (name, detect, parse) in PARSERS {
         if detect(udf) {
             tracing::info!(parser = name, "label parser matched");
+            parsers_detected.push(name);
             if let Some(labels) = parse(reader, udf) {
                 return LabelAnalysis {
                     parser: Some(name),
+                    parsers_detected,
                     jar_inventory: inventory,
                     labels,
                 };
             }
         }
     }
-    tracing::info!("no label parser matched");
+    if parsers_detected.is_empty() {
+        tracing::info!("no label parser matched");
+    } else {
+        tracing::info!(
+            detected = ?parsers_detected,
+            "label parsers detected but produced no labels"
+        );
+    }
     LabelAnalysis {
         parser: None,
+        parsers_detected,
         jar_inventory: inventory,
         labels: Vec::new(),
     }
@@ -314,12 +330,20 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
 #[derive(Debug, Clone)]
 pub struct LabelAnalysis {
     /// Which parser matched ("paramount" / "criterion" / "pixelogic" /
-    /// "ctrm"), or `None` if no parser matched and the labels code
-    /// would have fallen through to `fill_defaults`.
+    /// "ctrm") AND emitted labels. `None` means either no parser
+    /// recognized the disc, OR a parser recognized it but its parse
+    /// step returned None (file unreadable, no parseable tokens). Use
+    /// `parsers_detected` to disambiguate.
     pub parser: Option<&'static str>,
+    /// Every parser whose discriminator matched, in priority order.
+    /// Distinguishes "we recognized this disc but couldn't extract
+    /// labels" from "we don't recognize this disc at all" — the
+    /// former points at a parser bug or a truncated capture, the
+    /// latter points at a missing parser.
+    pub parsers_detected: Vec<&'static str>,
     /// Filenames found under any `/BDMV/JAR/*/` subdirectory, deduped
-    /// and sorted. Helps spot unknown authoring formats when `parser`
-    /// is `None`.
+    /// and sorted. Helps spot unknown authoring formats when no
+    /// parser detected.
     pub jar_inventory: Vec<String>,
     /// Raw labels emitted by the matched parser (empty if `parser` is
     /// `None`).
