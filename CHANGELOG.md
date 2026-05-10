@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — 0.18.3
+
+### Behaviour change
+
+- **`Disc::titles[0]` is now the canonical main feature on branching
+  discs, not the longest playlist.** Previously titles were sorted
+  purely by `duration_secs` descending, which puts a "play-all"
+  virtual playlist (alternate angles / seamless branching) at index 0
+  on UHDs that ship one — its inflated duration overshoots the real
+  movie. Concrete example: *The Amateur (2025)* 4K UHD on a 58.5 GB
+  disc has Title 1 = `00020.mpls` 4h13m / 92.4 GB / 253 clips
+  (impossible — the size exceeds the disc capacity, proving it's a
+  virtual composite) and Title 2 = `00800.mpls` 2h02m / 57.2 GB /
+  1 clip (the actual film, matching TMDB).
+
+  New sort priority:
+  1. Real titles (`size_bytes <= capacity_bytes`) before virtual
+     composites.
+  2. Among real titles, fewer clips first (1-clip wins).
+  3. Tiebreak on longer duration first.
+
+  **Migration:** consumers calling `disc.titles.first()` /
+  `disc.titles[0]` automatically get the corrected title — no code
+  changes needed. CLI users invoking `freemkv -t 1 disc:// …` now hit
+  the actual main feature on branching discs (this was the user-
+  visible bug). On non-branching discs the order is unchanged.
+
+  The comparator is exposed as
+  [`Disc::canonical_title_order`](#) for callers that need to
+  re-sort a custom title set with the same logic.
+
+  Regression tests: `disc::tests::canonical_order_*` (three cases:
+  branching-UHD, normal disc, clip-count tiebreak).
+
 ## 0.18.2 (2026-05-09)
 
 ### Bug fixes
