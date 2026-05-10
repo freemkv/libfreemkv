@@ -12,7 +12,7 @@
 //!   sub_com1_idx="23,24,25" />
 //! ```
 
-use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 
@@ -30,8 +30,8 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
     let mut labels = Vec::new();
 
     // Parse audio streams
-    if let Some(aud) = extract_attr(&feature, "aud") {
-        let com_idx = extract_attr(&feature, "aud_com1_idx").and_then(|s| s.parse::<usize>().ok());
+    if let Some(aud) = xml::attr(&feature, "aud") {
+        let com_idx = xml::attr(&feature, "aud_com1_idx").and_then(|s| s.parse::<usize>().ok());
 
         for (i, lang) in aud.split(',').enumerate() {
             let lang = lang.trim();
@@ -57,12 +57,12 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
     }
 
     // Parse subtitle streams
-    if let Some(sub) = extract_attr(&feature, "sub") {
-        let forced: Vec<bool> = extract_attr(&feature, "forced_sub")
+    if let Some(sub) = xml::attr(&feature, "sub") {
+        let forced: Vec<bool> = xml::attr(&feature, "forced_sub")
             .map(|s| s.split(',').map(|f| f.trim() == "1").collect())
             .unwrap_or_default();
 
-        let com_indices: Vec<usize> = extract_attr(&feature, "sub_com1_idx")
+        let com_indices: Vec<usize> = xml::attr(&feature, "sub_com1_idx")
             .map(|s| s.split(',').filter_map(|i| i.trim().parse().ok()).collect())
             .unwrap_or_default();
 
@@ -106,28 +106,23 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
 }
 
 /// Find the feature playlist element (the one with the most audio tracks).
-fn find_feature_playlist(xml: &str) -> Option<String> {
+fn find_feature_playlist(text: &str) -> Option<String> {
     let mut best: Option<String> = None;
     let mut best_aud_count = 0;
+    let mut from = 0;
 
-    let mut pos = 0;
-    while let Some(start) = xml[pos..].find("<playlist ") {
-        let abs_start = pos + start;
-        let end = match xml[abs_start..].find("/>") {
-            Some(p) => abs_start + p + 2,
-            None => break,
-        };
-        let element = &xml[abs_start..end];
+    while let Some((start, end)) = xml::find_element(text, "playlist", from) {
+        let element = &text[start..end];
 
-        // Prefer name="Feature" explicitly
-        if let Some(name) = extract_attr(element, "name") {
+        // Prefer name="Feature" explicitly.
+        if let Some(name) = xml::attr(element, "name") {
             if name.eq_ignore_ascii_case("Feature") {
                 return Some(element.to_string());
             }
         }
 
-        // Otherwise pick the one with the most audio streams
-        if let Some(aud) = extract_attr(element, "aud") {
+        // Otherwise pick the one with the most audio streams.
+        if let Some(aud) = xml::attr(element, "aud") {
             let count = aud.split(',').count();
             if count > best_aud_count {
                 best_aud_count = count;
@@ -135,15 +130,7 @@ fn find_feature_playlist(xml: &str) -> Option<String> {
             }
         }
 
-        pos = end;
+        from = end;
     }
     best
-}
-
-/// Extract an XML attribute value from an element string.
-fn extract_attr(element: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = element.find(&needle)? + needle.len();
-    let end = element[start..].find('"')? + start;
-    Some(element[start..end].to_string())
 }
