@@ -65,6 +65,13 @@ pub struct ReadCtx {
     /// is its core job, and it has the right tools (single-sector
     /// reads, 60s recovery timeout, retry budget, escalating skip).
     pub bisect_on_marginal: bool,
+    /// Count of consecutive firmware-wedge responses (HARDWARE_ERROR
+    /// or ILLEGAL_REQUEST sense keys) since the last successful read.
+    /// Pass 1 uses this to drive the wedge-skip path: each wedge
+    /// triggers a 1 GB jump + cooldown pause. Reaching
+    /// `WEDGE_ABORT_THRESHOLD` consecutive wedges with no good read
+    /// in between → real AbortPass.
+    pub wedge_count: u64,
 }
 
 impl ReadCtx {
@@ -90,6 +97,7 @@ impl ReadCtx {
             bridge_degradation_count: 0,
             bisecting: false,
             bisect_on_marginal: false,
+            wedge_count: 0,
         }
     }
 
@@ -115,6 +123,7 @@ impl ReadCtx {
             bridge_degradation_count: 0,
             bisecting: false,
             bisect_on_marginal: true,
+            wedge_count: 0,
         }
     }
 
@@ -123,6 +132,10 @@ impl ReadCtx {
         self.consecutive_good += 1;
         self.consecutive_failures = 0;
         self.not_ready_retries = 0;
+        // Any successful read clears the wedge-skip counter — the
+        // drive recovered, so further wedges should reset the skip
+        // budget instead of accumulating toward a real abort.
+        self.wedge_count = 0;
         // Outer-success only: a good single-sector read inside a
         // bisect doesn't mean we've left the damaged batch. Only an
         // outer-batch success resets the outer-failure counter.
@@ -173,6 +186,45 @@ const NOT_READY_PAUSE_SECS: u64 = 3;
 const NOT_READY_MAX_RETRIES: u32 = 3;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 15;
 const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
+
+// Firmware-wedge skip policy for Pass 1 sweep
+// ===========================================
+//
+// When the BU40N (or similar drives) hits a physical-damage cluster,
+// its firmware can transition into a "wedge" state where it returns
+// HARDWARE_ERROR or ILLEGAL_REQUEST for every subsequent read —
+// often for many LBAs after the actual bad sector. Per CLAUDE.md
+// "Bad-sector handling" rule #2: "Recovery requires eject+reload OR
+// significant cool-down."
+//
+// Pass 1's pre-fix behavior was to immediately AbortPass on the
+// first HARDWARE_ERROR / ILLEGAL_REQUEST, killing the rip at
+// whatever percentage it had reached. That's the wrong call when:
+//   - the damage zone may be small (jumping past it could resume
+//     normal reads), AND
+//   - even if the drive stays wedged, finishing the sweep gives us
+//     an honest mapfile for Pass N to attack later.
+//
+// New policy: treat wedge sense codes the same way the damage-window
+// treats persistent failure — JumpAhead by a large distance with a
+// cooldown pause. Allow up to WEDGE_ABORT_THRESHOLD consecutive
+// wedges (no successful read in between) before declaring the drive
+// truly stuck and surfacing AbortPass to autorip.
+
+/// One-gigabyte jump (1024 MiB) on each wedge. Big enough to clear
+/// almost any single-cluster damage zone we've seen.
+const WEDGE_JUMP_SECTORS: u64 = 524_288;
+/// Cooldown pause after each wedge. Per CLAUDE.md the drive needs
+/// "significant cool-down"; 30 s strikes a balance between giving
+/// the drive a chance to recover and not stalling the rip if the
+/// drive is permanently stuck.
+const WEDGE_PAUSE_SECS: u64 = 30;
+/// Bail after this many consecutive wedges with no good read in
+/// between. At 1 GB jumps this lets us scan ~16 GB worth of fully
+/// wedged area before giving up — generous enough to clear most
+/// physical-damage clusters, bounded enough to not loop forever on
+/// a permanently bricked drive.
+const WEDGE_ABORT_THRESHOLD: u64 = 16;
 
 /// THE single error-handling entry point. Updates `ctx`, returns the
 /// action the caller must apply.
@@ -239,11 +291,54 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         ctx.not_ready_retries = 0;
     }
 
-    // 4. Hardware / illegal request: the drive said "no, won't do it".
-    //    Retrying won't change the answer. Surface to the outer layer
-    //    so it can eject + prompt user.
+    // 4. Hardware error / illegal request — the firmware-wedge family.
+    //    The drive transitioned into a fast-fail state where it
+    //    rejects reads near the LBA. Two policies:
+    //
+    //    Pass 1 sweep (bisect_on_marginal=false): the wedge is
+    //      *recoverable* by skipping. Jump a large distance ahead
+    //      (1 GB), pause for cooldown, mark the skipped region
+    //      NonTrimmed so Pass N revisits. Allow up to
+    //      WEDGE_ABORT_THRESHOLD consecutive wedges before truly
+    //      giving up. This replaces the pre-fix "abort the entire
+    //      rip on first wedge" behavior that caused 48%-and-die
+    //      failures on discs with one bad cluster.
+    //
+    //    Pass N patch (bisect_on_marginal=true): Pass N's job IS
+    //      single-sector recovery; a wedge means the drive won't
+    //      give us the specific sectors we asked for. Skipping
+    //      doesn't help here. Abort and let autorip decide whether
+    //      to retry, eject, or surface the failure to the user.
     if sense_key == scsi::SENSE_KEY_HARDWARE_ERROR || sense_key == scsi::SENSE_KEY_ILLEGAL_REQUEST {
-        return ReadAction::AbortPass;
+        if ctx.bisect_on_marginal {
+            return ReadAction::AbortPass;
+        }
+        // Pass 1 wedge-skip path.
+        if !ctx.bisecting {
+            ctx.wedge_count += 1;
+        }
+        if ctx.wedge_count >= WEDGE_ABORT_THRESHOLD {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "wedge_abort",
+                wedge_count = ctx.wedge_count,
+                threshold = WEDGE_ABORT_THRESHOLD,
+                "Pass 1 wedge-skip exhausted — drive appears permanently stuck"
+            );
+            return ReadAction::AbortPass;
+        }
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "wedge_skip",
+            wedge_count = ctx.wedge_count,
+            jump_sectors = WEDGE_JUMP_SECTORS,
+            pause_secs = WEDGE_PAUSE_SECS,
+            "Pass 1 wedge detected — jumping ahead and pausing for drive cooldown"
+        );
+        return ReadAction::JumpAhead {
+            sectors: WEDGE_JUMP_SECTORS,
+            pause_secs: WEDGE_PAUSE_SECS,
+        };
     }
 
     // 5. Marginal media (MEDIUM_ERROR / ABORTED_COMMAND) on a multi-
@@ -374,6 +469,18 @@ mod tests {
         }
     }
 
+    fn illegal_request_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_ILLEGAL_REQUEST,
+                asc: 0x24,
+                ascq: 0x00,
+            }),
+        }
+    }
+
     #[test]
     fn pass_n_marginal_with_batch_gt_1_bisects() {
         let mut ctx = ReadCtx::for_patch(32);
@@ -485,10 +592,84 @@ mod tests {
     }
 
     #[test]
-    fn hardware_error_aborts() {
+    fn pass_1_hardware_error_jumps_ahead_not_aborts() {
+        // New wedge-skip policy: Pass 1 (bisect_on_marginal=false)
+        // should JumpAhead with a 1 GB skip + cooldown pause instead
+        // of immediately aborting. Aborting on first wedge was the
+        // pre-fix behavior that killed rips at 48% on damaged discs.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&hardware_err(), &mut ctx);
+        match action {
+            ReadAction::JumpAhead {
+                sectors,
+                pause_secs,
+            } => {
+                assert_eq!(sectors, WEDGE_JUMP_SECTORS);
+                assert_eq!(pause_secs, WEDGE_PAUSE_SECS);
+            }
+            other => panic!("expected JumpAhead, got {other:?}"),
+        }
+        assert_eq!(ctx.wedge_count, 1);
+    }
+
+    #[test]
+    fn pass_1_hardware_error_aborts_after_threshold() {
+        // After WEDGE_ABORT_THRESHOLD consecutive wedges with no good
+        // read in between, autorip should see a real AbortPass so it
+        // can surface "drive is stuck, power-cycle required" to the
+        // user — rather than looping forever on a permanently bricked
+        // drive.
+        let mut ctx = ReadCtx::for_sweep(32);
+        for i in 0..WEDGE_ABORT_THRESHOLD - 1 {
+            let action = handle_read_error(&hardware_err(), &mut ctx);
+            assert!(
+                matches!(action, ReadAction::JumpAhead { .. }),
+                "iter {i}: expected JumpAhead, got {action:?}"
+            );
+        }
+        // The Nth wedge crosses the threshold.
+        let action = handle_read_error(&hardware_err(), &mut ctx);
         assert_eq!(action, ReadAction::AbortPass);
+    }
+
+    #[test]
+    fn pass_1_good_read_resets_wedge_count() {
+        // A single successful read between wedges must clear the
+        // skip counter — otherwise a disc with a few scattered bad
+        // zones would eventually run out of skip budget even though
+        // the drive was recovering between zones.
+        let mut ctx = ReadCtx::for_sweep(32);
+        for _ in 0..(WEDGE_ABORT_THRESHOLD - 1) {
+            handle_read_error(&hardware_err(), &mut ctx);
+        }
+        assert_eq!(ctx.wedge_count, WEDGE_ABORT_THRESHOLD - 1);
+        ctx.on_success();
+        assert_eq!(ctx.wedge_count, 0);
+        // After the success, we should still get JumpAhead (not
+        // AbortPass) on the next wedge.
+        let action = handle_read_error(&hardware_err(), &mut ctx);
+        assert!(matches!(action, ReadAction::JumpAhead { .. }));
+    }
+
+    #[test]
+    fn pass_n_hardware_error_still_aborts() {
+        // Pass N (bisect_on_marginal=true) keeps the original
+        // AbortPass behavior — single-sector recovery can't make
+        // progress through a wedge, so the right answer is to bail
+        // and let the outer layer decide.
+        let mut ctx = ReadCtx::for_patch(1);
+        let action = handle_read_error(&hardware_err(), &mut ctx);
+        assert_eq!(action, ReadAction::AbortPass);
+    }
+
+    #[test]
+    fn pass_1_illegal_request_also_routes_to_wedge_skip() {
+        // ILLEGAL_REQUEST is the other half of the wedge family:
+        // drive saying "I won't parse your CDB" after entering the
+        // fast-fail state. Same treatment as HARDWARE_ERROR.
+        let mut ctx = ReadCtx::for_sweep(32);
+        let action = handle_read_error(&illegal_request_err(), &mut ctx);
+        assert!(matches!(action, ReadAction::JumpAhead { .. }));
     }
 
     #[test]
