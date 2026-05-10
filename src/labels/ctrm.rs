@@ -172,6 +172,164 @@ fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<
     Some(labels)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal menu_base.prop text and run `parse_menu_base`'s
+    /// inner logic via a temporary closure. This isolates the prop
+    /// parsing without needing a SectorReader.
+    fn parse_props(text: &str) -> Vec<StreamLabel> {
+        // Mirror the inner loop of parse_menu_base exactly. Kept
+        // separate so the test doesn't need disc fixtures.
+        use std::collections::HashMap;
+        let mut entries: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(eq_pos) = line.find('=') else {
+                continue;
+            };
+            let full_key = &line[..eq_pos];
+            let value = &line[eq_pos + 1..];
+            if let Some(dot_pos) = full_key.rfind('.') {
+                entries
+                    .entry(full_key[..dot_pos].to_string())
+                    .or_default()
+                    .insert(full_key[dot_pos + 1..].to_string(), value.to_string());
+            }
+        }
+        let mut labels = Vec::new();
+        for (prefix, props) in &entries {
+            let is_audio = props
+                .get("class")
+                .is_some_and(|c| c.contains("AudioButton"))
+                || prefix.starts_with("audio_");
+            let is_subtitle = props
+                .get("class")
+                .is_some_and(|c| c.contains("SubtitleButton"))
+                || prefix.starts_with("subtitle_");
+            let stream_num_str = props
+                .get("streamNumber")
+                .or_else(|| props.get("audioStream"))
+                .or_else(|| props.get("subtitleStream"));
+            let stream_num: u16 = match stream_num_str.and_then(|s| s.parse().ok()) {
+                Some(n) if n > 0 => n,
+                _ => continue,
+            };
+            if !is_audio && !is_subtitle {
+                continue;
+            }
+            let name = props.get("name").cloned().unwrap_or_default();
+            let purpose = match vocab::purpose(&name) {
+                LabelPurpose::Normal if prefix.contains("comm") => LabelPurpose::Commentary,
+                p => p,
+            };
+            let qualifier = if is_subtitle {
+                vocab::qualifier(&name)
+            } else {
+                LabelQualifier::None
+            };
+            let stream_type = if is_audio {
+                StreamLabelType::Audio
+            } else {
+                StreamLabelType::Subtitle
+            };
+            let language = props
+                .get("audioLanguage")
+                .or_else(|| props.get("subtitleLanguage"))
+                .cloned()
+                .unwrap_or_default();
+            labels.push(StreamLabel {
+                stream_number: stream_num,
+                stream_type,
+                language,
+                name,
+                purpose,
+                qualifier,
+                codec_hint: String::new(),
+                variant: String::new(),
+            });
+        }
+        labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
+        labels
+    }
+
+    #[test]
+    fn commentary_via_name() {
+        let labels = parse_props(
+            "audio_1.class=AudioButton\n\
+             audio_1.streamNumber=2\n\
+             audio_1.name=Director's Commentary\n\
+             audio_1.audioLanguage=eng\n",
+        );
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+        assert_eq!(labels[0].language, "eng");
+    }
+
+    #[test]
+    fn commentary_via_prefix_when_name_silent() {
+        let labels = parse_props(
+            "audio_commentary_1.class=AudioButton\n\
+             audio_commentary_1.streamNumber=2\n\
+             audio_commentary_1.name=Track 2\n\
+             audio_commentary_1.audioLanguage=eng\n",
+        );
+        assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+    }
+
+    #[test]
+    fn commenter_does_not_false_match_commentary() {
+        // Regression for the pre-refactor `name.contains("comment")`
+        // bug: this would wrongly classify a "Commenter Pro" track as
+        // Commentary. vocab::purpose enforces a word boundary.
+        let labels = parse_props(
+            "audio_1.class=AudioButton\n\
+             audio_1.streamNumber=2\n\
+             audio_1.name=Commenter Pro Track\n\
+             audio_1.audioLanguage=eng\n",
+        );
+        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+    }
+
+    #[test]
+    fn descriptive_via_name() {
+        let labels = parse_props(
+            "audio_1.class=AudioButton\n\
+             audio_1.streamNumber=3\n\
+             audio_1.name=English Descriptive Audio\n",
+        );
+        assert_eq!(labels[0].purpose, LabelPurpose::Descriptive);
+    }
+
+    #[test]
+    fn sdh_only_on_subtitles() {
+        // SDH applied to a subtitle stream.
+        let labels = parse_props(
+            "subtitle_1.class=SubtitleButton\n\
+             subtitle_1.streamNumber=4\n\
+             subtitle_1.name=English SDH\n",
+        );
+        assert_eq!(labels[0].qualifier, LabelQualifier::Sdh);
+    }
+
+    #[test]
+    fn sdh_not_applied_to_audio_stream_even_if_name_contains_sdh() {
+        // Audio streams should not pick up SDH (it's a subtitle
+        // concept). Edge case: badly-authored name happens to include
+        // "SDH" — we don't propagate it to audio metadata.
+        let labels = parse_props(
+            "audio_1.class=AudioButton\n\
+             audio_1.streamNumber=5\n\
+             audio_1.name=English SDH (track?)\n",
+        );
+        assert_eq!(labels[0].qualifier, LabelQualifier::None);
+    }
+}
+
 // ── menu_base.prop parser ──────────────────────────────────────────────────
 
 fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
@@ -231,16 +389,20 @@ fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<Str
         }
 
         let name = props.get("name").cloned().unwrap_or_default();
-        let name_lower = name.to_lowercase();
 
-        let purpose = if name_lower.contains("comment") || prefix.contains("comm") {
-            LabelPurpose::Commentary
-        } else {
-            LabelPurpose::Normal
+        // Purpose: ask vocab first (word-boundary matched — avoids the
+        // "Commenter" false positive the prior `name.contains("comment")`
+        // had). Then fall back to the structural prefix check
+        // (`audio_commentary.foo`-style keys group commentary streams
+        // regardless of display name).
+        let purpose = match vocab::purpose(&name) {
+            LabelPurpose::Normal if prefix.contains("comm") => LabelPurpose::Commentary,
+            p => p,
         };
 
-        let qualifier = if is_subtitle && name_lower.contains("sdh") {
-            LabelQualifier::Sdh
+        // Qualifier: only apply to subtitles (SDH is a subtitle concept).
+        let qualifier = if is_subtitle {
+            vocab::qualifier(&name)
         } else {
             LabelQualifier::None
         };
