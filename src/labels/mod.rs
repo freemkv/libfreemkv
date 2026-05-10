@@ -268,14 +268,83 @@ fn generate_audio_label(
 }
 
 fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
-    for (_name, detect, parse) in PARSERS {
+    for (name, detect, parse) in PARSERS {
         if detect(udf) {
+            tracing::info!(parser = name, "label parser matched");
             if let Some(labels) = parse(reader, udf) {
                 return labels;
             }
         }
     }
+    tracing::info!("no label parser matched");
     Vec::new()
+}
+
+/// Diagnostic introspection — returns the parser that matched, the
+/// labels it emitted, and the inventory of files under `/BDMV/JAR/*/`
+/// that the discriminators looked at. Intended for `freemkv-tools
+/// labels-analyze` and corpus regression tooling, not production code
+/// paths. The matching/parsing logic is identical to [`extract`]; only
+/// the return shape is richer.
+#[doc(hidden)]
+pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
+    let inventory = jar_inventory(udf);
+    for (name, detect, parse) in PARSERS {
+        if detect(udf) {
+            tracing::info!(parser = name, "label parser matched");
+            if let Some(labels) = parse(reader, udf) {
+                return LabelAnalysis {
+                    parser: Some(name),
+                    jar_inventory: inventory,
+                    labels,
+                };
+            }
+        }
+    }
+    tracing::info!("no label parser matched");
+    LabelAnalysis {
+        parser: None,
+        jar_inventory: inventory,
+        labels: Vec::new(),
+    }
+}
+
+/// Result of [`analyze`].
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct LabelAnalysis {
+    /// Which parser matched ("paramount" / "criterion" / "pixelogic" /
+    /// "ctrm"), or `None` if no parser matched and the labels code
+    /// would have fallen through to `fill_defaults`.
+    pub parser: Option<&'static str>,
+    /// Filenames found under any `/BDMV/JAR/*/` subdirectory, deduped
+    /// and sorted. Helps spot unknown authoring formats when `parser`
+    /// is `None`.
+    pub jar_inventory: Vec<String>,
+    /// Raw labels emitted by the matched parser (empty if `parser` is
+    /// `None`).
+    pub labels: Vec<StreamLabel>,
+}
+
+/// List filenames found under any `/BDMV/JAR/<x>/` subdirectory of
+/// the disc. Deduped, sorted. Returns an empty vec if no JAR dir is
+/// present.
+fn jar_inventory(udf: &UdfFs) -> Vec<String> {
+    let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in &jar_dir.entries {
+        if entry.is_dir {
+            for child in &entry.entries {
+                if !child.is_dir && !out.contains(&child.name) {
+                    out.push(child.name.clone());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
