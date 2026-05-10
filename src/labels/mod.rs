@@ -17,6 +17,7 @@ mod paramount;
 mod pixelogic;
 pub(crate) mod text;
 pub mod vocab;
+pub(crate) mod xml;
 
 use crate::disc::{DiscTitle, Stream};
 use crate::sector::SectorReader;

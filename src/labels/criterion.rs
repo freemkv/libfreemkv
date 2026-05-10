@@ -3,7 +3,7 @@
 //! Clean structured XML with Content/Qualifier per stream and
 //! stream number mapping via playbackconfig.
 
-use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
@@ -79,105 +79,68 @@ struct StreamInfo {
     qualifier: LabelQualifier,
 }
 
-fn parse_stream_infos(xml: &str) -> Vec<StreamInfo> {
+fn parse_stream_infos(text: &str) -> Vec<StreamInfo> {
     let mut infos = Vec::new();
-    let mut pos = 0;
 
-    while pos < xml.len() {
-        let (tag, stream_type) = if let Some(p) = xml[pos..].find("<AudioStreamInfos>") {
-            (p + pos, StreamLabelType::Audio)
-        } else if let Some(p) = xml[pos..].find("<SubtitleStreamInfos>") {
-            (p + pos, StreamLabelType::Subtitle)
-        } else {
-            break;
-        };
+    for (tag_name, stream_type) in [
+        ("AudioStreamInfos", StreamLabelType::Audio),
+        ("SubtitleStreamInfos", StreamLabelType::Subtitle),
+    ] {
+        let mut from = 0;
+        while let Some((start, end)) = xml::find_element(text, tag_name, from) {
+            let block = &text[start..end];
+            let id = xml::text(block, "ID").unwrap_or_default();
+            let lang_id = xml::text(block, "LangInfoID").unwrap_or_default();
+            let content = xml::text(block, "Content").unwrap_or_default();
+            let qualifier_str = xml::text(block, "Qualifier").unwrap_or_default();
 
-        let end_tag = match stream_type {
-            StreamLabelType::Audio => "</AudioStreamInfos>",
-            StreamLabelType::Subtitle => "</SubtitleStreamInfos>",
-        };
+            let (language, variant) = if lang_id.contains('_') {
+                let parts: Vec<&str> = lang_id.splitn(2, '_').collect();
+                (parts[0].to_lowercase(), parts[1].to_string())
+            } else {
+                (lang_id.to_lowercase(), String::new())
+            };
 
-        let block_end = match xml[tag..].find(end_tag) {
-            Some(p) => tag + p + end_tag.len(),
-            None => break,
-        };
+            let purpose = if content.eq_ignore_ascii_case("COMMENTARY") {
+                LabelPurpose::Commentary
+            } else {
+                LabelPurpose::Normal
+            };
 
-        let block = &xml[tag..block_end];
-        let id = extract_tag(block, "ID").unwrap_or_default();
-        let lang_id = extract_tag(block, "LangInfoID").unwrap_or_default();
-        let content = extract_tag(block, "Content").unwrap_or_default();
-        let qualifier_str = extract_tag(block, "Qualifier").unwrap_or_default();
+            let qualifier = match qualifier_str.to_ascii_uppercase().as_str() {
+                "SDH" => LabelQualifier::Sdh,
+                "DS" => LabelQualifier::DescriptiveService,
+                _ => LabelQualifier::None,
+            };
 
-        let (language, variant) = if lang_id.contains('_') {
-            let parts: Vec<&str> = lang_id.splitn(2, '_').collect();
-            (parts[0].to_lowercase(), parts[1].to_string())
-        } else {
-            (lang_id.to_lowercase(), String::new())
-        };
-
-        let purpose = match content.as_str() {
-            "COMMENTARY" => LabelPurpose::Commentary,
-            _ => LabelPurpose::Normal,
-        };
-
-        let qualifier = match qualifier_str.as_str() {
-            "SDH" => LabelQualifier::Sdh,
-            "DS" => LabelQualifier::DescriptiveService,
-            _ => LabelQualifier::None,
-        };
-
-        infos.push(StreamInfo {
-            id,
-            stream_type,
-            language,
-            variant,
-            purpose,
-            qualifier,
-        });
-        pos = block_end;
+            infos.push(StreamInfo {
+                id,
+                stream_type,
+                language,
+                variant,
+                purpose,
+                qualifier,
+            });
+            from = end;
+        }
     }
     infos
 }
 
-fn parse_playback_config(xml: &str, map: &mut HashMap<String, u16>) {
-    let mut pos = 0;
-    while pos < xml.len() {
-        let tag_start = if let Some(p) = xml[pos..].find("<AudioStreams>") {
-            Some(p + pos)
-        } else {
-            xml[pos..].find("<SubtitlesStreams>").map(|p| p + pos)
-        };
-
-        let tag_start = match tag_start {
-            Some(p) => p,
-            None => break,
-        };
-
-        let block_end = xml[tag_start..]
-            .find("</AudioStreams>")
-            .or_else(|| xml[tag_start..].find("</SubtitlesStreams>"))
-            .map(|p| tag_start + p + 20)
-            .unwrap_or(xml.len());
-
-        let block = &xml[tag_start..block_end];
-
-        if let (Some(stream_id_str), Some(info_id)) = (
-            extract_tag(block, "StreamID"),
-            extract_tag(block, "StreamInfo_ID"),
-        ) {
-            if let Ok(stream_num) = stream_id_str.parse::<u16>() {
-                map.insert(info_id, stream_num);
+fn parse_playback_config(text: &str, map: &mut HashMap<String, u16>) {
+    for tag_name in ["AudioStreams", "SubtitlesStreams"] {
+        let mut from = 0;
+        while let Some((start, end)) = xml::find_element(text, tag_name, from) {
+            let block = &text[start..end];
+            if let (Some(stream_id_str), Some(info_id)) = (
+                xml::text(block, "StreamID"),
+                xml::text(block, "StreamInfo_ID"),
+            ) {
+                if let Ok(stream_num) = stream_id_str.parse::<u16>() {
+                    map.insert(info_id, stream_num);
+                }
             }
+            from = end;
         }
-
-        pos = block_end;
     }
-}
-
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].trim().to_string())
 }
