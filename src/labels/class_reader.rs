@@ -1132,4 +1132,168 @@ mod tests {
         };
         assert_eq!(i.cp_index(), None);
     }
+
+    // ── Robustness smoke tests ──────────────────────────────────────────────
+    //
+    // ClassFile::parse must NEVER panic on adversarial input, only
+    // return Err. These tests feed a battery of malformed byte
+    // sequences and assert Err results — they're the lightweight
+    // alternative to a full cargo-fuzz target (which would need
+    // nightly + separate crate). If we adopt cargo-fuzz later, these
+    // tests stay as deterministic regression cases.
+
+    /// Tiny pseudo-random byte generator — deterministic + reproducible
+    /// without needing a `rand` dep. xorshift64*; good enough for
+    /// generating adversarial byte payloads.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn parse_rejects_empty_input() {
+        assert!(ClassFile::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_short_magic() {
+        for n in 0..4 {
+            let buf = vec![0u8; n];
+            assert!(ClassFile::parse(&buf).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_rejects_wrong_magic() {
+        let buf = vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        match ClassFile::parse(&buf) {
+            Err(Error::BadMagic(0xDEADBEEF)) => {}
+            Err(other) => panic!("expected BadMagic, got {:?}", other),
+            Ok(_) => panic!("expected BadMagic error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_truncated_after_magic() {
+        // CAFEBABE + 1 byte = not enough for minor_version (u16).
+        let buf = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00];
+        assert!(ClassFile::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_bad_cp_tag() {
+        // CAFEBABE + minor/major(0,0,0,52) + cp_count=2 + tag=99 (unknown).
+        let buf = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, // magic
+            0x00, 0x00, // minor
+            0x00, 0x34, // major
+            0x00, 0x02, // cp_count = 2 (one entry)
+            99,   // unknown tag
+        ];
+        match ClassFile::parse(&buf) {
+            Err(_) => {} // BadCpTag, BadMagic, or any other malformed-input err
+            Ok(_) => panic!("expected error on unknown CP tag"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_truncated_utf8() {
+        // CAFEBABE + minor/major + cp_count=2 + tag=1 (Utf8) + length=10 + 3 bytes (< 10).
+        let buf = vec![
+            0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34, 0x00, 0x02, // cp_count=2
+            1,    // Utf8 tag
+            0x00, 10, // length=10
+            b'h', b'i', b'!', // only 3 bytes (truncated)
+        ];
+        assert!(ClassFile::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn parse_does_not_panic_on_random_bytes() {
+        // 200 deterministic-pseudo-random byte buffers of varying
+        // lengths. The contract: never panic, only return Err (or in
+        // the vanishingly unlikely case of a coincidentally-valid
+        // buffer, Ok — we don't assert one or the other).
+        let mut state: u64 = 0xDEADBEEF_DEADBEEF;
+        for _ in 0..200 {
+            let len = (xorshift(&mut state) % 256) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push((xorshift(&mut state) & 0xFF) as u8);
+            }
+            // No panic. Result doesn't matter — Err is expected for
+            // 99%+ of inputs.
+            let _ = ClassFile::parse(&buf);
+        }
+    }
+
+    #[test]
+    fn parse_does_not_panic_on_valid_magic_random_tail() {
+        // 100 buffers that start with the magic + plausible
+        // minor/major but have garbage afterwards. These are the
+        // most adversarial — they pass the magic check and then
+        // exercise every other parser path.
+        let mut state: u64 = 0xCAFEBABE_DEADBEEF;
+        for _ in 0..100 {
+            let mut buf = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34];
+            let tail_len = (xorshift(&mut state) % 512) as usize;
+            for _ in 0..tail_len {
+                buf.push((xorshift(&mut state) & 0xFF) as u8);
+            }
+            let _ = ClassFile::parse(&buf);
+        }
+    }
+
+    #[test]
+    fn instructions_never_panic_on_random_code() {
+        // Bytecode iterator must not panic on any byte sequence.
+        let mut state: u64 = 0x12345678_87654321;
+        for _ in 0..200 {
+            let len = (xorshift(&mut state) % 256) as usize;
+            let mut code = Vec::with_capacity(len);
+            for _ in 0..len {
+                code.push((xorshift(&mut state) & 0xFF) as u8);
+            }
+            let attr = CodeAttribute {
+                max_stack: 0,
+                max_locals: 0,
+                code: &code,
+            };
+            // Bounded — iterator stops on truncated/unknown opcodes.
+            let _: Vec<_> = attr.instructions().collect();
+        }
+    }
+
+    #[test]
+    fn instruction_size_never_panics() {
+        // Cover every opcode byte 0..=255 with various code-buffer
+        // shapes. instruction_size returns Option but must not panic.
+        for op in 0u8..=255 {
+            for tail_len in [0usize, 1, 2, 3, 7, 16, 32] {
+                let mut buf = vec![op];
+                for i in 0..tail_len {
+                    buf.push((i as u8).wrapping_mul(31));
+                }
+                let _ = instruction_size(&buf, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn modified_utf8_never_panics_on_random_bytes() {
+        let mut state: u64 = 0xABCDEF12_34567890;
+        for _ in 0..500 {
+            let len = (xorshift(&mut state) % 64) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push((xorshift(&mut state) & 0xFF) as u8);
+            }
+            // Either Ok or Err; never a panic.
+            let _ = decode_modified_utf8(&buf);
+        }
+    }
 }
