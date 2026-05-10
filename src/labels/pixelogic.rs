@@ -5,9 +5,13 @@
 //!
 //! Token format: `{lang}_{codec?}_{purpose?}_{region?}_`
 
-use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType, text, vocab};
+use super::{
+    Confidence, LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, text,
+    vocab,
+};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Known audio codec tokens
 const AUDIO_CODECS: &[&str] = &["MLP", "AC3", "DTS", "DDL", "WAV", "AC"];
@@ -20,12 +24,18 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "bluray_project.bin")?;
     // min_len=4 matches the prior local extract_strings impl. The token
     // grammar is `{lang3}_{codec?}_{purpose?}_{region?}_` so the
     // shortest meaningful run is 4 chars (lang + underscore).
     let strings = text::extract_ascii_strings(&data, 4);
+
+    // Tracked across all parse_token calls in this run: did any stream
+    // hit an unrecognized token component (skip-unknown path)? If yes
+    // we downgrade confidence to Medium — the labels are still valid
+    // but the corpus surfaced something we don't catalogue.
+    let saw_unknown = AtomicBool::new(false);
 
     let mut labels = Vec::new();
     let mut in_feature = false;
@@ -53,7 +63,7 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
             continue;
         }
 
-        if let Some(label) = parse_token(s) {
+        if let Some(label) = parse_token_inner(s, Some(&saw_unknown)) {
             match label.stream_type {
                 StreamLabelType::Audio => {
                     audio_num += 1;
@@ -76,10 +86,15 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     if labels.is_empty() {
         return None;
     }
-    Some(labels)
+    let confidence = if saw_unknown.load(Ordering::Relaxed) {
+        Confidence::Medium
+    } else {
+        Confidence::High
+    };
+    Some(ParseResult { labels, confidence })
 }
 
-fn parse_token(s: &str) -> Option<StreamLabel> {
+fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<StreamLabel> {
     let clean = s.trim().trim_start_matches('\t').trim_end_matches('_');
     let parts: Vec<&str> = clean.split('_').collect();
     if parts.len() < 2 {
@@ -135,8 +150,13 @@ fn parse_token(s: &str) -> Option<StreamLabel> {
             // behavior was `return None` here, which silently dropped
             // any stream containing a single uncatalogued token (e.g.
             // a new codec ID or framework variant). Better to surface
-            // what we know than discard a whole stream over one part.
+            // what we know than discard a whole stream over one part,
+            // but flag the parse as Medium-confidence so callers know
+            // some data was elided.
             tracing::debug!(part = %part, "pixelogic: unrecognized token component, skipping");
+            if let Some(flag) = saw_unknown {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -170,7 +190,7 @@ mod tests {
 
     #[test]
     fn parse_token_basic_audio() {
-        let l = parse_token("eng_MLP_").unwrap();
+        let l = parse_token_inner("eng_MLP_", None).unwrap();
         assert_eq!(l.stream_type, StreamLabelType::Audio);
         assert_eq!(l.language, "eng");
         assert_eq!(l.codec_hint, "TrueHD");
@@ -179,7 +199,7 @@ mod tests {
 
     #[test]
     fn parse_token_basic_subtitle_sdh() {
-        let l = parse_token("eng_SDH_").unwrap();
+        let l = parse_token_inner("eng_SDH_", None).unwrap();
         assert_eq!(l.stream_type, StreamLabelType::Subtitle);
         assert_eq!(l.language, "eng");
         assert_eq!(l.qualifier, LabelQualifier::Sdh);
@@ -187,20 +207,20 @@ mod tests {
 
     #[test]
     fn parse_token_commentary() {
-        let l = parse_token("eng_MLP_ACOM_").unwrap();
+        let l = parse_token_inner("eng_MLP_ACOM_", None).unwrap();
         assert_eq!(l.stream_type, StreamLabelType::Audio);
         assert_eq!(l.purpose, LabelPurpose::Commentary);
     }
 
     #[test]
     fn parse_token_descriptive() {
-        let l = parse_token("eng_AC3_ADES_").unwrap();
+        let l = parse_token_inner("eng_AC3_ADES_", None).unwrap();
         assert_eq!(l.purpose, LabelPurpose::Descriptive);
     }
 
     #[test]
     fn parse_token_with_region() {
-        let l = parse_token("eng_MLP_US_").unwrap();
+        let l = parse_token_inner("eng_MLP_US_", None).unwrap();
         assert_eq!(l.language, "eng");
         assert_eq!(l.variant, "US");
     }
@@ -210,7 +230,7 @@ mod tests {
         // Regression: pre-refactor, an unrecognized token part returned
         // None for the whole stream, silently dropping it. New
         // behavior: skip the unknown part, surface what we know.
-        let l = parse_token("eng_MLP_FUTUREFLAG_FOR_").unwrap();
+        let l = parse_token_inner("eng_MLP_FUTUREFLAG_FOR_", None).unwrap();
         assert_eq!(l.stream_type, StreamLabelType::Audio);
         assert_eq!(l.language, "eng");
         assert_eq!(l.codec_hint, "TrueHD");
@@ -222,12 +242,12 @@ mod tests {
         // A token that has only a language and an unknown part with
         // no audio/subtitle classifier should still return None —
         // there's no way to file it as a stream.
-        assert!(parse_token("eng_UNKNOWN_").is_none());
+        assert!(parse_token_inner("eng_UNKNOWN_", None).is_none());
     }
 
     #[test]
     fn parse_token_rejects_non_lang_prefix() {
-        assert!(parse_token("XX_MLP_").is_none());
-        assert!(parse_token("ENG_MLP_").is_none()); // uppercase not accepted as ISO 639-2
+        assert!(parse_token_inner("XX_MLP_", None).is_none());
+        assert!(parse_token_inner("ENG_MLP_", None).is_none()); // uppercase not accepted as ISO 639-2
     }
 }

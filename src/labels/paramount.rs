@@ -12,7 +12,7 @@
 //!   sub_com1_idx="23,24,25" />
 //! ```
 
-use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 
@@ -20,7 +20,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "playlists.xml")?;
     let text = std::str::from_utf8(&data).ok()?;
 
@@ -100,7 +100,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     if labels.is_empty() {
         return None;
     }
-    Some(labels)
+    // High confidence: paramount's playlists.xml is fully structured
+    // and we extract every documented field.
+    Some(ParseResult::high(labels))
 }
 
 /// Find the feature playlist element (the one with the most audio tracks).

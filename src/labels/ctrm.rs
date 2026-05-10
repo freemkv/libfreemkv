@@ -4,7 +4,7 @@
 //! When both exist, language_streams.txt provides structured types while
 //! menu_base.prop provides stream number → button name mapping.
 
-use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType, vocab};
+use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, vocab};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ pub fn detect(udf: &UdfFs) -> bool {
         || super::jar_file_exists(udf, "language_streams.txt")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     // Try language_streams.txt first (richer structured data)
     let ls_labels = parse_language_streams(reader, udf);
 
@@ -22,12 +22,18 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     let mb_labels = parse_menu_base(reader, udf);
 
     // If we have both, merge: language_streams for structure, menu_base for names
-    match (ls_labels, mb_labels) {
-        (Some(ls), Some(mb)) => Some(merge(ls, mb)),
-        (Some(ls), None) => Some(ls),
-        (None, Some(mb)) => Some(mb),
-        (None, None) => None,
+    let labels = match (ls_labels, mb_labels) {
+        (Some(ls), Some(mb)) => merge(ls, mb),
+        (Some(ls), None) => ls,
+        (None, Some(mb)) => mb,
+        (None, None) => return None,
+    };
+    if labels.is_empty() {
+        return None;
     }
+    // High confidence: both language_streams.txt and menu_base.prop
+    // are structured key-value formats with documented types.
+    Some(ParseResult::high(labels))
 }
 
 fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {

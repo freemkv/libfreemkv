@@ -54,7 +54,7 @@
 //! finder), and D land as follow-up commits.
 
 use super::class_reader::{AASTORE, CpInfo, LDC, LDC_W, NEW};
-use super::{StreamLabel, jar};
+use super::{ParseResult, jar};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 
@@ -65,7 +65,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     jar::has_any_top_level_jar(udf)
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
             return None;

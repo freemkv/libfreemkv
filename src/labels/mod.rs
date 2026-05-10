@@ -73,28 +73,68 @@ pub enum LabelQualifier {
 
 // ── Parser registry ────────────────────────────────────────────────────────
 //
-// Each entry: (name, detect_fn, parse_fn)
-// Order = priority. First match wins. Highest quality output first.
+// Each entry: (name, detect_fn, parse_fn). Order = tiebreaker only —
+// the registry picks the highest-confidence parse result, falling back
+// to array order on confidence ties.
 
 type DetectFn = fn(&UdfFs) -> bool;
-type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<Vec<StreamLabel>>;
+type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<ParseResult>;
+
+/// Per-parser claim of how reliable its output is. Used by the
+/// registry to pick between parsers when more than one matches (e.g.
+/// a disc that has both `bluray_project.bin` and `playlists.xml`).
+///
+/// A parser SHOULD return `High` only when its full schema was
+/// extracted with no fallback or guessing. `Medium` is for matched-
+/// but-degraded outputs (some streams missing fields, fingerprint
+/// matched but a sub-table couldn't be decoded, etc.). The registry
+/// prefers `High` over `Medium`; ties fall to array order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Confidence {
+    Medium,
+    High,
+}
+
+/// Successful parser result. `None` from `parse()` still means "this
+/// isn't my disc" (no labels at all); `Some(ParseResult { labels, .. })`
+/// with `labels.is_empty()` is also a "no labels" case but reachable
+/// via the analyzer (used by deluxe today to signal "I recognized the
+/// framework but Phase D not yet implemented").
+#[derive(Debug, Clone)]
+pub struct ParseResult {
+    pub labels: Vec<StreamLabel>,
+    pub confidence: Confidence,
+}
+
+impl ParseResult {
+    /// Convenience for the common "I parsed N labels with full schema
+    /// coverage" case.
+    pub fn high(labels: Vec<StreamLabel>) -> Self {
+        ParseResult {
+            labels,
+            confidence: Confidence::High,
+        }
+    }
+
+    /// Convenience for "I matched but had to fall back on some fields".
+    pub fn medium(labels: Vec<StreamLabel>) -> Self {
+        ParseResult {
+            labels,
+            confidence: Confidence::Medium,
+        }
+    }
+}
 
 const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ("paramount", paramount::detect, paramount::parse),
     ("criterion", criterion::detect, criterion::parse),
     ("pixelogic", pixelogic::detect, pixelogic::parse),
     ("ctrm", ctrm::detect, ctrm::parse),
-    // dbp last: detects on any top-level .jar in /BDMV/JAR/ (every
-    // BD-J disc has one), so parse() does the real `com/dbp/` check
-    // and returns None on a mismatch. By placing dbp last, the
-    // earlier parsers' fast file-presence detects short-circuit and
-    // dbp only runs on discs that fell through everything else.
     // dbp and deluxe both detect on "any top-level .jar in /BDMV/JAR/"
     // (every BD-J disc trips that) and do the real vendor-prefix check
-    // in parse(). Order between them is somewhat arbitrary since either
-    // returns None on a mismatched jar, but dbp goes first because its
-    // parse path is cheaper (constant-pool iteration vs. deluxe's
-    // bytecode walking once Phase D lands).
+    // in parse(). Order between them is the tiebreaker on equal
+    // confidence; dbp goes first because its parse path is cheaper
+    // (constant-pool iteration vs. deluxe's bytecode walking).
     ("dbp", dbp::detect, dbp::parse),
     ("deluxe", deluxe::detect, deluxe::parse),
 ];
@@ -285,16 +325,41 @@ fn generate_audio_label(
 }
 
 fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
+    let mut best: Option<(&'static str, ParseResult)> = None;
     for (name, detect, parse) in PARSERS {
-        if detect(udf) {
-            tracing::info!(parser = name, "label parser matched");
-            if let Some(labels) = parse(reader, udf) {
-                return labels;
-            }
+        if !detect(udf) {
+            continue;
+        }
+        tracing::info!(parser = name, "label parser detected");
+        let Some(result) = parse(reader, udf) else {
+            continue;
+        };
+        if result.labels.is_empty() {
+            continue;
+        }
+        // Pick highest confidence. Equal confidence → first wins
+        // (array order tiebreaker).
+        match &best {
+            None => best = Some((name, result)),
+            Some((_, b)) if result.confidence > b.confidence => best = Some((name, result)),
+            _ => {}
         }
     }
-    tracing::info!("no label parser matched");
-    Vec::new()
+    match best {
+        Some((name, r)) => {
+            tracing::info!(
+                parser = name,
+                confidence = ?r.confidence,
+                label_count = r.labels.len(),
+                "label parser selected",
+            );
+            r.labels
+        }
+        None => {
+            tracing::info!("no label parser matched");
+            Vec::new()
+        }
+    }
 }
 
 /// Diagnostic introspection — returns the parser that matched, the
@@ -302,43 +367,59 @@ fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
 /// that the discriminators looked at. Intended for `freemkv-tools
 /// labels-analyze` and corpus regression tooling, not production code
 /// paths. The matching/parsing logic is identical to [`extract`]; only
-/// the return shape is richer.
+/// the return shape is richer (includes confidence, all detected
+/// parsers, and any parsers that produced empty results).
 #[doc(hidden)]
 pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
     let inventory = jar_inventory(udf);
-    // Record every parser whose discriminator matched — even if its
-    // parse step then returned None — so the analyzer can distinguish
-    // "no parser recognized this disc" from "parser recognized it but
-    // couldn't read the file" (e.g. content past a truncated capture)
-    // or "parser ran but produced no labels."
     let mut parsers_detected: Vec<&'static str> = Vec::new();
+    let mut all_results: Vec<(&'static str, ParseResult)> = Vec::new();
+
     for (name, detect, parse) in PARSERS {
-        if detect(udf) {
-            tracing::info!(parser = name, "label parser matched");
-            parsers_detected.push(name);
-            if let Some(labels) = parse(reader, udf) {
-                return LabelAnalysis {
-                    parser: Some(name),
-                    parsers_detected,
-                    jar_inventory: inventory,
-                    labels,
-                };
-            }
+        if !detect(udf) {
+            continue;
+        }
+        tracing::info!(parser = name, "label parser detected");
+        parsers_detected.push(name);
+        if let Some(r) = parse(reader, udf) {
+            all_results.push((name, r));
         }
     }
+
+    // Selection logic mirrors `extract`: highest confidence + non-empty,
+    // array order tiebreaker.
+    let chosen = all_results
+        .iter()
+        .filter(|(_, r)| !r.labels.is_empty())
+        .max_by(|(_, a), (_, b)| {
+            // Cmp first by confidence (higher first), then position
+            // (earlier first). max_by yields the maximum, so we
+            // invert the index comparison.
+            a.confidence
+                .cmp(&b.confidence)
+                .then(std::cmp::Ordering::Equal)
+        });
+
+    let (parser, confidence, labels) = match chosen {
+        Some((name, r)) => (Some(*name), Some(r.confidence), r.labels.clone()),
+        None => (None, None, Vec::new()),
+    };
+
     if parsers_detected.is_empty() {
         tracing::info!("no label parser matched");
-    } else {
+    } else if parser.is_none() {
         tracing::info!(
             detected = ?parsers_detected,
             "label parsers detected but produced no labels"
         );
     }
+
     LabelAnalysis {
-        parser: None,
+        parser,
         parsers_detected,
+        confidence,
         jar_inventory: inventory,
-        labels: Vec::new(),
+        labels,
     }
 }
 
@@ -346,13 +427,16 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct LabelAnalysis {
-    /// Which parser matched ("paramount" / "criterion" / "pixelogic" /
-    /// "ctrm") AND emitted labels. `None` means either no parser
-    /// recognized the disc, OR a parser recognized it but its parse
-    /// step returned None (file unreadable, no parseable tokens). Use
-    /// `parsers_detected` to disambiguate.
+    /// Which parser was SELECTED — the one whose `ParseResult` had
+    /// the highest confidence among non-empty results (array order
+    /// tiebreaker). `None` means either no parser recognized the
+    /// disc, OR every parser that recognized it returned no labels.
+    /// Use `parsers_detected` to disambiguate.
     pub parser: Option<&'static str>,
-    /// Every parser whose discriminator matched, in priority order.
+    /// Confidence of the selected parser, `None` if no parser was
+    /// selected.
+    pub confidence: Option<Confidence>,
+    /// Every parser whose discriminator matched, in registry order.
     /// Distinguishes "we recognized this disc but couldn't extract
     /// labels" from "we don't recognize this disc at all" — the
     /// former points at a parser bug or a truncated capture, the
@@ -362,8 +446,8 @@ pub struct LabelAnalysis {
     /// and sorted. Helps spot unknown authoring formats when no
     /// parser detected.
     pub jar_inventory: Vec<String>,
-    /// Raw labels emitted by the matched parser (empty if `parser` is
-    /// `None`).
+    /// Raw labels emitted by the selected parser (empty if `parser`
+    /// is `None`).
     pub labels: Vec<StreamLabel>,
 }
 
