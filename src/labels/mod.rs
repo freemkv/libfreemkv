@@ -11,6 +11,7 @@ pub(crate) mod class_reader;
 mod criterion;
 mod ctrm;
 mod dbp;
+mod deluxe;
 pub(crate) mod jar;
 mod paramount;
 mod pixelogic;
@@ -89,7 +90,12 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     // earlier parsers' fast file-presence detects short-circuit and
     // dbp only runs on discs that fell through everything else.
     ("dbp", dbp::detect, dbp::parse),
-    // ("deluxe",  deluxe::detect,     deluxe::parse),  // TODO: bytecode parser
+    // deluxe last for the same reason as dbp: its detect() triggers
+    // on any top-level .jar (every BD-J disc), and parse() does the
+    // real `com/bydeluxe/` check. Phase A (master enum identification)
+    // shipped 2026-05-10; phases B/C/D (per-stream binding decoder)
+    // pending.
+    ("deluxe", deluxe::detect, deluxe::parse),
 ];
 
 /// Search disc for config files, extract labels, apply to streams.
