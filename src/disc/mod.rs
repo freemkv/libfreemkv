@@ -1781,9 +1781,18 @@ impl Disc {
                             .unwrap_or(0),
                         None => 0,
                     };
+                    // The consumer's snapshot is the source of truth for
+                    // bytes_unreadable / bytes_pending (the producer doesn't
+                    // see them), but its bytes_good lags producer-side
+                    // `bytes_done` whenever the consumer is behind on draining
+                    // the work channel. Take the max so the user-visible
+                    // counter never regresses below what the producer has
+                    // already sent — Anomaly B in the 0.18.1 prod test was
+                    // this regression: a stale early snapshot pinned the
+                    // display to 0 GB while bytes_done was already advancing.
                     let (bytes_good, bytes_unreadable, bytes_pending) = match &cached_snapshot {
                         Some(snap) => (
-                            snap.stats.bytes_good,
+                            snap.stats.bytes_good.max(bytes_done),
                             snap.stats.bytes_unreadable,
                             snap.stats.bytes_pending,
                         ),

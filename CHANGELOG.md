@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.18.2 (2026-05-09)
+
+### Bug fixes
+
+- **Nav-file scramble during AACS rip** (`decrypt::decrypt_sectors`). 0.18's
+  `DecryptingSectorSource` decorator broadened the call surface of
+  `decrypt_sectors` to every sector flowing through sweep, including UDF
+  navigation files (MPLS playlists, CLPI clip-info). The byte-0 heuristic
+  in `aacs::is_unit_encrypted` correctly fires on m2ts source-packet copy
+  markers but false-positives on any binary file whose first byte happens
+  to have the top 2 bits set — most notably MPLS files (start with 'M' =
+  0x4D) and CLPI files (start with 'H' = 0x48). `decrypt_unit_full`
+  already self-checks the result via TS-sync verification and returns
+  `false` on a misfire, but the chunk had been mutated by then;
+  `decrypt_sectors` discarded the return value, leaving scrambled bytes
+  in the ISO. Fix: snapshot the chunk before decryption and restore on
+  verification failure (same pattern `decrypt_unit_try_keys` already used
+  for multi-key discs). Symptom: `freemkv info iso://UHD.iso` and
+  `iso:// → mkv://` returned E6009 NoStreams on freshly-ripped UHD ISOs;
+  affected only the iso-source path, not the disc-source path or the
+  m2ts video payload itself. Regression test:
+  `decrypt::tests::nav_file_unit_survives_decrypt_attempt`.
+
+- **Sweep progress display can regress to zero** (`Disc::sweep`). The
+  consumer-side `bytes_good` snapshot lags producer-side `bytes_done`
+  whenever the consumer is behind on draining the work channel. Until
+  the first snapshot arrived, the placeholder branch reported
+  `bytes_done` correctly; once a stale snapshot landed, the report
+  switched to `snap.bytes_good` and could regress below `bytes_done`.
+  Fix: `bytes_good_total = max(snap.bytes_good, bytes_done)`, so the
+  user-visible counter never moves backward.
+
 ## 0.18.1 (2026-05-09)
 
 ### I/O stack redesign — primitives over orchestration
