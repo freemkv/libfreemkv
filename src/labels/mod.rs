@@ -148,7 +148,18 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
     if labels.is_empty() {
         return;
     }
+    apply_labels(&labels, titles);
+}
 
+/// Apply a pre-extracted set of labels to titles' streams. Match
+/// labels to streams by (stream_type, 1-based stream_number per type).
+/// Audio streams update `purpose` + `label` (codec/variant info; never
+/// English purpose text). Subtitle streams update `qualifier` and the
+/// `forced` flag.
+///
+/// Extracted from `apply()` so the matching logic is unit-testable
+/// without needing a SectorReader / UdfFs.
+pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     for title in titles.iter_mut() {
         let mut audio_idx: u16 = 0;
         let mut sub_idx: u16 = 0;
@@ -557,5 +568,363 @@ mod registry_tests {
             let _ = (name, detect, parse);
         }
         assert!(!PARSERS.is_empty(), "PARSERS array must not be empty");
+    }
+}
+
+// ── apply() integration tests ──────────────────────────────────────────────
+//
+// End-to-end coverage for the apply_labels + fill_defaults pipeline
+// without needing a SectorReader / UdfFs. Synthetic DiscTitle +
+// StreamLabel inputs, assert on the resulting Stream field values.
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::disc::{
+        AudioChannels, AudioStream, Codec, ColorSpace, FrameRate, HdrFormat, Resolution,
+        SampleRate, SubtitleStream, VideoStream,
+    };
+
+    fn audio(pid: u16, codec: Codec, channels: AudioChannels, language: &str) -> Stream {
+        Stream::Audio(AudioStream {
+            pid,
+            codec,
+            channels,
+            language: language.into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        })
+    }
+
+    fn subtitle(pid: u16, language: &str) -> Stream {
+        Stream::Subtitle(SubtitleStream {
+            pid,
+            codec: Codec::Pgs,
+            language: language.into(),
+            forced: false,
+            qualifier: LabelQualifier::None,
+            codec_data: None,
+        })
+    }
+
+    fn video() -> Stream {
+        Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Hdr10,
+            color_space: ColorSpace::Bt2020,
+            secondary: false,
+            label: String::new(),
+        })
+    }
+
+    fn title_with(streams: Vec<Stream>) -> DiscTitle {
+        DiscTitle {
+            playlist: "00800.mpls".into(),
+            playlist_id: 800,
+            duration_secs: 7200.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams,
+            chapters: Vec::new(),
+            extents: Vec::new(),
+            content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    fn audio_label(num: u16, lang: &str, codec_hint: &str, variant: &str) -> StreamLabel {
+        StreamLabel {
+            stream_number: num,
+            stream_type: StreamLabelType::Audio,
+            language: lang.into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: codec_hint.into(),
+            variant: variant.into(),
+        }
+    }
+
+    #[test]
+    fn apply_attaches_codec_hint_and_variant_to_audio() {
+        let mut titles = vec![title_with(vec![
+            video(),
+            audio(0x1100, Codec::TrueHd, AudioChannels::Surround51, "eng"),
+        ])];
+        let labels = vec![audio_label(1, "eng", "Dolby Atmos", "")];
+        apply_labels(&labels, &mut titles);
+
+        if let Stream::Audio(a) = &titles[0].streams[1] {
+            assert_eq!(a.label, "Dolby Atmos");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_combines_variant_and_codec_hint() {
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround51,
+            "por",
+        )])];
+        let labels = vec![audio_label(1, "por", "Dolby Atmos", "Brazilian")];
+        apply_labels(&labels, &mut titles);
+
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "(Brazilian) Dolby Atmos");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_sets_purpose_on_audio_commentary() {
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::Ac3,
+            AudioChannels::Stereo,
+            "eng",
+        )])];
+        let labels = vec![StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Audio,
+            language: "eng".into(),
+            name: String::new(),
+            purpose: LabelPurpose::Commentary,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }];
+        apply_labels(&labels, &mut titles);
+
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.purpose, LabelPurpose::Commentary);
+            // Label stays empty: no codec/variant; purpose is conveyed
+            // structurally, NOT as English text.
+            assert_eq!(a.label, "");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_uses_name_fallback_only_for_normal_purpose() {
+        // Name fallback fires when purpose=Normal and codec/variant are empty.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround71,
+            "eng",
+        )])];
+        let labels = vec![StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Audio,
+            language: "eng".into(),
+            name: "Director's Cut Edition".into(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }];
+        apply_labels(&labels, &mut titles);
+
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Director's Cut Edition");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_name_fallback_suppressed_for_non_normal_purpose() {
+        // Name fallback must NOT fire when purpose != Normal — the
+        // CLI is responsible for rendering purpose text.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::Ac3,
+            AudioChannels::Stereo,
+            "eng",
+        )])];
+        let labels = vec![StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Audio,
+            language: "eng".into(),
+            name: "Commentary by Director".into(),
+            purpose: LabelPurpose::Commentary,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "", "label must not contain English purpose text");
+            assert_eq!(a.purpose, LabelPurpose::Commentary);
+        }
+    }
+
+    #[test]
+    fn apply_sets_qualifier_on_subtitle_sdh() {
+        let mut titles = vec![title_with(vec![subtitle(0x1200, "eng")])];
+        let labels = vec![StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Subtitle,
+            language: "eng".into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::Sdh,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }];
+        apply_labels(&labels, &mut titles);
+
+        if let Stream::Subtitle(s) = &titles[0].streams[0] {
+            assert_eq!(s.qualifier, LabelQualifier::Sdh);
+            // SDH doesn't flip the `forced` flag.
+            assert!(!s.forced);
+        } else {
+            panic!("expected subtitle");
+        }
+    }
+
+    #[test]
+    fn apply_flips_forced_flag_on_subtitle_forced_qualifier() {
+        let mut titles = vec![title_with(vec![subtitle(0x1200, "eng")])];
+        let labels = vec![StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Subtitle,
+            language: "eng".into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::Forced,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Subtitle(s) = &titles[0].streams[0] {
+            assert_eq!(s.qualifier, LabelQualifier::Forced);
+            assert!(s.forced);
+        }
+    }
+
+    #[test]
+    fn apply_indexes_streams_by_type_separately() {
+        // Audio and subtitle each have their own 1-based index; an
+        // Audio #2 label maps to the 2nd audio stream, not the 2nd
+        // stream overall (which could be a subtitle).
+        let mut titles = vec![title_with(vec![
+            video(),
+            audio(0x1100, Codec::TrueHd, AudioChannels::Surround51, "eng"),
+            subtitle(0x1200, "eng"),
+            audio(0x1101, Codec::Ac3, AudioChannels::Stereo, "fra"),
+        ])];
+        let labels = vec![
+            audio_label(1, "eng", "Dolby Atmos", ""),
+            audio_label(2, "fra", "Dolby Digital", ""),
+            StreamLabel {
+                stream_number: 1,
+                stream_type: StreamLabelType::Subtitle,
+                language: "eng".into(),
+                name: String::new(),
+                purpose: LabelPurpose::Normal,
+                qualifier: LabelQualifier::Sdh,
+                codec_hint: String::new(),
+                variant: String::new(),
+            },
+        ];
+        apply_labels(&labels, &mut titles);
+
+        // Audio #1
+        if let Stream::Audio(a) = &titles[0].streams[1] {
+            assert_eq!(a.label, "Dolby Atmos");
+        }
+        // Audio #2 (4th stream overall)
+        if let Stream::Audio(a) = &titles[0].streams[3] {
+            assert_eq!(a.label, "Dolby Digital");
+        }
+        // Subtitle #1
+        if let Stream::Subtitle(s) = &titles[0].streams[2] {
+            assert_eq!(s.qualifier, LabelQualifier::Sdh);
+        }
+    }
+
+    #[test]
+    fn apply_ignores_labels_for_nonexistent_streams() {
+        // A label for stream #99 with no matching stream is a no-op.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround51,
+            "eng",
+        )])];
+        let labels = vec![audio_label(99, "fra", "Dolby Digital", "")];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "", "label must be untouched");
+        }
+    }
+
+    #[test]
+    fn apply_empty_labels_does_not_touch_streams() {
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround51,
+            "eng",
+        )])];
+        apply_labels(&[], &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "");
+        }
+    }
+
+    // ── fill_defaults() tests ───────────────────────────────────────────────
+
+    #[test]
+    fn fill_defaults_generates_audio_label_when_empty() {
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround71,
+            "eng",
+        )])];
+        fill_defaults(&mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Dolby TrueHD 7.1");
+        }
+    }
+
+    #[test]
+    fn fill_defaults_preserves_existing_audio_label() {
+        let mut titles = vec![title_with(vec![Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::TrueHd,
+            channels: AudioChannels::Surround71,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: "Pre-set Atmos".into(),
+        })])];
+        fill_defaults(&mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Pre-set Atmos");
+        }
+    }
+
+    #[test]
+    fn fill_defaults_generates_video_label_with_hdr() {
+        let mut titles = vec![title_with(vec![video()])];
+        fill_defaults(&mut titles);
+        if let Stream::Video(v) = &titles[0].streams[0] {
+            assert!(v.label.contains("4K"), "expected 4K, got {}", v.label);
+            assert!(v.label.contains("HDR10"), "expected HDR10, got {}", v.label);
+        }
     }
 }
