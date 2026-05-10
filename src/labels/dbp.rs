@@ -34,7 +34,7 @@
 //! Java-parser families share one source of truth.
 
 use super::class_reader::CpInfo;
-use super::{StreamLabel, StreamLabelType, jar, vocab};
+use super::{ParseResult, StreamLabel, StreamLabelType, jar, vocab};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
@@ -49,7 +49,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     jar::has_any_top_level_jar(udf)
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     jar::for_each_jar(reader, udf, |_entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/dbp/") {
             return None;
@@ -58,7 +58,9 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
         if labels.is_empty() {
             None
         } else {
-            Some(labels)
+            // High confidence: TextField,Audio1,... is a stable anchor
+            // pattern + vocab routes language/purpose/qualifier.
+            Some(ParseResult::high(labels))
         }
     })
 }

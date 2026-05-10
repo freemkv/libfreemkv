@@ -3,7 +3,7 @@
 //! Clean structured XML with Content/Qualifier per stream and
 //! stream number mapping via playbackconfig.
 
-use super::{LabelPurpose, LabelQualifier, StreamLabel, StreamLabelType};
+use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "streamproperties.xml")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
     let sp_data = super::read_jar_file(reader, udf, "streamproperties.xml")?;
     let sp_text = std::str::from_utf8(&sp_data).ok()?;
 
@@ -66,7 +66,8 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLab
     if labels.is_empty() {
         return None;
     }
-    Some(labels)
+    // High confidence: streamproperties.xml is fully structured.
+    Some(ParseResult::high(labels))
 }
 
 struct StreamInfo {
