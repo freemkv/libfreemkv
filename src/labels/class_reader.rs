@@ -118,6 +118,21 @@ pub struct ConstantPool {
 }
 
 impl ConstantPool {
+    /// Test-only constructor — build a constant pool directly from a
+    /// vector of entries. Real callers go through `ClassFile::parse`
+    /// which builds this from class-file bytes. Used by parser unit
+    /// tests (e.g. `labels::deluxe`) that need to exercise bytecode
+    /// walkers against synthetic class fixtures without hand-rolling
+    /// valid .class byte buffers.
+    ///
+    /// Caller is responsible for: prepending a `CpInfo::Empty` at
+    /// index 0 (the spec-reserved slot), and inserting a `CpInfo::Empty`
+    /// after each Long/Double entry (the 2-slot quirk).
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<CpInfo>) -> Self {
+        ConstantPool { entries }
+    }
+
     #[inline]
     pub fn get(&self, index: u16) -> Option<&CpInfo> {
         self.entries.get(index as usize)
