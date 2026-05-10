@@ -624,19 +624,27 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(libfreemkv::disc::mapfile_path_for(&iso_path));
 
-    // Pass 1 reads every batch at bpt=32 (no batch reduction, no skip-ahead).
-    // BlockSizeFailingReader fails on multi-sector reads but succeeds on single-sector.
-    // Bridge degradation handling retries failed batches as individual sectors,
-    // so all data is recovered as Finished. bytes_good == total_bytes is correct.
+    // Pass 1's job is "fast and accurate, get the most data in the
+    // shortest time." It no longer bisects on marginal media — that's
+    // Pass N's purpose-built role. So a BlockSizeFailingReader that
+    // fails on multi-sector reads and succeeds on single-sector
+    // results in: every batch fails → SkipBlock → whole 32-sector
+    // ECC block marked NonTrimmed → Pass N (Disc::patch) revisits and
+    // recovers via single-sector reads with proper recovery semantics.
+    //
+    // Pass 1 alone:
     assert_eq!(
-        result.bytes_good, total_bytes,
-        "Pass 1 at bpt=32 recovers all sectors via single-sector retry on MEDIUM_ERROR"
+        result.bytes_good, 0,
+        "Pass 1 doesn't bisect on marginal media — failed batches become NonTrimmed for Pass N to revisit"
     );
     assert_eq!(
-        result.bytes_pending, 0,
-        "no pending sectors after full recovery"
+        result.bytes_pending, total_bytes,
+        "every sector is NonTrimmed (pending) after Pass 1, awaiting Pass N"
     );
-    assert!(result.complete, "complete=true when all sectors recovered");
+    assert!(
+        !result.complete,
+        "complete=false because NonTrimmed regions remain (Pass N's work)"
+    );
 }
 
 // ── 9. PassProgress carries separate unreadable vs pending byte counts ─────
