@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 0.18.3
+## 0.18.3 (2026-05-09)
 
 ### Behaviour change
 
