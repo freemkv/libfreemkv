@@ -657,11 +657,8 @@ mod tests {
         // produces no frames, but the call still routes through the blanket
         // dispatch into Stream::read.
         let mut frames = 0usize;
-        loop {
-            match src.read().expect("read") {
-                Some(_) => frames += 1,
-                None => break,
-            }
+        while src.read().expect("read").is_some() {
+            frames += 1;
             if frames > 1024 {
                 panic!("unexpected unbounded frame stream from empty title");
             }
