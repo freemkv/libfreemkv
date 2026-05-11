@@ -70,8 +70,14 @@ impl SectorReader for PatternedSectorReader {
                 });
             }
         }
-        for chunk in buf.chunks_mut(SECTOR_SIZE) {
-            chunk.fill((lba & 0xff) as u8);
+        // Fill each sector with ITS OWN LBA byte, not the starting LBA's
+        // byte. This matches real drive behavior: a multi-sector READ
+        // returns per-sector-correct data. Pre-0.18.13 only single-sector
+        // reads were exercised by patch tests, so the cheaper "fill the
+        // whole batch with one byte" worked; adaptive batching needs the
+        // per-sector pattern to verify correct positioning.
+        for (i, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
+            chunk.fill(((lba + i as u32) & 0xff) as u8);
         }
         Ok(buf.len())
     }
