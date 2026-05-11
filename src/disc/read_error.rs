@@ -294,7 +294,26 @@ pub enum ReadAction {
 // Pause budget constants. Tuned from 2026-05-07 BU40N traces showing
 // bridge wedges 524 ms after a 5.4-second internal ECC retry. The
 // post-failure pauses give the drive — and the bridge — time to settle.
-const POST_FAILURE_PAUSE_SECS: u64 = 1;
+/// Pause between a failed read and the next read attempt — applied
+/// uniformly to Pass 1 sweep and Pass N patch.
+///
+/// 2026-05-11 reframe: a failed read is a failed read, regardless of
+/// which pass is running. The prior split (1s for Pass N, 5s for Pass
+/// 1 via `PASS_1_FAIL_PAUSE_SECS`) was solving an imaginary cost
+/// problem — real damaged-disc cases mark <50 MB NonTrimmed, and the
+/// extra 5s/error is single-digit minutes per pass, not hours. The
+/// cost of NOT pausing — a drive wedge that aborts the entire
+/// multi-pass recovery — is much worse.
+///
+/// The wedge avoidance principle: error → drive ECC retry (5-10s
+/// internal) → return → cooldown pause → next read. Same shape
+/// everywhere reads can fail.
+const FAIL_PAUSE_SECS: u64 = 5;
+/// Cooldown when a long streak of failures suggests the drive is
+/// stuck in a damage zone and needs MORE breathing room than the
+/// standard inter-error pause. Same value as `FAIL_PAUSE_SECS`
+/// because empirically 5s is enough; kept as a separate name so the
+/// escalation policy is explicit at the call site.
 const CONSECUTIVE_FAIL_LONG_PAUSE_SECS: u64 = 5;
 const CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD: u64 = 10;
 const POST_JUMP_EXTRA_PAUSE_SECS: u64 = 2;
@@ -302,14 +321,6 @@ const NOT_READY_PAUSE_SECS: u64 = 3;
 const NOT_READY_MAX_RETRIES: u32 = 3;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 15;
 const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
-
-/// Pass 1 inter-error pause. ZERO on the clean path (sweep zooms
-/// past damage windows) but applied to every failed read so the
-/// drive's firmware gets cool-down time between damage-cluster
-/// exposures. Wedge-avoidance change 2026-05-10: pre-fix `pause_secs
-/// = 0` on Pass 1 errors caused back-to-back exposures that
-/// accumulated firmware wedge state.
-const PASS_1_FAIL_PAUSE_SECS: u64 = 5;
 
 /// Base of the damage-jump distance formula: `jump_sectors =
 /// JUMP_BASE_SECTORS × batch × jump_multiplier`. Bumped 2026-05-10
@@ -359,6 +370,15 @@ const WEDGE_PAUSE_SECS: u64 = 30;
 /// physical-damage clusters, bounded enough to not loop forever on
 /// a permanently bricked drive.
 const WEDGE_ABORT_THRESHOLD: u64 = 16;
+
+/// Pass-N wedge-skip distance. Pass N's batch=1 reads target
+/// specific NonTrimmed sectors from Pass 1, so a big 1 GB skip
+/// would blow past the current NonTrimmed range and abandon many
+/// sectors that might still recover. Use a smaller skip just to
+/// move past the bricked LBA + a small buffer — the outer patch
+/// loop's next iteration picks up the next sector in the same or
+/// next range.
+const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 
 /// THE single error-handling entry point. Updates `ctx`, returns the
 /// action the caller must apply.
@@ -479,27 +499,27 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
 
     // 4. Hardware error / illegal request — the firmware-wedge family.
     //    The drive transitioned into a fast-fail state where it
-    //    rejects reads near the LBA. Two policies:
+    //    rejects reads near the LBA. Same response shape for both
+    //    passes (2026-05-11 reframe — error handling is centralized,
+    //    and the wedge is a code-induced state we can avoid via
+    //    pacing + skip):
     //
-    //    Pass 1 sweep (bisect_on_marginal=false): the wedge is
-    //      *recoverable* by skipping. Jump a large distance ahead
-    //      (1 GB), pause for cooldown, mark the skipped region
-    //      NonTrimmed so Pass N revisits. Allow up to
-    //      WEDGE_ABORT_THRESHOLD consecutive wedges before truly
-    //      giving up. This replaces the pre-fix "abort the entire
-    //      rip on first wedge" behavior that caused 48%-and-die
-    //      failures on discs with one bad cluster.
+    //    - Pass 1 sweep (bisect_on_marginal=false): jump
+    //      WEDGE_JUMP_SECTORS (1 GB) ahead, pause WEDGE_PAUSE_SECS,
+    //      mark skipped region NonTrimmed.
+    //    - Pass N patch (bisect_on_marginal=true): give up on the
+    //      current sector (the granular target), pause for cooldown,
+    //      let the outer patch loop move to the next NonTrimmed
+    //      range. Implemented as a small JumpAhead so the same code
+    //      path serves both — Pass N's batch=1 means JumpAhead by
+    //      WEDGE_PASS_N_SKIP_SECTORS effectively skips just this
+    //      sector and a small buffer (gives the drive room to
+    //      recover before the next per-sector attempt).
     //
-    //    Pass N patch (bisect_on_marginal=true): Pass N's job IS
-    //      single-sector recovery; a wedge means the drive won't
-    //      give us the specific sectors we asked for. Skipping
-    //      doesn't help here. Abort and let autorip decide whether
-    //      to retry, eject, or surface the failure to the user.
+    //    Both paths share the WEDGE_ABORT_THRESHOLD budget — only
+    //    AbortPass after N consecutive wedges with no successful
+    //    read in between.
     if sense_key == scsi::SENSE_KEY_HARDWARE_ERROR || sense_key == scsi::SENSE_KEY_ILLEGAL_REQUEST {
-        if ctx.bisect_on_marginal {
-            return ReadAction::AbortPass;
-        }
-        // Pass 1 wedge-skip path.
         if !ctx.bisecting {
             ctx.wedge_count += 1;
         }
@@ -509,21 +529,28 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
                 phase = "wedge_abort",
                 wedge_count = ctx.wedge_count,
                 threshold = WEDGE_ABORT_THRESHOLD,
-                "Pass 1 wedge-skip exhausted — drive appears permanently stuck"
+                pass = if ctx.bisect_on_marginal { "N" } else { "1" },
+                "wedge-skip exhausted — drive appears permanently stuck"
             );
             return ReadAction::AbortPass;
         }
+        let jump_sectors = if ctx.bisect_on_marginal {
+            WEDGE_PASS_N_SKIP_SECTORS
+        } else {
+            WEDGE_JUMP_SECTORS
+        };
         tracing::warn!(
             target: "freemkv::disc",
             phase = "wedge_skip",
+            pass = if ctx.bisect_on_marginal { "N" } else { "1" },
             wedge_count = ctx.wedge_count,
-            jump_sectors = WEDGE_JUMP_SECTORS,
+            jump_sectors,
             pause_secs = WEDGE_PAUSE_SECS,
-            "Pass 1 wedge detected — jumping ahead and pausing for drive cooldown"
+            "wedge detected — skipping ahead and pausing for drive cooldown"
         );
         ctx.jumps_taken += 1;
         return ReadAction::JumpAhead {
-            sectors: WEDGE_JUMP_SECTORS,
+            sectors: jump_sectors,
             pause_secs: WEDGE_PAUSE_SECS,
         };
     }
@@ -572,35 +599,15 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         bad_count * 100 / ctx.damage_window.len()
     };
 
-    // Inter-error pause on Pass 1 — wedge avoidance.
-    //
-    // Pre-2026-05-10 Pass 1 ran `pause_secs = 0` on all errors so
-    // sweep would zoom past damage zones in seconds instead of
-    // minutes. Empirically on the BU40N this caused firmware-wedge
-    // events: each read failure leaves residual state in the drive's
-    // firmware, and back-to-back errors without cooldown accumulate
-    // toward a wedge threshold. We hit wedge on Dune Pt 2 after 5
-    // errors in 43 s spread over a 140 MB damage cluster — even
-    // though wall-clock pacing was slow, the drive had no breathing
-    // room between exposures.
-    //
-    // New policy: Pass 1 keeps `pause = 0` on the CLEAN path
-    // (successful reads zoom past damage windows fine), but every
-    // failed read takes a PASS_1_FAIL_PAUSE_SECS pause before the
-    // next read. Cost: ~5 s extra per scattered failure, ~30-60 s
-    // total in a damage cluster — trivial compared to the alternative
-    // of crashing the whole rip at 48%. Long failure streaks still
-    // escalate via CONSECUTIVE_FAIL_LONG_PAUSE.
-    let pause_secs = if !ctx.bisect_on_marginal {
-        if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
-            CONSECUTIVE_FAIL_LONG_PAUSE_SECS
-        } else {
-            PASS_1_FAIL_PAUSE_SECS
-        }
-    } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
+    // Inter-error pause — wedge avoidance, applied uniformly across
+    // Pass 1 and Pass N. A failed read is a failed read; same
+    // cool-down regardless of which pass is calling. The escalation
+    // arm (LONG_PAUSE after a long streak) currently resolves to the
+    // same value but is kept as a separate branch for future tuning.
+    let pause_secs = if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
         CONSECUTIVE_FAIL_LONG_PAUSE_SECS
     } else {
-        POST_FAILURE_PAUSE_SECS
+        FAIL_PAUSE_SECS
     };
 
     // 7. Damage-jump: too many failures → skip ahead by an escalating
@@ -868,12 +875,39 @@ mod tests {
     }
 
     #[test]
-    fn pass_n_hardware_error_still_aborts() {
-        // Pass N (bisect_on_marginal=true) keeps the original
-        // AbortPass behavior — single-sector recovery can't make
-        // progress through a wedge, so the right answer is to bail
-        // and let the outer layer decide.
+    fn pass_n_hardware_error_also_skips_not_aborts() {
+        // 2026-05-11 reframe: error handling is centralized, the
+        // wedge is a code-induced state, and the avoidance principle
+        // (skip + pause + continue) applies to Pass N too. Previously
+        // Pass N AbortPass'd on first wedge — same fatal-at-48% bug
+        // Pass 1 had pre-fix. Now Pass N gets a smaller skip
+        // (WEDGE_PASS_N_SKIP_SECTORS, not the 1 GB Pass 1 jump)
+        // because Pass N's job IS to revisit specific NonTrimmed
+        // ranges; over-skipping abandons recoverable sectors.
         let mut ctx = ReadCtx::for_patch(1);
+        let action = handle_read_error(&hardware_err(), &mut ctx);
+        match action {
+            ReadAction::JumpAhead {
+                sectors,
+                pause_secs,
+            } => {
+                assert_eq!(sectors, WEDGE_PASS_N_SKIP_SECTORS);
+                assert_eq!(pause_secs, WEDGE_PAUSE_SECS);
+            }
+            other => panic!("expected JumpAhead, got {other:?}"),
+        }
+        assert_eq!(ctx.wedge_count, 1);
+    }
+
+    #[test]
+    fn pass_n_hardware_error_aborts_after_threshold() {
+        // Same threshold as Pass 1 — after WEDGE_ABORT_THRESHOLD
+        // consecutive wedges with no good read in between, give up.
+        let mut ctx = ReadCtx::for_patch(1);
+        for _ in 0..WEDGE_ABORT_THRESHOLD - 1 {
+            let action = handle_read_error(&hardware_err(), &mut ctx);
+            assert!(matches!(action, ReadAction::JumpAhead { .. }));
+        }
         let action = handle_read_error(&hardware_err(), &mut ctx);
         assert_eq!(action, ReadAction::AbortPass);
     }
@@ -911,24 +945,21 @@ mod tests {
     }
 
     #[test]
-    fn pass_1_pauses_briefly_on_skip_for_wedge_avoidance() {
-        // Pre-2026-05-10 Pass 1 ran pause_secs=0 on all errors (zoom
-        // past damage zones in seconds). That caused firmware wedges
-        // on the BU40N — back-to-back errors with no cooldown built
-        // up firmware state until the drive entered the wedge fast-
-        // fail mode. New policy: a brief inter-error pause (5 s) on
-        // Pass 1 to give the drive's firmware time to settle between
-        // damage-zone exposures. Successful reads remain zero-pause
-        // — only errors cost time, and only a few seconds per
-        // scattered failure. Trivial cost compared to crashing the
-        // whole rip at 48%.
-        let mut ctx = ReadCtx::for_sweep(32);
-        let action = handle_read_error(&medium_err(), &mut ctx);
-        match action {
-            ReadAction::SkipBlock { pause_secs } => {
-                assert_eq!(pause_secs, PASS_1_FAIL_PAUSE_SECS);
-            }
-            other => panic!("expected SkipBlock, got {other:?}"),
+    fn both_passes_pause_on_failed_read_for_wedge_avoidance() {
+        // 2026-05-11 reframe: a failed read is a failed read. Same
+        // FAIL_PAUSE_SECS for both Pass 1 (sweep) and Pass N (patch).
+        // Pre-reframe Pass 1 had its own PASS_1_FAIL_PAUSE_SECS=5
+        // and Pass N had POST_FAILURE_PAUSE_SECS=1 — the asymmetry
+        // is gone. The wedge avoidance is a centralized policy now.
+        for mut ctx in [ReadCtx::for_sweep(32), ReadCtx::for_patch(1)] {
+            let action = handle_read_error(&medium_err(), &mut ctx);
+            let pause = match action {
+                ReadAction::SkipBlock { pause_secs } => pause_secs,
+                ReadAction::JumpAhead { pause_secs, .. } => pause_secs,
+                ReadAction::Bisect => continue,
+                other => panic!("expected pausing action, got {other:?}"),
+            };
+            assert_eq!(pause, FAIL_PAUSE_SECS);
         }
     }
 
