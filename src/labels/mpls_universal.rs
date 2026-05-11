@@ -175,7 +175,7 @@ fn normalize_language(raw: &str) -> String {
 /// Human-readable English name for an ISO 639-2 code, or empty if
 /// the code is unknown. Kept inline rather than in vocab because
 /// vocab is the *reverse* mapping (name → code).
-fn language_display_name(iso: &str) -> String {
+pub(crate) fn language_display_name(iso: &str) -> String {
     match iso {
         "eng" => "English",
         "fra" | "fre" => "French",
@@ -226,7 +226,7 @@ fn language_display_name(iso: &str) -> String {
 /// Map BD coding_type byte → codec name. Returns empty for unknown
 /// bytes (the table covers everything the spec defines, but unknown
 /// values are still possible on malformed discs).
-fn codec_name(coding_type: u8) -> &'static str {
+pub(crate) fn codec_name(coding_type: u8) -> &'static str {
     match coding_type {
         0x02 => "MPEG-2",
         0x1B => "H.264",
