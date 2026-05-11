@@ -68,6 +68,15 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
     // to share a PID across playlists with different metadata.
     let mut seen: Vec<(u8, String, String, u16)> = Vec::new();
 
+    // Global 1-based counters keyed by StreamLabelType. Incremented
+    // only when an entry survives dedup, so stream_numbers are dense
+    // (1, 2, 3, ...) per type across the whole disc — not reset per
+    // playlist. A disc with 2 MPLS files that each list the same
+    // 8 audio streams ends up with audio_1..audio_8, not audio_1..
+    // audio_16 or audio_1..audio_8 with audio_1 duplicated.
+    let mut audio_idx: u16 = 0;
+    let mut sub_idx: u16 = 0;
+
     for name in &mpls_names {
         let path = format!("/BDMV/PLAYLIST/{}", name);
         let Ok(data) = udf.read_file(reader, &path) else {
@@ -76,13 +85,6 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
         let Ok(playlist) = crate::mpls::parse(&data) else {
             continue;
         };
-
-        // Per-MPLS-file 1-based counters keyed by StreamLabelType.
-        // The dedup pass below removes duplicates across files; the
-        // numbering of the *surviving* entries comes from whichever
-        // playlist contributed each PID first.
-        let mut audio_idx: u16 = 0;
-        let mut sub_idx: u16 = 0;
 
         for entry in &playlist.streams {
             let label_type = match entry.stream_type {
@@ -95,17 +97,6 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
                 _ => continue,
             };
 
-            let stream_number = match label_type {
-                StreamLabelType::Audio => {
-                    audio_idx += 1;
-                    audio_idx
-                }
-                StreamLabelType::Subtitle => {
-                    sub_idx += 1;
-                    sub_idx
-                }
-            };
-
             let language = normalize_language(&entry.language);
             let name = language_display_name(&language);
             let codec_hint = build_codec_hint(label_type, entry);
@@ -116,6 +107,17 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
                 continue;
             }
             seen.push(key);
+
+            let stream_number = match label_type {
+                StreamLabelType::Audio => {
+                    audio_idx += 1;
+                    audio_idx
+                }
+                StreamLabelType::Subtitle => {
+                    sub_idx += 1;
+                    sub_idx
+                }
+            };
 
             labels.push(StreamLabel {
                 stream_number,
