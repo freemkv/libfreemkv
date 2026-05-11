@@ -136,9 +136,23 @@ pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 /// authoring-tool conventions documented at the module level).
 pub(crate) fn parse_bdmt_xml(_lang_code: &str, xml_text: &str) -> Option<BdmtFields> {
     let title = extract_title(xml_text)?;
-    let description = xml::text(xml_text, "description").filter(|s| !s.is_empty());
+    let description = xml::text(xml_text, "description")
+        .filter(|s| !s.is_empty())
+        .filter(|s| !looks_like_xml(s))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let disc_set = extract_disc_set(xml_text);
     Some((title, description, disc_set))
+}
+
+/// Reject candidate description strings that are themselves XML
+/// fragments — observed on disc-04 (Top Gun: Maverick), where
+/// `<di:description>` contained `<di:thumbnail href="…"/>` child
+/// elements and no actual prose. Surfacing that raw to the JSON
+/// output is worse than dropping the field entirely.
+fn looks_like_xml(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with('<')
 }
 
 /// Try title-bearing element variants in priority order. The `xml`
@@ -324,6 +338,44 @@ mod tests {
         // Half-open tag, no body, no close: also yields no title.
         let truncated = "<discInfo><di:name>";
         assert!(parse_bdmt_xml("eng", truncated).is_none());
+    }
+
+    #[test]
+    fn description_with_only_child_xml_is_dropped() {
+        // Real-world bug from disc-04 (Top Gun: Maverick, 2026-05-11
+        // capture): <di:description> contained only <di:thumbnail/>
+        // child elements with no actual prose. The previous parser
+        // surfaced the raw XML fragment as the description string.
+        // Now we reject candidates that begin with `<`.
+        let xml = r#"<discInfo>
+            <di:name>Top Gun: Maverick</di:name>
+            <di:description>
+              <di:thumbnail href="tgm_meta_sm.jpg" />
+              <di:thumbnail href="tgm_meta_lg.jpg" />
+            </di:description>
+        </discInfo>"#;
+        let (title, description, _) =
+            parse_bdmt_xml("eng", xml).expect("title is present so parse must succeed");
+        assert_eq!(title, "Top Gun: Maverick");
+        assert!(
+            description.is_none(),
+            "description containing only XML children must be dropped, got {description:?}"
+        );
+    }
+
+    #[test]
+    fn description_with_plain_text_passes_through() {
+        // The legitimate case still works: a description with actual
+        // prose survives the looks_like_xml filter.
+        let xml = r#"<discInfo>
+            <di:name>Some Movie</di:name>
+            <di:description>An epic tale of one man's quest for tea.</di:description>
+        </discInfo>"#;
+        let (_, description, _) = parse_bdmt_xml("eng", xml).expect("must parse");
+        assert_eq!(
+            description.as_deref(),
+            Some("An epic tale of one man's quest for tea.")
+        );
     }
 
     #[test]
