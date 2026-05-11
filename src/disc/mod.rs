@@ -3049,13 +3049,23 @@ impl Disc {
                                     "Drive responsive — bad sector cluster, not wedged"
                                 );
                             } else if probes_ok == 0 && consecutive_failures >= 10 {
+                                // Heuristic suspicion of wedge — NOT the
+                                // confirmed wedge_transition log that fires
+                                // when the SCSI sense family flips into
+                                // Hardware/IllegalRequest. This log just
+                                // says "the local zone is fully bad" which
+                                // could mean a real wedge OR a fully-bad
+                                // cluster on a non-wedged drive. The
+                                // wedge_skip handler in read_error.rs is
+                                // what actually decides + acts.
                                 tracing::warn!(
                                     target: "freemkv::disc",
-                                    phase = "patch_potential_wedge",
+                                    phase = "patch_zone_fully_bad",
                                     consecutive_failures,
                                     lba,
                                     range_idx,
-                                    "All probes failed — possible wedge condition"
+                                    "patch zone fully bad (10+ failures, all probes failed); \
+                                     not a wedge unless read_error.rs's wedge_transition also fires"
                                 );
                             }
                         }
