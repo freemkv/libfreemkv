@@ -7,14 +7,17 @@
 //!   3. Implement `pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
+mod bdmt;
 pub(crate) mod class_reader;
 mod criterion;
 mod ctrm;
 mod dbp;
 mod deluxe;
 pub(crate) mod jar;
+mod mpls_universal;
 mod paramount;
 mod pixelogic;
+mod png_filenames;
 pub(crate) mod text;
 pub mod vocab;
 pub(crate) mod xml;
@@ -22,6 +25,11 @@ pub(crate) mod xml;
 use crate::disc::{DiscTitle, Stream};
 use crate::sector::SectorReader;
 use crate::udf::UdfFs;
+
+// Re-export bdmt's public type so callers can construct/inspect
+// disc-level metadata via `labels::DiscMetadata`. The module itself
+// stays private — analyze() drives the parse path.
+pub use bdmt::DiscMetadata;
 
 // Re-exported via crate::disc — the public API surfaces these next to
 // AudioStream/SubtitleStream so callers can map purpose/qualifier to display
@@ -88,10 +96,14 @@ type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<ParseResult>;
 /// A parser SHOULD return `High` only when its full schema was
 /// extracted with no fallback or guessing. `Medium` is for matched-
 /// but-degraded outputs (some streams missing fields, fingerprint
-/// matched but a sub-table couldn't be decoded, etc.). The registry
-/// prefers `High` over `Medium`; ties fall to array order.
+/// matched but a sub-table couldn't be decoded, etc.). `Low` is for
+/// the universal MPLS fallback — spec-mandated stream metadata
+/// (language + base codec) that's correct but lacks editorial labels
+/// (commentary, SDH, etc.). The registry prefers `High > Medium > Low`;
+/// ties fall to array order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
+    Low,
     Medium,
     High,
 }
@@ -124,6 +136,16 @@ impl ParseResult {
             confidence: Confidence::Medium,
         }
     }
+
+    /// Convenience for the universal MPLS fallback: spec-derived
+    /// stream language + codec, but no editorial labels (commentary,
+    /// SDH, etc.). Framework parsers always win over `low`.
+    pub fn low(labels: Vec<StreamLabel>) -> Self {
+        ParseResult {
+            labels,
+            confidence: Confidence::Low,
+        }
+    }
 }
 
 const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
@@ -138,6 +160,17 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     // (constant-pool iteration vs. deluxe's bytecode walking).
     ("dbp", dbp::detect, dbp::parse),
     ("deluxe", deluxe::detect, deluxe::parse),
+    // Universal MPLS fallback. Returns Confidence::Low so framework
+    // parsers always win when they match. Closes the "no framework
+    // matched" gap (e.g. HDMV-only discs) with spec-derived language
+    // + base codec for every stream the playlist references. Runs
+    // last in registry order so it's only the chosen parser when
+    // nothing else fired.
+    (
+        "mpls_universal",
+        mpls_universal::detect,
+        mpls_universal::parse,
+    ),
 ];
 
 /// Search disc for config files, extract labels, apply to streams.
@@ -426,12 +459,23 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
         );
     }
 
+    // bdmt runs independently of the parser registry: it's disc-level
+    // metadata (localized titles, box-set position), not per-stream
+    // labels, so the "highest confidence wins" logic doesn't apply.
+    // Always run if detected; surface result as a separate field.
+    let disc_metadata = if bdmt::detect(udf) {
+        bdmt::parse(reader, udf)
+    } else {
+        None
+    };
+
     LabelAnalysis {
         parser,
         parsers_detected,
         confidence,
         jar_inventory: inventory,
         labels,
+        disc_metadata,
     }
 }
 
@@ -461,6 +505,11 @@ pub struct LabelAnalysis {
     /// Raw labels emitted by the selected parser (empty if `parser`
     /// is `None`).
     pub labels: Vec<StreamLabel>,
+    /// Disc-level metadata from `/BDMV/META/DL/bdmt_*.xml` if present.
+    /// Localized title names, descriptions, box-set position. Orthogonal
+    /// to per-stream labels; populated independently from the parser
+    /// registry.
+    pub disc_metadata: Option<bdmt::DiscMetadata>,
 }
 
 /// List filenames found under any `/BDMV/JAR/<x>/` subdirectory of
@@ -544,12 +593,14 @@ mod registry_tests {
                 "pixelogic",
                 "ctrm",
                 "dbp",
-                "deluxe"
+                "deluxe",
+                "mpls_universal",
             ],
-            "PARSERS array order changed — confirm dbp + deluxe stay last \
-             (loose detect, real check in parse), and stricter parsers \
-             (paramount/criterion/pixelogic/ctrm — all file-presence \
-             gated detect) stay first."
+            "PARSERS array order changed — confirm dbp + deluxe stay just \
+             before mpls_universal (loose detect, real check in parse), \
+             stricter parsers (paramount/criterion/pixelogic/ctrm — all \
+             file-presence gated detect) stay first, and mpls_universal \
+             stays LAST as the universal Low-confidence fallback."
         );
     }
 
