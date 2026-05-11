@@ -72,6 +72,73 @@ pub struct ReadCtx {
     /// `WEDGE_ABORT_THRESHOLD` consecutive wedges with no good read
     /// in between → real AbortPass.
     pub wedge_count: u64,
+    // ── Diagnostic counters (added 2026-05-10) ──
+    //
+    // Aggregate state for post-mortem analysis of wedge incidents.
+    // Every Pass 1 / Pass N sweep now produces a structured summary
+    // at the WARN log on each error AND an end-of-pass INFO summary.
+    // Goal: when a wedge happens, the operator should be able to tell
+    // from the logs whether it was triggered by ONE read at a
+    // physically-damaged sector (immediate failure) or by accumulated
+    // exposure across MANY reads (firmware-state buildup), and what
+    // the timing pattern looked like.
+    /// `Instant` of the most recent successful read. Used to compute
+    /// "time since last good" for the WARN log on each error. None
+    /// before the first successful read.
+    pub last_success_at: Option<std::time::Instant>,
+    /// `Instant` of the most recent failed read. Used to compute
+    /// "time since last error" for the WARN log. None before the
+    /// first error.
+    pub last_error_at: Option<std::time::Instant>,
+    /// Last error's sense-key "family" (Medium / Hardware / IllegalRequest
+    /// / NotReady / Other). Used to detect WEDGE TRANSITIONS — when
+    /// the family changes from Medium → Hardware/IllegalRequest, the
+    /// drive almost certainly just entered fast-fail mode. That
+    /// transition gets its own WARN log so the trace is unambiguous.
+    pub last_error_family: Option<SenseFamily>,
+    /// Sum of all errors observed during this sweep. Reported in the
+    /// end-of-pass summary.
+    pub total_errors: u64,
+    /// Sum of all successful reads during this sweep.
+    pub total_reads_ok: u64,
+    /// Count of damage zones entered (transitions from clean → in-damage).
+    pub zones_entered: u64,
+    /// Count of damage-jumps executed during this sweep.
+    pub jumps_taken: u64,
+    /// True between "first error after a clean period" and "16 consecutive
+    /// good reads after the last error in the cluster." Used to count
+    /// zone entries and to bound zone_reads accurately.
+    pub in_damage_zone: bool,
+}
+
+/// Coarse classification of a SCSI sense key for diagnostic logging.
+/// Wedge-family events (Hardware + IllegalRequest) get their own
+/// transition log when the sense family changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenseFamily {
+    NotReady,
+    Medium,
+    Hardware,
+    IllegalRequest,
+    Other,
+}
+
+impl SenseFamily {
+    pub fn from_sense_key(sense_key: u8) -> Self {
+        match sense_key {
+            scsi::SENSE_KEY_NOT_READY => SenseFamily::NotReady,
+            scsi::SENSE_KEY_MEDIUM_ERROR => SenseFamily::Medium,
+            scsi::SENSE_KEY_HARDWARE_ERROR => SenseFamily::Hardware,
+            scsi::SENSE_KEY_ILLEGAL_REQUEST => SenseFamily::IllegalRequest,
+            _ => SenseFamily::Other,
+        }
+    }
+
+    /// True for the "wedge family" — Hardware + IllegalRequest are
+    /// the senses the BU40N firmware returns in its fast-fail state.
+    pub fn is_wedge_family(self) -> bool {
+        matches!(self, SenseFamily::Hardware | SenseFamily::IllegalRequest)
+    }
 }
 
 impl ReadCtx {
@@ -98,6 +165,14 @@ impl ReadCtx {
             bisecting: false,
             bisect_on_marginal: false,
             wedge_count: 0,
+            last_success_at: None,
+            last_error_at: None,
+            last_error_family: None,
+            total_errors: 0,
+            total_reads_ok: 0,
+            zones_entered: 0,
+            jumps_taken: 0,
+            in_damage_zone: false,
         }
     }
 
@@ -124,6 +199,14 @@ impl ReadCtx {
             bisecting: false,
             bisect_on_marginal: true,
             wedge_count: 0,
+            last_success_at: None,
+            last_error_at: None,
+            last_error_family: None,
+            total_errors: 0,
+            total_reads_ok: 0,
+            zones_entered: 0,
+            jumps_taken: 0,
+            in_damage_zone: false,
         }
     }
 
@@ -146,7 +229,40 @@ impl ReadCtx {
         if self.damage_window.len() > self.damage_window_max {
             self.damage_window.remove(0);
         }
+        // Diagnostic state.
+        self.total_reads_ok += 1;
+        self.last_success_at = Some(std::time::Instant::now());
+        // If we were in a damage zone and accumulated enough good
+        // reads to exit (damage_window now all-good), the zone is
+        // over. Don't reset zones_entered — that's a sweep total.
+        if self.in_damage_zone && self.consecutive_good >= self.damage_window_max as u64 {
+            self.in_damage_zone = false;
+            self.last_error_family = None;
+        }
     }
+
+    /// Final per-pass summary suitable for an INFO log at the end of
+    /// `sweep` / `patch`. Caller renders this to a single structured
+    /// log line.
+    pub fn pass_summary(&self) -> PassSummary {
+        PassSummary {
+            total_reads_ok: self.total_reads_ok,
+            total_errors: self.total_errors,
+            zones_entered: self.zones_entered,
+            jumps_taken: self.jumps_taken,
+        }
+    }
+}
+
+/// End-of-pass stats logged at INFO for post-mortem analysis. Lets
+/// an operator answer "how damaged is this disc?" from a single log
+/// line per pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PassSummary {
+    pub total_reads_ok: u64,
+    pub total_errors: u64,
+    pub zones_entered: u64,
+    pub jumps_taken: u64,
 }
 
 /// What the caller should do after a read failure. The caller owns the
@@ -261,18 +377,70 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         ctx.consecutive_outer_failures += 1;
     }
 
+    // Diagnostic instrumentation — compute timing context BEFORE
+    // mutating the timestamps so the log reflects the gap to the
+    // PREVIOUS error / success, not zero.
+    let now = std::time::Instant::now();
+    let ms_since_last_error = ctx
+        .last_error_at
+        .map(|t| now.duration_since(t).as_millis() as u64);
+    let ms_since_last_success = ctx
+        .last_success_at
+        .map(|t| now.duration_since(t).as_millis() as u64);
+
+    let current_family = err
+        .scsi_sense()
+        .map(|s| SenseFamily::from_sense_key(s.sense_key))
+        .unwrap_or(SenseFamily::Other);
+
+    // Zone-entry tracking: this is the first error after a clean run
+    // (or the first error of the sweep).
+    if !ctx.in_damage_zone && !ctx.bisecting {
+        ctx.in_damage_zone = true;
+        ctx.zones_entered += 1;
+    }
+
+    ctx.total_errors += 1;
+    ctx.last_error_at = Some(now);
+
+    // Wedge transition: previous error was MEDIUM, this one is
+    // HARDWARE or ILLEGAL_REQUEST. That's the moment the drive's
+    // firmware flipped into fast-fail mode. Distinct WARN so logs
+    // make it unambiguous when the wedge "started."
+    let is_wedge_transition = matches!(ctx.last_error_family, Some(prev) if !prev.is_wedge_family())
+        && current_family.is_wedge_family();
+    ctx.last_error_family = Some(current_family);
+
     tracing::warn!(
         target: "freemkv::disc",
         phase = "read_error",
         consecutive_failures = ctx.consecutive_failures,
+        consecutive_outer_failures = ctx.consecutive_outer_failures,
+        ms_since_last_error,
+        ms_since_last_success,
+        total_errors = ctx.total_errors,
+        total_reads_ok = ctx.total_reads_ok,
         batch = ctx.batch,
         bisecting = ctx.bisecting,
+        wedge_count = ctx.wedge_count,
+        sense_family = ?current_family,
         sense_key = err.scsi_sense().map(|s| s.sense_key),
         asc = err.scsi_sense().map(|s| s.asc),
         ascq = err.scsi_sense().map(|s| s.ascq),
         error = %err,
         "read failed; classifying"
     );
+
+    if is_wedge_transition {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "wedge_transition",
+            errors_in_zone = ctx.total_errors,
+            ms_since_last_success,
+            new_family = ?current_family,
+            "drive entered wedge / fast-fail family (was returning recoverable medium errors before this)"
+        );
+    }
 
     // 1. Transport failure: bridge crash / USB disconnect. The outer
     //    pass loop knows how to handle this (rediscover sg path,
@@ -353,6 +521,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
             pause_secs = WEDGE_PAUSE_SECS,
             "Pass 1 wedge detected — jumping ahead and pausing for drive cooldown"
         );
+        ctx.jumps_taken += 1;
         return ReadAction::JumpAhead {
             sectors: WEDGE_JUMP_SECTORS,
             pause_secs: WEDGE_PAUSE_SECS,
@@ -474,6 +643,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         // doesn't keep firing fast-jump every read after the initial
         // jump fired. The window-based trigger handles further jumps.
         ctx.consecutive_outer_failures = 0;
+        ctx.jumps_taken += 1;
         return ReadAction::JumpAhead {
             sectors,
             pause_secs: pause_secs + POST_JUMP_EXTRA_PAUSE_SECS,
