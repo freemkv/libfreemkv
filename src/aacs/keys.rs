@@ -247,6 +247,7 @@ fn validate_processing_key(
 /// Find Verify Media Key Record (type 0x10) in MKB.
 fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     let mut pos = 0;
+    let mut type10_seen: Vec<(usize, usize)> = Vec::new();
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
@@ -254,14 +255,32 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
             break;
         }
 
+        if rec_type == 0x10 {
+            type10_seen.push((pos, rec_len));
+        }
+
         if rec_type == 0x10 && rec_len >= 20 {
             // mk_dv is at offset 4 (after record header)
             let mut dv = [0u8; 16];
             dv.copy_from_slice(&mkb[pos + 4..pos + 20]);
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "mkb_mk_dv_found",
+                pos,
+                rec_len,
+                "mk_dv extracted from MKB"
+            );
             return Some(dv);
         }
         pos += rec_len;
     }
+    tracing::warn!(
+        target: "freemkv::disc",
+        phase = "mkb_mk_dv_not_found",
+        type10_seen = ?type10_seen,
+        scanned_bytes = pos,
+        "no 0x10 record with rec_len>=20 found"
+    );
     None
 }
 
@@ -628,32 +647,70 @@ pub fn resolve_keys(
         }
     };
 
+    tracing::warn!(
+        target: "freemkv::disc",
+        phase = "resolve_keys_start",
+        aacs2,
+        bus_encryption,
+        disc_hash = %hash_hex,
+        mkb_present = mkb_data.is_some(),
+        "resolve_keys: starting"
+    );
+
     // Path 1: Look up VUK by disc hash in KEYDB
     if let Some(entry) = keydb.find_disc(&hash_hex) {
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit_entry", "disc hash found in keydb");
         if let Some(vuk) = entry.vuk {
             return Some(build(vuk, 1));
         }
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_no_vuk", "disc hash entry has no VUK");
+    } else {
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", "disc hash NOT in keydb");
     }
 
     // Path 2: Find entry with matching VID → derive VUK from MK + VID
+    let mut path2_mk_did_count = 0usize;
     for entry in keydb.disc_entries.values() {
         if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+            path2_mk_did_count += 1;
             if did == *volume_id {
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "MK+VID entry matched volume_id");
                 return Some(build(derive_vuk(&mk, volume_id), 2));
             }
         }
     }
+    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", mk_did_entries = path2_mk_did_count, "no MK+VID entry matched volume_id");
 
     // Path 3: MKB + processing keys → media key → VUK
     if let Some(mkb) = mkb_data {
+        let mk_dv = mkb_find_mk_dv(mkb);
+        let subdiff = mkb_find_subdiff_records(mkb);
+        let cvalues = mkb_find_cvalues(mkb);
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "resolve_keys_mkb_records",
+            mk_dv_found = mk_dv.is_some(),
+            subdiff_found = subdiff.is_some(),
+            subdiff_len = subdiff.as_ref().map(|s| s.len()).unwrap_or(0),
+            cvalues_found = cvalues.is_some(),
+            cvalues_len = cvalues.as_ref().map(|c| c.len()).unwrap_or(0),
+            "MKB record scan results"
+        );
+
         if let Some(mk) = derive_media_key_from_pk(mkb, &keydb.processing_keys) {
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "media key derived from processing key");
             return Some(build(derive_vuk(&mk, volume_id), 3));
         }
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", pk_count = keydb.processing_keys.len(), "PK derivation failed");
 
         // Path 4: MKB + device keys → processing key → media key → VUK
         if let Some(mk) = derive_media_key_from_dk(mkb, &keydb.device_keys) {
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "media key derived from device key");
             return Some(build(derive_vuk(&mk, volume_id), 4));
         }
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_miss", dk_count = keydb.device_keys.len(), "DK derivation failed");
+    } else {
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB data available; paths 3/4 skipped");
     }
 
     None
