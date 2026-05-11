@@ -20,6 +20,35 @@ pub struct ClipInfo {
     pub ep_coarse: Vec<EpCoarse>,
     /// Fine EP entries for the primary video stream
     pub ep_fine: Vec<EpFine>,
+    /// Per-stream metadata from the ProgramInfo section (BD spec).
+    /// Cross-validates the MPLS STN view — see `labels/clpi.rs`.
+    /// Empty when program_info is missing or malformed.
+    pub streams: Vec<ClpiStream>,
+}
+
+/// One stream descriptor from the CLPI ProgramInfo / stream_coding_info
+/// table. Mirrors the same fields the MPLS STN table carries — see
+/// `mpls::StreamEntry` for the playlist-side equivalent.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ClpiStream {
+    /// PID of the stream in the MPEG-TS (matches MPLS).
+    pub pid: u16,
+    /// SCSI/BD coding type byte (0x80 LPCM, 0x83 TrueHD, 0x86 DTS-HD MA,
+    /// 0x90 PG, etc.). See `labels::mpls_universal::coding_type_to_codec_hint`.
+    pub coding_type: u8,
+    /// ISO 639-2 3-char language code. Empty for video streams.
+    pub language: String,
+    /// Audio format byte (1=mono, 3=stereo, 6=5.1, 12=7.1).
+    /// Zero for non-audio streams.
+    pub audio_format: u8,
+    /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz). Zero for non-audio.
+    pub audio_rate: u8,
+    /// Video format byte (1=480i, 4=1080i, 5=720p, 6=1080p, 8=2160p).
+    /// Zero for non-video.
+    pub video_format: u8,
+    /// Video rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94).
+    pub video_rate: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +157,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 
     // Header offsets
     let _seq_info_start = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-    let _prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let prog_info_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
     let cpi_start = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
 
     // ClipInfo section at offset 40
@@ -137,6 +166,16 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
         u32::from_be_bytes([data[56], data[57], data[58], data[59]])
     } else {
         0
+    };
+
+    // Parse ProgramInfo (per-stream language + codec). Best-effort:
+    // malformed program_info doesn't fail the parse, just gives an
+    // empty streams list. EP map is unaffected — sector-range lookups
+    // continue to work.
+    let streams = if prog_info_start > 0 && prog_info_start + 6 < data.len() {
+        parse_program_info(&data[prog_info_start..])
+    } else {
+        Vec::new()
     };
 
     // Parse CPI / EP Map
@@ -151,7 +190,125 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
         source_packet_count,
         ep_coarse,
         ep_fine,
+        streams,
     })
+}
+
+/// Parse the ProgramInfo section: per-stream (pid, coding_type,
+/// language, codec sub-fields). Layout per BD spec / libbluray
+/// clpi_parse.c:
+///
+/// ```text
+/// ProgramInfo:
+///   length: 4 bytes
+///   reserved: 1 byte
+///   num_programs: 1 byte
+///   for each program:
+///     spn_program_sequence_start: 4 bytes
+///     program_map_pid: 2 bytes
+///     num_streams: 1 byte
+///     num_groups: 1 byte
+///     for each stream:
+///       pid: 2 bytes
+///       stream_coding_info_length: 1 byte
+///       stream_coding_info: (varies by coding_type)
+///         coding_type: 1 byte
+///         per-type bytes (see match arms below)
+/// ```
+///
+/// Returns `Vec::new()` on any structural mismatch — we don't propagate
+/// errors because the EP map is the primary CLPI output, and a corrupt
+/// program_info shouldn't break sector-range lookups.
+fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
+    let mut out = Vec::new();
+    if data.len() < 6 {
+        return out;
+    }
+    // length: 4 bytes (skipped — we trust the section bounds in the
+    // caller's slice and read the bytes that follow). Reserved 1 byte
+    // at offset 4. num_programs at offset 5.
+    let num_programs = data[5] as usize;
+    let mut pos = 6usize;
+    for _ in 0..num_programs {
+        // Program header: 4 (spn) + 2 (pmt_pid) + 1 (num_streams) + 1 (num_groups) = 8 bytes
+        if pos + 8 > data.len() {
+            return out;
+        }
+        let num_streams = data[pos + 6] as usize;
+        pos += 8;
+
+        for _ in 0..num_streams {
+            // Stream header: 2 (pid) + 1 (sci_length) + sci bytes
+            if pos + 3 > data.len() {
+                return out;
+            }
+            let pid = u16::from_be_bytes([data[pos], data[pos + 1]]);
+            let sci_len = data[pos + 2] as usize;
+            let sci_end = pos + 3 + sci_len;
+            if sci_end > data.len() || sci_len < 1 {
+                return out;
+            }
+            let sci = &data[pos + 3..sci_end];
+            let coding_type = sci[0];
+
+            let mut audio_format = 0u8;
+            let mut audio_rate = 0u8;
+            let mut video_format = 0u8;
+            let mut video_rate = 0u8;
+            let mut language = String::new();
+
+            match coding_type {
+                // Video — MPEG-2 (0x02), H.264 (0x1B), HEVC (0x24)
+                0x02 | 0x1B | 0x24 => {
+                    if sci.len() >= 2 {
+                        video_format = (sci[1] >> 4) & 0x0F;
+                        video_rate = sci[1] & 0x0F;
+                    }
+                }
+                // Primary audio — LPCM(0x80), AC-3(0x81), DTS(0x82),
+                // TrueHD(0x83), AC-3+(0x84), DTS-HD(0x85), DTS-HD MA(0x86)
+                0x80..=0x86 => {
+                    if sci.len() >= 2 {
+                        audio_format = (sci[1] >> 4) & 0x0F;
+                        audio_rate = sci[1] & 0x0F;
+                    }
+                    if sci.len() >= 5 {
+                        language = String::from_utf8_lossy(&sci[2..5]).to_string();
+                    }
+                }
+                // Secondary audio (0xA1 AC-3+, 0xA2 DTS-HD)
+                0xA1 | 0xA2 => {
+                    if sci.len() >= 2 {
+                        audio_format = (sci[1] >> 4) & 0x0F;
+                        audio_rate = sci[1] & 0x0F;
+                    }
+                    if sci.len() >= 5 {
+                        language = String::from_utf8_lossy(&sci[2..5]).to_string();
+                    }
+                }
+                // PG (0x90), IG (0x91): coding_type + 3-byte language [+ char_code for PG]
+                0x90 | 0x91 => {
+                    if sci.len() >= 4 {
+                        language = String::from_utf8_lossy(&sci[1..4]).to_string();
+                    }
+                }
+                _ => {}
+            }
+
+            out.push(ClpiStream {
+                pid,
+                coding_type,
+                language,
+                audio_format,
+                audio_rate,
+                video_format,
+                video_rate,
+            });
+
+            pos = sci_end;
+        }
+    }
+    out
 }
 
 /// Parse the CPI section containing the EP map.
