@@ -57,7 +57,7 @@ pub struct StreamLabel {
     pub variant: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamLabelType {
     Audio,
     Subtitle,
@@ -390,20 +390,74 @@ fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
             _ => {}
         }
     }
-    match best {
-        Some((name, r)) => {
+    let (name, mut labels) = match best {
+        Some((n, r)) => {
             tracing::info!(
-                parser = name,
+                parser = n,
                 confidence = ?r.confidence,
                 label_count = r.labels.len(),
                 "label parser selected",
             );
-            r.labels
+            (n, r.labels)
         }
         None => {
             tracing::info!("no label parser matched");
-            Vec::new()
+            return Vec::new();
         }
+    };
+
+    // Gap-fill: framework parsers often under-yield on multi-track
+    // discs because their authoring layer only ships editorial labels
+    // for "interesting" streams (Director's Cut, Atmos, SDH) and
+    // leaves the rest as plain numbered slots. MPLS sees all streams
+    // the playlist references. If MPLS has entries the framework
+    // didn't cover (by stream_type + stream_number), merge them in
+    // so the user sees every track even when only the "interesting"
+    // ones have editorial names. Skips the merge when mpls_universal
+    // was itself the chosen parser (its labels ARE the labels).
+    if name != "mpls_universal" {
+        if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
+            fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
+        }
+    }
+
+    labels
+}
+
+/// Append entries from `mpls` whose `(stream_type, stream_number)`
+/// isn't already represented in `framework`. Framework labels are
+/// richer (editorial purpose/qualifier, codec_hint with object-audio
+/// detail like Atmos) so they always win for slots they cover; MPLS
+/// only fills in untaken slots. Stable sort by (type, number) at
+/// the end so callers see a deterministic, ascending list.
+fn fill_gaps_from_mpls(framework: &mut Vec<StreamLabel>, mpls: &[StreamLabel]) {
+    use std::collections::HashSet;
+    let covered: HashSet<(StreamLabelType, u16)> = framework
+        .iter()
+        .map(|l| (l.stream_type, l.stream_number))
+        .collect();
+    let mut added = 0usize;
+    for m in mpls {
+        if !covered.contains(&(m.stream_type, m.stream_number)) {
+            framework.push(m.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        tracing::info!(
+            gap_fill_added = added,
+            "MPLS gap-fill merged streams the framework parser left uncovered"
+        );
+        framework.sort_by_key(|l| (type_tag(l.stream_type), l.stream_number));
+    }
+}
+
+/// Stable sort key for `StreamLabelType`. Audio < Subtitle so the
+/// merged label list groups audios first then subtitles.
+fn type_tag(t: StreamLabelType) -> u8 {
+    match t {
+        StreamLabelType::Audio => 0,
+        StreamLabelType::Subtitle => 1,
     }
 }
 
@@ -445,9 +499,27 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
                 .then(std::cmp::Ordering::Equal)
         });
 
-    let (parser, confidence, labels) = match chosen {
+    let (parser, confidence, mut labels) = match chosen {
         Some((name, r)) => (Some(*name), Some(r.confidence), r.labels.clone()),
         None => (None, None, Vec::new()),
+    };
+
+    // Gap-fill: same merge as `extract()`. Framework labels (when
+    // present) win for the slots they cover; MPLS fills in uncovered
+    // stream_numbers. Skipped when MPLS was itself the chosen parser
+    // (no gaps to fill against itself).
+    let gap_fill_added = if parser.is_some() && parser != Some("mpls_universal") {
+        let before = labels.len();
+        // Re-run MPLS unconditionally — we only ran framework parsers
+        // above (we want to know which one to pick), and in the
+        // common case where MPLS would have detected but wasn't
+        // chosen we still need its labels for the merge.
+        if let Some(mpls_result) = mpls_universal::parse(reader, udf) {
+            fill_gaps_from_mpls(&mut labels, &mpls_result.labels);
+        }
+        labels.len().saturating_sub(before)
+    } else {
+        0
     };
 
     if parsers_detected.is_empty() {
@@ -476,6 +548,7 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
         jar_inventory: inventory,
         labels,
         disc_metadata,
+        gap_fill_added,
     }
 }
 
@@ -510,6 +583,11 @@ pub struct LabelAnalysis {
     /// to per-stream labels; populated independently from the parser
     /// registry.
     pub disc_metadata: Option<bdmt::DiscMetadata>,
+    /// Number of stream slots the MPLS gap-fill merge added on top of
+    /// the framework parser's output. 0 means the framework covered
+    /// every MPLS-known stream slot, or MPLS itself was the chosen
+    /// parser. Diagnostic for the labels-analyze tool.
+    pub gap_fill_added: usize,
 }
 
 /// List filenames found under any `/BDMV/JAR/<x>/` subdirectory of
@@ -619,6 +697,112 @@ mod registry_tests {
             let _ = (name, detect, parse);
         }
         assert!(!PARSERS.is_empty(), "PARSERS array must not be empty");
+    }
+}
+
+// ── gap_fill_from_mpls tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod gap_fill_tests {
+    use super::*;
+
+    fn label(t: StreamLabelType, n: u16, lang: &str, codec: &str) -> StreamLabel {
+        StreamLabel {
+            stream_number: n,
+            stream_type: t,
+            language: lang.into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: codec.into(),
+            variant: String::new(),
+        }
+    }
+
+    #[test]
+    fn empty_framework_takes_all_mpls() {
+        let mut framework: Vec<StreamLabel> = Vec::new();
+        let mpls = vec![
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
+            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
+        ];
+        fill_gaps_from_mpls(&mut framework, &mpls);
+        assert_eq!(framework.len(), 3);
+    }
+
+    #[test]
+    fn framework_covers_all_mpls_no_op() {
+        let mut framework = vec![
+            label(StreamLabelType::Audio, 1, "eng", "Atmos"),
+            label(StreamLabelType::Audio, 2, "fra", "Atmos"),
+        ];
+        let mpls = vec![
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Audio, 2, "fra", "TrueHD"),
+        ];
+        fill_gaps_from_mpls(&mut framework, &mpls);
+        assert_eq!(framework.len(), 2, "no gaps to fill");
+        // Framework entries kept verbatim — richer codec_hint survives.
+        assert_eq!(framework[0].codec_hint, "Atmos");
+        assert_eq!(framework[1].codec_hint, "Atmos");
+    }
+
+    #[test]
+    fn partial_yield_fills_gaps_keeps_framework() {
+        // Oppenheimer-style: framework matched but only labeled 2 of 6 audios.
+        let mut framework = vec![
+            label(StreamLabelType::Audio, 1, "eng", "Atmos"),
+            label(StreamLabelType::Audio, 4, "eng", "Commentary"),
+            label(StreamLabelType::Subtitle, 1, "eng", "PG SDH"),
+        ];
+        let mpls = vec![
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
+            label(StreamLabelType::Audio, 3, "spa", "AC-3"),
+            label(StreamLabelType::Audio, 4, "eng", "AC-3"),
+            label(StreamLabelType::Audio, 5, "deu", "AC-3"),
+            label(StreamLabelType::Audio, 6, "ita", "AC-3"),
+            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
+            label(StreamLabelType::Subtitle, 2, "fra", "PG"),
+        ];
+        fill_gaps_from_mpls(&mut framework, &mpls);
+        assert_eq!(
+            framework.len(),
+            8,
+            "3 framework + 4 audio fills (2,3,5,6) + 1 subtitle fill (2) = 8"
+        );
+        // sort by (type, number) means audios first
+        let audios: Vec<_> = framework
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(audios.len(), 6, "all 6 audio slots covered");
+        // Slot 1 + 4 retain framework codec_hint
+        assert_eq!(audios[0].codec_hint, "Atmos");
+        assert_eq!(audios[3].codec_hint, "Commentary");
+        // Slots 2, 3, 5, 6 are MPLS-derived
+        assert_eq!(audios[1].codec_hint, "AC-3");
+        assert_eq!(audios[2].codec_hint, "AC-3");
+    }
+
+    #[test]
+    fn sort_groups_audio_before_subtitle() {
+        let mut framework: Vec<StreamLabel> = Vec::new();
+        let mpls = vec![
+            label(StreamLabelType::Subtitle, 1, "eng", "PG"),
+            label(StreamLabelType::Audio, 1, "eng", "TrueHD"),
+            label(StreamLabelType::Subtitle, 2, "fra", "PG"),
+            label(StreamLabelType::Audio, 2, "fra", "AC-3"),
+        ];
+        fill_gaps_from_mpls(&mut framework, &mpls);
+        assert_eq!(framework.len(), 4);
+        assert_eq!(framework[0].stream_type, StreamLabelType::Audio);
+        assert_eq!(framework[0].stream_number, 1);
+        assert_eq!(framework[1].stream_type, StreamLabelType::Audio);
+        assert_eq!(framework[1].stream_number, 2);
+        assert_eq!(framework[2].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(framework[3].stream_type, StreamLabelType::Subtitle);
     }
 }
 
