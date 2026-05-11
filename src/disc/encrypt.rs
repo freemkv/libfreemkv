@@ -22,12 +22,27 @@ impl Disc {
     ) -> Option<HandshakeResult> {
         use crate::aacs::{self, KeyDb};
 
-        let keydb_path = opts.resolve_keydb()?;
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "handshake_entry",
+            "do_handshake entered"
+        );
+        let keydb_path = match opts.resolve_keydb() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "handshake_no_keydb",
+                    "no KEYDB found in search paths; handshake skipped"
+                );
+                return None;
+            }
+        };
         let keydb = match KeyDb::load(&keydb_path) {
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(
-                    target: "freemkv::aacs",
+                    target: "freemkv::disc",
                     phase = "handshake_keydb_load_failed",
                     io_error_kind = ?e.kind(),
                     keydb = %keydb_path.display(),
@@ -38,11 +53,12 @@ impl Disc {
         };
 
         let host_cert_count = keydb.host_certs.len();
-        tracing::debug!(
-            target: "freemkv::aacs",
+        tracing::warn!(
+            target: "freemkv::disc",
             phase = "handshake_start",
             host_cert_count,
             keydb = %keydb_path.display(),
+            "handshake starting"
         );
 
         const MAX_CERT_ATTEMPTS: usize = 16;
@@ -54,7 +70,7 @@ impl Disc {
                         Ok(vid) => vid,
                         Err(e) => {
                             tracing::warn!(
-                                target: "freemkv::aacs",
+                                target: "freemkv::disc",
                                 phase = "handshake_vid_read_failed",
                                 cert_index = idx,
                                 error_code = e.code(),
@@ -67,7 +83,7 @@ impl Disc {
                         .ok()
                         .map(|(rdk, _)| rdk);
                     tracing::debug!(
-                        target: "freemkv::aacs",
+                        target: "freemkv::disc",
                         phase = "handshake_ok",
                         cert_index = idx,
                         has_read_data_key = read_data_key.is_some(),
@@ -84,7 +100,7 @@ impl Disc {
             }
         }
         tracing::warn!(
-            target: "freemkv::aacs",
+            target: "freemkv::disc",
             phase = "handshake_all_certs_failed",
             host_cert_count,
             tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
@@ -118,6 +134,19 @@ impl Disc {
             .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
 
+        // Log the disc hash so we can confirm whether it's present in KEYDB
+        // when key resolution fails. The disc hash is SHA-1 of the full
+        // Unit_Key_RO.inf file bytes — same value KEYDB.cfg keys VUK entries by.
+        let dh = crate::aacs::disc_hash(&uk_ro_data);
+        let dh_hex = crate::aacs::disc_hash_hex(&dh);
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "scan_aacs_disc_hash",
+            disc_hash = %dh_hex,
+            uk_ro_len = uk_ro_data.len(),
+            "disc hash computed (compare with keydb.cfg entries)"
+        );
+
         let cc_data = udf_fs
             .read_file(reader, "/AACS/Content000.cer")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
@@ -128,6 +157,28 @@ impl Disc {
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
             .ok();
         let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
+
+        let mkb_first_64_hex = mkb_data
+            .as_deref()
+            .map(|m| {
+                m.iter()
+                    .take(64)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "scan_aacs_mkb_info",
+            mkb_present = mkb_data.is_some(),
+            mkb_len = mkb_data.as_deref().map(|m| m.len()).unwrap_or(0),
+            mkb_version = ?mkb_ver,
+            mkb_first_64 = %mkb_first_64_hex,
+            keydb_disc_count = keydb.disc_entries.len(),
+            keydb_dk_count = keydb.device_keys.len(),
+            keydb_pk_count = keydb.processing_keys.len(),
+            "AACS resolution inputs"
+        );
 
         // Use handshake volume ID if available, otherwise zeros
         // (KEYDB VUK lookup by disc hash works without volume ID)
