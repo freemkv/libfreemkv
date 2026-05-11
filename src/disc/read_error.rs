@@ -147,8 +147,13 @@ impl ReadCtx {
     /// is the one that grinds on the bad ranges. So bisect-on-
     /// marginal is OFF (failed batches become SkipBlock; whole 32-
     /// sector blocks marked NonTrimmed for Pass N to revisit), and
-    /// the damage-jump fast-path triggers after just 4 consecutive
-    /// outer-batch failures.
+    /// the damage-jump fast-path triggers after just 1 consecutive
+    /// outer-batch failure — the user's wedge-prevention principle
+    /// (2026-05-11): once the drive returns ANY recoverable error,
+    /// retrying the same LBA quickly is what triggers the firmware
+    /// fast-fail transition. Jump immediately, never retry in Pass 1.
+    /// Pass N owns retries — it gets per-sector timeouts that don't
+    /// hammer the firmware the same way.
     pub fn for_sweep(batch: u16) -> Self {
         Self {
             batch,
@@ -158,7 +163,7 @@ impl ReadCtx {
             damage_window: Vec::with_capacity(16),
             damage_window_max: 16,
             damage_threshold_pct: 12,
-            fast_jump_threshold: 4,
+            fast_jump_threshold: 1,
             jump_multiplier: 1,
             not_ready_retries: 0,
             bridge_degradation_count: 0,
@@ -309,6 +314,22 @@ pub enum ReadAction {
 /// internal) → return → cooldown pause → next read. Same shape
 /// everywhere reads can fail.
 const FAIL_PAUSE_SECS: u64 = 5;
+/// Long cooldown applied when a damage zone is first entered (the
+/// FIRST read failure after a clean run, before the drive has had a
+/// chance to cycle in retries that push it toward fast-fail).
+///
+/// Empirical: 2026-05-11 Dune Pt 2 wedge incident showed 7 medium
+/// errors in 6.5 seconds (~1s per attempt + ~1s pause) push the
+/// BU40N's firmware into IllegalRequest fast-fail mode permanently.
+/// Once there, only physical eject + reload clears it. Giving the
+/// drive 30s of breathing room after the FIRST error in a zone —
+/// before we start adding more error counts in the firmware's
+/// internal window — prevents the transition.
+///
+/// Cost on clean discs: zero (first-error path doesn't trigger).
+/// Cost on damaged discs: ~30s × N damage zones; on a 5-zone disc
+/// that's 2.5 min extra. Trade for never wedging the drive.
+const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
 /// Cooldown when a long streak of failures suggests the drive is
 /// stuck in a damage zone and needs MORE breathing room than the
 /// standard inter-error pause. Same value as `FAIL_PAUSE_SECS`
@@ -599,12 +620,29 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         bad_count * 100 / ctx.damage_window.len()
     };
 
-    // Inter-error pause — wedge avoidance, applied uniformly across
-    // Pass 1 and Pass N. A failed read is a failed read; same
-    // cool-down regardless of which pass is calling. The escalation
-    // arm (LONG_PAUSE after a long streak) currently resolves to the
-    // same value but is kept as a separate branch for future tuning.
-    let pause_secs = if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
+    // Inter-error pause — wedge prevention via pacing.
+    //
+    // Zone-entry case (first error after a clean run): apply the
+    // long ZONE_ENTRY_COOLDOWN_SECS pause. The empirical wedge
+    // observed 2026-05-11 happened ~7 errors into a damage zone,
+    // each retry adding to the firmware's internal counter. A 30s
+    // pause at zone entry lets the drive's bridge / firmware
+    // counters reset before we issue the next read.
+    //
+    // Subsequent errors in the same zone: the standard 5s pause.
+    // (We've already jumped past the initial damage; further errors
+    // mean we landed in another bad cluster — same pacing applies.)
+    //
+    // Long-streak escalation: same 5s currently; kept as a separate
+    // branch for future tuning. Pass N (bisect_on_marginal=true)
+    // uses the standard pauses — it's running single-sector retries
+    // on already-known-bad LBAs by design.
+    let is_zone_entry = ctx.consecutive_outer_failures == 1
+        && !ctx.bisecting
+        && !ctx.bisect_on_marginal;
+    let pause_secs = if is_zone_entry {
+        ZONE_ENTRY_COOLDOWN_SECS
+    } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
         CONSECUTIVE_FAIL_LONG_PAUSE_SECS
     } else {
         FAIL_PAUSE_SECS
@@ -712,15 +750,18 @@ mod tests {
     }
 
     #[test]
-    fn pass_1_marginal_skips_instead_of_bisecting() {
-        // Pass 1's job is "fast and accurate" — leave bisection to
-        // Pass N. A failed batch becomes SkipBlock (whole 32-sector
-        // block marked NonTrimmed for Pass N to revisit).
+    fn pass_1_marginal_jumps_immediately_not_bisecting() {
+        // 2026-05-11 wedge-prevention rewrite: Pass 1 jumps on the
+        // FIRST marginal error (fast_jump_threshold=1) rather than
+        // SkipBlock. Retrying the same LBA quickly is what triggers
+        // the BU40N's firmware fast-fail transition; immediate jump
+        // prevents the cascade. Pass N still bisects (its job is
+        // per-sector recovery on already-known-bad LBAs).
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
-            ReadAction::SkipBlock { .. } => {}
-            other => panic!("expected SkipBlock for Pass 1, got {other:?}"),
+            ReadAction::JumpAhead { .. } => {}
+            other => panic!("expected JumpAhead on first Pass 1 marginal error, got {other:?}"),
         }
     }
 
@@ -746,26 +787,18 @@ mod tests {
     }
 
     #[test]
-    fn pass_1_jumps_after_4_consecutive_outer_failures() {
-        // The fast-entry trigger: Pass 1 should JumpAhead after 4
-        // consecutive outer-batch failures, BEFORE the 16-block
-        // damage window has filled. Otherwise we spend ~40 minutes
-        // of bisecting/grinding to fill the window before the first
-        // jump on a damage zone we entered cleanly.
+    fn pass_1_jumps_immediately_on_first_outer_failure() {
+        // 2026-05-11 rewrite: fast_jump_threshold is 1 on Pass 1, not
+        // 4. Even ONE error triggers a jump because BU40N's firmware
+        // fast-fail mode is sensitive to retry cadence. The wedge
+        // observed 2026-05-11 happened at 7 errors / 6.5s — by then
+        // we were already wedged. Jumping on error #1 means we
+        // physically can't reach the cascade.
         let mut ctx = ReadCtx::for_sweep(32);
-        // First three should NOT jump (still under threshold of 4).
-        for _ in 0..3 {
-            let a = handle_read_error(&medium_err(), &mut ctx);
-            assert!(
-                !matches!(a, ReadAction::JumpAhead { .. }),
-                "should not jump until 4 consecutive outer failures"
-            );
-        }
-        // Fourth should jump.
         let a = handle_read_error(&medium_err(), &mut ctx);
         assert!(
             matches!(a, ReadAction::JumpAhead { .. }),
-            "expected JumpAhead at 4th consecutive outer failure, got {a:?}"
+            "expected JumpAhead on first outer failure (fast_jump_threshold=1), got {a:?}"
         );
     }
 
@@ -786,12 +819,15 @@ mod tests {
 
     #[test]
     fn outer_success_resets_consecutive_outer_failures() {
+        // With fast_jump_threshold=1 each Pass 1 error fires a jump
+        // and resets `consecutive_outer_failures` to 0 inside the
+        // handler. So we can't accumulate "3" the old way — instead,
+        // verify the counter goes back to 0 after on_success too.
         let mut ctx = ReadCtx::for_sweep(32);
-        for _ in 0..3 {
-            handle_read_error(&medium_err(), &mut ctx);
-        }
-        assert_eq!(ctx.consecutive_outer_failures, 3);
-        // An outer-success (bisecting=false) should reset the counter.
+        handle_read_error(&medium_err(), &mut ctx);
+        // After fast-jump, consecutive_outer_failures already 0.
+        assert_eq!(ctx.consecutive_outer_failures, 0);
+        // on_success keeps it at 0 (defensive).
         ctx.bisecting = false;
         ctx.on_success();
         assert_eq!(ctx.consecutive_outer_failures, 0);
@@ -945,21 +981,43 @@ mod tests {
     }
 
     #[test]
-    fn both_passes_pause_on_failed_read_for_wedge_avoidance() {
-        // 2026-05-11 reframe: a failed read is a failed read. Same
-        // FAIL_PAUSE_SECS for both Pass 1 (sweep) and Pass N (patch).
-        // Pre-reframe Pass 1 had its own PASS_1_FAIL_PAUSE_SECS=5
-        // and Pass N had POST_FAILURE_PAUSE_SECS=1 — the asymmetry
-        // is gone. The wedge avoidance is a centralized policy now.
-        for mut ctx in [ReadCtx::for_sweep(32), ReadCtx::for_patch(1)] {
-            let action = handle_read_error(&medium_err(), &mut ctx);
-            let pause = match action {
-                ReadAction::SkipBlock { pause_secs } => pause_secs,
-                ReadAction::JumpAhead { pause_secs, .. } => pause_secs,
-                ReadAction::Bisect => continue,
-                other => panic!("expected pausing action, got {other:?}"),
-            };
-            assert_eq!(pause, FAIL_PAUSE_SECS);
+    fn pass_1_zone_entry_uses_long_cooldown() {
+        // 2026-05-11 wedge-prevention rewrite: Pass 1's FIRST error
+        // (zone entry) gets a 30 s ZONE_ENTRY_COOLDOWN_SECS pause +
+        // a 2 s POST_JUMP_EXTRA on top (since we're also jumping).
+        // The long pause prevents the retry cadence that triggers
+        // firmware fast-fail. Subsequent errors in the same zone fall
+        // back to the standard 5 s FAIL_PAUSE_SECS.
+        let mut ctx = ReadCtx::for_sweep(32);
+        let action = handle_read_error(&medium_err(), &mut ctx);
+        match action {
+            ReadAction::JumpAhead { pause_secs, .. } => {
+                assert_eq!(
+                    pause_secs,
+                    ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
+                    "first-error pause should be 30 + 2 = 32 s"
+                );
+            }
+            other => panic!("expected JumpAhead on first Pass 1 error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pass_n_pauses_uniformly_on_failed_read() {
+        // Pass N (bisect_on_marginal=true) is exempt from the
+        // zone-entry long pause — its whole job is to retry single
+        // sectors on already-known-bad LBAs, and the 30 s pause every
+        // single-sector failure would multiply slow recovery
+        // pointlessly. Pass N keeps the standard 5 s FAIL_PAUSE_SECS.
+        let mut ctx = ReadCtx::for_patch(1);
+        let action = handle_read_error(&medium_err(), &mut ctx);
+        match action {
+            ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, FAIL_PAUSE_SECS),
+            ReadAction::JumpAhead { pause_secs, .. } => {
+                assert_eq!(pause_secs, FAIL_PAUSE_SECS + POST_JUMP_EXTRA_PAUSE_SECS)
+            }
+            ReadAction::Bisect => {}
+            other => panic!("expected pausing action, got {other:?}"),
         }
     }
 
