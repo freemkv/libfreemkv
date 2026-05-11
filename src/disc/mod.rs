@@ -2654,9 +2654,17 @@ impl Disc {
                                         }
                                         Err(_err) => {
                                             blocks_read_failed += 1;
+                                            // Leave NonTrimmed (not Unreadable) so a later
+                                            // pass gets another shot. Per the project goal
+                                            // — "recover 100% of readable data" — and the
+                                            // multi-pass design's promise: bytes stay
+                                            // Good-or-Maybe across passes; promotion to
+                                            // Unreadable is the orchestrator's job at
+                                            // end-of-recovery (final retry pass complete).
+                                            // Reference: 2026-05-11 design call.
                                             send_or_abort(
                                                 &pipe,
-                                                PatchItem::Unreadable {
+                                                PatchItem::NonTrimmed {
                                                     pos: bt_pos,
                                                     len: span,
                                                 },
@@ -2840,10 +2848,21 @@ impl Disc {
                             }
                         }
 
-                        // All retries exhausted - mark as Unreadable
+                        // All retries exhausted IN THIS PASS — leave NonTrimmed
+                        // so a subsequent pass gets another shot. Bytes stay
+                        // Good-or-Maybe across passes; only the orchestrator
+                        // (autorip) promotes still-NonTrimmed → Unreadable
+                        // after the FINAL retry pass completes. Reference:
+                        // 2026-05-11 design call ("good or maybe until all
+                        // passes are done, then it's gone"). Pre-fix the
+                        // patch loop marked Unreadable here, which gave up
+                        // on sectors that a later pass might have recovered
+                        // (drive reads are stochastic — same sector that
+                        // fails 10x in Pass 2 might succeed on attempt 1 in
+                        // Pass 3 after the drive state has shifted).
                         send_or_abort(
                             &pipe,
-                            PatchItem::Unreadable {
+                            PatchItem::NonTrimmed {
                                 pos,
                                 len: block_bytes,
                             },
@@ -2960,25 +2979,24 @@ impl Disc {
                             }
                         }
 
-                        // Redundant second Unreadable mark — preserved
-                        // bit-for-bit from the pre-split loop (`record`
-                        // is idempotent for same-status replacement of
-                        // the same range). Routes through the consumer
-                        // like every other state change.
+                        // Pair with the earlier NonTrimmed dispatch — same
+                        // bytes, same state. Pre-2026-05-11 this was a
+                        // second Unreadable mark; now it's NonTrimmed for
+                        // the same reason: cross-pass retry survival.
                         send_or_abort(
                             &pipe,
-                            PatchItem::Unreadable {
+                            PatchItem::NonTrimmed {
                                 pos,
                                 len: block_bytes,
                             },
                         )?;
                         tracing::info!(
                             target: "freemkv::disc",
-                            phase = "patch_mapfile_record_unreadable",
+                            phase = "patch_mapfile_record_nontrimmed",
                             pos,
                             block_bytes,
                             consecutive_failures,
-                            "Mapfile record dispatched as Unreadable"
+                            "Mapfile record dispatched as NonTrimmed (retry next pass)"
                         );
 
                         let pause_secs = if err.is_bridge_degradation() {

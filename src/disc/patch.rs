@@ -70,14 +70,33 @@ pub(super) enum PatchItem {
     /// Producer exhausted retries on `[pos, pos+len)`. Consumer records
     /// the range as `Unreadable`. No file write — the existing zero-fill
     /// from sweep is preserved in place.
+    ///
+    /// Currently unused by `Disc::patch` itself (2026-05-11 design call:
+    /// patch never marks `Unreadable` mid-multipass; bytes stay
+    /// `NonTrimmed` so future passes get another shot at them). Kept
+    /// in the enum for the orchestrator-side end-of-recovery promotion
+    /// (autorip, after the final retry pass completes, promotes
+    /// still-NonTrimmed bytes to Unreadable). When that ships, this
+    /// becomes the variant the orchestrator emits to the same
+    /// PatchSink.
+    #[allow(dead_code)]
     Unreadable { pos: u64, len: u64 },
 
-    /// Producer hit the per-range skip limit and is leaving the
-    /// remaining bytes as `NonTrimmed` for a future pass. CRITICAL:
-    /// this is not the same as `Unreadable` — sectors we never tried
-    /// stay hopeful. (See the comment at the skip-limit branch in
-    /// `Disc::patch`: ~36% of patch-marked Unreadable sectors are
-    /// actually readable on a later pass.) No file write.
+    /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH
+    /// the per-range skip-limit case (remaining bytes never tried) AND
+    /// individual sector failures (tried-but-failed within a pass).
+    /// Both stay "hopeful" — a later pass retries them.
+    ///
+    /// CRITICAL: "NonTrimmed in pass N" does NOT mean "Unreadable
+    /// forever." Drive reads are stochastic: the same sector that
+    /// fails 10 times in Pass 2 may succeed on attempt 1 in Pass 3
+    /// after temperature / bus state / prior-read patterns shift.
+    /// Pre-2026-05-11 patch marked individual failures Unreadable,
+    /// which gave up on sectors that subsequent passes could have
+    /// recovered (historical: ~36% of patch-marked Unreadable
+    /// sectors turned out to be readable in re-rip experiments).
+    /// Promotion to true Unreadable is the orchestrator's job,
+    /// applied once after all retry passes complete.
     NonTrimmed { pos: u64, len: u64 },
 }
 

@@ -655,12 +655,16 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
 
 // ── 9. PassProgress carries separate unreadable vs pending byte counts ─────
 //
-// The video-damage-time display needs bytes_unreadable_total (confirmed dead)
-// separate from bytes_pending_total (might still recover). This test verifies
-// that a Pass 2 with some confirmed failures produces correct field values.
+// 2026-05-11 design call: Pass N never marks bytes as `Unreadable` mid-multipass —
+// failed reads stay `NonTrimmed` so the next pass can retry them. The orchestrator
+// (autorip) promotes still-NonTrimmed bytes to Unreadable after the FINAL retry
+// pass completes. This test was rewritten from its pre-design-call shape (which
+// asserted Pass 2 produced bytes_unreadable > 0) to verify the new invariant:
+// pass-level retries keep failed bytes in `bytes_pending` so subsequent passes
+// get more shots at them.
 
 #[test]
-fn test_pass_progress_separates_unreadable_from_pending() {
+fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
     let capacity_sectors: u32 = 128;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
@@ -734,24 +738,30 @@ fn test_pass_progress_separates_unreadable_from_pending() {
         pass2.bytes_good, 0,
         "pass2: still no good sectors (reader always fails)"
     );
-    assert!(
-        pass2.bytes_unreadable > 0,
-        "pass2: some sectors confirmed unreadable"
+    // 2026-05-11 design: pass-level retries do NOT promote failed bytes
+    // to Unreadable. Failed bytes stay NonTrimmed (pending) so a later
+    // pass can retry. End-of-recovery promotion is an orchestrator
+    // concern (autorip), not the patch loop's.
+    assert_eq!(
+        pass2.bytes_unreadable, 0,
+        "pass2: Disc::patch never marks Unreadable mid-multipass — orchestrator promotes after final pass"
     );
-    assert!(
-        pass2.bytes_pending < pass1.bytes_pending,
-        "pass2: fewer pending sectors than pass1"
+    // bytes_pending stays at total_bytes because everything still
+    // failed and nothing got recovered or promoted out of pending.
+    assert_eq!(
+        pass2.bytes_pending, total_bytes,
+        "pass2: failed bytes remain NonTrimmed for the next pass to retry"
     );
 
     let observed_unreadable = last_unreadable.load(Ordering::Relaxed);
     let observed_pending = last_pending.load(Ordering::Relaxed);
-    assert!(
-        observed_unreadable > 0,
-        "progress should report confirmed unreadable bytes"
+    assert_eq!(
+        observed_unreadable, 0,
+        "progress should report zero confirmed-unreadable mid-pass under the new design"
     );
     assert!(
-        observed_pending == 0 || observed_pending < total_bytes,
-        "pending should shrink as sectors are confirmed unreadable"
+        observed_pending > 0,
+        "progress should report pending bytes as the reader keeps failing"
     );
 
     // Video damage time: unreadable / total * duration
