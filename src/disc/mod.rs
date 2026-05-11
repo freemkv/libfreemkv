@@ -1545,7 +1545,7 @@ impl Disc {
         let batch: u16 = match opts.batch_sectors {
             Some(b) => b,
             None if opts.skip_on_error => ecc_sectors(self.format),
-            None => DEFAULT_BATCH_SECTORS,
+            None => DEFAULT_BATCH_SECTORS_OPTICAL,
         };
 
         // Pre-compute the list of NonTried regions before handing the
@@ -3327,7 +3327,8 @@ impl Disc {
 }
 
 const MAX_BATCH_SECTORS: u16 = 510;
-const DEFAULT_BATCH_SECTORS: u16 = 60;
+const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
+const DEFAULT_BATCH_SECTORS_BLOCK: u16 = 8192;
 const MIN_BATCH_SECTORS: u16 = 3;
 
 pub(crate) fn ecc_sectors(format: DiscFormat) -> u16 {
@@ -3404,43 +3405,63 @@ mod severity_tests {
 }
 
 /// Detect the maximum transfer size in sectors for a device.
-/// Reads /sys/block/<dev>/queue/max_hw_sectors_kb on Linux.
-/// For sg devices, resolves the corresponding block device via sysfs.
-/// Returns a value aligned to 3 sectors (one aligned unit).
 pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
     let dev_name = device_path.rsplit('/').next().unwrap_or("");
     if dev_name.is_empty() {
-        return DEFAULT_BATCH_SECTORS;
+        return DEFAULT_BATCH_SECTORS_OPTICAL;
     }
 
-    // For sg devices, find the corresponding block device name
-    let block_name = if dev_name.starts_with("sg") {
-        let block_dir = format!("/sys/class/scsi_generic/{dev_name}/device/block");
-        std::fs::read_dir(&block_dir)
-            .ok()
-            .and_then(|mut entries| entries.next())
-            .and_then(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-    } else {
-        Some(dev_name.to_string())
-    };
-
-    if let Some(bname) = block_name {
-        let sysfs_path = format!("/sys/block/{bname}/queue/max_hw_sectors_kb");
-        if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
-            if let Ok(kb) = content.trim().parse::<u32>() {
-                // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
-                let sectors = (kb / 2) as u16;
-                // Align down to 3 (one aligned unit)
-                let aligned = (sectors / 3) * 3;
-                if aligned >= MIN_BATCH_SECTORS {
-                    return aligned.min(MAX_BATCH_SECTORS);
+    // Check if optical drive (0x05 = CD/DVD)
+   let is_optical = (|| -> bool {
+        use std::path::Path;
+        let scsi_device_dir = format!("/sys/class/scsi_device/");
+        if let Ok(entries) = std::fs::read_dir(&scsi_device_dir) {
+            for entry in entries.flatten() {
+                let device_type_path = entry.path().join("device/type");
+                if Path::new(&device_type_path).exists() {
+                    if let Ok(content) = std::fs::read_to_string(&device_type_path) {
+                        // Type 0x05 (decimal 5) = CD/DVD drive
+                        if content.trim().parse::<u32>() == Ok(5) {
+                            return true;
+                        }
+                    }
                 }
             }
         }
+        false
+    })();
+
+    if is_optical {
+        // For sg devices, find the corresponding block device name
+        let block_name = if dev_name.starts_with("sg") {
+            let block_dir = format!("/sys/class/scsi_generic/{dev_name}/device/block");
+            std::fs::read_dir(&block_dir)
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .and_then(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+        } else {
+            Some(dev_name.to_string())
+        };
+
+        if let Some(bname) = block_name {
+            let sysfs_path = format!("/sys/block/{bname}/queue/max_hw_sectors_kb");
+            if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
+                if let Ok(kb) = content.trim().parse::<u32>() {
+                    // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
+                    let sectors = (kb / 2) as u16;
+                    // Align down to 3 (one aligned unit)
+                    let aligned = (sectors / 3) * 3;
+                    if aligned >= MIN_BATCH_SECTORS {
+                        return aligned.min(MAX_BATCH_SECTORS);
+                    }
+                }
+            }
+        }
+     DEFAULT_BATCH_SECTORS_OPTICAL
+    } else {
+        DEFAULT_BATCH_SECTORS_BLOCK
     }
-    // Fallback: safe default well under typical kernel limits
-    DEFAULT_BATCH_SECTORS
 }
 
 // ─── Format helpers ────────────────────────────────────────────────────────
