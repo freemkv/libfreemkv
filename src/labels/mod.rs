@@ -9,6 +9,7 @@
 
 mod bdmt;
 pub(crate) mod class_reader;
+pub mod clpi_audit;
 mod criterion;
 mod ctrm;
 mod dbp;
