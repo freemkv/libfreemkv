@@ -541,6 +541,8 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
         None
     };
 
+    let chapter_summary = collect_chapter_summary(reader, udf);
+
     LabelAnalysis {
         parser,
         parsers_detected,
@@ -549,7 +551,57 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
         labels,
         disc_metadata,
         gap_fill_added,
+        chapter_summary,
     }
+}
+
+/// Scan `/BDMV/PLAYLIST/*.mpls`, parse each, return a row per playlist
+/// with chapter count (mark_type ≤ 1) and total duration. Sorted by
+/// playlist filename. Skipped entries (read error, parse error, no
+/// marks) silently dropped — this is a diagnostic field, not a
+/// correctness-critical one.
+fn collect_chapter_summary(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<ChapterSummary> {
+    let Some(playlist_dir) = udf.find_dir("/BDMV/PLAYLIST") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = playlist_dir
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(".mpls"))
+        .map(|e| e.name.clone())
+        .collect();
+    names.sort();
+
+    let mut out: Vec<ChapterSummary> = Vec::new();
+    for name in names {
+        let path = format!("/BDMV/PLAYLIST/{}", name);
+        let Ok(data) = udf.read_file(reader, &path) else {
+            continue;
+        };
+        let Ok(playlist) = crate::mpls::parse(&data) else {
+            continue;
+        };
+        let chapter_count = playlist.marks.iter().filter(|m| m.mark_type <= 1).count();
+        if chapter_count == 0 {
+            continue;
+        }
+        // Duration: sum of (out_time - in_time) across play items,
+        // each in 45kHz PTS ticks → seconds. Approximates the disc
+        // module's per-title duration; we don't claim sample accuracy
+        // here, just enough to identify "the long one" (main movie).
+        let duration_ticks: u64 = playlist
+            .play_items
+            .iter()
+            .map(|pi| pi.out_time.saturating_sub(pi.in_time) as u64)
+            .sum();
+        let duration_secs = duration_ticks as f64 / 45000.0;
+        out.push(ChapterSummary {
+            playlist: name,
+            chapter_count,
+            duration_secs,
+        });
+    }
+    out
 }
 
 /// Result of [`analyze`].
@@ -588,6 +640,20 @@ pub struct LabelAnalysis {
     /// every MPLS-known stream slot, or MPLS itself was the chosen
     /// parser. Diagnostic for the labels-analyze tool.
     pub gap_fill_added: usize,
+    /// Per-playlist chapter summary: `(playlist_filename, chapter_count, duration_secs)`.
+    /// Sourced from MPLS PlaylistMark entries with `mark_type ≤ 1`
+    /// (chapter entries). Ordered by playlist filename. Empty if no
+    /// MPLS files have parseable marks, or the disc isn't Blu-ray.
+    pub chapter_summary: Vec<ChapterSummary>,
+}
+
+/// One row of the per-playlist chapter summary in `LabelAnalysis`.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ChapterSummary {
+    pub playlist: String,
+    pub chapter_count: usize,
+    pub duration_secs: f64,
 }
 
 /// List filenames found under any `/BDMV/JAR/<x>/` subdirectory of
