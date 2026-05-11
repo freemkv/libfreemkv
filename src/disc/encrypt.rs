@@ -23,29 +23,74 @@ impl Disc {
         use crate::aacs::{self, KeyDb};
 
         let keydb_path = opts.resolve_keydb()?;
-        let keydb = KeyDb::load(&keydb_path).ok()?;
+        let keydb = match KeyDb::load(&keydb_path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(
+                    target: "freemkv::aacs",
+                    phase = "handshake_keydb_load_failed",
+                    io_error_kind = ?e.kind(),
+                    keydb = %keydb_path.display(),
+                    "KEYDB load failed; handshake skipped"
+                );
+                return None;
+            }
+        };
+
+        let host_cert_count = keydb.host_certs.len();
+        tracing::debug!(
+            target: "freemkv::aacs",
+            phase = "handshake_start",
+            host_cert_count,
+            keydb = %keydb_path.display(),
+        );
 
         const MAX_CERT_ATTEMPTS: usize = 16;
-        for hc in keydb.host_certs.iter().take(MAX_CERT_ATTEMPTS) {
+        let mut last_err_code: Option<u16> = None;
+        for (idx, hc) in keydb.host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
             match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
                     let volume_id = match aacs::handshake::read_volume_id(session, &mut auth) {
                         Ok(vid) => vid,
-                        Err(_) => return None, // handshake succeeded but can't read VID
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "freemkv::aacs",
+                                phase = "handshake_vid_read_failed",
+                                cert_index = idx,
+                                error_code = e.code(),
+                                "auth ok but volume ID read failed"
+                            );
+                            return None;
+                        }
                     };
                     let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
                         .ok()
                         .map(|(rdk, _)| rdk);
+                    tracing::debug!(
+                        target: "freemkv::aacs",
+                        phase = "handshake_ok",
+                        cert_index = idx,
+                        has_read_data_key = read_data_key.is_some(),
+                    );
                     return Some(HandshakeResult {
                         volume_id,
                         read_data_key,
                     });
                 }
-                Err(_) => {
+                Err(e) => {
+                    last_err_code = Some(e.code());
                     continue;
                 }
             }
         }
+        tracing::warn!(
+            target: "freemkv::aacs",
+            phase = "handshake_all_certs_failed",
+            host_cert_count,
+            tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
+            last_error_code = last_err_code,
+            "all host certs in KEYDB rejected by drive"
+        );
         // All host certs failed — return None, not a fake success
         None
     }

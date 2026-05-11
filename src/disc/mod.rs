@@ -55,6 +55,11 @@ pub struct Disc {
     pub css: Option<crate::css::CssState>,
     /// Whether this disc requires decryption (AACS or CSS)
     pub encrypted: bool,
+    /// AACS resolution error when `encrypted` is true and `aacs` is None.
+    /// Lets callers distinguish "no KEYDB found", "KEYDB failed to parse",
+    /// "disc hash not in KEYDB", etc. None when AACS resolution wasn't
+    /// attempted (unencrypted disc) or succeeded.
+    pub aacs_error: Option<crate::error::Error>,
     /// Content format (BD transport stream vs DVD program stream)
     pub content_format: ContentFormat,
 }
@@ -1110,14 +1115,45 @@ impl Disc {
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
-        let aacs = if encrypted {
-            if let Some(keydb_path) = opts.resolve_keydb() {
-                Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref()).ok()
-            } else {
-                None
+        let (aacs, aacs_error) = if encrypted {
+            match opts.resolve_keydb() {
+                Some(keydb_path) => {
+                    match Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref())
+                    {
+                        Ok(state) => (Some(state), None),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "scan_aacs_resolve_failed",
+                                error_code = e.code(),
+                                keydb = %keydb_path.display(),
+                                handshake_ok = handshake.is_some(),
+                                "AACS key resolution failed"
+                            );
+                            (None, Some(e))
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "scan_aacs_no_keydb",
+                        "encrypted disc but no KEYDB found in search paths"
+                    );
+                    // Reuse KeydbLoad with sentinel path — adding a new Error
+                    // variant would be a breaking change for downstream
+                    // exhaustive matches. The path string makes the cause
+                    // unambiguous to autorip's message switch.
+                    (
+                        None,
+                        Some(crate::error::Error::KeydbLoad {
+                            path: String::from("<no keydb in search paths>"),
+                        }),
+                    )
+                }
             }
         } else {
-            None
+            (None, None)
         };
 
         // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)
@@ -1174,6 +1210,7 @@ impl Disc {
             aacs,
             css,
             encrypted,
+            aacs_error,
             content_format,
         })
     }
@@ -3582,6 +3619,7 @@ mod tests {
             aacs: None,
             css: None,
             encrypted: false,
+            aacs_error: None,
             content_format: ContentFormat::BdTs,
         };
         let gb = disc.capacity_gb();
@@ -3667,6 +3705,7 @@ mod tests {
             aacs: None,
             css: None,
             encrypted: false,
+            aacs_error: None,
             content_format: ContentFormat::BdTs,
         }
     }
