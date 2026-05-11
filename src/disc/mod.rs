@@ -1901,6 +1901,26 @@ impl Disc {
             copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
             "Disc::sweep returning"
         );
+
+        // End-of-pass diagnostic summary (added 2026-05-10 alongside
+        // the per-error timing instrumentation in read_error.rs).
+        // One INFO line per sweep that lets a post-mortem analyst tell
+        // at a glance how much damage the disc + drive saw, without
+        // grepping through the per-error WARN log. The PassSummary
+        // counters come from `ReadCtx`'s accumulated state.
+        let pass_sum = read_ctx.pass_summary();
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "pass1_summary",
+            total_reads_ok = pass_sum.total_reads_ok,
+            total_errors = pass_sum.total_errors,
+            zones_entered = pass_sum.zones_entered,
+            jumps_taken = pass_sum.jumps_taken,
+            bytes_good = stats.bytes_good,
+            bytes_pending = stats.bytes_pending,
+            copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
+            "Pass 1 complete"
+        );
         Ok(CopyResult {
             bytes_total: total_bytes,
             bytes_good: stats.bytes_good,
