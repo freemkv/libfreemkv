@@ -52,7 +52,7 @@
 //!   (each enum value's `<init>` is called with its name string as
 //!   the first arg).
 //!
-//! - **Phase C** — binding-class identification (`find_binding_class`).
+//! - **Phase C** — binding-class identification (`find_binding_classes`).
 //!   The per-stream table is built by some class via repeated
 //!   `getstatic` references to the master enums identified in A.
 //!   That class has the highest such `getstatic` count in the jar.
@@ -138,34 +138,41 @@ pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> 
             );
         }
 
-        // Phase C — find the binding class via getstatic count to
-        // the master enums.
-        let binding_class_name = find_binding_class(archive, &master_table.class_name_set());
-        let Some(binding_class_name) = binding_class_name else {
+        // Phase C — find ALL binding-class candidates (audio + subtitle
+        // are often split across two classes on Deluxe). Each gets its
+        // own `<clinit>` walk; constructions union into a single
+        // stream list for interpret_streams.
+        let binding_classes = find_binding_classes(archive, &master_table.class_name_set());
+        if binding_classes.is_empty() {
             tracing::info!(
                 jar = %entry_name,
                 "deluxe: no binding class found (no class has enough getstatic refs to master enums)"
             );
             return None;
-        };
-        tracing::info!(
-            jar = %entry_name,
-            binding_class = %binding_class_name,
-            "deluxe binding class identified",
-        );
+        }
+        for (name, count) in &binding_classes {
+            tracing::info!(
+                jar = %entry_name,
+                binding_class = %name,
+                getstatic_count = count,
+                "deluxe binding class candidate",
+            );
+        }
 
-        // Phase D — decode the binding class's <clinit>.
-        let streams = decode_binding(archive, &binding_class_name, &master_table);
+        // Phase D — decode each binding class's <clinit>.
+        let mut streams: Vec<Construction> = Vec::new();
+        for (name, _) in &binding_classes {
+            streams.extend(decode_binding(archive, name, &master_table));
+        }
         if streams.is_empty() {
             tracing::info!(
                 jar = %entry_name,
-                binding_class = %binding_class_name,
-                "deluxe: binding class found but produced 0 decoded streams"
+                "deluxe: binding classes found but produced 0 decoded streams"
             );
             return None;
         }
 
-        let labels = interpret_streams(&streams, &codec_table, &master_table);
+        let labels = interpret_streams(&streams, &master_table);
         if labels.is_empty() {
             return None;
         }
@@ -545,26 +552,39 @@ fn clinit_news_and_ldcs(
 /// arity); we use a low floor (4) so a small disc with few streams
 /// still qualifies, but high enough to filter out classes that just
 /// reference the language enum once for a config string.
-pub(crate) fn find_binding_class(
+/// Identify all binding-class candidates by getstatic-count to the
+/// master enums. Some Deluxe discs split the per-stream table across
+/// two binding classes (one for audio, one for subtitle), so the
+/// per-stream decoder needs to walk all of them. Returns top-K
+/// candidates ordered by descending getstatic count, filtered to a
+/// minimum concentration of master-enum references.
+///
+/// Empirically (POC v0.3 dumps): on disc-01 the audio binding class
+///   (`ma.class`) has ~82 getstatic refs, the subtitle binding
+///   (`ko.class`) has ~63. Both share the master Language + Purpose
+///   enums.
+pub(crate) fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
-) -> Option<String> {
+) -> Vec<(String, usize)> {
     const MIN_GETSTATIC: usize = 4;
-    let mut best: Option<(String, usize)> = None;
+    let mut candidates: Vec<(String, usize)> = Vec::new();
     jar::for_each_class(archive, |class_name, class| {
         let count = count_master_enum_getstatic(class, master_enum_classes);
-        if count < MIN_GETSTATIC {
-            return;
-        }
-        match &best {
-            None => best = Some((class_name.to_string(), count)),
-            Some((_, c)) if count > *c => {
-                best = Some((class_name.to_string(), count));
-            }
-            _ => {}
+        if count >= MIN_GETSTATIC {
+            candidates.push((class_name.to_string(), count));
         }
     });
-    best.map(|(name, _)| name)
+    candidates.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    // Top candidates only — anything significantly below the top one
+    // is noise. We keep candidates whose count is at least 40% of the
+    // top, capped at 4 total (audio + subtitle + future use).
+    if let Some(top_count) = candidates.first().map(|(_, c)| *c) {
+        let threshold = (top_count * 2) / 5; // 40%
+        candidates.retain(|(_, c)| *c >= threshold);
+        candidates.truncate(4);
+    }
+    candidates
 }
 
 /// Count `getstatic` instructions in this class's `<clinit>` whose
@@ -617,6 +637,15 @@ pub(crate) enum StackVal {
         kind: &'static str,
         ordinal: u16,
     },
+    /// Reference to a `org.bluray.ti.CodingType` enum value. Field
+    /// name (e.g. `DOLBY_AC3_AUDIO`, `DOLBY_LOSSLESS_AUDIO`) is the
+    /// codec identifier. Deluxe binding constructors take a
+    /// `LCodingType;` arg directly — codecs are NOT a Deluxe-internal
+    /// enum (Phase B's codec-subclass walk was based on a wrong
+    /// assumption; the actual codec source is the standard BD-J API
+    /// enum). Discovered via deluxe-poc v0.3 binding-bytecode dump
+    /// against disc-01 (Disney) + disc-09 (Warner) on 2026-05-10.
+    CodingType(String),
     /// An uninitialized `new` object — popped by the matching
     /// invokespecial.
     NewObj(String),
@@ -625,6 +654,10 @@ pub(crate) enum StackVal {
     /// values it doesn't understand.
     Unknown,
 }
+
+/// Fully-qualified class name of the BD-J spec codec enum that
+/// Deluxe constructors reference directly.
+const BD_CODING_TYPE_CLASS: &str = "org/bluray/ti/CodingType";
 
 /// Phase D entry point: find the binding class in `archive`, run the
 /// bytecode walker against its `<clinit>`, return one `Construction`
@@ -755,10 +788,19 @@ impl<'a> BindingDecoder<'a> {
                 let val = insn
                     .cp_index()
                     .and_then(|i| self.pool.member_ref(i))
-                    .and_then(|m| {
-                        self.master
-                            .resolve(m.class_name, m.name)
-                            .map(|(kind, ord)| StackVal::EnumRef { kind, ordinal: ord })
+                    .map(|m| {
+                        // Three-way resolution:
+                        //   1. org.bluray.ti.CodingType.X → CodingType(X)
+                        //   2. master-enum classname.X → EnumRef(kind, ord)
+                        //   3. anything else → Unknown
+                        if m.class_name == BD_CODING_TYPE_CLASS {
+                            StackVal::CodingType(m.name.to_string())
+                        } else if let Some((kind, ord)) = self.master.resolve(m.class_name, m.name)
+                        {
+                            StackVal::EnumRef { kind, ordinal: ord }
+                        } else {
+                            StackVal::Unknown
+                        }
                     })
                     .unwrap_or(StackVal::Unknown);
                 self.stack.push(val);
@@ -946,48 +988,37 @@ impl MasterEnumTable {
 // ── interpret_streams: Constructions → StreamLabels ─────────────────────────
 
 /// Convert the per-construction tuples from Phase D into
-/// [`StreamLabel`]s using a documented heuristic.
+/// [`StreamLabel`]s. Pattern verified against corpus discs via
+/// deluxe-poc v0.3 binding-bytecode dump (2026-05-10):
 ///
-/// Heuristic:
-/// - For each Construction, classify the args into language / codec /
-///   purpose / region / int slots using the EnumRef kinds.
-/// - A construction with a Language ref AND a Codec ref → Audio stream.
-/// - A construction with a Language ref AND no Codec ref → Subtitle.
-/// - Any construction with no Language ref → ignored (not a stream).
-/// - stream_number = sequential per type (1, 2, 3 ...).
-/// - language = vocab::lang fallback applied to the enum value
-///   string (so "Brazilian Portuguese" → "por" + variant="Brazilian").
-///   When the enum value isn't a recognized phrase, the raw value is
-///   used as language verbatim (ISO codes pass through).
-/// - codec_hint = the CodecTable lookup of the codec ordinal.
-/// - purpose = LabelPurpose decoded from the Purpose-enum value
-///   string via the documented Deluxe Purpose enum (Normal,
-///   Commentary, PiP, Trivia, Descriptive, Score, NoForced,
-///   NoForcedDescriptive).
-/// - qualifier = LabelQualifier::Forced when the Purpose-enum value
-///   is one of the *Forced* variants (Normal+Forced bit etc.); else
-///   None. (Deluxe's framework doesn't appear to expose SDH at this
-///   layer — that comes from the subtitle codec.)
+/// Disney binding (5-arg): `BindingType.<init>(I, Lbe;, Llp;, I, LCodingType;)V`
+/// Warner binding (4-arg): `BindingType.<init>(I, Law;, Lgp;, LCodingType;)V`
 ///
-/// This heuristic is the part of Phase D that needs corpus-disc
-/// verification. The DECODING (Constructions from bytecode) is
-/// mechanically correct; the SEMANTIC INTERPRETATION here may need
-/// adjustment once we see real binding-class output.
-fn interpret_streams(
-    constructions: &[Construction],
-    codec_table: &CodecTable,
-    master: &MasterEnumTable,
-) -> Vec<StreamLabel> {
+/// Args are identified by **TYPE**, not position:
+/// - First `EnumRef{kind: "Language"}` → audio/subtitle language
+/// - First `EnumRef{kind: "Purpose"}` → Deluxe purpose ordinal
+/// - First `CodingType(name)` → codec field name (translated via
+///   [`coding_type_to_codec_hint`])
+/// - First `Int(n)` → stream index (preserved as ordering hint;
+///   per-type sequential stream_number is what actually goes into
+///   the StreamLabel, since BD spec stream-numbering is anchored on
+///   MPLS data, not the binding code)
+///
+/// Stream type inference:
+/// - Construction has a `CodingType` arg → audio stream (subtitles
+///   on Deluxe don't carry a CodingType; their codec is implicit
+///   PGS via the BD spec).
+/// - Construction has Language but no CodingType → subtitle stream.
+/// - No Language → not a stream (skip).
+fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -> Vec<StreamLabel> {
     let mut audio_idx: u16 = 0;
     let mut sub_idx: u16 = 0;
     let mut out = Vec::new();
 
     for c in constructions {
-        // Collect typed args: language / purpose ordinals + any int
-        // (preserved for future stream-index resolution; logged only
-        // for now).
         let mut lang_ord: Option<u16> = None;
         let mut purpose_ord: Option<u16> = None;
+        let mut coding_type: Option<String> = None;
         let mut stream_idx_hint: Option<i32> = None;
         for arg in &c.args {
             match arg {
@@ -996,31 +1027,28 @@ fn interpret_streams(
                     "Purpose" => purpose_ord = purpose_ord.or(Some(*ordinal)),
                     _ => {}
                 },
-                StackVal::Int(n) => stream_idx_hint = stream_idx_hint.or(Some(*n)),
+                StackVal::CodingType(name) => {
+                    coding_type = coding_type.or_else(|| Some(name.clone()));
+                }
+                StackVal::Int(n) => {
+                    stream_idx_hint = stream_idx_hint.or(Some(*n));
+                }
                 _ => {}
             }
         }
 
-        // The Codec enum isn't fingerprinted by ldc prefix (0 ldcs
-        // in its <clinit>), so it isn't in MasterEnumTable.
-        // EnumRefs resolved through master_table never carry the
-        // "Codec" kind. Codec association at this layer is heuristic:
-        // if the construction's binding_type matches one of the
-        // CodecTable entries (substring match), use that codec.
-        // Stronger codec→ordinal resolution is deferred until corpus
-        // bytecode confirms the codec field's location in the
-        // binding constructor's args.
-        let codec_hint = codec_table
-            .codecs
-            .iter()
-            .find(|name| !name.is_empty() && c.binding_type.contains(name.as_str()))
-            .cloned()
-            .unwrap_or_default();
-
         let Some(lang_ord) = lang_ord else { continue };
 
-        // Audio when codec is known, subtitle otherwise.
-        let (stream_type, stream_number) = if !codec_hint.is_empty() {
+        // Audio when a CodingType is present (audio binding type
+        // always references org.bluray.ti.CodingType); subtitle
+        // otherwise.
+        let codec_hint = coding_type
+            .as_deref()
+            .map(coding_type_to_codec_hint)
+            .map(str::to_string)
+            .unwrap_or_default();
+
+        let (stream_type, stream_number) = if coding_type.is_some() {
             audio_idx += 1;
             (StreamLabelType::Audio, audio_idx)
         } else {
@@ -1044,10 +1072,10 @@ fn interpret_streams(
 
         if let Some(hint) = stream_idx_hint {
             tracing::debug!(
-                stream_idx_hint = hint,
+                disc_stream_idx = hint,
                 lang = %language,
                 binding = %c.binding_type,
-                "deluxe interpret_streams: captured int arg for future stream-index resolution"
+                "deluxe interpret_streams: disc-authored stream index (not used for stream_number; preserved for diagnostic)"
             );
         }
 
@@ -1064,6 +1092,39 @@ fn interpret_streams(
     }
 
     out
+}
+
+/// Map a `org.bluray.ti.CodingType` field name (as observed in
+/// getstatic operands on Deluxe binding classes) to a human-readable
+/// codec hint string.
+///
+/// CodingType is the standard BD-J API enum; values are documented
+/// in the BD-J specification and verified empirically against the
+/// binding-bytecode dumps in `freemkv-private/research/deluxe-poc/data/`.
+/// Unknown field names pass through unchanged so unfamiliar codecs
+/// still surface something rather than going silent.
+fn coding_type_to_codec_hint(field: &str) -> &str {
+    match field {
+        // Lossless / hi-res.
+        "DOLBY_LOSSLESS_AUDIO" => "Dolby TrueHD",
+        "DTS_HD_LOSSLESS_AUDIO" | "DTS_HD_MA_AUDIO" => "DTS-HD Master Audio",
+        "LPCM_AUDIO" => "LPCM",
+        // Dolby family.
+        "DOLBY_AC3_AUDIO" => "Dolby Digital",
+        "DOLBY_DIGITAL_PLUS_AUDIO" => "Dolby Digital Plus",
+        "DOLBY_ATMOS_AUDIO" => "Dolby Atmos",
+        // DTS family.
+        "DTS_AUDIO" => "DTS",
+        "DTS_HD_AUDIO" | "DTS_HD_HR_AUDIO" => "DTS-HD HR",
+        // MPEG family.
+        "MPEG1_AUDIO_LAYER2" | "MPEG2_AUDIO_LAYER2" => "MPEG Audio",
+        // PG-style subtitle codecs (rare to see in Deluxe bindings;
+        // subtitles usually have NO CodingType arg).
+        "PG_STREAM" | "PRESENTATION_GRAPHICS_STREAM" => "PGS",
+        // Unknown / future — pass through verbatim so the operator
+        // can see what the disc actually authored.
+        _ => field,
+    }
 }
 
 /// Deluxe Purpose enum ordinal → (LabelPurpose, LabelQualifier). The
@@ -1419,9 +1480,10 @@ mod tests {
     }
 
     #[test]
-    fn interpret_streams_emits_subtitle_when_no_codec() {
-        // A Construction with just a language enum ref + no codec
-        // → subtitle stream (codec_hint stays empty).
+    fn interpret_streams_emits_subtitle_when_no_codingtype() {
+        // A Construction with just a language enum ref (no CodingType)
+        // -> subtitle stream (codec_hint stays empty). Subtitles on
+        // Deluxe don't carry a CodingType arg.
         let constructions = vec![Construction {
             binding_type: "SubtitleSlot".into(),
             args: vec![StackVal::EnumRef {
@@ -1429,9 +1491,7 @@ mod tests {
                 ordinal: 0,
             }],
         }];
-        let codec_table = CodecTable::default();
-        let master = lang_enum_master();
-        let out = interpret_streams(&constructions, &codec_table, &master);
+        let out = interpret_streams(&constructions, &lang_enum_master());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].stream_type, StreamLabelType::Subtitle);
         assert_eq!(out[0].language, "eng");
@@ -1439,24 +1499,28 @@ mod tests {
     }
 
     #[test]
-    fn interpret_streams_emits_audio_when_binding_matches_codec_name() {
-        // A Construction whose binding_type contains a codec name
-        // from CodecTable → audio stream with codec_hint populated.
+    fn interpret_streams_emits_audio_when_codingtype_present() {
+        // A Construction with a CodingType arg -> audio stream with
+        // codec_hint populated by coding_type_to_codec_hint.
         let constructions = vec![Construction {
-            binding_type: "AudioSlot_ATMOS".into(),
-            args: vec![StackVal::EnumRef {
-                kind: "Language",
-                ordinal: 0,
-            }],
+            binding_type: "ng".into(),
+            args: vec![
+                StackVal::Int(1),
+                StackVal::EnumRef {
+                    kind: "Language",
+                    ordinal: 0,
+                },
+                StackVal::EnumRef {
+                    kind: "Purpose",
+                    ordinal: 0,
+                },
+                StackVal::CodingType("DOLBY_LOSSLESS_AUDIO".into()),
+            ],
         }];
-        let codec_table = CodecTable {
-            codecs: vec!["ATMOS".into(), "DTS".into()],
-        };
-        let master = lang_enum_master();
-        let out = interpret_streams(&constructions, &codec_table, &master);
+        let out = interpret_streams(&constructions, &lang_enum_master());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].stream_type, StreamLabelType::Audio);
-        assert_eq!(out[0].codec_hint, "ATMOS");
+        assert_eq!(out[0].codec_hint, "Dolby TrueHD");
         assert_eq!(out[0].language, "eng");
     }
 
@@ -1475,7 +1539,7 @@ mod tests {
                 },
             ],
         }];
-        let out = interpret_streams(&constructions, &CodecTable::default(), &lang_enum_master());
+        let out = interpret_streams(&constructions, &lang_enum_master());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].purpose, LabelPurpose::Commentary);
     }
@@ -1486,8 +1550,41 @@ mod tests {
             binding_type: "SomeOtherType".into(),
             args: vec![StackVal::Int(1)],
         }];
-        let out = interpret_streams(&constructions, &CodecTable::default(), &lang_enum_master());
+        let out = interpret_streams(&constructions, &lang_enum_master());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn coding_type_maps_known_codecs() {
+        // BD-J spec CodingType field names -> display strings.
+        assert_eq!(
+            coding_type_to_codec_hint("DOLBY_LOSSLESS_AUDIO"),
+            "Dolby TrueHD"
+        );
+        assert_eq!(
+            coding_type_to_codec_hint("DOLBY_AC3_AUDIO"),
+            "Dolby Digital"
+        );
+        assert_eq!(
+            coding_type_to_codec_hint("DOLBY_DIGITAL_PLUS_AUDIO"),
+            "Dolby Digital Plus"
+        );
+        assert_eq!(coding_type_to_codec_hint("DTS_AUDIO"), "DTS");
+        assert_eq!(
+            coding_type_to_codec_hint("DTS_HD_MA_AUDIO"),
+            "DTS-HD Master Audio"
+        );
+        assert_eq!(coding_type_to_codec_hint("LPCM_AUDIO"), "LPCM");
+    }
+
+    #[test]
+    fn coding_type_passes_through_unknown() {
+        // Unknown field names pass through verbatim so the operator
+        // sees what the disc authored.
+        assert_eq!(
+            coding_type_to_codec_hint("FUTURE_CODEC_X"),
+            "FUTURE_CODEC_X"
+        );
     }
 
     #[test]
