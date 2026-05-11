@@ -1390,7 +1390,15 @@ impl Disc {
     ) -> Result<CopyResult> {
         let patch_opts = PatchOptions {
             decrypt: opts.decrypt,
-            block_sectors: Some(1),
+            // 0.18.13: adaptive batching. patch() reads at 32 sectors
+            // when the drive is healthy, drops to 1 on failure to
+            // probe each sector individually, then climbs back after
+            // 16 consecutive clean singles. Walks NonTrimmed regions
+            // ~32x faster in clean stretches without sacrificing any
+            // per-sector recovery quality — the drop-to-1 retry from
+            // the same position guarantees every sector in a failed
+            // batch is individually probed. See Disc::patch body.
+            block_sectors: Some(32),
             full_recovery: true,
             reverse: true,
             wedged_threshold: 50,
@@ -2202,7 +2210,23 @@ impl Disc {
             );
         }
 
-        let block_sectors = opts.block_sectors.unwrap_or(1);
+        // Adaptive batching: read at `current_batch`, drop to 1 on
+        // batch-read failure, climb back to `initial_batch` after
+        // ADAPTIVE_UPSCALE_THRESHOLD consecutive single-sector successes.
+        // Rationale: dense damage scattered through a NonTrimmed range
+        // is rare — most "bad ranges" in pass N have lots of good
+        // sectors that swept-by-default landed inside. Batch reads
+        // walk those at ~32x the speed of singles, dropping to 1
+        // only when the drive actually returns an error. Guarantees:
+        //   - no good sector is ever marked NonTrimmed because it
+        //     was bundled in a failed batch — failed batches are
+        //     "split decisions", not recorded failures
+        //   - drop-to-1 retries the SAME starting position, so every
+        //     sector in the failed batch is individually probed
+        let initial_batch = opts.block_sectors.unwrap_or(1);
+        let mut current_batch: u16 = initial_batch;
+        let mut consecutive_singles_ok: u32 = 0;
+        const ADAPTIVE_UPSCALE_THRESHOLD: u32 = 16;
         let recovery = opts.full_recovery;
 
         let mut halted = false;
@@ -2239,7 +2263,7 @@ impl Disc {
         const RANGE_BUDGET_CAP_SECS: u64 = 1800;
         const MAX_SKIPS_PER_RANGE: u32 = 10;
         let mut skip_count: u32;
-        let mut buf = vec![0u8; block_sectors as usize * 2048];
+        let mut buf = vec![0u8; initial_batch as usize * 2048];
 
         // Pass 2 uses smaller sectors (1 vs 32) but same damage detection logic
         const PASSN_DAMAGE_WINDOW: usize = 16;
@@ -2322,7 +2346,7 @@ impl Disc {
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch_start",
-            block_sectors,
+            block_sectors = initial_batch,
             recovery,
             reverse = opts.reverse,
             wedged_threshold = opts.wedged_threshold,
@@ -2463,13 +2487,13 @@ impl Disc {
                     if block_end <= *range_pos {
                         break;
                     }
-                    let span = (block_end - *range_pos).min(block_sectors as u64 * 2048);
+                    let span = (block_end - *range_pos).min(current_batch as u64 * 2048);
                     (block_end - span, span)
                 } else {
                     if block_end >= end {
                         break;
                     }
-                    let span = (end - block_end).min(block_sectors as u64 * 2048);
+                    let span = (end - block_end).min(current_batch as u64 * 2048);
                     (block_end, span)
                 };
                 let lba = (pos / 2048) as u32;
@@ -2531,6 +2555,28 @@ impl Disc {
                         consecutive_good_since_skip += 1;
                         if consecutive_good_since_skip >= PASSN_ESCALATION_RESET_GOOD {
                             consecutive_skips_without_recovery = 0;
+                        }
+                        // Adaptive batching: track clean single-sector reads to
+                        // decide when to climb back to `initial_batch`. A batch
+                        // read succeeding (count > 1) tells us the drive is healthy
+                        // but doesn't accumulate toward upscale — we got back to
+                        // batch=1 because of a failure here, we need consistent
+                        // health at the slow tempo before scaling up again.
+                        if count == 1 && current_batch < initial_batch {
+                            consecutive_singles_ok += 1;
+                            if consecutive_singles_ok >= ADAPTIVE_UPSCALE_THRESHOLD {
+                                tracing::info!(
+                                    target: "freemkv::disc",
+                                    phase = "patch_adaptive_upscale",
+                                    from = current_batch,
+                                    to = initial_batch,
+                                    consecutive_singles_ok,
+                                    lba,
+                                    "adaptive batching: drive stable, climbing back to initial_batch"
+                                );
+                                current_batch = initial_batch;
+                                consecutive_singles_ok = 0;
+                            }
                         }
                         damage_window.push(true);
                         if damage_window.len() > PASSN_DAMAGE_WINDOW {
@@ -2629,7 +2675,14 @@ impl Disc {
                                 let mut bt_pos = backtrack_start;
                                 while bt_pos < backtrack_end {
                                     let span =
-                                        (backtrack_end - bt_pos).min(block_sectors as u64 * 2048);
+                                        // Backtrack always at count=1: this path
+                                        // fills a gap that the main loop's damage-
+                                        // window skip jumped over. Using batched
+                                        // reads here would lump good sectors into
+                                        // NonTrimmed marks when the gap contains
+                                        // even one bad sector. Backtrack is rare
+                                        // enough that the per-sector cost is fine.
+                                        (backtrack_end - bt_pos).min(2048);
                                     let bt_lba = (bt_pos / 2048) as u32;
                                     let bt_count = (span / 2048) as u16;
                                     let bt_bytes = bt_count as usize * 2048;
@@ -2685,9 +2738,37 @@ impl Disc {
                         }
                     }
                     Err(err) => {
+                        // Adaptive batching split decision: a batch-read
+                        // failure (count > 1) is NOT a recorded failure.
+                        // We don't yet know which sector in the batch was
+                        // actually bad — could be one, could be many.
+                        // Drop to count=1 and retry the SAME starting
+                        // position so every sector gets individually
+                        // probed. Cursor stays put; loop continues.
+                        // Invariants: no good sector ever gets lumped
+                        // into a NonTrimmed mark, no spurious
+                        // consecutive_failures (which drives wedge
+                        // detection), no damage_window pollution from
+                        // batch-level signals.
+                        if count > 1 {
+                            tracing::info!(
+                                target: "freemkv::disc",
+                                phase = "patch_adaptive_split",
+                                lba,
+                                count,
+                                from_batch = current_batch,
+                                err_code = err.code(),
+                                "adaptive batching: batch read failed, dropping to count=1 to probe individually"
+                            );
+                            current_batch = 1;
+                            consecutive_singles_ok = 0;
+                            continue;
+                        }
+
                         blocks_read_failed += 1;
                         consecutive_failures += 1;
                         consecutive_good_since_skip = 0;
+                        consecutive_singles_ok = 0;
                         unreadable_count += 1;
 
                         tracing::warn!(
@@ -3111,7 +3192,7 @@ impl Disc {
 
                 if let Some(reporter) = opts.progress {
                     let (s, bad_ranges_now) = read_shared(&shared);
-                    let kind = if block_sectors == 1 {
+                    let kind = if initial_batch == 1 {
                         crate::progress::PassKind::Scrape {
                             reverse: opts.reverse,
                         }
