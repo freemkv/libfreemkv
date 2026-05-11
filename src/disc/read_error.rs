@@ -637,9 +637,8 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     // branch for future tuning. Pass N (bisect_on_marginal=true)
     // uses the standard pauses — it's running single-sector retries
     // on already-known-bad LBAs by design.
-    let is_zone_entry = ctx.consecutive_outer_failures == 1
-        && !ctx.bisecting
-        && !ctx.bisect_on_marginal;
+    let is_zone_entry =
+        ctx.consecutive_outer_failures == 1 && !ctx.bisecting && !ctx.bisect_on_marginal;
     let pause_secs = if is_zone_entry {
         ZONE_ENTRY_COOLDOWN_SECS
     } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
