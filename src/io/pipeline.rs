@@ -49,13 +49,14 @@ use crate::error::Error;
 /// Empirically tuned for sweep and mux — both want enough slack that
 /// short consumer stalls don't immediately back up onto the producer,
 /// but not so much that a producer outpacing the consumer accumulates
-/// arbitrary buffered work. `4` matches the depth sweep has used
-/// since 0.17.11 (originally in `disc/sweep_pipeline.rs`, now in
-/// `disc/sweep.rs::SweepSink`). Patch should usually use
-/// [`WRITE_THROUGH_DEPTH`] (`1`) instead — write-through gives clean
-/// back-pressure between every read attempt and the matching write,
-/// which matters when the consumer is updating the mapfile in lockstep.
-pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
+/// arbitrary buffered work. `16` matches the depth needed for UHD-scale
+/// mux where WritebackFile sync_file_range on NFS can stall the consumer;
+/// sweep uses [`DEFAULT_PIPELINE_DEPTH`] directly, mux should use this
+/// or deeper if ISO read is moved to a separate producer thread. Patch
+/// should usually use [`WRITE_THROUGH_DEPTH`] (`1`) instead — write-through
+/// gives clean back-pressure between every read attempt and the matching
+/// write, which matters when the consumer is updating the mapfile in lockstep.
+pub const DEFAULT_PIPELINE_DEPTH: usize = 32;
 
 /// Channel depth for write-through pipelines. Each `send` fully
 /// drains before the next can enqueue. Use this when the producer
