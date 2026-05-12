@@ -207,7 +207,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // ISO file: use large batch size (16 MB) — sequential read from fast storage, no bad sectors.
             // Physical drives need small batches for adaptive error handling and retry logic.
             const ISO_MUX_BATCH_SECTORS: u16 = 8192;
-            let mut stream = DiscStream::new(Box::new(reader), title, keys, ISO_MUX_BATCH_SECTORS, format);
+            let mut stream =
+                DiscStream::new(Box::new(reader), title, keys, ISO_MUX_BATCH_SECTORS, format);
             if opts.raw {
                 stream.set_raw();
             }

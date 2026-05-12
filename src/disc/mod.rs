@@ -3412,9 +3412,9 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
     }
 
     // Check if optical drive (0x05 = CD/DVD)
-   let is_optical = (|| -> bool {
+    let is_optical = (|| -> bool {
         use std::path::Path;
-        let scsi_device_dir = format!("/sys/class/scsi_device/");
+        let scsi_device_dir = "/sys/class/scsi_device/".to_string();
         if let Ok(entries) = std::fs::read_dir(&scsi_device_dir) {
             for entry in entries.flatten() {
                 let device_type_path = entry.path().join("device/type");
@@ -3458,7 +3458,7 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
                 }
             }
         }
-     DEFAULT_BATCH_SECTORS_OPTICAL
+        DEFAULT_BATCH_SECTORS_OPTICAL
     } else {
         DEFAULT_BATCH_SECTORS_BLOCK
     }
