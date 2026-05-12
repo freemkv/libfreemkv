@@ -72,18 +72,18 @@
 //! | E7xxx | AACS errors |
 
 pub mod aacs;
- pub(crate) mod clpi;
- pub mod css;
- pub mod decrypt;
- pub mod disc;
- pub mod drive;
- pub mod error;
- pub mod event;
- pub mod halt;
- pub(crate) mod identity;
- pub(crate) mod ifo;
- pub mod io;
- pub mod keydb;
+pub(crate) mod clpi;
+pub mod css;
+pub mod decrypt;
+pub mod disc;
+pub mod drive;
+pub mod error;
+pub mod event;
+pub mod halt;
+pub(crate) mod identity;
+pub(crate) mod ifo;
+pub mod io;
+pub mod keydb;
 pub mod labels;
 pub(crate) mod mpls;
 pub mod mux;
