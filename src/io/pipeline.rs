@@ -44,19 +44,19 @@ use std::thread::{self, JoinHandle};
 use crate::error::Error;
 
 /// Default channel depth for callers without a specific reason to
-/// pick another value.
-///
-/// Empirically tuned for sweep and mux — both want enough slack that
-/// short consumer stalls don't immediately back up onto the producer,
-/// but not so much that a producer outpacing the consumer accumulates
-/// arbitrary buffered work. `16` matches the depth needed for UHD-scale
-/// mux where WritebackFile sync_file_range on NFS can stall the consumer;
-/// sweep uses [`DEFAULT_PIPELINE_DEPTH`] directly, mux should use this
-/// or deeper if ISO read is moved to a separate producer thread. Patch
-/// should usually use [`WRITE_THROUGH_DEPTH`] (`1`) instead — write-through
-/// gives clean back-pressure between every read attempt and the matching
-/// write, which matters when the consumer is updating the mapfile in lockstep.
-pub const DEFAULT_PIPELINE_DEPTH: usize = 32;
+/// pick another value. Kept conservative (4) — most callers should
+/// use READ_PIPELINE_DEPTH or WRITE_PIPELINE_DEPTH instead.
+pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
+
+/// Read pipeline depth. Larger buffer compensates for drive variability
+/// and NFS sync_file_range stalls; keeps ISO reader thread fed even when
+/// consumer blocks on write.
+pub const READ_PIPELINE_DEPTH: usize = 32;
+
+/// Write pipeline depth. Smaller buffer reduces backpressure risk when
+/// sync_file_range blocks; prevents producer from accumulating too much
+/// work while consumer waits for NFS to drain.
+pub const WRITE_PIPELINE_DEPTH: usize = 16;
 
 /// Channel depth for write-through pipelines. Each `send` fully
 /// drains before the next can enqueue. Use this when the producer

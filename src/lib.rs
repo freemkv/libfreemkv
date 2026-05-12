@@ -133,11 +133,14 @@ pub use halt::Halt;
 // consumer and surfaces its `close()` output. Callers implement `Sink`
 // to define per-item behaviour and end-of-stream finalisation.
 //
-// `DEFAULT_PIPELINE_DEPTH` (=4) is the depth sweep + mux use; patch
-// uses `WRITE_THROUGH_DEPTH` (=1) so each read fully drains before the
-// next can enqueue. Returning `Flow::Stop` from `apply` ends the
-// consumer cleanly (still calls `close()`).
-pub use io::pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+// `DEFAULT_PIPELINE_DEPTH` (=4) is for callers without specific needs;
+// most should use READ_PIPELINE_DEPTH or WRITE_PIPELINE_DEPTH instead.
+// Patch uses `WRITE_THROUGH_DEPTH` (=1). Returning `Flow::Stop` from
+// `apply` ends the consumer cleanly (still calls `close()`).
+pub use io::pipeline::{
+    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
+    WRITE_THROUGH_DEPTH,
+};
 
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{Event, EventKind};
