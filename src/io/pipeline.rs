@@ -178,13 +178,13 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                                 }
                             }
                             Err(e) => {
-                                first_err = Some(e);
                                 if debug_enabled() {
                                     tracing::debug!(
                                         "Pipeline: apply error, stopping, err={:?}",
                                         e
                                     );
                                 }
+                                first_err = Some(e);
                             }
                         }
 
