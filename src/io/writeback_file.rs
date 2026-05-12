@@ -27,7 +27,7 @@ use std::path::Path;
 
 use super::writeback::WritebackPipeline;
 
-const CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct WritebackFile {
     file: File,
@@ -42,7 +42,7 @@ impl WritebackFile {
     /// or appended files).
     pub(crate) fn new(mut file: File) -> io::Result<Self> {
         let pos = file.stream_position()?;
-        let pipeline = WritebackPipeline::new(&file, pos, CHUNK_BYTES);
+        let pipeline = WritebackPipeline::new(&file, pos, WRITEBACK_CHUNK_BYTES);
         Ok(Self {
             file,
             pipeline,
