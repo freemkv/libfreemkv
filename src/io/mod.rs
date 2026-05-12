@@ -27,4 +27,7 @@ pub(crate) use writeback_file::WritebackFile;
 // caller — the targeted `#[allow]` keeps the re-export visible without
 // dragging the rest of the module under `dead_code`.
 #[allow(unused_imports)]
-pub use pipeline::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH, WRITE_THROUGH_DEPTH};
+pub use pipeline::{
+    DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
+    WRITE_THROUGH_DEPTH,
+};

@@ -153,56 +153,50 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 let mut first_err: Option<Error> = None;
                 let mut stopped = false;
 
-          while let Ok(item) = rx.recv() {
-                        if debug_enabled() {
-                            tracing::debug!(
-                                "Pipeline receive: item={}",
-                                std::any::type_name::<I>()
-                            );
-                        }
+                while let Ok(item) = rx.recv() {
+                    if debug_enabled() {
+                        tracing::debug!("Pipeline receive: item={}", std::any::type_name::<I>());
+                    }
 
-                        let apply_start = std::time::Instant::now();
+                    let apply_start = std::time::Instant::now();
 
-                        if first_err.is_some() || stopped {
-                            // Drain remaining items so the producer never
-                            // blocks on a dead receiver. `apply` is not
-                            // called once we've decided to stop.
-                            continue;
-                        }
-                        match sink.apply(item) {
-                            Ok(Flow::Continue) => {}
-                            Ok(Flow::Stop) => {
-                                stopped = true;
-                                if debug_enabled() {
-                                    tracing::debug!("Pipeline: consumer returned Flow::Stop");
-                                }
-                            }
-                            Err(e) => {
-                                if debug_enabled() {
-                                    tracing::debug!(
-                                        "Pipeline: apply error, stopping, err={:?}",
-                                        e
-                                    );
-                                }
-                                first_err = Some(e);
+                    if first_err.is_some() || stopped {
+                        // Drain remaining items so the producer never
+                        // blocks on a dead receiver. `apply` is not
+                        // called once we've decided to stop.
+                        continue;
+                    }
+                    match sink.apply(item) {
+                        Ok(Flow::Continue) => {}
+                        Ok(Flow::Stop) => {
+                            stopped = true;
+                            if debug_enabled() {
+                                tracing::debug!("Pipeline: consumer returned Flow::Stop");
                             }
                         }
-
-                        let apply_elapsed = apply_start.elapsed();
-                        if debug_enabled() && apply_elapsed > std::time::Duration::from_millis(100) {
-                            tracing::debug!(
-                                "Pipeline apply: took {:.2}s, item={}",
-                                apply_elapsed.as_secs_f64(),
-                                std::any::type_name::<I>()
-                            );
-                        } else if debug_enabled() {
-                            tracing::debug!(
-                                "Pipeline apply: OK in {:.3}ms, item={}",
-                                apply_elapsed.as_micros(),
-                                std::any::type_name::<I>()
-                            );
+                        Err(e) => {
+                            if debug_enabled() {
+                                tracing::debug!("Pipeline: apply error, stopping, err={:?}", e);
+                            }
+                            first_err = Some(e);
                         }
                     }
+
+                    let apply_elapsed = apply_start.elapsed();
+                    if debug_enabled() && apply_elapsed > std::time::Duration::from_millis(100) {
+                        tracing::debug!(
+                            "Pipeline apply: took {:.2}s, item={}",
+                            apply_elapsed.as_secs_f64(),
+                            std::any::type_name::<I>()
+                        );
+                    } else if debug_enabled() {
+                        tracing::debug!(
+                            "Pipeline apply: OK in {:.3}ms, item={}",
+                            apply_elapsed.as_micros(),
+                            std::any::type_name::<I>()
+                        );
+                    }
+                }
 
                 match first_err {
                     Some(e) => Err(e),
