@@ -40,7 +40,7 @@ use std::thread::{self, JoinHandle};
 use crate::error::Error;
 
 /// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
-fn debug_enabled() -> bool {
+pub fn debug_enabled() -> bool {
     std::env::var("FREEMKV_DEBUG")
         .ok()
         .map(|v| v == "1" || v == "true" || v == "yes")
