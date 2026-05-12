@@ -173,6 +173,13 @@ impl DiscStream {
         let extents = title.extents.clone();
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
+        // Debug log reader type at construction — critical for diagnosing mux reading from drive instead of ISO
+        tracing::debug!(
+            target: "mux",
+            "DiscStream constructed with reader type: {}",
+            std::any::type_name::<dyn SectorReader>()
+        );
+
         let mut pids = Vec::new();
         let mut parsers = Vec::new();
         let mut pid_to_track = Vec::new();
@@ -311,14 +318,24 @@ impl DiscStream {
         // on failure, advance on success. One 5s read attempt per try — no
         // retry loops, no sleeps. On size-1 failure, skip or error.
         //
-        // Halt is checked at the top of every iteration — in a dense bad zone
+      // Halt is checked at the top of every iteration — in a dense bad zone
         // this loop can spend minutes shrinking and skipping sectors; without
         // the check, Stop wouldn't take effect until the outer PES read() loop
         // finally emits a frame, which may never happen.
+        
+        let start_lba = lba;
+        let start_time = std::time::Instant::now();
+        
         loop {
             if self.is_halted() {
                 return Err(crate::error::Error::Halted.into());
             }
+
+            // Debug: log slow reads during mux — helps diagnose stalls
+            if cfg!(debug_assertions) && start_time.elapsed().as_secs() > 5 {
+                tracing::debug!(target: "mux", "fill_extents waiting at LBA {} ({}s elapsed, sectors={})", lba, start_time.elapsed().as_secs(), remaining);
+            }
+
             let mut sectors = remaining.min(self.adaptive.current() as u32) as u16;
             // Align to 3-sector AACS units when possible. Partial units at
             // extent boundaries are safely handled by decrypt_sectors().
