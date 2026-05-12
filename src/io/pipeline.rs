@@ -27,21 +27,25 @@
 //! - Consumer panic is converted into
 //!   `Error::IoError { source: io::Error::other(...) }`.
 //!
-//! ## Dead-code suppression
+//! ## Debug logging
 //!
-//! Both `Disc::sweep` (`DEFAULT_PIPELINE_DEPTH`, `spawn_named`,
-//! `try_send`) and `Disc::patch` (`WRITE_THROUGH_DEPTH`, `Flow::Stop`)
-//! are now in-tree callers (0.18 round 2). The targeted `#[allow]`
-//! markers below cover the corners of the API not exercised by either
-//! call site (e.g. `Pipeline::spawn` without a name; `Flow::Stop`
-//! return path from sweep's sink — sweep always consumes the producer's
-//! full work-list). Drop the allows once mux migrates.
+//! Set `FREEMKV_DEBUG=1` environment variable to enable verbose debug
+//! logging throughout the pipeline (channel sends/receives, backpressure,
+//! consumer lag detection). This is critical for diagnosing stalls.
 
 use std::io;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use crate::error::Error;
+
+/// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
+fn debug_enabled() -> bool {
+    std::env::var("FREEMKV_DEBUG")
+        .ok()
+        .map(|v| v == "1" || v == "true" || v == "yes")
+        .unwrap_or(false)
+}
 
 /// Default channel depth for callers without a specific reason to
 /// pick another value. Kept conservative (4) — most callers should
@@ -149,23 +153,56 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 let mut first_err: Option<Error> = None;
                 let mut stopped = false;
 
-                while let Ok(item) = rx.recv() {
-                    if first_err.is_some() || stopped {
-                        // Drain remaining items so the producer never
-                        // blocks on a dead receiver. `apply` is not
-                        // called once we've decided to stop.
-                        continue;
-                    }
-                    match sink.apply(item) {
-                        Ok(Flow::Continue) => {}
-                        Ok(Flow::Stop) => {
-                            stopped = true;
+          while let Ok(item) = rx.recv() {
+                        if debug_enabled() {
+                            tracing::debug!(
+                                "Pipeline receive: item={}",
+                                std::any::type_name::<I>()
+                            );
                         }
-                        Err(e) => {
-                            first_err = Some(e);
+
+                        let apply_start = std::time::Instant::now();
+
+                        if first_err.is_some() || stopped {
+                            // Drain remaining items so the producer never
+                            // blocks on a dead receiver. `apply` is not
+                            // called once we've decided to stop.
+                            continue;
+                        }
+                        match sink.apply(item) {
+                            Ok(Flow::Continue) => {}
+                            Ok(Flow::Stop) => {
+                                stopped = true;
+                                if debug_enabled() {
+                                    tracing::debug!("Pipeline: consumer returned Flow::Stop");
+                                }
+                            }
+                            Err(e) => {
+                                first_err = Some(e);
+                                if debug_enabled() {
+                                    tracing::debug!(
+                                        "Pipeline: apply error, stopping, err={:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        let apply_elapsed = apply_start.elapsed();
+                        if debug_enabled() && apply_elapsed > std::time::Duration::from_millis(100) {
+                            tracing::debug!(
+                                "Pipeline apply: took {:.2}s, item={}",
+                                apply_elapsed.as_secs_f64(),
+                                std::any::type_name::<I>()
+                            );
+                        } else if debug_enabled() {
+                            tracing::debug!(
+                                "Pipeline apply: OK in {:.3}ms, item={}",
+                                apply_elapsed.as_micros(),
+                                std::any::type_name::<I>()
+                            );
                         }
                     }
-                }
 
                 match first_err {
                     Some(e) => Err(e),
@@ -189,7 +226,35 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// independent signal (e.g. `Halt`) — `send` alone is not the
     /// notification edge.
     pub fn send(&self, item: I) -> Result<(), I> {
-        self.tx.send(item).map_err(|e| e.0)
+        let start = std::time::Instant::now();
+        match self.tx.send(item) {
+            Ok(()) => {
+                let elapsed = start.elapsed();
+                if debug_enabled() && elapsed > std::time::Duration::from_millis(10) {
+                    tracing::debug!(
+                        "Pipeline send: blocked {:.2}s, item={}",
+                        elapsed.as_secs_f64(),
+                        std::any::type_name::<I>()
+                    );
+                } else if debug_enabled() {
+                    tracing::debug!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                if debug_enabled() && elapsed > std::time::Duration::from_millis(10) {
+                    tracing::debug!(
+                        "Pipeline send: blocked {:.2}s before channel closed, item={}",
+                        elapsed.as_secs_f64(),
+                        std::any::type_name::<I>()
+                    );
+                } else if debug_enabled() {
+                    tracing::debug!("Pipeline send: failed after {:.3}ms", elapsed.as_micros());
+                }
+                Err(e.0)
+            }
+        }
     }
 
     /// Non-blocking variant of [`Pipeline::send`]. If the channel is
