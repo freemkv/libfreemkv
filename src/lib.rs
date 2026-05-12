@@ -128,7 +128,7 @@ pub use halt::Halt;
 
 // Generic bounded producer/consumer primitive used by sweep, patch, and
 // mux to overlap reads with writes via a dedicated consumer thread.
-// `Pipeline::spawn(depth, sink)` spawns the consumer; `pipe.send(item)`
+// `Pipeline::spawn(name, depth, sink)` spawns a named consumer; `pipe.send(item)`
 // pushes one item with back-pressure; `pipe.finish()` joins the
 // consumer and surfaces its `close()` output. Callers implement `Sink`
 // to define per-item behaviour and end-of-stream finalisation.
