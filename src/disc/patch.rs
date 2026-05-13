@@ -449,6 +449,15 @@ impl Disc {
         // Reset to 0 at the start of every range; declared without init
         // because the per-range reset (below) always runs before any read.
         let mut consecutive_failures: u64;
+        // Wedge-family (HARDWARE_ERROR / ILLEGAL_REQUEST) counter — resets
+        // on any non-wedge read result, accumulates across ranges on
+        // consecutive wedge senses. After WEDGE_ABORT_THRESHOLD wedges
+        // with no recovery in between, the pass aborts so autorip can
+        // eject + reload the disc (the only thing that reliably clears
+        // a real firmware fast-fail wedge).
+        let mut wedge_count: u32 = 0;
+        const WEDGE_FAMILY_COOLDOWN_SECS: u64 = 30;
+        const WEDGE_ABORT_THRESHOLD: u32 = 16;
         let mut unreadable_count: u64 = 0;
         let mut bytes_good_last = bytes_good_before;
         let mut stall_start = std::time::Instant::now();
@@ -1041,105 +1050,20 @@ impl Disc {
                             continue;
                         }
 
-                        // For non-NOT_READY errors (MEDIUM ERROR, ABORTED COMMAND, etc.),
-                        // try additional retries before marking Unreadable. This is especially
-                        // important for encrypted UHD discs where decryption failures can
-                        // manifest as read errors that succeed on retry.
-                        let mut retry_count = 0;
-                        const MAX_NON_NOT_READY_RETRIES: u64 = 3;
-                        let should_retry = opts.decrypt && retry_count < MAX_NON_NOT_READY_RETRIES;
-
-                        if should_retry {
-                            tracing::info!(
-                                target: "freemkv::disc",
-                                phase = "patch_non_not_ready_retry",
-                                lba,
-                                err_code = err.code(),
-                                retry = retry_count + 1,
-                                max_retries = MAX_NON_NOT_READY_RETRIES,
-                                "Non-NOT_READY error on encrypted disc; retrying"
-                            );
-
-                            // Exponential backoff: 2s, 4s, 8s before final Unreadable mark
-                            let pause_secs = (1u64 << retry_count).min(8);
-                            std::thread::sleep(std::time::Duration::from_secs(pause_secs));
-                            retry_count += 1;
-
-                            // Retry the read
-                            match reader.read_sectors(lba, count, &mut buf[..bytes], recovery) {
-                                Ok(_) => {
-                                    blocks_read_ok += 1;
-                                    consecutive_failures = 0;
-                                    consecutive_good_since_skip += 1;
-                                    if consecutive_good_since_skip >= PASSN_ESCALATION_RESET_GOOD {
-                                        consecutive_skips_without_recovery = 0;
-                                    }
-                                    damage_window.push(true);
-                                    if damage_window.len() > PASSN_DAMAGE_WINDOW {
-                                        damage_window.remove(0);
-                                    }
-
-                                    tracing::info!(
-                                        target: "freemkv::disc",
-                                        phase = "patch_retry_success",
-                                        lba,
-                                        retry_count,
-                                        "Retry succeeded after non-NOT_READY error"
-                                    );
-
-                                    // Plaintext via DecryptingSectorSource;
-                                    // same path the original read takes.
-                                    let write_start = std::time::Instant::now();
-                                    tracing::debug!(
-                                        target: "freemkv::disc",
-                                        phase = "patch_write_start",
-                                        pos,
-                                        bytes,
-                                        "Starting ISO write"
-                                    );
-                                    send_or_abort(
-                                        &pipe,
-                                        PatchItem::Recovered {
-                                            pos,
-                                            buf: buf[..bytes].to_vec(),
-                                        },
-                                    )?;
-                                    let write_duration_ms = write_start.elapsed().as_millis();
-                                    tracing::info!(
-                                        target: "freemkv::disc",
-                                        phase = "patch_write_ok",
-                                        pos,
-                                        bytes,
-                                        write_duration_ms,
-                                        "ISO write succeeded"
-                                    );
-                                    tracing::info!(
-                                        target: "freemkv::disc",
-                                        phase = "patch_mapfile_record_ok",
-                                        pos,
-                                        block_bytes,
-                                        "Mapfile record dispatched"
-                                    );
-
-                                    // Stall guard after successful retry
-                                    let bytes_good_now = read_shared(&shared).0.bytes_good;
-                                    if bytes_good_now > bytes_good_last {
-                                        stall_start = std::time::Instant::now();
-                                        bytes_good_last = bytes_good_now;
-                                    }
-                                    continue;
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        target: "freemkv::disc",
-                                        phase = "patch_retry_failed",
-                                        lba,
-                                        retry_count,
-                                        "Retry failed after non-NOT_READY error"
-                                    );
-                                }
-                            }
-                        }
+                        // (Removed in 0.20.2) The previous code retried
+                        // non-NOT_READY errors on encrypted discs with an
+                        // "exponential backoff: 2s, 4s, 8s" comment — but
+                        // `retry_count` was declared inside the per-iteration
+                        // `Err` arm so it reset to 0 every iteration. The
+                        // "MAX_NON_NOT_READY_RETRIES=3" budget actually fired
+                        // exactly once (1s pause + 1 retry), then fell through
+                        // to the NonTrimmed dispatch below. The block was a
+                        // 100-line illusion. Cross-pass NonTrimmed retry
+                        // (next pass gives the same sectors another shot)
+                        // already covers the recovery case it was supposed
+                        // to handle — and it gives the drive minutes between
+                        // attempts instead of 1-8 seconds, which empirically
+                        // matters for stochastic recovery on the BU40N.
 
                         // All retries exhausted IN THIS PASS — leave NonTrimmed
                         // so a subsequent pass gets another shot. Bytes stay
@@ -1282,27 +1206,56 @@ impl Disc {
                             }
                         }
 
-                        // Pair with the earlier NonTrimmed dispatch — same
-                        // bytes, same state. Pre-2026-05-11 this was a
-                        // second Unreadable mark; now it's NonTrimmed for
-                        // the same reason: cross-pass retry survival.
-                        send_or_abort(
-                            &pipe,
-                            PatchItem::NonTrimmed {
-                                pos,
-                                len: block_bytes,
-                            },
-                        )?;
-                        tracing::info!(
-                            target: "freemkv::disc",
-                            phase = "patch_mapfile_record_nontrimmed",
-                            pos,
-                            block_bytes,
-                            consecutive_failures,
-                            "Mapfile record dispatched as NonTrimmed (retry next pass)"
-                        );
+                        // (Removed in 0.20.2) Duplicate NonTrimmed dispatch.
+                        // The earlier `send_or_abort(PatchItem::NonTrimmed)`
+                        // already recorded the range. `Mapfile::record` is
+                        // idempotent so it wasn't a correctness bug, but
+                        // it doubled the consumer's per-failure work.
 
-                        let pause_secs = if err.is_bridge_degradation() {
+                        // Wedge-family detection: HARDWARE_ERROR / ILLEGAL_REQUEST
+                        // are the senses the BU40N's firmware fast-fail mode
+                        // returns. When the drive is wedged, every subsequent
+                        // read returns these in <100ms — exactly the rapid-retry
+                        // cadence that bricks the drive further. Long cooldown
+                        // (30s, matching read_error::ZONE_ENTRY_COOLDOWN_SECS)
+                        // gives the firmware breathing room to clear the fast-
+                        // fail state. After WEDGE_ABORT_THRESHOLD consecutive
+                        // wedge senses with no recovery, bail to autorip so it
+                        // can eject + reload (the only thing that reliably
+                        // clears a real wedge).
+                        let is_wedge_family = err
+                            .scsi_sense()
+                            .map(|s| {
+                                s.sense_key == crate::scsi::SENSE_KEY_HARDWARE_ERROR
+                                    || s.sense_key == crate::scsi::SENSE_KEY_ILLEGAL_REQUEST
+                            })
+                            .unwrap_or(false);
+
+                        let pause_secs = if is_wedge_family {
+                            wedge_count += 1;
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "patch_wedge_family",
+                                lba,
+                                wedge_count,
+                                wedge_abort_threshold = WEDGE_ABORT_THRESHOLD,
+                                sense_key = err.scsi_sense().map(|s| s.sense_key as u32).unwrap_or(0),
+                                "HARDWARE_ERROR / ILLEGAL_REQUEST sense — wedge family, applying long cooldown"
+                            );
+                            if wedge_count >= WEDGE_ABORT_THRESHOLD {
+                                tracing::warn!(
+                                    target: "freemkv::disc",
+                                    phase = "patch_wedge_abort",
+                                    wedge_count,
+                                    WEDGE_ABORT_THRESHOLD,
+                                    "Drive appears wedged ({} consecutive wedge-family senses); aborting pass for autorip eject+reload",
+                                    wedge_count
+                                );
+                                wedged_exit = true;
+                                break 'outer;
+                            }
+                            WEDGE_FAMILY_COOLDOWN_SECS
+                        } else if err.is_bridge_degradation() {
                             tracing::debug!(
                                 target: "freemkv::disc",
                                 phase = "patch_bridge_degradation",
@@ -1317,6 +1270,11 @@ impl Disc {
                         } else {
                             POST_FAILURE_PAUSE_SECS
                         };
+
+                        // Any non-wedge-family read clears the wedge counter.
+                        if !is_wedge_family {
+                            wedge_count = 0;
+                        }
 
                         tracing::debug!(
                             target: "freemkv::disc",
