@@ -250,11 +250,13 @@ pub fn output(
             // writeback) so a UHD-scale MKV mux to slow / network-attached
             // staging doesn't hit the dirty-page burst pathology that
             // sweep already side-steps. BufWriter sits on top to coalesce
-            // mux's many small EBML element writes.
+            // mux's many small EBML element writes. Pre-reserve the
+            // target's worth of extents on Linux via fallocate(KEEP_SIZE)
+            // to reduce extent fragmentation during the mux.
             let writer: Box<dyn super::WriteSeek + Send> =
                 Box::new(std::io::BufWriter::with_capacity(
                     IO_BUF_SIZE,
-                    crate::io::WritebackFile::create(path)?,
+                    crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
                 ));
             Ok(Box::new(MkvStream::create(writer, title)?))
         }
@@ -262,7 +264,7 @@ pub fn output(
             validate_file_path(path, "m2ts")?;
             let writer = std::io::BufWriter::with_capacity(
                 IO_BUF_SIZE,
-                crate::io::WritebackFile::create(path)?,
+                crate::io::WritebackFile::create_with_size_hint(path, title.size_bytes)?,
             );
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }

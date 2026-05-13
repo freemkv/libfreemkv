@@ -54,8 +54,54 @@ impl WritebackFile {
     /// and wrap it. Convenience for the common
     /// `File::create(path)` + `WritebackFile::new(file)` pair so callers
     /// don't have to assemble a `File` first.
+    ///
+    /// Callers that know the target output size should prefer
+    /// [`Self::create_with_size_hint`] so the kernel can pre-reserve
+    /// extents.
+    #[allow(dead_code)]
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
+        Self::new(file)
+    }
+
+    /// Like [`Self::create`] but pre-reserves `size_bytes` of disk
+    /// space via `fallocate(FALLOC_FL_KEEP_SIZE)` on Linux. The
+    /// reported file size is unchanged (writes still grow the file
+    /// naturally) — only the on-disk extent allocation is preallocated,
+    /// which reduces extent fragmentation on large sequential writes
+    /// (mux output, especially on slow storage / NFS).
+    ///
+    /// On macOS / Windows the size hint is ignored and this is
+    /// equivalent to `create`.
+    pub(crate) fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
+        let file = File::create(path)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // FALLOC_FL_KEEP_SIZE = 0x01 — keep the reported file
+            // size at 0 (writes grow it normally) while still
+            // pre-reserving the extents.
+            let rc = unsafe {
+                libc::fallocate(
+                    file.as_raw_fd(),
+                    libc::FALLOC_FL_KEEP_SIZE,
+                    0,
+                    size_bytes as i64,
+                )
+            };
+            tracing::debug!(
+                target: "mux",
+                "WritebackFile fallocate size_hint={size_bytes} rc={rc} ok={}",
+                rc == 0
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::debug!(
+                target: "mux",
+                "WritebackFile fallocate size_hint={size_bytes} skipped (non-linux)"
+            );
+        }
         Self::new(file)
     }
 

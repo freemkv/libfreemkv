@@ -15,6 +15,12 @@ use crate::error::{Error, Result};
 
 use super::{SectorSink, SectorSource};
 
+/// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
+/// read side. Mirrors the writeback chunk size so the read-side
+/// page cache stays bounded the same way the write side does.
+#[cfg(target_os = "linux")]
+const READ_DROP_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
 /// SectorSource backed by a file (ISO image).
 ///
 /// Seeks to `lba * 2048`, reads `count * 2048` bytes per call. The
@@ -27,6 +33,14 @@ use super::{SectorSink, SectorSource};
 pub struct FileSectorSource {
     file: File,
     capacity: u32,
+    /// Bytes read since the last `posix_fadvise(DONTNEED)` drop.
+    /// Only updated on Linux; on other targets it stays at 0.
+    #[cfg(target_os = "linux")]
+    bytes_read_since_drop: u64,
+    /// Byte offset at which the current drop window starts (the
+    /// next `posix_fadvise(DONTNEED)` call drops from here).
+    #[cfg(target_os = "linux")]
+    drop_window_start: u64,
 }
 
 impl FileSectorSource {
@@ -45,7 +59,26 @@ impl FileSectorSource {
             .into());
         }
         let capacity = sectors as u32;
-        Ok(Self { file, capacity })
+
+        // Hint sequential access on Linux so the kernel's readahead
+        // window widens for the ISO sweep. Best-effort: return value
+        // is ignored. On macOS / Windows this is a no-op.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
+
+        Ok(Self {
+            file,
+            capacity,
+            #[cfg(target_os = "linux")]
+            bytes_read_since_drop: 0,
+            #[cfg(target_os = "linux")]
+            drop_window_start: 0,
+        })
     }
 }
 
@@ -75,6 +108,38 @@ impl SectorSource for FileSectorSource {
         self.file
             .read_exact(&mut buf[..bytes])
             .map_err(|e| Error::IoError { source: e })?;
+
+        // On Linux, periodically drop the just-read region from the
+        // page cache to keep cache pressure bounded during multi-GB
+        // sequential ISO reads. Mirrors the write-side pipeline.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.bytes_read_since_drop += bytes as u64;
+            if self.bytes_read_since_drop >= READ_DROP_CHUNK_BYTES {
+                let drop_start = self.drop_window_start;
+                let drop_len = self.bytes_read_since_drop;
+                let t0 = std::time::Instant::now();
+                unsafe {
+                    libc::posix_fadvise(
+                        self.file.as_raw_fd(),
+                        drop_start as i64,
+                        drop_len as i64,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                }
+                let elapsed_ms = t0.elapsed().as_millis();
+                let start_lba = drop_start / 2048;
+                let end_lba = (drop_start + drop_len) / 2048;
+                tracing::trace!(
+                    target: "mux",
+                    "FileSectorSource fadvise DONTNEED lba=[{start_lba}..{end_lba}) bytes={drop_len} elapsed_ms={elapsed_ms}"
+                );
+                self.drop_window_start = drop_start + drop_len;
+                self.bytes_read_since_drop = 0;
+            }
+        }
+
         Ok(bytes)
     }
 }
