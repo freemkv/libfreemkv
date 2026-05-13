@@ -116,9 +116,49 @@ impl WritebackFile {
 
     /// Drain in-flight writeback then issue a full fsync. Use this in
     /// place of `File::sync_all`.
+    ///
+    /// The final fsync is wrapped in
+    /// [`crate::io::bounded::bounded_syscall`] with a 60 s deadline.
+    /// fsync on a wedged NFS server (or a degraded local disk) can
+    /// hang the calling thread; the wrapper ensures the worst case is
+    /// 60 s + log-and-continue rather than indefinite. On timeout the
+    /// page cache is left to the kernel's normal flush-on-close path —
+    /// best effort, but bounded.
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
         self.pipeline.finalize();
-        self.file.sync_all()
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            use std::time::Duration;
+            let fd = self.file.as_raw_fd();
+            match crate::io::bounded::bounded_syscall(
+                None,
+                Duration::from_secs(60),
+                move || -> io::Result<()> {
+                    let rc = unsafe { libc::fsync(fd) };
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::last_os_error())
+                    }
+                },
+            ) {
+                Ok(inner) => inner,
+                Err(crate::io::bounded::BoundedError::Timeout) => {
+                    tracing::error!(
+                        target: "mux",
+                        "WritebackFile::sync_all fsync timed out after 60s; kernel will flush on close (best-effort)"
+                    );
+                    Ok(())
+                }
+                Err(crate::io::bounded::BoundedError::Halted) => Ok(()),
+                Err(crate::io::bounded::BoundedError::WorkerLost) => Ok(()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            self.file.sync_all()
+        }
     }
 }
 

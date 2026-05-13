@@ -56,8 +56,6 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const ADAPTIVE_WINDOW: usize = 16;
@@ -332,34 +330,20 @@ fn detect_nfs(fd: RawFd) -> bool {
 /// Run `sync_file_range(WAIT_AFTER)` on a worker thread and wait up
 /// to [`WAIT_AFTER_TIMEOUT`] for it to return. `Some(elapsed_ms)` on
 /// success; `None` on timeout. On timeout the worker thread is
-/// intentionally leaked — it'll unwind whenever the syscall
-/// eventually returns or the process exits.
-///
-/// Channel capacity is 0 (rendezvous). The worker sends `()` once
-/// the syscall returns; if we time out first, the send blocks
-/// forever inside the leaked worker — fine, the receiver is gone
-/// and the OS reaps the thread at process exit.
+/// 0.20.6 generalizes the worker-thread + recv_timeout pattern into
+/// [`crate::io::bounded::bounded_syscall`]; this helper now just adapts
+/// the generic primitive to the WAIT_AFTER call shape (returns elapsed_ms
+/// instead of the syscall's `()` return, treats `WorkerLost` as a benign
+/// no-op to match the original semantics).
 fn wait_after_with_timeout(fd: RawFd, off: u64, len: u64) -> Option<u64> {
-    let (tx, rx) = sync_channel::<()>(0);
     let started = Instant::now();
-    // `RawFd` is `Copy` + `Send`; `off`/`len` are `u64`. Nothing
-    // borrows from the caller — the worker can safely outlive this
-    // function on timeout.
-    let _ = thread::Builder::new()
-        .name("freemkv-writeback-wait".into())
-        .spawn(move || {
-            unsafe {
-                libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER);
-            }
-            // If the receiver is gone (we timed out) this send
-            // returns Err — fine, we just drop and the worker
-            // exits.
-            let _ = tx.send(());
-        });
-    match rx.recv_timeout(WAIT_AFTER_TIMEOUT) {
+    match crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
+        libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER);
+    }) {
         Ok(()) => Some(started.elapsed().as_millis() as u64),
-        Err(RecvTimeoutError::Timeout) => None,
-        Err(RecvTimeoutError::Disconnected) => {
+        Err(crate::io::bounded::BoundedError::Timeout)
+        | Err(crate::io::bounded::BoundedError::Halted) => None,
+        Err(crate::io::bounded::BoundedError::WorkerLost) => {
             // Worker thread spawn failed or panicked before sending.
             // Treat as a benign success (no syscall ran) rather than
             // a degrade trigger — falling through with elapsed_ms=0

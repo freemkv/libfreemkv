@@ -14,6 +14,7 @@
 //! used by sweep, patch, and mux to overlap reads with writes via a
 //! bounded channel + dedicated consumer thread.
 
+pub(crate) mod bounded;
 mod writeback;
 mod writeback_file;
 
