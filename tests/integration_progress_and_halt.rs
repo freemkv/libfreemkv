@@ -5,8 +5,8 @@ use libfreemkv::disc::{CopyOptions, DiscRegion};
 use libfreemkv::error::Result;
 use libfreemkv::pes::Stream as PesStream;
 use libfreemkv::{
-    ContentFormat, Disc, DiscFormat, DiscStream, DiscTitle, EventKind, Extent, FileSectorReader,
-    SectorReader,
+    ContentFormat, Disc, DiscFormat, DiscStream, DiscTitle, EventKind, Extent, FileSectorSource,
+    SectorSource,
 };
 use std::io::Write;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ impl ZeroSectorReader {
     }
 }
 
-impl SectorReader for ZeroSectorReader {
+impl SectorSource for ZeroSectorReader {
     fn read_sectors(
         &mut self,
         _lba: u32,
@@ -46,7 +46,7 @@ impl SectorReader for ZeroSectorReader {
         Ok(bytes)
     }
 
-    fn capacity(&self) -> u32 {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }
@@ -67,7 +67,7 @@ impl SlowZeroSectorReader {
     }
 }
 
-impl SectorReader for SlowZeroSectorReader {
+impl SectorSource for SlowZeroSectorReader {
     fn read_sectors(
         &mut self,
         _lba: u32,
@@ -81,7 +81,7 @@ impl SectorReader for SlowZeroSectorReader {
         Ok(bytes)
     }
 
-    fn capacity(&self) -> u32 {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }
@@ -304,7 +304,7 @@ fn test_drop_impls_do_not_panic_or_block() {
     panic!("DiscStream drop did not complete within 100ms");
 }
 
-// ── 5. FileSectorReader round trip ────────────────────────────────────────
+// ── 5. FileSectorSource round trip ────────────────────────────────────────
 
 #[test]
 fn test_file_sector_reader_round_trip() {
@@ -321,9 +321,13 @@ fn test_file_sector_reader_round_trip() {
     tmp.flush().expect("flush");
 
     let path = tmp.path().to_path_buf();
-    let mut fsr = FileSectorReader::open(&path).expect("open FileSectorReader");
+    let mut fsr = FileSectorSource::open(&path).expect("open FileSectorSource");
 
-    assert_eq!(fsr.capacity(), N_SECTORS as u32, "capacity mismatch");
+    assert_eq!(
+        fsr.capacity_sectors(),
+        N_SECTORS as u32,
+        "capacity mismatch"
+    );
 
     // Read each sector individually and compare.
     let mut buf = vec![0u8; SECTOR_SIZE];
@@ -391,7 +395,7 @@ impl FailingSectorReader {
     }
 }
 
-impl SectorReader for FailingSectorReader {
+impl SectorSource for FailingSectorReader {
     fn read_sectors(
         &mut self,
         _lba: u32,
@@ -418,7 +422,7 @@ impl SectorReader for FailingSectorReader {
         })
     }
 
-    fn capacity(&self) -> u32 {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }
@@ -567,7 +571,7 @@ struct BlockSizeFailingReader {
     capacity: u32,
 }
 
-impl SectorReader for BlockSizeFailingReader {
+impl SectorSource for BlockSizeFailingReader {
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -593,7 +597,7 @@ impl SectorReader for BlockSizeFailingReader {
         }
     }
 
-    fn capacity(&self) -> u32 {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }

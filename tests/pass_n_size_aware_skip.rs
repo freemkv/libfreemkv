@@ -15,7 +15,7 @@ use libfreemkv::disc::CopyOptions;
 use libfreemkv::disc::DiscRegion;
 use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
 use libfreemkv::error::Result;
-use libfreemkv::{ContentFormat, Disc, DiscFormat, SectorReader};
+use libfreemkv::{ContentFormat, Disc, DiscFormat, SectorSource};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -46,7 +46,7 @@ impl PatternedSectorReader {
     }
 }
 
-impl SectorReader for PatternedSectorReader {
+impl SectorSource for PatternedSectorReader {
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -82,7 +82,7 @@ impl SectorReader for PatternedSectorReader {
         Ok(buf.len())
     }
 
-    fn capacity(&self) -> u32 {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }

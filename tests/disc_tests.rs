@@ -1,6 +1,6 @@
 //! Disc scanning pipeline tests.
 
-use libfreemkv::SectorReader;
+use libfreemkv::SectorSource;
 use libfreemkv::error::Result;
 use libfreemkv::{Disc, DiscTitle, ScanOptions};
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ impl MockSectorReader {
     }
 }
 
-impl SectorReader for MockSectorReader {
+impl SectorSource for MockSectorReader {
     fn read_sectors(
         &mut self,
         lba: u32,

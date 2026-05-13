@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::class_reader::ClassFile;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::io::Cursor;
 use zip::ZipArchive;
@@ -26,7 +26,7 @@ pub type Jar = ZipArchive<Cursor<Vec<u8>>>;
 /// True if `/BDMV/JAR/` contains at least one top-level `.jar` file
 /// (not under a subdir). Used by `detect()` in parsers whose real
 /// signal lives inside a jar — they can't open the jar without a
-/// `SectorReader`, so they use this cheap pre-check and do the real
+/// `SectorSource`, so they use this cheap pre-check and do the real
 /// `com/<vendor>/` discriminator in `parse()`.
 pub fn has_any_top_level_jar(udf: &UdfFs) -> bool {
     let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
@@ -49,7 +49,7 @@ pub fn has_any_top_level_jar(udf: &UdfFs) -> bool {
 ///
 /// Entries that fail to read from UDF or that aren't valid zips are
 /// silently skipped — same defensive shape as the existing dbp parser.
-pub fn for_each_jar<R, F>(reader: &mut dyn SectorReader, udf: &UdfFs, mut f: F) -> Option<R>
+pub fn for_each_jar<R, F>(reader: &mut dyn SectorSource, udf: &UdfFs, mut f: F) -> Option<R>
 where
     F: FnMut(&str, &mut Jar) -> Option<R>,
 {

@@ -13,14 +13,14 @@
 //! ```
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
 pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "playlists.xml")?;
     let text = std::str::from_utf8(&data).ok()?;
 

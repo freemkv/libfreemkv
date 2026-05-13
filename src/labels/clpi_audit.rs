@@ -29,7 +29,7 @@
 //! report. Surfaced via the labels-analyze tool — not part of the
 //! `analyze()` pipeline (no impact on the label output).
 
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
@@ -116,7 +116,7 @@ impl ClpiVsMplsAudit {
 /// dedup-by-PID table of (CLPI fields, MPLS fields), return the
 /// merged view. Missing files (read errors, parse failures) are
 /// silently skipped — this is diagnostic, not correctness-critical.
-pub fn audit(reader: &mut dyn SectorReader, udf: &UdfFs) -> ClpiVsMplsAudit {
+pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
     // Aggregate by PID across all CLPI files. If a PID appears in
     // multiple clips (typical — main movie clip + trailers reference
     // the same audio stream PIDs), first encountered wins (they should

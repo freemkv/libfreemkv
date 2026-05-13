@@ -4,7 +4,7 @@
 //! To add a new format:
 //!   1. Create `src/labels/myformat.rs`
 //!   2. Implement `pub fn detect(udf: &UdfFs) -> bool`
-//!   3. Implement `pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
+//!   3. Implement `pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
 mod bdmt;
@@ -18,13 +18,12 @@ pub(crate) mod jar;
 mod mpls_universal;
 mod paramount;
 mod pixelogic;
-mod png_filenames;
 pub(crate) mod text;
 pub mod vocab;
 pub(crate) mod xml;
 
 use crate::disc::{DiscTitle, Stream};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
 // Re-export bdmt's public type so callers can construct/inspect
@@ -88,7 +87,7 @@ pub enum LabelQualifier {
 // to array order on confidence ties.
 
 type DetectFn = fn(&UdfFs) -> bool;
-type ParseFn = fn(&mut dyn SectorReader, &UdfFs) -> Option<ParseResult>;
+type ParseFn = fn(&mut dyn SectorSource, &UdfFs) -> Option<ParseResult>;
 
 /// Per-parser claim of how reliable its output is. Used by the
 /// registry to pick between parsers when more than one matches (e.g.
@@ -176,7 +175,7 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
 
 /// Search disc for config files, extract labels, apply to streams.
 /// This is 100% optional — if anything fails, streams are untouched.
-pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle]) {
+pub fn apply(reader: &mut dyn SectorSource, udf: &UdfFs, titles: &mut [DiscTitle]) {
     let labels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract(reader, udf)))
         .unwrap_or_default();
     if labels.is_empty() {
@@ -192,7 +191,7 @@ pub fn apply(reader: &mut dyn SectorReader, udf: &UdfFs, titles: &mut [DiscTitle
 /// `forced` flag.
 ///
 /// Extracted from `apply()` so the matching logic is unit-testable
-/// without needing a SectorReader / UdfFs.
+/// without needing a SectorSource / UdfFs.
 pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
     for title in titles.iter_mut() {
         let mut audio_idx: u16 = 0;
@@ -370,7 +369,7 @@ fn generate_audio_label(
     }
 }
 
-fn extract(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<StreamLabel> {
+fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     let mut best: Option<(&'static str, ParseResult)> = None;
     for (name, detect, parse) in PARSERS {
         if !detect(udf) {
@@ -483,7 +482,7 @@ fn type_tag(t: StreamLabelType) -> u8 {
 /// authoring tool left out of the published playlist.
 fn append_clpi_orphans(
     labels: &mut Vec<StreamLabel>,
-    reader: &mut dyn SectorReader,
+    reader: &mut dyn SectorSource,
     udf: &UdfFs,
 ) -> usize {
     // Index existing labels by PID — but StreamLabel doesn't carry
@@ -608,7 +607,7 @@ fn append_clpi_orphans(
 /// the return shape is richer (includes confidence, all detected
 /// parsers, and any parsers that produced empty results).
 #[doc(hidden)]
-pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
+pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     let inventory = jar_inventory(udf);
     let mut parsers_detected: Vec<&'static str> = Vec::new();
     let mut all_results: Vec<(&'static str, ParseResult)> = Vec::new();
@@ -699,7 +698,7 @@ pub fn analyze(reader: &mut dyn SectorReader, udf: &UdfFs) -> LabelAnalysis {
 /// playlist filename. Skipped entries (read error, parse error, no
 /// marks) silently dropped — this is a diagnostic field, not a
 /// correctness-critical one.
-fn collect_chapter_summary(reader: &mut dyn SectorReader, udf: &UdfFs) -> Vec<ChapterSummary> {
+fn collect_chapter_summary(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<ChapterSummary> {
     let Some(playlist_dir) = udf.find_dir("/BDMV/PLAYLIST") else {
         return Vec::new();
     };
@@ -842,7 +841,7 @@ pub(crate) fn find_jar_file(udf: &UdfFs, filename: &str) -> Option<String> {
 
 /// Read a file from any BDMV/JAR subdirectory by filename.
 pub(crate) fn read_jar_file(
-    reader: &mut dyn SectorReader,
+    reader: &mut dyn SectorSource,
     udf: &UdfFs,
     filename: &str,
 ) -> Option<Vec<u8>> {
@@ -1073,7 +1072,7 @@ mod gap_fill_tests {
 // ── apply() integration tests ──────────────────────────────────────────────
 //
 // End-to-end coverage for the apply_labels + fill_defaults pipeline
-// without needing a SectorReader / UdfFs. Synthetic DiscTitle +
+// without needing a SectorSource / UdfFs. Synthetic DiscTitle +
 // StreamLabel inputs, assert on the resulting Stream field values.
 
 #[cfg(test)]

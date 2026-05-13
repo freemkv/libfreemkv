@@ -1,7 +1,7 @@
 //! UDF parser tests using a MockSectorReader.
 
 use libfreemkv::error::Result;
-use libfreemkv::{SectorReader, read_filesystem};
+use libfreemkv::{SectorSource, read_filesystem};
 use std::collections::HashMap;
 
 const SECTOR_SIZE: usize = 2048;
@@ -38,7 +38,7 @@ impl MockSectorReader {
     }
 }
 
-impl SectorReader for MockSectorReader {
+impl SectorSource for MockSectorReader {
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -463,11 +463,11 @@ fn find_dir_case_insensitive() {
 
 #[test]
 fn sector_reader_is_object_safe() {
-    // Verify SectorReader can be used as a trait object
+    // Verify SectorSource can be used as a trait object
     let mut reader = MockSectorReader::new();
     reader.set_sector(0, vec![42u8; SECTOR_SIZE]);
 
-    let dyn_reader: &mut dyn SectorReader = &mut reader;
+    let dyn_reader: &mut dyn SectorSource = &mut reader;
     let mut buf = vec![0u8; SECTOR_SIZE];
     let n = dyn_reader.read_sectors(0, 1, &mut buf, true).unwrap();
     assert_eq!(n, SECTOR_SIZE);

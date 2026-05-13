@@ -84,18 +84,18 @@ use super::class_reader::{
     ICONST_2, ICONST_3, ICONST_4, ICONST_5, ICONST_M1, INVOKESPECIAL, LDC, LDC_W, NEW, SIPUSH,
 };
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, jar, vocab};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::{HashMap, HashSet};
 
 pub fn detect(udf: &UdfFs) -> bool {
     // Cheap pre-check at the dir level; the real signal is
     // `com/bydeluxe/` inside any top-level jar's central directory,
-    // which `parse()` confirms when given a `SectorReader`.
+    // which `parse()` confirms when given a `SectorSource`.
     jar::has_any_top_level_jar(udf)
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     jar::for_each_jar(reader, udf, |entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/bydeluxe/") {
             return None;

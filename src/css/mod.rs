@@ -16,7 +16,7 @@ pub mod lfsr;
 pub(crate) mod tables;
 
 use crate::disc::Extent;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 
 /// CSS decryption state for a DVD title.
 #[derive(Debug, Clone)]
@@ -34,7 +34,7 @@ pub struct CssState {
 /// 0x80 (start of the encrypted region). This only happens when a new PES
 /// packet begins at exactly sector offset 128. We scan up to 50000
 /// scrambled sectors sequentially across all extents.
-pub fn crack_key(reader: &mut dyn SectorReader, extents: &[Extent]) -> Option<CssState> {
+pub fn crack_key(reader: &mut dyn SectorSource, extents: &[Extent]) -> Option<CssState> {
     let mut tried = 0u32;
     let max_tries = 50_000;
 

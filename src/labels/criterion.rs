@@ -4,7 +4,7 @@
 //! stream number mapping via playbackconfig.
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, xml};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "streamproperties.xml")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let sp_data = super::read_jar_file(reader, udf, "streamproperties.xml")?;
     let sp_text = std::str::from_utf8(&sp_data).ok()?;
 

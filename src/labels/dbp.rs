@@ -35,11 +35,11 @@
 
 use super::class_reader::CpInfo;
 use super::{ParseResult, StreamLabel, StreamLabelType, jar, vocab};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
-/// dbp detect can't peek inside a jar without a SectorReader (the
+/// dbp detect can't peek inside a jar without a SectorSource (the
 /// trait function only takes `&UdfFs`), so we trigger on the cheap
 /// signal "any top-level .jar in /BDMV/JAR/." That fires on every
 /// BD-J disc, but parse() does the real `com/dbp/` check and
@@ -49,7 +49,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     jar::has_any_top_level_jar(udf)
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     jar::for_each_jar(reader, udf, |_entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/dbp/") {
             return None;

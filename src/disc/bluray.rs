@@ -3,13 +3,13 @@
 use super::*;
 use crate::clpi;
 use crate::mpls;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf;
 
 impl Disc {
     /// Scan Blu-ray titles from MPLS playlists.
     pub(super) fn scan_bluray_titles(
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Vec<DiscTitle> {
         let mut titles = Vec::new();
@@ -31,7 +31,7 @@ impl Disc {
     }
 
     pub(super) fn parse_playlist(
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
         filename: &str,
         data: &[u8],
@@ -199,7 +199,7 @@ impl Disc {
     /// Prefers English, falls back to first available language.
     /// Returns None if META directory is empty or XML has no usable title.
     pub(super) fn read_meta_title(
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Option<String> {
         let meta_dir = udf_fs.find_dir("/BDMV/META")?;

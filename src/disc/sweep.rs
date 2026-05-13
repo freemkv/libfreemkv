@@ -20,7 +20,7 @@
 //! - Mapfile is single-writer (consumer-only). No locking.
 //! - All `read_error::ReadCtx` state stays on the producer thread.
 //! - `set_speed` calls happen on the producer thread (same thread that
-//!   owns the `SectorReader`). No new SCSI concurrency.
+//!   owns the `SectorSource`). No new SCSI concurrency.
 //! - Per-iteration ordering of file-write → mapfile-record is kept
 //!   intact in the consumer (write before record), so the on-disk
 //!   invariant "mapfile only marks Finished what the file has

@@ -2,7 +2,7 @@
 
 use crate::disc::{Chapter, DiscTitle};
 use crate::progress::Progress;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use std::time::Instant;
 
 /// Health status of a single sector read.
@@ -82,7 +82,7 @@ impl VerifyResult {
 /// Reads in batches for speed, falls back to single-sector on failure.
 /// The progress callback returns false to request early stop.
 pub fn verify_title(
-    reader: &mut dyn SectorReader,
+    reader: &mut dyn SectorSource,
     title: &DiscTitle,
     batch_sectors: u16,
     on_progress: Option<&dyn Progress>,

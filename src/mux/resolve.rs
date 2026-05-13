@@ -186,7 +186,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 None => crate::disc::ScanOptions::default(),
             };
             let mut reader = super::iso::IsoSectorReader::open(&path.to_string_lossy())?;
-            let capacity = reader.capacity();
+            let capacity = reader.capacity_sectors();
             let disc = crate::disc::Disc::scan_image(&mut reader, capacity, &scan_opts)
                 .map_err(|e| -> io::Error { e.into() })?;
             if disc.titles.is_empty() {

@@ -1,10 +1,10 @@
-//! ISO sector reader — file-backed SectorReader for Blu-ray ISO images.
+//! ISO sector reader — file-backed SectorSource for Blu-ray ISO images.
 //!
 //! An ISO is a flat image of 2048-byte sectors. Sector N starts at byte offset N * 2048.
 //! Used by DiscStream::open_iso() and Disc::scan_image().
 
 use crate::error::{Error, Result};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -32,12 +32,12 @@ impl IsoSectorReader {
         Ok(Self { file, capacity })
     }
 
-    pub fn capacity(&self) -> u32 {
+    pub fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 }
 
-impl SectorReader for IsoSectorReader {
+impl SectorSource for IsoSectorReader {
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -73,7 +73,7 @@ mod tests {
         std::fs::write(&dir, &data).unwrap();
 
         let mut reader = IsoSectorReader::open(dir.to_str().unwrap()).unwrap();
-        assert_eq!(reader.capacity(), 4);
+        assert_eq!(reader.capacity_sectors(), 4);
 
         let mut buf = [0u8; 2048];
         reader.read_sectors(0, 1, &mut buf, true).unwrap();
@@ -94,7 +94,7 @@ mod tests {
         std::fs::write(&dir, &data).unwrap();
 
         let reader = IsoSectorReader::open(dir.to_str().unwrap()).unwrap();
-        assert_eq!(reader.capacity(), 10);
+        assert_eq!(reader.capacity_sectors(), 10);
 
         std::fs::remove_file(&dir).ok();
     }

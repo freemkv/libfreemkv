@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-use super::{SectorReader, SectorSink};
+use super::{SectorSink, SectorSource};
 
 /// SectorSource backed by a file (ISO image).
 ///
@@ -49,14 +49,14 @@ impl FileSectorSource {
     }
 }
 
-// Implement the legacy `SectorReader` trait. The blanket impl in
+// Implement the legacy `SectorSource` trait. The blanket impl in
 // `super` produces the `SectorSource` impl automatically — no need
 // to write both, and writing both would conflict. This keeps the
-// 0.17 method-resolution path intact (callers with `SectorReader`
+// 0.17 method-resolution path intact (callers with `SectorSource`
 // in scope can still write `fsr.read_sectors(..)` against a
 // `FileSectorSource`).
-impl SectorReader for FileSectorSource {
-    fn capacity(&self) -> u32 {
+impl SectorSource for FileSectorSource {
+    fn capacity_sectors(&self) -> u32 {
         self.capacity
     }
 
@@ -147,8 +147,8 @@ impl SectorSink for FileSectorSink {
 #[cfg(test)]
 mod tests {
     // Bring the 0.18 trait into scope (not super::*: the super
-    // module also re-exports the legacy `SectorReader`, and
-    // having both `SectorReader::read_sectors` and
+    // module also re-exports the legacy `SectorSource`, and
+    // having both `SectorSource::read_sectors` and
     // `SectorSource::read_sectors` visible would force every
     // call site to disambiguate). External consumers see the
     // same surface this test exercises.

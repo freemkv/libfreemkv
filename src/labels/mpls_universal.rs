@@ -24,7 +24,7 @@ use super::{
     LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType,
     vocab::{self, LangInfo},
 };
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
 /// True iff `/BDMV/PLAYLIST/` exists and contains at least one
@@ -45,7 +45,7 @@ pub fn detect(udf: &UdfFs) -> bool {
 /// Returns `None` if no labels could be produced (e.g. no .mpls files
 /// parsed successfully, or every parsed stream was a type we skip
 /// like IG / DV EL).
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let playlist_dir = udf.find_dir("/BDMV/PLAYLIST")?;
 
     // Collect mpls filenames first so we don't hold a borrow on udf

@@ -29,7 +29,7 @@ use crate::platform::PlatformDriver;
 use crate::platform::mt1959::Mt1959;
 use crate::profile::{self, DriveProfile};
 use crate::scsi::ScsiTransport;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -707,7 +707,7 @@ fn open_block_device_for_sg(sg_path: &Path) -> Option<std::os::unix::io::RawFd> 
     }
 }
 
-impl SectorReader for Drive {
+impl SectorSource for Drive {
     fn read_sectors(
         &mut self,
         lba: u32,

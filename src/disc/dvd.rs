@@ -2,13 +2,13 @@
 
 use super::*;
 use crate::ifo;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf;
 
 impl Disc {
     /// Scan DVD titles from IFO files (VIDEO_TS.IFO + VTS_XX_0.IFO).
     pub(super) fn scan_dvd_titles(
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Vec<DiscTitle> {
         let dvd_info = match ifo::parse_vmg(reader, udf_fs) {
