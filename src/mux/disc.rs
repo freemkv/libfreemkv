@@ -318,14 +318,13 @@ impl DiscStream {
         // on failure, advance on success. One 5s read attempt per try — no
         // retry loops, no sleeps. On size-1 failure, skip or error.
         //
-      // Halt is checked at the top of every iteration — in a dense bad zone
+        // Halt is checked at the top of every iteration — in a dense bad zone
         // this loop can spend minutes shrinking and skipping sectors; without
         // the check, Stop wouldn't take effect until the outer PES read() loop
         // finally emits a frame, which may never happen.
-        
-        let start_lba = lba;
+
         let start_time = std::time::Instant::now();
-        
+
         loop {
             if self.is_halted() {
                 return Err(crate::error::Error::Halted.into());
