@@ -92,7 +92,6 @@ impl MkvStream {
     }
 }
 
-#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         let rs = match self.mode {
@@ -186,35 +185,6 @@ impl crate::pes::Stream for MkvStream {
 
     fn headers_ready(&self) -> bool {
         true // MKV has all headers upfront in the EBML header
-    }
-}
-
-/// FrameSink sibling to the deprecated Stream impl; both coexist during the
-/// 0.18 deprecation window. Caller may pick either at the trait-object
-/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
-/// Use `MkvStream::create(writer, title)` to construct the write half;
-/// calling `FrameSink::write` on a `MkvStream::open(reader)` instance returns
-/// `StreamReadOnly`. `finish` is where the Cues index is written, so it must
-/// be called for the resulting MKV to be seekable.
-#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
-impl crate::pes::FrameSink for MkvStream {
-    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        <Self as crate::pes::Stream>::write(self, frame)
-    }
-
-    fn finish(self: Box<Self>) -> io::Result<()> {
-        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
-        // Re-borrow inside the box, call Stream::finish, drop the box.
-        // The inner `MkvMuxer` is owned via `Option`, and `Stream::finish`
-        // already takes it via `Option::take()` — moving `*self` out of the
-        // box hands it the same field by-value, so the muxer's own
-        // by-value `finish()` runs correctly.
-        let mut s: Self = *self;
-        <Self as crate::pes::Stream>::finish(&mut s)
-    }
-
-    fn info(&self) -> &crate::disc::DiscTitle {
-        <Self as crate::pes::Stream>::info(self)
     }
 }
 
