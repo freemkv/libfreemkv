@@ -150,6 +150,20 @@ impl Seek for WritebackFile {
         // before every write, and we don't want that to drain the
         // pipeline on every iteration.
         if p != self.pos {
+            // Diagnostic for the NFS 73 % mux hang: the MKV format
+            // requires the muxer to seek back occasionally (cluster
+            // size patching, Cues index write, Segment header
+            // backpatch). Each such seek invalidates the writeback
+            // chunk tracking and forces a finalize → WAIT_AFTER on
+            // the in-flight chunk. Logging the seek delta lets us
+            // correlate hang offsets with specific muxer operations.
+            let from_pos = self.pos;
+            let to_pos = p;
+            let delta: i64 = (to_pos as i64).wrapping_sub(from_pos as i64);
+            tracing::debug!(
+                target: "mux",
+                "WritebackFile seek from={from_pos} to={to_pos} delta={delta}"
+            );
             self.pipeline.handle_seek(p);
             self.pos = p;
         }
