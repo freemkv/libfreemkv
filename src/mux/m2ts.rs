@@ -173,7 +173,6 @@ impl M2tsStream {
     }
 }
 
-#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for M2tsStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
@@ -282,29 +281,5 @@ impl crate::pes::Stream for M2tsStream {
             }
         }
         true
-    }
-}
-
-/// FrameSink sibling to the deprecated Stream impl; both coexist during the
-/// 0.18 deprecation window. Caller may pick either at the trait-object
-/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
-/// Use `M2tsStream::create(writer, title)` to construct the write half;
-/// calling `FrameSink::write` on an `M2tsStream::open(reader)` instance
-/// returns `StreamReadOnly`.
-#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
-impl crate::pes::FrameSink for M2tsStream {
-    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        <Self as crate::pes::Stream>::write(self, frame)
-    }
-
-    fn finish(self: Box<Self>) -> io::Result<()> {
-        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
-        // Re-borrow inside the box, call Stream::finish, drop the box.
-        let mut s: Self = *self;
-        <Self as crate::pes::Stream>::finish(&mut s)
-    }
-
-    fn info(&self) -> &crate::disc::DiscTitle {
-        <Self as crate::pes::Stream>::info(self)
     }
 }

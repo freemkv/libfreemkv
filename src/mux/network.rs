@@ -70,7 +70,6 @@ impl NetworkStream {
     }
 }
 
-#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for NetworkStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         match &mut self.mode {
@@ -106,30 +105,6 @@ impl crate::pes::Stream for NetworkStream {
     }
     fn info(&self) -> &DiscTitle {
         &self.disc_title
-    }
-}
-
-/// FrameSink sibling to the deprecated Stream impl; both coexist during the
-/// 0.18 deprecation window. Caller may pick either at the trait-object
-/// boundary — `Box<dyn Stream>` (deprecated) or `Box<dyn FrameSink>` (new).
-/// Use `NetworkStream::connect(addr).meta(title)` to construct the write
-/// half; calling `FrameSink::write` on `NetworkStream::listen(addr)` returns
-/// `StreamReadOnly`.
-#[allow(deprecated)] // delegating to deprecated Stream during the 0.18 deprecation window so callers don't see the deprecation twice.
-impl crate::pes::FrameSink for NetworkStream {
-    fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        <Self as crate::pes::Stream>::write(self, frame)
-    }
-
-    fn finish(self: Box<Self>) -> io::Result<()> {
-        // Why: Stream::finish takes &mut self, FrameSink::finish takes Box<Self>.
-        // Re-borrow inside the box, call Stream::finish, drop the box.
-        let mut s: Self = *self;
-        <Self as crate::pes::Stream>::finish(&mut s)
-    }
-
-    fn info(&self) -> &DiscTitle {
-        <Self as crate::pes::Stream>::info(self)
     }
 }
 
@@ -182,7 +157,6 @@ mod tests {
 
     #[test]
     #[ignore] // Requires TCP; may be flaky in CI environments
-    #[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
     fn network_pes_roundtrip() {
         use crate::pes;
 

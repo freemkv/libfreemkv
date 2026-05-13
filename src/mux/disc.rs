@@ -403,7 +403,6 @@ impl DiscStream {
     }
 }
 
-#[allow(deprecated)] // 0.18 trait split: migrate to FrameSource/FrameSink in follow-up commit.
 impl crate::pes::Stream for DiscStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
@@ -584,23 +583,18 @@ impl crate::pes::Stream for DiscStream {
 
 #[cfg(test)]
 mod tests {
-    //! `DiscStream` is the only meaningful `FrameSource` impl in tree (every
-    //! other concrete `pes::Stream` impl in `mux/*` is a sink). The 0.18
-    //! round-1 blanket `impl<T: pes::Stream + Send> pes::FrameSource for T`
-    //! covers `DiscStream` for free as long as it is `Send`. These tests
-    //! lock that down: a static `Send` assertion plus a `Box<dyn FrameSource>`
-    //! round trip exercising every `FrameSource` method through the trait
-    //! object, so future Send-breaking edits to `DiscStream`'s interior
-    //! types fail at compile time and the trait-bridge dispatch is verified
-    //! at runtime.
-    #![allow(deprecated)] // exercising the 0.18 deprecation-window blanket bridge.
+    //! `DiscStream` is the only read-only `Stream` impl in tree (every
+    //! other concrete impl in `mux/*` is bidirectional or write-only).
+    //! These tests lock down a static `Send` assertion plus a
+    //! `Box<dyn Stream>` round trip exercising every method through the
+    //! trait object, so future Send-breaking edits to `DiscStream`'s
+    //! interior types fail at compile time.
     use super::*;
     use crate::disc::{ContentFormat, DiscTitle};
-    use crate::pes::FrameSource;
+    use crate::pes::Stream;
 
-    /// Static-assert `DiscStream: Send`. The blanket
-    /// `impl<T: pes::Stream + Send> pes::FrameSource for T` only fires for
-    /// `Send` types — if a future field on `DiscStream` is non-`Send` (e.g.
+    /// Static-assert `DiscStream: Send`. The `Stream` trait has `Send` as a
+    /// supertrait — if a future field on `DiscStream` is non-`Send` (e.g.
     /// a `Box<dyn Read>` instead of `Box<dyn SectorReader>`), this fails
     /// at compile time, before the runtime trait-object test below.
     fn _assert_disc_stream_is_send() {
@@ -644,13 +638,11 @@ mod tests {
         }
     }
 
-    /// Smallest credible witness that `DiscStream` flows through the
-    /// `FrameSource` blanket impl: build a `Box<dyn FrameSource>`, drive
-    /// `read()` to EOF, exercise `info()` / `headers_ready()` /
-    /// `codec_private()` through the trait object. The trait-bridge
-    /// correctness is what's being verified — not demuxer behaviour.
+    /// Smallest credible witness that `DiscStream` flows through `dyn Stream`:
+    /// build a `Box<dyn Stream>`, drive `read()` to EOF, exercise `info()` /
+    /// `headers_ready()` / `codec_private()` through the trait object.
     #[test]
-    fn frame_source_via_dyn_object() {
+    fn stream_via_dyn_object() {
         let reader = ZeroReader { capacity: 8 };
         let title = synthetic_title(8);
         let stream = DiscStream::new(
@@ -661,7 +653,7 @@ mod tests {
             ContentFormat::BdTs,
         );
 
-        let mut src: Box<dyn FrameSource> = Box::new(stream);
+        let mut src: Box<dyn Stream> = Box::new(stream);
 
         // Empty-title fixture has no streams configured, so headers are
         // trivially ready and codec_private() yields nothing on track 0.

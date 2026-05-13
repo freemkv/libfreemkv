@@ -165,8 +165,8 @@ pub use decrypt::{DecryptKeys, decrypt_sectors};
 // structured representation; never compare against display strings.
 // Note: `disc::Stream` here is the codec enum (audio / video / sub kind)
 // — not the `pes::Stream` trait re-exported below as `PesStream`. Two
-// different concepts, the same short name; both stay because both are
-// load-bearing in their respective domains.
+// different concepts, the same short name; the trait gets the `Pes`
+// prefix at the crate root to keep both addressable.
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
     Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, KeySource, LabelPurpose,
@@ -179,7 +179,7 @@ pub use disc::{
 // All stream types implement `pes::Stream` — read PES frames from a source,
 // write PES frames to a sink. Pick the right type at construction:
 //
-// - `DiscStream` — physical drive or ISO (any `SectorReader`). Always read.
+// - `DiscStream` — physical drive or ISO (any `SectorReader`). Read-only.
 // - `MkvStream`  — Matroska container. Read on `open()`, write on `create()`.
 // - `M2tsStream` — Blu-ray Transport Stream. Read on `open()`, write on `create()`.
 // - `NetworkStream` — TCP. Read on `listen()`, write on `connect()`.
@@ -189,14 +189,11 @@ pub use disc::{
 // Most consumers use the URL resolvers (`input()` / `output()`) which pick
 // the right type from a scheme:// URL. Direct construction is for callers
 // that need to wire custom readers (e.g. autorip's drive-session reuse).
-// 0.18 trait split: `FrameSource` (read-only) and `FrameSink` (write-only)
-// supersede the unified `pes::Stream`. The old `Stream` re-export below
-// stays available for the deprecation window — re-exported as
-// `PesStream` to disambiguate from `disc::Stream` (the codec-kind enum
-// re-exported above), which would otherwise collide at the crate root.
-#[allow(deprecated)]
+// The trait is re-exported as `PesStream` here to disambiguate from
+// `disc::Stream` (the codec-kind enum re-exported above), which would
+// otherwise collide at the crate root.
+pub use pes::PesFrame;
 pub use pes::Stream as PesStream;
-pub use pes::{FrameSink, FrameSource, PesFrame};
 
 pub use mux::DiscStream;
 pub use mux::M2tsStream;
