@@ -895,6 +895,18 @@ impl Disc {
                                 );
                                 let mut bt_pos = backtrack_start;
                                 while bt_pos < backtrack_end {
+                                    // Honor cancellation inside the
+                                    // backtrack inner loop. A long
+                                    // backtrack span can run minutes
+                                    // of single-sector reads; without
+                                    // this check the outer halt only
+                                    // takes effect when control
+                                    // returns to the per-range loop.
+                                    if let Some(h) = &opts.halt {
+                                        if h.load(std::sync::atomic::Ordering::Relaxed) {
+                                            return Err(crate::error::Error::Halted);
+                                        }
+                                    }
                                     let span =
                                         // Backtrack always at count=1: this path
                                         // fills a gap that the main loop's damage-
