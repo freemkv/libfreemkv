@@ -19,7 +19,7 @@
 //!   BD-ROM Part 3 — Blu-ray filesystem profile
 
 use crate::error::{Error, Result};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 
 /// A UDF filesystem parsed from disc.
 #[derive(Debug)]
@@ -84,7 +84,7 @@ impl UdfFs {
     /// Reads sector by sector from disc — no buffering.
     /// Get the absolute starting LBA of a file on disc.
     /// Used by the rip pipeline to locate m2ts content sectors.
-    pub fn file_start_lba(&self, reader: &mut dyn SectorReader, path: &str) -> Result<u32> {
+    pub fn file_start_lba(&self, reader: &mut dyn SectorSource, path: &str) -> Result<u32> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
         for part in &parts[..parts.len() - 1] {
@@ -115,7 +115,7 @@ impl UdfFs {
         Ok(self.partition_start + data_lba)
     }
 
-    pub fn read_file(&self, reader: &mut dyn SectorReader, path: &str) -> Result<Vec<u8>> {
+    pub fn read_file(&self, reader: &mut dyn SectorSource, path: &str) -> Result<Vec<u8>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
 
@@ -175,7 +175,7 @@ impl UdfFs {
     ///
     /// Skips: STREAM/ (video), BACKUP/, DUPLICATE/,
     ///   MKB_RO.inf, ContentHash*, ContentRevocation*
-    pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorReader) -> Result<Vec<(u32, u32)>> {
+    pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
         // UDF structure: sector 0 through end of metadata partition
@@ -194,7 +194,7 @@ impl UdfFs {
 
     /// All sector ranges that contain data (metadata + all files including STREAM).
     /// For full disc-to-ISO dumps — reads only allocated sectors, skips gaps.
-    pub fn all_sector_ranges(&self, reader: &mut dyn SectorReader) -> Result<Vec<(u32, u32)>> {
+    pub fn all_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
         // UDF structure sectors
@@ -212,7 +212,7 @@ impl UdfFs {
 
     fn collect_all_file_ranges(
         &self,
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         entry: &DirEntry,
         ranges: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
@@ -238,7 +238,7 @@ impl UdfFs {
 
     fn collect_file_ranges(
         &self,
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         entry: &DirEntry,
         ranges: &mut Vec<(u32, u32)>,
     ) -> Result<()> {
@@ -276,7 +276,7 @@ impl UdfFs {
     /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
     /// and return its first allocation extent: (data_lba, data_length).
     /// The data_lba is partition-relative.
-    fn read_icb_extent(&self, reader: &mut dyn SectorReader, meta_lba: u32) -> Result<(u32, u32)> {
+    fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<(u32, u32)> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
         extents.first().copied().ok_or(Error::DiscRead {
             sector: 0,
@@ -290,7 +290,7 @@ impl UdfFs {
     /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents).
     fn read_icb_extents(
         &self,
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         meta_lba: u32,
     ) -> Result<Vec<(u32, u32)>> {
         let mut icb = [0u8; 2048];
@@ -367,7 +367,7 @@ impl UdfFs {
     /// Returns Vec of (absolute_lba, sector_count) covering the entire file.
     pub fn file_extents(
         &self,
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         path: &str,
     ) -> Result<Vec<(u32, u32)>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -417,7 +417,7 @@ impl UdfFs {
 /// 3. Metadata partition file → metadata content location
 /// 4. FSD → root directory ICB
 /// 5. Root directory → file tree
-pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
+pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // Step 1: Anchor Volume Descriptor Pointer at sector 256
     // ECMA-167 §10.2 — always at sector 256
     let mut avdp = [0u8; 2048];
@@ -593,7 +593,7 @@ pub fn read_filesystem(reader: &mut dyn SectorReader) -> Result<UdfFs> {
 /// and points to its ICB.
 #[allow(clippy::only_used_in_recursion)]
 fn read_directory(
-    reader: &mut dyn SectorReader,
+    reader: &mut dyn SectorSource,
     part_start: u32,
     meta_start: u32,
     meta_lba: u32,
@@ -758,7 +758,7 @@ fn read_directory(
 }
 
 /// Read file size (info_length) from an Extended File Entry ICB.
-fn read_file_size(reader: &mut dyn SectorReader, meta_start: u32, meta_lba: u32) -> Result<u64> {
+fn read_file_size(reader: &mut dyn SectorSource, meta_start: u32, meta_lba: u32) -> Result<u64> {
     let mut icb = [0u8; 2048];
     read_sector(reader, meta_start + meta_lba, &mut icb)?;
 
@@ -874,7 +874,7 @@ fn parse_dstring(data: &[u8]) -> String {
 /// Each SCSI command has ~500ms overhead on USB drives, so reading 32 sectors
 /// at once (one command) is 32x faster than 32 individual reads.
 pub(crate) struct BufferedSectorReader<'a> {
-    inner: &'a mut dyn SectorReader,
+    inner: &'a mut dyn SectorSource,
     cache_start: u32,
     cache: Vec<u8>,
     cache_sectors: u32,
@@ -884,7 +884,7 @@ pub(crate) struct BufferedSectorReader<'a> {
 }
 
 impl<'a> BufferedSectorReader<'a> {
-    pub(crate) fn new(inner: &'a mut dyn SectorReader, batch: u16) -> Self {
+    pub(crate) fn new(inner: &'a mut dyn SectorSource, batch: u16) -> Self {
         Self {
             inner,
             cache_start: u32::MAX,
@@ -952,7 +952,7 @@ impl BufferedSectorReader<'_> {
     }
 }
 
-impl SectorReader for BufferedSectorReader<'_> {
+impl SectorSource for BufferedSectorReader<'_> {
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -996,7 +996,7 @@ impl SectorReader for BufferedSectorReader<'_> {
     }
 }
 
-fn read_sector(reader: &mut dyn SectorReader, lba: u32, buf: &mut [u8]) -> Result<()> {
+fn read_sector(reader: &mut dyn SectorSource, lba: u32, buf: &mut [u8]) -> Result<()> {
     reader.read_sectors(lba, 1, buf, true)?;
     Ok(())
 }

@@ -26,7 +26,7 @@
 // The module wiring (registry hook + public re-export) is added
 // separately. Until then the parse/detect entry points have no
 use super::xml;
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
@@ -60,7 +60,7 @@ pub fn detect(udf: &UdfFs) -> bool {
 /// Read every `bdmt_<lang>.xml` under `/BDMV/META/DL/` and return the
 /// aggregated [`DiscMetadata`]. Returns `None` if no titles could be
 /// extracted from any file.
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<DiscMetadata> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata> {
     let dir = udf.find_dir("/BDMV/META/DL")?;
     let mut out = DiscMetadata::default();
 

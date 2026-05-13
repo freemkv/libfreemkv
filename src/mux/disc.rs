@@ -1,6 +1,6 @@
 //! DiscStream — read any disc (physical drive or ISO file) → PES frames.
 //!
-//! One stream type for all disc sources. The source is a SectorReader —
+//! One stream type for all disc sources. The source is a SectorSource —
 //! Drive (hardware) or IsoSectorReader (file). DiscStream doesn't care.
 //!
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
@@ -9,7 +9,7 @@ use crate::disc::{Disc, DiscTitle, Extent};
 use crate::drive::extract_scsi_context;
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
-use crate::sector::{DecryptingSectorSource, SectorReader, SectorSource};
+use crate::sector::{DecryptingSectorSource, SectorSource};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -97,7 +97,7 @@ impl AdaptiveBatch {
 
 /// Disc stream. Reads sectors from any source → PES frames.
 ///
-/// Sources: physical drive, ISO file, or any SectorReader.
+/// Sources: physical drive, ISO file, or any SectorSource.
 /// Decrypt, demux, and codec parsing happen internally.
 pub struct DiscStream {
     /// Underlying sector source wrapped in the 0.18
@@ -105,7 +105,7 @@ pub struct DiscStream {
     /// call yields plaintext, so `fill_extents` no longer needs an
     /// inline `decrypt::decrypt_sectors` step. `DecryptKeys::None`
     /// (raw / unencrypted disc) makes the decorator a pass-through.
-    reader: DecryptingSectorSource<Box<dyn SectorReader>>,
+    reader: DecryptingSectorSource<Box<dyn SectorSource>>,
     title: DiscTitle,
     disc: Option<Disc>,
     /// Mirror of the keys handed in at construction. The decorator
@@ -160,11 +160,11 @@ pub struct DiscStream {
 impl DiscStream {
     /// Create a disc stream from any sector reader.
     ///
-    /// Works with physical drives and ISO files — both implement SectorReader.
+    /// Works with physical drives and ISO files — both implement SectorSource.
     /// The caller opens the source, scans for titles/keys, and passes them in.
     /// The stream handles demuxing, decryption, and codec parsing internally.
     pub fn new(
-        reader: Box<dyn SectorReader>,
+        reader: Box<dyn SectorSource>,
         title: DiscTitle,
         decrypt_keys: crate::decrypt::DecryptKeys,
         batch_sectors: u16,
@@ -177,7 +177,7 @@ impl DiscStream {
         tracing::debug!(
             target: "mux",
             "DiscStream constructed with reader type: {}",
-            std::any::type_name::<dyn SectorReader>()
+            std::any::type_name::<dyn SectorSource>()
         );
 
         let mut pids = Vec::new();
@@ -595,14 +595,14 @@ mod tests {
 
     /// Static-assert `DiscStream: Send`. The `Stream` trait has `Send` as a
     /// supertrait — if a future field on `DiscStream` is non-`Send` (e.g.
-    /// a `Box<dyn Read>` instead of `Box<dyn SectorReader>`), this fails
+    /// a `Box<dyn Read>` instead of `Box<dyn SectorSource>`), this fails
     /// at compile time, before the runtime trait-object test below.
     fn _assert_disc_stream_is_send() {
         fn requires_send<T: Send>() {}
         requires_send::<DiscStream>();
     }
 
-    /// Trivial `SectorReader` that yields zeroed sectors. Empty title means
+    /// Trivial `SectorSource` that yields zeroed sectors. Empty title means
     /// the demuxer produces no PES frames, so `read()` walks the extents to
     /// EOF and returns `Ok(None)`. That's enough to exercise the trait-object
     /// dispatch — the goal here is the bridge, not the demuxer.
@@ -610,7 +610,7 @@ mod tests {
         capacity: u32,
     }
 
-    impl crate::sector::SectorReader for ZeroReader {
+    impl crate::sector::SectorSource for ZeroReader {
         fn read_sectors(
             &mut self,
             _lba: u32,
@@ -623,7 +623,7 @@ mod tests {
             Ok(bytes)
         }
 
-        fn capacity(&self) -> u32 {
+        fn capacity_sectors(&self) -> u32 {
             self.capacity
         }
     }

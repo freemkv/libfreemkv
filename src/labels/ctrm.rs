@@ -5,7 +5,7 @@
 //! menu_base.prop provides stream number → button name mapping.
 
 use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, vocab};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
 
@@ -14,7 +14,7 @@ pub fn detect(udf: &UdfFs) -> bool {
         || super::jar_file_exists(udf, "language_streams.txt")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     // Try language_streams.txt first (richer structured data)
     let ls_labels = parse_language_streams(reader, udf);
 
@@ -55,7 +55,7 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
 
 // ── language_streams.txt parser ────────────────────────────────────────────
 
-fn parse_language_streams(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
     let data = super::read_jar_file(reader, udf, "language_streams.txt")?;
     let text = std::str::from_utf8(&data).ok()?;
 
@@ -184,7 +184,7 @@ mod tests {
 
     /// Build a minimal menu_base.prop text and run `parse_menu_base`'s
     /// inner logic via a temporary closure. This isolates the prop
-    /// parsing without needing a SectorReader.
+    /// parsing without needing a SectorSource.
     fn parse_props(text: &str) -> Vec<StreamLabel> {
         // Mirror the inner loop of parse_menu_base exactly. Kept
         // separate so the test doesn't need disc fixtures.
@@ -338,7 +338,7 @@ mod tests {
 
 // ── menu_base.prop parser ──────────────────────────────────────────────────
 
-fn parse_menu_base(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
+fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
     let data = super::read_jar_file(reader, udf, "menu_base.prop")?;
     let text = std::str::from_utf8(&data).ok()?;
 

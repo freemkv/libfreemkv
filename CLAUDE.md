@@ -53,7 +53,7 @@ When `skip_on_error=true` (multipass mode):
 - Read each ECC block sequentially. Track a sliding window of the last 16 ECC block results.
 - On error: zero-fill, mark NonTrimmed, push `false` to window.
 - On success: write data, mark Finished, push `true` to window. Track consecutive good count.
-- When ≥12% of the 16-block window are failures → **jump** ahead by `256×batch×multiplier` sectors (8 MB base for UHD). Zero-fill the gap as NonTrimmed. Double the multiplier (8→16→32→64 MB...).
+- When ≥12% of the 16-block window are failures → **jump** ahead by `JUMP_BASE_SECTORS (1024) × batch × multiplier` sectors. For UHD encrypted ECC (batch=32) that's a 64 MiB base jump. Zero-fill the gap as NonTrimmed. Double the multiplier (64→128→256→512 MiB...) up to `MAX_JUMP_MULTIPLIER=64` (4 GiB cap). Plus a separate wedge-skip path of `WEDGE_JUMP_SECTORS=524288` (1 GiB) for HARDWARE_ERROR / ILLEGAL_REQUEST senses, capped at 16 consecutive wedges.
 - When 16 consecutive good reads → reset multiplier to 1, restore max read speed.
 - Only transport failures (bridge crash) abort the pass.
 
@@ -65,11 +65,11 @@ Tuning knobs: `DAMAGE_WINDOW=16` and `DAMAGE_THRESHOLD_PCT=12%`. Calibrated from
 - Single-sector reads with 60 s timeout (`READ_RECOVERY_TIMEOUT_MS`).
 - NOT_READY (sense=2, ASC ∈ {0x02, 0x03, 0x04}): 15 s pause, retry without immediate Unreadable mark.
 - Non-marginal SCSI sense → mark Unreadable and continue.
-- Skip escalation: damage window 16/12 %, skip `64 << escalation` sectors capped at 4096; max 10 skips per range, then mark range Unreadable.
+- Skip escalation: damage window 16, `PASSN_DAMAGE_THRESHOLD_PCT=6`, skip `PASSN_SKIP_SECTORS_BASE (32) << escalation` sectors capped at `PASSN_SKIP_SECTORS_CAP=4096`; `MAX_SKIPS_PER_RANGE=10`, then mark range Unreadable.
 - Wedge exit: 50 consecutive failures **and** ≥ 2 ranges attempted (single-range stalls don't kill the pass).
-- Whole-pass watchdog: `STALL_SECS = 3600` on `bytes_good`. Per-range watchdog: `MAX_RANGE_SECS = 180`.
+- Whole-pass watchdog: `STALL_SECS = 3600` on `bytes_good`. Per-range watchdog: proportional `range_sectors × SECONDS_PER_SECTOR(25)`, capped at `RANGE_BUDGET_CAP_SECS=1800` (replaces the old flat 180s/range — tiny ranges got starved).
 
-Constants live at `disc/mod.rs:1974-1985` (PASSN_*, STALL_SECS, MAX_RANGE_SECS, MAX_SKIPS_PER_RANGE). The full algorithm is documented in `freemkv-private/memory/project_recovery_v0_16.md`.
+Constants live in `disc/patch.rs::Disc::patch` (PASSN_*, STALL_SECS, SECONDS_PER_SECTOR, RANGE_BUDGET_CAP_SECS, MAX_SKIPS_PER_RANGE). The full algorithm is documented in `freemkv-private/memory/project_recovery_v0_16.md`.
 
 ## Public repo rules
 

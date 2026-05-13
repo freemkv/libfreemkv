@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::error::{Error, Result};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf;
 
 /// Result of SCSI AACS handshake (ECDH authentication).
@@ -113,12 +113,12 @@ impl Disc {
 
     /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
     ///
-    /// Reads AACS files from UDF (via SectorReader), resolves keys through
+    /// Reads AACS files from UDF (via SectorSource), resolves keys through
     /// whatever path works: KEYDB VUK lookup, media key derivation, processing
     /// keys, device keys. Uses handshake result (volume ID, bus key) if available.
     pub(super) fn resolve_encryption(
         udf_fs: &udf::UdfFs,
-        reader: &mut dyn SectorReader,
+        reader: &mut dyn SectorSource,
         keydb_path: &std::path::Path,
         handshake: Option<&HandshakeResult>,
     ) -> Result<AacsState> {

@@ -9,7 +9,7 @@
 
 use crate::disc::{Codec, Resolution};
 use crate::error::{Error, Result};
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ fn bcd_byte(b: u8) -> u32 {
 ///
 /// Reads the VMG (Video Manager) to discover title sets, then reads each
 /// VTS IFO to extract PGC chains, cell addresses, and stream attributes.
-pub fn parse_vmg(reader: &mut dyn SectorReader, udf: &UdfFs) -> Result<DvdInfo> {
+pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> {
     let vmg_data = udf.read_file(reader, "/VIDEO_TS/VIDEO_TS.IFO")?;
 
     // Validate VMG magic
@@ -263,7 +263,7 @@ pub fn parse_vmg(reader: &mut dyn SectorReader, udf: &UdfFs) -> Result<DvdInfo> 
 ///
 /// `titles_info` is a list of (chapter_count, vts_title_number) from TT_SRPT.
 fn parse_vts(
-    reader: &mut dyn SectorReader,
+    reader: &mut dyn SectorSource,
     udf: &UdfFs,
     vts_number: u8,
     titles_info: &[(u16, u8)],

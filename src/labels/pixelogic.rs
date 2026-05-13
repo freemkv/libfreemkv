@@ -9,7 +9,7 @@ use super::{
     Confidence, LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelType, text,
     vocab,
 };
-use crate::sector::SectorReader;
+use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,7 +24,7 @@ pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
 }
 
-pub fn parse(reader: &mut dyn SectorReader, udf: &UdfFs) -> Option<ParseResult> {
+pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     let data = super::read_jar_file(reader, udf, "bluray_project.bin")?;
     // min_len=4 matches the prior local extract_strings impl. The token
     // grammar is `{lang3}_{codec?}_{purpose?}_{region?}_` so the
