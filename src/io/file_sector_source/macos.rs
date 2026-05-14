@@ -36,3 +36,11 @@ pub(super) fn hint_sequential(file: &File, len_bytes: u64) {
         libc::fcntl(file.as_raw_fd(), F_RDADVISE, &mut ra);
     }
 }
+
+/// macOS has no direct `POSIX_FADV_DONTNEED` equivalent for a byte
+/// range. `fcntl(F_NOCACHE)` would disable caching globally on the fd
+/// (too coarse — we want the unread region to still benefit). Best
+/// approximation: no-op. macOS's unified buffer cache is generally
+/// less prone to the pin-everything pathology that triggers the
+/// regression on Linux NFS clients.
+pub(super) fn drop_window(_file: &File, _start: u64, _len: u64) {}

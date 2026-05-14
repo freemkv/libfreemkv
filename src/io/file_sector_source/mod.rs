@@ -87,6 +87,17 @@ const BUF_SECTORS: u32 = (READAHEAD_BUF_BYTES / SECTOR_SIZE) as u32;
 /// `read_sectors` is satisfied from the buffer when possible; otherwise
 /// a full-buffer refill is issued at the requested LBA's position and
 /// the call is re-tried against the freshly populated window.
+/// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
+/// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
+/// cache stays bounded the same way the write side does.
+///
+/// 0.21.6: re-added after empirical discovery that Phase 1 had silently
+/// dropped this from the pre-Phase-1 (0.20.7) hot path. Without it,
+/// 85 GB of streaming ISO reads pin the entire file in the kernel page
+/// cache, starving the MKV writeback and collapsing mux throughput
+/// (observed: 2.7 MB/s mux on 0.21.5 vs. 70 MB/s isolated NFS reads).
+const READ_DROP_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
 pub struct FileSectorSource {
     file: File,
     /// Total file size in sectors. Constant after construction;
@@ -102,6 +113,13 @@ pub struct FileSectorSource {
     #[allow(dead_code)]
     buf_start_lba: u32,
     buf_len_sectors: u32,
+    /// 0.21.6: bytes read since the last DONTNEED drop. Drives the
+    /// per-`READ_DROP_CHUNK_BYTES` page-cache eviction in read_sectors.
+    bytes_read_since_drop: u64,
+    /// 0.21.6: file offset at which the current drop window starts.
+    /// The next DONTNEED drops from `drop_window_start` for
+    /// `bytes_read_since_drop` bytes.
+    drop_window_start: u64,
 }
 
 impl FileSectorSource {
@@ -142,6 +160,8 @@ impl FileSectorSource {
             buf,
             buf_start_lba: 0,
             buf_len_sectors: 0,
+            bytes_read_since_drop: 0,
+            drop_window_start: 0,
         })
     }
 
@@ -228,6 +248,21 @@ impl SectorSource for FileSectorSource {
             .read_exact(&mut out[..bytes])
             .map_err(|e| Error::IoError { source: e })?;
         self.buf_len_sectors = 0;
+
+        // 0.21.6: periodic page-cache eviction on the read side. Without
+        // this, an 85 GB streaming ISO read pins the entire file in
+        // kernel page cache, which starves concurrent NFS writes (the
+        // MKV output) and collapses mux throughput. Mirrors the
+        // write-side WritebackPipeline's DONTNEED policy.
+        self.bytes_read_since_drop += bytes as u64;
+        if self.bytes_read_since_drop >= READ_DROP_CHUNK_BYTES {
+            let drop_start = self.drop_window_start;
+            let drop_len = self.bytes_read_since_drop;
+            platform::drop_window(&self.file, drop_start, drop_len);
+            self.drop_window_start = drop_start + drop_len;
+            self.bytes_read_since_drop = 0;
+        }
+
         Ok(bytes)
     }
 }
