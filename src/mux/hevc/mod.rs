@@ -222,7 +222,11 @@ mod tests {
         // we can spot in the output.
         let mut hvcc = vec![0u8; 22];
         hvcc.push(3); // numOfArrays
-        for (nal_type, payload) in [(32u8, [0x40, 0x01, 0x0C, 0x01]), (33, [0x42, 0x01, 0x01, 0x01]), (34, [0x44, 0x01, 0xC1, 0x72])] {
+        for (nal_type, payload) in [
+            (32u8, [0x40, 0x01, 0x0C, 0x01]),
+            (33, [0x42, 0x01, 0x01, 0x01]),
+            (34, [0x44, 0x01, 0xC1, 0x72]),
+        ] {
             hvcc.push(nal_type & 0x3F);
             hvcc.extend_from_slice(&1u16.to_be_bytes()); // numNalus
             hvcc.extend_from_slice(&(payload.len() as u16).to_be_bytes());

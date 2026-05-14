@@ -356,7 +356,8 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = Fmp4Mux::new(&mut sink);
         // Trigger init emission via a single (stubbed) write.
-        mux.write_video(0, true, &[0x00, 0x00, 0x00, 0x01, 0x40]).unwrap();
+        mux.write_video(0, true, &[0x00, 0x00, 0x00, 0x01, 0x40])
+            .unwrap();
         mux.finish().unwrap();
         drop(mux);
 
