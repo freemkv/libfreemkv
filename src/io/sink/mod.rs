@@ -28,8 +28,10 @@ use std::io::{Seek, Write};
 
 mod local_file;
 mod preallocate;
+mod socket;
 
 pub use local_file::LocalFileSink;
+pub use socket::{SocketSink, UdpSocketSink};
 
 /// Sequential-only write destination. Sockets, pipes, append-only
 /// stores. No seek. Implementations own their write buffering — the
