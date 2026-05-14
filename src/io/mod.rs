@@ -26,6 +26,7 @@
 pub(crate) mod bounded;
 pub mod byte_channel;
 pub mod file_sector_source;
+pub mod sink;
 mod writeback;
 mod writeback_file;
 

@@ -1,5 +1,6 @@
 //! Platform-specific drive initialization and disc probing.
 
+pub mod fs_type;
 pub mod mt1959;
 
 use crate::error::Result;
