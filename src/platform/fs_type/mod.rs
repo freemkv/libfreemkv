@@ -37,19 +37,19 @@ pub enum FsType {
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod other;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 use linux::detect_impl;
 #[cfg(target_os = "macos")]
 use macos::detect_impl;
-#[cfg(target_os = "windows")]
-use windows::detect_impl;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use other::detect_impl;
+#[cfg(target_os = "windows")]
+use windows::detect_impl;
 
 /// Best-effort classification of the filesystem under `path`.
 ///
