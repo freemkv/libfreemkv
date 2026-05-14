@@ -83,10 +83,10 @@ pub fn open_for_mkv(
     dest: &std::path::Path,
     size_hint: Option<u64>,
 ) -> std::io::Result<Box<dyn RandomAccessSink>> {
-    #[cfg(target_os = "linux")]
-    use crate::platform::fs_type::{FsType, detect};
     #[cfg(not(target_os = "linux"))]
     use crate::platform::fs_type::detect;
+    #[cfg(target_os = "linux")]
+    use crate::platform::fs_type::{FsType, detect};
 
     #[cfg(target_os = "linux")]
     {
