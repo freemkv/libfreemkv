@@ -207,33 +207,28 @@ impl SectorSource for FileSectorSource {
         if count == 0 {
             return Ok(0);
         }
-        // Refill if the requested range isn't entirely buffered.
-        // `buffer_covers` also handles the empty-buffer case
-        // (buf_len_sectors == 0).
-        if !self.buffer_covers(lba, count) {
-            // A request larger than the buffer itself can never fit;
-            // fall back to a one-shot direct pread for that pathological
-            // case so callers can't deadlock the source.
-            if count > BUF_SECTORS {
-                let offset = lba as u64 * SECTOR_SIZE as u64;
-                self.file
-                    .seek(SeekFrom::Start(offset))
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.file
-                    .read_exact(&mut out[..bytes])
-                    .map_err(|e| Error::IoError { source: e })?;
-                // Invalidate buffer state — we bypassed it, the
-                // window is no longer authoritative for this LBA.
-                self.buf_len_sectors = 0;
-                return Ok(bytes);
-            }
-            self.refill(lba)?;
-        }
-
-        // Slice the buffer at the requested LBA's offset within it.
-        let off_sectors = (lba - self.buf_start_lba) as usize;
-        let off_bytes = off_sectors * SECTOR_SIZE;
-        out[..bytes].copy_from_slice(&self.buf[off_bytes..off_bytes + bytes]);
+        // 0.21.3: bypass the application-level buffer entirely.
+        //
+        // Empirically the 32 MiB readahead window (0.21.0–0.21.1) and the
+        // 4 MiB shrink (0.21.2) both regressed mux throughput vs the
+        // pre-Phase-1 0.20.7 baseline on NFS bidirectional workloads
+        // (sweep ~25 MB/s OK; mux dropped from 18 → 7-8 → 5-6 MB/s).
+        // Direct pread per call lets the kernel's own readahead policy
+        // run, which interleaves naturally with concurrent NFS writes on
+        // the same TCP connection.
+        //
+        // Buffer fields are retained (currently unused on this path) so
+        // any future per-source policy can be reintroduced without
+        // re-plumbing structure. `refill` / `buffer_covers` are kept too
+        // (still exercised by the tests so the API contract is locked).
+        let offset = lba as u64 * SECTOR_SIZE as u64;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::IoError { source: e })?;
+        self.file
+            .read_exact(&mut out[..bytes])
+            .map_err(|e| Error::IoError { source: e })?;
+        self.buf_len_sectors = 0;
         Ok(bytes)
     }
 }
