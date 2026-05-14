@@ -247,7 +247,8 @@ impl<W: Write> M2tsMux<W> {
             let attach_pcr = first
                 && (pid == PID_VIDEO)
                 && (pcr.is_some())
-                && (self.packets_written == 0 || self.video_packets_since_pcr >= PCR_INTERVAL_PACKETS);
+                && (self.packets_written == 0
+                    || self.video_packets_since_pcr >= PCR_INTERVAL_PACKETS);
 
             let af_body: Vec<u8> = if attach_pcr {
                 build_pcr_adaptation(pcr.unwrap_or(0))
@@ -317,7 +318,7 @@ impl<W: Write> M2tsMux<W> {
     }
 
     fn maybe_emit_psi(&mut self) -> io::Result<()> {
-        if self.packets_written == 0 || self.packets_written.is_multiple_of(PSI_INTERVAL_PACKETS) {
+        if self.packets_written == 0 || self.packets_written % PSI_INTERVAL_PACKETS == 0 {
             self.emit_pat()?;
             self.emit_pmt()?;
         }
@@ -547,7 +548,12 @@ mod tests {
     /// All emitted bytes must align to 188-byte packet boundaries and
     /// every packet must start with `0x47`.
     fn assert_ts_well_formed(buf: &[u8]) {
-        assert_eq!(buf.len() % 188, 0, "stream not packet-aligned: {} bytes", buf.len());
+        assert_eq!(
+            buf.len() % 188,
+            0,
+            "stream not packet-aligned: {} bytes",
+            buf.len()
+        );
         for (i, chunk) in buf.chunks(188).enumerate() {
             assert_eq!(chunk[0], 0x47, "packet {} missing sync byte", i);
         }
@@ -567,7 +573,9 @@ mod tests {
         // than hardcoding sample bytes, verify the underlying algorithm
         // by checking that two distinct inputs produce distinct CRCs
         // and that the same input is deterministic.
-        let a = [0u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00];
+        let a = [
+            0u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
+        ];
         let mut b = a;
         b[5] ^= 0x01; // flip one bit
         let crc_a = mpegts_crc32(&a);
@@ -612,7 +620,8 @@ mod tests {
         frame.extend_from_slice(&3u32.to_be_bytes());
         frame.extend_from_slice(&[0x40, 0x01, 0x0C]);
         mux.write_video(0, &frame).unwrap();
-        mux.write_audio(20_000_000, &[0x0B, 0x77, 0x12, 0x34]).unwrap();
+        mux.write_audio(20_000_000, &[0x0B, 0x77, 0x12, 0x34])
+            .unwrap();
         mux.finish().unwrap();
         drop(mux);
 
