@@ -290,14 +290,14 @@ mod tests {
 
         let mut src = FileSectorSource::open(&path).unwrap();
 
-        // Prime: read sector 0 to populate buffer #0.
+        // Prime: read sector 0. (0.21.3+: app-level buffer is bypassed,
+        // so we don't assert internal buf state here — just exercise
+        // the read path.)
         let mut got = vec![0u8; SECTOR_SIZE];
         src.read_sectors(0, 1, &mut got, false).unwrap();
-        assert_eq!(src.buf_start_lba, 0);
-        assert!(src.buf_len_sectors > 0);
 
-        // Now read 4 sectors crossing the buffer boundary at
-        // BUF_SECTORS - 2 → BUF_SECTORS + 1. Spans the refill.
+        // Now read 4 sectors crossing what used to be the buffer
+        // boundary. Still a valid SectorSource-contract test.
         let span_lba = BUF_SECTORS - 2;
         let mut buf4 = vec![0u8; SECTOR_SIZE * 4];
         src.read_sectors(span_lba, 4, &mut buf4, false).unwrap();
@@ -325,13 +325,11 @@ mod tests {
         // Forward to the second window.
         src.read_sectors(BUF_SECTORS + 1, 1, &mut got, false)
             .unwrap();
-        let start_after_forward = src.buf_start_lba;
-        assert!(start_after_forward >= BUF_SECTORS);
 
-        // Backward to sector 0. The current buffer doesn't cover it
-        // → refill must happen.
+        // Backward to sector 0. (0.21.3+: app-level buffer is bypassed
+        // so we only assert the byte-level contract, not internal
+        // buffer state.)
         src.read_sectors(0, 1, &mut got, false).unwrap();
-        assert_eq!(src.buf_start_lba, 0);
         assert!(got.iter().all(|b| *b == 0));
     }
 
@@ -350,11 +348,12 @@ mod tests {
         assert_eq!(src.capacity_sectors(), total);
 
         let mut got = vec![0u8; SECTOR_SIZE];
-        // First read triggers refill clamped to `total`.
+        // First read at sector 0.
         src.read_sectors(0, 1, &mut got, false).unwrap();
-        assert_eq!(src.buf_len_sectors, total);
 
-        // Read the very last sector — still inside the buffer.
+        // Read the very last sector. (0.21.3+: app-level buffer is
+        // bypassed; the test still verifies that EOF-region reads
+        // return correct bytes.)
         src.read_sectors(total - 1, 1, &mut got, false).unwrap();
         let expected = ((total - 1) & 0xff) as u8;
         assert!(got.iter().all(|b| *b == expected));
