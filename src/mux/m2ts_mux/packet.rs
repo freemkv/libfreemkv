@@ -57,11 +57,11 @@ impl Packet {
 
     /// Append the adaptation field after the header.
     ///
-    /// `body` is the adaptation field body (flags byte + optional PCR
-    /// + …). `stuffing` is the number of `0xFF` stuffing bytes to
+    /// `body` is the adaptation field body (flags byte plus optional PCR
+    /// and so on). `stuffing` is the number of `0xFF` stuffing bytes to
     /// append after the body. The first byte of the field
-    /// (`adaptation_field_length`) is computed here from `body.len() +
-    /// stuffing`.
+    /// (`adaptation_field_length`) is computed here from
+    /// `body.len() + stuffing`.
     pub(super) fn append_adaptation(&mut self, body: &[u8], stuffing: usize) {
         let af_len = body.len() + stuffing;
         debug_assert!(af_len <= 183, "adaptation field overflow");
