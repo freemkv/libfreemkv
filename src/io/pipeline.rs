@@ -34,9 +34,10 @@
 //! consumer lag detection). This is critical for diagnosing stalls.
 
 use std::io;
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Sender, TrySendError, bounded};
 
 use crate::error::Error;
 use crate::halt::Halt;
@@ -57,12 +58,21 @@ pub const JOIN_TIMEOUT_SECS: u64 = 600;
 /// responsive across both primitives.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Polling slice for the halt-aware send loop. Smaller than
-/// [`POLL_INTERVAL`] because send latency tolerance is much lower —
-/// frames must move through the channel at hundreds-of-Hz on the
-/// happy path; 50 ms keeps backpressure-driven wakeups fine-grained
-/// without busy-looping.
-const SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Halt-check cadence for the send loop. Producer blocks on
+/// [`crossbeam_channel::Sender::send_timeout`] for this slice — the
+/// kernel wakes it the instant the consumer drains a slot, so on the
+/// happy path there's no throughput cap from this primitive at all
+/// (the cap is whatever the underlying medium can sustain). When the
+/// consumer is genuinely wedged, the timeout fires every 250 ms and
+/// the producer checks the halt token; that's the latency a stop
+/// request will observe.
+///
+/// 0.21.7 replaced an old `std::sync::mpsc::sync_channel` + 50 ms
+/// `thread::sleep` polling loop that capped mux throughput at
+/// ~20 frames/sec ≈ 1 MB/s on saturated channels. See
+/// freemkv-private/memory/feedback_send_with_halt_poll_throttle.md
+/// for the multi-day diagnostic that surfaced it.
+const SEND_HALT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
 pub fn debug_enabled() -> bool {
@@ -135,7 +145,7 @@ pub trait Sink<I>: Send + 'static {
 /// Bounded producer/consumer pipeline. Holds the producer-side
 /// channel and the consumer thread's join handle.
 pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
-    tx: SyncSender<I>,
+    tx: Sender<I>,
     handle: JoinHandle<Result<R, Error>>,
 }
 
@@ -170,7 +180,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         depth: usize,
         sink: S,
     ) -> Result<Self, Error> {
-        let (tx, rx) = sync_channel::<I>(depth);
+        let (tx, rx) = bounded::<I>(depth);
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || -> Result<R, Error> {
@@ -281,14 +291,20 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// `Err`. Useful for best-effort signalling (e.g. sweep's
     /// throttled `StatsRequest`) where dropping the message is
     /// preferable to blocking the producer.
-    pub fn try_send(&self, item: I) -> Result<(), std::sync::mpsc::TrySendError<I>> {
+    pub fn try_send(&self, item: I) -> Result<(), TrySendError<I>> {
         self.tx.try_send(item)
     }
 
     /// Halt-aware bounded variant of [`Pipeline::send`].
     ///
-    /// Polls `try_send` on a 50 ms slice. Between slices, checks
-    /// (1) the [`Halt`] token and (2) the per-call `deadline`. Returns:
+    /// Uses [`crossbeam_channel::Sender::send_timeout`] so the producer
+    /// thread BLOCKS on consumer drain (kernel-wakeup) rather than
+    /// polling. The timeout slice is just the halt-observation cadence
+    /// ([`SEND_HALT_CHECK_INTERVAL`]) — on the happy path the producer
+    /// wakes the instant the consumer drains a slot, so there is no
+    /// throughput cap from this primitive at any medium speed.
+    ///
+    /// Returns:
     ///
     /// - `Ok(())` once the item lands in the channel.
     /// - `Err(item)` if the consumer disconnected, the halt fired, or
@@ -302,36 +318,45 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Unlike [`Pipeline::send`], this never blocks the producer
     /// thread inside an unkillable `mpsc::send` — if the consumer is
     /// wedged inside an unkillable syscall, the producer can still
-    /// observe `/api/stop` and unwind.
+    /// observe `/api/stop` and unwind within
+    /// [`SEND_HALT_CHECK_INTERVAL`].
     pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
+        use crossbeam_channel::SendTimeoutError;
         let end = Instant::now() + deadline;
         let mut pending = item;
         loop {
-            match self.tx.try_send(pending) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) => {
-                    pending = returned;
-                    if halt.is_cancelled() {
-                        if debug_enabled() {
-                            tracing::debug!(
-                                "Pipeline send_with_halt: halt observed, returning item={}",
-                                std::any::type_name::<I>()
-                            );
-                        }
-                        return Err(pending);
-                    }
-                    if Instant::now() >= end {
-                        if debug_enabled() {
-                            tracing::debug!(
-                                "Pipeline send_with_halt: deadline elapsed, returning item={}",
-                                std::any::type_name::<I>()
-                            );
-                        }
-                        return Err(pending);
-                    }
-                    thread::sleep(SEND_POLL_INTERVAL);
+            // Pre-check the cheap exit conditions before parking.
+            if halt.is_cancelled() {
+                if debug_enabled() {
+                    tracing::debug!(
+                        "Pipeline send_with_halt: halt observed, returning item={}",
+                        std::any::type_name::<I>()
+                    );
                 }
-                Err(TrySendError::Disconnected(returned)) => {
+                return Err(pending);
+            }
+            let now = Instant::now();
+            if now >= end {
+                if debug_enabled() {
+                    tracing::debug!(
+                        "Pipeline send_with_halt: deadline elapsed, returning item={}",
+                        std::any::type_name::<I>()
+                    );
+                }
+                return Err(pending);
+            }
+            // Wait for space-available or halt-check tick, whichever
+            // is sooner. Crossbeam's send_timeout is kernel-wakeup
+            // based: the consumer's recv on a saturated channel
+            // signals this thread the moment a slot opens up.
+            let slice = SEND_HALT_CHECK_INTERVAL.min(end.saturating_duration_since(now));
+            match self.tx.send_timeout(pending, slice) {
+                Ok(()) => return Ok(()),
+                Err(SendTimeoutError::Timeout(returned)) => {
+                    pending = returned;
+                    // loop: re-check halt + deadline, then park again
+                }
+                Err(SendTimeoutError::Disconnected(returned)) => {
                     if debug_enabled() {
                         tracing::debug!(
                             "Pipeline send_with_halt: consumer disconnected, item={}",

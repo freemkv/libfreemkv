@@ -28,6 +28,12 @@ base64 = "0.22.1"
 # under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
 # wire a tracing subscriber and pipe events into the JSONL debug log.
 tracing = "0.1"
+# Bounded MPSC channel with kernel-wakeup send_timeout. Used by `io::pipeline`
+# so the halt-aware send/finish loops can BLOCK on consumer drain instead of
+# polling — the 50 ms poll cadence of the previous mpsc-based impl capped mux
+# throughput at ~1 MB/s (see freemkv-private/memory/
+# feedback_send_with_halt_poll_throttle.md, 0.21.7).
+crossbeam-channel = "0.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
