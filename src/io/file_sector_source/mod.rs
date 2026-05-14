@@ -92,18 +92,15 @@ pub struct FileSectorSource {
     /// Total file size in sectors. Constant after construction;
     /// surfaced via [`SectorSource::capacity_sectors`].
     capacity: u32,
-    /// Heap-allocated read-ahead buffer. Boxed slice (not `Vec`) so
-    /// the allocation is sized exactly once and the layout is
-    /// stable. Length is at most [`READAHEAD_BUF_BYTES`].
+    /// 0.21.3+: the app-level buffer is no longer touched on the hot
+    /// path (every `read_sectors` is a direct pread). The fields are
+    /// retained so a future per-source-type policy (e.g. a local-disk
+    /// source where batched reads ARE beneficial) can re-enable
+    /// buffering cleanly without re-plumbing the struct.
+    #[allow(dead_code)]
     buf: Box<[u8]>,
-    /// First LBA covered by `buf`. `buf_len_sectors == 0` means the
-    /// buffer is empty (e.g. immediately after construction or a
-    /// backward seek); the value of `buf_start_lba` is then
-    /// meaningless.
+    #[allow(dead_code)]
     buf_start_lba: u32,
-    /// Number of valid sectors in `buf`. `[buf_start_lba,
-    /// buf_start_lba + buf_len_sectors)` is the half-open LBA range
-    /// the buffer currently caches.
     buf_len_sectors: u32,
 }
 
@@ -150,6 +147,7 @@ impl FileSectorSource {
 
     /// True if `[lba, lba + count)` is wholly inside the current
     /// buffer window. `count == 0` is vacuously true.
+    #[allow(dead_code)]
     fn buffer_covers(&self, lba: u32, count: u32) -> bool {
         if self.buf_len_sectors == 0 {
             return false;
@@ -165,6 +163,7 @@ impl FileSectorSource {
     /// Refill the buffer so it starts at `lba`. Read as many sectors
     /// as we have buffer space AND file capacity for. Caller has
     /// already checked `lba < capacity`.
+    #[allow(dead_code)]
     fn refill(&mut self, lba: u32) -> Result<()> {
         debug_assert!(lba < self.capacity, "refill past capacity");
         // Don't read past EOF — clamp the request to remaining
