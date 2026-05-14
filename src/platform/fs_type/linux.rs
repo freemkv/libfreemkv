@@ -32,8 +32,12 @@ pub(super) fn detect_impl(path: &Path) -> FsType {
     }
     // `f_type` is signed (`__fsword_t`) on glibc and unsigned
     // (`c_ulong`) on musl. Cast both sides to i64 for a portable
-    // comparison.
+    // comparison. On glibc x86_64 both already are i64 — clippy flags
+    // the cast as unnecessary on that target only, but we need it for
+    // musl, so silence the lint.
+    #[allow(clippy::unnecessary_cast)]
     let f_type = buf.f_type as i64;
+    #[allow(clippy::unnecessary_cast)]
     let nfs_magic = libc::NFS_SUPER_MAGIC as i64;
     if f_type == nfs_magic {
         return FsType::Nfs;
