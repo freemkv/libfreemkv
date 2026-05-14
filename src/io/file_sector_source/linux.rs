@@ -1,15 +1,18 @@
-//! Linux: hint the kernel that this fd will be read sequentially so
-//! readahead widens. `posix_fadvise(POSIX_FADV_SEQUENTIAL)` is a hint,
-//! not a guarantee — the kernel still owns the policy decision.
+//! Linux: kernel readahead hint for the ISO file.
+//!
+//! Originally `POSIX_FADV_SEQUENTIAL` to widen the readahead window.
+//! On NFS that turned out to cause aggressive multi-MB readahead bursts
+//! that saturated the TCP connection and starved concurrent writes
+//! during mux — observed empirically as a ~3× drop in mux throughput
+//! on the rip1/unraid-1 setup (0.21.0 vs 0.20.7 baseline). The kernel's
+//! default readahead (~128 KiB on Linux) interleaves more naturally
+//! with the muxer's concurrent NFS writes, so we no longer issue any
+//! hint here. The per-OS file stays so the convention is honoured and
+//! we can re-enable a hint cleanly if a different storage path benefits.
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 
-pub(super) fn hint_sequential(file: &File, _len_bytes: u64) {
-    // Best-effort: return value ignored. A fadvise failure has no
-    // user-observable consequence (reads still work, just without the
-    // widened readahead window).
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-    }
+pub(super) fn hint_sequential(_file: &File, _len_bytes: u64) {
+    // No-op: see module-level comment. Kernel default readahead is
+    // what we want on NFS-backed ISOs, which is the dominant case.
 }

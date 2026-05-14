@@ -65,8 +65,15 @@ use crate::sector::SectorSource;
 /// than per-sector pread, and large enough to coast through a typical
 /// NFS server commit blip.
 ///
+/// 0.21.2: shrunk from 32 MiB → 4 MiB. On NFS-backed ISOs with
+/// concurrent NFS writes (the mux phase), a 32 MiB refill bursts the
+/// TCP connection hard enough to starve the writer thread, observed
+/// empirically as a ~3× drop in sustained mux throughput on the
+/// rip1/unraid-1 setup. 4 MiB matches `rsize=1 MiB` × 4 round-trips
+/// and interleaves cleanly with writes.
+///
 /// Tweakable. Named const, not a magic number.
-pub const READAHEAD_BUF_BYTES: usize = 32 * 1024 * 1024;
+pub const READAHEAD_BUF_BYTES: usize = 4 * 1024 * 1024;
 
 const SECTOR_SIZE: usize = 2048;
 /// Sectors per refill: [`READAHEAD_BUF_BYTES`] / [`SECTOR_SIZE`]. The
