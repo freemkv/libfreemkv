@@ -109,5 +109,6 @@ pub trait SectorSink: Send {
     fn finish(self: Box<Self>) -> Result<()>;
 }
 
+pub use crate::io::file_sector_source::FileSectorSource;
 pub use decrypting::DecryptingSectorSource;
-pub use file::{FileSectorSink, FileSectorSource};
+pub use file::FileSectorSink;
