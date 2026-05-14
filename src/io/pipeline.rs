@@ -34,10 +34,35 @@
 //! consumer lag detection). This is critical for diagnosing stalls.
 
 use std::io;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
+use crate::halt::Halt;
+
+/// Deadline for [`Pipeline::finish_with_halt`]'s polling join. Chosen
+/// to be comfortably longer than the autorip hard watchdog
+/// (`HARD_WATCHDOG_STALL_SECS = 300s`) so the watchdog's `exit(1)`
+/// fires first when both are racing on the same wedged consumer.
+///
+/// 10 minutes is a backstop, not a normal timeout — the consumer is
+/// expected to drain in seconds. If we hit this, something is wedged
+/// inside a kernel call the consumer thread can't unwind from, and the
+/// caller has already lost the rip.
+pub const JOIN_TIMEOUT_SECS: u64 = 600;
+
+/// Polling slice for the halt-aware send/finish loops. Mirrors the
+/// `bounded_syscall` cadence (250 ms) so halt observation feels equally
+/// responsive across both primitives.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Polling slice for the halt-aware send loop. Smaller than
+/// [`POLL_INTERVAL`] because send latency tolerance is much lower —
+/// frames must move through the channel at hundreds-of-Hz on the
+/// happy path; 50 ms keeps backpressure-driven wakeups fine-grained
+/// without busy-looping.
+const SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
 pub fn debug_enabled() -> bool {
@@ -260,6 +285,65 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         self.tx.try_send(item)
     }
 
+    /// Halt-aware bounded variant of [`Pipeline::send`].
+    ///
+    /// Polls `try_send` on a 50 ms slice. Between slices, checks
+    /// (1) the [`Halt`] token and (2) the per-call `deadline`. Returns:
+    ///
+    /// - `Ok(())` once the item lands in the channel.
+    /// - `Err(item)` if the consumer disconnected, the halt fired, or
+    ///   the deadline elapsed — the caller gets the item back so it
+    ///   can decide whether to drop it, route it elsewhere, or unwind.
+    ///
+    /// Use this in producer threads that have a `Halt` token threaded
+    /// through (mux, sweep, patch). Plain [`Pipeline::send`] is
+    /// preserved for callers that don't (yet) plumb halt through.
+    ///
+    /// Unlike [`Pipeline::send`], this never blocks the producer
+    /// thread inside an unkillable `mpsc::send` — if the consumer is
+    /// wedged inside an unkillable syscall, the producer can still
+    /// observe `/api/stop` and unwind.
+    pub fn send_with_halt(&self, item: I, halt: &Halt, deadline: Duration) -> Result<(), I> {
+        let end = Instant::now() + deadline;
+        let mut pending = item;
+        loop {
+            match self.tx.try_send(pending) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    pending = returned;
+                    if halt.is_cancelled() {
+                        if debug_enabled() {
+                            tracing::debug!(
+                                "Pipeline send_with_halt: halt observed, returning item={}",
+                                std::any::type_name::<I>()
+                            );
+                        }
+                        return Err(pending);
+                    }
+                    if Instant::now() >= end {
+                        if debug_enabled() {
+                            tracing::debug!(
+                                "Pipeline send_with_halt: deadline elapsed, returning item={}",
+                                std::any::type_name::<I>()
+                            );
+                        }
+                        return Err(pending);
+                    }
+                    thread::sleep(SEND_POLL_INTERVAL);
+                }
+                Err(TrySendError::Disconnected(returned)) => {
+                    if debug_enabled() {
+                        tracing::debug!(
+                            "Pipeline send_with_halt: consumer disconnected, item={}",
+                            std::any::type_name::<I>()
+                        );
+                    }
+                    return Err(returned);
+                }
+            }
+        }
+    }
+
     /// Drop the producer-side channel and wait for the consumer
     /// thread to finish. Returns whatever the consumer's `close()`
     /// produced, or the first `apply` error, or — on consumer panic —
@@ -287,6 +371,69 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     source: io::Error::other(format!("pipeline consumer panicked: {msg}")),
                 })
             }
+        }
+    }
+
+    /// Halt-aware, deadline-bounded variant of [`Pipeline::finish`].
+    ///
+    /// Drops the producer-side channel (same as `finish`) and then
+    /// polls `JoinHandle::is_finished()` on a 250 ms cadence. Between
+    /// slices, checks (1) the optional [`Halt`] token and (2) the
+    /// [`JOIN_TIMEOUT_SECS`] deadline. Returns:
+    ///
+    /// - `Ok(R)` on a clean consumer exit.
+    /// - `Err(Error::IoError)` with one of three message prefixes for
+    ///   wedge cases:
+    ///   - `"pipeline join halted"` — halt fired while waiting.
+    ///   - `"pipeline join timed out"` — `JOIN_TIMEOUT_SECS` elapsed.
+    ///   - `"pipeline consumer panicked"` — same as `finish()`.
+    ///
+    /// In the `halted` and `timed out` branches the consumer thread is
+    /// intentionally leaked — exactly the same trade-off the
+    /// `bounded_syscall` primitive makes. The wedged kernel call
+    /// inside the consumer will unwind whenever it does, or at
+    /// process exit. The caller is free to fall back to a degraded
+    /// path (in autorip's case: `exit(1)` after the hard watchdog
+    /// escalation, letting Docker restart the container).
+    ///
+    /// Plain [`Pipeline::finish`] is preserved for callers without a
+    /// halt-token plumbed through; that path still blocks indefinitely
+    /// on `join()`, matching pre-0.20.8 behaviour.
+    pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
+        let Pipeline { tx, handle } = self;
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
+        loop {
+            if handle.is_finished() {
+                return match handle.join() {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&'static str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                            .unwrap_or("(no message)");
+                        Err(Error::IoError {
+                            source: io::Error::other(format!("pipeline consumer panicked: {msg}")),
+                        })
+                    }
+                };
+            }
+            if let Some(h) = halt {
+                if h.is_cancelled() {
+                    // Consumer thread is intentionally leaked.
+                    return Err(Error::IoError {
+                        source: io::Error::other("pipeline join halted"),
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                // Consumer thread is intentionally leaked.
+                return Err(Error::IoError {
+                    source: io::Error::other("pipeline join timed out"),
+                });
+            }
+            thread::sleep(POLL_INTERVAL);
         }
     }
 }
@@ -552,5 +699,195 @@ mod tests {
             }
             other => panic!("expected Err(IoError), got {other:?}"),
         }
+    }
+
+    /// Never-completing sink — `apply` blocks until cancelled. Signals
+    /// `started` once it has consumed its first item so the test
+    /// driver knows the consumer thread is wedged in `apply` (and
+    /// will no longer drain the channel). Used to drive the
+    /// halt/timeout paths of `send_with_halt` and `finish_with_halt`
+    /// without depending on real I/O.
+    struct NeverDrainsSink {
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Sink<u64> for NeverDrainsSink {
+        type Output = ();
+
+        fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.cancel.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(Flow::Continue)
+        }
+
+        fn close(self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Spin until `started` flips or `bail` elapses. Used by the
+    /// send_with_halt tests to synchronise with the consumer thread
+    /// before exercising the bounded-send timeout path.
+    fn wait_for_started(started: &Arc<std::sync::atomic::AtomicBool>, bail: Duration) {
+        let end = Instant::now() + bail;
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < end, "consumer never started apply()");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn send_with_halt_returns_item_on_deadline() {
+        // depth=1 + consumer wedged in apply on the first item, AND
+        // the channel buffer already loaded with a second item, means
+        // any further `try_send` sees Full; with a 200 ms deadline and
+        // no halt fired, send_with_halt must return `Err(item)` within
+        // roughly the deadline. Synchronising on `started` ensures the
+        // consumer has actually started its wedged apply BEFORE we
+        // load the channel-buffer slot — without that, the consumer
+        // could still drain in a race window.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            1,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn should succeed");
+        // First send: consumer recv()s it and wedges in apply.
+        pipe.send(0u64).expect("first send hands off to consumer");
+        wait_for_started(&started, Duration::from_secs(2));
+        // Second send: lands in the depth=1 buffer slot, consumer
+        // can't pick it up because it's wedged in apply. Channel now
+        // full from the producer's perspective.
+        pipe.send(1u64).expect("second send fills the buffer");
+
+        let halt = crate::halt::Halt::new();
+        let start = Instant::now();
+        let res = pipe.send_with_halt(99u64, &halt, Duration::from_millis(200));
+        let elapsed = start.elapsed();
+
+        // Release the leaked consumer so the test process winds down.
+        cancel.store(true, Ordering::SeqCst);
+        let _ = pipe.finish();
+
+        assert!(matches!(res, Err(99)), "expected item returned on deadline");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "deadline returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "deadline blew past tolerance: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn send_with_halt_returns_item_on_halt() {
+        // Same setup, but the halt fires before the deadline elapses.
+        // The send loop must observe the halt within ~50 ms (the
+        // SEND_POLL_INTERVAL) and return the item.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            1,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn should succeed");
+        pipe.send(0u64).expect("first send hands off to consumer");
+        wait_for_started(&started, Duration::from_secs(2));
+        pipe.send(1u64).expect("second send fills the buffer");
+
+        let halt = crate::halt::Halt::new();
+        let halt2 = halt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            halt2.cancel();
+        });
+
+        let start = Instant::now();
+        let res = pipe.send_with_halt(7u64, &halt, Duration::from_secs(10));
+        let elapsed = start.elapsed();
+
+        cancel.store(true, Ordering::SeqCst);
+        let _ = pipe.finish();
+
+        assert!(matches!(res, Err(7)), "expected item returned on halt");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "halt observation took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn finish_with_halt_returns_halted_when_consumer_wedged() {
+        // Consumer wedges on the first apply; halt fires; finish
+        // returns the documented "pipeline join halted" error rather
+        // than blocking forever.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn should succeed");
+        pipe.send(0u64).expect("seed item the consumer wedges on");
+        wait_for_started(&started, Duration::from_secs(2));
+
+        let halt = crate::halt::Halt::new();
+        let halt2 = halt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            halt2.cancel();
+        });
+
+        let start = Instant::now();
+        let res = pipe.finish_with_halt(Some(&halt));
+        let elapsed = start.elapsed();
+
+        // Release the leaked consumer so the test process exits cleanly.
+        cancel.store(true, Ordering::SeqCst);
+
+        match res {
+            Err(Error::IoError { source }) => {
+                assert!(
+                    source.to_string().contains("pipeline join halted"),
+                    "expected halt-prefix error, got: {source}"
+                );
+            }
+            other => panic!("expected Err(IoError) halted, got {other:?}"),
+        }
+        // Bailed out within ~1 second of the halt firing (worst case
+        // one POLL_INTERVAL = 250 ms of slack).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "halt observation took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn finish_with_halt_happy_path_returns_output() {
+        // No halt token, sink completes normally — finish_with_halt
+        // must return the same Output that `finish` would.
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 })
+            .expect("spawn should succeed");
+        for i in 0..10u64 {
+            pipe.send(i).expect("send should succeed");
+        }
+        let total = pipe
+            .finish_with_halt(None)
+            .expect("happy-path finish_with_halt should succeed");
+        assert_eq!(total, (0..10u64).sum::<u64>());
     }
 }
