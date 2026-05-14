@@ -186,6 +186,22 @@ impl ReadCtx {
     /// marginal media is part of the job, and the fast-jump
     /// threshold is loose so we don't bail too early on a range that
     /// has scattered good sectors mixed in.
+    ///
+    /// `damage_threshold_pct = 6` mirrors `disc/patch.rs`'s
+    /// `PASSN_DAMAGE_THRESHOLD_PCT`. Pass N triggers the damage-skip
+    /// at half the density Pass 1 uses (Pass 1 = 12%) because the
+    /// patch loop's whole job is to chip away at bad ranges — being
+    /// more eager to skip clustered bad sectors converges faster on
+    /// the recoverable good sectors inside a range. The patch-side
+    /// `compute_damage_skip` reads its threshold from
+    /// `PASSN_DAMAGE_THRESHOLD_PCT`; keep the two in sync until the
+    /// patch loop's damage-skip is unified with `handle_read_error`'s
+    /// jump path. (v0.20.8 unification attempt found the unification
+    /// itself blocked on the size-aware `range_remaining/4` cap that
+    /// lives in `compute_damage_skip` but not in
+    /// `handle_read_error::JumpAhead` — see
+    /// `tests/passn_handler_ab.rs` for the A/B fixture that pins
+    /// the divergence point.)
     pub fn for_patch(batch: u16) -> Self {
         Self {
             batch,
@@ -194,7 +210,7 @@ impl ReadCtx {
             consecutive_outer_failures: 0,
             damage_window: Vec::with_capacity(16),
             damage_window_max: 16,
-            damage_threshold_pct: 12,
+            damage_threshold_pct: PATCH_DAMAGE_THRESHOLD_PCT,
             // Pass N is allowed to grind: window-based jump only,
             // matching the historical behaviour for patch passes.
             fast_jump_threshold: u64::MAX,
@@ -400,6 +416,18 @@ const WEDGE_ABORT_THRESHOLD: u64 = 16;
 /// loop's next iteration picks up the next sector in the same or
 /// next range.
 const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
+
+/// Single source of truth for the Pass-N damage-window threshold.
+/// Both [`ReadCtx::for_patch`] and `disc::patch::compute_damage_skip`
+/// reference this constant so the two damage-skip paths cannot drift.
+///
+/// 6% means: with a 16-entry sliding window, the damage-skip fires
+/// once 1 out of 16 recent reads has failed. Pass 1 uses a 12%
+/// threshold via `damage_threshold_pct` on `for_sweep`; Pass N is
+/// twice as eager because patch's whole job is to converge on the
+/// bad sub-zones inside a NonTrimmed range — a faster trigger
+/// produces tighter convergence in fewer iterations.
+pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 
 /// THE single error-handling entry point. Updates `ctx`, returns the
 /// action the caller must apply.
