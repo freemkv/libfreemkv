@@ -10,11 +10,22 @@
 //! no-op pipeline — their default cache policies have not been shown
 //! to exhibit the same pathology for this access pattern.
 //!
+//! `FileSectorSource` is the read-side dual — it implements
+//! [`crate::sector::SectorSource`] for an ISO file with an internal
+//! 32 MiB read-ahead buffer that amortises NFS round-trip latency
+//! across thousands of sector reads.
+//!
 //! `Pipeline` + `Sink` (0.18) is the generic producer/consumer primitive
 //! used by sweep, patch, and mux to overlap reads with writes via a
 //! bounded channel + dedicated consumer thread.
+//!
+//! `byte_channel` is a byte-sized producer/consumer channel for the
+//! mux pipeline, sized to absorb worst-case input read stalls (see
+//! `freemkv-private/memory/project_buffering_architecture.md`).
 
 pub(crate) mod bounded;
+pub mod byte_channel;
+pub mod file_sector_source;
 mod writeback;
 mod writeback_file;
 

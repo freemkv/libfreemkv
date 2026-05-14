@@ -20,6 +20,34 @@
 //!
 //! See `super::writeback::linux` for the underlying pathology and the
 //! strategy.
+//!
+//! ## Platform split
+//!
+//! The platform-specific pieces of this wrapper — extent preallocation
+//! (Linux `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows
+//! `SetFileValidData`) and the durable-flush primitive (Linux/macOS
+//! `fsync`/`F_FULLFSYNC` wrapped in a bounded syscall, Windows
+//! `FlushFileBuffers`) — live in per-OS sibling modules. The dispatch
+//! happens once at the bottom of this file via cfg-gated `mod` decls.
+//! No inline `#[cfg(target_os = "...")]` in the business-logic above.
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+mod other;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+use other as platform;
+#[cfg(target_os = "windows")]
+use windows as platform;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -65,43 +93,20 @@ impl WritebackFile {
     }
 
     /// Like [`Self::create`] but pre-reserves `size_bytes` of disk
-    /// space via `fallocate(FALLOC_FL_KEEP_SIZE)` on Linux. The
-    /// reported file size is unchanged (writes still grow the file
-    /// naturally) — only the on-disk extent allocation is preallocated,
-    /// which reduces extent fragmentation on large sequential writes
-    /// (mux output, especially on slow storage / NFS).
+    /// space via the platform's extent-preallocation primitive (Linux
+    /// `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows
+    /// `SetFileValidData` stub). The reported file size is unchanged
+    /// (writes still grow the file naturally) — only the on-disk extent
+    /// allocation is preallocated, which reduces extent fragmentation
+    /// on large sequential writes (mux output, especially on slow
+    /// storage / NFS).
     ///
-    /// On macOS / Windows the size hint is ignored and this is
-    /// equivalent to `create`.
+    /// On platforms without an extent-preallocation primitive this is
+    /// equivalent to `create` — the size hint is dropped after a debug
+    /// log.
     pub(crate) fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            // FALLOC_FL_KEEP_SIZE = 0x01 — keep the reported file
-            // size at 0 (writes grow it normally) while still
-            // pre-reserving the extents.
-            let rc = unsafe {
-                libc::fallocate(
-                    file.as_raw_fd(),
-                    libc::FALLOC_FL_KEEP_SIZE,
-                    0,
-                    size_bytes as i64,
-                )
-            };
-            tracing::debug!(
-                target: "mux",
-                "WritebackFile fallocate size_hint={size_bytes} rc={rc} ok={}",
-                rc == 0
-            );
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            tracing::debug!(
-                target: "mux",
-                "WritebackFile fallocate size_hint={size_bytes} skipped (non-linux)"
-            );
-        }
+        platform::preallocate(&file, size_bytes);
         Self::new(file)
     }
 
@@ -118,7 +123,8 @@ impl WritebackFile {
     /// place of `File::sync_all`.
     ///
     /// The final fsync is wrapped in
-    /// [`crate::io::bounded::bounded_syscall`] with a 60 s deadline.
+    /// [`crate::io::bounded::bounded_syscall`] with a 60 s deadline on
+    /// platforms that have a usable bounded primitive (Linux + macOS).
     /// fsync on a wedged NFS server (or a degraded local disk) can
     /// hang the calling thread; the wrapper ensures the worst case is
     /// 60 s + log-and-continue rather than indefinite. On timeout the
@@ -126,39 +132,7 @@ impl WritebackFile {
     /// best effort, but bounded.
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
         self.pipeline.finalize();
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            use std::time::Duration;
-            let fd = self.file.as_raw_fd();
-            match crate::io::bounded::bounded_syscall(
-                None,
-                Duration::from_secs(60),
-                move || -> io::Result<()> {
-                    let rc = unsafe { libc::fsync(fd) };
-                    if rc == 0 {
-                        Ok(())
-                    } else {
-                        Err(io::Error::last_os_error())
-                    }
-                },
-            ) {
-                Ok(inner) => inner,
-                Err(crate::io::bounded::BoundedError::Timeout) => {
-                    tracing::error!(
-                        target: "mux",
-                        "WritebackFile::sync_all fsync timed out after 60s; kernel will flush on close (best-effort)"
-                    );
-                    Ok(())
-                }
-                Err(crate::io::bounded::BoundedError::Halted) => Ok(()),
-                Err(crate::io::bounded::BoundedError::WorkerLost) => Ok(()),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            self.file.sync_all()
-        }
+        platform::durable_sync(&self.file)
     }
 }
 
