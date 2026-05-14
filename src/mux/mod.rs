@@ -33,6 +33,17 @@ pub(crate) mod m2ts;
 /// to round-trip codec_privates that don't fit inside the underlying format).
 /// Exposed for integration tests that exercise the wire format directly.
 pub mod meta;
+
+// ── Phase 3 sequential muxers ──────────────────────────────────────────────
+//
+// New container muxers that consume PES frames and write to a
+// `SequentialSink`. They are NOT refactors of the existing `MkvStream` /
+// `M2tsStream` (which round-trip via the legacy `Stream` trait + the
+// BD-TS framing); they're sequential-only and target the Phase 2 sink
+// split end-to-end.
+pub mod fmp4;
+pub mod hevc;
+pub mod m2ts_mux;
 pub(crate) mod mkv;
 pub(crate) mod mkvstream;
 pub(crate) mod network;
