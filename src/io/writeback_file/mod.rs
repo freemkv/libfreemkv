@@ -121,10 +121,24 @@ use std::thread::{self, JoinHandle};
 
 use super::writeback::WritebackPipeline;
 
-/// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs. 32 MiB is the
-/// historical default — bounded-cache pressure stays at ~2 × this size.
-const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// Initial granularity at which the Linux writeback pipeline issues
+/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs. The pipeline's
+/// adaptive autotuner grows/shrinks this between
+/// [`super::writeback::linux::CHUNK_BYTES_MIN`] and `CHUNK_BYTES_MAX`
+/// based on p95 of `WAIT_AFTER` latency.
+///
+/// 0.21.14: bumped from 32 MiB to 128 MiB. On NFS,
+/// `sync_file_range(WAIT_AFTER)` translates to an NFS COMMIT RPC whose
+/// completion ack arrives within ~10 ms (measured via mountstats), so
+/// the adaptive autotuner — which only grows when p95 > 200 ms —
+/// never triggered and the pipeline sat at 32 MiB forever, paying
+/// COMMIT-RPC overhead per ~1 s of writes. Empirical 2026-05-15:
+/// bidirectional mux on rip1 capped at ~29 MB/s write side while the
+/// rig's bidirectional dd ceiling is ~91 MB/s write + ~65 MB/s read.
+/// At a larger initial chunk the COMMIT cadence drops 4×, leaving
+/// the dirty-cache invariant intact (bounded at ~2 × chunk = 256 MiB,
+/// well under the kernel's `vm.dirty_ratio` cap on a 32 GB rig).
+const WRITEBACK_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Maximum bytes outstanding in the muxer → writer-thread ring. Sized
 /// to cover ~4 s of muxer output at a 32 MB/s peak — enough to absorb a
