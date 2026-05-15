@@ -92,10 +92,16 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// consumer blocks on write.
 pub const READ_PIPELINE_DEPTH: usize = 32;
 
-/// Write pipeline depth. Smaller buffer reduces backpressure risk when
-/// sync_file_range blocks; prevents producer from accumulating too much
-/// work while consumer waits for NFS to drain.
-pub const WRITE_PIPELINE_DEPTH: usize = 16;
+/// Write pipeline depth. 0.21.8 restored the writer-thread + 128 MiB
+/// byte-bounded ring inside WritebackFile, which absorbs kernel
+/// writeback stalls downstream of this channel. The pre-0.21.8
+/// rationale ("smaller buffer reduces backpressure risk when
+/// sync_file_range blocks") no longer applies — `sync_file_range` only
+/// hits the writer thread, never this channel. Doubling 16 → 32 gives
+/// the matroska builder headroom to keep emitting frames when the sink
+/// momentarily lags behind, smoothing out the 5-50 MB/s instantaneous
+/// burst pattern observed on NFS bidirectional workloads at 0.21.8.
+pub const WRITE_PIPELINE_DEPTH: usize = 32;
 
 /// Channel depth for write-through pipelines. Each `send` fully
 /// drains before the next can enqueue. Use this when the producer
