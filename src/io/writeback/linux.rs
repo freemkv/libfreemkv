@@ -22,21 +22,24 @@
 //! fast storage (NVMe) sees smaller chunks to keep cache pressure
 //! tight. Bounds: [4 MiB, 256 MiB].
 //!
-//! ## NFS escape hatch
+//! ## NFS — same path, same safety net
 //!
-//! `sync_file_range(WAIT_AFTER)` on an NFS-mounted file can block
-//! indefinitely waiting for the server's commit ack. If the server
-//! never acks (network partition, server-side hang, slow commit), the
-//! syscall never returns and the consumer thread is stuck inside the
-//! kernel — `/api/stop` can't reach it because halt is cooperative.
+//! Earlier revisions of this code unconditionally skipped WAIT_AFTER +
+//! `posix_fadvise(DONTNEED)` on NFS-mounted files, on the premise that
+//! "NFS clients have their own buffering and commit semantics that
+//! handle dirty-page bounds without us forcing the issue." That premise
+//! was empirically wrong: on Linux NFS clients dirty pages still
+//! accumulate up to `vm.dirty_ratio` (default 20% of RAM, ~6.6 GB on a
+//! 32 GB box) before the kernel forces writeback and throttles app
+//! writes. Mux throughput on NFS therefore cycled between ~50 MB/s
+//! (cache absorbing) and ~10 MB/s (cache draining under throttle) on
+//! a ~100 s period — exactly the pathology this pipeline was built to
+//! fix, but disabled on the medium where it actually mattered.
 //!
-//! When `fstatfs` reports the file lives on an NFS mount
-//! (`f_type == NFS_SUPER_MAGIC`), the pipeline skips the WAIT_AFTER +
-//! `posix_fadvise(DONTNEED)` dance entirely. NFS clients have their
-//! own buffering and commit semantics that handle dirty-page bounds
-//! without us forcing the issue. The async `SYNC_FILE_RANGE_WRITE`
-//! kickoff still runs (non-blocking by spec) so writeback still gets
-//! a nudge.
+//! `is_nfs` is still detected (for logging and observability) but
+//! `skip_wait` no longer keys off it. WAIT_AFTER + DONTNEED run on NFS
+//! exactly as on local storage. The safety net described below
+//! (`WAIT_AFTER_TIMEOUT`) catches the original NFS-hang concern.
 //!
 //! ## Defence in depth: WAIT_AFTER timeout
 //!
@@ -113,8 +116,8 @@ impl WritebackPipeline {
         let is_nfs = detect_nfs(fd);
         tracing::info!(
             target: "mux",
-            "WritebackPipeline fd={fd} is_nfs={is_nfs} chunk_bytes={chunk_bytes} strategy={}",
-            if is_nfs { "nfs-skip-wait" } else { "wait+dontneed" }
+            "WritebackPipeline fd={fd} is_nfs={is_nfs} chunk_bytes={chunk_bytes} strategy=wait+dontneed (falls back to skip if WAIT_AFTER timeouts past {}s)",
+            WAIT_AFTER_TIMEOUT.as_secs(),
         );
         Self {
             fd,
@@ -129,11 +132,15 @@ impl WritebackPipeline {
     }
 
     /// True if we should bypass the WAIT_AFTER + DONTNEED finalisation
-    /// step. NFS always bypasses; local storage bypasses once the
-    /// pipeline has flipped to degraded after a WAIT_AFTER timeout.
+    /// step. The pipeline starts in the normal path on every medium
+    /// (NFS, local, etc.) and flips here only if a real
+    /// `WAIT_AFTER` call exceeds [`WAIT_AFTER_TIMEOUT`] — at which
+    /// point we conclude this particular FS/server combination cannot
+    /// safely service WAIT_AFTER and fall back to skip mode for the
+    /// rest of the pipeline's life. See module-level comment.
     #[inline]
     fn skip_wait(&self) -> bool {
-        self.is_nfs || self.degraded.load(Ordering::Relaxed)
+        self.degraded.load(Ordering::Relaxed)
     }
 
     /// Caller advanced the file position to `pos`. If a chunk boundary
