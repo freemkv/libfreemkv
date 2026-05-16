@@ -638,41 +638,11 @@ struct WriterState {
     shared: Arc<Shared>,
 }
 
-/// Target byte budget for coalescing consecutive `Cmd::Write` commands
-/// into a single `file.write_all` syscall. Sized to match NFS wsize on
-/// rip1 (1 MiB), which is also the kernel default for most filesystems
-/// and a reasonable upper bound for a single block-layer write on any
-/// medium. The medium-specific syscall path may split further; that's
-/// the kernel's job, not ours.
-///
-/// 0.21.11 added coalescing because pre-coalescing the writer thread
-/// emitted one syscall per muxer `Write` call (typically 30-200 KB PES
-/// frames), and on NFS that translates to one RPC per syscall, capping
-/// throughput at `(wsize / rtt) × inflight` — well below what the same
-/// disk delivers under a 1 MiB `dd oflag=direct` workload (~71 MB/s
-/// empirical 2026-05-15 vs ~25 MB/s sustained mux). Bigger app writes
-/// = fewer NFS RPCs = better throughput on the same hardware.
-const WRITE_COALESCE_TARGET_BYTES: usize = 1024 * 1024;
-
-/// One unit of work pulled off the ring. Either a coalesced run of
-/// consecutive `Cmd::Write` commands (batched into a single
-/// `file.write_all`) or a single non-write command.
-enum DequeuedWork {
-    /// At least one consecutive `Cmd::Write` buffer, total length
-    /// bounded by [`WRITE_COALESCE_TARGET_BYTES`] (except when a
-    /// single `Cmd::Write` already exceeds the budget — in which case
-    /// it's returned alone). Coalesced and issued to the kernel as one
-    /// write_all.
-    Writes(Vec<Vec<u8>>),
-    /// A single non-`Write` command (Seek / Flush / SyncAll / Finish).
-    Other(Cmd),
-}
-
 impl WriterState {
     fn run(&mut self) {
         loop {
-            let work = match self.dequeue_work() {
-                Some(w) => w,
+            let cmd = match self.dequeue() {
+                Some(c) => c,
                 None => {
                     // All senders dropped (handle leaked); mark
                     // writer_gone and exit. The Drop join will surface
@@ -681,48 +651,28 @@ impl WriterState {
                     return;
                 }
             };
-            match work {
-                DequeuedWork::Writes(bufs) => {
-                    // Single-buffer fast path: skip the concat alloc.
-                    // For the multi-buffer case, concatenate into a
-                    // single contiguous slice so the kernel sees one
-                    // write_all syscall — on NFS this becomes one RPC
-                    // (per inflight slot) instead of N small RPCs,
-                    // which is the whole point.
-                    let result = if bufs.len() == 1 {
-                        self.do_write(&bufs[0])
-                    } else {
-                        let total: usize = bufs.iter().map(|b| b.len()).sum();
-                        let mut concat = Vec::with_capacity(total);
-                        for b in &bufs {
-                            concat.extend_from_slice(b);
-                        }
-                        self.do_write(&concat)
-                    };
-                    if let Err(e) = result {
+            match cmd {
+                Cmd::Write(buf) => {
+                    if let Err(e) = self.do_write(&buf) {
                         self.publish_error(e.kind());
                     }
                 }
-                DequeuedWork::Other(Cmd::Write(_)) => {
-                    // dequeue_work places all Writes into DequeuedWork::Writes.
-                    unreachable!("DequeuedWork::Other never wraps Cmd::Write");
-                }
-                DequeuedWork::Other(Cmd::Seek(from)) => {
+                Cmd::Seek(from) => {
                     if let Err(e) = self.do_seek(from) {
                         self.publish_error(e.kind());
                     }
                 }
-                DequeuedWork::Other(Cmd::Flush) => {
+                Cmd::Flush => {
                     // No-op for now (see note on `Cmd::Flush`).
                 }
-                DequeuedWork::Other(Cmd::SyncAll { done }) => {
+                Cmd::SyncAll { done } => {
                     let r = self.do_sync_all();
                     // Ignore send errors: if the muxer dropped the
                     // receiver (cancelled wait), there's nothing to
                     // do.
                     let _ = done.send(r);
                 }
-                DequeuedWork::Other(Cmd::Finish { done }) => {
+                Cmd::Finish { done } => {
                     // Drain pipeline tail; do not fsync. Mark
                     // `writer_gone` so any racing `push_command` after
                     // this returns BrokenPipe instead of queueing into
@@ -736,54 +686,21 @@ impl WriterState {
         }
     }
 
-    /// Block until at least one command is available, then drain a
-    /// unit of work. Consecutive `Cmd::Write` commands at the front of
-    /// the queue are coalesced into a single `DequeuedWork::Writes`
-    /// (up to [`WRITE_COALESCE_TARGET_BYTES`] total). Non-write
-    /// commands break the run and are returned as `DequeuedWork::Other`
-    /// one at a time, preserving their ordering relative to writes.
-    /// Notifies the muxer side once after the dequeue completes so
-    /// ring-full waiters wake.
-    fn dequeue_work(&mut self) -> Option<DequeuedWork> {
+    /// Block until at least one command is available, then return it.
+    /// Notifies the muxer side that bytes are free.
+    fn dequeue(&mut self) -> Option<Cmd> {
         let mut guard = self.shared.state.lock().unwrap();
         loop {
-            if guard.queue.is_empty() {
-                guard = self.shared.work_available.wait(guard).unwrap();
-                continue;
-            }
-            // Branch on whether the front is a Write or something else.
-            if matches!(guard.queue.front(), Some(Cmd::Write(_))) {
-                let mut bufs: Vec<Vec<u8>> = Vec::new();
-                let mut total_bytes: usize = 0;
-                while let Some(front_len) = guard.queue.front().and_then(|c| match c {
-                    Cmd::Write(b) => Some(b.len()),
-                    _ => None,
-                }) {
-                    // Always admit the first write (even if oversize)
-                    // so a giant single buffer still makes progress.
-                    // Stop before exceeding the target on subsequent
-                    // additions.
-                    if !bufs.is_empty() && total_bytes + front_len > WRITE_COALESCE_TARGET_BYTES {
-                        break;
-                    }
-                    match guard.queue.pop_front() {
-                        Some(Cmd::Write(b)) => {
-                            total_bytes += b.len();
-                            guard.bytes_inflight = guard.bytes_inflight.saturating_sub(b.len());
-                            bufs.push(b);
-                        }
-                        _ => unreachable!("front was Cmd::Write per the peek above"),
-                    }
+            if let Some(cmd) = guard.queue.pop_front() {
+                if let Cmd::Write(ref buf) = cmd {
+                    guard.bytes_inflight = guard.bytes_inflight.saturating_sub(buf.len());
                 }
                 drop(guard);
                 self.shared.space_available.notify_all();
-                return Some(DequeuedWork::Writes(bufs));
-            } else {
-                let cmd = guard.queue.pop_front().expect("front was non-empty");
-                drop(guard);
-                self.shared.space_available.notify_all();
-                return Some(DequeuedWork::Other(cmd));
+                return Some(cmd);
             }
+            // Queue is empty. Wait for new work.
+            guard = self.shared.work_available.wait(guard).unwrap();
         }
     }
 
