@@ -22,48 +22,34 @@
 //! fast storage (NVMe) sees smaller chunks to keep cache pressure
 //! tight. Bounds: [4 MiB, 256 MiB].
 //!
-//! ## Medium-agnostic by construction
+//! ## NFS escape hatch
 //!
-//! `sync_file_range(WAIT_AFTER)` runs on every medium (local FS, NFS,
-//! etc.). It bounds the dirty-page set at ~2 × `chunk_bytes` by
-//! waiting for each chunk's kernel writeback to complete before
-//! advancing. There is no `if is_nfs` branch in the hot path. The
-//! safety net described below ([`WAIT_AFTER_TIMEOUT`]) handles wedged
-//! filesystems generically: if a particular FS proves unable to ack
-//! `WAIT_AFTER` within the deadline, the pipeline flips to `degraded`
-//! and skips for the rest of its life. That covers the original
-//! NFS-hang concern (network partition, server stuck on commit)
-//! without baking the failure mode into a per-FS branch.
+//! `sync_file_range(WAIT_AFTER)` on an NFS-mounted file can block
+//! indefinitely waiting for the server's commit ack. If the server
+//! never acks (network partition, server-side hang, slow commit), the
+//! syscall never returns and the consumer thread is stuck inside the
+//! kernel — `/api/stop` can't reach it because halt is cooperative.
 //!
-//! **No `posix_fadvise(DONTNEED)` after the wait.** Earlier revisions
-//! evicted the just-WAIT_AFTER'd range from the page cache on the
-//! theory that bounding *dirty* pages required also bounding *clean*
-//! pages. That was unnecessary and counterproductive: clean cached
-//! pages cost nothing (the kernel reclaims them under LRU when memory
-//! is needed) and DONTNEED forces a read-modify-write on any
-//! subsequent in-window write — exactly the pattern matroska
-//! cluster-size backpatches produce, costing ~40-50% of measured NFS
-//! write bandwidth in empirical tests 2026-05-15/16.
-//!
-//! Medium detection happens *exactly once*, at construction, and
-//! produces *exactly one* value: the initial `chunk_bytes` seed for
-//! the autotuner. The detector's job is to give the autotuner a
-//! decent starting point on cold start; from there p95 of WAIT_AFTER
-//! latency drives all subsequent decisions, identically on every
-//! medium.
+//! When `fstatfs` reports the file lives on an NFS mount
+//! (`f_type == NFS_SUPER_MAGIC`), the pipeline skips the WAIT_AFTER +
+//! `posix_fadvise(DONTNEED)` dance entirely. NFS clients have their
+//! own buffering and commit semantics that handle dirty-page bounds
+//! without us forcing the issue. The async `SYNC_FILE_RANGE_WRITE`
+//! kickoff still runs (non-blocking by spec) so writeback still gets
+//! a nudge.
 //!
 //! ## Defence in depth: WAIT_AFTER timeout
 //!
-//! A degraded disk, wedged NFS server, or odd FS driver could in
-//! principle hang inside WAIT_AFTER. Each call runs on a worker
-//! thread with a 30s recv_timeout on its result channel
-//! ([`crate::io::bounded::bounded_syscall`]). On timeout the pipeline
-//! flips to `degraded`, logs a loud error, and skips WAIT_AFTER for
-//! the rest of its life. The worker thread is intentionally leaked —
-//! it unwinds whenever the syscall eventually returns or the process
-//! exits. The mux continues; the original dirty-burst pathology
-//! re-emerges only on the specific (medium, server, FS) combination
-//! that actually wedged.
+//! Even on local storage, a degraded disk or odd filesystem driver
+//! could in principle wedge inside WAIT_AFTER. Each WAIT_AFTER call
+//! runs on a worker thread with a 30s recv_timeout on its result
+//! channel. On timeout we log a loud error, set a `degraded` flag,
+//! and from then on skip WAIT_AFTER + DONTNEED for the rest of the
+//! pipeline's life (same shape as the NFS path). The worker thread
+//! is intentionally leaked — it unwinds whenever the syscall
+//! eventually returns or the process exits. The mux continues; the
+//! original dirty-burst pathology re-emerges but the rip can still
+//! finish instead of freezing.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -101,9 +87,11 @@ pub(crate) struct WritebackPipeline {
     /// Count of chunks emitted (used to space out periodic
     /// `debug!` size snapshots).
     chunk_count: u64,
-    /// What `detect_storage_class` saw at construction. Carried for
-    /// diagnostic logging only — *not* keyed off in the hot path.
-    storage_class: StorageClass,
+    /// True when the underlying file is on an NFS mount. NFS makes
+    /// WAIT_AFTER unsafe (can block forever on missing server ack), so
+    /// we skip it entirely and let the NFS client handle commit on
+    /// close.
+    is_nfs: bool,
     /// Set the first time WAIT_AFTER exceeds [`WAIT_AFTER_TIMEOUT`].
     /// Once set, behaviour matches the NFS path for the rest of the
     /// pipeline's life. Wrapped in `Arc` only because both this
@@ -120,25 +108,13 @@ impl WritebackPipeline {
     /// returned `WritebackPipeline` MUST be dropped before `file`
     /// itself, or kept inside the same struct that owns `file` — the
     /// alias is unchecked.
-    ///
-    /// `chunk_bytes_hint` is the caller's preferred starting chunk
-    /// size; the constructor overrides it with a medium-specific
-    /// initial seed if `detect_storage_class` recognises the fd's
-    /// filesystem. The autotuner then drives the value from there
-    /// based on measured `WAIT_AFTER` latency, identically on every
-    /// medium.
-    pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes_hint: u64) -> Self {
+    pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         let fd = file.as_raw_fd();
-        let (class, seed) = detect_storage_class(fd);
-        // Medium-aware initial seed: bias toward bigger chunks on
-        // slow-commit media so the autotuner doesn't waste a minute
-        // climbing from a too-small starting value. A returned seed
-        // of 0 means "the detector has no opinion; use the caller's
-        // hint". All subsequent tuning is medium-agnostic.
-        let chunk_bytes = if seed > 0 { seed } else { chunk_bytes_hint };
+        let is_nfs = detect_nfs(fd);
         tracing::info!(
             target: "mux",
-            "WritebackPipeline fd={fd} storage_class={class:?} chunk_bytes={chunk_bytes}"
+            "WritebackPipeline fd={fd} is_nfs={is_nfs} chunk_bytes={chunk_bytes} strategy={}",
+            if is_nfs { "nfs-skip-wait" } else { "wait+dontneed" }
         );
         Self {
             fd,
@@ -147,18 +123,17 @@ impl WritebackPipeline {
             pending: None,
             wait_after_window: VecDeque::with_capacity(ADAPTIVE_WINDOW),
             chunk_count: 0,
-            storage_class: class,
+            is_nfs,
             degraded: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// True if we should bypass the WAIT_AFTER finalisation step. The
-    /// pipeline only skips after `WAIT_AFTER` has *empirically* hung
-    /// past [`WAIT_AFTER_TIMEOUT`] on this particular fd. No per-FS
-    /// branch — the failure is detected, not predicted.
+    /// True if we should bypass the WAIT_AFTER + DONTNEED finalisation
+    /// step. NFS always bypasses; local storage bypasses once the
+    /// pipeline has flipped to degraded after a WAIT_AFTER timeout.
     #[inline]
     fn skip_wait(&self) -> bool {
-        self.degraded.load(Ordering::Relaxed)
+        self.is_nfs || self.degraded.load(Ordering::Relaxed)
     }
 
     /// Caller advanced the file position to `pos`. If a chunk boundary
@@ -181,29 +156,40 @@ impl WritebackPipeline {
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
             if self.skip_wait() {
-                // Degraded path (set only after an empirical
-                // WAIT_AFTER timeout on this fd). We still advance
-                // `pending` so the next call has a stable cycle.
+                // NFS branch (or degraded fallback after a prior
+                // timeout): the WAIT_AFTER + DONTNEED dance is what
+                // hangs on NFS — skip it. We still advance `pending`
+                // so the next call has a stable cycle.
             } else {
+                // Normal local-storage branch with belt-and-braces
+                // timeout. If WAIT_AFTER hangs > WAIT_AFTER_TIMEOUT
+                // we mark the pipeline degraded, log a loud error,
+                // and fall through to the skip path on subsequent
+                // calls.
                 match wait_after_with_timeout(self.fd, prev_off, prev_len) {
                     Some(ms) => {
                         wait_ms = ms;
-                        // Deliberately NO `posix_fadvise(DONTNEED)`
-                        // here. See module-level docs: evicting clean
-                        // pages costs us read-modify-write on
-                        // matroska cluster backpatches and gains
-                        // nothing — the kernel will reclaim clean
-                        // pages under LRU when memory is needed.
+                        let t_fadv = Instant::now();
+                        unsafe {
+                            libc::posix_fadvise(
+                                self.fd,
+                                prev_off as i64,
+                                prev_len as i64,
+                                libc::POSIX_FADV_DONTNEED,
+                            );
+                        }
+                        fadvise_ms = t_fadv.elapsed().as_millis() as u64;
                         self.record_wait(wait_ms);
                     }
                     None => {
-                        // Timeout branch: this fd's FS or server is
-                        // unable to ack WAIT_AFTER. Flip to skip mode
-                        // for the rest of the pipeline's life.
+                        // Timeout branch: switch to NFS-style skip
+                        // for the rest of the pipeline's life. Do
+                        // NOT call DONTNEED — if WAIT_AFTER hasn't
+                        // returned, the pages aren't safely flushed.
                         self.degraded.store(true, Ordering::Relaxed);
                         tracing::error!(
                             target: "mux",
-                            "WritebackPipeline WAIT_AFTER timed out after {}s on chunk off={} len={}, marking writeback degraded (subsequent chunks will skip WAIT_AFTER)",
+                            "WritebackPipeline WAIT_AFTER timed out after {}s on chunk off={} len={}, marking writeback degraded (subsequent chunks will skip WAIT_AFTER + DONTNEED)",
                             WAIT_AFTER_TIMEOUT.as_secs(),
                             prev_off,
                             prev_len
@@ -215,10 +201,9 @@ impl WritebackPipeline {
         self.pending = Some((chunk_off as u64, chunk_len as u64));
         self.last_flush_pos = pos;
         self.chunk_count += 1;
-        let _ = fadvise_ms;
         tracing::trace!(
             target: "mux",
-            "WritebackPipeline chunk off={} len={} sync_file_range_ms={wait_ms} chunk_bytes={} skip_wait={}",
+            "WritebackPipeline chunk off={} len={} sync_file_range_ms={wait_ms} fadvise_ms={fadvise_ms} chunk_bytes={} skip_wait={}",
             chunk_off,
             chunk_len,
             self.chunk_bytes,
@@ -227,10 +212,10 @@ impl WritebackPipeline {
         if self.chunk_count % SIZE_LOG_INTERVAL == 0 {
             tracing::debug!(
                 target: "mux",
-                "WritebackPipeline chunk_bytes={} after {} chunks storage_class={:?} degraded={}",
+                "WritebackPipeline chunk_bytes={} after {} chunks is_nfs={} degraded={}",
                 self.chunk_bytes,
                 self.chunk_count,
-                self.storage_class,
+                self.is_nfs,
                 self.degraded.load(Ordering::Relaxed),
             );
         }
@@ -282,51 +267,46 @@ impl WritebackPipeline {
         if let Some((prev_off, prev_len)) = self.pending.take() {
             tracing::debug!(
                 target: "mux",
-                "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} storage_class={:?} degraded={}",
+                "WritebackPipeline finalize chunk off={prev_off} len={prev_len} skip_wait={} is_nfs={} degraded={}",
                 self.skip_wait(),
-                self.storage_class,
+                self.is_nfs,
                 self.degraded.load(Ordering::Relaxed),
             );
             if self.skip_wait() {
+                // NFS / degraded: skip WAIT_AFTER + DONTNEED. close()
+                // / sync_all() handle commit through their normal
+                // paths.
                 return;
             }
-            if wait_after_with_timeout(self.fd, prev_off, prev_len).is_none() {
-                self.degraded.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    target: "mux",
-                    "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
-                    WAIT_AFTER_TIMEOUT.as_secs(),
-                );
+            match wait_after_with_timeout(self.fd, prev_off, prev_len) {
+                Some(_ms) => unsafe {
+                    libc::posix_fadvise(
+                        self.fd,
+                        prev_off as i64,
+                        prev_len as i64,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                },
+                None => {
+                    self.degraded.store(true, Ordering::Relaxed);
+                    tracing::error!(
+                        target: "mux",
+                        "WritebackPipeline finalize WAIT_AFTER timed out after {}s on chunk off={prev_off} len={prev_len}, marking writeback degraded",
+                        WAIT_AFTER_TIMEOUT.as_secs(),
+                    );
+                }
             }
         }
     }
 }
 
-/// Coarse classification of the medium an open file is on. Used only
-/// at construction to seed the autotuner with a sensible initial
-/// `chunk_bytes`. Never branched on in the hot path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StorageClass {
-    /// `fstatfs.f_type == NFS_SUPER_MAGIC`. Slow-commit; seed a
-    /// generous initial chunk so the autotuner doesn't waste cycles
-    /// climbing from a too-small value.
-    Nfs,
-    /// Anything else we successfully stat'd. Local FS, tmpfs, ZFS,
-    /// network FS we don't have a constant for, etc. Use the caller's
-    /// hint as the seed.
-    Other,
-    /// `fstatfs` failed. Caller's hint wins.
-    Unknown,
-}
-
-/// Probe the FS class via `fstatfs` and return both the class label
-/// and a recommended `chunk_bytes` seed. `seed == 0` means "no
-/// medium-specific recommendation; use the caller's hint." Failure
-/// modes default to `Unknown` + seed 0 so the caller's hint applies.
-///
-/// This is the single medium-detection point in the whole writeback
-/// pipeline. Everything else is medium-agnostic.
-fn detect_storage_class(fd: RawFd) -> (StorageClass, u64) {
+/// Probe whether `fd` lives on an NFS mount via `fstatfs`. Returns
+/// `false` on any error — we fail open, not closed: better to run the
+/// normal local-storage path on a misdetected NFS mount (and surface
+/// the freeze loudly via the timeout) than to needlessly disable
+/// writeback bounding on every local file because of a transient
+/// stat error.
+fn detect_nfs(fd: RawFd) -> bool {
     // `libc::statfs` is repr(C) with a fixed layout; zeroing is the
     // documented init pattern for the kernel uapi struct.
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
@@ -335,9 +315,9 @@ fn detect_storage_class(fd: RawFd) -> (StorageClass, u64) {
         let errno = std::io::Error::last_os_error();
         tracing::warn!(
             target: "mux",
-            "WritebackPipeline fstatfs(fd={fd}) failed: {errno} — defaulting to Unknown",
+            "WritebackPipeline fstatfs(fd={fd}) failed: {errno} — defaulting is_nfs=false",
         );
-        return (StorageClass::Unknown, 0);
+        return false;
     }
     // `f_type` is signed (`__fsword_t`) on glibc and unsigned
     // (`c_ulong`) on musl. Cast both sides to i64 for a portable
@@ -348,18 +328,7 @@ fn detect_storage_class(fd: RawFd) -> (StorageClass, u64) {
     let f_type = buf.f_type as i64;
     #[allow(clippy::unnecessary_cast)]
     let nfs_magic = libc::NFS_SUPER_MAGIC as i64;
-    if f_type == nfs_magic {
-        // NFS commit ack typically ~10-30 ms RTT. The autotuner grows
-        // by doubling when p95 > 200 ms — so starting at 32 MiB it
-        // would never grow on a healthy NFS. Seed at 64 MiB so the
-        // commit cadence amortizes properly from the first chunk.
-        (StorageClass::Nfs, 64 * 1024 * 1024)
-    } else {
-        // Local FS / unknown remote FS. Caller's hint (typically 32
-        // MiB) is a fine starting point; autotuner adjusts from
-        // measured latency.
-        (StorageClass::Other, 0)
-    }
+    f_type == nfs_magic
 }
 
 /// Run `sync_file_range(WAIT_AFTER)` on a worker thread and wait up
