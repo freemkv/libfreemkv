@@ -122,15 +122,15 @@ use std::thread::{self, JoinHandle};
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs. 32 MiB is the
-/// historical default — bounded-cache pressure stays at ~2 × this size.
+/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs.
 ///
-/// iter6 (2026-05-17): 32 → 8 MiB. iter4 data showed ~30 s
-/// oscillation (peak 45 → dip 3 MB/s with ~30 s period) matching
-/// Linux's `vm.dirty_expire_centisecs` (30 s default). Smaller chunks
-/// keep dirty pages younger so the kernel flusher daemon's bursts are
-/// shorter.
-const WRITEBACK_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// iter7 (2026-05-17): 32 → 64 MiB. iter6 (8 MiB) regressed -8.2 MB/s
+/// vs iter4 (32 MiB), confirming smaller=slower for this workload.
+/// Trying bigger to see if fewer-but-larger syncs reduces overhead
+/// further. 0.21.14 tried 128 MiB and was reverted — we don't know
+/// whether that was measurement noise or a real TCP-buffer / NFS
+/// commit issue. 64 MiB is the middle test point.
+const WRITEBACK_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum bytes outstanding in the muxer → writer-thread ring. Sized
 /// to cover ~4 s of muxer output at a 32 MB/s peak — enough to absorb a
