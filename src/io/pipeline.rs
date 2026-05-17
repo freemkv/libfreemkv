@@ -90,16 +90,7 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// Read pipeline depth. Larger buffer compensates for drive variability
 /// and NFS sync_file_range stalls; keeps ISO reader thread fed even when
 /// consumer blocks on write.
-///
-/// iter5 (2026-05-17): bumped 32 → 256 frames. autorip iter4 measured
-/// dips to 2.8 MB/s with the previous 32-frame channel (~1.6 MiB at
-/// ~50 KB/frame avg). When the producer thread hits any micro-stall
-/// (UDF metadata cache miss, NFS RTT, decrypt key lookup), a 1.6 MiB
-/// buffer drains in <100 ms and the consumer sits idle. 256 frames is
-/// ~12 MiB — ~3-4 seconds of consumer drain at 4 MB/s worst-case
-/// sustained output rate, enough to coast through any single-event
-/// producer pause without starving the consumer.
-pub const READ_PIPELINE_DEPTH: usize = 256;
+pub const READ_PIPELINE_DEPTH: usize = 32;
 
 /// Write pipeline depth. Smaller buffer reduces backpressure risk when
 /// sync_file_range blocks; prevents producer from accumulating too much

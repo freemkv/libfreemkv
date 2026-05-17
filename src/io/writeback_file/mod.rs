@@ -124,7 +124,13 @@ use super::writeback::WritebackPipeline;
 /// Granularity at which the Linux writeback pipeline issues
 /// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs. 32 MiB is the
 /// historical default — bounded-cache pressure stays at ~2 × this size.
-const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+///
+/// iter6 (2026-05-17): 32 → 8 MiB. iter4 data showed ~30 s
+/// oscillation (peak 45 → dip 3 MB/s with ~30 s period) matching
+/// Linux's `vm.dirty_expire_centisecs` (30 s default). Smaller chunks
+/// keep dirty pages younger so the kernel flusher daemon's bursts are
+/// shorter.
+const WRITEBACK_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Maximum bytes outstanding in the muxer → writer-thread ring. Sized
 /// to cover ~4 s of muxer output at a 32 MB/s peak — enough to absorb a
