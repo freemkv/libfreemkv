@@ -321,6 +321,12 @@ pub const EBML_DOC_TYPE_READ_VERSION: u32 = 0x4285;
 // Segment
 pub const SEGMENT: u32 = 0x1853_8067;
 
+// SeekHead
+pub const SEEK_HEAD: u32 = 0x114D_9B74;
+pub const SEEK: u32 = 0x4DBB;
+pub const SEEK_ID: u32 = 0x53AB;
+pub const SEEK_POSITION: u32 = 0x53AC;
+
 // Segment Info
 pub const INFO: u32 = 0x1549_A966;
 pub const TIMESTAMP_SCALE: u32 = 0x2A_D7B1;

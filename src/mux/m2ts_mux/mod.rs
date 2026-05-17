@@ -161,16 +161,21 @@ impl<W: Write> M2tsMux<W> {
     }
 
     /// Write one video PES frame. `data` is either length-prefixed
-    /// NALUs (MKV-style) or already Annex B; both are accepted.
-    pub fn write_video(&mut self, pts_ns: i64, data: &[u8]) -> io::Result<()> {
+    /// NALUs (MKV-style) or already Annex B; both are accepted. `keyframe`
+    /// drives the random_access_indicator bit on the first packet of this
+    /// PES (and gates codec_private NAL prepending — those only attach to
+    /// the first keyframe).
+    pub fn write_video(&mut self, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
         let pts_90k = self.base_relative_pts(pts_ns);
         // PCR comes "before" the PTS it timestamps; clamp at 0 for the
         // first frame so we don't underflow.
         let pcr = pts_90k.saturating_sub(PCR_LEAD_90KHZ);
 
-        // Annex-B-ify the frame and prepend VPS/SPS/PPS once.
+        // Annex-B-ify the frame and prepend VPS/SPS/PPS once, on the
+        // FIRST keyframe (not first frame — non-key frames before the
+        // first keyframe can't carry params usefully).
         let mut es = Vec::with_capacity(data.len() + 64);
-        if !self.params_written {
+        if keyframe && !self.params_written {
             if let Some(cp) = &self.video_codec_private {
                 let payload = hvcc_payload(cp);
                 if !payload.is_empty() {
@@ -184,7 +189,7 @@ impl<W: Write> M2tsMux<W> {
         es.extend_from_slice(&annex_b);
 
         let pes = build_video_pes(pts_90k, &es);
-        self.write_pes(PID_VIDEO, &pes, Some(pcr))
+        self.write_pes(PID_VIDEO, &pes, Some(pcr), keyframe)
     }
 
     /// Write one audio PES frame. Returns `Ok(())` and silently drops
@@ -197,7 +202,7 @@ impl<W: Write> M2tsMux<W> {
         }
         let pts_90k = self.base_relative_pts(pts_ns);
         let pes = build_audio_pes(pts_90k, data);
-        self.write_pes(PID_AUDIO, &pes, None)
+        self.write_pes(PID_AUDIO, &pes, None, false)
     }
 
     /// Drain the underlying writer. No TS-level trailer is mandatory —
@@ -234,7 +239,13 @@ impl<W: Write> M2tsMux<W> {
     /// The fit-the-tail logic on the last packet of the PES uses
     /// stuffing rather than a separate small packet, which is the
     /// standard MPEG-TS convention.
-    fn write_pes(&mut self, pid: u16, pes: &[u8], pcr: Option<u64>) -> io::Result<()> {
+    fn write_pes(
+        &mut self,
+        pid: u16,
+        pes: &[u8],
+        pcr: Option<u64>,
+        is_keyframe_video: bool,
+    ) -> io::Result<()> {
         // PSI cadence is enforced per TS packet — interleave a fresh
         // PAT+PMT into the packet stream every PSI_INTERVAL_PACKETS so
         // long single-PES emissions (e.g. one 60 KB video frame) don't
@@ -250,11 +261,21 @@ impl<W: Write> M2tsMux<W> {
                 && (self.packets_written == 0
                     || self.video_packets_since_pcr >= PCR_INTERVAL_PACKETS);
 
-            let af_body: Vec<u8> = if attach_pcr {
+            // RAI rides only the FIRST packet of a keyframe video PES.
+            let attach_rai = first && is_keyframe_video && pid == PID_VIDEO;
+
+            let mut af_body: Vec<u8> = if attach_pcr {
                 build_pcr_adaptation(pcr.unwrap_or(0))
             } else {
                 Vec::new()
             };
+            if attach_rai {
+                if af_body.is_empty() {
+                    af_body.push(0x40); // flags: RAI only
+                } else {
+                    af_body[0] |= 0x40; // OR RAI into existing PCR flags
+                }
+            }
 
             let remaining = pes.len() - offset;
             // Capacity for payload given AF body and 1-byte AF length.
@@ -510,7 +531,7 @@ fn build_pcr_adaptation(pcr_90k: u64) -> Vec<u8> {
     // elementary_stream_priority(1) | PCR_flag(1) | OPCR_flag(1) |
     // splicing_point_flag(1) | transport_private_data_flag(1) |
     // adaptation_field_extension_flag(1) | PCR(48b).
-    let mut af = vec![0x50]; // PCR_flag=1, random_access_indicator=1
+    let mut af = vec![0x10]; // PCR_flag=1; RAI is OR'd in by the caller when applicable
     let pcr_base = pcr_90k & 0x1_FFFF_FFFF; // 33-bit
     let pcr_ext: u16 = 0; // 9-bit, we keep it zero (no sub-tick precision)
     // Encode PCR: 33b base | 6b reserved | 9b extension = 48b
@@ -598,7 +619,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&4u32.to_be_bytes());
         frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
-        mux.write_video(0, &frame).unwrap();
+        mux.write_video(0, true, &frame).unwrap();
         mux.finish().unwrap();
         drop(mux);
 
@@ -619,7 +640,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&3u32.to_be_bytes());
         frame.extend_from_slice(&[0x40, 0x01, 0x0C]);
-        mux.write_video(0, &frame).unwrap();
+        mux.write_video(0, true, &frame).unwrap();
         mux.write_audio(20_000_000, &[0x0B, 0x77, 0x12, 0x34])
             .unwrap();
         mux.finish().unwrap();
@@ -641,7 +662,7 @@ mod tests {
         let mut frame = Vec::new();
         frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
         frame.extend_from_slice(&big);
-        mux.write_video(0, &frame).unwrap();
+        mux.write_video(0, true, &frame).unwrap();
         mux.finish().unwrap();
         drop(mux);
 
@@ -663,7 +684,7 @@ mod tests {
             let mut frame = Vec::new();
             frame.extend_from_slice(&3u32.to_be_bytes());
             frame.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-            mux.write_video(pts, &frame).unwrap();
+            mux.write_video(pts, pts == 0, &frame).unwrap();
         }
         mux.finish().unwrap();
         drop(mux);
@@ -677,5 +698,131 @@ mod tests {
         for w in ccs.windows(2) {
             assert_eq!(w[1], (w[0] + 1) & 0x0F);
         }
+    }
+
+    /// Return the adaptation field body (length byte stripped) for one
+    /// 188-byte TS packet, or None when the packet has no AF.
+    fn af_body(packet: &[u8]) -> Option<Vec<u8>> {
+        let afc = (packet[3] >> 4) & 0x03;
+        if afc & 0b10 == 0 {
+            return None;
+        }
+        let af_len = packet[4] as usize;
+        if af_len == 0 {
+            return Some(Vec::new());
+        }
+        Some(packet[5..5 + af_len].to_vec())
+    }
+
+    #[test]
+    fn rai_set_on_keyframe_pes_packet() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+        mux.write_video(0, true, &frame).unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+
+        // Find the first PUSI packet on PID_VIDEO.
+        let pkt = sink
+            .chunks(188)
+            .find(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
+            .expect("video PUSI packet exists");
+        let af = af_body(pkt).expect("AF present on first packet of keyframe video PES");
+        assert!(!af.is_empty(), "AF flags byte present");
+        assert_eq!(af[0] & 0x40, 0x40, "RAI bit set");
+    }
+
+    #[test]
+    fn pcr_packet_without_keyframe_has_rai_clear() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        // First frame is the keyframe (gates codec_private; also gets PCR).
+        let mut frame0 = Vec::new();
+        frame0.extend_from_slice(&4u32.to_be_bytes());
+        frame0.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+        mux.write_video(0, true, &frame0).unwrap();
+        // Push enough non-key video frames to cross PCR_INTERVAL_PACKETS
+        // video packets so a later PCR-bearing packet exists.
+        // Each frame is ~50 KB → ~270 packets, well over 40.
+        let big: Vec<u8> = (0..(50 * 1024)).map(|i| (i & 0xff) as u8).collect();
+        for i in 1..3 {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&big);
+            mux.write_video((i as i64) * 40_000_000, false, &frame)
+                .unwrap();
+        }
+        mux.finish().unwrap();
+        drop(mux);
+
+        // The first PUSI video packet carries PCR + RAI (keyframe).
+        // A later video PUSI packet with AF + PCR but NOT keyframe must
+        // have RAI clear.
+        let video_pusi: Vec<&[u8]> = sink
+            .chunks(188)
+            .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
+            .collect();
+        assert!(
+            video_pusi.len() >= 2,
+            "expected ≥2 video PES starts, got {}",
+            video_pusi.len()
+        );
+        // Find a later one with AF that carries PCR (flags & 0x10 set).
+        let later_pcr = video_pusi
+            .iter()
+            .skip(1)
+            .find_map(|p| {
+                let af = af_body(p)?;
+                if !af.is_empty() && (af[0] & 0x10) != 0 {
+                    Some(af)
+                } else {
+                    None
+                }
+            })
+            .expect("later PCR-bearing PUSI exists");
+        assert_eq!(
+            later_pcr[0] & 0x40,
+            0,
+            "RAI must be clear on non-keyframe PCR packet"
+        );
+    }
+
+    #[test]
+    fn keyframe_video_with_pcr_combines_flags() {
+        // PCR attaches only when video_packets_since_pcr >=
+        // PCR_INTERVAL_PACKETS (40). The very first video packet emits a
+        // PAT+PMT first, so packets_written != 0 and attach_pcr is false on
+        // frame 0. We push: keyframe (no PCR) → many non-key (drives the
+        // PCR counter past the interval) → second keyframe (PCR + RAI).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        let mut small = Vec::new();
+        small.extend_from_slice(&4u32.to_be_bytes());
+        small.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+        mux.write_video(0, true, &small).unwrap();
+        // ~50 KB ≈ 270 packets — well over PCR_INTERVAL_PACKETS.
+        let big: Vec<u8> = (0..(50 * 1024)).map(|i| (i & 0xff) as u8).collect();
+        let mut big_frame = Vec::new();
+        big_frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
+        big_frame.extend_from_slice(&big);
+        mux.write_video(40_000_000, false, &big_frame).unwrap();
+        // Now a second keyframe — must combine RAI (keyframe) and PCR
+        // (counter exceeded).
+        mux.write_video(80_000_000, true, &small).unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+
+        // Collect video PUSI packets and find the third (second keyframe).
+        let video_pusi: Vec<&[u8]> = sink
+            .chunks(188)
+            .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
+            .collect();
+        assert!(video_pusi.len() >= 3, "three video PES starts expected");
+        let af = af_body(video_pusi[2]).expect("AF present");
+        assert!(!af.is_empty(), "AF flags byte present");
+        assert_eq!(af[0], 0x50, "flags == RAI | PCR");
     }
 }

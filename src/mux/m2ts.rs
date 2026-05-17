@@ -239,7 +239,9 @@ impl crate::pes::Stream for M2tsStream {
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write { muxer } => muxer.write_frame(frame.track, frame.pts, &frame.data),
+            Mode::Write { muxer } => {
+                muxer.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data)
+            }
             Mode::Read { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         }
     }
@@ -281,5 +283,120 @@ impl crate::pes::Stream for M2tsStream {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc::{
+        Codec, ColorSpace, ContentFormat, DiscTitle, FrameRate, HdrFormat, Resolution,
+        Stream as DiscStream, VideoStream,
+    };
+    use crate::pes::{PesFrame, Stream as PesStreamTrait};
+
+    const VIDEO_PID: u16 = 0x1011;
+
+    fn make_title() -> DiscTitle {
+        DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: vec![DiscStream::Video(VideoStream {
+                pid: VIDEO_PID,
+                codec: Codec::Hevc,
+                resolution: Resolution::R1080p,
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt709,
+                secondary: false,
+                label: String::new(),
+            })],
+            chapters: Vec::new(),
+            extents: Vec::new(),
+            content_format: ContentFormat::BdTs,
+            codec_privates: vec![Some({
+                // Minimal hvcC with one VPS-like array entry.
+                let marker: &[u8] = &[0x40, 0x01, 0x0C, 0x01];
+                let mut hvcc = vec![0u8; 22];
+                hvcc.push(1); // numArrays
+                hvcc.push(32);
+                hvcc.extend_from_slice(&1u16.to_be_bytes()); // numNalus
+                hvcc.extend_from_slice(&(marker.len() as u16).to_be_bytes());
+                hvcc.extend_from_slice(marker);
+                hvcc
+            })],
+        }
+    }
+
+    fn fake_idr_pes_data() -> Vec<u8> {
+        // 4-byte length prefix + NAL: type 19 (IDR_W_RADL).
+        let mut nal = vec![(19u8 << 1) & 0x7E, 0x01];
+        for i in 0..200 {
+            nal.push((i & 0xFF) as u8);
+        }
+        let mut out = Vec::with_capacity(4 + nal.len());
+        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        out.extend_from_slice(&nal);
+        out
+    }
+
+    /// Writer wrapper that shares an Arc<Mutex<Vec<u8>>> so the test can
+    /// inspect the bytes after the muxer drops.
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for SharedSink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn m2ts_stream_forwards_keyframe_to_rai() {
+        let title = make_title();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = SharedSink(shared.clone());
+        let mut stream = M2tsStream::create(sink, &title).unwrap();
+        let frame = PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: fake_idr_pes_data(),
+        };
+        stream.write(&frame).unwrap();
+        stream.finish().unwrap();
+        drop(stream);
+
+        let buf = shared.lock().unwrap().clone();
+
+        // Skip FMKV metadata header via meta::read_header.
+        let mut cursor = std::io::Cursor::new(&buf);
+        let _meta = super::meta::read_header(&mut cursor)
+            .unwrap()
+            .expect("FMKV header present");
+        let header_end = cursor.position() as usize;
+        let ts_bytes = &buf[header_end..];
+
+        // Find first PUSI packet on VIDEO_PID; verify RAI in AF flags.
+        let pkt = ts_bytes
+            .chunks(192)
+            .find(|p| {
+                let h = &p[4..];
+                let pid = (((h[1] & 0x1F) as u16) << 8) | h[2] as u16;
+                pid == VIDEO_PID && (h[1] & 0x40) != 0
+            })
+            .expect("video PUSI packet present");
+        let h = &pkt[4..];
+        let afc = (h[3] >> 4) & 0x03;
+        assert!(afc & 0b10 != 0, "AF must be present");
+        let af_len = h[4] as usize;
+        assert!(af_len >= 1, "AF length must include flags byte");
+        let flags = h[5];
+        assert_eq!(flags & 0x40, 0x40, "RAI bit set");
     }
 }

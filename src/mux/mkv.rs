@@ -159,6 +159,12 @@ struct CuePoint {
     cluster_pos: u64, // relative to Segment start
 }
 
+/// SeekHead entry that needs its 8-byte SeekPosition back-patched after Cues are written.
+struct SeekPositionFixup {
+    target_id: u32,
+    value_offset: u64, // absolute file offset of the 8-byte SeekPosition value
+}
+
 /// MKV muxer. Call write_frame() for each frame, then finish() at the end.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -170,6 +176,10 @@ pub struct MkvMuxer<W: Write + Seek> {
     base_pts_ms: Option<i64>,
     cues: Vec<CuePoint>,
     frame_count: u64,
+    seek_fixups: Vec<SeekPositionFixup>,
+    info_offset: u64,
+    tracks_offset: u64,
+    chapters_offset: Option<u64>,
 }
 
 /// New cluster every 5 seconds.
@@ -200,7 +210,34 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::write_unknown_size(&mut writer)?;
         let segment_start = writer.stream_position()?;
 
+        // SeekHead with fixed-width SeekPosition placeholders. Order: Info, Tracks, [Chapters], Cues.
+        let mut seek_fixups: Vec<SeekPositionFixup> = Vec::new();
+        let seekhead_pos = ebml::start_master(&mut writer, ebml::SEEK_HEAD)?;
+        let mut targets: Vec<u32> = vec![ebml::INFO, ebml::TRACKS];
+        if !chapters.is_empty() {
+            targets.push(ebml::CHAPTERS);
+        }
+        targets.push(ebml::CUES);
+        let seek_id_be = (ebml::SEEK as u16).to_be_bytes();
+        let seek_inner_id_be = (ebml::SEEK_ID as u16).to_be_bytes();
+        let seek_pos_id_be = (ebml::SEEK_POSITION as u16).to_be_bytes();
+        for target_id in &targets {
+            writer.write_all(&[seek_id_be[0], seek_id_be[1], 0x92])?;
+            writer.write_all(&[seek_inner_id_be[0], seek_inner_id_be[1], 0x84])?;
+            writer.write_all(&target_id.to_be_bytes())?;
+            writer.write_all(&[seek_pos_id_be[0], seek_pos_id_be[1], 0x88])?;
+            let value_offset = writer.stream_position()?;
+            writer.write_all(&[0u8; 8])?;
+            seek_fixups.push(SeekPositionFixup {
+                target_id: *target_id,
+                value_offset,
+            });
+        }
+        ebml::end_master(&mut writer, seekhead_pos)?;
+
         // Info
+        let info_start = writer.stream_position()?;
+        let info_offset = info_start - segment_start;
         let info_pos = ebml::start_master(&mut writer, ebml::INFO)?;
         ebml::write_uint(&mut writer, ebml::TIMESTAMP_SCALE, 1_000_000)?; // 1ms precision
         if duration_secs > 0.0 {
@@ -215,6 +252,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::end_master(&mut writer, info_pos)?;
 
         // Tracks
+        let tracks_start = writer.stream_position()?;
+        let tracks_offset = tracks_start - segment_start;
         let tracks_pos = ebml::start_master(&mut writer, ebml::TRACKS)?;
         for (i, track) in tracks.iter().enumerate() {
             let entry_pos = ebml::start_master(&mut writer, ebml::TRACK_ENTRY)?;
@@ -302,7 +341,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::end_master(&mut writer, tracks_pos)?;
 
         // Chapters
+        let mut chapters_offset: Option<u64> = None;
         if !chapters.is_empty() {
+            let chapters_start = writer.stream_position()?;
+            chapters_offset = Some(chapters_start - segment_start);
             let chapters_pos = ebml::start_master(&mut writer, ebml::CHAPTERS)?;
             let edition_pos = ebml::start_master(&mut writer, ebml::EDITION_ENTRY)?;
             for (i, ch) in chapters.iter().enumerate() {
@@ -330,6 +372,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             base_pts_ms: None,
             cues: Vec::new(),
             frame_count: 0,
+            seek_fixups,
+            info_offset,
+            tracks_offset,
+            chapters_offset,
         })
     }
 
@@ -345,22 +391,22 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let base = *self.base_pts_ms.get_or_insert(raw_ms);
         let pts_ms = raw_ms - base;
 
-        // Start new cluster if needed
-        if !self.cluster_open || (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS {
-            if self.cluster_open {
-                // Close current cluster (it's a master with unknown size — we use known size)
-                // Actually, for streaming we keep clusters open-ended. Just start a new one.
+        // Cluster boundaries must coincide with a video keyframe so every
+        // Cues entry resolves to a seekable IDR at the cluster start.
+        let is_video_key = keyframe && track_idx == 0;
+        let needs_new_cluster = !self.cluster_open
+            || (is_video_key && (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS);
+
+        if needs_new_cluster {
+            if !is_video_key {
+                return Ok(());
             }
             self.start_cluster(pts_ms)?;
-
-            // Add cue point at cluster start for keyframes (video track 0)
-            if keyframe && track_idx == 0 {
-                self.cues.push(CuePoint {
-                    timestamp_ms: pts_ms,
-                    track: track_idx + 1,
-                    cluster_pos: self.cluster_pos - self.segment_start,
-                });
-            }
+            self.cues.push(CuePoint {
+                timestamp_ms: pts_ms,
+                track: track_idx + 1,
+                cluster_pos: self.cluster_pos - self.segment_start,
+            });
         }
 
         // Write SimpleBlock
@@ -377,6 +423,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.end_cluster()?;
 
         // Write Cues
+        let cues_start = self.writer.stream_position()?;
+        let cues_offset = cues_start - self.segment_start;
         if !self.cues.is_empty() {
             let cues_pos = ebml::start_master(&mut self.writer, ebml::CUES)?;
             for cue in &self.cues {
@@ -394,6 +442,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
             }
             ebml::end_master(&mut self.writer, cues_pos)?;
         }
+
+        // Back-patch SeekHead SeekPosition values now that all element offsets are known.
+        for fixup in &self.seek_fixups {
+            let offset = match fixup.target_id {
+                ebml::INFO => self.info_offset,
+                ebml::TRACKS => self.tracks_offset,
+                ebml::CHAPTERS => self.chapters_offset.unwrap_or(0),
+                ebml::CUES => cues_offset,
+                _ => 0,
+            };
+            self.writer
+                .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
+            self.writer.write_all(&offset.to_be_bytes())?;
+        }
+        self.writer.seek(std::io::SeekFrom::End(0))?;
 
         self.writer.flush()?;
         Ok(())
@@ -811,5 +874,423 @@ mod tests {
             find_id(&data, ebml::FLAG_FORCED).is_none(),
             "FlagForced element should not be present for non-forced subtitle"
         );
+    }
+
+    // ============================================================
+    // Seekability tests: SeekHead, keyframe-aligned clusters, Cues
+    // ============================================================
+
+    use std::sync::{Arc, Mutex};
+
+    /// Writer that lets the test inspect the buffer after `finish()` consumes the muxer.
+    struct SharedWriter(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+    impl Seek for SharedWriter {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    /// Build interleaved frames at 24 fps video (IDR every gop_secs) + 48 kHz audio (1024 samples per frame).
+    fn frames_for(duration_secs: f64, gop_secs: f64) -> Vec<(usize, i64, bool, Vec<u8>)> {
+        let video_interval_ns: i64 = 1_000_000_000 / 24;
+        let audio_interval_ns: i64 = (1024i64 * 1_000_000_000) / 48_000;
+        let gop_frames = (gop_secs * 24.0).round() as i64;
+
+        let mut out: Vec<(usize, i64, bool, Vec<u8>)> = Vec::new();
+        let total_ns = (duration_secs * 1_000_000_000.0) as i64;
+
+        let mut vi: i64 = 0;
+        loop {
+            let pts = vi * video_interval_ns;
+            if pts >= total_ns {
+                break;
+            }
+            let keyframe = vi % gop_frames == 0;
+            out.push((0, pts, keyframe, vec![0xAB; 64]));
+            vi += 1;
+        }
+
+        let mut ai: i64 = 0;
+        loop {
+            let pts = ai * audio_interval_ns;
+            if pts >= total_ns {
+                break;
+            }
+            out.push((1, pts, true, vec![0xCD; 32]));
+            ai += 1;
+        }
+
+        out.sort_by_key(|f| f.1);
+        out
+    }
+
+    /// Mux frames through a SharedWriter and return the final buffer.
+    fn mux_to_bytes(
+        tracks: &[MkvTrack],
+        chapters: &[Chapter],
+        frames: &[(usize, i64, bool, Vec<u8>)],
+    ) -> (Vec<u8>, u64) {
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, tracks, None, 0.0, chapters).unwrap();
+        for (t, pts, kf, data) in frames {
+            muxer.write_frame(*t, *pts, *kf, data).unwrap();
+        }
+        let frame_count = muxer.frame_count;
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+        (data, frame_count)
+    }
+
+    /// Find the Segment header in the buffer and return (segment_id_pos, segment_start_pos).
+    /// segment_start = position immediately after Segment's id + size bytes.
+    fn locate_segment(data: &[u8]) -> (usize, usize) {
+        let segment_id_pos = find_id(data, ebml::SEGMENT).expect("segment id not found");
+        // Segment is written via write_id + write_unknown_size: 4 byte id + 8 byte size
+        (segment_id_pos, segment_id_pos + 4 + 8)
+    }
+
+    /// Walk Segment's top-level children. Returns Vec<(id, data_start_offset, data_size)>
+    /// where data_start_offset is absolute file offset and data_size is the element body size.
+    fn segment_children(data: &[u8]) -> Vec<(u32, usize, u64)> {
+        let (_, seg_start) = locate_segment(data);
+        let mut out = Vec::new();
+        let mut cursor = Cursor::new(&data[seg_start..]);
+        while (cursor.position() as usize) < data.len() - seg_start {
+            let pos_before = cursor.position();
+            let (id, size, hdr_len) = match ebml::read_element_header(&mut cursor) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let data_abs = seg_start + pos_before as usize + hdr_len;
+            out.push((id, data_abs, size));
+            // Skip the body to advance to the next element.
+            cursor
+                .seek(io::SeekFrom::Current(size as i64))
+                .expect("seek past element body");
+        }
+        out
+    }
+
+    /// Find every Cluster: returns Vec<(cluster_data_start_abs, cluster_data_size, cluster_timestamp_ms)>.
+    fn find_clusters(data: &[u8]) -> Vec<(usize, u64, u64)> {
+        let mut out = Vec::new();
+        for (id, body_start, body_size) in segment_children(data) {
+            if id == ebml::CLUSTER {
+                let mut cursor = Cursor::new(&data[body_start..body_start + body_size as usize]);
+                let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+                assert_eq!(
+                    tid,
+                    ebml::CLUSTER_TIMESTAMP,
+                    "cluster must start with timestamp"
+                );
+                let ts = ebml::read_uint_val(&mut cursor, tsize as usize).unwrap();
+                out.push((body_start, body_size, ts));
+            }
+        }
+        out
+    }
+
+    /// Parse the first SimpleBlock that appears in a cluster body slice.
+    /// Returns (track_num, flags_byte). track_num decoded from VINT.
+    fn first_simple_block(cluster_body: &[u8]) -> (u64, u8) {
+        let mut cursor = Cursor::new(cluster_body);
+        loop {
+            let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+            if id == ebml::SIMPLE_BLOCK {
+                let body_start = cursor.position() as usize;
+                // Decode track VINT.
+                let b0 = cluster_body[body_start];
+                let (track_num, vint_len) = if b0 & 0x80 != 0 {
+                    ((b0 & 0x7F) as u64, 1usize)
+                } else if b0 & 0x40 != 0 {
+                    let b1 = cluster_body[body_start + 1];
+                    ((((b0 & 0x3F) as u64) << 8) | b1 as u64, 2)
+                } else {
+                    panic!("unsupported track vint width");
+                };
+                let flags = cluster_body[body_start + vint_len + 2];
+                return (track_num, flags);
+            }
+            // Skip non-SimpleBlock child.
+            cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
+        }
+    }
+
+    /// Parse the Cues element body into Vec<(cue_time, cue_track, cue_cluster_position)>.
+    fn parse_cues(data: &[u8]) -> Vec<(u64, u64, u64)> {
+        let mut out = Vec::new();
+        let (cues_id, cues_body_start, cues_body_size) = segment_children(data)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::CUES)
+            .expect("cues element not found");
+        assert_eq!(cues_id, ebml::CUES);
+        let cues_body = &data[cues_body_start..cues_body_start + cues_body_size as usize];
+        let mut cursor = Cursor::new(cues_body);
+        while (cursor.position() as usize) < cues_body.len() {
+            let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(id, ebml::CUE_POINT);
+            let cp_end = cursor.position() + size;
+            let mut cue_time = 0u64;
+            let mut cue_track = 0u64;
+            let mut cue_pos = 0u64;
+            while cursor.position() < cp_end {
+                let (sid, ssize, _) = ebml::read_element_header(&mut cursor).unwrap();
+                match sid {
+                    ebml::CUE_TIME => {
+                        cue_time = ebml::read_uint_val(&mut cursor, ssize as usize).unwrap();
+                    }
+                    ebml::CUE_TRACK_POSITIONS => {
+                        let ctp_end = cursor.position() + ssize;
+                        while cursor.position() < ctp_end {
+                            let (iid, isize_, _) = ebml::read_element_header(&mut cursor).unwrap();
+                            match iid {
+                                ebml::CUE_TRACK => {
+                                    cue_track =
+                                        ebml::read_uint_val(&mut cursor, isize_ as usize).unwrap();
+                                }
+                                ebml::CUE_CLUSTER_POSITION => {
+                                    cue_pos =
+                                        ebml::read_uint_val(&mut cursor, isize_ as usize).unwrap();
+                                }
+                                _ => {
+                                    cursor.seek(io::SeekFrom::Current(isize_ as i64)).unwrap();
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        cursor.seek(io::SeekFrom::Current(ssize as i64)).unwrap();
+                    }
+                }
+            }
+            out.push((cue_time, cue_track, cue_pos));
+        }
+        out
+    }
+
+    /// Parse the SeekHead body into Vec<(seek_id, seek_position)>.
+    fn parse_seekhead(data: &[u8]) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        let (sh_id, sh_body_start, sh_body_size) = segment_children(data)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::SEEK_HEAD)
+            .expect("seekhead not found");
+        assert_eq!(sh_id, ebml::SEEK_HEAD);
+        let sh_body = &data[sh_body_start..sh_body_start + sh_body_size as usize];
+        let mut cursor = Cursor::new(sh_body);
+        while (cursor.position() as usize) < sh_body.len() {
+            let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(id, ebml::SEEK);
+            let seek_end = cursor.position() + size;
+            let mut seek_id_val: u32 = 0;
+            let mut seek_pos_val: u64 = 0;
+            while cursor.position() < seek_end {
+                let (sid, ssize, _) = ebml::read_element_header(&mut cursor).unwrap();
+                match sid {
+                    ebml::SEEK_ID => {
+                        let raw = ebml::read_uint_val(&mut cursor, ssize as usize).unwrap();
+                        seek_id_val = raw as u32;
+                    }
+                    ebml::SEEK_POSITION => {
+                        seek_pos_val = ebml::read_uint_val(&mut cursor, ssize as usize).unwrap();
+                    }
+                    _ => {
+                        cursor.seek(io::SeekFrom::Current(ssize as i64)).unwrap();
+                    }
+                }
+            }
+            out.push((seek_id_val, seek_pos_val));
+        }
+        out
+    }
+
+    #[test]
+    fn cluster_starts_only_on_video_keyframe() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let frames = frames_for(30.0, 1.0);
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let clusters = find_clusters(&data);
+        assert!(!clusters.is_empty(), "expected at least one cluster");
+        for (body_start, body_size, _ts) in clusters {
+            let body = &data[body_start..body_start + body_size as usize];
+            // Skip past the CLUSTER_TIMESTAMP element first.
+            let mut cursor = Cursor::new(body);
+            let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+            cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+            let after_ts = cursor.position() as usize;
+            let (track_num, flags) = first_simple_block(&body[after_ts..]);
+            assert_eq!(
+                track_num, 1,
+                "first block in cluster must be track 1 (video)"
+            );
+            assert_eq!(
+                flags & 0x80,
+                0x80,
+                "first block in cluster must have keyframe flag set, got 0x{:02X}",
+                flags
+            );
+        }
+    }
+
+    #[test]
+    fn cue_count_equals_cluster_count() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let frames = frames_for(30.0, 1.0);
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let clusters = find_clusters(&data);
+        let cues = parse_cues(&data);
+        assert_eq!(
+            clusters.len(),
+            cues.len(),
+            "cluster count {} != cue count {}",
+            clusters.len(),
+            cues.len()
+        );
+        // For 30s @ 5s min cluster duration with 1s GOP, expect 6 clusters / 6 cues.
+        assert_eq!(
+            clusters.len(),
+            6,
+            "expected 6 clusters for 30s @ 5s cluster duration"
+        );
+    }
+
+    #[test]
+    fn cue_positions_resolve_to_clusters() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let frames = frames_for(30.0, 1.0);
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let (_, seg_start) = locate_segment(&data);
+        let cues = parse_cues(&data);
+        assert!(!cues.is_empty());
+        for (_time, _track, pos) in cues {
+            let abs = seg_start + pos as usize;
+            let mut cursor = Cursor::new(&data[abs..]);
+            let (id, _size, _hdr_len) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(
+                id,
+                ebml::CLUSTER,
+                "cue position 0x{:X} did not resolve to a cluster",
+                pos
+            );
+        }
+    }
+
+    #[test]
+    fn cue_times_match_cluster_timestamps() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let frames = frames_for(30.0, 1.0);
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let (_, seg_start) = locate_segment(&data);
+        let cues = parse_cues(&data);
+        for (time, _track, pos) in cues {
+            let abs = seg_start + pos as usize;
+            let mut cursor = Cursor::new(&data[abs..]);
+            let (id, size, _hdr_len) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(id, ebml::CLUSTER);
+            let body_start = abs + (cursor.position() as usize);
+            let body = &data[body_start..body_start + size as usize];
+            let mut bc = Cursor::new(body);
+            let (tid, tsize, _) = ebml::read_element_header(&mut bc).unwrap();
+            assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+            let cluster_ts = ebml::read_uint_val(&mut bc, tsize as usize).unwrap();
+            assert_eq!(
+                cluster_ts, time,
+                "cluster timestamp {} != cue time {}",
+                cluster_ts, time
+            );
+        }
+    }
+
+    #[test]
+    fn seekhead_is_first_child_of_segment() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
+        let children = segment_children(&data);
+        assert!(!children.is_empty());
+        assert_eq!(
+            children[0].0,
+            ebml::SEEK_HEAD,
+            "first child of segment must be SeekHead, got id 0x{:X}",
+            children[0].0
+        );
+    }
+
+    #[test]
+    fn seekhead_points_to_real_elements() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
+        let (_, seg_start) = locate_segment(&data);
+        let entries = parse_seekhead(&data);
+        let required = [ebml::INFO, ebml::TRACKS, ebml::CUES];
+        for &want_id in &required {
+            let entry = entries
+                .iter()
+                .find(|(id, _)| *id == want_id)
+                .unwrap_or_else(|| panic!("seekhead missing entry for id 0x{:X}", want_id));
+            let abs = seg_start + entry.1 as usize;
+            let mut cursor = Cursor::new(&data[abs..]);
+            let (got_id, _, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(
+                got_id, want_id,
+                "seekhead entry for 0x{:X} resolves to wrong id 0x{:X}",
+                want_id, got_id
+            );
+        }
+    }
+
+    #[test]
+    fn seekhead_omits_chapters_when_empty() {
+        let tracks = [make_video_track()];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(5.0, 1.0));
+        let entries = parse_seekhead(&data);
+        assert_eq!(
+            entries.len(),
+            3,
+            "expected 3 seek entries (Info, Tracks, Cues), got {}",
+            entries.len()
+        );
+        assert!(
+            entries.iter().all(|(id, _)| *id != ebml::CHAPTERS),
+            "seekhead should not contain Chapters entry when chapters are empty"
+        );
+    }
+
+    #[test]
+    fn pre_first_keyframe_frames_dropped() {
+        let tracks = [make_video_track()];
+        let frames = vec![
+            (0usize, 0i64, false, vec![0x11; 16]),
+            (0usize, 41_000_000i64, true, vec![0x22; 16]),
+        ];
+        let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(frame_count, 1, "muxer.frame_count must equal 1");
+        let clusters = find_clusters(&data);
+        assert_eq!(clusters.len(), 1, "expected exactly one cluster");
+        let (body_start, body_size, _ts) = clusters[0];
+        let body = &data[body_start..body_start + body_size as usize];
+        let mut cursor = Cursor::new(body);
+        // Skip CLUSTER_TIMESTAMP.
+        let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+        assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+        cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+        let mut sb_count = 0;
+        while (cursor.position() as usize) < body.len() {
+            let (id, sz, _) = ebml::read_element_header(&mut cursor).unwrap();
+            if id == ebml::SIMPLE_BLOCK {
+                sb_count += 1;
+            }
+            cursor.seek(io::SeekFrom::Current(sz as i64)).unwrap();
+        }
+        assert_eq!(sb_count, 1, "expected exactly one SimpleBlock in output");
     }
 }
