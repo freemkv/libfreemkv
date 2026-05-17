@@ -1,14 +1,9 @@
 //! Linux platform impl for [`super::WritebackFile`].
 //!
-//! - `preallocate`: `fallocate(0)` — reserve extents AND extend the
-//!   reported file size up-front. iter12 (2026-05-17): switched from
-//!   `FALLOC_FL_KEEP_SIZE` to plain mode 0. With KEEP_SIZE the file's
-//!   reported length stayed at 0 and every write past the previous
-//!   EOF triggered an NFS SETATTR (server-side metadata commit) to
-//!   grow the file. With mode 0, the file is full-size from the
-//!   start; subsequent writes overwrite pre-extended region in place
-//!   with zero metadata ops. At end of mux, caller `ftruncate`s down
-//!   to actual content size if hint was an overestimate.
+//! - `preallocate`: `fallocate(FALLOC_FL_KEEP_SIZE)` — reserve extents
+//!   without growing the reported file size. Reduces extent
+//!   fragmentation on large sequential writes (mux output on NFS in
+//!   particular).
 //! - `durable_sync`: `fsync` wrapped in
 //!   [`crate::io::bounded::bounded_syscall`] with a 60 s deadline so a
 //!   wedged NFS server can't trap the calling thread indefinitely.
@@ -22,11 +17,16 @@ use std::time::Duration;
 /// Best-effort: a non-zero rc is logged but not propagated, since the
 /// caller would just continue with the unreserved file anyway.
 pub(super) fn preallocate(file: &File, size_bytes: u64) {
-    // Mode 0 (no KEEP_SIZE) — reserve extents AND extend the
-    // reported file size to `size_bytes`. On NFS this eliminates the
-    // per-write SETATTR that would otherwise fire each time writes
-    // crossed the previous EOF.
-    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size_bytes as i64) };
+    // FALLOC_FL_KEEP_SIZE = 0x01 — keep the reported file size at 0
+    // (writes grow it normally) while still pre-reserving the extents.
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            size_bytes as i64,
+        )
+    };
     tracing::debug!(
         target: "mux",
         "WritebackFile fallocate size_hint={size_bytes} rc={rc} ok={}",

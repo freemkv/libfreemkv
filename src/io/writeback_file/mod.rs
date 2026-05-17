@@ -73,23 +73,18 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` pairs. 32 MiB is the empirically best value
-/// (iter8: 28.7; iter9 64 MiB: 27.5; iter11 128 MiB: 16.6; iter6
-/// 8 MiB: 15.8). Locking in.
-const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// `sync_file_range` pairs.
+///
+/// iter11 (2026-05-17): 32 → 128 MiB. 0.21.14 tried this under Phase
+/// 2.5 and reverted; with Phase 2.5 disabled (iter8 baseline) the
+/// tradeoff is different. iter8 (32 MiB) = 28.7, iter9 (64 MiB) = 27.5.
+/// Trying 128 to see if the iter9 dip was noise or a real trend.
+const WRITEBACK_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) struct WritebackFile {
     file: File,
     pipeline: WritebackPipeline,
     pos: u64,
-    /// Highest position ever reached by `write`/`write_all`. Used by
-    /// `sync_all` to truncate the file down to the actual content
-    /// extent if `preallocate` over-reserved.
-    high_water: u64,
-    /// True if the file was preallocated AND extended to a hint size
-    /// at construction. `sync_all` will `ftruncate` to `high_water`
-    /// when this is set, to discard any over-reservation.
-    truncate_at_sync: bool,
 }
 
 impl WritebackFile {
@@ -104,8 +99,6 @@ impl WritebackFile {
             file,
             pipeline,
             pos,
-            high_water: pos,
-            truncate_at_sync: false,
         })
     }
 
@@ -138,14 +131,7 @@ impl WritebackFile {
     pub(crate) fn create_with_size_hint(path: &Path, size_bytes: u64) -> io::Result<Self> {
         let file = File::create(path)?;
         platform::preallocate(&file, size_bytes);
-        let mut wbf = Self::new(file)?;
-        // `preallocate` (on Linux/macOS where it's implemented) extends
-        // the file's reported size to `size_bytes`. We mark this so
-        // `sync_all` will truncate down to actual content extent at
-        // mux end. If the hint was an underestimate, writes simply
-        // extend past it as normal.
-        wbf.truncate_at_sync = true;
-        Ok(wbf)
+        Self::new(file)
     }
 
     /// Open an existing file at `path` for writing (no truncation) and
@@ -168,14 +154,6 @@ impl WritebackFile {
     /// effort, but bounded.
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
         self.pipeline.finalize();
-        if self.truncate_at_sync {
-            // Truncate down to the actual content extent. If
-            // `preallocate` extended past the muxer's real output
-            // size, the tail is otherwise zero-filled garbage.
-            // `set_len` is ftruncate; safe to call even when
-            // high_water == current file size (no-op).
-            self.file.set_len(self.high_water)?;
-        }
         platform::durable_sync(&self.file)
     }
 }
@@ -184,9 +162,6 @@ impl Write for WritebackFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.file.write(buf)?;
         self.pos += n as u64;
-        if self.pos > self.high_water {
-            self.high_water = self.pos;
-        }
         self.pipeline.note_progress(self.pos);
         Ok(n)
     }
@@ -194,9 +169,6 @@ impl Write for WritebackFile {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.file.write_all(buf)?;
         self.pos += buf.len() as u64;
-        if self.pos > self.high_water {
-            self.high_water = self.pos;
-        }
         self.pipeline.note_progress(self.pos);
         Ok(())
     }
