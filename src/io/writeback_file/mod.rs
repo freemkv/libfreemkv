@@ -73,13 +73,10 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` pairs.
-///
-/// iter11 (2026-05-17): 32 → 128 MiB. 0.21.14 tried this under Phase
-/// 2.5 and reverted; with Phase 2.5 disabled (iter8 baseline) the
-/// tradeoff is different. iter8 (32 MiB) = 28.7, iter9 (64 MiB) = 27.5.
-/// Trying 128 to see if the iter9 dip was noise or a real trend.
-const WRITEBACK_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+/// `sync_file_range` pairs. 32 MiB is the empirically best value:
+/// iter8 = 28.7, iter9 (64 MiB) = 27.5, iter11 (128 MiB) = 16.6,
+/// iter6 (8 MiB) = 15.8. Locked.
+const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct WritebackFile {
     file: File,
