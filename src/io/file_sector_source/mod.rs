@@ -103,14 +103,10 @@ pub struct FileSectorSource {
     /// Total file size in sectors. Constant after construction;
     /// surfaced via [`SectorSource::capacity_sectors`].
     capacity: u32,
-    /// 0.21.3+: the app-level buffer is no longer touched on the hot
-    /// path (every `read_sectors` is a direct pread). The fields are
-    /// retained so a future per-source-type policy (e.g. a local-disk
-    /// source where batched reads ARE beneficial) can re-enable
-    /// buffering cleanly without re-plumbing the struct.
-    #[allow(dead_code)]
+    /// 32 MiB application-level readahead buffer. Restored 2026-05-17
+    /// after iter1 baseline (18.4 MB/s mean) showed per-sector pread is
+    /// the bottleneck.
     buf: Box<[u8]>,
-    #[allow(dead_code)]
     buf_start_lba: u32,
     buf_len_sectors: u32,
     /// 0.21.6: bytes read since the last DONTNEED drop. Drives the
@@ -167,7 +163,6 @@ impl FileSectorSource {
 
     /// True if `[lba, lba + count)` is wholly inside the current
     /// buffer window. `count == 0` is vacuously true.
-    #[allow(dead_code)]
     fn buffer_covers(&self, lba: u32, count: u32) -> bool {
         if self.buf_len_sectors == 0 {
             return false;
@@ -183,7 +178,6 @@ impl FileSectorSource {
     /// Refill the buffer so it starts at `lba`. Read as many sectors
     /// as we have buffer space AND file capacity for. Caller has
     /// already checked `lba < capacity`.
-    #[allow(dead_code)]
     fn refill(&mut self, lba: u32) -> Result<()> {
         debug_assert!(lba < self.capacity, "refill past capacity");
         // Don't read past EOF — clamp the request to remaining
@@ -226,28 +220,40 @@ impl SectorSource for FileSectorSource {
         if count == 0 {
             return Ok(0);
         }
-        // 0.21.3: bypass the application-level buffer entirely.
+        // Iteration 2 (2026-05-17): restore the 32 MiB readahead buffer.
         //
-        // Empirically the 32 MiB readahead window (0.21.0–0.21.1) and the
-        // 4 MiB shrink (0.21.2) both regressed mux throughput vs the
-        // pre-Phase-1 0.20.7 baseline on NFS bidirectional workloads
-        // (sweep ~25 MB/s OK; mux dropped from 18 → 7-8 → 5-6 MB/s).
-        // Direct pread per call lets the kernel's own readahead policy
-        // run, which interleaves naturally with concurrent NFS writes on
-        // the same TCP connection.
+        // The 0.21.3 bypass was justified by an A/B test taken under the
+        // 0.21.7 producer-side polling cap. Under that cap the producer
+        // couldn't push fast enough to saturate the channel regardless of
+        // read strategy, so the comparison "buffer vs no-buffer" measured
+        // the cap, not the read path. Iter1 baseline with bypass + Phase
+        // 2.5 + DONTNEED = 18.4 MB/s mean — well below the rig's measured
+        // concurrent-r+w ceiling (37 MB/s). Per-sector pread costs ~50 us
+        // each ≈ 19k syscalls/sec = 38 MB/s ceiling just in syscall
+        // overhead. The 32 MiB app buffer amortises that to 1 pread per
+        // 16k sectors and lets the kernel's readahead operate on a wider
+        // window. DONTNEED below still evicts the page cache so we don't
+        // pin the ISO in RAM.
         //
-        // Buffer fields are retained (currently unused on this path) so
-        // any future per-source policy can be reintroduced without
-        // re-plumbing structure. `refill` / `buffer_covers` are kept too
-        // (still exercised by the tests so the API contract is locked).
-        let offset = lba as u64 * SECTOR_SIZE as u64;
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Error::IoError { source: e })?;
-        self.file
-            .read_exact(&mut out[..bytes])
-            .map_err(|e| Error::IoError { source: e })?;
-        self.buf_len_sectors = 0;
+        // Pathological-large requests (> BUF_SECTORS = 16384) fall back
+        // to direct pread so callers can't deadlock the source.
+        if count > BUF_SECTORS {
+            let offset = lba as u64 * SECTOR_SIZE as u64;
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::IoError { source: e })?;
+            self.file
+                .read_exact(&mut out[..bytes])
+                .map_err(|e| Error::IoError { source: e })?;
+            self.buf_len_sectors = 0;
+        } else {
+            if !self.buffer_covers(lba, count) {
+                self.refill(lba)?;
+            }
+            let off_sectors = (lba - self.buf_start_lba) as usize;
+            let off_bytes = off_sectors * SECTOR_SIZE;
+            out[..bytes].copy_from_slice(&self.buf[off_bytes..off_bytes + bytes]);
+        }
 
         // 0.21.6: periodic page-cache eviction on the read side. Without
         // this, an 85 GB streaming ISO read pins the entire file in
