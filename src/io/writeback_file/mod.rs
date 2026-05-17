@@ -73,15 +73,9 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs.
-///
-/// iter7 (2026-05-17): 32 → 64 MiB. iter6 (8 MiB) regressed -8.2 MB/s
-/// vs iter4 (32 MiB), confirming smaller=slower for this workload.
-/// Trying bigger to see if fewer-but-larger syncs reduces overhead
-/// further. 0.21.14 tried 128 MiB and was reverted — we don't know
-/// whether that was measurement noise or a real TCP-buffer / NFS
-/// commit issue. 64 MiB is the middle test point.
-const WRITEBACK_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs. 32 MiB
+/// remains the best-tested value.
+const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct WritebackFile {
     file: File,
