@@ -73,14 +73,8 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` / `posix_fadvise(DONTNEED)` pairs.
-///
-/// iter9 (2026-05-17): 32 → 64 MiB on top of iter8 (Phase 2.5
-/// disabled). Without Phase 2.5's writer thread, WAIT_AFTER blocks
-/// the mux thread directly. Bigger chunks = fewer WAIT_AFTER calls
-/// = less mux-thread blocking. iter8 mean was 28.7 with 32 MiB; aim
-/// to clear the 30 floor by halving WAIT_AFTER frequency.
-const WRITEBACK_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+/// `sync_file_range` pairs. 32 MiB best-tested with iter8 (28.7 mean).
+const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) struct WritebackFile {
     file: File,
