@@ -149,28 +149,16 @@ pub struct DiscStream {
     // a percent without a separate API call.
     bytes_total_extents: u64,
 
-    // PES output. `ts_demuxer` and `ps_demuxer` are `None` when the
-    // stream is in pipeline mode — the demux state lives inside a
-    // [`super::demux_thread::DemuxThread`] and PesPackets arrive
-    // through `demux_rx` already parsed.
+    // PES output — single-threaded inline demux + codec parse. The
+    // pipeline-mode mux (3-stage threaded) lives in
+    // [`super::pipelined_stream::PipelinedPesStream`]; this type is
+    // the legacy in-thread path for live-disc reads where adaptive
+    // batch retry on bad sectors lives in `fill_extents`.
     ts_demuxer: Option<super::ts::TsDemuxer>,
     ps_demuxer: Option<super::ps::PsDemuxer>,
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
-
-    // Pipeline mode: when `Some`, the read+decrypt+demux pipeline
-    // runs on a dedicated thread; this stream's `read()` just pulls
-    // PesPacket batches from `demux_rx` and runs codec parse on the
-    // caller thread. See [`super::demux_thread`].
-    //
-    // `demux_thread` is kept solely so that `Drop` joins the worker
-    // before this stream is dropped — direct reads happen through
-    // `demux_rx`. The `allow(dead_code)` keeps the optimizer happy
-    // since the field is only used at drop time.
-    #[allow(dead_code)]
-    demux_thread: Option<super::demux_thread::DemuxThread>,
-    demux_rx: Option<crossbeam_channel::Receiver<super::demux_thread::DemuxBatch>>,
 }
 
 impl DiscStream {
@@ -251,118 +239,6 @@ impl DiscStream {
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
-            demux_thread: None,
-            demux_rx: None,
-        }
-    }
-
-    /// Pipeline-mode constructor. Moves the read+decrypt+demux work
-    /// onto a [`super::demux_thread::DemuxThread`] so the caller's
-    /// `read()` thread only does codec parse + frame emission.
-    ///
-    /// `reader` is a [`crate::sector::PrefetchedSectorSource`] — the
-    /// prefetched producer thread already runs read+decrypt on its
-    /// own thread; this constructor peels off its channels for the
-    /// demux thread to consume in zero-copy mode (no buffer memcpy
-    /// across thread boundary, recycled-pool of two buffers, no
-    /// allocator activity in the hot loop).
-    ///
-    /// Pipeline mode is the preferred wiring for ISO file mux on a
-    /// multi-core host; it gives a ~2× consumer throughput in the
-    /// `null://` benchmark vs the single-thread inline path.
-    pub fn new_pipeline(
-        reader: crate::sector::PrefetchedSectorSource,
-        title: DiscTitle,
-        decrypt_keys: crate::decrypt::DecryptKeys,
-        batch_sectors: u16,
-        content_format: crate::disc::ContentFormat,
-        halt: Option<Halt>,
-    ) -> Self {
-        let extents = title.extents.clone();
-        let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
-
-        let mut pids = Vec::new();
-        let mut parsers = Vec::new();
-        let mut pid_to_track = Vec::new();
-        for (idx, s) in title.streams.iter().enumerate() {
-            let (pid, codec) = match s {
-                crate::disc::Stream::Video(v) => (v.pid, v.codec),
-                crate::disc::Stream::Audio(a) => (a.pid, a.codec),
-                crate::disc::Stream::Subtitle(s) => (s.pid, s.codec),
-            };
-            pids.push(pid);
-            pid_to_track.push((pid, idx));
-            parsers.push((pid, super::codec::parser_for_codec(codec, None)));
-        }
-
-        let (ts, ps) = match content_format {
-            crate::disc::ContentFormat::MpegPs => (None, Some(super::ps::PsDemuxer::new())),
-            crate::disc::ContentFormat::BdTs => {
-                let ts_pids: Vec<u16> = pids.clone();
-                if ts_pids.is_empty() {
-                    (None, None)
-                } else {
-                    (Some(super::ts::TsDemuxer::new(&ts_pids)), None)
-                }
-            }
-        };
-
-        let (prefetch_rx, recycle_tx, shell) = reader.into_channels();
-        let (handle, rx) = super::demux_thread::DemuxThread::spawn_zero_copy(
-            prefetch_rx,
-            recycle_tx,
-            shell,
-            halt.clone(),
-            ts,
-            ps,
-        );
-
-        // The DiscStream's own reader is a no-op pass-through — the
-        // real reader lives inside the demux thread. We need *some*
-        // Box<dyn SectorSource> to satisfy the field type; use a
-        // tiny stub. fill_extents won't be called in pipeline mode.
-        struct NullSource;
-        impl SectorSource for NullSource {
-            fn capacity_sectors(&self) -> u32 {
-                0
-            }
-            fn read_sectors(
-                &mut self,
-                _: u32,
-                _: u16,
-                _: &mut [u8],
-                _: bool,
-            ) -> crate::error::Result<usize> {
-                Ok(0)
-            }
-        }
-        let dummy: Box<dyn SectorSource> = Box::new(NullSource);
-
-        Self {
-            reader: DecryptingSectorSource::new(dummy, crate::decrypt::DecryptKeys::None),
-            title,
-            disc: None,
-            decrypt_keys,
-            extents,
-            current_extent: 0,
-            current_offset: 0,
-            read_buf: Vec::new(),
-            buf_valid: 0,
-            adaptive: AdaptiveBatch::new(batch_sectors),
-            errors: 0,
-            skip_errors: false,
-            halt,
-            event_fn: None,
-            eof: false,
-            bytes_read_total: 0,
-            bytes_total_extents,
-            ts_demuxer: None,
-            ps_demuxer: None,
-            parsers,
-            pending_frames: std::collections::VecDeque::new(),
-            pid_to_track,
-            demux_thread: Some(handle),
-            demux_rx: Some(rx),
         }
     }
 
@@ -596,88 +472,6 @@ fn prof_tick(stage: &str, ns: u128, bytes: u64) {
     });
 }
 
-impl DiscStream {
-    /// Pipeline-mode `read()` helper: pull one PesPacket batch from
-    /// the demux thread, run codec parse on each PES, enqueue the
-    /// resulting PesFrames, return the first one.
-    fn read_pipeline(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
-        use super::demux_thread::DemuxBatch;
-        let rx = self.demux_rx.as_ref().expect("read_pipeline without rx");
-        match rx.recv() {
-            Ok(DemuxBatch::Ts(packets)) => {
-                let skip_parse = std::env::var_os("FREEMKV_SKIP_PARSE").is_some();
-                for pes in packets {
-                    if let Some((_, track)) = self
-                        .pid_to_track
-                        .iter()
-                        .find(|(pid, _)| *pid == pes.pid)
-                        .copied()
-                    {
-                        if skip_parse {
-                            self.pending_frames.push_back(crate::pes::PesFrame {
-                                track,
-                                pts: pes.pts.map(super::codec::pts_to_ns).unwrap_or(0),
-                                keyframe: false,
-                                data: pes.data,
-                            });
-                        } else if let Some((_, parser)) =
-                            self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
-                        {
-                            for frame in parser.parse(&pes) {
-                                self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(track, frame),
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(self.pending_frames.pop_front())
-            }
-            Ok(DemuxBatch::Ps(packets)) => {
-                for ps in packets {
-                    let track = match ps.stream_id {
-                        0xE0..=0xEF => 0,
-                        0xC0..=0xDF => 1,
-                        0xBD => ps
-                            .sub_stream_id
-                            .map(|s| (s & 0x1F) as usize + 1)
-                            .unwrap_or(1),
-                        _ => continue,
-                    };
-                    if track >= self.title.streams.len() {
-                        continue;
-                    }
-                    let pid = self
-                        .pid_to_track
-                        .iter()
-                        .find(|(_, idx)| *idx == track)
-                        .map(|(p, _)| *p)
-                        .unwrap_or(0);
-                    let pes = super::ts::PesPacket {
-                        pid,
-                        pts: ps.pts.map(|p| p as i64),
-                        dts: ps.dts.map(|d| d as i64),
-                        data: ps.data,
-                    };
-                    if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
-                        for frame in parser.parse(&pes) {
-                            self.pending_frames
-                                .push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
-                        }
-                    }
-                }
-                Ok(self.pending_frames.pop_front())
-            }
-            Ok(DemuxBatch::Err(e)) => Err(e),
-            Err(_) => {
-                // Channel closed → demux thread finished. EOF.
-                self.eof = true;
-                Ok(None)
-            }
-        }
-    }
-}
-
 impl crate::pes::Stream for DiscStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         if let Some(frame) = self.pending_frames.pop_front() {
@@ -686,19 +480,6 @@ impl crate::pes::Stream for DiscStream {
 
         if self.eof {
             return Ok(None);
-        }
-
-        // Pipeline mode: read+decrypt+demux all happen on the demux
-        // thread. Pull a batch of PesPackets and run codec parse on
-        // this thread; loop until we have at least one frame OR EOF.
-        if self.demux_rx.is_some() {
-            loop {
-                match self.read_pipeline()? {
-                    Some(f) => return Ok(Some(f)),
-                    None if self.eof => return Ok(None),
-                    None => continue,
-                }
-            }
         }
 
         loop {
@@ -896,6 +677,10 @@ impl crate::pes::Stream for DiscStream {
             }
         }
         true
+    }
+
+    fn errors(&self) -> u64 {
+        self.errors
     }
 }
 

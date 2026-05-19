@@ -115,6 +115,16 @@ pub trait Stream: Send {
     fn headers_ready(&self) -> bool {
         true
     }
+
+    /// Cumulative count of read errors the stream skipped past (e.g.
+    /// zero-filled bad sectors on a live drive). Default `0` for
+    /// streams that don't have a notion of skip-on-error (file ISO,
+    /// network, stdio, the pipeline highway, etc.); concrete impls
+    /// with adaptive retry (`DiscStream` on the drive single-pass
+    /// path) override.
+    fn errors(&self) -> u64 {
+        0
+    }
 }
 
 /// Wraps any output stream and counts bytes written.

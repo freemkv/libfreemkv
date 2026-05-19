@@ -211,6 +211,7 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 // are the ISO-on-disk implementations. [`DecryptingSectorSource`] is the
 // single decrypt-on-read decorator (AACS / CSS / none) — wrap any
 // `SectorSource` to get plaintext sectors out.
+pub use mux::build_iso_pipeline;
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, drive_has_disc, list_drives};
 pub use sector::{
     DecryptingSectorSource, FileSectorSink, FileSectorSource, PrefetchedSectorSource, SectorSink,

@@ -41,10 +41,17 @@
 //! reading the underlying source directly.
 
 use crate::error::Result;
+use crate::event::{Event, EventKind};
 use crate::halt::Halt;
 use crate::sector::SectorSource;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::thread::JoinHandle;
+
+/// Producer-thread event callback. Fires `BytesRead` after every
+/// successful batch read so the consumer side can update a UI
+/// progress indicator without polling. `Send + 'static` because the
+/// callback runs on the producer thread.
+pub type EventFn = Box<dyn Fn(Event) + Send + 'static>;
 
 const PREFETCH_CHANNEL_DEPTH: usize = 2;
 
@@ -85,7 +92,7 @@ impl PrefetchedSectorSource {
     /// — every byte the producer emits is what the consumer's demux
     /// will feed to its codec parsers.
     pub fn new<S>(
-        mut reader: S,
+        reader: S,
         extents: Vec<crate::disc::Extent>,
         batch_sectors: u16,
         halt: Option<Halt>,
@@ -93,7 +100,25 @@ impl PrefetchedSectorSource {
     where
         S: SectorSource + Send + 'static,
     {
+        Self::new_with_events(reader, extents, batch_sectors, halt, None)
+    }
+
+    /// Same as [`new`] but with a callback fired from the producer
+    /// thread after each successful batch — used by autorip's mux
+    /// path to surface `BytesRead` progress to the UI without the
+    /// consumer thread having to poll.
+    pub fn new_with_events<S>(
+        mut reader: S,
+        extents: Vec<crate::disc::Extent>,
+        batch_sectors: u16,
+        halt: Option<Halt>,
+        event_fn: Option<EventFn>,
+    ) -> Self
+    where
+        S: SectorSource + Send + 'static,
+    {
         let total_sectors: u32 = extents.iter().map(|e| e.sector_count).sum();
+        let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
         let (tx, rx) = bounded::<Batch>(PREFETCH_CHANNEL_DEPTH);
         let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(PREFETCH_CHANNEL_DEPTH + 1);
         let batch_bytes = batch_sectors as usize * 2048;
@@ -111,6 +136,7 @@ impl PrefetchedSectorSource {
             .spawn(move || {
                 let mut ext_idx = 0usize;
                 let mut offset: u32 = 0;
+                let mut bytes_read_total: u64 = 0;
                 while ext_idx < extents.len() {
                     if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
                         return;
@@ -144,6 +170,15 @@ impl PrefetchedSectorSource {
                     match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
                         Ok(n) => {
                             buf.truncate(n);
+                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
+                            if let Some(ref f) = event_fn {
+                                f(Event {
+                                    kind: EventKind::BytesRead {
+                                        bytes: bytes_read_total,
+                                        total: bytes_total_extents,
+                                    },
+                                });
+                            }
                             if tx.send(Ok(buf)).is_err() {
                                 return; // consumer dropped
                             }

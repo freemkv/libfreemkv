@@ -234,6 +234,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 ISO_MUX_BATCH_SECTORS,
                 format,
                 None,
+                None,
             );
             Ok(Box::new(stream))
         }
@@ -357,15 +358,17 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     batch_sectors: u16,
     format: ContentFormat,
     halt: Option<crate::halt::Halt>,
+    event_fn: Option<crate::sector::prefetched::EventFn>,
 ) -> PipelinedPesStream {
     let extents = title.extents.clone();
     let decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
-    let prefetched = crate::sector::PrefetchedSectorSource::new(
+    let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,
         extents,
         batch_sectors,
         halt.clone(),
+        event_fn,
     );
     let (rx, recycle_tx, shell) = prefetched.into_channels();
 
