@@ -138,6 +138,7 @@ impl crate::pes::Stream for MkvStream {
                         pts: pts_ms * 1_000_000, // ms → ns
                         keyframe,
                         data,
+                        duration_ns: None,
                     }));
                 }
                 _ => {
@@ -150,9 +151,13 @@ impl crate::pes::Stream for MkvStream {
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
         match &mut self.mode {
-            Mode::Write { muxer: Some(m) } => {
-                m.write_frame(frame.track, frame.pts, frame.keyframe, &frame.data)
-            }
+            Mode::Write { muxer: Some(m) } => m.write_frame(
+                frame.track,
+                frame.pts,
+                frame.keyframe,
+                &frame.data,
+                frame.duration_ns,
+            ),
             Mode::Write { muxer: None } => Ok(()),
             Mode::Read(_) => Err(crate::error::Error::StreamReadOnly.into()),
         }

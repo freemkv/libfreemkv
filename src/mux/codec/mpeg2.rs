@@ -194,6 +194,7 @@ impl CodecParser for Mpeg2Parser {
             pts_ns,
             keyframe,
             data: pes.data.clone(),
+            duration_ns: None,
         }]
     }
 

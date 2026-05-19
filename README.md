@@ -18,7 +18,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.18"
+libfreemkv = "0.25"
 ```
 
 ## Quick Start
@@ -56,8 +56,7 @@ output.finish()?;
 For damaged discs the library exposes two flat verbs — `Disc::sweep` for the
 forward Pass 1 and `Disc::patch` for retrying bad ranges. The library never
 loops; the multipass policy is the caller's job. See
-[`docs/rip-recovery.md`](docs/rip-recovery.md) and the design notes in
-`(internal)/memory/0_18_redesign.md`.
+[`docs/rip-recovery.md`](docs/rip-recovery.md).
 
 ```rust
 use libfreemkv::{SweepOptions, PatchOptions};

@@ -372,6 +372,9 @@ pub const BIT_DEPTH: u32 = 0x6264;
 pub const CLUSTER: u32 = 0x1F43_B675;
 pub const CLUSTER_TIMESTAMP: u32 = 0xE7;
 pub const SIMPLE_BLOCK: u32 = 0xA3;
+pub const BLOCK_GROUP: u32 = 0xA0;
+pub const BLOCK: u32 = 0xA1;
+pub const BLOCK_DURATION: u32 = 0x9B;
 
 // Cues
 pub const CUES: u32 = 0x1C53_BB6B;

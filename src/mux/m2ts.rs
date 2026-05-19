@@ -161,6 +161,7 @@ mod tests {
             pts: 0,
             keyframe: true,
             data: fake_idr_pes_data(),
+            duration_ns: None,
         };
         stream.write(&frame).unwrap();
         stream.finish().unwrap();

@@ -30,6 +30,7 @@ impl CodecParser for DvdSubParser {
             pts_ns,
             keyframe: true,
             data: pes.data.clone(),
+            duration_ns: None,
         }]
     }
 

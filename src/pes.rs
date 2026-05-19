@@ -17,6 +17,10 @@ pub struct PesFrame {
     pub keyframe: bool,
     /// Raw elementary stream data (NAL units, audio samples, etc).
     pub data: Vec<u8>,
+    /// Optional duration in nanoseconds. In-memory only; not part of
+    /// the on-wire serialization. Currently set by the PGS parser so
+    /// the MKV muxer can emit `BlockDuration`.
+    pub duration_ns: Option<u64>,
 }
 
 impl PesFrame {
@@ -64,6 +68,7 @@ impl PesFrame {
             pts,
             keyframe,
             data,
+            duration_ns: None,
         }))
     }
 
@@ -74,6 +79,7 @@ impl PesFrame {
             pts: frame.pts_ns,
             keyframe: frame.keyframe,
             data: frame.data,
+            duration_ns: frame.duration_ns,
         }
     }
 }
@@ -193,6 +199,7 @@ mod tests {
             pts,
             keyframe: track == 0 && pts == 0,
             data: vec![track as u8, (pts & 0xff) as u8, 0xAA],
+            duration_ns: None,
         }
     }
 

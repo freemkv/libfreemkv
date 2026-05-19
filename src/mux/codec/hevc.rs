@@ -110,6 +110,7 @@ impl CodecParser for HevcParser {
             pts_ns,
             keyframe,
             data: frame_data,
+            duration_ns: None,
         }]
     }
 

@@ -86,6 +86,7 @@ impl CodecParser for DtsParser {
                 pts_ns,
                 keyframe: true,
                 data: data[start..start + total_size].to_vec(),
+                duration_ns: None,
             });
             pos = start + total_size;
         }

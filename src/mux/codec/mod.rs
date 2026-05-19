@@ -29,6 +29,13 @@ pub struct Frame {
     pub keyframe: bool,
     /// Frame data (elementary stream bytes).
     pub data: Vec<u8>,
+    /// Optional duration in nanoseconds — only set by parsers that
+    /// can compute one (currently PGS, which pairs a display PCS
+    /// with the following empty PCS). When `Some`, the MKV muxer
+    /// emits a `BlockGroup` with `BlockDuration` instead of a
+    /// `SimpleBlock`; without it players guess the display interval
+    /// (subtitles linger past their end-time).
+    pub duration_ns: Option<u64>,
 }
 
 /// Convert 90kHz PTS to nanoseconds (round to nearest).
@@ -71,6 +78,7 @@ impl CodecParser for PassthroughParser {
             pts_ns,
             keyframe: self.keyframe,
             data: pes.data.clone(),
+            duration_ns: None,
         }]
     }
 

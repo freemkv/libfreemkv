@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.25.2 (2026-05-19)
+
+### Fixed
+
+- **DTS-HD codec ID** — `MkvTrack::audio` now emits `A_DTS/MA` for
+  DTS-HD MA and `A_DTS/HR` for DTS-HD HR instead of mislabelling
+  both as plain `A_DTS`. Strict players (Plex transcoder, some
+  hardware decoders, AV receivers) reject lossless DTS-HD MA
+  payload when the track advertises `A_DTS` because the ID
+  implies the 1.5 Mbps core-only bitstream.
+- **PGS subtitle BlockDuration** — the PGS parser is now stateful:
+  it pairs each display PCS with the following empty/clear PCS to
+  compute a duration, and the MKV muxer emits a `BlockGroup` +
+  `BlockDuration` for subtitles that carry one. Without this the
+  last bitmap lingered on screen until the next display set
+  replaced it (or until end of file).
+
+### Changed
+
+- `codec::Frame` gains `duration_ns: Option<u64>` (set by parsers
+  that can compute one; currently only PGS).
+- `pes::PesFrame` gains `duration_ns: Option<u64>` (in-memory only;
+  not part of the on-wire serialization).
+- `MkvMuxer::write_frame` now takes a final `duration_ns: Option<u64>`
+  parameter. When `Some`, the frame is emitted as a `BlockGroup`
+  with `BlockDuration` instead of a `SimpleBlock`.
+
+## 0.25.1 (2026-05-19)
+
+### New — autorip event_fn plumbing
+
+- `PrefetchedSectorSource::new_with_events(reader, extents, batch,
+  halt, event_fn)` — same producer-thread pipeline as `new()`, plus
+  an optional callback fired from the producer with `BytesRead`
+  events after every successful batch. Lets the autorip multipass
+  + resume mux paths drive their progress UI from the highway
+  without polling the consumer side.
+- `build_iso_pipeline` gains an `event_fn` parameter so callers can
+  wire the same callback through one ctor.
+
+### Changed
+
+- `pes::Stream` trait: new default `errors() -> u64` method
+  (default returns 0). Lets `Box<dyn Stream>` callers query the
+  skip-on-error counter without downcasting. `DiscStream` overrides
+  to surface its existing `errors` field.
+
+### Removed (breaking)
+
+- `DiscStream::new_pipeline` and `DiscStream::read_pipeline`
+  deleted. All file-backed mux now uses `build_iso_pipeline` →
+  `PipelinedPesStream`. `DiscStream` is now the single-threaded
+  inline reader used by autorip's live-drive single-pass path only.
+- `DiscStream::demux_thread` and `demux_rx` fields removed.
+- `M2tsStream::open` deleted; `Mode::Read` variant removed.
+  `m2ts://` URLs go through the internal `build_m2ts_pipeline`
+  helper in `mux/resolve.rs` → `PipelinedPesStream`. `M2tsStream`
+  is a write-only sink now.
+
+## 0.25.0 (2026-05-19)
+
+### New — the freemkv mux throughput "highway"
+
+Three-stage pipelined PES read path. Read+decrypt runs on a
+producer thread, M2TS demux runs on a second thread, codec parse
+runs on the caller's thread. Communication between stages is via
+bounded `crossbeam_channel` with a recycled buffer pool — no
+allocations or memcpys in the steady-state hot loop.
+
+**Throughput on the rip1 testbed (Civil_War UHD, 62 GiB ISO →
+`null://`, single-thread caller):**
+
+|                                       |   MB/s |
+| ------------------------------------- | -----: |
+| 0.23.2 baseline                       |     60 |
+| + memchr SIMD HEVC start-code scan    |     69 |
+| + ts.feed no-copy boundary            |     72 |
+| + `PrefetchedSectorSource` (producer) |    124 |
+| + `DemuxThread` (3-stage pipeline)    |    135 |
+| + zero-copy recycled buffer pool      |    148 |
+| + 16 KiB initial PesAssembler buffer  |    162 |
+| + mimalloc allocator in freemkv CLI   |  200+  |
+| **+ warm cache**                      | **660** |
+
+The new public API:
+
+- `libfreemkv::PrefetchedSectorSource` — wraps any `SectorSource`,
+  spawns a producer thread, exposes recycled-buffer channels.
+- `libfreemkv::io::byte_prefetcher::BytePrefetcher` —
+  `std::io::Read` analogue for byte-stream sources (m2ts files,
+  sockets, stdin).
+- `libfreemkv::mux::demux_thread::DemuxThread` — the M2TS demux
+  worker; `spawn_zero_copy` takes either prefetcher's channels.
+- `libfreemkv::PipelinedPesStream` — the read-side `Stream` impl
+  that runs codec parse on the caller thread.
+- `libfreemkv::build_iso_pipeline(reader, title, keys, batch,
+  format, halt)` — the canonical ctor that wires all three stages
+  for an ISO file source.
+
+### Changed (breaking)
+
+- `IsoSectorReader` (the naive duplicate of `FileSectorSource`)
+  deleted. `FileSectorSource` is the sole file-backed sector
+  source; it carries the SEQUENTIAL fadvise hint, the periodic
+  DONTNEED page-cache eviction, and (new) the per-read
+  `readahead()` async-prefetch syscall.
+- `mux::input("iso://...", &opts)` now returns a
+  `PipelinedPesStream`. Function signature
+  `input(&str, &InputOptions) -> io::Result<Box<dyn Stream>>` is
+  unchanged; callers that treated the return value as
+  `Box<dyn Stream>` keep working.
+
+### Other
+
+- `FileSectorSource` exposes per-OS `prefetch()` hooks
+  (`readahead(2)` on Linux, `fcntl(F_RDADVISE)` on macOS, no-op on
+  Windows + other).
+- AACS decrypt thread-pool: env var renamed from
+  `FREEMKV_DECRYPT_THREADS` to `FREEMKV_THREADS`; default raised
+  to `cores.clamp(1, 64)`.
+- `PesAssembler` initial buffer capacity 256 KiB → 16 KiB (avoids
+  the 64-page first-touch fault tax on every PES boundary).
+- HEVC / H.264 `find_start_code` swapped onto
+  `memchr::memmem::find` (SIMD).
+
 ## 0.18.4 (2026-05-09)
 
 ### Build / CI hardening — no library code changes

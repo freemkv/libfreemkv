@@ -47,6 +47,7 @@ mod tests {
             pts: 0,
             keyframe: true,
             data: vec![0x01, 0x02, 0x03],
+            duration_ns: None,
         };
         sink.write(&frame).unwrap();
         let _ = sink.info();

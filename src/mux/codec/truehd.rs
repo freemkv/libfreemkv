@@ -139,6 +139,7 @@ impl CodecParser for TrueHdParser {
                 pts_ns: self.next_pts_ns,
                 keyframe: is_major_sync,
                 data: self.buf[..unit_bytes].to_vec(),
+                duration_ns: None,
             });
             self.buf.drain(..unit_bytes);
             self.next_pts_ns += AU_DURATION_NS;

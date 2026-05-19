@@ -87,11 +87,19 @@ impl MkvTrack {
     }
 
     pub fn audio(a: &AudioStream) -> Self {
+        // Codec ID strings must distinguish the DTS family — strict
+        // players (Plex transcoder, some hardware decoders, some AV
+        // receivers) reject lossless DTS-HD MA payload when the
+        // track advertises plain `A_DTS` because it implies the
+        // bitstream is the 1.5 Mbps "core" only. Fix is just to
+        // emit the right ID per BD-STN codec field.
         let codec_id = match a.codec {
             Codec::Ac3 => "A_AC3",
             Codec::Ac3Plus => "A_EAC3",
             Codec::TrueHd => "A_TRUEHD",
-            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => "A_DTS",
+            Codec::DtsHdMa => "A_DTS/MA",
+            Codec::DtsHdHr => "A_DTS/HR",
+            Codec::Dts => "A_DTS",
             Codec::Lpcm => "A_PCM/INT/BIG",
             _ => "A_AC3",
         };
@@ -380,12 +388,19 @@ impl<W: Write + Seek> MkvMuxer<W> {
     }
 
     /// Write a single frame.
+    ///
+    /// When `duration_ns` is `Some`, the frame is emitted as a
+    /// `BlockGroup` with `BlockDuration` so the player knows exactly
+    /// when to remove the on-screen artifact (the practical case is
+    /// PGS subtitles — without it, the last bitmap lingers until the
+    /// next display set replaces it). Otherwise a plain `SimpleBlock`.
     pub fn write_frame(
         &mut self,
         track_idx: usize,
         pts_ns: i64,
         keyframe: bool,
         data: &[u8],
+        duration_ns: Option<u64>,
     ) -> io::Result<()> {
         let raw_ms = pts_ns / 1_000_000;
         let base = *self.base_pts_ms.get_or_insert(raw_ms);
@@ -409,9 +424,16 @@ impl<W: Write + Seek> MkvMuxer<W> {
             });
         }
 
-        // Write SimpleBlock
         let relative_ts = (pts_ms - self.cluster_ts_ms) as i16;
-        self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
+        match duration_ns {
+            Some(dur_ns) => {
+                let duration_ms = (dur_ns / 1_000_000).max(1);
+                self.write_block_group(track_idx + 1, relative_ts, keyframe, data, duration_ms)?;
+            }
+            None => {
+                self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
+            }
+        }
         self.frame_count += 1;
 
         Ok(())
@@ -508,6 +530,34 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.writer.write_all(&[flags])?;
         self.writer.write_all(data)?;
 
+        Ok(())
+    }
+
+    fn write_block_group(
+        &mut self,
+        track_num: usize,
+        relative_ts: i16,
+        keyframe: bool,
+        data: &[u8],
+        duration_ms: u64,
+    ) -> io::Result<()> {
+        let track_vint = if track_num < 0x80 {
+            vec![(track_num as u8) | 0x80]
+        } else {
+            vec![0x40 | ((track_num >> 8) as u8), track_num as u8]
+        };
+        let flags: u8 = if keyframe { 0x80 } else { 0x00 };
+        let block_size = track_vint.len() + 2 + 1 + data.len();
+
+        let bg_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_GROUP)?;
+        ebml::write_id(&mut self.writer, ebml::BLOCK)?;
+        ebml::write_size(&mut self.writer, block_size as u64)?;
+        self.writer.write_all(&track_vint)?;
+        self.writer.write_all(&relative_ts.to_be_bytes())?;
+        self.writer.write_all(&[flags])?;
+        self.writer.write_all(data)?;
+        ebml::write_uint(&mut self.writer, ebml::BLOCK_DURATION, duration_ms)?;
+        ebml::end_master(&mut self.writer, bg_pos)?;
         Ok(())
     }
 }
@@ -619,7 +669,7 @@ mod tests {
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         muxer
-            .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF], None)
             .unwrap();
         let data = muxer.writer.into_inner();
         assert!(
@@ -657,7 +707,9 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0, &[]).unwrap();
-        muxer.write_frame(0, 0, true, &[0x01, 0x02, 0x03]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None)
+            .unwrap();
         muxer.finish().unwrap();
 
         let data = shared.lock().unwrap().clone().into_inner();
@@ -673,13 +725,17 @@ mod tests {
         let tracks = [make_video_track(), make_audio_track()];
         let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0, &[]).unwrap();
         // Write frames to both tracks
-        muxer.write_frame(0, 0, true, &[0x00, 0x00, 0x01]).unwrap();
-        muxer.write_frame(1, 0, false, &[0x0B, 0x77, 0x00]).unwrap();
         muxer
-            .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01])
+            .write_frame(0, 0, true, &[0x00, 0x00, 0x01], None)
             .unwrap();
         muxer
-            .write_frame(1, 32_000_000, false, &[0x0B, 0x77, 0x01])
+            .write_frame(1, 0, false, &[0x0B, 0x77, 0x00], None)
+            .unwrap();
+        muxer
+            .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01], None)
+            .unwrap();
+        muxer
+            .write_frame(1, 32_000_000, false, &[0x0B, 0x77, 0x01], None)
             .unwrap();
         // Should not panic
         let data = muxer.writer.into_inner();
@@ -694,10 +750,12 @@ mod tests {
 
         // Record position before first frame
         let pos_before_kf = muxer.writer.position();
-        muxer.write_frame(0, 0, true, &[0xAA]).unwrap();
+        muxer.write_frame(0, 0, true, &[0xAA], None).unwrap();
         let pos_after_kf = muxer.writer.position();
 
-        muxer.write_frame(0, 1_000_000, false, &[0xBB]).unwrap();
+        muxer
+            .write_frame(0, 1_000_000, false, &[0xBB], None)
+            .unwrap();
         let pos_after_nkf = muxer.writer.position();
 
         let data = muxer.writer.into_inner();
@@ -942,7 +1000,7 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, tracks, None, 0.0, chapters).unwrap();
         for (t, pts, kf, data) in frames {
-            muxer.write_frame(*t, *pts, *kf, data).unwrap();
+            muxer.write_frame(*t, *pts, *kf, data, None).unwrap();
         }
         let frame_count = muxer.frame_count;
         muxer.finish().unwrap();

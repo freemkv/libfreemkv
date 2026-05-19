@@ -76,6 +76,7 @@ impl CodecParser for Ac3Parser {
                 pts_ns,
                 keyframe: true,
                 data: data[start..start + frame_size].to_vec(),
+                duration_ns: None,
             });
             pos = start + frame_size;
         }

@@ -186,6 +186,7 @@ mod tests {
             pts: 90000,
             keyframe: true,
             data: vec![0x47; 192],
+            duration_ns: None,
         };
         pes::Stream::write(&mut writer, &frame).unwrap();
         pes::Stream::finish(&mut writer).unwrap();

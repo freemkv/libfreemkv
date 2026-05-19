@@ -301,6 +301,7 @@ fn m2ts_stream_write_read() {
             pts: i as i64 * 1_000_000,
             keyframe: i == 0,
             data: vec![i; 100],
+            duration_ns: None,
         };
         PesStream::write(&mut stream, &frame).unwrap();
     }
@@ -322,6 +323,7 @@ fn m2ts_pes_frame_roundtrip() {
         pts: 1_234_567_890,
         keyframe: true,
         data: vec![0xDE; 200],
+        duration_ns: None,
     };
 
     let mut buf = Vec::new();
@@ -589,6 +591,7 @@ fn mkvstream_write_finish() {
             pts: i as i64 * 1_000_000,
             keyframe: i == 0,
             data: vec![i; 100],
+            duration_ns: None,
         };
         PesStream::write(&mut stream, &frame).unwrap();
     }
@@ -650,6 +653,7 @@ fn mkvstream_roundtrip_bdts() {
             pts: i as i64 * 1_000_000,
             keyframe: true,
             data: vec![i; 100],
+            duration_ns: None,
         };
         PesStream::write(&mut stream, &frame).unwrap();
     }
@@ -842,6 +846,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         pts: 1_000_000_000, // 1 second in ns
         keyframe: true,
         data: es_data,
+        duration_ns: None,
     };
     PesStream::write(&mut stream2, &frame1).unwrap();
 
@@ -851,6 +856,7 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
         pts: 1_041_700_000, // ~1 frame later in ns
         keyframe: false,
         data: es_data2,
+        duration_ns: None,
     };
     PesStream::write(&mut stream2, &frame2).unwrap();
     PesStream::finish(&mut stream2).unwrap();

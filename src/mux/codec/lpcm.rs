@@ -44,6 +44,7 @@ impl CodecParser for LpcmParser {
             pts_ns,
             keyframe: true,
             data: pes.data[BD_LPCM_HEADER_SIZE..].to_vec(),
+            duration_ns: None,
         }]
     }
 

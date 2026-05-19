@@ -96,6 +96,7 @@ impl CodecParser for Vc1Parser {
             pts_ns: ts_ns,
             keyframe,
             data: frame_data.to_vec(),
+            duration_ns: None,
         }]
     }
 

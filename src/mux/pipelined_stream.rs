@@ -108,6 +108,7 @@ impl PipelinedPesStream {
                         pts: pes.pts.map(super::codec::pts_to_ns).unwrap_or(0),
                         keyframe: false,
                         data: pes.data,
+                        duration_ns: None,
                     });
                 } else if let Some((_, parser)) =
                     self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)

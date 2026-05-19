@@ -85,6 +85,7 @@ impl CodecParser for H264Parser {
             pts_ns,
             keyframe,
             data: frame_data,
+            duration_ns: None,
         }]
     }
 
