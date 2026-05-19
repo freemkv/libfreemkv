@@ -52,7 +52,10 @@ impl CodecParser for HevcParser {
         let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
-        let mut frame_data = Vec::new();
+        // Pre-size: output is ~input bytes with a few 4-byte length
+        // prefixes added. UHD frames are 150-300 KB; the unsized Vec
+        // growth chain otherwise reallocs 5-7× per frame.
+        let mut frame_data = Vec::with_capacity(data.len() + 64);
 
         // Single-pass NAL scan: extract params, detect keyframes, build length-prefixed output
         let mut pos = 0;

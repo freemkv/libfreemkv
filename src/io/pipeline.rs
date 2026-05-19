@@ -53,26 +53,26 @@ use crate::halt::Halt;
 /// caller has already lost the rip.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
-/// Polling slice for the halt-aware send/finish loops. Mirrors the
-/// `bounded_syscall` cadence (250 ms) so halt observation feels equally
-/// responsive across both primitives.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
-
 /// Halt-check cadence for the send loop. Producer blocks on
 /// [`crossbeam_channel::Sender::send_timeout`] for this slice — the
 /// kernel wakes it the instant the consumer drains a slot, so on the
 /// happy path there's no throughput cap from this primitive at all
 /// (the cap is whatever the underlying medium can sustain). When the
-/// consumer is genuinely wedged, the timeout fires every 250 ms and
-/// the producer checks the halt token; that's the latency a stop
-/// request will observe.
+/// consumer is genuinely wedged, the timeout fires every
+/// [`crate::halt::POLL_INTERVAL`] and the producer checks the halt
+/// token; that's the latency a stop request will observe.
+///
+/// Single source of truth lives in [`crate::halt::POLL_INTERVAL`]
+/// (also used by `bounded_syscall`). Aliased here for readability of
+/// the send/finish call sites below.
 ///
 /// 0.21.7 replaced an old `std::sync::mpsc::sync_channel` + 50 ms
 /// `thread::sleep` polling loop that capped mux throughput at
 /// ~20 frames/sec ≈ 1 MB/s on saturated channels. See
 /// (internal)/memory/feedback_send_with_halt_poll_throttle.md
 /// for the multi-day diagnostic that surfaced it.
-const SEND_HALT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+use crate::halt::POLL_INTERVAL;
+const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
 
 /// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
 pub fn debug_enabled() -> bool {
@@ -100,8 +100,7 @@ pub const WRITE_PIPELINE_DEPTH: usize = 16;
 /// Channel depth for write-through pipelines. Each `send` fully
 /// drains before the next can enqueue. Use this when the producer
 /// must observe consumer side-effects (e.g. mapfile state) before
-/// emitting the next item.
-#[allow(dead_code)]
+/// emitting the next item. Currently used by `disc::patch`.
 pub const WRITE_THROUGH_DEPTH: usize = 1;
 
 /// Outcome of [`Sink::apply`]: either keep feeding items
@@ -162,11 +161,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// propagated rather than panicked.
     ///
     /// Sweep uses [`Pipeline::spawn_named`] directly so the consumer
-    /// thread shows up as `freemkv-sweep-consumer`; this function has
-    /// no in-tree caller yet. Patch and mux migrate in later 0.18
-    /// slices. The targeted `#[allow]` is removed when one of them
-    /// lands on the default name.
-    #[allow(dead_code)]
+    /// thread shows up as `freemkv-sweep-consumer`; mux uses
+    /// `freemkv-mux-consumer`. `Pipeline::spawn` (this function, with
+    /// the default name) is used by `disc::patch` and by the unit
+    /// tests in this module.
     pub fn spawn<S: Sink<I, Output = R>>(depth: usize, sink: S) -> Result<Self, Error> {
         Self::spawn_named("freemkv-pipeline-consumer", depth, sink)
     }

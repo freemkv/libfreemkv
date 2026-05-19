@@ -54,15 +54,7 @@ use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::halt::Halt;
-
-/// Granularity of the halt poll. The receive loop wakes every
-/// [`POLL_INTERVAL`] to (a) check the [`Halt`] token, then (b) check
-/// the overall deadline, then go back to waiting. 250 ms is a
-/// pragmatic balance: short enough that human-driven `/api/stop` feels
-/// responsive (< 0.5 s p99), long enough that the polling overhead is
-/// negligible against multi-second syscalls.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+use crate::halt::{Halt, POLL_INTERVAL};
 
 /// Failure outcome from a bounded syscall wrapper.
 #[derive(Debug)]

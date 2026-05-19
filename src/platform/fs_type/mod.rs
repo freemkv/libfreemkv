@@ -51,6 +51,9 @@ use other::detect_impl;
 #[cfg(target_os = "windows")]
 use windows::detect_impl;
 
+#[cfg(target_os = "linux")]
+use linux::detect_fd_impl;
+
 /// Best-effort classification of the filesystem under `path`.
 ///
 /// Falls back to [`FsType::Unknown`] on any syscall error or unrecognised
@@ -58,6 +61,25 @@ use windows::detect_impl;
 /// a single `statfs(2)` (Unix) or a string check (Windows).
 pub fn detect(path: &Path) -> FsType {
     detect_impl(path)
+}
+
+/// fd-based classification. Same return semantics as [`detect`], but
+/// takes a `RawFd` so callers that only have an open file (notably
+/// [`crate::io::writeback::WritebackPipeline`]) don't have to
+/// round-trip through the path.
+///
+/// Only implemented on Linux; other platforms return
+/// [`FsType::Unknown`] (none of them have a writeback policy that
+/// keys off this classification today).
+#[cfg(target_os = "linux")]
+pub fn detect_fd(fd: std::os::unix::io::RawFd) -> FsType {
+    detect_fd_impl(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // API parity with the linux impl; callers cfg-gate.
+pub fn detect_fd(_fd: i32) -> FsType {
+    FsType::Unknown
 }
 
 #[cfg(test)]

@@ -44,3 +44,19 @@ pub(super) fn hint_sequential(file: &File, len_bytes: u64) {
 /// less prone to the pin-everything pathology that triggers the
 /// regression on Linux NFS clients.
 pub(super) fn drop_window(_file: &File, _start: u64, _len: u64) {}
+
+/// Async-prefetch the byte range `[offset, offset+len)`. macOS uses
+/// the same `fcntl(F_RDADVISE, &radvisory)` primitive as the open-
+/// time sequential hint, just targeted at a moving window instead of
+/// the whole file. The kernel queues I/O for the requested range and
+/// returns immediately.
+pub(super) fn prefetch(file: &File, offset: u64, len: u64) {
+    let bytes = (len as i64).min(RDADVISE_MAX_BYTES);
+    let mut ra = RadAdvisory {
+        ra_offset: offset as libc::off_t,
+        ra_count: bytes as libc::c_int,
+    };
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), F_RDADVISE, &mut ra);
+    }
+}

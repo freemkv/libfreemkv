@@ -37,11 +37,20 @@ struct PesAssembler {
     active: bool,
 }
 
+/// Initial capacity for a fresh PES buffer. Sized to cover the
+/// common BD-TS audio / subtitle PES outright (a few KB to ~16 KB).
+/// Video PES (typically 150–300 KB on UHD) will grow this via the
+/// standard Vec doubling, but the doublings hit the allocator's
+/// slab caches instead of the 64-page first-touch faults that the
+/// previous `Vec::with_capacity(256 * 1024)` triggered on every PES
+/// boundary.
+const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
+
 impl PesAssembler {
     fn new(pid: u16) -> Self {
         Self {
             pid,
-            buffer: Vec::with_capacity(256 * 1024),
+            buffer: Vec::with_capacity(PES_BUFFER_INIT_CAP),
             pts: None,
             dts: None,
             active: false,
@@ -55,7 +64,7 @@ impl PesAssembler {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
-                data: std::mem::replace(&mut self.buffer, Vec::with_capacity(256 * 1024)),
+                data: std::mem::replace(&mut self.buffer, Vec::with_capacity(PES_BUFFER_INIT_CAP)),
             })
         } else {
             self.buffer.clear();
@@ -124,102 +133,118 @@ impl TsDemuxer {
         }
     }
 
-    /// Feed a chunk of BD transport stream data. Handles non-192-byte-aligned input
-    /// by buffering leftover bytes between calls. Returns completed PES packets.
+    /// Feed a chunk of BD transport stream data. Handles non-192-byte-
+    /// aligned input by buffering leftover bytes between calls. Returns
+    /// completed PES packets.
+    ///
+    /// 16 MiB ISO batches never divide evenly into 192-byte BD-TS
+    /// packets, so every call after the first carries a ~64-byte
+    /// remainder. The pre-0.24 implementation handled this by building
+    /// a `combined` Vec containing remainder + the entire new input —
+    /// a 16 MiB+ memcpy on every call. Now we splice exactly one
+    /// boundary packet from a stack buffer, then process the rest of
+    /// `data` in place. Zero-copy on the bulk path; one 192-byte copy
+    /// on the boundary.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
         let mut completed = Vec::with_capacity(4);
-
-        // Prepend any remainder from previous call
-        let mut combined: Vec<u8> = Vec::new();
-        let work: &[u8] = if !self.remainder.is_empty() {
-            combined.reserve(self.remainder.len() + data.len());
-            combined.extend_from_slice(&self.remainder);
-            combined.extend_from_slice(data);
-            self.remainder.clear();
-            &combined
-        } else {
-            data
-        };
-
         let mut offset = 0;
 
-        while offset + BD_TS_PACKET_SIZE <= work.len() {
-            let packet = &work[offset..offset + BD_TS_PACKET_SIZE];
-            offset += BD_TS_PACKET_SIZE;
-
-            // Skip 4-byte TP_extra_header, check sync byte
-            if packet[4] != SYNC_BYTE {
-                continue;
+        // Boundary packet: if a partial packet was left from the last
+        // call, complete it from the head of `data` without touching
+        // the rest of `data`.
+        if !self.remainder.is_empty() {
+            let need = BD_TS_PACKET_SIZE - self.remainder.len();
+            if data.len() < need {
+                // Still not a full packet — accumulate and wait.
+                self.remainder.extend_from_slice(data);
+                return completed;
             }
-
-            let ts = &packet[4..]; // 188-byte standard TS packet
-
-            // Parse TS header
-            let pid = (((ts[1] & 0x1F) as u16) << 8) | ts[2] as u16;
-            let pusi = ts[1] & 0x40 != 0; // Payload Unit Start Indicator
-            let adaptation = (ts[3] >> 4) & 0x03;
-
-            // Check if we're tracking this PID
-            let idx = if (pid as usize) < self.pid_index.len() {
-                self.pid_index[pid as usize]
-            } else {
-                -1
-            };
-            if idx < 0 {
-                continue;
-            }
-            let asm = &mut self.assemblers[idx as usize];
-
-            // Find payload start (skip adaptation field if present)
-            let payload_start = if adaptation == 0x03 || adaptation == 0x02 {
-                // Adaptation field present
-                let af_len = ts[4] as usize;
-                if af_len > 183 {
-                    continue; // Malformed: AF length exceeds TS payload
-                }
-                5 + af_len
-            } else {
-                4
-            };
-
-            if payload_start >= TS_PACKET_SIZE {
-                continue;
-            }
-
-            // No payload
-            if adaptation == 0x02 {
-                continue;
-            }
-
-            let payload = &ts[payload_start..];
-
-            if pusi {
-                // New PES packet starts here — parse PES header
-                let (pts, dts, pes_data_start) = parse_pes_header(payload);
-                if let Some(prev) = asm.start(pts, dts) {
-                    completed.push(prev);
-                }
-                if pes_data_start < payload.len() {
-                    asm.push(&payload[pes_data_start..]);
-                }
-            } else {
-                // Continuation of current PES packet
-                asm.push(payload);
-            }
+            let mut boundary = [0u8; BD_TS_PACKET_SIZE];
+            boundary[..self.remainder.len()].copy_from_slice(&self.remainder);
+            boundary[self.remainder.len()..].copy_from_slice(&data[..need]);
+            self.remainder.clear();
+            self.process_packet(&boundary, &mut completed);
+            offset = need;
         }
 
-        // Save leftover bytes for next call (cap at one packet to prevent unbounded growth)
-        if offset < work.len() {
-            let leftover = &work[offset..];
+        // Aligned-packets fast path — reads directly out of `data`.
+        while offset + BD_TS_PACKET_SIZE <= data.len() {
+            let packet = &data[offset..offset + BD_TS_PACKET_SIZE];
+            offset += BD_TS_PACKET_SIZE;
+            self.process_packet(packet, &mut completed);
+        }
+
+        // Save leftover bytes for next call (cap at one packet to
+        // prevent unbounded growth on a desynchronised stream).
+        if offset < data.len() {
+            let leftover = &data[offset..];
             if leftover.len() < BD_TS_PACKET_SIZE {
                 self.remainder.extend_from_slice(leftover);
             } else {
-                // More than one full packet leftover — something is wrong, discard
                 self.remainder.clear();
             }
         }
 
         completed
+    }
+
+    /// Demux a single 192-byte BD-TS packet (4-byte TP_extra_header +
+    /// 188-byte TS). Routes payload bytes into the per-PID
+    /// `PesAssembler`; completed PES packets are pushed onto
+    /// `completed` so the caller's allocation amortises across the
+    /// batch.
+    fn process_packet(&mut self, packet: &[u8], completed: &mut Vec<PesPacket>) {
+        // Sync byte check skips malformed packets.
+        if packet[4] != SYNC_BYTE {
+            return;
+        }
+        let ts = &packet[4..]; // 188-byte standard TS packet
+
+        let pid = (((ts[1] & 0x1F) as u16) << 8) | ts[2] as u16;
+        let pusi = ts[1] & 0x40 != 0; // Payload Unit Start Indicator
+        let adaptation = (ts[3] >> 4) & 0x03;
+
+        let idx = if (pid as usize) < self.pid_index.len() {
+            self.pid_index[pid as usize]
+        } else {
+            -1
+        };
+        if idx < 0 {
+            return;
+        }
+        let asm = &mut self.assemblers[idx as usize];
+
+        let payload_start = if adaptation == 0x03 || adaptation == 0x02 {
+            let af_len = ts[4] as usize;
+            if af_len > 183 {
+                return; // Malformed: AF length exceeds TS payload
+            }
+            5 + af_len
+        } else {
+            4
+        };
+
+        if payload_start >= TS_PACKET_SIZE {
+            return;
+        }
+        // adaptation == 0x02 → AF only, no payload.
+        if adaptation == 0x02 {
+            return;
+        }
+
+        let payload = &ts[payload_start..];
+
+        if pusi {
+            let (pts, dts, pes_data_start) = parse_pes_header(payload);
+            if let Some(prev) = asm.start(pts, dts) {
+                completed.push(prev);
+            }
+            if pes_data_start < payload.len() {
+                asm.push(&payload[pes_data_start..]);
+            }
+        } else {
+            asm.push(payload);
+        }
     }
 
     /// Flush all assemblers, returning any remaining PES packets.

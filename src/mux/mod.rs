@@ -17,8 +17,9 @@
 
 // Public modules — types here are intentionally part of the consumable API.
 pub mod codec;
+pub mod demux_thread;
 pub mod disc;
-pub mod iso;
+pub mod pipelined_stream;
 pub mod resolve;
 
 // Internal modules — implementation details. Their *types* are re-exported
@@ -54,11 +55,12 @@ pub(crate) mod ts;
 pub(crate) mod tsmux;
 
 pub use disc::DiscStream;
-pub use iso::IsoSectorReader;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
 pub use null::NullStream;
+pub use pipelined_stream::PipelinedPesStream;
+pub use resolve::build_iso_pipeline;
 pub use resolve::{InputOptions, StreamUrl, input, output, parse_url};
 pub use stdio::StdioStream;
 

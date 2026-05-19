@@ -44,3 +44,22 @@ pub(super) fn drop_window(file: &File, start: u64, len: u64) {
         );
     }
 }
+
+/// Async-prefetch `len` bytes at `offset` into the page cache. The
+/// kernel `readahead(2)` syscall queues the I/O and returns
+/// immediately — it does NOT wait for completion. Called right after
+/// each consumed read so the next batch's I/O overlaps with the
+/// caller's processing of the current batch (decrypt + demux + mux).
+///
+/// Without this hint, with a synchronous demux consumer running at
+/// ~50 MB/s and a single-spindle disk capable of ~150 MB/s, the disk
+/// sits idle ~70% of each iteration because kernel readahead alone
+/// (capped at `/sys/block/<dev>/queue/read_ahead_kb`, default 128 KB)
+/// can only pre-stage a tiny slice of the next batch. An explicit
+/// `readahead()` of the same size as the current batch tells the
+/// kernel to queue the full next-batch read now.
+pub(super) fn prefetch(file: &File, offset: u64, len: u64) {
+    unsafe {
+        libc::readahead(file.as_raw_fd(), offset as i64, len as usize);
+    }
+}

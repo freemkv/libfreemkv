@@ -16,30 +16,13 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
-/// libc `F_PREALLOCATE` — not exposed by the `libc` crate on all macOS
-/// SDK versions, so define it here.
-const F_PREALLOCATE: libc::c_int = 42;
-/// Allocate from current EOF.
-const F_PEOFPOSMODE: libc::c_int = 3;
-/// Hint: contiguous extent preferred.
-const F_ALLOCATECONTIG: libc::c_uint = 0x00000002;
-/// Allocate all the requested bytes (fall back to non-contig if needed).
-const F_ALLOCATEALL: libc::c_uint = 0x00000004;
+use crate::io::platform_macos::{
+    F_ALLOCATEALL, F_ALLOCATECONTIG, F_PEOFPOSMODE, F_PREALLOCATE, Fstore,
+};
 
 /// `fcntl(F_FULLFSYNC)` opcode. Documented in `man 2 fcntl` on macOS;
 /// not in the `libc` crate as a named constant.
 const F_FULLFSYNC: libc::c_int = 51;
-
-/// `fstore_t` layout matches `sys/fcntl.h`. Repr is C-stable so we can
-/// build it manually.
-#[repr(C)]
-struct Fstore {
-    fst_flags: libc::c_uint,
-    fst_posmode: libc::c_int,
-    fst_offset: libc::off_t,
-    fst_length: libc::off_t,
-    fst_bytesalloc: libc::off_t,
-}
 
 pub(super) fn preallocate(file: &File, size_bytes: u64) {
     let mut fst = Fstore {

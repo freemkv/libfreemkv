@@ -6,7 +6,7 @@
 //! ISO images are opened for read OR write at construction time.
 //!
 //! - [`SectorSource`] is implemented by `Drive` (hardware) and
-//!   [`FileSectorSource`] / `IsoSectorReader` (file-backed).
+//!   [`FileSectorSource`] (file-backed).
 //! - [`SectorSink`] is implemented by [`FileSectorSink`]
 //!   (ISO-backed) and sweep/patch consumer adapters.
 //! - [`DecryptingSectorSource`] is a decorator that wraps any
@@ -15,6 +15,7 @@
 
 pub mod decrypting;
 pub mod file;
+pub mod prefetched;
 
 use crate::error::Result;
 
@@ -112,3 +113,4 @@ pub trait SectorSink: Send {
 pub use crate::io::file_sector_source::FileSectorSource;
 pub use decrypting::DecryptingSectorSource;
 pub use file::FileSectorSink;
+pub use prefetched::PrefetchedSectorSource;

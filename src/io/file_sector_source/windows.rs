@@ -22,3 +22,9 @@ pub(super) fn hint_sequential(_file: &File, _len_bytes: u64) {
 /// equivalent. The kernel does its own working-set management. No-op
 /// for now.
 pub(super) fn drop_window(_file: &File, _start: u64, _len: u64) {}
+
+/// Windows async-prefetch hint. With FILE_FLAG_SEQUENTIAL_SCAN at
+/// open the kernel already prefetches aggressively, so there's no
+/// per-range hint we'd add on top. No-op stub for parity with the
+/// posix platforms.
+pub(super) fn prefetch(_file: &File, _offset: u64, _len: u64) {}

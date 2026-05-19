@@ -73,10 +73,21 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` pairs. 32 MiB is the empirically best value:
-/// iter8 = 28.7, iter9 (64 MiB) = 27.5, iter11 (128 MiB) = 16.6,
-/// iter6 (8 MiB) = 15.8. Locked.
-const WRITEBACK_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// `sync_file_range` pairs. 32 MiB is the empirically best value on
+/// the rip1 test bed (NFS to unraid-1 over 1 GbE, single-disk SAS):
+/// 8 MiB / 64 MiB / 128 MiB all measured worse in the 0.21.x mux
+/// iteration runs. Override via `FREEMKV_WRITEBACK_CHUNK_MIB` —
+/// faster backends (NVMe, RAID) may tolerate larger windows.
+const WRITEBACK_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
+
+fn writeback_chunk_bytes() -> u64 {
+    std::env::var("FREEMKV_WRITEBACK_CHUNK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n * 1024 * 1024)
+        .unwrap_or(WRITEBACK_CHUNK_BYTES_DEFAULT)
+}
 
 pub(crate) struct WritebackFile {
     file: File,
@@ -91,7 +102,7 @@ impl WritebackFile {
     /// or appended files).
     pub(crate) fn new(mut file: File) -> io::Result<Self> {
         let pos = file.stream_position()?;
-        let pipeline = WritebackPipeline::new(&file, pos, WRITEBACK_CHUNK_BYTES);
+        let pipeline = WritebackPipeline::new(&file, pos, writeback_chunk_bytes());
         Ok(Self {
             file,
             pipeline,

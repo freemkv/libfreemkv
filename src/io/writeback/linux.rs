@@ -300,35 +300,22 @@ impl WritebackPipeline {
     }
 }
 
-/// Probe whether `fd` lives on an NFS mount via `fstatfs`. Returns
-/// `false` on any error — we fail open, not closed: better to run the
-/// normal local-storage path on a misdetected NFS mount (and surface
-/// the freeze loudly via the timeout) than to needlessly disable
-/// writeback bounding on every local file because of a transient
-/// stat error.
+/// Probe whether `fd` lives on an NFS mount. Thin wrapper around
+/// [`crate::platform::fs_type::detect_fd`] so writeback policy and
+/// general-purpose fs-type classification stay in sync (same magic
+/// numbers, same musl-vs-glibc cast handling).
+///
+/// Fails open: any classification other than NFS counts as "not NFS"
+/// (including `Unknown` on `fstatfs` error) — better to run the
+/// normal local-storage path on a misdetected NFS mount and surface
+/// the freeze loudly via [`WAIT_AFTER_TIMEOUT`] than to needlessly
+/// disable writeback bounding on every local file because of a
+/// transient stat error.
 fn detect_nfs(fd: RawFd) -> bool {
-    // `libc::statfs` is repr(C) with a fixed layout; zeroing is the
-    // documented init pattern for the kernel uapi struct.
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatfs(fd, &mut buf) };
-    if rc != 0 {
-        let errno = std::io::Error::last_os_error();
-        tracing::warn!(
-            target: "mux",
-            "WritebackPipeline fstatfs(fd={fd}) failed: {errno} — defaulting is_nfs=false",
-        );
-        return false;
-    }
-    // `f_type` is signed (`__fsword_t`) on glibc and unsigned
-    // (`c_ulong`) on musl. Cast both sides to i64 for a portable
-    // comparison. On glibc x86_64 both already are i64 — clippy flags
-    // the cast as unnecessary on that target only, but we need it for
-    // musl, so silence the lint.
-    #[allow(clippy::unnecessary_cast)]
-    let f_type = buf.f_type as i64;
-    #[allow(clippy::unnecessary_cast)]
-    let nfs_magic = libc::NFS_SUPER_MAGIC as i64;
-    f_type == nfs_magic
+    matches!(
+        crate::platform::fs_type::detect_fd(fd),
+        crate::platform::fs_type::FsType::Nfs
+    )
 }
 
 /// Run `sync_file_range(WAIT_AFTER)` on a worker thread and wait up
@@ -354,5 +341,119 @@ fn wait_after_with_timeout(fd: RawFd, off: u64, len: u64) -> Option<u64> {
             // matches the no-op behaviour.
             Some(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    /// Helper: build a `WritebackPipeline` over a local tempfile. On
+    /// every test rig (linux dev box, CI) the tempfile lives on a
+    /// local FS, so `is_nfs=false` and `skip_wait` returns false until
+    /// we explicitly mark the pipeline degraded.
+    fn local_pipeline(chunk_bytes: u64) -> (NamedTempFile, WritebackPipeline) {
+        let f = NamedTempFile::new().expect("tempfile create");
+        let pipeline = WritebackPipeline::new(f.as_file(), 0, chunk_bytes);
+        (f, pipeline)
+    }
+
+    #[test]
+    fn new_pipeline_starts_active() {
+        let (_f, p) = local_pipeline(32 * 1024 * 1024);
+        assert!(!p.is_nfs, "local tempfile must not classify as NFS");
+        assert!(!p.degraded.load(Ordering::Relaxed));
+        assert!(!p.skip_wait(), "fresh local pipeline must not skip wait");
+    }
+
+    #[test]
+    fn degraded_flag_short_circuits_wait() {
+        let (_f, p) = local_pipeline(32 * 1024 * 1024);
+        assert!(!p.skip_wait());
+        p.degraded.store(true, Ordering::Relaxed);
+        assert!(
+            p.skip_wait(),
+            "degraded flag must force the wait+dontneed bypass"
+        );
+    }
+
+    #[test]
+    fn record_wait_grows_chunk_on_high_p95() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        // Fill the window with samples above the grow threshold.
+        for _ in 0..ADAPTIVE_WINDOW {
+            p.record_wait(ADAPTIVE_GROW_MS + 50);
+        }
+        assert!(
+            p.chunk_bytes > 16 * 1024 * 1024,
+            "chunk should have grown; got {}",
+            p.chunk_bytes
+        );
+        assert!(p.chunk_bytes <= CHUNK_BYTES_MAX);
+    }
+
+    #[test]
+    fn record_wait_shrinks_chunk_on_low_p95() {
+        let (_f, mut p) = local_pipeline(64 * 1024 * 1024);
+        for _ in 0..ADAPTIVE_WINDOW {
+            p.record_wait(1); // well under ADAPTIVE_SHRINK_MS
+        }
+        assert!(
+            p.chunk_bytes < 64 * 1024 * 1024,
+            "chunk should have shrunk; got {}",
+            p.chunk_bytes
+        );
+        assert!(p.chunk_bytes >= CHUNK_BYTES_MIN);
+    }
+
+    #[test]
+    fn record_wait_no_op_below_window_fill() {
+        let (_f, mut p) = local_pipeline(16 * 1024 * 1024);
+        let initial = p.chunk_bytes;
+        // Only push a few samples; window not full → no adaptation.
+        for _ in 0..(ADAPTIVE_WINDOW - 1) {
+            p.record_wait(ADAPTIVE_GROW_MS + 100);
+        }
+        assert_eq!(
+            p.chunk_bytes, initial,
+            "chunk must not change before window is full"
+        );
+    }
+
+    #[test]
+    fn record_wait_clamps_to_chunk_bounds() {
+        // Grow past the max.
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MAX);
+        for _ in 0..ADAPTIVE_WINDOW {
+            p.record_wait(ADAPTIVE_GROW_MS + 1000);
+        }
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MAX, "must clamp to MAX");
+
+        // Shrink past the min.
+        let (_f, mut p) = local_pipeline(CHUNK_BYTES_MIN);
+        for _ in 0..ADAPTIVE_WINDOW {
+            p.record_wait(0);
+        }
+        assert_eq!(p.chunk_bytes, CHUNK_BYTES_MIN, "must clamp to MIN");
+    }
+
+    #[test]
+    fn detect_nfs_local_file_is_false() {
+        // Local tempfile must not classify as NFS. This locks in the
+        // consolidation through `crate::platform::fs_type::detect_fd`.
+        let f = NamedTempFile::new().expect("tempfile create");
+        use std::os::unix::io::AsRawFd;
+        assert!(!detect_nfs(f.as_file().as_raw_fd()));
+    }
+
+    #[test]
+    fn note_progress_below_chunk_is_noop() {
+        let (_f, mut p) = local_pipeline(32 * 1024 * 1024);
+        // No-op return before crossing the first chunk boundary.
+        let before = p.chunk_count;
+        p.note_progress(1024); // < 32 MiB
+        assert_eq!(p.chunk_count, before);
+        assert!(p.pending.is_none());
     }
 }

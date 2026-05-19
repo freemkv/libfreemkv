@@ -71,6 +71,20 @@ impl Default for Halt {
     }
 }
 
+/// Shared poll interval for halt-aware loops.
+///
+/// `bounded_syscall` checks the cancellation flag and the deadline
+/// every [`POLL_INTERVAL`] while blocked on a worker; the same
+/// cadence governs `Pipeline::send_with_halt`'s `try_send` retry.
+/// 250 ms is the sweet spot between responsiveness (operator presses
+/// Stop, sees it take effect within ~quarter-second) and waste
+/// (atomic load + clock read is cheap but not free at thousands of
+/// hertz).
+///
+/// Centralised here so the half-dozen halt-polling loops across `io`
+/// can't drift apart silently.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "0.23.2"
+version = "0.24.0"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -34,6 +34,17 @@ tracing = "0.1"
 # throughput at ~1 MB/s (see (internal)/memory/
 # feedback_send_with_halt_poll_throttle.md, 0.21.7).
 crossbeam-channel = "0.5"
+# Persistent work-stealing thread pool for parallel AACS unit
+# decryption. Per-call std::thread::scope spawned fresh OS threads
+# and that overhead dominated for typical batch sizes (60 units).
+# rayon's global pool initialises once on first use.
+rayon = "1"
+# SIMD-accelerated bytestring search. Drives the HEVC/H.264 start-code
+# scan in `mux::codec::h264::find_start_code` — naive byte-by-byte
+# walk is ~500 MB/s single-thread on x86_64; memchr's vectorised
+# `memmem::find` for the 3-byte `00 00 01` needle hits ~5 GB/s on
+# AVX2-capable hosts.
+memchr = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

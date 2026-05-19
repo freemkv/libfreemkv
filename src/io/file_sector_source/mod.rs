@@ -1,39 +1,43 @@
 //! [`FileSectorSource`] — read 2048-byte sectors from an ISO file on
-//! disk, with an internal 32 MiB read-ahead buffer.
+//! disk via direct `seek + read_exact` (`pread`-equivalent) calls,
+//! letting the kernel's own readahead policy manage prefetch.
 //!
-//! ## Why the buffer
+//! ## Why no app-level buffer
 //!
-//! On NFS-mounted ISOs, an unbuffered `pread(2048)` per sector pays an
-//! NFS round-trip for every sector. With `rsize=1 MiB` and a 100-150 ms
-//! NFS RTT, that's three orders of magnitude more round trips than
-//! necessary — the muxer goes read-bound on every read, even though
-//! the local NFS client could deliver MB/s on bigger requests.
+//! Pre-0.21.3 this source held a 32 MiB (later 4 MiB) read-ahead
+//! buffer to amortise per-sector NFS round-trips. Empirically that
+//! buffer hurt: 32 MiB refills bursted the NFS TCP connection hard
+//! enough to starve the concurrent writer, and even a 4 MiB window
+//! gave the kernel less freedom to pipeline reads with writes. Direct
+//! pread per call lets Linux's readahead widen as it detects the
+//! sequential pattern, and naturally interleaves with writeback.
 //!
-//! Internally this source keeps a [`READAHEAD_BUF_BYTES`] (32 MiB)
-//! window pre-read from the file. `read_sectors(lba, count)` slices
-//! into the window if `[lba, lba+count)` is contained in it; otherwise
-//! the window is refilled (full-size aligned to the requested LBA's
-//! buffer position).
+//! ## DONTNEED on the consumed window
 //!
-//! ## Access pattern assumption
+//! Without page-cache eviction an 85 GB streaming ISO read pins the
+//! entire file in memory, starves the concurrent writer, and collapses
+//! mux throughput (observed: 2.7 MB/s mux on 0.21.5 vs. 70 MB/s
+//! isolated NFS reads). Every [`READ_DROP_CHUNK_BYTES`] of consumed
+//! bytes we call `posix_fadvise(DONTNEED)` over that window, mirroring
+//! the write-side [`crate::io::writeback::WritebackPipeline`] policy.
 //!
-//! The buffer is sized for **forward-sequential** reads (sweep, mux).
-//! Reverse-mode patch is range-local, so a refill per range works out
-//! fine (the buffer covers the whole range for typical bad-range
-//! sizes). Random-access reads thrash the buffer — at which point the
-//! 32 MiB pre-read is wasted work. We accept that: the use case is
-//! mux + sweep, both forward-sequential.
-//!
-//! Backward seeks rebuffer from the new LBA; partial reads at EOF
-//! return only the bytes that exist (the underlying file is shorter
-//! than a full buffer slot).
-//!
-//! ## Platform open hints
+//! ## Platform open hint
 //!
 //! On `open()` each platform issues its "sequential access expected"
-//! hint to the kernel so OS-level readahead widens. The hint lives in
-//! a per-OS sibling module ([`linux::hint_sequential`] et al.) — no
-//! inline `#[cfg]` in this file.
+//! hint so OS-level readahead widens. The hint and the DONTNEED call
+//! live in per-OS sibling modules ([`linux::hint_sequential`] et al.)
+//! — no inline `#[cfg]` in this file.
+//!
+//! ## Read-ahead prefetch
+//!
+//! After every consumed read we issue an OS-level prefetch hint for
+//! the next equivalent-sized window (`platform::prefetch`). The
+//! kernel queues that I/O asynchronously and returns immediately, so
+//! the next batch's read overlaps with the caller's processing of
+//! the current batch (decrypt + demux + mux). Without this the disk
+//! sits idle ~70% of each iteration because kernel SEQUENTIAL
+//! readahead alone (capped at `read_ahead_kb`, default 128 KB) is
+//! far smaller than our 16 MiB app-level batch.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -60,66 +64,48 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 
-/// Internal read-ahead buffer size. 32 MiB amortises one NFS round
-/// trip across ~16 k sectors — three orders of magnitude fewer trips
-/// than per-sector pread, and large enough to coast through a typical
-/// NFS server commit blip.
-///
-/// 0.21.2: shrunk from 32 MiB → 4 MiB. On NFS-backed ISOs with
-/// concurrent NFS writes (the mux phase), a 32 MiB refill bursts the
-/// TCP connection hard enough to starve the writer thread, observed
-/// empirically as a ~3× drop in sustained mux throughput on the
-/// rip1/unraid-1 setup. 4 MiB matches `rsize=1 MiB` × 4 round-trips
-/// and interleaves cleanly with writes.
-///
-/// Tweakable. Named const, not a magic number.
-pub const READAHEAD_BUF_BYTES: usize = 4 * 1024 * 1024;
-
 const SECTOR_SIZE: usize = 2048;
-/// Sectors per refill: [`READAHEAD_BUF_BYTES`] / [`SECTOR_SIZE`]. The
-/// buffer always tries to hold this many, except at the tail of the
-/// file where less data exists.
-const BUF_SECTORS: u32 = (READAHEAD_BUF_BYTES / SECTOR_SIZE) as u32;
 
-/// SectorSource backed by a file (ISO image) with an internal
-/// `READAHEAD_BUF_BYTES`-sized read-ahead window.
-///
-/// `read_sectors` is satisfied from the buffer when possible; otherwise
-/// a full-buffer refill is issued at the requested LBA's position and
-/// the call is re-tried against the freshly populated window.
 /// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
 /// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
 /// cache stays bounded the same way the write side does.
 ///
-/// 0.21.6: re-added after empirical discovery that Phase 1 had silently
-/// dropped this from the pre-Phase-1 (0.20.7) hot path. Without it,
-/// 85 GB of streaming ISO reads pin the entire file in the kernel page
-/// cache, starving the MKV writeback and collapsing mux throughput
-/// (observed: 2.7 MB/s mux on 0.21.5 vs. 70 MB/s isolated NFS reads).
-const READ_DROP_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// 32 MiB is the empirically tuned value on the rip1 test bed (single
+/// 7200rpm HDD via SATA): smaller windows (8 / 16 MiB) shorten the
+/// kernel-readahead overlap and slow the producer; larger windows
+/// (64 / 128 MiB) let the page cache pin enough of the ISO to
+/// pressure concurrent writes. Override via `FREEMKV_READ_DROP_CHUNK_MIB`.
+const READ_DROP_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
 
+fn read_drop_chunk_bytes() -> u64 {
+    std::env::var("FREEMKV_READ_DROP_CHUNK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n * 1024 * 1024)
+        .unwrap_or(READ_DROP_CHUNK_BYTES_DEFAULT)
+}
+
+/// SectorSource backed by a file (ISO image). Every `read_sectors`
+/// call is a direct `seek + read_exact` against the underlying file
+/// — kernel readahead handles prefetch, and every
+/// [`READ_DROP_CHUNK_BYTES_DEFAULT`] bytes of consumed data the
+/// platform's `DONTNEED` hook drops the consumed window from the
+/// page cache to bound memory pressure.
 pub struct FileSectorSource {
     file: File,
     /// Total file size in sectors. Constant after construction;
     /// surfaced via [`SectorSource::capacity_sectors`].
     capacity: u32,
-    /// 0.21.3+: the app-level buffer is no longer touched on the hot
-    /// path (every `read_sectors` is a direct pread). The fields are
-    /// retained so a future per-source-type policy (e.g. a local-disk
-    /// source where batched reads ARE beneficial) can re-enable
-    /// buffering cleanly without re-plumbing the struct.
-    #[allow(dead_code)]
-    buf: Box<[u8]>,
-    #[allow(dead_code)]
-    buf_start_lba: u32,
-    buf_len_sectors: u32,
-    /// 0.21.6: bytes read since the last DONTNEED drop. Drives the
-    /// per-`READ_DROP_CHUNK_BYTES` page-cache eviction in read_sectors.
+    /// Bytes read since the last DONTNEED drop. Drives the per-
+    /// [`read_drop_chunk_bytes`] page-cache eviction in read_sectors.
     bytes_read_since_drop: u64,
-    /// 0.21.6: file offset at which the current drop window starts.
-    /// The next DONTNEED drops from `drop_window_start` for
+    /// File offset at which the current drop window starts. The next
+    /// DONTNEED drops from `drop_window_start` for
     /// `bytes_read_since_drop` bytes.
     drop_window_start: u64,
+    /// Cached drop chunk size (resolved from env once at open).
+    drop_chunk_bytes: u64,
 }
 
 impl FileSectorSource {
@@ -148,58 +134,13 @@ impl FileSectorSource {
         // FS doesn't honour it).
         platform::hint_sequential(&file, len);
 
-        // Pre-allocate the buffer once. `vec![0u8; N].into_boxed_slice()`
-        // is the canonical way to fix the allocation size up-front;
-        // `Vec::with_capacity` would leave `len == 0` and force callers
-        // to do unsafe length manipulation to write into it.
-        let buf = vec![0u8; READAHEAD_BUF_BYTES].into_boxed_slice();
-
         Ok(Self {
             file,
             capacity,
-            buf,
-            buf_start_lba: 0,
-            buf_len_sectors: 0,
             bytes_read_since_drop: 0,
             drop_window_start: 0,
+            drop_chunk_bytes: read_drop_chunk_bytes(),
         })
-    }
-
-    /// True if `[lba, lba + count)` is wholly inside the current
-    /// buffer window. `count == 0` is vacuously true.
-    #[allow(dead_code)]
-    fn buffer_covers(&self, lba: u32, count: u32) -> bool {
-        if self.buf_len_sectors == 0 {
-            return false;
-        }
-        let end = match lba.checked_add(count) {
-            Some(e) => e,
-            None => return false,
-        };
-        let buf_end = self.buf_start_lba.saturating_add(self.buf_len_sectors);
-        lba >= self.buf_start_lba && end <= buf_end
-    }
-
-    /// Refill the buffer so it starts at `lba`. Read as many sectors
-    /// as we have buffer space AND file capacity for. Caller has
-    /// already checked `lba < capacity`.
-    #[allow(dead_code)]
-    fn refill(&mut self, lba: u32) -> Result<()> {
-        debug_assert!(lba < self.capacity, "refill past capacity");
-        // Don't read past EOF — clamp the request to remaining
-        // sectors. partial-buffer-at-EOF behaviour is intentional.
-        let want = BUF_SECTORS.min(self.capacity - lba);
-        let want_bytes = want as usize * SECTOR_SIZE;
-        let offset = lba as u64 * SECTOR_SIZE as u64;
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Error::IoError { source: e })?;
-        self.file
-            .read_exact(&mut self.buf[..want_bytes])
-            .map_err(|e| Error::IoError { source: e })?;
-        self.buf_start_lba = lba;
-        self.buf_len_sectors = want;
-        Ok(())
     }
 }
 
@@ -226,20 +167,6 @@ impl SectorSource for FileSectorSource {
         if count == 0 {
             return Ok(0);
         }
-        // 0.21.3: bypass the application-level buffer entirely.
-        //
-        // Empirically the 32 MiB readahead window (0.21.0–0.21.1) and the
-        // 4 MiB shrink (0.21.2) both regressed mux throughput vs the
-        // pre-Phase-1 0.20.7 baseline on NFS bidirectional workloads
-        // (sweep ~25 MB/s OK; mux dropped from 18 → 7-8 → 5-6 MB/s).
-        // Direct pread per call lets the kernel's own readahead policy
-        // run, which interleaves naturally with concurrent NFS writes on
-        // the same TCP connection.
-        //
-        // Buffer fields are retained (currently unused on this path) so
-        // any future per-source policy can be reintroduced without
-        // re-plumbing structure. `refill` / `buffer_covers` are kept too
-        // (still exercised by the tests so the API contract is locked).
         let offset = lba as u64 * SECTOR_SIZE as u64;
         self.file
             .seek(SeekFrom::Start(offset))
@@ -247,15 +174,21 @@ impl SectorSource for FileSectorSource {
         self.file
             .read_exact(&mut out[..bytes])
             .map_err(|e| Error::IoError { source: e })?;
-        self.buf_len_sectors = 0;
 
-        // 0.21.6: periodic page-cache eviction on the read side. Without
+        // Queue the next batch's read with the kernel before the
+        // caller starts processing what we just returned. readahead()
+        // is non-blocking — it queues I/O and returns, so the kernel
+        // pulls those pages into cache while the consumer (decrypt +
+        // demux + mux) runs. Next read_sectors call hits a warm cache.
+        platform::prefetch(&self.file, offset + bytes as u64, bytes as u64);
+
+        // Periodic page-cache eviction on the read side. Without
         // this, an 85 GB streaming ISO read pins the entire file in
-        // kernel page cache, which starves concurrent NFS writes (the
-        // MKV output) and collapses mux throughput. Mirrors the
-        // write-side WritebackPipeline's DONTNEED policy.
+        // the kernel page cache, which starves concurrent writes and
+        // collapses mux throughput. Mirrors the write-side
+        // WritebackPipeline's DONTNEED policy.
         self.bytes_read_since_drop += bytes as u64;
-        if self.bytes_read_since_drop >= READ_DROP_CHUNK_BYTES {
+        if self.bytes_read_since_drop >= self.drop_chunk_bytes {
             let drop_start = self.drop_window_start;
             let drop_len = self.bytes_read_since_drop;
             platform::drop_window(&self.file, drop_start, drop_len);
@@ -287,11 +220,15 @@ mod tests {
         f.flush().unwrap();
     }
 
+    /// Sectors used by spanning-boundary tests. Pick something that
+    /// exercises multi-megabyte reads without making test ISOs huge.
+    /// 8192 sectors = 16 MiB — large enough to cross any readahead
+    /// chunk size we set the kernel hint to.
+    const TEST_SPAN_SECTORS: u32 = 8192;
+
     #[test]
     fn sequential_reads_match_file() {
-        // Two full buffer windows + a tail = exercise refill across
-        // boundaries.
-        let total = BUF_SECTORS * 2 + 17;
+        let total = TEST_SPAN_SECTORS * 2 + 17;
         let dir = tempdir().unwrap();
         let path = dir.path().join("seq.iso");
         make_iso(&path, total);
@@ -311,28 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn multi_sector_read_spanning_buffer_boundary() {
-        // A read that lands exactly on the last sector of the buffer
-        // plus the first sector of the next refill must rebuffer
-        // mid-read. Bypass path triggers when count > BUF_SECTORS; we
-        // want the in-window path, so count stays small but
-        // straddles the boundary.
-        let total = BUF_SECTORS * 2;
+    fn multi_sector_read_across_chunk_boundary() {
+        let total = TEST_SPAN_SECTORS * 2;
         let dir = tempdir().unwrap();
         let path = dir.path().join("span.iso");
         make_iso(&path, total);
 
         let mut src = FileSectorSource::open(&path).unwrap();
 
-        // Prime: read sector 0. (0.21.3+: app-level buffer is bypassed,
-        // so we don't assert internal buf state here — just exercise
-        // the read path.)
-        let mut got = vec![0u8; SECTOR_SIZE];
-        src.read_sectors(0, 1, &mut got, false).unwrap();
-
-        // Now read 4 sectors crossing what used to be the buffer
-        // boundary. Still a valid SectorSource-contract test.
-        let span_lba = BUF_SECTORS - 2;
+        let span_lba = TEST_SPAN_SECTORS - 2;
         let mut buf4 = vec![0u8; SECTOR_SIZE * 4];
         src.read_sectors(span_lba, 4, &mut buf4, false).unwrap();
         for i in 0..4 {
@@ -345,10 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn backward_seek_rebuffers() {
-        // Read forward across two windows, then jump back to sector
-        // 0. Buffer must refill from the start.
-        let total = BUF_SECTORS * 2 + 5;
+    fn backward_seek_reads_correct_bytes() {
+        // Read forward then jump back: the SectorSource contract is
+        // byte-correctness regardless of access pattern.
+        let total = TEST_SPAN_SECTORS * 2 + 5;
         let dir = tempdir().unwrap();
         let path = dir.path().join("back.iso");
         make_iso(&path, total);
@@ -356,24 +280,17 @@ mod tests {
         let mut src = FileSectorSource::open(&path).unwrap();
         let mut got = vec![0u8; SECTOR_SIZE];
 
-        // Forward to the second window.
-        src.read_sectors(BUF_SECTORS + 1, 1, &mut got, false)
+        src.read_sectors(TEST_SPAN_SECTORS + 1, 1, &mut got, false)
             .unwrap();
-
-        // Backward to sector 0. (0.21.3+: app-level buffer is bypassed
-        // so we only assert the byte-level contract, not internal
-        // buffer state.)
         src.read_sectors(0, 1, &mut got, false).unwrap();
         assert!(got.iter().all(|b| *b == 0));
     }
 
     #[test]
-    fn partial_buffer_at_eof() {
-        // File is smaller than one buffer window. The buffer must
-        // populate with only the available sectors and reads must
-        // still succeed.
+    fn read_at_eof_returns_correct_bytes() {
+        // File smaller than the readahead chunk — reads near EOF must
+        // still return correct bytes.
         let total: u32 = 100;
-        assert!(total < BUF_SECTORS);
         let dir = tempdir().unwrap();
         let path = dir.path().join("small.iso");
         make_iso(&path, total);
@@ -382,39 +299,27 @@ mod tests {
         assert_eq!(src.capacity_sectors(), total);
 
         let mut got = vec![0u8; SECTOR_SIZE];
-        // First read at sector 0.
         src.read_sectors(0, 1, &mut got, false).unwrap();
-
-        // Read the very last sector. (0.21.3+: app-level buffer is
-        // bypassed; the test still verifies that EOF-region reads
-        // return correct bytes.)
         src.read_sectors(total - 1, 1, &mut got, false).unwrap();
         let expected = ((total - 1) & 0xff) as u8;
         assert!(got.iter().all(|b| *b == expected));
     }
 
     #[test]
-    fn oversized_read_bypasses_buffer() {
-        // A request larger than the buffer must not deadlock the
-        // refill (which only loads BUF_SECTORS at a time). Bypass
-        // path handles it via direct pread.
-        let total = BUF_SECTORS + 100;
+    fn large_single_read() {
+        // A multi-MB single read must work — the implementation has
+        // no app-level chunking, so this just exercises the direct
+        // pread path on a larger request.
+        let total = TEST_SPAN_SECTORS + 100;
         let dir = tempdir().unwrap();
-        let path = dir.path().join("over.iso");
+        let path = dir.path().join("big.iso");
         make_iso(&path, total);
 
         let mut src = FileSectorSource::open(&path).unwrap();
-        // Read more than BUF_SECTORS in one call. count is u16, so we
-        // can't actually exceed BUF_SECTORS (16k) — but the path also
-        // triggers via `out.len() / SECTOR_SIZE > BUF_SECTORS` check
-        // implicitly because count > BUF_SECTORS. BUF_SECTORS for
-        // 32 MiB is 16384, which does fit in u16 (max 65535). Cap
-        // at BUF_SECTORS + 1 to exercise the bypass.
-        let req = (BUF_SECTORS + 1) as u16;
+        let req = (TEST_SPAN_SECTORS + 1) as u16;
         let req_bytes = req as usize * SECTOR_SIZE;
         let mut big = vec![0u8; req_bytes];
         src.read_sectors(0, req, &mut big, false).unwrap();
-        // Spot-check sector 0 and the last requested sector.
         assert!(big[..SECTOR_SIZE].iter().all(|b| *b == 0));
         let last_lba = req as u32 - 1;
         let exp = (last_lba & 0xff) as u8;
@@ -424,5 +329,33 @@ mod tests {
                 .iter()
                 .all(|b| *b == exp)
         );
+    }
+
+    #[test]
+    fn drop_chunk_size_env_override() {
+        // Explicit 8 MiB via env var.
+        // SAFETY: tests in this crate are single-threaded per the
+        // default cargo test harness, but std::env::set_var is
+        // declared `unsafe` since Rust 2024 (it can race with other
+        // threads / TLS). For a test that runs in-process before any
+        // FileSectorSource construction this is safe in practice.
+        unsafe {
+            std::env::set_var("FREEMKV_READ_DROP_CHUNK_MIB", "8");
+        }
+        assert_eq!(read_drop_chunk_bytes(), 8 * 1024 * 1024);
+
+        unsafe {
+            std::env::remove_var("FREEMKV_READ_DROP_CHUNK_MIB");
+        }
+        assert_eq!(read_drop_chunk_bytes(), READ_DROP_CHUNK_BYTES_DEFAULT);
+
+        // Garbage env value falls back to default.
+        unsafe {
+            std::env::set_var("FREEMKV_READ_DROP_CHUNK_MIB", "not-a-number");
+        }
+        assert_eq!(read_drop_chunk_bytes(), READ_DROP_CHUNK_BYTES_DEFAULT);
+        unsafe {
+            std::env::remove_var("FREEMKV_READ_DROP_CHUNK_MIB");
+        }
     }
 }

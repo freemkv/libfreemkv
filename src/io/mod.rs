@@ -11,9 +11,12 @@
 //! to exhibit the same pathology for this access pattern.
 //!
 //! `FileSectorSource` is the read-side dual — it implements
-//! [`crate::sector::SectorSource`] for an ISO file with an internal
-//! 32 MiB read-ahead buffer that amortises NFS round-trip latency
-//! across thousands of sector reads.
+//! [`crate::sector::SectorSource`] for an ISO file using direct
+//! `pread`-equivalent calls so the kernel's own readahead policy runs
+//! (which interleaves naturally with the concurrent writeback). It
+//! pairs that with periodic `posix_fadvise(DONTNEED)` drops on the
+//! consumed window so an 85 GB streaming ISO read doesn't fill the
+//! page cache and starve the concurrent MKV write.
 //!
 //! `Pipeline` + `Sink` (0.18) is the generic producer/consumer primitive
 //! used by sweep, patch, and mux to overlap reads with writes via a
@@ -25,21 +28,21 @@
 
 pub(crate) mod bounded;
 pub mod byte_channel;
+pub mod byte_prefetcher;
 pub mod file_sector_source;
 pub mod sink;
 mod writeback;
 mod writeback_file;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod platform_macos;
+
 pub mod pipeline;
 
 pub(crate) use writeback_file::WritebackFile;
 
-// Re-exports for the 0.18 redesign. Sweep + patch are both wired up
-// (disc/sweep.rs, disc/patch.rs); mux migrates separately in autorip.
-// `WRITE_THROUGH_DEPTH` is patch-specific and has no other in-tree
-// caller — the targeted `#[allow]` keeps the re-export visible without
-// dragging the rest of the module under `dead_code`.
-#[allow(unused_imports)]
+// Re-exports for the 0.18 redesign. Sweep, patch, and mux are all
+// wired up (disc/sweep.rs, disc/patch.rs, autorip's ripper/mux.rs).
 pub use pipeline::{
     DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
     WRITE_THROUGH_DEPTH,

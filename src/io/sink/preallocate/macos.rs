@@ -7,23 +7,9 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
-// Mirror the Darwin `fstore_t` struct from `<sys/fcntl.h>`. libc on
-// some Rust toolchains/versions doesn't ship this binding, so define
-// it locally with the layout the kernel ABI requires.
-#[repr(C)]
-struct Fstore {
-    fst_flags: libc::c_uint,
-    fst_posmode: libc::c_int,
-    fst_offset: libc::off_t,
-    fst_length: libc::off_t,
-    fst_bytesalloc: libc::off_t,
-}
-
-// Constants from <sys/fcntl.h>.
-const F_PREALLOCATE: libc::c_int = 42;
-const F_ALLOCATECONTIG: libc::c_uint = 0x0000_0002;
-const F_ALLOCATEALL: libc::c_uint = 0x0000_0004;
-const F_PEOFPOSMODE: libc::c_int = 3;
+use crate::io::platform_macos::{
+    F_ALLOCATEALL, F_ALLOCATECONTIG, F_PEOFPOSMODE, F_PREALLOCATE, Fstore,
+};
 
 pub(super) fn preallocate_impl(file: &File, size_bytes: u64) {
     let fd = file.as_raw_fd();
