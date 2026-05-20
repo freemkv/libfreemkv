@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.25.3 (2026-05-19)
+
+### Changed
+
+- Synchronized to autorip 0.25.3 release. No behavioural changes
+  in the library — the v0.25.3 release ships the autorip-side
+  parallel mux pipeline.
+
 ## 0.25.2 (2026-05-19)
 
 ### Fixed
