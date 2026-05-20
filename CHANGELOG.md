@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.25.8 (2026-05-20)
+
+### Changed
+
+- Synchronized to autorip 0.25.8. No libfreemkv code changes —
+  unified versioning bump only. autorip 0.25.7 image was DOA
+  (missing +x on the binary); see autorip changelog.
+
 ## 0.25.7 (2026-05-20)
 
 ### Fixed — BU40N firmware wedge on KEYDB-miss discs
