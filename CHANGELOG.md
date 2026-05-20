@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.25.5 (2026-05-20)
+
+### Changed
+
+- Synchronized to autorip 0.25.5 release. No behavioural changes.
+
 ## 0.25.4 (2026-05-20)
 
 ### Changed
