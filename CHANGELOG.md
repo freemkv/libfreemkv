@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.25.4 (2026-05-20)
+
+### Changed
+
+- Synchronized to autorip 0.25.4 release. No behavioural changes
+  in the library — the v0.25.4 release ships the autorip-side
+  in-container NFS mount option.
+
 ## 0.25.3 (2026-05-19)
 
 ### Changed
