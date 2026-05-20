@@ -4,13 +4,14 @@
 //!   1. Bus authentication (challenge-response) → bus key
 //!   2. Read disc key block (READ DVD STRUCTURE) → XOR with bus key → decrypt with player keys → disc key
 //!   3. Read title key (REPORT KEY format 0x04) → XOR with bus key → decrypt with disc key → title key
-//!
-//! Based on libdvdcss (VideoLAN) and Stevenson 1999 analysis.
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
 
-// ── Player keys (from libdvdcss, Stevenson's PlayerKey cracker) ───────────
+// ── Built-in public DVD CSS player keys ────────────────────────────────────
+//
+// These 31 5-byte player keys are long-public CSS inputs. With them
+// compiled in, DVD ripping works with no external key file required.
 
 const PLAYER_KEYS: [[u8; 5]; 31] = [
     [0x01, 0xaf, 0xe3, 0x12, 0x80],

@@ -6,6 +6,8 @@
 
 Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
 
+Built-in keys cover DVDs and Blu-rays (AACS 1.0). For UHD (AACS 2.0 / 2.1) discs, an optional `keydb.cfg` supplies disc-specific volume unique keys.
+
 **12+ MB/s** sustained read speeds on BD. Full init: unlock, firmware upload, speed calibration — all from pure Rust.
 
 Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
@@ -121,7 +123,13 @@ loop {
 
 Streams implement `FrameSource` (read) and/or `FrameSink` (write); direction is type-checked. `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
-AACS decryption requires a KEYDB.cfg file. If available at `~/.config/aacs/KEYDB.cfg` or passed via `ScanOptions`, the library handles everything — handshake, key derivation, and per-sector decryption — without the application needing to know anything about encryption.
+### Keys
+
+DVDs (CSS) and Blu-rays (AACS 1.0) decrypt out of the box using bundled material — public AACS keys covering MKB version ranges are compiled into the library.
+
+UHD discs (AACS 2.0 / 2.1) use per-disc volume unique keys, so they need a `keydb.cfg`. If one is available at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`), libfreemkv handles handshake, key resolution, and per-sector decryption transparently.
+
+Operators with additional device keys, processing keys, or VUKs they have derived themselves can drop them into `~/.config/freemkv/local_keys.cfg`. This file uses the same syntax as `keydb.cfg` and is loaded on top of the built-in keys and any main `keydb.cfg` — entries are additive.
 
 ## Architecture
 

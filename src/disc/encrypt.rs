@@ -157,14 +157,20 @@ impl Disc {
     pub(super) fn resolve_encryption(
         udf_fs: &udf::UdfFs,
         reader: &mut dyn SectorSource,
-        keydb_path: &std::path::Path,
+        keydb_path: Option<&std::path::Path>,
         handshake: Option<&HandshakeResult>,
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
 
-        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
-            path: keydb_path.display().to_string(),
-        })?;
+        // Built-in AACS 1.0 keys are always available. When a keydb.cfg
+        // path is supplied, layer it on top; otherwise fall back to
+        // built-ins (plus the operator local-plugin slot, if any).
+        let keydb = match keydb_path {
+            Some(path) => KeyDb::load(path).map_err(|_| Error::KeydbLoad {
+                path: path.display().to_string(),
+            })?,
+            None => KeyDb::load_or_builtins(),
+        };
 
         // Read AACS files from disc/image via UDF
         let uk_ro_data = udf_fs

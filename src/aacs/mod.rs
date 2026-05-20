@@ -13,6 +13,7 @@
 //! The VUK decrypts title keys from AACS/Unit_Key_RO.inf on disc.
 //! Title keys decrypt m2ts stream content (AES-128-CBC).
 
+pub(crate) mod builtin_keys;
 pub mod decrypt;
 pub mod handshake;
 pub mod keydb;

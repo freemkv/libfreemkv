@@ -169,8 +169,9 @@ pub fn parse_unit_key_ro(data: &[u8], aacs2: bool) -> Option<UnitKeyFile> {
 /// This is the fast path — no subset-difference tree traversal needed.
 ///
 /// MKB format:
-///   Record type 0x10 = Verify Media Key Record (has mk_dv)
-///   Record type 0x81 = Type and Version Record (has MKB version)
+///   Record type 0x10 = Type and Version Record (has MKB version)
+///   Record type 0x81 = Verify Media Key Record, AACS 1.0 (has mk_dv)
+///   Record type 0x86 = Verify Media Key Record, AACS 2.0/2.1 (has mk_dv)
 ///   Record type 0x04 = Subset-Difference Index (has UVS entries)
 ///   Record type 0x07 = Explicit Subset-Difference Record (has cvalues)
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
@@ -244,10 +245,10 @@ fn validate_processing_key(
     None
 }
 
-/// Find Verify Media Key Record (type 0x10) in MKB.
+/// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
 fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     let mut pos = 0;
-    let mut type10_seen: Vec<(usize, usize)> = Vec::new();
+    let mut verify_rec_seen: Vec<(u8, usize, usize)> = Vec::new();
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
         let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
@@ -255,17 +256,18 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
             break;
         }
 
-        if rec_type == 0x10 {
-            type10_seen.push((pos, rec_len));
+        if rec_type == 0x81 || rec_type == 0x86 {
+            verify_rec_seen.push((rec_type, pos, rec_len));
         }
 
-        if rec_type == 0x10 && rec_len >= 20 {
-            // mk_dv is at offset 4 (after record header)
+        if (rec_type == 0x81 || rec_type == 0x86) && rec_len >= 20 {
+            // mk_dv is at offset 4 of the record (after the 4-byte header)
             let mut dv = [0u8; 16];
             dv.copy_from_slice(&mkb[pos + 4..pos + 20]);
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "mkb_mk_dv_found",
+                rec_type,
                 pos,
                 rec_len,
                 "mk_dv extracted from MKB"
@@ -277,9 +279,9 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     tracing::warn!(
         target: "freemkv::disc",
         phase = "mkb_mk_dv_not_found",
-        type10_seen = ?type10_seen,
+        verify_rec_seen = ?verify_rec_seen,
         scanned_bytes = pos,
-        "no 0x10 record with rec_len>=20 found"
+        "no 0x81/0x86 record with rec_len>=20 found"
     );
     None
 }
@@ -320,7 +322,8 @@ fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Get MKB version from Type and Version Record (type 0x81).
+/// Get MKB version from Type and Version Record (type 0x10).
+/// Version is a BE u32 at offset 8 of the record body (offset 12 from `pos`).
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     let mut pos = 0;
     while pos + 4 <= mkb.len() {
@@ -330,12 +333,12 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
             break;
         }
 
-        if rec_type == 0x81 && rec_len >= 8 {
+        if rec_type == 0x10 && rec_len >= 12 {
             return Some(u32::from_be_bytes([
-                mkb[pos + 4],
-                mkb[pos + 5],
-                mkb[pos + 6],
-                mkb[pos + 7],
+                mkb[pos + 8],
+                mkb[pos + 9],
+                mkb[pos + 10],
+                mkb[pos + 11],
             ]));
         }
         pos += rec_len;
@@ -935,21 +938,58 @@ mod tests {
     }
 
     #[test]
-    fn test_mkb_version_parse() {
-        // Synthetic MKB with Type and Version record (0x81)
-        let mut mkb = vec![0u8; 32];
-        // Record: type=0x81, length=12 (BE24)
-        mkb[0] = 0x81;
-        mkb[1] = 0x00;
-        mkb[2] = 0x00;
-        mkb[3] = 0x0C;
-        // Version = 77
-        mkb[4] = 0x00;
-        mkb[5] = 0x00;
-        mkb[6] = 0x00;
-        mkb[7] = 77;
-
+    fn mkb_version_recognizes_type_0x10() {
+        // Type-and-Version record: type=0x10, rec_len=12 (BE24).
+        // Body is 8 bytes; the version u32 sits at offset 8 of the record.
+        let mkb = [
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
         assert_eq!(mkb_version(&mkb), Some(77));
+    }
+
+    #[test]
+    fn mkb_version_returns_none_on_empty() {
+        assert_eq!(mkb_version(&[]), None);
+        assert_eq!(mkb_version(&[0x10, 0x00]), None);
+        // Type 0x10 record but rec_len < 12 → no version available.
+        let short = [0x10, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(mkb_version(&short), None);
+    }
+
+    #[test]
+    fn mkb_find_mk_dv_recognizes_type_0x81() {
+        // First: type-0x10 type/version record (12 bytes), then type-0x81 verify record.
+        // Verify record carries a known 16-byte mk_dv at offset 4 of the record body.
+        let expected: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        // type=0x81, rec_len=24 (4-byte header + 16-byte mk_dv + 4-byte trailing zeros)
+        mkb.extend_from_slice(&[0x81, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&expected);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        assert_eq!(mkb_find_mk_dv(&mkb), Some(expected));
+    }
+
+    #[test]
+    fn mkb_find_mk_dv_recognizes_type_0x86() {
+        // AACS 2.0 form uses type 0x86 for the verify record.
+        let expected: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C,
+        ];
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&expected);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        assert_eq!(mkb_find_mk_dv(&mkb), Some(expected));
     }
 
     #[test]

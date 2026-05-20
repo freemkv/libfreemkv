@@ -54,6 +54,16 @@ pub struct DiscEntry {
     pub unit_keys: Vec<(u32, [u8; 16])>,
 }
 
+/// Path to the operator-managed local plugin file. Operators drop
+/// additional AACS keys here (same on-disk format as keydb.cfg) and
+/// they layer transparently on top of the built-ins and the main
+/// keydb.cfg at load time. Returns `None` if `HOME` (or `USERPROFILE`
+/// on Windows) is not set in the environment.
+pub fn local_plugin_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(std::path::PathBuf::from(home).join(".config/freemkv/local_keys.cfg"))
+}
+
 /// Parse a hex string like "0xABCD..." into bytes.
 pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
@@ -89,6 +99,74 @@ pub(crate) fn parse_hex20(s: &str) -> Option<[u8; 20]> {
 }
 
 impl KeyDb {
+    /// Construct an empty KeyDb.
+    pub fn empty() -> Self {
+        KeyDb {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            host_certs: Vec::new(),
+            disc_entries: HashMap::new(),
+        }
+    }
+
+    /// Construct a KeyDb pre-populated with the compiled-in public AACS 1.0
+    /// device keys and processing keys. Sufficient on its own to derive
+    /// VUKs for any AACS 1.0 disc whose MKB version is covered.
+    pub fn with_builtins() -> Self {
+        let mut db = Self::empty();
+        db.add_builtins();
+        db
+    }
+
+    /// Push the built-in AACS 1.0 device keys and processing keys into
+    /// this KeyDb. Duplicates (identical device-key triples or identical
+    /// processing-key bytes) are silently skipped — first-seen wins.
+    fn add_builtins(&mut self) {
+        for entry in crate::aacs::builtin_keys::BUILTIN_DEVICE_KEYS {
+            self.add_device_key_dedup(entry.to_device_key());
+        }
+        for pk in crate::aacs::builtin_keys::BUILTIN_PROCESSING_KEYS {
+            self.add_processing_key_dedup(*pk);
+        }
+    }
+
+    fn add_device_key_dedup(&mut self, dk: DeviceKey) {
+        let dup = self
+            .device_keys
+            .iter()
+            .any(|x| x.node == dk.node && x.uv == dk.uv && x.u_mask_shift == dk.u_mask_shift);
+        if !dup {
+            self.device_keys.push(dk);
+        }
+    }
+
+    fn add_processing_key_dedup(&mut self, pk: [u8; 16]) {
+        if !self.processing_keys.iter().any(|x| *x == pk) {
+            self.processing_keys.push(pk);
+        }
+    }
+
+    /// Merge another KeyDb's entries into this one, additively. Existing
+    /// entries are kept; duplicates from `other` are silently dropped.
+    /// Used to layer external keydb.cfg / local plugin contents on top of
+    /// the built-ins.
+    pub fn merge_from(&mut self, other: KeyDb) {
+        for dk in other.device_keys {
+            self.add_device_key_dedup(dk);
+        }
+        for pk in other.processing_keys {
+            self.add_processing_key_dedup(pk);
+        }
+        // Host certs and disc entries do not have a stable "identity"
+        // key suitable for dedup beyond byte-equality, so append host
+        // certs as-is and insert disc entries with first-wins semantics
+        // by hash.
+        self.host_certs.extend(other.host_certs);
+        for (hash, entry) in other.disc_entries {
+            self.disc_entries.entry(hash).or_insert(entry);
+        }
+    }
+
     /// Parse a KEYDB.cfg file from a string.
     pub fn parse(data: &str) -> Self {
         let mut db = KeyDb {
@@ -152,10 +230,47 @@ impl KeyDb {
         db
     }
 
-    /// Load KEYDB.cfg from a file path.
+    /// Load a KEYDB.cfg from disk, layered on top of the compiled-in
+    /// built-in keys. If `path` does not exist, returns a KeyDb that
+    /// contains only the built-ins (no error). If `path` exists but
+    /// cannot be read, the underlying I/O error is returned.
+    ///
+    /// An operator plugin slot at `$HOME/.config/freemkv/local_keys.cfg`
+    /// (same on-disk format) is also layered on top when present. This
+    /// lets operators drop additional keys at runtime without editing
+    /// the main keydb.cfg.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
-        Ok(Self::parse(&data))
+        let mut db = Self::with_builtins();
+        if path.exists() {
+            let data = std::fs::read_to_string(path)?;
+            db.merge_from(Self::parse(&data));
+        }
+        db.merge_local_plugin();
+        Ok(db)
+    }
+
+    /// Load only the built-in keys plus the operator plugin slot at
+    /// `$HOME/.config/freemkv/local_keys.cfg` (if present). Used when
+    /// no main keydb.cfg path is configured.
+    pub fn load_or_builtins() -> Self {
+        let mut db = Self::with_builtins();
+        db.merge_local_plugin();
+        db
+    }
+
+    /// If `$HOME/.config/freemkv/local_keys.cfg` exists, layer its
+    /// contents on top of this KeyDb. Errors reading the plugin file
+    /// are silently ignored — the plugin is a best-effort augmentation.
+    fn merge_local_plugin(&mut self) {
+        let Some(path) = local_plugin_path() else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            self.merge_from(Self::parse(&data));
+        }
     }
 
     /// Look up a disc by its hash. Returns the VUK if found.
@@ -389,6 +504,160 @@ mod tests {
         let hc = KeyDb::parse_host_cert(line).unwrap();
         assert_eq!(hc.private_key[0], 0x90);
         assert_eq!(hc.certificate.len(), 92);
+    }
+
+    // Mutex serializes tests that mutate process-wide environment
+    // variables (HOME). Tests in the same module run on threads by
+    // default; a shared lock here prevents env-var bleed-through.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn keydb_default_has_builtins() {
+        let db = KeyDb::with_builtins();
+        assert_eq!(db.device_keys.len(), 4);
+        assert_eq!(db.processing_keys.len(), 3);
+        assert!(db.host_certs.is_empty());
+        assert!(db.disc_entries.is_empty());
+
+        let expected_first: [u8; 16] = [
+            0x5F, 0xB8, 0x6E, 0xF1, 0x27, 0xC1, 0x9C, 0x17, 0x1E, 0x79, 0x9F, 0x61, 0xC2, 0x7B,
+            0xDC, 0x2A,
+        ];
+        assert_eq!(db.device_keys[0].key, expected_first);
+        assert_eq!(db.device_keys[0].node, 0x0800);
+    }
+
+    #[test]
+    fn keydb_load_layers_on_builtins() {
+        // Synthetic keydb.cfg with one extra device key not in built-ins.
+        let extra_dk = "| DK | DEVICE_KEY 0xAABBCCDDEEFF00112233445566778899 | DEVICE_NODE 0x1234 | KEY_UV 0x00001234 | KEY_U_MASK_SHIFT 0x05 ; extra\n";
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir_isolated_home();
+        let cfg_path = tmp.path().join("keydb.cfg");
+        std::fs::write(&cfg_path, extra_dk).unwrap();
+
+        let db = KeyDb::load(&cfg_path).unwrap();
+        // 4 built-ins + 1 extra = 5 DKs total
+        assert_eq!(db.device_keys.len(), 5);
+        // Built-ins are still present and come first
+        assert_eq!(db.device_keys[0].node, 0x0800);
+        // Extra entry is layered on top
+        assert!(db.device_keys.iter().any(|d| d.node == 0x1234));
+        assert_eq!(db.processing_keys.len(), 3);
+    }
+
+    #[test]
+    fn keydb_load_missing_file_falls_back_to_builtins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _tmp = tempdir_isolated_home();
+        let db = KeyDb::load(std::path::Path::new("/nonexistent/keydb.cfg")).unwrap();
+        assert_eq!(db.device_keys.len(), 4);
+        assert_eq!(db.processing_keys.len(), 3);
+        assert!(db.host_certs.is_empty());
+        assert!(db.disc_entries.is_empty());
+    }
+
+    #[test]
+    fn keydb_local_plugin_layered() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir_isolated_home();
+
+        // Drop a local_keys.cfg into the synthetic HOME with one extra DK.
+        let plugin_dir = tmp.path().join(".config/freemkv");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let plugin_path = plugin_dir.join("local_keys.cfg");
+        std::fs::write(
+            &plugin_path,
+            "| DK | DEVICE_KEY 0x112233445566778899AABBCCDDEEFF00 | DEVICE_NODE 0xABCD | KEY_UV 0x0000ABCD | KEY_U_MASK_SHIFT 0x07 ; plugin\n",
+        )
+        .unwrap();
+
+        // load_or_builtins must include the plugin entry.
+        let db = KeyDb::load_or_builtins();
+        assert_eq!(db.device_keys.len(), 5);
+        assert!(db.device_keys.iter().any(|d| d.node == 0xABCD));
+
+        // load() of a non-existent main keydb must also include the plugin.
+        let db2 = KeyDb::load(std::path::Path::new("/nonexistent/keydb.cfg")).unwrap();
+        assert!(db2.device_keys.iter().any(|d| d.node == 0xABCD));
+    }
+
+    #[test]
+    fn resolve_with_no_keydb_path() {
+        // Higher-level resolution: when ScanOptions has no keydb_path
+        // and no keydb.cfg is in standard search paths, the loader
+        // returns a KeyDb populated with the built-ins (plus any
+        // plugin entries). This is the "AACS 1.0 just works" path.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _tmp = tempdir_isolated_home();
+        // Wipe XDG/system paths from view by pointing HOME at an empty
+        // dir and confirming there's nothing in our plugin slot. Then
+        // assert the no-path entry point returns built-ins only.
+        let db = KeyDb::load_or_builtins();
+        assert_eq!(db.device_keys.len(), 4);
+        assert_eq!(db.processing_keys.len(), 3);
+    }
+
+    #[test]
+    fn keydb_dedup_keeps_first() {
+        // Loading the same DK twice (built-in + identical entry in cfg)
+        // results in one entry, not two.
+        let dup_dk = "| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; duplicate of builtin\n";
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir_isolated_home();
+        let cfg_path = tmp.path().join("keydb.cfg");
+        std::fs::write(&cfg_path, dup_dk).unwrap();
+
+        let db = KeyDb::load(&cfg_path).unwrap();
+        // Still 4, not 5 — the duplicate was deduped
+        assert_eq!(db.device_keys.len(), 4);
+    }
+
+    /// Build a temporary directory and point `HOME`/`USERPROFILE` at it
+    /// so the local-plugin loader sees an isolated, empty environment by
+    /// default. The returned [`TempDir`] auto-cleans on drop.
+    fn tempdir_isolated_home() -> TempDir {
+        let tmp = TempDir::new();
+        // SAFETY: tests serialize via ENV_LOCK before calling this.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("USERPROFILE", tmp.path());
+        }
+        tmp
+    }
+
+    /// Minimal scoped temp directory — auto-removes on drop.
+    /// Avoids adding the `tempfile` crate as a dependency.
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+    impl TempDir {
+        fn new() -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tid = std::thread::current().id();
+            let path = std::env::temp_dir().join(format!(
+                "libfreemkv-keydb-test-{:?}-{}-{}",
+                tid,
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&path).expect("create tempdir");
+            TempDir { path }
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]

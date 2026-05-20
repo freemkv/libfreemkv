@@ -1116,40 +1116,35 @@ impl Disc {
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
         let (aacs, aacs_error) = if encrypted {
-            match opts.resolve_keydb() {
-                Some(keydb_path) => {
-                    match Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref())
-                    {
-                        Ok(state) => (Some(state), None),
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "scan_aacs_resolve_failed",
-                                error_code = e.code(),
-                                keydb = %keydb_path.display(),
-                                handshake_ok = handshake.is_some(),
-                                "AACS key resolution failed"
-                            );
-                            (None, Some(e))
-                        }
-                    }
-                }
-                None => {
+            // KEYDB is now optional: the library ships built-in AACS 1.0
+            // device + processing keys, so a missing keydb.cfg just falls
+            // back to the built-ins (plus the operator local-plugin slot,
+            // if any). External keydb.cfg layers on top when supplied.
+            let keydb_path = opts.resolve_keydb();
+            if keydb_path.is_none() {
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "scan_aacs_builtins_only",
+                    "no external KEYDB found; resolving with built-in AACS 1.0 keys"
+                );
+            }
+            match Self::resolve_encryption(
+                &udf_fs,
+                reader,
+                keydb_path.as_deref(),
+                handshake.as_ref(),
+            ) {
+                Ok(state) => (Some(state), None),
+                Err(e) => {
                     tracing::warn!(
                         target: "freemkv::disc",
-                        phase = "scan_aacs_no_keydb",
-                        "encrypted disc but no KEYDB found in search paths"
+                        phase = "scan_aacs_resolve_failed",
+                        error_code = e.code(),
+                        keydb = ?keydb_path.as_ref().map(|p| p.display().to_string()),
+                        handshake_ok = handshake.is_some(),
+                        "AACS key resolution failed"
                     );
-                    // Reuse KeydbLoad with sentinel path — adding a new Error
-                    // variant would be a breaking change for downstream
-                    // exhaustive matches. The path string makes the cause
-                    // unambiguous to autorip's message switch.
-                    (
-                        None,
-                        Some(crate::error::Error::KeydbLoad {
-                            path: String::from("<no keydb in search paths>"),
-                        }),
-                    )
+                    (None, Some(e))
                 }
             }
         } else {

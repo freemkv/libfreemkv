@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.25.9 (2026-05-20)
+
+### Fixed
+
+- **MKB record-type identification.** `mkb_find_mk_dv` and `mkb_version`
+  had their record-type constants swapped. The Verify Media Key record
+  is Type 0x81 (AACS 1.0) or Type 0x86 (AACS 2.0/2.1), not 0x10. The
+  Type-and-Version record is Type 0x10, not 0x81. PK and DK derivation
+  paths therefore failed silently on every disc, masking how often the
+  fallback paths could have succeeded. Fixed; mk_dv extracted at
+  offset 4 of the verify record, MKB version read at offset 8 of the
+  Type 0x10 record body. Tests added for both forms.
+
+### Added
+
+- **Built-in AACS keys.** Four device keys (covering MKB v01-v82+) and
+  three processing keys (covering v63-v68) are now compiled into
+  `libfreemkv` directly. DVDs and Blu-rays (AACS 1.0) decrypt with
+  zero external files. Combined with the existing 31 CSS player keys
+  in `css/auth.rs`, the library is self-sufficient for all DVD and
+  AACS 1.0 content.
+- **Operator plugin slot.** `~/.config/freemkv/local_keys.cfg` is
+  loaded automatically (same format as `keydb.cfg`) and layered
+  additively on top of the built-ins and the main keydb.cfg. For
+  operators who derive their own keys, this is the additive surface
+  to drop them into — main keydb.cfg from upstream auto-update stays
+  separate and overwritable.
+- `KeyDb::with_builtins()`, `KeyDb::load_or_builtins()`,
+  `KeyDb::empty()` constructors.
+
+### Changed
+
+- `Disc::scan` no longer errors when keydb.cfg is absent. With
+  built-ins covering DVD/BD, missing keydb is treated as "no UHD
+  keys available" — the AACS 2.0 / UHD code path surfaces a
+  specific error only when the disc actually needs keys that
+  aren't in built-ins, main keydb, or local plugin.
+
 ## 0.25.8 (2026-05-20)
 
 ### Changed
