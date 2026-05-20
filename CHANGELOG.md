@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.25.7 (2026-05-20)
+
+### Fixed — BU40N firmware wedge on KEYDB-miss discs
+
+`disc::encrypt::do_handshake` used to fire up to 16 AACS authenticate
+attempts back-to-back with no pause between them. Each attempt is
+5-10 SCSI REPORT_KEY/SEND_KEY exchanges. On a disc whose host cert
+isn't in our KEYDB (or one the drive rejects), that's 80-160 SCSI
+commands hammered at the drive in a few hundred milliseconds — and
+the BU40N (plus most consumer optical drives) responds by entering
+a fast-fail firmware wedge state where every subsequent CDB returns
+`ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB` (sense 0x05/0x24) until the
+drive is physically power-cycled.
+
+Live wedge event on rip1 2026-05-20 during a Barbie UHD scan
+(KEYDB miss) confirmed the diagnosis and motivated this fix.
+
+Defence-in-depth:
+- `MAX_CERT_ATTEMPTS` capped at 3 (was 16). If three different
+  host certs all fail, more won't help — the drive doesn't have a
+  match.
+- 1-second sleep between attempts. Gives the drive's firmware time
+  to recover internal state between auth challenges.
+- Bail immediately on any sense code with sense_key = 0x05
+  (`ILLEGAL_REQUEST`). The drive isn't merely rejecting our cert
+  — it's saying "I won't talk to you anymore" — so trying more
+  certs would deepen the wedge.
+
 ## 0.25.6 (2026-05-20)
 
 ### Changed

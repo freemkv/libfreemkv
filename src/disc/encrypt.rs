@@ -61,9 +61,29 @@ impl Disc {
             "handshake starting"
         );
 
-        const MAX_CERT_ATTEMPTS: usize = 16;
+        // v0.25.7 wedge fix. Pre-0.25.7 this loop fired up to 16 AACS
+        // authenticate attempts back-to-back with no pause. Each attempt
+        // is 5-10 SCSI REPORT_KEY/SEND_KEY exchanges. On a disc whose
+        // host cert isn't in our KEYDB (or one the drive rejects),
+        // that's 80-160 SCSI commands hammered at the drive in a
+        // few hundred milliseconds — and the BU40N (and most consumer
+        // optical drives) responds by entering a fast-fail firmware
+        // wedge state where every subsequent CDB returns
+        // ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB (sense 05/24) until
+        // power-cycled. Hit live on rip1 2026-05-20 during a Barbie
+        // UHD scan: KEYDB miss → 16 cert attempts in a tight loop →
+        // wedge → forced host reboot + drive disconnect to recover.
+        //
+        // Defense-in-depth: cap attempts, sleep between, and bail
+        // early on the drive's wedge sense so any later regression
+        // can't undo the protection silently.
+        const MAX_CERT_ATTEMPTS: usize = 3;
+        const PER_CERT_BACKOFF_MS: u64 = 1000;
         let mut last_err_code: Option<u16> = None;
         for (idx, hc) in keydb.host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
+            if idx > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
+            }
             match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
                 Ok(mut auth) => {
                     let volume_id = match aacs::handshake::read_volume_id(session, &mut auth) {
@@ -94,7 +114,24 @@ impl Disc {
                     });
                 }
                 Err(e) => {
-                    last_err_code = Some(e.code());
+                    let code = e.code();
+                    last_err_code = Some(code);
+                    // Drive wedge senses (any with high byte 0x05 =
+                    // ILLEGAL_REQUEST). The drive isn't merely
+                    // rejecting our cert — it's saying "I won't talk
+                    // to you anymore." Trying more certs makes the
+                    // wedge worse. Bail out immediately.
+                    let sense_key = ((code >> 8) & 0xFF) as u8;
+                    if sense_key == 0x05 {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "handshake_wedge_detected",
+                            cert_index = idx,
+                            error_code = code,
+                            "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
+                        );
+                        return None;
+                    }
                     continue;
                 }
             }
@@ -105,7 +142,8 @@ impl Disc {
             host_cert_count,
             tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
             last_error_code = last_err_code,
-            "all host certs in KEYDB rejected by drive"
+            "all host certs in KEYDB rejected by drive (capped at {} attempts to prevent firmware wedge)",
+            MAX_CERT_ATTEMPTS
         );
         // All host certs failed — return None, not a fake success
         None
