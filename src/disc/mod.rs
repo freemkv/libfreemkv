@@ -1043,9 +1043,10 @@ impl Disc {
     /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // AACS handshake (Blu-ray/UHD). Cert-based mutual auth; logs
-        // is_raw_read_active() as a diagnostic but the auth path no
-        // longer branches on it.
+        // AACS handshake (Blu-ray/UHD). Routes through Disc::read_vid,
+        // which prefers the per-drive OEM CDB path when the drive is
+        // in the extended-access state and falls back to cert-based
+        // mutual auth otherwise.
         let (handshake, handshake_error) = Self::do_handshake(session, opts);
 
         // Request max read speed — removes riplock on DVD

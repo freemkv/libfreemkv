@@ -184,6 +184,13 @@ impl Drive {
         self.profile.is_some()
     }
 
+    /// Borrow the matched drive profile, if any. Used by callers that
+    /// need to issue per-drive OEM CDB templates (e.g. the OEM VID
+    /// retrieval path in `disc::encrypt`).
+    pub fn drive_profile(&self) -> Option<&DriveProfile> {
+        self.profile.as_ref()
+    }
+
     /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
     pub fn scsi_mut(&mut self) -> &mut dyn ScsiTransport {
         self.scsi.as_mut()
@@ -432,23 +439,23 @@ impl Drive {
         }
     }
 
-    /// True if the drive is currently in raw-read mode.
+    /// True if the drive is currently in the extended-access state.
     ///
     /// Detected by the platform driver during `init()` from the unlock
     /// response's mode markers. When true:
     ///   - SCSI READ_10 returns plaintext sectors (no AACS bus
     ///     encryption applied)
-    ///   - VID retrieval works without the cert-based AACS handshake
+    ///   - VID retrieval works via the per-drive OEM CDB in
+    ///     [`DriveProfile`] without the cert-based AACS handshake
     ///   - Disc-side Host Revocation List enforcement is effectively
     ///     bypassed by the alternate data path
     ///
-    /// AACS layer code should branch on this: if true, skip
-    /// `aacs::handshake::aacs_authenticate` (the cert dance) and read
-    /// VID via the alternate VID read path. If false, fall back to the
-    /// standard cert-based handshake.
-    pub fn is_raw_read_active(&self) -> bool {
+    /// AACS layer code branches on this: if true, issue the OEM
+    /// `read_vid_cdb` to retrieve VID directly; if false, fall back
+    /// to the cert-based mutual-auth handshake.
+    pub fn is_unlocked(&self) -> bool {
         match self.driver {
-            Some(ref d) => d.is_raw_read_active(),
+            Some(ref d) => d.is_unlocked(),
             None => false,
         }
     }

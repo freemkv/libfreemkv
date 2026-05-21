@@ -25,10 +25,14 @@ const SUB_CMD_INIT: u8 = 0x12;
 const SUB_CMD_PROBE: u8 = 0x14;
 const UNLOCK_RESPONSE_SIZE: u8 = 64;
 const VALIDATE_RESPONSE_SIZE: u8 = 4;
+/// Primary mode marker at bytes [12..16] of the unlock response — set
+/// by the platform firmware when the runtime image is loaded and the
+/// extended-access surface is live.
 const FIRMWARE_ACTIVE_OFFSET: usize = 12;
 const FIRMWARE_ACTIVE_SIG: [u8; 4] = [0x4D, 0x4D, 0x6B, 0x76];
-/// Mode-identifier marker repeated through bytes 16..64 of the unlock
-/// response on a drive whose runtime firmware is uploaded and active.
+/// Secondary mode marker repeated through bytes [16..64] of the unlock
+/// response. Confirms the runtime firmware is the one driving the
+/// response, not a stale image's residual buffer.
 const FIRMWARE_MODE_OFFSET: usize = 16;
 const FIRMWARE_MODE_SIG: [u8; 4] = [0x4C, 0x62, 0x44, 0x72];
 
@@ -50,12 +54,18 @@ pub struct Mt1959 {
     pub(crate) profile: DriveProfile,
     pub(crate) mode: u8,
     pub(crate) buffer_id: u8,
-    pub(crate) unlocked: bool,
+    /// True after `run_init` has completed the unlock handshake (and any
+    /// required firmware upload). Gates probe + downstream control
+    /// commands; says nothing about whether the drive is in
+    /// extended-access mode.
+    pub(crate) init_complete: bool,
     /// True when the unlock response carried both the per-drive
-    /// signature AND a 4-byte marker at offset 12 plus a secondary
-    /// 4-byte marker at offset 16. When true the drive will accept
-    /// raw-read SCSI traffic without AACS bus encryption / cert auth.
-    raw_read_active: bool,
+    /// signature AND the primary mode marker at offset 12 AND the
+    /// secondary mode marker at offset 16. When true the drive is in
+    /// the extended-access state — host can issue the per-drive
+    /// OEM CDBs and read sectors without the cert-based AACS bus
+    /// encryption / mutual-auth gate.
+    unlocked: bool,
     probed: bool,
 }
 
@@ -70,8 +80,8 @@ impl Mt1959 {
             profile,
             mode,
             buffer_id,
+            init_complete: false,
             unlocked: false,
-            raw_read_active: false,
             probed: false,
         }
     }
@@ -151,20 +161,20 @@ impl Mt1959 {
             return Err(Error::UnlockFailed);
         }
 
-        // Raw-read mode is active when BOTH the per-drive signature
-        // matched AND the response carries the secondary 4-byte marker
-        // at offset 16, repeated through bytes 16..64. The active-mode
-        // signature at [12..16] checked above is the primary gate; the
-        // [16..20] marker is the redundant confirmation the firmware
-        // writes through the rest of the response. Requiring both
-        // before we tell the AACS layer "skip the cert dance" keeps
-        // any partial / corrupted response from steering us into the
-        // bypass.
-        self.raw_read_active = response.len() >= FIRMWARE_MODE_OFFSET + 4
+        // Extended-access state is active when BOTH the per-drive
+        // signature matched AND the response carries the secondary
+        // marker at offset 16 (repeated through bytes 16..64) AND the
+        // primary mode marker at [12..16] is present. The active-mode
+        // marker at [12..16] is the primary gate; the [16..20] marker
+        // is the redundant confirmation the firmware writes through
+        // the rest of the response. Requiring both before we tell the
+        // upper layer "OEM path is live" keeps any partial / corrupted
+        // response from steering us off the cert-auth fallback.
+        self.unlocked = response.len() >= FIRMWARE_MODE_OFFSET + 4
             && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] == FIRMWARE_ACTIVE_SIG
             && response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
-        self.unlocked = true;
+        self.init_complete = true;
         Ok(response)
     }
 
@@ -200,11 +210,11 @@ impl Mt1959 {
     // ── Init (unlock + firmware) ───────────────────────────────────────
 
     fn run_init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        let mut unlocked = false;
+        let mut succeeded = false;
         for _attempt in 0..3 {
             match self.do_unlock(scsi) {
                 Ok(_) => {
-                    unlocked = true;
+                    succeeded = true;
                     break;
                 }
                 Err(Error::SignatureMismatch { .. }) => {
@@ -225,7 +235,7 @@ impl Mt1959 {
                 }
             }
         }
-        if !unlocked {
+        if !succeeded {
             return Err(Error::UnlockFailed);
         }
         Ok(())
@@ -237,14 +247,14 @@ impl Mt1959 {
     /// per region. Two passes, then SET_CD_SPEED(max). After this the
     /// drive manages per-zone speeds internally.
     fn run_probe(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        if !self.unlocked {
+        if !self.init_complete {
             self.do_unlock(scsi)?;
         }
 
         // Detect disc type from capacity to select probe mode.
         // BD:  3C 01 44 12 01 00 00 00 04 00  (init_addr = 0x0100)
         // UHD: 3C 01 44 12 02 00 00 00 04 00  (init_addr = 0x0200)
-        // Verified from MakeMKV strace: BD and UHD use different init addresses.
+        // Empirically verified via SCSI capture: BD and UHD use different init addresses.
         let cap_cdb = [
             SCSI_READ_CAPACITY,
             0x00,
@@ -336,14 +346,14 @@ impl Mt1959 {
 
 impl PlatformDriver for Mt1959 {
     fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        if self.unlocked {
+        if self.init_complete {
             return Ok(());
         }
         self.run_init(scsi)
     }
 
     fn probe_disc(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        if !self.unlocked {
+        if !self.init_complete {
             // Don't retry init here — if init() failed, probing can't work either.
             // Retrying causes repeated USB bus resets on BU40N.
             return Ok(());
@@ -355,11 +365,11 @@ impl PlatformDriver for Mt1959 {
     }
 
     fn is_ready(&self) -> bool {
-        self.unlocked
+        self.init_complete
     }
 
-    fn is_raw_read_active(&self) -> bool {
-        self.raw_read_active
+    fn is_unlocked(&self) -> bool {
+        self.unlocked
     }
 }
 
@@ -404,6 +414,19 @@ mod tests {
             },
             signature,
             firmware: Vec::new(),
+            unlock_init_value: 0,
+            unlock_response_size: 0,
+            read_vid_cdb: None,
+            read_disc_keys_cdb: None,
+            drive_nominal_speed_cdb: None,
+            set_speed_max_cdb: None,
+            read10_raw_2sec_cdb: None,
+            read10_raw_1sec_cdb: None,
+            read_buffer_verify_cdb: None,
+            write_buffer_cdb: None,
+            read_buffer_unlock_cdb: None,
+            speed_zone_table: None,
+            speed_calc_table: None,
         }
     }
 
@@ -426,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn do_unlock_sets_raw_read_active_when_both_markers_present() {
+    fn do_unlock_sets_unlocked_when_both_markers_present() {
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
         let mut transport = ScriptedTransport { response };
@@ -434,28 +457,28 @@ mod tests {
 
         let raw = mt.do_unlock(&mut transport).expect("unlock should succeed");
         assert_eq!(raw.len(), 64);
-        assert!(mt.unlocked, "unlocked flag set after success");
+        assert!(mt.init_complete, "init_complete set after success");
         assert!(
-            mt.is_raw_read_active(),
-            "both markers present -> raw_read_active"
+            mt.is_unlocked(),
+            "both markers present -> extended-access state"
         );
     }
 
     #[test]
-    fn do_unlock_unlocked_but_not_raw_read_when_id_marker_missing() {
-        // Active-mode primary marker present (so unlock passes) but the
-        // secondary marker is replaced with zeros — drive isn't serving
-        // raw-read traffic on this path.
+    fn do_unlock_init_complete_but_not_unlocked_when_id_marker_missing() {
+        // Primary mode marker present (so init passes) but the
+        // secondary marker is replaced with zeros — drive isn't in
+        // extended-access state.
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, FIRMWARE_ACTIVE_SIG, [0u8; 4]);
         let mut transport = ScriptedTransport { response };
         let mut mt = Mt1959::new(fixture_profile(sig), false);
 
         mt.do_unlock(&mut transport).expect("unlock should succeed");
-        assert!(mt.unlocked);
+        assert!(mt.init_complete);
         assert!(
-            !mt.is_raw_read_active(),
-            "missing secondary marker -> raw-read not active"
+            !mt.is_unlocked(),
+            "missing secondary marker -> not in extended-access state"
         );
     }
 
@@ -471,15 +494,15 @@ mod tests {
 
         let err = mt.do_unlock(&mut transport).unwrap_err();
         assert!(matches!(err, Error::SignatureMismatch { .. }));
-        assert!(!mt.unlocked);
-        assert!(!mt.is_raw_read_active());
+        assert!(!mt.init_complete);
+        assert!(!mt.is_unlocked());
     }
 
     #[test]
     fn do_unlock_rejects_inactive_mode_marker() {
         // Signature matches but the primary marker at [12..16] is
-        // missing -> drive is not in active mode; both unlock and the
-        // raw-read flag must stay false.
+        // missing -> drive is not in active mode; init_complete and the
+        // unlocked flag must both stay false.
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, [0u8; 4], FIRMWARE_MODE_SIG);
         let mut transport = ScriptedTransport { response };
@@ -487,7 +510,7 @@ mod tests {
 
         let err = mt.do_unlock(&mut transport).unwrap_err();
         assert!(matches!(err, Error::UnlockFailed));
-        assert!(!mt.unlocked);
-        assert!(!mt.is_raw_read_active());
+        assert!(!mt.init_complete);
+        assert!(!mt.is_unlocked());
     }
 }

@@ -19,17 +19,18 @@ pub(crate) trait PlatformDriver: Send {
     /// True after successful init().
     fn is_ready(&self) -> bool;
 
-    /// True if the drive is currently in raw-read mode (the per-drive
-    /// runtime firmware has been uploaded AND the drive confirms
-    /// active mode via the marker bytes in the unlock response). When
-    /// true the host can read sectors without AACS bus encryption and
-    /// retrieve VID without cert-based mutual auth — the cert/HRL gate
-    /// on the drive's standard AACS path is effectively bypassed by
-    /// the alternate data path.
+    /// True if the drive is currently in the extended-access state —
+    /// per-drive runtime firmware uploaded AND the unlock response's
+    /// marker bytes confirm the mode is live. When true:
+    ///   - host can issue the per-drive OEM CDBs in
+    ///     [`crate::profile::DriveProfile`]
+    ///   - VID retrieval works via the OEM CDB path (no cert-based
+    ///     mutual auth required)
+    ///   - SCSI READ_10 returns plaintext sectors (no bus encryption)
     ///
-    /// Default `false` — platforms that don't implement this mode are
-    /// always reported as inactive.
-    fn is_raw_read_active(&self) -> bool {
+    /// Default `false` — platforms without this mode always report
+    /// inactive.
+    fn is_unlocked(&self) -> bool {
         false
     }
 }

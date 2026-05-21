@@ -35,6 +35,42 @@ pub struct DriveProfile {
     pub signature: [u8; 4],
     #[serde(default, deserialize_with = "deserialize_base64")]
     pub firmware: Vec<u8>,
+
+    // ── OEM-extended-access CDB templates ──────────────────────────────
+    //
+    // All optional — older profile blobs that pre-date the CDB capture
+    // pipeline simply omit these fields and decode as `None`. Encoded
+    // in the JSON as lowercase hex strings without separators
+    // (e.g. `"3c014410e29100002400"` for a 10-byte CDB).
+    #[serde(default)]
+    pub unlock_init_value: u8,
+    #[serde(default)]
+    pub unlock_response_size: u8,
+
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read_vid_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read_disc_keys_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_12")]
+    pub drive_nominal_speed_cdb: Option<[u8; 12]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_12")]
+    pub set_speed_max_cdb: Option<[u8; 12]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read10_raw_2sec_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read10_raw_1sec_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read_buffer_verify_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub write_buffer_cdb: Option<[u8; 10]>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub read_buffer_unlock_cdb: Option<[u8; 10]>,
+
+    // Per-drive identifier tables — variable-length hex strings.
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
+    pub speed_zone_table: Option<Vec<u8>>,
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
+    pub speed_calc_table: Option<Vec<u8>>,
 }
 
 /// Chipset + variant — determined by which section the profile was found in.
@@ -97,6 +133,78 @@ where
     base64::engine::general_purpose::STANDARD
         .decode(&s)
         .map_err(serde::de::Error::custom)
+}
+
+// ── Fixed-length hex deserializers for CDB templates ────────────────────
+//
+// Profile JSON encodes CDBs as lowercase hex strings without separators.
+// An empty string / null / missing field decodes as `None`.
+
+fn parse_hex_bytes(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    if s.len() % 2 != 0 {
+        return Err("odd hex length");
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "invalid hex digit")?;
+        out.push(byte);
+    }
+    Ok(out)
+}
+
+fn deserialize_opt_hex_bytes_10<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<[u8; 10]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    let Some(s) = opt else { return Ok(None) };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let bytes = parse_hex_bytes(&s).map_err(serde::de::Error::custom)?;
+    if bytes.len() != 10 {
+        return Err(serde::de::Error::custom("expected 10 bytes"));
+    }
+    let mut out = [0u8; 10];
+    out.copy_from_slice(&bytes);
+    Ok(Some(out))
+}
+
+fn deserialize_opt_hex_bytes_12<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<[u8; 12]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    let Some(s) = opt else { return Ok(None) };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let bytes = parse_hex_bytes(&s).map_err(serde::de::Error::custom)?;
+    if bytes.len() != 12 {
+        return Err(serde::de::Error::custom("expected 12 bytes"));
+    }
+    let mut out = [0u8; 12];
+    out.copy_from_slice(&bytes);
+    Ok(Some(out))
+}
+
+fn deserialize_opt_hex_bytes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    let Some(s) = opt else { return Ok(None) };
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let bytes = parse_hex_bytes(&s).map_err(serde::de::Error::custom)?;
+    Ok(Some(bytes))
 }
 
 // ── Loading ────────────────────────────────────────────────────────────

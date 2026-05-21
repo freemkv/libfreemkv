@@ -76,6 +76,8 @@ pub const E_AACS_RAW_READ_UNSUPPORTED: u16 = 7016;
 pub const E_AACS_VID_UNAVAILABLE: u16 = 7017;
 pub const E_AACS_MK_UNAVAILABLE: u16 = 7018;
 pub const E_AACS_VUK_NOT_IN_KEYDB: u16 = 7019;
+pub const E_DRIVE_PROFILE_MISSING: u16 = 7020;
+pub const E_VID_CDB_UNAVAILABLE: u16 = 7021;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -243,6 +245,14 @@ pub enum Error {
     /// Disc-hash lookup in the keydb missed and no other path is
     /// available (typically because VID is missing).
     AacsVukNotInKeydb,
+    /// Drive identity did not match any bundled profile; per-drive CDB
+    /// templates aren't available so the OEM VID retrieval path can't
+    /// run.
+    DriveProfileMissing,
+    /// Drive's profile is present but doesn't carry a VID-retrieval CDB
+    /// template (older profile blob, or a drive class without an OEM
+    /// VID path).
+    VidCdbUnavailable,
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -333,6 +343,8 @@ impl Error {
             Error::AacsVidUnavailable => E_AACS_VID_UNAVAILABLE,
             Error::AacsMkUnavailable => E_AACS_MK_UNAVAILABLE,
             Error::AacsVukNotInKeydb => E_AACS_VUK_NOT_IN_KEYDB,
+            Error::DriveProfileMissing => E_DRIVE_PROFILE_MISSING,
+            Error::VidCdbUnavailable => E_VID_CDB_UNAVAILABLE,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
