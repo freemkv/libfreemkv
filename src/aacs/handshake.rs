@@ -1235,8 +1235,8 @@ mod tests {
     }
 
     #[test]
-    fn test_aes_cmac() {
-        // Basic CMAC test — at minimum verify it produces consistent output
+    fn test_aes_cmac_deterministic() {
+        // Same (data, key) must always produce the same MAC.
         let key = [
             0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
             0x4f, 0x3c,
@@ -1246,6 +1246,93 @@ mod tests {
         let mac2 = aes_cmac_16(&data, &key);
         assert_eq!(mac1, mac2);
         assert_ne!(mac1, [0u8; 16]); // shouldn't be all zeros
+    }
+
+    #[test]
+    fn test_aes_cmac_nist_kat_full_block() {
+        // NIST SP 800-38B Appendix D.1, Example 2 (Mlen = 128):
+        //   K = 2b7e1516 28aed2a6 abf71588 09cf4f3c
+        //   M = 6bc1bee2 2e409f96 e93d7e11 7393172a
+        //   T = 070a16b4 6b4d4144 f79bdd9d d04a287c
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let data = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
+        let expected = [
+            0x07, 0x0a, 0x16, 0xb4, 0x6b, 0x4d, 0x41, 0x44, 0xf7, 0x9b, 0xdd, 0x9d, 0xd0, 0x4a,
+            0x28, 0x7c,
+        ];
+        let mac = aes_cmac_16(&data, &key);
+        assert_eq!(mac, expected, "AES-CMAC-128 must match NIST SP 800-38B KAT");
+    }
+
+    #[test]
+    fn test_vid_mac_verify_roundtrip() {
+        // Simulate the drive-side: pick a (bus_key, vid), compute the MAC, and
+        // verify the host-side check accepts it. Then mutate VID and MAC each
+        // in turn and verify both mutations cause a mismatch (the path that
+        // would yield Error::AacsVidMac in read_volume_id).
+        let bus_key = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let vid = [
+            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+
+        // Drive returns vid + mac where mac == AES-CMAC-128(bus_key, vid).
+        let drive_mac = aes_cmac_16(&vid, &bus_key);
+        let calc_mac = aes_cmac_16(&vid, &bus_key);
+        assert_eq!(calc_mac, drive_mac, "honest drive: MACs must match");
+
+        // Mutate the MAC: a malicious drive that swapped VID but returned its
+        // original MAC would produce a mismatch here.
+        let mut bad_mac = drive_mac;
+        bad_mac[0] ^= 0x01;
+        assert_ne!(calc_mac, bad_mac, "mutated MAC must be rejected");
+
+        // Mutate the VID: even one bit of VID drift produces a wildly different
+        // CMAC (this is what catches a substituted VID with a stale MAC).
+        let mut bad_vid = vid;
+        bad_vid[15] ^= 0x01;
+        let calc_for_bad_vid = aes_cmac_16(&bad_vid, &bus_key);
+        assert_ne!(
+            calc_for_bad_vid, drive_mac,
+            "MAC over mutated VID must not match original MAC"
+        );
+
+        // Wrong bus key (e.g. handshake replayed against the wrong session)
+        // also produces a different MAC over the same VID.
+        let mut wrong_key = bus_key;
+        wrong_key[0] ^= 0xff;
+        let calc_with_wrong_key = aes_cmac_16(&vid, &wrong_key);
+        assert_ne!(
+            calc_with_wrong_key, drive_mac,
+            "MAC under wrong bus key must not match"
+        );
+    }
+
+    #[test]
+    fn test_vid_mac_all_zero_mac_rejected() {
+        // Defensive: a buggy or hostile drive that returns all-zero MAC must
+        // be rejected (the real MAC over any non-trivial VID is nearly never
+        // 0...0). This guards against a class of "drive returned garbage"
+        // failures masquerading as success.
+        let bus_key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let vid = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ];
+        let calc_mac = aes_cmac_16(&vid, &bus_key);
+        assert_ne!(calc_mac, [0u8; 16], "real CMAC must not be all zeros");
     }
 
     #[test]

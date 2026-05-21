@@ -125,11 +125,9 @@ Streams implement `FrameSource` (read) and/or `FrameSink` (write); direction is 
 
 ### Keys
 
-DVDs (CSS) and Blu-rays (AACS 1.0) decrypt out of the box using bundled material — public AACS keys covering MKB version ranges are compiled into the library.
+DVDs (CSS) decrypt out of the box — the 1999-era public player keys are compiled into the library.
 
-UHD discs (AACS 2.0 / 2.1) use per-disc volume unique keys, so they need a `keydb.cfg`. If one is available at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`), libfreemkv handles handshake, key resolution, and per-sector decryption transparently.
-
-Operators with additional device keys, processing keys, or VUKs they have derived themselves can drop them into `~/.config/freemkv/local_keys.cfg`. This file uses the same syntax as `keydb.cfg` and is loaded on top of the built-in keys and any main `keydb.cfg` — entries are additive.
+Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`). The file holds all DKs, PKs, host certs, and per-disc VUKs. No AACS key material is compiled into the binary.
 
 ## Architecture
 

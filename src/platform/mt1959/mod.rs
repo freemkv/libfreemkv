@@ -27,6 +27,10 @@ const UNLOCK_RESPONSE_SIZE: u8 = 64;
 const VALIDATE_RESPONSE_SIZE: u8 = 4;
 const FIRMWARE_ACTIVE_OFFSET: usize = 12;
 const FIRMWARE_ACTIVE_SIG: [u8; 4] = [0x4D, 0x4D, 0x6B, 0x76];
+/// Mode-identifier marker repeated through bytes 16..64 of the unlock
+/// response on a drive whose runtime firmware is uploaded and active.
+const FIRMWARE_MODE_OFFSET: usize = 16;
+const FIRMWARE_MODE_SIG: [u8; 4] = [0x4C, 0x62, 0x44, 0x72];
 
 // ── Init address (per disc type) ──────────────────────────────────────
 const INIT_ADDR_BD: u16 = 0x0100;
@@ -47,6 +51,11 @@ pub struct Mt1959 {
     pub(crate) mode: u8,
     pub(crate) buffer_id: u8,
     pub(crate) unlocked: bool,
+    /// True when the unlock response carried both the per-drive
+    /// signature AND the active-mode markers (`MMkv` at [12..16],
+    /// `LbDr` at [16..20]). When true the drive will accept raw-read
+    /// SCSI traffic without AACS bus encryption / cert auth.
+    libredrive_active: bool,
     probed: bool,
 }
 
@@ -62,6 +71,7 @@ impl Mt1959 {
             mode,
             buffer_id,
             unlocked: false,
+            libredrive_active: false,
             probed: false,
         }
     }
@@ -140,6 +150,18 @@ impl Mt1959 {
         {
             return Err(Error::UnlockFailed);
         }
+
+        // Raw-read mode is active when BOTH the per-drive signature
+        // matched AND the response carries the secondary `LbDr` marker
+        // repeated through bytes 16..64. The active-mode signature at
+        // [12..16] checked above is the primary gate; the [16..20]
+        // marker is the redundant confirmation Mt1959 firmware writes
+        // through the rest of the response. Requiring both before we
+        // tell the AACS layer "skip the cert dance" keeps any partial
+        // / corrupted response from steering us into the bypass.
+        self.libredrive_active = response.len() >= FIRMWARE_MODE_OFFSET + 4
+            && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] == FIRMWARE_ACTIVE_SIG
+            && response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
         self.unlocked = true;
         Ok(response)
@@ -333,5 +355,136 @@ impl PlatformDriver for Mt1959 {
 
     fn is_ready(&self) -> bool {
         self.unlocked
+    }
+
+    fn is_libredrive_active(&self) -> bool {
+        self.libredrive_active
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{DriveProfile, Identity};
+    use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+    /// Minimal mock transport that returns a scripted response to the
+    /// next `execute()` call. Only used for verifying that `do_unlock`
+    /// classifies the response correctly — no general SCSI coverage.
+    struct ScriptedTransport {
+        response: Vec<u8>,
+    }
+
+    impl ScsiTransport for ScriptedTransport {
+        fn execute(
+            &mut self,
+            _cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            let n = self.response.len().min(data.len());
+            data[..n].copy_from_slice(&self.response[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn fixture_profile(signature: [u8; 4]) -> DriveProfile {
+        DriveProfile {
+            identity: Identity {
+                vendor_id: "TEST".into(),
+                product_revision: String::new(),
+                vendor_specific: String::new(),
+                firmware_date: String::new(),
+            },
+            signature,
+            firmware: Vec::new(),
+        }
+    }
+
+    /// Build a synthetic 64-byte unlock response.
+    ///
+    /// `mode_marker`: bytes [12..16]. Pass `FIRMWARE_ACTIVE_SIG` for the
+    /// active-mode primary marker.
+    /// `id_marker`:   bytes [16..20] (and repeated through [20..64] in
+    /// real responses; only [16..20] is checked).
+    fn build_response(signature: [u8; 4], mode_marker: [u8; 4], id_marker: [u8; 4]) -> Vec<u8> {
+        let mut r = vec![0u8; 64];
+        r[0..4].copy_from_slice(&signature);
+        // bytes [4..12] left as zeros (version + reserved per format)
+        r[12..16].copy_from_slice(&mode_marker);
+        // Real firmware repeats LbDr through [16..64]; the parser only
+        // checks [16..20], so we just write the marker once.
+        r[16..20].copy_from_slice(&id_marker);
+        r
+    }
+
+    #[test]
+    fn do_unlock_sets_libredrive_active_when_both_markers_present() {
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let mut transport = ScriptedTransport { response };
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+
+        let raw = mt.do_unlock(&mut transport).expect("unlock should succeed");
+        assert_eq!(raw.len(), 64);
+        assert!(mt.unlocked, "unlocked flag set after success");
+        assert!(
+            mt.is_libredrive_active(),
+            "both MMkv and LbDr present -> libredrive_active"
+        );
+    }
+
+    #[test]
+    fn do_unlock_unlocked_but_not_libredrive_when_id_marker_missing() {
+        // Active-mode primary marker present (so unlock passes) but the
+        // secondary LbDr marker is replaced with zeros — drive isn't
+        // serving raw-read traffic on this path.
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let response = build_response(sig, FIRMWARE_ACTIVE_SIG, [0u8; 4]);
+        let mut transport = ScriptedTransport { response };
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+
+        mt.do_unlock(&mut transport).expect("unlock should succeed");
+        assert!(mt.unlocked);
+        assert!(
+            !mt.is_libredrive_active(),
+            "missing LbDr marker -> raw-read not active"
+        );
+    }
+
+    #[test]
+    fn do_unlock_rejects_signature_mismatch() {
+        let response = build_response(
+            [0xAA, 0xBB, 0xCC, 0xDD],
+            FIRMWARE_ACTIVE_SIG,
+            FIRMWARE_MODE_SIG,
+        );
+        let mut transport = ScriptedTransport { response };
+        let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), false);
+
+        let err = mt.do_unlock(&mut transport).unwrap_err();
+        assert!(matches!(err, Error::SignatureMismatch { .. }));
+        assert!(!mt.unlocked);
+        assert!(!mt.is_libredrive_active());
+    }
+
+    #[test]
+    fn do_unlock_rejects_inactive_mode_marker() {
+        // Signature matches but [12..16] is NOT MMkv -> drive is not in
+        // active mode; both unlock and libredrive flag must stay false.
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let response = build_response(sig, [0u8; 4], FIRMWARE_MODE_SIG);
+        let mut transport = ScriptedTransport { response };
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+
+        let err = mt.do_unlock(&mut transport).unwrap_err();
+        assert!(matches!(err, Error::UnlockFailed));
+        assert!(!mt.unlocked);
+        assert!(!mt.is_libredrive_active());
     }
 }

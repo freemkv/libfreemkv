@@ -1043,8 +1043,11 @@ impl Disc {
     /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // AACS handshake (Blu-ray/UHD)
-        let handshake = Self::do_handshake(session, opts);
+        // AACS handshake (Blu-ray/UHD). Branches internally on
+        // libredrive raw-read mode: when active the drive serves VID
+        // without cert auth and no bus encryption is in play. When
+        // inactive we fall back to the cert-based mutual auth.
+        let (handshake, handshake_error) = Self::do_handshake(session, opts);
 
         // Request max read speed — removes riplock on DVD
         // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
@@ -1059,7 +1062,14 @@ impl Disc {
             buffered.prefetch_ranges(&ranges);
         }
 
-        let mut disc = Self::scan_with(&mut buffered, capacity, handshake, opts, udf_fs)?;
+        let mut disc = Self::scan_with(
+            &mut buffered,
+            capacity,
+            handshake,
+            handshake_error,
+            opts,
+            udf_fs,
+        )?;
 
         // CSS key extraction for DVDs (bus auth → disc key → title key).
         // Must be a single auth session — can't call authenticate() separately.
@@ -1100,14 +1110,21 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let udf_fs = udf::read_filesystem(reader)?;
-        Self::scan_with(reader, capacity, None, opts, udf_fs)
+        Self::scan_with(reader, capacity, None, None, opts, udf_fs)
     }
 
     /// Core scan pipeline — works with any SectorSource.
+    ///
+    /// `handshake_error` is plumbed from `do_handshake` so failures
+    /// (cert rejected, libredrive unsupported, VID read failed) are
+    /// preserved as `disc.aacs_error` for callers to render. When key
+    /// resolution succeeds despite the handshake failure (built-in
+    /// keys + disc-hash lookup hit) the error is dropped.
     fn scan_with(
         reader: &mut dyn SectorSource,
         capacity: u32,
         handshake: Option<HandshakeResult>,
+        handshake_error: Option<Error>,
         opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
@@ -1116,35 +1133,51 @@ impl Disc {
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
         let (aacs, aacs_error) = if encrypted {
-            // KEYDB is now optional: the library ships built-in AACS 1.0
-            // device + processing keys, so a missing keydb.cfg just falls
-            // back to the built-ins (plus the operator local-plugin slot,
-            // if any). External keydb.cfg layers on top when supplied.
-            let keydb_path = opts.resolve_keydb();
-            if keydb_path.is_none() {
-                tracing::debug!(
-                    target: "freemkv::disc",
-                    phase = "scan_aacs_builtins_only",
-                    "no external KEYDB found; resolving with built-in AACS 1.0 keys"
-                );
-            }
-            match Self::resolve_encryption(
-                &udf_fs,
-                reader,
-                keydb_path.as_deref(),
-                handshake.as_ref(),
-            ) {
-                Ok(state) => (Some(state), None),
-                Err(e) => {
+            match opts.resolve_keydb() {
+                Some(keydb_path) => {
+                    match Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref())
+                    {
+                        Ok(state) => (Some(state), None),
+                        Err(e) => {
+                            // When the handshake itself failed AND resolution
+                            // bottomed out at "no keys", surface the upstream
+                            // handshake failure — it's more actionable than
+                            // the generic AacsNoKeys.
+                            let final_err = match (&e, handshake_error.as_ref()) {
+                                (
+                                    Error::AacsNoKeys
+                                    | Error::AacsVukNotInKeydb
+                                    | Error::AacsVidUnavailable,
+                                    Some(_),
+                                ) => handshake_error.unwrap(),
+                                _ => e,
+                            };
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "scan_aacs_resolve_failed",
+                                error_code = final_err.code(),
+                                keydb = %keydb_path.display(),
+                                handshake_ok = handshake.is_some(),
+                                "AACS key resolution failed"
+                            );
+                            (None, Some(final_err))
+                        }
+                    }
+                }
+                None => {
                     tracing::warn!(
                         target: "freemkv::disc",
-                        phase = "scan_aacs_resolve_failed",
-                        error_code = e.code(),
-                        keydb = ?keydb_path.as_ref().map(|p| p.display().to_string()),
-                        handshake_ok = handshake.is_some(),
-                        "AACS key resolution failed"
+                        phase = "scan_aacs_no_keydb",
+                        "encrypted disc but no KEYDB found in search paths"
                     );
-                    (None, Some(e))
+                    // Sentinel path string lets autorip's message switch
+                    // distinguish "no keydb found anywhere" from "keydb at
+                    // <path> failed to parse".
+                    let final_err =
+                        handshake_error.unwrap_or_else(|| crate::error::Error::KeydbLoad {
+                            path: String::from("<no keydb in search paths>"),
+                        });
+                    (None, Some(final_err))
                 }
             }
         } else {

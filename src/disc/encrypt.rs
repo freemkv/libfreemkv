@@ -13,20 +13,126 @@ pub(super) struct HandshakeResult {
     pub read_data_key: Option<[u8; 16]>,
 }
 
+/// Retrieve VID via the libredrive alternate read path. The drive's
+/// runtime firmware has cleared bus encryption AND no longer requires
+/// a cert-based AGID for protected-area queries — standard
+/// READ_DISC_STRUCTURE format 0x80 with AGID = 0 returns the raw VID.
+///
+/// Layout matches the spec response (4-byte header + 16-byte VID +
+/// 16-byte MAC), but MAC is meaningless without a bus key derivation;
+/// libredrive mode delivers `[0u8; 16]` (or stale bytes) in the MAC
+/// field. We extract the VID bytes only and skip MAC validation
+/// entirely — this is the documented behavior gap when bus encryption
+/// is off.
+fn read_volume_id_libredrive(session: &mut crate::drive::Drive) -> Result<[u8; 16]> {
+    // CDB: READ_DISC_STRUCTURE (0xAD), media=Blu-ray (0x01), AGID=0,
+    // format=0x80 (AACS Volume ID), allocation_length=36 (4-byte
+    // header + 16-byte VID + 16-byte MAC).
+    let mut cdb = [0u8; 12];
+    cdb[0] = crate::scsi::SCSI_READ_DISC_STRUCTURE;
+    cdb[1] = 0x01; // Blu-ray media type
+    cdb[7] = 0x80; // format = Volume ID
+    cdb[8] = 0x00;
+    cdb[9] = 36;
+    cdb[10] = 0; // AGID = 0 (no auth session)
+
+    let mut buf = [0u8; 36];
+    let result = session.scsi_execute(
+        &cdb,
+        crate::scsi::DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    )?;
+    if result.bytes_transferred < 20 {
+        return Err(Error::AacsVidRead);
+    }
+    let mut vid = [0u8; 16];
+    vid.copy_from_slice(&buf[4..20]);
+    Ok(vid)
+}
+
 impl Disc {
-    /// SCSI handshake result — volume ID and bus keys from ECDH authentication.
-    /// Only available when scanning from a real drive (not ISO images).
+    /// SCSI handshake — retrieve VID (and bus keys when applicable).
+    ///
+    /// Branches on `Drive::is_libredrive_active()`:
+    ///   * libredrive raw-read mode active → skip cert auth, read VID
+    ///     directly via the alternate path (bus encryption is already
+    ///     off; the drive accepts standard READ_DISC_STRUCTURE format
+    ///     0x80 without an AGID).
+    ///   * libredrive inactive → traditional AACS mutual auth using
+    ///     host certs from the keydb. Caps attempts at 3 with a 1 s
+    ///     backoff to avoid the firmware-wedge hammering we hit in
+    ///     v0.25.7.
+    ///
+    /// Returns `(handshake, error)`:
+    ///   * `(Some(_), None)`  — VID acquired
+    ///   * `(None, Some(_))`  — specific failure mode (see new
+    ///     `AacsHostCertRejected` / `AacsLibredriveUnsupported` /
+    ///     `AacsVidUnavailable` variants in `error.rs`)
+    ///   * `(None, None)`     — handshake not attempted (no keydb;
+    ///     resolution will proceed with built-in keys and VID=zero)
     pub(super) fn do_handshake(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
-    ) -> Option<HandshakeResult> {
-        use crate::aacs::{self, KeyDb};
-
+    ) -> (Option<HandshakeResult>, Option<Error>) {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "handshake_entry",
+            libredrive_active = session.is_libredrive_active(),
             "do_handshake entered"
         );
+
+        // Libredrive mode: skip cert auth entirely. The drive returns
+        // VID via READ_DISC_STRUCTURE format 0x80 with no AGID and no
+        // bus encryption applied. This is what MakeMKV does on the
+        // same drive + disc combination where libfreemkv used to fail
+        // with E7000 — empirically confirmed 2026-05-21 on rip1
+        // (BU40N + Barbie UHD, MKB v77, libaacs leaked cert revoked
+        // by HRL but disc rips cleanly via libredrive).
+        if session.is_libredrive_active() {
+            return match read_volume_id_libredrive(session) {
+                Ok(vid) => {
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "handshake_libredrive_ok",
+                        "libredrive VID acquired without cert auth"
+                    );
+                    (
+                        Some(HandshakeResult {
+                            volume_id: vid,
+                            // No bus key in libredrive mode -> no
+                            // encrypted-read-data-key to decrypt.
+                            // AACS 2.0 bus-encrypted sectors are
+                            // already plaintext when libredrive is
+                            // active, so consumers don't need RDK.
+                            read_data_key: None,
+                        }),
+                        None,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "handshake_libredrive_vid_failed",
+                        error_code = e.code(),
+                        "libredrive VID read failed"
+                    );
+                    (None, Some(Error::AacsVidUnavailable))
+                }
+            };
+        }
+
+        Self::do_handshake_cert(session, opts)
+    }
+
+    /// Cert-based AACS handshake. Only called when libredrive mode is
+    /// NOT active — see `do_handshake` for the dispatch.
+    fn do_handshake_cert(
+        session: &mut crate::drive::Drive,
+        opts: &ScanOptions,
+    ) -> (Option<HandshakeResult>, Option<Error>) {
+        use crate::aacs::{self, KeyDb};
+
         let keydb_path = match opts.resolve_keydb() {
             Some(p) => p,
             None => {
@@ -35,7 +141,7 @@ impl Disc {
                     phase = "handshake_no_keydb",
                     "no KEYDB found in search paths; handshake skipped"
                 );
-                return None;
+                return (None, None);
             }
         };
         let keydb = match KeyDb::load(&keydb_path) {
@@ -48,7 +154,12 @@ impl Disc {
                     keydb = %keydb_path.display(),
                     "KEYDB load failed; handshake skipped"
                 );
-                return None;
+                return (
+                    None,
+                    Some(Error::KeydbLoad {
+                        path: keydb_path.display().to_string(),
+                    }),
+                );
             }
         };
 
@@ -60,6 +171,14 @@ impl Disc {
             keydb = %keydb_path.display(),
             "handshake starting"
         );
+
+        if host_cert_count == 0 {
+            // Drive isn't in libredrive mode AND keydb has no host
+            // certs -> cert auth cannot proceed. Surface as
+            // LibredriveUnsupported so the caller knows neither path
+            // is available on this configuration.
+            return (None, Some(Error::AacsLibredriveUnsupported));
+        }
 
         // v0.25.7 wedge fix. Pre-0.25.7 this loop fired up to 16 AACS
         // authenticate attempts back-to-back with no pause. Each attempt
@@ -96,7 +215,7 @@ impl Disc {
                                 error_code = e.code(),
                                 "auth ok but volume ID read failed"
                             );
-                            return None;
+                            return (None, Some(Error::AacsVidUnavailable));
                         }
                     };
                     let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
@@ -108,10 +227,13 @@ impl Disc {
                         cert_index = idx,
                         has_read_data_key = read_data_key.is_some(),
                     );
-                    return Some(HandshakeResult {
-                        volume_id,
-                        read_data_key,
-                    });
+                    return (
+                        Some(HandshakeResult {
+                            volume_id,
+                            read_data_key,
+                        }),
+                        None,
+                    );
                 }
                 Err(e) => {
                     let code = e.code();
@@ -130,7 +252,7 @@ impl Disc {
                             error_code = code,
                             "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
                         );
-                        return None;
+                        return (None, Some(Error::AacsHostCertRejected));
                     }
                     continue;
                 }
@@ -145,8 +267,7 @@ impl Disc {
             "all host certs in KEYDB rejected by drive (capped at {} attempts to prevent firmware wedge)",
             MAX_CERT_ATTEMPTS
         );
-        // All host certs failed — return None, not a fake success
-        None
+        (None, Some(Error::AacsHostCertRejected))
     }
 
     /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
@@ -157,20 +278,14 @@ impl Disc {
     pub(super) fn resolve_encryption(
         udf_fs: &udf::UdfFs,
         reader: &mut dyn SectorSource,
-        keydb_path: Option<&std::path::Path>,
+        keydb_path: &std::path::Path,
         handshake: Option<&HandshakeResult>,
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
 
-        // Built-in AACS 1.0 keys are always available. When a keydb.cfg
-        // path is supplied, layer it on top; otherwise fall back to
-        // built-ins (plus the operator local-plugin slot, if any).
-        let keydb = match keydb_path {
-            Some(path) => KeyDb::load(path).map_err(|_| Error::KeydbLoad {
-                path: path.display().to_string(),
-            })?,
-            None => KeyDb::load_or_builtins(),
-        };
+        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
+            path: keydb_path.display().to_string(),
+        })?;
 
         // Read AACS files from disc/image via UDF
         let uk_ro_data = udf_fs
@@ -225,11 +340,28 @@ impl Disc {
         );
 
         // Use handshake volume ID if available, otherwise zeros
-        // (KEYDB VUK lookup by disc hash works without volume ID)
+        // (KEYDB VUK lookup by disc hash works without volume ID;
+        // paths 2/3/4 in `resolve_keys` short-circuit on the zero
+        // sentinel and don't waste cycles trying to derive against
+        // garbage input).
         let volume_id = handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]);
+        let vid_available = volume_id != [0u8; 16];
         let read_data_key = handshake.and_then(|h| h.read_data_key);
 
-        // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key
+        // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key.
+        //
+        // Distinguish "we had every input and still missed" from "we
+        // never had VID so the derivation paths couldn't run." The
+        // former points at a stale keydb / unsupported MKB; the
+        // latter points at a failed handshake upstream. Path 1
+        // (disc-hash lookup) ran without VID and missed -> disc isn't
+        // in the keydb. If the caller has a handshake-failure reason
+        // it overrides this in `scan_with`.
+        let miss_error = if vid_available {
+            Error::AacsMkUnavailable
+        } else {
+            Error::AacsVukNotInKeydb
+        };
         let resolved = aacs::resolve_keys(
             &uk_ro_data,
             cc_data.as_deref(),
@@ -237,7 +369,7 @@ impl Disc {
             &keydb,
             mkb_data.as_deref(),
         )
-        .ok_or(Error::AacsNoKeys)?;
+        .ok_or(miss_error)?;
 
         Ok(AacsState {
             version: if resolved.aacs2 { 2 } else { 1 },

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.25.11 (2026-05-21)
+
+### Added
+
+- **Libredrive raw-read VID path.** When the Mt1959 unlock response
+  confirms both the active-mode (`MMkv`) and mode-ID (`LbDr`) markers,
+  `Drive::is_libredrive_active()` returns true and `do_handshake`
+  skips the AACS cert dance entirely — VID is retrieved via
+  `READ_DISC_STRUCTURE` format 0x80 with AGID=0, and bus encryption
+  is already off. This is what unblocks UHD ripping on drives whose
+  leaked host cert is on the AACS HRL.
+- New `Error` variants for finer-grained AACS failure reporting:
+  `AacsHostCertRejected` (E7015), `AacsLibredriveUnsupported`
+  (E7016), `AacsVidUnavailable` (E7017), `AacsMkUnavailable`
+  (E7018), `AacsVukNotInKeydb` (E7019). Lets CLIs/UIs render which
+  piece of the AACS chain failed instead of always saying "no keys."
+
+### Fixed
+
+- `validate_processing_key` now matches libaacs `_validate_pk`
+  exactly: XORs `uv` into `mk[12..16]` (was omitted), AES-decrypts
+  `mk_dv` and checks the `01 23 45 67 89 AB CD EF` magic (was
+  AES-encrypt + 12-zero check). Pre-fix, every non-zero-uv
+  processing key was rejected — i.e. essentially every real disc.
+- `mkb_find_cvalues` now prefers record type `0x07` (AACS 2.x) and
+  falls back to `0x05` (AACS 1.0), so the walker handles both
+  generations without an out-of-band version flag.
+- `resolve_keys` short-circuits paths 2/3/4 when VID is the zero
+  sentinel — saves cycles and emits an honest "VID unavailable" log
+  instead of the misleading "all paths failed."
+- AES-CMAC VID verification gains NIST SP 800-38B KAT + round-trip
+  + mutation + all-zero-rejection tests.
+
+### Removed
+
+- **Built-in AACS keys** (added in 0.25.9). `src/aacs/builtin_keys.rs`
+  deleted; `KeyDb::with_builtins`, `KeyDb::load_or_builtins`,
+  `KeyDb::merge_from`, and internal dedup helpers gone. The
+  compiled-in shortcut was a slim convenience that didn't move the
+  hard problem (no v77+ DKs) and added a maintenance surface.
+- **Operator plugin slot** at `~/.config/freemkv/local_keys.cfg`
+  (added in 0.25.9). `local_plugin_path` and `KeyDb::merge_local_plugin`
+  removed. Single source: the main `keydb.cfg`.
+- `KeyDb::load` reverts to the pre-0.25.9 form — read the file or
+  return I/O error; no layering, no fallback.
+- `Disc::scan` reverts to surfacing `KeydbLoad { path: "<no keydb
+  in search paths>" }` for an encrypted disc with no keydb — same
+  sentinel autorip's message switch already handles.
+
+CSS player keys in `src/css/auth.rs` remain compiled in; they're
+1999-era public inputs separate from the AACS pipeline and were
+never part of the 0.25.9 additions.
+
 ## 0.25.9 (2026-05-20)
 
 ### Fixed

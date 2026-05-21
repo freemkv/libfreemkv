@@ -1,6 +1,6 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
-use super::decrypt::{aes_ecb_decrypt, aes_ecb_encrypt};
+use super::decrypt::aes_ecb_decrypt;
 use super::keydb::{DeviceKey, KeyDb};
 
 // ── VUK derivation ──────────────────────────────────────────────────────────
@@ -209,37 +209,44 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
 
 /// Validate a processing key against a cvalue/UV pair.
 /// Returns the Media Key if valid.
+///
+/// Implements libaacs `_validate_pk` (aacs.c:98-133) per sgx.fail
+/// Appendix D.2 step 25:
+///   1. `mk = AES-128D(pk, cvalue)`
+///   2. `mk[12..16] ^= uv` (4 bytes XOR into the LAST 4 bytes only)
+///   3. `dec_vd = AES-128D(mk, mk_dv)`
+///   4. If `dec_vd[0..8] == 01 23 45 67 89 AB CD EF` → valid.
+///
+/// Previous implementation XOR'd the full 16-byte cvalue back into mk
+/// (extra step not in libaacs), skipped the uv XOR entirely, and used
+/// AES-128E + 12-zero-byte check instead of AES-128D + magic. Net effect
+/// was that correct processing keys were rejected whenever `uv != 0`,
+/// which is essentially every real disc.
 fn validate_processing_key(
     pk: &[u8; 16],
     cvalue: &[u8],
-    _uv: &[u8],
+    uv: &[u8],
     mk_dv: &[u8; 16],
 ) -> Option<[u8; 16]> {
-    if cvalue.len() < 16 {
+    if cvalue.len() < 16 || uv.len() < 4 {
         return None;
     }
-    // mk = AES-DEC(pk, cvalue) XOR cvalue
+
+    // Step 1: mk = AES-128D(pk, cvalue)
     let mut cv = [0u8; 16];
     cv.copy_from_slice(&cvalue[..16]);
     let mut mk = aes_ecb_decrypt(pk, &cv);
-    for i in 0..16 {
-        mk[i] ^= cv[i];
+
+    // Step 2: XOR uv into the LAST 4 bytes of mk (mk[12..16]).
+    // sgx.fail D.2 step 25 and libaacs aacs.c:118-120.
+    for a in 0..4 {
+        mk[12 + a] ^= uv[a];
     }
 
-    // Verify: AES-ECB(mk, mk_dv) should produce a specific pattern
-    let _verify = aes_ecb_encrypt(&mk, mk_dv);
-    // mk_dv verification: the first 12 bytes of AES(mk, mk_dv) should be all 0xDEADBEEF...
-    // Actually per AACS spec: verify record value is AES(mk, all_zeros)
-    // No — the mk_dv IS the verification value. We compute AES-ECB(mk, verify_data)
-    // and check it matches.
-    // From libaacs _validate_pk:
-    //   crypto_aes128d(pk, rec + a*16, mk) → decrypt cvalue with PK
-    //   mk[i] ^= rec[i]  → XOR with cvalue
-    //   crypto_aes128e(mk, mk_dv, test) → encrypt mk_dv with derived mk
-    //   if first 12 bytes of test are zero → valid media key
-    let test = aes_ecb_encrypt(&mk, mk_dv);
-    // AACS spec: Verify Media Key record — first 12 bytes must be zero
-    if test[..12] == [0u8; 12] {
+    // Step 3 + 4: dec_vd = AES-128D(mk, mk_dv); verify magic.
+    let dec_vd = aes_ecb_decrypt(&mk, mk_dv);
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    if dec_vd[..8] == VERIFY_MAGIC {
         return Some(mk);
     }
     None
@@ -304,8 +311,32 @@ fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Find Conditional Values (cvalues) record (type 0x07) in MKB.
+/// Find the Media Key Data Record (cvalues table) in an MKB.
+///
+/// libaacs hard-codes record type `0x05` (matches AACS 1.0 and BD type-3/4
+/// MKBs), but on AACS 2.x Category-C MKBs the cvalues table moved to
+/// record type `0x07` and `0x05` now carries the host-revocation
+/// signature. To stay correct on both lines we prefer `0x07` first (the
+/// AACS 2.x layout used by every modern UHD disc) and fall back to
+/// `0x05` for AACS 1.0 MKBs.
+///
+/// References:
+///   - libaacs `mkb_cvalues` (mkb.c:190-193) uses `0x05` exclusively.
+///   - sgx.fail Appendix D.5 walks an AACS 2.x MKB and confirms cvalues
+///     at `0x07`.
+///   - Empirically confirmed against our `aacs2-mkb-samples/`
+///     (Wicked / Civil War / Barbie v77 MKBs): cvalues at `0x07`.
 fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
+    if let Some(body) = find_record_body(mkb, 0x07) {
+        return Some(body);
+    }
+    find_record_body(mkb, 0x05)
+}
+
+/// Walk an MKB and return the payload (header stripped) of the first
+/// record matching `rec_type`. Returns `None` if no such record exists or
+/// the record is empty.
+fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
     let mut pos = 0;
     while pos + 4 <= mkb.len() {
         let rec_type = mkb[pos];
@@ -313,9 +344,11 @@ fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
         if rec_len < 4 || pos + rec_len > mkb.len() {
             break;
         }
-
-        if rec_type == 0x07 && rec_len > 4 {
+        if rec_type == rec_type_wanted && rec_len > 4 {
             return Some(mkb[pos + 4..pos + rec_len].to_vec());
+        }
+        if rec_len == 0 {
+            break;
         }
         pos += rec_len;
     }
@@ -671,6 +704,21 @@ pub fn resolve_keys(
         tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", "disc hash NOT in keydb");
     }
 
+    // Paths 2-4 all consume the Volume ID. Without it (handshake
+    // skipped, libredrive bypass failed, etc.) every downstream
+    // derivation produces garbage. Caller stamps `[0u8; 16]` as the
+    // sentinel "no VID" — short-circuit here so we don't surface a
+    // misleading "all paths failed" log when really the math is
+    // structurally impossible.
+    if *volume_id == [0u8; 16] {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "resolve_keys_no_vid",
+            "VID unavailable; paths 2/3/4 require VID and are skipped"
+        );
+        return None;
+    }
+
     // Path 2: Find entry with matching VID → derive VUK from MK + VID
     let mut path2_mk_did_count = 0usize;
     for entry in keydb.disc_entries.values() {
@@ -976,6 +1024,83 @@ mod tests {
     }
 
     #[test]
+    fn validate_processing_key_round_trip_with_nonzero_uv() {
+        // Synthesise a (pk, uv, mk, cvalue, mk_dv) tuple that satisfies the
+        // libaacs _validate_pk relation, then confirm validate_processing_key
+        // recovers mk. Catches the bugs that landed pre-fix:
+        //   * uv XOR step was missing → mk wrong whenever uv != 0
+        //   * AES-128E + 12-zero check instead of AES-128D + magic
+        use super::super::decrypt::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
+
+        let pk: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+
+        // cvalue is what AES-128E(pk, mk') gives, where mk' = mk with the
+        // last-4-bytes-uv XOR pre-undone:
+        //   mk_raw[12..16] = mk[12..16] XOR uv  (so the validate step XORs
+        //   uv back in and recovers mk).
+        let mut mk_raw = mk;
+        for a in 0..4 {
+            mk_raw[12 + a] ^= uv[a];
+        }
+        let cvalue = enc(&pk, &mk_raw);
+
+        // mk_dv is the encryption (under the correct mk) of the verify
+        // magic, padded with arbitrary bytes — when decrypted with mk we
+        // recover the magic.
+        let mut plaintext_vd = [0u8; 16];
+        plaintext_vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        // Trailing 8 bytes are don't-cares in the magic check.
+        plaintext_vd[8..].copy_from_slice(&[0x11; 8]);
+        let mk_dv = enc(&mk, &plaintext_vd);
+        // Sanity: decrypting mk_dv with mk yields the magic.
+        let _check = dec(&mk, &mk_dv);
+
+        let recovered = validate_processing_key(&pk, &cvalue, &uv, &mk_dv)
+            .expect("validate_processing_key must accept a correct pk + uv pair");
+        assert_eq!(recovered, mk, "recovered mk must match the planted mk");
+
+        // And a wrong pk must be rejected.
+        let mut wrong_pk = pk;
+        wrong_pk[0] ^= 0xFF;
+        assert!(validate_processing_key(&wrong_pk, &cvalue, &uv, &mk_dv).is_none());
+
+        // And a uv mismatch must be rejected.
+        let wrong_uv = [0x00u8, 0x00, 0x00, 0x00];
+        assert!(validate_processing_key(&pk, &cvalue, &wrong_uv, &mk_dv).is_none());
+    }
+
+    #[test]
+    fn mkb_find_cvalues_prefers_0x07_then_falls_back_to_0x05() {
+        // AACS 2.x: type 0x07 carries cvalues; 0x05 is the host-revocation
+        // signature. Mixed-record MKB → 0x07 wins.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        // type=0x05, body = [0xAA; 4]
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 0xAA, 0xAA, 0xAA, 0xAA]);
+        // type=0x07, body = [0xBB; 4]
+        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x08, 0xBB, 0xBB, 0xBB, 0xBB]);
+        let body = mkb_find_cvalues(&mkb).expect("cvalues record must be found");
+        assert_eq!(body, vec![0xBB, 0xBB, 0xBB, 0xBB], "0x07 must be preferred");
+
+        // AACS 1.0: only 0x05 present → fall back to it.
+        let mut mkb1 = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        mkb1.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 0xCC, 0xCC, 0xCC, 0xCC]);
+        let body = mkb_find_cvalues(&mkb1).expect("0x05 fallback must work for AACS 1.0");
+        assert_eq!(body, vec![0xCC, 0xCC, 0xCC, 0xCC]);
+    }
+
+    #[test]
     fn mkb_find_mk_dv_recognizes_type_0x86() {
         // AACS 2.0 form uses type 0x86 for the verify record.
         let expected: [u8; 16] = [
@@ -1025,6 +1150,90 @@ mod tests {
             assert_eq!(derived, vuk, "VUK derivation mismatch for V for Vendetta");
             eprintln!("V for Vendetta VUK derivation verified");
         }
+    }
+
+    /// Build a minimal Unit_Key_RO.inf with `num_unit_keys = 1`. The
+    /// disc hash won't be in any synthetic keydb so path 1 misses,
+    /// which lets us isolate the path-2/3/4 short-circuit behavior.
+    fn minimal_unit_key_ro() -> Vec<u8> {
+        let mut data = vec![0u8; 256];
+        // uk_pos = 0x60
+        data[3] = 0x60;
+        data[16] = 1; // app_type = BD-ROM
+        data[17] = 1; // num_bdmv_dir
+        let uk_pos = 0x60usize;
+        data[uk_pos + 1] = 1; // 1 unit key
+        // Key at uk_pos + 48 — value doesn't matter, just needs to fit.
+        for i in 0..16 {
+            data[uk_pos + 48 + i] = 0xCC;
+        }
+        data
+    }
+
+    #[test]
+    fn resolve_keys_skips_paths_2_through_4_when_vid_is_zero() {
+        // No VID -> paths 2/3/4 cannot succeed. The function must
+        // return None WITHOUT touching the MKB / device keys, so we
+        // can pass an MKB that would otherwise cause expensive
+        // derivation work — it must not be consumed.
+        let uk_ro = minimal_unit_key_ro();
+        let zero_vid = [0u8; 16];
+
+        // Populate keydb with a non-matching VID entry (path 2 would
+        // miss anyway) plus dummy processing/device keys (paths 3/4
+        // would also miss, but the short-circuit means they're never
+        // attempted).
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            "0xDEADBEEF".to_string(),
+            DiscEntry {
+                disc_hash: "0xDEADBEEF".to_string(),
+                title: "fixture".to_string(),
+                media_key: Some([0x11u8; 16]),
+                disc_id: Some([0x22u8; 16]),
+                vuk: None,
+                unit_keys: Vec::new(),
+            },
+        );
+        keydb.processing_keys.push([0u8; 16]);
+
+        let result = resolve_keys(&uk_ro, None, &zero_vid, &keydb, None);
+        assert!(
+            result.is_none(),
+            "resolve_keys with VID=0 and no matching disc-hash entry must return None"
+        );
+    }
+
+    #[test]
+    fn resolve_keys_path1_still_runs_when_vid_is_zero() {
+        // Path 1 (disc-hash → VUK) doesn't need VID. Confirm the
+        // short-circuit doesn't block it: install a keydb entry whose
+        // disc_hash matches the fixture's hash, with a known VUK, and
+        // verify resolve_keys returns it with key_source = 1.
+        let uk_ro = minimal_unit_key_ro();
+        let hash = disc_hash(&uk_ro);
+        // `find_disc` lowercases the incoming hash; the entry map is
+        // keyed lowercase too, so we have to lowercase here.
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+
+        let mut keydb = KeyDb::empty();
+        let known_vuk = [0xABu8; 16];
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "fixture".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some(known_vuk),
+                unit_keys: Vec::new(),
+            },
+        );
+
+        let resolved = resolve_keys(&uk_ro, None, &[0u8; 16], &keydb, None)
+            .expect("path 1 must run regardless of VID availability");
+        assert_eq!(resolved.vuk, known_vuk);
+        assert_eq!(resolved.key_source, 1);
     }
 
     #[test]

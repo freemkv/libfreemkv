@@ -18,4 +18,18 @@ pub(crate) trait PlatformDriver: Send {
 
     /// True after successful init().
     fn is_ready(&self) -> bool;
+
+    /// True if the drive is currently in libredrive raw-read mode (the
+    /// per-drive runtime firmware has been uploaded AND the drive
+    /// confirms active mode via the `MMkv` / `LbDr` markers in the
+    /// unlock response). When true the host can read sectors without
+    /// AACS bus encryption and retrieve VID without cert-based mutual
+    /// auth — the cert/HRL gate on the drive's standard AACS path is
+    /// effectively bypassed by the alternate data path.
+    ///
+    /// Default `false` — platforms that don't implement this mode are
+    /// always reported as inactive.
+    fn is_libredrive_active(&self) -> bool {
+        false
+    }
 }

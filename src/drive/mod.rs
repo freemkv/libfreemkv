@@ -432,6 +432,27 @@ impl Drive {
         }
     }
 
+    /// True if the drive is currently in libredrive raw-read mode.
+    ///
+    /// Detected by the platform driver during `init()` from the unlock
+    /// response's mode markers. When true:
+    ///   - SCSI READ_10 returns plaintext sectors (no AACS bus
+    ///     encryption applied)
+    ///   - VID retrieval works without the cert-based AACS handshake
+    ///   - Disc-side Host Revocation List enforcement is effectively
+    ///     bypassed by the alternate data path
+    ///
+    /// AACS layer code should branch on this: if true, skip
+    /// `aacs::handshake::aacs_authenticate` (the cert dance) and read
+    /// VID via the libredrive alternate path. If false, fall back to
+    /// the standard cert-based handshake.
+    pub fn is_libredrive_active(&self) -> bool {
+        match self.driver {
+            Some(ref d) => d.is_libredrive_active(),
+            None => false,
+        }
+    }
+
     /// Read sectors from the disc. Single-shot — no inline retries, no
     /// SCSI reset.
     ///
