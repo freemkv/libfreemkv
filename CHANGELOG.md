@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.25.13 (2026-05-21)
+
+### Added
+
+- **`DrmScheme` top-level dispatcher.** New `drm` module with a
+  `DrmScheme` enum (`Css`, `Aacs10`, `Aacs20`, `Aacs21`) and a
+  `detect` + `load` pair that uniformly handles all four content
+  protection schemes. Replaces the inlined dispatch in
+  `disc::encrypt::resolve_encryption` and the scattered CSS routing
+  in `disc::mod`. Both CSS call sites now route through the same
+  entry point.
+- **AACS 2.1 Media Key Variant framework.** New `aacs::variants`
+  module implementing the Media Key Variant derivation chain
+  (`Kp + C → Kmp → ⊕KCD → Kpnew → Km → VUK`), Variant-scheme MKB
+  record parsing (record types `0x82` / `0x83`), bit-0x02 SoftKCD
+  and bit-0x04 online-challenge detection with dedicated error
+  variants. Wired into `DrmScheme::Aacs21` but the dispatcher arm
+  is commented out pending validation against a Variant-scheme
+  disc. Per-manufacturer Key Correction Data must be supplied by
+  the integrator; `KEY_CORRECTION_DATA_PLACEHOLDER` is the empty
+  placeholder slot.
+- **`AacsVersion` enum.** Replaces the `aacs2: bool` field on
+  `ContentCertificate`, `UnitKeyFile`, and `ResolvedKeys`.
+  `parse_unit_key_ro` and `parse_content_cert` now take/emit the
+  enum. `resolve_keys` is split into `resolve_keys_v1`,
+  `resolve_keys_v2`, and `resolve_keys_v21` (the last not reachable
+  from the dispatcher today).
+
+### Fixed
+
+- **Libredrive raw-read VID shortcut deleted.** v0.25.11 introduced a
+  `do_handshake` branch that, on libredrive-active drives, skipped the
+  AACS cert handshake and issued `READ_DISC_STRUCTURE` format 0x80
+  with AGID=0 directly. The hypothesis was that firmware-uploaded
+  drives would serve VID without auth. Empirical test on rip1 (BU40N
+  + Barbie UHD, 2026-05-21) showed the drive returns
+  `0x05 / 0x6F / 0x02` (`ILLEGAL_REQUEST / Copy protection key
+  exchange failure: KEY NOT ESTABLISHED`) to that CDB regardless of
+  firmware-upload state. The AACS spec requires a successful
+  `REPORT_KEY` / `SEND_KEY` exchange to establish an AGID before
+  format 0x80 returns VID; that requirement is enforced by the drive
+  itself and isn't bypassed by libredrive firmware. The shortcut
+  fired for every libredrive-active drive, so v0.25.11 / v0.25.12
+  Barbie scans were stuck at E7017 instead of progressing to the
+  real wall (no DK walks MKB v77).
+- `Disc::do_handshake` now always routes through `do_handshake_cert`.
+  `Drive::is_libredrive_active()` and the Mt1959 MMkv+LbDr marker
+  detection are kept as informational signals (logged in the
+  `handshake_entry` warn line) but no longer steer the auth path.
+- `read_volume_id_libredrive` deleted (~50 LOC).
+
+The corollary: AACS resolution on HRL-burned drives + UHD discs now
+fails honestly. Either cert auth succeeds (firmware-upload may or
+may not bypass the HRL — that's the new empirical question) and we
+hit the actual DK wall (E7018 "No DK that walks this MKB" for v77+
+UHD without a v77+ DK in keydb), or cert auth fails and we surface
+E7015. Both are real verdicts; E7017's previous spurious dispatch
+is gone.
+
+## 0.25.12 (2026-05-21)
+
+No libfreemkv source changes — unified sync bump for autorip's
+`aacs_failure_message` two-line wording rewrite. See the autorip
+v0.25.12 release for details.
+
 ## 0.25.11 (2026-05-21)
 
 ### Added

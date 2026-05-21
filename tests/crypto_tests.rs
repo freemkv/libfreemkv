@@ -724,7 +724,7 @@ fn aacs_parse_unit_key_ro_minimal() {
         data[key_pos + i] = (0xA0 + i) as u8;
     }
 
-    let result = aacs::parse_unit_key_ro(&data, false);
+    let result = aacs::parse_unit_key_ro(&data, aacs::AacsVersion::V10);
     assert!(
         result.is_some(),
         "parse_unit_key_ro should succeed on valid data"

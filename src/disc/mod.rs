@@ -1043,10 +1043,9 @@ impl Disc {
     /// The session must be open and unlocked (Drive::open handles this).
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // AACS handshake (Blu-ray/UHD). Branches internally on
-        // libredrive raw-read mode: when active the drive serves VID
-        // without cert auth and no bus encryption is in play. When
-        // inactive we fall back to the cert-based mutual auth.
+        // AACS handshake (Blu-ray/UHD). Cert-based mutual auth; logs
+        // is_libredrive_active() as a diagnostic but the auth path no
+        // longer branches on it.
         let (handshake, handshake_error) = Self::do_handshake(session, opts);
 
         // Request max read speed — removes riplock on DVD
@@ -1073,27 +1072,45 @@ impl Disc {
 
         // CSS key extraction for DVDs (bus auth → disc key → title key).
         // Must be a single auth session — can't call authenticate() separately.
+        // Route through the DRM dispatcher: probe a title sector, detect
+        // CSS if scrambled, then load via the SCSI auth path.
         if disc.css.is_none()
             && disc.content_format == ContentFormat::MpegPs
             && !disc.titles.is_empty()
         {
-            let lba = disc.titles[0].extents.iter().find_map(|ext| {
-                let mut buf = vec![0u8; 2048];
+            let mut probe_buf = vec![0u8; 2048];
+            let auth_lba = disc.titles[0].extents.iter().find_map(|ext| {
                 if session
-                    .read_sectors(ext.start_lba, 1, &mut buf, true)
+                    .read_sectors(ext.start_lba, 1, &mut probe_buf, true)
                     .is_ok()
-                    && crate::css::is_scrambled(&buf)
                 {
-                    return Some(ext.start_lba);
+                    let probe = crate::drm::DrmProbe {
+                        dvd_sample_sector: Some(&probe_buf),
+                        content_cert: None,
+                        mkb: None,
+                    };
+                    if crate::drm::DrmScheme::detect(&probe) == Some(crate::drm::DrmScheme::Css) {
+                        return Some(ext.start_lba);
+                    }
                 }
                 None
             });
 
-            if let Some(lba) = lba {
-                if let Ok(title_key) =
-                    crate::css::auth::authenticate_and_read_title_key(session, lba)
+            if let Some(lba) = auth_lba {
+                let css_ctx = crate::css::CssContext {
+                    drive: Some(session),
+                    auth_lba: Some(lba),
+                    reader: None,
+                    extents: None,
+                };
+                let mut ctx = crate::drm::DrmContext {
+                    aacs: None,
+                    css: Some(css_ctx),
+                };
+                if let Some(crate::drm::ResolvedScheme::Css(state)) =
+                    crate::drm::DrmScheme::Css.load(&mut ctx)
                 {
-                    disc.css = Some(crate::css::CssState { title_key });
+                    disc.css = Some(state);
                     disc.encrypted = true;
                 }
             }
@@ -1218,9 +1235,27 @@ impl Disc {
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = DiscRegion::Free;
 
-        // 6. CSS detection for DVDs
+        // 6. CSS detection for DVDs — route through the DRM dispatcher.
+        //    Detection from a single probe sector would miss
+        //    DVDs whose first sector is unscrambled, so we go straight
+        //    to `DrmScheme::Css.load` with the crack-path context; the
+        //    crack path scans extents internally and bottoms out at
+        //    None on unencrypted media.
         let css = if content_format == ContentFormat::MpegPs && !titles.is_empty() {
-            crate::css::crack_key(reader, &titles[0].extents)
+            let css_ctx = crate::css::CssContext {
+                drive: None,
+                auth_lba: None,
+                reader: Some(reader),
+                extents: Some(&titles[0].extents),
+            };
+            let mut ctx = crate::drm::DrmContext {
+                aacs: None,
+                css: Some(css_ctx),
+            };
+            match crate::drm::DrmScheme::Css.load(&mut ctx) {
+                Some(crate::drm::ResolvedScheme::Css(s)) => Some(s),
+                _ => None,
+            }
         } else {
             None
         };

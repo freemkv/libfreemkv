@@ -16,6 +16,7 @@ pub mod lfsr;
 pub(crate) mod tables;
 
 use crate::disc::Extent;
+use crate::drive::Drive;
 use crate::sector::SectorSource;
 
 /// CSS decryption state for a DVD title.
@@ -23,6 +24,50 @@ use crate::sector::SectorSource;
 pub struct CssState {
     /// Cracked 5-byte title key
     pub title_key: [u8; 5],
+}
+
+/// Inputs for CSS key acquisition.
+///
+/// The acquisition path depends on which inputs the caller supplies:
+///
+/// - With `drive` + `auth_lba` set, [`resolve`] runs the full SCSI bus
+///   auth + title-key path (live BU40N / DVD drive).
+/// - With `reader` + `extents` set, [`resolve`] falls back to the
+///   crack path (Stevenson known-plaintext attack on encrypted PES
+///   headers; works on disc images and on drives whose CSS auth path
+///   is unavailable).
+///
+/// `live_drive` always wins when both modes are populated.
+pub struct CssContext<'a> {
+    /// Live SCSI drive — when present, [`resolve`] tries the auth path.
+    pub drive: Option<&'a mut Drive>,
+    /// LBA of a known-scrambled sector for the auth path's title-key
+    /// query. Required when `drive` is set.
+    pub auth_lba: Option<u32>,
+    /// Sector source for the crack path.
+    pub reader: Option<&'a mut dyn SectorSource>,
+    /// Extents to scan for the crack path. Required when `reader` is
+    /// set.
+    pub extents: Option<&'a [Extent]>,
+}
+
+/// Acquire a CSS title key using whichever inputs the context provides.
+///
+/// Order of attempts:
+///   1. SCSI auth path (when `drive` and `auth_lba` are set).
+///   2. Crack path (when `reader` and `extents` are set).
+///
+/// Returns `None` if neither path is configured or both fail.
+pub fn resolve(ctx: &mut CssContext<'_>) -> Option<CssState> {
+    if let (Some(drive), Some(lba)) = (ctx.drive.as_deref_mut(), ctx.auth_lba) {
+        if let Ok(title_key) = auth::authenticate_and_read_title_key(drive, lba) {
+            return Some(CssState { title_key });
+        }
+    }
+    if let (Some(reader), Some(extents)) = (ctx.reader.as_deref_mut(), ctx.extents) {
+        return crack_key(reader, extents);
+    }
+    None
 }
 
 /// Crack the CSS title key by reading encrypted sectors and applying

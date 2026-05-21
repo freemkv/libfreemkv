@@ -13,64 +13,31 @@ pub(super) struct HandshakeResult {
     pub read_data_key: Option<[u8; 16]>,
 }
 
-/// Retrieve VID via the libredrive alternate read path. The drive's
-/// runtime firmware has cleared bus encryption AND no longer requires
-/// a cert-based AGID for protected-area queries — standard
-/// READ_DISC_STRUCTURE format 0x80 with AGID = 0 returns the raw VID.
-///
-/// Layout matches the spec response (4-byte header + 16-byte VID +
-/// 16-byte MAC), but MAC is meaningless without a bus key derivation;
-/// libredrive mode delivers `[0u8; 16]` (or stale bytes) in the MAC
-/// field. We extract the VID bytes only and skip MAC validation
-/// entirely — this is the documented behavior gap when bus encryption
-/// is off.
-fn read_volume_id_libredrive(session: &mut crate::drive::Drive) -> Result<[u8; 16]> {
-    // CDB: READ_DISC_STRUCTURE (0xAD), media=Blu-ray (0x01), AGID=0,
-    // format=0x80 (AACS Volume ID), allocation_length=36 (4-byte
-    // header + 16-byte VID + 16-byte MAC).
-    let mut cdb = [0u8; 12];
-    cdb[0] = crate::scsi::SCSI_READ_DISC_STRUCTURE;
-    cdb[1] = 0x01; // Blu-ray media type
-    cdb[7] = 0x80; // format = Volume ID
-    cdb[8] = 0x00;
-    cdb[9] = 36;
-    cdb[10] = 0; // AGID = 0 (no auth session)
-
-    let mut buf = [0u8; 36];
-    let result = session.scsi_execute(
-        &cdb,
-        crate::scsi::DataDirection::FromDevice,
-        &mut buf,
-        5_000,
-    )?;
-    if result.bytes_transferred < 20 {
-        return Err(Error::AacsVidRead);
-    }
-    let mut vid = [0u8; 16];
-    vid.copy_from_slice(&buf[4..20]);
-    Ok(vid)
-}
-
 impl Disc {
-    /// SCSI handshake — retrieve VID (and bus keys when applicable).
+    /// SCSI handshake — AACS mutual auth via host certs from the keydb,
+    /// returning VID (and bus keys when applicable) on success.
     ///
-    /// Branches on `Drive::is_libredrive_active()`:
-    ///   * libredrive raw-read mode active → skip cert auth, read VID
-    ///     directly via the alternate path (bus encryption is already
-    ///     off; the drive accepts standard READ_DISC_STRUCTURE format
-    ///     0x80 without an AGID).
-    ///   * libredrive inactive → traditional AACS mutual auth using
-    ///     host certs from the keydb. Caps attempts at 3 with a 1 s
-    ///     backoff to avoid the firmware-wedge hammering we hit in
-    ///     v0.25.7.
+    /// `Drive::is_libredrive_active()` is logged for diagnostics but no
+    /// longer alters the auth path. v0.25.11 introduced a "raw-read VID"
+    /// shortcut that issued `READ_DISC_STRUCTURE` format 0x80 with
+    /// AGID=0 on libredrive-active drives, on the hypothesis that the
+    /// firmware-uploaded drive would serve VID without cert auth. The
+    /// BU40N returned 0x05/0x6F/0x02 (`KEY NOT ESTABLISHED`) to that
+    /// CDB — the AACS spec requires an AGID established via successful
+    /// `REPORT_KEY` / `SEND_KEY` before format 0x80 will return VID,
+    /// regardless of firmware-upload state. The shortcut was deleted
+    /// in v0.25.13. Firmware upload still helps — it removes bus
+    /// encryption and (per memory) may allow HRL-burned certs through
+    /// the cert handshake — but it doesn't bypass the AGID requirement.
     ///
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
-    ///   * `(None, Some(_))`  — specific failure mode (see new
+    ///   * `(None, Some(_))`  — specific failure mode (see
     ///     `AacsHostCertRejected` / `AacsLibredriveUnsupported` /
     ///     `AacsVidUnavailable` variants in `error.rs`)
     ///   * `(None, None)`     — handshake not attempted (no keydb;
-    ///     resolution will proceed with built-in keys and VID=zero)
+    ///     resolution will proceed with VID=zero and rely on path 1
+    ///     disc-hash → VUK lookup)
     pub(super) fn do_handshake(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -82,51 +49,11 @@ impl Disc {
             "do_handshake entered"
         );
 
-        // Libredrive mode: skip cert auth entirely. The drive returns
-        // VID via READ_DISC_STRUCTURE format 0x80 with no AGID and no
-        // bus encryption applied. This is what MakeMKV does on the
-        // same drive + disc combination where libfreemkv used to fail
-        // with E7000 — empirically confirmed 2026-05-21 on rip1
-        // (BU40N + Barbie UHD, MKB v77, libaacs leaked cert revoked
-        // by HRL but disc rips cleanly via libredrive).
-        if session.is_libredrive_active() {
-            return match read_volume_id_libredrive(session) {
-                Ok(vid) => {
-                    tracing::debug!(
-                        target: "freemkv::disc",
-                        phase = "handshake_libredrive_ok",
-                        "libredrive VID acquired without cert auth"
-                    );
-                    (
-                        Some(HandshakeResult {
-                            volume_id: vid,
-                            // No bus key in libredrive mode -> no
-                            // encrypted-read-data-key to decrypt.
-                            // AACS 2.0 bus-encrypted sectors are
-                            // already plaintext when libredrive is
-                            // active, so consumers don't need RDK.
-                            read_data_key: None,
-                        }),
-                        None,
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "handshake_libredrive_vid_failed",
-                        error_code = e.code(),
-                        "libredrive VID read failed"
-                    );
-                    (None, Some(Error::AacsVidUnavailable))
-                }
-            };
-        }
-
         Self::do_handshake_cert(session, opts)
     }
 
-    /// Cert-based AACS handshake. Only called when libredrive mode is
-    /// NOT active — see `do_handshake` for the dispatch.
+    /// Cert-based AACS handshake. The only auth path post-v0.25.13;
+    /// `do_handshake` is now a thin diagnostic wrapper.
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -173,8 +100,8 @@ impl Disc {
         );
 
         if host_cert_count == 0 {
-            // Drive isn't in libredrive mode AND keydb has no host
-            // certs -> cert auth cannot proceed. Surface as
+            // No host certs in keydb -> cert auth cannot proceed.
+            // Surface as
             // LibredriveUnsupported so the caller knows neither path
             // is available on this configuration.
             return (None, Some(Error::AacsLibredriveUnsupported));
@@ -282,6 +209,7 @@ impl Disc {
         handshake: Option<&HandshakeResult>,
     ) -> Result<AacsState> {
         use crate::aacs::{self, KeyDb};
+        use crate::drm::{DrmContext, DrmProbe, DrmScheme, ResolvedScheme};
 
         let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
             path: keydb_path.display().to_string(),
@@ -362,17 +290,45 @@ impl Disc {
         } else {
             Error::AacsVukNotInKeydb
         };
-        let resolved = aacs::resolve_keys(
-            &uk_ro_data,
-            cc_data.as_deref(),
-            &volume_id,
-            &keydb,
-            mkb_data.as_deref(),
-        )
-        .ok_or(miss_error)?;
+
+        // Build a probe + context and let the dispatcher pick V10 / V20
+        // / V21. CSS is impossible here (this function is only called
+        // when /AACS exists), so we don't populate the DVD probe sector
+        // or a CSS context.
+        let probe = DrmProbe {
+            dvd_sample_sector: None,
+            content_cert: cc_data.as_deref(),
+            mkb: mkb_data.as_deref(),
+        };
+        let scheme = match DrmScheme::detect(&probe) {
+            Some(s) => s,
+            None => return Err(miss_error),
+        };
+        let aacs_ctx = aacs::ResolveContext {
+            unit_key_ro: &uk_ro_data,
+            content_cert: cc_data.as_deref(),
+            volume_id: &volume_id,
+            keydb: &keydb,
+            mkb: mkb_data.as_deref(),
+        };
+        let mut ctx = DrmContext {
+            aacs: Some(aacs_ctx),
+            css: None,
+        };
+        let resolved = match scheme.load(&mut ctx) {
+            Some(ResolvedScheme::Aacs(r)) => r,
+            // Resolution against /AACS inputs can only produce AACS
+            // keys. Either the dispatcher returned None (load failed)
+            // or — structurally impossible here — a CSS state. Both
+            // surface as the upstream miss-error.
+            _ => return Err(miss_error),
+        };
 
         Ok(AacsState {
-            version: if resolved.aacs2 { 2 } else { 1 },
+            version: match resolved.version {
+                aacs::AacsVersion::V10 => 1,
+                aacs::AacsVersion::V20 | aacs::AacsVersion::V21 => 2,
+            },
             bus_encryption: resolved.bus_encryption,
             mkb_version: mkb_ver,
             disc_hash: aacs::disc_hash_hex(&resolved.disc_hash),

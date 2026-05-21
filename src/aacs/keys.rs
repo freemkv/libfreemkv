@@ -3,6 +3,38 @@
 use super::decrypt::aes_ecb_decrypt;
 use super::keydb::{DeviceKey, KeyDb};
 
+// ── AACS version ────────────────────────────────────────────────────────────
+
+/// AACS protection generation a disc carries.
+///
+/// The content cert byte distinguishes V10 (`0x00`) from V20 (`0x01`). V21
+/// cannot be detected from the cert alone — a V21 disc carries a V20 cert
+/// and is upgraded to `V21` only after the MKB walk turns up record types
+/// `0x82` / `0x83` (Media Key Variant Data and Variant Number).
+///
+/// Key-storage stride in `Unit_Key_RO.inf` is 48 bytes for V10 and 64
+/// bytes for V20 / V21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AacsVersion {
+    /// AACS 1.0 — original BD-ROM.
+    V10,
+    /// AACS 2.0 — UHD-BD, classical Media Key derivation.
+    V20,
+    /// AACS 2.1 — UHD-BD with Media Key Variant chain on top of V20.
+    V21,
+}
+
+impl AacsVersion {
+    /// Stride (in bytes) between successive encrypted unit keys in
+    /// `Unit_Key_RO.inf`.
+    fn unit_key_stride(self) -> usize {
+        match self {
+            AacsVersion::V10 => 48,
+            AacsVersion::V20 | AacsVersion::V21 => 64,
+        }
+    }
+}
+
 // ── VUK derivation ──────────────────────────────────────────────────────────
 
 /// Derive VUK from Media Key and Volume ID.
@@ -33,8 +65,8 @@ pub struct UnitKeyFile {
     pub num_bdmv_dir: u8,
     /// Whether SKB MKB is used
     pub use_skb_mkb: bool,
-    /// Whether this is AACS 2.0
-    pub aacs2: bool,
+    /// AACS generation this file's stride matches
+    pub version: AacsVersion,
     /// Encrypted unit keys (CPS unit number, encrypted key)
     pub encrypted_keys: Vec<(u32, [u8; 16])>,
     /// Title → CPS unit index mapping (title_idx → unit_key_idx)
@@ -76,8 +108,8 @@ pub fn disc_hash_hex(hash: &[u8; 20]) -> String {
 ///   [uk_pos..uk_pos+2]   BE16: num_unit_keys
 ///   [uk_pos+48..]        encrypted keys, 16 bytes each
 ///                         AACS 1.0: 48-byte stride
-///                         AACS 2.0: 64-byte stride (48 + 16 extra)
-pub fn parse_unit_key_ro(data: &[u8], aacs2: bool) -> Option<UnitKeyFile> {
+///                         AACS 2.0 / 2.1: 64-byte stride (48 + 16 extra)
+pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFile> {
     if data.len() < 20 {
         return None;
     }
@@ -103,14 +135,14 @@ pub fn parse_unit_key_ro(data: &[u8], aacs2: bool) -> Option<UnitKeyFile> {
             app_type,
             num_bdmv_dir,
             use_skb_mkb,
-            aacs2,
+            version,
             encrypted_keys: Vec::new(),
             title_cps_unit: Vec::new(),
         });
     }
 
     // Stride between keys
-    let stride = if aacs2 { 64 } else { 48 };
+    let stride = version.unit_key_stride();
 
     // Validate size
     let keys_start = uk_pos + 48; // first key at uk_pos + 48
@@ -155,7 +187,7 @@ pub fn parse_unit_key_ro(data: &[u8], aacs2: bool) -> Option<UnitKeyFile> {
         app_type,
         num_bdmv_dir,
         use_skb_mkb,
-        aacs2,
+        version,
         encrypted_keys,
         title_cps_unit,
     })
@@ -210,18 +242,11 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
 /// Validate a processing key against a cvalue/UV pair.
 /// Returns the Media Key if valid.
 ///
-/// Implements libaacs `_validate_pk` (aacs.c:98-133) per sgx.fail
-/// Appendix D.2 step 25:
+/// Steps:
 ///   1. `mk = AES-128D(pk, cvalue)`
-///   2. `mk[12..16] ^= uv` (4 bytes XOR into the LAST 4 bytes only)
+///   2. `mk[12..16] ^= uv` (4 bytes XOR into the last 4 bytes only)
 ///   3. `dec_vd = AES-128D(mk, mk_dv)`
 ///   4. If `dec_vd[0..8] == 01 23 45 67 89 AB CD EF` → valid.
-///
-/// Previous implementation XOR'd the full 16-byte cvalue back into mk
-/// (extra step not in libaacs), skipped the uv XOR entirely, and used
-/// AES-128E + 12-zero-byte check instead of AES-128D + magic. Net effect
-/// was that correct processing keys were rejected whenever `uv != 0`,
-/// which is essentially every real disc.
 fn validate_processing_key(
     pk: &[u8; 16],
     cvalue: &[u8],
@@ -237,8 +262,7 @@ fn validate_processing_key(
     cv.copy_from_slice(&cvalue[..16]);
     let mut mk = aes_ecb_decrypt(pk, &cv);
 
-    // Step 2: XOR uv into the LAST 4 bytes of mk (mk[12..16]).
-    // sgx.fail D.2 step 25 and libaacs aacs.c:118-120.
+    // Step 2: XOR uv into the last 4 bytes of mk (mk[12..16]).
     for a in 0..4 {
         mk[12 + a] ^= uv[a];
     }
@@ -319,13 +343,6 @@ fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
 /// signature. To stay correct on both lines we prefer `0x07` first (the
 /// AACS 2.x layout used by every modern UHD disc) and fall back to
 /// `0x05` for AACS 1.0 MKBs.
-///
-/// References:
-///   - libaacs `mkb_cvalues` (mkb.c:190-193) uses `0x05` exclusively.
-///   - sgx.fail Appendix D.5 walks an AACS 2.x MKB and confirms cvalues
-///     at `0x07`.
-///   - Empirically confirmed against our `aacs2-mkb-samples/`
-///     (Wicked / Civil War / Barbie v77 MKBs): cvalues at `0x07`.
 fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
     if let Some(body) = find_record_body(mkb, 0x07) {
         return Some(body);
@@ -585,8 +602,12 @@ pub struct ContentCert {
     pub bus_encryption: bool,
     /// Content Certificate ID (6 bytes)
     pub cc_id: [u8; 6],
-    /// AACS version: false = AACS 1.0, true = AACS 2.0
-    pub aacs2: bool,
+    /// AACS generation indicated by the certificate type byte.
+    ///
+    /// Cert type `0x00` → [`AacsVersion::V10`]; any other value →
+    /// [`AacsVersion::V20`]. The certificate alone cannot distinguish
+    /// V20 from V21 — Variant detection happens after the MKB walk.
+    pub version: AacsVersion,
 }
 
 /// Parse a Content Certificate (ContentXXX.cer) file.
@@ -599,7 +620,11 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
     //   [0] certificate type (0x00 = AACS1, 0x01 = AACS2)
     //   [1] bus_encryption_enabled (bit 0)
     //   [2..8] cc_id (6 bytes)
-    let aacs2 = data[0] != 0x00;
+    let version = if data[0] == 0x00 {
+        AacsVersion::V10
+    } else {
+        AacsVersion::V20
+    };
     let bus_encryption = (data[1] & 0x01) != 0;
     let mut cc_id = [0u8; 6];
     cc_id.copy_from_slice(&data[2..8]);
@@ -607,7 +632,7 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
     Some(ContentCert {
         bus_encryption,
         cc_id,
-        aacs2,
+        version,
     })
 }
 
@@ -624,44 +649,172 @@ pub struct ResolvedKeys {
     pub unit_keys: Vec<(u32, [u8; 16])>,
     /// Title → CPS unit index mapping
     pub title_cps_unit: Vec<u16>,
-    /// Whether AACS 2.0
-    pub aacs2: bool,
+    /// AACS generation that drove the resolution
+    pub version: AacsVersion,
     /// Whether bus encryption is enabled (from Content Certificate)
     pub bus_encryption: bool,
     /// Which resolution path succeeded (1=KEYDB, 2=KEYDB derived, 3=PK, 4=DK)
     pub key_source: u8,
 }
 
-/// Resolve all AACS keys for a disc given:
-///   - Unit_Key_RO.inf raw data
-///   - Content Certificate raw data (optional, for AACS version detection)
-///   - Volume ID (from SCSI handshake)
-///   - KEYDB
-///
-/// Tries in order:
-///   1. Disc hash → KEYDB → VUK (fast path)
-///   2. KEYDB media key + volume ID → VUK (if disc hash not in KEYDB but MK is)
-///   3. MKB + processing keys → media key → VUK (full derivation)
-pub fn resolve_keys(
-    unit_key_ro_data: &[u8],
-    content_cert_data: Option<&[u8]>,
-    volume_id: &[u8; 16],
-    keydb: &KeyDb,
-    mkb_data: Option<&[u8]>,
-) -> Option<ResolvedKeys> {
-    // Detect AACS version
-    let aacs2 = content_cert_data
-        .and_then(parse_content_cert)
-        .map(|cc| cc.aacs2)
-        .unwrap_or(false);
+/// Inputs shared by every classical-path resolver. References only —
+/// callers retain ownership of all buffers.
+pub struct ResolveContext<'a> {
+    /// `Unit_Key_RO.inf` raw bytes.
+    pub unit_key_ro: &'a [u8],
+    /// Content Certificate raw bytes (optional — used for bus-encryption flag).
+    pub content_cert: Option<&'a [u8]>,
+    /// 16-byte Volume ID from SCSI handshake. `[0u8; 16]` is the
+    /// "no VID" sentinel and disables paths 2/3/4.
+    pub volume_id: &'a [u8; 16],
+    /// Key database.
+    pub keydb: &'a KeyDb,
+    /// MKB raw bytes (optional — paths 3/4 require it).
+    pub mkb: Option<&'a [u8]>,
+}
 
-    let bus_encryption = content_cert_data
+/// AACS 1.0 key resolution. Parses `Unit_Key_RO.inf` with 48-byte
+/// stride. Tries paths 1 → 4 in order.
+pub fn resolve_keys_v1(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
+    resolve_keys_classical(ctx, AacsVersion::V10)
+}
+
+/// AACS 2.0 key resolution. Parses `Unit_Key_RO.inf` with 64-byte
+/// stride. Tries paths 1 → 4 in order. When paths 3/4 succeed against
+/// an MKB carrying Variant records (`0x82` / `0x83`), the result's
+/// `version` is upgraded to [`AacsVersion::V21`] — derivation still
+/// runs through the classical V2 path; the V21-specific Variant chain
+/// is wired separately via [`resolve_keys_v21`].
+pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
+    let mut resolved = resolve_keys_classical(ctx, AacsVersion::V20)?;
+    if let Some(mkb) = ctx.mkb {
+        let recs = super::variants::walk_mkb(mkb);
+        if super::variants::is_variant_mkb(&recs) {
+            resolved.version = AacsVersion::V21;
+        }
+    }
+    Some(resolved)
+}
+
+/// AACS 2.1 key resolution via the Media Key Variant chain.
+///
+/// This is wired but not reachable from the production dispatcher — the
+/// Variant chain still requires an integrator-supplied Key Correction
+/// Data constant (see [`super::variants::KEY_CORRECTION_DATA_PLACEHOLDER`])
+/// and an empirically-validated `VARIANTS[uv]` table. Until both are
+/// available, [`super::variants::derive_media_key_variant`] returns
+/// errors that this wrapper logs and converts to `None`.
+///
+/// The chain still passes the disc hash → KEYDB path (1) and the
+/// KEYDB-derived MK+VID path (2) before attempting variant derivation;
+/// V21 discs already in the keydb behave identically to V20.
+pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
+    // Paths 1 and 2 are version-agnostic — try them first via the
+    // classical V20-stride parser.
+    let uk_file = parse_unit_key_ro(ctx.unit_key_ro, AacsVersion::V20)?;
+    let hash_hex = disc_hash_hex(&uk_file.disc_hash);
+    let bus_encryption = ctx
+        .content_cert
         .and_then(parse_content_cert)
         .map(|cc| cc.bus_encryption)
         .unwrap_or(false);
 
-    // Parse Unit_Key_RO.inf
-    let uk_file = parse_unit_key_ro(unit_key_ro_data, aacs2)?;
+    let build = |vuk: [u8; 16], key_source: u8| -> ResolvedKeys {
+        let unit_keys: Vec<(u32, [u8; 16])> = uk_file
+            .encrypted_keys
+            .iter()
+            .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
+            .collect();
+        ResolvedKeys {
+            disc_hash: uk_file.disc_hash,
+            vuk,
+            unit_keys,
+            title_cps_unit: uk_file.title_cps_unit.clone(),
+            version: AacsVersion::V21,
+            bus_encryption,
+            key_source,
+        }
+    };
+
+    tracing::warn!(
+        target: "freemkv::disc",
+        phase = "resolve_keys_v21_start",
+        bus_encryption,
+        disc_hash = %hash_hex,
+        mkb_present = ctx.mkb.is_some(),
+        "resolve_keys_v21: starting"
+    );
+
+    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
+        if let Some(vuk) = entry.vuk {
+            return Some(build(vuk, 1));
+        }
+    }
+
+    if *ctx.volume_id == [0u8; 16] {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "resolve_keys_v21_no_vid",
+            "VID unavailable; v21 derivation requires VID"
+        );
+        return None;
+    }
+
+    for entry in ctx.keydb.disc_entries.values() {
+        if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+            if did == *ctx.volume_id {
+                return Some(build(derive_vuk(&mk, ctx.volume_id), 2));
+            }
+        }
+    }
+
+    // Variant chain — walk MKB, derive Km via the Media Key Variant
+    // chain, then derive VUK off Km and the disc's VID.
+    let mkb = ctx.mkb?;
+    let recs = super::variants::walk_mkb(mkb);
+    match super::variants::derive_media_key_variant(
+        &recs,
+        &ctx.keydb.device_keys,
+        &super::variants::KEY_CORRECTION_DATA_PLACEHOLDER,
+        ctx.volume_id,
+    ) {
+        Ok((_km, kvu)) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "resolve_keys_v21_variant_ok",
+                "Media Key Variant chain produced Km + Kvu"
+            );
+            Some(build(kvu, 4))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "resolve_keys_v21_variant_err",
+                error_code = %e,
+                "Media Key Variant chain failed"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve all AACS keys for a disc using the classical (single-stage
+/// Media Key derivation) paths. Used by both V10 and V20.
+///
+/// Tries in order:
+///   1. Disc hash → KEYDB → VUK (fast path, no VID required)
+///   2. KEYDB media key + volume ID → VUK
+///   3. MKB + processing keys → media key → VUK
+///   4. MKB + device keys → processing key → media key → VUK
+fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Option<ResolvedKeys> {
+    let bus_encryption = ctx
+        .content_cert
+        .and_then(parse_content_cert)
+        .map(|cc| cc.bus_encryption)
+        .unwrap_or(false);
+
+    // Parse Unit_Key_RO.inf at the version-appropriate stride.
+    let uk_file = parse_unit_key_ro(ctx.unit_key_ro, version)?;
 
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
 
@@ -677,7 +830,7 @@ pub fn resolve_keys(
             vuk,
             unit_keys,
             title_cps_unit: uk_file.title_cps_unit.clone(),
-            aacs2,
+            version,
             bus_encryption,
             key_source,
         }
@@ -686,15 +839,15 @@ pub fn resolve_keys(
     tracing::warn!(
         target: "freemkv::disc",
         phase = "resolve_keys_start",
-        aacs2,
+        version = ?version,
         bus_encryption,
         disc_hash = %hash_hex,
-        mkb_present = mkb_data.is_some(),
+        mkb_present = ctx.mkb.is_some(),
         "resolve_keys: starting"
     );
 
     // Path 1: Look up VUK by disc hash in KEYDB
-    if let Some(entry) = keydb.find_disc(&hash_hex) {
+    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
         tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit_entry", "disc hash found in keydb");
         if let Some(vuk) = entry.vuk {
             return Some(build(vuk, 1));
@@ -710,7 +863,7 @@ pub fn resolve_keys(
     // sentinel "no VID" — short-circuit here so we don't surface a
     // misleading "all paths failed" log when really the math is
     // structurally impossible.
-    if *volume_id == [0u8; 16] {
+    if *ctx.volume_id == [0u8; 16] {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "resolve_keys_no_vid",
@@ -721,19 +874,19 @@ pub fn resolve_keys(
 
     // Path 2: Find entry with matching VID → derive VUK from MK + VID
     let mut path2_mk_did_count = 0usize;
-    for entry in keydb.disc_entries.values() {
+    for entry in ctx.keydb.disc_entries.values() {
         if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
             path2_mk_did_count += 1;
-            if did == *volume_id {
+            if did == *ctx.volume_id {
                 tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "MK+VID entry matched volume_id");
-                return Some(build(derive_vuk(&mk, volume_id), 2));
+                return Some(build(derive_vuk(&mk, ctx.volume_id), 2));
             }
         }
     }
     tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", mk_did_entries = path2_mk_did_count, "no MK+VID entry matched volume_id");
 
     // Path 3: MKB + processing keys → media key → VUK
-    if let Some(mkb) = mkb_data {
+    if let Some(mkb) = ctx.mkb {
         let mk_dv = mkb_find_mk_dv(mkb);
         let subdiff = mkb_find_subdiff_records(mkb);
         let cvalues = mkb_find_cvalues(mkb);
@@ -748,18 +901,18 @@ pub fn resolve_keys(
             "MKB record scan results"
         );
 
-        if let Some(mk) = derive_media_key_from_pk(mkb, &keydb.processing_keys) {
+        if let Some(mk) = derive_media_key_from_pk(mkb, &ctx.keydb.processing_keys) {
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "media key derived from processing key");
-            return Some(build(derive_vuk(&mk, volume_id), 3));
+            return Some(build(derive_vuk(&mk, ctx.volume_id), 3));
         }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", pk_count = keydb.processing_keys.len(), "PK derivation failed");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", pk_count = ctx.keydb.processing_keys.len(), "PK derivation failed");
 
         // Path 4: MKB + device keys → processing key → media key → VUK
-        if let Some(mk) = derive_media_key_from_dk(mkb, &keydb.device_keys) {
+        if let Some(mk) = derive_media_key_from_dk(mkb, &ctx.keydb.device_keys) {
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "media key derived from device key");
-            return Some(build(derive_vuk(&mk, volume_id), 4));
+            return Some(build(derive_vuk(&mk, ctx.volume_id), 4));
         }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_miss", dk_count = keydb.device_keys.len(), "DK derivation failed");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_miss", dk_count = ctx.keydb.device_keys.len(), "DK derivation failed");
     } else {
         tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB data available; paths 3/4 skipped");
     }
@@ -974,10 +1127,10 @@ mod tests {
             data[key2_pos + i] = 0xBB;
         }
 
-        let parsed = parse_unit_key_ro(&data, false).unwrap();
+        let parsed = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
         assert_eq!(parsed.app_type, 1);
         assert_eq!(parsed.num_bdmv_dir, 1);
-        assert!(!parsed.aacs2);
+        assert_eq!(parsed.version, AacsVersion::V10);
         assert_eq!(parsed.encrypted_keys.len(), 2);
         assert_eq!(parsed.encrypted_keys[0].0, 1); // CPS unit 1
         assert_eq!(parsed.encrypted_keys[0].1, [0xAA; 16]);
@@ -1197,7 +1350,14 @@ mod tests {
         );
         keydb.processing_keys.push([0u8; 16]);
 
-        let result = resolve_keys(&uk_ro, None, &zero_vid, &keydb, None);
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &zero_vid,
+            keydb: &keydb,
+            mkb: None,
+        };
+        let result = resolve_keys_v1(&ctx);
         assert!(
             result.is_none(),
             "resolve_keys with VID=0 and no matching disc-hash entry must return None"
@@ -1230,8 +1390,16 @@ mod tests {
             },
         );
 
-        let resolved = resolve_keys(&uk_ro, None, &[0u8; 16], &keydb, None)
-            .expect("path 1 must run regardless of VID availability");
+        let vid = [0u8; 16];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            keydb: &keydb,
+            mkb: None,
+        };
+        let resolved =
+            resolve_keys_v1(&ctx).expect("path 1 must run regardless of VID availability");
         assert_eq!(resolved.vuk, known_vuk);
         assert_eq!(resolved.key_source, 1);
     }
@@ -1243,14 +1411,14 @@ mod tests {
         data[0] = 0x00; // AACS 1.0
         data[1] = 0x00; // no bus encryption
         let cc = parse_content_cert(&data).unwrap();
-        assert!(!cc.aacs2);
+        assert_eq!(cc.version, AacsVersion::V10);
         assert!(!cc.bus_encryption);
 
         // AACS 2.0 with bus encryption
         data[0] = 0x01; // AACS 2.0
         data[1] = 0x01; // bus encryption enabled
         let cc = parse_content_cert(&data).unwrap();
-        assert!(cc.aacs2);
+        assert_eq!(cc.version, AacsVersion::V20);
         assert!(cc.bus_encryption);
     }
 }

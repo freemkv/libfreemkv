@@ -77,6 +77,7 @@ pub mod css;
 pub mod decrypt;
 pub mod disc;
 pub mod drive;
+pub mod drm;
 pub mod error;
 pub mod event;
 pub mod halt;

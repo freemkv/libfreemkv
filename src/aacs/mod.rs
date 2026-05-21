@@ -17,6 +17,7 @@ pub mod decrypt;
 pub mod handshake;
 pub mod keydb;
 pub mod keys;
+pub mod variants;
 
 // Explicit re-exports — only items needed by external consumers and sibling crate modules.
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
@@ -26,7 +27,13 @@ pub use decrypt::{
 };
 pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::{
-    ContentCert, ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_from_dk,
-    derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex, mkb_version,
-    parse_content_cert, parse_unit_key_ro, read_mkb_from_drive, resolve_keys,
+    AacsVersion, ContentCert, ResolveContext, ResolvedKeys, UnitKeyFile, decrypt_unit_key,
+    derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex,
+    mkb_version, parse_content_cert, parse_unit_key_ro, read_mkb_from_drive, resolve_keys_v1,
+    resolve_keys_v2, resolve_keys_v21,
+};
+pub use variants::{
+    KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, MkbRecord, ProcessingKeyMatch,
+    derive_media_key_variant, is_variant_mkb, variant_data_record, variant_key_data, variant_nonce,
+    walk_mkb, walk_processing_key,
 };
