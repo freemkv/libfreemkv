@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.25.14 (2026-05-21)
+
+### Changed
+
+- `Drive::is_libredrive_active()` renamed to `Drive::is_raw_read_active()`.
+  Same semantics; old name removed. Mirrored on the internal
+  `PlatformDriver::is_libredrive_active()` trait method (now
+  `is_raw_read_active()`).
+- `Error::AacsLibredriveUnsupported` renamed to
+  `Error::AacsRawReadUnsupported`; the underlying numeric code (E7016)
+  is unchanged. The `E_AACS_LIBREDRIVE_UNSUPPORTED` constant is
+  renamed to `E_AACS_RAW_READ_UNSUPPORTED`.
+
+No behavioural change — purely a rename pass.
+
 ## 0.25.13 (2026-05-21)
 
 ### Added

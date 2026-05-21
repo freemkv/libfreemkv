@@ -72,7 +72,7 @@ pub const E_AACS_DATA_KEY: u16 = 7011;
 pub const E_DECRYPT_FAILED: u16 = 7013;
 pub const E_CSS_AUTH_FAILED: u16 = 7014;
 pub const E_AACS_HOST_CERT_REJECTED: u16 = 7015;
-pub const E_AACS_LIBREDRIVE_UNSUPPORTED: u16 = 7016;
+pub const E_AACS_RAW_READ_UNSUPPORTED: u16 = 7016;
 pub const E_AACS_VID_UNAVAILABLE: u16 = 7017;
 pub const E_AACS_MK_UNAVAILABLE: u16 = 7018;
 pub const E_AACS_VUK_NOT_IN_KEYDB: u16 = 7019;
@@ -230,11 +230,11 @@ pub enum Error {
     /// Host certificate rejected by the drive's revocation list (HRL hit).
     /// All available host certs failed mutual auth on this drive.
     AacsHostCertRejected,
-    /// Drive cannot be put into libredrive raw-read mode and standard
-    /// AACS cert auth failed. No path to decryption remains.
-    AacsLibredriveUnsupported,
+    /// Drive cannot be put into raw-read mode and standard AACS cert
+    /// auth failed. No path to decryption remains.
+    AacsRawReadUnsupported,
     /// Volume ID could not be retrieved from the drive (neither via cert
-    /// auth nor via the libredrive alternate path). Downstream of step 1
+    /// auth nor via the alternate VID read path). Downstream of step 1
     /// of the AACS chain.
     AacsVidUnavailable,
     /// No available path produced a Media Key (no MK+VID in keydb, no
@@ -329,7 +329,7 @@ impl Error {
             Error::DecryptFailed => E_DECRYPT_FAILED,
             Error::CssAuthFailed => E_CSS_AUTH_FAILED,
             Error::AacsHostCertRejected => E_AACS_HOST_CERT_REJECTED,
-            Error::AacsLibredriveUnsupported => E_AACS_LIBREDRIVE_UNSUPPORTED,
+            Error::AacsRawReadUnsupported => E_AACS_RAW_READ_UNSUPPORTED,
             Error::AacsVidUnavailable => E_AACS_VID_UNAVAILABLE,
             Error::AacsMkUnavailable => E_AACS_MK_UNAVAILABLE,
             Error::AacsVukNotInKeydb => E_AACS_VUK_NOT_IN_KEYDB,

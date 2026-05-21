@@ -858,7 +858,7 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     }
 
     // Paths 2-4 all consume the Volume ID. Without it (handshake
-    // skipped, libredrive bypass failed, etc.) every downstream
+    // skipped, raw-read bypass failed, etc.) every downstream
     // derivation produces garbage. Caller stamps `[0u8; 16]` as the
     // sentinel "no VID" — short-circuit here so we don't surface a
     // misleading "all paths failed" log when really the math is

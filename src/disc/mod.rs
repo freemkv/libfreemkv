@@ -1044,7 +1044,7 @@ impl Disc {
     /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         // AACS handshake (Blu-ray/UHD). Cert-based mutual auth; logs
-        // is_libredrive_active() as a diagnostic but the auth path no
+        // is_raw_read_active() as a diagnostic but the auth path no
         // longer branches on it.
         let (handshake, handshake_error) = Self::do_handshake(session, opts);
 
@@ -1133,7 +1133,7 @@ impl Disc {
     /// Core scan pipeline — works with any SectorSource.
     ///
     /// `handshake_error` is plumbed from `do_handshake` so failures
-    /// (cert rejected, libredrive unsupported, VID read failed) are
+    /// (cert rejected, raw-read unsupported, VID read failed) are
     /// preserved as `disc.aacs_error` for callers to render. When key
     /// resolution succeeds despite the handshake failure (built-in
     /// keys + disc-hash lookup hit) the error is dropped.

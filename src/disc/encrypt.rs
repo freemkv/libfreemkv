@@ -17,10 +17,10 @@ impl Disc {
     /// SCSI handshake — AACS mutual auth via host certs from the keydb,
     /// returning VID (and bus keys when applicable) on success.
     ///
-    /// `Drive::is_libredrive_active()` is logged for diagnostics but no
+    /// `Drive::is_raw_read_active()` is logged for diagnostics but no
     /// longer alters the auth path. v0.25.11 introduced a "raw-read VID"
     /// shortcut that issued `READ_DISC_STRUCTURE` format 0x80 with
-    /// AGID=0 on libredrive-active drives, on the hypothesis that the
+    /// AGID=0 on raw-read-active drives, on the hypothesis that the
     /// firmware-uploaded drive would serve VID without cert auth. The
     /// BU40N returned 0x05/0x6F/0x02 (`KEY NOT ESTABLISHED`) to that
     /// CDB — the AACS spec requires an AGID established via successful
@@ -33,7 +33,7 @@ impl Disc {
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
     ///   * `(None, Some(_))`  — specific failure mode (see
-    ///     `AacsHostCertRejected` / `AacsLibredriveUnsupported` /
+    ///     `AacsHostCertRejected` / `AacsRawReadUnsupported` /
     ///     `AacsVidUnavailable` variants in `error.rs`)
     ///   * `(None, None)`     — handshake not attempted (no keydb;
     ///     resolution will proceed with VID=zero and rely on path 1
@@ -45,7 +45,7 @@ impl Disc {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "handshake_entry",
-            libredrive_active = session.is_libredrive_active(),
+            raw_read_active = session.is_raw_read_active(),
             "do_handshake entered"
         );
 
@@ -101,10 +101,9 @@ impl Disc {
 
         if host_cert_count == 0 {
             // No host certs in keydb -> cert auth cannot proceed.
-            // Surface as
-            // LibredriveUnsupported so the caller knows neither path
-            // is available on this configuration.
-            return (None, Some(Error::AacsLibredriveUnsupported));
+            // Surface as RawReadUnsupported so the caller knows
+            // neither path is available on this configuration.
+            return (None, Some(Error::AacsRawReadUnsupported));
         }
 
         // v0.25.7 wedge fix. Pre-0.25.7 this loop fired up to 16 AACS

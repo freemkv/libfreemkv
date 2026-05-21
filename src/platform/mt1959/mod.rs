@@ -52,10 +52,10 @@ pub struct Mt1959 {
     pub(crate) buffer_id: u8,
     pub(crate) unlocked: bool,
     /// True when the unlock response carried both the per-drive
-    /// signature AND the active-mode markers (`MMkv` at [12..16],
-    /// `LbDr` at [16..20]). When true the drive will accept raw-read
-    /// SCSI traffic without AACS bus encryption / cert auth.
-    libredrive_active: bool,
+    /// signature AND a 4-byte marker at offset 12 plus a secondary
+    /// 4-byte marker at offset 16. When true the drive will accept
+    /// raw-read SCSI traffic without AACS bus encryption / cert auth.
+    raw_read_active: bool,
     probed: bool,
 }
 
@@ -71,7 +71,7 @@ impl Mt1959 {
             mode,
             buffer_id,
             unlocked: false,
-            libredrive_active: false,
+            raw_read_active: false,
             probed: false,
         }
     }
@@ -152,14 +152,15 @@ impl Mt1959 {
         }
 
         // Raw-read mode is active when BOTH the per-drive signature
-        // matched AND the response carries the secondary `LbDr` marker
-        // repeated through bytes 16..64. The active-mode signature at
-        // [12..16] checked above is the primary gate; the [16..20]
-        // marker is the redundant confirmation Mt1959 firmware writes
-        // through the rest of the response. Requiring both before we
-        // tell the AACS layer "skip the cert dance" keeps any partial
-        // / corrupted response from steering us into the bypass.
-        self.libredrive_active = response.len() >= FIRMWARE_MODE_OFFSET + 4
+        // matched AND the response carries the secondary 4-byte marker
+        // at offset 16, repeated through bytes 16..64. The active-mode
+        // signature at [12..16] checked above is the primary gate; the
+        // [16..20] marker is the redundant confirmation the firmware
+        // writes through the rest of the response. Requiring both
+        // before we tell the AACS layer "skip the cert dance" keeps
+        // any partial / corrupted response from steering us into the
+        // bypass.
+        self.raw_read_active = response.len() >= FIRMWARE_MODE_OFFSET + 4
             && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] == FIRMWARE_ACTIVE_SIG
             && response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
@@ -357,8 +358,8 @@ impl PlatformDriver for Mt1959 {
         self.unlocked
     }
 
-    fn is_libredrive_active(&self) -> bool {
-        self.libredrive_active
+    fn is_raw_read_active(&self) -> bool {
+        self.raw_read_active
     }
 }
 
@@ -417,14 +418,15 @@ mod tests {
         r[0..4].copy_from_slice(&signature);
         // bytes [4..12] left as zeros (version + reserved per format)
         r[12..16].copy_from_slice(&mode_marker);
-        // Real firmware repeats LbDr through [16..64]; the parser only
-        // checks [16..20], so we just write the marker once.
+        // Real firmware repeats the secondary marker through [16..64];
+        // the parser only checks [16..20], so we just write the marker
+        // once.
         r[16..20].copy_from_slice(&id_marker);
         r
     }
 
     #[test]
-    fn do_unlock_sets_libredrive_active_when_both_markers_present() {
+    fn do_unlock_sets_raw_read_active_when_both_markers_present() {
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
         let mut transport = ScriptedTransport { response };
@@ -434,16 +436,16 @@ mod tests {
         assert_eq!(raw.len(), 64);
         assert!(mt.unlocked, "unlocked flag set after success");
         assert!(
-            mt.is_libredrive_active(),
-            "both MMkv and LbDr present -> libredrive_active"
+            mt.is_raw_read_active(),
+            "both markers present -> raw_read_active"
         );
     }
 
     #[test]
-    fn do_unlock_unlocked_but_not_libredrive_when_id_marker_missing() {
+    fn do_unlock_unlocked_but_not_raw_read_when_id_marker_missing() {
         // Active-mode primary marker present (so unlock passes) but the
-        // secondary LbDr marker is replaced with zeros — drive isn't
-        // serving raw-read traffic on this path.
+        // secondary marker is replaced with zeros — drive isn't serving
+        // raw-read traffic on this path.
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, FIRMWARE_ACTIVE_SIG, [0u8; 4]);
         let mut transport = ScriptedTransport { response };
@@ -452,8 +454,8 @@ mod tests {
         mt.do_unlock(&mut transport).expect("unlock should succeed");
         assert!(mt.unlocked);
         assert!(
-            !mt.is_libredrive_active(),
-            "missing LbDr marker -> raw-read not active"
+            !mt.is_raw_read_active(),
+            "missing secondary marker -> raw-read not active"
         );
     }
 
@@ -470,13 +472,14 @@ mod tests {
         let err = mt.do_unlock(&mut transport).unwrap_err();
         assert!(matches!(err, Error::SignatureMismatch { .. }));
         assert!(!mt.unlocked);
-        assert!(!mt.is_libredrive_active());
+        assert!(!mt.is_raw_read_active());
     }
 
     #[test]
     fn do_unlock_rejects_inactive_mode_marker() {
-        // Signature matches but [12..16] is NOT MMkv -> drive is not in
-        // active mode; both unlock and libredrive flag must stay false.
+        // Signature matches but the primary marker at [12..16] is
+        // missing -> drive is not in active mode; both unlock and the
+        // raw-read flag must stay false.
         let sig = [0x99, 0x9E, 0xC3, 0x75];
         let response = build_response(sig, [0u8; 4], FIRMWARE_MODE_SIG);
         let mut transport = ScriptedTransport { response };
@@ -485,6 +488,6 @@ mod tests {
         let err = mt.do_unlock(&mut transport).unwrap_err();
         assert!(matches!(err, Error::UnlockFailed));
         assert!(!mt.unlocked);
-        assert!(!mt.is_libredrive_active());
+        assert!(!mt.is_raw_read_active());
     }
 }
