@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.26.1 (2026-05-22)
+
+### Added
+
+- **AACS resolver path 5 — KEYDB unit-keys direct fallback.** When a
+  KEYDB entry for the disc has no VUK field but does have pre-decrypted
+  unit keys, the resolver now consumes those unit keys directly instead
+  of treating the entry as unusable. Covers ~4,572 entries in the
+  public keydb (≈2.5% of the database, heavily skewed toward MKBv76+
+  UHD discs that DVDFab/FindVUK can no longer extract VUKs for).
+  Surfaces as `KeySource::KeyDbUnitKeys`; `AacsState::vuk` and
+  `ResolvedKeys::vuk` are `None` on this path because no VUK exists to
+  return. Partial CPS-unit coverage is rejected so a disc is never
+  half-decrypted.
+
+### Changed
+
+- **AACS resolver path order reordered root-to-leaf.** Paths now run in
+  derivation-strength order: device-key (1) → processing-key (2) →
+  KEYDB-derived from MK+VID (3) → KEYDB VUK direct (4) → KEYDB unit
+  keys direct (5). Previous order was leaf-first (KEYDB hash lookup,
+  then derivation). Resolution runs once per disc, so the few extra
+  milliseconds of MKB walking when a KEYDB VUK would have answered are
+  invisible against the rip itself; the new order matches the AACS
+  derivation hierarchy. `KeySource` enum variants are reordered to
+  match.
+- **`AacsState::vuk` type is now `Option<[u8; 16]>`** (was `[u8; 16]`).
+  Required by path 5, which has no VUK. Public-API break.
+- **`ResolvedKeys::vuk` type is now `Option<[u8; 16]>`** (was
+  `[u8; 16]`). Same rationale.
+
 ## 0.25.14 (2026-05-21)
 
 ### Changed

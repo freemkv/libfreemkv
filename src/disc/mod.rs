@@ -883,8 +883,10 @@ pub struct AacsState {
     pub disc_hash: String,
     /// How keys were resolved
     pub key_source: KeySource,
-    /// Volume Unique Key (16 bytes)
-    pub vuk: [u8; 16],
+    /// Volume Unique Key (16 bytes). `None` when keys were resolved
+    /// via the [`KeySource::KeyDbUnitKeys`] path — that source delivers
+    /// pre-decrypted unit keys without a VUK to derive them from.
+    pub vuk: Option<[u8; 16]>,
     /// Decrypted unit keys (CPS unit number, key)
     pub unit_keys: Vec<(u32, [u8; 16])>,
     /// Read data key for AACS 2.0 bus decryption -- None for AACS 1.0
@@ -893,26 +895,33 @@ pub struct AacsState {
     pub volume_id: [u8; 16],
 }
 
-/// How AACS keys were resolved.
+/// How AACS keys were resolved. Variants are ordered root-of-trust →
+/// per-disc-leaf, matching the resolver's path-try order: the resolver
+/// attempts derivation from the strongest input it has first and falls
+/// back toward pre-computed per-disc material.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeySource {
-    /// VUK found directly in KEYDB by disc hash
-    KeyDb,
-    /// Media key + Volume ID from KEYDB → derived VUK
-    KeyDbDerived,
-    /// MKB + processing keys → media key → VUK
-    ProcessingKey,
     /// MKB + device keys → subset-difference tree → VUK
     DeviceKey,
+    /// MKB + processing keys → media key → VUK
+    ProcessingKey,
+    /// Media key + Volume ID from KEYDB → derived VUK
+    KeyDbDerived,
+    /// VUK found directly in KEYDB by disc hash
+    KeyDb,
+    /// Pre-decrypted unit keys taken directly from KEYDB by disc hash.
+    /// No VUK present in the entry — `AacsState::vuk` is `None`.
+    KeyDbUnitKeys,
 }
 
 impl KeySource {
     pub fn name(&self) -> &'static str {
         match self {
-            KeySource::KeyDb => "KEYDB",
-            KeySource::KeyDbDerived => "KEYDB (derived)",
-            KeySource::ProcessingKey => "MKB + processing key",
             KeySource::DeviceKey => "MKB + device key",
+            KeySource::ProcessingKey => "MKB + processing key",
+            KeySource::KeyDbDerived => "KEYDB (derived)",
+            KeySource::KeyDb => "KEYDB",
+            KeySource::KeyDbUnitKeys => "KEYDB (unit keys)",
         }
     }
 }

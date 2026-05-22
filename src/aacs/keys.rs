@@ -643,8 +643,10 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
 pub struct ResolvedKeys {
     /// Disc hash (SHA1 of Unit_Key_RO.inf)
     pub disc_hash: [u8; 20],
-    /// Volume Unique Key
-    pub vuk: [u8; 16],
+    /// Volume Unique Key. `None` for path 5 — the KEYDB unit-keys
+    /// fallback consumes pre-decrypted unit keys directly and has no
+    /// VUK to surface.
+    pub vuk: Option<[u8; 16]>,
     /// Decrypted unit keys (CPS unit number, key)
     pub unit_keys: Vec<(u32, [u8; 16])>,
     /// Title → CPS unit index mapping
@@ -653,7 +655,8 @@ pub struct ResolvedKeys {
     pub version: AacsVersion,
     /// Whether bus encryption is enabled (from Content Certificate)
     pub bus_encryption: bool,
-    /// Which resolution path succeeded (1=KEYDB, 2=KEYDB derived, 3=PK, 4=DK)
+    /// Which resolution path succeeded (1=DK, 2=PK, 3=KEYDB derived,
+    /// 4=KEYDB VUK, 5=KEYDB unit keys)
     pub key_source: u8,
 }
 
@@ -665,11 +668,11 @@ pub struct ResolveContext<'a> {
     /// Content Certificate raw bytes (optional — used for bus-encryption flag).
     pub content_cert: Option<&'a [u8]>,
     /// 16-byte Volume ID from SCSI handshake. `[0u8; 16]` is the
-    /// "no VID" sentinel and disables paths 2/3/4.
+    /// "no VID" sentinel and disables paths 1-3.
     pub volume_id: &'a [u8; 16],
     /// Key database.
     pub keydb: &'a KeyDb,
-    /// MKB raw bytes (optional — paths 3/4 require it).
+    /// MKB raw bytes (optional — paths 1/2 require it).
     pub mkb: Option<&'a [u8]>,
 }
 
@@ -698,19 +701,20 @@ pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 
 /// AACS 2.1 key resolution via the Media Key Variant chain.
 ///
-/// This is wired but not reachable from the production dispatcher — the
-/// Variant chain still requires an integrator-supplied Key Correction
-/// Data constant (see [`super::variants::KEY_CORRECTION_DATA_PLACEHOLDER`])
-/// and an empirically-validated `VARIANTS[uv]` table. Until both are
-/// available, [`super::variants::derive_media_key_variant`] returns
-/// errors that this wrapper logs and converts to `None`.
+/// Paths run in root-of-trust → per-disc-leaf order:
+///   1. Variant chain: MKB Variant records + device keys → Km → Kvu
+///      (currently unreachable in production — requires an
+///      integrator-supplied Key Correction Data constant; see
+///      [`super::variants::KEY_CORRECTION_DATA_PLACEHOLDER`])
+///   3. KEYDB MK + matching VID → derived VUK (V21 discs already in
+///      the keydb decrypt identically to V20)
+///   4. KEYDB disc-hash → VUK
+///   5. KEYDB disc-hash → pre-decrypted unit keys (no VUK)
 ///
-/// The chain still passes the disc hash → KEYDB path (1) and the
-/// KEYDB-derived MK+VID path (2) before attempting variant derivation;
-/// V21 discs already in the keydb behave identically to V20.
+/// (Numbering preserves the cross-resolver convention; AACS 2.1 has no
+/// equivalent of path 2 — there's no host-side PK derivation against a
+/// Variant MKB.)
 pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
-    // Paths 1 and 2 are version-agnostic — try them first via the
-    // classical V20-stride parser.
     let uk_file = parse_unit_key_ro(ctx.unit_key_ro, AacsVersion::V20)?;
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
     let bus_encryption = ctx
@@ -718,94 +722,116 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         .and_then(parse_content_cert)
         .map(|cc| cc.bus_encryption)
         .unwrap_or(false);
+    let has_vid = *ctx.volume_id != [0u8; 16];
 
-    let build = |vuk: [u8; 16], key_source: u8| -> ResolvedKeys {
-        let unit_keys: Vec<(u32, [u8; 16])> = uk_file
+    let derive_uks = |vuk: &[u8; 16]| -> Vec<(u32, [u8; 16])> {
+        uk_file
             .encrypted_keys
             .iter()
-            .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-            .collect();
-        ResolvedKeys {
-            disc_hash: uk_file.disc_hash,
-            vuk,
-            unit_keys,
-            title_cps_unit: uk_file.title_cps_unit.clone(),
-            version: AacsVersion::V21,
-            bus_encryption,
-            key_source,
-        }
+            .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
+            .collect()
     };
+
+    let build =
+        |vuk: Option<[u8; 16]>, unit_keys: Vec<(u32, [u8; 16])>, key_source: u8| -> ResolvedKeys {
+            ResolvedKeys {
+                disc_hash: uk_file.disc_hash,
+                vuk,
+                unit_keys,
+                title_cps_unit: uk_file.title_cps_unit.clone(),
+                version: AacsVersion::V21,
+                bus_encryption,
+                key_source,
+            }
+        };
 
     tracing::warn!(
         target: "freemkv::disc",
         phase = "resolve_keys_v21_start",
         bus_encryption,
         disc_hash = %hash_hex,
+        has_vid,
         mkb_present = ctx.mkb.is_some(),
         "resolve_keys_v21: starting"
     );
 
-    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
-        if let Some(vuk) = entry.vuk {
-            return Some(build(vuk, 1));
+    if has_vid {
+        // Path 1: Variant chain (V21's analogue of classical Path 1's
+        // DK derivation). Placeholder until KCD constant is supplied.
+        if let Some(mkb) = ctx.mkb {
+            let recs = super::variants::walk_mkb(mkb);
+            match super::variants::derive_media_key_variant(
+                &recs,
+                &ctx.keydb.device_keys,
+                &super::variants::KEY_CORRECTION_DATA_PLACEHOLDER,
+                ctx.volume_id,
+            ) {
+                Ok((_km, kvu)) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "resolve_keys_v21_path1_hit",
+                        "Variant chain produced Km + Kvu"
+                    );
+                    return Some(build(Some(kvu), derive_uks(&kvu), 1));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "resolve_keys_v21_path1_miss",
+                        error_code = %e,
+                        "Variant chain failed"
+                    );
+                }
+            }
         }
-    }
 
-    if *ctx.volume_id == [0u8; 16] {
+        // Path 3: KEYDB MK + matching VID → derived VUK
+        for entry in ctx.keydb.disc_entries.values() {
+            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+                if did == *ctx.volume_id {
+                    let vuk = derive_vuk(&mk, ctx.volume_id);
+                    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
+                    return Some(build(Some(vuk), derive_uks(&vuk), 3));
+                }
+            }
+        }
+    } else {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "resolve_keys_v21_no_vid",
-            "VID unavailable; v21 derivation requires VID"
+            "VID unavailable; paths 1/3 skipped"
         );
-        return None;
     }
 
-    for entry in ctx.keydb.disc_entries.values() {
-        if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-            if did == *ctx.volume_id {
-                return Some(build(derive_vuk(&mk, ctx.volume_id), 2));
-            }
+    // Paths 4 and 5: hash lookup, prefer V over U on the same entry.
+    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
+        if let Some(vuk) = entry.vuk {
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path4_hit", "VUK from KEYDB");
+            return Some(build(Some(vuk), derive_uks(&vuk), 4));
+        } else if let Some(unit_keys) = match_keydb_unit_keys(&uk_file, &entry.unit_keys) {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "resolve_keys_v21_path5_hit",
+                uk_count = unit_keys.len(),
+                "unit keys from KEYDB (no VUK)"
+            );
+            return Some(build(None, unit_keys, 5));
         }
     }
 
-    // Variant chain — walk MKB, derive Km via the Media Key Variant
-    // chain, then derive VUK off Km and the disc's VID.
-    let mkb = ctx.mkb?;
-    let recs = super::variants::walk_mkb(mkb);
-    match super::variants::derive_media_key_variant(
-        &recs,
-        &ctx.keydb.device_keys,
-        &super::variants::KEY_CORRECTION_DATA_PLACEHOLDER,
-        ctx.volume_id,
-    ) {
-        Ok((_km, kvu)) => {
-            tracing::warn!(
-                target: "freemkv::disc",
-                phase = "resolve_keys_v21_variant_ok",
-                "Media Key Variant chain produced Km + Kvu"
-            );
-            Some(build(kvu, 4))
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "freemkv::disc",
-                phase = "resolve_keys_v21_variant_err",
-                error_code = %e,
-                "Media Key Variant chain failed"
-            );
-            None
-        }
-    }
+    None
 }
 
 /// Resolve all AACS keys for a disc using the classical (single-stage
 /// Media Key derivation) paths. Used by both V10 and V20.
 ///
-/// Tries in order:
-///   1. Disc hash → KEYDB → VUK (fast path, no VID required)
-///   2. KEYDB media key + volume ID → VUK
-///   3. MKB + processing keys → media key → VUK
-///   4. MKB + device keys → processing key → media key → VUK
+/// Paths run in root-of-trust → per-disc-leaf order. A match at any
+/// path returns immediately:
+///   1. MKB + device keys → processing key → media key → VUK
+///   2. MKB + processing keys → media key → VUK
+///   3. KEYDB MK + matching VID → derived VUK
+///   4. KEYDB disc-hash → VUK
+///   5. KEYDB disc-hash → pre-decrypted unit keys (no VUK)
 fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Option<ResolvedKeys> {
     let bus_encryption = ctx
         .content_cert
@@ -817,24 +843,32 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     let uk_file = parse_unit_key_ro(ctx.unit_key_ro, version)?;
 
     let hash_hex = disc_hash_hex(&uk_file.disc_hash);
+    let has_vid = *ctx.volume_id != [0u8; 16];
 
-    // Helper to build result
-    let build = |vuk: [u8; 16], key_source: u8| -> ResolvedKeys {
-        let unit_keys: Vec<(u32, [u8; 16])> = uk_file
+    // Decrypt the disc's encrypted unit keys with a freshly-derived VUK.
+    let derive_uks = |vuk: &[u8; 16]| -> Vec<(u32, [u8; 16])> {
+        uk_file
             .encrypted_keys
             .iter()
-            .map(|(num, enc_key)| (*num, decrypt_unit_key(&vuk, enc_key)))
-            .collect();
-        ResolvedKeys {
-            disc_hash: uk_file.disc_hash,
-            vuk,
-            unit_keys,
-            title_cps_unit: uk_file.title_cps_unit.clone(),
-            version,
-            bus_encryption,
-            key_source,
-        }
+            .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
+            .collect()
     };
+
+    // Common result constructor — paths 1-4 supply Some(VUK) + derived
+    // unit keys; path 5 supplies None + pre-decrypted unit keys from
+    // KEYDB.
+    let build =
+        |vuk: Option<[u8; 16]>, unit_keys: Vec<(u32, [u8; 16])>, key_source: u8| -> ResolvedKeys {
+            ResolvedKeys {
+                disc_hash: uk_file.disc_hash,
+                vuk,
+                unit_keys,
+                title_cps_unit: uk_file.title_cps_unit.clone(),
+                version,
+                bus_encryption,
+                key_source,
+            }
+        };
 
     tracing::warn!(
         target: "freemkv::disc",
@@ -842,82 +876,112 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
         version = ?version,
         bus_encryption,
         disc_hash = %hash_hex,
+        has_vid,
         mkb_present = ctx.mkb.is_some(),
         "resolve_keys: starting"
     );
 
-    // Path 1: Look up VUK by disc hash in KEYDB
-    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit_entry", "disc hash found in keydb");
-        if let Some(vuk) = entry.vuk {
-            return Some(build(vuk, 1));
-        }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_no_vuk", "disc hash entry has no VUK");
-    } else {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", "disc hash NOT in keydb");
-    }
+    // Paths 1 and 2 need both MKB and VID. Logged as a single skip when
+    // either is absent so operators see one reason, not two.
+    if has_vid {
+        if let Some(mkb) = ctx.mkb {
+            let mk_dv = mkb_find_mk_dv(mkb);
+            let subdiff = mkb_find_subdiff_records(mkb);
+            let cvalues = mkb_find_cvalues(mkb);
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "resolve_keys_mkb_records",
+                mk_dv_found = mk_dv.is_some(),
+                subdiff_found = subdiff.is_some(),
+                subdiff_len = subdiff.as_ref().map(|s| s.len()).unwrap_or(0),
+                cvalues_found = cvalues.is_some(),
+                cvalues_len = cvalues.as_ref().map(|c| c.len()).unwrap_or(0),
+                "MKB record scan results"
+            );
 
-    // Paths 2-4 all consume the Volume ID. Without it (handshake
-    // skipped, raw-read bypass failed, etc.) every downstream
-    // derivation produces garbage. Caller stamps `[0u8; 16]` as the
-    // sentinel "no VID" — short-circuit here so we don't surface a
-    // misleading "all paths failed" log when really the math is
-    // structurally impossible.
-    if *ctx.volume_id == [0u8; 16] {
+            // Path 1: MKB + device keys → media key → VUK
+            if let Some(mk) = derive_media_key_from_dk(mkb, &ctx.keydb.device_keys) {
+                let vuk = derive_vuk(&mk, ctx.volume_id);
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit", "media key derived from device key");
+                return Some(build(Some(vuk), derive_uks(&vuk), 1));
+            }
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", dk_count = ctx.keydb.device_keys.len(), "DK derivation failed");
+
+            // Path 2: MKB + processing keys → media key → VUK
+            if let Some(mk) = derive_media_key_from_pk(mkb, &ctx.keydb.processing_keys) {
+                let vuk = derive_vuk(&mk, ctx.volume_id);
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "media key derived from processing key");
+                return Some(build(Some(vuk), derive_uks(&vuk), 2));
+            }
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = ctx.keydb.processing_keys.len(), "PK derivation failed");
+        } else {
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
+        }
+
+        // Path 3: KEYDB MK + matching VID → derived VUK
+        let mut path3_mk_did_count = 0usize;
+        for entry in ctx.keydb.disc_entries.values() {
+            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
+                path3_mk_did_count += 1;
+                if did == *ctx.volume_id {
+                    let vuk = derive_vuk(&mk, ctx.volume_id);
+                    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
+                    return Some(build(Some(vuk), derive_uks(&vuk), 3));
+                }
+            }
+        }
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", mk_did_entries = path3_mk_did_count, "no MK+VID entry matched volume_id");
+    } else {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "resolve_keys_no_vid",
-            "VID unavailable; paths 2/3/4 require VID and are skipped"
+            "VID unavailable; paths 1/2/3 require VID and are skipped"
         );
-        return None;
     }
 
-    // Path 2: Find entry with matching VID → derive VUK from MK + VID
-    let mut path2_mk_did_count = 0usize;
-    for entry in ctx.keydb.disc_entries.values() {
-        if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-            path2_mk_did_count += 1;
-            if did == *ctx.volume_id {
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "MK+VID entry matched volume_id");
-                return Some(build(derive_vuk(&mk, ctx.volume_id), 2));
-            }
+    // Paths 4 and 5: single hash-table lookup, prefer V (path 4) over
+    // U (path 5). They are not independent checks — path 5 only fires
+    // because path 4 had no VUK on the same entry.
+    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_hit_entry", "disc hash found in keydb");
+        if let Some(vuk) = entry.vuk {
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "VUK from KEYDB");
+            return Some(build(Some(vuk), derive_uks(&vuk), 4));
+        } else if let Some(unit_keys) = match_keydb_unit_keys(&uk_file, &entry.unit_keys) {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "resolve_keys_path5_hit",
+                uk_count = unit_keys.len(),
+                "unit keys from KEYDB (no VUK)"
+            );
+            return Some(build(None, unit_keys, 5));
         }
-    }
-    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", mk_did_entries = path2_mk_did_count, "no MK+VID entry matched volume_id");
-
-    // Path 3: MKB + processing keys → media key → VUK
-    if let Some(mkb) = ctx.mkb {
-        let mk_dv = mkb_find_mk_dv(mkb);
-        let subdiff = mkb_find_subdiff_records(mkb);
-        let cvalues = mkb_find_cvalues(mkb);
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "resolve_keys_mkb_records",
-            mk_dv_found = mk_dv.is_some(),
-            subdiff_found = subdiff.is_some(),
-            subdiff_len = subdiff.as_ref().map(|s| s.len()).unwrap_or(0),
-            cvalues_found = cvalues.is_some(),
-            cvalues_len = cvalues.as_ref().map(|c| c.len()).unwrap_or(0),
-            "MKB record scan results"
-        );
-
-        if let Some(mk) = derive_media_key_from_pk(mkb, &ctx.keydb.processing_keys) {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "media key derived from processing key");
-            return Some(build(derive_vuk(&mk, ctx.volume_id), 3));
-        }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", pk_count = ctx.keydb.processing_keys.len(), "PK derivation failed");
-
-        // Path 4: MKB + device keys → processing key → media key → VUK
-        if let Some(mk) = derive_media_key_from_dk(mkb, &ctx.keydb.device_keys) {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "media key derived from device key");
-            return Some(build(derive_vuk(&mk, ctx.volume_id), 4));
-        }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_miss", dk_count = ctx.keydb.device_keys.len(), "DK derivation failed");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_no_keys", "KEYDB entry has neither VUK nor matching unit keys");
     } else {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB data available; paths 3/4 skipped");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_miss", "disc hash NOT in KEYDB");
     }
 
     None
+}
+
+/// For path 5: cross-reference the disc's `Unit_Key_RO.inf` CPS-unit
+/// numbering against the KEYDB entry's pre-decrypted unit keys. Every
+/// CPS unit the disc declares must have a matching entry in KEYDB;
+/// partial coverage returns `None` so the resolver doesn't half-decrypt
+/// a disc.
+fn match_keydb_unit_keys(
+    uk_file: &UnitKeyFile,
+    keydb_unit_keys: &[(u32, [u8; 16])],
+) -> Option<Vec<(u32, [u8; 16])>> {
+    if keydb_unit_keys.is_empty() {
+        return None;
+    }
+    let mut matched = Vec::with_capacity(uk_file.encrypted_keys.len());
+    for (disc_num, _enc_key) in &uk_file.encrypted_keys {
+        let entry = keydb_unit_keys.iter().find(|(n, _)| n == disc_num)?;
+        matched.push(*entry);
+    }
+    Some(matched)
 }
 
 #[cfg(test)]
@@ -1365,11 +1429,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_keys_path1_still_runs_when_vid_is_zero() {
-        // Path 1 (disc-hash → VUK) doesn't need VID. Confirm the
+    fn resolve_keys_path4_still_runs_when_vid_is_zero() {
+        // Path 4 (disc-hash → VUK) doesn't need VID. Confirm the
         // short-circuit doesn't block it: install a keydb entry whose
         // disc_hash matches the fixture's hash, with a known VUK, and
-        // verify resolve_keys returns it with key_source = 1.
+        // verify resolve_keys returns it with key_source = 4.
         let uk_ro = minimal_unit_key_ro();
         let hash = disc_hash(&uk_ro);
         // `find_disc` lowercases the incoming hash; the entry map is
@@ -1399,9 +1463,89 @@ mod tests {
             mkb: None,
         };
         let resolved =
-            resolve_keys_v1(&ctx).expect("path 1 must run regardless of VID availability");
-        assert_eq!(resolved.vuk, known_vuk);
-        assert_eq!(resolved.key_source, 1);
+            resolve_keys_v1(&ctx).expect("path 4 must run regardless of VID availability");
+        assert_eq!(resolved.vuk, Some(known_vuk));
+        assert_eq!(resolved.key_source, 4);
+    }
+
+    #[test]
+    fn resolve_keys_path5_uses_keydb_unit_keys_when_vuk_absent() {
+        // Path 5: an entry with no VUK but with pre-decrypted unit
+        // keys matching the disc's CPS-unit numbering decrypts the
+        // disc directly. Covers the ~4,572 U-only KEYDB entries
+        // (mostly MKBv76+ UHDs) that the resolver previously ignored.
+        let uk_ro = minimal_unit_key_ro();
+        let hash = disc_hash(&uk_ro);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+
+        // `minimal_unit_key_ro` declares CPS unit 1; supply a matching
+        // pre-decrypted unit key in the KEYDB entry.
+        let known_uk = [0xCDu8; 16];
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "fixture".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: None,
+                unit_keys: vec![(1, known_uk)],
+            },
+        );
+
+        let vid = [0u8; 16];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            keydb: &keydb,
+            mkb: None,
+        };
+        let resolved =
+            resolve_keys_v1(&ctx).expect("path 5 must succeed when KEYDB carries unit keys");
+        assert_eq!(resolved.vuk, None, "path 5 has no VUK to return");
+        assert_eq!(resolved.key_source, 5);
+        assert_eq!(resolved.unit_keys, vec![(1, known_uk)]);
+    }
+
+    #[test]
+    fn resolve_keys_path5_rejects_partial_unit_key_coverage() {
+        // If the disc declares a CPS unit that's not in the KEYDB
+        // entry's unit_keys, path 5 must NOT half-decrypt the disc.
+        // The match function returns None and the resolver falls
+        // through to None overall (no other paths available in this
+        // setup).
+        let uk_ro = minimal_unit_key_ro();
+        let hash = disc_hash(&uk_ro);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+
+        // KEYDB has a key for CPS unit 99, but the disc declares unit 1.
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "fixture".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: None,
+                unit_keys: vec![(99, [0xEEu8; 16])],
+            },
+        );
+
+        let vid = [0u8; 16];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            keydb: &keydb,
+            mkb: None,
+        };
+        assert!(
+            resolve_keys_v1(&ctx).is_none(),
+            "partial CPS-unit coverage must not produce a half-decrypted result"
+        );
     }
 
     #[test]
