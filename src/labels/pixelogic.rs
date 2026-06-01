@@ -37,14 +37,47 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // but the corpus surfaced something we don't catalogue.
     let saw_unknown = AtomicBool::new(false);
 
+    let labels = assign_labels(&strings, &saw_unknown);
+
+    if labels.is_empty() {
+        return None;
+    }
+    let confidence = if saw_unknown.load(Ordering::Relaxed) {
+        Confidence::Medium
+    } else {
+        Confidence::High
+    };
+    Some(ParseResult { labels, confidence })
+}
+
+/// Walk the extracted token strings of the feature section and emit a
+/// `StreamLabel` per editorial token, numbered in STN order. Split out
+/// from `parse` so the section/numbering logic is unit-testable without
+/// a `SectorSource`/`UdfFs`.
+fn assign_labels(strings: &[String], saw_unknown: &AtomicBool) -> Vec<StreamLabel> {
+    // The authoritative per-feature stream list lives in the `FPL_`
+    // (FeaturePLaylist) section, in STN order. `SEG_*` entries are menu
+    // segments (intros, logos, disclaimers, previews) that can also carry
+    // stray stream tokens — e.g. a `SEG_MainFeature` preview segment that
+    // lists only a commentary track. Anchoring on such a segment grabs the
+    // wrong streams and misnumbers them. So when the project ships any
+    // `FPL_` playlist, anchor exclusively on it; only fall back to
+    // `SEG_MainFeature` on discs that have no `FPL_` section at all.
+    let has_fpl = strings.iter().any(|s| s.starts_with("FPL_"));
+
     let mut labels = Vec::new();
     let mut in_feature = false;
     let mut audio_num: u16 = 0;
     let mut sub_num: u16 = 0;
 
-    for s in &strings {
+    for s in strings {
         // Detect feature section start
-        if s.starts_with("FPL_") || s.starts_with("SEG_MainFeature") {
+        let is_start = if has_fpl {
+            s.starts_with("FPL_")
+        } else {
+            s.starts_with("SEG_MainFeature")
+        };
+        if is_start {
             if in_feature {
                 break;
             }
@@ -63,7 +96,25 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             continue;
         }
 
-        if let Some(label) = parse_token_inner(s, Some(&saw_unknown)) {
+        // Generic audio-slot placeholder. Pixelogic lists each audio stream
+        // in the playlist as either an editorial `{lang}_{codec}_…` token OR
+        // a bare `Audio Stream N` placeholder when no editorial label was
+        // authored. The placeholder carries nothing to label, but it DOES
+        // occupy an STN slot — so it must advance `audio_num`. Otherwise a
+        // later editorial token (e.g. a lone `eng_ACOM_` commentary sitting
+        // at STN slot 4, behind three unlabelled main tracks) collapses onto
+        // slot 1 and its Commentary purpose lands on the main feature track.
+        //
+        // Only audio is corrected here: subtitle (`PG Stream N`) numbering is
+        // left exactly as-is — the corpus snapshots show forced/commentary
+        // subtitle tokens already align with STN without counting the
+        // placeholders, and counting them regresses several discs.
+        if s.starts_with("Audio Stream") {
+            audio_num += 1;
+            continue;
+        }
+
+        if let Some(label) = parse_token_inner(s, Some(saw_unknown)) {
             match label.stream_type {
                 StreamLabelType::Audio => {
                     audio_num += 1;
@@ -83,15 +134,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
         }
     }
 
-    if labels.is_empty() {
-        return None;
-    }
-    let confidence = if saw_unknown.load(Ordering::Relaxed) {
-        Confidence::Medium
-    } else {
-        Confidence::High
-    };
-    Some(ParseResult { labels, confidence })
+    labels
 }
 
 fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<StreamLabel> {
@@ -249,5 +292,76 @@ mod tests {
     fn parse_token_rejects_non_lang_prefix() {
         assert!(parse_token_inner("XX_MLP_", None).is_none());
         assert!(parse_token_inner("ENG_MLP_", None).is_none()); // uppercase not accepted as ISO 639-2
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn assign_labels_numbers_commentary_behind_placeholders() {
+        // Wicked: the FPL_MainFeature playlist lists three unlabelled main
+        // audio tracks as `Audio Stream N` placeholders, then a lone
+        // `eng_ACOM_` commentary at STN slot 4. The commentary must land on
+        // audio #4, not collapse onto #1 (which would tag the main feature
+        // track as commentary).
+        let flag = AtomicBool::new(false);
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "Audio Stream 1",
+            "Audio Stream 2",
+            "Audio Stream 3",
+            "eng_ACOM_",
+        ]);
+        let labels = assign_labels(&tokens, &flag);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(audio.len(), 1, "only the commentary carries a label");
+        assert_eq!(audio[0].stream_number, 4, "commentary is STN slot 4");
+        assert_eq!(audio[0].purpose, LabelPurpose::Commentary);
+        assert_eq!(audio[0].language, "eng");
+    }
+
+    #[test]
+    fn assign_labels_prefers_fpl_over_seg_mainfeature() {
+        // A `SEG_MainFeature` menu/preview segment carries a stray commentary
+        // token, but the real playlist is `FPL_MainFeature`. When an FPL_
+        // section exists, the SEG_ one must be ignored as an anchor — so we
+        // number from the FPL playlist, putting the commentary at slot 2.
+        let flag = AtomicBool::new(false);
+        let tokens = strs(&[
+            "SEG_MainFeature",
+            "eng_ACOM_", // stray token in the menu segment — must be ignored
+            "FPL_MainFeature",
+            "Audio Stream 1",
+            "eng_ACOM_",
+        ]);
+        let labels = assign_labels(&tokens, &flag);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].stream_number, 2, "numbered from the FPL playlist");
+        assert_eq!(audio[0].purpose, LabelPurpose::Commentary);
+    }
+
+    #[test]
+    fn assign_labels_falls_back_to_seg_without_fpl() {
+        // Discs with no FPL_ playlist still anchor on SEG_MainFeature.
+        let flag = AtomicBool::new(false);
+        let tokens = strs(&["SEG_MainFeature", "eng_MLP_", "spa_AC3_"]);
+        let labels = assign_labels(&tokens, &flag);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].stream_number, 1);
+        assert_eq!(audio[0].language, "eng");
+        assert_eq!(audio[1].stream_number, 2);
+        assert_eq!(audio[1].language, "spa");
     }
 }
