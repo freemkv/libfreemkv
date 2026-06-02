@@ -31,8 +31,8 @@ pub use keys::probe;
 pub use keys::{
     AacsVersion, ContentCert, ResolveContext, ResolvedKeys, UnitKeyFile, decrypt_unit_key,
     derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex,
-    mkb_version, parse_content_cert, parse_unit_key_ro, read_mkb_from_drive, resolve_keys_v1,
-    resolve_keys_v2, resolve_keys_v21,
+    mkb_content_len, mkb_version, parse_content_cert, parse_unit_key_ro, read_mkb_from_drive,
+    resolve_keys_v1, resolve_keys_v2, resolve_keys_v21,
 };
 pub use provider::KeyProvider;
 pub use variants::{

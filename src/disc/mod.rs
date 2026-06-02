@@ -1173,13 +1173,18 @@ impl Disc {
             .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
-        // Prefer MKB_RO: it's the real, correctly-sized MKB. MKB_RW is a
-        // fixed ~128 MiB rewritable region that is mostly zero padding — reading
-        // it ships 124 MiB of nothing. Fall back to RW only if RO is absent.
-        let mkb = udf_fs
+        // Prefer MKB_RO, fall back to MKB_RW, then TRIM to the real record
+        // length. Both files are allocated to a fixed ~128 MiB and zero-padded,
+        // so reading either ships up to ~124 MiB of nothing — trim to the
+        // record stream so callers send/store a few MB, not 128 MiB.
+        let mut mkb = udf_fs
             .read_file(&mut reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
+        let n = crate::aacs::mkb_content_len(&mkb);
+        if n > 0 && n < mkb.len() {
+            mkb.truncate(n);
+        }
         Ok((inf, mkb))
     }
 
@@ -1194,13 +1199,18 @@ impl Disc {
             .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
-        // Prefer MKB_RO: it's the real, correctly-sized MKB. MKB_RW is a
-        // fixed ~128 MiB rewritable region that is mostly zero padding — reading
-        // it ships 124 MiB of nothing. Fall back to RW only if RO is absent.
-        let mkb = udf_fs
+        // Prefer MKB_RO, fall back to MKB_RW, then TRIM to the real record
+        // length. Both files are allocated to a fixed ~128 MiB and zero-padded,
+        // so reading either ships up to ~124 MiB of nothing — trim to the
+        // record stream so callers send/store a few MB, not 128 MiB.
+        let mut mkb = udf_fs
             .read_file(&mut reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
+        let n = crate::aacs::mkb_content_len(&mkb);
+        if n > 0 && n < mkb.len() {
+            mkb.truncate(n);
+        }
         Ok((inf, mkb))
     }
 
@@ -1471,6 +1481,13 @@ impl Disc {
     /// Used by disc-to-ISO and other full-disc operations.
     pub fn decrypt_keys(&self) -> crate::decrypt::DecryptKeys {
         if let Some(ref aacs) = self.aacs {
+            // An AACS state with NO unit keys is "encrypted, no keys" — e.g.
+            // the VID-only state from out-of-band resolution before a Unit Key
+            // is supplied. Report None so callers treat it as missing keys
+            // (not a usable, empty key set).
+            if aacs.unit_keys.is_empty() {
+                return crate::decrypt::DecryptKeys::None;
+            }
             crate::decrypt::DecryptKeys::Aacs {
                 unit_keys: aacs.unit_keys.clone(),
                 read_data_key: aacs.read_data_key,

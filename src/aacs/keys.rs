@@ -532,6 +532,27 @@ fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
     None
 }
 
+/// Real content length of an MKB: the byte offset where the record stream
+/// ends. MKB files (especially `MKB_RW.inf`, but `MKB_RO.inf` too on some
+/// discs) are allocated to a fixed size — often ~128 MiB — with the records at
+/// the front and the rest zero padding. Walking records (type+len) and stopping
+/// at the first padding byte (`type == 0` / zero-length / overrun) gives the
+/// actual size so callers can trim off megabytes of zeros before sending or
+/// archiving. Returns `mkb.len()` only if the whole buffer parsed as records.
+pub fn mkb_content_len(mkb: &[u8]) -> usize {
+    let mut pos = 0;
+    while pos + 4 <= mkb.len() {
+        let rec_type = mkb[pos];
+        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
+        // A zero type, a zero/short length, or an overrun = records done, padding begun.
+        if rec_type == 0x00 || rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
+        pos += rec_len;
+    }
+    pos
+}
+
 /// Get MKB version from Type and Version Record (type 0x10).
 /// Version is a BE u32 at offset 8 of the record body (offset 12 from `pos`).
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
@@ -1372,6 +1393,26 @@ mod tests {
             0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
         ];
         assert_eq!(mkb_version(&mkb), Some(77));
+    }
+
+    #[test]
+    fn mkb_content_len_trims_trailing_padding() {
+        // Two real records (0x10 type/version + 0x86 verify), then 128 KiB of
+        // zero padding (the fixed-region tail). Content length must stop at the
+        // end of the records, not include the padding.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let records_len = mkb.len();
+        mkb.extend(std::iter::repeat(0u8).take(128 * 1024)); // padding
+        assert_eq!(mkb_content_len(&mkb), records_len);
+        // No padding → returns the full length.
+        assert_eq!(mkb_content_len(&mkb[..records_len]), records_len);
+        // Empty → 0.
+        assert_eq!(mkb_content_len(&[]), 0);
     }
 
     #[test]
