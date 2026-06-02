@@ -1171,6 +1171,25 @@ impl Disc {
         Ok((inf, mkb))
     }
 
+    /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. Keys are
+    /// needed *during* scan and the ISO only exists post-rip, so the keyserver
+    /// path fetches the disc's key files from the live drive before
+    /// [`Disc::scan`], POSTs them, then scans with
+    /// `ScanOptions { unit_key: Some(uk), .. }`. These files are plaintext UDF
+    /// metadata — no AACS handshake or keys are required to read them.
+    pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>)> {
+        let (_, mut reader, udf_fs) = Self::read_udf(drive)?;
+        let inf = udf_fs
+            .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let mkb = udf_fs
+            .read_file(&mut reader, "/AACS/MKB_RW.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        Ok((inf, mkb))
+    }
+
     /// Core scan pipeline — works with any SectorSource.
     ///
     /// `handshake_error` is plumbed from `do_handshake` so failures
