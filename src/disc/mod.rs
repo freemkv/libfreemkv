@@ -912,7 +912,7 @@ pub enum KeySource {
     /// Pre-decrypted unit keys taken directly from KEYDB by disc hash.
     /// No VUK present in the entry — `AacsState::vuk` is `None`.
     KeyDbUnitKeys,
-    /// Unit key supplied directly by the caller (the keyserver path).
+    /// Unit key supplied directly by the caller (the external Unit Key path).
     /// No keydb, no derivation — `AacsState::vuk` is `None`.
     ExternalUk,
 }
@@ -945,12 +945,11 @@ pub struct ScanOptions {
     /// Path to KEYDB.cfg for AACS key lookup.
     /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
     pub keydb_path: Option<std::path::PathBuf>,
-    /// Caller-supplied Unit Key — the second, mutually-exclusive key source
-    /// (the online-keyserver path). When set, libfreemkv skips keydb lookup
-    /// and all derivation and uses this key directly to decrypt. Takes
-    /// precedence over `keydb_path` if both are set. The caller obtains it
-    /// however it likes (e.g. POSTing the disc's `Unit_Key_RO.inf` + MKB to a
-    /// keyserver); libfreemkv stays free of any network dependency.
+    /// Caller-supplied Unit Key — an alternative to keydb lookup. When set,
+    /// libfreemkv skips keydb lookup and all derivation and uses this key
+    /// directly to decrypt; it takes precedence over `keydb_path`. The caller
+    /// obtains the key however it likes; libfreemkv stays free of any network
+    /// dependency.
     pub unit_key: Option<[u8; 16]>,
 }
 
@@ -1152,10 +1151,10 @@ impl Disc {
     }
 
     /// Read a disc's AACS key-input files from an ISO image: returns
-    /// `(Unit_Key_RO.inf, MKB)` raw bytes. For callers that resolve keys
-    /// out-of-band (the keyserver path) — POST these to the keyserver, get the
-    /// Unit Key, then scan with `ScanOptions { unit_key: Some(uk), .. }`.
-    /// libfreemkv itself never makes the network call.
+    /// `(Unit_Key_RO.inf, MKB)` raw bytes. For callers that resolve a Unit Key
+    /// out-of-band: obtain the key however you like, then scan with
+    /// `ScanOptions { unit_key: Some(uk), .. }`. libfreemkv never makes a
+    /// network call.
     pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut reader = crate::io::file_sector_source::FileSectorSource::open(iso_path)
             .map_err(|_| Error::AacsNoKeys)?;
@@ -1171,10 +1170,9 @@ impl Disc {
         Ok((inf, mkb))
     }
 
-    /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. Keys are
-    /// needed *during* scan and the ISO only exists post-rip, so the keyserver
-    /// path fetches the disc's key files from the live drive before
-    /// [`Disc::scan`], POSTs them, then scans with
+    /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
+    /// out-of-band Unit Key path fetches the disc's key files from the drive,
+    /// resolves a key from them however it likes, then scans with
     /// `ScanOptions { unit_key: Some(uk), .. }`. These files are plaintext UDF
     /// metadata — no AACS handshake or keys are required to read them.
     pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1213,7 +1211,7 @@ impl Disc {
             (None, None)
         } else if let Some(unit_key) = opts.unit_key {
             // Second key source: caller supplied the Unit Key directly
-            // (keyserver path). Skip keydb entirely.
+            // (external Unit Key). Skip keydb entirely.
             match Self::resolve_encryption_static(&udf_fs, reader, unit_key, handshake.as_ref()) {
                 Ok(state) => (Some(state), None),
                 Err(e) => (None, Some(e)),

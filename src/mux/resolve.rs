@@ -163,7 +163,7 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
 #[derive(Default)]
 pub struct InputOptions {
     pub keydb_path: Option<String>,
-    /// Caller-supplied Unit Key (keyserver path) — the second, mutually
+    /// Caller-supplied Unit Key (external Unit Key) — the second, mutually
     /// exclusive key source. Takes precedence over `keydb_path`.
     pub unit_key: Option<[u8; 16]>,
     pub title_index: Option<usize>,

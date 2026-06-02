@@ -468,7 +468,7 @@ impl Disc {
         })
     }
 
-    /// Resolve encryption from a caller-supplied Unit Key (the keyserver
+    /// Resolve encryption from a caller-supplied Unit Key (the external key service
     /// path). No keydb, no derivation: read `Unit_Key_RO.inf` for the disc
     /// hash + version/bus-encryption flags, then use `unit_key` directly as
     /// CPS unit 1's decryption key. The handshake (if any) still supplies the
@@ -514,7 +514,7 @@ impl Disc {
             disc_hash = %aacs::disc_hash_hex(&dh),
             version,
             bus_encryption,
-            "using caller-supplied unit key (keyserver path)"
+            "using caller-supplied unit key"
         );
 
         Ok(AacsState {

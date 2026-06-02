@@ -15,7 +15,7 @@
 //!   fastest/closest first.
 //!
 //! Default impls return empty / `None` so backends only override
-//! the methods they actually support — an HTTP keyserver might
+//! the methods they actually support — an external key service might
 //! implement only `lookup_disc_by_hash`, while a local file might
 //! implement all five.
 //!
