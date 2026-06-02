@@ -9,7 +9,6 @@
 //! sweep (migrated to `disc/sweep.rs::SweepSink`), patch, and mux.
 //! 0.18 collapses all three onto this primitive; sweep is in,
 //! patch and mux migrate in later 0.18 slices.
-//! See `(internal)/memory/0_18_redesign.md` for the full picture.
 //!
 //! ## Cancellation and error semantics
 //!
@@ -68,9 +67,7 @@ pub const JOIN_TIMEOUT_SECS: u64 = 600;
 ///
 /// 0.21.7 replaced an old `std::sync::mpsc::sync_channel` + 50 ms
 /// `thread::sleep` polling loop that capped mux throughput at
-/// ~20 frames/sec ≈ 1 MB/s on saturated channels. See
-/// (internal)/memory/feedback_send_with_halt_poll_throttle.md
-/// for the multi-day diagnostic that surfaced it.
+/// ~20 frames/sec ≈ 1 MB/s on saturated channels.
 use crate::halt::POLL_INTERVAL;
 const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
 

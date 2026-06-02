@@ -1163,8 +1163,7 @@ mod tests {
 
     #[test]
     fn test_vuk_derivation() {
-        // Civil War UHD: known MK, VID, VUK from KEYDB
-        // MK = 15665F98..., VID (disc_id) = from entry, VUK = F96D7908...
+        // Pick any UHD entry with a known MK, VID, and VUK from KEYDB.
         // VUK = AES-DEC(MK, VID) XOR VID
         let path = match keydb_path() {
             Some(p) => p,
@@ -1237,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_real_unit() {
-        // Try decrypting a real encrypted aligned unit from Civil War UHD
+        // Try decrypting a real encrypted aligned unit from a UHD sample.
         // This disc is AACS 2.0 (BEE) so unit key alone won't work —
         // we need bus decryption first. But this verifies the pipeline.
         let unit_path = std::path::Path::new("/tmp/encrypted_unit.bin");
@@ -1258,20 +1257,17 @@ mod tests {
         };
         let db = KeyDb::load(&kp).unwrap();
 
-        // Civil War UHD entries
-        let civil_war_entries: Vec<&DiscEntry> = db
+        // Candidate entries: any UHD entry that carries unit keys.
+        let candidate_entries: Vec<&DiscEntry> = db
             .disc_entries
             .values()
-            .filter(|e| e.title.contains("CIVIL WAR") && !e.unit_keys.is_empty())
+            .filter(|e| !e.unit_keys.is_empty())
             .collect();
 
-        eprintln!(
-            "Found {} Civil War entries with unit keys",
-            civil_war_entries.len()
-        );
+        eprintln!("Found {} entries with unit keys", candidate_entries.len());
 
         // Try each entry's unit keys
-        for entry in &civil_war_entries {
+        for entry in &candidate_entries {
             let keys: Vec<[u8; 16]> = entry.unit_keys.iter().map(|(_, k)| *k).collect();
             let mut unit = original.clone();
 
@@ -1304,10 +1300,11 @@ mod tests {
     #[test]
     fn test_disc_hash_hex() {
         let hash = [
-            ***REMOVED***,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
         ];
         let hex = disc_hash_hex(&hash);
-        assert_eq!(hex, "***REMOVED***");
+        assert_eq!(hex, "0x000102030405060708090A0B0C0D0E0F10111213");
     }
 
     #[test]
@@ -1601,29 +1598,26 @@ mod tests {
         assert_eq!(selected, only07, "fallback returns the 0x07 body");
     }
 
-    /// Locate a captured MKB research sample, if the private research tree
-    /// is checked out alongside the crate. Returns `None` (skip) otherwise.
+    /// Locate a captured MKB sample under the optional `MKB_SAMPLE_DIR`.
+    /// Returns `None` (skip) when the directory or file is absent.
     fn mkb_sample(rel: &str) -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()? // freemkv/
-            .join("(internal)/research/aacs/mkb-samples")
-            .join(rel);
+        let dir = std::env::var("MKB_SAMPLE_DIR").ok()?;
+        let p = std::path::Path::new(&dir).join(rel);
         if p.exists() { Some(p) } else { None }
     }
 
     #[test]
     fn real_aacs2_samples_select_large_0x05_not_small_0x07() {
-        // Real in-drive AACS 2.x UHD MKBs (Wicked / Civil War / MOVIE)
-        // carry BOTH a small 0x07 Explicit-Subset-Difference record (96
-        // 16-byte entries) AND the large 0x05 Media Key Data / cvalue table
-        // (181270 entries, 1:1 with the 0x04 index). The production selector
-        // must return the LARGE 0x05 body, not the small 0x07 one. This is
-        // the exact regression #259 found. Skips when the research tree is
-        // absent.
+        // Real in-drive AACS 2.x UHD MKBs carry BOTH a small 0x07
+        // Explicit-Subset-Difference record (96 16-byte entries) AND the
+        // large 0x05 Media Key Data / cvalue table (181270 entries, 1:1
+        // with the 0x04 index). The production selector must return the
+        // LARGE 0x05 body, not the small 0x07 one. This is the exact
+        // regression #259 found. Skips when no sample dir is present.
         let samples = [
-            "wicked/MKB_RO.inf",
-            "civilwar-uhd/MKB_RO.inf",
-            "movie-uhd-2.1/MKB_RO.inf",
+            "sample-a/MKB_RO.inf",
+            "sample-b/MKB_RO.inf",
+            "sample-c/MKB_RO.inf",
         ];
         let mut checked = 0;
         for rel in samples {
@@ -1707,29 +1701,32 @@ mod tests {
         };
         let db = KeyDb::load(&path).unwrap();
 
-        // Find V for Vendetta BD — has VUK and unit keys
-        // hash: ***REMOVED***
-        let entry = db.find_disc("***REMOVED***");
+        // Find any BD entry that carries a VUK and unit keys, then exercise
+        // the lookup-by-hash + VUK-derivation chain against it.
+        let entry = db
+            .disc_entries
+            .values()
+            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.disc_id.is_some());
         if entry.is_none() {
             return;
         }
         let entry = entry.unwrap();
         let vuk = entry.vuk.unwrap();
         let vid = entry.disc_id.unwrap();
+        let hash_hex = format!("0x{}", entry.disc_hash.trim_start_matches("0x"));
 
         // We need the actual Unit_Key_RO.inf from the disc to compute disc hash.
         // Since we don't have it, we can at least test that the KEYDB lookup
         // works with a known hash.
-        let hash_hex = "***REMOVED***";
-        let found = db.find_disc(hash_hex);
+        let found = db.find_disc(&hash_hex);
         assert!(found.is_some());
         assert_eq!(found.unwrap().vuk, Some(vuk));
 
         // Verify VUK derivation if we have MK + VID
         if let Some(mk) = entry.media_key {
             let derived = derive_vuk(&mk, &vid);
-            assert_eq!(derived, vuk, "VUK derivation mismatch for V for Vendetta");
-            eprintln!("V for Vendetta VUK derivation verified");
+            assert_eq!(derived, vuk, "VUK derivation mismatch");
+            eprintln!("VUK derivation verified");
         }
     }
 

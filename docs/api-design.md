@@ -85,10 +85,10 @@ All URLs require a `scheme://path` format. Bare paths are rejected.
 // PES pipeline (frame-level) — input() returns Box<dyn FrameSource>,
 // output() returns Box<dyn FrameSink>.
 let input = libfreemkv::input("disc:///dev/sg4", &opts)?;    // DiscStream
-let input = libfreemkv::input("iso://Dune.iso", &opts)?;     // IsoStream
-let output = libfreemkv::output("mkv://Dune.mkv", &title)?;  // MkvOutputStream
-let output = libfreemkv::output("m2ts://Dune.m2ts", &title)?; // M2tsOutputStream
-let output = libfreemkv::output("network://10.0.0.1:9000", &title)?; // NetworkOutputStream
+let input = libfreemkv::input("iso://Movie.iso", &opts)?;     // IsoStream
+let output = libfreemkv::output("mkv://Movie.mkv", &title)?;  // MkvOutputStream
+let output = libfreemkv::output("m2ts://Movie.m2ts", &title)?; // M2tsOutputStream
+let output = libfreemkv::output("network://192.0.2.10:9000", &title)?; // NetworkOutputStream
 let output = libfreemkv::output("null://", &title)?;          // NullOutputStream
 ```
 

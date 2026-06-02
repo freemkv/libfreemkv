@@ -954,7 +954,7 @@ mod gap_fill_tests {
 
     #[test]
     fn partial_yield_fills_gaps_keeps_framework() {
-        // Oppenheimer-style: framework matched but only labeled 2 of 6 audios.
+        // Partial-coverage case: framework matched but only labeled 2 of 6 audios.
         let mut framework = vec![
             label(StreamLabelType::Audio, 1, "eng", "Atmos"),
             label(StreamLabelType::Audio, 4, "eng", "Commentary"),

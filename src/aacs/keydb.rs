@@ -448,9 +448,9 @@ mod tests {
 
     #[test]
     fn test_parse_disc_entry() {
-        let line = r#"***REMOVED*** = DUNE_PART_TWO (Dune: Part Two) | D | 2024-04-02 | M | ***REMOVED*** | I | ***REMOVED*** | V | ***REMOVED*** | U | 1-***REMOVED*** ; MKBv77"#;
+        let line = r#"0x000102030405060708090A0B0C0D0E0F10111213 = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x000102030405060708090A0B0C0D0E0F | I | 0x101112131415161718191A1B1C1D1E1F | V | 0x202122232425262728292A2B2C2D2E2F | U | 1-0x303132333435363738393A3B3C3D3E3F ; MKBv77"#;
         let entry = KeyDb::parse_disc_entry(line).unwrap();
-        assert_eq!(entry.title, "Dune: Part Two");
+        assert_eq!(entry.title, "Sample Film");
         assert!(entry.media_key.is_some());
         assert!(entry.vuk.is_some());
         assert_eq!(entry.unit_keys.len(), 1);
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_parse_device_key() {
-        let line = "| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; MKBv01-MKBv48";
+        let line = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; MKBv01-MKBv48";
         let dk = KeyDb::parse_device_key(line).unwrap();
         assert_eq!(dk.node, 0x0800);
         assert_eq!(dk.u_mask_shift, 0x17);
@@ -472,9 +472,9 @@ mod tests {
         // candidate: it lands in `processing_keys` and the brute walker
         // handles it.
         let cfg = r#"
-| DK | DEVICE_KEY ***REMOVED*** ; orphan from HKD\x02 corpus
-| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
-| PK | ***REMOVED*** ; legacy PK row still works
+| DK | DEVICE_KEY 0xDEADBEEF0001020304050607080900AA ; orphan, no position fields
+| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
+| PK | 0xCAFEBABE0001020304050607080900BB ; legacy PK row still works
 "#;
         let db = KeyDb::parse(cfg);
         assert_eq!(
@@ -488,29 +488,29 @@ mod tests {
             2,
             "orphan DK row + legacy PK row both belong in processing_keys"
         );
-        assert_eq!(db.processing_keys[0][..4], [0xC5, 0xDD, 0xB5, 0xB4]);
-        assert_eq!(db.processing_keys[1][..4], [0x76, 0xDD, 0xD7, 0x09]);
+        assert_eq!(db.processing_keys[0][..4], [0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(db.processing_keys[1][..4], [0xCA, 0xFE, 0xBA, 0xBE]);
     }
 
     #[test]
     fn test_parse_orphan_dk_rejects_lines_with_position_fields() {
         // The parser must NOT pick up a positioned DK row as an orphan
         // (that would double-count). parse_orphan_dk explicitly checks.
-        let positioned = "| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17";
+        let positioned = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17";
         assert!(
             KeyDb::parse_orphan_dk(positioned).is_none(),
             "positioned DK must not match orphan parser"
         );
-        let orphan = "| DK | DEVICE_KEY ***REMOVED***";
+        let orphan = "| DK | DEVICE_KEY 0xDEADBEEF0001020304050607080900AA";
         let key = KeyDb::parse_orphan_dk(orphan).expect("orphan should parse");
-        assert_eq!(key[..4], [0xC5, 0xDD, 0xB5, 0xB4]);
+        assert_eq!(key[..4], [0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
     fn test_parse_host_cert() {
-        let line = "| HC | HOST_PRIV_KEY ***REMOVED*** | HOST_CERT ***REMOVED*** ; Revoked";
+        let line = "| HC | HOST_PRIV_KEY 0xDEADBEEF000102030405060708090A0B0C0D0E0F | HOST_CERT 0x000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B ; Revoked";
         let hc = KeyDb::parse_host_cert(line).unwrap();
-        assert_eq!(hc.private_key[0], 0x90);
+        assert_eq!(hc.private_key[0], 0xDE);
         assert_eq!(hc.certificate.len(), 92);
     }
 
@@ -528,15 +528,15 @@ mod tests {
         assert!(!db.host_certs.is_empty());
         assert!(db.disc_entries.len() > 170000);
 
-        // Look up Dune: Part Two
-        let dune = db
+        // Look up any disc entry carrying a full key set.
+        let entry = db
             .disc_entries
             .values()
-            .find(|e| e.title.contains("Dune: Part Two") && e.vuk.is_some())
-            .expect("Dune: Part Two not found");
-        assert!(dune.media_key.is_some());
-        assert!(dune.vuk.is_some());
-        assert!(!dune.unit_keys.is_empty());
+            .find(|e| e.vuk.is_some() && e.media_key.is_some() && !e.unit_keys.is_empty())
+            .expect("no disc entry with a full key set");
+        assert!(entry.media_key.is_some());
+        assert!(entry.vuk.is_some());
+        assert!(!entry.unit_keys.is_empty());
 
         eprintln!(
             "Parsed {} disc entries, {} DK, {} PK",

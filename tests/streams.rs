@@ -77,21 +77,21 @@ fn parse_url_disc_device() {
 
 #[test]
 fn parse_url_mkv() {
-    let u = parse_url("mkv://Dune.mkv");
+    let u = parse_url("mkv://Movie.mkv");
     assert_eq!(u.scheme(), "mkv");
-    assert_eq!(u.path_str(), "Dune.mkv");
+    assert_eq!(u.path_str(), "Movie.mkv");
 }
 
 #[test]
 fn parse_url_network() {
-    let u = parse_url("network://10.0.0.1:9000");
+    let u = parse_url("network://192.0.2.10:9000");
     assert_eq!(u.scheme(), "network");
-    assert_eq!(u.path_str(), "10.0.0.1:9000");
+    assert_eq!(u.path_str(), "192.0.2.10:9000");
 }
 
 #[test]
 fn parse_url_bare_path_rejected() {
-    let u = parse_url("Dune.mkv");
+    let u = parse_url("Movie.mkv");
     assert_eq!(u.scheme(), "unknown");
 }
 
@@ -104,21 +104,21 @@ fn parse_url_null() {
 
 #[test]
 fn parse_url_m2ts_with_path() {
-    let u = parse_url("m2ts:///tmp/Dune.m2ts");
+    let u = parse_url("m2ts:///tmp/Movie.m2ts");
     assert_eq!(u.scheme(), "m2ts");
-    assert_eq!(u.path_str(), "/tmp/Dune.m2ts");
+    assert_eq!(u.path_str(), "/tmp/Movie.m2ts");
 }
 
 #[test]
 fn parse_url_m2ts_relative() {
-    let u = parse_url("m2ts://Dune.m2ts");
+    let u = parse_url("m2ts://Movie.m2ts");
     assert_eq!(u.scheme(), "m2ts");
-    assert_eq!(u.path_str(), "Dune.m2ts");
+    assert_eq!(u.path_str(), "Movie.m2ts");
 }
 
 #[test]
 fn open_input_bare_path_errors() {
-    let result = libfreemkv::input("Dune.mkv", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("Movie.mkv", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -134,7 +134,7 @@ fn open_input_bare_path_errors() {
 #[test]
 fn open_output_bare_path_errors() {
     let dt = sample_disc_title();
-    let result = libfreemkv::output("Dune.mkv", &dt);
+    let result = libfreemkv::output("Movie.mkv", &dt);
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),
@@ -195,7 +195,7 @@ fn open_output_disc_errors() {
 
 #[test]
 fn open_input_network_no_port_errors() {
-    let result = libfreemkv::input("network://10.0.0.1", &libfreemkv::InputOptions::default());
+    let result = libfreemkv::input("network://192.0.2.1", &libfreemkv::InputOptions::default());
     assert!(result.is_err());
     let msg = match result {
         Err(e) => e.to_string(),

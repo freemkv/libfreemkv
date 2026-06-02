@@ -334,7 +334,7 @@ const FAIL_PAUSE_SECS: u64 = 5;
 /// FIRST read failure after a clean run, before the drive has had a
 /// chance to cycle in retries that push it toward fast-fail).
 ///
-/// Empirical: 2026-05-11 Dune Pt 2 wedge incident showed 7 medium
+/// Empirical: a 2026-05-11 wedge incident showed 7 medium
 /// errors in 6.5 seconds (~1s per attempt + ~1s pause) push the
 /// BU40N's firmware into IllegalRequest fast-fail mode permanently.
 /// Once there, only physical eject + reload clears it. Giving the

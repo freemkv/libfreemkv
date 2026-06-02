@@ -23,8 +23,7 @@
 //! bounded channel + dedicated consumer thread.
 //!
 //! `byte_channel` is a byte-sized producer/consumer channel for the
-//! mux pipeline, sized to absorb worst-case input read stalls (see
-//! `(internal)/memory/project_buffering_architecture.md`).
+//! mux pipeline, sized to absorb worst-case input read stalls.
 
 pub(crate) mod bounded;
 pub mod byte_channel;

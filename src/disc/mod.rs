@@ -981,9 +981,9 @@ impl ScanOptions {
 /// Quick disc identification — name, format, capacity. No title/stream parsing.
 #[derive(Debug)]
 pub struct DiscId {
-    /// UDF Volume Identifier (always present, e.g. "V_FOR_VENDETTA")
+    /// UDF Volume Identifier (always present, e.g. "SAMPLE_FILM")
     pub volume_id: String,
-    /// Disc title from META/DL/bdmt_eng.xml (e.g. "V for Vendetta")
+    /// Disc title from META/DL/bdmt_eng.xml (e.g. "Sample Film")
     pub meta_title: Option<String>,
     /// Disc format (BD, UHD, DVD) — UHD vs BD requires full scan to confirm
     pub format: DiscFormat,

@@ -9,9 +9,7 @@
 //! [`ScsiSense::is_*`].
 //!
 //! The actual `ioctl(SG_IO, ...)` call is impossible to mock without a
-//! kernel — see
-//! `(internal)/docs/audits/2026-04-26-scsi-architecture-research.md`
-//! for why the audit recommends against libc shims here. These tests
+//! kernel, so libc shims are deliberately avoided here. These tests
 //! therefore pin the *contract* every backend must satisfy via a mock
 //! `ScsiTransport`:
 //!

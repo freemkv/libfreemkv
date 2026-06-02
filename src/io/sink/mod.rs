@@ -20,9 +20,6 @@
 //! 4 MiB buffer for the common local-disk case; `WritebackFile`
 //! (separate module) wraps a `File` with the adaptive-chunk
 //! `sync_file_range` machinery for the Linux+NFS case.
-//!
-//! See `(internal)/memory/project_buffering_architecture.md` for
-//! the full design and the source/sink matrix.
 
 use std::io::{Seek, Write};
 

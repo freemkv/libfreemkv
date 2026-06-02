@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn assign_labels_numbers_commentary_behind_placeholders() {
-        // Wicked: the FPL_MainFeature playlist lists three unlabelled main
+        // Observed case: the FPL_MainFeature playlist lists three unlabelled main
         // audio tracks as `Audio Stream N` placeholders, then a lone
         // `eng_ACOM_` commentary at STN slot 4. The commentary must land on
         // audio #4, not collapse onto #1 (which would tag the main feature

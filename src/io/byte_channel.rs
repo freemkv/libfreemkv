@@ -16,9 +16,6 @@
 //! The underlying mpsc channel is created with a very large slot count
 //! so the byte cap (not the slot count) is the real backpressure. Slot
 //! count is only there to give the kernel a small chunk to wake on.
-//!
-//! See `(internal)/memory/project_buffering_architecture.md` §
-//! Pipeline channel — sizing.
 
 use std::sync::mpsc::{Receiver as MpscReceiver, RecvError, SendError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};

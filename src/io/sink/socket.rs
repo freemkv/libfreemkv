@@ -47,7 +47,7 @@ impl SocketSink {
     /// writing. `sndbuf_bytes`, when present, is forwarded to
     /// `setsockopt(SO_SNDBUF)` as a kernel hint — the OS may clamp it.
     ///
-    /// `addr` accepts anything `ToSocketAddrs` does: `"10.0.0.1:1234"`,
+    /// `addr` accepts anything `ToSocketAddrs` does: `"192.0.2.1:1234"`,
     /// `("host", 1234)`, a `SocketAddr`, etc.
     pub fn connect<A: ToSocketAddrs>(addr: A, sndbuf_bytes: Option<usize>) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;

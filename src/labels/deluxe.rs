@@ -1,83 +1,65 @@
 //! Deluxe BD-J framework — `com/bydeluxe/bluray/` package signature.
 //!
-//! Used by major studios (Disney, Warner, others) for their UHD
-//! BD-J authoring. Detected on discs whose `/BDMV/JAR/<x>.jar`
-//! contains a `com/bydeluxe/` directory entry.
+//! Detected on discs whose `/BDMV/JAR/<x>.jar` contains a
+//! `com/bydeluxe/` directory entry.
 //!
-//! ## Why this parser exists
+//! ## What this parser reads
 //!
-//! Deluxe-authored discs store stream labels as **ordinal references
-//! into obfuscated enum classes**. The label text isn't a literal
-//! string in any anchor pattern (unlike dbp's `TextField,...` rows).
-//! Instead, the binding code is roughly:
-//!
-//! ```java
-//! streamTable.put(1, new AudioSlot(LanguageEnum.English,
-//!                                  CodecEnum.ATMOS_HD_AUDIO,
-//!                                  PurposeEnum.Normal));
-//! ```
-//!
-//! The class names `LanguageEnum`, `CodecEnum`, `PurposeEnum`, and
-//! `AudioSlot` are obfuscated per-disc (`be.class`, `ma.class`,
-//! `lp.class`, etc.) — no name pattern survives the obfuscator. But
-//! the **shape of `<clinit>`** is framework-stable:
+//! Deluxe-authored discs store stream labels as ordinal references into
+//! enum classes whose names are obfuscated per-disc, so a name-based
+//! match won't work. The label data is instead recovered by matching on
+//! the **shape of each enum's `<clinit>`**, which is framework-stable:
 //!
 //! | Enum | Signature |
 //! |---|---|
 //! | Language | 70 `ldc` operations in `<clinit>`, sequence starts `English, French, Spanish, Dutch, ...` |
 //! | Purpose | 8 ldcs starting `Normal, Commentary, PiP, Trivia, ...` |
 //! | VideoFormat | 7 ldcs starting `HD, HDR10 Plus, HD Dolby, ...` |
-//! | Region | 22 ldcs starting `USA_D1, LIC1, LIC2, LIC3, ...` (Disney only) |
-//! | Studio | 6 ldcs starting `Disney, Marvel, Pixar, ...` (Disney only) |
-//! | Codec | ~46 `new` instructions, 0 ldcs in `<clinit>` (codec strings live in subclasses) |
+//! | Region | 22 ldcs starting `USA_D1, LIC1, LIC2, LIC3, ...` |
+//! | Studio | 6 ldcs starting `Disney, Marvel, Pixar, ...` |
+//! | Codec | many `new` instructions, 0 ldcs in `<clinit>` (codec strings live in subclasses) |
 //!
-//! Match on the SHAPE, not the name, and the parser survives obfuscation.
+//! Matching on the shape rather than the class name keeps the parser
+//! working across obfuscation variants.
 //!
 //! ## Implementation phases
 //!
 //! - **Phase A** — master enum identification (`identify_master_enums`).
 //!   Walks every `.class`'s `<clinit>` ldc sequence and matches against
 //!   the framework-stable fingerprints. Output: `Vec<(label, MasterEnum)>`
-//!   with full ordinal → string-value tables. **Empirically verified**
-//!   on disc-01 (Disney) + disc-09 (Warner).
+//!   with full ordinal → string-value tables.
 //!
 //! - **Phase B** — codec enum subclass walk (`decode_codec_enum`).
-//!   The codec enum's `<clinit>` has ~46 `new` instructions and zero
+//!   The codec enum's `<clinit>` has many `new` instructions and zero
 //!   string ldcs — codec name strings live in the subclasses each
 //!   `new` constructs. Walks every referenced subclass's constant
-//!   pool, extracts the codec name string. **Structural shape
-//!   verified** on disc-01 (ma.class, 41 `new` ops) + disc-09
-//!   (ea.class, 46 `new` ops); per-subclass string extraction
-//!   designed against the published Java enum compilation convention
-//!   (each enum value's `<init>` is called with its name string as
-//!   the first arg).
+//!   pool, extracts the codec name string, following the standard Java
+//!   enum compilation convention (each enum value's `<init>` is called
+//!   with its name string as the first arg).
 //!
 //! - **Phase C** — binding-class identification (`find_binding_classes`).
 //!   The per-stream table is built by some class via repeated
 //!   `getstatic` references to the master enums identified in A.
 //!   That class has the highest such `getstatic` count in the jar.
-//!   **Heuristic shape**; precise threshold may need tuning.
+//!   Heuristic shape; precise threshold may need tuning.
 //!
 //! - **Phase D** — binding-class bytecode decoder (`decode_binding`).
 //!   Walks the binding class's `<clinit>` with a tiny symbolic stack
 //!   machine. For each `new X / dup / ... / invokespecial X.<init>`
 //!   sequence, collects the int values and enum-reference operands
 //!   between the `dup` and the constructor call, then emits a
-//!   `DecodedStream`. **Mechanism verified** in unit tests against
-//!   synthetic class fixtures; the **signal-to-StreamLabel mapping**
-//!   (which arg is stream index? which is language? audio vs
-//!   subtitle?) uses a documented heuristic that needs corpus-disc
-//!   verification — see `interpret_stream` for the mapping rules.
+//!   `DecodedStream`. The signal-to-StreamLabel mapping (which arg is
+//!   stream index? which is language? audio vs subtitle?) uses a
+//!   heuristic — see `interpret_streams` for the mapping rules.
 //!
 //! ## Confidence
 //!
 //! [`parse`] returns `Some(ParseResult::medium(labels))` when Phases A
 //! through D produce at least one stream — `Medium` because the
-//! signal-to-label mapping is heuristic until real disc bytecode
-//! confirms the binding pattern. Once verified the parser can promote
-//! to `High`. `None` when the disc isn't Deluxe-authored or when
-//! decoding produces zero streams (a recognized-but-broken state that
-//! the analyzer still surfaces via `parsers_detected`).
+//! signal-to-label mapping is heuristic. `None` when the disc isn't
+//! Deluxe-authored or when decoding produces zero streams (a
+//! recognized-but-broken state that the analyzer still surfaces via
+//! `parsers_detected`).
 
 use super::class_reader::{
     AASTORE, BIPUSH, ClassFile, CodeAttribute, ConstantPool, CpInfo, GETSTATIC, ICONST_0, ICONST_1,
@@ -559,10 +541,9 @@ fn clinit_news_and_ldcs(
 /// candidates ordered by descending getstatic count, filtered to a
 /// minimum concentration of master-enum references.
 ///
-/// Empirically (POC v0.3 dumps): on disc-01 the audio binding class
-///   (`ma.class`) has ~82 getstatic refs, the subtitle binding
-///   (`ko.class`) has ~63. Both share the master Language + Purpose
-///   enums.
+/// A disc that splits the table commonly has one audio binding class
+/// with the most getstatic refs and a subtitle binding class with
+/// somewhat fewer; both share the master Language + Purpose enums.
 pub(crate) fn find_binding_classes(
     archive: &mut jar::Jar,
     master_enum_classes: &HashSet<&str>,
@@ -641,10 +622,9 @@ pub(crate) enum StackVal {
     /// name (e.g. `DOLBY_AC3_AUDIO`, `DOLBY_LOSSLESS_AUDIO`) is the
     /// codec identifier. Deluxe binding constructors take a
     /// `LCodingType;` arg directly — codecs are NOT a Deluxe-internal
-    /// enum (Phase B's codec-subclass walk was based on a wrong
-    /// assumption; the actual codec source is the standard BD-J API
-    /// enum). Discovered via deluxe-poc v0.3 binding-bytecode dump
-    /// against disc-01 (Disney) + disc-09 (Warner) on 2026-05-10.
+    /// enum; the codec source is the standard BD-J API `CodingType`
+    /// enum, so the binding constructor's codec arg is read straight
+    /// from that getstatic operand.
     CodingType(String),
     /// An uninitialized `new` object — popped by the matching
     /// invokespecial.
@@ -988,11 +968,10 @@ impl MasterEnumTable {
 // ── interpret_streams: Constructions → StreamLabels ─────────────────────────
 
 /// Convert the per-construction tuples from Phase D into
-/// [`StreamLabel`]s. Pattern verified against corpus discs via
-/// deluxe-poc v0.3 binding-bytecode dump (2026-05-10):
+/// [`StreamLabel`]s. Two binding-constructor shapes are handled:
 ///
-/// Disney binding (5-arg): `BindingType.<init>(I, Lbe;, Llp;, I, LCodingType;)V`
-/// Warner binding (4-arg): `BindingType.<init>(I, Law;, Lgp;, LCodingType;)V`
+/// 5-arg: `BindingType.<init>(I, Lang;, Lpurpose;, I, LCodingType;)V`
+/// 4-arg: `BindingType.<init>(I, Lang;, Lpurpose;, LCodingType;)V`
 ///
 /// Args are identified by **TYPE**, not position:
 /// - First `EnumRef{kind: "Language"}` → audio/subtitle language
@@ -1098,11 +1077,10 @@ fn interpret_streams(constructions: &[Construction], master: &MasterEnumTable) -
 /// getstatic operands on Deluxe binding classes) to a human-readable
 /// codec hint string.
 ///
-/// CodingType is the standard BD-J API enum; values are documented
-/// in the BD-J specification and verified empirically against the
-/// binding-bytecode dumps in `(internal)/research/deluxe-poc/data/`.
-/// Unknown field names pass through unchanged so unfamiliar codecs
-/// still surface something rather than going silent.
+/// CodingType is the standard BD-J API enum; values are documented in
+/// the BD-J specification. Unknown field names pass through unchanged
+/// so unfamiliar codecs still surface something rather than going
+/// silent.
 fn coding_type_to_codec_hint(field: &str) -> &str {
     match field {
         // Lossless / hi-res.

@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct DiscMetadata {
     /// Localized titles, keyed by 3-char ISO 639-2 lang code
-    /// (e.g. "eng" → "Dune Part Two")
+    /// (e.g. "eng" → "Aurora Drift")
     pub titles: BTreeMap<String, String>,
     /// First-line / short description, per lang
     pub descriptions: BTreeMap<String, String>,
@@ -146,7 +146,7 @@ pub(crate) fn parse_bdmt_xml(_lang_code: &str, xml_text: &str) -> Option<BdmtFie
 }
 
 /// Reject candidate description strings that are themselves XML
-/// fragments — observed on disc-04 (Top Gun: Maverick), where
+/// fragments — observed on a captured disc, where
 /// `<di:description>` contained `<di:thumbnail href="…"/>` child
 /// elements and no actual prose. Surfacing that raw to the JSON
 /// output is worse than dropping the field entirely.
@@ -210,10 +210,10 @@ mod tests {
         // carrier inside a <discInfo> root.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Dune Part Two</di:name>
+  <di:name>Aurora Drift</di:name>
 </discInfo>"#;
         let (title, desc, set) = parse_bdmt_xml("eng", xml).expect("title should parse");
-        assert_eq!(title, "Dune Part Two");
+        assert_eq!(title, "Aurora Drift");
         assert_eq!(desc, None);
         assert_eq!(set, None);
     }
@@ -223,12 +223,12 @@ mod tests {
         // <di:title> is the alternate carrier; should be picked up
         // when <di:name> is absent.
         let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:title>The Matrix</di:title>
-  <di:description>A film about computers.</di:description>
+  <di:title>Echo Chamber</di:title>
+  <di:description>A film about machines.</di:description>
 </discInfo>"#;
         let (title, desc, _) = parse_bdmt_xml("eng", xml).unwrap();
-        assert_eq!(title, "The Matrix");
-        assert_eq!(desc.as_deref(), Some("A film about computers."));
+        assert_eq!(title, "Echo Chamber");
+        assert_eq!(desc.as_deref(), Some("A film about machines."));
     }
 
     #[test]
@@ -238,17 +238,17 @@ mod tests {
         // titleName inside tableOfContents.
         let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
   <di:tableOfContents>
-    <di:titleName>Inside Out 2</di:titleName>
+    <di:titleName>Feelings Two</di:titleName>
   </di:tableOfContents>
 </discInfo>"#;
         let (title, _, _) = parse_bdmt_xml("eng", xml).unwrap();
-        assert_eq!(title, "Inside Out 2");
+        assert_eq!(title, "Feelings Two");
     }
 
     #[test]
     fn extract_box_set_position() {
         let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>LOTR Disc 2</di:name>
+  <di:name>Box Set Disc 2</di:name>
   <di:discNumber>2</di:discNumber>
   <di:numSets>5</di:numSets>
 </discInfo>"#;
@@ -287,11 +287,11 @@ mod tests {
         // would. This exercises the BTreeMap key handling without
         // needing a UdfFs.
         let eng_xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Dune Part Two</di:name>
+  <di:name>Aurora Drift</di:name>
 </discInfo>"#;
         let fra_xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Dune Deuxième Partie</di:name>
-  <di:description>Suite du film de 2021.</di:description>
+  <di:name>Aurora Drift (Partie Deux)</di:name>
+  <di:description>Suite du film fictif.</di:description>
 </discInfo>"#;
 
         let mut meta = DiscMetadata::default();
@@ -310,16 +310,16 @@ mod tests {
 
         assert_eq!(
             meta.titles.get("eng").map(String::as_str),
-            Some("Dune Part Two")
+            Some("Aurora Drift")
         );
         assert_eq!(
             meta.titles.get("fra").map(String::as_str),
-            Some("Dune Deuxième Partie")
+            Some("Aurora Drift (Partie Deux)")
         );
         assert!(meta.descriptions.get("eng").is_none());
         assert_eq!(
             meta.descriptions.get("fra").map(String::as_str),
-            Some("Suite du film de 2021.")
+            Some("Suite du film fictif.")
         );
         assert_eq!(meta.disc_number, None);
     }
@@ -342,21 +342,21 @@ mod tests {
 
     #[test]
     fn description_with_only_child_xml_is_dropped() {
-        // Real-world bug from disc-04 (Top Gun: Maverick, 2026-05-11
+        // Real-world bug from a captured disc (2026-05-11
         // capture): <di:description> contained only <di:thumbnail/>
         // child elements with no actual prose. The previous parser
         // surfaced the raw XML fragment as the description string.
         // Now we reject candidates that begin with `<`.
         let xml = r#"<discInfo>
-            <di:name>Top Gun: Maverick</di:name>
+            <di:name>Skyline Run</di:name>
             <di:description>
-              <di:thumbnail href="tgm_meta_sm.jpg" />
-              <di:thumbnail href="tgm_meta_lg.jpg" />
+              <di:thumbnail href="sample_meta_sm.jpg" />
+              <di:thumbnail href="sample_meta_lg.jpg" />
             </di:description>
         </discInfo>"#;
         let (title, description, _) =
             parse_bdmt_xml("eng", xml).expect("title is present so parse must succeed");
-        assert_eq!(title, "Top Gun: Maverick");
+        assert_eq!(title, "Skyline Run");
         assert!(
             description.is_none(),
             "description containing only XML children must be dropped, got {description:?}"
@@ -381,10 +381,10 @@ mod tests {
     #[test]
     fn whitespace_in_title_is_trimmed() {
         let xml = r#"<discInfo><di:name>
-            Dune Part Two
+            Aurora Drift
         </di:name></discInfo>"#;
         let (title, _, _) = parse_bdmt_xml("eng", xml).unwrap();
-        assert_eq!(title, "Dune Part Two");
+        assert_eq!(title, "Aurora Drift");
     }
 
     #[test]

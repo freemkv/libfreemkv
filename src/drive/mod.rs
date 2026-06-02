@@ -529,7 +529,7 @@ impl Drive {
 
                 // /dev/sr0 pread fallback (Linux only). The kernel
                 // sr_mod driver auto-retries failed reads (~5× per
-                // command). Empirically (BU40N + Dune Part 2 UHD,
+                // command). Empirically (BU40N + a UHD disc,
                 // 2026-05-08) dd via /dev/sr0 recovers ~50% of bad
                 // sectors that a single-shot SG_IO READ misses.
                 #[cfg(target_os = "linux")]

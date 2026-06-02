@@ -7,8 +7,7 @@
 //! Stream labels live as plain ASCII strings inside compiled `.class`
 //! files in the jar — a quirk of the menu-rendering layer encoding
 //! its TextField positions and content as constant strings the
-//! Java compiler retained in the class string pool. Format observed
-//! in the corpus (Civil War UHD, 2024):
+//! Java compiler retained in the class string pool. Observed format:
 //!
 //! ```text
 //! LTextField,Audio1,English Dolby Atmos,Fontstrip_Composite,...

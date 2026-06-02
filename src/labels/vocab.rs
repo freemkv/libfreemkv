@@ -10,8 +10,7 @@
 //! - English text → [`LabelPurpose`] (Commentary / Descriptive / etc.).
 //! - English text → [`LabelQualifier`] (SDH / Forced / Descriptive Service).
 //!
-//! Rules of engagement (carried over from
-//! `(internal)/memory/feedback_label_data_rules.md`):
+//! Rules of engagement:
 //!
 //! 1. Only map values we are 100% certain about — published codec
 //!    names, well-known ISO 639-2 mappings, vendor-documented purpose

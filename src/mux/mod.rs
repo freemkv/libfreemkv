@@ -6,7 +6,7 @@
 //! ```text
 //! let mut input = input("iso://Disc.iso", &opts)?;
 //! let title = input.info().clone();
-//! let mut output = output("mkv://Dune.mkv", &title)?;
+//! let mut output = output("mkv://Movie.mkv", &title)?;
 //! while let Ok(Some(frame)) = input.read() {
 //!     output.write(&frame)?;
 //! }
