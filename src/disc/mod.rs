@@ -1545,6 +1545,7 @@ impl Disc {
             skip_on_error: opts.multipass,
             progress: opts.progress,
             halt: opts.halt.clone(),
+            vid: opts.vid,
         };
         self.sweep(reader, path, &sweep_opts)
     }
@@ -1636,12 +1637,21 @@ impl Disc {
         if !opts.resume {
             let _ = std::fs::remove_file(&mapfile_path);
         }
-        let map = mapfile::Mapfile::open_or_create(
+        let mut map = mapfile::Mapfile::open_or_create(
             &mapfile_path,
             total_bytes,
             concat!("libfreemkv v", env!("CARGO_PKG_VERSION")),
         )
         .map_err(|e| Error::IoError { source: e })?;
+
+        // Persist the disc's AACS Volume ID into the mapfile header so it
+        // survives to deferred-mux / resume. ddrescue-safe (comment line);
+        // does not touch the ISO payload. On a resume-load the VID is
+        // already present, but re-setting it (idempotent) covers the case
+        // where Pass 1 created the mapfile before the VID was known.
+        if let Some(vid) = opts.vid {
+            map.set_vid(vid);
+        }
 
         // ISO file: if resuming and mapfile has Finished ranges, open existing;
         // otherwise create fresh and pre-size to total_bytes (sparse holes for
@@ -2114,6 +2124,11 @@ pub struct CopyOptions<'a> {
     pub multipass: bool,
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// AACS Volume ID (16 bytes) to persist into the mapfile during
+    /// Pass 1 so it survives to deferred-mux / resume. `None` for
+    /// unencrypted / non-AACS discs. Caller wires this from
+    /// `Disc::aacs.volume_id`.
+    pub vid: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2135,6 +2150,9 @@ pub struct SweepOptions<'a> {
     pub skip_on_error: bool,
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// AACS Volume ID (16 bytes) persisted into the mapfile when the
+    /// sweep creates / opens it. `None` for unencrypted discs.
+    pub vid: Option<[u8; 16]>,
 }
 
 /// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
@@ -2645,6 +2663,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         assert!(
@@ -2669,6 +2688,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -2699,6 +2719,7 @@ mod tests {
             multipass: false,
             progress: None,
             halt: None,
+            vid: None,
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -2728,6 +2749,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts);
         assert!(
@@ -2745,6 +2767,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let patch_result = disc.copy(&mut reader2, &iso_path, &patch_opts);
         assert!(
@@ -2777,6 +2800,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let _sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts).unwrap();
 
@@ -2789,6 +2813,7 @@ mod tests {
             multipass: true,
             progress: None,
             halt: None,
+            vid: None,
         };
         let patch_result = disc.copy(&mut reader2, std::path::Path::new("/dev/null"), &patch_opts);
         assert!(
@@ -2821,6 +2846,7 @@ mod tests {
             multipass: false,
             progress: None,
             halt: None,
+            vid: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         let r = result.expect("100-batch clean sweep should succeed");

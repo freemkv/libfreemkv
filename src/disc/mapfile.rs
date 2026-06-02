@@ -130,6 +130,11 @@ pub struct Mapfile {
     /// Wall-clock timestamp of the last successful `write_to_disk` (or
     /// the moment the mapfile was constructed, whichever is later).
     last_flushed: Instant,
+    /// AACS Volume ID (16 bytes) for the disc, persisted as a
+    /// `# freemkv-vid:` comment header so it survives to deferred-mux /
+    /// resume without altering the ISO payload or breaking ddrescue
+    /// data-line parsing. `None` for unencrypted / non-AACS discs.
+    vid: Option<[u8; 16]>,
 }
 
 impl Mapfile {
@@ -154,6 +159,7 @@ impl Mapfile {
             },
             dirty: false,
             last_flushed: Instant::now(),
+            vid: None,
         };
         // Eager initial persist so a resume can pick this up even if
         // `record()` is never called.
@@ -168,6 +174,7 @@ impl Mapfile {
         let mut entries = Vec::new();
         let mut saw_current_line = false;
         let mut version = String::from("unknown");
+        let mut vid: Option<[u8; 16]> = None;
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
@@ -177,6 +184,11 @@ impl Mapfile {
                 let rest = rest.trim();
                 if let Some(v) = rest.strip_prefix("Rescue Logfile. Created by ") {
                     version = v.to_string();
+                }
+                if let Some(hex) = rest.strip_prefix("freemkv-vid:") {
+                    // Best-effort: a malformed or short VID comment is
+                    // ignored rather than failing the whole load.
+                    vid = parse_vid_hex(hex.trim());
                 }
                 continue;
             }
@@ -227,6 +239,7 @@ impl Mapfile {
             stats,
             dirty: false,
             last_flushed: Instant::now(),
+            vid,
         })
     }
 
@@ -316,6 +329,22 @@ impl Mapfile {
         Ok(())
     }
 
+    /// Record the disc's 16-byte AACS Volume ID so it persists in the
+    /// mapfile's comment header. Marks the mapfile dirty; the next
+    /// `flush()` / `Drop` writes the `# freemkv-vid:` line. Does not
+    /// touch the ISO payload or the ddrescue data lines.
+    pub fn set_vid(&mut self, vid: [u8; 16]) {
+        self.vid = Some(vid);
+        self.dirty = true;
+    }
+
+    /// The disc's AACS Volume ID, if one was set or parsed from a
+    /// `# freemkv-vid:` comment on load. `None` for unencrypted /
+    /// non-AACS discs.
+    pub fn vid(&self) -> Option<[u8; 16]> {
+        self.vid
+    }
+
     pub fn entries(&self) -> &[MapEntry] {
         &self.entries
     }
@@ -388,6 +417,18 @@ impl Mapfile {
             let file = std::fs::File::create(&tmp)?;
             let mut w = std::io::BufWriter::new(file);
             writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
+            // VID comment lives in the header block. ddrescue treats any
+            // `#`-prefixed line as a comment, so this round-trips through
+            // our `load()` without affecting the `pos size status` data
+            // parser. 16 bytes → 32 lowercase hex chars.
+            if let Some(vid) = self.vid {
+                let mut hex = String::with_capacity(32);
+                for b in vid {
+                    use std::fmt::Write as _;
+                    let _ = write!(hex, "{b:02x}");
+                }
+                writeln!(w, "# freemkv-vid: {hex}")?;
+            }
             writeln!(w, "# Current pos / status / pass / pass_time")?;
             writeln!(w, "0x000000000  ?  1  0")?;
             writeln!(w, "#      pos        size  status")?;
@@ -415,6 +456,22 @@ impl Drop for Mapfile {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+/// Parse a 32-char lowercase/uppercase hex string into a 16-byte VID.
+/// Returns `None` on any malformation (wrong length, non-hex) — the
+/// caller treats a bad VID comment as simply absent rather than an
+/// error, so a corrupt header never fails a mapfile load.
+fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn parse_hex(s: &str) -> io::Result<u64> {
@@ -581,6 +638,79 @@ mod tests {
         assert_eq!(s2.bytes_retryable, 100);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn vid_round_trips_and_data_lines_unaffected() {
+        let p = tmpfile("vid_round_trips");
+        let _ = std::fs::remove_file(&p);
+
+        // Build a mapfile with some data ranges, set a VID, persist.
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(100, 200, SectorStatus::Finished).unwrap();
+        mf.record(500, 100, SectorStatus::Unreadable).unwrap();
+        mf.record(700, 50, SectorStatus::NonTrimmed).unwrap();
+        let vid: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        mf.set_vid(vid);
+        mf.flush().unwrap();
+
+        // The saved file must contain the VID comment in lowercase hex.
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("# freemkv-vid:"),
+            "saved mapfile missing VID comment: {text}"
+        );
+        assert!(
+            text.contains("# freemkv-vid: 00112233445566778899aabbccddeeff"),
+            "VID comment format mismatch: {text}"
+        );
+
+        // load() recovers the VID and the identical data ranges.
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.vid(), Some(vid));
+        assert_eq!(loaded.entries(), mf.entries());
+
+        // A mapfile WITHOUT the VID comment must parse the same +/-/?
+        // data ranges as the one WITH it (comment ignored by parser).
+        let p2 = tmpfile("vid_round_trips_novid");
+        let _ = std::fs::remove_file(&p2);
+        let mut mf2 = Mapfile::create(&p2, 1000, "test").unwrap();
+        mf2.record(100, 200, SectorStatus::Finished).unwrap();
+        mf2.record(500, 100, SectorStatus::Unreadable).unwrap();
+        mf2.record(700, 50, SectorStatus::NonTrimmed).unwrap();
+        mf2.flush().unwrap();
+        let loaded_novid = Mapfile::load(&p2).unwrap();
+        assert_eq!(loaded_novid.vid(), None);
+        assert_eq!(loaded_novid.entries(), loaded.entries());
+
+        // Malformed VID comments must not error the load (treated absent).
+        let mut bad = text.replace("00112233445566778899aabbccddeeff", "zzzz");
+        let pbad = tmpfile("vid_round_trips_bad");
+        let _ = std::fs::remove_file(&pbad);
+        std::fs::write(&pbad, &bad).unwrap();
+        let loaded_bad = Mapfile::load(&pbad).unwrap();
+        assert_eq!(loaded_bad.vid(), None);
+        assert_eq!(loaded_bad.entries(), loaded.entries());
+
+        // A load->save cycle preserves the VID (the patch-pass path).
+        bad.clear();
+        let resaved = tmpfile("vid_round_trips_resave");
+        let _ = std::fs::remove_file(&resaved);
+        let mut reloaded = Mapfile::load(&p).unwrap();
+        // Repoint at a fresh path and flush; mark dirty via a no-op record.
+        reloaded.path = resaved.clone();
+        reloaded.dirty = true;
+        reloaded.flush().unwrap();
+        let again = Mapfile::load(&resaved).unwrap();
+        assert_eq!(again.vid(), Some(vid));
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
+        let _ = std::fs::remove_file(&pbad);
+        let _ = std::fs::remove_file(&resaved);
     }
 
     #[test]
