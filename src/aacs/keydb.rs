@@ -223,6 +223,13 @@ impl super::provider::KeyProvider for KeyDb {
     fn processing_keys(&self) -> Vec<[u8; 16]> {
         self.processing_keys.clone()
     }
+    fn media_keys(&self) -> Vec<[u8; 16]> {
+        // Every per-disc Media Key in the db. The resolver dedups; MKs are
+        // MKB-scoped so the same value recurs across a pressing's discs.
+        self.iter_disc_entries()
+            .filter_map(|e| e.media_key)
+            .collect()
+    }
     fn host_certs(&self) -> Vec<HostCert> {
         self.host_certs.clone()
     }

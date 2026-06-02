@@ -48,6 +48,14 @@ pub trait KeyProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Every Media Key this provider holds, regardless of which disc it was
+    /// filed under. An MK is MKB-scoped (shared across a pressing/MKB-family),
+    /// so the resolver can verify each against the disc's MKB (`km_verifies`)
+    /// and resolve a disc whose own hash/VID isn't directly keyed.
+    fn media_keys(&self) -> Vec<[u8; 16]> {
+        Vec::new()
+    }
+
     /// AACS host certificates (with their private keys) for drive
     /// authentication. Multiple in case some are revoked.
     fn host_certs(&self) -> Vec<HostCert> {
@@ -83,6 +91,15 @@ impl Providers<'_> {
     /// Union — gather PKs from every provider.
     pub fn processing_keys(&self) -> Vec<[u8; 16]> {
         self.0.iter().flat_map(|p| p.processing_keys()).collect()
+    }
+
+    /// Union of distinct Media Keys across every provider, for the MK-pool
+    /// brute (`km_verifies` against the disc's MKB).
+    pub fn media_keys(&self) -> Vec<[u8; 16]> {
+        let mut v: Vec<[u8; 16]> = self.0.iter().flat_map(|p| p.media_keys()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// Union — gather host certs from every provider. Not yet wired into

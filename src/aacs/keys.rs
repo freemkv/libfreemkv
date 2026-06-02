@@ -1103,6 +1103,30 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
                 return Some(build(Some(vuk), derive_uks(&vuk), 2));
             }
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = all_pks.len(), "PK derivation failed");
+
+            // Path 2.5: MK-pool brute. keydb stores Media Keys per-disc, but an
+            // MK is MKB-scoped (shared across a pressing/MKB-family). A disc
+            // whose own hash/VID isn't keyed can still resolve if ANY stored MK
+            // verifies against its MKB. Try every distinct MK via km_verifies;
+            // a UNIQUE pass is this disc's Km → derive VUK (needs VID) → UK.
+            // km_verifies is one AES-D + magic check per candidate (cheap).
+            let mks = providers.media_keys();
+            let mut mk_hits: Vec<[u8; 16]> = Vec::new();
+            for mk in &mks {
+                if probe::km_verifies(mkb, mk) && !mk_hits.contains(mk) {
+                    mk_hits.push(*mk);
+                    if mk_hits.len() > 1 {
+                        break; // ambiguous — bail to avoid a wrong key
+                    }
+                }
+            }
+            if mk_hits.len() == 1 {
+                let vuk = derive_vuk(&mk_hits[0], ctx.volume_id);
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_5_hit", mk_pool = mks.len(), "media key from keydb MK-pool brute (km_verifies)");
+                // Same class as path 3 (KEYDB MK → derived VUK).
+                return Some(build(Some(vuk), derive_uks(&vuk), 3));
+            }
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_5_miss", mk_pool = mks.len(), mk_hits = mk_hits.len(), "MK-pool brute: no unique verifying MK");
         } else {
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
         }
@@ -1951,6 +1975,68 @@ mod tests {
         assert!(
             resolve_keys_v1(&ctx).is_none(),
             "partial CPS-unit coverage must not produce a half-decrypted result"
+        );
+    }
+
+    #[test]
+    fn resolve_keys_path2_5_mk_pool_brute_resolves_unkeyed_disc() {
+        // The Dunkirk case: this disc's own hash/VID are NOT in keydb, but its
+        // Media Key IS — filed under a sibling disc that shares its MKB. Path
+        // 2.5 must km_verifies that MK against the MKB and resolve.
+        use super::super::decrypt::aes_ecb_encrypt as enc;
+
+        let km = [0x11u8; 16];
+        let vid = [0x22u8; 16];
+
+        // MKB: 0x10 type/version + 0x86 verify record whose mk_dv decrypts under
+        // km to the AACS verify magic, so km_verifies(mkb, km) == true.
+        let mut vd = [0u8; 16];
+        vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        let mk_dv = enc(&km, &vd);
+        let mut mkb = mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x4D]);
+        mkb.extend_from_slice(&mkb_record(0x86, &mk_dv));
+        assert!(
+            probe::km_verifies(&mkb, &km),
+            "fixture: km must verify the MKB"
+        );
+
+        // This disc's inf (its hash will NOT be in keydb).
+        let uk_ro = minimal_unit_key_ro();
+
+        // keydb: a SIBLING disc carries our km, keyed by the sibling's own
+        // hash + VID (neither matches THIS disc) — so only the MK-pool brute
+        // (km_verifies) can find it.
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            "0xsibling".to_string(),
+            DiscEntry {
+                disc_hash: "0xsibling".to_string(),
+                title: "sibling".to_string(),
+                media_key: Some(km),
+                disc_id: Some([0x99u8; 16]),
+                vuk: None,
+                unit_keys: Vec::new(),
+            },
+        );
+
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            providers,
+            mkb: Some(&mkb),
+        };
+        let resolved = resolve_keys_v1(&ctx)
+            .expect("MK-pool brute (path 2.5) must resolve a disc whose MK is in keydb");
+        assert_eq!(
+            resolved.key_source, 3,
+            "MK-pool brute is the KEYDB-derived class"
+        );
+        assert_eq!(
+            resolved.vuk,
+            Some(derive_vuk(&km, &vid)),
+            "VUK must derive from the verified Km + this disc's VID"
         );
     }
 
