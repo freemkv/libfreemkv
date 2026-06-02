@@ -1,7 +1,7 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
 use super::decrypt::aes_ecb_decrypt;
-use super::keydb::{DeviceKey, KeyDb};
+use super::keydb::DeviceKey;
 
 // ── AACS version ────────────────────────────────────────────────────────────
 
@@ -205,21 +205,59 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
 ///   Record type 0x81 = Verify Media Key Record, AACS 1.0 (has mk_dv)
 ///   Record type 0x86 = Verify Media Key Record, AACS 2.0/2.1 (has mk_dv)
 ///   Record type 0x04 = Subset-Difference Index (has UVS entries)
-///   Record type 0x07 = Explicit Subset-Difference Record (has cvalues)
+///   Record type 0x05 = Media Key Data Record (cvalues, 1:1 with 0x04)
+///   Record type 0x07 = Explicit Subset-Difference Record (NOT cvalues)
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
-    // Parse MKB records
+    derive_media_key_from_pk_walked(mkb, processing_keys, PK_WALK_MAX_DEPTH)
+}
+
+/// SD-tree walk depth applied to every entry in `processing_keys`.
+///
+/// Each entry is treated as a node-key (label) at unknown depth. The
+/// resolver applies `AES-G3(K, 1)` to derive the PK at this node, then
+/// descends via `AES-G3(K, 0)` (left child) and `AES-G3(K, 2)` (right
+/// child) up to this many additional levels — try-everything since we
+/// have no path bits per entry.
+///
+/// Each level doubles the candidate count. Cost per entry per MKB
+/// cvalue ≈ `2 × (2^(D+1) - 1)` AES decrypts. For a ~100-cvalue MKB
+/// (typical UHD) at depth 2: ~14 × 100 = 1400 ops per entry; for 1.5k
+/// entries that's ~2 M validate calls, sub-second with AES-NI.
+///
+/// Set to 0 to disable walking (entries tried only as terminal PKs).
+const PK_WALK_MAX_DEPTH: u8 = 3;
+
+/// Same as [`derive_media_key_from_pk`] but with explicit walk depth.
+/// Each entry is tried as a terminal PK at depth 0, then as a node-key
+/// whose PK and children are derived via `AES-G3(K, 0|1|2)` for up to
+/// `max_depth` additional levels.
+pub fn derive_media_key_from_pk_walked(
+    mkb: &[u8],
+    processing_keys: &[[u8; 16]],
+    max_depth: u8,
+) -> Option<[u8; 16]> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
     let cvalues = mkb_find_cvalues(mkb)?;
+    walk_pk_against_tables_impl(processing_keys, &uvs, &cvalues, &mk_dv, max_depth)
+}
 
-    // Count UV entries (each 5 bytes, stop when high bits set)
+/// Core Subset-Difference PK walk over explicit record bodies. Shared by
+/// [`derive_media_key_from_pk_walked`] (production, records auto-selected) and
+/// [`probe::walk_pk_against_tables`] (harness, records caller-pinned).
+fn walk_pk_against_tables_impl(
+    processing_keys: &[[u8; 16]],
+    uvs: &[u8],
+    cvalues: &[u8],
+    mk_dv: &[u8; 16],
+    max_depth: u8,
+) -> Option<[u8; 16]> {
     let num_uvs = uvs
         .chunks(5)
         .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
         .count();
 
-    // Try each processing key against each UV/cvalue pair
-    for pk in processing_keys {
+    let try_against_mkb = |pk: &[u8; 16]| -> Option<[u8; 16]> {
         for i in 0..num_uvs {
             if (i + 1) * 16 > cvalues.len() {
                 continue;
@@ -228,12 +266,53 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
             if record_start + 5 > uvs.len() {
                 continue;
             }
-            let _u_mask_shift = uvs[record_start];
             let uv = &uvs[record_start + 1..record_start + 5];
             let cv = &cvalues[i * 16..(i + 1) * 16];
-            if let Some(mk) = validate_processing_key(pk, cv, uv, &mk_dv) {
+            if let Some(mk) = validate_processing_key(pk, cv, uv, mk_dv) {
                 return Some(mk);
             }
+        }
+        None
+    };
+
+    // Two interpretations per entry:
+    //   (a) entry IS already a terminal PK → validate directly
+    //   (b) entry is a node key (label) → derive PK via aesg3(K, 1) and validate
+    // Then descend to children's node keys via aesg3(K, 0) / aesg3(K, 2) and
+    // repeat up to max_depth levels deep.
+    for entry in processing_keys {
+        // Depth-0 attempts on the raw entry
+        if let Some(mk) = try_against_mkb(entry) {
+            return Some(mk);
+        }
+        let pk_at_node = aesg3(entry, 1);
+        if let Some(mk) = try_against_mkb(&pk_at_node) {
+            return Some(mk);
+        }
+        if max_depth == 0 {
+            continue;
+        }
+        // Walk: BFS through child node keys
+        let mut frontier: Vec<[u8; 16]> = vec![aesg3(entry, 0), aesg3(entry, 2)];
+        for depth in 1..=max_depth {
+            let mut next = Vec::with_capacity(frontier.len() * 2);
+            for nk in &frontier {
+                // Try this node's PK (label → PK at this level)
+                let pk_here = aesg3(nk, 1);
+                if let Some(mk) = try_against_mkb(&pk_here) {
+                    return Some(mk);
+                }
+                // Some leaked materials are themselves PKs at this depth, so
+                // also try the node-key bytes directly.
+                if let Some(mk) = try_against_mkb(nk) {
+                    return Some(mk);
+                }
+                if depth < max_depth {
+                    next.push(aesg3(nk, 0));
+                    next.push(aesg3(nk, 2));
+                }
+            }
+            frontier = next;
         }
     }
     None
@@ -274,6 +353,78 @@ fn validate_processing_key(
         return Some(mk);
     }
     None
+}
+
+/// Public, side-effect-free accessors over the MKB record helpers, exposed so
+/// independent reproduction harnesses (e.g. `examples/prove_hkd_aacs.rs`) can
+/// exercise the exact same parser + verify primitives the production walk uses.
+/// These are thin wrappers — no new logic.
+pub mod probe {
+    use super::aes_ecb_decrypt;
+
+    /// `mk_dv` from the MKB's Verify-Media-Key record (type 0x81 / 0x86).
+    pub fn mkb_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
+        super::mkb_find_mk_dv(mkb)
+    }
+
+    /// Body of the MKB's Subset-Difference Index record (type 0x04).
+    pub fn mkb_subdiff(mkb: &[u8]) -> Option<Vec<u8>> {
+        super::mkb_find_subdiff_records(mkb)
+    }
+
+    /// Body of the MKB's Media-Key-Data (cvalues) record. Selects record
+    /// `0x05` (the large cvalue table, 1:1 with the `0x04` Subset-Difference
+    /// index on AACS 2.x UHD MKBs), falling back to `0x07` only when `0x05`
+    /// is absent.
+    pub fn mkb_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
+        super::mkb_find_cvalues(mkb)
+    }
+
+    /// Body (header stripped) of the first MKB record of `rec_type`. Lets a
+    /// harness pin an exact record type for cross-checking the production
+    /// cvalue selection (e.g. compare record `0x05` vs `0x07` sizes).
+    pub fn mkb_record_body(mkb: &[u8], rec_type: u8) -> Option<Vec<u8>> {
+        super::find_record_body(mkb, rec_type)
+    }
+
+    /// AES-128-ECB single-block decrypt (the AACS verify primitive).
+    pub fn aes_dec(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
+        aes_ecb_decrypt(key, block)
+    }
+
+    /// Does `km` satisfy the MKB's Verify-Media-Key relation?
+    /// `AES-D(km, mk_dv)[0..8] == 01 23 45 67 89 AB CD EF`.
+    pub fn km_verifies(mkb: &[u8], km: &[u8; 16]) -> bool {
+        match super::mkb_find_mk_dv(mkb) {
+            Some(mk_dv) => {
+                aes_ecb_decrypt(km, &mk_dv)[..8] == [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+            }
+            None => false,
+        }
+    }
+
+    /// Run the exact production Subset-Difference PK walk
+    /// ([`super::derive_media_key_from_pk_walked`]) but against
+    /// CALLER-SUPPLIED record bodies — so a harness can pin a specific
+    /// Media-Key-Data table (record `0x05` on AACS 2.x UHD MKBs, which the
+    /// production `mkb_find_cvalues` now selects) and the matching `0x04`
+    /// Subset-Difference Index, across ALL entries.
+    ///
+    /// `subdiff` is the type-0x04 body (5-byte entries
+    /// `[u_mask_shift][uv:be32]`); `cvalues` is the chosen cvalue table
+    /// (16-byte entries); `mk_dv` is from the verify record. Each entry in
+    /// `keys` is tried as a terminal PK and as an SD node-key descending via
+    /// `AES-G3(K, 0|1|2)` for `max_depth` levels — identical logic to the
+    /// production walk. Returns the verified Media Key, if any.
+    pub fn walk_pk_against_tables(
+        keys: &[[u8; 16]],
+        subdiff: &[u8],
+        cvalues: &[u8],
+        mk_dv: &[u8; 16],
+        max_depth: u8,
+    ) -> Option<[u8; 16]> {
+        super::walk_pk_against_tables_impl(keys, subdiff, cvalues, mk_dv, max_depth)
+    }
 }
 
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
@@ -337,17 +488,26 @@ fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
 
 /// Find the Media Key Data Record (cvalues table) in an MKB.
 ///
-/// libaacs hard-codes record type `0x05` (matches AACS 1.0 and BD type-3/4
-/// MKBs), but on AACS 2.x Category-C MKBs the cvalues table moved to
-/// record type `0x07` and `0x05` now carries the host-revocation
-/// signature. To stay correct on both lines we prefer `0x07` first (the
-/// AACS 2.x layout used by every modern UHD disc) and fall back to
-/// `0x05` for AACS 1.0 MKBs.
+/// The cvalue table is record type `0x05` (Media Key Data) on BOTH AACS
+/// 1.0 and AACS 2.x MKBs — its 16-byte cvalue entries are 1:1 with the
+/// 5-byte Subset-Difference index entries in record `0x04`. This matches
+/// libaacs, whose `mkb_cvalues()` reads `0x05` and `mkb_subdiff_records()`
+/// reads `0x04`.
+///
+/// On AACS 2.x in-drive UHD MKBs the `0x05` table is large (the full
+/// subset-difference cvalue set: ~181k entries on a retail MKB, 1:1 with
+/// the giant `0x04` index), while record `0x07` (Explicit
+/// Subset-Difference Record) is a much smaller structure (~96 entries) and
+/// is NOT the cvalue table. An earlier version of this function preferred
+/// `0x07`, which under-tested the Subset-Difference walk on UHD discs and
+/// prevented the DK→walk path from ever finding the matching uv. The
+/// selection MUST therefore be `0x05`-first; `0x07` is only a fallback for
+/// malformed/legacy MKBs that somehow lack a `0x05` record.
 fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
-    if let Some(body) = find_record_body(mkb, 0x07) {
+    if let Some(body) = find_record_body(mkb, 0x05) {
         return Some(body);
     }
-    find_record_body(mkb, 0x05)
+    find_record_body(mkb, 0x07)
 }
 
 /// Walk an MKB and return the payload (header stripped) of the first
@@ -670,8 +830,10 @@ pub struct ResolveContext<'a> {
     /// 16-byte Volume ID from SCSI handshake. `[0u8; 16]` is the
     /// "no VID" sentinel and disables paths 1-3.
     pub volume_id: &'a [u8; 16],
-    /// Key database.
-    pub keydb: &'a KeyDb,
+    /// Key sources — checked in array order for disc-keyed lookups,
+    /// union'd across all entries for bulk material (DKs, PKs, HCs).
+    /// A keydb file, a webservice, an OEM provider can all coexist.
+    pub providers: &'a [&'a dyn super::provider::KeyProvider],
     /// MKB raw bytes (optional — paths 1/2 require it).
     pub mkb: Option<&'a [u8]>,
 }
@@ -755,14 +917,17 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         "resolve_keys_v21: starting"
     );
 
+    let providers = super::provider::Providers(ctx.providers);
+
     if has_vid {
         // Path 1: Variant chain (V21's analogue of classical Path 1's
         // DK derivation). Placeholder until KCD constant is supplied.
         if let Some(mkb) = ctx.mkb {
             let recs = super::variants::walk_mkb(mkb);
+            let all_dks = providers.device_keys();
             match super::variants::derive_media_key_variant(
                 &recs,
-                &ctx.keydb.device_keys,
+                &all_dks,
                 &super::variants::KEY_CORRECTION_DATA_PLACEHOLDER,
                 ctx.volume_id,
             ) {
@@ -785,14 +950,13 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
             }
         }
 
-        // Path 3: KEYDB MK + matching VID → derived VUK
-        for entry in ctx.keydb.disc_entries.values() {
-            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-                if did == *ctx.volume_id {
-                    let vuk = derive_vuk(&mk, ctx.volume_id);
-                    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
-                    return Some(build(Some(vuk), derive_uks(&vuk), 3));
-                }
+        // Path 3: pre-computed MK + matching VID → derived VUK.
+        // Short-circuit: first provider with a matching VID wins.
+        if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
+            if let (Some(mk), Some(_)) = (entry.media_key, entry.disc_id) {
+                let vuk = derive_vuk(&mk, ctx.volume_id);
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
+                return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
         }
     } else {
@@ -804,7 +968,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     }
 
     // Paths 4 and 5: hash lookup, prefer V over U on the same entry.
-    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
+    if let Some(entry) = providers.lookup_disc_by_hash(&uk_file.disc_hash) {
         if let Some(vuk) = entry.vuk {
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path4_hit", "VUK from KEYDB");
             return Some(build(Some(vuk), derive_uks(&vuk), 4));
@@ -881,6 +1045,8 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
         "resolve_keys: starting"
     );
 
+    let providers = super::provider::Providers(ctx.providers);
+
     // Paths 1 and 2 need both MKB and VID. Logged as a single skip when
     // either is absent so operators see one reason, not two.
     if has_vid {
@@ -900,37 +1066,36 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             );
 
             // Path 1: MKB + device keys → media key → VUK
-            if let Some(mk) = derive_media_key_from_dk(mkb, &ctx.keydb.device_keys) {
+            let all_dks = providers.device_keys();
+            if let Some(mk) = derive_media_key_from_dk(mkb, &all_dks) {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
                 tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit", "media key derived from device key");
                 return Some(build(Some(vuk), derive_uks(&vuk), 1));
             }
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", dk_count = ctx.keydb.device_keys.len(), "DK derivation failed");
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", dk_count = all_dks.len(), "DK derivation failed");
 
             // Path 2: MKB + processing keys → media key → VUK
-            if let Some(mk) = derive_media_key_from_pk(mkb, &ctx.keydb.processing_keys) {
+            let all_pks = providers.processing_keys();
+            if let Some(mk) = derive_media_key_from_pk(mkb, &all_pks) {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
                 tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "media key derived from processing key");
                 return Some(build(Some(vuk), derive_uks(&vuk), 2));
             }
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = ctx.keydb.processing_keys.len(), "PK derivation failed");
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = all_pks.len(), "PK derivation failed");
         } else {
             tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
         }
 
-        // Path 3: KEYDB MK + matching VID → derived VUK
-        let mut path3_mk_did_count = 0usize;
-        for entry in ctx.keydb.disc_entries.values() {
-            if let (Some(mk), Some(did)) = (entry.media_key, entry.disc_id) {
-                path3_mk_did_count += 1;
-                if did == *ctx.volume_id {
-                    let vuk = derive_vuk(&mk, ctx.volume_id);
-                    tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
-                    return Some(build(Some(vuk), derive_uks(&vuk), 3));
-                }
+        // Path 3: pre-computed MK + matching VID → derived VUK.
+        // Short-circuit: first provider with a matching VID wins.
+        if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
+            if let (Some(mk), Some(_)) = (entry.media_key, entry.disc_id) {
+                let vuk = derive_vuk(&mk, ctx.volume_id);
+                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
+                return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
         }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", mk_did_entries = path3_mk_did_count, "no MK+VID entry matched volume_id");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", "no MK+VID entry matched volume_id");
     } else {
         tracing::warn!(
             target: "freemkv::disc",
@@ -939,26 +1104,26 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
         );
     }
 
-    // Paths 4 and 5: single hash-table lookup, prefer V (path 4) over
+    // Paths 4 and 5: single hash-keyed lookup, prefer V (path 4) over
     // U (path 5). They are not independent checks — path 5 only fires
     // because path 4 had no VUK on the same entry.
-    if let Some(entry) = ctx.keydb.find_disc(&hash_hex) {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_hit_entry", "disc hash found in keydb");
+    if let Some(entry) = providers.lookup_disc_by_hash(&uk_file.disc_hash) {
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_hit_entry", "disc hash found in provider");
         if let Some(vuk) = entry.vuk {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "VUK from KEYDB");
+            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "VUK from provider");
             return Some(build(Some(vuk), derive_uks(&vuk), 4));
         } else if let Some(unit_keys) = match_keydb_unit_keys(&uk_file, &entry.unit_keys) {
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "resolve_keys_path5_hit",
                 uk_count = unit_keys.len(),
-                "unit keys from KEYDB (no VUK)"
+                "unit keys from provider (no VUK)"
             );
             return Some(build(None, unit_keys, 5));
         }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_no_keys", "KEYDB entry has neither VUK nor matching unit keys");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_no_keys", "provider entry has neither VUK nor matching unit keys");
     } else {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_miss", "disc hash NOT in KEYDB");
+        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_miss", "disc hash NOT found in any provider");
     }
 
     None
@@ -1241,6 +1406,53 @@ mod tests {
     }
 
     #[test]
+    fn probe_walk_pk_against_tables_accepts_planted_pk_rejects_corrupt() {
+        // Lock in the shared SD walk used by both production
+        // (`derive_media_key_from_pk_walked`) and the independent-reproduction
+        // harness (`probe::walk_pk_against_tables`). Plant a terminal PK whose
+        // derived Media Key satisfies a synthetic verify record; confirm the
+        // walk ACCEPTS it against caller-supplied SD/cvalue tables and REJECTS a
+        // 1-byte corruption.
+        use super::super::decrypt::aes_ecb_encrypt as enc;
+
+        let pk: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+
+        let mut mk_raw = mk;
+        for a in 0..4 {
+            mk_raw[12 + a] ^= uv[a];
+        }
+        let cv = enc(&pk, &mk_raw); // AES-D(pk, cv) == mk_raw
+        let mut vd = [0u8; 16];
+        vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        let mk_dv = enc(&mk, &vd); // AES-D(mk, mk_dv) starts with sentinel
+
+        // 0x04 SD body: one entry [u_mask_shift=0][uv].
+        let mut subdiff = vec![0u8];
+        subdiff.extend_from_slice(&uv);
+
+        assert_eq!(
+            probe::walk_pk_against_tables(std::slice::from_ref(&pk), &subdiff, &cv, &mk_dv, 1),
+            Some(mk),
+            "planted terminal PK must verify"
+        );
+        let mut bad = pk;
+        bad[0] ^= 0xFF;
+        assert_eq!(
+            probe::walk_pk_against_tables(std::slice::from_ref(&bad), &subdiff, &cv, &mk_dv, 1),
+            None,
+            "corrupted PK must be rejected"
+        );
+    }
+
+    #[test]
     fn validate_processing_key_round_trip_with_nonzero_uv() {
         // Synthesise a (pk, uv, mk, cvalue, mk_dv) tuple that satisfies the
         // libaacs _validate_pk relation, then confirm validate_processing_key
@@ -1294,27 +1506,179 @@ mod tests {
         assert!(validate_processing_key(&pk, &cvalue, &wrong_uv, &mk_dv).is_none());
     }
 
-    #[test]
-    fn mkb_find_cvalues_prefers_0x07_then_falls_back_to_0x05() {
-        // AACS 2.x: type 0x07 carries cvalues; 0x05 is the host-revocation
-        // signature. Mixed-record MKB → 0x07 wins.
-        let mut mkb = vec![
-            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D,
-        ];
-        // type=0x05, body = [0xAA; 4]
-        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 0xAA, 0xAA, 0xAA, 0xAA]);
-        // type=0x07, body = [0xBB; 4]
-        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x08, 0xBB, 0xBB, 0xBB, 0xBB]);
-        let body = mkb_find_cvalues(&mkb).expect("cvalues record must be found");
-        assert_eq!(body, vec![0xBB, 0xBB, 0xBB, 0xBB], "0x07 must be preferred");
+    // ── MKB cvalue-record selection (issue #259 / #281) ─────────────────
+    //
+    // The cvalue (Media Key Data) table is record 0x05; the
+    // Subset-Difference index is record 0x04. This matches libaacs
+    // (`mkb_cvalues` → 0x05, `mkb_subdiff_records` → 0x04). Record 0x07
+    // (Explicit Subset-Difference Record) is NOT the cvalue table. On real
+    // in-drive AACS 2.x UHD MKBs 0x07 is small (~96 entries) while the 0x05
+    // table is large (181270 entries, 1:1 with 0x04). An earlier
+    // `mkb_find_cvalues` preferred 0x07, which under-tested the SD walk and
+    // broke the DK→walk path. The selector must prefer 0x05.
 
-        // AACS 1.0: only 0x05 present → fall back to it.
-        let mut mkb1 = vec![
-            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    /// Build a 4-byte MKB record header (type + 3-byte big-endian total
+    /// length, header included) and append `body`.
+    fn mkb_record(rec_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = 4 + body.len();
+        let mut rec = Vec::with_capacity(total);
+        rec.push(rec_type);
+        rec.push(((total >> 16) & 0xFF) as u8);
+        rec.push(((total >> 8) & 0xFF) as u8);
+        rec.push((total & 0xFF) as u8);
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    /// Synthesize an AACS-2.x-shaped MKB carrying BOTH a small 0x07 record
+    /// and the real 0x05 cvalue table, with 0x07 placed first so a
+    /// "0x07-first" selector would pick the wrong record. The 0x05 table
+    /// has `n` 16-byte entries (1:1 with the `n`-entry 0x04 SD index); the
+    /// 0x07 decoy has `decoy` 16-byte entries.
+    fn synth_aacs2_mkb(n: usize, decoy: usize) -> Vec<u8> {
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&mkb_record(0x86, &[0xABu8; 16]));
+        let mut sd = Vec::with_capacity(n * 5);
+        for i in 0..n {
+            sd.push(0x00); // u_mask_shift, top bits clear → not revoked
+            sd.extend_from_slice(&((i as u32) + 1).to_be_bytes());
+        }
+        mkb.extend_from_slice(&mkb_record(0x04, &sd));
+        mkb.extend_from_slice(&mkb_record(0x07, &vec![0x11u8; decoy * 16])); // decoy first
+        mkb.extend_from_slice(&mkb_record(0x05, &vec![0x22u8; n * 16])); // real cvalues
+        mkb
+    }
+
+    #[test]
+    fn cvalue_selection_prefers_0x05_over_0x07() {
+        // AACS-2.x layout: large 0x05 (1:1 with 0x04) + smaller decoy 0x07
+        // placed earlier in the record stream.
+        let n = 1500;
+        let decoy = 96;
+        let mkb = synth_aacs2_mkb(n, decoy);
+
+        let sd = probe::mkb_subdiff(&mkb).expect("0x04 present");
+        let r05 = probe::mkb_record_body(&mkb, 0x05).expect("0x05 present");
+        let r07 = probe::mkb_record_body(&mkb, 0x07).expect("0x07 present");
+        let selected = mkb_find_cvalues(&mkb).expect("cvalues selected");
+
+        assert_eq!(sd.len() / 5, n, "0x04 SD index entry count");
+        assert_eq!(r05.len() / 16, n, "0x05 cvalue entry count");
+        assert_eq!(r07.len() / 16, decoy, "0x07 decoy entry count");
+
+        // The fix: selection MUST pick 0x05 (the large 1:1 table), NOT the
+        // 0x07 decoy a "0x07-first" rule would return.
+        assert_eq!(
+            selected.len() / 16,
+            n,
+            "cvalue selection must use the large 0x05 table, not the {decoy}-entry 0x07 decoy"
+        );
+        assert_eq!(
+            selected, r05,
+            "selected body must be the 0x05 record verbatim"
+        );
+        assert_eq!(
+            selected.len() / 16,
+            sd.len() / 5,
+            "cvalue table must be 1:1 with the 0x04 Subset-Difference index"
+        );
+    }
+
+    #[test]
+    fn cvalue_selection_falls_back_to_0x07_when_no_0x05() {
+        // Malformed/legacy MKB with only a 0x07 record and no 0x05: the
+        // selector falls back to 0x07 rather than returning None.
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x10, 0, 0, 0, 1]));
+        mkb.extend_from_slice(&mkb_record(0x86, &[0xCDu8; 16]));
+        mkb.extend_from_slice(&mkb_record(0x04, &[0x00, 0, 0, 0, 1]));
+        let only07 = vec![0x33u8; 16];
+        mkb.extend_from_slice(&mkb_record(0x07, &only07));
+
+        assert!(probe::mkb_record_body(&mkb, 0x05).is_none());
+        let selected = mkb_find_cvalues(&mkb).expect("falls back to 0x07");
+        assert_eq!(selected, only07, "fallback returns the 0x07 body");
+    }
+
+    /// Locate a captured MKB research sample, if the private research tree
+    /// is checked out alongside the crate. Returns `None` (skip) otherwise.
+    fn mkb_sample(rel: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()? // freemkv/
+            .join("(internal)/research/aacs/mkb-samples")
+            .join(rel);
+        if p.exists() { Some(p) } else { None }
+    }
+
+    #[test]
+    fn real_aacs2_samples_select_large_0x05_not_small_0x07() {
+        // Real in-drive AACS 2.x UHD MKBs (Wicked / Civil War / MOVIE)
+        // carry BOTH a small 0x07 Explicit-Subset-Difference record (96
+        // 16-byte entries) AND the large 0x05 Media Key Data / cvalue table
+        // (181270 entries, 1:1 with the 0x04 index). The production selector
+        // must return the LARGE 0x05 body, not the small 0x07 one. This is
+        // the exact regression #259 found. Skips when the research tree is
+        // absent.
+        let samples = [
+            "wicked/MKB_RO.inf",
+            "civilwar-uhd/MKB_RO.inf",
+            "movie-uhd-2.1/MKB_RO.inf",
         ];
-        mkb1.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 0xCC, 0xCC, 0xCC, 0xCC]);
-        let body = mkb_find_cvalues(&mkb1).expect("0x05 fallback must work for AACS 1.0");
-        assert_eq!(body, vec![0xCC, 0xCC, 0xCC, 0xCC]);
+        let mut checked = 0;
+        for rel in samples {
+            let path = match mkb_sample(rel) {
+                Some(p) => p,
+                None => continue,
+            };
+            let data = std::fs::read(&path).expect("read sample MKB");
+
+            let r05 = probe::mkb_record_body(&data, 0x05)
+                .unwrap_or_else(|| panic!("{rel}: expected a 0x05 Media Key Data record"));
+            let r07 = probe::mkb_record_body(&data, 0x07)
+                .unwrap_or_else(|| panic!("{rel}: expected a 0x07 record"));
+            let sd = probe::mkb_subdiff(&data)
+                .unwrap_or_else(|| panic!("{rel}: expected a 0x04 Subset-Difference index"));
+
+            let n05 = r05.len() / 16;
+            let n07 = r07.len() / 16;
+
+            // The discriminating facts the bug report cited.
+            assert!(
+                n05 > n07 * 100,
+                "{rel}: 0x05 ({n05}) must dwarf 0x07 ({n07})"
+            );
+            assert_eq!(n05, 181270, "{rel}: full 0x05 cvalue table size");
+            assert_eq!(n07, 96, "{rel}: small 0x07 record size");
+
+            // Production selection must be the large 0x05 table.
+            let selected = mkb_find_cvalues(&data)
+                .unwrap_or_else(|| panic!("{rel}: cvalue selection returned None"));
+            assert_eq!(
+                selected, r05,
+                "{rel}: selector must return the large 0x05 body, not 0x07"
+            );
+
+            // And it is 1:1 with the 0x04 SD index the walk iterates: the
+            // walk's UV count (take_while top-2-bits clear) lines up with
+            // the cvalue count to within the trailing padding entry.
+            let uv_entries = sd
+                .chunks(5)
+                .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
+                .count();
+            assert!(
+                uv_entries >= n05 - 2 && uv_entries <= n05,
+                "{rel}: 0x04 UV count ({uv_entries}) should match 0x05 cvalue count ({n05})"
+            );
+
+            eprintln!(
+                "{rel}: 0x05={n05} cvalues, 0x07={n07}, 0x04 UVs={uv_entries} — selected 0x05"
+            );
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("no MKB samples present; skipping real-sample assertion");
+        }
     }
 
     #[test]
@@ -1414,11 +1778,12 @@ mod tests {
         );
         keydb.processing_keys.push([0u8; 16]);
 
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &zero_vid,
-            keydb: &keydb,
+            providers,
             mkb: None,
         };
         let result = resolve_keys_v1(&ctx);
@@ -1455,11 +1820,12 @@ mod tests {
         );
 
         let vid = [0u8; 16];
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &vid,
-            keydb: &keydb,
+            providers,
             mkb: None,
         };
         let resolved =
@@ -1495,11 +1861,12 @@ mod tests {
         );
 
         let vid = [0u8; 16];
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &vid,
-            keydb: &keydb,
+            providers,
             mkb: None,
         };
         let resolved =
@@ -1535,11 +1902,12 @@ mod tests {
         );
 
         let vid = [0u8; 16];
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &vid,
-            keydb: &keydb,
+            providers,
             mkb: None,
         };
         assert!(

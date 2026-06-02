@@ -236,7 +236,7 @@ impl Disc {
         // optical drives) responds by entering a fast-fail firmware
         // wedge state where every subsequent CDB returns
         // ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB (sense 05/24) until
-        // power-cycled. Hit live on rip1 2026-05-20 during a Barbie
+        // power-cycled. Hit live on rip1 2026-05-20 during a MOVIE
         // UHD scan: KEYDB miss → 16 cert attempts in a tight loop →
         // wedge → forced host reboot + drive disconnect to recover.
         //
@@ -424,11 +424,12 @@ impl Disc {
             Some(s) => s,
             None => return Err(miss_error),
         };
+        let providers: &[&dyn aacs::KeyProvider] = &[&keydb];
         let aacs_ctx = aacs::ResolveContext {
             unit_key_ro: &uk_ro_data,
             content_cert: cc_data.as_deref(),
             volume_id: &volume_id,
-            keydb: &keydb,
+            providers,
             mkb: mkb_data.as_deref(),
         };
         let mut ctx = DrmContext {
@@ -464,6 +465,68 @@ impl Disc {
             unit_keys: resolved.unit_keys,
             read_data_key,
             volume_id,
+        })
+    }
+
+    /// Resolve encryption from a caller-supplied Unit Key (the keyserver
+    /// path). No keydb, no derivation: read `Unit_Key_RO.inf` for the disc
+    /// hash + version/bus-encryption flags, then use `unit_key` directly as
+    /// CPS unit 1's decryption key. The handshake (if any) still supplies the
+    /// volume ID and AACS 2.0 read-data key for bus decryption.
+    pub(super) fn resolve_encryption_static(
+        udf_fs: &udf::UdfFs,
+        reader: &mut dyn SectorSource,
+        unit_key: [u8; 16],
+        handshake: Option<&HandshakeResult>,
+    ) -> Result<AacsState> {
+        use crate::aacs;
+
+        let uk_ro_data = udf_fs
+            .read_file(reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let dh = aacs::disc_hash(&uk_ro_data);
+
+        let cc = udf_fs
+            .read_file(reader, "/AACS/Content000.cer")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
+            .ok()
+            .as_deref()
+            .and_then(aacs::parse_content_cert);
+        let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
+        let version = match cc.as_ref().map(|c| c.version) {
+            Some(aacs::AacsVersion::V10) => 1,
+            Some(_) => 2,
+            None if bus_encryption => 2,
+            None => 1,
+        };
+
+        let mkb_ver = udf_fs
+            .read_file(reader, "/AACS/MKB_RW.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
+            .ok()
+            .as_deref()
+            .and_then(aacs::mkb_version);
+
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "scan_aacs_external_uk",
+            disc_hash = %aacs::disc_hash_hex(&dh),
+            version,
+            bus_encryption,
+            "using caller-supplied unit key (keyserver path)"
+        );
+
+        Ok(AacsState {
+            version,
+            bus_encryption,
+            mkb_version: mkb_ver,
+            disc_hash: aacs::disc_hash_hex(&dh),
+            key_source: KeySource::ExternalUk,
+            vuk: None,
+            unit_keys: vec![(1, unit_key)],
+            read_data_key: handshake.and_then(|h| h.read_data_key),
+            volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
         })
     }
 }

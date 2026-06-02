@@ -163,6 +163,9 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
 #[derive(Default)]
 pub struct InputOptions {
     pub keydb_path: Option<String>,
+    /// Caller-supplied Unit Key (keyserver path) — the second, mutually
+    /// exclusive key source. Takes precedence over `keydb_path`.
+    pub unit_key: Option<[u8; 16]>,
     pub title_index: Option<usize>,
     /// Skip decryption — return raw encrypted bytes.
     pub raw: bool,
@@ -181,11 +184,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
-            let scan_opts = match &opts.keydb_path {
-                Some(p) => crate::disc::ScanOptions {
-                    keydb_path: Some(p.into()),
-                },
-                None => crate::disc::ScanOptions::default(),
+            let scan_opts = crate::disc::ScanOptions {
+                keydb_path: opts.keydb_path.as_ref().map(Into::into),
+                unit_key: opts.unit_key,
             };
             // FileSectorSource is the sole file-backed sector source.
             // It carries the platform-tuned SEQUENTIAL fadvise hint

@@ -81,7 +81,7 @@ No behavioural change — purely a rename pass.
   AACS cert handshake and issued `READ_DISC_STRUCTURE` format 0x80
   with AGID=0 directly. The hypothesis was that firmware-uploaded
   drives would serve VID without auth. Empirical test on rip1 (BU40N
-  + Barbie UHD, 2026-05-21) showed the drive returns
+  + MOVIE UHD, 2026-05-21) showed the drive returns
   `0x05 / 0x6F / 0x02` (`ILLEGAL_REQUEST / Copy protection key
   exchange failure: KEY NOT ESTABLISHED`) to that CDB regardless of
   firmware-upload state. The AACS spec requires a successful
@@ -89,7 +89,7 @@ No behavioural change — purely a rename pass.
   format 0x80 returns VID; that requirement is enforced by the drive
   itself and isn't bypassed by libredrive firmware. The shortcut
   fired for every libredrive-active drive, so v0.25.11 / v0.25.12
-  Barbie scans were stuck at E7017 instead of progressing to the
+  MOVIE scans were stuck at E7017 instead of progressing to the
   real wall (no DK walks MKB v77).
 - `Disc::do_handshake` now always routes through `do_handshake_cert`.
   `Drive::is_libredrive_active()` and the Mt1959 MMkv+LbDr marker
@@ -224,7 +224,7 @@ a fast-fail firmware wedge state where every subsequent CDB returns
 `ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB` (sense 0x05/0x24) until the
 drive is physically power-cycled.
 
-Live wedge event on rip1 2026-05-20 during a Barbie UHD scan
+Live wedge event on rip1 2026-05-20 during a MOVIE UHD scan
 (KEYDB miss) confirmed the diagnosis and motivated this fix.
 
 Defence-in-depth:

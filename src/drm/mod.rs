@@ -246,11 +246,12 @@ mod tests {
         let uk_ro = vec![0u8; 256];
         let vid = [0u8; 16];
         let keydb = aacs::KeyDb::empty();
+        let providers: &[&dyn aacs::KeyProvider] = &[&keydb];
         let ctx_aacs = aacs::ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &vid,
-            keydb: &keydb,
+            providers,
             mkb: None,
         };
         let mut ctx = DrmContext {
@@ -272,12 +273,13 @@ mod tests {
         let uk_ro = vec![0u8; 256];
         let vid = [0xAAu8; 16];
         let keydb = aacs::KeyDb::empty();
+        let providers: &[&dyn aacs::KeyProvider] = &[&keydb];
         let mkb = mkb_with_variant();
         let ctx = aacs::ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &vid,
-            keydb: &keydb,
+            providers,
             mkb: Some(&mkb),
         };
         // Just confirm the symbol is callable; we don't assert on the

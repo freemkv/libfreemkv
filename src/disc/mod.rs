@@ -912,6 +912,9 @@ pub enum KeySource {
     /// Pre-decrypted unit keys taken directly from KEYDB by disc hash.
     /// No VUK present in the entry — `AacsState::vuk` is `None`.
     KeyDbUnitKeys,
+    /// Unit key supplied directly by the caller (the keyserver path).
+    /// No keydb, no derivation — `AacsState::vuk` is `None`.
+    ExternalUk,
 }
 
 impl KeySource {
@@ -922,6 +925,7 @@ impl KeySource {
             KeySource::KeyDbDerived => "KEYDB (derived)",
             KeySource::KeyDb => "KEYDB",
             KeySource::KeyDbUnitKeys => "KEYDB (unit keys)",
+            KeySource::ExternalUk => "external UK",
         }
     }
 }
@@ -941,6 +945,13 @@ pub struct ScanOptions {
     /// Path to KEYDB.cfg for AACS key lookup.
     /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
     pub keydb_path: Option<std::path::PathBuf>,
+    /// Caller-supplied Unit Key — the second, mutually-exclusive key source
+    /// (the online-keyserver path). When set, libfreemkv skips keydb lookup
+    /// and all derivation and uses this key directly to decrypt. Takes
+    /// precedence over `keydb_path` if both are set. The caller obtains it
+    /// however it likes (e.g. POSTing the disc's `Unit_Key_RO.inf` + MKB to a
+    /// keyserver); libfreemkv stays free of any network dependency.
+    pub unit_key: Option<[u8; 16]>,
 }
 
 impl ScanOptions {
@@ -1140,6 +1151,26 @@ impl Disc {
         Self::scan_with(reader, capacity, None, None, opts, udf_fs)
     }
 
+    /// Read a disc's AACS key-input files from an ISO image: returns
+    /// `(Unit_Key_RO.inf, MKB)` raw bytes. For callers that resolve keys
+    /// out-of-band (the keyserver path) — POST these to the keyserver, get the
+    /// Unit Key, then scan with `ScanOptions { unit_key: Some(uk), .. }`.
+    /// libfreemkv itself never makes the network call.
+    pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut reader = crate::io::file_sector_source::FileSectorSource::open(iso_path)
+            .map_err(|_| Error::AacsNoKeys)?;
+        let udf_fs = udf::read_filesystem(&mut reader)?;
+        let inf = udf_fs
+            .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let mkb = udf_fs
+            .read_file(&mut reader, "/AACS/MKB_RW.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        Ok((inf, mkb))
+    }
+
     /// Core scan pipeline — works with any SectorSource.
     ///
     /// `handshake_error` is plumbed from `do_handshake` so failures
@@ -1159,7 +1190,16 @@ impl Disc {
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
 
-        let (aacs, aacs_error) = if encrypted {
+        let (aacs, aacs_error) = if !encrypted {
+            (None, None)
+        } else if let Some(unit_key) = opts.unit_key {
+            // Second key source: caller supplied the Unit Key directly
+            // (keyserver path). Skip keydb entirely.
+            match Self::resolve_encryption_static(&udf_fs, reader, unit_key, handshake.as_ref()) {
+                Ok(state) => (Some(state), None),
+                Err(e) => (None, Some(e)),
+            }
+        } else {
             match opts.resolve_keydb() {
                 Some(keydb_path) => {
                     match Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref())
@@ -1207,8 +1247,6 @@ impl Disc {
                     (None, Some(final_err))
                 }
             }
-        } else {
-            (None, None)
         };
 
         // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)

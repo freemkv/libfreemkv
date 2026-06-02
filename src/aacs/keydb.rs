@@ -117,10 +117,19 @@ impl KeyDb {
                 continue;
             }
 
-            // Device Key
+            // Device Key.
+            // Two shapes are accepted:
+            //   1. Positioned DK: `| DK | DEVICE_KEY 0x... | DEVICE_NODE 0x... | KEY_UV 0x... | KEY_U_MASK_SHIFT 0x...`
+            //      → loaded into `device_keys` (deterministic tree walk via `calc_pk_from_dk`).
+            //   2. Orphan DK: `| DK | DEVICE_KEY 0x...` with no position fields.
+            //      → loaded into `processing_keys` (brute walker / terminal validation).
+            // Per AACS spec a "PK" IS a DK at terminal position, so both row types
+            // are DKs in the unified model; only the metadata differs.
             if line.starts_with("| DK") {
                 if let Some(dk) = Self::parse_device_key(line) {
                     db.device_keys.push(dk);
+                } else if let Some(key) = Self::parse_orphan_dk(line) {
+                    db.processing_keys.push(key);
                 }
                 continue;
             }
@@ -195,8 +204,46 @@ impl KeyDb {
             .or_else(|| self.disc_entries.get(&hash))
     }
 
-    // ── Parsers ─────────────────────────────────────────────────────────────
+    /// Iterate every disc entry. Used by Path 3 (scan for matching VID).
+    pub fn iter_disc_entries(&self) -> impl Iterator<Item = &DiscEntry> {
+        self.disc_entries.values()
+    }
+}
 
+// ── KeyProvider impl ──────────────────────────────────────────────────────────
+//
+// Lets `KeyDb` plug into `resolve_keys` via the trait. Cloning happens in the
+// bulk methods because the trait returns owned `Vec`s (so HTTP-backed providers
+// don't need to retain state across calls).
+
+impl super::provider::KeyProvider for KeyDb {
+    fn device_keys(&self) -> Vec<DeviceKey> {
+        self.device_keys.clone()
+    }
+    fn processing_keys(&self) -> Vec<[u8; 16]> {
+        self.processing_keys.clone()
+    }
+    fn host_certs(&self) -> Vec<HostCert> {
+        self.host_certs.clone()
+    }
+    fn lookup_disc_by_hash(&self, disc_hash: &[u8; 20]) -> Option<DiscEntry> {
+        let mut hex = String::with_capacity(42);
+        hex.push_str("0x");
+        for b in disc_hash {
+            hex.push_str(&format!("{b:02X}"));
+        }
+        self.find_disc(&hex).cloned()
+    }
+    fn lookup_disc_by_vid(&self, volume_id: &[u8; 16]) -> Option<DiscEntry> {
+        self.iter_disc_entries()
+            .find(|e| matches!(e.disc_id, Some(id) if &id == volume_id))
+            .cloned()
+    }
+}
+
+// ── Private parsers (re-open the inherent impl) ─────────────────────────────
+
+impl KeyDb {
     fn parse_device_key(line: &str) -> Option<DeviceKey> {
         // | DK | DEVICE_KEY 0x... | DEVICE_NODE 0x... | KEY_UV 0x... | KEY_U_MASK_SHIFT 0x...
         let key_str = line.split("DEVICE_KEY").nth(1)?.split('|').next()?.trim();
@@ -227,6 +274,30 @@ impl KeyDb {
             return parse_hex16(key_str);
         }
         None
+    }
+
+    /// Parse an orphan DK row: a `| DK |` line carrying only the
+    /// `DEVICE_KEY` field (no position metadata). The key is then
+    /// treated like a terminal/unpositioned label by the resolver
+    /// (Path 2's brute walker). Returns `None` if the line carries
+    /// any position field — those are positioned DKs and parsed by
+    /// [`Self::parse_device_key`] instead.
+    fn parse_orphan_dk(line: &str) -> Option<[u8; 16]> {
+        if line.contains("DEVICE_NODE")
+            || line.contains("KEY_UV")
+            || line.contains("KEY_U_MASK_SHIFT")
+        {
+            return None;
+        }
+        let key_str = line
+            .split("DEVICE_KEY")
+            .nth(1)?
+            .split('|')
+            .next()?
+            .split(';')
+            .next()?
+            .trim();
+        parse_hex16(key_str)
     }
 
     fn parse_host_cert(line: &str) -> Option<HostCert> {
@@ -392,6 +463,47 @@ mod tests {
         let dk = KeyDb::parse_device_key(line).unwrap();
         assert_eq!(dk.node, 0x0800);
         assert_eq!(dk.u_mask_shift, 0x17);
+    }
+
+    #[test]
+    fn test_orphan_dk_row_loads_into_processing_keys() {
+        // `| DK |` row without position fields = an orphan DK. Per the
+        // unified model the resolver treats it like a terminal/PK
+        // candidate: it lands in `processing_keys` and the brute walker
+        // handles it.
+        let cfg = r#"
+| DK | DEVICE_KEY ***REMOVED*** ; orphan from HKD\x02 corpus
+| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
+| PK | ***REMOVED*** ; legacy PK row still works
+"#;
+        let db = KeyDb::parse(cfg);
+        assert_eq!(
+            db.device_keys.len(),
+            1,
+            "positioned DK row should land in device_keys"
+        );
+        // Orphan DK + legacy PK row both end up in processing_keys.
+        assert_eq!(
+            db.processing_keys.len(),
+            2,
+            "orphan DK row + legacy PK row both belong in processing_keys"
+        );
+        assert_eq!(db.processing_keys[0][..4], [0xC5, 0xDD, 0xB5, 0xB4]);
+        assert_eq!(db.processing_keys[1][..4], [0x76, 0xDD, 0xD7, 0x09]);
+    }
+
+    #[test]
+    fn test_parse_orphan_dk_rejects_lines_with_position_fields() {
+        // The parser must NOT pick up a positioned DK row as an orphan
+        // (that would double-count). parse_orphan_dk explicitly checks.
+        let positioned = "| DK | DEVICE_KEY ***REMOVED*** | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17";
+        assert!(
+            KeyDb::parse_orphan_dk(positioned).is_none(),
+            "positioned DK must not match orphan parser"
+        );
+        let orphan = "| DK | DEVICE_KEY ***REMOVED***";
+        let key = KeyDb::parse_orphan_dk(orphan).expect("orphan should parse");
+        assert_eq!(key[..4], [0xC5, 0xDD, 0xB5, 0xB4]);
     }
 
     #[test]

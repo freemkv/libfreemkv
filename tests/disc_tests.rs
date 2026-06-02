@@ -135,6 +135,7 @@ fn scan_options_default() {
 fn scan_options_with_keydb() {
     let opts = ScanOptions {
         keydb_path: Some(("/tmp/KEYDB.cfg").into()),
+        ..Default::default()
     };
     assert_eq!(
         opts.keydb_path.as_ref().unwrap().to_str().unwrap(),
@@ -147,6 +148,7 @@ fn scan_options_with_keydb_pathbuf() {
     let path = std::path::PathBuf::from("/home/user/.config/aacs/KEYDB.cfg");
     let opts = ScanOptions {
         keydb_path: Some(path.clone()),
+        ..Default::default()
     };
     assert_eq!(opts.keydb_path.unwrap(), path);
 }
@@ -517,6 +519,7 @@ fn resolve_encryption_no_keydb() {
     // No keydb configured and no standard keydb on the system
     let opts = ScanOptions {
         keydb_path: Some(("/nonexistent/path/KEYDB.cfg").into()),
+        ..Default::default()
     };
     let disc = Disc::scan_image(&mut reader, 1000, &opts).unwrap();
 
