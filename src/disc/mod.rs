@@ -951,11 +951,21 @@ pub struct ScanOptions {
     /// obtains the key however it likes; libfreemkv stays free of any network
     /// dependency.
     pub unit_key: Option<[u8; 16]>,
+    /// Disable KEYDB entirely: skip both the explicit `keydb_path` and the
+    /// standard-location search, so no keydb is loaded for this scan. A caller
+    /// that resolves keys out-of-band (e.g. a remote key service) sets this so
+    /// a keydb that merely happens to sit in a default location does not shadow
+    /// the out-of-band path. `unit_key` still takes precedence over everything.
+    pub disable_keydb: bool,
 }
 
 impl ScanOptions {
     /// Resolve KEYDB path: explicit path first, then standard locations.
+    /// Returns `None` when `disable_keydb` is set — no keydb is consulted.
     fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
+        if self.disable_keydb {
+            return None;
+        }
         if let Some(p) = &self.keydb_path {
             if p.exists() {
                 return Some(p.clone());

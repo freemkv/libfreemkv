@@ -187,6 +187,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             let scan_opts = crate::disc::ScanOptions {
                 keydb_path: opts.keydb_path.as_ref().map(Into::into),
                 unit_key: opts.unit_key,
+                ..Default::default()
             };
             // FileSectorSource is the sole file-backed sector source.
             // It carries the platform-tuned SEQUENTIAL fadvise hint
