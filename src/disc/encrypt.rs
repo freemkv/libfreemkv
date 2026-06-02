@@ -529,4 +529,67 @@ impl Disc {
             volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
         })
     }
+
+    /// Build a keys-free AACS state that carries only the Volume ID (+ version
+    /// metadata), for callers that resolve Unit Keys out-of-band and have
+    /// disabled the local keydb. The VID is on-disc content read during the
+    /// handshake; preserving it here lets the out-of-band path use it. No keys
+    /// are present (`unit_keys` empty, `vuk` None), so the disc reports as
+    /// "encrypted, no keys" until the caller re-scans with a resolved Unit Key.
+    pub(super) fn resolve_vid_only(
+        udf_fs: &udf::UdfFs,
+        reader: &mut dyn SectorSource,
+        handshake: Option<&HandshakeResult>,
+    ) -> Result<AacsState> {
+        use crate::aacs;
+
+        let uk_ro_data = udf_fs
+            .read_file(reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let dh = aacs::disc_hash(&uk_ro_data);
+
+        let cc = udf_fs
+            .read_file(reader, "/AACS/Content000.cer")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
+            .ok()
+            .as_deref()
+            .and_then(aacs::parse_content_cert);
+        let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
+        let version = match cc.as_ref().map(|c| c.version) {
+            Some(aacs::AacsVersion::V10) => 1,
+            Some(_) => 2,
+            None if bus_encryption => 2,
+            None => 1,
+        };
+        // MKB_RO is the correctly-sized copy; avoid reading the padded RW region.
+        let mkb_ver = udf_fs
+            .read_file(reader, "/AACS/MKB_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
+            .ok()
+            .as_deref()
+            .and_then(aacs::mkb_version);
+
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "scan_aacs_vid_only",
+            disc_hash = %aacs::disc_hash_hex(&dh),
+            version,
+            bus_encryption,
+            has_vid = handshake.is_some(),
+            "keydb disabled — carrying VID only, keys resolved out-of-band"
+        );
+
+        Ok(AacsState {
+            version,
+            bus_encryption,
+            mkb_version: mkb_ver,
+            disc_hash: aacs::disc_hash_hex(&dh),
+            key_source: KeySource::ExternalUk,
+            vuk: None,
+            unit_keys: vec![],
+            read_data_key: handshake.and_then(|h| h.read_data_key),
+            volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
+        })
+    }
 }

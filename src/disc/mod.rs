@@ -1173,9 +1173,12 @@ impl Disc {
             .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
+        // Prefer MKB_RO: it's the real, correctly-sized MKB. MKB_RW is a
+        // fixed ~128 MiB rewritable region that is mostly zero padding — reading
+        // it ships 124 MiB of nothing. Fall back to RW only if RO is absent.
         let mkb = udf_fs
-            .read_file(&mut reader, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RO.inf"))
+            .read_file(&mut reader, "/AACS/MKB_RO.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
         Ok((inf, mkb))
     }
@@ -1191,9 +1194,12 @@ impl Disc {
             .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
+        // Prefer MKB_RO: it's the real, correctly-sized MKB. MKB_RW is a
+        // fixed ~128 MiB rewritable region that is mostly zero padding — reading
+        // it ships 124 MiB of nothing. Fall back to RW only if RO is absent.
         let mkb = udf_fs
-            .read_file(&mut reader, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RO.inf"))
+            .read_file(&mut reader, "/AACS/MKB_RO.inf")
+            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
         Ok((inf, mkb))
     }
@@ -1223,6 +1229,15 @@ impl Disc {
             // Second key source: caller supplied the Unit Key directly
             // (external Unit Key). Skip keydb entirely.
             match Self::resolve_encryption_static(&udf_fs, reader, unit_key, handshake.as_ref()) {
+                Ok(state) => (Some(state), None),
+                Err(e) => (None, Some(e)),
+            }
+        } else if opts.disable_keydb {
+            // Keydb disabled: keys are resolved out-of-band. Still capture the
+            // VID (read during the handshake) so the out-of-band path has it;
+            // carry no keys (disc reports "encrypted, no keys" until re-scanned
+            // with a resolved Unit Key).
+            match Self::resolve_vid_only(&udf_fs, reader, handshake.as_ref()) {
                 Ok(state) => (Some(state), None),
                 Err(e) => (None, Some(e)),
             }
