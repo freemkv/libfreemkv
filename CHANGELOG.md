@@ -79,12 +79,12 @@ No behavioural change — purely a rename pass.
 - **Libredrive raw-read VID shortcut deleted.** v0.25.11 introduced a
   `do_handshake` branch that, on libredrive-active drives, skipped the
   AACS cert handshake and issued `READ_DISC_STRUCTURE` format 0x80
-  with AGID=0 directly. The hypothesis was that firmware-uploaded
-  drives would serve VID without auth. Empirical test on rip1 (BU40N
-  + MOVIE UHD, 2026-05-21) showed the drive returns
+  with AGID=0 directly. The hypothesis was that unlocked
+  drives would serve VID without auth. Empirical test (BU40N
+  + UHD disc, 2026-05-21) showed the drive returns
   `0x05 / 0x6F / 0x02` (`ILLEGAL_REQUEST / Copy protection key
   exchange failure: KEY NOT ESTABLISHED`) to that CDB regardless of
-  firmware-upload state. The AACS spec requires a successful
+  drive-unlock state. The AACS spec requires a successful
   `REPORT_KEY` / `SEND_KEY` exchange to establish an AGID before
   format 0x80 returns VID; that requirement is enforced by the drive
   itself and isn't bypassed by libredrive firmware. The shortcut
@@ -98,7 +98,7 @@ No behavioural change — purely a rename pass.
 - `read_volume_id_libredrive` deleted (~50 LOC).
 
 The corollary: AACS resolution on HRL-burned drives + UHD discs now
-fails honestly. Either cert auth succeeds (firmware-upload may or
+fails honestly. Either cert auth succeeds (drive unlock may or
 may not bypass the HRL — that's the new empirical question) and we
 hit the actual DK wall (E7018 "No DK that walks this MKB" for v77+
 UHD without a v77+ DK in keydb), or cert auth fails and we surface
@@ -224,7 +224,7 @@ a fast-fail firmware wedge state where every subsequent CDB returns
 `ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB` (sense 0x05/0x24) until the
 drive is physically power-cycled.
 
-Live wedge event on rip1 2026-05-20 during a MOVIE UHD scan
+Live wedge event 2026-05-20 during a UHD disc scan
 (KEYDB miss) confirmed the diagnosis and motivated this fix.
 
 Defence-in-depth:
@@ -335,7 +335,7 @@ runs on the caller's thread. Communication between stages is via
 bounded `crossbeam_channel` with a recycled buffer pool — no
 allocations or memcpys in the steady-state hot loop.
 
-**Throughput on the rip1 testbed (Civil_War UHD, 62 GiB ISO →
+**Throughput on the test bed (a UHD disc, 62 GiB ISO →
 `null://`, single-thread caller):**
 
 |                                       |   MB/s |
@@ -485,8 +485,7 @@ in-tree consumers (autorip, the `freemkv` CLI) drove their own multipass
 loops in 0.18 rounds 1-3; 0.18.1 lands the cleanup with the deprecated names
 still alive for one minor-version window.
 
-The 0.18 design notes are in
-`(internal)/memory/0_18_redesign.md` (private) — this entry sticks to
+The 0.18 design notes are kept privately — this entry sticks to
 what changed at the public surface.
 
 #### Flat verbs
@@ -766,7 +765,7 @@ recovery.
   `READ_RECOVERY_TIMEOUT_MS = 60_000` (the v0.17.3 baseline; the kernel-
   auto-retry pattern is now provided by the `/dev/sr0` fallback above).
 
-### Empirical results (Dune Part Two UHD, BU40N direct SATA)
+### Empirical results (a UHD disc, BU40N direct SATA)
 
 - Pass 1: **94.6 MB recovered** (28% of formerly-bad data, 33 sr0 fallback
   saves), **11 s of main-title content** restored. Patch completed all 47
@@ -894,7 +893,7 @@ bridges (notably the Initio INIC-1618L) that crash on MEDIUM ERROR retries.
 - Patch instrumentation: counters for reads_ok/err, writes_ok/err, finished/unreadable.
 - `as_encoded_bytes()` replaces `as_bytes()` for portable OsStr handling.
 - Removed inline retry/reset from Drive::read — orchestration layer handles recovery.
-- Removed all `(internal)` references from public code.
+- Removed all internal references from public code.
 
 ## 0.13.26 (2026-04-27)
 
@@ -922,7 +921,7 @@ warnings` red on Linux CI that the Mac toolchain doesn't catch.
 
 ### Pre-commit gate uses CI's exact toolchain
 
-`(internal)/scripts/precommit.sh` (new) runs `cargo +1.86 fmt
+A new pre-commit script runs `cargo +1.86 fmt
 --check`, `cargo +1.86 clippy -- -D warnings`, and `cargo +1.86 test
 --tests` across all 5 freemkv crates. Mirrors each repo's
 `.github/workflows/ci.yml` step-for-step. Use it as a pre-commit hook
@@ -964,7 +963,7 @@ Through the entire 0.13.x line, every CHECK CONDITION reply from the
 drive (the standard way SCSI reports a sector failure) was being
 collapsed into a synthetic `status=0xFF, sense_key=0` "transport
 wedge" sentinel and the real sense data was thrown away. Live tracing
-on the BU40N reading Dune 2 on 2026-04-27 confirmed it: the drive was
+on the BU40N reading a UHD disc on 2026-04-27 confirmed it: the drive was
 returning `host_status=0, driver_status=8, status=2, exec_elapsed_ms=1416`
 on every bad sector — a clean CHECK CONDITION carrying full sense
 data — and the library was misclassifying it as a wedge and bailing.
@@ -1036,7 +1035,7 @@ recovered or marked Unreadable. Calibration data
 
 ### Replace bisect-on-fail with hysteresis state machine (Block ↔ Single)
 
-Live test on Dune 2 v0.13.21 showed bisect-on-fail recovered every
+Live test on a UHD disc v0.13.21 showed bisect-on-fail recovered every
 recoverable sector, but spent ~30 sec per damaged 60-block (paying a
 ~5 sec kernel timeout at every bisection level). Each level descended
 log₂(60) ≈ 6 times on the failing branch.
@@ -1065,7 +1064,7 @@ Per-block cost on a 60-sector damaged block with 1 bad sector:
 
 Plus inside a damaged cluster spanning many 60-blocks, hysteresis
 pays the bpt=batch fail cost ONCE on entry; bisection paid it every
-60 sectors. For Dune 2's ~1248-sector boundary cluster that's ~21
+60 sectors. For the ~1248-sector boundary cluster that's ~21
 fewer 5-sec waits = ~100 sec saved.
 
 Telemetry: new `phase=mode_change` trace event with `from`, `to`,
@@ -1083,8 +1082,7 @@ synthetic BU40N-pattern reader; same 100% recovery expectation.
 ### Fix: Disc::copy bisect-on-fail (replaces skip-forward)
 
 Empirical live-hardware testing on the LG BU40N (see
-`(internal)/docs/audits/2026-04-26-test-plan-audit.md` and the
-TEST_PLAN.md run log) revealed that the drive often **fails
+the internal test-plan audit and run log) revealed that the drive often **fails
 multi-sector READ commands** in damaged regions but **succeeds when
 asked one sector at a time**. The old skip-forward strategy responded
 to multi-sector failures by jumping up to 1 % of the disc forward,
@@ -1096,7 +1094,7 @@ half, retry each half, recurse down to single-sector reads. Sectors
 the drive can read individually are recovered in Pass 1; only sectors
 that fail at bpt=1 are marked NonTrimmed for the patch passes.
 
-Empirical results on Dune 2 UHD on the BU40N:
+Empirical results on a UHD disc on the BU40N:
 - Old algorithm: 25 GB read in Pass 1, then ~6 GB skip-forwarded;
   retry passes failed to recover most of the skipped zone.
 - New algorithm: ~99 % of disc recovered in Pass 1; only the truly
@@ -1138,7 +1136,7 @@ LUN/BUS/HOST reset. `READ_RECOVERY_TIMEOUT_MS` (60 s) unchanged.
 `ioctl(fd, SG_IO, &hdr)`. The old pattern abandoned slow-but-alive
 commands faster than the drive could drain its internal queue,
 deepening the BU40N wedge. Per the audit at
-`(internal)/docs/audits/2026-04-26-scsi-architecture-research.md`,
+internal SCSI-architecture research,
 no reference project (MakeMKV / sg_dd / ddrescue) does what we did —
 all use sync blocking SG_IO with 8-60 s timeouts and let the kernel's
 mid-layer (`scsi_eh.rst`) run ABORT TASK / LUN RESET / BUS RESET /
@@ -1265,7 +1263,7 @@ clean reads (Finished sectors) and freezes during skip-forward bad zones,
 which made every previous version's UI look hung at the bad-zone boundary.
 This was the v0.13.9 stall-guard origin bug.
 
-Live trace from v0.13.14: Pass 1 hit a Dune 2 bad zone at 24 GB and
+Live trace from v0.13.14: Pass 1 hit a bad zone at 24 GB and
 appeared "stuck" for 14 minutes per autorip's UI (`bytes_good = 23.97 GB`
 unchanged). Disc trace events showed `pos` actually advanced from 25.8 GB
 to 70 GB during that window — Pass 1 was 83 % through the disc, marking
@@ -1313,7 +1311,7 @@ trace events were silently dropped by the default `libfreemkv=warn` rule.
 
 ### Telemetry: instrument the rip pipeline for in-flight diagnosis
 
-v0.13.12 shipped Fix 1+2+4 + cross-platform parity but a live test on Dune 2
+v0.13.12 shipped Fix 1+2+4 + cross-platform parity but a live test
 showed Pass 1 sat for 14 minutes with `bytes_good=0` while the inner loop
 appeared to iterate (the throttled `on_progress` log fired every 78s). The
 async fd_recovery design at §7 said each `execute()` call should bound at
@@ -1357,7 +1355,7 @@ The v0.13.9 stall guard at `disc/mod.rs` exited Pass 1 early when
 `bytes_good` was flat for `stall_secs` (default 120s). This violated the
 ddrescue model: Pass 1 must sweep end-to-end, marking failed reads
 NonTrimmed for Pass 2 retry. The guard caused Pass 1 to bail at 30% on
-Dune 2 with 56 GB still NonTried, leaving Pass 2 nothing useful to do.
+a UHD disc with 56 GB still NonTried, leaving Pass 2 nothing useful to do.
 
 - Deleted the stall-guard state vars and the `if cur_good != ...
   break 'outer;` block.
@@ -1412,7 +1410,7 @@ same observable recovery contract as Linux:
 
 `PatchResult` now reports `blocks_attempted`, `blocks_read_ok`,
 `blocks_read_failed`. Pass 2's "100 minutes recovered 0 bytes" mystery
-(Dune 2) becomes diagnosable from these counters: distinguish "drive
+(a UHD disc) becomes diagnosable from these counters: distinguish "drive
 returned Ok but write/record dropped data" from "every read was Err for
 the entire range" without instrumenting from outside the lib.
 
@@ -1441,7 +1439,7 @@ against the spawned close()). The intent was to escape the 60-s
 blocking reopen.
 
 The cost was too high: a single transient poll timeout permanently
-killed the transport. Live test on Dune 2 (post-replug):
+killed the transport. Live test on a UHD disc (post-replug):
 - Pass 1 ran for **45 ms** then returned with 0 GB good and 80 GB
   pending.
 - The first SCSI READ timed out, fd went to -1, every subsequent
@@ -1474,7 +1472,7 @@ Sync bump for the autorip-side fix in 0.13.10 (Pass 1 batch reporting).
 ### Fix: Disc::copy silent stall + SgIoTransport reopen-after-timeout serialization
 
 Two correlated fixes for a hang observed live on the LG BU40N during a
-v0.13.8 rip of Dune: Part Two. At ~30 % progress through Pass 1
+v0.13.8 rip of a UHD disc. At ~30 % progress through Pass 1
 (disc → ISO), `bytes_good` froze for 10+ minutes with `errs=0`,
 no error surfaced, drive not wedged.
 
@@ -2361,10 +2359,9 @@ Rip recovery rewritten. The old binary-search-per-bad-sector model paid the full
 - **Kernel transfer limit detection**: auto-detect `max_hw_sectors_kb` via sysfs, resolve sg→block device. Previously hardcoded to 510 sectors (1MB) which exceeded the 120KB kernel limit, causing all reads to error and fall back to 6KB reads at 4.8 MB/s. Now auto-tunes to 48 sectors (96KB) or whatever the device supports.
 - **Result: 12.5 MB/s sustained, 23 MB/s peak** (was 4.8 MB/s)
 
-### LibreDrive — full init pipeline
+### Drive init pipeline
 
-- **All 10 ARM handlers translated**: unlock, firmware upload (A: WRITE_BUFFER, B: MODE SELECT), calibrate (256 zones), register reads, status, probe, set_read_speed, keepalive, timing
-- **Cold boot firmware upload**: WRITE_BUFFER 1888B (A variant) or MODE SELECT 2496B (B variant) proven on hardware
+- **Full drive init pipeline**: unlock, calibrate (256 zones), register reads, status, probe, set_read_speed, keepalive, timing
 - **Speed calibration**: 256+ disc surface probes, 64-entry speed table, triple SET_CD_SPEED
 - **Platform trait locked down**: `pub(crate)`, 3 methods only (init, set_read_speed, is_ready)
 - **Init guard**: prevents double-init, signature mismatch aborts early
@@ -2379,7 +2376,7 @@ Rip recovery rewritten. The old binary-search-per-bad-sector model paid the full
 ### Profiles
 
 - **206 profiles with full per-drive data**: ld_microcode (base64), all CDBs, speed tables, signatures
-- **Automated pipeline**: `sdf_unpack --profiles` → profiles.json (no manual merging)
+- **Automated pipeline**: profile import → profiles.json (no manual merging)
 
 ## 0.4.0 (2026-04-07)
 

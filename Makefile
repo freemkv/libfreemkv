@@ -1,6 +1,5 @@
 # libfreemkv — local dev helper.
-# Mirrors the cross-crate scripts in (internal)/scripts/test-all.sh
-# but scoped to this single crate.
+# Mirrors the workspace-wide CI checks but scoped to this single crate.
 
 .PHONY: test build check ci clean
 
