@@ -82,25 +82,24 @@ fn decrypt_sectors_with_css_keys_works() {
 /// Test: AACS unit encryption detection works.
 #[test]
 fn aacs_encryption_flag_detection() {
+    // A clear unit: TS syncs (0x47) intact at every 192-byte packet.
     let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < aacs::ALIGNED_UNIT_LEN {
+        unit[off] = 0x47;
+        off += 192;
+    }
+    // Encryption is the scrambled body (TS syncs destroyed), NOT a flag bit.
+    assert!(!aacs::is_aacs_scrambled(&unit));
 
-    // The encryption flag is the TS transport_scrambling_control (top two bits
-    // of byte 7), not byte 0's copy-control bits.
-    assert!(!aacs::is_unit_encrypted(&unit));
-
-    unit[7] = 0x40; // TSC = 01
-    assert!(aacs::is_unit_encrypted(&unit));
-
-    unit[7] = 0x80; // TSC = 10
-    assert!(aacs::is_unit_encrypted(&unit));
-
-    unit[7] = 0xC0; // TSC = 11
-    assert!(aacs::is_unit_encrypted(&unit));
-
-    // Byte 0 copy-control bits must NOT count as encryption.
-    unit[7] = 0x00;
+    // Flag bits on a synced unit do not make it look encrypted.
     unit[0] = 0xC0;
-    assert!(!aacs::is_unit_encrypted(&unit));
+    unit[7] = 0xC0;
+    assert!(!aacs::is_aacs_scrambled(&unit));
+
+    // Scrambled body (syncs gone) → encrypted.
+    let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
+    assert!(aacs::is_aacs_scrambled(&scrambled));
 }
 
 /// Test: DecryptKeys::is_encrypted() correctly identifies encrypted state.

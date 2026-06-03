@@ -1292,7 +1292,7 @@ mod tests {
         let original = std::fs::read(unit_path).unwrap();
         assert_eq!(original.len(), ALIGNED_UNIT_LEN);
         assert!(
-            super::super::decrypt::is_unit_encrypted(&original),
+            super::super::decrypt::is_aacs_scrambled(&original),
             "Unit should be encrypted"
         );
 

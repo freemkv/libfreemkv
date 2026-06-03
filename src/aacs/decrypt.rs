@@ -69,28 +69,29 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-/// Check if a 6144-byte aligned unit is encrypted.
+/// True if a 6144-byte aligned unit is AACS-scrambled on disc.
 ///
-/// AACS encrypts at aligned-unit granularity (all-or-nothing per unit) and
-/// signals it via the TS `transport_scrambling_control` (TSC) bits — the top
-/// two bits of TS-header byte 3, which is byte 7 of the unit (4-byte
-/// TP_extra_header + sync + PID/flags). TSC `00` = clear, non-zero = scrambled.
-/// Byte 7 sits inside the clear 16-byte seed, so this is readable without the
-/// key.
+/// AACS encrypts the unit body, which destroys the MPEG-TS sync bytes (`0x47`)
+/// a clear unit carries at offsets 4, 196, 388, … (one per 192-byte source
+/// packet). So "scrambled" = "the TS syncs are NOT intact". This is
+/// flag-independent: it does NOT read the TP_extra copy-control bits (byte 0)
+/// or the TS scrambling-control bits (byte 7) — AACS sets neither reliably
+/// across discs/players.
 ///
-/// NOTE: the earlier check read byte 0's TP_extra copy-control bits (`& 0xC0`),
-/// which are copy-permission, NOT encryption status — they false-positive on
-/// clear navigation units (PAT/PMT at a clip's start), causing a correct key to
-/// be decrypted against clear data and wrongly rejected.
-pub fn is_unit_encrypted(unit: &[u8]) -> bool {
-    unit.len() >= ALIGNED_UNIT_LEN && (unit[7] >> 6) & 0x03 != 0
+/// This is the single shared definition of "encrypted" for the whole ecosystem
+/// — libfreemkv's decrypt gate, autorip's sample selection, and the online key
+/// service's validation gate all call THIS, so they always agree on what is
+/// encrypted. A correctly-decrypted (or natively-clear) unit reports `false`,
+/// so the decrypt path never double-decrypts and there is no flag to clear.
+pub fn is_aacs_scrambled(unit: &[u8]) -> bool {
+    unit.len() >= ALIGNED_UNIT_LEN && !ts_syncs_intact(unit)
 }
 
-/// Verify decrypted unit by checking TS sync bytes at expected offsets.
-fn verify_ts(unit: &[u8]) -> bool {
-    // In a 6144-byte unit, TS packets start at byte 0 with 4-byte TP_extra_header
-    // then 188-byte TS packet, repeating every 192 bytes.
-    // Sync byte 0x47 should appear at offset 4, 196, 388, ...
+/// Most TS packet positions in `unit` carry the `0x47` sync byte — i.e. the
+/// unit looks like clear MPEG-TS. Syncs sit at offset 4 and every 192 bytes
+/// after (4-byte TP_extra_header + 188-byte TS packet). An encrypted body
+/// scrambles all but the first (which lives in the clear 16-byte seed).
+fn ts_syncs_intact(unit: &[u8]) -> bool {
     let mut count = 0;
     let mut offset = 4;
     while offset < unit.len() {
@@ -99,9 +100,13 @@ fn verify_ts(unit: &[u8]) -> bool {
         }
         offset += TS_PACKET_LEN;
     }
-    // Expect at least most packets to have sync bytes
     let total = (unit.len() - 4) / TS_PACKET_LEN + 1;
     count > total / 2
+}
+
+/// Verify a decrypted unit looks like clear MPEG-TS (sync bytes intact).
+fn verify_ts(unit: &[u8]) -> bool {
+    ts_syncs_intact(unit)
 }
 
 /// Decrypt one AACS aligned unit (6144 bytes) in-place.
@@ -111,12 +116,14 @@ fn verify_ts(unit: &[u8]) -> bool {
 /// 1. AES-128-ECB encrypt first 16 bytes with unit_key → derived
 /// 2. XOR derived with original 16 bytes → unit_decrypt_key
 /// 3. AES-128-CBC decrypt bytes 16..6143 with unit_decrypt_key and AACS IV
-/// 4. Clear encryption flag bits
+///
+/// Decryption restores the TS sync bytes, so the unit reads as clear afterward;
+/// there is no flag to clear.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     if unit.len() < ALIGNED_UNIT_LEN {
         return false;
     }
-    if !is_unit_encrypted(unit) {
+    if !is_aacs_scrambled(unit) {
         return true; // not encrypted
     }
 
@@ -136,24 +143,13 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     // Step 3: Decrypt bytes 16..6143 with AES-CBC
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
-    // Step 4: Clear the encryption flag — the TS transport_scrambling_control
-    // bits (top two of TS-header byte 3) of every packet, so the output is
-    // valid unscrambled TS. Each 192-byte cell's TS header byte 3 sits at
-    // offset 7 within the cell. (The old code cleared byte 0's TP_extra
-    // copy-control bits, which are NOT the scrambling flag.)
-    let mut off = 7;
-    while off < ALIGNED_UNIT_LEN {
-        unit[off] &= 0x3F;
-        off += TS_PACKET_LEN;
-    }
-
-    // Verify
+    // Decryption restored the TS syncs; verify the unit now looks like clear TS.
     verify_ts(unit)
 }
 
 /// Decrypt one aligned unit trying multiple unit keys. Returns the key index that worked.
 pub fn decrypt_unit_try_keys(unit: &mut [u8], unit_keys: &[[u8; 16]]) -> Option<usize> {
-    if !is_unit_encrypted(unit) {
+    if !is_aacs_scrambled(unit) {
         return Some(0);
     }
 
@@ -193,7 +189,7 @@ pub fn decrypt_unit_full(
     unit_key: &[u8; 16],
     read_data_key: Option<&[u8; 16]>,
 ) -> bool {
-    if !is_unit_encrypted(unit) {
+    if !is_aacs_scrambled(unit) {
         return true;
     }
     if let Some(rdk) = read_data_key {
@@ -220,10 +216,15 @@ mod tests {
 
     #[test]
     fn test_decrypt_unit_unencrypted() {
-        // Unit with 0xC0 bits clear should pass through unchanged
+        // A clear unit (TS syncs intact) is not scrambled → passes through.
         let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
-        unit[0] = 0x00; // not encrypted
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            unit[off] = TS_SYNC;
+            off += TS_PACKET_LEN;
+        }
         let key = [0u8; 16];
+        assert!(!is_aacs_scrambled(&unit));
         assert!(decrypt_unit(&mut unit, &key));
     }
 
@@ -273,9 +274,8 @@ mod tests {
             plain[offset] = TS_SYNC;
             offset += TS_PACKET_LEN;
         }
-        // Set the encryption flag: TS transport_scrambling_control (top two
-        // bits of byte 7), inside the clear seed.
-        plain[7] |= 0x80;
+        // No flag set: CBC-encrypting the body below scrambles packets 1..31's
+        // TS syncs, which is exactly what `is_aacs_scrambled` (raw-sync) detects.
 
         // Now encrypt bytes 16..6143 using the AACS algorithm (reverse of decrypt)
         let header: [u8; 16] = plain[..16].try_into().unwrap();
@@ -302,9 +302,9 @@ mod tests {
 
         // Now plain contains encrypted data. Decrypt it.
         let mut unit = plain;
-        assert!(is_unit_encrypted(&unit));
+        assert!(is_aacs_scrambled(&unit));
         assert!(decrypt_unit(&mut unit, &unit_key));
-        assert!(!is_unit_encrypted(&unit)); // flag should be cleared
+        assert!(!is_aacs_scrambled(&unit)); // decrypted: TS syncs restored
 
         // Verify TS sync bytes
         let mut count = 0;

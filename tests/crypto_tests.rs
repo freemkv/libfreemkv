@@ -89,9 +89,8 @@ fn aacs_decrypt_unit_roundtrip() {
         plain[offset] = 0x47; // TS sync byte
         offset += 192;
     }
-    // Set encryption flag: TS transport_scrambling_control (top two bits of
-    // byte 7), inside the clear seed.
-    plain[7] |= 0x80;
+    // No flag set: CBC-encrypting the body below scrambles packets 1..31's TS
+    // syncs, which is exactly what `is_aacs_scrambled` (raw-sync) detects.
 
     // Save original plaintext for comparison
     let expected = plain.clone();
@@ -127,8 +126,8 @@ fn aacs_decrypt_unit_roundtrip() {
         prev.copy_from_slice(&plain[off..off + 16]);
     }
 
-    // Verify it looks encrypted
-    assert!(aacs::is_unit_encrypted(&plain));
+    // Verify it looks encrypted (body TS syncs scrambled)
+    assert!(aacs::is_aacs_scrambled(&plain));
 
     // Now decrypt
     let result = aacs::decrypt_unit(&mut plain, &unit_key);
@@ -137,8 +136,8 @@ fn aacs_decrypt_unit_roundtrip() {
         "decrypt_unit should return true on valid encrypted unit"
     );
     assert!(
-        !aacs::is_unit_encrypted(&plain),
-        "encryption flag should be cleared"
+        !aacs::is_aacs_scrambled(&plain),
+        "decrypted unit should read as clear (TS syncs restored)"
     );
 
     // Verify TS sync bytes at expected positions (flag byte is cleared by decrypt)
@@ -157,14 +156,11 @@ fn aacs_decrypt_unit_roundtrip() {
         sync_count, expected_syncs
     );
 
-    // decrypt clears the TSC bits (byte 7, top two) — the only change from the
-    // original plaintext. Everything else round-trips exactly.
-    assert_eq!(plain[7], expected[7] & 0x3F, "TSC bits should be cleared");
-    assert_eq!(&plain[..7], &expected[..7], "bytes 0..7 mismatch");
+    // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(
-        &plain[8..aacs::ALIGNED_UNIT_LEN],
-        &expected[8..aacs::ALIGNED_UNIT_LEN],
-        "decrypted unit body does not match original"
+        &plain[..],
+        &expected[..],
+        "decrypted unit does not match original plaintext"
     );
 }
 
@@ -258,56 +254,65 @@ fn aacs_vuk_derivation_roundtrip() {
     assert_eq!(vuk, vuk2, "derive_vuk not deterministic");
 }
 
-/// Test: aacs_is_unit_encrypted detects encryption flags correctly.
+/// Test: aacs_is_aacs_scrambled detects scrambled units via the raw TS syncs.
 #[test]
-fn aacs_is_unit_encrypted_detection() {
-    let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
-
+fn aacs_is_aacs_scrambled_detection() {
+    // A clear unit: TS sync (0x47) intact at every 192-byte packet → not
+    // scrambled. (Flag bits play no role.)
+    let mut clear = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut off = 4;
+    while off < aacs::ALIGNED_UNIT_LEN {
+        clear[off] = 0x47;
+        off += 192;
+    }
     assert!(
-        !aacs::is_unit_encrypted(&unit),
-        "zero unit should not be encrypted"
+        !aacs::is_aacs_scrambled(&clear),
+        "clear unit (syncs intact) must not be scrambled"
     );
 
-    // The encryption flag is the TS transport_scrambling_control (top two bits
-    // of byte 7). Any non-zero TSC = encrypted.
-    unit[7] = 0x40; // TSC = 01
-    assert!(aacs::is_unit_encrypted(&unit));
-    unit[7] = 0x80; // TSC = 10
-    assert!(aacs::is_unit_encrypted(&unit));
-    unit[7] = 0xC0; // TSC = 11
-    assert!(aacs::is_unit_encrypted(&unit));
-    unit[7] = 0x3F; // top two bits clear
-    assert!(!aacs::is_unit_encrypted(&unit));
-
-    // Byte 0's TP_extra copy-control bits are NOT the encryption flag.
-    unit[7] = 0x00;
-    unit[0] = 0xC0;
+    // Flag bits do NOT make a synced unit look scrambled.
+    let mut flagged = clear.clone();
+    flagged[0] = 0xC0; // copy-control bits
+    flagged[7] = 0xC0; // TSC bits
     assert!(
-        !aacs::is_unit_encrypted(&unit),
-        "byte-0 copy-control bits must not be read as encryption"
+        !aacs::is_aacs_scrambled(&flagged),
+        "flag bits must not be read as encryption"
+    );
+
+    // A scrambled body (syncs destroyed) → scrambled.
+    let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
+    assert!(
+        aacs::is_aacs_scrambled(&scrambled),
+        "unit with no intact TS syncs must read as scrambled"
     );
 
     // Too short
     let short = vec![0xFFu8; 100];
     assert!(
-        !aacs::is_unit_encrypted(&short),
+        !aacs::is_aacs_scrambled(&short),
         "short buffer should not be detected"
     );
 }
 
 /// Test: aacs_decrypt_unit_unencrypted_passthrough
 ///
-/// A unit without encryption flags should pass through decrypt_unit unchanged.
+/// A clear unit (TS syncs intact) should pass through decrypt_unit unchanged.
 #[test]
 fn aacs_decrypt_unit_unencrypted_passthrough() {
     let mut unit = vec![0x42u8; aacs::ALIGNED_UNIT_LEN];
-    unit[7] &= 0x3F; // TSC = 0 → clear/unencrypted unit
+    // Intact TS syncs every 192 bytes → not scrambled → passthrough.
+    let mut off = 4;
+    while off < aacs::ALIGNED_UNIT_LEN {
+        unit[off] = 0x47;
+        off += 192;
+    }
     let original = unit.clone();
     let key = [0xAA; 16];
 
+    assert!(!aacs::is_aacs_scrambled(&unit));
     let result = aacs::decrypt_unit(&mut unit, &key);
-    assert!(result, "unencrypted unit should return true");
-    assert_eq!(unit, original, "unencrypted unit should be unchanged");
+    assert!(result, "clear unit should return true");
+    assert_eq!(unit, original, "clear unit should be unchanged");
 }
 
 // ── AACS cross-validation with independent AES implementation ──────────────
@@ -374,8 +379,7 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
             plaintext[i] = (i % 251) as u8;
         }
     }
-    // Set encryption flag: TSC bits of packet 0 (byte 7).
-    plaintext[7] |= 0x80;
+    // No flag set: the CBC-encrypted body scrambles the packet syncs.
 
     let expected = plaintext.clone();
 
@@ -406,19 +410,11 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
         ok,
         "decrypt_unit returned false (TS sync verification failed)"
     );
-    assert_eq!(plaintext[7] >> 6, 0, "TSC bits not cleared");
 
-    // decrypt clears the TSC bits of every packet (byte 7 of each 192-byte
-    // cell). Clear the same positions in the expected copy before comparing.
-    let mut expected_cleared = expected.clone();
-    let mut o = 7;
-    while o < aacs::ALIGNED_UNIT_LEN {
-        expected_cleared[o] &= 0x3F;
-        o += 192;
-    }
+    // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(
         &plaintext[..],
-        &expected_cleared[..],
+        &expected[..],
         "decrypted unit does not match original plaintext"
     );
 }
@@ -438,7 +434,7 @@ fn aacs_cross_validation_alternate_key() {
         plaintext[off] = 0x47;
         off += 192;
     }
-    plaintext[7] |= 0x80; // TSC encryption flag
+    // No flag set: the CBC-encrypted body scrambles the packet syncs.
     let expected = plaintext.clone();
 
     let mut header = [0u8; 16];
@@ -456,13 +452,8 @@ fn aacs_cross_validation_alternate_key() {
 
     assert!(aacs::decrypt_unit(&mut plaintext, &unit_key));
 
-    let mut expected_cleared = expected;
-    let mut o = 7;
-    while o < aacs::ALIGNED_UNIT_LEN {
-        expected_cleared[o] &= 0x3F;
-        o += 192;
-    }
-    assert_eq!(&plaintext[..], &expected_cleared[..]);
+    // Decryption clears no flag, so the unit round-trips byte-for-byte.
+    assert_eq!(&plaintext[..], &expected[..]);
 }
 
 /// Verify that `decrypt_bus` correctly reverses AES-CBC encryption applied

@@ -24,7 +24,7 @@ pub mod variants;
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
 pub use decrypt::{
     ALIGNED_UNIT_LEN, decrypt_bus, decrypt_unit, decrypt_unit_full, decrypt_unit_try_keys,
-    is_unit_encrypted,
+    is_aacs_scrambled,
 };
 pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::probe;

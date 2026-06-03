@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.27.0 (2026-06-03)
+
+### Changed
+
+- **AACS unit-encryption detection now reads the raw MPEG-TS sync bytes
+  instead of header flag bits.** `is_unit_encrypted` is renamed
+  `is_aacs_scrambled`: a unit is encrypted iff its body TS packet sync bytes
+  (`0x47` at offset 4 and every 192 bytes) are not intact — the encrypted
+  body destroys them. The previous check read the TP_extra copy-control bits
+  (byte 0) or TS transport_scrambling_control bits (byte 7), which discs and
+  players do not set reliably. A single predicate now backs both the decrypt
+  gate and out-of-band key validation, so all callers agree on what
+  "encrypted" means. Decryption restores the syncs, so a decrypted unit reads
+  as clear and there is no encryption flag to clear.
+
 ## 0.26.1 (2026-05-22)
 
 ### Added

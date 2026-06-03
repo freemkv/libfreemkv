@@ -185,12 +185,13 @@ pub fn decrypt_sectors(
             let chunks: Vec<&mut [u8]> = buf.chunks_mut(unit_len).collect();
             let nunits = chunks.len();
 
-            // Per-unit decrypt closure. The is_unit_encrypted check is
-            // a byte-0 heuristic; on a misfire we snapshot+restore via
-            // the original bytes so non-m2ts (e.g. MPLS/CLPI nav files)
-            // survive. See test `nav_file_unit_survives_decrypt_attempt`.
+            // Per-unit decrypt closure. The is_aacs_scrambled check reads the
+            // raw TS syncs; a non-m2ts unit (e.g. MPLS/CLPI nav file) can look
+            // scrambled and trigger a decrypt attempt, so on a verify miss we
+            // snapshot+restore the original bytes so it survives. See test
+            // `nav_file_unit_survives_decrypt_attempt`.
             let decrypt_one = |chunk: &mut [u8]| {
-                if chunk.len() == unit_len && aacs::is_unit_encrypted(chunk) {
+                if chunk.len() == unit_len && aacs::is_aacs_scrambled(chunk) {
                     let original: Vec<u8> = chunk.to_vec();
                     if !aacs::decrypt_unit_full(chunk, &uk, rdk.as_ref()) {
                         chunk.copy_from_slice(&original);
@@ -232,11 +233,11 @@ pub fn decrypt_sectors(
 mod tests {
     use super::*;
 
-    /// Regression for the 0.18.1 nav-file scramble bug. A non-m2ts unit whose
-    /// first byte has the top 2 bits set (here: the ASCII letter 'M' that
-    /// MPLS files start with, 0x4D = 0b01001101) trips `is_unit_encrypted`,
-    /// gets AES-decrypted with the unit key, fails the TS-sync verification,
-    /// and must be restored to its original bytes — not left scrambled.
+    /// Regression for the 0.18.1 nav-file scramble bug. A non-m2ts unit (here
+    /// an MPLS file: starts "MPLS", carries no TS syncs) reads as scrambled
+    /// under `is_aacs_scrambled`, gets AES-decrypted with the unit key, fails
+    /// the TS-sync verification, and must be restored to its original bytes —
+    /// not left scrambled.
     #[test]
     fn nav_file_unit_survives_decrypt_attempt() {
         let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
