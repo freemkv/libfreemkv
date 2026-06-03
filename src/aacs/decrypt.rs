@@ -69,9 +69,21 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-/// Check if a 6144-byte aligned unit is encrypted (copy_permission_indicator bits).
+/// Check if a 6144-byte aligned unit is encrypted.
+///
+/// AACS encrypts at aligned-unit granularity (all-or-nothing per unit) and
+/// signals it via the TS `transport_scrambling_control` (TSC) bits — the top
+/// two bits of TS-header byte 3, which is byte 7 of the unit (4-byte
+/// TP_extra_header + sync + PID/flags). TSC `00` = clear, non-zero = scrambled.
+/// Byte 7 sits inside the clear 16-byte seed, so this is readable without the
+/// key.
+///
+/// NOTE: the earlier check read byte 0's TP_extra copy-control bits (`& 0xC0`),
+/// which are copy-permission, NOT encryption status — they false-positive on
+/// clear navigation units (PAT/PMT at a clip's start), causing a correct key to
+/// be decrypted against clear data and wrongly rejected.
 pub fn is_unit_encrypted(unit: &[u8]) -> bool {
-    unit.len() >= ALIGNED_UNIT_LEN && (unit[0] & 0xC0) != 0
+    unit.len() >= ALIGNED_UNIT_LEN && (unit[7] >> 6) & 0x03 != 0
 }
 
 /// Verify decrypted unit by checking TS sync bytes at expected offsets.
@@ -124,8 +136,16 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     // Step 3: Decrypt bytes 16..6143 with AES-CBC
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
-    // Step 4: Clear encryption flag
-    unit[0] &= !0xC0;
+    // Step 4: Clear the encryption flag — the TS transport_scrambling_control
+    // bits (top two of TS-header byte 3) of every packet, so the output is
+    // valid unscrambled TS. Each 192-byte cell's TS header byte 3 sits at
+    // offset 7 within the cell. (The old code cleared byte 0's TP_extra
+    // copy-control bits, which are NOT the scrambling flag.)
+    let mut off = 7;
+    while off < ALIGNED_UNIT_LEN {
+        unit[off] &= 0x3F;
+        off += TS_PACKET_LEN;
+    }
 
     // Verify
     verify_ts(unit)
@@ -253,8 +273,9 @@ mod tests {
             plain[offset] = TS_SYNC;
             offset += TS_PACKET_LEN;
         }
-        // Set encryption flag
-        plain[0] |= 0xC0;
+        // Set the encryption flag: TS transport_scrambling_control (top two
+        // bits of byte 7), inside the clear seed.
+        plain[7] |= 0x80;
 
         // Now encrypt bytes 16..6143 using the AACS algorithm (reverse of decrypt)
         let header: [u8; 16] = plain[..16].try_into().unwrap();

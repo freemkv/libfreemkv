@@ -84,20 +84,23 @@ fn decrypt_sectors_with_css_keys_works() {
 fn aacs_encryption_flag_detection() {
     let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
 
-    // No encryption flag
+    // The encryption flag is the TS transport_scrambling_control (top two bits
+    // of byte 7), not byte 0's copy-control bits.
     assert!(!aacs::is_unit_encrypted(&unit));
 
-    // Set bit 6
-    unit[0] |= 0x40;
+    unit[7] = 0x40; // TSC = 01
     assert!(aacs::is_unit_encrypted(&unit));
 
-    // Set bit 7
-    unit[0] = 0x80;
+    unit[7] = 0x80; // TSC = 10
     assert!(aacs::is_unit_encrypted(&unit));
 
-    // Both bits set
+    unit[7] = 0xC0; // TSC = 11
+    assert!(aacs::is_unit_encrypted(&unit));
+
+    // Byte 0 copy-control bits must NOT count as encryption.
+    unit[7] = 0x00;
     unit[0] = 0xC0;
-    assert!(aacs::is_unit_encrypted(&unit));
+    assert!(!aacs::is_unit_encrypted(&unit));
 }
 
 /// Test: DecryptKeys::is_encrypted() correctly identifies encrypted state.
