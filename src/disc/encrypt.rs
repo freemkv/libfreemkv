@@ -570,12 +570,21 @@ impl Disc {
             None if bus_encryption => 2,
             None => 1,
         };
-        // MKB_RO is the correctly-sized copy; avoid reading the padded RW region.
-        let mkb_bytes = udf_fs
+        // MKB_RO/RW are allocated to a fixed ~128 MiB and zero-padded; trim to
+        // the real record length (same as `read_aacs_inputs`). Without this the
+        // MKB stashed on `AacsState` — which `Disc::inputs()` and the device/
+        // processing-key `decrypt_with` derivation consume, and which a key
+        // source ships to an online service — is the full 128 MiB pad, not the
+        // ~few-MB record stream.
+        let mut mkb_bytes = udf_fs
             .read_file(reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
             .ok()
             .unwrap_or_default();
+        let n = aacs::mkb_content_len(&mkb_bytes);
+        if n > 0 && n < mkb_bytes.len() {
+            mkb_bytes.truncate(n);
+        }
         let mkb_ver = aacs::mkb_version(&mkb_bytes);
 
         tracing::warn!(
