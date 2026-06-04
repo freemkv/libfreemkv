@@ -882,9 +882,9 @@ pub struct AacsState {
     /// Disc hash (SHA1 of Unit_Key_RO.inf) -- hex string with 0x prefix
     pub disc_hash: String,
     /// How keys were resolved
-    pub key_source: KeySource,
+    pub key_source: KeyOrigin,
     /// Volume Unique Key (16 bytes). `None` when keys were resolved
-    /// via the [`KeySource::KeyDbUnitKeys`] path — that source delivers
+    /// via the [`KeyOrigin::KeyDbUnitKeys`] path — that source delivers
     /// pre-decrypted unit keys without a VUK to derive them from.
     pub vuk: Option<[u8; 16]>,
     /// Decrypted unit keys (CPS unit number, key)
@@ -900,7 +900,7 @@ pub struct AacsState {
 /// attempts derivation from the strongest input it has first and falls
 /// back toward pre-computed per-disc material.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum KeySource {
+pub enum KeyOrigin {
     /// MKB + device keys → subset-difference tree → VUK
     DeviceKey,
     /// MKB + processing keys → media key → VUK
@@ -917,15 +917,15 @@ pub enum KeySource {
     ExternalUk,
 }
 
-impl KeySource {
+impl KeyOrigin {
     pub fn name(&self) -> &'static str {
         match self {
-            KeySource::DeviceKey => "MKB + device key",
-            KeySource::ProcessingKey => "MKB + processing key",
-            KeySource::KeyDbDerived => "KEYDB (derived)",
-            KeySource::KeyDb => "KEYDB",
-            KeySource::KeyDbUnitKeys => "KEYDB (unit keys)",
-            KeySource::ExternalUk => "external UK",
+            KeyOrigin::DeviceKey => "MKB + device key",
+            KeyOrigin::ProcessingKey => "MKB + processing key",
+            KeyOrigin::KeyDbDerived => "KEYDB (derived)",
+            KeyOrigin::KeyDb => "KEYDB",
+            KeyOrigin::KeyDbUnitKeys => "KEYDB (unit keys)",
+            KeyOrigin::ExternalUk => "external UK",
         }
     }
 }
@@ -1543,14 +1543,14 @@ impl Disc {
     pub fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
         if let Some(aacs) = self.aacs.as_mut() {
             aacs.unit_keys = keys;
-            aacs.key_source = KeySource::ExternalUk;
+            aacs.key_source = KeyOrigin::ExternalUk;
         } else if self.encrypted && self.css.is_none() {
             self.aacs = Some(AacsState {
                 version: if self.format == DiscFormat::Uhd { 2 } else { 1 },
                 bus_encryption: self.format == DiscFormat::Uhd,
                 mkb_version: None,
                 disc_hash: String::new(),
-                key_source: KeySource::ExternalUk,
+                key_source: KeyOrigin::ExternalUk,
                 vuk: None,
                 unit_keys: keys,
                 read_data_key: None,
@@ -2816,7 +2816,7 @@ mod tests {
         );
         assert_eq!(
             disc.aacs.as_ref().unwrap().key_source,
-            KeySource::ExternalUk
+            KeyOrigin::ExternalUk
         );
     }
 
@@ -2828,7 +2828,7 @@ mod tests {
             bus_encryption: true,
             mkb_version: None,
             disc_hash: String::new(),
-            key_source: KeySource::DeviceKey,
+            key_source: KeyOrigin::DeviceKey,
             vuk: None,
             unit_keys,
             read_data_key: None,
@@ -2866,7 +2866,7 @@ mod tests {
         }
         assert_eq!(
             disc.aacs.as_ref().unwrap().key_source,
-            KeySource::ExternalUk
+            KeyOrigin::ExternalUk
         );
     }
 
