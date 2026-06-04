@@ -126,31 +126,19 @@ fn disc_title_total_sectors() {
 // ── ScanOptions tests ──────────────────────────────────────────────────────
 
 #[test]
-fn scan_options_default() {
+fn scan_options_default_has_no_credentials() {
+    // Lookup-free: the only scan input is the optional live-drive credentials.
     let opts = ScanOptions::default();
-    assert!(opts.keydb_path.is_none());
+    assert!(opts.credentials.is_none());
 }
 
 #[test]
-fn scan_options_with_keydb() {
+fn scan_options_with_credentials() {
     let opts = ScanOptions {
-        keydb_path: Some(("/tmp/KEYDB.cfg").into()),
-        ..Default::default()
+        credentials: Some(libfreemkv::DriveCredentials::default()),
     };
-    assert_eq!(
-        opts.keydb_path.as_ref().unwrap().to_str().unwrap(),
-        "/tmp/KEYDB.cfg"
-    );
-}
-
-#[test]
-fn scan_options_with_keydb_pathbuf() {
-    let path = std::path::PathBuf::from("/home/user/.config/aacs/KEYDB.cfg");
-    let opts = ScanOptions {
-        keydb_path: Some(path.clone()),
-        ..Default::default()
-    };
-    assert_eq!(opts.keydb_path.unwrap(), path);
+    assert!(opts.credentials.is_some());
+    assert!(opts.credentials.unwrap().host_certs.is_empty());
 }
 
 // ── detect_format integration tests ───────────────────────────────────────
@@ -511,21 +499,16 @@ fn batch_count_max_batch_sizes() {
 }
 
 #[test]
-fn resolve_encryption_no_keydb() {
-    // A UDF image with /AACS directory but no keydb path -> aacs is None
+fn scan_encrypted_resolves_no_keys() {
+    // A UDF image with an /AACS directory: the lookup-free scan detects
+    // encryption and captures inputs, but resolves NO key on its own — a
+    // caller applies one later via Disc::decrypt_with.
     let mut reader = MockSectorReader::new();
     build_udf_with_aacs_dir(&mut reader);
 
-    // No keydb configured and no standard keydb on the system
-    let opts = ScanOptions {
-        keydb_path: Some(("/nonexistent/path/KEYDB.cfg").into()),
-        ..Default::default()
-    };
-    let disc = Disc::scan_image(&mut reader, 1000, &opts).unwrap();
+    let disc = Disc::scan_image(&mut reader, 1000, &ScanOptions::default()).unwrap();
 
-    // The disc detects encryption but can't resolve keys without a keydb
-    assert!(
-        disc.aacs.is_none(),
-        "aacs should be None when keydb is unavailable"
-    );
+    // No unit keys without an external key (the mock has no Unit_Key_RO.inf to
+    // capture, so the keyless state isn't even built) — either way, no keys.
+    assert!(matches!(disc.decrypt_keys(), libfreemkv::DecryptKeys::None));
 }

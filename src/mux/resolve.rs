@@ -162,10 +162,11 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
 /// Options for opening an input stream.
 #[derive(Default)]
 pub struct InputOptions {
-    pub keydb_path: Option<String>,
-    /// Caller-supplied Unit Key (external Unit Key) — the second, mutually
-    /// exclusive key source. Takes precedence over `keydb_path`.
-    pub unit_key: Option<[u8; 16]>,
+    /// Caller-resolved per-CPS-unit AACS keys to apply to the scanned disc
+    /// (`(cps_unit, 16-byte key)`). Empty for an unencrypted disc or when the
+    /// caller has no key. The library does no lookup — a key source resolves
+    /// these and the caller passes them here.
+    pub unit_keys: Vec<(u32, [u8; 16])>,
     pub title_index: Option<usize>,
     /// Skip decryption — return raw encrypted bytes.
     pub raw: bool,
@@ -184,11 +185,6 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         }
         StreamUrl::Iso { ref path } => {
             validate_file_path(path, "iso")?;
-            let scan_opts = crate::disc::ScanOptions {
-                keydb_path: opts.keydb_path.as_ref().map(Into::into),
-                unit_key: opts.unit_key,
-                ..Default::default()
-            };
             // FileSectorSource is the sole file-backed sector source.
             // It carries the platform-tuned SEQUENTIAL fadvise hint
             // (so the kernel readahead window widens) and the periodic
@@ -196,8 +192,17 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // when the mux output is being written to the same disk.
             let mut reader = crate::io::file_sector_source::FileSectorSource::open(path)?;
             let capacity = reader.capacity_sectors();
-            let disc = crate::disc::Disc::scan_image(&mut reader, capacity, &scan_opts)
-                .map_err(|e| -> io::Error { e.into() })?;
+            let mut disc = crate::disc::Disc::scan_image(
+                &mut reader,
+                capacity,
+                &crate::disc::ScanOptions::default(),
+            )
+            .map_err(|e| -> io::Error { e.into() })?;
+            // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
+            // yields them for the stream below.
+            if !opts.unit_keys.is_empty() {
+                let _ = disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()));
+            }
             if disc.titles.is_empty() {
                 return Err(crate::error::Error::NoStreams.into());
             }

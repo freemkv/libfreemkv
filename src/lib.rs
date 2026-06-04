@@ -171,9 +171,9 @@ pub use decrypt::{DecryptKeys, decrypt_sectors, decrypt_threads, set_decrypt_thr
 // prefix at the crate root to keep both addressable.
 pub use disc::{
     AacsState, AudioChannels, AudioStream, Clip, Codec, ColorSpace, ContentFormat, DamageSeverity,
-    Disc, DiscFormat, DiscId, DiscTitle, Extent, FrameRate, HdrFormat, Key, KeyOrigin,
-    LabelPurpose, LabelQualifier, PatchOptions, PatchOutcome, Resolution, SampleRate, ScanOptions,
-    Stream, SubtitleStream, SweepOptions, VideoStream, classify_damage,
+    Disc, DiscFormat, DiscId, DiscTitle, DriveCredentials, Extent, FrameRate, HdrFormat, Key,
+    KeyOrigin, LabelPurpose, LabelQualifier, PatchOptions, PatchOutcome, Resolution, SampleRate,
+    ScanOptions, Stream, SubtitleStream, SweepOptions, VideoStream, classify_damage,
 };
 pub use keysource::{DiscInputs, KeySource};
 

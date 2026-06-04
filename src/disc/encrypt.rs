@@ -179,53 +179,32 @@ impl Disc {
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
     ) -> (Option<HandshakeResult>, Option<Error>) {
-        use crate::aacs::{self, KeyDb};
+        use crate::aacs;
 
-        let keydb_path = match opts.resolve_keydb() {
-            Some(p) => p,
-            None => {
+        // Host certs come from the caller's DriveCredentials (e.g. the keydb's
+        // host_certs(), sourced app-side) — the library does not load a keydb.
+        // Absent ⇒ no cert auth: an unlocked / LibreDrive drive already returned
+        // a Volume ID via the OEM path before reaching here, so this is the
+        // locked-drive-without-credentials case.
+        let host_certs: &[aacs::HostCert] = match &opts.credentials {
+            Some(c) if !c.host_certs.is_empty() => &c.host_certs,
+            _ => {
                 tracing::warn!(
                     target: "freemkv::disc",
-                    phase = "handshake_no_keydb",
-                    "no KEYDB found in search paths; handshake skipped"
+                    phase = "handshake_no_credentials",
+                    "no drive credentials supplied; cert handshake skipped"
                 );
                 return (None, None);
             }
         };
-        let keydb = match KeyDb::load(&keydb_path) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "handshake_keydb_load_failed",
-                    io_error_kind = ?e.kind(),
-                    keydb = %keydb_path.display(),
-                    "KEYDB load failed; handshake skipped"
-                );
-                return (
-                    None,
-                    Some(Error::KeydbLoad {
-                        path: keydb_path.display().to_string(),
-                    }),
-                );
-            }
-        };
 
-        let host_cert_count = keydb.host_certs.len();
+        let host_cert_count = host_certs.len();
         tracing::warn!(
             target: "freemkv::disc",
             phase = "handshake_start",
             host_cert_count,
-            keydb = %keydb_path.display(),
             "handshake starting"
         );
-
-        if host_cert_count == 0 {
-            // No host certs in keydb -> cert auth cannot proceed.
-            // Surface as RawReadUnsupported so the caller knows
-            // neither path is available on this configuration.
-            return (None, Some(Error::AacsRawReadUnsupported));
-        }
 
         // v0.25.7 wedge fix. Pre-0.25.7 this loop fired up to 16 AACS
         // authenticate attempts back-to-back with no pause. Each attempt
@@ -246,7 +225,7 @@ impl Disc {
         const MAX_CERT_ATTEMPTS: usize = 3;
         const PER_CERT_BACKOFF_MS: u64 = 1000;
         let mut last_err_code: Option<u16> = None;
-        for (idx, hc) in keydb.host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
+        for (idx, hc) in host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
             if idx > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
             }
@@ -315,227 +294,6 @@ impl Disc {
             MAX_CERT_ATTEMPTS
         );
         (None, Some(Error::AacsHostCertRejected))
-    }
-
-    /// Resolve disc encryption — AACS 1.0, AACS 2.0, CSS, or none.
-    ///
-    /// Reads AACS files from UDF (via SectorSource), resolves keys through
-    /// whatever path works: KEYDB VUK lookup, media key derivation, processing
-    /// keys, device keys. Uses handshake result (volume ID, bus key) if available.
-    pub(super) fn resolve_encryption(
-        udf_fs: &udf::UdfFs,
-        reader: &mut dyn SectorSource,
-        keydb_path: &std::path::Path,
-        handshake: Option<&HandshakeResult>,
-    ) -> Result<AacsState> {
-        use crate::aacs::{self, KeyDb};
-        use crate::drm::{DrmContext, DrmProbe, DrmScheme, ResolvedScheme};
-
-        let keydb = KeyDb::load(keydb_path).map_err(|_| Error::KeydbLoad {
-            path: keydb_path.display().to_string(),
-        })?;
-
-        // Read AACS files from disc/image via UDF
-        let uk_ro_data = udf_fs
-            .read_file(reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-
-        // Log the disc hash so we can confirm whether it's present in KEYDB
-        // when key resolution fails. The disc hash is SHA-1 of the full
-        // Unit_Key_RO.inf file bytes — same value KEYDB.cfg keys VUK entries by.
-        let dh = crate::aacs::disc_hash(&uk_ro_data);
-        let dh_hex = crate::aacs::disc_hash_hex(&dh);
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "scan_aacs_disc_hash",
-            disc_hash = %dh_hex,
-            uk_ro_len = uk_ro_data.len(),
-            "disc hash computed (compare with keydb.cfg entries)"
-        );
-
-        let cc_data = udf_fs
-            .read_file(reader, "/AACS/Content000.cer")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
-            .ok();
-
-        let mkb_data = udf_fs
-            .read_file(reader, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
-            .ok();
-        let mkb_ver = mkb_data.as_deref().and_then(aacs::mkb_version);
-
-        let mkb_first_64_hex = mkb_data
-            .as_deref()
-            .map(|m| {
-                m.iter()
-                    .take(64)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "scan_aacs_mkb_info",
-            mkb_present = mkb_data.is_some(),
-            mkb_len = mkb_data.as_deref().map(|m| m.len()).unwrap_or(0),
-            mkb_version = ?mkb_ver,
-            mkb_first_64 = %mkb_first_64_hex,
-            keydb_disc_count = keydb.disc_entries.len(),
-            keydb_dk_count = keydb.device_keys.len(),
-            keydb_pk_count = keydb.processing_keys.len(),
-            "AACS resolution inputs"
-        );
-
-        // Use handshake volume ID if available, otherwise zeros
-        // (KEYDB VUK lookup by disc hash works without volume ID;
-        // paths 2/3/4 in `resolve_keys` short-circuit on the zero
-        // sentinel and don't waste cycles trying to derive against
-        // garbage input).
-        let volume_id = handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]);
-        let vid_available = volume_id != [0u8; 16];
-        let read_data_key = handshake.and_then(|h| h.read_data_key);
-
-        // Resolve: tries all available paths — KEYDB VUK, media key, processing key, device key.
-        //
-        // Distinguish "we had every input and still missed" from "we
-        // never had VID so the derivation paths couldn't run." The
-        // former points at a stale keydb / unsupported MKB; the
-        // latter points at a failed handshake upstream. Path 1
-        // (disc-hash lookup) ran without VID and missed -> disc isn't
-        // in the keydb. If the caller has a handshake-failure reason
-        // it overrides this in `scan_with`.
-        let miss_error = if vid_available {
-            Error::AacsMkUnavailable
-        } else {
-            Error::AacsVukNotInKeydb
-        };
-
-        // Build a probe + context and let the dispatcher pick V10 / V20
-        // / V21. CSS is impossible here (this function is only called
-        // when /AACS exists), so we don't populate the DVD probe sector
-        // or a CSS context.
-        let probe = DrmProbe {
-            dvd_sample_sector: None,
-            content_cert: cc_data.as_deref(),
-            mkb: mkb_data.as_deref(),
-        };
-        let scheme = match DrmScheme::detect(&probe) {
-            Some(s) => s,
-            None => return Err(miss_error),
-        };
-        let providers: &[&dyn aacs::KeyProvider] = &[&keydb];
-        let aacs_ctx = aacs::ResolveContext {
-            unit_key_ro: &uk_ro_data,
-            content_cert: cc_data.as_deref(),
-            volume_id: &volume_id,
-            providers,
-            mkb: mkb_data.as_deref(),
-        };
-        let mut ctx = DrmContext {
-            aacs: Some(aacs_ctx),
-            css: None,
-        };
-        let resolved = match scheme.load(&mut ctx) {
-            Some(ResolvedScheme::Aacs(r)) => r,
-            // Resolution against /AACS inputs can only produce AACS
-            // keys. Either the dispatcher returned None (load failed)
-            // or — structurally impossible here — a CSS state. Both
-            // surface as the upstream miss-error.
-            _ => return Err(miss_error),
-        };
-
-        Ok(AacsState {
-            version: match resolved.version {
-                aacs::AacsVersion::V10 => 1,
-                aacs::AacsVersion::V20 | aacs::AacsVersion::V21 => 2,
-            },
-            bus_encryption: resolved.bus_encryption,
-            mkb_version: mkb_ver,
-            disc_hash: aacs::disc_hash_hex(&resolved.disc_hash),
-            key_source: match resolved.key_source {
-                1 => KeyOrigin::DeviceKey,
-                2 => KeyOrigin::ProcessingKey,
-                3 => KeyOrigin::KeyDbDerived,
-                4 => KeyOrigin::KeyDb,
-                5 => KeyOrigin::KeyDbUnitKeys,
-                _ => KeyOrigin::KeyDb,
-            },
-            vuk: resolved.vuk,
-            unit_keys: resolved.unit_keys,
-            read_data_key,
-            volume_id,
-            // Stash the AACS inputs so a later out-of-band `Disc::decrypt_with`
-            // (caller-resolved Key → derive down) can run without re-reading
-            // the disc. The borrows in `aacs_ctx` ended when `scheme.load`
-            // returned, so these buffers are free to move here.
-            uk_ro: uk_ro_data,
-            mkb: mkb_data.unwrap_or_default(),
-        })
-    }
-
-    /// Resolve encryption from a caller-supplied Unit Key (the external key service
-    /// path). No keydb, no derivation: read `Unit_Key_RO.inf` for the disc
-    /// hash + version/bus-encryption flags, then use `unit_key` directly as
-    /// CPS unit 1's decryption key. The handshake (if any) still supplies the
-    /// volume ID and AACS 2.0 read-data key for bus decryption.
-    pub(super) fn resolve_encryption_static(
-        udf_fs: &udf::UdfFs,
-        reader: &mut dyn SectorSource,
-        unit_key: [u8; 16],
-        handshake: Option<&HandshakeResult>,
-    ) -> Result<AacsState> {
-        use crate::aacs;
-
-        let uk_ro_data = udf_fs
-            .read_file(reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        let dh = aacs::disc_hash(&uk_ro_data);
-
-        let cc = udf_fs
-            .read_file(reader, "/AACS/Content000.cer")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
-            .ok()
-            .as_deref()
-            .and_then(aacs::parse_content_cert);
-        let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
-        let version = match cc.as_ref().map(|c| c.version) {
-            Some(aacs::AacsVersion::V10) => 1,
-            Some(_) => 2,
-            None if bus_encryption => 2,
-            None => 1,
-        };
-
-        let mkb_ver = udf_fs
-            .read_file(reader, "/AACS/MKB_RW.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RO.inf"))
-            .ok()
-            .as_deref()
-            .and_then(aacs::mkb_version);
-
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "scan_aacs_external_uk",
-            disc_hash = %aacs::disc_hash_hex(&dh),
-            version,
-            bus_encryption,
-            "using caller-supplied unit key"
-        );
-
-        Ok(AacsState {
-            version,
-            bus_encryption,
-            mkb_version: mkb_ver,
-            disc_hash: aacs::disc_hash_hex(&dh),
-            key_source: KeyOrigin::ExternalUk,
-            vuk: None,
-            unit_keys: vec![(1, unit_key)],
-            read_data_key: handshake.and_then(|h| h.read_data_key),
-            volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
-        })
     }
 
     /// Build a keys-free AACS state that carries only the Volume ID (+ version

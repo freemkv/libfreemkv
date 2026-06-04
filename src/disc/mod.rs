@@ -939,59 +939,31 @@ impl KeyOrigin {
 
 // ─── Disc scanning ──────────────────────────────────────────────────────────
 
-/// Standard KEYDB.cfg search locations (compatible with libaacs).
-const KEYDB_SEARCH_PATHS: &[&str] = &[
-    ".config/aacs/KEYDB.cfg",    // libaacs standard path
-    ".config/freemkv/keydb.cfg", // freemkv download path
-];
-const KEYDB_SYSTEM_PATH: &str = "/etc/aacs/KEYDB.cfg";
-
-/// Options for disc scanning.
-#[derive(Default)]
-pub struct ScanOptions {
-    /// Path to KEYDB.cfg for AACS key lookup.
-    /// If None, searches standard locations ($HOME/.config/aacs/ and /etc/aacs/).
-    pub keydb_path: Option<std::path::PathBuf>,
-    /// Caller-supplied Unit Key — an alternative to keydb lookup. When set,
-    /// libfreemkv skips keydb lookup and all derivation and uses this key
-    /// directly to decrypt; it takes precedence over `keydb_path`. The caller
-    /// obtains the key however it likes; libfreemkv stays free of any network
-    /// dependency.
-    pub unit_key: Option<[u8; 16]>,
-    /// Disable KEYDB entirely: skip both the explicit `keydb_path` and the
-    /// standard-location search, so no keydb is loaded for this scan. A caller
-    /// that resolves keys out-of-band (e.g. a remote key service) sets this so
-    /// a keydb that merely happens to sit in a default location does not shadow
-    /// the out-of-band path. `unit_key` still takes precedence over everything.
-    pub disable_keydb: bool,
+/// AACS host credentials for the live-drive authenticated handshake.
+///
+/// Optional and source-agnostic: an unlocked / LibreDrive drive uses the OEM
+/// Volume-ID path and needs none, and an ISO scan has no handshake at all. The
+/// caller supplies the host cert(s) from wherever it likes — today the keydb's
+/// `host_certs()`, tomorrow a cert file or built-in. Decoupled from the key
+/// source: a locked drive needs the cert to unlock even when the decryption key
+/// comes from an online service.
+#[derive(Default, Clone)]
+pub struct DriveCredentials {
+    /// Host certificate(s) + private key(s) for the SCSI AACS handshake.
+    pub host_certs: Vec<crate::aacs::HostCert>,
 }
 
-impl ScanOptions {
-    /// Resolve KEYDB path: explicit path first, then standard locations.
-    /// Returns `None` when `disable_keydb` is set — no keydb is consulted.
-    fn resolve_keydb(&self) -> Option<std::path::PathBuf> {
-        if self.disable_keydb {
-            return None;
-        }
-        if let Some(p) = &self.keydb_path {
-            if p.exists() {
-                return Some(p.clone());
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            for relative in KEYDB_SEARCH_PATHS {
-                let p = std::path::PathBuf::from(&home).join(relative);
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-        }
-        let p = std::path::PathBuf::from(KEYDB_SYSTEM_PATH);
-        if p.exists() {
-            return Some(p);
-        }
-        None
-    }
+/// Options for disc scanning.
+///
+/// libfreemkv is lookup-free — it resolves no keys. The caller resolves a key
+/// out-of-band (a key source) and applies it via [`Disc::decrypt_with`]. The
+/// only scan input is the optional drive credentials for the live-drive
+/// authenticated handshake.
+#[derive(Default)]
+pub struct ScanOptions {
+    /// Host credentials for the live-drive AACS handshake. `None` for an
+    /// unlocked / LibreDrive drive (OEM Volume-ID path) and for ISO scans.
+    pub credentials: Option<DriveCredentials>,
 }
 
 /// Quick disc identification — name, format, capacity. No title/stream parsing.
@@ -1233,7 +1205,7 @@ impl Disc {
         capacity: u32,
         handshake: Option<HandshakeResult>,
         handshake_error: Option<Error>,
-        opts: &ScanOptions,
+        _opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
         // 2. Resolve encryption (AACS, CSS, or none)
@@ -1242,69 +1214,16 @@ impl Disc {
 
         let (aacs, aacs_error) = if !encrypted {
             (None, None)
-        } else if let Some(unit_key) = opts.unit_key {
-            // Second key source: caller supplied the Unit Key directly
-            // (external Unit Key). Skip keydb entirely.
-            match Self::resolve_encryption_static(&udf_fs, reader, unit_key, handshake.as_ref()) {
-                Ok(state) => (Some(state), None),
-                Err(e) => (None, Some(e)),
-            }
-        } else if opts.disable_keydb {
-            // Keydb disabled: keys are resolved out-of-band. Still capture the
-            // VID (read during the handshake) so the out-of-band path has it;
-            // carry no keys (disc reports "encrypted, no keys" until re-scanned
-            // with a resolved Unit Key).
+        } else {
+            // Lookup-free: capture the disc's AACS inputs (MKB, VID,
+            // Unit_Key_RO.inf) but resolve NO key. The caller resolves a Key
+            // from a key source and applies it via `Disc::decrypt_with`. The
+            // disc reports "encrypted, no keys" until then.
             match Self::resolve_vid_only(&udf_fs, reader, handshake.as_ref()) {
                 Ok(state) => (Some(state), None),
-                Err(e) => (None, Some(e)),
-            }
-        } else {
-            match opts.resolve_keydb() {
-                Some(keydb_path) => {
-                    match Self::resolve_encryption(&udf_fs, reader, &keydb_path, handshake.as_ref())
-                    {
-                        Ok(state) => (Some(state), None),
-                        Err(e) => {
-                            // When the handshake itself failed AND resolution
-                            // bottomed out at "no keys", surface the upstream
-                            // handshake failure — it's more actionable than
-                            // the generic AacsNoKeys.
-                            let final_err = match (&e, handshake_error.as_ref()) {
-                                (
-                                    Error::AacsNoKeys
-                                    | Error::AacsVukNotInKeydb
-                                    | Error::AacsVidUnavailable,
-                                    Some(_),
-                                ) => handshake_error.unwrap(),
-                                _ => e,
-                            };
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "scan_aacs_resolve_failed",
-                                error_code = final_err.code(),
-                                keydb = %keydb_path.display(),
-                                handshake_ok = handshake.is_some(),
-                                "AACS key resolution failed"
-                            );
-                            (None, Some(final_err))
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "scan_aacs_no_keydb",
-                        "encrypted disc but no KEYDB found in search paths"
-                    );
-                    // Sentinel path string lets autorip's message switch
-                    // distinguish "no keydb found anywhere" from "keydb at
-                    // <path> failed to parse".
-                    let final_err =
-                        handshake_error.unwrap_or_else(|| crate::error::Error::KeydbLoad {
-                            path: String::from("<no keydb in search paths>"),
-                        });
-                    (None, Some(final_err))
-                }
+                // A handshake failure (no VID) is more actionable than the
+                // generic capture error, so surface it when present.
+                Err(e) => (None, Some(handshake_error.unwrap_or(e))),
             }
         };
 
