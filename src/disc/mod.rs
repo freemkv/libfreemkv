@@ -1492,11 +1492,11 @@ impl Disc {
 /// AACS-chain steps it can from disc-read inputs (MKB / VID / `Unit_Key_RO.inf`).
 ///
 /// `#[non_exhaustive]`: AACS is a derivation chain
-/// (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→ UK`). Today only the final
-/// [`Key::Unit`] entry point is wired; the higher entry points
-/// (device / media / volume key) land as the derivation is lifted out of the
-/// keydb-coupled scan path. Adding them is non-breaking thanks to
-/// `#[non_exhaustive]`.
+/// (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→ UK`). Each variant is an entry
+/// point at one level of that chain; [`Disc::decrypt_with`] derives down from
+/// it to the per-CPS unit keys. New levels can be added without breaking
+/// callers.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Key {
     /// Device key(s) (AACS DK, positioned). libfreemkv walks the MKB
@@ -1602,6 +1602,9 @@ impl Disc {
             volume_id: a.volume_id,
             mkb: a.mkb.clone(),
             unit_key_ro: a.uk_ro.clone(),
+            // Content samples need the disc reader, which scan does not retain;
+            // the caller fills these for sources that validate against ciphertext.
+            samples: Vec::new(),
         })
     }
 

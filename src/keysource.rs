@@ -29,21 +29,33 @@ pub struct DiscInputs {
     pub mkb: Vec<u8>,
     /// Raw `Unit_Key_RO.inf` bytes. Empty when not captured.
     pub unit_key_ro: Vec<u8>,
+    /// Encrypted on-disc content sample units (each a 6144-byte aligned unit),
+    /// for sources that validate a key server-side against real ciphertext
+    /// (e.g. an online key service). Empty for sources that don't need them
+    /// (a local keydb). Populated by the application — reading content requires
+    /// the disc reader, which the library's scan does not retain — so
+    /// [`crate::Disc::inputs`] leaves it empty for the caller to fill.
+    pub samples: Vec<Vec<u8>>,
 }
 
-/// A key source: given a disc's [`DiscInputs`], look up a [`Key`].
+/// A key source: given a disc's [`DiscInputs`], offer candidate [`Key`]s.
 ///
-/// Dumb by contract — a source queries its backing store and returns the raw
-/// key at whatever level it has (device / processing / media / volume / unit).
-/// It performs NO AACS derivation; `Disc::decrypt_with` derives down. That
-/// keeps every derivation step in one place (the library) across AACS
-/// 1.0 / 2.0 / 2.1 / 2.x.
+/// Dumb by contract — a source queries its backing store and enumerates the raw
+/// material it holds as candidate keys at whatever level it has (device /
+/// processing / media / volume / unit). It performs NO AACS derivation and NO
+/// validation; `Disc::decrypt_with` derives down, and the caller validates by
+/// decrypting a sample. That keeps every derivation step in one place (the
+/// library) across AACS 1.0 / 2.0 / 2.1 / 2.x.
+///
+/// A source returns *multiple ordered candidates* because a single store can
+/// hold material for several derivation paths (a keydb has a per-disc VUK *and*
+/// a device-key pool *and* a media-key pool — the source can't know which
+/// applies without the MKB walk, which is derivation). The caller tries the
+/// candidates in order and keeps the first that decrypts (validate-before-
+/// return). A source that resolves server-side (an online key service) or holds
+/// a cached final key (the mapfile) simply returns one candidate.
 pub trait KeySource {
-    /// Look up a key for this disc.
-    ///
-    /// - `Ok(Some(key))` — a key was found; the caller hands it to
-    ///   `Disc::decrypt_with`.
-    /// - `Ok(None)` — this source has nothing for the disc; try the next one.
-    /// - `Err(_)` — the source itself failed (I/O, network, parse).
-    fn resolve(&self, inputs: &DiscInputs) -> Result<Option<Key>>;
+    /// Candidate keys for this disc, most-specific first. Empty = this source
+    /// has nothing; `Err(_)` = the source itself failed (I/O, network, parse).
+    fn resolve(&self, inputs: &DiscInputs) -> Result<Vec<Key>>;
 }
