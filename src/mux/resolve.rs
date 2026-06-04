@@ -199,9 +199,11 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             )
             .map_err(|e| -> io::Error { e.into() })?;
             // Apply the caller-resolved keys (lookup-free); decrypt_keys() then
-            // yields them for the stream below.
+            // yields them for the stream below. Propagate a failed application
+            // rather than silently muxing an undecryptable stream.
             if !opts.unit_keys.is_empty() {
-                let _ = disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()));
+                disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()))
+                    .map_err(|e| -> io::Error { e.into() })?;
             }
             if disc.titles.is_empty() {
                 return Err(crate::error::Error::NoStreams.into());

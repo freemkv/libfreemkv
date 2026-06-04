@@ -455,8 +455,13 @@ mod tests {
 
     #[test]
     fn test_parse_disc_entry() {
-        let line = r#"0x000102030405060708090A0B0C0D0E0F10111213 = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x000102030405060708090A0B0C0D0E0F | I | 0x101112131415161718191A1B1C1D1E1F | V | 0x202122232425262728292A2B2C2D2E2F | U | 1-0x303132333435363738393A3B3C3D3E3F ; MKBv77"#;
-        let entry = KeyDb::parse_disc_entry(line).unwrap();
+        // All-zero placeholders — synthetic; no real key material in code.
+        let z40 = "00".repeat(20);
+        let z32 = "00".repeat(16);
+        let line = format!(
+            "0x{z40} = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x{z32} | I | 0x{z32} | V | 0x{z32} | U | 1-0x{z32} ; MKBv77"
+        );
+        let entry = KeyDb::parse_disc_entry(&line).unwrap();
         assert_eq!(entry.title, "Sample Film");
         assert!(entry.media_key.is_some());
         assert!(entry.vuk.is_some());
@@ -464,9 +469,14 @@ mod tests {
         assert_eq!(entry.unit_keys[0].0, 1);
     }
 
+    // NOTE: key fields below use obvious repeated-byte / zero placeholders
+    // (0x01.., 0x02.., 0x03.., 0x00..). NEVER put real — or real-looking — host,
+    // device, or processing key material in code; these tests exercise the
+    // parser's field-splitting only, not any genuine key.
+
     #[test]
     fn test_parse_device_key() {
-        let line = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; MKBv01-MKBv48";
+        let line = "| DK | DEVICE_KEY 0x00000000000000000000000000000000 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; MKBv01-MKBv48";
         let dk = KeyDb::parse_device_key(line).unwrap();
         assert_eq!(dk.node, 0x0800);
         assert_eq!(dk.u_mask_shift, 0x17);
@@ -479,9 +489,9 @@ mod tests {
         // candidate: it lands in `processing_keys` and the brute walker
         // handles it.
         let cfg = r#"
-| DK | DEVICE_KEY 0xDEADBEEF0001020304050607080900AA ; orphan, no position fields
-| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
-| PK | 0xCAFEBABE0001020304050607080900BB ; legacy PK row still works
+| DK | DEVICE_KEY 0x01010101010101010101010101010101 ; orphan, no position fields
+| DK | DEVICE_KEY 0x02020202020202020202020202020202 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
+| PK | 0x03030303030303030303030303030303 ; legacy PK row still works
 "#;
         let db = KeyDb::parse(cfg);
         assert_eq!(
@@ -495,29 +505,34 @@ mod tests {
             2,
             "orphan DK row + legacy PK row both belong in processing_keys"
         );
-        assert_eq!(db.processing_keys[0][..4], [0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(db.processing_keys[1][..4], [0xCA, 0xFE, 0xBA, 0xBE]);
+        assert_eq!(db.processing_keys[0][..4], [0x01, 0x01, 0x01, 0x01]);
+        assert_eq!(db.processing_keys[1][..4], [0x03, 0x03, 0x03, 0x03]);
     }
 
     #[test]
     fn test_parse_orphan_dk_rejects_lines_with_position_fields() {
         // The parser must NOT pick up a positioned DK row as an orphan
         // (that would double-count). parse_orphan_dk explicitly checks.
-        let positioned = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17";
+        let positioned = "| DK | DEVICE_KEY 0x02020202020202020202020202020202 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17";
         assert!(
             KeyDb::parse_orphan_dk(positioned).is_none(),
             "positioned DK must not match orphan parser"
         );
-        let orphan = "| DK | DEVICE_KEY 0xDEADBEEF0001020304050607080900AA";
+        let orphan = "| DK | DEVICE_KEY 0x01010101010101010101010101010101";
         let key = KeyDb::parse_orphan_dk(orphan).expect("orphan should parse");
-        assert_eq!(key[..4], [0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(key[..4], [0x01, 0x01, 0x01, 0x01]);
     }
 
     #[test]
     fn test_parse_host_cert() {
-        let line = "| HC | HOST_PRIV_KEY 0xDEADBEEF000102030405060708090A0B0C0D0E0F | HOST_CERT 0x000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B ; Revoked";
-        let hc = KeyDb::parse_host_cert(line).unwrap();
-        assert_eq!(hc.private_key[0], 0xDE);
+        // 20-byte priv + 92-byte cert, all zeros — placeholders, not a key.
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{} ; Revoked",
+            "00".repeat(20),
+            "00".repeat(92)
+        );
+        let hc = KeyDb::parse_host_cert(&line).unwrap();
+        assert_eq!(hc.private_key, [0u8; 20]);
         assert_eq!(hc.certificate.len(), 92);
     }
 
