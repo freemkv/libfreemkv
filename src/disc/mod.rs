@@ -1476,6 +1476,28 @@ impl Disc {
     }
 }
 
+/// A decryption key handed to libfreemkv by the caller.
+///
+/// libfreemkv is **lookup-free**: it never reads a keydb, never talks to a key
+/// server, never searches paths. The application resolves a key from whatever
+/// source it likes (a local keydb, an online key service, a mapfile cache) and
+/// hands it in here; libfreemkv uses it to decrypt, deriving any remaining
+/// AACS-chain steps it can from disc-read inputs (MKB / VID / `Unit_Key_RO.inf`).
+///
+/// `#[non_exhaustive]`: AACS is a derivation chain
+/// (`DK →(MKB)→ MK →(VID)→ VK →(Unit_Key_RO)→ UK`). Today only the final
+/// [`Key::Unit`] entry point is wired; the higher entry points
+/// (device / media / volume key) land as the derivation is lifted out of the
+/// keydb-coupled scan path. Adding them is non-breaking thanks to
+/// `#[non_exhaustive]`.
+#[non_exhaustive]
+pub enum Key {
+    /// Final per-CPS-unit AACS keys (`(cps_unit, 16-byte key)`). A key source
+    /// (keydb / key server) resolved these, or they were cached in the mapfile
+    /// at sweep; libfreemkv decrypts directly with no further derivation.
+    Unit(Vec<(u32, [u8; 16])>),
+}
+
 impl Disc {
     /// Get the resolved decryption keys for this disc.
     /// Used by disc-to-ISO and other full-disc operations.
@@ -1506,11 +1528,53 @@ impl Disc {
     /// (persisted at sweep time when the disc was keyed), so the mux decrypts
     /// directly with NO key-service round-trip. Populates `self.aacs.unit_keys`
     /// so [`decrypt_keys`] returns them and marks the source `ExternalUk`.
-    /// No-op for a disc with no AACS state (unencrypted / non-AACS).
+    ///
+    /// If the scan built no AACS state (`self.aacs == None`) — which happens
+    /// when the keydb was absent at scan time (`scan_aacs_no_keydb` →
+    /// `aacs_error = KeydbLoad`) — this synthesizes a minimal `ExternalUk`
+    /// state for an encrypted AACS disc. A Unit Key is the FINAL per-title
+    /// decryption key; the keydb is only needed to *derive* it, and that
+    /// derivation already happened at sweep (the UK is in the mapfile). So a UK
+    /// alone is sufficient to decrypt the on-disk ISO — AACS 2.0 bus decryption
+    /// was applied by the drive at read time, so `read_data_key` is unused for
+    /// file-backed mux. Without this, a keyed disc swept without a keydb would
+    /// recover its UK yet still report E8005 (no usable `decrypt_keys`) at
+    /// remux. No-op for an unencrypted or CSS (DVD) disc.
     pub fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
         if let Some(aacs) = self.aacs.as_mut() {
             aacs.unit_keys = keys;
             aacs.key_source = KeySource::ExternalUk;
+        } else if self.encrypted && self.css.is_none() {
+            self.aacs = Some(AacsState {
+                version: if self.format == DiscFormat::Uhd { 2 } else { 1 },
+                bus_encryption: self.format == DiscFormat::Uhd,
+                mkb_version: None,
+                disc_hash: String::new(),
+                key_source: KeySource::ExternalUk,
+                vuk: None,
+                unit_keys: keys,
+                read_data_key: None,
+                volume_id: [0u8; 16],
+            });
+            // The prior resolution error (e.g. KeydbLoad) is now moot — we have
+            // the decryption key. Clear it so callers don't treat the disc as
+            // keyless on the stale error.
+            self.aacs_error = None;
+        }
+    }
+
+    /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
+    /// decryption state. **Lookup-free**: no keydb, no network — the caller
+    /// (an application, via a key source) does all resolution and hands the key
+    /// in here. For [`Key::Unit`] this is the deferred-mux / resume path: the
+    /// unit keys came from a key source or the mapfile cache, and libfreemkv
+    /// decrypts directly (see [`Self::inject_unit_keys`]).
+    pub fn decrypt_with(&mut self, key: Key) -> Result<()> {
+        match key {
+            Key::Unit(keys) => {
+                self.inject_unit_keys(keys);
+                Ok(())
+            }
         }
     }
 
@@ -2713,6 +2777,136 @@ mod tests {
             aacs_error: None,
             content_format: ContentFormat::BdTs,
         }
+    }
+
+    #[test]
+    fn inject_unit_keys_synthesizes_aacs_state_when_scan_built_none() {
+        // Regression (E8005 deferred-mux loop): a keyed AACS disc swept WITHOUT a
+        // keydb scans to aacs=None + aacs_error=KeydbLoad, but its UK is persisted
+        // in the mapfile. At remux the UK is recovered and injected — that MUST
+        // yield usable decrypt keys. Before the fix, inject_unit_keys no-op'd
+        // (no aacs to mutate), decrypt_keys stayed None, and the mux deferred
+        // forever with "No keys available (E8005)" despite holding the UK.
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs_error = Some(crate::error::Error::KeydbLoad {
+            path: "<no keydb in search paths>".into(),
+        });
+        assert!(
+            matches!(disc.decrypt_keys(), crate::decrypt::DecryptKeys::None),
+            "precondition: encrypted disc with no aacs state => no decrypt keys"
+        );
+
+        let uk = vec![(0u32, [0x11u8; 16])];
+        disc.inject_unit_keys(uk.clone());
+
+        match disc.decrypt_keys() {
+            crate::decrypt::DecryptKeys::Aacs {
+                unit_keys,
+                read_data_key,
+            } => {
+                assert_eq!(unit_keys, uk, "injected UK must be the decrypt key");
+                assert_eq!(read_data_key, None, "ISO mux needs no bus key");
+            }
+            _ => panic!("expected Aacs decrypt keys after injecting a UK"),
+        }
+        assert!(
+            disc.aacs_error.is_none(),
+            "stale KeydbLoad must be cleared once a UK is in hand"
+        );
+        assert_eq!(
+            disc.aacs.as_ref().unwrap().key_source,
+            KeySource::ExternalUk
+        );
+    }
+
+    /// Build an AacsState carrying the given unit keys (other fields are inert
+    /// defaults — these tests only exercise the unit-key/decrypt-keys plumbing).
+    fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
+        AacsState {
+            version: 2,
+            bus_encryption: true,
+            mkb_version: None,
+            disc_hash: String::new(),
+            key_source: KeySource::DeviceKey,
+            vuk: None,
+            unit_keys,
+            read_data_key: None,
+            volume_id: [0u8; 16],
+        }
+    }
+
+    #[test]
+    fn decrypt_keys_none_when_aacs_present_but_unit_keys_empty() {
+        // VID-only state (resolved but no Unit Key yet) must read as None, not
+        // an empty-but-usable key set — callers treat it as "keys missing".
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new()));
+        assert!(matches!(
+            disc.decrypt_keys(),
+            crate::decrypt::DecryptKeys::None
+        ));
+    }
+
+    #[test]
+    fn decrypt_with_replaces_existing_aacs_unit_keys_and_marks_external() {
+        // When scan DID build an AACS state, decrypt_with must overwrite its
+        // unit keys (not append) and mark the source ExternalUk.
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(vec![(0, [0x01; 16])]));
+        let new = vec![(0u32, [0x77u8; 16]), (1, [0x88; 16])];
+        disc.decrypt_with(Key::Unit(new.clone())).unwrap();
+        match disc.decrypt_keys() {
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
+                assert_eq!(unit_keys, new, "must replace, preserving every CPS unit");
+            }
+            _ => panic!("expected Aacs decrypt keys"),
+        }
+        assert_eq!(
+            disc.aacs.as_ref().unwrap().key_source,
+            KeySource::ExternalUk
+        );
+    }
+
+    #[test]
+    fn decrypt_with_unit_key_yields_decrypt_keys() {
+        // The public lookup-free entry point: hand libfreemkv a Key::Unit and
+        // decrypt_keys() must return usable AACS state (same path as the
+        // deferred-mux resume — autorip resolves the UK and passes it in).
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        let uk = vec![(0u32, [0x44u8; 16])];
+        disc.decrypt_with(Key::Unit(uk.clone())).unwrap();
+        match disc.decrypt_keys() {
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
+                assert_eq!(unit_keys, uk);
+            }
+            _ => panic!("expected Aacs decrypt keys after decrypt_with(Key::Unit)"),
+        }
+    }
+
+    #[test]
+    fn inject_unit_keys_is_noop_without_aacs_on_unencrypted_or_css() {
+        // Unencrypted disc: nothing to inject into, stays None.
+        let mut plain = make_test_disc(1000, "PLAIN");
+        plain.inject_unit_keys(vec![(0, [0x22; 16])]);
+        assert!(plain.aacs.is_none());
+        assert!(matches!(
+            plain.decrypt_keys(),
+            crate::decrypt::DecryptKeys::None
+        ));
+
+        // Encrypted CSS (DVD): an AACS UK must NOT synthesize an AACS state.
+        let mut dvd = make_test_disc(1000, "DVD");
+        dvd.format = DiscFormat::Dvd;
+        dvd.encrypted = true;
+        dvd.css = Some(crate::css::CssState {
+            title_key: [0u8; 5],
+        });
+        dvd.inject_unit_keys(vec![(0, [0x33; 16])]);
+        assert!(dvd.aacs.is_none(), "CSS disc must not gain an AACS state");
     }
 
     #[test]
