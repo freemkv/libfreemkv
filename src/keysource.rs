@@ -58,4 +58,12 @@ pub trait KeySource {
     /// Candidate keys for this disc, most-specific first. Empty = this source
     /// has nothing; `Err(_)` = the source itself failed (I/O, network, parse).
     fn resolve(&self, inputs: &DiscInputs) -> Result<Vec<Key>>;
+
+    /// Whether this source needs [`DiscInputs::samples`] populated (encrypted
+    /// content samples) — true for a source that validates against ciphertext
+    /// server-side, false for one that keys purely on disc identity. The caller
+    /// reads samples (an extra disc read) only when some source needs them.
+    fn needs_samples(&self) -> bool {
+        false
+    }
 }
