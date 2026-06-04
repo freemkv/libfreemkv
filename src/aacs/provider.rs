@@ -120,3 +120,42 @@ impl Providers<'_> {
         self.0.iter().find_map(|p| p.lookup_disc_by_vid(volume_id))
     }
 }
+
+/// A [`KeyProvider`] backed by a single caller-supplied key's raw material —
+/// the bridge for [`crate::disc::Disc::decrypt_with`].
+///
+/// The application's key source did the lookup and handed in material at one
+/// level (DK / PK / MK / VUK). This exposes exactly that material to the
+/// version-dispatched resolver, which owns ALL derivation — so a source never
+/// derives, and the lib remains the single home for the AACS chain across
+/// 1.0 / 2.0 / 2.1 / 2.x.
+///
+/// Each level fills only its own field; the rest stay empty, so the resolver
+/// naturally runs the matching path (DK→…, PK→…, MK-pool brute, or a
+/// disc-keyed VUK hit). `decrypt_with` already knows the disc, so the
+/// `lookup_disc_by_*` hash/VID arguments are irrelevant — a present
+/// `disc_entry` is returned for any query.
+pub(crate) struct SuppliedKey {
+    pub device_keys: Vec<DeviceKey>,
+    pub processing_keys: Vec<[u8; 16]>,
+    pub media_keys: Vec<[u8; 16]>,
+    pub disc_entry: Option<DiscEntry>,
+}
+
+impl KeyProvider for SuppliedKey {
+    fn device_keys(&self) -> Vec<DeviceKey> {
+        self.device_keys.clone()
+    }
+    fn processing_keys(&self) -> Vec<[u8; 16]> {
+        self.processing_keys.clone()
+    }
+    fn media_keys(&self) -> Vec<[u8; 16]> {
+        self.media_keys.clone()
+    }
+    fn lookup_disc_by_hash(&self, _disc_hash: &[u8; 20]) -> Option<DiscEntry> {
+        self.disc_entry.clone()
+    }
+    fn lookup_disc_by_vid(&self, _volume_id: &[u8; 16]) -> Option<DiscEntry> {
+        self.disc_entry.clone()
+    }
+}

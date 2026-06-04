@@ -465,8 +465,12 @@ impl Disc {
             unit_keys: resolved.unit_keys,
             read_data_key,
             volume_id,
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
+            // Stash the AACS inputs so a later out-of-band `Disc::decrypt_with`
+            // (caller-resolved Key → derive down) can run without re-reading
+            // the disc. The borrows in `aacs_ctx` ended when `scheme.load`
+            // returned, so these buffers are free to move here.
+            uk_ro: uk_ro_data,
+            mkb: mkb_data.unwrap_or_default(),
         })
     }
 

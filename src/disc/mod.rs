@@ -1499,9 +1499,26 @@ impl Disc {
 /// `#[non_exhaustive]`.
 #[non_exhaustive]
 pub enum Key {
+    /// Device key(s) (AACS DK, positioned). libfreemkv walks the MKB
+    /// (subset-difference tree) to find the one that applies → media key →
+    /// VUK → unit keys. A source hands in its FULL device-key set, because
+    /// choosing which one applies *is* the MKB walk (derivation), and all
+    /// derivation lives here — never in a source.
+    Device(Vec<crate::aacs::keydb::DeviceKey>),
+    /// Processing key(s) (AACS PK). libfreemkv applies each against the MKB
+    /// → media key → VUK → unit keys.
+    Processing(Vec<[u8; 16]>),
+    /// Media key (Km). libfreemkv derives the VUK from it via the Volume ID,
+    /// then the per-CPS-unit keys.
+    Media([u8; 16]),
+    /// Volume Unique Key (VK / VUK). libfreemkv decrypts `Unit_Key_RO.inf`
+    /// into the per-CPS-unit keys. NOT terminal — the chain continues to the
+    /// unit keys.
+    Volume([u8; 16]),
     /// Final per-CPS-unit AACS keys (`(cps_unit, 16-byte key)`). A key source
     /// (keydb / key server) resolved these, or they were cached in the mapfile
-    /// at sweep; libfreemkv decrypts directly with no further derivation.
+    /// at sweep; libfreemkv decrypts directly with no further derivation. This
+    /// is the terminal level every other variant derives down into.
     Unit(Vec<(u32, [u8; 16])>),
 }
 
@@ -1562,9 +1579,9 @@ impl Disc {
                 unit_keys: keys,
                 read_data_key: None,
                 volume_id: [0u8; 16],
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
-        });
+                uk_ro: Vec::new(),
+                mkb: Vec::new(),
+            });
             // The prior resolution error (e.g. KeydbLoad) is now moot — we have
             // the decryption key. Clear it so callers don't treat the disc as
             // keyless on the stale error.
@@ -1579,12 +1596,85 @@ impl Disc {
     /// unit keys came from a key source or the mapfile cache, and libfreemkv
     /// decrypts directly (see [`Self::inject_unit_keys`]).
     pub fn decrypt_with(&mut self, key: Key) -> Result<()> {
-        match key {
-            Key::Unit(keys) => {
-                self.inject_unit_keys(keys);
-                Ok(())
-            }
+        // Unit keys are terminal — no derivation. Inject directly (resume /
+        // mapfile cache / a source that already had the final UKs).
+        if let Key::Unit(keys) = key {
+            self.inject_unit_keys(keys);
+            return Ok(());
         }
+
+        // Every higher level derives DOWN to the unit keys, reusing the
+        // version-dispatched resolver — the single home for all AACS
+        // derivation (1.0 / 2.0 / 2.1 / 2.x). It needs the AACS inputs
+        // (Unit_Key_RO.inf, MKB, VID) stashed on the disc at scan time.
+        let aacs = self.aacs.as_ref().ok_or(crate::error::Error::AacsNoKeys)?;
+        if aacs.uk_ro.is_empty() {
+            // Scan captured no Unit_Key_RO.inf — nothing to derive into.
+            return Err(crate::error::Error::AacsNoKeys);
+        }
+
+        // Map the supplied Key -> raw material. The source handed in material
+        // at exactly one level; choosing/applying it is the resolver's job.
+        let mut supplied = crate::aacs::provider::SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        match key {
+            Key::Device(dks) => supplied.device_keys = dks,
+            Key::Processing(pks) => supplied.processing_keys = pks,
+            Key::Media(mk) => supplied.media_keys = vec![mk],
+            Key::Volume(vuk) => {
+                supplied.disc_entry = Some(crate::aacs::DiscEntry {
+                    disc_hash: aacs.disc_hash.clone(),
+                    title: String::new(),
+                    media_key: None,
+                    disc_id: None,
+                    vuk: Some(vuk),
+                    unit_keys: Vec::new(),
+                });
+            }
+            Key::Unit(_) => unreachable!("Key::Unit handled above"),
+        }
+
+        // Snapshot inputs (releases the &self borrow before the &mut below).
+        let volume_id = aacs.volume_id;
+        let mkb = aacs.mkb.clone();
+        let uk_ro = aacs.uk_ro.clone();
+        let version_u8 = aacs.version;
+
+        let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
+        let ctx = crate::aacs::ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &volume_id,
+            providers: &provider_refs,
+            mkb: if mkb.is_empty() { None } else { Some(&mkb) },
+        };
+
+        // Version dispatch — V10 uses the classical resolver at 48-byte
+        // stride; V20/V21 share the 64-byte stride, so try the classical V20
+        // paths first and fall back to the 2.1 variant chain.
+        let resolved = match version_u8 {
+            1 => crate::aacs::resolve_keys_v1(&ctx),
+            _ => crate::aacs::resolve_keys_v2(&ctx).or_else(|| crate::aacs::resolve_keys_v21(&ctx)),
+        }
+        .ok_or(crate::error::Error::AacsKeyRejected)?;
+
+        if resolved.unit_keys.is_empty() {
+            return Err(crate::error::Error::AacsKeyRejected);
+        }
+
+        let a = self.aacs.as_mut().expect("aacs present (checked above)");
+        a.unit_keys = resolved.unit_keys;
+        if resolved.vuk.is_some() {
+            a.vuk = resolved.vuk;
+        }
+        a.key_source = KeyOrigin::ExternalUk;
+        // A prior scan-time resolution error (e.g. keyless scan) is now moot.
+        self.aacs_error = None;
+        Ok(())
     }
 
     /// Copy disc sectors to an ISO image file.
@@ -2879,6 +2969,95 @@ mod tests {
             disc.aacs.as_ref().unwrap().key_source,
             KeyOrigin::ExternalUk
         );
+    }
+
+    /// Build a minimal valid `Unit_Key_RO.inf` carrying the given encrypted
+    /// unit keys at the V20 (64-byte) stride. Header is inert (no titles); only
+    /// the key-storage area matters for `parse_unit_key_ro`.
+    fn uk_ro_v20(enc_keys: &[[u8; 16]]) -> Vec<u8> {
+        let uk_pos = 32usize;
+        let keys_start = uk_pos + 48;
+        let stride = 64usize;
+        let mut data = vec![0u8; keys_start + enc_keys.len().max(1) * stride];
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[uk_pos..uk_pos + 2].copy_from_slice(&(enc_keys.len() as u16).to_be_bytes());
+        for (i, k) in enc_keys.iter().enumerate() {
+            let off = keys_start + i * stride;
+            data[off..off + 16].copy_from_slice(k);
+        }
+        data
+    }
+
+    #[test]
+    fn decrypt_with_volume_derives_per_cps_unit_keys() {
+        // A Volume key (VUK) is NOT terminal — the lib must decrypt
+        // Unit_Key_RO.inf into ONE unit key per CPS unit. Oracle = the lib's
+        // own decrypt_unit_key, so this pins the derive-down WIRING (Volume →
+        // per-CPS Unit), not the cipher.
+        let vuk = [0x5au8; 16];
+        let enc0 = [0x12u8; 16];
+        let enc1 = [0x34u8; 16];
+        let exp0 = crate::aacs::decrypt_unit_key(&vuk, &enc0);
+        let exp1 = crate::aacs::decrypt_unit_key(&vuk, &enc1);
+
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        let mut a = aacs_with(Vec::new());
+        a.uk_ro = uk_ro_v20(&[enc0, enc1]);
+        disc.aacs = Some(a);
+
+        disc.decrypt_with(Key::Volume(vuk)).unwrap();
+        match disc.decrypt_keys() {
+            crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
+                assert_eq!(
+                    unit_keys,
+                    vec![(1u32, exp0), (2u32, exp1)],
+                    "VUK must decrypt EACH CPS unit's encrypted key (does not stop at VK)"
+                );
+            }
+            _ => panic!("expected Aacs decrypt keys after Volume-key derive-down"),
+        }
+        assert_eq!(
+            disc.aacs.as_ref().unwrap().key_source,
+            KeyOrigin::ExternalUk
+        );
+    }
+
+    #[test]
+    fn decrypt_with_higher_key_without_inputs_errors() {
+        // A non-Unit key needs the AACS inputs (Unit_Key_RO.inf) stashed at
+        // scan. Without them the lib cannot derive — surfaces AacsNoKeys, not a
+        // panic and not a silent keyless "success".
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new())); // uk_ro empty
+        assert!(matches!(
+            disc.decrypt_with(Key::Volume([0x11u8; 16])).unwrap_err(),
+            crate::error::Error::AacsNoKeys
+        ));
+
+        // No AACS state at all → same.
+        let mut disc2 = make_test_disc(1000, "UHD");
+        disc2.encrypted = true;
+        assert!(matches!(
+            disc2.decrypt_with(Key::Media([0x22u8; 16])).unwrap_err(),
+            crate::error::Error::AacsNoKeys
+        ));
+    }
+
+    #[test]
+    fn decrypt_with_volume_yielding_no_units_is_rejected() {
+        // A key that produces zero unit keys (here: an empty key-storage area)
+        // is a rejection, not a silent empty success.
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        let mut a = aacs_with(Vec::new());
+        a.uk_ro = uk_ro_v20(&[]); // num_uk = 0
+        disc.aacs = Some(a);
+        assert!(matches!(
+            disc.decrypt_with(Key::Volume([0x11u8; 16])).unwrap_err(),
+            crate::error::Error::AacsKeyRejected
+        ));
     }
 
     #[test]
