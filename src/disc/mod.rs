@@ -1508,9 +1508,12 @@ pub enum Key {
     /// Processing key(s) (AACS PK). libfreemkv applies each against the MKB
     /// → media key → VUK → unit keys.
     Processing(Vec<[u8; 16]>),
-    /// Media key (Km). libfreemkv derives the VUK from it via the Volume ID,
-    /// then the per-CPS-unit keys.
-    Media([u8; 16]),
+    /// Media key candidate(s) (Km). A source hands its full pool because an MK
+    /// is MKB-scoped (shared across a pressing/MKB family) — picking the one
+    /// that applies is `km_verifies` against this disc's MKB, which is
+    /// derivation, so it lives here. libfreemkv verifies, then derives the VUK
+    /// via the Volume ID and the per-CPS-unit keys.
+    Media(Vec<[u8; 16]>),
     /// Volume Unique Key (VK / VUK). libfreemkv decrypts `Unit_Key_RO.inf`
     /// into the per-CPS-unit keys. NOT terminal — the chain continues to the
     /// unit keys.
@@ -1589,6 +1592,19 @@ impl Disc {
         }
     }
 
+    /// The public AACS inputs for this disc, for a [`crate::KeySource`] to look
+    /// a key up. `None` when the disc carries no AACS state (unencrypted, CSS,
+    /// or AACS inputs not captured at scan). Contains no secrets — just disc
+    /// identity plus the on-disc AACS structures.
+    pub fn inputs(&self) -> Option<crate::keysource::DiscInputs> {
+        self.aacs.as_ref().map(|a| crate::keysource::DiscInputs {
+            disc_hash: a.disc_hash.clone(),
+            volume_id: a.volume_id,
+            mkb: a.mkb.clone(),
+            unit_key_ro: a.uk_ro.clone(),
+        })
+    }
+
     /// Apply a caller-resolved [`Key`] so [`Self::decrypt_keys`] yields usable
     /// decryption state. **Lookup-free**: no keydb, no network — the caller
     /// (an application, via a key source) does all resolution and hands the key
@@ -1624,7 +1640,7 @@ impl Disc {
         match key {
             Key::Device(dks) => supplied.device_keys = dks,
             Key::Processing(pks) => supplied.processing_keys = pks,
-            Key::Media(mk) => supplied.media_keys = vec![mk],
+            Key::Media(mks) => supplied.media_keys = mks,
             Key::Volume(vuk) => {
                 supplied.disc_entry = Some(crate::aacs::DiscEntry {
                     disc_hash: aacs.disc_hash.clone(),
@@ -3040,7 +3056,9 @@ mod tests {
         let mut disc2 = make_test_disc(1000, "UHD");
         disc2.encrypted = true;
         assert!(matches!(
-            disc2.decrypt_with(Key::Media([0x22u8; 16])).unwrap_err(),
+            disc2
+                .decrypt_with(Key::Media(vec![[0x22u8; 16]]))
+                .unwrap_err(),
             crate::error::Error::AacsNoKeys
         ));
     }

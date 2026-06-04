@@ -85,6 +85,7 @@ pub(crate) mod identity;
 pub(crate) mod ifo;
 pub mod io;
 pub mod keydb;
+pub mod keysource;
 pub mod labels;
 pub(crate) mod mpls;
 pub mod mux;
@@ -174,6 +175,7 @@ pub use disc::{
     LabelPurpose, LabelQualifier, PatchOptions, PatchOutcome, Resolution, SampleRate, ScanOptions,
     Stream, SubtitleStream, SweepOptions, VideoStream, classify_damage,
 };
+pub use keysource::{DiscInputs, KeySource};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
 //
