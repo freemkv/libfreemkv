@@ -134,7 +134,17 @@ pub struct Mapfile {
     /// `# freemkv-vid:` comment header so it survives to deferred-mux /
     /// resume without altering the ISO payload or breaking ddrescue
     /// data-line parsing. `None` for unencrypted / non-AACS discs.
+    ///
+    /// MUTUALLY EXCLUSIVE with `unit_keys`: a disc whose keys were resolved
+    /// persists the keys (`unit_keys`) and NOT the VID — the keys are the final
+    /// answer, so deferred-mux/resume decrypts directly with no key service. A
+    /// disc that did NOT resolve persists only the VID, the retry-able "still
+    /// need a key" marker (a future mux can re-ask the key service with it).
     vid: Option<[u8; 16]>,
+    /// Decrypted AACS unit keys `(CPS unit, key)`, persisted as `# freemkv-uk:`
+    /// comment headers when the disc was successfully keyed. Mutually exclusive
+    /// with `vid` (see above). Empty when unresolved.
+    unit_keys: Vec<(u32, [u8; 16])>,
 }
 
 impl Mapfile {
@@ -160,6 +170,7 @@ impl Mapfile {
             dirty: false,
             last_flushed: Instant::now(),
             vid: None,
+            unit_keys: Vec::new(),
         };
         // Eager initial persist so a resume can pick this up even if
         // `record()` is never called.
@@ -175,6 +186,7 @@ impl Mapfile {
         let mut saw_current_line = false;
         let mut version = String::from("unknown");
         let mut vid: Option<[u8; 16]> = None;
+        let mut unit_keys: Vec<(u32, [u8; 16])> = Vec::new();
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
@@ -189,6 +201,12 @@ impl Mapfile {
                     // Best-effort: a malformed or short VID comment is
                     // ignored rather than failing the whole load.
                     vid = parse_vid_hex(hex.trim());
+                }
+                if let Some(uk) = rest.strip_prefix("freemkv-uk:") {
+                    // `<cps>:<32hex>`. Best-effort: a malformed line is skipped.
+                    if let Some(entry) = parse_uk_line(uk.trim()) {
+                        unit_keys.push(entry);
+                    }
                 }
                 continue;
             }
@@ -240,6 +258,7 @@ impl Mapfile {
             dirty: false,
             last_flushed: Instant::now(),
             vid,
+            unit_keys,
         })
     }
 
@@ -345,6 +364,25 @@ impl Mapfile {
         self.vid
     }
 
+    /// Record the disc's decrypted AACS unit keys so they persist in the
+    /// mapfile header (`# freemkv-uk:` lines). The KEYED state: a deferred-mux /
+    /// resume decrypts directly from these with no key-service round-trip.
+    /// Setting keys clears any VID — the mapfile holds keys XOR VID, never both
+    /// (keys are the final answer; VID is only the "still unresolved" marker).
+    pub fn set_unit_keys(&mut self, keys: &[(u32, [u8; 16])]) {
+        self.unit_keys = keys.to_vec();
+        if !self.unit_keys.is_empty() {
+            self.vid = None;
+        }
+        self.dirty = true;
+    }
+
+    /// The disc's decrypted AACS unit keys, if the disc was keyed (parsed from
+    /// `# freemkv-uk:` comments on load). Empty = unresolved (check `vid()`).
+    pub fn unit_keys(&self) -> &[(u32, [u8; 16])] {
+        &self.unit_keys
+    }
+
     pub fn entries(&self) -> &[MapEntry] {
         &self.entries
     }
@@ -421,10 +459,22 @@ impl Mapfile {
             // `#`-prefixed line as a comment, so this round-trips through
             // our `load()` without affecting the `pos size status` data
             // parser. 16 bytes → 32 lowercase hex chars.
-            if let Some(vid) = self.vid {
+            // KEYS XOR VID: a keyed disc persists its unit keys (the final
+            // answer — deferred-mux decrypts directly); an unresolved disc
+            // persists only the VID (the retry marker, so a future mux can
+            // re-ask the key service). Never both.
+            use std::fmt::Write as _;
+            if !self.unit_keys.is_empty() {
+                for (cps, key) in &self.unit_keys {
+                    let mut hex = String::with_capacity(32);
+                    for b in key {
+                        let _ = write!(hex, "{b:02x}");
+                    }
+                    writeln!(w, "# freemkv-uk: {cps}:{hex}")?;
+                }
+            } else if let Some(vid) = self.vid {
                 let mut hex = String::with_capacity(32);
                 for b in vid {
-                    use std::fmt::Write as _;
                     let _ = write!(hex, "{b:02x}");
                 }
                 writeln!(w, "# freemkv-vid: {hex}")?;
@@ -472,6 +522,15 @@ fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
         *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+/// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`. Returns
+/// `None` on any malformation so a corrupt line is ignored, never fatal.
+fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
+    let (cps, hex) = s.split_once(':')?;
+    let cps: u32 = cps.trim().parse().ok()?;
+    let key = parse_vid_hex(hex.trim())?; // 32-hex → [u8; 16], shared parser
+    Some((cps, key))
 }
 
 fn parse_hex(s: &str) -> io::Result<u64> {
@@ -638,6 +697,65 @@ mod tests {
         assert_eq!(s2.bytes_retryable, 100);
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unit_keys_round_trip_and_are_mutually_exclusive_with_vid() {
+        let p = tmpfile("uk_round_trips");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(0, 500, SectorStatus::Finished).unwrap();
+        // Set a VID first, then unit keys: keys must WIN and clear the VID.
+        mf.set_vid([0xAA; 16]);
+        let keys: Vec<(u32, [u8; 16])> = vec![
+            (
+                0,
+                [
+                    0x57, 0x60, 0xcc, 0x83, 0x3d, 0x86, 0x0e, 0x48, 0x92, 0x1f, 0x88, 0x16, 0xe1,
+                    0x35, 0x9b, 0xad,
+                ],
+            ),
+            (1, [0x11; 16]),
+        ];
+        mf.set_unit_keys(&keys);
+        assert_eq!(
+            mf.vid(),
+            None,
+            "set_unit_keys must clear vid (keys XOR vid)"
+        );
+        mf.flush().unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("# freemkv-uk: 0:5760cc833d860e48921f8816e1359bad"),
+            "uk comment format mismatch: {text}"
+        );
+        assert!(
+            text.contains("# freemkv-uk: 1:11111111111111111111111111111111"),
+            "second uk missing: {text}"
+        );
+        assert!(
+            !text.contains("# freemkv-vid:"),
+            "VID must NOT be written when keys are present: {text}"
+        );
+
+        // load() recovers the unit keys (and no VID).
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.unit_keys(), keys.as_slice());
+        assert_eq!(loaded.vid(), None);
+        assert_eq!(loaded.entries(), mf.entries());
+
+        // VID-only path (no keys) still persists the VID as the retry marker.
+        let p2 = tmpfile("uk_vid_only");
+        let _ = std::fs::remove_file(&p2);
+        let mut mf2 = Mapfile::create(&p2, 1000, "test").unwrap();
+        mf2.set_vid([0xBB; 16]);
+        mf2.flush().unwrap();
+        let loaded2 = Mapfile::load(&p2).unwrap();
+        assert_eq!(loaded2.vid(), Some([0xBB; 16]));
+        assert!(loaded2.unit_keys().is_empty());
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]

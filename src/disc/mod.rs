@@ -1501,6 +1501,19 @@ impl Disc {
         }
     }
 
+    /// Inject pre-resolved AACS unit keys into a scanned disc — the deferred-mux
+    /// / resume path. The keys come from the mapfile's `# freemkv-uk:` header
+    /// (persisted at sweep time when the disc was keyed), so the mux decrypts
+    /// directly with NO key-service round-trip. Populates `self.aacs.unit_keys`
+    /// so [`decrypt_keys`] returns them and marks the source `ExternalUk`.
+    /// No-op for a disc with no AACS state (unencrypted / non-AACS).
+    pub fn inject_unit_keys(&mut self, keys: Vec<(u32, [u8; 16])>) {
+        if let Some(aacs) = self.aacs.as_mut() {
+            aacs.unit_keys = keys;
+            aacs.key_source = KeySource::ExternalUk;
+        }
+    }
+
     /// Copy disc sectors to an ISO image file.
     ///
     /// NOT a stream operation. Copies sectors byte-for-byte producing a valid
@@ -1586,6 +1599,7 @@ impl Disc {
             progress: opts.progress,
             halt: opts.halt.clone(),
             vid: opts.vid,
+            unit_keys: opts.unit_keys.clone(),
         };
         self.sweep(reader, path, &sweep_opts)
     }
@@ -1684,12 +1698,14 @@ impl Disc {
         )
         .map_err(|e| Error::IoError { source: e })?;
 
-        // Persist the disc's AACS Volume ID into the mapfile header so it
-        // survives to deferred-mux / resume. ddrescue-safe (comment line);
-        // does not touch the ISO payload. On a resume-load the VID is
-        // already present, but re-setting it (idempotent) covers the case
-        // where Pass 1 created the mapfile before the VID was known.
-        if let Some(vid) = opts.vid {
+        // Persist the disc's decryption state into the mapfile header so it
+        // survives to deferred-mux / resume. ddrescue-safe (comment lines);
+        // does not touch the ISO payload. KEYS XOR VID: a keyed disc writes its
+        // unit keys (the final answer — deferred-mux decrypts directly, no key
+        // service); an unresolved disc writes only the VID (the retry marker).
+        if !opts.unit_keys.is_empty() {
+            map.set_unit_keys(&opts.unit_keys);
+        } else if let Some(vid) = opts.vid {
             map.set_vid(vid);
         }
 
@@ -2168,7 +2184,15 @@ pub struct CopyOptions<'a> {
     /// Pass 1 so it survives to deferred-mux / resume. `None` for
     /// unencrypted / non-AACS discs. Caller wires this from
     /// `Disc::aacs.volume_id`.
+    ///
+    /// Persisted ONLY when `unit_keys` is empty (the disc didn't resolve a
+    /// key): the VID is the "still unresolved, retry-able" marker.
     pub vid: Option<[u8; 16]>,
+    /// Resolved AACS unit keys `(CPS unit, key)` to persist into the mapfile
+    /// during Pass 1. When non-empty these are written (the final answer, so
+    /// deferred-mux/resume decrypts directly) and the VID is NOT — keys XOR VID.
+    /// Caller wires this from `Disc::aacs.unit_keys`.
+    pub unit_keys: Vec<(u32, [u8; 16])>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2191,8 +2215,12 @@ pub struct SweepOptions<'a> {
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// AACS Volume ID (16 bytes) persisted into the mapfile when the
-    /// sweep creates / opens it. `None` for unencrypted discs.
+    /// sweep creates / opens it. `None` for unencrypted discs. Written ONLY
+    /// when `unit_keys` is empty (keys XOR VID — the VID is the retry marker).
     pub vid: Option<[u8; 16]>,
+    /// Resolved AACS unit keys persisted into the mapfile when the sweep
+    /// creates / opens it. When non-empty these win over `vid`.
+    pub unit_keys: Vec<(u32, [u8; 16])>,
 }
 
 /// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
@@ -2704,6 +2732,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         assert!(
@@ -2729,6 +2758,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -2760,6 +2790,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -2790,6 +2821,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts);
         assert!(
@@ -2808,6 +2840,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let patch_result = disc.copy(&mut reader2, &iso_path, &patch_opts);
         assert!(
@@ -2841,6 +2874,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let _sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts).unwrap();
 
@@ -2854,6 +2888,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let patch_result = disc.copy(&mut reader2, std::path::Path::new("/dev/null"), &patch_opts);
         assert!(
@@ -2887,6 +2922,7 @@ mod tests {
             progress: None,
             halt: None,
             vid: None,
+            unit_keys: Vec::new(),
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         let r = result.expect("100-batch clean sweep should succeed");

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.27.3 (2026-06-04)
+
+### Added
+
+- **The mapfile now persists resolved AACS unit keys, not just the Volume ID.**
+  A keyed disc writes its decrypted unit keys as `# freemkv-uk: <cps>:<hex>`
+  comment headers; an unresolved disc writes only the `# freemkv-vid:` marker.
+  The two are **mutually exclusive** (`Mapfile::set_unit_keys` clears the VID):
+  unit keys are the final answer, so a deferred-mux / resume decrypts directly
+  with no key-service round-trip, while the VID alone means "still unresolved —
+  retry the key service." `CopyOptions`/`SweepOptions` gain a `unit_keys` field
+  (written when non-empty, else the VID), and `Disc::inject_unit_keys` applies
+  mapfile-recovered keys to a scanned disc (marking the source `ExternalUk`).
+
 ## 0.27.0 (2026-06-03)
 
 ### Changed
