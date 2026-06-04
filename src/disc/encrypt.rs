@@ -465,6 +465,8 @@ impl Disc {
             unit_keys: resolved.unit_keys,
             read_data_key,
             volume_id,
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
         })
     }
 
@@ -527,6 +529,8 @@ impl Disc {
             unit_keys: vec![(1, unit_key)],
             read_data_key: handshake.and_then(|h| h.read_data_key),
             volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
         })
     }
 
@@ -563,12 +567,12 @@ impl Disc {
             None => 1,
         };
         // MKB_RO is the correctly-sized copy; avoid reading the padded RW region.
-        let mkb_ver = udf_fs
+        let mkb_bytes = udf_fs
             .read_file(reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
             .ok()
-            .as_deref()
-            .and_then(aacs::mkb_version);
+            .unwrap_or_default();
+        let mkb_ver = aacs::mkb_version(&mkb_bytes);
 
         tracing::warn!(
             target: "freemkv::disc",
@@ -590,6 +594,8 @@ impl Disc {
             unit_keys: vec![],
             read_data_key: handshake.and_then(|h| h.read_data_key),
             volume_id: handshake.map(|h| h.volume_id).unwrap_or([0u8; 16]),
+            uk_ro: uk_ro_data,
+            mkb: mkb_bytes,
         })
     }
 }

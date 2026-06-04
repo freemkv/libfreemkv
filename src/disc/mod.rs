@@ -893,6 +893,13 @@ pub struct AacsState {
     pub read_data_key: Option<[u8; 16]>,
     /// Volume ID (16 bytes) -- from SCSI handshake
     pub volume_id: [u8; 16],
+    /// Raw `Unit_Key_RO.inf` bytes (encrypted unit keys + CPS map). Stashed at
+    /// scan so an external resolver (key-resolver) can derive the unit keys
+    /// from a VUK without re-reading the disc. Empty when not captured.
+    pub uk_ro: Vec<u8>,
+    /// Raw MKB bytes (`MKB_RO.inf`). Stashed at scan so an external resolver can
+    /// walk it (device/processing key → media key). Empty when not captured.
+    pub mkb: Vec<u8>,
 }
 
 /// How AACS keys were resolved. Variants are ordered root-of-trust →
@@ -1555,7 +1562,9 @@ impl Disc {
                 unit_keys: keys,
                 read_data_key: None,
                 volume_id: [0u8; 16],
-            });
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
+        });
             // The prior resolution error (e.g. KeydbLoad) is now moot — we have
             // the decryption key. Clear it so callers don't treat the disc as
             // keyless on the stale error.
@@ -2833,6 +2842,8 @@ mod tests {
             unit_keys,
             read_data_key: None,
             volume_id: [0u8; 16],
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
         }
     }
 
