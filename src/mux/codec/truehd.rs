@@ -153,6 +153,52 @@ impl CodecParser for TrueHdParser {
     }
 }
 
+/// Per-bit channel counts for the TrueHD 8-channel and 6-channel presentation
+/// channel-assignment masks (per the MLP spec / FFmpeg `thd_channels`). Some
+/// bits denote a stereo pair (2), others a single channel (1).
+const THD_8CH: [u8; 13] = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
+const THD_6CH: [u8; 5] = [2, 1, 1, 2, 1];
+
+/// Decode the true channel count from a TrueHD major-sync `format_info` word
+/// (the 32 bits immediately after the 0xF8726FBA sync). Returns the richest
+/// presentation's channel count — the 8-channel (e.g. 7.1) presentation when
+/// present, else the 6-channel (5.1) one. This is the real layout that the MPLS
+/// `audio_format` base field (often 5.1 even on a 7.1/Atmos track) understates.
+pub fn truehd_channels(format_info: u32) -> Option<u8> {
+    let ch8 = (format_info & 0x1FFF) as u16; // 8ch_presentation_channel_assignment (13 bits)
+    let ch6 = ((format_info >> 15) & 0x1F) as u16; // 6ch_presentation_channel_assignment (5 bits)
+    let count = |mask: u16, tbl: &[u8]| -> u8 {
+        tbl.iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, &c)| c)
+            .sum()
+    };
+    if ch8 != 0 {
+        Some(count(ch8, &THD_8CH))
+    } else if ch6 != 0 {
+        Some(count(ch6, &THD_6CH))
+    } else {
+        None
+    }
+}
+
+/// Scan a demuxed TrueHD elementary-stream chunk for the first major sync and
+/// decode its true channel count. The stream may interleave AC-3; we scan for
+/// the major-sync word anywhere and read the following `format_info`.
+pub fn truehd_channels_from_stream(data: &[u8]) -> Option<u8> {
+    let mut p = 0;
+    while p + 8 <= data.len() {
+        let w = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+        if (w & 0xFFFF_FFFE) == 0xF872_6FBA {
+            let fi = u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
+            return truehd_channels(fi);
+        }
+        p += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +292,28 @@ mod tests {
     fn codec_private_none() {
         let parser = TrueHdParser::new();
         assert!(parser.codec_private().is_none());
+    }
+
+    #[test]
+    fn truehd_channels_71_from_8ch_presentation() {
+        // 8ch presentation assignment bits 0-4 (LR,C,LFE,LsRs,back-LR) = 2+1+1+2+2 = 8.
+        let format_info = 0x1F; // low 13 bits = 0x1F
+        assert_eq!(truehd_channels(format_info), Some(8));
+    }
+
+    #[test]
+    fn truehd_channels_51_from_6ch_presentation() {
+        // No 8ch presentation; 6ch bits 0-3 (LR,C,LFE,LsRs) = 2+1+1+2 = 6.
+        let format_info = 0xF << 15; // 6ch field = 0xF, 8ch field = 0
+        assert_eq!(truehd_channels(format_info), Some(6));
+    }
+
+    #[test]
+    fn truehd_channels_scan_finds_major_sync() {
+        // [junk][major sync 0xF8726FBA][format_info: 8ch=0x1F -> 7.1]
+        let mut data = vec![0xAA, 0xBB];
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
+        assert_eq!(truehd_channels_from_stream(&data), Some(8));
     }
 }
