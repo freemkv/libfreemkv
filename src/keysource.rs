@@ -12,7 +12,6 @@
 //! stays in it.
 
 use crate::disc::Key;
-use crate::error::Result;
 
 /// The public AACS inputs a key source needs to look a disc up. Captured at
 /// scan; contains no secrets — only the disc identity and the on-disc AACS
@@ -38,32 +37,47 @@ pub struct DiscInputs {
     pub samples: Vec<Vec<u8>>,
 }
 
-/// A key source: given a disc's [`DiscInputs`], offer candidate [`Key`]s.
+/// A key source: a stateful provider that hands a disc's candidate [`Key`]s out
+/// **one at a time**, in whatever order it judges best for its backing store.
 ///
-/// Dumb by contract — a source queries its backing store and enumerates the raw
-/// material it holds as candidate keys at whatever level it has (device /
-/// processing / media / volume / unit). It performs NO AACS derivation and NO
-/// validation; `Disc::decrypt_with` derives down, and the caller validates by
-/// decrypting a sample. That keeps every derivation step in one place (the
-/// library) across AACS 1.0 / 2.0 / 2.1 / 2.x.
+/// Dumb by contract — a source queries its store and yields the raw material it
+/// holds at whatever level it has (device / processing / media / volume / unit).
+/// It performs NO AACS derivation and NO validation: `Disc::decrypt_with`
+/// derives down AND validates against real ciphertext, returning `Err` for a key
+/// that does not decrypt this disc. That keeps every derivation step and the one
+/// validation gate in the library, across AACS 1.0 / 2.0 / 2.1 / 2.x.
 ///
-/// A source returns *multiple ordered candidates* because a single store can
-/// hold material for several derivation paths (a keydb has a per-disc VUK *and*
-/// a device-key pool *and* a media-key pool — the source can't know which
-/// applies without the MKB walk, which is derivation). The caller tries the
-/// candidates in order and keeps the first that decrypts (validate-before-
-/// return). A source that resolves server-side (an online key service) or holds
-/// a cached final key (the mapfile) simply returns one candidate.
+/// The source is the one that knows how many candidates it has and in what order
+/// to try them — a keydb holds a per-disc UK *and* VUK *and* a device-key pool,
+/// so it hands them out cheapest/most-specific first (UK ▸ VK ▸ MK ▸ DK) and
+/// reports exhaustion when its list runs out; an online key service or a mapfile
+/// cache hold exactly one. The caller drives the loop: `next_key` →
+/// `Disc::decrypt_with` → on `Err`, ask again → until a key decrypts or the
+/// source returns `None` (a genuine "no key for this disc"). Compose several
+/// sources, in the caller's chosen order, with [`crate`]'s `MultiSource`.
 pub trait KeySource {
-    /// Candidate keys for this disc, most-specific first. Empty = this source
-    /// has nothing; `Err(_)` = the source itself failed (I/O, network, parse).
-    fn resolve(&self, inputs: &DiscInputs) -> Result<Vec<Key>>;
+    /// Hand the NEXT candidate key for this disc, or `None` once this source is
+    /// exhausted. Stateful: the source tracks what it already handed out this
+    /// session, so asking again after a rejected key yields the next candidate
+    /// (or `None`) — it never re-offers a key or re-hits a one-shot backend (an
+    /// online service is asked at most once). A source failure (I/O, network,
+    /// parse) surfaces as `None` — there is simply nothing more to try.
+    fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key>;
 
     /// Whether this source needs [`DiscInputs::samples`] populated (encrypted
     /// content samples) — true for a source that validates against ciphertext
     /// server-side, false for one that keys purely on disc identity. The caller
     /// reads samples (an extra disc read) only when some source needs them.
     fn needs_samples(&self) -> bool {
+        false
+    }
+
+    /// Whether this source FAILED (I/O, network, parse) rather than simply
+    /// having no key. Checked after exhaustion so the caller can tell a genuine
+    /// "no key for this disc" apart from "the key service was unreachable". A
+    /// store that treats absence as not-an-error (a missing keydb / mapfile)
+    /// leaves this `false`.
+    fn errored(&self) -> bool {
         false
     }
 }

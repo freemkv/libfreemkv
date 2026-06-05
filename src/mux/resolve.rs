@@ -218,7 +218,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // yields them for the stream below. Propagate a failed application
             // rather than silently muxing an undecryptable stream.
             if !opts.unit_keys.is_empty() {
-                disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()))
+                // These UKs were already resolved AND validated by the caller
+                // (the CLI's keydb loop), so no re-validation sample is needed.
+                disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
                     .map_err(|e| -> io::Error { e.into() })?;
             }
             // No-key guard: if decryption is requested (not --raw) and the disc

@@ -1555,6 +1555,43 @@ pub enum Key {
     Unit(Vec<(u32, [u8; 16])>),
 }
 
+/// True if `unit_keys` can de-scramble at least one of the supplied content
+/// `samples` — the validation gate for [`Disc::decrypt_with`]. Conservative: a
+/// sample that is not AACS-scrambled proves nothing, and with no scrambled
+/// sample at all there is nothing to disprove against, so it returns `true`
+/// (accept). It only returns `false` when a scrambled sample exists and NO unit
+/// key restores it to clear MPEG-TS — i.e. the key is provably wrong for this
+/// disc. Reuses the ecosystem's single `is_aacs_scrambled` predicate and the
+/// full (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
+fn aligned_unit_keys_validate(
+    unit_keys: &[(u32, [u8; 16])],
+    read_data_key: Option<&[u8; 16]>,
+    samples: &[Vec<u8>],
+) -> bool {
+    use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, decrypt_unit_full, is_aacs_scrambled};
+    let scrambled: Vec<&[u8]> = samples
+        .iter()
+        .map(|s| s.as_slice())
+        .filter(|s| s.len() >= ALIGNED_UNIT_LEN && is_aacs_scrambled(s))
+        .collect();
+    if scrambled.is_empty() {
+        return true; // nothing to disprove against — accept
+    }
+    if unit_keys.is_empty() {
+        return false;
+    }
+    let mut probe = vec![0u8; ALIGNED_UNIT_LEN];
+    for sample in scrambled {
+        for (_, k) in unit_keys {
+            probe.copy_from_slice(&sample[..ALIGNED_UNIT_LEN]);
+            if decrypt_unit_full(&mut probe, k, read_data_key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl Disc {
     /// Get the resolved decryption keys for this disc.
     /// Used by disc-to-ISO and other full-disc operations.
@@ -1644,83 +1681,116 @@ impl Disc {
     /// in here. For [`Key::Unit`] this is the deferred-mux / resume path: the
     /// unit keys came from a key source or the mapfile cache, and libfreemkv
     /// decrypts directly (see [`Self::inject_unit_keys`]).
-    pub fn decrypt_with(&mut self, key: Key) -> Result<()> {
-        // Unit keys are terminal — no derivation. Inject directly (resume /
-        // mapfile cache / a source that already had the final UKs).
-        if let Key::Unit(keys) = key {
-            self.inject_unit_keys(keys);
-            return Ok(());
-        }
+    /// `samples` are encrypted on-disc aligned units (each 6144 bytes), supplied
+    /// by the caller for content validation. A wrong key — a keydb VK that does
+    /// not match this disc, a stale UK — can still *derive* a non-empty (garbage)
+    /// unit-key set, so before the key touches disc state we confirm it actually
+    /// de-scrambles real ciphertext. This is the single home of key validation:
+    /// every caller loops a key source's candidates through `decrypt_with` and a
+    /// rejected key (`Err(AacsKeyRejected)`) transparently falls through to the
+    /// next. Pass `&[]` when no content sample is available (resume / mapfile
+    /// cache) — validation is then skipped and the key is applied as-is.
+    pub fn decrypt_with(&mut self, key: Key, samples: &[Vec<u8>]) -> Result<()> {
+        // The AACS 2.x bus key, needed to de-scramble a sample for validation;
+        // captured before any mutable borrow. None for AACS 1.0 and file-backed
+        // ISO units (bus encryption was already removed at read time).
+        let read_data_key = self.aacs.as_ref().and_then(|a| a.read_data_key);
 
-        // Every higher level derives DOWN to the unit keys, reusing the
-        // version-dispatched resolver — the single home for all AACS
-        // derivation (1.0 / 2.0 / 2.1 / 2.x). It needs the AACS inputs
-        // (Unit_Key_RO.inf, MKB, VID) stashed on the disc at scan time.
-        let aacs = self.aacs.as_ref().ok_or(crate::error::Error::AacsNoKeys)?;
-        if aacs.uk_ro.is_empty() {
-            // Scan captured no Unit_Key_RO.inf — nothing to derive into.
-            return Err(crate::error::Error::AacsNoKeys);
-        }
-
-        // Map the supplied Key -> raw material. The source handed in material
-        // at exactly one level; choosing/applying it is the resolver's job.
-        let mut supplied = crate::aacs::provider::SuppliedKey {
-            device_keys: Vec::new(),
-            processing_keys: Vec::new(),
-            media_keys: Vec::new(),
-            disc_entry: None,
-        };
-        match key {
-            Key::Device(dks) => supplied.device_keys = dks,
-            Key::Processing(pks) => supplied.processing_keys = pks,
-            Key::Media(mks) => supplied.media_keys = mks,
-            Key::Volume(vuk) => {
-                supplied.disc_entry = Some(crate::aacs::DiscEntry {
-                    disc_hash: aacs.disc_hash.clone(),
-                    title: String::new(),
-                    media_key: None,
-                    disc_id: None,
-                    vuk: Some(vuk),
-                    unit_keys: Vec::new(),
-                });
+        // Resolve the supplied key DOWN to candidate unit keys WITHOUT
+        // committing them, so a wrong higher-level key can be rejected before it
+        // poisons disc state.
+        let (candidate_unit_keys, candidate_vuk) = if let Key::Unit(keys) = key {
+            // Terminal — the source / mapfile already holds the final UKs.
+            (keys, None)
+        } else {
+            // Every higher level derives DOWN to the unit keys, reusing the
+            // version-dispatched resolver — the single home for all AACS
+            // derivation (1.0 / 2.0 / 2.1 / 2.x). It needs the AACS inputs
+            // (Unit_Key_RO.inf, MKB, VID) stashed on the disc at scan time.
+            let aacs = self.aacs.as_ref().ok_or(crate::error::Error::AacsNoKeys)?;
+            if aacs.uk_ro.is_empty() {
+                // Scan captured no Unit_Key_RO.inf — nothing to derive into.
+                return Err(crate::error::Error::AacsNoKeys);
             }
-            Key::Unit(_) => unreachable!("Key::Unit handled above"),
-        }
 
-        // Snapshot inputs (releases the &self borrow before the &mut below).
-        let volume_id = aacs.volume_id;
-        let mkb = aacs.mkb.clone();
-        let uk_ro = aacs.uk_ro.clone();
-        let version_u8 = aacs.version;
+            // Map the supplied Key -> raw material. The source handed in material
+            // at exactly one level; choosing/applying it is the resolver's job.
+            let mut supplied = crate::aacs::provider::SuppliedKey {
+                device_keys: Vec::new(),
+                processing_keys: Vec::new(),
+                media_keys: Vec::new(),
+                disc_entry: None,
+            };
+            match key {
+                Key::Device(dks) => supplied.device_keys = dks,
+                Key::Processing(pks) => supplied.processing_keys = pks,
+                Key::Media(mks) => supplied.media_keys = mks,
+                Key::Volume(vuk) => {
+                    supplied.disc_entry = Some(crate::aacs::DiscEntry {
+                        disc_hash: aacs.disc_hash.clone(),
+                        title: String::new(),
+                        media_key: None,
+                        disc_id: None,
+                        vuk: Some(vuk),
+                        unit_keys: Vec::new(),
+                    });
+                }
+                Key::Unit(_) => unreachable!("Key::Unit handled above"),
+            }
 
-        let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
-        let ctx = crate::aacs::ResolveContext {
-            unit_key_ro: &uk_ro,
-            content_cert: None,
-            volume_id: &volume_id,
-            providers: &provider_refs,
-            mkb: if mkb.is_empty() { None } else { Some(&mkb) },
+            // Snapshot inputs (releases the &self borrow before the &mut below).
+            let volume_id = aacs.volume_id;
+            let mkb = aacs.mkb.clone();
+            let uk_ro = aacs.uk_ro.clone();
+            let version_u8 = aacs.version;
+
+            let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
+            let ctx = crate::aacs::ResolveContext {
+                unit_key_ro: &uk_ro,
+                content_cert: None,
+                volume_id: &volume_id,
+                providers: &provider_refs,
+                mkb: if mkb.is_empty() { None } else { Some(&mkb) },
+            };
+
+            // Version dispatch — V10 uses the classical resolver at 48-byte
+            // stride; V20/V21 share the 64-byte stride, so try the classical V20
+            // paths first and fall back to the 2.1 variant chain.
+            let resolved = match version_u8 {
+                1 => crate::aacs::resolve_keys_v1(&ctx),
+                _ => crate::aacs::resolve_keys_v2(&ctx)
+                    .or_else(|| crate::aacs::resolve_keys_v21(&ctx)),
+            }
+            .ok_or(crate::error::Error::AacsKeyRejected)?;
+
+            if resolved.unit_keys.is_empty() {
+                return Err(crate::error::Error::AacsKeyRejected);
+            }
+            (resolved.unit_keys, resolved.vuk)
         };
 
-        // Version dispatch — V10 uses the classical resolver at 48-byte
-        // stride; V20/V21 share the 64-byte stride, so try the classical V20
-        // paths first and fall back to the 2.1 variant chain.
-        let resolved = match version_u8 {
-            1 => crate::aacs::resolve_keys_v1(&ctx),
-            _ => crate::aacs::resolve_keys_v2(&ctx).or_else(|| crate::aacs::resolve_keys_v21(&ctx)),
-        }
-        .ok_or(crate::error::Error::AacsKeyRejected)?;
-
-        if resolved.unit_keys.is_empty() {
+        // VALIDATE against real ciphertext. Conservative: reject only when a
+        // supplied sample is AACS-scrambled and NO candidate unit key can
+        // de-scramble it. With no samples (or only clear ones) there is nothing
+        // to disprove against, so the key is accepted as-is — keeping the
+        // sample-less paths (resume / mapfile cache) byte-for-byte unchanged.
+        if !aligned_unit_keys_validate(&candidate_unit_keys, read_data_key.as_ref(), samples) {
             return Err(crate::error::Error::AacsKeyRejected);
         }
 
-        let a = self.aacs.as_mut().expect("aacs present (checked above)");
-        a.unit_keys = resolved.unit_keys;
-        if resolved.vuk.is_some() {
-            a.vuk = resolved.vuk;
+        // Commit — only now does the key touch disc state.
+        match self.aacs.as_mut() {
+            Some(a) => {
+                a.unit_keys = candidate_unit_keys;
+                if candidate_vuk.is_some() {
+                    a.vuk = candidate_vuk;
+                }
+                a.key_source = KeyOrigin::ExternalUk;
+            }
+            // A Unit key for an AACS disc whose scan built no state (keyless
+            // scan, no keydb): synthesize a minimal ExternalUk state.
+            None => self.inject_unit_keys(candidate_unit_keys),
         }
-        a.key_source = KeyOrigin::ExternalUk;
         // A prior scan-time resolution error (e.g. keyless scan) is now moot.
         self.aacs_error = None;
         Ok(())
@@ -3007,7 +3077,7 @@ mod tests {
         disc.encrypted = true;
         disc.aacs = Some(aacs_with(vec![(0, [0x01; 16])]));
         let new = vec![(0u32, [0x77u8; 16]), (1, [0x88; 16])];
-        disc.decrypt_with(Key::Unit(new.clone())).unwrap();
+        disc.decrypt_with(Key::Unit(new.clone()), &[]).unwrap();
         match disc.decrypt_keys() {
             crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
                 assert_eq!(unit_keys, new, "must replace, preserving every CPS unit");
@@ -3055,7 +3125,7 @@ mod tests {
         a.uk_ro = uk_ro_v20(&[enc0, enc1]);
         disc.aacs = Some(a);
 
-        disc.decrypt_with(Key::Volume(vuk)).unwrap();
+        disc.decrypt_with(Key::Volume(vuk), &[]).unwrap();
         match disc.decrypt_keys() {
             crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
                 assert_eq!(
@@ -3081,7 +3151,8 @@ mod tests {
         disc.encrypted = true;
         disc.aacs = Some(aacs_with(Vec::new())); // uk_ro empty
         assert!(matches!(
-            disc.decrypt_with(Key::Volume([0x11u8; 16])).unwrap_err(),
+            disc.decrypt_with(Key::Volume([0x11u8; 16]), &[])
+                .unwrap_err(),
             crate::error::Error::AacsNoKeys
         ));
 
@@ -3090,7 +3161,7 @@ mod tests {
         disc2.encrypted = true;
         assert!(matches!(
             disc2
-                .decrypt_with(Key::Media(vec![[0x22u8; 16]]))
+                .decrypt_with(Key::Media(vec![[0x22u8; 16]]), &[])
                 .unwrap_err(),
             crate::error::Error::AacsNoKeys
         ));
@@ -3106,7 +3177,8 @@ mod tests {
         a.uk_ro = uk_ro_v20(&[]); // num_uk = 0
         disc.aacs = Some(a);
         assert!(matches!(
-            disc.decrypt_with(Key::Volume([0x11u8; 16])).unwrap_err(),
+            disc.decrypt_with(Key::Volume([0x11u8; 16]), &[])
+                .unwrap_err(),
             crate::error::Error::AacsKeyRejected
         ));
     }
@@ -3119,13 +3191,101 @@ mod tests {
         let mut disc = make_test_disc(1000, "UHD");
         disc.encrypted = true;
         let uk = vec![(0u32, [0x44u8; 16])];
-        disc.decrypt_with(Key::Unit(uk.clone())).unwrap();
+        disc.decrypt_with(Key::Unit(uk.clone()), &[]).unwrap();
         match disc.decrypt_keys() {
             crate::decrypt::DecryptKeys::Aacs { unit_keys, .. } => {
                 assert_eq!(unit_keys, uk);
             }
             _ => panic!("expected Aacs decrypt keys after decrypt_with(Key::Unit)"),
         }
+    }
+
+    #[test]
+    fn unit_key_validation_gates_on_real_ciphertext() {
+        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, is_aacs_scrambled};
+
+        // No samples -> nothing to disprove against -> accept (sample-less paths
+        // like resume / mapfile must be unaffected).
+        assert!(super::aligned_unit_keys_validate(
+            &[(0, [0x11u8; 16])],
+            None,
+            &[]
+        ));
+
+        // A clear unit (TS syncs intact) is not scrambled -> proves nothing ->
+        // accept even with an arbitrary key.
+        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            clear[off] = 0x47;
+            off += 192;
+        }
+        assert!(!is_aacs_scrambled(&clear));
+        assert!(super::aligned_unit_keys_validate(
+            &[(0, [0x11u8; 16])],
+            None,
+            &[clear.clone()]
+        ));
+
+        // A genuinely scrambled unit the RIGHT key restores to clear TS.
+        let uk = [0x5au8; 16];
+        let enc = encrypt_unit_for_test(&clear, &uk);
+        assert!(
+            is_aacs_scrambled(&enc),
+            "encrypted unit must read scrambled"
+        );
+
+        // Right key -> de-scrambles -> accept (NO false reject of a good key).
+        assert!(super::aligned_unit_keys_validate(
+            &[(7, uk)],
+            None,
+            &[enc.clone()]
+        ));
+        // Wrong key -> cannot de-scramble a scrambled sample -> reject.
+        assert!(!super::aligned_unit_keys_validate(
+            &[(7, [0x00u8; 16])],
+            None,
+            &[enc.clone()]
+        ));
+        // Empty key set against a scrambled sample -> reject.
+        assert!(!super::aligned_unit_keys_validate(&[], None, &[enc]));
+    }
+
+    /// Inverse of `decrypt_unit` for one 6144-byte unit: produce on-disc
+    /// ciphertext that `decrypt_unit(uk)` restores to `clear`. Mirrors the AACS
+    /// unit algorithm — ECB-derive the per-unit key, then AES-CBC encrypt the
+    /// body with the fixed AACS IV.
+    fn encrypt_unit_for_test(clear: &[u8], uk: &[u8; 16]) -> Vec<u8> {
+        use crate::aacs::decrypt::{AACS_IV, ALIGNED_UNIT_LEN};
+        use aes::Aes128;
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();
+        let mut header = [0u8; 16];
+        header.copy_from_slice(&unit[..16]);
+        let cipher = Aes128::new(GenericArray::from_slice(uk));
+        let mut blk = GenericArray::clone_from_slice(&header);
+        cipher.encrypt_block(&mut blk);
+        let mut dk = [0u8; 16];
+        for i in 0..16 {
+            dk[i] = blk[i] ^ header[i];
+        }
+        let bc = Aes128::new(GenericArray::from_slice(&dk));
+        let mut prev = AACS_IV;
+        let mut i = 16;
+        while i + 16 <= ALIGNED_UNIT_LEN {
+            let mut b = [0u8; 16];
+            for j in 0..16 {
+                b[j] = unit[i + j] ^ prev[j];
+            }
+            let mut g = GenericArray::clone_from_slice(&b);
+            bc.encrypt_block(&mut g);
+            for j in 0..16 {
+                unit[i + j] = g[j];
+            }
+            prev.copy_from_slice(&unit[i..i + 16]);
+            i += 16;
+        }
+        unit
     }
 
     #[test]
