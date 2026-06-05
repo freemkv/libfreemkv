@@ -34,6 +34,24 @@ pub struct MkvTrack {
     pub sample_rate: f64,
     pub channels: u8,
     pub bit_depth: u8,
+    // Dolby Vision: the dvcC (DOVIDecoderConfigurationRecord) for the DV layer,
+    // emitted as a BlockAdditionMapping. `None` for non-DV tracks.
+    pub dv_config: Option<Vec<u8>>,
+}
+
+/// Build a DOVIDecoderConfigurationRecord (dvcC) — 24 bytes — for the Matroska
+/// BlockAdditionMapping. For disc Profile 7 dual-layer the base, enhancement,
+/// and RPU are all present (lossless FEL/MEL preserved as a second track).
+pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 24];
+    v[0] = 1; // dv_version_major
+    v[1] = 0; // dv_version_minor
+    // profile(7) | level(6) | rpu_present(1) | el_present(1) | bl_present(1)
+    v[2] = ((profile & 0x7F) << 1) | ((level >> 5) & 0x01);
+    v[3] = ((level & 0x1F) << 3) | (1 << 2) | (1 << 1) | 1; // rpu = el = bl = 1
+    v[4] = (bl_compat_id & 0x0F) << 4;
+    // v[5..24] reserved = 0
+    v
 }
 
 impl MkvTrack {
@@ -83,6 +101,13 @@ impl MkvTrack {
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
+            // The DV layer (hdr=DolbyVision) carries the dvcC so the track is
+            // recognised as Dolby Vision (disc Profile 7 dual-layer).
+            dv_config: if matches!(v.hdr, HdrFormat::DolbyVision) {
+                Some(dolby_vision_config(7, 6, 0))
+            } else {
+                None
+            },
         }
     }
 
@@ -128,6 +153,7 @@ impl MkvTrack {
             sample_rate: sr,
             channels: ch,
             bit_depth: 0,
+            dv_config: None,
         }
     }
 
@@ -156,6 +182,7 @@ impl MkvTrack {
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
+            dv_config: None,
         }
     }
 }
@@ -331,6 +358,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     ebml::end_master(&mut writer, col_pos)?;
                 }
                 ebml::end_master(&mut writer, vid_pos)?;
+            }
+
+            // Dolby Vision signaling — BlockAdditionMapping is a child of the
+            // TrackEntry (sibling of Video). Carries the dvcC so players /
+            // mediainfo recognise the track as Dolby Vision.
+            if let Some(ref dvcc) = track.dv_config {
+                let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
+                // BlockAddIDType = "dvcC" fourcc (DOVIDecoderConfigurationRecord).
+                ebml::write_uint(&mut writer, ebml::BLOCK_ADD_ID_TYPE, 0x6476_6343)?;
+                ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, dvcc)?;
+                ebml::end_master(&mut writer, map_pos)?;
             }
 
             // Audio-specific
@@ -612,6 +650,7 @@ mod tests {
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
+            dv_config: None,
         }
     }
 
@@ -636,7 +675,22 @@ mod tests {
             sample_rate: 48000.0,
             channels: 6,
             bit_depth: 0,
+            dv_config: None,
         }
+    }
+
+    #[test]
+    fn dolby_vision_config_profile7() {
+        // dvcC for disc Profile 7 dual-layer: version 1.0, profile 7, all of
+        // bl/el/rpu present. 24 bytes.
+        let c = dolby_vision_config(7, 6, 0);
+        assert_eq!(c.len(), 24);
+        assert_eq!(c[0], 1); // dv_version_major
+        assert_eq!(c[1], 0); // dv_version_minor
+        // profile in the top 7 bits of byte 2
+        assert_eq!(c[2] >> 1, 7, "dv_profile must be 7");
+        // rpu/el/bl present flags in byte 3 (low 3 bits after level)
+        assert_eq!(c[3] & 0b0000_0111, 0b0000_0111, "rpu+el+bl all present");
     }
 
     #[test]

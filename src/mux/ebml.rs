@@ -362,6 +362,12 @@ pub const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 pub const PRIMARIES: u32 = 0x55BB;
 pub const RANGE: u32 = 0x55B9;
 
+// Dolby Vision — BlockAdditionMapping carries the DOVIDecoderConfigurationRecord
+// (dvcC) so players / mediainfo recognise the track as Dolby Vision.
+pub const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
+pub const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
+pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
+
 // Audio
 pub const AUDIO: u32 = 0xE1;
 pub const SAMPLING_FREQUENCY: u32 = 0xB5;
