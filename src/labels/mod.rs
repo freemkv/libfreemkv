@@ -207,14 +207,41 @@ pub(crate) fn apply_labels(labels: &[StreamLabel], titles: &mut [DiscTitle]) {
                         // Structured fields — callers translate purpose to UI text.
                         a.purpose = label.purpose;
 
+                        // Codec descriptor: trust the parser's `codec_hint` ONLY
+                        // when it's consistent with the stream's actual codec — it
+                        // may legitimately be richer (e.g. "Dolby Atmos" on a TrueHD
+                        // stream, which the raw spec codec can't express). If the
+                        // hint CONTRADICTS the stream (a mis-bound / shuffled label,
+                        // e.g. "AC-3 2.0" on a TrueHD track, or "TrueHD" on a DD+
+                        // track), discard it and derive the descriptor from the
+                        // stream itself — that's correct per-stream and can never be
+                        // shuffled. An empty hint is left for `fill_defaults`.
+                        let codec_desc = if label.codec_hint.is_empty() {
+                            // No codec hint — leave for fill_defaults.
+                            String::new()
+                        } else if !codec_hint_consistent(&label.codec_hint, &a.codec) {
+                            // Hint contradicts the stream (mis-bound / shuffled):
+                            // derive from the stream itself.
+                            generate_audio_label(&a.codec, &a.channels, a.secondary)
+                        } else if codec_hint_adds_detail(&label.codec_hint) {
+                            // Consistent AND richer than the spec codec can express
+                            // (e.g. "Dolby Atmos", "DTS:X") — keep the parser's hint.
+                            label.codec_hint.clone()
+                        } else {
+                            // Consistent but a plain codec/channel restatement —
+                            // normalize to the stream's own marketing descriptor so
+                            // styling is uniform across tracks.
+                            generate_audio_label(&a.codec, &a.channels, a.secondary)
+                        };
+
                         // a.label only carries codec/variant info. NEVER any
                         // English purpose text — the CLI handles that via i18n.
                         let mut parts = Vec::new();
                         if !label.variant.is_empty() {
                             parts.push(format!("({})", label.variant));
                         }
-                        if !label.codec_hint.is_empty() {
-                            parts.push(label.codec_hint.clone());
+                        if !codec_desc.is_empty() {
+                            parts.push(codec_desc);
                         }
                         if !parts.is_empty() {
                             a.label = parts.join(" ");
@@ -320,6 +347,69 @@ fn generate_video_label(
     }
 
     parts.join(" ")
+}
+
+/// Does the parser's `codec_hint` name a codec consistent with the stream's
+/// actual `codec`? [`apply_labels`] uses this to keep richer-but-consistent
+/// hints (e.g. "Dolby Atmos" on a TrueHD stream — Atmos is a TrueHD extension
+/// the raw spec codec can't express) while rejecting mis-bound ones (e.g.
+/// "AC-3 2.0" on a TrueHD stream, the shuffled-label bug). Matching is by codec
+/// FAMILY parsed out of the hint string. "Atmos" with no carrier named is
+/// treated as compatible with its lossless carriers (TrueHD / E-AC-3). A hint
+/// naming no recognizable codec family (pure editorial, e.g. "Commentary") is
+/// consistent — it isn't asserting a codec.
+fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
+    use crate::disc::Codec;
+    let h = hint.to_ascii_lowercase();
+
+    let says_truehd = h.contains("truehd") || h.contains("true hd");
+    let says_ddp = h.contains("ac-3+")
+        || h.contains("ac3+")
+        || h.contains("e-ac-3")
+        || h.contains("eac-3")
+        || h.contains("eac3")
+        || h.contains("digital plus")
+        || h.contains("dd+");
+    let says_ac3 =
+        !says_ddp && (h.contains("ac-3") || h.contains("ac3") || h.contains("dolby digital"));
+    let says_dts_ma = h.contains("master audio") || h.contains("hd ma");
+    let says_dts_hr = h.contains("high resolution") || h.contains("hd hr");
+    let says_dts = !says_dts_ma && !says_dts_hr && h.contains("dts");
+    let says_lpcm = h.contains("lpcm") || h.contains("pcm");
+    let says_atmos = h.contains("atmos");
+
+    let names_family =
+        says_truehd || says_ddp || says_ac3 || says_dts_ma || says_dts_hr || says_dts || says_lpcm;
+
+    // Pure-editorial hint (no codec family named) isn't asserting a codec →
+    // consistent. "Atmos" alone implies a lossless carrier (TrueHD or DD+).
+    if !names_family {
+        return if says_atmos {
+            matches!(codec, Codec::TrueHd | Codec::Ac3Plus)
+        } else {
+            true
+        };
+    }
+
+    match codec {
+        Codec::TrueHd => says_truehd || says_atmos,
+        Codec::Ac3Plus => says_ddp || says_atmos,
+        Codec::Ac3 => says_ac3,
+        Codec::DtsHdMa => says_dts_ma,
+        Codec::DtsHdHr => says_dts_hr,
+        Codec::Dts => says_dts,
+        Codec::Lpcm => says_lpcm,
+        // Unknown / other stream codec — don't second-guess the parser's hint.
+        _ => true,
+    }
+}
+
+/// Does the hint carry object-audio detail the spec codec can't express
+/// (Atmos / DTS:X)? Such hints are kept verbatim; plain codec/channel hints are
+/// normalized to the stream's own descriptor for uniform styling across tracks.
+fn codec_hint_adds_detail(hint: &str) -> bool {
+    let h = hint.to_ascii_lowercase();
+    h.contains("atmos") || h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx")
 }
 
 fn generate_audio_label(
@@ -1183,6 +1273,94 @@ mod apply_tests {
     }
 
     #[test]
+    fn apply_rejects_mismatched_codec_hint_and_uses_stream_codec() {
+        // Paddington case: a TrueHD+Atmos main track the parser mislabeled
+        // "AC-3 2.0" (a compat-core hint bound to the wrong stream). The hint
+        // contradicts the stream's real codec → discard it, use the stream's own.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::TrueHd,
+            AudioChannels::Surround71,
+            "eng",
+        )])];
+        let labels = vec![audio_label(1, "eng", "AC-3 2.0", "")];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Dolby TrueHD 7.1");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_unshuffles_cross_labeled_streams() {
+        // Wicked case: hints fully cross-bound — a TrueHD stream wears "AC-3 5.1"
+        // and a DD+ stream wears "TrueHD 5.1". Each is corrected from its own
+        // stream codec, eliminating the shuffle.
+        let mut titles = vec![title_with(vec![
+            audio(0x1100, Codec::TrueHd, AudioChannels::Surround51, "eng"),
+            audio(0x1101, Codec::Ac3Plus, AudioChannels::Surround51, "spa"),
+        ])];
+        let labels = vec![
+            audio_label(1, "eng", "AC-3 5.1", ""),
+            audio_label(2, "spa", "TrueHD 5.1", ""),
+        ];
+        apply_labels(&labels, &mut titles);
+        let got: Vec<String> = titles[0]
+            .streams
+            .iter()
+            .filter_map(|s| {
+                if let Stream::Audio(a) = s {
+                    Some(a.label.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(got, vec!["Dolby TrueHD 5.1", "Dolby Digital Plus 5.1"]);
+    }
+
+    #[test]
+    fn apply_keeps_consistent_richer_atmos_hint() {
+        // A DD+ Atmos stream legitimately labeled "Dolby Atmos" — the hint is
+        // richer than the spec codec yet consistent with it, so it's kept.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::Ac3Plus,
+            AudioChannels::Surround51,
+            "eng",
+        )])];
+        let labels = vec![audio_label(1, "eng", "Dolby Atmos", "")];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Dolby Atmos");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn apply_normalizes_plain_consistent_hint_to_marketing() {
+        // Wicked's French track: a DD+ stream whose hint "AC-3+ 5.1" is correct
+        // but short-form. A sibling DD+ track that fell back uses the marketing
+        // form — keeping the short form here would read inconsistently, so a
+        // plain (non-richer) consistent hint is normalized to the stream's own.
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::Ac3Plus,
+            AudioChannels::Surround51,
+            "fra",
+        )])];
+        let labels = vec![audio_label(1, "fra", "AC-3+ 5.1", "")];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "Dolby Digital Plus 5.1");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
     fn apply_sets_purpose_on_audio_commentary() {
         let mut titles = vec![title_with(vec![audio(
             0x1100,
@@ -1342,9 +1520,11 @@ mod apply_tests {
         if let Stream::Audio(a) = &titles[0].streams[1] {
             assert_eq!(a.label, "Dolby Atmos");
         }
-        // Audio #2 (4th stream overall)
+        // Audio #2 (4th stream overall). The plain "Dolby Digital" hint is
+        // consistent with the AC-3 stream but carries no channel info, so it's
+        // normalized to the stream's own uniform descriptor.
         if let Stream::Audio(a) = &titles[0].streams[3] {
-            assert_eq!(a.label, "Dolby Digital");
+            assert_eq!(a.label, "Dolby Digital 2.0");
         }
         // Subtitle #1
         if let Stream::Subtitle(s) = &titles[0].streams[2] {

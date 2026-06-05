@@ -1356,6 +1356,44 @@ impl Disc {
             .cmp(&b_oversize)
             .then_with(|| a.clips.len().cmp(&b.clips.len()))
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
+            // Same length + clip count = the same feature authored as multiple
+            // playlists (a full-audio main vs an audio-reduced twin, e.g. Fight
+            // Club's 00800 [DTS-HD MA + 13 tracks] vs 00004 [stereo AC-3 only]).
+            // Prefer the richer audio so we never rip a stereo-only variant over
+            // the lossless-multichannel main feature.
+            .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
+    }
+
+    /// Audio-richness rank for `canonical_title_order`'s same-length tiebreak.
+    /// Higher is better: `(any lossless track, best channel count, audio count)`.
+    fn audio_richness(t: &DiscTitle) -> (u8, u8, usize) {
+        let mut lossless = 0u8;
+        let mut max_ch = 0u8;
+        let mut count = 0usize;
+        for s in &t.streams {
+            if let Stream::Audio(a) = s {
+                count += 1;
+                if matches!(
+                    a.codec,
+                    Codec::TrueHd | Codec::DtsHdMa | Codec::DtsHdHr | Codec::Lpcm | Codec::Flac
+                ) {
+                    lossless = 1;
+                }
+                let ch = match a.channels {
+                    AudioChannels::Surround71 => 8,
+                    AudioChannels::Surround61 => 7,
+                    AudioChannels::Surround51 => 6,
+                    AudioChannels::Surround50 => 5,
+                    AudioChannels::Quad => 4,
+                    AudioChannels::Stereo21 => 3,
+                    AudioChannels::Stereo => 2,
+                    AudioChannels::Mono => 1,
+                    AudioChannels::Unknown => 0,
+                };
+                max_ch = max_ch.max(ch);
+            }
+        }
+        (lossless, max_ch, count)
     }
 
     fn detect_format(titles: &[DiscTitle]) -> DiscFormat {
