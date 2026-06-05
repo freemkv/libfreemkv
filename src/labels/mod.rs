@@ -412,7 +412,7 @@ fn codec_hint_adds_detail(hint: &str) -> bool {
     h.contains("atmos") || h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx")
 }
 
-fn generate_audio_label(
+pub(crate) fn generate_audio_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
     _secondary: bool,

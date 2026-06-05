@@ -375,6 +375,79 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
+/// Correct the channel count of a title's TrueHD audio streams by probing the
+/// first decrypted access units. The MPLS `audio_format` field declares the
+/// BASE layout (often 5.1) even for a 7.1/Atmos TrueHD track; the real count is
+/// in the MLP major sync. `reader` must yield DECRYPTED sectors (the m2ts is
+/// AACS-encrypted, so this can only run at mux time, not scan). Reads a bounded
+/// window of the title's first extent. Also regenerates the stream's codec
+/// label when it was the basic descriptor for the (now corrected) count —
+/// richer editorial labels (e.g. "Dolby Atmos") are left untouched.
+pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
+    use crate::mux::codec::truehd::truehd_channels_from_stream;
+
+    let pids: Vec<u16> = title
+        .streams
+        .iter()
+        .filter_map(|s| match s {
+            Stream::Audio(a) if matches!(a.codec, Codec::TrueHd) => Some(a.pid),
+            _ => None,
+        })
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    let Some(ext) = title.extents.first() else {
+        return;
+    };
+    // Bounded probe: up to 8 MiB from the start of the title — enough for the
+    // first interleaved TrueHD major sync of each stream.
+    const PROBE_SECTORS: u32 = 4096;
+    let n = ext.sector_count.min(PROBE_SECTORS) as u16;
+    if n == 0 {
+        return;
+    }
+    let mut buf = vec![0u8; n as usize * 2048];
+    if reader
+        .read_sectors(ext.start_lba, n, &mut buf, true)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut demux = crate::mux::ts::TsDemuxer::new(&pids);
+    let mut payloads: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+    for pes in demux.feed(&buf).into_iter().chain(demux.flush()) {
+        payloads
+            .entry(pes.pid)
+            .or_default()
+            .extend_from_slice(&pes.data);
+    }
+
+    for s in title.streams.iter_mut() {
+        let Stream::Audio(a) = s else { continue };
+        if !matches!(a.codec, Codec::TrueHd) {
+            continue;
+        }
+        let Some(payload) = payloads.get(&a.pid) else {
+            continue;
+        };
+        let Some(count) = truehd_channels_from_stream(payload) else {
+            continue;
+        };
+        let new_ch = AudioChannels::from_count(count);
+        if new_ch == AudioChannels::Unknown || new_ch == a.channels {
+            continue;
+        }
+        let was_basic =
+            a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
+        a.channels = new_ch;
+        if was_basic {
+            a.label = crate::labels::generate_audio_label(&a.codec, &new_ch, a.secondary);
+        }
+    }
+}
+
 /// Calculate how many bytes of bad/unreadable data fall within a title's extents.
 /// `pub(crate)` so autorip can use it for main-movie lost_ms computation.
 pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {

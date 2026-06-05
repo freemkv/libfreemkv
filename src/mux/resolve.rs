@@ -216,8 +216,15 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 }
                 .into());
             }
-            let title = disc.titles[idx].clone();
+            // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
+            // by probing the first DECRYPTED access units of the chosen title.
+            // A fresh reader avoids disturbing the mux reader below.
             let keys = disc.decrypt_keys();
+            if let Ok(probe) = crate::io::file_sector_source::FileSectorSource::open(path) {
+                let mut dec = crate::sector::DecryptingSectorSource::new(probe, keys.clone());
+                crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
+            }
+            let title = disc.titles[idx].clone();
             let format = disc.content_format;
             // ISO file: 16 MiB batch — sequential read from fast
             // storage, no bad sectors. Measured optimum on the rip1
