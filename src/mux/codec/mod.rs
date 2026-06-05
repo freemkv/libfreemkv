@@ -52,6 +52,18 @@ pub trait CodecParser: Send {
     /// Some (TrueHD): multiple access units per PES.
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame>;
 
+    /// Drain any access unit still buffered after the last PES.
+    ///
+    /// Parsers that buffer across PES boundaries to assemble a complete
+    /// access unit (e.g. DTS-HD, whose extension substreams arrive in
+    /// separate PES packets) hold the final unit until they can prove it's
+    /// complete. At end-of-stream there is no following packet to prove it,
+    /// so the demuxer calls `flush()` once after the last PES to emit it.
+    /// Default: nothing buffered, no tail.
+    fn flush(&mut self) -> Vec<Frame> {
+        Vec::new()
+    }
+
     /// Get codec initialization data (e.g., SPS+PPS for H.264).
     /// Returns None until enough data has been seen.
     fn codec_private(&self) -> Option<Vec<u8>>;

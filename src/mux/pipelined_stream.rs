@@ -176,6 +176,18 @@ impl Stream for PipelinedPesStream {
                 }
                 false => {
                     self.eof = true;
+                    // Drain any access unit a parser buffered past the last
+                    // PES (e.g. DTS-HD's final core+extension unit).
+                    let pid_to_track = &self.pid_to_track;
+                    let pending = &mut self.pending_frames;
+                    for (pid, parser) in self.parsers.iter_mut() {
+                        let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
+                            continue;
+                        };
+                        for frame in parser.flush() {
+                            pending.push_back(PesFrame::from_codec_frame(track, frame));
+                        }
+                    }
                     return Ok(self.pending_frames.pop_front());
                 }
             }
