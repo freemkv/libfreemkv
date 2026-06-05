@@ -64,23 +64,40 @@ impl CodecParser for DtsParser {
                 break;
             }
 
-            // Check for DTS-HD extension after core
-            let mut total_size = core_size;
-            if start + core_size + 4 <= data.len() {
-                if let Some(0) = find_sync(
-                    &data[start + core_size..start + core_size + 4],
-                    &DTS_HD_EXT_SYNC,
-                ) {
-                    let ext = &data[start + core_size..];
-                    if ext.len() >= 9 {
-                        let ext_size = dts_hd_ext_frame_size(ext);
-                        if start + core_size + ext_size <= data.len() {
-                            total_size = core_size + ext_size;
-                        }
-                        // If ext incomplete, just emit core
-                    }
+            // Include the DTS-HD extension substream if one immediately follows
+            // the core. The extension carries the LOSSLESS (DTS-HD MA / HRA)
+            // data; emitting a core-only frame and dropping the trailing
+            // extension silently downgrades the track to lossy DTS core. If we
+            // can't yet tell whether an extension follows, or it's present but
+            // not fully buffered, WAIT for more PES data (break, leaving `pos`
+            // at this access unit's core sync so the buffer keeps the partial
+            // unit) rather than splitting the extension off and losing it.
+            let after = start + core_size;
+            let avail = data.len() - after;
+            // Does a DTS-HD extension substream follow the core? Match the full
+            // sync when it's buffered, or a partial PREFIX when the buffer ends
+            // mid-sync — so we wait for the rest instead of splitting the
+            // extension off and losing the lossless data. Nothing after the core
+            // (e.g. the final access unit / EOF, with no parser flush) is taken
+            // as a legitimate lossy core-only unit.
+            let ext_follows = if avail >= 4 {
+                data[after..after + 4] == DTS_HD_EXT_SYNC
+            } else if avail > 0 {
+                DTS_HD_EXT_SYNC[..avail] == data[after..]
+            } else {
+                false
+            };
+            let total_size = if !ext_follows {
+                core_size
+            } else if avail < 9 {
+                break; // extension present but its size header isn't buffered — wait
+            } else {
+                let ext_size = dts_hd_ext_frame_size(&data[after..]);
+                if ext_size == 0 || avail < ext_size {
+                    break; // extension known but not fully buffered — wait
                 }
-            }
+                core_size + ext_size
+            };
 
             frames.push(Frame {
                 pts_ns,
@@ -202,6 +219,47 @@ mod tests {
         let frames = parser.parse(&pes2);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data.len(), 512);
+    }
+
+    /// Build a DTS-HD extension substream of `size` bytes with a valid sync +
+    /// size header (matching `dts_hd_ext_frame_size`).
+    fn make_dts_ext(size: usize) -> Vec<u8> {
+        let raw = size - 1;
+        let mut e = vec![0u8; size];
+        e[0..4].copy_from_slice(&DTS_HD_EXT_SYNC);
+        e[6] = ((raw >> 11) & 0x1F) as u8;
+        e[7] = ((raw >> 3) & 0xFF) as u8;
+        e[8] = (((raw & 0x07) << 5) as u8) | (e[8] & 0x1F);
+        e
+    }
+
+    #[test]
+    fn keeps_dts_hd_extension_across_pes_boundary() {
+        // DTS-HD MA access unit = core + extension substream. When the
+        // extension straddles a PES boundary, the parser must WAIT and emit the
+        // full unit — not a core-only frame (which would drop the lossless
+        // data, the Dunkirk lossy-core bug).
+        let mut parser = DtsParser::new();
+        let core = make_dts_core(512);
+        let ext = make_dts_ext(256);
+        let mut au = core;
+        au.extend_from_slice(&ext); // 768-byte access unit
+
+        // Split mid-extension: first PES carries the core + 100 ext bytes.
+        let split = 512 + 100;
+        let f1 = parser.parse(&make_pes(au[..split].to_vec(), Some(90000)));
+        assert!(
+            f1.is_empty(),
+            "must wait for the full extension, not emit a core-only frame"
+        );
+
+        let f2 = parser.parse(&make_pes(au[split..].to_vec(), Some(90000)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(
+            f2[0].data.len(),
+            768,
+            "frame must include core + extension (lossless preserved)"
+        );
     }
 
     #[test]
