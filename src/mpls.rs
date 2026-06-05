@@ -301,9 +301,21 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         return None;
     }
 
-    // PID from stream entry (type 0x01 = PlayItem stream: PID at bytes 2-3)
-    let pid = if item[pos + 1] == 0x01 && pos + 4 <= item.len() {
-        u16::from_be_bytes([item[pos + 2], item[pos + 3]])
+    // PID location depends on the stream-entry type (BD spec stream_entry()):
+    //   type 1 (stream in the PlayItem's Clip):          PID at +2
+    //   type 2 (stream in a SubPath SubClip):            +subpath_id(1)+subclip_id(1) → PID at +4
+    //   type 3 / 4 (SubPath clip; type 4 = Dolby Vision  +subpath_id(1)              → PID at +3
+    //              enhancement layer, e.g. PID 0x1015):
+    // Previously only type 1 was handled, so the DV EL (type 4) and any
+    // sub-path stream fell through to PID 0 and were dropped by the mux.
+    let pid_off = match item[pos + 1] {
+        0x01 => 2,
+        0x02 => 4,
+        0x03 | 0x04 => 3,
+        _ => 0,
+    };
+    let pid = if pid_off != 0 && pos + pid_off + 2 <= item.len() {
+        u16::from_be_bytes([item[pos + pid_off], item[pos + pid_off + 1]])
     } else {
         0
     };
