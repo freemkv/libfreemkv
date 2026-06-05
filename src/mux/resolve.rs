@@ -172,6 +172,22 @@ pub struct InputOptions {
     pub raw: bool,
 }
 
+/// Decide whether an ISO mux must abort for lack of a usable AACS key.
+///
+/// Returns `true` only when ALL hold: decryption is requested (`!raw`), the
+/// disc carries AACS state (`has_aacs` — AACS-encrypted, not CSS/unencrypted),
+/// and key resolution produced no usable key (`keys` is
+/// [`crate::decrypt::DecryptKeys::None`]). In that case muxing would emit
+/// undecryptable garbage, so the caller fails fast with [`Error::NoDiscKey`].
+///
+/// `--raw` (raw=true) always returns `false` — raw intentionally skips
+/// decryption and needs no key. A non-AACS disc (`has_aacs=false`) always
+/// returns `false`: unencrypted content has `None` keys legitimately, and CSS
+/// DVDs resolve to `DecryptKeys::Css{..}` (never `None`).
+fn aacs_key_missing(raw: bool, has_aacs: bool, keys: &crate::decrypt::DecryptKeys) -> bool {
+    !raw && has_aacs && matches!(keys, crate::decrypt::DecryptKeys::None)
+}
+
 /// Open a PES input stream (produces PES frames).
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
@@ -204,6 +220,23 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             if !opts.unit_keys.is_empty() {
                 disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()))
                     .map_err(|e| -> io::Error { e.into() })?;
+            }
+            // No-key guard: if decryption is requested (not --raw) and the disc
+            // is AACS-encrypted but key resolution yielded no usable key, FAIL
+            // here — muxing an undecryptable stream produces ~100 MB of garbage
+            // (encrypted m2ts → no TS syncs → demuxer emits nothing). A cheap
+            // result-check on `decrypt_keys()`; no probe decryption needed.
+            // CSS (DVD) decrypts from compiled keys (`decrypt_keys()` returns
+            // `Css{..}`, never `None`), so this gate is AACS-only via `disc.aacs`.
+            if aacs_key_missing(opts.raw, disc.aacs.is_some(), &disc.decrypt_keys()) {
+                // Surface the disc hash (40-hex, no `0x` prefix) so the caller
+                // can name the disc. Empty if scan didn't capture it.
+                let disc_hash = disc
+                    .aacs
+                    .as_ref()
+                    .map(|a| a.disc_hash.trim_start_matches("0x").to_string())
+                    .unwrap_or_default();
+                return Err(crate::error::Error::NoDiscKey { disc_hash }.into());
             }
             if disc.titles.is_empty() {
                 return Err(crate::error::Error::NoStreams.into());
@@ -456,4 +489,51 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
         parsers,
         pid_to_track,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aacs_key_missing;
+    use crate::decrypt::DecryptKeys;
+
+    fn aacs_keys() -> DecryptKeys {
+        DecryptKeys::Aacs {
+            unit_keys: vec![(1, [0x11u8; 16])],
+            read_data_key: None,
+        }
+    }
+
+    fn css_keys() -> DecryptKeys {
+        DecryptKeys::Css {
+            title_key: [0u8; 5],
+        }
+    }
+
+    #[test]
+    fn encrypted_no_key_aborts() {
+        // AACS disc, decryption requested, resolver yielded no key → abort.
+        assert!(aacs_key_missing(false, true, &DecryptKeys::None));
+    }
+
+    #[test]
+    fn encrypted_with_key_proceeds() {
+        // AACS disc with a usable key → proceed.
+        assert!(!aacs_key_missing(false, true, &aacs_keys()));
+    }
+
+    #[test]
+    fn not_encrypted_proceeds() {
+        // No AACS state: unencrypted (None keys) and CSS (Css keys) both OK.
+        assert!(!aacs_key_missing(false, false, &DecryptKeys::None));
+        assert!(!aacs_key_missing(false, false, &css_keys()));
+    }
+
+    #[test]
+    fn raw_never_aborts() {
+        // --raw skips decryption — must never hit the no-key abort, even on an
+        // AACS disc with no key resolved.
+        assert!(!aacs_key_missing(true, true, &DecryptKeys::None));
+        assert!(!aacs_key_missing(true, true, &aacs_keys()));
+        assert!(!aacs_key_missing(true, false, &DecryptKeys::None));
+    }
 }

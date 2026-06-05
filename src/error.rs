@@ -78,6 +78,7 @@ pub const E_AACS_MK_UNAVAILABLE: u16 = 7018;
 pub const E_AACS_VUK_NOT_IN_KEYDB: u16 = 7019;
 pub const E_DRIVE_PROFILE_MISSING: u16 = 7020;
 pub const E_VID_CDB_UNAVAILABLE: u16 = 7021;
+pub const E_NO_DISC_KEY: u16 = 7022;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -253,6 +254,16 @@ pub enum Error {
     /// template (older profile blob, or a drive class without an OEM
     /// VID path).
     VidCdbUnavailable,
+    /// The disc is AACS-encrypted and decryption was requested, but key
+    /// resolution produced no usable key for it — so muxing would emit
+    /// undecryptable garbage. Distinct from [`Error::KeydbLoad`] (no keydb
+    /// file at all): a keydb may be present but lack an entry for this disc.
+    /// `disc_hash` is the 40-hex SHA1 of `Unit_Key_RO.inf` (no `0x` prefix)
+    /// so the application can name the disc; empty if the hash wasn't
+    /// captured at scan.
+    NoDiscKey {
+        disc_hash: String,
+    },
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -345,6 +356,7 @@ impl Error {
             Error::AacsVukNotInKeydb => E_AACS_VUK_NOT_IN_KEYDB,
             Error::DriveProfileMissing => E_DRIVE_PROFILE_MISSING,
             Error::VidCdbUnavailable => E_VID_CDB_UNAVAILABLE,
+            Error::NoDiscKey { .. } => E_NO_DISC_KEY,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
@@ -471,6 +483,7 @@ impl std::fmt::Display for Error {
             Error::StreamUrlMissingPort { addr } => write!(f, "E{}: {}", self.code(), addr),
             Error::PesFrameTooLarge { size } => write!(f, "E{}: {}", self.code(), size),
             Error::IsoTooLarge { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::NoDiscKey { disc_hash } => write!(f, "E{}: {}", self.code(), disc_hash),
             _ => write!(f, "E{}", self.code()),
         }
     }
