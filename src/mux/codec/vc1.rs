@@ -44,6 +44,7 @@ impl CodecParser for Vc1Parser {
         // Use DTS when available (monotonic for B-frame content), fall back to PTS
         let ts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
         let mut has_seq_header = false;
+        let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
 
         // Scan for start codes (00 00 01 XX)
@@ -67,6 +68,7 @@ impl CodecParser for Vc1Parser {
                     SC_ENTRY_POINT => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
                         self.entry_point = Some(data[i..end].to_vec());
+                        has_entry_point = true;
                     }
                     SC_FRAME => {
                         // Frame data starts at this start code
@@ -85,11 +87,23 @@ impl CodecParser for Vc1Parser {
         // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
         let keyframe = has_seq_header;
 
-        // Strip sequence header + entry point from frame data — those are in codecPrivate.
-        // Only include data from the frame start code onwards.
+        // Strip sequence header + entry point from frame data — those are in
+        // codecPrivate, not coded-picture data. Only include data from the
+        // frame start code onwards.
         let frame_data = match frame_start {
             Some(start) => &data[start..],
-            None => data, // no frame start code found, pass through entire PES
+            None => {
+                // No frame start code. If this PES carried only parameter sets
+                // (sequence header / entry point, captured above into
+                // codecPrivate), there is no coded picture to emit — drop it
+                // rather than passing parameter bytes through as a bogus
+                // keyframe. Mirrors how the H.264/HEVC parsers skip
+                // parameter-set-only access units.
+                if has_seq_header || has_entry_point {
+                    return Vec::new();
+                }
+                data // genuine picture payload with no leading 0x0D — pass through
+            }
         };
 
         vec![Frame {
@@ -341,6 +355,42 @@ mod tests {
         // Frame data should start with the frame start code (00 00 01 0D)
         assert!(frames[0].data.len() >= 4);
         assert_eq!(&frames[0].data[0..4], &[0x00, 0x00, 0x01, SC_FRAME]);
+    }
+
+    // --- parameter-set-only PES (seq header + entry point, no frame SC) ---
+
+    #[test]
+    fn param_set_only_pes_emits_no_frame() {
+        let mut parser = Vc1Parser::new();
+
+        // Sequence header + entry point, but NO frame start code (0x0D).
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_ENTRY_POINT]);
+        data.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+
+        let pes = make_pes(data, Some(90000));
+        let frames = parser.parse(&pes);
+
+        // No coded picture → no frame emitted (parameter bytes must not be
+        // passed through as a bogus keyframe).
+        assert!(
+            frames.is_empty(),
+            "parameter-set-only PES should not emit a frame"
+        );
+        // But codecPrivate is still captured.
+        assert!(parser.seq_header.is_some());
+        assert!(parser.entry_point.is_some());
+        assert!(parser.codec_private().is_some());
+
+        // A following frame-bearing PES still emits its picture.
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data2.extend_from_slice(&[0x55, 0x66, 0x77]);
+        let frames2 = parser.parse(&make_pes(data2, Some(180000)));
+        assert_eq!(frames2.len(), 1);
+        assert_eq!(&frames2[0].data[0..4], &[0x00, 0x00, 0x01, SC_FRAME]);
     }
 
     // --- empty PES ---

@@ -100,7 +100,12 @@ fn ts_syncs_intact(unit: &[u8]) -> bool {
         }
         offset += TS_PACKET_LEN;
     }
-    let total = (unit.len() - 4) / TS_PACKET_LEN + 1;
+    // One sync byte is checked per 192-byte BD-TS packet (at offset 4 of
+    // each). `total` is exactly that packet count; the old
+    // `(len - 4) / TS_PACKET_LEN + 1` over-counted by one for lengths of
+    // the form `4 + k·192` (harmless for the always-6144 aligned unit, but
+    // wrong in general and it biased the majority threshold).
+    let total = unit.len() / TS_PACKET_LEN;
     count > total / 2
 }
 

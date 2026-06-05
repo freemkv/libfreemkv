@@ -44,6 +44,19 @@ impl DtsParser {
 /// this without a clean boundary we resync rather than stall or balloon.
 const MAX_AU_BYTES: usize = 65536;
 
+/// Minimum plausible DTS core frame size. The core header alone is ~10-14
+/// bytes; a decoded `core_size` below this means we matched a false/corrupt
+/// core sync (the 14-bit `fsize` field decoded to a tiny value) rather than a
+/// real frame, so we resync instead of emitting a junk access unit.
+const MIN_CORE_FRAME_BYTES: usize = 10;
+
+/// Sentinel for "no valid PTS base captured yet". Real PTS-in-ns values are
+/// non-negative (derived from the unsigned 90 kHz PES timestamp), so a negative
+/// value can never collide with a genuine timestamp. Used to mark the PTS base
+/// invalid after a forced flush so the next PES sets it regardless of buffer
+/// state.
+const PTS_UNSET: i64 = -1;
+
 impl CodecParser for DtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         if pes.data.is_empty() {
@@ -65,7 +78,11 @@ impl CodecParser for DtsParser {
         // old per-PES emit that dropped the extension PES packets and
         // downgraded the track to lossy DTS core (the Dunkirk / Fight Club
         // bug). The PTS is the core frame's PTS, captured when the unit began.
-        if self.buf.is_empty() {
+        // Capture the access unit's PTS base on a fresh buffer, or whenever a
+        // prior forced (safety-valve) flush left it invalidated — in the
+        // forced case the bytes still in `buf` are not a real core frame, so
+        // the first PES to arrive after the flush carries the correct base.
+        if self.buf.is_empty() || self.pending_pts == PTS_UNSET {
             self.pending_pts = pts_ns;
         }
         self.buf.extend_from_slice(&pes.data);
@@ -96,7 +113,15 @@ impl CodecParser for DtsParser {
                 break;
             }
             let core_size = dts_core_frame_size(&self.buf);
-            if core_size == 0 || core_size > MAX_AU_BYTES {
+            // `dts_core_frame_size` returns a 14-bit `fsize + 1`, so it is
+            // always in [1, 16384]; the bare `== 0` / `> MAX_AU_BYTES` checks
+            // can never fire. A real DTS core header is at least ~10-14 bytes,
+            // so any decoded size below that came from a false/corrupt sync.
+            // Reject it (drain the 4 syncword bytes and resync) instead of
+            // letting a tiny bogus size close the current access unit at a junk
+            // boundary and drop the trailing extension substreams. The
+            // `> MAX_AU_BYTES` upper bound is kept as a harmless guard.
+            if !(MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&core_size) {
                 // Bogus core sync — skip past it and resync.
                 self.buf.drain(..4);
                 continue;
@@ -105,12 +130,25 @@ impl CodecParser for DtsParser {
                 break; // core frame not fully buffered yet — wait
             }
 
-            // The access unit ends at the next core sync. Search begins after
-            // this core's syncword so we don't re-match it. Anything between
-            // the core and that next sync is this unit's extension substream(s).
-            let au_end = match find_sync(&self.buf[core_size..], &DTS_CORE_SYNC) {
-                Some(rel) => core_size + rel,
-                None => {
+            // The access unit ends at the next *valid* core sync. The search
+            // begins after this core's syncword so we don't re-match it.
+            // Anything between the core and that next sync is this unit's
+            // extension substream(s) — which can themselves contain byte
+            // sequences matching the core syncword, so a raw `find_sync` match
+            // is not enough: a candidate is only a real boundary if its decoded
+            // core size is plausible. `next_core_boundary` skips bogus matches.
+            //
+            // `forced` distinguishes a real next-core boundary from a forced
+            // safety-valve flush. On a forced flush the access unit was NOT
+            // closed by a new core sync, so the bytes following it are not a
+            // fresh core frame and the current PES's PTS (which on a forced
+            // flush is an extension-substream PES, carrying its own later
+            // timestamp) must NOT become the next unit's PTS base.
+            let mut forced = false;
+            let au_end = match next_core_boundary(&self.buf, core_size) {
+                NextCore::Found(end) => end,
+                NextCore::NeedMore => break, // candidate sync needs more header
+                NextCore::None => {
                     // No next core sync buffered yet. The trailing extension
                     // substream PES packets may still be arriving, so WAIT for
                     // them rather than emit a core-only (lossy) frame — unless
@@ -119,6 +157,7 @@ impl CodecParser for DtsParser {
                     if self.buf.len() <= MAX_AU_BYTES {
                         break;
                     }
+                    forced = true;
                     self.buf.len()
                 }
             };
@@ -131,11 +170,18 @@ impl CodecParser for DtsParser {
                 duration_ns: None,
             });
             self.buf.drain(..au_end);
-            // The next access unit (now at buf start) belongs to a later PTS.
-            // We can't know it exactly until its core PES arrives, but the
-            // current PES's PTS is the best available approximation when the
-            // boundary fell inside this PES; refine on the next call's start.
-            self.pending_pts = pts_ns;
+            if forced {
+                // Safety-valve flush: the next access unit's real core PES has
+                // not arrived. Invalidate the PTS so the next PES sets it
+                // regardless of buffer state, rather than inheriting this
+                // (non-core) PES's timestamp.
+                self.pending_pts = PTS_UNSET;
+            } else {
+                // Real boundary: the next access unit (now at buf start) begins
+                // at a core sync that arrived inside this PES, so this PES's PTS
+                // is the correct base for it.
+                self.pending_pts = pts_ns;
+            }
         }
 
         frames
@@ -151,12 +197,21 @@ impl CodecParser for DtsParser {
             return Vec::new();
         }
         let core_size = dts_core_frame_size(&self.buf);
-        if core_size == 0 || self.buf.len() < core_size {
+        // `dts_core_frame_size` returns a 14-bit `fsize + 1` (never 0), so the
+        // old `== 0` check was dead; reject a sub-minimum core like `parse()`.
+        if core_size < MIN_CORE_FRAME_BYTES || self.buf.len() < core_size {
             self.buf.clear();
             return Vec::new();
         }
         let au = std::mem::take(&mut self.buf);
-        let pts_ns = self.pending_pts;
+        // A non-empty buffer here means a PES arrived after any prior forced
+        // flush (which fully drains `buf`), so `pending_pts` was reset to that
+        // PES's real PTS. Clamp the sentinel to 0 defensively all the same.
+        let pts_ns = if self.pending_pts == PTS_UNSET {
+            0
+        } else {
+            self.pending_pts
+        };
         vec![Frame {
             pts_ns,
             keyframe: true,
@@ -175,6 +230,40 @@ fn find_sync(data: &[u8], pattern: &[u8; 4]) -> Option<usize> {
         return None;
     }
     (0..=data.len() - 4).find(|&i| data[i..i + 4] == *pattern)
+}
+
+/// Result of scanning for the next valid core sync that closes an access unit.
+enum NextCore {
+    /// A valid next core sync was found; the access unit ends at this offset.
+    Found(usize),
+    /// A candidate core sync was found but its header isn't fully buffered yet,
+    /// so its validity can't be decided — wait for more data.
+    NeedMore,
+    /// No (further) core sync found in the buffer.
+    None,
+}
+
+/// Find the next *valid* core sync after the current core frame, to delimit the
+/// access unit. Extension-substream payload can contain byte sequences that
+/// match the core syncword, so each candidate is validated by decoding its
+/// core size: a match whose decoded size is implausible (< MIN_CORE_FRAME_BYTES
+/// or > MAX_AU_BYTES) is a false sync and is skipped, continuing the search.
+fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
+    let mut from = core_size;
+    while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
+        let pos = from + rel;
+        // Need the candidate's core header to judge it.
+        if buf.len() - pos < 10 {
+            return NextCore::NeedMore;
+        }
+        let sz = dts_core_frame_size(&buf[pos..]);
+        if (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&sz) {
+            return NextCore::Found(pos);
+        }
+        // False sync inside extension payload — skip it and keep searching.
+        from = pos + 4;
+    }
+    NextCore::None
 }
 
 /// DTS core frame size from header bits.
@@ -347,6 +436,104 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 512 + 300);
+    }
+
+    /// Build 4 bytes that look like a DTS core sync but whose `fsize` field
+    /// decodes to a tiny `core_size` (< MIN_CORE_FRAME_BYTES). With the
+    /// dead-code guards this passed validation and could close an access unit
+    /// at a junk boundary; with the fix it must be drained and resynced past.
+    fn bogus_tiny_core_sync() -> Vec<u8> {
+        // Core sync + zero header bytes. fsize = 0 → core_size = 1 (< 10).
+        let mut v = vec![0u8; 10];
+        v[0..4].copy_from_slice(&DTS_CORE_SYNC);
+        // bytes 5,6,7 left zero → fsize = 0 → dts_core_frame_size = 1.
+        assert_eq!(dts_core_frame_size(&v), 1);
+        v
+    }
+
+    #[test]
+    fn bogus_tiny_core_sync_does_not_split_or_drop_real_au() {
+        // A real core frame followed by an extension substream that happens to
+        // contain a false core sync whose fsize decodes tiny. The bogus sync
+        // must NOT close the real access unit early (dropping the rest of the
+        // extension) nor emit a junk few-byte frame — it must be skipped, and
+        // the whole core + extension preserved as one access unit.
+        let mut parser = DtsParser::new();
+
+        // Frame 1: core(512) + an extension whose body embeds a bogus tiny
+        // core sync midway through.
+        let mut ext = make_dts_ext(256);
+        // Embed the bogus core sync inside the extension body (offset 64).
+        let bogus = bogus_tiny_core_sync();
+        ext[64..64 + bogus.len()].copy_from_slice(&bogus);
+
+        let mut frame1 = make_dts_core(512);
+        frame1.extend_from_slice(&ext);
+
+        // No next REAL core yet → frame 1 held.
+        assert!(
+            parser.parse(&make_pes(frame1, Some(90000))).is_empty(),
+            "bogus tiny core sync must not close the AU; wait for a real core"
+        );
+
+        // Frame 2's real core arrives — closes frame 1.
+        let f = parser.parse(&make_pes(make_dts_core(640), Some(93000)));
+        assert_eq!(f.len(), 1, "exactly one real access unit emitted");
+        assert_eq!(
+            f[0].data.len(),
+            512 + 256,
+            "AU must be the full core + extension, not split at the bogus sync"
+        );
+        assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU keeps the core's PTS");
+
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].data.len(), 640);
+    }
+
+    #[test]
+    fn forced_emit_does_not_corrupt_next_au_pts() {
+        // When the buffer exceeds MAX_AU_BYTES with no next core sync, the
+        // parser force-emits for forward progress. The current PES at that
+        // point is an extension-substream PES (later PTS). The forced path must
+        // NOT make that extension PTS the base of the NEXT access unit.
+        let mut parser = DtsParser::new();
+
+        // Core PES at the real PTS, then a giant extension (no next core) that
+        // pushes the buffer past MAX_AU_BYTES, forcing an emit.
+        let core_pts = 90000i64;
+        assert!(
+            parser
+                .parse(&make_pes(make_dts_core(512), Some(core_pts)))
+                .is_empty()
+        );
+        let ext_pts = 120000i64; // later extension-PES timestamp
+        let big_ext = make_dts_ext(MAX_AU_BYTES + 1024);
+        let f = parser.parse(&make_pes(big_ext, Some(ext_pts)));
+        assert_eq!(f.len(), 1, "oversized buffer force-emits one AU");
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(core_pts),
+            "forced AU keeps the core PTS"
+        );
+
+        // The next REAL core PES arrives with its own PTS. Its AU must inherit
+        // THIS core's PTS, not the prior extension PES timestamp.
+        let next_core_pts = 150000i64;
+        assert!(
+            parser
+                .parse(&make_pes(make_dts_core(512), Some(next_core_pts)))
+                .is_empty()
+        );
+        let next_next_pts = 180000i64;
+        let f2 = parser.parse(&make_pes(make_dts_core(512), Some(next_next_pts)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(
+            f2[0].pts_ns,
+            pts_to_ns(next_core_pts),
+            "AU after a forced emit must use the next core's PTS, not the \
+             stale extension PTS"
+        );
     }
 
     #[test]

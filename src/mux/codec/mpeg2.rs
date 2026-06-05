@@ -99,6 +99,7 @@ impl CodecParser for Mpeg2Parser {
         let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
+        let mut has_picture = false;
 
         // Scan for start codes in the elementary stream data.
         let mut pos = 0;
@@ -176,6 +177,7 @@ impl CodecParser for Mpeg2Parser {
                 PICTURE_CODE => {
                     // Picture header: bytes after start code contain temporal_reference
                     // (10 bits) + picture_coding_type (3 bits).
+                    has_picture = true;
                     if sc + 5 < data.len() {
                         let picture_coding_type = (data[sc + 5] >> 3) & 0x07;
                         if picture_coding_type == PICTURE_TYPE_I {
@@ -188,6 +190,23 @@ impl CodecParser for Mpeg2Parser {
                     pos = sc + 4;
                 }
             }
+        }
+
+        // A PES that carried a sequence header but no picture start code is a
+        // parameter-set-only access unit: it has no coded picture to emit.
+        // Emitting it as a standalone keyframe would put bare sequence-header
+        // bytes into frame data with no picture. The sequence header is
+        // captured into codec_private above and is re-emitted in-band on the
+        // next real picture's PES, so dropping the empty access unit loses
+        // nothing. Mirrors how the H.264/HEVC parsers skip parameter-set-only
+        // access units.
+        //
+        // Conservative: only drop when this PES actually contained a sequence
+        // header and no picture. A PES with neither (e.g. a slice
+        // continuation) still passes through unchanged, preserving real
+        // keyframe detection.
+        if !has_picture && contains_seq_header(data) {
+            return Vec::new();
         }
 
         vec![Frame {
@@ -239,6 +258,21 @@ fn parse_aspect_ratio(hdr: &[u8]) -> Option<(u8, u8)> {
         return None;
     }
     Some(ASPECT_RATIOS[ar_code])
+}
+
+/// Returns true if `data` contains a sequence-header start code (00 00 01 B3).
+fn contains_seq_header(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while let Some(sc) = find_start_code(data, pos) {
+        if sc + 3 >= data.len() {
+            break;
+        }
+        if data[sc + 3] == SEQ_HEADER_CODE {
+            return true;
+        }
+        pos = sc + 4;
+    }
+    false
 }
 
 /// Find the position of the next start code (00 00 01) at or after `from`.
@@ -429,15 +463,15 @@ mod tests {
         assert!(has_ext, "codec_private should include sequence extension");
     }
 
-    // --- I-frame with sequence header = keyframe ---
+    // --- sequence header + picture = keyframe ---
 
     #[test]
-    fn sequence_header_implies_keyframe() {
+    fn sequence_header_with_picture_is_keyframe() {
         let mut parser = Mpeg2Parser::new();
 
         let mut data = Vec::new();
         data.extend_from_slice(&make_seq_header(720, 480, 3, 4));
-        // Even without an explicit picture header, a sequence header implies I-frame.
+        data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
         data.extend_from_slice(&[0xFF; 16]);
 
         let pes = make_pes(data, Some(0));
@@ -445,6 +479,43 @@ mod tests {
 
         assert_eq!(frames.len(), 1);
         assert!(frames[0].keyframe);
+        // codecPrivate is still captured.
+        assert!(parser.codec_private().is_some());
+    }
+
+    // --- parameter-set-only PES (seq header, no picture) emits no frame ---
+
+    #[test]
+    fn sequence_header_only_pes_emits_no_frame() {
+        let mut parser = Mpeg2Parser::new();
+
+        // A PES carrying only a sequence header (+ extension), no picture.
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_seq_header(1920, 1080, 3, 4));
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE]);
+        data.extend_from_slice(&[0x14, 0x8A, 0x00, 0x01, 0x00, 0x00]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+
+        // No coded picture → no frame emitted, but the sequence header is
+        // still captured for codecPrivate.
+        assert!(
+            frames.is_empty(),
+            "parameter-set-only PES should not emit a frame"
+        );
+        assert!(
+            parser.codec_private().is_some(),
+            "sequence header should still be captured into codec_private"
+        );
+
+        // A following picture-bearing PES emits the real keyframe.
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+        data2.extend_from_slice(&[0xFF; 16]);
+        let frames2 = parser.parse(&make_pes(data2, Some(3600)));
+        assert_eq!(frames2.len(), 1);
+        assert!(frames2[0].keyframe);
     }
 
     // --- PTS conversion ---

@@ -18,6 +18,13 @@
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SEGMENT_PCS: u8 = 0x16;
+// Upper bound on a pending display set's accumulated bytes. Real PGS
+// display sets are small (a 1080p RLE bitmap plus palette is well under
+// 1 MB); a stream that keeps appending non-PCS segments without ever
+// emitting a PCS is malformed. Cap accumulation to bound memory and
+// drop further appends until the next PCS resyncs the parser. Mirrors
+// the MAX_*_BYTES / MAX_*_BUF caps in the DTS and AC-3 parsers.
+const MAX_PGS_PENDING_BYTES: usize = 4 * 1024 * 1024;
 // Offset within the PES payload at which number_of_composition_objects
 // lives in a PCS: 3-byte segment header + 10 bytes of PCS fields
 // (video_w/h, frame_rate, comp_num, comp_state, palette_update,
@@ -90,7 +97,12 @@ impl CodecParser for PgsParser {
             // a pending display, append; otherwise emit as-is.
             None => {
                 if let Some((_, ref mut buf)) = self.pending {
-                    buf.extend_from_slice(&pes.data);
+                    // Bound accumulation: a well-formed display set is small.
+                    // Past the cap, drop further appends (malformed stream);
+                    // the next PCS will take/replace `pending` and resync.
+                    if buf.len() + pes.data.len() <= MAX_PGS_PENDING_BYTES {
+                        buf.extend_from_slice(&pes.data);
+                    }
                 } else {
                     out.push(Frame {
                         pts_ns,
@@ -178,6 +190,32 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let data = &frames[0].data;
         assert!(data.windows(5).any(|w| w == [0x15, 0x00, 0x02, 0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn pending_buffer_is_capped() {
+        let mut parser = PgsParser::new();
+        // Open a display set.
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+
+        // Flood with non-PCS segments far exceeding the cap.
+        let chunk = vec![0x15u8; 256 * 1024]; // 256 KB ODS-like segment
+        let floods = (MAX_PGS_PENDING_BYTES / chunk.len()) + 32;
+        for _ in 0..floods {
+            let frames = parser.parse(&make_pes(chunk.clone(), Some(90000)));
+            assert!(frames.is_empty(), "non-PCS appends should not emit");
+        }
+
+        // The pending buffer must not have grown without bound.
+        let pending_len = parser.pending.as_ref().map(|(_, b)| b.len()).unwrap_or(0);
+        assert!(
+            pending_len <= MAX_PGS_PENDING_BYTES,
+            "pending buffer {pending_len} exceeded cap {MAX_PGS_PENDING_BYTES}"
+        );
+
+        // A following PCS still resyncs and emits the (capped) pending set.
+        let frames = parser.parse(&make_pes(pcs_bytes(0), Some(180000)));
+        assert_eq!(frames.len(), 1);
     }
 
     #[test]

@@ -102,7 +102,16 @@ impl CodecParser for PassthroughParser {
 /// Create the appropriate parser for a codec, with optional codec private data.
 ///
 /// For DvdSub, `codec_data` should be the pre-formatted VobSub .idx palette header.
-pub fn parser_for_codec(codec: Codec, codec_data: Option<Vec<u8>>) -> Box<dyn CodecParser> {
+///
+/// `is_dvd_ps` selects the DVD program-stream variant where it matters: DVD
+/// LPCM arrives with its private sub-header already stripped by the
+/// `PsDemuxer`, so the LPCM parser must NOT strip the 4-byte BD LPCM header
+/// again (that would drop one PCM sample pair per PES → progressive drift).
+pub fn parser_for_codec(
+    codec: Codec,
+    codec_data: Option<Vec<u8>>,
+    is_dvd_ps: bool,
+) -> Box<dyn CodecParser> {
     match codec {
         Codec::H264 => Box::new(h264::H264Parser::new()),
         Codec::Hevc => Box::new(hevc::HevcParser::new()),
@@ -112,6 +121,7 @@ pub fn parser_for_codec(codec: Codec, codec_data: Option<Vec<u8>>) -> Box<dyn Co
         Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => Box::new(dts::DtsParser::new()),
         Codec::TrueHd => Box::new(truehd::TrueHdParser::new()),
         Codec::Pgs => Box::new(pgs::PgsParser::new()),
+        Codec::Lpcm if is_dvd_ps => Box::new(lpcm::LpcmParser::new_dvd()),
         Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
         Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new(codec_data)),
         _ => Box::new(PassthroughParser::new(true)),

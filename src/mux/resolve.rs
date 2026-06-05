@@ -384,7 +384,8 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
         };
         pids.push(pid);
         pid_to_track.push((pid, idx));
-        parsers.push((pid, super::codec::parser_for_codec(codec, None)));
+        let is_dvd_ps = matches!(format, ContentFormat::MpegPs);
+        parsers.push((pid, super::codec::parser_for_codec(codec, None, is_dvd_ps)));
     }
     let (ts, ps) = match format {
         ContentFormat::MpegPs => (None, Some(super::ps::PsDemuxer::new())),

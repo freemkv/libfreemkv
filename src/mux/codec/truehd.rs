@@ -16,6 +16,12 @@ use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 /// Duration of one TrueHD access unit in nanoseconds (1/1200 second).
 const AU_DURATION_NS: i64 = 833_333;
 
+/// Hard cap on the reassembly buffer. A valid TrueHD/MAT access unit is
+/// well under 32 KiB; if the buffer grows far past that without yielding a
+/// frame the stream is malformed, so we drop it and resync rather than grow
+/// without bound. Parity with the AC-3 / DTS / PGS caps.
+const MAX_TRUEHD_BUF: usize = 256 * 1024;
+
 pub struct TrueHdParser {
     buf: Vec<u8>,
     next_pts_ns: i64,
@@ -143,6 +149,12 @@ impl CodecParser for TrueHdParser {
             });
             self.buf.drain(..unit_bytes);
             self.next_pts_ns += AU_DURATION_NS;
+        }
+
+        // Bound memory on malformed input: a stream that never yields a
+        // complete frame must not grow the buffer without limit.
+        if self.buf.len() > MAX_TRUEHD_BUF {
+            self.buf.clear();
         }
 
         frames

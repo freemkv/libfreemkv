@@ -35,6 +35,15 @@ struct PesAssembler {
     pts: Option<i64>,
     dts: Option<i64>,
     active: bool,
+    /// PES-header bytes still to be skipped on the next continuation
+    /// packet(s). A PES header (9 + PES_header_data_length, up to 264
+    /// bytes) can exceed a single 184-byte TS payload, spilling into the
+    /// following continuation packet. Those spillover bytes are NOT
+    /// elementary-stream data and must be skipped, or the PES start code
+    /// (`00 00 01 …`) and timestamp bytes get injected into the ES — for
+    /// HEVC/H264 that reads as a spurious start code / corrupt slice
+    /// payload. Tracks how many header bytes remain across packets.
+    header_remaining: usize,
 }
 
 /// Initial capacity for a fresh PES buffer. Sized to cover the
@@ -54,6 +63,7 @@ impl PesAssembler {
             pts: None,
             dts: None,
             active: false,
+            header_remaining: 0,
         }
     }
 
@@ -235,12 +245,35 @@ impl TsDemuxer {
         let payload = &ts[payload_start..];
 
         if pusi {
-            let (pts, dts, pes_data_start) = parse_pes_header(payload);
+            // `header_len` is the FULL (uncapped) PES-header length:
+            // 0 = malformed (payload is not a PES start), else 6/9+N.
+            let (pts, dts, header_len) = parse_pes_header(payload);
             if let Some(prev) = asm.start(pts, dts) {
                 completed.push(prev);
             }
-            if pes_data_start < payload.len() {
-                asm.push(&payload[pes_data_start..]);
+            if header_len == 0 {
+                // PUSI packet whose payload is not a valid PES start. Do
+                // NOT push it — those bytes are not elementary-stream data
+                // and would inject a spurious start code / garbage.
+                asm.header_remaining = 0;
+            } else if header_len <= payload.len() {
+                // Header fits in this packet (the common case).
+                asm.header_remaining = 0;
+                if header_len < payload.len() {
+                    asm.push(&payload[header_len..]);
+                }
+            } else {
+                // Header spills past this packet — skip the remainder on
+                // the following continuation packet(s).
+                asm.header_remaining = header_len - payload.len();
+            }
+        } else if asm.header_remaining > 0 {
+            // Continuation packet still inside a PES header that spanned
+            // the boundary — consume header bytes before any ES data.
+            let skip = asm.header_remaining.min(payload.len());
+            asm.header_remaining -= skip;
+            if skip < payload.len() {
+                asm.push(&payload[skip..]);
             }
         } else {
             asm.push(payload);
@@ -260,7 +293,14 @@ impl TsDemuxer {
 }
 
 /// Parse a PES packet header, extracting PTS and DTS.
-/// Returns (pts, dts, offset_to_elementary_stream_data).
+///
+/// Returns `(pts, dts, header_len)` where `header_len` is the FULL,
+/// UNCAPPED PES-header length in bytes (`9 + PES_header_data_length`, or
+/// 6 for stream IDs without the standard extension). `0` signals the
+/// payload is not a valid PES start (malformed / too short). The caller
+/// must treat `header_len` as bytes-to-skip and carry any remainder past
+/// this packet's payload into the next continuation packet — the header
+/// can exceed one TS payload, and the spillover is header, not ES data.
 fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
     // PES packet: 00 00 01 [stream_id] [length:2] [flags...]
     if data.len() < 9 || data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x01 {
@@ -288,7 +328,10 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     let pts_dts_flags = (data[7] >> 6) & 0x03;
     let header_data_len = data[8] as usize;
-    let data_start = (9 + header_data_len).min(data.len());
+    // Full, uncapped header length. PTS/DTS (if present) live in the
+    // first ~19 bytes, always within this packet's payload, so they parse
+    // here; only the *skip* length may extend into the next packet.
+    let header_len = 9 + header_data_len;
 
     let mut pts = None;
     let mut dts = None;
@@ -300,7 +343,7 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
         dts = parse_timestamp(&data[14..19]);
     }
 
-    (pts, dts, data_start)
+    (pts, dts, header_len)
 }
 
 /// Parse a 5-byte PTS/DTS timestamp (33 bits in 90kHz).
@@ -404,10 +447,19 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
 
             let section_len =
                 (((data[pmt_start + 1] & 0x0F) as usize) << 8) | data[pmt_start + 2] as usize;
+            // section_length counts the bytes after this field, including the
+            // trailing 4-byte CRC; `< 4` would underflow `end` below. Guard it
+            // exactly like the PAT parser above.
+            if section_len < 4 {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            }
             let prog_info_len =
                 (((data[pmt_start + 10] & 0x0F) as usize) << 8) | data[pmt_start + 11] as usize;
             let mut pos = pmt_start + 12 + prog_info_len;
-            let end = pmt_start + 3 + section_len - 4;
+            // Clamp the section end to the buffer; a malformed section_len or
+            // prog_info_len must never drive reads past `data`.
+            let end = (pmt_start + 3 + section_len - 4).min(data.len());
 
             while pos + 5 <= data.len() && pos < end {
                 let stream_type = data[pos];

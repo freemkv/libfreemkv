@@ -1,24 +1,39 @@
 //! BD/DVD LPCM (Linear PCM) audio parser.
 //!
-//! BD LPCM PES packets have a 4-byte header:
+//! BD LPCM PES packets (TS stream type 0x80) carry a 4-byte header on the
+//! elementary-stream payload:
 //!   Bytes 0-1: audio frame number
 //!   Byte 2:    reserved
 //!   Byte 3:    quantization (bits 7-6), sample rate (bits 5-4), channel assignment (bits 3-0)
+//! This header is part of the ES payload, so the BD parser must strip it.
 //!
-//! DVD LPCM (private stream 1, sub-stream 0xA0-0xA7) has a 3-byte header.
+//! DVD LPCM lives in private stream 1 (sub-stream 0xA0-0xA7). Its 7-byte
+//! private sub-header (sub_id + frames + first-access-unit-ptr(2) + emphasis +
+//! quant/freq + channels) is stripped by `PsDemuxer` while demuxing the
+//! Program Stream. By the time a DVD LPCM `PesPacket` reaches this parser its
+//! `data` is already raw PCM, so the parser must NOT strip any further bytes —
+//! doing so drops one sample pair per PES and drifts the audio.
 //!
-//! The raw PCM data follows the header. No framing is needed — each PES
-//! payload minus its header is one complete audio frame.
+//! The two origins are distinguished by the `strip_header` flag: BD = strip,
+//! DVD = leave intact. The raw PCM data is otherwise one complete audio frame
+//! per PES; no framing is needed.
 //!
 //! For MKV: codec ID "A_PCM/INT/BIG" (BD) or "A_PCM/INT/LIT" (DVD).
 //! All frames are keyframes (uncompressed audio).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
-/// BD LPCM header size in bytes.
+/// BD LPCM header size in bytes (present on BD-TS LPCM, absent on DVD-PS LPCM
+/// because `PsDemuxer` already stripped the private sub-header).
 const BD_LPCM_HEADER_SIZE: usize = 4;
 
-pub struct LpcmParser;
+pub struct LpcmParser {
+    /// Whether to strip the 4-byte BD LPCM header from each PES payload.
+    ///
+    /// `true` for BD-TS LPCM (header still present), `false` for DVD-PS LPCM
+    /// (header already removed by `PsDemuxer`).
+    strip_header: bool,
+}
 
 impl Default for LpcmParser {
     fn default() -> Self {
@@ -27,23 +42,36 @@ impl Default for LpcmParser {
 }
 
 impl LpcmParser {
+    /// BD-TS LPCM parser: strips the 4-byte BD LPCM header from each PES.
     pub fn new() -> Self {
-        Self
+        Self { strip_header: true }
+    }
+
+    /// DVD-PS LPCM parser: `PsDemuxer` already stripped the private sub-header,
+    /// so the payload is raw PCM and no further bytes are removed.
+    pub fn new_dvd() -> Self {
+        Self {
+            strip_header: false,
+        }
     }
 }
 
 impl CodecParser for LpcmParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        // Skip the BD LPCM header (4 bytes).
+        let offset = if self.strip_header {
+            BD_LPCM_HEADER_SIZE
+        } else {
+            0
+        };
         // If the PES is too short to contain header + data, return nothing.
-        if pes.data.len() <= BD_LPCM_HEADER_SIZE {
+        if pes.data.len() <= offset {
             return Vec::new();
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
         vec![Frame {
             pts_ns,
             keyframe: true,
-            data: pes.data[BD_LPCM_HEADER_SIZE..].to_vec(),
+            data: pes.data[offset..].to_vec(),
             duration_ns: None,
         }]
     }
@@ -82,6 +110,56 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, pcm_data);
         assert_eq!(frames[0].pts_ns, 1_000_000_000); // 90000 ticks = 1 second
+    }
+
+    #[test]
+    fn bd_lpcm_strips_4_byte_header() {
+        // BD-TS LPCM: the 4-byte BD header is part of the ES payload and must
+        // be stripped, leaving exactly the PCM bytes.
+        let mut parser = LpcmParser::new();
+        let header = vec![0x00, 0x01, 0x00, 0b1001_0001];
+        let pcm = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut data = header;
+        data.extend_from_slice(&pcm);
+
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, pcm, "BD must strip exactly 4 header bytes");
+    }
+
+    #[test]
+    fn dvd_lpcm_preserves_all_pcm_bytes() {
+        // DVD-PS LPCM: PsDemuxer already removed the 7-byte private sub-header,
+        // so the payload handed to this parser is raw PCM. The DVD parser must
+        // NOT strip any further bytes (the round-2 audit Finding 3 bug: the BD
+        // 4-byte strip dropped one sample pair per PES, drifting the audio).
+        let mut parser = LpcmParser::new_dvd();
+        let pcm = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02];
+        let frames = parser.parse(&make_pes(pcm.clone(), Some(90000)));
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].data, pcm,
+            "DVD must preserve every PCM byte — no second strip"
+        );
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn dvd_lpcm_emits_short_payload_bd_would_drop() {
+        // A 4-byte raw-PCM DVD payload (1 sample pair at 16-bit stereo). The BD
+        // parser drops <= 4 bytes as "header only"; the DVD parser must emit it.
+        let mut bd = LpcmParser::new();
+        let mut dvd = LpcmParser::new_dvd();
+        let pcm = vec![0xAA, 0xBB, 0xCC, 0xDD];
+
+        assert!(
+            bd.parse(&make_pes(pcm.clone(), Some(0))).is_empty(),
+            "BD treats 4 bytes as header-only"
+        );
+        let frames = dvd.parse(&make_pes(pcm.clone(), Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, pcm);
     }
 
     #[test]

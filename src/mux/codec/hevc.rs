@@ -62,6 +62,11 @@ impl CodecParser for HevcParser {
         while let Some(sc_pos) = find_start_code(data, pos) {
             if let Some(nal_start) = skip_start_code(data, sc_pos) {
                 let next = find_start_code(data, nal_start).unwrap_or(data.len());
+                // Strip the leading zeros of the following start code. For a
+                // conforming bitstream this is lossless: rbsp_trailing_bits()
+                // sets a stop-one bit, so the final byte of any RBSP is never
+                // 0x00 — the only trailing zeros here belong to the next
+                // 00 00 (00) 01 prefix.
                 let mut end = next;
                 while end > nal_start && data[end - 1] == 0x00 {
                     end -= 1;
@@ -124,34 +129,41 @@ impl CodecParser for HevcParser {
         // Full HEVCDecoderConfigurationRecord is complex — for now, concatenate
         let mut record = Vec::new();
 
-        // Minimal HEVCDecoderConfigurationRecord header
+        // Minimal HEVCDecoderConfigurationRecord header.
+        //
+        // The stored SPS NAL is [2-byte HEVC NAL header][SPS RBSP...].
+        // The RBSP begins at sps[2]; profile_tier_level() begins one byte
+        // later, after sps_video_parameter_set_id u(4) +
+        // sps_max_sub_layers_minus1 u(3) + sps_temporal_id_nesting_flag u(1)
+        // (= sps[2], a full byte). So the profile_tier_level fields are:
+        //   sps[3]      general_profile_space u(2)+tier u(1)+profile_idc u(5)
+        //   sps[4..8]   general_profile_compatibility_flags u(32)
+        //   sps[8..14]  general_constraint_indicator_flags 48 bits
+        //   sps[14]     general_level_idc u(8)
+        // (Byte-aligned read; emulation-prevention bytes within the first
+        // 15 SPS bytes are not handled — extremely rare and matches the
+        // pre-existing simplification.)
         record.push(1); // configurationVersion
-        // General profile space, tier flag, profile IDC from SPS
-        if sps.len() > 3 {
-            record.push(sps[1]); // general_profile_space + general_tier_flag + general_profile_idc
+        // general_profile_space + general_tier_flag + general_profile_idc
+        record.push(if sps.len() > 3 { sps[3] } else { 0 });
+        // general_profile_compatibility_flags (4 bytes) — SPS bytes 4..8
+        if sps.len() > 7 {
+            record.extend_from_slice(&sps[4..8]);
         } else {
-            record.push(0);
+            let avail = sps.len().saturating_sub(4).min(4);
+            record.extend_from_slice(&sps[sps.len().min(4)..sps.len().min(8)]);
+            record.extend_from_slice(&vec![0u8; 4 - avail]);
         }
-        // general_profile_compatibility_flags (4 bytes) — from SPS bytes 2..6
-        if sps.len() > 5 {
-            record.extend_from_slice(&sps[2..6]);
+        // general_constraint_indicator_flags (6 bytes) — SPS bytes 8..14
+        if sps.len() > 13 {
+            record.extend_from_slice(&sps[8..14]);
         } else {
-            record.extend_from_slice(&[0, 0, 0, 0]);
+            let avail = sps.len().saturating_sub(8).min(6);
+            record.extend_from_slice(&sps[sps.len().min(8)..sps.len().min(14)]);
+            record.extend_from_slice(&vec![0u8; 6 - avail]);
         }
-        // general_constraint_indicator_flags (6 bytes) — from SPS bytes 6..12
-        if sps.len() > 11 {
-            record.extend_from_slice(&sps[6..12]);
-        } else {
-            let avail = sps.len().saturating_sub(6).min(6);
-            if avail > 0 {
-                record.extend_from_slice(&sps[6..6 + avail]);
-                record.extend_from_slice(&vec![0u8; 6 - avail]);
-            } else {
-                record.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-            }
-        }
-        // general_level_idc
-        record.push(if sps.len() > 12 { sps[12] } else { 0 });
+        // general_level_idc — SPS byte 14
+        record.push(if sps.len() > 14 { sps[14] } else { 0 });
         // min_spatial_segmentation_idc (4 + 12 bits)
         record.extend_from_slice(&[0xF0, 0x00]);
         // parallelismType (6 + 2 bits)
@@ -266,6 +278,103 @@ mod tests {
             cp.len() > 23,
             "codec_private should contain VPS+SPS+PPS data"
         );
+    }
+
+    #[test]
+    fn hvcc_profile_tier_level_offsets() {
+        // The hvcC fixed header must read profile_tier_level from the SPS
+        // RBSP, not from the NAL header. Stored SPS = [2-byte NAL header][RBSP].
+        // RBSP layout (byte-aligned):
+        //   sps[2]      sps_vps_id/max_sub_layers/temporal_nesting
+        //   sps[3]      general_profile_space+tier+profile_idc
+        //   sps[4..8]   general_profile_compatibility_flags
+        //   sps[8..14]  general_constraint_indicator_flags
+        //   sps[14]     general_level_idc
+        let mut parser = HevcParser::new();
+
+        // Distinct, recognizable values for each field.
+        let sps_rbsp: [u8; 13] = [
+            0xAB, // sps[2]  (vps_id etc.) — must NOT leak into profile fields
+            0x21, // sps[3]  profile byte: space=0, tier=0, profile_idc=1
+            0x60, 0x00, 0x00, 0x00, // sps[4..8] compat flags
+            0x90, 0x00, 0x00, 0x00, 0x00, 0x00, // sps[8..14] constraint flags
+            0x7B, // sps[14] level_idc = 123
+        ];
+
+        let mut data = Vec::new();
+        // VPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        // SPS — 2-byte header + the structured RBSP above
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&sps_rbsp);
+        // PPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xDD, 0xEE]);
+
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        let cp = parser
+            .codec_private()
+            .expect("codec_private should be Some");
+
+        // record[0] = configurationVersion
+        assert_eq!(cp[0], 1, "configurationVersion");
+        // record[1] = general_profile_space+tier+profile_idc  <- sps[3]
+        assert_eq!(
+            cp[1], 0x21,
+            "profile byte must come from SPS RBSP, not NAL hdr"
+        );
+        // record[2..6] = general_profile_compatibility_flags  <- sps[4..8]
+        assert_eq!(&cp[2..6], &[0x60, 0x00, 0x00, 0x00], "compatibility flags");
+        // record[6..12] = general_constraint_indicator_flags  <- sps[8..14]
+        assert_eq!(
+            &cp[6..12],
+            &[0x90, 0x00, 0x00, 0x00, 0x00, 0x00],
+            "constraint flags"
+        );
+        // record[12] = general_level_idc  <- sps[14]
+        assert_eq!(cp[12], 0x7B, "level_idc must come from sps[14]");
+    }
+
+    #[test]
+    fn hvcc_short_sps_does_not_panic() {
+        // A truncated SPS must still produce a fixed header without panicking
+        // and zero-pad the missing profile/level bytes.
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA]);
+        // SPS with only 3 RBSP bytes (stored len = 5): forces every guard path
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x11, 0x22, 0x33]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xDD]);
+
+        let pes = make_pes(data, Some(0));
+        parser.parse(&pes);
+
+        let cp = parser
+            .codec_private()
+            .expect("codec_private should be Some");
+        // sps stored = [hdr0, hdr1, 0x11, 0x22, 0x33], len 5.
+        // profile byte = sps[3] = 0x22; everything past sps[4]=0x33 is absent.
+        assert_eq!(cp[0], 1);
+        assert_eq!(cp[1], 0x22, "profile byte = sps[3]");
+        // compat flags: only sps[4]=0x33 present, rest zero-padded.
+        assert_eq!(&cp[2..6], &[0x33, 0x00, 0x00, 0x00]);
+        // constraint flags: none present, all zero.
+        assert_eq!(&cp[6..12], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // level_idc: absent, zero.
+        assert_eq!(cp[12], 0x00);
     }
 
     #[test]

@@ -6,6 +6,14 @@
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
+/// Hard cap on the carry-over buffer. An AC-3/E-AC-3 frame is at most 8192
+/// bytes (the `frame_size > 8192` reject below), so a single straddling frame
+/// plus a little slack never needs more than this. If the buffer grows past
+/// the cap without yielding a frame (pathological / never-syncing input) we
+/// drop it and resync rather than accumulate one PES worth of data per call
+/// for the whole title.
+const MAX_AC3_BUF: usize = 64 * 1024;
+
 pub struct Ac3Parser {
     /// Leftover bytes from previous PES (incomplete frame at end).
     buf: Vec<u8>,
@@ -81,19 +89,38 @@ impl CodecParser for Ac3Parser {
             pos = start + frame_size;
         }
 
-        // Keep unconsumed data for next call
-        // `pos` points to the start of unconsumed data (either a partial sync or leftover)
+        // Keep unconsumed data for the next call. `pos` is the start of the
+        // unconsumed region: either a partial frame that straddles this PES
+        // boundary — which, by construction, begins at a syncword (every byte
+        // before `pos` was emitted as a frame or skipped as pre-sync junk) — or
+        // trailing bytes too short to size/complete a frame. Carry from `pos`,
+        // NOT from the next syncword: discarding bytes between `pos` and the
+        // next sync would drop the partial frame we are deliberately keeping
+        // across the boundary.
         let keep_from = if pos < data.len() {
-            // Find the last sync word position in the unconsumed region
-            find_ac3_sync(&data[pos..])
-                .map(|o| pos + o)
-                .unwrap_or(data.len())
+            // A syncword at/after `pos` marks the carry-over start (anything
+            // before it is junk with no sync). With no full sync, retain the
+            // whole tail — including a lone trailing 0x0B that may be the first
+            // half of a syncword split across the PES boundary.
+            match find_ac3_sync(&data[pos..]) {
+                Some(o) => pos + o,
+                None if data.last() == Some(&0x0B) => data.len() - 1,
+                None => data.len(),
+            }
         } else {
             data.len()
         };
 
         if keep_from < data.len() {
-            self.buf = data[keep_from..].to_vec();
+            let tail = &data[keep_from..];
+            if tail.len() > MAX_AC3_BUF {
+                // No frame could be parsed out of a buffer this large — this is
+                // not valid AC-3 here. Drop it and resync on the next PES rather
+                // than grow without bound on pathological input.
+                self.buf.clear();
+            } else {
+                self.buf = tail.to_vec();
+            }
         } else {
             self.buf.clear();
         }
@@ -274,6 +301,91 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data.len(), 160);
+    }
+
+    #[test]
+    fn sync_word_split_across_pes_is_preserved() {
+        // A frame whose 0x0B77 syncword straddles the PES boundary (0x0B at the
+        // tail of PES 1, 0x77 at the head of PES 2) must still be emitted whole.
+        // Previously the lone trailing 0x0B was dropped and the frame lost.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2); // 160 bytes, starts with 0x0B 0x77
+
+        // PES 1: a complete frame, then a single 0x0B (first half of next sync).
+        let mut pes1_data = frame_data.clone();
+        pes1_data.push(0x0B);
+        let pes1 = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data: pes1_data,
+        };
+        let frames1 = parser.parse(&pes1);
+        assert_eq!(frames1.len(), 1, "first complete frame emitted");
+
+        // PES 2: 0x77 (second half of sync) + rest of the second frame.
+        let mut pes2_data = vec![0x77];
+        pes2_data.extend_from_slice(&frame_data[2..]);
+        let pes2 = PesPacket {
+            pid: 0,
+            pts: Some(93000),
+            dts: None,
+            data: pes2_data,
+        };
+        let frames2 = parser.parse(&pes2);
+        assert_eq!(frames2.len(), 1, "split-sync frame must be recovered");
+        assert_eq!(frames2[0].data.len(), 160);
+    }
+
+    #[test]
+    fn buffer_stays_bounded_across_many_garbage_pes() {
+        // Finding 14: the carry-over buffer must never grow without bound. Feed
+        // many large PES packets that contain no usable frame and assert the
+        // retained buffer stays tiny — carry-from-`pos` drops all pre-sync junk,
+        // and a never-completing frame is bounded by the 8192-byte frame cap and
+        // the MAX_AC3_BUF resync guard.
+        let mut parser = Ac3Parser::new();
+        for i in 0..256 {
+            // Vary the trailing byte so we also exercise the lone-0x0B retain.
+            let mut data = vec![0x55u8; 8192];
+            if i % 3 == 0 {
+                *data.last_mut().unwrap() = 0x0B;
+            }
+            let pes = PesPacket {
+                pid: 0,
+                pts: None,
+                dts: None,
+                data,
+            };
+            let frames = parser.parse(&pes);
+            assert!(frames.is_empty());
+            assert!(
+                parser.buf.len() <= MAX_AC3_BUF,
+                "buffer grew to {} (cap {})",
+                parser.buf.len(),
+                MAX_AC3_BUF
+            );
+        }
+        // After all that garbage the retained tail is at most a single partial
+        // syncword byte — never an accumulation of whole PES packets.
+        assert!(parser.buf.len() <= 1, "retained {} bytes", parser.buf.len());
+    }
+
+    #[test]
+    fn split_sync_below_cap_is_still_retained() {
+        // The cap must not break the normal split-sync straddle: a short tail
+        // ending in 0x0B (well under the cap) is retained so the next PES can
+        // complete the syncword.
+        let mut parser = Ac3Parser::new();
+        let data = vec![0x00, 0x00, 0x0B];
+        let pes = PesPacket {
+            pid: 0,
+            pts: None,
+            dts: None,
+            data,
+        };
+        assert!(parser.parse(&pes).is_empty());
+        assert_eq!(parser.buf, vec![0x0B], "lone trailing 0x0B retained");
     }
 
     #[test]

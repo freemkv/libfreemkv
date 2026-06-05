@@ -264,6 +264,13 @@ pub fn read_element_header(r: &mut impl Read) -> io::Result<(u32, u64, usize)> {
 
 /// Read an unsigned integer value of `len` bytes.
 pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
+    // An EBML unsigned integer is at most 8 bytes. A malformed element
+    // claiming `len > 8` would index past this stack buffer and panic
+    // (DoS on untrusted input) — reject it at the source so every caller
+    // is safe, not just the ones that pre-check.
+    if len > 8 {
+        return Err(crate::error::Error::MkvInvalid.into());
+    }
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf[..len])?;
     let mut val = 0u64;
@@ -273,23 +280,33 @@ pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
     Ok(val)
 }
 
-/// Read a float value (4 or 8 bytes).
+/// Read a float value. EBML floats are exactly 0, 4, or 8 bytes.
+///
+/// The previous `else` branch read a fixed 8 bytes for ANY non-4 length,
+/// so a malformed element with `len > 8` left `len - 8` unconsumed bytes
+/// (mis-read as the next EBML header → desync of the rest of the parent
+/// element) and `len < 4` over-read. Consume exactly `len` bytes and
+/// reject anything that isn't a valid float width.
 pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
-    if len == 4 {
-        let mut buf = [0u8; 4];
-        r.read_exact(&mut buf)?;
-        Ok(f32::from_be_bytes(buf) as f64)
-    } else {
-        let mut buf = [0u8; 8];
-        r.read_exact(&mut buf)?;
-        Ok(f64::from_be_bytes(buf))
+    match len {
+        0 => Ok(0.0),
+        4 => {
+            let mut buf = [0u8; 4];
+            r.read_exact(&mut buf)?;
+            Ok(f32::from_be_bytes(buf) as f64)
+        }
+        8 => {
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf)?;
+            Ok(f64::from_be_bytes(buf))
+        }
+        _ => Err(crate::error::Error::MkvInvalid.into()),
     }
 }
 
 /// Read a UTF-8 string value of `len` bytes.
 pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    let mut buf = read_exact_bounded(r, len)?;
     // Strip trailing nulls
     while buf.last() == Some(&0) {
         buf.pop();
@@ -299,8 +316,22 @@ pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
 
 /// Read binary data of `len` bytes.
 pub fn read_binary_val(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    read_exact_bounded(r, len)
+}
+
+/// Read exactly `len` bytes WITHOUT trusting `len` to size the allocation.
+///
+/// `vec![0u8; len]` on an attacker-controlled EBML size would allocate
+/// gigabytes before the read fails. Instead we cap the reader to `len`
+/// and grow the buffer as bytes actually arrive: a malformed element that
+/// claims a huge length but supplies few bytes allocates only what it
+/// delivers, then errors on the short read.
+fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let got = r.take(len as u64).read_to_end(&mut buf)?;
+    if got != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(buf)
 }
 

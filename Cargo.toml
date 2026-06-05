@@ -8,6 +8,8 @@ description = "Open source raw disc access library for optical drives"
 repository = "https://github.com/freemkv/libfreemkv"
 keywords = ["bluray", "uhd", "optical", "scsi", "disc"]
 categories = ["hardware-support", "multimedia"]
+# Keep internal AI-instruction / private notes out of the published crate.
+exclude = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

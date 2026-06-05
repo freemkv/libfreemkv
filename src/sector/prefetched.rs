@@ -157,14 +157,15 @@ impl PrefetchedSectorSource {
                         Ok(b) => b,
                         Err(_) => return, // consumer dropped both channels
                     };
-                    if buf.len() < bytes {
-                        buf.resize(bytes, 0);
-                    } else {
-                        // Re-expose the full extent; previous truncate
-                        // shrank the visible len without freeing pages.
-                        // SAFETY: capacity is at least `bytes` after
-                        // construction with `vec![0u8; batch_bytes]`.
+                    if bytes <= buf.capacity() {
+                        // Re-expose `bytes` without zero-filling pages that
+                        // `read_sectors` is about to overwrite. The capacity
+                        // guard makes the `set_len` provably sound even if a
+                        // recycled buffer ever comes back smaller than the
+                        // `vec![0u8; batch_bytes]` it was born with.
                         unsafe { buf.set_len(bytes) };
+                    } else {
+                        buf.resize(bytes, 0);
                     }
                     let lba = extent.start_lba + offset;
                     match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {

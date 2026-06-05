@@ -112,19 +112,22 @@ impl MkvTrack {
     }
 
     pub fn audio(a: &AudioStream) -> Self {
-        // Codec ID strings must distinguish the DTS family — strict
-        // players (Plex transcoder, some hardware decoders, some AV
-        // receivers) reject lossless DTS-HD MA payload when the
-        // track advertises plain `A_DTS` because it implies the
-        // bitstream is the 1.5 Mbps "core" only. Fix is just to
-        // emit the right ID per BD-STN codec field.
+        // The Matroska codec-ID registry defines `A_DTS` for the entire
+        // DTS family — the spec text for `A_DTS` explicitly states it
+        // "Supports DTS, DTS-ES, DTS-96/26, DTS-HD High Resolution Audio
+        // and DTS-HD Master Audio." Players distinguish core vs HD-HRA vs
+        // HD-MA by parsing the DTS bitstream extension substreams, not by
+        // the container codec ID. The previously-emitted `A_DTS/MA` and
+        // `A_DTS/HR` suffixes are NOT registered codec IDs; strict parsers
+        // (libmatroska) and some hardware renderers fail to recognise the
+        // track at all. Emit plain `A_DTS` for every DTS variant — the
+        // lossless MA / HRA payload bytes are unchanged, only the
+        // container codec-ID string differs.
         let codec_id = match a.codec {
             Codec::Ac3 => "A_AC3",
             Codec::Ac3Plus => "A_EAC3",
             Codec::TrueHd => "A_TRUEHD",
-            Codec::DtsHdMa => "A_DTS/MA",
-            Codec::DtsHdHr => "A_DTS/HR",
-            Codec::Dts => "A_DTS",
+            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => "A_DTS",
             Codec::Lpcm => "A_PCM/INT/BIG",
             _ => "A_AC3",
         };
@@ -219,6 +222,12 @@ pub struct MkvMuxer<W: Write + Seek> {
 
 /// New cluster every 5 seconds.
 const CLUSTER_DURATION_MS: i64 = 5000;
+
+/// Maximum block-relative timestamp expressible in the signed 16-bit
+/// SimpleBlock/Block field (`i16::MAX` ms). A frame further than this from
+/// the open cluster's timestamp forces a new cluster (see `write_frame`) so
+/// the `as i16` cast can never wrap.
+const MAX_BLOCK_REL_MS: i64 = i16::MAX as i64;
 
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
@@ -444,7 +453,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let base = *self.base_pts_ms.get_or_insert(raw_ms);
         let pts_ms = raw_ms - base;
 
-        // Cluster boundaries must coincide with a video keyframe so every
+        // Cluster boundaries normally coincide with a video keyframe so every
         // Cues entry resolves to a seekable IDR at the cluster start.
         let is_video_key = keyframe && track_idx == 0;
         let needs_new_cluster = !self.cluster_open
@@ -460,6 +469,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 track: track_idx + 1,
                 cluster_pos: self.cluster_pos - self.segment_start,
             });
+        } else if (pts_ms - self.cluster_ts_ms) > MAX_BLOCK_REL_MS {
+            // The block-relative timestamp is a signed 16-bit value, so a
+            // frame more than i16::MAX ms (~32.767 s) past the current
+            // cluster's timestamp would silently wrap on the `as i16` cast,
+            // corrupting A/V sync. The keyframe-driven boundary above only
+            // fires on a video keyframe — a long audio-only stretch, or a
+            // very long GOP with no intervening keyframe, can drift past the
+            // i16 range. Force a fresh cluster here even without a keyframe
+            // to keep the cast in range. This cluster is not keyframe-aligned
+            // so it gets no Cues entry (Cues stay IDR-only for seekability).
+            self.start_cluster(pts_ms)?;
         }
 
         let relative_ts = (pts_ms - self.cluster_ts_ms) as i16;
@@ -677,6 +697,42 @@ mod tests {
             bit_depth: 0,
             dv_config: None,
         }
+    }
+
+    fn audio_stream(codec: Codec) -> AudioStream {
+        use crate::disc::{AudioChannels, LabelPurpose, SampleRate};
+        AudioStream {
+            pid: 0x1100,
+            codec,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn dts_variants_map_to_registered_a_dts_codec_id() {
+        // The Matroska codec-ID registry defines `A_DTS` for the whole DTS
+        // family (core, DTS-HD HRA, DTS-HD MA). The `/MA` and `/HR` suffixes
+        // are not registered and break strict parsers, so every DTS variant
+        // must emit plain `A_DTS`.
+        for codec in [Codec::Dts, Codec::DtsHdMa, Codec::DtsHdHr] {
+            let track = MkvTrack::audio(&audio_stream(codec));
+            assert_eq!(
+                track.codec_id, "A_DTS",
+                "{codec:?} must map to registered codec ID A_DTS, got {}",
+                track.codec_id
+            );
+        }
+        // Sanity: the non-DTS variants keep their distinct IDs.
+        assert_eq!(MkvTrack::audio(&audio_stream(Codec::Ac3)).codec_id, "A_AC3");
+        assert_eq!(
+            MkvTrack::audio(&audio_stream(Codec::TrueHd)).codec_id,
+            "A_TRUEHD"
+        );
     }
 
     #[test]
@@ -1374,6 +1430,85 @@ mod tests {
         assert!(
             entries.iter().all(|(id, _)| *id != ebml::CHAPTERS),
             "seekhead should not contain Chapters entry when chapters are empty"
+        );
+    }
+
+    /// Collect every (cluster_ts_ms, block_relative_ts_i16, absolute_ms) for
+    /// all SimpleBlocks across all clusters, so a test can assert that the
+    /// reconstructed absolute timestamp (cluster_ts + relative_ts) is correct
+    /// and that no relative_ts ever wrapped the i16 range.
+    fn all_block_timestamps(data: &[u8]) -> Vec<(i64, i16, i64)> {
+        let mut out = Vec::new();
+        for (body_start, body_size, cluster_ts) in find_clusters(data) {
+            let body = &data[body_start..body_start + body_size as usize];
+            let mut cursor = Cursor::new(body);
+            // Skip CLUSTER_TIMESTAMP.
+            let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+            cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+            while (cursor.position() as usize) < body.len() {
+                let (id, sz, _) = ebml::read_element_header(&mut cursor).unwrap();
+                if id == ebml::SIMPLE_BLOCK {
+                    let bstart = cursor.position() as usize;
+                    let b0 = body[bstart];
+                    let vint_len = if b0 & 0x80 != 0 { 1 } else { 2 };
+                    let ts_pos = bstart + vint_len;
+                    let rel = i16::from_be_bytes([body[ts_pos], body[ts_pos + 1]]);
+                    out.push((cluster_ts as i64, rel, cluster_ts as i64 + rel as i64));
+                }
+                cursor.seek(io::SeekFrom::Current(sz as i64)).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn long_audio_gap_forces_cluster_no_i16_overflow() {
+        // Regression for the `(pts_ms - cluster_ts_ms) as i16` truncation:
+        // a single video keyframe at t=0 opens one cluster, then a long
+        // audio-only stretch (no further video keyframe) drifts well past
+        // i16::MAX ms (~32.767 s). Without the overflow guard the audio
+        // blocks past 32.767 s would write a wrapped (negative) relative
+        // timestamp into the SimpleBlock. With the guard a fresh cluster is
+        // forced so every relative_ts stays in range and reconstructs to the
+        // true absolute timestamp.
+        let tracks = [make_video_track(), make_audio_track()];
+        let mut frames: Vec<(usize, i64, bool, Vec<u8>)> = Vec::new();
+        // One video keyframe at t=0 (opens the first cluster).
+        frames.push((0, 0, true, vec![0xAB; 16]));
+        // Audio frames every 100 ms out to 60 s — past the 32.767 s i16 limit
+        // and past two i16 spans, with NO further video keyframe.
+        let mut t_ms = 0i64;
+        while t_ms <= 60_000 {
+            frames.push((1, t_ms * 1_000_000, true, vec![0xCD; 16]));
+            t_ms += 100;
+        }
+
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+
+        let blocks = all_block_timestamps(&data);
+        assert!(!blocks.is_empty());
+        // Every block's relative timestamp must be within i16 range (it is by
+        // type), AND must reconstruct to a non-negative, monotonic-ish
+        // absolute timestamp matching the source — i.e. no silent wrap.
+        for (cluster_ts, rel, abs) in &blocks {
+            assert!(
+                *rel as i64 >= 0 && (*rel as i64) <= MAX_BLOCK_REL_MS,
+                "block relative_ts {rel} out of [0, i16::MAX] range \
+                 (cluster_ts={cluster_ts}, abs={abs}) — i16 overflow"
+            );
+        }
+        // The latest audio frame is at 60_000 ms; its reconstructed absolute
+        // timestamp must equal that, proving no truncation occurred.
+        let max_abs = blocks.iter().map(|(_, _, abs)| *abs).max().unwrap();
+        assert_eq!(max_abs, 60_000, "last block must reconstruct to 60_000 ms");
+        // The overflow guard must have opened more than one cluster (the
+        // single keyframe alone would otherwise yield exactly one).
+        let clusters = find_clusters(&data);
+        assert!(
+            clusters.len() >= 2,
+            "expected the i16 guard to force extra clusters, got {}",
+            clusters.len()
         );
     }
 
