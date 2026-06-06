@@ -96,7 +96,11 @@ impl CodecParser for Mpeg2Parser {
             return Vec::new();
         }
 
-        let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
+        // MKV block timecodes are PRESENTATION timestamps; frames are stored in
+        // decode order and the player reorders by timecode. Use PTS, not DTS —
+        // DTS presents B-frames in decode order (visible judder) and breaks
+        // PTS-based seeking. Fall back to DTS only if PTS is absent.
+        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
         let mut has_picture = false;

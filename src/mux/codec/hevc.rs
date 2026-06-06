@@ -48,8 +48,13 @@ impl CodecParser for HevcParser {
             return Vec::new();
         }
 
-        // Use DTS when available (monotonic for B-frame content), fall back to PTS
-        let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
+        // MKV block timecodes are PRESENTATION timestamps; frames are stored
+        // in decode order (the order they arrive here) and the player reorders
+        // for display by timecode. So use PTS, not DTS — using DTS makes the
+        // block timecode monotonic in storage order, which presents B-frames in
+        // decode order (visible judder / wrong frames) and breaks PTS-based
+        // seeking. Fall back to DTS only if PTS is somehow absent.
+        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
         // Pre-size: output is ~input bytes with a few 4-byte length
@@ -581,6 +586,33 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    // --- PTS (presentation), not DTS, drives the MKV block timecode ---
+    // Regression for B-frame presentation: writing DTS as the block timecode
+    // presents frames in decode order (visible judder) and breaks seeking.
+
+    #[test]
+    fn pts_preferred_over_dts() {
+        let mut parser = HevcParser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(1)); // TRAIL_R slice
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: Some(180000), // 2 s (presentation)
+            dts: Some(90000),  // 1 s (decode)
+            data,
+        };
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].pts_ns, 2_000_000_000,
+            "block timecode must be PTS"
+        );
     }
 
     // --- Dolby Vision enhancement layer ---

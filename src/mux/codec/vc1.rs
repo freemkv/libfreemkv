@@ -41,8 +41,11 @@ impl CodecParser for Vc1Parser {
             return Vec::new();
         }
 
-        // Use DTS when available (monotonic for B-frame content), fall back to PTS
-        let ts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
+        // MKV block timecodes are PRESENTATION timestamps; frames are stored in
+        // decode order and the player reorders by timecode. Use PTS, not DTS —
+        // DTS presents B-frames in decode order (visible judder) and breaks
+        // PTS-based seeking. Fall back to DTS only if PTS is absent.
+        let ts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         let mut has_seq_header = false;
         let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
@@ -419,10 +422,10 @@ mod tests {
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
     }
 
-    // --- DTS preferred over PTS ---
+    // --- PTS (presentation) used for the MKV block timecode, not DTS ---
 
     #[test]
-    fn dts_preferred_over_pts() {
+    fn pts_preferred_over_dts() {
         let mut parser = Vc1Parser::new();
 
         let mut data = Vec::new();
@@ -431,13 +434,14 @@ mod tests {
 
         let pes = PesPacket {
             pid: 0x1011,
-            pts: Some(180000),
-            dts: Some(90000),
+            pts: Some(180000), // presentation
+            dts: Some(90000),  // decode
             data,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+        // PTS must be used — MKV block timecodes are presentation timestamps.
+        assert_eq!(frames[0].pts_ns, 2_000_000_000);
     }
 
     // --- find_next_sc utility ---

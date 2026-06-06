@@ -38,8 +38,11 @@ impl CodecParser for H264Parser {
             return Vec::new();
         }
 
-        // Use DTS when available (monotonic for B-frame content), fall back to PTS
-        let pts_ns = pes.dts.or(pes.pts).map(pts_to_ns).unwrap_or(0);
+        // MKV block timecodes are PRESENTATION timestamps; frames are stored in
+        // decode order and the player reorders by timecode. Use PTS, not DTS —
+        // DTS presents B-frames in decode order (visible judder) and breaks
+        // PTS-based seeking. Fall back to DTS only if PTS is absent.
+        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
 
         // Scan NAL units for SPS, PPS, and IDR detection
         let mut keyframe = false;
@@ -451,10 +454,10 @@ mod tests {
         assert!(frames.is_empty());
     }
 
-    // --- DTS preferred over PTS when present ---
+    // --- PTS (presentation) used for the MKV block timecode, not DTS ---
 
     #[test]
-    fn dts_preferred_over_pts() {
+    fn pts_preferred_over_dts() {
         let mut parser = H264Parser::new();
 
         let mut data = Vec::new();
@@ -464,13 +467,13 @@ mod tests {
 
         let pes = PesPacket {
             pid: 0x1011,
-            pts: Some(180000), // 2 seconds
-            dts: Some(90000),  // 1 second
+            pts: Some(180000), // 2 seconds (presentation)
+            dts: Some(90000),  // 1 second (decode)
             data,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
-        // DTS should be used, not PTS
-        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+        // PTS must be used — MKV block timecodes are presentation timestamps.
+        assert_eq!(frames[0].pts_ns, 2_000_000_000);
     }
 }
