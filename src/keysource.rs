@@ -35,6 +35,12 @@ pub struct DiscInputs {
     /// the disc reader, which the library's scan does not retain — so
     /// [`crate::Disc::inputs`] leaves it empty for the caller to fill.
     pub samples: Vec<Vec<u8>>,
+    /// The disc's human title — the UDF/ISO volume identifier (e.g.
+    /// `WICKED_FOR_GOOD`), falling back to the BDMV `<di:name>` when present.
+    /// `None` when not captured. Identity only, no secret; a key service may
+    /// record it (keyed by `disc_hash`) to build a hash→title catalog. Not used
+    /// in any AACS derivation.
+    pub volume_label: Option<String>,
 }
 
 /// A key source: a stateful provider that hands a disc's candidate [`Key`]s out

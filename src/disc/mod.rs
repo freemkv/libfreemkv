@@ -1672,6 +1672,16 @@ impl Disc {
             // Content samples need the disc reader, which scan does not retain;
             // the caller fills these for sources that validate against ciphertext.
             samples: Vec::new(),
+            // Human title: prefer the UDF/ISO volume identifier, fall back to the
+            // BDMV display name. Identity only — a key service may catalog it.
+            volume_label: {
+                let v = self.volume_id.trim();
+                if v.is_empty() {
+                    self.meta_title.clone()
+                } else {
+                    Some(v.to_string())
+                }
+            },
         })
     }
 
