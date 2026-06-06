@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.29.0 (2026-06-06)
+
+### Fixed
+
+- **Video frames now carry their presentation timestamp (PTS), not the decode
+  timestamp (DTS), as the MKV block timecode.** The HEVC, H.264, VC-1 and
+  MPEG-2 parsers stamped each frame with `dts.or(pts)`, so B-frame titles were
+  muxed with monotonic decode-order timecodes: players presented frames in
+  decode order (visible judder / apparent "corruption") and PTS-based seeking
+  landed on the wrong frame. The compressed video was always byte-correct —
+  this was purely a timestamp defect, and it affected every B-frame title. The
+  parsers now use `pts.or(dts)`. Verified against a reference muxer on a real
+  UHD title: the emitted frame sequence is now identical.
+- **DTS-HD MA tracks no longer downgrade to the lossy DTS core** — the access
+  unit is delimited by the next *validated* core sync, so a `0x7FFE8001` byte
+  pattern inside the XLL extension can no longer truncate the unit. (#10)
+- **A resolved AACS key is verified against the content before it is applied**,
+  so a stale or wrong VUK can no longer silently produce garbage output.
+- **`iso://` mux fails fast when no usable AACS key is available** instead of
+  writing a garbage MKV.
+
+### Changed
+
+- Codec / EBML / TS hardening: bounds-checked PMT and PES-header parsing, EBML
+  length validation, and bounded codec buffers (DTS, TrueHD, PGS).
+
 ## 0.27.3 (2026-06-04)
 
 ### Added
