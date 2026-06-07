@@ -13,6 +13,14 @@ const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
 
 pub struct H264Parser {
+    // First-seen SPS/PPS seed the MKV codecPrivate (avcC) — the only out-of-band
+    // copy the player gets. BD H.264 repeats the parameter sets at every IDR;
+    // a player re-applies the avcC copy at each keyframe. A stream may redefine
+    // a parameter set mid-title under the SAME id with a different body. Any
+    // occurrence whose body DIFFERS from the codecPrivate copy must therefore be
+    // emitted IN-BAND at each point it appears so it overrides the re-applied
+    // avcC set; otherwise those frames decode against the wrong parameter set.
+    // (Same defect class as the HEVC PPS-redefinition bug.)
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
 }
@@ -32,6 +40,28 @@ impl H264Parser {
     }
 }
 
+/// Handle an SPS/PPS NAL (mirrors the HEVC fix):
+/// - First of its type → seeds codecPrivate (`first`); stripped from frame data
+///   (the player gets it from avcC).
+/// - Identical to the codecPrivate copy → stripped (the player re-applies it
+///   from avcC at each keyframe; BD streams repeat param sets at every IDR).
+/// - DIFFERENT body from the codecPrivate copy (a mid-title redefinition of the
+///   same id) → emitted IN-BAND (length-prefixed) at EVERY occurrence so it
+///   overrides the avcC copy the player re-applies at each keyframe.
+fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Vec<u8>) {
+    match first {
+        None => {
+            first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
+        }
+        Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
+        Some(_) => {
+            // Differs from codecPrivate → emit in-band so it wins at this AU.
+            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            frame_data.extend_from_slice(nal);
+        }
+    }
+}
+
 impl CodecParser for H264Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         if pes.data.is_empty() {
@@ -44,7 +74,9 @@ impl CodecParser for H264Parser {
         // PTS-based seeking. Fall back to DTS only if PTS is absent.
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
 
-        // Scan NAL units for SPS, PPS, and IDR detection
+        // Single pass: detect IDR keyframes, seed/strip param sets, and convert
+        // Annex B (start-code prefixed) NALUs to length-prefixed NALUs (MKV with
+        // AVCDecoderConfigurationRecord expects a 4-byte length prefix per NAL).
         let mut keyframe = false;
         let mut frame_data = Vec::new();
 
@@ -52,32 +84,21 @@ impl CodecParser for H264Parser {
             let nal_type = nal[0] & 0x1F;
 
             match nal_type {
-                NAL_SPS => {
-                    self.sps = Some(nal.to_vec());
+                // Param sets: seed avcC, strip if identical, emit in-band if a
+                // mid-title redefinition differs from the avcC copy.
+                NAL_SPS => handle_param_set(&mut self.sps, nal, &mut frame_data),
+                NAL_PPS => handle_param_set(&mut self.pps, nal, &mut frame_data),
+                // Access unit delimiters: drop.
+                NAL_AUD => {}
+                _ => {
+                    if nal_type == NAL_SLICE_IDR {
+                        keyframe = true;
+                    }
+                    let len = nal.len() as u32;
+                    frame_data.extend_from_slice(&len.to_be_bytes());
+                    frame_data.extend_from_slice(nal);
                 }
-                NAL_PPS => {
-                    self.pps = Some(nal.to_vec());
-                }
-                NAL_SLICE_IDR => {
-                    keyframe = true;
-                }
-                _ => {}
             }
-        }
-
-        // Convert Annex B (start code prefixed) to length-prefixed NALUs.
-        // MKV with AVCDecoderConfigurationRecord expects 4-byte length prefix per NALU.
-        // Skip SPS/PPS/AUD NALUs — they're in codecPrivate, not in frame data.
-        for nal in NalIterator::new(&pes.data) {
-            let nal_type = nal[0] & 0x1F;
-            // Skip parameter sets and access unit delimiters
-            if nal_type == NAL_SPS || nal_type == NAL_PPS || nal_type == NAL_AUD {
-                continue;
-            }
-            // 4-byte big-endian length prefix
-            let len = nal.len() as u32;
-            frame_data.extend_from_slice(&len.to_be_bytes());
-            frame_data.extend_from_slice(nal);
         }
 
         if frame_data.is_empty() {
@@ -98,6 +119,14 @@ impl CodecParser for H264Parser {
         let pps = self.pps.as_ref()?;
 
         if sps.len() < 4 {
+            return None;
+        }
+
+        // avcC encodes each NAL's length in a 16-bit field. A param set larger
+        // than 65535 bytes would truncate the length while the full bytes are
+        // appended → mis-framed record. Refuse rather than emit a corrupt avcC
+        // (param sets this large are non-conforming anyway).
+        if sps.len() > 0xFFFF || pps.len() > 0xFFFF {
             return None;
         }
 
@@ -475,5 +504,105 @@ mod tests {
         assert_eq!(frames.len(), 1);
         // PTS must be used — MKV block timecodes are presentation timestamps.
         assert_eq!(frames[0].pts_ns, 2_000_000_000);
+    }
+
+    // --- mid-title param-set redefinition emitted in-band ---
+
+    /// Collect the NAL types from a length-prefixed frame_data buffer.
+    fn frame_nal_types(fd: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut off = 0;
+        while off + 4 <= fd.len() {
+            let len = u32::from_be_bytes([fd[off], fd[off + 1], fd[off + 2], fd[off + 3]]) as usize;
+            off += 4;
+            if off + len > fd.len() {
+                break;
+            }
+            types.push(fd[off] & 0x1F);
+            off += len;
+        }
+        types
+    }
+
+    #[test]
+    fn first_param_sets_stripped_redefinition_emitted_inline() {
+        let mut parser = H264Parser::new();
+
+        // AU 1: SPS(id0,bodyA) + PPS(id0,bodyA) + IDR. Both param sets are the
+        // first of their type → seed avcC, stripped from frame data.
+        let mut au1 = Vec::new();
+        au1.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au1.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAA]); // SPS body A
+        au1.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au1.extend_from_slice(&[0x68, 0x11]); // PPS body A
+        au1.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au1.extend_from_slice(&[0x65, 0x10, 0x20]); // IDR
+        let f1 = parser.parse(&make_pes(au1, Some(0)));
+        assert_eq!(f1.len(), 1);
+        // Frame 1 carries only the IDR — param sets stripped (in avcC).
+        assert_eq!(frame_nal_types(&f1[0].data), vec![5], "AU1: only IDR in-band");
+
+        // AU 2: SPS identical to avcC, PPS REDEFINED (same id, different body) +
+        // IDR. The identical SPS is stripped; the redefined PPS must be emitted
+        // in-band so it overrides the avcC copy at this keyframe.
+        let mut au2 = Vec::new();
+        au2.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au2.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAA]); // SPS == body A
+        au2.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au2.extend_from_slice(&[0x68, 0x22]); // PPS body B (redefinition)
+        au2.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au2.extend_from_slice(&[0x65, 0x30, 0x40]); // IDR
+        let f2 = parser.parse(&make_pes(au2, Some(90000)));
+        assert_eq!(f2.len(), 1);
+        let types = frame_nal_types(&f2[0].data);
+        assert!(
+            types.contains(&8),
+            "redefined PPS (type 8) must be emitted in-band, got {types:?}"
+        );
+        assert!(
+            !types.contains(&7),
+            "identical SPS (type 7) must stay stripped, got {types:?}"
+        );
+        assert!(types.contains(&5), "IDR (type 5) present, got {types:?}");
+    }
+
+    #[test]
+    fn repeated_identical_param_sets_stay_stripped() {
+        let mut parser = H264Parser::new();
+        let mut au = Vec::new();
+        au.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAA]);
+        au.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au.extend_from_slice(&[0x68, 0x11]);
+        au.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au.extend_from_slice(&[0x65, 0x10]);
+        // Two identical AUs.
+        parser.parse(&make_pes(au.clone(), Some(0)));
+        let f = parser.parse(&make_pes(au, Some(90000)));
+        assert_eq!(
+            frame_nal_types(&f[0].data),
+            vec![5],
+            "repeated identical SPS/PPS stay in avcC, not duplicated in-band"
+        );
+    }
+
+    #[test]
+    fn avcc_oversized_param_set_returns_none() {
+        // A param set > 65535 bytes can't be length-encoded in avcC's 16-bit
+        // field; codec_private must refuse rather than emit a truncated record.
+        let mut parser = H264Parser::new();
+        let mut data = Vec::new();
+        // Oversized SPS (header byte 0x67 + 70000 filler bytes).
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.push(0x67);
+        data.extend_from_slice(&vec![0x11u8; 70_000]);
+        // PPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&[0x68, 0x11]);
+        parser.parse(&make_pes(data, Some(0)));
+        assert!(
+            parser.codec_private().is_none(),
+            "oversized SPS must not produce a truncated avcC"
+        );
     }
 }
