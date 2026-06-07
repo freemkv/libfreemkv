@@ -21,6 +21,15 @@ const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
 
 pub struct HevcParser {
+    // First-seen parameter set of each type → seeds the MKV codecPrivate (hvcC).
+    // This is the ONLY copy the player gets out-of-band, and a player re-applies
+    // it at every keyframe (ffmpeg's hvcC→Annex-B insertion). A stream may
+    // redefine a parameter set mid-title under the SAME id with a different body
+    // (Fight Club redefines PPS id 0 partway through). Any occurrence whose body
+    // DIFFERS from this codecPrivate copy must therefore be emitted IN-BAND at
+    // each point it appears (i.e. at every keyframe of the redefined segment) so
+    // it overrides the re-applied codecPrivate set; otherwise those frames decode
+    // against the wrong parameter set → CABAC/cu_qp_delta desync.
     vps: Option<Vec<u8>>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
@@ -38,6 +47,32 @@ impl HevcParser {
             vps: None,
             sps: None,
             pps: None,
+        }
+    }
+}
+
+/// Handle a VPS/SPS/PPS NAL.
+///
+/// - First of its type → seeds codecPrivate (`first`); stripped from frame data
+///   (the player gets it from hvcC).
+/// - Identical to the codecPrivate copy → stripped (the player already re-applies
+///   it from hvcC at each keyframe; BD streams repeat param sets at every IRAP).
+/// - DIFFERENT body from the codecPrivate copy (a mid-title redefinition of the
+///   same id) → emitted IN-BAND (length-prefixed) at EVERY occurrence, so it
+///   overrides the hvcC copy the player re-applies at each keyframe. Emitting it
+///   only once is not enough — the next keyframe's hvcC re-insertion would revert
+///   it. This matches what a conforming muxer produces and fixes the Fight Club
+///   PPS-id-0 redefinition.
+fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Vec<u8>) {
+    match first {
+        None => {
+            first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
+        }
+        Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
+        Some(_) => {
+            // Differs from codecPrivate → emit in-band so it wins at this AU.
+            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            frame_data.extend_from_slice(nal);
         }
     }
 }
@@ -83,13 +118,13 @@ impl CodecParser for HevcParser {
 
                     match nal_type {
                         NAL_VPS => {
-                            self.vps = Some(data[nal_start..end].to_vec());
+                            handle_param_set(&mut self.vps, &data[nal_start..end], &mut frame_data)
                         }
                         NAL_SPS => {
-                            self.sps = Some(data[nal_start..end].to_vec());
+                            handle_param_set(&mut self.sps, &data[nal_start..end], &mut frame_data)
                         }
                         NAL_PPS => {
-                            self.pps = Some(data[nal_start..end].to_vec());
+                            handle_param_set(&mut self.pps, &data[nal_start..end], &mut frame_data)
                         }
                         NAL_AUD => {} // Skip access unit delimiters
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
@@ -559,6 +594,70 @@ mod tests {
             fd.len(),
             "frame should contain exactly one length-prefixed NAL"
         );
+    }
+
+    // --- parameter-set redefinition (Fight Club bug) ---
+
+    /// A parameter set REDEFINED mid-stream (same id, different body) must be
+    /// emitted INLINE so the decoder re-activates it. Fight Club redefines PPS
+    /// id 0 partway through the title; the old parser kept only the first PPS,
+    /// so the second segment decoded against the wrong PPS (CABAC desync).
+    #[test]
+    fn redefined_pps_emitted_inline() {
+        let mut parser = HevcParser::new();
+        let pps = |body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(34)); // PPS
+            v.extend_from_slice(&[body, body]);
+            v
+        };
+        let slice = || {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(1)); // TRAIL_R
+            v.extend_from_slice(&[0x10, 0x20]);
+            v
+        };
+        // count PPS (type 34) NALs in length-prefixed frame data
+        let count_pps = |fd: &[u8]| {
+            let (mut n, mut o) = (0usize, 0usize);
+            while o + 4 <= fd.len() {
+                let len =
+                    u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+                o += 4;
+                if o < fd.len() && (fd[o] >> 1) & 0x3F == 34 {
+                    n += 1;
+                }
+                o += len;
+            }
+            n
+        };
+
+        // PES1: first PPS-A → seeds codecPrivate, stripped from frame.
+        let mut d = pps(0xAA);
+        d.extend(slice());
+        let f = parser.parse(&make_pes(d, Some(0)));
+        assert_eq!(count_pps(&f[0].data), 0, "first PPS goes to codecPrivate");
+
+        // PES2: PPS-B (redefinition, different body) → emitted INLINE.
+        let mut d = pps(0xBB);
+        d.extend(slice());
+        let f = parser.parse(&make_pes(d, Some(1)));
+        assert_eq!(count_pps(&f[0].data), 1, "redefined PPS must be inline");
+
+        // PES3: PPS-B repeated — still differs from codecPrivate(A), so emitted
+        // AGAIN. Every keyframe of the redefined segment must carry it, because
+        // the player re-applies the hvcC (codecPrivate) copy at each keyframe;
+        // emitting once would be reverted at the next keyframe.
+        let mut d = pps(0xBB);
+        d.extend(slice());
+        let f = parser.parse(&make_pes(d, Some(2)));
+        assert_eq!(count_pps(&f[0].data), 1, "redefined PPS re-emitted every occurrence");
+
+        // PES4: back to PPS-A (== codecPrivate) → stripped (hvcC supplies it).
+        let mut d = pps(0xAA);
+        d.extend(slice());
+        let f = parser.parse(&make_pes(d, Some(3)));
+        assert_eq!(count_pps(&f[0].data), 0, "occurrence equal to codecPrivate stripped");
     }
 
     // --- empty PES ---
