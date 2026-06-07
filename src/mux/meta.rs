@@ -3,7 +3,9 @@
 //! Format: [8B magic] [4B json_len] [JSON] [padding to 192B boundary] [BD-TS data...]
 //! Other tools skip the header during TS sync recovery (scan for 0x47).
 
-use crate::disc::{AudioStream, ColorSpace, DiscTitle, HdrFormat, Stream, SubtitleStream, VideoStream};
+use crate::disc::{
+    AudioStream, ColorSpace, DiscTitle, HdrFormat, Stream, SubtitleStream, VideoStream,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 

@@ -813,8 +813,7 @@ mod tests {
         let count_pps = |fd: &[u8]| {
             let (mut n, mut o) = (0usize, 0usize);
             while o + 4 <= fd.len() {
-                let len =
-                    u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+                let len = u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
                 o += 4;
                 if o < fd.len() && (fd[o] >> 1) & 0x3F == 34 {
                     n += 1;
@@ -843,13 +842,21 @@ mod tests {
         let mut d = pps(0xBB);
         d.extend(slice());
         let f = parser.parse(&make_pes(d, Some(2)));
-        assert_eq!(count_pps(&f[0].data), 1, "redefined PPS re-emitted every occurrence");
+        assert_eq!(
+            count_pps(&f[0].data),
+            1,
+            "redefined PPS re-emitted every occurrence"
+        );
 
         // PES4: back to PPS-A (== codecPrivate) → stripped (hvcC supplies it).
         let mut d = pps(0xAA);
         d.extend(slice());
         let f = parser.parse(&make_pes(d, Some(3)));
-        assert_eq!(count_pps(&f[0].data), 0, "occurrence equal to codecPrivate stripped");
+        assert_eq!(
+            count_pps(&f[0].data),
+            0,
+            "occurrence equal to codecPrivate stripped"
+        );
     }
 
     // --- empty PES ---

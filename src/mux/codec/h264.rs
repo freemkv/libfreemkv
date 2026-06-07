@@ -540,7 +540,11 @@ mod tests {
         let f1 = parser.parse(&make_pes(au1, Some(0)));
         assert_eq!(f1.len(), 1);
         // Frame 1 carries only the IDR — param sets stripped (in avcC).
-        assert_eq!(frame_nal_types(&f1[0].data), vec![5], "AU1: only IDR in-band");
+        assert_eq!(
+            frame_nal_types(&f1[0].data),
+            vec![5],
+            "AU1: only IDR in-band"
+        );
 
         // AU 2: SPS identical to avcC, PPS REDEFINED (same id, different body) +
         // IDR. The identical SPS is stripped; the redefined PPS must be emitted
