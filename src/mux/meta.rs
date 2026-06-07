@@ -3,9 +3,21 @@
 //! Format: [8B magic] [4B json_len] [JSON] [padding to 192B boundary] [BD-TS data...]
 //! Other tools skip the header during TS sync recovery (scan for 0x47).
 
-use crate::disc::{AudioStream, ColorSpace, DiscTitle, Stream, SubtitleStream, VideoStream};
+use crate::disc::{AudioStream, ColorSpace, DiscTitle, HdrFormat, Stream, SubtitleStream, VideoStream};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+
+/// Derive the color space from the HDR format, for metadata written before the
+/// color space was persisted (pre-0.30.7). All HDR formats use BT.2020 wide
+/// gamut; SDR uses BT.709.
+fn color_space_from_hdr(hdr: HdrFormat) -> ColorSpace {
+    match hdr {
+        HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::Hlg | HdrFormat::DolbyVision => {
+            ColorSpace::Bt2020
+        }
+        HdrFormat::Sdr => ColorSpace::Bt709,
+    }
+}
 
 /// Magic bytes: "FMKV" + version 1 + 2 reserved bytes.
 const MAGIC: [u8; 8] = [b'F', b'M', b'K', b'V', 0x00, 0x01, 0x00, 0x00];
@@ -42,6 +54,11 @@ pub enum MetaStream {
         frame_rate: String,
         #[serde(default)]
         hdr: String,
+        /// Color space id (e.g. "bt709", "bt2020"). Empty/absent in pre-0.30.7
+        /// metadata — `to_title` then derives it from `hdr` so HDR color
+        /// primaries/transfer/matrix still round-trip.
+        #[serde(default)]
+        color_space: String,
         #[serde(default)]
         label: String,
         #[serde(default)]
@@ -91,6 +108,7 @@ impl M2tsMeta {
                     resolution: v.resolution.to_string(),
                     frame_rate: v.frame_rate.to_string(),
                     hdr: v.hdr.id().into(),
+                    color_space: v.color_space.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
                     codec_private: title
@@ -137,23 +155,38 @@ impl M2tsMeta {
                     resolution,
                     frame_rate,
                     hdr,
+                    color_space,
                     label,
                     secondary,
                     codec_private: _,
-                } => Stream::Video(VideoStream {
-                    pid: *pid,
-                    codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
-                    resolution: resolution
-                        .parse()
-                        .unwrap_or(crate::disc::Resolution::Unknown),
-                    frame_rate: frame_rate
-                        .parse()
-                        .unwrap_or(crate::disc::FrameRate::Unknown),
-                    hdr: hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr),
-                    color_space: ColorSpace::Bt709,
-                    secondary: *secondary,
-                    label: label.clone(),
-                }),
+                } => {
+                    let hdr_fmt = hdr.parse().unwrap_or(crate::disc::HdrFormat::Sdr);
+                    // Prefer the explicitly stored color space. Pre-0.30.7
+                    // metadata has none, so derive it from the HDR format:
+                    // every HDR variant (HDR10/HDR10+/HLG/Dolby Vision) is
+                    // BT.2020; SDR is BT.709.
+                    let cs = if color_space.is_empty() {
+                        color_space_from_hdr(hdr_fmt)
+                    } else {
+                        color_space
+                            .parse::<ColorSpace>()
+                            .unwrap_or(ColorSpace::Unknown)
+                    };
+                    Stream::Video(VideoStream {
+                        pid: *pid,
+                        codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
+                        resolution: resolution
+                            .parse()
+                            .unwrap_or(crate::disc::Resolution::Unknown),
+                        frame_rate: frame_rate
+                            .parse()
+                            .unwrap_or(crate::disc::FrameRate::Unknown),
+                        hdr: hdr_fmt,
+                        color_space: cs,
+                        secondary: *secondary,
+                        label: label.clone(),
+                    })
+                }
                 MetaStream::Audio {
                     pid,
                     codec,
@@ -289,3 +322,104 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
 
 // Serialization uses Codec::id() / HdrFormat::id() and Display impls.
 // Deserialization uses FromStr impls (.parse()) on each enum.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc::{Codec, FrameRate, Resolution};
+
+    fn video_title(hdr: HdrFormat, cs: ColorSpace) -> DiscTitle {
+        let mut t = DiscTitle::empty();
+        t.streams.push(Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: FrameRate::F23_976,
+            hdr,
+            color_space: cs,
+            secondary: false,
+            label: String::new(),
+        }));
+        t
+    }
+
+    fn round_trip_color_space(title: &DiscTitle) -> ColorSpace {
+        let meta = M2tsMeta::from_title(title);
+        let back = meta.to_title();
+        match &back.streams[0] {
+            Stream::Video(v) => v.color_space,
+            _ => panic!("expected video stream"),
+        }
+    }
+
+    #[test]
+    fn color_space_round_trips_bt2020() {
+        // The regression: HDR10 / BT.2020 must survive from_title → to_title,
+        // not collapse to the hardcoded BT.709.
+        let cs = round_trip_color_space(&video_title(HdrFormat::Hdr10, ColorSpace::Bt2020));
+        assert_eq!(cs, ColorSpace::Bt2020, "BT.2020 must round-trip");
+    }
+
+    #[test]
+    fn color_space_round_trips_bt709() {
+        let cs = round_trip_color_space(&video_title(HdrFormat::Sdr, ColorSpace::Bt709));
+        assert_eq!(cs, ColorSpace::Bt709);
+    }
+
+    #[test]
+    fn color_space_serialized_in_json() {
+        let meta = M2tsMeta::from_title(&video_title(HdrFormat::Hdr10, ColorSpace::Bt2020));
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("bt2020"),
+            "color_space must be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_without_color_space_derives_from_hdr() {
+        // Pre-0.30.7 JSON has no color_space field. to_title must derive the
+        // color space from the HDR format so HDR color metadata is preserved.
+        let json = r#"{
+            "v": 1,
+            "title": "x",
+            "duration": 0.0,
+            "streams": [
+                {"type":"video","pid":4113,"codec":"hevc","resolution":"2160p",
+                 "frame_rate":"23.976","hdr":"hdr10","label":"","secondary":false}
+            ]
+        }"#;
+        let meta: M2tsMeta = serde_json::from_str(json).unwrap();
+        let back = meta.to_title();
+        match &back.streams[0] {
+            Stream::Video(v) => {
+                assert_eq!(v.hdr, HdrFormat::Hdr10);
+                assert_eq!(
+                    v.color_space,
+                    ColorSpace::Bt2020,
+                    "HDR10 must derive BT.2020 when color_space absent"
+                );
+            }
+            _ => panic!("expected video stream"),
+        }
+    }
+
+    #[test]
+    fn legacy_sdr_without_color_space_derives_bt709() {
+        let json = r#"{
+            "v": 1,
+            "title": "x",
+            "duration": 0.0,
+            "streams": [
+                {"type":"video","pid":4113,"codec":"h264","resolution":"1080p",
+                 "frame_rate":"24","hdr":"sdr","label":"","secondary":false}
+            ]
+        }"#;
+        let meta: M2tsMeta = serde_json::from_str(json).unwrap();
+        let back = meta.to_title();
+        match &back.streams[0] {
+            Stream::Video(v) => assert_eq!(v.color_space, ColorSpace::Bt709),
+            _ => panic!("expected video stream"),
+        }
+    }
+}

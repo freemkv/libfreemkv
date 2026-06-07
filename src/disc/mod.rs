@@ -779,11 +779,45 @@ impl ColorSpace {
             ColorSpace::Unknown => "",
         }
     }
+
+    const ALL_CS: &[(&'static str, ColorSpace)] = &[
+        ("bt709", ColorSpace::Bt709),
+        ("bt2020", ColorSpace::Bt2020),
+        ("unknown", ColorSpace::Unknown),
+    ];
+
+    /// Compact identifier for serialization (round-trips via `FromStr`).
+    pub fn id(&self) -> &'static str {
+        for (id, v) in Self::ALL_CS {
+            if v == self {
+                return id;
+            }
+        }
+        "unknown"
+    }
 }
 
 impl std::fmt::Display for ColorSpace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ColorSpace {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        for (id, v) in ColorSpace::ALL_CS {
+            if *id == s {
+                return Ok(*v);
+            }
+        }
+        // Also accept display names (e.g. "BT.2020").
+        for (_id, v) in ColorSpace::ALL_CS {
+            if ColorSpace::name(v) == s {
+                return Ok(*v);
+            }
+        }
+        Ok(ColorSpace::Unknown)
     }
 }
 
