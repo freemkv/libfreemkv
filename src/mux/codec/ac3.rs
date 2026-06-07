@@ -6,6 +6,14 @@
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
+/// Sample rates indexed by fscod (0=48kHz, 1=44.1kHz, 2=32kHz). fscod=3 is
+/// reserved in AC-3 and signals "fscod2" (reduced rates) in E-AC-3; we treat
+/// the base rate as 48 kHz in that case for duration purposes.
+const SAMPLE_RATES: [u32; 4] = [48_000, 44_100, 32_000, 48_000];
+
+/// AC-3 (legacy) always carries 6 audio blocks × 256 samples = 1536 samples.
+const AC3_SAMPLES_PER_FRAME: u32 = 1536;
+
 /// Hard cap on the carry-over buffer. An AC-3/E-AC-3 frame is at most 8192
 /// bytes (the `frame_size > 8192` reject below), so a single straddling frame
 /// plus a little slack never needs more than this. If the buffer grows past
@@ -17,6 +25,10 @@ const MAX_AC3_BUF: usize = 64 * 1024;
 pub struct Ac3Parser {
     /// Leftover bytes from previous PES (incomplete frame at end).
     buf: Vec<u8>,
+    /// PTS (ns) to stamp on the frame that begins the carry-over `buf` — i.e.
+    /// the running per-frame PTS at the point the partial tail was retained.
+    /// Used by `flush()` to time the final buffered frame at EOS.
+    flush_pts_ns: i64,
 }
 
 impl Default for Ac3Parser {
@@ -29,6 +41,7 @@ impl Ac3Parser {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(4096),
+            flush_pts_ns: 0,
         }
     }
 }
@@ -39,7 +52,12 @@ impl CodecParser for Ac3Parser {
             return Vec::new();
         }
 
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // Base PTS for the FIRST frame emitted from this call. Each subsequent
+        // frame in the same call advances by the previous frame's duration, so a
+        // PES that carries several AC-3 frames stamps a monotonically increasing
+        // PTS per frame instead of the same PES timestamp on all of them (which
+        // collapses their timecodes and drifts A/V).
+        let base_pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
 
         // Prepend leftover from previous PES
         self.buf.extend_from_slice(&pes.data);
@@ -47,6 +65,8 @@ impl CodecParser for Ac3Parser {
         let data = &self.buf;
         let mut frames = Vec::new();
         let mut pos = 0;
+        // Running PTS for the next frame to emit in this call.
+        let mut frame_pts_ns = base_pts_ns;
 
         while pos < data.len() {
             let sync = find_ac3_sync(&data[pos..]);
@@ -80,12 +100,14 @@ impl CodecParser for Ac3Parser {
                 break;
             }
 
+            let duration_ns = frame_duration_ns(remaining, bsid);
             frames.push(Frame {
-                pts_ns,
+                pts_ns: frame_pts_ns,
                 keyframe: true,
                 data: data[start..start + frame_size].to_vec(),
-                duration_ns: None,
+                duration_ns: Some(duration_ns),
             });
+            frame_pts_ns += duration_ns as i64;
             pos = start + frame_size;
         }
 
@@ -120,6 +142,10 @@ impl CodecParser for Ac3Parser {
                 self.buf.clear();
             } else {
                 self.buf = tail.to_vec();
+                // The carried partial frame, when later completed and emitted by
+                // flush() at EOS, is timed at the running per-frame PTS reached
+                // here (the PTS of the next frame in presentation order).
+                self.flush_pts_ns = frame_pts_ns;
             }
         } else {
             self.buf.clear();
@@ -128,9 +154,83 @@ impl CodecParser for Ac3Parser {
         frames
     }
 
+    fn flush(&mut self) -> Vec<Frame> {
+        // End of stream: emit a complete final frame still buffered. During
+        // streaming a final frame may sit in `buf` with no following PES to
+        // complete/confirm it; without this drain the last ~32 ms of audio is
+        // dropped at EOS (mirrors dts.rs::flush). Only a fully-sized frame at a
+        // syncword is emitted; a partial/garbage tail is discarded.
+        let buf = std::mem::take(&mut self.buf);
+        let Some(off) = find_ac3_sync(&buf) else {
+            return Vec::new();
+        };
+        let frame = &buf[off..];
+        if frame.len() < 6 {
+            return Vec::new();
+        }
+        let bsid = get_bsid(frame);
+        let frame_size = if bsid >= 11 {
+            eac3_frame_size(frame)
+        } else {
+            ac3_frame_size(frame)
+        };
+        if frame_size == 0 || frame_size > 8192 || off + frame_size > buf.len() {
+            return Vec::new();
+        }
+        let duration_ns = frame_duration_ns(frame, bsid);
+        vec![Frame {
+            pts_ns: self.flush_pts_ns,
+            keyframe: true,
+            data: buf[off..off + frame_size].to_vec(),
+            duration_ns: Some(duration_ns),
+        }]
+    }
+
     fn codec_private(&self) -> Option<Vec<u8>> {
         None
     }
+}
+
+/// Number of samples per E-AC-3 frame from numblkscod (audio blocks × 256).
+fn eac3_samples_per_frame(data: &[u8]) -> u32 {
+    if data.len() < 5 {
+        return AC3_SAMPLES_PER_FRAME;
+    }
+    // E-AC-3 byte 4: fscod(2) | numblkscod(2) | ... — but only when fscod != 3.
+    // When fscod == 3 (fscod2 / reduced rate), numblks is fixed at 6.
+    let fscod = (data[4] >> 6) & 0x03;
+    if fscod == 0x03 {
+        return 6 * 256;
+    }
+    let numblkscod = (data[4] >> 4) & 0x03;
+    let numblks = match numblkscod {
+        0 => 1,
+        1 => 2,
+        2 => 3,
+        _ => 6,
+    };
+    numblks * 256
+}
+
+/// Sample rate (Hz) of an AC-3/E-AC-3 frame from its fscod field (byte 4 bits 7-6).
+fn frame_sample_rate(data: &[u8]) -> u32 {
+    if data.len() < 5 {
+        return SAMPLE_RATES[0];
+    }
+    SAMPLE_RATES[((data[4] >> 6) & 0x03) as usize]
+}
+
+/// Duration of one AC-3/E-AC-3 frame in nanoseconds: samples_per_frame /
+/// sample_rate. AC-3 is always 1536 samples; E-AC-3 derives from numblkscod.
+fn frame_duration_ns(data: &[u8], bsid: u8) -> u64 {
+    let samples = if bsid >= 11 {
+        eac3_samples_per_frame(data)
+    } else {
+        AC3_SAMPLES_PER_FRAME
+    } as u64;
+    let rate = frame_sample_rate(data) as u64;
+    // samples / rate seconds → ns, rounded to nearest.
+    (samples * 1_000_000_000 + rate / 2) / rate
 }
 
 /// Find AC3/E-AC-3 syncword (0x0B77) in data.
@@ -386,6 +486,91 @@ mod tests {
         };
         assert!(parser.parse(&pes).is_empty());
         assert_eq!(parser.buf, vec![0x0B], "lone trailing 0x0B retained");
+    }
+
+    #[test]
+    fn flush_emits_complete_buffered_frame_at_eos() {
+        // A complete final frame sitting in the carry-over buffer with no
+        // following PES must be drained by flush() at EOS — the bug was that
+        // ac3 inherited the no-op default flush and dropped the last frame.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2);
+        parser.buf = frame_data.clone();
+        parser.flush_pts_ns = pts_to_ns(99000);
+        let f = parser.flush();
+        assert_eq!(f.len(), 1, "complete buffered frame drained at EOS");
+        assert_eq!(f[0].data.len(), 160);
+        assert_eq!(f[0].pts_ns, pts_to_ns(99000), "flush uses carried PTS");
+        assert!(f[0].duration_ns.is_some(), "flush sets duration");
+        assert!(parser.buf.is_empty(), "buffer consumed by flush");
+    }
+
+    #[test]
+    fn flush_carries_running_pts_from_partial_tail() {
+        // After a full frame emits in parse, the partial next frame held in the
+        // buffer is timed at the running per-frame PTS; flush completing it must
+        // use that, not the original PES base.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2);
+        let mut data = frame_data.clone();
+        data.extend_from_slice(&frame_data[..40]); // partial frame 2 held
+        let pes = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data,
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f.len(), 1, "frame 1 emitted in parse");
+        let dur = f[0].duration_ns.unwrap() as i64;
+        // The held partial's flush PTS should be base + one frame duration.
+        assert_eq!(parser.flush_pts_ns, pts_to_ns(90000) + dur);
+    }
+
+    #[test]
+    fn flush_drops_partial_tail() {
+        // A partial frame (cannot be sized/completed) at EOS is dropped, not
+        // emitted truncated.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2);
+        parser.buf = frame_data[..80].to_vec(); // half a frame
+        assert!(parser.flush().is_empty(), "partial tail dropped");
+    }
+
+    #[test]
+    fn per_frame_pts_increments_within_one_pes() {
+        // Two AC-3 frames in a single PES must get distinct, increasing PTS —
+        // one per frame, not the single PES timestamp on both.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2); // 48kHz, 1536 samples
+        let mut data = frame_data.clone();
+        data.extend_from_slice(&frame_data);
+        let pes = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data,
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].pts_ns, pts_to_ns(90000), "frame 0 uses PES base PTS");
+        // 1536 samples @ 48kHz = 32 ms = 32_000_000 ns.
+        let expect = 1536u64 * 1_000_000_000 / 48_000;
+        assert_eq!(f[0].duration_ns, Some(expect));
+        assert_eq!(
+            f[1].pts_ns - f[0].pts_ns,
+            expect as i64,
+            "frame 1 PTS advances by one frame duration, not equal to frame 0"
+        );
+    }
+
+    #[test]
+    fn frame_duration_ac3_48khz() {
+        // AC-3 @ 48kHz: 1536 / 48000 s = 32 ms.
+        let frame = make_ac3_frame(0, 2);
+        let bsid = get_bsid(&frame);
+        assert!(bsid < 11, "test frame is legacy AC-3");
+        assert_eq!(frame_duration_ns(&frame, bsid), 32_000_000);
     }
 
     #[test]
