@@ -522,7 +522,7 @@ impl Codec {
         ("ssa", "SSA", Codec::Ssa),
     ];
 
-    fn from_coding_type(ct: u8) -> Self {
+    pub(crate) fn from_coding_type(ct: u8) -> Self {
         match ct {
             0x24 => Codec::Hevc,
             0x1B => Codec::H264,
@@ -540,6 +540,40 @@ impl Codec {
             ct => Codec::Unknown(ct),
         }
     }
+
+    /// Broad stream category for a codec. Used by demuxers to decide
+    /// whether a PMT/STN entry becomes a video, audio, or subtitle
+    /// `Stream` without duplicating per-codec knowledge.
+    pub fn kind(&self) -> CodecKind {
+        match self {
+            Codec::Hevc | Codec::H264 | Codec::Vc1 | Codec::Mpeg2 | Codec::Mpeg1 | Codec::Av1 => {
+                CodecKind::Video
+            }
+            Codec::TrueHd
+            | Codec::DtsHdMa
+            | Codec::DtsHdHr
+            | Codec::Dts
+            | Codec::Ac3
+            | Codec::Ac3Plus
+            | Codec::Lpcm
+            | Codec::Aac
+            | Codec::Mp2
+            | Codec::Mp3
+            | Codec::Flac
+            | Codec::Opus => CodecKind::Audio,
+            Codec::Pgs | Codec::DvdSub | Codec::Srt | Codec::Ssa => CodecKind::Subtitle,
+            Codec::Unknown(_) => CodecKind::Unknown,
+        }
+    }
+}
+
+/// Broad category of a [`Codec`] — video / audio / subtitle / unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecKind {
+    Video,
+    Audio,
+    Subtitle,
+    Unknown,
 }
 
 impl std::fmt::Display for Codec {

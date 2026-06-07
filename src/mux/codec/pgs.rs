@@ -117,6 +117,25 @@ impl CodecParser for PgsParser {
         out
     }
 
+    fn flush(&mut self) -> Vec<Frame> {
+        // A display set is only emitted when the *next* PCS arrives
+        // (either an empty clear PCS or a replacing display PCS). At
+        // end-of-stream there is no follower, so without this the last
+        // subtitle of every PGS track would be silently dropped. Emit
+        // the pending set with no duration — the trailing block lingers
+        // until end of file, which is exactly the desired behavior for
+        // the final on-screen subtitle (see the module doc).
+        match self.pending.take() {
+            Some((start_pts, data)) => vec![Frame {
+                pts_ns: start_pts,
+                keyframe: true,
+                data,
+                duration_ns: None,
+            }],
+            None => Vec::new(),
+        }
+    }
+
     fn codec_private(&self) -> Option<Vec<u8>> {
         None
     }
@@ -216,6 +235,30 @@ mod tests {
         // A following PCS still resyncs and emits the (capped) pending set.
         let frames = parser.parse(&make_pes(pcs_bytes(0), Some(180000)));
         assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn flush_emits_final_pending_subtitle() {
+        let mut parser = PgsParser::new();
+
+        // Display PCS at PTS 90000 — buffered as pending, no follower.
+        let display = pcs_bytes(1);
+        let frames = parser.parse(&make_pes(display.clone(), Some(90000)));
+        assert!(frames.is_empty(), "display PCS should be pending");
+
+        // EOF: without flush() this last subtitle would be dropped.
+        let frames = parser.flush();
+        assert_eq!(frames.len(), 1, "final pending subtitle must flush");
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+        assert_eq!(frames[0].data, display);
+        // Trailing block lingers to EOF — no duration per module doc.
+        assert_eq!(frames[0].duration_ns, None);
+    }
+
+    #[test]
+    fn flush_with_nothing_pending_is_empty() {
+        let mut parser = PgsParser::new();
+        assert!(parser.flush().is_empty());
     }
 
     #[test]

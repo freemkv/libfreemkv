@@ -1,22 +1,52 @@
 //! DVD bitmap subtitle (VobSub) parser.
 //!
 //! DVD subtitles are carried in PS private stream 1 with sub-stream IDs 0x20-0x3F.
-//! Each subtitle display set may span multiple PES packets, but at the MKV level
-//! we pass through the raw VobSub packets as-is — the container wraps them.
+//! A single subpicture unit (SPU — one displayed bitmap) may span multiple PES
+//! packets: only the first PES carries a PTS, continuations carry PTS=0. The SPU
+//! begins with a 2-byte big-endian `SPU_size` giving the total byte length of the
+//! whole unit. We reassemble across PES boundaries into one Frame so large
+//! subtitles aren't split/garbled, inheriting the head PES's PTS.
 //!
 //! For MKV: codec ID "S_VOBSUB".
 //! All frames are keyframes (each is a complete bitmap).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
+/// Upper bound on a single reassembled SPU. The SPU_size field is 16 bits, so a
+/// well-formed unit is at most 0xFFFF bytes; cap accumulation here to bound
+/// memory if the field is corrupt or the stream never completes a unit.
+const MAX_SPU_BYTES: usize = 0xFFFF;
+
 pub struct DvdSubParser {
     /// Pre-formatted VobSub .idx palette header for codec_private.
     codec_data: Option<Vec<u8>>,
+    /// In-progress SPU reassembly: (head PTS in ns, declared SPU_size, bytes).
+    pending: Option<(i64, usize, Vec<u8>)>,
 }
 
 impl DvdSubParser {
     pub fn new(codec_data: Option<Vec<u8>>) -> Self {
-        Self { codec_data }
+        Self {
+            codec_data,
+            pending: None,
+        }
+    }
+
+    /// Emit `pending` as a Frame if it is complete (or `force` at EOF),
+    /// returning it and clearing the buffer. Returns None if nothing to emit.
+    fn take_if_complete(&mut self, force: bool) -> Option<Frame> {
+        let (pts_ns, size, buf) = self.pending.as_ref()?;
+        if force || buf.len() >= *size {
+            let (pts_ns, _, data) = self.pending.take().unwrap();
+            return Some(Frame {
+                pts_ns,
+                keyframe: true,
+                data,
+                duration_ns: None,
+            });
+        }
+        let _ = pts_ns;
+        None
     }
 }
 
@@ -25,13 +55,52 @@ impl CodecParser for DvdSubParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
+
+        let mut out = Vec::new();
+
+        if self.pending.is_some() {
+            // Continuation of an in-progress SPU (PTS=0 on these). Append,
+            // bounded by MAX_SPU_BYTES.
+            if let Some((_, _, buf)) = self.pending.as_mut() {
+                let room = MAX_SPU_BYTES.saturating_sub(buf.len());
+                let take = room.min(pes.data.len());
+                buf.extend_from_slice(&pes.data[..take]);
+            }
+            if let Some(frame) = self.take_if_complete(false) {
+                out.push(frame);
+            }
+            return out;
+        }
+
+        // Start of a new SPU. The first 2 bytes are the big-endian total size.
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
-        vec![Frame {
-            pts_ns,
-            keyframe: true,
-            data: pes.data.clone(),
-            duration_ns: None,
-        }]
+        let declared = if pes.data.len() >= 2 {
+            ((pes.data[0] as usize) << 8) | pes.data[1] as usize
+        } else {
+            // Too short to carry SPU_size — pass through as a lone frame.
+            return vec![Frame {
+                pts_ns,
+                keyframe: true,
+                data: pes.data.clone(),
+                duration_ns: None,
+            }];
+        };
+
+        let mut buf = pes.data.clone();
+        if buf.len() > MAX_SPU_BYTES {
+            buf.truncate(MAX_SPU_BYTES);
+        }
+        self.pending = Some((pts_ns, declared, buf));
+        if let Some(frame) = self.take_if_complete(false) {
+            out.push(frame);
+        }
+        out
+    }
+
+    fn flush(&mut self) -> Vec<Frame> {
+        // At EOF, emit whatever SPU bytes remain even if the declared size was
+        // never reached (truncated final subtitle is better than dropping it).
+        self.take_if_complete(true).into_iter().collect()
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -152,10 +221,51 @@ mod tests {
     #[test]
     fn no_pts_defaults_to_zero() {
         let mut parser = DvdSubParser::new(None);
-        let pes = make_pes(vec![0x01, 0x02], None);
+        // SPU_size = 2, single complete PES (the 2 size bytes themselves).
+        let pes = make_pes(vec![0x00, 0x02], None);
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].pts_ns, 0);
+    }
+
+    #[test]
+    fn multi_pes_spu_reassembled() {
+        let mut parser = DvdSubParser::new(None);
+        // Declared SPU_size = 12 bytes total. First PES carries the 2 size
+        // bytes + 4 payload bytes and the only PTS; the next two PESs are
+        // continuations with PTS=0.
+        let head = vec![0x00, 0x0C, 0xAA, 0xBB, 0xCC, 0xDD];
+        let cont1 = vec![0x11, 0x22, 0x33];
+        let cont2 = vec![0x44, 0x55, 0x66];
+
+        let f = parser.parse(&make_pes(head.clone(), Some(90000)));
+        assert!(f.is_empty(), "incomplete SPU should not emit yet");
+        let f = parser.parse(&make_pes(cont1.clone(), Some(0)));
+        assert!(f.is_empty(), "still incomplete");
+        let frames = parser.parse(&make_pes(cont2.clone(), Some(0)));
+        assert_eq!(frames.len(), 1, "completed SPU emits exactly one frame");
+
+        // Reassembled bytes = head + cont1 + cont2, in order.
+        let mut expected = head;
+        expected.extend_from_slice(&cont1);
+        expected.extend_from_slice(&cont2);
+        assert_eq!(frames[0].data, expected);
+        // PTS inherited from the head PES (1s = 1e9 ns), not the PTS=0 tails.
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
+        assert!(frames[0].keyframe);
+    }
+
+    #[test]
+    fn flush_emits_truncated_trailing_spu() {
+        let mut parser = DvdSubParser::new(None);
+        // Declared 100 bytes but only 6 ever arrive before EOF.
+        let head = vec![0x00, 0x64, 0xDE, 0xAD, 0xBE, 0xEF];
+        let f = parser.parse(&make_pes(head.clone(), Some(90000)));
+        assert!(f.is_empty(), "incomplete SPU should not emit during parse");
+        let frames = parser.flush();
+        assert_eq!(frames.len(), 1, "EOF flush emits the partial SPU");
+        assert_eq!(frames[0].data, head);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
     }
 
     // ── YCbCr → RGB conversion tests ──────────────────────────────────────

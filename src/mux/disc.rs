@@ -508,24 +508,30 @@ impl crate::pes::Stream for DiscStream {
                 // PS demuxer flush (DVD)
                 if let Some(ref mut demuxer) = self.ps_demuxer {
                     for ps in &demuxer.flush() {
-                        let track = match ps.stream_id {
-                            0xE0..=0xEF => 0,
-                            0xC0..=0xDF => 1,
-                            0xBD => ps
-                                .sub_stream_id
-                                .map(|s| (s & 0x1F) as usize + 1)
-                                .unwrap_or(1),
-                            _ => continue,
-                        };
-                        if track >= self.title.streams.len() {
+                        // Route by the REAL DVD PID (see consume_ps in
+                        // pipelined_stream.rs); the old (sub_id & 0x1F)+1
+                        // heuristic mis-routed VobSub into the AC-3 parser.
+                        let Some(pid) = ps.dvd_pid() else {
+                            tracing::warn!(
+                                target: "mux",
+                                "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                                ps.stream_id,
+                                ps.sub_stream_id,
+                            );
                             continue;
-                        }
-                        let pid = self
-                            .pid_to_track
-                            .iter()
-                            .find(|(_, idx)| *idx == track)
-                            .map(|(p, _)| *p)
-                            .unwrap_or(0);
+                        };
+                        let Some((_, track)) =
+                            self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
+                        else {
+                            tracing::warn!(
+                                target: "mux",
+                                "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
+                                pid,
+                                ps.stream_id,
+                                ps.sub_stream_id,
+                            );
+                            continue;
+                        };
                         let pes = super::ts::PesPacket {
                             pid,
                             pts: ps.pts.map(|p| p as i64),
@@ -607,26 +613,30 @@ impl crate::pes::Stream for DiscStream {
             } else if let Some(ref mut demuxer) = self.ps_demuxer {
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for ps in &packets {
-                    let track = match ps.stream_id {
-                        0xE0..=0xEF => 0,
-                        0xC0..=0xDF => 1,
-                        0xBD => ps
-                            .sub_stream_id
-                            .map(|s| (s & 0x1F) as usize + 1)
-                            .unwrap_or(1),
-                        _ => continue,
-                    };
-                    if track >= self.title.streams.len() {
+                    // Route by the REAL DVD PID (see consume_ps in
+                    // pipelined_stream.rs); the old (sub_id & 0x1F)+1
+                    // heuristic mis-routed VobSub into the AC-3 parser.
+                    let Some(pid) = ps.dvd_pid() else {
+                        tracing::warn!(
+                            target: "mux",
+                            "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                            ps.stream_id,
+                            ps.sub_stream_id,
+                        );
                         continue;
-                    }
-
-                    // Convert PsPacket to PesPacket for codec parser (same as BD-TS path)
-                    let pid = self
-                        .pid_to_track
-                        .iter()
-                        .find(|(_, idx)| *idx == track)
-                        .map(|(p, _)| *p)
-                        .unwrap_or(0);
+                    };
+                    let Some((_, track)) =
+                        self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
+                    else {
+                        tracing::warn!(
+                            target: "mux",
+                            "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
+                            pid,
+                            ps.stream_id,
+                            ps.sub_stream_id,
+                        );
+                        continue;
+                    };
 
                     let pes = super::ts::PesPacket {
                         pid,
