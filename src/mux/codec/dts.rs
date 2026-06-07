@@ -22,6 +22,17 @@ pub struct DtsParser {
     /// frame's PES first arrived; the trailing extension-substream PES
     /// packets carry their own (later) PTS which must NOT override it.
     pending_pts: i64,
+    /// PTS markers attributing buffer regions to their source PES. Each entry
+    /// is `(buffer_offset, pts_ns)` for the PES whose bytes begin at that
+    /// offset. When an access unit is emitted from the front of `buf`, its PTS
+    /// is the marker covering offset 0 — NOT the most recent PES's PTS. This is
+    /// what fixes multi-AU-per-call PTS attribution: if a PES carries the
+    /// extension substreams (and possibly the next core) for an AU whose own
+    /// core arrived in an earlier PES, the emitted AU keeps its own core PES's
+    /// timestamp instead of the later PES's. Offsets are kept relative to the
+    /// current `buf` start and rebased whenever bytes are drained from the
+    /// front.
+    pts_marks: Vec<(usize, i64)>,
 }
 
 impl Default for DtsParser {
@@ -35,7 +46,44 @@ impl DtsParser {
         Self {
             buf: Vec::with_capacity(32768),
             pending_pts: 0,
+            pts_marks: Vec::new(),
         }
+    }
+
+    /// Drop `n` bytes from the front of `buf` and rebase the PTS markers so
+    /// their offsets stay relative to the new buffer start. A marker that now
+    /// sits at or before offset 0 is clamped to 0 (it still covers the front).
+    /// Redundant markers all at offset 0 collapse to the last one.
+    fn drain_front(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.buf.drain(..n);
+        for m in &mut self.pts_marks {
+            m.0 = m.0.saturating_sub(n);
+        }
+        // Collapse all leading markers that now sit at offset 0 to the last
+        // such marker — that is the PES whose data currently begins the buffer.
+        let last_zero = self
+            .pts_marks
+            .iter()
+            .rposition(|&(off, _)| off == 0)
+            .filter(|&i| i > 0);
+        if let Some(i) = last_zero {
+            self.pts_marks.drain(..i);
+        }
+    }
+
+    /// PTS that should be stamped on an access unit currently at the front of
+    /// `buf` (offset 0): the most recent marker at offset 0, falling back to
+    /// `pending_pts`.
+    fn front_pts(&self) -> i64 {
+        self.pts_marks
+            .iter()
+            .rev()
+            .find(|&&(off, _)| off == 0)
+            .map(|&(_, pts)| pts)
+            .unwrap_or(self.pending_pts)
     }
 }
 
@@ -85,6 +133,12 @@ impl CodecParser for DtsParser {
         if self.buf.is_empty() || self.pending_pts == PTS_UNSET {
             self.pending_pts = pts_ns;
         }
+        // Mark where THIS PES's bytes begin in the buffer, with its PTS. The
+        // emitted access unit takes the PTS of the PES covering its first byte
+        // (see `front_pts`), so an AU whose core arrived in an earlier PES keeps
+        // that core's timestamp even when its extensions / the following core
+        // arrive (with a later PTS) in this same parse() call.
+        self.pts_marks.push((self.buf.len(), pts_ns));
         self.buf.extend_from_slice(&pes.data);
 
         let mut frames = Vec::new();
@@ -96,12 +150,12 @@ impl CodecParser for DtsParser {
                 // sync split across PES packets can still be found next time.
                 if self.buf.len() > 3 {
                     let tail = self.buf.len() - 3;
-                    self.buf.drain(..tail);
+                    self.drain_front(tail);
                 }
                 break;
             };
             if start > 0 {
-                self.buf.drain(..start);
+                self.drain_front(start);
                 if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) {
                     // Shouldn't happen, but never loop forever.
                     break;
@@ -123,7 +177,7 @@ impl CodecParser for DtsParser {
             // `> MAX_AU_BYTES` upper bound is kept as a harmless guard.
             if !(MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&core_size) {
                 // Bogus core sync — skip past it and resync.
-                self.buf.drain(..4);
+                self.drain_front(4);
                 continue;
             }
             if self.buf.len() < core_size {
@@ -163,25 +217,36 @@ impl CodecParser for DtsParser {
             };
 
             let au: Vec<u8> = self.buf[..au_end].to_vec();
+            // The AU takes the PTS of the PES covering its first byte — its own
+            // core's PES, even if that PES preceded the one(s) carrying its
+            // extensions or the next core.
+            let au_pts = self.front_pts();
             frames.push(Frame {
-                pts_ns: self.pending_pts,
+                pts_ns: au_pts,
                 keyframe: true,
                 data: au,
                 duration_ns: None,
             });
-            self.buf.drain(..au_end);
+            self.drain_front(au_end);
+            // After draining, the marker covering the new front (if any) carries
+            // the next AU's PTS; `pending_pts` is only the fallback when no
+            // marker survives. Track it so the fallback stays sensible.
+            self.pending_pts = self.front_pts();
             if forced {
                 // Safety-valve flush: the next access unit's real core PES has
                 // not arrived. Invalidate the PTS so the next PES sets it
                 // regardless of buffer state, rather than inheriting this
                 // (non-core) PES's timestamp.
                 self.pending_pts = PTS_UNSET;
-            } else {
-                // Real boundary: the next access unit (now at buf start) begins
-                // at a core sync that arrived inside this PES, so this PES's PTS
-                // is the correct base for it.
-                self.pending_pts = pts_ns;
+                self.pts_marks.clear();
             }
+        }
+
+        // Discard markers that no longer reference live buffer bytes (everything
+        // past the buffer end can't happen, but collapse duplicates at offset 0
+        // and drop a stale empty-buffer marker set).
+        if self.buf.is_empty() {
+            self.pts_marks.clear();
         }
 
         frames
@@ -203,15 +268,12 @@ impl CodecParser for DtsParser {
             self.buf.clear();
             return Vec::new();
         }
+        // The final AU's PTS is the PES covering the buffer front (its core's
+        // PES). Fall back to pending_pts, clamping the sentinel to 0.
+        let front = self.front_pts();
+        let pts_ns = if front == PTS_UNSET { 0 } else { front };
         let au = std::mem::take(&mut self.buf);
-        // A non-empty buffer here means a PES arrived after any prior forced
-        // flush (which fully drains `buf`), so `pending_pts` was reset to that
-        // PES's real PTS. Clamp the sentinel to 0 defensively all the same.
-        let pts_ns = if self.pending_pts == PTS_UNSET {
-            0
-        } else {
-            self.pending_pts
-        };
+        self.pts_marks.clear();
         vec![Frame {
             pts_ns,
             keyframe: true,
@@ -343,16 +405,92 @@ mod tests {
     #[test]
     fn two_cores_back_to_back_emit_first_on_boundary() {
         // The first complete unit is emitted as soon as the next core sync is
-        // seen; the second is held until flush.
+        // seen; the second is held until flush. Both cores arrived in ONE PES,
+        // so both legitimately carry that PES's PTS.
         let mut parser = DtsParser::new();
         let mut stream = make_dts_core(512);
         stream.extend_from_slice(&make_dts_core(640));
         let f = parser.parse(&make_pes(stream, Some(90000)));
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].data.len(), 512);
+        assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU1 keeps its PES PTS");
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 640);
+        assert_eq!(
+            tail[0].pts_ns,
+            pts_to_ns(90000),
+            "AU2 came in the same PES → same PTS"
+        );
+    }
+
+    #[test]
+    fn two_aus_flushed_in_one_call_keep_their_own_pts() {
+        // The real-stream trigger: core1 in PES A (pts 100), then core2 + core3
+        // arrive in a LATER PES B (pts 200). Processing PES B closes both AU1
+        // (core1) and AU2 (core2) in a single parse() call. AU2's core arrived
+        // in PES A region? No — here AU2 (core2) is in PES B, so it should be
+        // 200. The defect to guard is AU1 NOT being overwritten to 200, and AU2
+        // not inheriting an unrelated timestamp.
+        let mut parser = DtsParser::new();
+
+        // PES A: just core1 (held — no following core yet).
+        let f0 = parser.parse(&make_pes(make_dts_core(512), Some(100)));
+        assert!(f0.is_empty(), "core1 held awaiting next core");
+
+        // PES B: core2 + core3. Closes AU1 (core1) and AU2 (core2).
+        let mut pes_b = make_dts_core(600);
+        pes_b.extend_from_slice(&make_dts_core(640));
+        let f = parser.parse(&make_pes(pes_b, Some(200)));
+        assert_eq!(f.len(), 2, "AU1 and AU2 both close in this call");
+        assert_eq!(f[0].data.len(), 512, "AU1 = core1");
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(100),
+            "AU1 keeps PES A's PTS, not the later PES B PTS"
+        );
+        assert_eq!(f[1].data.len(), 600, "AU2 = core2");
+        assert_eq!(
+            f[1].pts_ns,
+            pts_to_ns(200),
+            "AU2's core arrived in PES B → PES B PTS"
+        );
+
+        // AU3 (core3) drains on flush, also PES B PTS.
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, pts_to_ns(200));
+    }
+
+    #[test]
+    fn second_au_with_core_in_earlier_pes_keeps_that_pts() {
+        // core1 + core2 both arrive in PES A (pts 100); core3 arrives in PES B
+        // (pts 200). When PES B closes AU2 (core2, whose core was in PES A), AU2
+        // must keep PES A's 100 — the bug was AU2 inheriting the closing PES's
+        // 200.
+        let mut parser = DtsParser::new();
+
+        // PES A: core1 + core2. AU1 (core1) emits immediately (core2 boundary);
+        // AU2 (core2) held awaiting a third core.
+        let mut pes_a = make_dts_core(512);
+        pes_a.extend_from_slice(&make_dts_core(600));
+        let f = parser.parse(&make_pes(pes_a, Some(100)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, pts_to_ns(100), "AU1 PES A PTS");
+
+        // PES B: core3 — closes AU2 (core2). AU2's core was in PES A.
+        let f2 = parser.parse(&make_pes(make_dts_core(640), Some(200)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].data.len(), 600, "AU2 = core2");
+        assert_eq!(
+            f2[0].pts_ns,
+            pts_to_ns(100),
+            "AU2's core arrived in PES A → must keep PES A's PTS, not PES B's"
+        );
+
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, pts_to_ns(200), "AU3 = core3, PES B PTS");
     }
 
     /// Build a minimal DTS-HD extension substream of `size` bytes (just the
