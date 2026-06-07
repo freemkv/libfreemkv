@@ -212,6 +212,11 @@ pub struct MkvMuxer<W: Write + Seek> {
     cluster_size_pos: u64,
     cluster_ts_ms: i64,
     base_pts_ms: Option<i64>,
+    /// Last block timecode (ms, relative to base_pts) written PER TRACK, to
+    /// enforce strictly-monotonic per-track timestamps — players/ffmpeg reject
+    /// non-monotonic DTS, and some audio PES PTS land on the same millisecond
+    /// (or tick back 1ms from rounding).
+    last_pts_ms: std::collections::HashMap<usize, i64>,
     cues: Vec<CuePoint>,
     frame_count: u64,
     seek_fixups: Vec<SeekPositionFixup>,
@@ -228,6 +233,19 @@ const CLUSTER_DURATION_MS: i64 = 5000;
 /// the open cluster's timestamp forces a new cluster (see `write_frame`) so
 /// the `as i16` cast can never wrap.
 const MAX_BLOCK_REL_MS: i64 = i16::MAX as i64;
+
+/// Force a per-track block timestamp to be strictly later than the previous one
+/// written for that track. `prev` is the last timestamp for the track (`None`
+/// for the first frame). Fixes non-monotonic DTS: some audio PES PTS truncate to
+/// the same millisecond as the prior frame (or tick back 1ms from rounding),
+/// which ffmpeg/strict players reject. The nudge is at most a few ms — sub-frame
+/// and inaudible — and never moves a timestamp earlier.
+fn monotonic_ts(prev: Option<i64>, pts_ms: i64) -> i64 {
+    match prev {
+        Some(p) => pts_ms.max(p.saturating_add(1)),
+        None => pts_ms,
+    }
+}
 
 impl<W: Write + Seek> MkvMuxer<W> {
     /// Create a new MKV muxer: writes EBML header, Segment start, Info, Tracks, Chapters.
@@ -425,6 +443,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             cluster_size_pos: 0,
             cluster_ts_ms: 0,
             base_pts_ms: None,
+            last_pts_ms: std::collections::HashMap::new(),
             cues: Vec::new(),
             frame_count: 0,
             seek_fixups,
@@ -452,6 +471,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let raw_ms = pts_ns / 1_000_000;
         let base = *self.base_pts_ms.get_or_insert(raw_ms);
         let pts_ms = raw_ms - base;
+
+        // Enforce strictly-monotonic per-track block timestamps. Some audio PES
+        // PTS truncate to the same millisecond as the previous frame (or, rarely,
+        // tick back 1ms), which surfaces as "non-monotonic DTS" and is rejected
+        // by ffmpeg/strict players. Nudge to prev+1ms — sub-frame, inaudible,
+        // and A/V sync is unaffected at millisecond granularity.
+        let pts_ms = monotonic_ts(self.last_pts_ms.get(&track_idx).copied(), pts_ms);
 
         // Cluster boundaries normally coincide with a video keyframe so every
         // Cues entry resolves to a seekable IDR at the cluster start.
@@ -481,6 +507,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // so it gets no Cues entry (Cues stay IDR-only for seekability).
             self.start_cluster(pts_ms)?;
         }
+
+        // Committed to writing this frame — record its (monotonic) timestamp so
+        // the next block on this track is forced strictly later.
+        self.last_pts_ms.insert(track_idx, pts_ms);
 
         let relative_ts = (pts_ms - self.cluster_ts_ms) as i16;
         match duration_ns {
@@ -827,6 +857,33 @@ mod tests {
             find_id(&data, ebml::CUES).is_some(),
             "Cues element (0x1C53BB6B) not found after finish()"
         );
+    }
+
+    #[test]
+    fn monotonic_ts_forces_strictly_increasing() {
+        // First frame passes through unchanged.
+        assert_eq!(monotonic_ts(None, 1000), 1000);
+        // A repeated millisecond is nudged to prev+1.
+        assert_eq!(monotonic_ts(Some(1000), 1000), 1001);
+        // A backwards tick is nudged forward, never earlier.
+        assert_eq!(monotonic_ts(Some(1001), 1000), 1002);
+        // A genuine advance is left alone.
+        assert_eq!(monotonic_ts(Some(1000), 1040), 1040);
+        // Simulate a stream of audio PTS that round to dup/back-tick ms and
+        // confirm the emitted sequence is strictly increasing.
+        let raw = [1000i64, 1000, 1000, 999, 1032, 1032, 1064];
+        let mut prev: Option<i64> = None;
+        let mut out = Vec::new();
+        for &p in &raw {
+            let t = monotonic_ts(prev, p);
+            out.push(t);
+            prev = Some(t);
+        }
+        assert!(
+            out.windows(2).all(|w| w[1] > w[0]),
+            "not strictly monotonic: {out:?}"
+        );
+        assert_eq!(out, [1000, 1001, 1002, 1003, 1032, 1033, 1064]);
     }
 
     #[test]

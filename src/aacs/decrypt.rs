@@ -91,7 +91,11 @@ pub fn is_aacs_scrambled(unit: &[u8]) -> bool {
 /// unit looks like clear MPEG-TS. Syncs sit at offset 4 and every 192 bytes
 /// after (4-byte TP_extra_header + 188-byte TS packet). An encrypted body
 /// scrambles all but the first (which lives in the clear 16-byte seed).
-fn ts_syncs_intact(unit: &[u8]) -> bool {
+/// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
+/// (offset 4 and every 192 bytes after). A clear or correctly-decrypted m2ts
+/// unit shows ~one per packet; an encrypted unit, or a non-content unit
+/// decrypted under a key that doesn't apply, shows ~none.
+pub fn ts_sync_count(unit: &[u8]) -> usize {
     let mut count = 0;
     let mut offset = 4;
     while offset < unit.len() {
@@ -100,13 +104,19 @@ fn ts_syncs_intact(unit: &[u8]) -> bool {
         }
         offset += TS_PACKET_LEN;
     }
-    // One sync byte is checked per 192-byte BD-TS packet (at offset 4 of
-    // each). `total` is exactly that packet count; the old
-    // `(len - 4) / TS_PACKET_LEN + 1` over-counted by one for lengths of
-    // the form `4 + k·192` (harmless for the always-6144 aligned unit, but
-    // wrong in general and it biased the majority threshold).
-    let total = unit.len() / TS_PACKET_LEN;
-    count > total / 2
+    count
+}
+
+/// Number of BD-TS packets in the unit — the maximum possible sync count.
+pub fn ts_packet_total(unit: &[u8]) -> usize {
+    // One sync byte per 192-byte BD-TS packet (at offset 4 of each). The old
+    // `(len - 4) / TS_PACKET_LEN + 1` over-counted by one for lengths of the
+    // form `4 + k·192`.
+    unit.len() / TS_PACKET_LEN
+}
+
+fn ts_syncs_intact(unit: &[u8]) -> bool {
+    ts_sync_count(unit) > ts_packet_total(unit) / 2
 }
 
 /// Verify a decrypted unit looks like clear MPEG-TS (sync bytes intact).
@@ -150,6 +160,64 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
 
     // Decryption restored the TS syncs; verify the unit now looks like clear TS.
     verify_ts(unit)
+}
+
+/// Fast, NON-MUTATING unit-key validation for the brute-force key search.
+///
+/// `decrypt_unit` pays a full 6128-byte (383-block) CBC decrypt before
+/// `verify_ts` can reject a wrong key — but in a brute scan ~every candidate is
+/// wrong. In CBC the plaintext of block *i* is `AES_dec(C_i) XOR C_{i-1}`, so
+/// the FIRST restored TS sync byte (payload offset 196, which lands in CBC
+/// block 11 of the `unit[16..]` region) can be recovered with a SINGLE block
+/// decrypt instead of 383. A wrong key fails this 1-byte gate ~255/256 of the
+/// time for the cost of one AES block; the rare survivor is then confirmed with
+/// the full [`decrypt_unit`], so the set of accepted keys is bit-for-bit
+/// identical to the slow path.
+///
+/// The caller MUST pass an aligned, already-[`is_aacs_scrambled`] unit
+/// (`unit.len() >= ALIGNED_UNIT_LEN`). The brute pre-filters its units, so the
+/// per-candidate scramble re-scan is intentionally skipped here.
+///
+/// NOTE: this is a search accelerator — it never writes the input and never
+/// participates in the content decrypt path. Aggregate correctness (does a key
+/// validate against *any* of the disc's units) is preserved because a true key
+/// restores offset-196 on every standard BD-TS unit.
+pub fn unit_key_validates(unit: &[u8], unit_key: &[u8; 16]) -> bool {
+    if unit.len() < ALIGNED_UNIT_LEN {
+        return false;
+    }
+    // Per-unit decrypt key: AES-ECB-encrypt the 16-byte plaintext header with
+    // the unit key, XOR with the header (same derivation as `decrypt_unit`).
+    let mut header = [0u8; 16];
+    header.copy_from_slice(&unit[..16]);
+    let derived = aes_ecb_encrypt(unit_key, &header);
+    let mut decrypt_key = [0u8; 16];
+    for i in 0..16 {
+        decrypt_key[i] = derived[i] ^ header[i];
+    }
+
+    // Cheap gate: recover ONLY payload byte 196 (the 2nd BD-TS packet's sync).
+    // The CBC region is `unit[16..]`; payload offset 196 → region offset 180 =
+    // block 11, byte 4. P[11] = AES_dec(C[11]) XOR C[10]; C[10] is raw
+    // ciphertext (no decrypt needed). Constant offsets for the fixed 6144 unit.
+    const SYNC_PAYLOAD_OFF: usize = 196;
+    let region_off = SYNC_PAYLOAD_OFF - 16; // 180
+    let blk = region_off / 16; // 11
+    let byte = region_off % 16; // 4
+    let c11 = 16 + blk * 16; // absolute offset of C[11] in `unit` (=192)
+    let cipher = Aes128::new(GenericArray::from_slice(&decrypt_key));
+    let mut b = GenericArray::clone_from_slice(&unit[c11..c11 + 16]);
+    cipher.decrypt_block(&mut b);
+    let prev = unit[c11 - 16 + byte]; // C[10] byte (region block 10)
+    if b[byte] ^ prev != TS_SYNC {
+        return false;
+    }
+
+    // Survivor (~1/256 of candidates): confirm with the authoritative full
+    // decrypt + verify, so the verdict matches `decrypt_unit` exactly.
+    let mut full = [0u8; ALIGNED_UNIT_LEN];
+    full.copy_from_slice(&unit[..ALIGNED_UNIT_LEN]);
+    decrypt_unit(&mut full, unit_key)
 }
 
 /// Decrypt one aligned unit trying multiple unit keys. Returns the key index that worked.
