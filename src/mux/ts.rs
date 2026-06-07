@@ -466,50 +466,36 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                 let es_pid = (((data[pos + 1] & 0x1F) as u16) << 8) | data[pos + 2] as u16;
                 let es_info_len = (((data[pos + 3] & 0x0F) as usize) << 8) | data[pos + 4] as usize;
 
-                let stream = match stream_type {
-                    0x1B => Some(Stream::Video(VideoStream {
+                // Single source of truth for stream_type → Codec: reuse
+                // `Codec::from_coding_type` (the same table the BD STN /
+                // disc scanner uses) so the two mappings can never drift.
+                // We only retain the category (video/audio/subtitle) and
+                // per-kind default attribute logic here.
+                let codec = Codec::from_coding_type(stream_type);
+                let stream = match codec.kind() {
+                    CodecKind::Video => {
+                        // Default resolution by codec generation (HEVC →
+                        // UHD, MPEG-2 → 1080i, else 1080p); refined later
+                        // from the actual elementary stream.
+                        let resolution = match codec {
+                            Codec::Hevc => Resolution::R2160p,
+                            Codec::Mpeg2 => Resolution::R1080i,
+                            _ => Resolution::R1080p,
+                        };
+                        Some(Stream::Video(VideoStream {
+                            pid: es_pid,
+                            codec,
+                            resolution,
+                            frame_rate: FrameRate::Unknown,
+                            hdr: HdrFormat::Sdr,
+                            color_space: ColorSpace::Bt709,
+                            secondary: false,
+                            label: String::new(),
+                        }))
+                    }
+                    CodecKind::Audio => Some(Stream::Audio(AudioStream {
                         pid: es_pid,
-                        codec: Codec::H264,
-                        resolution: Resolution::R1080p,
-                        frame_rate: FrameRate::Unknown,
-                        hdr: HdrFormat::Sdr,
-                        color_space: ColorSpace::Bt709,
-                        secondary: false,
-                        label: String::new(),
-                    })),
-                    0x24 => Some(Stream::Video(VideoStream {
-                        pid: es_pid,
-                        codec: Codec::Hevc,
-                        resolution: Resolution::R2160p,
-                        frame_rate: FrameRate::Unknown,
-                        hdr: HdrFormat::Sdr,
-                        color_space: ColorSpace::Bt709,
-                        secondary: false,
-                        label: String::new(),
-                    })),
-                    0xEA => Some(Stream::Video(VideoStream {
-                        pid: es_pid,
-                        codec: Codec::Vc1,
-                        resolution: Resolution::R1080p,
-                        frame_rate: FrameRate::Unknown,
-                        hdr: HdrFormat::Sdr,
-                        color_space: ColorSpace::Bt709,
-                        secondary: false,
-                        label: String::new(),
-                    })),
-                    0x02 => Some(Stream::Video(VideoStream {
-                        pid: es_pid,
-                        codec: Codec::Mpeg2,
-                        resolution: Resolution::R1080i,
-                        frame_rate: FrameRate::Unknown,
-                        hdr: HdrFormat::Sdr,
-                        color_space: ColorSpace::Bt709,
-                        secondary: false,
-                        label: String::new(),
-                    })),
-                    0x81 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid,
-                        codec: Codec::Ac3,
+                        codec,
                         channels: AudioChannels::Surround51,
                         language: "und".into(),
                         sample_rate: SampleRate::S48,
@@ -517,55 +503,23 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
                     })),
-                    0x83 => Some(Stream::Audio(AudioStream {
+                    CodecKind::Subtitle => Some(Stream::Subtitle(SubtitleStream {
                         pid: es_pid,
-                        codec: Codec::TrueHd,
-                        channels: AudioChannels::Surround51,
-                        language: "und".into(),
-                        sample_rate: SampleRate::S48,
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })),
-                    0x84 | 0xA1 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid,
-                        codec: Codec::Ac3Plus,
-                        channels: AudioChannels::Surround51,
-                        language: "und".into(),
-                        sample_rate: SampleRate::S48,
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })),
-                    0x85 | 0x86 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid,
-                        codec: Codec::DtsHdMa,
-                        channels: AudioChannels::Surround51,
-                        language: "und".into(),
-                        sample_rate: SampleRate::S48,
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })),
-                    0x82 => Some(Stream::Audio(AudioStream {
-                        pid: es_pid,
-                        codec: Codec::Dts,
-                        channels: AudioChannels::Surround51,
-                        language: "und".into(),
-                        sample_rate: SampleRate::S48,
-                        secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
-                        label: String::new(),
-                    })),
-                    0x90 => Some(Stream::Subtitle(SubtitleStream {
-                        pid: es_pid,
-                        codec: Codec::Pgs,
+                        codec,
                         language: "und".into(),
                         forced: false,
                         qualifier: crate::disc::LabelQualifier::None,
                         codec_data: None,
                     })),
-                    _ => None,
+                    CodecKind::Unknown => {
+                        tracing::warn!(
+                            target: "mux",
+                            "dropping PMT stream entry with unknown stream_type {:#04x} (PID {:#06x})",
+                            stream_type,
+                            es_pid,
+                        );
+                        None
+                    }
                 };
 
                 if let Some(s) = stream {
@@ -612,5 +566,111 @@ mod tests {
         let mut demux = TsDemuxer::new(&[0x1011]);
         let result = demux.feed(&[]);
         assert!(result.is_empty());
+    }
+
+    // ── scan_streams PMT parsing ──────────────────────────────────────────
+
+    /// Wrap a 188-byte TS packet body in a 192-byte BD-TS packet
+    /// (4-byte timecode prefix the scanner skips).
+    fn bdts_packet(body: [u8; 184], pid: u16, pusi: bool) -> Vec<u8> {
+        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        // 4-byte timecode prefix is ignored; leave zero.
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40;
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x10; // payload only, no adaptation field
+        pkt[8..8 + 184].copy_from_slice(&body);
+        pkt
+    }
+
+    /// Build a PAT TS packet pointing program 1 at `pmt_pid`.
+    fn pat_packet(pmt_pid: u16) -> Vec<u8> {
+        let mut body = [0xFFu8; 184];
+        let mut i = 0;
+        body[i] = 0x00; // pointer_field
+        i += 1;
+        body[i] = 0x00; // table_id = PAT
+        // section_length counts bytes after the length field: tsid(2) +
+        // version/current_next(1) + section_number(1) + last_section(1) +
+        // one 4-byte program entry + 4-byte CRC = 13.
+        body[i + 1] = 0xB0; // section_syntax + reserved + len high nibble
+        body[i + 2] = 0x0D; // section_length low byte = 13
+        body[i + 3] = 0x00; // tsid hi
+        body[i + 4] = 0x01; // tsid lo
+        body[i + 5] = 0xC1; // version/current_next
+        body[i + 6] = 0x00; // section_number
+        body[i + 7] = 0x00; // last_section_number
+        // program entry: program_number=1 → pmt_pid
+        body[i + 8] = 0x00;
+        body[i + 9] = 0x01;
+        body[i + 10] = 0xE0 | (((pmt_pid >> 8) as u8) & 0x1F);
+        body[i + 11] = (pmt_pid & 0xFF) as u8;
+        // (CRC bytes left as 0xFF — scanner doesn't validate CRC)
+        let _ = &mut i;
+        bdts_packet(body, 0, true)
+    }
+
+    /// Build a PMT TS packet listing the given `(stream_type, es_pid)` entries.
+    fn pmt_packet(pmt_pid: u16, entries: &[(u8, u16)]) -> Vec<u8> {
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00; // pointer_field
+        let s = 1; // table start
+        body[s] = 0x02; // table_id = PMT
+        // Fixed PMT fields after section_length: 2(prog) +1 +2 +2(pcr)
+        // +2(prog_info_len=0) = 9, then per-entry 5 bytes, then 4 CRC.
+        let entries_len = entries.len() * 5;
+        let section_length = 9 + entries_len + 4;
+        body[s + 1] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        body[s + 2] = (section_length & 0xFF) as u8;
+        body[s + 3] = 0x00; // program_number hi
+        body[s + 4] = 0x01; // program_number lo
+        body[s + 5] = 0xC1; // version/current_next
+        body[s + 6] = 0x00; // section_number
+        body[s + 7] = 0x00; // last_section_number
+        body[s + 8] = 0xE0; // PCR PID hi (reserved bits)
+        body[s + 9] = 0x00; // PCR PID lo
+        body[s + 10] = 0xF0; // program_info_length hi (=0)
+        body[s + 11] = 0x00; // program_info_length lo
+        let mut p = s + 12;
+        for &(stype, es_pid) in entries {
+            body[p] = stype;
+            body[p + 1] = 0xE0 | (((es_pid >> 8) as u8) & 0x1F);
+            body[p + 2] = (es_pid & 0xFF) as u8;
+            body[p + 3] = 0xF0; // ES_info_length hi (=0)
+            body[p + 4] = 0x00; // ES_info_length lo
+            p += 5;
+        }
+        bdts_packet(body, pmt_pid, true)
+    }
+
+    #[test]
+    fn scan_streams_maps_lpcm_via_from_coding_type() {
+        use crate::disc::{Codec, Stream};
+        let pmt_pid = 0x0100;
+        let mut data = pat_packet(pmt_pid);
+        // 0x80 = LPCM (present in from_coding_type, was MISSING from the
+        // old duplicate table in scan_streams). 0x1B = H.264 video.
+        data.extend(pmt_packet(pmt_pid, &[(0x1B, 0x1011), (0x80, 0x1100)]));
+
+        let streams = scan_streams(&data).expect("PMT should parse");
+        assert_eq!(streams.len(), 2, "video + LPCM audio");
+
+        let lpcm = streams
+            .iter()
+            .find(|s| matches!(s, Stream::Audio(a) if a.pid == 0x1100))
+            .expect("LPCM audio stream present");
+        if let Stream::Audio(a) = lpcm {
+            assert_eq!(a.codec, Codec::Lpcm, "0x80 must map to LPCM");
+        }
+
+        assert!(
+            streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "H.264 video present"
+        );
     }
 }

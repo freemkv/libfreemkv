@@ -124,24 +124,31 @@ impl PipelinedPesStream {
 
     fn consume_ps(&mut self, packets: Vec<super::ps::PsPacket>) {
         for ps in packets {
-            let track = match ps.stream_id {
-                0xE0..=0xEF => 0,
-                0xC0..=0xDF => 1,
-                0xBD => ps
-                    .sub_stream_id
-                    .map(|s| (s & 0x1F) as usize + 1)
-                    .unwrap_or(1),
-                _ => continue,
-            };
-            if track >= self.title.streams.len() {
+            // Route by the REAL DVD PID (matching the PIDs that
+            // `scan_dvd_titles` assigns) rather than a synthetic track
+            // index. The old `(sub_id & 0x1F) + 1` heuristic collided
+            // subtitle sub-id 0x20+j with audio track j+1, feeding
+            // VobSub PES into the AC-3 parser.
+            let Some(pid) = ps.dvd_pid() else {
+                tracing::warn!(
+                    target: "mux",
+                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                    ps.stream_id,
+                    ps.sub_stream_id,
+                );
                 continue;
-            }
-            let pid = self
-                .pid_to_track
-                .iter()
-                .find(|(_, idx)| *idx == track)
-                .map(|(p, _)| *p)
-                .unwrap_or(0);
+            };
+            let Some((_, track)) = self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
+            else {
+                tracing::warn!(
+                    target: "mux",
+                    "dropping PS packet for unmapped PID {:#06x} (stream_id={:#04x}, sub_stream_id={:?})",
+                    pid,
+                    ps.stream_id,
+                    ps.sub_stream_id,
+                );
+                continue;
+            };
             let pes = PesPacket {
                 pid,
                 pts: ps.pts.map(|p| p as i64),

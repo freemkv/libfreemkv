@@ -156,8 +156,16 @@ impl Disc {
                         qualifier: crate::disc::LabelQualifier::None,
                         codec_data: None,
                     })),
-                    // Stream type 4 = IG, unknown types -- skip
-                    _ => None,
+                    // Stream type 4 = IG, unknown types -- skip.
+                    other => {
+                        tracing::warn!(
+                            "dropping STN stream entry: unhandled stream_type {} (PID {:#06x}, coding_type {:#04x})",
+                            other,
+                            s.pid,
+                            s.coding_type,
+                        );
+                        None
+                    }
                 }
             })
             .collect();

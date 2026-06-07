@@ -39,6 +39,39 @@ pub struct PsPacket {
     pub data: Vec<u8>,
 }
 
+impl PsPacket {
+    /// Map this packet to the canonical DVD PID assigned by
+    /// `Disc::scan_dvd_titles` (`src/disc/dvd.rs`), so demux output can
+    /// be looked up in the title's `pid_to_track` map.
+    ///
+    /// The PID space mirrors `dvd.rs` exactly:
+    /// - video stream id `0xE0..=0xEF` → `0xE0`
+    /// - private-stream-1 audio sub-id `0x80..=0x87` (AC-3),
+    ///   `0x88..=0x8F` (DTS), `0xA0..=0xA7` (LPCM) → `0xBD00 + index`
+    /// - private-stream-1 subtitle sub-id `0x20..=0x3F` → `0x20 + index`
+    ///
+    /// Returns `None` for stream/sub-stream combinations the DVD title
+    /// scanner does not assign a PID to (e.g. MPEG audio 0xC0-0xDF,
+    /// private stream 2, unrecognized sub-stream ranges). The caller is
+    /// expected to WARN-and-drop in that case rather than silently
+    /// mis-routing the packet.
+    pub fn dvd_pid(&self) -> Option<u16> {
+        match self.stream_id {
+            0xE0..=0xEF => Some(0xE0),
+            0xBD => match self.sub_stream_id? {
+                // AC-3 / DTS / LPCM audio → 0xBD00 + audio index.
+                s @ 0x80..=0x87 => Some(0xBD00 + (s - 0x80) as u16),
+                s @ 0x88..=0x8F => Some(0xBD00 + (s - 0x88) as u16),
+                s @ 0xA0..=0xA7 => Some(0xBD00 + (s - 0xA0) as u16),
+                // VobSub subtitle sub-id 0x20+j → PID 0x20+j (identity).
+                s @ 0x20..=0x3F => Some(s as u16),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 /// MPEG-2 Program Stream demuxer.
 ///
 /// Accepts raw PS bytes via `feed()` and produces demuxed PES packets.
@@ -547,6 +580,68 @@ mod tests {
         let encoded = encode_pts(val, 0x20);
         let decoded = parse_pts(&encoded);
         assert_eq!(decoded, val);
+    }
+
+    // --- DVD PID mapping (track-routing collision regression) ---
+
+    fn mk(stream_id: u8, sub: Option<u8>) -> PsPacket {
+        PsPacket {
+            stream_id,
+            sub_stream_id: sub,
+            pts: None,
+            dts: None,
+            data: vec![0xAA],
+        }
+    }
+
+    #[test]
+    fn dvd_pid_matches_scanner_assignment() {
+        // Video → 0xE0 (matches dvd.rs VideoStream pid).
+        assert_eq!(mk(0xE0, None).dvd_pid(), Some(0xE0));
+        // AC-3 audio stream 0/1 → 0xBD00 / 0xBD01 (matches 0xBD00 + i).
+        assert_eq!(mk(0xBD, Some(0x80)).dvd_pid(), Some(0xBD00));
+        assert_eq!(mk(0xBD, Some(0x81)).dvd_pid(), Some(0xBD01));
+        // DTS / LPCM audio indices.
+        assert_eq!(mk(0xBD, Some(0x88)).dvd_pid(), Some(0xBD00));
+        assert_eq!(mk(0xBD, Some(0xA0)).dvd_pid(), Some(0xBD00));
+        // VobSub subtitle 0x20/0x21 → 0x20 / 0x21 (matches 0x20 + j).
+        assert_eq!(mk(0xBD, Some(0x20)).dvd_pid(), Some(0x20));
+        assert_eq!(mk(0xBD, Some(0x21)).dvd_pid(), Some(0x21));
+        // Unmappable: MPEG audio, private stream 2, bogus sub-id.
+        assert_eq!(mk(0xC0, None).dvd_pid(), None);
+        assert_eq!(mk(0xBF, None).dvd_pid(), None);
+        assert_eq!(mk(0xBD, Some(0x10)).dvd_pid(), None);
+    }
+
+    #[test]
+    fn subtitle_does_not_collide_with_audio_track() {
+        // Regression for the (sub_id & 0x1F)+1 bug: subtitle sub-id 0x20
+        // used to alias audio track 1. With the real PID it routes to its
+        // own subtitle PID (0x20), distinct from audio (0xBD00+).
+        let audio0 = mk(0xBD, Some(0x80)).dvd_pid().unwrap(); // 0xBD00
+        let sub0 = mk(0xBD, Some(0x20)).dvd_pid().unwrap(); // 0x20
+        assert_ne!(
+            audio0, sub0,
+            "subtitle sub-id 0x20 must NOT map to the audio PID"
+        );
+
+        // Mirror dvd.rs PID assignment for a title with [video, audio0,
+        // audio1, sub0, sub1] and confirm each PS packet lands on its
+        // own track via pid_to_track.
+        let pid_to_track: Vec<(u16, usize)> =
+            vec![(0xE0, 0), (0xBD00, 1), (0xBD01, 2), (0x20, 3), (0x21, 4)];
+        let route = |p: PsPacket| -> Option<usize> {
+            let pid = p.dvd_pid()?;
+            pid_to_track
+                .iter()
+                .find(|(x, _)| *x == pid)
+                .map(|(_, t)| *t)
+        };
+        assert_eq!(route(mk(0xE0, None)), Some(0));
+        assert_eq!(route(mk(0xBD, Some(0x80))), Some(1));
+        assert_eq!(route(mk(0xBD, Some(0x81))), Some(2));
+        assert_eq!(route(mk(0xBD, Some(0x20))), Some(3)); // sub0 → track 3, NOT 1
+        assert_eq!(route(mk(0xBD, Some(0x21))), Some(4)); // sub1 → track 4, NOT 2
     }
 
     // --- Helper: encode PTS for tests ---
