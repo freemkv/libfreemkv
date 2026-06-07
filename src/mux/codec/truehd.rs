@@ -96,8 +96,17 @@ impl CodecParser for TrueHdParser {
             return Vec::new();
         }
 
-        if let Some(pts) = pes.pts {
-            self.next_pts_ns = pts_to_ns(pts);
+        // Capture the PTS base ONLY at an access-unit boundary, i.e. when no AU
+        // is mid-assembly in `buf`. TrueHD access units span PES packets; a PES
+        // that merely continues an AU already in progress carries its own (later)
+        // PTS, which must NOT override the running per-AU timestamp. Adopting it
+        // mid-AU would snap that AU's PTS backward/forward and break the
+        // monotonic +AU_DURATION_NS cadence (A/V drift). Once the buffer is empty
+        // the next PES legitimately begins a new AU and seeds the base.
+        if self.buf.is_empty() {
+            if let Some(pts) = pes.pts {
+                self.next_pts_ns = pts_to_ns(pts);
+            }
         }
 
         self.buf.extend_from_slice(&pes.data);
@@ -298,6 +307,49 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data.len(), 200);
+    }
+
+    #[test]
+    fn continuation_pes_pts_does_not_override_au_in_progress() {
+        // An AU split across two PES packets: the FIRST PES (pts 90000) begins
+        // the AU; the SECOND PES (pts 99999, a later timestamp) merely continues
+        // it. The emitted AU must keep the first PES's PTS, not adopt the
+        // continuation PES's later timestamp.
+        let mut parser = TrueHdParser::new();
+        let unit = make_truehd_unit(200);
+        let mid = 100;
+
+        let pes1 = make_pes(unit[..mid].to_vec(), Some(90000));
+        assert!(parser.parse(&pes1).is_empty(), "AU held mid-assembly");
+
+        // Continuation PES carries a later PTS that must be ignored for this AU.
+        let pes2 = make_pes(unit[mid..].to_vec(), Some(99999));
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].pts_ns,
+            pts_to_ns(90000),
+            "AU keeps the PTS of the PES that began it, not the continuation PES"
+        );
+    }
+
+    #[test]
+    fn new_au_after_empty_buffer_takes_new_pes_pts() {
+        // After an AU fully drains (buffer empty), the next PES legitimately
+        // seeds a fresh PTS base.
+        let mut parser = TrueHdParser::new();
+        let f1 = parser.parse(&make_pes(make_truehd_unit(200), Some(90000)));
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f1[0].pts_ns, pts_to_ns(90000));
+
+        // Buffer is now empty; a new PES with a new PTS starts a new AU.
+        let f2 = parser.parse(&make_pes(make_truehd_unit(200), Some(180000)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(
+            f2[0].pts_ns,
+            pts_to_ns(180000),
+            "new AU after empty buffer adopts the new PES PTS"
+        );
     }
 
     #[test]
