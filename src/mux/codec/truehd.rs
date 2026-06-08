@@ -526,12 +526,6 @@ mod tests {
         assert_eq!(truehd_channels(1 << 20), None);
     }
 
-    #[test]
-    fn truehd_channels_71_layout_low5_bits() {
-        // Standard 7.1: 8ch bits 0-4 = L/R(2)+C(1)+LFE(1)+Ls/Rs(2)+Lb/Rb(2) = 8.
-        assert_eq!(truehd_channels(0x1F), Some(8));
-    }
-
     // --- truehd_channels_from_stream: major-sync variant bit + scan ---
 
     #[test]

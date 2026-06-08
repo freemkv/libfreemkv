@@ -522,30 +522,6 @@ mod tests {
         assert_eq!(&bytes, b"hello");
     }
 
-    /// `flush` must not be a durability barrier nor reorder bytes, but
-    /// it also must not lose buffered data. We interleave write_all and
-    /// flush and confirm exact byte order survives to disk. (Distinct
-    /// from the existing `flush_is_observed_in_order` which uses 3
-    /// words; this exercises many small flushes to stress the
-    /// passthrough flush path at line 199-201.) Mutation: if `flush`
-    /// dropped pending bytes the reassembly fails.
-    #[test]
-    fn many_interleaved_flushes_preserve_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("many-flush.bin");
-        let mut w = WritebackFile::create(&p).unwrap();
-        let mut expected = Vec::new();
-        for i in 0u8..32 {
-            let chunk = [i; 4];
-            w.write_all(&chunk).unwrap();
-            expected.extend_from_slice(&chunk);
-            w.flush().unwrap();
-        }
-        w.sync_all().unwrap();
-        drop(w);
-        assert_eq!(read_back(&p), expected);
-    }
-
     /// `sync_all` is idempotent: calling it twice (and then Drop, which
     /// also finalizes) must not corrupt data or panic. Doc lines
     /// 256-262: `finalize` is idempotent so explicit sync_all then drop

@@ -588,47 +588,6 @@ mod tests {
         assert_eq!(parse_vc1_resolution(&sh), Some((8192, 8192)));
     }
 
-    #[test]
-    fn resolution_field_is_12_bits_no_higher() {
-        // Asserting the field width: a width one step above the max (8194 →
-        // coded_w 4096) overflows the 12-bit MAX_CODED_WIDTH field (4096 & 0xFFF
-        // = 0), so it cannot encode 8194 — it wraps to (0+1)*2 = 2. This proves
-        // the 12-bit masking in the parser, i.e. it never reads a 13th bit.
-        let sh = make_ap_seq_header(8194, 720);
-        assert_eq!(
-            parse_vc1_resolution(&sh),
-            Some((2, 720)),
-            "coded_w field is masked to 12 bits → 4096 wraps to 0 → width 2"
-        );
-    }
-
-    #[test]
-    fn resolution_deescapes_emulation_prevention() {
-        // VC-1 Annex-B EBDU payload may carry an emulation-prevention 0x03 after
-        // a 00 00 run. The resolution parser must de-escape before bit
-        // extraction; an EP byte in the first few payload bytes would otherwise
-        // shift every later bit and corrupt the dimensions. Build a header whose
-        // de-escaped payload encodes 1280x720, then splice 00 00 03 into the raw
-        // payload and confirm it still decodes 1280x720.
-        let base = make_ap_seq_header(1280, 720);
-        // base = [00 00 01 0F][5 payload bytes]. Insert a benign EP run that
-        // de-escapes away: find a spot where two zeros precede our inserted 0x03.
-        // Construct payload manually: prepend 00 00 03 then the real 5 bytes; the
-        // de-escaper drops the 0x03, leaving 00 00 + the 5 bytes → but that
-        // shifts the fields. Instead, the real coverage: the de-escaper collects
-        // 5 bytes skipping EP. Put the EP at the very front so after stripping we
-        // still recover the 5 meaningful bytes... that changes leading bits.
-        // Simpler grounded check: a payload with a trailing EP byte (after the 5
-        // needed bytes) must not change the result, since only 5 are collected.
-        let mut sh = base.clone();
-        sh.extend_from_slice(&[0x00, 0x00, 0x03, 0xFF]); // trailing EP run
-        assert_eq!(
-            parse_vc1_resolution(&sh),
-            Some((1280, 720)),
-            "trailing EP bytes beyond the 5 collected must not affect parsing"
-        );
-    }
-
     // --- codec_private BITMAPINFOHEADER field layout ---
 
     #[test]

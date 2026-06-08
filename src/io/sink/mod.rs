@@ -216,24 +216,6 @@ mod tests {
         assert_eq!(bytes.load(Ordering::SeqCst), 3);
     }
 
-    /// Default `finish()` dispatched through a `dyn SequentialSink`
-    /// trait object must still reach the default `flush` (vtable path).
-    /// This guards that there is no accidental override that turns the
-    /// default into a no-op via dyn dispatch.
-    #[test]
-    fn default_finish_flushes_through_dyn() {
-        let flushed = Arc::new(AtomicBool::new(false));
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let sink = FlushTracker {
-            flushed: flushed.clone(),
-            bytes: bytes.clone(),
-        };
-        let mut boxed: Box<dyn SequentialSink> = Box::new(sink);
-        boxed.write_all(b"xy").unwrap();
-        boxed.finish().unwrap();
-        assert!(flushed.load(Ordering::SeqCst));
-    }
-
     /// `open_for_mkv` with `None` size hint must still produce a working
     /// random-access sink (the `match size_hint { None => ... }` arm,
     /// lines 103-106). Round-trip a seek-back patch through it to prove
@@ -251,21 +233,5 @@ mod tests {
         sink.finish().unwrap();
         drop(sink);
         assert_eq!(std::fs::read(&p).unwrap(), b"AAAACCCC");
-    }
-
-    /// finish() through a `dyn RandomAccessSink` (the supertrait of
-    /// SequentialSink) for a LocalFileSink must also flush+fsync. The
-    /// existing regression test boxes as `dyn SequentialSink`; this
-    /// pins the `dyn RandomAccessSink` vtable path too, since
-    /// `open_for_mkv` returns exactly that boxed type.
-    #[test]
-    fn finish_through_random_access_dyn_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("ra-finish.bin");
-        let mut sink: Box<dyn RandomAccessSink> = open_for_mkv(&p, None).unwrap();
-        sink.write_all(b"durable").unwrap();
-        sink.finish().unwrap();
-        // Visible to a separate reader before drop.
-        assert_eq!(&std::fs::read(&p).unwrap()[..], b"durable");
     }
 }

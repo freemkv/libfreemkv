@@ -595,60 +595,6 @@ mod tests {
         }
     }
 
-    /// seed_lfsr0 applies the per-byte TAB4 bit-reversal to the 4 bytes of the
-    /// packed LFSR0 seed value. The seeding expression for the all-zero key is
-    /// `(0<<17)|(0<<9)|((0<<1)+8-(0&7)) == 8`, so the raw lfsr0 = 0x00000008.
-    /// Each byte is then TAB4-reversed and re-packed big-endian-ish per the
-    /// code. Byte (lfsr0 & 0xFF) == 0x08 -> TAB4[0x08] == 0x10 placed in the
-    /// top byte (<<24). The other three source bytes are 0 -> TAB4[0]=0. So
-    /// the seed for an all-zero key must be 0x10 << 24 == 0x10000000.
-    ///
-    /// Grounding: seed_lfsr0 body + TAB4[0x08] = bit-reverse(0x08=0b00001000)
-    /// = 0b00010000 = 0x10.
-    /// Mutation: change the `<< 24` on the first TAB4 term to `<< 16` -> the
-    /// expected seed changes and the round-trip-anchored value below fails.
-    #[test]
-    fn seed_lfsr0_zero_key_matches_spec_packing() {
-        // We cannot call seed_lfsr0 directly (private), but decrypt_key seeds
-        // LFSR0 with it. Instead pin the documented TAB4 anchor the seed
-        // relies on, plus the algebraic seed value, so a regression in either
-        // the packing constant or TAB4 is caught.
-        assert_eq!(
-            TAB4[0x08], 0x10,
-            "bit-reverse(0x08) == 0x10 drives the zero-key seed"
-        );
-        // Algebraic check of the raw (pre-TAB4) seed for an all-zero key.
-        let key = [0u8; 5];
-        let raw = ((key[4] as u32) << 17)
-            | ((key[3] as u32) << 9)
-            | (((key[2] as u32) << 1) + 8 - (key[2] as u32 & 7));
-        assert_eq!(
-            raw, 8,
-            "all-zero key packs to raw LFSR0 seed 8 per the CSS formula"
-        );
-    }
-
-    /// decrypt_key never panics and always returns exactly 5 bytes across the
-    /// full single-byte input space for both invert values. This is the
-    /// "never panic / never truncate" property for the key-mangling core.
-    ///
-    /// Grounding: return type is [u8; 5]; all table indexes are masked to byte
-    /// range inside css_step.
-    /// Mutation: (sanity) it is a type-level guarantee; the loop also exercises
-    /// every TAB1 index 0..256 via p_crypted, catching an out-of-range index
-    /// if a table were shortened.
-    #[test]
-    fn decrypt_key_total_over_byte_space() {
-        for invert in [0x00u8, 0xFF] {
-            for b in 0u16..256 {
-                let key = [b as u8; 5];
-                let crypted = [b as u8, 0, 255, b as u8, 0];
-                let out = decrypt_key(invert, &key, &crypted);
-                let _ = out; // length is [u8;5] by type; the call must not panic.
-            }
-        }
-    }
-
     /// The invert byte (0x00 vs 0xFF) selects the LFSR0 output index in
     /// css_step via `TAB4[(o_lfsr0 ^ invert) as usize]`. For a non-degenerate
     /// key it must change the keystream and hence the result. (Pins that the

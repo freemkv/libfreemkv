@@ -804,20 +804,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_data_is_whole_pes_not_just_picture() {
-        // The emitted frame data is the ENTIRE PES payload (pes.data.clone()),
-        // not just the picture NAL — MPEG-2 ES is muxed as-is. Confirm a seq
-        // header + picture PES emits the whole buffer.
-        let mut parser = Mpeg2Parser::new();
-        let mut data = make_seq_header(720, 480, 3, 4);
-        data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
-        data.extend_from_slice(&[0x12, 0x34]);
-        let f = parser.parse(&make_pes(data.clone(), Some(0)));
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].data, data, "frame data = whole PES payload");
-    }
-
-    #[test]
     fn parser_resolution_method() {
         let mut parser = Mpeg2Parser::new();
 

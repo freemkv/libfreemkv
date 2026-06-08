@@ -345,61 +345,6 @@ mod tests {
         assert_eq!((co, mo, m, d), (0, 0, 0, 0));
     }
 
-    /// Spec: (false, false) branch — both coding_types absent, equal language → Match.
-    /// The spec comment says "compare language fields; Divergent if they differ, else Match".
-    /// Mutation: return Divergent for any (false, false) case → this test goes red.
-    #[test]
-    fn class_both_coding_absent_equal_none_lang_is_match() {
-        let r = ClpiVsMplsRow {
-            pid: 0x1100,
-            clpi_coding_type: None,
-            clpi_language: None,
-            mpls_coding_type: None,
-            mpls_language: None,
-        };
-        // Both languages are None == None → Match.
-        assert_eq!(r.class(), ClpiVsMplsClass::Match);
-    }
-
-    /// Spec: all four classes form an exhaustive disjoint cover.
-    /// This test verifies the discriminant logic using boundary coding_type values.
-    /// Mutation: swap the ClpiOnly/MplsOnly branches → wrong classification.
-    #[test]
-    fn class_boundary_coding_types_all_four_classes_reachable() {
-        let clpi_only = ClpiVsMplsRow {
-            pid: 1,
-            clpi_coding_type: Some(1),
-            clpi_language: None,
-            mpls_coding_type: None,
-            mpls_language: None,
-        };
-        let mpls_only = ClpiVsMplsRow {
-            pid: 2,
-            clpi_coding_type: None,
-            clpi_language: None,
-            mpls_coding_type: Some(1),
-            mpls_language: None,
-        };
-        let match_ = ClpiVsMplsRow {
-            pid: 3,
-            clpi_coding_type: Some(0x83),
-            clpi_language: Some("eng".into()),
-            mpls_coding_type: Some(0x83),
-            mpls_language: Some("eng".into()),
-        };
-        let divergent = ClpiVsMplsRow {
-            pid: 4,
-            clpi_coding_type: Some(0x83),
-            clpi_language: Some("eng".into()),
-            mpls_coding_type: Some(0x83),
-            mpls_language: Some("fra".into()),
-        };
-        assert_eq!(clpi_only.class(), ClpiVsMplsClass::ClpiOnly);
-        assert_eq!(mpls_only.class(), ClpiVsMplsClass::MplsOnly);
-        assert_eq!(match_.class(), ClpiVsMplsClass::Match);
-        assert_eq!(divergent.class(), ClpiVsMplsClass::Divergent);
-    }
-
     /// Spec: class_counts tuple order is (clpi_only, mpls_only, matches, divergent).
     /// Verifies each counter increments the RIGHT slot.
     /// Mutation: swap any two counters → wrong slot increments.

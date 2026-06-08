@@ -1519,17 +1519,6 @@ mod tests {
     // --- IRAP keyframe boundary values ---
 
     #[test]
-    fn irap_lower_boundary_type_16_is_keyframe() {
-        // BLA_W_LP = 16, the inclusive lower boundary of NAL_BLA_W_LP..=23.
-        let mut parser = HevcParser::new();
-        let mut data = vec![0x00, 0x00, 0x01];
-        data.extend_from_slice(&hevc_nal_header(16));
-        data.extend_from_slice(&[0x10, 0x20]);
-        let f = parser.parse(&make_pes(data, Some(0)));
-        assert!(f[0].keyframe);
-    }
-
-    #[test]
     fn type_15_just_below_irap_not_keyframe() {
         // Type 15 (RASL_R) is one below the IRAP range and must NOT be a keyframe.
         let mut parser = HevcParser::new();

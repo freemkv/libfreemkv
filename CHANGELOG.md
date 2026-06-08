@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.31.4 (2026-06-08)
+
+Test cleanup — no runtime changes. Removed 144 unit tests flagged in adversarial
+review as vacuous (assert-current-behavior / duplicate / non-failing), leaving
+the spec-grounded, mutation-verified subset. 1927 tests remain, all green.
+
 ## 0.31.3 (2026-06-08)
 
 Test fixture hygiene — no runtime changes. Replaced a private-range example

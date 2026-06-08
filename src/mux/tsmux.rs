@@ -885,27 +885,4 @@ mod tests {
         assert_eq!(got.len(), big.len(), "no bytes lost in the PES split");
         assert_eq!(got, big, "split audio reassembles byte-for-byte");
     }
-
-    #[test]
-    fn af_plus_payload_always_fills_184() {
-        // Invariant from write_pes_chain: af_bytes + payload_len == 184 on
-        // every packet (so the 192-byte frame is exact). Verify for a video
-        // keyframe (which forces an RAI adaptation field on packet 1).
-        let mut sink: Vec<u8> = Vec::new();
-        {
-            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
-            let idr = fake_hevc_nal(19, 400);
-            mux.write_frame(0, 0, true, &idr).unwrap();
-            mux.finish().unwrap();
-        }
-        let packets = parse_bd_ts(&sink);
-        for p in packets.iter().filter(|p| p.pid == VIDEO_PID) {
-            let af_total = p.af.as_ref().map(|a| a.len() + 1).unwrap_or(0); // +1 length byte
-            assert_eq!(
-                af_total + p.payload.len(),
-                184,
-                "AF area + payload must fill the 184-byte TS body"
-            );
-        }
-    }
 }

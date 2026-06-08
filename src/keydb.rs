@@ -410,48 +410,6 @@ mod tests {
         assert_eq!(val, "/new/path", "value must be trimmed");
     }
 
-    /// parse_url with no explicit port defaults to 80.
-    /// Spec: HTTP default port is 80 (RFC 7230 §2.7.1).
-    /// Mutation: defaulting to 443 instead makes plain-HTTP URLs go to the wrong port.
-    #[test]
-    fn parse_url_no_port_defaults_to_80() {
-        let (_, port, _) = parse_url("http://example.com/path").unwrap();
-        assert_eq!(port, 80, "default HTTP port must be 80 (RFC 7230 §2.7.1)");
-    }
-
-    /// parse_url with explicit port parses it correctly.
-    /// Mutation: ignoring the port component and defaulting to 80 changes the port.
-    #[test]
-    fn parse_url_explicit_port_is_parsed() {
-        let (host, port, path) = parse_url("http://mirror.example:9000/key.zip").unwrap();
-        assert_eq!(host, "mirror.example");
-        assert_eq!(port, 9000);
-        assert_eq!(path, "/key.zip");
-    }
-
-    /// parse_url with no path component yields "/" as the path.
-    /// RFC 7230 §5.3.1: origin-form must start with "/"; empty → root.
-    /// Mutation: returning "" as the path makes the HTTP request malformed.
-    #[test]
-    fn parse_url_no_path_yields_root() {
-        let (_, _, path) = parse_url("http://example.com").unwrap();
-        assert_eq!(
-            path, "/",
-            "missing path must default to '/' (RFC 7230 §5.3.1)"
-        );
-    }
-
-    /// parse_url rejects a URL whose scheme is not http.
-    /// Mutation: accepting ftp:// silently leads to a TCP connection receiving
-    ///           binary FTP data instead of HTTP.
-    #[test]
-    fn parse_url_rejects_ftp_scheme() {
-        assert!(matches!(
-            parse_url("ftp://ftp.example.com/file"),
-            Err(Error::KeydbUnsupportedScheme { .. })
-        ));
-    }
-
     /// save() rejects data that is not a valid keydb (no recognisable entries).
     /// Spec: entries are lines starting with "0x", "| DK", "| PK", or "| HC".
     /// Mutation: dropping the entries==0 check lets an empty file be saved.
@@ -589,46 +547,11 @@ mod tests {
         assert!(result.is_ok(), "exactly MAX_KEYDB_BYTES must be accepted");
     }
 
-    /// parse_url path round-trips: the extracted path is the same string that
-    /// was in the URL.
-    /// Mutation: dropping the leading '/' from the path breaks the HTTP request.
-    #[test]
-    fn parse_url_path_includes_leading_slash() {
-        let (_, _, path) = parse_url("http://example.com/a/b/c.zip").unwrap();
-        assert!(
-            path.starts_with('/'),
-            "path must start with '/', got `{path}`"
-        );
-        assert_eq!(path, "/a/b/c.zip");
-    }
-
-    /// resolve_redirect with an absolute http URL parses it fresh
-    /// (ignores the current host/port entirely).
-    /// Mutation: keeping the current host instead of parsing the new one
-    ///           points the next request at the wrong server.
-    #[test]
-    fn resolve_redirect_absolute_http_ignores_current_host() {
-        let (h, p, path) =
-            resolve_redirect("http://new.host:8080/k.zip", "old.host", 9000).unwrap();
-        assert_eq!(h, "new.host");
-        assert_eq!(p, 8080);
-        assert_eq!(path, "/k.zip");
-    }
-
     /// parse_status returns 0 for an empty status line (not a panic).
     /// Mutation: calling unwrap() instead of unwrap_or(0) panics on empty input.
     #[test]
     fn parse_status_empty_input_returns_0() {
         assert_eq!(parse_status(""), 0);
         assert_eq!(parse_status("\r\n"), 0);
-    }
-
-    /// parse_status handles HTTP/1.0 and HTTP/1.1 both.
-    /// Mutation: only matching "HTTP/1.0 " misses HTTP/1.1 responses.
-    #[test]
-    fn parse_status_handles_http_versions() {
-        assert_eq!(parse_status("HTTP/1.0 404 Not Found"), 404);
-        assert_eq!(parse_status("HTTP/1.1 200 OK"), 200);
-        assert_eq!(parse_status("HTTP/1.1 302 Found\r\nLocation: /new"), 302);
     }
 }

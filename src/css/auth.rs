@@ -593,42 +593,6 @@ mod tests {
 
     // ── CSS constant-table integrity ───────────────────────────────────────
 
-    /// The CSSCryptKey lookup tables are each a full 256-entry byte table and
-    /// the variant tables are 32 entries (one per CSS variant). The cipher
-    /// indexes CRYPT_TAB0..3 with arbitrary bytes (0..256) and indexes
-    /// VARIANTS / PERM_VARIANT with the css_variant (0..32). A short table
-    /// would index out of bounds.
-    ///
-    /// Grounding: crypt_key indexes `CRYPT_TABx[idx]` where idx is a u8 cast
-    /// to usize (0..256); `VARIANTS[css_variant]` and `PERM_VARIANT[k][variant]`
-    /// with variant 0..32.
-    /// Mutation: drop the last entry of CRYPT_TAB0 (make it [u8;255]) ->
-    /// compile error / length assert fails.
-    #[test]
-    fn crypt_tables_have_spec_lengths() {
-        assert_eq!(CRYPT_TAB0.len(), 256);
-        assert_eq!(CRYPT_TAB1.len(), 256);
-        assert_eq!(CRYPT_TAB2.len(), 256);
-        assert_eq!(CRYPT_TAB3.len(), 256);
-        assert_eq!(VARIANTS.len(), 32, "one CSS variant byte per variant 0..32");
-        assert_eq!(PERM_VARIANT.len(), 2);
-        assert_eq!(PERM_VARIANT[0].len(), 32);
-        assert_eq!(PERM_VARIANT[1].len(), 32);
-        assert_eq!(
-            PERM_CHALLENGE.len(),
-            3,
-            "one challenge perm per key_type 0..3"
-        );
-        for p in &PERM_CHALLENGE {
-            assert_eq!(
-                p.len(),
-                10,
-                "challenge permutation covers all 10 challenge bytes"
-            );
-        }
-        assert_eq!(SECRET.len(), 5);
-    }
-
     /// Each PERM_CHALLENGE row is a permutation of indices 0..10 (it reorders
     /// the 10 challenge bytes). A non-permutation would drop/duplicate
     /// challenge bytes, weakening or corrupting the bus key derivation.

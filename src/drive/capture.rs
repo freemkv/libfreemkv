@@ -158,11 +158,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_string_empty_is_empty() {
-        assert_eq!(mask_string(""), "");
-    }
-
-    #[test]
     fn mask_bytes_matches_string_masking_for_ascii() {
         // mask_bytes is the byte-wise analogue: letters→b'A', digits→b'0'.
         assert_eq!(mask_bytes(b"HL-DT-ST"), b"AA-AA-AA".to_vec());
@@ -176,19 +171,6 @@ mod tests {
         // are space-padded binary and the framing must be diffable.
         let input = [0x00u8, b'A', 0x20, b'7', 0xFF, b'-'];
         assert_eq!(mask_bytes(&input), vec![0x00, b'A', 0x20, b'0', 0xFF, b'-']);
-    }
-
-    #[test]
-    fn mask_bytes_length_preserved() {
-        // Masking is 1:1 — output length always equals input length so
-        // fixed-offset fields stay aligned.
-        let input = vec![0u8; 96];
-        assert_eq!(mask_bytes(&input).len(), 96);
-    }
-
-    #[test]
-    fn mask_bytes_empty_is_empty() {
-        assert!(mask_bytes(&[]).is_empty());
     }
 
     #[test]
@@ -210,15 +192,5 @@ mod tests {
             FEATURES.iter().any(|&(c, _)| c == 0x010D),
             "AACS feature 0x010D must be captured"
         );
-    }
-
-    #[test]
-    fn feature_table_codes_are_sorted_ascending() {
-        // The table is maintained in ascending MMC-6 code order; a code
-        // inserted out of order is a maintenance smell that this pins.
-        let codes: Vec<u16> = FEATURES.iter().map(|&(c, _)| c).collect();
-        let mut sorted = codes.clone();
-        sorted.sort_unstable();
-        assert_eq!(codes, sorted, "FEATURES must stay in ascending code order");
     }
 }

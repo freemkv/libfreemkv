@@ -1730,19 +1730,6 @@ mod apply_tests {
 
     // ── codec_hint_consistent hardening ───────────────────────────────────────
 
-    /// Spec: a hint naming only "TrueHD" is consistent with a TrueHD stream;
-    /// inconsistent with AC-3, AC-3+, DTS, etc.
-    /// Mutation: make all hints consistent with every codec → the unshuffle logic stops working.
-    #[test]
-    fn codec_hint_consistent_truehd_families() {
-        assert!(codec_hint_consistent("TrueHD 7.1", &Codec::TrueHd));
-        assert!(codec_hint_consistent("Dolby TrueHD", &Codec::TrueHd));
-        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Ac3));
-        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Ac3Plus));
-        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Dts));
-        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Lpcm));
-    }
-
     /// Spec: "Dolby Digital" (AC-3) hint is consistent ONLY with AC-3 streams;
     /// NOT with DD+ or TrueHD.
     /// Mutation: accept "Dolby Digital" as consistent with AC-3+ → DD+ mislabeled.

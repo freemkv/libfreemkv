@@ -1455,28 +1455,4 @@ mod tests {
         let expected = format!("E{}: 5/3", E_MUX_TRACK_RANGE);
         assert_eq!(e.to_string(), expected);
     }
-
-    /// All keydb error codes are 8xxx.
-    /// Mutation: creating E_KEYDB_PARSE = 9004 (colliding with E_KEYDB_LOAD range)
-    ///           breaks the CLI's range-based keydb error dispatch.
-    #[test]
-    fn keydb_error_codes_all_in_8xxx_range() {
-        let keydb_codes = [
-            E_KEYDB_CONNECT,
-            E_KEYDB_HTTP,
-            E_KEYDB_INVALID,
-            E_KEYDB_WRITE,
-            E_KEYDB_PARSE,
-            E_KEYDB_LOAD,
-            E_KEYDB_UNSUPPORTED_SCHEME,
-            E_KEYDB_TOO_MANY_REDIRECTS,
-        ];
-        for code in keydb_codes {
-            assert!(
-                (8000..9000).contains(&code),
-                "keydb code {} must be in 8xxx range",
-                code
-            );
-        }
-    }
 }

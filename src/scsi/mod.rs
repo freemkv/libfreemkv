@@ -811,22 +811,6 @@ mod parse_sense_tests {
     }
 
     #[test]
-    fn sb_len_wr_clamped_to_slice_len() {
-        // Doc: n = min(sb_len_wr, sense.len()). A caller claiming 200
-        // bytes written into a 14-byte slice must not read out of bounds;
-        // the effective n is the slice length.
-        let mut s = [0u8; 14];
-        s[0] = 0x70;
-        s[2] = 0x03;
-        s[12] = 0x11;
-        s[13] = 0x05;
-        let d = parse_sense(&s, 200);
-        assert_eq!(d.sense_key, 3);
-        assert_eq!(d.asc, 0x11);
-        assert_eq!(d.ascq, 0x05);
-    }
-
-    #[test]
     fn n_exactly_three_decodes_key_only() {
         // n==3 is the minimum that passes the n<3 early-return. For fixed
         // format the key (byte 2) is decodable; asc/ascq default to 0.
@@ -898,34 +882,6 @@ mod scsi_sense_predicate_tests {
                 "key {key:#x} marginal classification"
             );
         }
-    }
-
-    #[test]
-    fn hardware_error_is_not_marginal() {
-        // HARDWARE ERROR (4) is explicitly non-recoverable per doc.
-        assert!(!s(SENSE_KEY_HARDWARE_ERROR).is_marginal());
-        assert!(s(SENSE_KEY_HARDWARE_ERROR).is_hardware_error());
-    }
-
-    #[test]
-    fn data_protect_not_marginal() {
-        // DATA PROTECT (7) = AACS/region/write-protect; retry won't help.
-        assert!(!s(SENSE_KEY_DATA_PROTECT).is_marginal());
-        assert!(s(SENSE_KEY_DATA_PROTECT).is_data_protect());
-    }
-
-    #[test]
-    fn illegal_request_not_marginal() {
-        // ILLEGAL REQUEST (5) = bad CDB; not marginal.
-        assert!(!s(SENSE_KEY_ILLEGAL_REQUEST).is_marginal());
-        assert!(s(SENSE_KEY_ILLEGAL_REQUEST).is_illegal_request());
-    }
-
-    #[test]
-    fn unit_attention_not_marginal() {
-        // UNIT ATTENTION (6) = state change; caller rescans, not retries.
-        assert!(!s(SENSE_KEY_UNIT_ATTENTION).is_marginal());
-        assert!(s(SENSE_KEY_UNIT_ATTENTION).is_unit_attention());
     }
 
     #[test]

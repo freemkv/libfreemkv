@@ -551,14 +551,6 @@ mod tests {
         assert!(!starts_with_start_code(&[]));
     }
 
-    #[test]
-    fn three_byte_start_code_only_buffer_passes_through() {
-        // A buffer that is exactly a 3-byte start code prefix is passed through
-        // (the probe wins before length parsing).
-        let raw = [0x00, 0x00, 0x01, 0x40, 0x01];
-        assert_eq!(length_prefixed_to_annex_b(&raw), raw);
-    }
-
     // --- HevcMux: params-once + error semantics ---
 
     #[test]

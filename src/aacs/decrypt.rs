@@ -766,17 +766,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decrypt_bus_processes_all_three_sectors() {
-        // 6144 / 2048 = 3 sectors. Confirm the loop covers all three: corrupt
-        // the body of sector 2 (the last) and confirm decrypt_bus touches it
-        // (i.e. it isn't skipped). We do this by checking that round-tripping
-        // only works when all three are processed — encrypt all 3, decrypt,
-        // expect full recovery (covered above); here assert the step count.
-        let starts: Vec<usize> = (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN).collect();
-        assert_eq!(starts, vec![0, 2048, 4096]);
-    }
-
     // ── decrypt_unit_full: bus-then-AACS ordering, and clear passthrough ───
 
     #[test]

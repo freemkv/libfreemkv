@@ -226,17 +226,6 @@ mod tests {
     }
 
     #[test]
-    fn bd_exactly_four_bytes_dropped() {
-        // Exactly 4 bytes = header only: `len <= offset` (4 <= 4) → dropped.
-        let mut parser = LpcmParser::new();
-        assert!(
-            parser
-                .parse(&make_pes(vec![0x00, 0x01, 0x00, 0x91], Some(0)))
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn bd_three_bytes_dropped() {
         // Fewer than the 4-byte header → dropped, no panic / no underflow slice.
         let mut parser = LpcmParser::new();

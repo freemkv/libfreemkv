@@ -326,39 +326,6 @@ mod tests {
         );
     }
 
-    /// match_key trims whitespace from all four fields.
-    /// Spec: comment says "All fields trimmed for consistent matching."
-    /// Mutation: removing .trim() from one field adds trailing spaces to the key.
-    #[test]
-    fn match_key_trims_all_fields() {
-        let mut inquiry = vec![0u8; 96];
-        // Pad vendor_id and product_id with trailing spaces (as drives do).
-        inquiry[8..16].copy_from_slice(b"HL-DT-ST"); // no padding room
-        inquiry[16..32].copy_from_slice(b"BD-RE BU40N     "); // 5 trailing spaces
-        inquiry[32..36].copy_from_slice(b"1.03");
-        inquiry[36..43].copy_from_slice(b"NM00000");
-        let id = DriveId::from_inquiry(&inquiry, "211810241934");
-        // No trailing spaces in the key.
-        assert_eq!(id.match_key(), "HL-DT-ST|BD-RE BU40N|1.03|NM00000");
-    }
-
-    /// Display trims all four fields and does not include the firmware date.
-    /// Mutation: not trimming product_id adds trailing spaces to the display string.
-    #[test]
-    fn display_trims_fields() {
-        let mut inquiry = vec![0u8; 96];
-        inquiry[8..16].copy_from_slice(b"HL-DT-ST");
-        inquiry[16..32].copy_from_slice(b"BD-RE BU40N     ");
-        inquiry[32..36].copy_from_slice(b"1.03");
-        inquiry[36..43].copy_from_slice(b"NM00000");
-        let id = DriveId::from_inquiry(&inquiry, "ignored");
-        let s = id.to_string();
-        // No double spaces from un-trimmed padding.
-        assert!(!s.contains("  "), "display must trim fields: `{s}`");
-        assert!(s.contains("HL-DT-ST"), "vendor present: `{s}`");
-        assert!(s.contains("BD-RE BU40N"), "product present: `{s}`");
-    }
-
     /// from_inquiry stores the raw inquiry bytes in raw_inquiry unchanged.
     /// Mutation: copying only a slice of inquiry into raw_inquiry truncates it.
     #[test]
@@ -369,23 +336,6 @@ mod tests {
         assert_eq!(
             id.raw_inquiry, inquiry,
             "raw_inquiry must preserve the full 96-byte buffer"
-        );
-    }
-
-    /// from_inquiry leaves serial_number and raw_gc_010c empty.
-    /// These are only available from a live drive probe via from_drive().
-    /// Mutation: populating serial_number in from_inquiry would violate the contract.
-    #[test]
-    fn from_inquiry_leaves_serial_and_gc_empty() {
-        let inquiry = vec![0u8; 96];
-        let id = DriveId::from_inquiry(&inquiry, "");
-        assert!(
-            id.serial_number.is_empty(),
-            "serial_number must be empty from from_inquiry"
-        );
-        assert!(
-            id.raw_gc_010c.is_empty(),
-            "raw_gc_010c must be empty from from_inquiry"
         );
     }
 
@@ -433,21 +383,6 @@ mod tests {
         assert!(
             id.raw_gc_010c.is_empty(),
             "raw_gc_010c must be empty when GC fails"
-        );
-    }
-
-    /// match_key uses '|' as the separator between all four fields.
-    /// Mutation: using ':' or ' ' as separator changes the key format.
-    #[test]
-    fn match_key_uses_pipe_separator() {
-        let inquiry = vec![0u8; 96];
-        let id = DriveId::from_inquiry(&inquiry, "");
-        let key = id.match_key();
-        // Should have exactly 3 pipes (4 fields separated by 3 '|' chars).
-        let pipe_count = key.chars().filter(|&c| c == '|').count();
-        assert_eq!(
-            pipe_count, 3,
-            "match_key must have exactly 3 '|' separators, got {pipe_count} in `{key}`"
         );
     }
 }

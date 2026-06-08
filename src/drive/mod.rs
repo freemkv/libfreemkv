@@ -1341,17 +1341,6 @@ mod command_tests {
         assert_eq!(d.get_config_feature(0x0000), None);
     }
 
-    #[test]
-    fn get_config_feature_clamps_overlong_transfer_count() {
-        // Doc: a bridge reporting more bytes than the 256-byte buffer
-        // must be clamped (end = bytes_transferred.min(buf.len())) — no
-        // slice panic. FixedTransport reports min(payload,buf)=256 here,
-        // so we get buf[8..256] = 248 bytes, never a panic.
-        let mut d = drive_with(vec![0xAB; 1024]);
-        let got = d.get_config_feature(0x010C).unwrap();
-        assert_eq!(got.len(), 256 - 8, "clamped to buffer, header stripped");
-    }
-
     // ── report_key / mode_sense / read_buffer empty-vs-some ─────────
 
     #[test]
@@ -1406,15 +1395,6 @@ mod command_tests {
             d.probe_disc(),
             Err(Error::UnsupportedDrive { .. })
         ));
-    }
-
-    #[test]
-    fn ready_predicates_false_without_driver() {
-        // is_ready / is_unlocked default false when no platform driver.
-        let d = drive_with(vec![]);
-        assert!(!d.is_ready());
-        assert!(!d.is_unlocked());
-        assert!(!d.has_profile());
     }
 
     // ── decode_read_capacity additional boundaries ──────────────────

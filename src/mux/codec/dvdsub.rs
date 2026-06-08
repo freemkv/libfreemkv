@@ -632,27 +632,6 @@ mod tests {
     // --- YCbCr → RGB green channel + neutral chroma ---
 
     #[test]
-    fn ycbcr_green_channel_formula() {
-        // G = Y - 0.344*(Cb-128) - 0.714*(Cr-128). For pure-ish green choose
-        // Y=145, Cb=54, Cr=34: G should be high, R and B low. (Full-range BT.601
-        // per the module's deliberate convention.)
-        let [r, g, b] = ycbcr_to_rgb(&[0x00, 145, 54, 34]);
-        assert!(g > 200, "G high for green, got {g}");
-        assert!(r < 80, "R low for green, got {r}");
-        assert!(b < 80, "B low for green, got {b}");
-    }
-
-    #[test]
-    fn ycbcr_neutral_chroma_is_grey() {
-        // Cb=Cr=128 (neutral) → R=G=B=Y for any Y. (Confirms the chroma terms
-        // vanish at 128.)
-        for y in [0u8, 64, 128, 200, 255] {
-            let [r, g, b] = ycbcr_to_rgb(&[0x00, y, 128, 128]);
-            assert_eq!([r, g, b], [y, y, y], "neutral chroma → grey at Y={y}");
-        }
-    }
-
-    #[test]
     fn ycbcr_blue_channel_clamps_high() {
         // B = Y + 1.772*(Cb-128). Y=128, Cb=255 → 128 + 1.772*127 ≈ 353 → clamp 255.
         let [_r, _g, b] = ycbcr_to_rgb(&[0x00, 128, 255, 128]);

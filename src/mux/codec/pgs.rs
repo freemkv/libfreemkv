@@ -434,17 +434,6 @@ mod tests {
     // --- duration computation and clamping ---
 
     #[test]
-    fn duration_is_clear_minus_display() {
-        // BlockDuration = clear_pts - display_pts (in ns). display @ 90000 (1s),
-        // clear @ 450000 (5s) → duration 4s.
-        let mut parser = PgsParser::new();
-        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
-        let f = parser.parse(&make_pes(pcs_bytes(0), Some(450000)));
-        assert_eq!(f[0].pts_ns, 1_000_000_000);
-        assert_eq!(f[0].duration_ns, Some(4_000_000_000));
-    }
-
-    #[test]
     fn duration_clamps_to_zero_when_clear_precedes_display() {
         // A clear PTS earlier than the display PTS (corrupt/out-of-order stream)
         // must clamp duration to 0 via saturating_sub, never wrap to a huge u64.

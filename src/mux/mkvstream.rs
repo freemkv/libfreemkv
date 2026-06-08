@@ -1210,14 +1210,6 @@ mod tests {
     // 0x1100 + (tnum-2) formula).
     // ============================================================
 
-    #[test]
-    fn ts_pid_for_track_mid_range_formula() {
-        // tnum 10 → 0x1100 + 8 = 0x1108.
-        assert_eq!(ts_pid_for_track(10).unwrap(), 0x1108);
-        // tnum 0x100 → 0x1100 + 0xFE = 0x11FE.
-        assert_eq!(ts_pid_for_track(0x100).unwrap(), 0x11FE);
-    }
-
     // ============================================================
     // CLUSTER_TIMESTAMP overflow guard — a value above i64::MAX would cast
     // to a large negative i64 and poison every block PTS in the cluster.

@@ -232,16 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn write_seek_blanket_impl_covers_cursor() {
-        // WriteSeek is the MKV sink bound (Write + Seek). The blanket impl
-        // must opt in any T: Write+Seek; Cursor<Vec<u8>> is the canonical
-        // in-memory seekable sink. Compile-time proof via a generic fn.
-        fn assert_writeseek<T: super::super::WriteSeek>(_: &T) {}
-        let cur = std::io::Cursor::new(Vec::<u8>::new());
-        assert_writeseek(&cur);
-    }
-
-    #[test]
     fn first_matching_scheme_wins_no_double_prefix_confusion() {
         // A path component that itself looks like another scheme must be
         // treated as a path, not re-dispatched. iso://m2ts://x → Iso with

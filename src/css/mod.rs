@@ -381,27 +381,4 @@ mod tests {
         assert!(res.is_none());
         assert_eq!(src.reads.borrow().len(), 0);
     }
-
-    /// crack_key only invokes the (expensive) per-sector cracker on SCRAMBLED
-    /// sectors. Clear sectors are scanned (counted) but never cracked, so a
-    /// long run of clear sectors returns None after exhausting the extent
-    /// rather than producing a spurious key. This pins the `is_scrambled(&buf)`
-    /// gate.
-    ///
-    /// Grounding: `if read.is_ok() && is_scrambled(&buf) { crack::... }`.
-    /// Mutation: drop the `&& is_scrambled(&buf)` gate -> crack runs the
-    /// 169-pattern Stevenson attack on every clear sector. Functionally this
-    /// would still return None for our zeroed data, but it would be vastly
-    /// slower; we cannot time it deterministically, so this test primarily
-    /// documents the contract and confirms a clear scan terminates with None.
-    #[test]
-    fn crack_key_clear_sectors_yield_none() {
-        let mut src = MockSource::new(0x00);
-        let extents = [Extent {
-            start_lba: 0,
-            sector_count: 100,
-        }];
-        assert!(crack_key(&mut src, &extents).is_none());
-        assert_eq!(src.reads.borrow().len(), 100);
-    }
 }

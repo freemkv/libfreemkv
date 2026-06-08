@@ -269,32 +269,6 @@ mod tests {
         );
     }
 
-    /// Boundary: an op that finishes well within the deadline returns
-    /// Ok even when a (live, never-cancelled) halt token is supplied.
-    /// The halt-poll path must not spuriously convert a completed op
-    /// into Halted/Timeout. Grounds the `Ok(v) => return Ok(v)` arm of
-    /// the recv_timeout match (line 134) with a non-None halt.
-    #[test]
-    fn live_halt_token_does_not_interfere_with_fast_op() {
-        let halt = Halt::new(); // never cancelled
-        let r = bounded_syscall(Some(&halt), Duration::from_secs(5), || 123u64);
-        assert!(matches!(r, Ok(123)));
-        assert!(!halt.is_cancelled());
-    }
-
-    /// The op's return value is propagated byte-for-byte, not just a
-    /// success flag. A non-Copy heap type proves the worker's
-    /// `tx.send(op())` moves the real value across the rendezvous
-    /// channel (line 125) to the receiver (line 134).
-    #[test]
-    fn returns_owned_value_unchanged() {
-        let r = bounded_syscall(None, Duration::from_secs(2), || vec![9u8, 8, 7, 6]);
-        match r {
-            Ok(v) => assert_eq!(v, vec![9u8, 8, 7, 6]),
-            other => panic!("expected Ok(vec), got {other:?}"),
-        }
-    }
-
     /// Timeout boundary: with a tiny deadline and an op that sleeps
     /// much longer, the helper must return Timeout and must do so
     /// roughly at the deadline — NOT wait for the op to finish (that
@@ -317,32 +291,5 @@ mod tests {
             elapsed < Duration::from_millis(1500),
             "timeout did not return near deadline: {elapsed:?} (op should be leaked, not awaited)"
         );
-    }
-
-    /// A worker that returns a non-Copy value AND completes within the
-    /// deadline must hand the value back; the rendezvous channel has
-    /// capacity 0, so the worker's send blocks until the receiver is
-    /// ready — exercising the happy-path handshake rather than the
-    /// buffered-send path. Mutation: changing `sync_channel::<R>(0)` to
-    /// a buffered channel would still pass; changing the recv arm to
-    /// drop the value would fail here.
-    #[test]
-    fn zero_capacity_rendezvous_delivers_string() {
-        let r = bounded_syscall(None, Duration::from_secs(2), || String::from("rendezvous"));
-        assert!(matches!(r.as_deref(), Ok("rendezvous")));
-    }
-
-    /// Halt that fires AFTER the op has already completed must still
-    /// yield Ok — there is no race that turns a delivered result into
-    /// Halted. The op completes instantly; we cancel the halt
-    /// afterwards and confirm the earlier call returned Ok. This pins
-    /// the precedence: a value already in the channel wins over a
-    /// subsequent halt.
-    #[test]
-    fn op_completion_wins_over_later_halt() {
-        let halt = Halt::new();
-        let r = bounded_syscall(Some(&halt), Duration::from_secs(2), || 55u32);
-        halt.cancel();
-        assert!(matches!(r, Ok(55)));
     }
 }

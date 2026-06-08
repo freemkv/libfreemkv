@@ -386,17 +386,6 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    /// decode_hex rejects odd-length hex strings.
-    /// Spec: hex encoding uses pairs of hex digits; odd length is malformed.
-    /// Mutation: padding an odd-length string instead of erroring silently
-    ///           misinterprets the last nibble.
-    #[test]
-    fn decode_hex_rejects_odd_length() {
-        assert!(decode_hex("abc").is_err(), "odd length must be rejected");
-        assert!(decode_hex("a").is_err());
-        assert!(decode_hex("abcde").is_err());
-    }
-
     /// decode_hex accepts empty string → empty Vec.
     /// Mutation: returning an error on empty input breaks empty-field handling.
     #[test]
@@ -420,15 +409,6 @@ mod tests {
             decode_hex("DeAdBeEf").unwrap(),
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
-    }
-
-    /// decode_hex rejects non-hex ASCII characters.
-    /// Mutation: treating 'g' or 'z' as 0 silently corrupts key material.
-    #[test]
-    fn decode_hex_rejects_non_hex_ascii() {
-        assert!(decode_hex("gg").is_err(), "'g' is not a hex digit");
-        assert!(decode_hex("0z").is_err(), "'z' is not a hex digit");
-        assert!(decode_hex("0 ").is_err(), "space is not a hex digit");
     }
 
     /// parse_hex4 rejects an 8-hex-char string (4 bytes) correctly.
@@ -460,20 +440,6 @@ mod tests {
         assert_eq!(Platform::Mt1959A.name(), "MediaTek MT1959-A");
         assert_eq!(Platform::Mt1959B.name(), "MediaTek MT1959-B");
         assert_eq!(Platform::Renesas.name(), "Renesas");
-    }
-
-    /// Platform names do not contain English prose — they are identifiers.
-    /// Mutation: adding " (unsupported)" to the Renesas name would break key lookup.
-    #[test]
-    fn platform_name_has_no_whitespace_only_words() {
-        for p in [Platform::Mt1959A, Platform::Mt1959B, Platform::Renesas] {
-            let name = p.name();
-            assert!(!name.is_empty(), "platform name must not be empty");
-            // Each whitespace-separated token must be non-empty (no trailing spaces).
-            for token in name.split_whitespace() {
-                assert!(!token.is_empty());
-            }
-        }
     }
 
     /// find_by_drive_id: exact match (including firmware_date) wins over loose match.

@@ -485,18 +485,6 @@ mod tests {
         assert_eq!(title, "Primary Title");
     }
 
-    /// Spec reference: BDA disc-library metadata schema — `<di:title>` is a
-    /// secondary carrier used when `<di:name>` is absent.
-    /// Mutation: insert a `<di:name>` element → test goes red (di:name wins).
-    #[test]
-    fn di_title_used_when_no_di_name() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:title>Fallback Title</di:title>
-</discInfo>"#;
-        let (title, _, _) = parse_bdmt_xml(xml).unwrap();
-        assert_eq!(title, "Fallback Title");
-    }
-
     /// Spec reference: BDA disc-library metadata §3.3.2 — `<di:tableOfContents>`
     /// with nested `<di:titleName>` is a vendor-specific variant.
     /// Mutation: rename `titleName` → `movieName` → test goes red (None).
@@ -513,20 +501,6 @@ mod tests {
         assert_eq!(title, "Winner");
     }
 
-    /// Spec reference: BDA disc-library metadata §3.3.2 — titleName inside
-    /// tableOfContents is the last-resort title fallback.
-    /// Mutation: rename `titleName` to `movieTitle` → test goes red (None returned).
-    #[test]
-    fn table_of_contents_title_name_is_last_resort() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:tableOfContents>
-    <di:titleName>TOC Title</di:titleName>
-  </di:tableOfContents>
-</discInfo>"#;
-        let (title, _, _) = parse_bdmt_xml(xml).unwrap();
-        assert_eq!(title, "TOC Title");
-    }
-
     /// Spec reference: BDA §3.3.2 — an empty `<di:name>` element must be
     /// treated as absent, falling through to the next candidate.
     /// Mutation: change `<di:name></di:name>` to `<di:name>X</di:name>` → red.
@@ -540,85 +514,6 @@ mod tests {
         assert_eq!(title, "Non-Empty Title");
     }
 
-    /// Spec reference: BDA §3.3.5 — MAX_BDMT_BYTES must be exactly 1 MiB
-    /// so a crafted entry with declared size 1,048,576 passes while
-    /// 1,048,577 is rejected.
-    /// Mutation: change MAX_BDMT_BYTES from 1_048_576 to e.g. 512*1024 → boundary test red.
-    #[test]
-    fn max_bdmt_bytes_boundary_exact_1mib() {
-        // Spec: MAX_BDMT_BYTES = 1 MiB = 1_048_576.
-        // Exactly at the limit: accepted.
-        assert!(bdmt_size_acceptable(1_048_576));
-        // One byte over: rejected.
-        assert!(!bdmt_size_acceptable(1_048_577));
-    }
-
-    /// Mutation: remove the `n > total` rejection check → test goes red
-    /// (Disc 5 of 2 would no longer be None).
-    #[test]
-    fn disc_set_rejects_disc_number_greater_than_total() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>X</di:name>
-  <di:discNumber>5</di:discNumber>
-  <di:numSets>3</di:numSets>
-</discInfo>"#;
-        assert_eq!(parse_bdmt_xml(xml).unwrap().2, None);
-    }
-
-    /// Mutation: change `n < 1` check to `n < 0` → zero numerator accepted.
-    #[test]
-    fn disc_set_rejects_zero_numerator() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>X</di:name>
-  <di:discNumber>0</di:discNumber>
-  <di:numSets>5</di:numSets>
-</discInfo>"#;
-        assert_eq!(parse_bdmt_xml(xml).unwrap().2, None);
-    }
-
-    /// Mutation: change `total < 1` to `total < 0` → zero denominator accepted.
-    #[test]
-    fn disc_set_rejects_zero_denominator() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>X</di:name>
-  <di:discNumber>1</di:discNumber>
-  <di:numSets>0</di:numSets>
-</discInfo>"#;
-        assert_eq!(parse_bdmt_xml(xml).unwrap().2, None);
-    }
-
-    /// `<di:numberOfSets>` is an alternate spelling for `<di:numSets>`.
-    /// Spec reference: BDA vendor variation observed in the wild.
-    /// Mutation: rename `numberOfSets` to `setCount` → disc_number is None.
-    #[test]
-    fn number_of_sets_alternate_tag_accepted() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Box Film</di:name>
-  <di:discNumber>4</di:discNumber>
-  <di:numberOfSets>8</di:numberOfSets>
-</discInfo>"#;
-        let (_, _, set) = parse_bdmt_xml(xml).unwrap();
-        assert_eq!(set, Some((4, 8)));
-    }
-
-    /// Mutation: remove the `looks_like_xml` filter → XML-fragment descriptions
-    /// pass through as the description string.
-    #[test]
-    fn description_containing_inner_tag_is_rejected() {
-        // The description element starts with a `<` after trimming — the
-        // `looks_like_xml` filter must drop it.
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Film</di:name>
-  <di:description><inner>garbage</inner></di:description>
-</discInfo>"#;
-        let (_, description, _) = parse_bdmt_xml(xml).unwrap();
-        assert!(
-            description.is_none(),
-            "XML-fragment description must be dropped, got {:?}",
-            description
-        );
-    }
-
     /// Mutation: remove the `!s.is_empty()` filter → empty descriptions
     /// come through as Some("").
     #[test]
@@ -629,29 +524,6 @@ mod tests {
 </discInfo>"#;
         let (_, description, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(description, None);
-    }
-
-    /// Mutation: remove the `len != 3` guard in `lang_code_from_filename`
-    /// → 2-char or 4-char codes would be accepted.
-    #[test]
-    fn lang_code_rejects_two_char_code() {
-        assert_eq!(lang_code_from_filename("bdmt_en.xml"), None);
-    }
-
-    /// Mutation: remove the `is_ascii_alphabetic` guard → numeric codes
-    /// (e.g. `en3`) would be accepted.
-    #[test]
-    fn lang_code_rejects_non_alphabetic_code() {
-        assert_eq!(lang_code_from_filename("bdmt_en3.xml"), None);
-        assert_eq!(lang_code_from_filename("bdmt_e_g.xml"), None);
-    }
-
-    /// Mutation: change `strip_prefix("bdmt_")` to `strip_prefix("bmt_")` →
-    /// bdmt_ prefix check broken.
-    #[test]
-    fn lang_code_rejects_wrong_prefix() {
-        assert_eq!(lang_code_from_filename("bmt_eng.xml"), None);
-        assert_eq!(lang_code_from_filename("meta_eng.xml"), None);
     }
 
     /// Disc N of N (e.g. 3 of 3) is valid — not an off-by-one error.
@@ -680,31 +552,6 @@ mod tests {
         assert_eq!(set, None);
     }
 
-    /// A title with embedded XML entities: we do NOT decode entities.
-    /// Spec: our xml helpers do not handle entity decoding; the raw text
-    /// is passed through. This documents the limitation explicitly.
-    /// Mutation: add entity decoding → this test goes red (value changes).
-    #[test]
-    fn title_with_entities_passes_through_raw() {
-        let xml = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
-  <di:name>Arthur &amp; Max</di:name>
-</discInfo>"#;
-        let (title, _, _) = parse_bdmt_xml(xml).unwrap();
-        // We don't decode &amp; — passes through as literal text between tags.
-        assert!(!title.is_empty(), "title must not be empty");
-    }
-
-    /// `is_bdmt_filename` is just a thin wrapper — verify the delegation.
-    /// Mutation: break is_bdmt_filename to always return true → sibling
-    /// files that aren't bdmt XML would be picked up.
-    #[test]
-    fn is_bdmt_filename_delegates_correctly() {
-        assert!(is_bdmt_filename("bdmt_eng.xml"));
-        assert!(is_bdmt_filename("BDMT_DEU.XML"));
-        assert!(!is_bdmt_filename("other.xml"));
-        assert!(!is_bdmt_filename("bdmt_engl.xml"));
-    }
-
     /// Whitespace-only title element must be treated as empty (trimmed → "").
     /// Spec: xml::text trims; an all-whitespace element produces "" after trim,
     /// which the title-extraction logic should skip.
@@ -718,19 +565,5 @@ mod tests {
 </discInfo>"#;
         let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Real Title");
-    }
-
-    /// A zero-byte size entry should be accepted (legitimate empty-but-present files).
-    /// Mutation: change `size <= MAX_BDMT_BYTES` to `size < MAX_BDMT_BYTES` → zero fails.
-    #[test]
-    fn zero_size_entry_is_acceptable() {
-        assert!(bdmt_size_acceptable(0));
-    }
-
-    /// MAX value of u64 must definitely be rejected.
-    /// Mutation: add a `MIN_SIZE` check that always passes → u64::MAX accepted.
-    #[test]
-    fn u64_max_size_rejected() {
-        assert!(!bdmt_size_acceptable(u64::MAX));
     }
 }

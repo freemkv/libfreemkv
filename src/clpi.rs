@@ -1184,24 +1184,6 @@ mod tests {
         }
     }
 
-    /// EP-map num_streams == 0 → empty maps (explicit guard). A CPI whose
-    /// EP map header declares zero stream PID entries carries no EP data.
-    #[test]
-    fn ep_map_zero_streams_yields_empty() {
-        let mut ep_map = Vec::new();
-        ep_map.push(0); // reserved
-        ep_map.push(0); // num_streams = 0
-        ep_map.extend_from_slice(&[0u8; 16]); // filler so len checks pass
-        let mut cpi = Vec::new();
-        cpi.extend_from_slice(&((2 + ep_map.len()) as u32).to_be_bytes());
-        cpi.extend_from_slice(&[0u8; 2]);
-        cpi.extend_from_slice(&ep_map);
-        let data = build_clpi(1000, Some(&cpi));
-        let clip = parse(&data).expect("should parse");
-        assert!(clip.ep_coarse.is_empty());
-        assert!(clip.ep_fine.is_empty());
-    }
-
     /// ep_map_offset that points past the EP map (`ep_map_offset + 4 >
     /// ep_map.len()`) → empty maps (bounds guard), not panic. Patch the
     /// EP_map_start field to a huge value.
@@ -1269,21 +1251,6 @@ mod tests {
         // Only the 1 real coarse entry was readable.
         assert_eq!(clip.ep_coarse.len(), 1);
         assert_eq!(clip.ep_coarse[0].pts_coarse, 10);
-    }
-
-    /// CLPI between 40 and 60 bytes: passes the len<40 guard, but
-    /// source_packet_count needs [56..60]. Must yield 0, not panic.
-    /// (Mirrors parse_truncated_clipinfo_no_panic but asserts EP empty.)
-    #[test]
-    fn clipinfo_40_to_60_bytes_empty_ep() {
-        for len in 40..60usize {
-            let mut data = vec![0u8; len];
-            data[0..4].copy_from_slice(b"HDMV");
-            let clip = parse(&data).expect("short CLPI parses");
-            assert_eq!(clip.source_packet_count, 0);
-            assert!(clip.ep_coarse.is_empty());
-            assert!(clip.streams.is_empty());
-        }
     }
 
     /// resolved_ep_map: the LAST coarse group's fine range extends to

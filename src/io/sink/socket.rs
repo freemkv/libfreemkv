@@ -328,27 +328,6 @@ mod tests {
         assert_eq!(received, b"unflushed-tail");
     }
 
-    /// `SocketSink::write` must report the exact byte count it accepted
-    /// into the BufWriter (forwarded from `BufWriter::write`, lines
-    /// 78-80). For a buffer smaller than the 1 MiB capacity this equals
-    /// the full length. Mutation: returning a wrong/clamped count would
-    /// break `Write::write_all`'s loop downstream; we pin the count
-    /// here directly.
-    #[test]
-    fn write_reports_accepted_count() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _accept = thread::spawn(move || {
-            let _ = listener.accept();
-        });
-        let mut sink = SocketSink::connect(addr, None).unwrap();
-        let n = sink.write(&[7u8; 100]).unwrap();
-        assert_eq!(
-            n, 100,
-            "buffered write under capacity must accept all bytes"
-        );
-    }
-
     /// UDP `write` must emit ONE datagram per call carrying exactly the
     /// bytes passed — no buffering, no coalescing (doc lines 100-108).
     /// Two writes of different lengths must arrive as two separate

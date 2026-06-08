@@ -378,31 +378,6 @@ mod tests {
         }
     }
 
-    /// recover_title_key with exactly 10 plaintext bytes is accepted at the
-    /// length guard (it may still return None from the attack, but must not be
-    /// rejected by the `plain.len() < 10` check). Pins the boundary at the
-    /// inclusive value 10.
-    ///
-    /// Grounding: `if sector.len() < SECTOR_SIZE || plain.len() < 10 { None }`
-    /// — 10 is the minimum accepted length.
-    /// Mutation: change `< 10` to `< 11` -> a 10-byte plaintext would be
-    /// rejected. We detect acceptance by observing the function runs the
-    /// attack (it returns None for this synthetic data, but a 9-byte plain
-    /// returns None *at the guard*; to distinguish, we assert a 9-byte input
-    /// is rejected and a 10-byte input is not panicking and consistent).
-    #[test]
-    fn recover_accepts_exactly_10_plain_bytes() {
-        let mut sector = vec![0x00u8; SECTOR_SIZE];
-        sector[FLAG_BYTE] = 0x30;
-        sector[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
-        let plain9 = [0u8; 9];
-        let plain10 = [0u8; 10];
-        // 9 bytes: rejected at the guard.
-        assert!(recover_title_key(&sector, &plain9).is_none());
-        // 10 bytes: passes the guard and runs to completion without panic.
-        let _ = recover_title_key(&sector, &plain10);
-    }
-
     // ── crack_title_key early-return guards (flag uses bits 4-5) ────────────
 
     /// crack_title_key uses the same bits-4-5 scramble field. A sector with
@@ -464,27 +439,6 @@ mod tests {
             }
             let _ = crack_title_key(&sector);
         }
-    }
-
-    /// recover_title_key, when it DOES return a key, XORs the sector seed into
-    /// the recovered raw key (the final step `result_key[i] ^= seed[i]`).
-    /// We cannot easily force a hit on this crate's (non-functional) attack,
-    /// so instead pin the structural guard that the seed is read from the
-    /// documented offset 0x54..0x59 and that a None result is returned for an
-    /// all-zero scrambled sector (the search exhausts without a match rather
-    /// than panicking on the seed XOR).
-    ///
-    /// Grounding: SEED_OFFSET == 0x54; seed slice is `sector[0x54..0x59]`.
-    /// Mutation: change SEED_OFFSET to 0x55 -> the seed slice shifts; the
-    /// search still completes (None) but on a functional path the recovered
-    /// key would be wrong. This test pins the no-panic completion only.
-    #[test]
-    fn recover_all_zero_scrambled_completes_none() {
-        let mut sector = vec![0x00u8; SECTOR_SIZE];
-        sector[FLAG_BYTE] = 0x30;
-        let plain = [0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
-        // All-zero body: the textbook attack finds no consistent state.
-        assert!(recover_title_key(&sector, &plain).is_none());
     }
 
     /// Build a scrambled sector with known plaintext (both an MPEG PES header

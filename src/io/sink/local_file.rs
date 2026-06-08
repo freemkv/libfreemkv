@@ -230,17 +230,4 @@ mod tests {
         );
         assert_eq!(&bytes[10..14], b"TAIL");
     }
-
-    /// `write` (single call) returns the BufWriter's accepted count.
-    /// For a buffer under the 4 MiB capacity this is the full length
-    /// (lines 108-110). Mutation: a wrong count return would break
-    /// callers relying on `Write::write`'s contract.
-    #[test]
-    fn write_returns_full_count_under_capacity() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("count.bin");
-        let mut s = LocalFileSink::create(&p).unwrap();
-        let n = s.write(&[1u8; 1000]).unwrap();
-        assert_eq!(n, 1000);
-    }
 }

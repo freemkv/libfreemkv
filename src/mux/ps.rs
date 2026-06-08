@@ -889,21 +889,6 @@ mod tests {
         assert_eq!(parse_pts(&encode_pts(max, 0x20)), max);
     }
 
-    #[test]
-    fn parse_pts_ignores_marker_bits_in_value() {
-        // The marker bits (LSB of bytes 0,2,4) are NOT part of the 33-bit
-        // value. Two encodings differing only in marker bits decode equal.
-        let v = 0x1_2345_6789u64 & ((1 << 33) - 1);
-        let a = encode_pts(v, 0x20);
-        let mut b = a;
-        // markers are already 1; the value bits must dominate regardless.
-        b[0] |= 0x01;
-        b[2] |= 0x01;
-        b[4] |= 0x01;
-        assert_eq!(parse_pts(&a), v);
-        assert_eq!(parse_pts(&b), v);
-    }
-
     // ── pack header (0xBA) framing ────────────────────────────────────────
 
     #[test]
@@ -1149,14 +1134,6 @@ mod tests {
             flushed.is_empty(),
             "incomplete bounded PES must not be emitted on flush"
         );
-    }
-
-    #[test]
-    fn empty_feed_then_flush_is_empty() {
-        // No input at all → nothing to emit, no panic.
-        let mut demuxer = PsDemuxer::new();
-        assert!(demuxer.feed(&[]).is_empty());
-        assert!(demuxer.flush().is_empty());
     }
 
     #[test]

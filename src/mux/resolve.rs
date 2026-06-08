@@ -700,13 +700,6 @@ mod tests {
         );
     }
 
-    /// output() to null:// must succeed (it's the canonical write sink).
-    #[test]
-    fn output_null_succeeds() {
-        let t = DiscTitle::empty();
-        assert!(output("null://", &t).is_ok());
-    }
-
     /// output() to an unknown scheme must surface StreamUrlInvalid
     /// (E9002 → InvalidInput).
     #[test]
@@ -963,24 +956,5 @@ mod tests {
             None,
         );
         assert!(res.is_err(), "zero batch_sectors must be rejected");
-    }
-
-    /// info() on the assembled pipeline returns the title it was built with —
-    /// the consumer reads stream layout from here before muxing.
-    #[test]
-    fn build_iso_pipeline_info_returns_title() {
-        let mut title = aac_audio_title(0x1100);
-        title.playlist = "PipelineTitle".into();
-        let stream = build_iso_pipeline(
-            MemSource { data: Vec::new() },
-            title,
-            DecryptKeys::None,
-            8192,
-            ContentFormat::BdTs,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(stream.info().playlist, "PipelineTitle");
     }
 }

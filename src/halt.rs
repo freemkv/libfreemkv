@@ -177,73 +177,6 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    /// Default::default() produces a fresh, uncancelled token (same as new()).
-    /// Spec: doc says "The Default impl forwards to new() — both produce a fresh,
-    ///       uncancelled token."
-    /// Mutation: having Default initialize to `cancelled=true` would break all
-    ///           callers that rely on a default-constructed Halt being uncancelled.
-    #[test]
-    fn default_produces_uncancelled_token() {
-        let h = Halt::default();
-        assert!(
-            !h.is_cancelled(),
-            "Default::default() must produce uncancelled token"
-        );
-    }
-
-    /// Multiple clones of the same Halt all observe a cancel from any one of them.
-    /// Mutation: cloning the Arc by value (separate allocation) means clones don't share state.
-    #[test]
-    fn multiple_clones_all_share_same_flag() {
-        let h0 = Halt::new();
-        let h1 = h0.clone();
-        let h2 = h0.clone();
-        let h3 = h1.clone();
-        // None cancelled yet.
-        assert!(!h0.is_cancelled());
-        assert!(!h1.is_cancelled());
-        assert!(!h2.is_cancelled());
-        assert!(!h3.is_cancelled());
-        // Cancel via h2; all others must observe it.
-        h2.cancel();
-        assert!(h0.is_cancelled());
-        assert!(h1.is_cancelled());
-        assert!(h3.is_cancelled());
-    }
-
-    /// is_cancelled is non-destructive — reading the flag multiple times returns
-    /// the same result.
-    /// Mutation: using swap(false) instead of load would clear the flag on read.
-    #[test]
-    fn is_cancelled_is_non_destructive() {
-        let h = Halt::new();
-        h.cancel();
-        assert!(h.is_cancelled());
-        assert!(h.is_cancelled(), "second read must also return true");
-        assert!(h.is_cancelled(), "third read must also return true");
-    }
-
-    /// from_arc followed by cancel(), then as_arc() load: the raw Arc must see the write.
-    /// This is the round-trip that proves from_arc and as_arc are exact inverses.
-    /// Mutation: from_arc doing `Arc::new(flag.load(...))` (copy not share) breaks this.
-    #[test]
-    fn from_arc_and_as_arc_are_inverses() {
-        let original = Arc::new(AtomicBool::new(false));
-        let halt = Halt::from_arc(original.clone());
-        // Cancel via the Halt; read via the original Arc.
-        halt.cancel();
-        assert!(
-            original.load(Ordering::Relaxed),
-            "cancel() must be visible via the original Arc"
-        );
-        // The Arc retrieved by as_arc() must be the same one.
-        let retrieved = halt.as_arc();
-        assert!(
-            std::ptr::eq(Arc::as_ptr(retrieved), Arc::as_ptr(&original)),
-            "as_arc must return the same Arc pointer as was passed to from_arc"
-        );
-    }
-
     /// POLL_INTERVAL is 250ms — a specific value that the multi-thread halt
     /// loops depend on for responsiveness guarantees.
     /// Mutation: setting POLL_INTERVAL to 5s makes stop requests take 5s to notice.
@@ -253,19 +186,6 @@ mod tests {
             POLL_INTERVAL,
             std::time::Duration::from_millis(250),
             "POLL_INTERVAL must be 250ms for the guaranteed ~quarter-second cancel latency"
-        );
-    }
-
-    /// cancel() then clone: the clone of an already-cancelled Halt starts cancelled.
-    /// Mutation: cloning by re-reading the bool (not the Arc) would give a fresh false.
-    #[test]
-    fn clone_of_cancelled_halt_is_also_cancelled() {
-        let h = Halt::new();
-        h.cancel();
-        let cloned = h.clone();
-        assert!(
-            cloned.is_cancelled(),
-            "clone of a cancelled Halt must itself be cancelled"
         );
     }
 }

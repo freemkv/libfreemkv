@@ -87,30 +87,4 @@ mod tests {
         // size, track index, or post-finish state.
         sink.write(&frame).unwrap();
     }
-
-    /// info() must return the title the sink was constructed with, unchanged
-    /// — the Stream trait contract requires info() be stable and reflect the
-    /// supplied metadata (the muxer reads stream layout from it).
-    #[test]
-    fn info_reflects_constructed_title() {
-        let mut title = DiscTitle::empty();
-        title.playlist = "BenchTitle".into();
-        title.playlist_id = 7;
-        let sink = NullStream::new(&title);
-        assert_eq!(sink.info().playlist, "BenchTitle");
-        assert_eq!(sink.info().playlist_id, 7);
-    }
-
-    /// The write-only read() guard must hold on EVERY call, not just the
-    /// first — a caller that retries read() after the initial error must
-    /// keep getting StreamWriteOnly, never a stale Ok(None).
-    #[test]
-    fn read_stays_write_only_across_repeated_calls() {
-        let title = DiscTitle::empty();
-        let mut sink = NullStream::new(&title);
-        for _ in 0..3 {
-            let err = Stream::read(&mut sink).expect_err("read on a sink must always error");
-            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        }
-    }
 }

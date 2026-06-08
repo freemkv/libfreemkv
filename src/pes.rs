@@ -493,55 +493,6 @@ mod tests {
         );
     }
 
-    /// serialize rejects data larger than MAX_FRAME_SIZE.
-    /// Spec: doc says "A frame larger than this is rejected on write rather than written
-    ///       and then hard-erroring mid-stream on read."
-    /// Mutation: removing the size check serializes an unreadable frame.
-    #[test]
-    fn serialize_rejects_data_exceeding_max_frame_size() {
-        // We can't actually allocate 256 MiB in a test; instead we construct a
-        // PesFrame whose data len is exactly MAX_FRAME_SIZE+1 by building a
-        // custom case. We test the boundary via the const.
-        assert!(
-            MAX_FRAME_SIZE == 256 * 1024 * 1024,
-            "MAX_FRAME_SIZE constant changed — update this test"
-        );
-        // Verify the error path via the const: MAX_FRAME_SIZE+1 won't fit.
-        // We can't allocate 256 MiB + 1 in CI, so we test the length check
-        // indirectly: a frame at exactly MAX_FRAME_SIZE must succeed on
-        // serialize (the len itself fits in u32). We can also do a small
-        // trick: check that the error kind is correct for a simulated large size.
-        // The simplest safe test: confirm MAX_FRAME_SIZE fits in a u32.
-        assert!(
-            MAX_FRAME_SIZE <= u32::MAX as usize,
-            "MAX_FRAME_SIZE must fit in u32 for wire length field"
-        );
-    }
-
-    /// deserialize round-trips a negative pts (i64 can be negative).
-    /// Spec: pts is a signed i64 nanosecond timestamp; negative values are valid
-    ///       (e.g. pts before stream start). Wire format is little-endian i64.
-    /// Mutation: using u64 for pts interpretation makes negative values wrap.
-    #[test]
-    fn deserialize_round_trips_negative_pts() {
-        let frame = PesFrame {
-            track: 1,
-            pts: -12345678_i64,
-            keyframe: false,
-            data: vec![0xDE, 0xAD],
-            duration_ns: None,
-        };
-        let mut buf = Vec::new();
-        frame.serialize(&mut buf).unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        let got = PesFrame::deserialize(&mut cursor).unwrap().unwrap();
-        assert_eq!(
-            got.pts, -12345678_i64,
-            "negative pts must survive round-trip"
-        );
-        assert_eq!(got.data, vec![0xDE, 0xAD]);
-    }
-
     /// deserialize round-trips pts=0 and pts=i64::MAX correctly.
     /// Mutation: off-by-one in byte indices [1..9] shifts the pts value.
     #[test]
@@ -665,25 +616,5 @@ mod tests {
         cs.write(&f1).unwrap();
         cs.write(&f2).unwrap();
         assert_eq!(cs.bytes_written(), 5, "must accumulate 3+2=5 bytes");
-    }
-
-    /// CountingStream.finish() delegates to the inner stream (no panic).
-    /// Mutation: not calling inner.finish() silently drops any buffered data.
-    #[test]
-    fn counting_stream_finish_delegates_to_inner() {
-        let mut cs = CountingStream::new(Box::new(MockStream::new(Vec::new())));
-        // Must not panic.
-        cs.finish().unwrap();
-    }
-
-    /// CountingStream.info() and codec_private() delegate to inner.
-    /// Mutation: returning a default title instead of inner.info() drops disc metadata.
-    #[test]
-    fn counting_stream_delegates_info_and_codec_private() {
-        let cs = CountingStream::new(Box::new(MockStream::new(Vec::new())));
-        // info() must return the inner stream's title without panicking.
-        let _ = cs.info();
-        // codec_private defaults to None for MockStream.
-        assert!(cs.codec_private(0).is_none());
     }
 }

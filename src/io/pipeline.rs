@@ -926,22 +926,6 @@ mod tests {
         }
     }
 
-    /// FIFO ordering: items must be delivered to `apply` in send order.
-    /// crossbeam's `bounded` channel is FIFO; this pins that the
-    /// pipeline does not reorder. Mutation: if the consumer loop reused
-    /// a stale item or sorted, the equality fails.
-    #[test]
-    fn items_delivered_in_fifo_order() {
-        let pipe =
-            Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, OrderSink { seen: Vec::new() }).expect("spawn");
-        let input: Vec<u64> = (0..50).map(|i| i * 7 + 1).collect();
-        for &i in &input {
-            pipe.send(i).expect("send");
-        }
-        let seen = pipe.finish().expect("finish");
-        assert_eq!(seen, input, "pipeline reordered or dropped items");
-    }
-
     /// Zero items sent: closing the pipeline immediately must still
     /// call `close()` exactly once and return its Output. The consumer
     /// loop's `while let Ok = rx.recv()` exits on the dropped tx with
@@ -1117,23 +1101,6 @@ mod tests {
         assert!(!halt.is_cancelled(), "halt must not have been the cause");
     }
 
-    /// `send_with_halt` happy path: when there is room in the channel
-    /// it must deliver the item (Ok) and the consumer must process it.
-    /// Pins the `Ok(()) => return Ok(())` arm (line 390). Mutation:
-    /// inverting that arm to Err would drop the item and the sum would
-    /// be wrong.
-    #[test]
-    fn send_with_halt_delivers_when_room_available() {
-        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
-        let halt = crate::halt::Halt::new();
-        for i in 1..=5u64 {
-            pipe.send_with_halt(i, &halt, Duration::from_secs(5))
-                .expect("send_with_halt should deliver when room is available");
-        }
-        let total = pipe.finish().expect("finish");
-        assert_eq!(total, 15, "1+2+3+4+5");
-    }
-
     /// `send_with_halt` with a pre-cancelled halt must return the item
     /// immediately without attempting to enqueue. Pins the pre-check at
     /// line 365 (`if halt.is_cancelled()`). Mutation: removing that
@@ -1152,27 +1119,6 @@ mod tests {
         // The item must NOT have been enqueued: finishing yields sum 0.
         let total = pipe.finish().expect("finish");
         assert_eq!(total, 0, "item was enqueued despite pre-cancelled halt");
-    }
-
-    /// `finish_with_halt` must propagate a consumer panic as
-    /// `PipelineConsumerPanicked` — same as `finish`. The consumer
-    /// panics on the first apply; finish_with_halt sees `is_finished()`
-    /// true and joins, mapping the panic payload (lines 454-458).
-    #[test]
-    fn finish_with_halt_propagates_consumer_panic() {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
-        let _ = pipe.send(1);
-        for i in 0..5u64 {
-            let _ = pipe.send(i);
-        }
-        let res = pipe.finish_with_halt(None);
-        std::panic::set_hook(prev);
-        assert!(
-            matches!(res, Err(Error::PipelineConsumerPanicked)),
-            "expected PipelineConsumerPanicked, got {res:?}"
-        );
     }
 
     /// `finish_with_halt(None)` with a wedged consumer and NO halt

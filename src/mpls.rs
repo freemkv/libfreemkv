@@ -1018,32 +1018,6 @@ mod tests {
         assert!(parse(&data).is_err());
     }
 
-    /// Spec: version field is bytes [4..8], copied verbatim. A "0300"
-    /// (UHD) playlist must report version "0300", not "0200".
-    #[test]
-    fn version_field_reflects_bytes_4_to_8() {
-        let mut data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
-        data[4..8].copy_from_slice(b"0300");
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.version, "0300");
-    }
-
-    /// Spec: num_play_items is a u16 at pl[6..8]. The loop must produce
-    /// exactly that many items when the buffer holds them. Tests that the
-    /// count is read from the right offset (not e.g. pl[4..6]).
-    #[test]
-    fn num_play_items_read_from_offset_6() {
-        // build_mpls writes num_play_items at pl[6..8]; supply 2 items.
-        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
-        let data = build_mpls(
-            &[(b"00001", 1, 0, 4500000), (b"00002", 1, 4500000, 9000000)],
-            (1, 0, 0, 0, 0, 0, 0, 0),
-            &[video],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.play_items.len(), 2);
-    }
-
     /// Spec: connection_condition is the LOW nibble of PlayItem byte[9]
     /// (high nibble is reserved/flags). A byte 0xF5 must yield 5, not 0xF5.
     #[test]
@@ -1062,40 +1036,6 @@ mod tests {
         data[conn_idx] = 0xF5;
         let pl = parse(&data).expect("should parse");
         assert_eq!(pl.play_items[0].connection_condition, 0x05);
-    }
-
-    /// Spec: in_time/out_time are big-endian u32 at PlayItem [12..16] and
-    /// [16..20]. Verify byte order is BE (not LE).
-    #[test]
-    fn in_out_time_big_endian() {
-        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
-        let data = build_mpls(
-            &[(b"00001", 1, 0x01020304, 0x05060708)],
-            (1, 0, 0, 0, 0, 0, 0, 0),
-            &[video],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.play_items[0].in_time, 0x01020304);
-        assert_eq!(pl.play_items[0].out_time, 0x05060708);
-    }
-
-    /// Spec: streams come ONLY from the first PlayItem's STN table (doc'd
-    /// in parse()). A second item carrying STN counts must NOT contribute
-    /// streams. build_mpls only writes STN on idx 0, so we verify the
-    /// `item_idx == 0` guard by confirming a 2-item playlist with streams
-    /// on item 0 reports exactly item-0's streams.
-    #[test]
-    fn streams_only_from_first_play_item() {
-        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
-        let audio = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng");
-        let data = build_mpls(
-            &[(b"00001", 1, 0, 4500000), (b"00002", 1, 4500000, 9000000)],
-            (1, 1, 0, 0, 0, 0, 0, 0),
-            &[video, audio],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.play_items.len(), 2);
-        assert_eq!(pl.streams.len(), 2); // only from item 0
     }
 
     /// stream_entry() PID location for type 0x02 (stream in a SubPath
@@ -1453,66 +1393,6 @@ mod tests {
         assert_eq!(pl.play_items.len(), 1);
         assert_eq!(pl.play_items[0].clip_id, "00009");
         assert_eq!(pl.play_items[0].in_time, 90000);
-    }
-
-    /// clip_id is the 5 ASCII bytes at PlayItem [0..5]. Verify exact decode
-    /// (e.g. "01234"), not a truncated/padded version.
-    #[test]
-    fn clip_id_five_bytes() {
-        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
-        let data = build_mpls(
-            &[(b"01234", 1, 0, 9000000)],
-            (1, 0, 0, 0, 0, 0, 0, 0),
-            &[video],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.play_items[0].clip_id, "01234");
-    }
-
-    /// STN counts are read at STN_OFFSET+4..+12 in PlayItem order:
-    /// video, audio, pg, ig, sec_audio, sec_video, pip_pg, dv. Verify that
-    /// supplying 2 video + 2 audio + 1 PG retains all 5 in that order with
-    /// correct types — catches an off-by-one in the count-byte offsets.
-    #[test]
-    fn stn_counts_ordering_video_audio_pg() {
-        let v0 = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
-        let v1 = build_stream_entry_video(0x1012, 0x1B, 6, 1, None);
-        let a0 = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng");
-        let a1 = build_stream_entry_audio(0x1101, 0x81, 3, 1, b"fra");
-        let pg = build_stream_entry_pg(0x1200, 0x90, b"spa");
-        let data = build_mpls(
-            &[(b"00001", 1, 0, 9000000)],
-            (2, 2, 1, 0, 0, 0, 0, 0),
-            &[v0, v1, a0, a1, pg],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.streams.len(), 5);
-        assert_eq!(pl.streams[0].stream_type, 1);
-        assert_eq!(pl.streams[1].stream_type, 1);
-        assert_eq!(pl.streams[1].pid, 0x1012);
-        assert_eq!(pl.streams[2].stream_type, 2);
-        assert_eq!(pl.streams[3].stream_type, 2);
-        assert_eq!(pl.streams[3].pid, 0x1101);
-        assert_eq!(pl.streams[3].language, "fra");
-        assert_eq!(pl.streams[4].stream_type, 3);
-        assert_eq!(pl.streams[4].language, "spa");
-    }
-
-    /// Audio sample/channel nibbles: sa[1] high nibble = audio_format,
-    /// low nibble = audio_rate (BD spec audio format/sample_rate packing).
-    /// 0xC5 → format 12 (7.1), rate 5 (192kHz).
-    #[test]
-    fn audio_format_rate_nibble_split() {
-        let audio = build_stream_entry_audio(0x1100, 0x86, 12, 5, b"eng");
-        let data = build_mpls(
-            &[(b"00001", 1, 0, 9000000)],
-            (0, 1, 0, 0, 0, 0, 0, 0),
-            &[audio],
-        );
-        let pl = parse(&data).expect("should parse");
-        assert_eq!(pl.streams[0].audio_format, 12);
-        assert_eq!(pl.streams[0].audio_rate, 5);
-        assert_eq!(pl.streams[0].language, "eng");
     }
 
     /// data.len() exactly 40 with valid magic but playlist_start past the

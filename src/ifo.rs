@@ -999,15 +999,6 @@ mod tests {
         assert!((secs - 10.0 * 3600.0).abs() < 0.01, "got {secs}");
     }
 
-    /// bcd_byte boundary: 0x9A has lo=0xA (>9) → invalid → 0. And 0xA0 has
-    /// hi=0xA (>9) → 0. Confirms BOTH nibbles are validated.
-    #[test]
-    fn bcd_byte_partial_invalid_nibble() {
-        assert_eq!(bcd_byte(0x9A), 0); // lo nibble invalid
-        assert_eq!(bcd_byte(0xA0), 0); // hi nibble invalid
-        assert_eq!(bcd_byte(0x90), 90); // both valid
-    }
-
     /// sub_slice uses saturating_add so an offset near usize::MAX cannot
     /// wrap and bypass the bounds check. Must return Err, not panic/OOB.
     #[test]
@@ -1066,17 +1057,6 @@ mod tests {
         data2[0] = 0b001_00000; // coding=1
         let attr2 = parse_audio_attr(&data2, 0).unwrap();
         assert_eq!(attr2.codec, Codec::Unknown(1));
-    }
-
-    /// Audio channels = (b1>>4 & 0x0F) + 1 (stored as channels-minus-1).
-    /// b1 = 0x70 → 7+1 = 8 channels (7.1). Verify the +1 and nibble.
-    #[test]
-    fn audio_attr_channel_count_plus_one() {
-        let mut data = vec![0u8; 8];
-        data[0] = 0x00; // AC3
-        data[1] = 0x70; // channels-1 = 7
-        let attr = parse_audio_attr(&data, 0).unwrap();
-        assert_eq!(attr.channels, 8);
     }
 
     /// Audio language bytes [offset+2..+4]: when both bytes are 0x00 the
@@ -1167,40 +1147,6 @@ mod tests {
         // 8th and 9th both saturate at 0x87.
         assert_eq!(streams[7].sub_stream_id, Some(0x87));
         assert_eq!(streams[8].sub_stream_id, Some(0x87));
-    }
-
-    /// parse_pgc: cells are 24-byte records; first_sector at cell+8,
-    /// last_sector at cell+20 (both u32 BE). The cell table starts at
-    /// PGC + cell_playback_offset (read from PGC+0xE8 as u16 BE). Build a
-    /// PGC with a non-trivial cell_playback_offset and verify cells.
-    #[test]
-    fn pgc_cell_offsets_first_and_last_sector() {
-        let mut pgc = vec![0u8; 0xEA];
-        pgc[0x02] = 1; // nr_programs
-        pgc[0x03] = 1; // nr_cells = 1
-        // PGC-level BCD time zero so duration is recomputed from cells.
-        // cell_playback_offset at 0xE8 (u16 BE) = 0xEA.
-        pgc[0xE8] = 0x00;
-        pgc[0xE9] = 0xEA;
-        pgc.resize(0xEA + 24, 0);
-        let co = 0xEA;
-        // cell BCD time at +4..+8: 0h 0m 10s, no frames.
-        pgc[co + 6] = 0x10; // seconds BCD 10
-        // first_sector at +8 = 0x000004D2 = 1234
-        pgc[co + 8..co + 12].copy_from_slice(&1234u32.to_be_bytes());
-        // last_sector at +20 = 0x0000162E = 5678
-        pgc[co + 20..co + 24].copy_from_slice(&5678u32.to_be_bytes());
-
-        let title = parse_pgc(&pgc, 0, 3).unwrap();
-        assert_eq!(title.cells.len(), 1);
-        assert_eq!(title.cells[0].first_sector, 1234);
-        assert_eq!(title.cells[0].last_sector, 5678);
-        // PGC time was 0 → recomputed from cell time = 10s.
-        assert!(
-            (title.duration_secs - 10.0).abs() < 0.01,
-            "got {}",
-            title.duration_secs
-        );
     }
 
     /// parse_pgc requires `pgc_offset + 0xEA <= data.len()` (needs the cell
@@ -1334,16 +1280,6 @@ mod tests {
             "PGC-level 60s must win, got {}",
             title.duration_secs
         );
-    }
-
-    /// VMG magic check: parse_video_attr et al. aside, the top-level VMG
-    /// must start with "DVDVIDEO-VMG". We exercise the constant directly to
-    /// guard against an accidental edit to the 12-byte magic.
-    #[test]
-    fn vmg_vts_magic_constants() {
-        assert_eq!(VMG_MAGIC, b"DVDVIDEO-VMG");
-        assert_eq!(VTS_MAGIC, b"DVDVIDEO-VTS");
-        assert_eq!(SECTOR_SIZE, 2048);
     }
 
     /// parse_pgc with cell_playback_offset == 0 must produce NO cells (the

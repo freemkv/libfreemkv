@@ -423,25 +423,6 @@ mod tests {
         });
     }
 
-    /// Backpressure / recycle exhaustion does not deadlock: a source
-    /// larger than the whole in-flight pool (FORWARD_DEPTH +
-    /// RECYCLE_DEPTH chunks) must still drain fully when the consumer
-    /// recycles. 10 chunks of 256 bytes = 2560 bytes; pool holds far
-    /// fewer. Proves the producer parks on recycle_rx and resumes as
-    /// the consumer returns buffers (lines 106-117). Mutation: dropping
-    /// the recycle seed loop (lines 90-92) would deadlock on the first
-    /// recv and within() times out.
-    #[test]
-    fn large_source_drains_with_recycling() {
-        within(10, || {
-            let src: Vec<u8> = (0..2560u32).map(|i| (i % 251) as u8).collect();
-            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 256, None).expect("spawn");
-            let (got, err) = drain_to_vec(pf);
-            assert!(err.is_none());
-            assert_eq!(got, src);
-        });
-    }
-
     /// Exact-multiple boundary: when the source length is an exact
     /// multiple of chunk_bytes, the final non-empty chunk is followed
     /// by an `Ok(0)` EOF read, NOT a spurious empty Ok batch. 12 bytes

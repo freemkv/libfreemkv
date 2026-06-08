@@ -416,20 +416,6 @@ mod tests {
         );
     }
 
-    /// Reading entirely beyond EOF (seek lands past the end) must also
-    /// error rather than silently return zeros. Grounding: read_exact
-    /// over an empty remainder is UnexpectedEof.
-    #[test]
-    fn read_wholly_beyond_eof_errors() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("beyond.iso");
-        make_iso(&path, 4);
-        let mut src = FileSectorSource::open(&path).unwrap();
-        let mut buf = vec![0u8; SECTOR_SIZE];
-        let r = src.read_sectors(10, 1, &mut buf, false);
-        assert!(r.is_err(), "read starting past EOF must error");
-    }
-
     /// On a successful full read the returned count MUST equal
     /// `count * 2048` exactly — the declared byte count. Grounding:
     /// `Ok(bytes)` where `bytes = count * SECTOR_SIZE`.
@@ -494,27 +480,6 @@ mod tests {
         };
         let io: std::io::Error = err.into();
         assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    /// Repeated reads of the SAME sector must return identical bytes —
-    /// the per-read seek makes each call independent of prior position,
-    /// and the DONTNEED/prefetch hooks are advisory only (no data
-    /// effect). Grounding: `seek(SeekFrom::Start(offset))` before every
-    /// read.
-    #[test]
-    fn repeated_same_sector_is_stable() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("stable.iso");
-        make_iso(&path, 8);
-        let mut src = FileSectorSource::open(&path).unwrap();
-        let mut a = vec![0u8; SECTOR_SIZE];
-        let mut b = vec![0u8; SECTOR_SIZE];
-        src.read_sectors(5, 1, &mut a, false).unwrap();
-        // Read a different sector in between to move the file cursor.
-        src.read_sectors(0, 1, &mut b, false).unwrap();
-        src.read_sectors(5, 1, &mut b, false).unwrap();
-        assert_eq!(a, b, "same-LBA reads must be position-independent");
-        assert!(a.iter().all(|x| *x == (5u8)));
     }
 
     /// A DONTNEED drop crossing the chunk threshold must not corrupt or

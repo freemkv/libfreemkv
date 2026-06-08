@@ -231,13 +231,6 @@ mod tests {
         assert_eq!(s.codec_private(99), None);
     }
 
-    /// info() on the write side reflects the supplied title.
-    #[test]
-    fn output_info_reflects_title() {
-        let s = StdioStream::output(&title_with_codec_privates());
-        assert_eq!(s.info().playlist, "StdioTitle");
-    }
-
     /// A fresh input stream defaults to an empty title until a header is
     /// parsed — info() must not invent stream metadata.
     #[test]

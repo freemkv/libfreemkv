@@ -2036,20 +2036,6 @@ mod tests {
     // element ID bytes.
     // ============================================================
 
-    #[test]
-    fn seekhead_seek_id_values_match_target_element_ids() {
-        let tracks = [make_video_track(), make_audio_track()];
-        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
-        let entries = parse_seekhead(&data);
-        // The decoded SeekID for each entry must equal a real Matroska element
-        // ID (Info, Tracks, Cues). parse_seekhead reads SeekID as a uint; the
-        // value is the big-endian element ID.
-        let ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
-        assert!(ids.contains(&ebml::INFO));
-        assert!(ids.contains(&ebml::TRACKS));
-        assert!(ids.contains(&ebml::CUES));
-    }
-
     // ============================================================
     // dolby_vision_config (dvcC / DOVIDecoderConfigurationRecord) bit
     // packing. Byte 2: profile(7 bits) << 1 | level high bit. Byte 3:

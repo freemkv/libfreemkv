@@ -164,15 +164,6 @@ mod tests {
     // --- skip_start_code: boundary / form selection ---
 
     #[test]
-    fn skip_4byte_preferred_over_3byte_when_extra_zero_present() {
-        // `00 00 00 01`: the function must recognise the 4-byte form (return
-        // pos+4), not stop at a phantom 3-byte interpretation. data[pos+2]==0x00
-        // and data[pos+3]==0x01 select the 4-byte branch.
-        let data = [0x00, 0x00, 0x00, 0x01, 0x42];
-        assert_eq!(skip_start_code(&data, 0), Some(4));
-    }
-
-    #[test]
     fn skip_start_code_at_nonzero_pos() {
         // skip must honour pos: a 3-byte code at offset 2 returns 2+3 = 5.
         let data = [0xFF, 0xFF, 0x00, 0x00, 0x01, 0x67, 0x88];

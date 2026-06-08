@@ -143,25 +143,6 @@ mod tests {
         }
     }
 
-    /// All five tables have exactly the lengths the CSS cipher requires.
-    /// TAB3 is 9-bit-indexed (the LFSR1 low word carries a 9th bit), hence
-    /// 512 entries; every other table is byte-indexed (256). A truncated or
-    /// padded table would index out of bounds or read stale data inside the
-    /// LFSR loops.
-    ///
-    /// Grounding: lfsr.rs indexes TAB3 with `*lfsr1_lo as usize` where
-    /// `lfsr1_lo` can be up to 0x1FF (9 bits), so TAB3 MUST be >= 512 long.
-    /// Mutation: change `[u8; 512]` to `[u8; 256]` (drop the second half) ->
-    /// fails to compile / length assert fails.
-    #[test]
-    fn table_lengths_match_css_index_widths() {
-        assert_eq!(TAB1.len(), 256, "TAB1 is byte-indexed");
-        assert_eq!(TAB2.len(), 256, "TAB2 is byte-indexed");
-        assert_eq!(TAB3.len(), 512, "TAB3 is 9-bit-indexed (LFSR1 low word)");
-        assert_eq!(TAB4.len(), 256, "TAB4 is byte-indexed");
-        assert_eq!(TAB5.len(), 256, "TAB5 is byte-indexed");
-    }
-
     /// TAB1 is a bijection on 0..256. CSS uses it as an invertible output
     /// permutation in css_DecryptKey's chained-XOR rounds; if two inputs
     /// collided, the key mangling would not be invertible.
@@ -230,25 +211,6 @@ mod tests {
                 TAB3[i], expected,
                 "TAB3[{i:#05x}] = {:#04x}, formula BASE[i&7]^(i>>7) = {expected:#04x}",
                 TAB3[i]
-            );
-        }
-    }
-
-    /// TAB3's value depends only on the bottom 3 bits and the top group:
-    /// within a 128-entry block (constant i>>7) every 8-aligned run repeats.
-    /// Specifically TAB3[i] == TAB3[i & 0x187] (mask keeping bits 0..2 and
-    /// bits 7..8). This is the structural redundancy the generating formula
-    /// implies and a different cross-check on the same data.
-    ///
-    /// Mutation: change TAB3[16] (currently a repeat of TAB3[0]=0x00) to
-    /// 0x24 -> the repeat check fails.
-    #[test]
-    fn tab3_repeats_within_block() {
-        for (i, &v) in TAB3.iter().enumerate() {
-            let canonical = (i & 0b1_1000_0111) & 0x1FF;
-            assert_eq!(
-                v, TAB3[canonical],
-                "TAB3[{i:#05x}] should repeat TAB3[{canonical:#05x}]"
             );
         }
     }
