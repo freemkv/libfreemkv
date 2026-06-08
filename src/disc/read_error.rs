@@ -1205,4 +1205,170 @@ mod tests {
         assert_eq!(ctx.consecutive_failures, 0);
         assert!(*ctx.damage_window.last().unwrap());
     }
+
+    // ----------------------------------------------------------------
+    // Additional hardening: retry-budget boundaries, transport-abort
+    // precedence, and the bounded-jump invariant. These guard against
+    // off-by-one in the retry caps (which would either hammer a wedging
+    // drive or give up a recovery one attempt early) and against an
+    // unbounded jump multiplier skipping the rest of the disc.
+    // ----------------------------------------------------------------
+
+    /// NOT_READY check-condition (status 0x02 so it is NOT classified as
+    /// bridge degradation, which keys off non-standard status bytes).
+    /// sense_key=2 with a generic ASC routes to the NOT_READY retry path.
+    fn not_ready_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(crate::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_NOT_READY,
+                asc: 0x04,
+                ascq: 0x00, // not 0x3E, so not the bridge-degradation signature
+            }),
+        }
+    }
+
+    /// Transport failure: SCSI status 0xFF (bridge crash). CLAUDE.md
+    /// "Bad-sector handling": this aborts the copy.
+    fn transport_failure_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+            sense: None,
+        }
+    }
+
+    /// Bridge degradation: a non-standard status byte (0x04 - neither
+    /// GOOD/CHECK/TRANSPORT) with empty sense, per `Error::is_bridge_degradation`.
+    fn bridge_degradation_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(0x04),
+            sense: None,
+        }
+    }
+
+    #[test]
+    fn not_ready_retries_capped_at_three_then_falls_through() {
+        // CLAUDE.md "Bad-sector handling" mode 1: NOT READY -> "Pause 3s,
+        // retry up to 3x, then mark NonTrimmed." NOT_READY_MAX_RETRIES=3.
+        // The 1st-3rd NOT_READY must Retry; the 4th must NOT Retry (it
+        // falls through to skip). Pass N (batch=1) so the marginal-bisect
+        // branch is irrelevant.
+        // Mutation that makes this RED: change `ctx.not_ready_retries <
+        // NOT_READY_MAX_RETRIES` to `<=` (retries 4 times) or to `>`
+        // (never retries).
+        let mut ctx = ReadCtx::for_patch(1);
+        for i in 0..NOT_READY_MAX_RETRIES {
+            let a = handle_read_error(&not_ready_err(), &mut ctx);
+            assert!(
+                matches!(a, ReadAction::Retry { .. }),
+                "NOT_READY attempt {i} should Retry, got {a:?}"
+            );
+        }
+        // Budget exhausted: the next NOT_READY must not Retry.
+        let a = handle_read_error(&not_ready_err(), &mut ctx);
+        assert!(
+            !matches!(a, ReadAction::Retry { .. }),
+            "NOT_READY past the retry cap must fall through, got {a:?}"
+        );
+    }
+
+    #[test]
+    fn transport_failure_aborts_even_mid_bisect() {
+        // CLAUDE.md "Bad-sector handling" mode 2: a transport failure
+        // (bridge crash, status 0xFF) aborts the pass so the outer loop
+        // can re-enumerate the bridge. This must hold even while
+        // bisecting and even on Pass N - the wedge-skip/jump paths must
+        // NOT swallow a real transport crash into a JumpAhead.
+        // Mutation that makes this RED: move the transport-failure check
+        // below the HARDWARE/ILLEGAL wedge arm, so a transport failure
+        // that also carried a wedge-family sense would JumpAhead instead.
+        let mut ctx = ReadCtx::for_patch(32);
+        ctx.bisecting = true;
+        assert_eq!(
+            handle_read_error(&transport_failure_err(), &mut ctx),
+            ReadAction::AbortPass
+        );
+        // And on a fresh Pass 1 context, still AbortPass.
+        let mut ctx1 = ReadCtx::for_sweep(32);
+        assert_eq!(
+            handle_read_error(&transport_failure_err(), &mut ctx1),
+            ReadAction::AbortPass
+        );
+    }
+
+    #[test]
+    fn bridge_degradation_retries_to_budget_then_falls_through() {
+        // The bridge-degradation cooldown retry is bounded by
+        // BRIDGE_DEGRADATION_MAX_RETRIES (=5). The first 5 degradation
+        // errors must Retry with the long bridge cooldown; the 6th must
+        // fall through to skip/jump rather than retrying forever and
+        // stalling the pass.
+        // Mutation that makes this RED: change the budget comparison
+        // `ctx.bridge_degradation_count < BRIDGE_DEGRADATION_MAX_RETRIES`
+        // to `<=` (retries 6 times).
+        let mut ctx = ReadCtx::for_patch(1);
+        for i in 0..BRIDGE_DEGRADATION_MAX_RETRIES {
+            let a = handle_read_error(&bridge_degradation_err(), &mut ctx);
+            match a {
+                ReadAction::Retry { pause_secs } => {
+                    assert_eq!(
+                        pause_secs, BRIDGE_DEGRADATION_PAUSE_SECS,
+                        "bridge retry {i} should use the bridge cooldown"
+                    );
+                }
+                other => panic!("bridge degradation attempt {i} should Retry, got {other:?}"),
+            }
+        }
+        let a = handle_read_error(&bridge_degradation_err(), &mut ctx);
+        assert!(
+            !matches!(a, ReadAction::Retry { .. }),
+            "bridge degradation past the retry budget must fall through, got {a:?}"
+        );
+    }
+
+    #[test]
+    fn jump_multiplier_caps_and_jump_distance_stays_bounded() {
+        // CLAUDE.md damage-jump: multiplier doubles per jump but is
+        // capped at MAX_JUMP_MULTIPLIER=64 (the "4 GiB cap"); a single
+        // jump must never be allowed to grow without bound and skip the
+        // rest of the disc. Drive a long single-sector failure streak on
+        // a sweep ctx with a tiny window so window-trigger jumps fire
+        // repeatedly, and verify the multiplier saturates at 64 and the
+        // emitted jump distance equals JUMP_BASE_SECTORS * batch * 64.
+        // Mutation that makes this RED: remove the
+        // `.min(MAX_JUMP_MULTIPLIER)` on the multiplier doubling, or use
+        // wrapping/non-saturating mul -> distance overshoots or panics.
+        const MAX_JUMP_MULTIPLIER: u64 = 64;
+        let batch: u16 = 32;
+        let mut ctx = ReadCtx::for_sweep(batch);
+        // Small window + 0% threshold so every failure can window-trigger
+        // a jump and keep doubling the multiplier toward the cap.
+        ctx.damage_window_max = 2;
+        ctx.damage_threshold_pct = 0;
+        let mut last_jump_sectors = 0u64;
+        for _ in 0..40 {
+            // Reset bisecting flag defensively; these are outer failures.
+            ctx.bisecting = false;
+            if let ReadAction::JumpAhead { sectors, .. } =
+                handle_read_error(&medium_err(), &mut ctx)
+            {
+                last_jump_sectors = sectors;
+            }
+            assert!(
+                ctx.jump_multiplier <= MAX_JUMP_MULTIPLIER,
+                "jump_multiplier {} exceeded the cap {}",
+                ctx.jump_multiplier,
+                MAX_JUMP_MULTIPLIER
+            );
+        }
+        // After saturation, the jump distance is exactly base*batch*cap.
+        let expected = JUMP_BASE_SECTORS * batch as u64 * MAX_JUMP_MULTIPLIER;
+        assert_eq!(
+            last_jump_sectors, expected,
+            "saturated jump distance must equal base*batch*64"
+        );
+    }
 }

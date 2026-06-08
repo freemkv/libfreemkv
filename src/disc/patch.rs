@@ -1856,4 +1856,238 @@ mod tests {
         assert_eq!(r, Some((1000, 300)));
         assert_eq!(skip_limit_remainder(true, 1000, 2000, 1000), None);
     }
+
+    // ----------------------------------------------------------------
+    // compute_damage_skip - range-boundary + size-aware-cap coverage.
+    //
+    // These exercise the Pass-N damage-cluster skip documented in
+    // CLAUDE.md "Patch (Pass N)": skip is capped at 1/4 of the
+    // remaining bad range "so a single jump can't blow past a good
+    // middle", and the per-iteration cursor (`block_end`) must never
+    // cross the range boundary in either walk direction. A bug here
+    // silently abandons recoverable sectors (over-skip) or downgrades
+    // already-recovered sectors (cursor crossing the boundary).
+    //
+    // All byte offsets are multiples of 2048 (the sector size the code
+    // divides by at `range_remaining_bytes / 2048`).
+    // ----------------------------------------------------------------
+
+    /// Build a `PatchOptions` with only `reverse` meaningful for the
+    /// pure helpers under test (no I/O is performed).
+    fn opts_with_reverse(reverse: bool) -> crate::disc::PatchOptions<'static> {
+        crate::disc::PatchOptions {
+            decrypt: false,
+            block_sectors: Some(1),
+            full_recovery: false,
+            reverse,
+            wedged_threshold: 50,
+            progress: None,
+            halt: None,
+        }
+    }
+
+    /// A `PatchLoopState` whose damage window is full (16 entries) with
+    /// exactly `bad` failures - enough to evaluate the
+    /// `PASSN_DAMAGE_THRESHOLD_PCT` gate. `escalation` seeds
+    /// `consecutive_skips_without_recovery` so we can drive the
+    /// `PASSN_SKIP_SECTORS_BASE << escalation` size.
+    fn state_with_window(bad: usize, escalation: u32) -> PatchLoopState {
+        let mut s = PatchLoopState::new(0, 1 << 40, 1, false, 1 << 40);
+        s.damage_window.clear();
+        for i in 0..PASSN_DAMAGE_WINDOW {
+            s.damage_window.push(i >= bad); // first `bad` entries = false
+        }
+        s.consecutive_skips_without_recovery = escalation;
+        s
+    }
+
+    #[test]
+    fn damage_skip_forward_advances_cursor_toward_end_and_stays_in_range() {
+        // Forward walk: the per-iteration cursor moves UP, toward `end`,
+        // so the attempted region grows as [range_pos, block_end). A
+        // damage skip must push block_end FORWARD (higher) and never
+        // past `end` (the call site breaks on `block_end >= end`). Range
+        // [0, 80 KiB) = 40 sectors, cursor mid-range at 20 KiB. Spec:
+        // CLAUDE.md Pass-N reverse=false walks start->end.
+        // Mutation that makes this RED: swap the forward branch to
+        // subtract (reverse direction) e.g. `block_end - skip_bytes` ->
+        // the cursor moves the WRONG way and re-attempts recovered
+        // sectors / never converges. (Confirmed: the assertion
+        // block_end > before fails.)
+        let mut state = state_with_window(4, 0);
+        let opts = opts_with_reverse(false);
+        let mut frame = RangeFrame {
+            range_idx: 0,
+            range_pos: 0,
+            range_size: 80 * 1024,
+            end: 80 * 1024,
+            block_end: 20 * 1024, // 10 sectors in
+            range_budget_secs: 1,
+            range_sectors: 40,
+        };
+        let before = frame.block_end;
+        let did = compute_damage_skip(&mut state, &mut frame, &opts, 0, 2048);
+        assert!(did, "threshold crossed: a skip must apply");
+        assert!(
+            frame.block_end > before,
+            "forward skip must advance the cursor UP (toward end): {} !> {}",
+            frame.block_end,
+            before
+        );
+        assert!(
+            frame.block_end <= frame.end,
+            "forward cursor {} overshot range end {}",
+            frame.block_end,
+            frame.end
+        );
+    }
+
+    #[test]
+    fn damage_skip_reverse_moves_cursor_toward_range_start_and_stays_in_range() {
+        // Reverse walk (the recovery walker default): the cursor moves
+        // DOWN, toward `range_pos`, so the attempted region grows as
+        // [block_end, end). A damage skip must push block_end BACKWARD
+        // (lower) and never below `range_pos` (the call site breaks on
+        // `block_end <= range_pos`). Spec: CLAUDE.md "Patch (Pass N) -
+        // Default: reverse mode ... within each range from end to start."
+        // Mutation that makes this RED: the reverse branch adds instead
+        // of subtracts (copy-paste of the forward formula) -> cursor
+        // moves UP, away from range_pos, and the walk never converges on
+        // the low end of the range, silently abandoning those sectors.
+        let mut state = state_with_window(4, 0);
+        let opts = opts_with_reverse(true);
+        let range_pos = 40 * 1024;
+        let mut frame = RangeFrame {
+            range_idx: 0,
+            range_pos,
+            range_size: 80 * 1024,
+            end: range_pos + 80 * 1024,
+            block_end: range_pos + 60 * 1024, // 30 sectors above range_pos
+            range_budget_secs: 1,
+            range_sectors: 40,
+        };
+        let before = frame.block_end;
+        let did = compute_damage_skip(&mut state, &mut frame, &opts, 0, 2048);
+        assert!(did, "threshold crossed: a skip must apply");
+        assert!(
+            frame.block_end < before,
+            "reverse skip must move the cursor DOWN (toward range_pos): {} !< {}",
+            frame.block_end,
+            before
+        );
+        assert!(
+            frame.block_end >= frame.range_pos,
+            "reverse cursor {} descended below range_pos {}",
+            frame.block_end,
+            frame.range_pos
+        );
+    }
+
+    #[test]
+    fn damage_skip_caps_at_one_quarter_of_remaining_range() {
+        // CLAUDE.md: skip "capped at 1/4 of the remaining bad range so
+        // a single jump can't blow past a good middle." Forward walk,
+        // range [0, 80 KiB) = 40 sectors, cursor at start (block_end=0)
+        // so remaining = 40 sectors and quarter = 10 sectors. Drive a
+        // large escalation so the raw escalated skip far exceeds 10.
+        // The applied gap must be <= quarter (10 sectors = 20480 bytes).
+        // Mutation that makes this RED: remove `.min(range_quarter)`
+        // from `skip_sectors` -> the jump leaps the entire good middle.
+        let mut state = state_with_window(4, 10);
+        let opts = opts_with_reverse(false);
+        let mut frame = RangeFrame {
+            range_idx: 0,
+            range_pos: 0,
+            range_size: 80 * 1024,
+            end: 80 * 1024,
+            block_end: 0,
+            range_budget_secs: 1,
+            range_sectors: 40,
+        };
+        let did = compute_damage_skip(&mut state, &mut frame, &opts, 0, 2048);
+        assert!(did, "threshold crossed: a skip must apply");
+        let quarter_bytes = (40u64 / 4) * 2048; // 10 sectors
+        assert!(
+            frame.block_end <= quarter_bytes,
+            "skip advanced cursor to {} bytes, exceeding the 1/4 cap of {} bytes",
+            frame.block_end,
+            quarter_bytes
+        );
+        assert!(frame.block_end > 0, "a real skip must advance the cursor");
+    }
+
+    #[test]
+    fn damage_skip_below_threshold_does_not_skip_or_mutate_state() {
+        // With an all-good window (bad=0) the damage threshold is NOT
+        // crossed, so compute_damage_skip must be a no-op: it must NOT
+        // advance the cursor, increment skip_count, or charge work_done.
+        // A spurious skip here silently abandons readable sectors that
+        // the patch loop would otherwise retry.
+        // Mutation that makes this RED: invert/weaken the threshold
+        // guard (e.g. `>=` -> `<`) so a clean window still skips.
+        let mut state = state_with_window(/*bad=*/ 0, /*escalation=*/ 0);
+        let opts = opts_with_reverse(false);
+        let work_before = state.work_done;
+        let skips_before = state.skip_count;
+        let mut frame = RangeFrame {
+            range_idx: 0,
+            range_pos: 0,
+            range_size: 80 * 1024,
+            end: 80 * 1024,
+            block_end: 4096,
+            range_budget_secs: 1,
+            range_sectors: 40,
+        };
+        let did = compute_damage_skip(&mut state, &mut frame, &opts, 0, 2048);
+        assert!(!did, "clean window must not trigger a damage skip");
+        assert_eq!(frame.block_end, 4096, "cursor must not move on a no-op");
+        assert_eq!(
+            state.work_done, work_before,
+            "no-op must not charge work_done"
+        );
+        assert_eq!(
+            state.skip_count, skips_before,
+            "no-op must not bump skip_count"
+        );
+    }
+
+    #[test]
+    fn damage_skip_work_done_equals_actual_gap_skipped() {
+        // Progress accounting: when a skip fires, `work_done` must grow
+        // by EXACTLY the number of bytes the cursor moved (the gap),
+        // and skip_count must increment by exactly 1. Reverse range
+        // [0, 64 KiB) = 32 sectors, cursor at the top so remaining =
+        // 32, quarter = 8 sectors, escalation 0 -> escalated = base
+        // (32) capped to quarter (8). Expected gap = 8 sectors.
+        // Mutation that makes this RED: compute `gap_bytes` from the
+        // wrong endpoints or double-add it.
+        let mut state = state_with_window(/*bad=*/ 4, /*escalation=*/ 0);
+        let opts = opts_with_reverse(true);
+        let end = 64 * 1024;
+        let mut frame = RangeFrame {
+            range_idx: 0,
+            range_pos: 0,
+            range_size: end,
+            end,
+            block_end: end,
+            range_budget_secs: 1,
+            range_sectors: 32,
+        };
+        let before = frame.block_end;
+        let work_before = state.work_done;
+        let did = compute_damage_skip(&mut state, &mut frame, &opts, 0, 2048);
+        assert!(did, "threshold crossed: a skip must apply");
+        let expected_gap = 8 * 2048u64; // min(base=32, quarter=8) sectors
+        let actual_gap = before - frame.block_end; // reverse: cursor moved down
+        assert_eq!(
+            actual_gap, expected_gap,
+            "reverse skip should move the cursor down by the quarter-cap gap"
+        );
+        assert_eq!(
+            state.work_done - work_before,
+            actual_gap,
+            "work_done must grow by exactly the gap skipped"
+        );
+        assert_eq!(state.skip_count, 1, "exactly one skip must be recorded");
+    }
 }

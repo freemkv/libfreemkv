@@ -1702,4 +1702,240 @@ mod tests {
         assert!(dir.entries.is_empty());
         assert!(dir.is_dir);
     }
+
+    // ---- added: spec-boundary coverage for AD strides, flags, FIDs ----
+
+    /// Build an Extended File Entry (tag 266) ICB whose allocation
+    /// descriptors are EXTENDED ADs (ECMA-167 §14.14.3, 20 bytes each):
+    ///   ExtentLength(4) | RecordedLength(4) | InformationLength(4) |
+    ///   ExtentLocation lb_addr { logicalBlockNumber(4) | partitionRef(2) } |
+    ///   impl_use(2)
+    /// The 30-bit length + 2-bit type live in ExtentLength (offset +0); the
+    /// logical block number lives in ExtentLocation at offset +12. Sets ICB
+    /// Tag flags (abs offset 34) low bits to 2 = Extended AD so the parser
+    /// must select the 20-byte stride AND read the LBA from off+12, not off+4.
+    fn build_efe_ext(info_length: u64, ads: &[(u32, u32, u32)]) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // tag
+        // ICB Tag flags at abs offset 34: AD type 2 = Extended AD.
+        s[34..36].copy_from_slice(&2u16.to_le_bytes());
+        s[56..64].copy_from_slice(&info_length.to_le_bytes());
+        let l_ea: u32 = 0;
+        let l_ad: u32 = (ads.len() * 20) as u32;
+        s[208..212].copy_from_slice(&l_ea.to_le_bytes());
+        s[212..216].copy_from_slice(&l_ad.to_le_bytes());
+        let mut off = 216 + l_ea as usize;
+        for &(etype, dlen, dlba) in ads {
+            let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
+            // ExtentLength at +0 (carries type + 30-bit length).
+            s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
+            // RecordedLength (+4) and InformationLength (+8) set to distinct
+            // non-zero junk so a parser misreading the LBA at off+4 would
+            // pick THESE up instead of the real LBA at off+12.
+            s[off + 4..off + 8].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            s[off + 8..off + 12].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+            // ExtentLocation logicalBlockNumber at +12.
+            s[off + 12..off + 16].copy_from_slice(&dlba.to_le_bytes());
+            off += 20;
+        }
+        s
+    }
+
+    #[test]
+    fn icb_extents_extended_ad_uses_20byte_stride_and_lba_at_off12() {
+        // ECMA-167 §14.14.3: an Extended AD is 20 bytes and its extent LBA
+        // is at byte offset +12, NOT +4 (that's RecordedLength). The parser
+        // branches on ICB-tag flags==2 to a 20-byte stride and lba_off=off+12.
+        // Three extents must come back with the CORRECT LBAs and lengths.
+        let icb = build_efe_ext(3 * 2048, &[(0, 2048, 700), (0, 2048, 800), (0, 4096, 900)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("EXT", 5, 3 * 2048));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        // If the stride were wrong (8 or 16) or lba_off were off+4, the LBAs
+        // would be the 0xDEADBEEF junk or misaligned garbage, not these.
+        assert_eq!(extents, vec![(700, 2048), (800, 2048), (900, 4096)]);
+    }
+
+    #[test]
+    fn icb_extents_short_ad_type1_sparse_extent_is_skipped_not_emitted() {
+        // ECMA-167 §14.14.1.1: extent type 1 = "allocated but not recorded"
+        // (a sparse hole). It carries no on-disc data, so it must NOT be
+        // returned as a readable extent. A type-0 extent after it must still
+        // be reached (the loop must continue past a type-1, not break).
+        let icb = build_efe(
+            6144,
+            &[
+                (0, 2048, 10), // recorded
+                (1, 2048, 20), // sparse — allocated, not recorded
+                (0, 2048, 30), // recorded, after the hole
+            ],
+        );
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("SP", 5, 6144));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        // The sparse (type-1) middle descriptor must be absent; the two
+        // recorded extents must both be present and in order.
+        assert_eq!(extents, vec![(10, 2048), (30, 2048)]);
+    }
+
+    #[test]
+    fn icb_extents_zero_length_type0_terminates_list() {
+        // ECMA-167: a zero-length type-0 AD terminates the descriptor list.
+        // Trailing zero padding (all-zero ADs) MUST stop parsing — otherwise
+        // a stray non-zero AD after the terminator becomes a bogus extent.
+        // One real extent, then a zero AD, then an AD that must NEVER be read.
+        let icb = build_efe(
+            2048,
+            &[
+                (0, 2048, 10),  // recorded extent
+                (0, 0, 0),      // zero-length type-0 = terminator
+                (0, 4096, 999), // must NOT be parsed
+            ],
+        );
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("T", 5, 2048));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        assert_eq!(
+            extents,
+            vec![(10, 2048)],
+            "parsing must stop at the zero-length terminator"
+        );
+    }
+
+    #[test]
+    fn icb_extents_continuation_loop_terminates_without_hang_or_panic() {
+        // Hostile input: a type-3 continuation descriptor whose continuation
+        // block points back at itself (a cycle). The MAX_AD_BLOCKS bound must
+        // make this terminate rather than loop forever. We assert it returns
+        // a finite Vec and does not panic. The continuation block at meta-rel
+        // lba 50 contains a recorded extent + a type-3 AD pointing to lba 50.
+        let icb = build_efe(2048, &[(0, 2048, 10), (3, 2048, 50)]);
+        let cont = build_cont_block(&[(0, 2048, 20), (3, 2048, 50)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(50, cont);
+        let fs = fs_with(0, 0, file_entry("LOOP", 5, 2048));
+        // Must return Ok (bounded), not hang or panic.
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        // First block contributes extent (10,2048); each revisit of the
+        // self-referential cont block adds (20,2048). The hop bound caps the
+        // total, so the Vec is finite. (256 blocks max → < 600 extents.)
+        assert!(extents.len() < 1024, "continuation chain must be bounded");
+        assert_eq!(extents[0], (10, 2048));
+        assert_eq!(extents[1], (20, 2048));
+    }
+
+    #[test]
+    fn parse_udf_name_decodes_utf16be_compression_id_16() {
+        // UDF dchar: compression ID 16 = 16-bit big-endian Unicode. A FID
+        // whose filename uses ID 16 must decode correctly, not as mojibake.
+        // Bytes: [16][00 'A'][00 'Z'].
+        let raw = [16u8, 0x00, b'A', 0x00, b'Z'];
+        assert_eq!(parse_udf_name(&raw), "AZ");
+    }
+
+    #[test]
+    fn parse_udf_name_8bit_compression_id_8() {
+        // Compression ID 8 = 8-bit (OSTA CS0 / ASCII). "BDMV" must round-trip.
+        let mut raw = vec![8u8];
+        raw.extend_from_slice(b"BDMV");
+        assert_eq!(parse_udf_name(&raw), "BDMV");
+    }
+
+    #[test]
+    fn read_directory_honors_l_iu_offset_for_fid_name() {
+        // ECMA-167 §14.4 File Identifier Descriptor: the File Identifier
+        // begins at offset 38 + L_IU. A non-zero L_IU must shift the name
+        // read; ignoring it would read impl_use bytes as the name.
+        //   0..2  tag = 257   18 file chars   19 L_FI
+        //   24..28 ICB LBA    36..38 L_IU      38.. impl_use[L_IU] then FI[L_FI]
+        let mut dir = [0u8; 2048];
+        let l_iu: u16 = 4;
+        let mut name_bytes = vec![8u8]; // compression id 8
+        name_bytes.extend_from_slice(b"CLPI");
+        let l_fi = name_bytes.len() as u8;
+        dir[0..2].copy_from_slice(&257u16.to_le_bytes());
+        dir[18] = 0x00; // not parent, not dir → a file
+        dir[19] = l_fi;
+        dir[24..28].copy_from_slice(&7u32.to_le_bytes()); // child ICB LBA
+        dir[36..38].copy_from_slice(&l_iu.to_le_bytes());
+        dir[38..42].copy_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC]); // impl_use junk
+        let name_start = 38 + l_iu as usize;
+        dir[name_start..name_start + name_bytes.len()].copy_from_slice(&name_bytes);
+
+        let dir_icb = build_efe_icb(2048, 2048, 60); // dir data at ad_pos 60
+        let mut reader = MemReader::new();
+        reader.put(5, dir_icb);
+        reader.put(60, dir);
+        reader.put(7, build_efe_icb(123, 2048, 0)); // child size ICB
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0).expect("dir parses");
+        assert_eq!(parsed.entries.len(), 1, "exactly one FID entry");
+        assert_eq!(
+            parsed.entries[0].name, "CLPI",
+            "name must be read at 38+L_IU, not from impl_use bytes"
+        );
+        assert!(!parsed.entries[0].is_dir);
+    }
+
+    #[test]
+    fn read_directory_skips_parent_fid_entry() {
+        // ECMA-167 §14.4.3: file characteristics bit 3 (0x08) = "parent" (the
+        // ".." back-link). It must NOT appear as a named child entry. To
+        // isolate the parent-flag gate (rather than the L_FI==0 gate that
+        // real parent FIDs also have), this fixture gives the parent FID a
+        // VALID non-zero L_FI and a real name: the ONLY reason it must be
+        // skipped is the parent characteristic bit.
+        let mut dir = [0u8; 2048];
+        let mut name_bytes = vec![8u8];
+        name_bytes.extend_from_slice(b"PARENT");
+        let l_fi = name_bytes.len() as u8;
+        dir[0..2].copy_from_slice(&257u16.to_le_bytes());
+        dir[18] = 0x08 | 0x02; // parent + directory bits
+        dir[19] = l_fi; // non-zero L_FI: name present but must be ignored
+        dir[24..28].copy_from_slice(&9u32.to_le_bytes());
+        dir[36..38].copy_from_slice(&0u16.to_le_bytes()); // L_IU = 0
+        dir[38..38 + name_bytes.len()].copy_from_slice(&name_bytes);
+
+        let dir_icb = build_efe_icb(2048, 2048, 60);
+        let mut reader = MemReader::new();
+        reader.put(5, dir_icb);
+        reader.put(60, dir);
+        reader.put(9, build_efe_icb(0, 2048, 0)); // child size ICB
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0).expect("dir parses");
+        assert!(
+            parsed.entries.is_empty(),
+            "the parent (..) FID must not be emitted even with a valid name"
+        );
+    }
+
+    #[test]
+    fn parse_dstring_length_byte_caps_content() {
+        // UDF d-string: the final byte of the fixed field is the length of
+        // valid content (compression id + chars). Bytes past that length must
+        // be ignored. Field: [8]['V']['O']['L'] ... last byte = 4.
+        let mut field = [0u8; 32];
+        field[0] = 8; // compression id 8
+        field[1] = b'V';
+        field[2] = b'O';
+        field[3] = b'L';
+        field[10] = b'X'; // garbage beyond declared length — must be ignored
+        *field.last_mut().unwrap() = 4; // 4 valid bytes (id + 3 chars)
+        assert_eq!(parse_dstring(&field), "VOL");
+    }
+
+    #[test]
+    fn parse_dstring_oversized_length_byte_returns_empty_not_panic() {
+        // Hostile/corrupt input: a length byte larger than the field must not
+        // index out of bounds. parse_dstring guards len > data.len() → "".
+        let mut field = [0u8; 8];
+        field[0] = 8;
+        field[1] = b'A';
+        *field.last_mut().unwrap() = 200; // way past the 8-byte field
+        assert_eq!(parse_dstring(&field), "");
+    }
 }
