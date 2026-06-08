@@ -815,4 +815,493 @@ mod tests {
         assert!(clip2.ep_coarse.is_empty());
         assert!(clip2.ep_fine.is_empty());
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Added hardening tests. Grounded in the BD-ROM CLPI spec
+    // (https://github.com/lw/BluRay/wiki/CLPI) and libbluray clpi_parse.c.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a ProgramInfo section. `streams` = Vec<(pid, sci_bytes)>.
+    /// Layout per source doc: length(4)+reserved(1)+num_programs(1)+
+    /// per program [spn(4)+pmt_pid(2)+num_streams(1)+num_groups(1)] then
+    /// per stream [pid(2)+sci_len(1)+sci].
+    fn build_program_info(streams: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0); // reserved (offset 4)
+        body.push(1); // num_programs = 1 (offset 5)
+        // program 0 header (8 bytes)
+        body.extend_from_slice(&0u32.to_be_bytes()); // spn_program_sequence_start
+        body.extend_from_slice(&0u16.to_be_bytes()); // program_map_pid
+        body.push(streams.len() as u8); // num_streams
+        body.push(0); // num_groups
+        for (pid, sci) in streams {
+            body.extend_from_slice(&pid.to_be_bytes());
+            body.push(sci.len() as u8);
+            body.extend_from_slice(sci);
+        }
+        // Prepend length(4) = bytes after the length field.
+        let mut out = Vec::new();
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a CLPI with a ProgramInfo section. prog_info_start is placed
+    /// right after the 60-byte header; cpi (if any) follows program_info.
+    fn build_clpi_with_proginfo(
+        source_packet_count: u32,
+        prog_info: &[u8],
+        cpi_data: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 60];
+        buf[0..4].copy_from_slice(b"HDMV");
+        buf[4..8].copy_from_slice(b"0200");
+        let prog_info_start: u32 = 60;
+        buf[12..16].copy_from_slice(&prog_info_start.to_be_bytes());
+        let cpi_start: u32 = if cpi_data.is_some() {
+            (60 + prog_info.len()) as u32
+        } else {
+            0
+        };
+        buf[16..20].copy_from_slice(&cpi_start.to_be_bytes());
+        buf[56..60].copy_from_slice(&source_packet_count.to_be_bytes());
+        buf.extend_from_slice(prog_info);
+        if let Some(cpi) = cpi_data {
+            buf.extend_from_slice(cpi);
+        }
+        buf
+    }
+
+    /// source_packet_count is a big-endian u32 at offset [56..60]. Verify
+    /// BE decode of a value with all four bytes distinct (not LE / wrong
+    /// offset).
+    #[test]
+    fn source_packet_count_big_endian_offset_56() {
+        let data = build_clpi(0x01020304, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.source_packet_count, 0x01020304);
+    }
+
+    /// Magic must be exactly "HDMV" at [0..4]. Anything else → ClpiParse.
+    /// Spec: CLPI files begin with the type_indicator "HDMV".
+    #[test]
+    fn wrong_magic_rejected() {
+        let mut data = build_clpi(1000, None);
+        data[0..4].copy_from_slice(b"INDX");
+        assert!(parse(&data).is_err());
+    }
+
+    /// Under-40-byte input is rejected before any field read
+    /// (`data.len() < 40` guard).
+    #[test]
+    fn under_40_bytes_rejected() {
+        assert!(parse(&[0u8; 39]).is_err());
+        assert!(parse(b"HDMV0200").is_err());
+        assert!(parse(&[]).is_err());
+    }
+
+    /// ProgramInfo: a video stream (coding 0x1B = H.264) carries
+    /// format/rate in sci[1] nibbles and NO language. Verify the video
+    /// arm: format hi-nibble, rate lo-nibble, language stays empty.
+    #[test]
+    fn program_info_video_stream() {
+        // sci = coding_type(0x1B) + format_rate(0x61 → fmt 6, rate 1)
+        let sci = vec![0x1Bu8, 0x61];
+        let pi = build_program_info(&[(0x1011, sci)]);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.streams.len(), 1);
+        assert_eq!(clip.streams[0].pid, 0x1011);
+        assert_eq!(clip.streams[0].coding_type, 0x1B);
+        assert_eq!(clip.streams[0].video_format, 6);
+        assert_eq!(clip.streams[0].video_rate, 1);
+        assert_eq!(clip.streams[0].language, "");
+    }
+
+    /// ProgramInfo primary-audio (coding 0x80..=0x86): sci[1] = format/rate
+    /// nibbles, sci[2..5] = ISO 639 language. Verify TrueHD (0x83) at
+    /// offset, 5.1 / 48kHz, language "eng".
+    #[test]
+    fn program_info_audio_stream_lang_offset() {
+        // sci = 0x83 + 0x61 (fmt 6, rate 1) + "eng"
+        let sci = vec![0x83u8, 0x61, b'e', b'n', b'g'];
+        let pi = build_program_info(&[(0x1100, sci)]);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.streams[0].coding_type, 0x83);
+        assert_eq!(clip.streams[0].audio_format, 6);
+        assert_eq!(clip.streams[0].audio_rate, 1);
+        assert_eq!(clip.streams[0].language, "eng");
+    }
+
+    /// ProgramInfo PG (0x90)/IG (0x91): layout is coding_type(1)+lang(3),
+    /// so language is at sci[1..4] (NOT sci[2..5] like audio). Verify the
+    /// PG arm reads from the right offset.
+    #[test]
+    fn program_info_pg_lang_offset() {
+        // sci = 0x90 + "fra" (lang directly after coding_type)
+        let sci = vec![0x90u8, b'f', b'r', b'a'];
+        let pi = build_program_info(&[(0x1200, sci)]);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.streams[0].coding_type, 0x90);
+        assert_eq!(clip.streams[0].language, "fra");
+        // Audio nibbles must NOT be populated for a PG stream.
+        assert_eq!(clip.streams[0].audio_format, 0);
+    }
+
+    /// ProgramInfo with multiple streams: PID and coding for each must be
+    /// read from the correct per-stream offset (pid(2)+sci_len(1)+sci).
+    /// Three mixed streams must all parse with distinct PIDs in order.
+    #[test]
+    fn program_info_multiple_streams_advance_correctly() {
+        let v = (0x1011u16, vec![0x24u8, 0x81]); // HEVC video
+        let a = (0x1100u16, vec![0x86u8, 0x61, b'e', b'n', b'g']); // DTS-HD MA
+        let s = (0x1200u16, vec![0x90u8, b'j', b'p', b'n']); // PG
+        let pi = build_program_info(&[v, a, s]);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.streams.len(), 3);
+        assert_eq!(clip.streams[0].pid, 0x1011);
+        assert_eq!(clip.streams[0].coding_type, 0x24);
+        assert_eq!(clip.streams[1].pid, 0x1100);
+        assert_eq!(clip.streams[1].coding_type, 0x86);
+        assert_eq!(clip.streams[1].language, "eng");
+        assert_eq!(clip.streams[2].pid, 0x1200);
+        assert_eq!(clip.streams[2].language, "jpn");
+    }
+
+    /// parse_program_info is best-effort: a stream whose declared sci_len
+    /// runs past the section (`sci_end > data.len()`) makes it return the
+    /// streams collected so far (here: none), never panic. Source returns
+    /// `out` early on the overflow.
+    #[test]
+    fn program_info_truncated_sci_no_panic() {
+        // One stream claiming sci_len = 200 but with no body.
+        let mut body = Vec::new();
+        body.push(0); // reserved
+        body.push(1); // num_programs
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(1); // num_streams
+        body.push(0); // num_groups
+        body.extend_from_slice(&0x1011u16.to_be_bytes()); // pid
+        body.push(200); // sci_len = 200, no body follows
+        let mut pi = Vec::new();
+        pi.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        pi.extend_from_slice(&body);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should not panic");
+        assert!(clip.streams.is_empty());
+    }
+
+    /// parse_program_info rejects sci_len == 0 (`sci_len < 1` → return).
+    /// A zero-length stream_coding_info is unusable.
+    #[test]
+    fn program_info_zero_sci_len_yields_no_stream() {
+        let mut body = Vec::new();
+        body.push(0);
+        body.push(1);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&0x1011u16.to_be_bytes());
+        body.push(0); // sci_len = 0
+        let mut pi = Vec::new();
+        pi.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        pi.extend_from_slice(&body);
+        let data = build_clpi_with_proginfo(100, &pi, None);
+        let clip = parse(&data).expect("should parse");
+        assert!(clip.streams.is_empty());
+    }
+
+    /// pts_coarse field is 14 bits: dword0 = ref_to_fine_id<<14 | pts_coarse.
+    /// A pts_coarse of 0x3FFF (max) with ref_to_fine_id 5 must decode both
+    /// without bleed. Verify the >>14 and &0x3FFF split.
+    #[test]
+    fn coarse_pts_14bit_split() {
+        let cpi = build_cpi(0x1011, &[(5, 0x3FFF, 0x12340000)], &[(0, 0)]);
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.ep_coarse[0].ref_to_fine_id, 5);
+        assert_eq!(clip.ep_coarse[0].pts_coarse, 0x3FFF);
+        assert_eq!(clip.ep_coarse[0].spn_coarse, 0x12340000);
+    }
+
+    /// Fine entry: dword = is_angle(1)+i_end_offset(3)+pts_fine(11)+
+    /// spn_fine(17). pts_fine occupies bits 17..28 (>>17 & 0x7FF), spn_fine
+    /// the low 17 bits (& 0x1FFFF). Set high bits (is_angle/i_end_offset)
+    /// and verify they do NOT bleed into pts_fine.
+    #[test]
+    fn fine_entry_bit_layout_isolates_pts_and_spn() {
+        // Construct a raw fine dword with is_angle=1, i_end_offset=0b111,
+        // pts_fine=0x5AA, spn_fine=0x1AAAA, then verify decode.
+        let is_angle: u32 = 1;
+        let i_end: u32 = 0b111;
+        let pts_f: u32 = 0x5AA; // 11-bit
+        let spn_f: u32 = 0x1AAAA; // 17-bit
+        let dword: u32 = (is_angle << 31) | (i_end << 28) | (pts_f << 17) | spn_f;
+
+        // Build the CPI by hand with this raw fine dword.
+        let mut stream_ep = Vec::new();
+        let fine_start: u32 = 4; // no coarse entries → fine right after header
+        stream_ep.extend_from_slice(&fine_start.to_be_bytes());
+        stream_ep.extend_from_slice(&dword.to_be_bytes());
+
+        let num_coarse: u32 = 0;
+        let num_fine: u32 = 1;
+        let ep_map_start: u32 = 14;
+        let ep_stream_type: u32 = 1;
+        let packed: u128 = ((ep_stream_type as u128) << 66)
+            | ((num_coarse as u128) << 50)
+            | ((num_fine as u128) << 32)
+            | (ep_map_start as u128);
+        let packed_bytes = packed.to_be_bytes();
+        let stream_header_bits = &packed_bytes[6..16];
+
+        let mut ep_map = Vec::new();
+        ep_map.push(0);
+        ep_map.push(1);
+        ep_map.extend_from_slice(&0x1011u16.to_be_bytes());
+        ep_map.extend_from_slice(stream_header_bits);
+        ep_map.extend_from_slice(&stream_ep);
+
+        let mut cpi = Vec::new();
+        cpi.extend_from_slice(&((2 + ep_map.len()) as u32).to_be_bytes());
+        cpi.extend_from_slice(&[0u8; 2]);
+        cpi.extend_from_slice(&ep_map);
+
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        assert_eq!(clip.ep_fine.len(), 1);
+        assert_eq!(clip.ep_fine[0].pts_fine, 0x5AA); // high bits stripped
+        assert_eq!(clip.ep_fine[0].spn_fine, 0x1AAAA);
+    }
+
+    /// resolved_ep_map assigns fine entries to coarse groups via
+    /// [ref_to_fine_id .. next coarse's ref_to_fine_id). full_pts combines
+    /// coarse<<19 + fine<<8 and full_spn ORs masked coarse with fine.
+    /// Verify the first resolved entry's (pts, spn) for a known fixture.
+    #[test]
+    fn resolved_ep_map_combines_coarse_and_fine() {
+        // coarse 0: ref_to_fine_id=0, pts_coarse=10, spn_coarse=0x00020000
+        // fine 0: pts_fine=3, spn_fine=0x100
+        let cpi = build_cpi(0x1011, &[(0, 10, 0x00020000)], &[(3, 0x100)]);
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        let resolved = clip.resolved_ep_map();
+        assert_eq!(resolved.len(), 1);
+        let expected_pts = (10u64 << 19) + (3u64 << 8);
+        let expected_spn = (0x00020000u32 & 0xFFFE_0000) | 0x100;
+        assert_eq!(resolved[0].0, expected_pts);
+        assert_eq!(resolved[0].1, expected_spn);
+    }
+
+    /// get_extents converts an in/out PTS range to a single sector Extent.
+    /// SPN→byte = spn×192, byte→sector = /2048 (start floored, end ceiled),
+    /// relative to m2ts file start. Verify the math for a known fixture.
+    #[test]
+    fn get_extents_spn_to_sector_math() {
+        // Two EP points: PTS p0 → SPN 0, PTS p1 → SPN big_spn.
+        // full_spn ORs (spn_coarse & 0xFFFE0000) with spn_fine, so the SPN
+        // must be coarse-aligned (low 17 bits clear) to survive intact.
+        // 0x20000 (131072) is the smallest non-zero coarse-aligned SPN.
+        let big_spn: u32 = 0x20000;
+        let cpi = build_cpi(0x1011, &[(0, 0, 0), (1, 100, big_spn)], &[(0, 0), (0, 0)]);
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+
+        let p0 = (0u64 << 19) + (0u64 << 8); // PTS of first EP
+        let p1 = (100u64 << 19) + (0u64 << 8); // PTS of second EP
+        let extents = clip.get_extents(p0, p1);
+        assert_eq!(extents.len(), 1);
+        // start_spn = 0, end_spn = big_spn. SPN→byte ×192, byte→sector /2048.
+        let start_byte = 0u64 * 192;
+        let end_byte = big_spn as u64 * 192;
+        let start_sector = (start_byte / 2048) as u32;
+        let end_sector = end_byte.div_ceil(2048) as u32;
+        assert_eq!(extents[0].start_lba, start_sector);
+        assert_eq!(extents[0].sector_count, end_sector - start_sector);
+        // Concretely: 0x20000 × 192 / 2048 = 12288 sectors.
+        assert_eq!(extents[0].sector_count, 12288);
+    }
+
+    /// get_extents returns an empty Vec when the EP map is empty (no CPI),
+    /// since there is no SPN to resolve. Documented early return.
+    #[test]
+    fn get_extents_empty_when_no_ep_map() {
+        let data = build_clpi(1000, None);
+        let clip = parse(&data).expect("should parse");
+        assert!(clip.get_extents(0, 1_000_000).is_empty());
+    }
+
+    /// get_extents returns empty when end_spn <= start_spn (degenerate or
+    /// inverted range). Source has an explicit `if end_spn <= start_spn`
+    /// guard. Use in_time == out_time on a single-point map.
+    #[test]
+    fn get_extents_empty_on_degenerate_range() {
+        let cpi = build_cpi(0x1011, &[(0, 50, 0x1000)], &[(0, 0)]);
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        let p = (50u64 << 19) + (0u64 << 8);
+        // in == out → start_spn == end_spn → empty.
+        assert!(clip.get_extents(p, p).is_empty());
+    }
+
+    /// full_spn masks the LOW 17 bits of spn_coarse (& 0xFFFE0000) before
+    /// OR-ing fine. A spn_coarse with low bits set must have them cleared,
+    /// then replaced by spn_fine. Independent of parse, exercises the
+    /// reconstruction directly with a hostile low-bit pattern.
+    #[test]
+    fn full_spn_clears_coarse_low_17_bits() {
+        let coarse = EpCoarse {
+            ref_to_fine_id: 0,
+            pts_coarse: 0,
+            spn_coarse: 0x0006_FFFF, // low 17 bits all set
+        };
+        let fine = EpFine {
+            pts_fine: 0,
+            spn_fine: 0x5,
+        };
+        // 0x0006_FFFF & 0xFFFE_0000 = 0x0006_0000; | 0x5 = 0x0006_0005.
+        assert_eq!(ClipInfo::full_spn(&coarse, &fine), 0x0006_0005);
+    }
+
+    /// CPI guard: cpi_length < 4 short-circuits to empty maps (the length
+    /// field counts bytes after itself, and the EP map needs ≥4). A
+    /// cpi_length of 0/1/2/3 must yield empty EP maps, not panic.
+    #[test]
+    fn cpi_length_below_4_yields_empty() {
+        for bad_len in 0u32..4 {
+            let mut cpi = Vec::new();
+            cpi.extend_from_slice(&bad_len.to_be_bytes());
+            cpi.extend_from_slice(&[0u8; 20]); // padding so the slice exists
+            let data = build_clpi(1000, Some(&cpi));
+            let clip = parse(&data).expect("should parse");
+            assert!(clip.ep_coarse.is_empty(), "len={bad_len}");
+            assert!(clip.ep_fine.is_empty(), "len={bad_len}");
+        }
+    }
+
+    /// EP-map num_streams == 0 → empty maps (explicit guard). A CPI whose
+    /// EP map header declares zero stream PID entries carries no EP data.
+    #[test]
+    fn ep_map_zero_streams_yields_empty() {
+        let mut ep_map = Vec::new();
+        ep_map.push(0); // reserved
+        ep_map.push(0); // num_streams = 0
+        ep_map.extend_from_slice(&[0u8; 16]); // filler so len checks pass
+        let mut cpi = Vec::new();
+        cpi.extend_from_slice(&((2 + ep_map.len()) as u32).to_be_bytes());
+        cpi.extend_from_slice(&[0u8; 2]);
+        cpi.extend_from_slice(&ep_map);
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        assert!(clip.ep_coarse.is_empty());
+        assert!(clip.ep_fine.is_empty());
+    }
+
+    /// ep_map_offset that points past the EP map (`ep_map_offset + 4 >
+    /// ep_map.len()`) → empty maps (bounds guard), not panic. Patch the
+    /// EP_map_start field to a huge value.
+    #[test]
+    fn ep_map_offset_out_of_bounds_yields_empty() {
+        let cpi = build_cpi(0x1011, &[(0, 10, 0x20000)], &[(5, 100)]);
+        let mut data = build_clpi(1000, Some(&cpi));
+        // EP_map_start is the low 32 bits of the 80-bit stream header at
+        // ep_map[4..14]. In the file: header(60) + cpi_length(4) +
+        // reserved(2) + ep_map reserved(1) + num_streams(1) + pid(2) = 70,
+        // then 10 header bytes [70..80]; EP_map_start is the last 4 [76..80].
+        let off = 60 + 4 + 2 + 1 + 1 + 2 + 6; // = 76
+        data[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let clip = parse(&data).expect("should not panic");
+        assert!(clip.ep_coarse.is_empty());
+        assert!(clip.ep_fine.is_empty());
+    }
+
+    /// num_coarse declares more entries than the CPI section holds. The
+    /// loop must stop at `off + 8 > coarse_data.len()` (break), not read
+    /// out of bounds. Patch num_coarse to a large value while supplying 1
+    /// coarse entry's worth of bytes.
+    #[test]
+    fn coarse_count_overshoot_truncates_safely() {
+        let cpi = build_cpi(0x1011, &[(0, 10, 0x20000)], &[(5, 100)]);
+        let mut data = build_clpi(1000, Some(&cpi));
+        // num_coarse is bits 14..30 of the 80-bit header. Rather than
+        // bit-surgery, rebuild with a hand-set num_coarse=255 but only 1
+        // coarse entry of bytes — done below directly.
+        let _ = &mut data;
+
+        let num_coarse_decl: u32 = 255;
+        let num_fine: u32 = 1;
+        let ep_map_start: u32 = 14;
+        let ep_stream_type: u32 = 1;
+        let packed: u128 = ((ep_stream_type as u128) << 66)
+            | ((num_coarse_decl as u128) << 50)
+            | ((num_fine as u128) << 32)
+            | (ep_map_start as u128);
+        let packed_bytes = packed.to_be_bytes();
+        let stream_header_bits = &packed_bytes[6..16];
+
+        // stream EP data: fine_start points past the 1 coarse entry.
+        let fine_start: u32 = 4 + 1 * 8;
+        let mut stream_ep = Vec::new();
+        stream_ep.extend_from_slice(&fine_start.to_be_bytes());
+        // exactly ONE coarse entry (8 bytes), though header claims 255.
+        stream_ep.extend_from_slice(&((0u32 << 14) | 10).to_be_bytes());
+        stream_ep.extend_from_slice(&0x20000u32.to_be_bytes());
+        // one fine entry (4 bytes)
+        stream_ep.extend_from_slice(&(((5u32 & 0x7FF) << 17) | 100).to_be_bytes());
+
+        let mut ep_map = Vec::new();
+        ep_map.push(0);
+        ep_map.push(1);
+        ep_map.extend_from_slice(&0x1011u16.to_be_bytes());
+        ep_map.extend_from_slice(stream_header_bits);
+        ep_map.extend_from_slice(&stream_ep);
+        let mut cpi2 = Vec::new();
+        cpi2.extend_from_slice(&((2 + ep_map.len()) as u32).to_be_bytes());
+        cpi2.extend_from_slice(&[0u8; 2]);
+        cpi2.extend_from_slice(&ep_map);
+        let data2 = build_clpi(1000, Some(&cpi2));
+        let clip = parse(&data2).expect("should not panic on coarse overshoot");
+        // Only the 1 real coarse entry was readable.
+        assert_eq!(clip.ep_coarse.len(), 1);
+        assert_eq!(clip.ep_coarse[0].pts_coarse, 10);
+    }
+
+    /// CLPI between 40 and 60 bytes: passes the len<40 guard, but
+    /// source_packet_count needs [56..60]. Must yield 0, not panic.
+    /// (Mirrors parse_truncated_clipinfo_no_panic but asserts EP empty.)
+    #[test]
+    fn clipinfo_40_to_60_bytes_empty_ep() {
+        for len in 40..60usize {
+            let mut data = vec![0u8; len];
+            data[0..4].copy_from_slice(b"HDMV");
+            let clip = parse(&data).expect("short CLPI parses");
+            assert_eq!(clip.source_packet_count, 0);
+            assert!(clip.ep_coarse.is_empty());
+            assert!(clip.streams.is_empty());
+        }
+    }
+
+    /// resolved_ep_map: the LAST coarse group's fine range extends to
+    /// ep_fine.len() (no "next coarse" bound). Verify all trailing fine
+    /// entries are assigned to the final coarse group.
+    #[test]
+    fn resolved_ep_map_last_group_to_end() {
+        // coarse 0 ref_to_fine_id=0, coarse 1 ref_to_fine_id=1.
+        // 3 fine entries: fine 0 → coarse 0; fine 1,2 → coarse 1.
+        let cpi = build_cpi(
+            0x1011,
+            &[(0, 0, 0), (1, 100, 0)],
+            &[(0, 10), (0, 20), (0, 30)],
+        );
+        let data = build_clpi(1000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+        let resolved = clip.resolved_ep_map();
+        // All 3 fine entries resolved (last group picks up fine 1 and 2).
+        assert_eq!(resolved.len(), 3);
+    }
 }

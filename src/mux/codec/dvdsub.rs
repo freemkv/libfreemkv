@@ -479,4 +479,198 @@ mod tests {
         let text = String::from_utf8(result).unwrap();
         assert_eq!(text, "palette: 808080\n");
     }
+
+    // --- SPU_size boundary: completes exactly at declared size ---
+
+    #[test]
+    fn spu_completes_exactly_at_declared_size() {
+        // SPU_size is the total byte length including the 2-byte header. When the
+        // accumulated bytes reach exactly the declared size, the unit emits.
+        // Declared = 6, head carries all 6 → emits immediately on the head PES.
+        let mut parser = DvdSubParser::new(None);
+        let head = vec![0x00, 0x06, 0xAA, 0xBB, 0xCC, 0xDD]; // 6 bytes, declared 6
+        let f = parser.parse(&make_pes(head.clone(), Some(90000)));
+        assert_eq!(f.len(), 1, "complete-on-arrival SPU emits at once");
+        assert_eq!(f[0].data, head);
+        assert!(parser.pending.is_none(), "nothing left pending");
+    }
+
+    #[test]
+    fn spu_one_byte_short_waits_then_completes() {
+        // Declared 7 but head has 6 → held; a 1-byte continuation completes it.
+        let mut parser = DvdSubParser::new(None);
+        let head = vec![0x00, 0x07, 0xAA, 0xBB, 0xCC, 0xDD]; // 6 of 7
+        assert!(
+            parser
+                .parse(&make_pes(head.clone(), Some(90000)))
+                .is_empty()
+        );
+        let f = parser.parse(&make_pes(vec![0xEE], None)); // continuation
+        assert_eq!(f.len(), 1);
+        let mut expect = head;
+        expect.push(0xEE);
+        assert_eq!(
+            f[0].data, expect,
+            "reassembled to exactly the declared size"
+        );
+    }
+
+    #[test]
+    fn spu_overshoot_emits_all_buffered_bytes() {
+        // If a continuation pushes the buffer PAST the declared size, the unit
+        // still emits with all buffered bytes (>= size triggers emit). Declared
+        // 5, head 4, continuation 4 → 8 buffered, emits all 8.
+        let mut parser = DvdSubParser::new(None);
+        let head = vec![0x00, 0x05, 0xAA, 0xBB]; // 4 of 5
+        assert!(parser.parse(&make_pes(head, Some(90000))).is_empty());
+        let f = parser.parse(&make_pes(vec![0xCC, 0xDD, 0xEE, 0xFF], None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data,
+            vec![0x00, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            "all buffered bytes emitted, not truncated to declared size"
+        );
+    }
+
+    // --- MAX_SPU_BYTES bound ---
+
+    #[test]
+    fn head_pes_larger_than_max_spu_is_truncated() {
+        // A head PES larger than MAX_SPU_BYTES (0xFFFF) is truncated to the cap
+        // when buffered. Declared size in the first 2 bytes = 0xFFFF.
+        let mut parser = DvdSubParser::new(None);
+        let mut head = vec![0xFF, 0xFF]; // declared 0xFFFF
+        head.extend(std::iter::repeat_n(0xAB, MAX_SPU_BYTES + 100));
+        // The declared size 0xFFFF == buffered cap, so it completes at the cap.
+        let f = parser.parse(&make_pes(head, Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data.len(),
+            MAX_SPU_BYTES,
+            "head buffer truncated to MAX_SPU_BYTES"
+        );
+    }
+
+    #[test]
+    fn continuation_appends_bounded_by_max_spu() {
+        // A continuation must not push the buffer past MAX_SPU_BYTES. Declared a
+        // huge size so it never completes naturally, then flood continuations.
+        let mut parser = DvdSubParser::new(None);
+        let mut head = vec![0xFF, 0xFE]; // declared 0xFFFE
+        head.extend(std::iter::repeat_n(0x11, 1000));
+        assert!(parser.parse(&make_pes(head, Some(90000))).is_empty());
+        // Flood continuations far exceeding the cap.
+        for _ in 0..100 {
+            let _ = parser.parse(&make_pes(vec![0x22u8; 2000], None));
+        }
+        let pending_len = parser
+            .pending
+            .as_ref()
+            .map(|(_, _, b)| b.len())
+            .unwrap_or(0);
+        assert!(
+            pending_len <= MAX_SPU_BYTES,
+            "pending {pending_len} exceeded MAX_SPU_BYTES {MAX_SPU_BYTES}"
+        );
+    }
+
+    // --- one-byte head: too short to carry SPU_size ---
+
+    #[test]
+    fn single_byte_head_passes_through_as_lone_frame() {
+        // < 2 bytes can't carry the SPU_size field → passed through as a lone
+        // frame, not stored pending.
+        let mut parser = DvdSubParser::new(None);
+        let f = parser.parse(&make_pes(vec![0xAB], Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, vec![0xAB]);
+        assert!(parser.pending.is_none());
+    }
+
+    #[test]
+    fn declared_size_one_passes_through() {
+        // declared = 1 < 2 (the 2-byte header itself) is malformed → lone frame.
+        let mut parser = DvdSubParser::new(None);
+        let data = vec![0x00, 0x01, 0xAB];
+        let f = parser.parse(&make_pes(data.clone(), Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, data);
+        assert!(parser.pending.is_none());
+    }
+
+    #[test]
+    fn no_pts_short_segment_without_pending_passes_through() {
+        // A no-PTS segment with NO pending SPU and too few bytes to carry an
+        // SPU_size (< 2) has nothing to attach to and can't start a unit → passed
+        // through as a lone frame at pts 0 (the documented fallback).
+        let mut parser = DvdSubParser::new(None);
+        let f = parser.parse(&make_pes(vec![0xAA], None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 0, "lone no-PTS segment falls back to pts 0");
+        assert_eq!(f[0].data, vec![0xAA]);
+    }
+
+    #[test]
+    fn no_pts_sized_segment_without_pending_starts_new_spu() {
+        // A no-PTS segment with no pending but a valid SPU_size (>= 2) and an
+        // incomplete length begins a fresh pending SPU (the demuxer may have
+        // dropped the PTS, but the size field is authoritative for boundary).
+        // declared = 16, only 3 bytes present → held pending, no emit.
+        let mut parser = DvdSubParser::new(None);
+        let f = parser.parse(&make_pes(vec![0x00, 0x10, 0xAA], None));
+        assert!(f.is_empty(), "incomplete sized segment held, not emitted");
+        assert!(parser.pending.is_some(), "started a new pending SPU");
+        assert_eq!(parser.pending.as_ref().unwrap().0, 0, "pts 0 (no PTS)");
+    }
+
+    #[test]
+    fn flush_empty_when_nothing_pending() {
+        let mut parser = DvdSubParser::new(None);
+        assert!(parser.flush().is_empty());
+    }
+
+    // --- YCbCr → RGB green channel + neutral chroma ---
+
+    #[test]
+    fn ycbcr_green_channel_formula() {
+        // G = Y - 0.344*(Cb-128) - 0.714*(Cr-128). For pure-ish green choose
+        // Y=145, Cb=54, Cr=34: G should be high, R and B low. (Full-range BT.601
+        // per the module's deliberate convention.)
+        let [r, g, b] = ycbcr_to_rgb(&[0x00, 145, 54, 34]);
+        assert!(g > 200, "G high for green, got {g}");
+        assert!(r < 80, "R low for green, got {r}");
+        assert!(b < 80, "B low for green, got {b}");
+    }
+
+    #[test]
+    fn ycbcr_neutral_chroma_is_grey() {
+        // Cb=Cr=128 (neutral) → R=G=B=Y for any Y. (Confirms the chroma terms
+        // vanish at 128.)
+        for y in [0u8, 64, 128, 200, 255] {
+            let [r, g, b] = ycbcr_to_rgb(&[0x00, y, 128, 128]);
+            assert_eq!([r, g, b], [y, y, y], "neutral chroma → grey at Y={y}");
+        }
+    }
+
+    #[test]
+    fn ycbcr_blue_channel_clamps_high() {
+        // B = Y + 1.772*(Cb-128). Y=128, Cb=255 → 128 + 1.772*127 ≈ 353 → clamp 255.
+        let [_r, _g, b] = ycbcr_to_rgb(&[0x00, 128, 255, 128]);
+        assert_eq!(b, 255, "blue clamps at 255");
+    }
+
+    #[test]
+    fn format_palette_empty_is_just_prefix() {
+        // An empty palette yields "palette: \n" (prefix + newline, no entries).
+        let result = format_palette(&[]);
+        assert_eq!(String::from_utf8(result).unwrap(), "palette: \n");
+    }
+
+    #[test]
+    fn format_palette_pads_each_channel_to_two_hex_digits() {
+        // Each RGB channel is formatted as exactly 2 hex digits (zero-padded).
+        // Y=16,neutral → 0x10 → "101010" (each channel two digits).
+        let result = format_palette(&[[0x00, 16, 128, 128]]);
+        assert_eq!(String::from_utf8(result).unwrap(), "palette: 101010\n");
+    }
 }

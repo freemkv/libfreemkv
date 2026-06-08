@@ -984,4 +984,499 @@ mod tests {
         };
         assert_eq!(e2.to_string(), format!("E{}: abc", E_NO_DISC_KEY));
     }
+
+    // ── New comprehensive tests ────────────────────────────────────────────────
+
+    /// Every published error code constant must be unique.
+    /// This pins all code assignments: a new variant that accidentally reuses
+    /// an existing code will make this test fail.
+    /// Mutation: changing E_KEYDB_PARSE from 8004 to 8000 (duplicating E_KEYDB_CONNECT) fails here.
+    #[test]
+    fn all_error_code_constants_are_unique() {
+        let mut codes = vec![
+            E_DEVICE_NOT_FOUND,
+            E_DEVICE_PERMISSION,
+            E_DEVICE_NOT_READY,
+            E_DEVICE_RESET_FAILED,
+            E_SCSI_INTERFACE_UNAVAILABLE,
+            E_DEVICE_LOCKED,
+            E_IOKIT_PLUGIN_FAILED,
+            E_UNSUPPORTED_DRIVE,
+            E_PROFILE_PARSE,
+            E_UNSUPPORTED_PLATFORM,
+            E_PLATFORM_NOT_IMPLEMENTED,
+            E_UNLOCK_FAILED,
+            E_SIGNATURE_MISMATCH,
+            E_SCSI_ERROR,
+            E_IO_ERROR,
+            E_DISC_READ,
+            E_MPLS_PARSE,
+            E_CLPI_PARSE,
+            E_UDF_NOT_FOUND,
+            E_DISC_TITLE_RANGE,
+            E_IFO_PARSE,
+            E_MKV_INVALID,
+            E_NO_STREAMS,
+            E_HALTED,
+            E_MAPFILE_INVALID,
+            E_UDF_BUFFER_TOO_SMALL,
+            E_AACS_NO_KEYS,
+            E_AACS_CERT_SHORT,
+            E_AACS_AGID_ALLOC,
+            E_AACS_CERT_REJECTED,
+            E_AACS_CERT_READ,
+            E_AACS_CERT_VERIFY,
+            E_AACS_KEY_READ,
+            E_AACS_KEY_REJECTED,
+            E_AACS_KEY_VERIFY,
+            E_AACS_VID_READ,
+            E_AACS_VID_MAC,
+            E_AACS_DATA_KEY,
+            E_DECRYPT_FAILED,
+            E_CSS_AUTH_FAILED,
+            E_AACS_HOST_CERT_REJECTED,
+            E_AACS_RAW_READ_UNSUPPORTED,
+            E_AACS_VID_UNAVAILABLE,
+            E_AACS_MK_UNAVAILABLE,
+            E_AACS_VUK_NOT_IN_KEYDB,
+            E_DRIVE_PROFILE_MISSING,
+            E_VID_CDB_UNAVAILABLE,
+            E_NO_DISC_KEY,
+            E_KEYDB_CONNECT,
+            E_KEYDB_HTTP,
+            E_KEYDB_INVALID,
+            E_KEYDB_WRITE,
+            E_KEYDB_PARSE,
+            E_KEYDB_LOAD,
+            E_KEYDB_UNSUPPORTED_SCHEME,
+            E_KEYDB_TOO_MANY_REDIRECTS,
+            E_STREAM_READ_ONLY,
+            E_STREAM_WRITE_ONLY,
+            E_STREAM_URL_INVALID,
+            E_STREAM_URL_MISSING_PATH,
+            E_STREAM_URL_MISSING_PORT,
+            E_PES_FRAME_TOO_LARGE,
+            E_PES_INVALID_MAGIC,
+            E_PES_TRACK_TOO_LARGE,
+            E_ISO_TOO_LARGE,
+            E_NO_METADATA,
+            E_DISC_URL_NOT_DIRECT,
+            E_HEVC_PARAM_PARSE,
+            E_MUX_TRACK_RANGE,
+            E_FMP4_UNIMPLEMENTED,
+            E_DEMUX_THREAD_PANICKED,
+            E_PIPELINE_JOIN_TIMEOUT,
+            E_PIPELINE_CONSUMER_PANICKED,
+            E_SWEEP_CONSUMER_GONE,
+            E_PIPELINE_CONSUMER_GONE,
+            E_DISC_CAPACITY_OVERFLOW,
+            E_M2TS_PACKET_MALFORMED,
+            E_EXTENT_NOT_UNIT_ALIGNED,
+            E_DISC_CAPACITY_MALFORMED,
+        ];
+        let original_len = codes.len();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(
+            codes.len(),
+            original_len,
+            "duplicate error code constants detected — check error.rs"
+        );
+    }
+
+    /// Error code ranges match their documented category buckets.
+    /// E.g. all device codes are 1000–1999, all AACS codes are 7000–7999.
+    /// Mutation: accidentally shifting a constant out of its range (e.g. E_DEVICE_NOT_FOUND = 2000)
+    ///           breaks CLI range-based dispatch and logging.
+    #[test]
+    fn error_code_range_buckets_are_correct() {
+        // Device (1xxx)
+        assert!((1000..2000).contains(&E_DEVICE_NOT_FOUND));
+        assert!((1000..2000).contains(&E_DEVICE_PERMISSION));
+        assert!((1000..2000).contains(&E_SCSI_INTERFACE_UNAVAILABLE));
+        // Profile (2xxx)
+        assert!((2000..3000).contains(&E_UNSUPPORTED_DRIVE));
+        assert!((2000..3000).contains(&E_PROFILE_PARSE));
+        // Unlock (3xxx)
+        assert!((3000..4000).contains(&E_UNLOCK_FAILED));
+        assert!((3000..4000).contains(&E_SIGNATURE_MISMATCH));
+        // SCSI (4xxx)
+        assert!((4000..5000).contains(&E_SCSI_ERROR));
+        // I/O (5xxx)
+        assert!((5000..6000).contains(&E_IO_ERROR));
+        // Disc format (6xxx)
+        assert!((6000..7000).contains(&E_DISC_READ));
+        assert!((6000..7000).contains(&E_HALTED));
+        assert!((6000..7000).contains(&E_MAPFILE_INVALID));
+        // AACS (7xxx)
+        assert!((7000..8000).contains(&E_AACS_NO_KEYS));
+        assert!((7000..8000).contains(&E_NO_DISC_KEY));
+        // Keydb (8xxx)
+        assert!((8000..9000).contains(&E_KEYDB_CONNECT));
+        assert!((8000..9000).contains(&E_KEYDB_TOO_MANY_REDIRECTS));
+        // Stream/mux (9xxx)
+        assert!((9000..10000).contains(&E_STREAM_READ_ONLY));
+        assert!((9000..10000).contains(&E_DISC_CAPACITY_MALFORMED));
+    }
+
+    /// Error.code() matches its associated constant for every new 9xxx variant.
+    /// Mutation: swapping two adjacent code() arms (e.g. SweepConsumerGone ↔
+    ///           PipelineConsumerGone) makes the wrong code appear in logs.
+    #[test]
+    fn error_code_matches_constant_for_stream_variants() {
+        use std::io::ErrorKind;
+        let cases: &[(Error, u16)] = &[
+            (Error::StreamReadOnly, E_STREAM_READ_ONLY),
+            (Error::StreamWriteOnly, E_STREAM_WRITE_ONLY),
+            (Error::PesInvalidMagic, E_PES_INVALID_MAGIC),
+            (Error::NoMetadata, E_NO_METADATA),
+            (Error::DiscUrlNotDirect, E_DISC_URL_NOT_DIRECT),
+            (Error::HevcParamParse, E_HEVC_PARAM_PARSE),
+            (Error::Fmp4Unimplemented, E_FMP4_UNIMPLEMENTED),
+            (Error::DemuxThreadPanicked, E_DEMUX_THREAD_PANICKED),
+            (
+                Error::PipelineConsumerPanicked,
+                E_PIPELINE_CONSUMER_PANICKED,
+            ),
+            (Error::SweepConsumerGone, E_SWEEP_CONSUMER_GONE),
+            (Error::PipelineConsumerGone, E_PIPELINE_CONSUMER_GONE),
+            (Error::DiscCapacityOverflow, E_DISC_CAPACITY_OVERFLOW),
+            (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
+            (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
+            (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),
+        ];
+        for (e, expected_code) in cases {
+            assert_eq!(
+                e.code(),
+                *expected_code,
+                "{:?}.code() must equal {} (const)",
+                e,
+                expected_code
+            );
+        }
+        // io::ErrorKind mapping spot-check for 9xxx variants.
+        let to_kind = |e: Error| -> ErrorKind {
+            let io: std::io::Error = e.into();
+            io.kind()
+        };
+        assert_eq!(to_kind(Error::StreamReadOnly), ErrorKind::Unsupported);
+        assert_eq!(to_kind(Error::HevcParamParse), ErrorKind::InvalidData);
+        assert_eq!(to_kind(Error::Fmp4Unimplemented), ErrorKind::Unsupported);
+        assert_eq!(to_kind(Error::PipelineJoinTimeout), ErrorKind::TimedOut);
+        assert_eq!(
+            to_kind(Error::ExtentNotUnitAligned),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    /// Error.code() for AACS variants matches their constants.
+    /// Mutation: swapping E_AACS_CERT_READ and E_AACS_CERT_VERIFY codes
+    ///           makes the wrong diagnostic appear in the UI.
+    #[test]
+    fn error_code_matches_constant_for_aacs_variants() {
+        let aacs_cases: &[(Error, u16)] = &[
+            (Error::AacsNoKeys, E_AACS_NO_KEYS),
+            (Error::AacsCertShort, E_AACS_CERT_SHORT),
+            (Error::AacsAgidAlloc, E_AACS_AGID_ALLOC),
+            (Error::AacsCertRejected, E_AACS_CERT_REJECTED),
+            (Error::AacsCertRead, E_AACS_CERT_READ),
+            (Error::AacsCertVerify, E_AACS_CERT_VERIFY),
+            (Error::AacsKeyRead, E_AACS_KEY_READ),
+            (Error::AacsKeyRejected, E_AACS_KEY_REJECTED),
+            (Error::AacsKeyVerify, E_AACS_KEY_VERIFY),
+            (Error::AacsVidRead, E_AACS_VID_READ),
+            (Error::AacsVidMac, E_AACS_VID_MAC),
+            (Error::AacsDataKey, E_AACS_DATA_KEY),
+            (Error::DecryptFailed, E_DECRYPT_FAILED),
+            (Error::CssAuthFailed, E_CSS_AUTH_FAILED),
+            (Error::AacsHostCertRejected, E_AACS_HOST_CERT_REJECTED),
+            (Error::AacsRawReadUnsupported, E_AACS_RAW_READ_UNSUPPORTED),
+            (Error::AacsVidUnavailable, E_AACS_VID_UNAVAILABLE),
+            (Error::AacsMkUnavailable, E_AACS_MK_UNAVAILABLE),
+            (Error::AacsVukNotInKeydb, E_AACS_VUK_NOT_IN_KEYDB),
+            (Error::DriveProfileMissing, E_DRIVE_PROFILE_MISSING),
+            (Error::VidCdbUnavailable, E_VID_CDB_UNAVAILABLE),
+        ];
+        for (e, expected_code) in aacs_cases {
+            assert_eq!(
+                e.code(),
+                *expected_code,
+                "{:?}.code() must be {}",
+                e,
+                expected_code
+            );
+        }
+    }
+
+    /// is_scsi_transport_failure returns true only for SCSI_STATUS_TRANSPORT_FAILURE (0xFF).
+    /// Spec: comment on SCSI_STATUS_TRANSPORT_FAILURE says "synthesised sentinel: the
+    ///       transport never delivered a SCSI status byte".
+    /// Mutation: testing against 0x02 (CHECK CONDITION) would wrongly mark CHECK
+    ///           CONDITION replies as transport failures.
+    #[test]
+    fn is_scsi_transport_failure_only_for_0xff() {
+        use crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE;
+        // True: transport failure sentinel.
+        let tf = Error::ScsiError {
+            opcode: 0x28,
+            status: SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        };
+        assert!(tf.is_scsi_transport_failure());
+
+        // False: CHECK CONDITION is a real SCSI reply, not a transport failure.
+        let cc = Error::ScsiError {
+            opcode: 0x28,
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: 0x03,
+                asc: 0x11,
+                ascq: 0x00,
+            }),
+        };
+        assert!(!cc.is_scsi_transport_failure());
+
+        // False for non-SCSI errors.
+        assert!(!Error::Halted.is_scsi_transport_failure());
+    }
+
+    /// is_marginal_read returns true for MEDIUM ERROR (3), NOT READY (2),
+    /// ABORTED COMMAND (B), RECOVERED ERROR (1), NO SENSE (0).
+    /// Spec: comment on is_marginal_read lists these five sense keys.
+    /// Mutation: removing NOT_READY from the marginal set means BU40N "bad sector"
+    ///           responses are treated as fatal instead of retriable.
+    #[test]
+    fn is_marginal_read_sense_key_coverage() {
+        use crate::scsi::ScsiSense;
+        let marginal_keys = [
+            0x00, // NO SENSE
+            0x01, // RECOVERED ERROR
+            0x02, // NOT READY — dominant BU40N bad-sector sense key
+            0x03, // MEDIUM ERROR — canonical bad sector
+            0x0B, // ABORTED COMMAND
+        ];
+        for sk in marginal_keys {
+            let e = Error::ScsiError {
+                opcode: 0x28,
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(ScsiSense {
+                    sense_key: sk,
+                    asc: 0x11,
+                    ascq: 0x00,
+                }),
+            };
+            assert!(
+                e.is_marginal_read(),
+                "sense_key=0x{:02x} must be marginal",
+                sk
+            );
+        }
+        // Non-marginal keys: HARDWARE ERROR (4), ILLEGAL REQUEST (5),
+        // UNIT ATTENTION (6), DATA PROTECT (7), BLANK CHECK (8).
+        let non_marginal_keys = [0x04, 0x05, 0x06, 0x07, 0x08];
+        for sk in non_marginal_keys {
+            let e = Error::ScsiError {
+                opcode: 0x28,
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense: Some(ScsiSense {
+                    sense_key: sk,
+                    asc: 0x00,
+                    ascq: 0x00,
+                }),
+            };
+            assert!(
+                !e.is_marginal_read(),
+                "sense_key=0x{:02x} must NOT be marginal",
+                sk
+            );
+        }
+    }
+
+    /// is_bridge_degradation returns true for a status byte that is not GOOD,
+    /// CHECK CONDITION, or TRANSPORT_FAILURE.
+    /// Spec: comment says "bridge firmware returns non-standard status bytes
+    ///       (e.g. 0x04, 0x05) with empty sense data."
+    /// Mutation: checking only for 0x04 misses 0x05 and other degradation bytes.
+    #[test]
+    fn is_bridge_degradation_detects_non_standard_status() {
+        use crate::scsi::{
+            SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_GOOD, SCSI_STATUS_TRANSPORT_FAILURE,
+        };
+        // 0x04 and 0x05 are non-standard bridge degradation codes.
+        for bad_status in [0x04u8, 0x05, 0x08, 0x10] {
+            let e = Error::ScsiError {
+                opcode: 0x28,
+                status: bad_status,
+                sense: None,
+            };
+            assert!(
+                e.is_bridge_degradation(),
+                "status=0x{:02x} must be bridge degradation",
+                bad_status
+            );
+        }
+        // Standard codes must NOT be classified as bridge degradation.
+        assert!(
+            !Error::ScsiError {
+                opcode: 0x28,
+                status: SCSI_STATUS_GOOD,
+                sense: None
+            }
+            .is_bridge_degradation()
+        );
+        assert!(
+            !Error::ScsiError {
+                opcode: 0x28,
+                status: SCSI_STATUS_CHECK_CONDITION,
+                sense: None
+            }
+            .is_bridge_degradation()
+        );
+        assert!(
+            !Error::ScsiError {
+                opcode: 0x28,
+                status: SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None
+            }
+            .is_bridge_degradation()
+        );
+    }
+
+    /// scsi_sense returns Some for ScsiError with sense and DiscRead with sense.
+    /// Mutation: only checking ScsiError misses DiscRead sense data.
+    #[test]
+    fn scsi_sense_from_disc_read() {
+        use crate::scsi::ScsiSense;
+        let sense = ScsiSense {
+            sense_key: 0x02,
+            asc: 0x04,
+            ascq: 0x3e,
+        };
+        let disc_read = Error::DiscRead {
+            sector: 12345,
+            status: Some(0x02),
+            sense: Some(sense),
+        };
+        let got = disc_read.scsi_sense().unwrap();
+        assert_eq!(got.sense_key, 0x02);
+        assert_eq!(got.asc, 0x04);
+        assert_eq!(got.ascq, 0x3e);
+
+        // Non-SCSI errors return None.
+        assert!(Error::Halted.scsi_sense().is_none());
+        assert!(Error::NoMetadata.scsi_sense().is_none());
+    }
+
+    /// Display for SignatureMismatch includes both expected and got bytes in hex.
+    /// Mutation: printing only `expected` without `got` makes the mismatch undiscoverable.
+    #[test]
+    fn signature_mismatch_display_includes_both_sides() {
+        let e = Error::SignatureMismatch {
+            expected: [0xAA, 0xBB, 0xCC, 0xDD],
+            got: [0x11, 0x22, 0x33, 0x44],
+        };
+        let s = e.to_string();
+        // Must include the E-code prefix.
+        assert!(
+            s.starts_with(&format!("E{}", E_SIGNATURE_MISMATCH)),
+            "must start with code: {s}"
+        );
+        // Must include the expected bytes.
+        assert!(s.contains("aabbccdd"), "must contain expected bytes: {s}");
+        // Must include the got bytes.
+        assert!(s.contains("11223344"), "must contain got bytes: {s}");
+        // Must use '!=' as the separator between expected and got.
+        assert!(s.contains("!="), "must use '!=' separator: {s}");
+    }
+
+    /// DiscTitleRange display format is "E6005: index/count".
+    /// Mutation: swapping index and count in the format string makes logs misleading.
+    #[test]
+    fn disc_title_range_display_is_index_slash_count() {
+        let e = Error::DiscTitleRange {
+            index: 3,
+            count: 10,
+        };
+        let expected = format!("E{}: 3/10", E_DISC_TITLE_RANGE);
+        assert_eq!(e.to_string(), expected);
+    }
+
+    /// Keydb error variants display correctly with their structured data.
+    /// Mutation: using a generic "E{code}" fallback drops the host/path data from logs.
+    #[test]
+    fn keydb_errors_include_structured_data_in_display() {
+        let e_connect = Error::KeydbConnect {
+            host: "mirror.example".into(),
+        };
+        assert!(
+            e_connect.to_string().contains("mirror.example"),
+            "KeydbConnect display must include host"
+        );
+
+        let e_http = Error::KeydbHttp { status: 403 };
+        assert!(
+            e_http.to_string().contains("403"),
+            "KeydbHttp display must include status code"
+        );
+
+        let e_write = Error::KeydbWrite {
+            path: "/root/.config/freemkv/keydb.cfg".into(),
+        };
+        assert!(
+            e_write.to_string().contains("/root"),
+            "KeydbWrite display must include path"
+        );
+
+        let e_load = Error::KeydbLoad {
+            path: "<no keydb in search paths>".into(),
+        };
+        assert!(
+            e_load.to_string().contains("<no keydb in search paths>"),
+            "KeydbLoad display must include the sentinel path"
+        );
+
+        let e_scheme = Error::KeydbUnsupportedScheme {
+            scheme: "ftp".into(),
+        };
+        assert!(
+            e_scheme.to_string().contains("ftp"),
+            "KeydbUnsupportedScheme display must include scheme"
+        );
+    }
+
+    /// MuxTrackRange display format is "E9011: track/tracks".
+    /// Mutation: formatting as "track/count" or "tracks/track" is wrong.
+    #[test]
+    fn mux_track_range_display_is_track_slash_tracks() {
+        let e = Error::MuxTrackRange {
+            track: 5,
+            tracks: 3,
+        };
+        let expected = format!("E{}: 5/3", E_MUX_TRACK_RANGE);
+        assert_eq!(e.to_string(), expected);
+    }
+
+    /// All keydb error codes are 8xxx.
+    /// Mutation: creating E_KEYDB_PARSE = 9004 (colliding with E_KEYDB_LOAD range)
+    ///           breaks the CLI's range-based keydb error dispatch.
+    #[test]
+    fn keydb_error_codes_all_in_8xxx_range() {
+        let keydb_codes = [
+            E_KEYDB_CONNECT,
+            E_KEYDB_HTTP,
+            E_KEYDB_INVALID,
+            E_KEYDB_WRITE,
+            E_KEYDB_PARSE,
+            E_KEYDB_LOAD,
+            E_KEYDB_UNSUPPORTED_SCHEME,
+            E_KEYDB_TOO_MANY_REDIRECTS,
+        ];
+        for code in keydb_codes {
+            assert!(
+                (8000..9000).contains(&code),
+                "keydb code {} must be in 8xxx range",
+                code
+            );
+        }
+    }
 }

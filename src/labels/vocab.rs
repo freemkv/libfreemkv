@@ -491,4 +491,298 @@ mod tests {
         assert!(has_word("english (sdh)", "sdh"));
         assert!(has_word("commentary,extra,info", "commentary"));
     }
+
+    // ── Additional hardening tests ─────────────────────────────────────────
+
+    /// Spec: `MLP` is the Pixelogic token for Dolby TrueHD.
+    /// AUDIO_CODECS in pixelogic lists it; vocab maps it to "TrueHD".
+    /// Mutation: remove "MLP" from the codec match → "MLP" passes through.
+    #[test]
+    fn codec_mlp_maps_to_truehd() {
+        assert_eq!(codec("MLP"), "TrueHD");
+        assert_eq!(codec("mlp"), "TrueHD");
+        assert_eq!(codec("Mlp"), "TrueHD");
+    }
+
+    /// Spec: `AC` (without the `3` suffix) is also a recognized alias for
+    /// Dolby Digital in Pixelogic tokens.
+    /// Mutation: remove `"AC"` from the match arm → "AC" passes through.
+    #[test]
+    fn codec_ac_without_3_maps_to_dolby_digital() {
+        assert_eq!(codec("AC"), "Dolby Digital");
+        assert_eq!(codec("ac"), "Dolby Digital");
+    }
+
+    /// Spec: `DDL` is Dolby's internal token for Dolby Digital Plus (EAC-3).
+    /// Mutation: remove `"DDL"` arm → "DDL" passes through.
+    #[test]
+    fn codec_ddl_maps_to_dolby_digital_plus() {
+        assert_eq!(codec("DDL"), "Dolby Digital Plus");
+        assert_eq!(codec("ddl"), "Dolby Digital Plus");
+    }
+
+    /// Spec: `WAV` (PCM WAV) maps to "PCM" display string.
+    /// Mutation: remove `"WAV"` arm → "WAV" passes through.
+    #[test]
+    fn codec_wav_maps_to_pcm() {
+        assert_eq!(codec("WAV"), "PCM");
+        assert_eq!(codec("wav"), "PCM");
+    }
+
+    /// Spec: `ATMOS` maps to "Dolby Atmos" (the brand string).
+    /// Mutation: remove `"ATMOS"` arm → "ATMOS" passes through unchanged.
+    #[test]
+    fn codec_atmos_maps_to_dolby_atmos() {
+        assert_eq!(codec("ATMOS"), "Dolby Atmos");
+        assert_eq!(codec("Atmos"), "Dolby Atmos");
+        assert_eq!(codec("atmos"), "Dolby Atmos");
+    }
+
+    /// Spec: `DTS` is recognized but passes through unchanged (no alias needed).
+    /// Unknown codes return IN THEIR ORIGINAL CASING (the match branch is `_ => code`).
+    /// Mutation: add `"DTS" => "DTS-HD"` → DTS incorrectly upgraded.
+    #[test]
+    fn codec_dts_passes_through_unchanged() {
+        assert_eq!(codec("DTS"), "DTS");
+        // Lowercase input returns lowercase — unknown codes pass through raw.
+        assert_eq!(codec("dts"), "dts");
+    }
+
+    /// Spec: COMPOUND_LANGS must be ordered longest-first so that
+    /// "Brazilian Portuguese" is matched before bare "Portuguese".
+    /// Mutation: put "portuguese" before "brazilian portuguese" in the table →
+    /// Brazilian Portuguese returns variant="", losing the regional info.
+    #[test]
+    fn compound_lang_longest_match_wins() {
+        let r = lang("Brazilian Portuguese 5.1 Dolby").unwrap();
+        assert_eq!(r.code, "por");
+        assert_eq!(r.variant, "Brazilian");
+
+        let r = lang("Castilian Spanish").unwrap();
+        assert_eq!(r.code, "spa");
+        assert_eq!(r.variant, "Castilian");
+
+        let r = lang("Latin American Spanish").unwrap();
+        assert_eq!(r.code, "spa");
+        assert_eq!(r.variant, "Latin American");
+    }
+
+    /// Spec: bare language name lookup uses word-boundary matching.
+    /// Mutation: use `.contains()` instead of `has_word()` → "engineering" matches "english".
+    #[test]
+    fn lang_no_false_positive_substring() {
+        assert_eq!(lang("Audio Engineering"), None);
+        assert_eq!(lang("Francispeople"), None);
+    }
+
+    /// Spec: all 36 bare-lang entries must resolve correctly.
+    /// Mutation: swap two entries in BARE_LANGS → wrong code returned.
+    #[test]
+    fn lang_bare_all_entries_spot_check() {
+        let cases = [
+            ("English", "eng"),
+            ("Spanish", "spa"),
+            ("French", "fra"),
+            ("German", "deu"),
+            ("Italian", "ita"),
+            ("Japanese", "jpn"),
+            ("Chinese", "zho"),
+            ("Korean", "kor"),
+            ("Portuguese", "por"),
+            ("Polish", "pol"),
+            ("Czech", "ces"),
+            ("Hungarian", "hun"),
+            ("Dutch", "nld"),
+            ("Arabic", "ara"),
+            ("Russian", "rus"),
+            ("Swedish", "swe"),
+            ("Finnish", "fin"),
+        ];
+        for (name, code) in cases {
+            let r = lang(name).unwrap_or_else(|| panic!("lang({:?}) must be Some", name));
+            assert_eq!(r.code, code, "wrong code for {}", name);
+            assert_eq!(r.variant, "", "bare lang {} must have empty variant", name);
+        }
+    }
+
+    /// Spec: `purpose()` recognizes "commentary" (word-boundary).
+    /// Mutation: use `contains("comment")` → "commenter" wrongly matches.
+    #[test]
+    fn purpose_commentary_word_boundary() {
+        assert_eq!(purpose("English Commentary"), LabelPurpose::Commentary);
+        assert_eq!(purpose("Commenter Track"), LabelPurpose::Normal);
+        assert_eq!(purpose("recommentary"), LabelPurpose::Normal);
+    }
+
+    /// Spec: "Director's Commentary" is a recognized phrase.
+    /// Mutation: require exact "commentary" without apostrophe prefix → fails.
+    #[test]
+    fn purpose_directors_commentary_recognized() {
+        assert_eq!(purpose("Director's Commentary"), LabelPurpose::Commentary);
+    }
+
+    /// Spec: `purpose()` recognizes "audio description" compound phrase.
+    /// Mutation: remove the compound `audio description` check → Descriptive broken.
+    #[test]
+    fn purpose_audio_description_compound() {
+        assert_eq!(purpose("Audio Description"), LabelPurpose::Descriptive);
+        assert_eq!(
+            purpose("English Audio Description"),
+            LabelPurpose::Descriptive
+        );
+    }
+
+    /// Spec: "descriptive service" maps to Descriptive via compound check.
+    /// Mutation: remove "descriptive service" compound → Normal returned.
+    #[test]
+    fn purpose_descriptive_service_compound() {
+        assert_eq!(
+            purpose("English Descriptive Service"),
+            LabelPurpose::Descriptive
+        );
+    }
+
+    /// Spec: "music only" maps to Score via compound check.
+    /// Mutation: remove "music only" compound → Normal returned.
+    #[test]
+    fn purpose_music_only_maps_to_score() {
+        assert_eq!(purpose("Music Only"), LabelPurpose::Score);
+        assert_eq!(purpose("English Music Only Track"), LabelPurpose::Score);
+    }
+
+    /// Spec: "score" (bare word) maps to Score.
+    /// Mutation: remove `has_word(&lower, "score")` check → Normal returned.
+    #[test]
+    fn purpose_score_bare_word() {
+        assert_eq!(purpose("Isolated Score"), LabelPurpose::Score);
+        assert_eq!(purpose("Score Track"), LabelPurpose::Score);
+    }
+
+    /// Spec: "ime" maps to Ime (alternate music track).
+    /// Mutation: remove `has_word(&lower, "ime")` check → Normal returned.
+    #[test]
+    fn purpose_ime_recognized() {
+        assert_eq!(purpose("IME"), LabelPurpose::Ime);
+        assert_eq!(purpose("English ime track"), LabelPurpose::Ime);
+    }
+
+    /// Spec: "ime" inside "time" or "anime" must NOT match.
+    /// Mutation: use `contains("ime")` → "anime", "time" falsely match.
+    #[test]
+    fn purpose_ime_no_substring_match() {
+        assert_eq!(purpose("Showtime Audio"), LabelPurpose::Normal);
+        assert_eq!(purpose("Anime Commentary"), LabelPurpose::Commentary);
+    }
+
+    /// Spec: `qualifier()` prioritizes SDH over Forced when both present.
+    /// Mutation: reverse the SDH check order → Forced returned when both present.
+    #[test]
+    fn qualifier_sdh_priority_over_forced() {
+        assert_eq!(qualifier("English Forced SDH"), LabelQualifier::Sdh);
+        assert_eq!(qualifier("SDH Forced"), LabelQualifier::Sdh);
+    }
+
+    /// Spec: "captions" maps to Sdh (closed-caption subtitles for deaf).
+    /// Mutation: remove `has_word(&lower, "captions")` → "captions" returns None.
+    #[test]
+    fn qualifier_captions_maps_to_sdh() {
+        assert_eq!(qualifier("English Captions"), LabelQualifier::Sdh);
+        assert_eq!(qualifier("Closed Captions"), LabelQualifier::Sdh);
+    }
+
+    /// Spec: "forced narrative" → Forced qualifier.
+    /// Mutation: remove "forced" check → None returned.
+    #[test]
+    fn qualifier_forced_narrative() {
+        assert_eq!(qualifier("Forced Narrative"), LabelQualifier::Forced);
+        assert_eq!(
+            qualifier("English Forced Subtitles"),
+            LabelQualifier::Forced
+        );
+    }
+
+    /// Spec: "rnib" → DescriptiveService qualifier.
+    /// Mutation: remove `has_word(&lower, "rnib")` → None returned.
+    #[test]
+    fn qualifier_rnib_maps_to_descriptive_service() {
+        assert_eq!(
+            qualifier("English RNIB"),
+            LabelQualifier::DescriptiveService
+        );
+    }
+
+    /// Spec: "descriptive service" compound → DescriptiveService.
+    /// Mutation: remove compound check → None returned.
+    #[test]
+    fn qualifier_descriptive_service_compound() {
+        assert_eq!(
+            qualifier("English Descriptive Service"),
+            LabelQualifier::DescriptiveService
+        );
+    }
+
+    /// Word boundary: "sdh" inside "lambdash" must not match.
+    /// Mutation: use `contains("sdh")` → "lambdash" falsely triggers SDH.
+    #[test]
+    fn qualifier_no_substring_sdh() {
+        assert_eq!(qualifier("lambdash"), LabelQualifier::None);
+        assert_eq!(qualifier("Swedish"), LabelQualifier::None); // "swe" not "sdh"
+    }
+
+    /// ISO 639-2 codes as input (e.g. "eng") must NOT match via `lang()` because
+    /// the function maps English *names*, not ISO codes.
+    /// Mutation: add an ISO-code lookup table → "eng" returned for iso input.
+    #[test]
+    fn lang_iso_code_input_returns_none() {
+        assert_eq!(lang("eng"), None);
+        assert_eq!(lang("fra"), None);
+        assert_eq!(lang("jpn"), None);
+        assert_eq!(lang("zho"), None);
+    }
+
+    /// Compound lang "Australian English" → (eng, Australian).
+    /// Mutation: put "australian english" after "english" → bare "English" wins.
+    #[test]
+    fn compound_lang_australian_english() {
+        let r = lang("Australian English").unwrap();
+        assert_eq!(r.code, "eng");
+        assert_eq!(r.variant, "Australian");
+    }
+
+    /// Compound lang corpus typo "Austrailian English" (missing 'l') must still match.
+    /// Mutation: remove the typo entry → no variant info.
+    #[test]
+    fn compound_lang_austrailian_typo_matched() {
+        let r = lang("Austrailian English").unwrap();
+        assert_eq!(r.code, "eng");
+        assert_eq!(r.variant, "Australian");
+    }
+
+    /// Euro Portuguese vs European Portuguese: both map to (por, European).
+    /// Mutation: remove "euro portuguese" → "Euro Portuguese" returns (por, "").
+    #[test]
+    fn compound_lang_euro_portuguese() {
+        let r = lang("Euro Portuguese").unwrap();
+        assert_eq!(r.code, "por");
+        assert_eq!(r.variant, "European");
+
+        let r = lang("European Portuguese").unwrap();
+        assert_eq!(r.code, "por");
+        assert_eq!(r.variant, "European");
+    }
+
+    /// `has_word` empty needle returns false (guard against infinite loop).
+    /// Mutation: remove empty-needle early return → always returns true for empty needle.
+    #[test]
+    fn has_word_empty_needle_is_false() {
+        assert!(!has_word("anything", ""));
+        assert!(!has_word("", ""));
+    }
+
+    /// `codec()` with empty string passes through as empty (no panic).
+    /// Mutation: remove guard → match panics on empty.
+    #[test]
+    fn codec_empty_passes_through() {
+        assert_eq!(codec(""), "");
+    }
 }

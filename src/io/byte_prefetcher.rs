@@ -274,4 +274,214 @@ mod tests {
             drop(shell);
         });
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    use std::io::Cursor;
+
+    /// Drain the forward channel, recycling every buffer, and
+    /// reassemble the bytes. Returns the concatenation of every
+    /// delivered chunk. Stops on RecvError (producer dropped tx == EOF)
+    /// or on the first Err batch (which it returns separately).
+    fn drain_to_vec(pf: BytePrefetcher) -> (Vec<u8>, Option<std::io::Error>) {
+        let (rx, recycle_tx, shell) = pf.into_channels();
+        let mut out = Vec::new();
+        let mut err = None;
+        while let Ok(batch) = rx.recv() {
+            match batch {
+                Ok(buf) => {
+                    out.extend_from_slice(&buf);
+                    // Recycle so the producer can refill. Ignore send
+                    // error (producer may have already exited at EOF).
+                    let _ = recycle_tx.send(buf);
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(rx);
+        drop(recycle_tx);
+        drop(shell);
+        (out, err)
+    }
+
+    /// CORE CONTRACT: the prefetcher must deliver every source byte,
+    /// in order, exactly once — never silently truncate or duplicate.
+    /// Source is 5000 bytes; chunk size 1024 forces multiple chunks
+    /// (4 full + 1 short of 904). The reassembled stream must equal the
+    /// source. Mutation: replacing `buf.truncate(n)` (line 141) with a
+    /// no-op would over-report bytes on the final short read and this
+    /// fails.
+    #[test]
+    fn delivers_all_bytes_in_order_across_chunks() {
+        within(10, || {
+            let src: Vec<u8> = (0..5000u32).map(|i| (i & 0xff) as u8).collect();
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 1024, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none(), "unexpected error batch: {err:?}");
+            assert_eq!(got, src, "prefetcher truncated or reordered bytes");
+        });
+    }
+
+    /// Short-read truncation: a reader that returns fewer bytes than
+    /// requested per call must NOT leave stale tail bytes in the
+    /// delivered chunk. Cursor over 10 bytes with a 4096 chunk yields a
+    /// single 10-byte chunk; the consumer must see exactly 10 bytes,
+    /// not 4096. Grounds `buf.truncate(n)` at line 141. Mutation:
+    /// delete the truncate and the chunk would carry 4086 zero bytes of
+    /// padding, failing the length assert.
+    #[test]
+    fn short_read_truncates_to_actual_length() {
+        within(10, || {
+            let src = vec![0xAB; 10];
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 4096, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(got.len(), 10, "delivered chunk padded past actual read");
+            assert_eq!(got, src);
+        });
+    }
+
+    /// EOF semantics: an empty source (Cursor over `[]`) yields
+    /// `read() == Ok(0)` on the first call, which the producer treats
+    /// as EOF and returns, dropping tx. The consumer sees RecvError
+    /// (zero batches), NOT an Err batch and NOT a zero-length Ok batch.
+    /// Grounds the `Ok(0) => return` arm at line 134. Mutation:
+    /// changing `Ok(0) => return` to `Ok(0) => continue` would spin
+    /// forever (within() would time out).
+    #[test]
+    fn empty_source_yields_clean_eof_no_batches() {
+        within(10, || {
+            let pf = BytePrefetcher::new(Cursor::new(Vec::<u8>::new()), 4096, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            // No Ok batch should ever arrive; first recv must be Err
+            // (producer dropped tx at EOF).
+            let first = rx.recv();
+            assert!(
+                first.is_err(),
+                "empty source produced a batch instead of clean EOF: {first:?}"
+            );
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell);
+        });
+    }
+
+    /// Error propagation: a reader that fails mid-stream must surface
+    /// the io::Error as an `Err` batch on the forward channel (line
+    /// 137), not swallow it. We deliver one good chunk then an error.
+    /// The consumer must see the good bytes followed by the error.
+    /// Mutation: changing `let _ = tx.send(Err(e)); return;` to a plain
+    /// `return` would drop the error silently and this fails.
+    #[test]
+    fn read_error_is_propagated_as_err_batch() {
+        within(10, || {
+            struct OneThenError {
+                served: bool,
+            }
+            impl Read for OneThenError {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    if !self.served {
+                        self.served = true;
+                        let n = buf.len().min(8);
+                        buf[..n].fill(0x11);
+                        Ok(n)
+                    } else {
+                        Err(std::io::Error::other("synthetic mid-stream read failure"))
+                    }
+                }
+            }
+            let pf = BytePrefetcher::new(OneThenError { served: false }, 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert_eq!(got, vec![0x11; 8], "good chunk lost");
+            let err = err.expect("read error must surface as an Err batch");
+            assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        });
+    }
+
+    /// Recycle-buffer reuse must NOT leak stale bytes between chunks of
+    /// different lengths. After a full chunk, a short read reuses the
+    /// same recycled buffer; lines 123-129 regrow it to chunk_bytes
+    /// before reading, then line 141 truncates to the short count. We
+    /// verify the short chunk carries only fresh bytes by reassembling
+    /// the full stream. Source: 8 bytes of 0xAA + 3 bytes of 0xBB, with
+    /// chunk_bytes=8 → chunk0 = 8×0xAA, chunk1 = 3×0xBB.
+    #[test]
+    fn recycled_buffer_carries_no_stale_tail() {
+        within(10, || {
+            let mut src = vec![0xAA; 8];
+            src.extend_from_slice(&[0xBB; 3]);
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(
+                got, src,
+                "stale bytes from recycled buffer leaked into short chunk"
+            );
+        });
+    }
+
+    /// Backpressure / recycle exhaustion does not deadlock: a source
+    /// larger than the whole in-flight pool (FORWARD_DEPTH +
+    /// RECYCLE_DEPTH chunks) must still drain fully when the consumer
+    /// recycles. 10 chunks of 256 bytes = 2560 bytes; pool holds far
+    /// fewer. Proves the producer parks on recycle_rx and resumes as
+    /// the consumer returns buffers (lines 106-117). Mutation: dropping
+    /// the recycle seed loop (lines 90-92) would deadlock on the first
+    /// recv and within() times out.
+    #[test]
+    fn large_source_drains_with_recycling() {
+        within(10, || {
+            let src: Vec<u8> = (0..2560u32).map(|i| (i % 251) as u8).collect();
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 256, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert!(err.is_none());
+            assert_eq!(got, src);
+        });
+    }
+
+    /// Exact-multiple boundary: when the source length is an exact
+    /// multiple of chunk_bytes, the final non-empty chunk is followed
+    /// by an `Ok(0)` EOF read, NOT a spurious empty Ok batch. 12 bytes
+    /// with chunk_bytes=4 → three 4-byte chunks then clean EOF. Total
+    /// bytes must equal 12 and no zero-length batch may appear.
+    #[test]
+    fn exact_multiple_length_no_trailing_empty_batch() {
+        within(10, || {
+            let src = vec![0x42u8; 12];
+            let pf = BytePrefetcher::new(Cursor::new(src.clone()), 4, None).expect("spawn");
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            let mut total = 0usize;
+            let mut batch_count = 0usize;
+            while let Ok(Ok(buf)) = rx.recv() {
+                assert!(!buf.is_empty(), "producer emitted a zero-length batch");
+                total += buf.len();
+                batch_count += 1;
+                let _ = recycle_tx.send(buf);
+            }
+            assert_eq!(total, 12);
+            assert_eq!(batch_count, 3, "expected exactly 3 full chunks");
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell);
+        });
+    }
+
+    /// Dropping the BytePrefetcher directly (without into_channels)
+    /// must join the producer cleanly when the source is finite. The
+    /// producer reaches EOF, drops tx, and exits; Drop's join returns.
+    /// Grounds the BytePrefetcher Drop impl (lines 202-208). Mutation:
+    /// removing the `Ok(0) => return` EOF exit would hang this join.
+    #[test]
+    fn drop_finite_prefetcher_joins_cleanly() {
+        within(10, || {
+            let pf = BytePrefetcher::new(Cursor::new(vec![1u8; 100]), 4096, None).expect("spawn");
+            // Drop without consuming — producer fills the forward
+            // channel (capacity 2), reaches EOF on the third read since
+            // 100 < 4096 (single chunk + EOF), drops tx, exits.
+            drop(pf);
+        });
+    }
 }

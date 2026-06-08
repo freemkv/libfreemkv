@@ -356,4 +356,279 @@ mod tests {
         assert_eq!(parse_status("HTTP/1.1 301 Moved Permanently"), 301);
         assert_eq!(parse_status("garbage"), 0);
     }
+
+    // ── New comprehensive tests ────────────────────────────────────────────────
+
+    /// find_header_end detects the \r\n\r\n separator (RFC 7230 §3 — HTTP header
+    /// terminator is CRLF CRLF). Returns the byte position of the first \r.
+    /// Mutation: searching for \n\n instead of \r\n\r\n misses the boundary.
+    #[test]
+    fn find_header_end_locates_crlfcrlf() {
+        let data = b"HTTP/1.0 200 OK\r\nContent-Length: 42\r\n\r\nbody starts here";
+        // The \r\n\r\n starts at byte 37 (after the Content-Length line).
+        let pos = find_header_end(data).expect("must find header end");
+        // body starts at pos + 4 (past the \r\n\r\n).
+        assert_eq!(
+            &data[pos + 4..],
+            b"body starts here",
+            "body must begin immediately after the \\r\\n\\r\\n boundary"
+        );
+    }
+
+    /// find_header_end returns None when there is no \r\n\r\n.
+    /// Mutation: returning Some(0) unconditionally makes this fail.
+    #[test]
+    fn find_header_end_returns_none_when_absent() {
+        let data = b"no separator here at all";
+        assert!(find_header_end(data).is_none());
+    }
+
+    /// extract_header is case-insensitive per RFC 7230 §3.2.
+    /// Mutation: using case-sensitive comparison misses "location" vs "Location".
+    #[test]
+    fn extract_header_case_insensitive() {
+        let headers = "HTTP/1.1 301 Moved\r\nlocation: http://new.host/path\r\n";
+        let val = extract_header(headers, "Location").expect("must find Location");
+        assert_eq!(val, "http://new.host/path");
+    }
+
+    /// extract_header with a missing header returns None.
+    /// Mutation: returning Some("") makes the caller proceed on a missing Location header.
+    #[test]
+    fn extract_header_missing_returns_none() {
+        let headers = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n";
+        assert!(extract_header(headers, "Location").is_none());
+    }
+
+    /// extract_header trims leading/trailing whitespace from the value.
+    /// RFC 7230 §3.2.6: optional whitespace around field value.
+    /// Mutation: not trimming the value keeps leading spaces in the URL.
+    #[test]
+    fn extract_header_trims_value_whitespace() {
+        let headers = "HTTP/1.1 301 Moved\r\nLocation:   /new/path  \r\n";
+        let val = extract_header(headers, "Location").unwrap();
+        assert_eq!(val, "/new/path", "value must be trimmed");
+    }
+
+    /// parse_url with no explicit port defaults to 80.
+    /// Spec: HTTP default port is 80 (RFC 7230 §2.7.1).
+    /// Mutation: defaulting to 443 instead makes plain-HTTP URLs go to the wrong port.
+    #[test]
+    fn parse_url_no_port_defaults_to_80() {
+        let (_, port, _) = parse_url("http://example.com/path").unwrap();
+        assert_eq!(port, 80, "default HTTP port must be 80 (RFC 7230 §2.7.1)");
+    }
+
+    /// parse_url with explicit port parses it correctly.
+    /// Mutation: ignoring the port component and defaulting to 80 changes the port.
+    #[test]
+    fn parse_url_explicit_port_is_parsed() {
+        let (host, port, path) = parse_url("http://mirror.example:9000/key.zip").unwrap();
+        assert_eq!(host, "mirror.example");
+        assert_eq!(port, 9000);
+        assert_eq!(path, "/key.zip");
+    }
+
+    /// parse_url with no path component yields "/" as the path.
+    /// RFC 7230 §5.3.1: origin-form must start with "/"; empty → root.
+    /// Mutation: returning "" as the path makes the HTTP request malformed.
+    #[test]
+    fn parse_url_no_path_yields_root() {
+        let (_, _, path) = parse_url("http://example.com").unwrap();
+        assert_eq!(
+            path, "/",
+            "missing path must default to '/' (RFC 7230 §5.3.1)"
+        );
+    }
+
+    /// parse_url rejects a URL whose scheme is not http.
+    /// Mutation: accepting ftp:// silently leads to a TCP connection receiving
+    ///           binary FTP data instead of HTTP.
+    #[test]
+    fn parse_url_rejects_ftp_scheme() {
+        assert!(matches!(
+            parse_url("ftp://ftp.example.com/file"),
+            Err(Error::KeydbUnsupportedScheme { .. })
+        ));
+    }
+
+    /// save() rejects data that is not a valid keydb (no recognisable entries).
+    /// Spec: entries are lines starting with "0x", "| DK", "| PK", or "| HC".
+    /// Mutation: dropping the entries==0 check lets an empty file be saved.
+    #[test]
+    fn save_rejects_empty_text() {
+        // Plain text with no valid keydb entries.
+        let garbage = b"this is not a keydb\njust random text\n";
+        assert!(
+            matches!(save(garbage), Err(Error::KeydbInvalid)),
+            "keydb without valid entries must be rejected"
+        );
+    }
+
+    /// save() accepts plain text with at least one "0x"-prefixed entry line.
+    /// Mutation: counting only "| DK" lines ignores the "0x" entry format.
+    #[test]
+    fn save_accepts_plaintext_with_0x_entries() {
+        // Minimal keydb-style file with a VUK entry (0x-prefixed).
+        let content = b"0xDEADBEEFCAFEBABE0102030405060708090A0B0C0D0E0F\n";
+        // We can't predict the HOME path in test environments without
+        // potentially writing to a real location. So only check that save()
+        // accepts this content as valid (may return KeydbWrite if dir exists
+        // but we lack permission — that still proves it passed the parse check).
+        let result = save(content);
+        // Accept either Ok (wrote successfully) or a write error (env issue),
+        // but NOT KeydbInvalid or KeydbParse.
+        match &result {
+            Ok(_) => {}
+            Err(Error::KeydbWrite { .. }) => {}
+            Err(e) => panic!("unexpected error for valid keydb content: {:?}", e),
+        }
+    }
+
+    /// save() accepts content with "| DK" entries (device-key table format).
+    /// Mutation: only accepting "0x" lines rejects DK-format keydb files.
+    #[test]
+    fn save_accepts_pipe_dk_entry_format() {
+        let content = b"| DK 0102030405060708 | 0102030405060708090a0b0c0d0e0f10 |\n";
+        let result = save(content);
+        match &result {
+            Ok(_) => {}
+            Err(Error::KeydbWrite { .. }) => {}
+            Err(e) => panic!("unexpected error for DK-format entry: {:?}", e),
+        }
+    }
+
+    /// save() accepts content with "| PK" entries (processing-key format).
+    /// Mutation: not including "| PK" in the filter rejects PK-format keydb files.
+    #[test]
+    fn save_accepts_pipe_pk_entry_format() {
+        let content = b"| PK 0102030405060708090a0b0c0d0e0f10 |\n";
+        let result = save(content);
+        match &result {
+            Ok(_) => {}
+            Err(Error::KeydbWrite { .. }) => {}
+            Err(e) => panic!("unexpected error for PK-format entry: {:?}", e),
+        }
+    }
+
+    /// save() accepts content with "| HC" entries (host certificate format).
+    /// Mutation: not including "| HC" in the filter rejects HC-format keydb files.
+    #[test]
+    fn save_accepts_pipe_hc_entry_format() {
+        let content = b"| HC 0102030405060708090a0b0c0d0e0f10 |\n";
+        let result = save(content);
+        match &result {
+            Ok(_) => {}
+            Err(Error::KeydbWrite { .. }) => {}
+            Err(e) => panic!("unexpected error for HC-format entry: {:?}", e),
+        }
+    }
+
+    /// save() recognises gzip-compressed input (magic bytes 0x1f 0x8b).
+    /// Spec: gzip format magic is 0x1F 0x8B (RFC 1952 §2.3.1).
+    /// Mutation: treating gzip magic as plain text fails to decompress.
+    #[test]
+    fn save_recognises_gzip_magic() {
+        // Truncated gzip (header only, no valid body) — must not be treated as
+        // plain text (no KeydbInvalid about entries), but as a parse error.
+        let bad_gz = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        let result = save(&bad_gz);
+        // A truncated gzip is either KeydbParse (decompression error) or
+        // KeydbInvalid (decompressed to empty). Must not be Ok.
+        assert!(result.is_err(), "truncated gzip must not be accepted");
+        // Crucially: must NOT be a plain-text UTF-8 error — gzip magic is not UTF-8.
+        match result.unwrap_err() {
+            Error::KeydbParse | Error::KeydbInvalid => {}
+            e => panic!("wrong error kind for truncated gzip: {:?}", e),
+        }
+    }
+
+    /// save() recognises ZIP magic bytes PK\x03\x04 and routes to extract_zip.
+    /// Spec: ZIP local file header signature is 0x50 0x4B 0x03 0x04 (PKZIP APPNOTE §4.3.6).
+    /// A truncated ZIP must error, but NOT as plain UTF-8 text.
+    /// Mutation: checking gzip magic before ZIP magic means ZIP files are
+    ///           fed to the gzip decoder and produce the wrong error.
+    #[test]
+    fn save_recognises_zip_magic() {
+        // Valid ZIP magic followed by garbage — must be routed to extract_zip.
+        let bad_zip = b"PK\x03\x04garbage that is not a real zip";
+        let result = save(bad_zip);
+        assert!(result.is_err(), "invalid zip must be rejected");
+        // Must be a parse error, not a UTF-8 error.
+        match result.unwrap_err() {
+            Error::KeydbParse | Error::KeydbInvalid => {}
+            e => panic!("wrong error for bad zip: {:?}", e),
+        }
+    }
+
+    /// read_capped_to_string rejects data exceeding MAX_KEYDB_BYTES.
+    /// Spec: doc says "Returns Error::KeydbInvalid if the input exceeds the cap".
+    /// Mutation: removing the length check accepts decompression bombs.
+    #[test]
+    fn read_capped_to_string_rejects_oversized_input() {
+        // Build a reader that reports it has more data than the cap.
+        // We use a Cursor with MAX_KEYDB_BYTES + 1 bytes of content.
+        let too_big = vec![b'A'; (MAX_KEYDB_BYTES + 1) as usize];
+        let cursor = std::io::Cursor::new(too_big);
+        let result = read_capped_to_string(cursor);
+        assert!(
+            matches!(result, Err(Error::KeydbInvalid)),
+            "oversized input must yield KeydbInvalid, got: {:?}",
+            result
+        );
+    }
+
+    /// read_capped_to_string accepts exactly MAX_KEYDB_BYTES (at-cap is allowed).
+    /// Spec: doc says "Read one byte past the cap so an exactly-at-cap stream is accepted."
+    /// Mutation: using `>=` instead of `>` in the length check rejects valid at-cap files.
+    #[test]
+    fn read_capped_to_string_accepts_at_cap_size() {
+        let at_cap = vec![b'A'; MAX_KEYDB_BYTES as usize];
+        let cursor = std::io::Cursor::new(at_cap);
+        let result = read_capped_to_string(cursor);
+        assert!(result.is_ok(), "exactly MAX_KEYDB_BYTES must be accepted");
+    }
+
+    /// parse_url path round-trips: the extracted path is the same string that
+    /// was in the URL.
+    /// Mutation: dropping the leading '/' from the path breaks the HTTP request.
+    #[test]
+    fn parse_url_path_includes_leading_slash() {
+        let (_, _, path) = parse_url("http://example.com/a/b/c.zip").unwrap();
+        assert!(
+            path.starts_with('/'),
+            "path must start with '/', got `{path}`"
+        );
+        assert_eq!(path, "/a/b/c.zip");
+    }
+
+    /// resolve_redirect with an absolute http URL parses it fresh
+    /// (ignores the current host/port entirely).
+    /// Mutation: keeping the current host instead of parsing the new one
+    ///           points the next request at the wrong server.
+    #[test]
+    fn resolve_redirect_absolute_http_ignores_current_host() {
+        let (h, p, path) =
+            resolve_redirect("http://new.host:8080/k.zip", "old.host", 9000).unwrap();
+        assert_eq!(h, "new.host");
+        assert_eq!(p, 8080);
+        assert_eq!(path, "/k.zip");
+    }
+
+    /// parse_status returns 0 for an empty status line (not a panic).
+    /// Mutation: calling unwrap() instead of unwrap_or(0) panics on empty input.
+    #[test]
+    fn parse_status_empty_input_returns_0() {
+        assert_eq!(parse_status(""), 0);
+        assert_eq!(parse_status("\r\n"), 0);
+    }
+
+    /// parse_status handles HTTP/1.0 and HTTP/1.1 both.
+    /// Mutation: only matching "HTTP/1.0 " misses HTTP/1.1 responses.
+    #[test]
+    fn parse_status_handles_http_versions() {
+        assert_eq!(parse_status("HTTP/1.0 404 Not Found"), 404);
+        assert_eq!(parse_status("HTTP/1.1 200 OK"), 200);
+        assert_eq!(parse_status("HTTP/1.1 302 Found\r\nLocation: /new"), 302);
+    }
 }

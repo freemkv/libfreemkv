@@ -590,4 +590,274 @@ mod tests {
     fn player_keys_count() {
         assert_eq!(PLAYER_KEYS.len(), 31);
     }
+
+    // ── CSS constant-table integrity ───────────────────────────────────────
+
+    /// The CSSCryptKey lookup tables are each a full 256-entry byte table and
+    /// the variant tables are 32 entries (one per CSS variant). The cipher
+    /// indexes CRYPT_TAB0..3 with arbitrary bytes (0..256) and indexes
+    /// VARIANTS / PERM_VARIANT with the css_variant (0..32). A short table
+    /// would index out of bounds.
+    ///
+    /// Grounding: crypt_key indexes `CRYPT_TABx[idx]` where idx is a u8 cast
+    /// to usize (0..256); `VARIANTS[css_variant]` and `PERM_VARIANT[k][variant]`
+    /// with variant 0..32.
+    /// Mutation: drop the last entry of CRYPT_TAB0 (make it [u8;255]) ->
+    /// compile error / length assert fails.
+    #[test]
+    fn crypt_tables_have_spec_lengths() {
+        assert_eq!(CRYPT_TAB0.len(), 256);
+        assert_eq!(CRYPT_TAB1.len(), 256);
+        assert_eq!(CRYPT_TAB2.len(), 256);
+        assert_eq!(CRYPT_TAB3.len(), 256);
+        assert_eq!(VARIANTS.len(), 32, "one CSS variant byte per variant 0..32");
+        assert_eq!(PERM_VARIANT.len(), 2);
+        assert_eq!(PERM_VARIANT[0].len(), 32);
+        assert_eq!(PERM_VARIANT[1].len(), 32);
+        assert_eq!(
+            PERM_CHALLENGE.len(),
+            3,
+            "one challenge perm per key_type 0..3"
+        );
+        for p in &PERM_CHALLENGE {
+            assert_eq!(
+                p.len(),
+                10,
+                "challenge permutation covers all 10 challenge bytes"
+            );
+        }
+        assert_eq!(SECRET.len(), 5);
+    }
+
+    /// Each PERM_CHALLENGE row is a permutation of indices 0..10 (it reorders
+    /// the 10 challenge bytes). A non-permutation would drop/duplicate
+    /// challenge bytes, weakening or corrupting the bus key derivation.
+    ///
+    /// Grounding: crypt_key does `scratch[i] = challenge[perm[i]]` for i in
+    /// 0..10 — perm must be a bijection on 0..10 to use every challenge byte
+    /// exactly once.
+    /// Mutation: change PERM_CHALLENGE[0] entry `9` to `8` (duplicate) -> the
+    /// "covers 0..10" assert fires.
+    #[test]
+    fn perm_challenge_rows_are_permutations() {
+        for (row, perm) in PERM_CHALLENGE.iter().enumerate() {
+            let mut seen = [false; 10];
+            for &idx in perm.iter() {
+                assert!(idx < 10, "PERM_CHALLENGE[{row}] index {idx} out of range");
+                assert!(!seen[idx], "PERM_CHALLENGE[{row}] duplicates index {idx}");
+                seen[idx] = true;
+            }
+            assert!(
+                seen.iter().all(|&b| b),
+                "PERM_CHALLENGE[{row}] misses an index"
+            );
+        }
+    }
+
+    /// Each PERM_VARIANT row maps the 32 variants to 32 distinct 5-bit values
+    /// (it is a permutation of 0..32). key_type 1 uses PERM_VARIANT[0],
+    /// key_type 2 uses PERM_VARIANT[1] to pick the css_variant; a collision
+    /// would make two variants indistinguishable.
+    ///
+    /// Grounding: `css_variant = PERM_VARIANT[k][variant]` then indexes
+    /// VARIANTS[css_variant] (0..32).
+    /// Mutation: set PERM_VARIANT[0][1] = PERM_VARIANT[0][0] -> duplicate
+    /// assert fires; also any value >= 32 would later index VARIANTS OOB.
+    #[test]
+    fn perm_variant_rows_are_permutations_of_0_31() {
+        for (row, perm) in PERM_VARIANT.iter().enumerate() {
+            let mut seen = [false; 32];
+            for &v in perm.iter() {
+                let v = v as usize;
+                assert!(v < 32, "PERM_VARIANT[{row}] value {v} out of 0..32");
+                assert!(!seen[v], "PERM_VARIANT[{row}] duplicates {v}");
+                seen[v] = true;
+            }
+            assert!(
+                seen.iter().all(|&b| b),
+                "PERM_VARIANT[{row}] misses a value"
+            );
+        }
+    }
+
+    /// The 31 built-in player keys are all distinct. Duplicate keys would
+    /// waste disc-key trials and could mask a copy-paste error in the table.
+    ///
+    /// Grounding: PLAYER_KEYS is the set of long-public CSS player keys; each
+    /// is a unique 5-byte key.
+    /// Mutation: set PLAYER_KEYS[1] = PLAYER_KEYS[0] -> duplicate assert fires.
+    #[test]
+    fn player_keys_are_distinct() {
+        for (i, ki) in PLAYER_KEYS.iter().enumerate() {
+            for (j, kj) in PLAYER_KEYS.iter().enumerate().skip(i + 1) {
+                assert_ne!(ki, kj, "player keys {i} and {j} collide");
+            }
+        }
+    }
+
+    // ── crypt_key behaviour ────────────────────────────────────────────────
+
+    /// crypt_key result depends on every challenge byte. The challenge is
+    /// permuted into `scratch` and folded through the LFSR seeding and the 6
+    /// XOR rounds. Flipping any single challenge byte must change the output.
+    ///
+    /// Grounding: scratch[i]=challenge[perm[i]] for all 10 i, and scratch
+    /// seeds both LFSRs (bytes 5..10 via tmp1) and the round terms (bytes
+    /// 0..5).
+    /// Mutation: in `scratch[i] = challenge[perm[i]]` replace with
+    /// `challenge[i]` for a perm that drops a byte — or hardcode one scratch
+    /// entry — and some challenge byte stops mattering; this fails.
+    #[test]
+    fn crypt_key_depends_on_every_challenge_byte() {
+        let base: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let base_out = crypt_key(0, 5, &base);
+        for i in 0..10 {
+            let mut c = base;
+            c[i] ^= 0x55;
+            assert_ne!(
+                crypt_key(0, 5, &c),
+                base_out,
+                "flipping challenge byte {i} did not change the bus-key derivation"
+            );
+        }
+    }
+
+    /// crypt_key(0, v, ..) must produce a DISTINCT result for each of the 32
+    /// variants on a fixed challenge. bus_auth brute-forces the variant by
+    /// matching crypt_key(0, v, host_challenge) == key1; if two variants
+    /// collided, the wrong variant could be selected and the whole auth
+    /// derail.
+    ///
+    /// Grounding: variant selects css_variant -> VARIANTS[css_variant] -> cse,
+    /// which feeds every round; distinct variants give distinct cse-driven
+    /// keys in practice.
+    /// Mutation: make `cse` ignore the variant (e.g. `let cse = 0`) -> all 32
+    /// outputs collapse to one value; the distinctness assert fires.
+    #[test]
+    fn crypt_key_type0_distinct_per_variant() {
+        let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut outs = Vec::new();
+        for v in 0..32u8 {
+            let k = crypt_key(0, v, &challenge);
+            assert!(
+                !outs.contains(&k),
+                "variant {v} collides with an earlier variant"
+            );
+            outs.push(k);
+        }
+    }
+
+    /// crypt_key enforces its documented precondition `key_type < 3` via
+    /// debug_assert (active in test builds). A key_type of 3 would index
+    /// PERM_CHALLENGE (len 3) out of bounds; the assert turns that into an
+    /// explicit precondition panic.
+    ///
+    /// Grounding: `debug_assert!(key_type < 3, ...)`; PERM_CHALLENGE has 3
+    /// rows (indices 0,1,2).
+    /// Mutation: delete the debug_assert AND the match-arm guard — but the
+    /// match `_ =>` arm would then index PERM_CHALLENGE[3] OOB and panic
+    /// differently; with the assert in place this test pins the contract.
+    #[test]
+    #[should_panic]
+    fn crypt_key_rejects_out_of_range_key_type() {
+        let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let _ = crypt_key(3, 0, &challenge);
+    }
+
+    /// crypt_key enforces `variant < 32` via debug_assert. A variant of 32
+    /// would index VARIANTS / PERM_VARIANT (len 32) out of bounds.
+    ///
+    /// Grounding: `debug_assert!((variant as usize) < 32, ...)`.
+    /// Mutation: removing the assert makes this index VARIANTS[32] (still a
+    /// panic, but unguarded); the assert documents/enforces the contract.
+    #[test]
+    #[should_panic]
+    fn crypt_key_rejects_out_of_range_variant() {
+        let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let _ = crypt_key(0, 32, &challenge);
+    }
+
+    // ── SCSI CDB builders (MMC REPORT KEY / SEND KEY layout) ───────────────
+
+    /// report_key_cdb encodes a 12-byte MMC REPORT KEY (opcode 0xA4) CDB:
+    ///   byte 0  = operation code 0xA4
+    ///   bytes 8-9 = allocation length, big-endian
+    ///   byte 10 = (AGID << 6) | (key_format & 0x3F)
+    /// All other bytes are zero.
+    ///
+    /// Grounding: MMC REPORT KEY CDB; the AGID is the top 2 bits of byte 10,
+    /// key format the low 6 bits.
+    /// Mutation: change `(alloc_len >> 8)` to `alloc_len` for byte 8 (lose the
+    /// big-endian split) -> byte 8/9 assert fails. Change `agid << 6` to
+    /// `agid << 5` -> the AGID-position assert fails.
+    #[test]
+    fn report_key_cdb_matches_mmc_layout() {
+        let cdb = report_key_cdb(0b10, 0x04, 0x010C); // AGID=2, format=0x04, len=268
+        assert_eq!(cdb[0], 0xA4, "REPORT KEY opcode");
+        assert_eq!(cdb[8], 0x01, "alloc_len high byte (big-endian)");
+        assert_eq!(cdb[9], 0x0C, "alloc_len low byte");
+        assert_eq!(
+            cdb[10],
+            (0b10 << 6) | 0x04,
+            "AGID in bits 6-7, format in bits 0-5"
+        );
+        // Every other byte must be zero.
+        for (i, &b) in cdb.iter().enumerate() {
+            if ![0, 8, 9, 10].contains(&i) {
+                assert_eq!(b, 0, "CDB byte {i} must be zero");
+            }
+        }
+        assert_eq!(cdb.len(), 12, "REPORT KEY is a 12-byte CDB");
+    }
+
+    /// The key format field is masked to 6 bits: a format with high bits set
+    /// must not corrupt the AGID. report_key_cdb(0, 0xFF, _) -> byte 10 low 6
+    /// bits = 0x3F, AGID = 0.
+    ///
+    /// Grounding: `(agid << 6) | (format & 0x3F)`.
+    /// Mutation: drop the `& 0x3F` mask -> 0xFF would overwrite the AGID bits;
+    /// byte 10 would be 0xFF not 0x3F, this fails.
+    #[test]
+    fn report_key_cdb_masks_format_to_6_bits() {
+        let cdb = report_key_cdb(0, 0xFF, 8);
+        assert_eq!(cdb[10], 0x3F, "format masked to 6 bits, AGID stays 0");
+    }
+
+    /// send_key_cdb encodes a 12-byte MMC SEND KEY (opcode 0xA3) CDB with the
+    /// parameter-list length at bytes 8-9 (big-endian) and AGID/format at byte
+    /// 10.
+    ///
+    /// Grounding: MMC SEND KEY CDB layout.
+    /// Mutation: change opcode to SCSI_REPORT_KEY -> opcode assert fails;
+    /// swap bytes 8/9 -> length assert fails.
+    #[test]
+    fn send_key_cdb_matches_mmc_layout() {
+        let cdb = send_key_cdb(0b11, 0x03, 0x000C); // AGID=3, format=3, param_len=12
+        assert_eq!(cdb[0], 0xA3, "SEND KEY opcode");
+        assert_eq!(cdb[8], 0x00, "param_len high byte");
+        assert_eq!(cdb[9], 0x0C, "param_len low byte");
+        assert_eq!(
+            cdb[10],
+            (0b11 << 6) | 0x03,
+            "AGID bits 6-7, format bits 0-5"
+        );
+        assert_eq!(cdb.len(), 12);
+    }
+
+    /// Allocation length larger than 255 must split across bytes 8 (high) and
+    /// 9 (low) — a 16-bit big-endian field. report_key_cdb with alloc_len
+    /// 0x0804 (2052, the disc-key block size used in read_disc_key) -> byte 8
+    /// = 0x08, byte 9 = 0x04.
+    ///
+    /// Grounding: read_disc_key uses `alloc_len = 2048 + 4 = 2052 = 0x0804`
+    /// and writes `cdb[8] = (alloc_len >> 8); cdb[9] = alloc_len`.
+    /// Mutation: write only byte 9 (`cdb[9] = alloc_len as u8`) without byte 8
+    /// -> the drive sees a 4-byte transfer, truncating the disc-key block;
+    /// this asserts the high byte is present.
+    #[test]
+    fn report_key_cdb_alloc_len_is_16bit_big_endian() {
+        let cdb = report_key_cdb(0, 0x00, 0x0804);
+        assert_eq!(cdb[8], 0x08, "high byte of 2052-byte transfer");
+        assert_eq!(cdb[9], 0x04, "low byte of 2052-byte transfer");
+    }
 }

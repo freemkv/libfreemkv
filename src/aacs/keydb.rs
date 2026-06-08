@@ -675,4 +675,315 @@ mod tests {
             db.processing_keys.len()
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Hardening additions
+    // ════════════════════════════════════════════════════════════════════
+
+    use super::super::provider::KeyProvider;
+
+    // ── parse_hex / parse_hex16 / parse_hex20 ──────────────────────────────
+
+    #[test]
+    fn parse_hex_strips_lower_and_upper_prefixes() {
+        // Both lower- and upper-case prefixes are stripped (trim_start_matches
+        // "0x" then "0X"). Without one of those strips a value would be off by
+        // a nibble or fail length checks.
+        assert_eq!(parse_hex("0xABCD"), Some(vec![0xAB, 0xCD]));
+        assert_eq!(parse_hex("0XABCD"), Some(vec![0xAB, 0xCD]));
+        assert_eq!(parse_hex("ABCD"), Some(vec![0xAB, 0xCD]));
+    }
+
+    #[test]
+    fn parse_hex_mixed_case_nibbles() {
+        // to_digit(16) accepts both cases.
+        assert_eq!(parse_hex("aB"), Some(vec![0xAB]));
+        assert_eq!(parse_hex("Ff00"), Some(vec![0xFF, 0x00]));
+    }
+
+    #[test]
+    fn parse_hex_rejects_non_hex_digit() {
+        // 'G' is not a hex digit → None (not silently 0).
+        assert!(parse_hex("0xGG").is_none());
+        assert!(parse_hex("12ZZ").is_none());
+    }
+
+    #[test]
+    fn parse_hex_empty_is_empty_vec() {
+        // Empty (or bare "0x") → Some(empty): even byte-length 0 passes, and
+        // there are no nibbles to reject. parse_hex16/20 then reject on length.
+        assert_eq!(parse_hex(""), Some(vec![]));
+        assert_eq!(parse_hex("0x"), Some(vec![]));
+    }
+
+    #[test]
+    fn parse_hex16_enforces_exactly_16_bytes() {
+        assert!(parse_hex16(&format!("0x{}", "00".repeat(15))).is_none());
+        assert!(parse_hex16(&format!("0x{}", "00".repeat(17))).is_none());
+        assert_eq!(
+            parse_hex16(&format!("0x{}", "00".repeat(16))),
+            Some([0u8; 16])
+        );
+    }
+
+    #[test]
+    fn parse_hex20_enforces_exactly_20_bytes() {
+        assert!(parse_hex20(&format!("0x{}", "00".repeat(19))).is_none());
+        assert_eq!(
+            parse_hex20(&format!("0x{}", "11".repeat(20))),
+            Some([0x11u8; 20])
+        );
+    }
+
+    // ── Disc entry field parsing ───────────────────────────────────────────
+
+    #[test]
+    fn disc_entry_hash_is_lowercased() {
+        // The disc_hash key is lowercased so HashMap lookups are
+        // case-insensitive (find_disc lowercases its query too).
+        let z32 = "00".repeat(16);
+        let line = format!("0xABCDEF = T | M | 0x{z32}");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.disc_hash, "0xabcdef");
+    }
+
+    #[test]
+    fn disc_entry_title_uses_display_in_parens() {
+        // "RAW_NAME (Display Name)" → title is the parenthesised display name.
+        let line = "0x00 = RAW_NAME (Display Name) | M | 0x".to_string() + &"00".repeat(16);
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.title, "Display Name");
+    }
+
+    #[test]
+    fn disc_entry_title_without_parens_uses_whole() {
+        let line = "0x00 = PlainTitle | M | 0x".to_string() + &"00".repeat(16);
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.title, "PlainTitle");
+    }
+
+    #[test]
+    fn disc_entry_malformed_parens_falls_back_to_whole_title() {
+        // ')' before '(' would make start+1 > end; the guarded get() returns
+        // None and the parser falls back to the whole title (no panic).
+        let line = "0x00 = FILM) (X | M | 0x".to_string() + &"00".repeat(16);
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.title, "FILM) (X");
+    }
+
+    #[test]
+    fn disc_entry_parses_all_tagged_fields() {
+        // M, I, V, U each populate their field. U accepts "n-0xKEY".
+        let m = "11".repeat(16);
+        let i = "22".repeat(16);
+        let v = "33".repeat(16);
+        let u = "44".repeat(16);
+        let line = format!("0xAA = T | M | 0x{m} | I | 0x{i} | V | 0x{v} | U | 2-0x{u}");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.media_key, Some([0x11u8; 16]));
+        assert_eq!(e.disc_id, Some([0x22u8; 16]));
+        assert_eq!(e.vuk, Some([0x33u8; 16]));
+        assert_eq!(e.unit_keys, vec![(2, [0x44u8; 16])]);
+    }
+
+    #[test]
+    fn disc_entry_multiple_unit_keys_space_separated() {
+        // The U field carries space-separated "n-0xKEY" pairs.
+        let k1 = "01".repeat(16);
+        let k2 = "02".repeat(16);
+        let line = format!("0xAA = T | U | 1-0x{k1} 2-0x{k2}");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.unit_keys, vec![(1, [0x01u8; 16]), (2, [0x02u8; 16])]);
+    }
+
+    #[test]
+    fn disc_entry_unit_key_strips_trailing_comment() {
+        // "U | 1-0xKEY ; comment" — the ';' comment must be stripped before
+        // splitting unit keys.
+        let k = "05".repeat(16);
+        let line = format!("0xAA = T | U | 1-0x{k} ; MKBv77 note");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.unit_keys, vec![(1, [0x05u8; 16])]);
+    }
+
+    #[test]
+    fn disc_entry_skips_unparseable_unit_key_pair() {
+        // A bad nibble in one unit key drops just that pair (parse_hex16 →
+        // None), keeping the valid ones — no panic, no half-garbage key.
+        let good = "07".repeat(16);
+        let line = format!("0xAA = T | U | 1-0xZZ 2-0x{good}");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert_eq!(e.unit_keys, vec![(2, [0x07u8; 16])]);
+    }
+
+    #[test]
+    fn disc_entry_field_with_short_hex_is_none_not_panic() {
+        // A 30-hex-char (15-byte) M value fails parse_hex16 → media_key None.
+        let short = "00".repeat(15);
+        let line = format!("0xAA = T | M | 0x{short}");
+        let e = KeyDb::parse_disc_entry(&line).unwrap();
+        assert!(e.media_key.is_none());
+    }
+
+    // ── find_disc / find_vuk: prefix-agnostic lookup ───────────────────────
+
+    #[test]
+    fn find_disc_matches_with_and_without_0x_and_case() {
+        let v = "33".repeat(16);
+        let line = format!("0xABCDEF = T | V | 0x{v}");
+        let db = KeyDb::parse(&line);
+        // Stored key is "0xabcdef". Query in several shapes.
+        assert!(db.find_disc("0xABCDEF").is_some());
+        assert!(db.find_disc("ABCDEF").is_some()); // no prefix
+        assert!(db.find_disc("0xabcdef").is_some());
+        assert!(db.find_disc("  0xAbCdEf  ").is_some()); // padded + mixed case
+        assert_eq!(db.find_vuk("ABCDEF"), Some([0x33u8; 16]));
+        assert!(db.find_disc("0xDEADBE").is_none());
+    }
+
+    // ── KeyProvider impl over KeyDb ────────────────────────────────────────
+
+    #[test]
+    fn provider_lookup_by_hash_formats_lowercase_hex() {
+        // lookup_disc_by_hash writes the 20-byte hash as lowercase hex with a
+        // 0x prefix; it must hit an entry keyed that way.
+        let hash = [
+            0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let hex = format!(
+            "0x{}",
+            hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let mut db = KeyDb::empty();
+        db.disc_entries.insert(
+            hex.clone(),
+            DiscEntry {
+                disc_hash: hex,
+                title: "t".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some([0x9u8; 16]),
+                unit_keys: Vec::new(),
+            },
+        );
+        let found = db.lookup_disc_by_hash(&hash).expect("hash lookup hit");
+        assert_eq!(found.vuk, Some([0x9u8; 16]));
+        // A different hash misses.
+        assert!(db.lookup_disc_by_hash(&[0xFFu8; 20]).is_none());
+    }
+
+    #[test]
+    fn provider_lookup_by_vid_matches_disc_id() {
+        let vid = [0x42u8; 16];
+        let mut db = KeyDb::empty();
+        db.disc_entries.insert(
+            "0xa".to_string(),
+            DiscEntry {
+                disc_hash: "0xa".to_string(),
+                title: "t".to_string(),
+                media_key: Some([1u8; 16]),
+                disc_id: Some(vid),
+                vuk: None,
+                unit_keys: Vec::new(),
+            },
+        );
+        assert!(db.lookup_disc_by_vid(&vid).is_some());
+        assert!(db.lookup_disc_by_vid(&[0x00u8; 16]).is_none());
+    }
+
+    #[test]
+    fn provider_media_keys_collects_every_per_disc_mk() {
+        // media_keys() returns every entry's Some(media_key). MKs are
+        // MKB-scoped, so the resolver dedups later; the provider returns all.
+        let mut db = KeyDb::empty();
+        for (i, mk) in [[0x1u8; 16], [0x2u8; 16]].iter().enumerate() {
+            db.disc_entries.insert(
+                format!("0x{i}"),
+                DiscEntry {
+                    disc_hash: format!("0x{i}"),
+                    title: "t".to_string(),
+                    media_key: Some(*mk),
+                    disc_id: None,
+                    vuk: None,
+                    unit_keys: Vec::new(),
+                },
+            );
+        }
+        // An entry with no MK contributes nothing.
+        db.disc_entries.insert(
+            "0x9".to_string(),
+            DiscEntry {
+                disc_hash: "0x9".to_string(),
+                title: "t".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: None,
+                unit_keys: Vec::new(),
+            },
+        );
+        let mut mks = db.media_keys();
+        mks.sort();
+        assert_eq!(mks, vec![[0x1u8; 16], [0x2u8; 16]]);
+    }
+
+    // ── Comments / blank lines / unknown lines ─────────────────────────────
+
+    #[test]
+    fn parse_ignores_comments_and_blank_lines() {
+        let cfg = "\n; a comment\n# another\n   \n";
+        let db = KeyDb::parse(cfg);
+        assert!(db.device_keys.is_empty());
+        assert!(db.processing_keys.is_empty());
+        assert!(db.disc_entries.is_empty());
+        assert!(db.host_certs.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_or_keyless_file_is_lenient_not_error() {
+        // parse() never errors; a keyless file is an empty KeyDb (documented
+        // contract — load() errors only on read failure, not empty content).
+        let db = KeyDb::parse("; nothing here\n");
+        assert_eq!(db.disc_entries.len(), 0);
+    }
+
+    #[test]
+    fn parse_device_key_requires_all_four_fields() {
+        // Missing KEY_U_MASK_SHIFT → parse_device_key returns None; with no
+        // position fields at all it would be an orphan DK instead. Here the
+        // line has DEVICE_NODE + KEY_UV but no shift → neither parser accepts
+        // it as a positioned DK, and parse_orphan_dk rejects it (has position
+        // fields), so nothing is loaded.
+        let line = "| DK | DEVICE_KEY 0x00000000000000000000000000000000 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400";
+        assert!(KeyDb::parse_device_key(line).is_none());
+        let db = KeyDb::parse(line);
+        assert!(db.device_keys.is_empty());
+        assert!(db.processing_keys.is_empty());
+    }
+
+    #[test]
+    fn parse_host_cert_v2_rejects_wrong_priv_len_and_short_cert() {
+        // v2 priv must be exactly 32 bytes; cert must be >= 132.
+        let bad_priv = format!(
+            "| HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}",
+            "00".repeat(31),
+            "00".repeat(132)
+        );
+        assert!(KeyDb::parse_host_cert_v2(&bad_priv).is_none());
+        let short_cert = format!(
+            "| HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}",
+            "00".repeat(32),
+            "00".repeat(131)
+        );
+        assert!(KeyDb::parse_host_cert_v2(&short_cert).is_none());
+    }
+
+    #[test]
+    fn parse_processing_key_pk_row() {
+        // "| PK | 0x..." → 16-byte processing key. A trailing comment is
+        // stripped at ';'.
+        let line = format!("| PK | 0x{} ; MKBv64", "AB".repeat(16));
+        let pk = KeyDb::parse_processing_key(&line).unwrap();
+        assert_eq!(pk, [0xABu8; 16]);
+    }
 }

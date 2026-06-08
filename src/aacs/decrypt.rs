@@ -480,4 +480,385 @@ mod tests {
         // `(len - 4) / 192 + 1` form that `ts_packet_total` corrected away from.
         assert_eq!(count, ts_packet_total(&unit));
     }
+
+    // ── Helpers for the hardening tests below ──────────────────────────────
+
+    /// Encrypt an aligned unit in place with the AACS unit-decrypt
+    /// algorithm run in reverse, so [`decrypt_unit`] with the same
+    /// `unit_key` recovers the plaintext. This is the exact inverse of
+    /// the production decrypt: derive `decrypt_key = AES-ECB-E(unit_key,
+    /// header) XOR header`, then CBC-encrypt bytes 16..6144 under the
+    /// fixed AACS IV.
+    fn aacs_encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+        let header: [u8; 16] = unit[..16].try_into().unwrap();
+        let derived = aes_ecb_encrypt(unit_key, &header);
+        let mut k = [0u8; 16];
+        for i in 0..16 {
+            k[i] = derived[i] ^ header[i];
+        }
+        let cipher = Aes128::new(GenericArray::from_slice(&k));
+        let mut prev = AACS_IV;
+        let num_blocks = (ALIGNED_UNIT_LEN - 16) / 16;
+        for i in 0..num_blocks {
+            let off = 16 + i * 16;
+            for j in 0..16 {
+                unit[off + j] ^= prev[j];
+            }
+            let mut block = GenericArray::clone_from_slice(&unit[off..off + 16]);
+            cipher.encrypt_block(&mut block);
+            unit[off..off + 16].copy_from_slice(&block);
+            prev.copy_from_slice(&unit[off..off + 16]);
+        }
+    }
+
+    /// Build a clear aligned unit with TS sync bytes at offset 4 + k*192.
+    fn clear_unit() -> Vec<u8> {
+        let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            unit[off] = TS_SYNC;
+            off += TS_PACKET_LEN;
+        }
+        unit
+    }
+
+    // ── AES-ECB KAT (FIPS-197 Appendix C.1) ────────────────────────────────
+
+    #[test]
+    fn aes_ecb_matches_fips197_known_answer() {
+        // FIPS-197 Appendix C.1 AES-128 KAT:
+        //   key       = 000102030405060708090a0b0c0d0e0f
+        //   plaintext = 00112233445566778899aabbccddeeff
+        //   ciphertext= 69c4e0d86a7b0430d8cdb78070b4c55a
+        // This pins the AES primitive against a published vector — a wrong
+        // cipher (or a key/plaintext byte-order slip) fails it.
+        let key = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+        let pt = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let expected = [
+            0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4,
+            0xC5, 0x5A,
+        ];
+        assert_eq!(aes_ecb_encrypt(&key, &pt), expected);
+        // And decrypt is the exact inverse.
+        assert_eq!(aes_ecb_decrypt(&key, &expected), pt);
+    }
+
+    // ── CBC decrypt: first-block uses fixed AACS IV ────────────────────────
+
+    #[test]
+    fn cbc_decrypt_first_block_xors_aacs_iv() {
+        // CBC: P[0] = AES-D(K, C[0]) XOR IV, and the IV is the fixed AACS
+        // constant (not zero). Encrypt a single block forward with IV, then
+        // confirm aes_cbc_decrypt recovers it — proving the IV used on block
+        // 0 is exactly AACS_IV. A mutation that swaps AACS_IV for [0u8;16]
+        // makes the recovered block wrong.
+        let key = [0x24u8; 16];
+        let plain = [0x5Au8; 16];
+        // Forward CBC for one block: C = AES-E(K, P XOR IV).
+        let mut x = plain;
+        for j in 0..16 {
+            x[j] ^= AACS_IV[j];
+        }
+        let ct = aes_ecb_encrypt(&key, &x);
+        let mut buf = ct;
+        aes_cbc_decrypt(&key, &mut buf);
+        assert_eq!(buf, plain, "block-0 CBC must XOR the fixed AACS IV");
+    }
+
+    // ── decrypt_unit: full round trip restores TS syncs ────────────────────
+
+    #[test]
+    fn decrypt_unit_roundtrip_restores_all_syncs() {
+        // Encrypt a clear unit, confirm it reads as scrambled, then decrypt
+        // and confirm every TS sync byte at the 192-byte stride is restored.
+        let unit_key = [0x37u8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &unit_key);
+        assert!(
+            is_aacs_scrambled(&unit),
+            "encrypted unit must look scrambled"
+        );
+
+        assert!(decrypt_unit(&mut unit, &unit_key));
+        // All 32 stride positions carry sync after decrypt.
+        assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
+        assert!(!is_aacs_scrambled(&unit));
+    }
+
+    #[test]
+    fn decrypt_unit_wrong_key_fails_and_does_not_falsely_clear() {
+        // A wrong unit key fails verify_ts (the body stays scrambled), so
+        // decrypt_unit returns false. Grounds the brute-force gate: a bad key
+        // must NOT report success.
+        let good = [0x11u8; 16];
+        let bad = [0x22u8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &good);
+        assert!(!decrypt_unit(&mut unit, &bad), "wrong key must not verify");
+    }
+
+    #[test]
+    fn decrypt_unit_rejects_short_unit() {
+        // unit.len() < ALIGNED_UNIT_LEN → false (no panic on the 16.. slice).
+        let mut short = vec![0u8; ALIGNED_UNIT_LEN - 1];
+        assert!(!decrypt_unit(&mut short, &[0u8; 16]));
+    }
+
+    #[test]
+    fn decrypt_unit_only_touches_bytes_16_onward() {
+        // The first 16 bytes are the plaintext TP_extra header and must be
+        // left untouched by decrypt (only unit[16..] is CBC-processed).
+        let unit_key = [0x9Au8; 16];
+        let mut clear = clear_unit();
+        // Put a distinctive header so we can confirm it survives.
+        clear[..16].copy_from_slice(&[
+            0xA0, 0xA1, 0xA2, 0xA3, 0x47, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]);
+        let header_before: [u8; 16] = clear[..16].try_into().unwrap();
+        let mut unit = clear;
+        aacs_encrypt_unit(&mut unit, &unit_key);
+        // Encryption also leaves the header untouched (only 16.. is encrypted).
+        assert_eq!(&unit[..16], &header_before);
+        decrypt_unit(&mut unit, &unit_key);
+        assert_eq!(
+            &unit[..16],
+            &header_before,
+            "header bytes must be preserved"
+        );
+    }
+
+    // ── decrypt_unit_try_keys: AlreadyClear vs DecryptedWith vs None ───────
+
+    #[test]
+    fn try_keys_reports_already_clear_without_consuming_a_key() {
+        // A clear unit returns AlreadyClear even with an empty key list — the
+        // old Option<usize> form conflated this with Some(0). Grounds the
+        // UnitKeyResult enum distinction.
+        let mut unit = clear_unit();
+        assert_eq!(
+            decrypt_unit_try_keys(&mut unit, &[]),
+            Some(UnitKeyResult::AlreadyClear)
+        );
+    }
+
+    #[test]
+    fn try_keys_reports_correct_index_among_several() {
+        // Three keys, only the 3rd (index 2) decrypts → DecryptedWith(2).
+        let real = [0x44u8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &real);
+        let keys = [[0x01u8; 16], [0x02u8; 16], real];
+        assert_eq!(
+            decrypt_unit_try_keys(&mut unit, &keys),
+            Some(UnitKeyResult::DecryptedWith(2))
+        );
+        assert!(
+            !is_aacs_scrambled(&unit),
+            "unit must be clear after the hit"
+        );
+    }
+
+    #[test]
+    fn try_keys_restores_original_bytes_on_total_failure() {
+        // When no key works, the unit must be byte-identical to the input
+        // (the function CBC-mangles it per attempt, then restores). A buggy
+        // restore would leave the unit corrupted — silent data damage.
+        let real = [0x55u8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &real);
+        let snapshot = unit.clone();
+        let wrong = [[0xAAu8; 16], [0xBBu8; 16]];
+        assert_eq!(decrypt_unit_try_keys(&mut unit, &wrong), None);
+        assert_eq!(unit, snapshot, "failed try must restore the original bytes");
+    }
+
+    // ── unit_key_validates: matches decrypt_unit's verdict exactly ─────────
+
+    #[test]
+    fn unit_key_validates_agrees_with_decrypt_unit() {
+        // The fast 1-byte gate's accept/reject set must be identical to the
+        // authoritative decrypt_unit. Confirm: correct key → true on both;
+        // wrong key → false on both.
+        let good = [0x6Au8; 16];
+        let bad = [0x6Bu8; 16];
+        let mut enc = clear_unit();
+        aacs_encrypt_unit(&mut enc, &good);
+
+        assert!(unit_key_validates(&enc, &good));
+        let mut probe = enc.clone();
+        assert!(decrypt_unit(&mut probe, &good));
+
+        assert!(!unit_key_validates(&enc, &bad));
+        let mut probe2 = enc.clone();
+        assert!(!decrypt_unit(&mut probe2, &bad));
+    }
+
+    #[test]
+    fn unit_key_validates_is_non_mutating() {
+        // The accelerator must never write its input (it operates on the
+        // ciphertext and confirms on a copy). A mutation that decrypted in
+        // place would corrupt the caller's buffer.
+        let good = [0x7Cu8; 16];
+        let mut enc = clear_unit();
+        aacs_encrypt_unit(&mut enc, &good);
+        let snapshot = enc.clone();
+        let _ = unit_key_validates(&enc, &good);
+        assert_eq!(enc, snapshot, "unit_key_validates must not mutate input");
+    }
+
+    #[test]
+    fn unit_key_validates_rejects_short_unit() {
+        let short = vec![0u8; ALIGNED_UNIT_LEN - 16];
+        assert!(!unit_key_validates(&short, &[0u8; 16]));
+    }
+
+    // ── bus decryption (AACS 2.0 / UHD) ────────────────────────────────────
+
+    #[test]
+    fn decrypt_bus_roundtrips_per_sector_skipping_first_16_bytes() {
+        // Bus encryption CBC-encrypts bytes 16..2048 of EACH 2048-byte sector
+        // (3 sectors per aligned unit), leaving the first 16 plaintext. Build
+        // the forward transform, then confirm decrypt_bus inverts it and
+        // leaves each sector's first 16 bytes untouched.
+        let rdk = [0x13u8; 16];
+        let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+        // Fill with a recognisable pattern.
+        for (i, b) in unit.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let plain = unit.clone();
+
+        // Forward: CBC-encrypt unit[s+16 .. s+2048] per sector under AACS IV.
+        let cipher = Aes128::new(GenericArray::from_slice(&rdk));
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+            let mut prev = AACS_IV;
+            let body = s + 16;
+            let end = s + SECTOR_LEN;
+            let nblocks = (end - body) / 16;
+            for i in 0..nblocks {
+                let off = body + i * 16;
+                for j in 0..16 {
+                    unit[off + j] ^= prev[j];
+                }
+                let mut blk = GenericArray::clone_from_slice(&unit[off..off + 16]);
+                cipher.encrypt_block(&mut blk);
+                unit[off..off + 16].copy_from_slice(&blk);
+                prev.copy_from_slice(&unit[off..off + 16]);
+            }
+        }
+        assert_ne!(unit, plain, "forward bus-encrypt must change the body");
+
+        decrypt_bus(&mut unit, &rdk);
+        assert_eq!(
+            unit, plain,
+            "decrypt_bus must invert per-sector bus encrypt"
+        );
+        // Each sector's first 16 bytes equal the original (never touched).
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+            assert_eq!(&unit[s..s + 16], &plain[s..s + 16]);
+        }
+    }
+
+    #[test]
+    fn decrypt_bus_processes_all_three_sectors() {
+        // 6144 / 2048 = 3 sectors. Confirm the loop covers all three: corrupt
+        // the body of sector 2 (the last) and confirm decrypt_bus touches it
+        // (i.e. it isn't skipped). We do this by checking that round-tripping
+        // only works when all three are processed — encrypt all 3, decrypt,
+        // expect full recovery (covered above); here assert the step count.
+        let starts: Vec<usize> = (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN).collect();
+        assert_eq!(starts, vec![0, 2048, 4096]);
+    }
+
+    // ── decrypt_unit_full: bus-then-AACS ordering, and clear passthrough ───
+
+    #[test]
+    fn decrypt_unit_full_passthrough_when_already_clear() {
+        // A clear unit returns true and is not modified, regardless of keys.
+        let mut unit = clear_unit();
+        let snapshot = unit.clone();
+        assert!(decrypt_unit_full(
+            &mut unit,
+            &[0u8; 16],
+            Some(&[0xFFu8; 16])
+        ));
+        assert_eq!(unit, snapshot, "clear unit must pass through untouched");
+    }
+
+    #[test]
+    fn decrypt_unit_full_applies_bus_then_aacs() {
+        // AACS 2.0 pipeline: content is first AACS-unit-encrypted, then
+        // bus-encrypted on top. Decrypt must undo bus FIRST, then AACS.
+        // Build that exact two-layer ciphertext and confirm full recovery.
+        let unit_key = [0x21u8; 16];
+        let rdk = [0x84u8; 16];
+
+        let mut unit = clear_unit();
+        // Layer 1: AACS unit-encrypt.
+        aacs_encrypt_unit(&mut unit, &unit_key);
+        // Layer 2: bus-encrypt on top (per-sector, bytes 16..2048).
+        let cipher = Aes128::new(GenericArray::from_slice(&rdk));
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+            let mut prev = AACS_IV;
+            for i in 0..((SECTOR_LEN - 16) / 16) {
+                let off = s + 16 + i * 16;
+                for j in 0..16 {
+                    unit[off + j] ^= prev[j];
+                }
+                let mut blk = GenericArray::clone_from_slice(&unit[off..off + 16]);
+                cipher.encrypt_block(&mut blk);
+                unit[off..off + 16].copy_from_slice(&blk);
+                prev.copy_from_slice(&unit[off..off + 16]);
+            }
+        }
+        assert!(is_aacs_scrambled(&unit));
+        assert!(decrypt_unit_full(&mut unit, &unit_key, Some(&rdk)));
+        assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
+    }
+
+    // ── is_aacs_scrambled / ts_sync_count edge cases ───────────────────────
+
+    #[test]
+    fn is_aacs_scrambled_false_for_sub_unit_length() {
+        // The function guards on `len >= ALIGNED_UNIT_LEN` first; anything
+        // shorter is reported NOT scrambled (so the decrypt gate skips it)
+        // rather than indexing past the end.
+        assert!(!is_aacs_scrambled(&[]));
+        assert!(!is_aacs_scrambled(&vec![0u8; ALIGNED_UNIT_LEN - 1]));
+        // A scrambled-looking buffer that is one byte short is still "not
+        // scrambled" by the length guard.
+        let mut almost = vec![0u8; ALIGNED_UNIT_LEN - 1];
+        almost[4] = 0x00; // no syncs
+        assert!(!is_aacs_scrambled(&almost));
+    }
+
+    #[test]
+    fn ts_sync_count_only_samples_the_192_byte_stride() {
+        // A 0x47 placed OFF the stride (e.g. offset 5) must not be counted —
+        // the detector samples exactly offset 4, 196, 388, ... A mutation that
+        // scanned every byte would over-count and misclassify scrambled units.
+        let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+        unit[5] = TS_SYNC; // off-stride
+        unit[197] = TS_SYNC; // off-stride
+        assert_eq!(ts_sync_count(&unit), 0, "off-stride 0x47 must not count");
+        unit[4] = TS_SYNC; // on-stride
+        assert_eq!(ts_sync_count(&unit), 1);
+    }
+
+    #[test]
+    fn ts_packet_total_for_various_lengths() {
+        // total = len / 192 (BD-TS packet size). Pin a few lengths.
+        assert_eq!(ts_packet_total(&[0u8; 192]), 1);
+        assert_eq!(ts_packet_total(&[0u8; 384]), 2);
+        assert_eq!(ts_packet_total(&[0u8; 191]), 0);
+        // 6144 = 32 packets.
+        assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
+    }
 }

@@ -577,7 +577,11 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 mod tests {
     use super::aacs_key_missing;
     use super::validate_network_addr;
+    use super::{build_demux_state, build_iso_pipeline, input, output};
     use crate::decrypt::DecryptKeys;
+    use crate::disc::{ContentFormat, DiscTitle, Extent};
+    use crate::pes::Stream as _;
+    use crate::sector::SectorSource;
 
     #[test]
     fn validate_network_addr_rejects_portless() {
@@ -630,5 +634,353 @@ mod tests {
         assert!(!aacs_key_missing(true, true, &DecryptKeys::None));
         assert!(!aacs_key_missing(true, true, &aacs_keys()));
         assert!(!aacs_key_missing(true, false, &DecryptKeys::None));
+    }
+
+    // ── input()/output() routing + validation ─────────────────────────────
+
+    // Box<dyn Stream> is not Debug, so unwrap_err() won't compile. These
+    // helpers extract the io::ErrorKind from the Err arm (and panic on Ok).
+    fn input_err_kind(url: &str) -> std::io::ErrorKind {
+        match input(url, &Default::default()) {
+            Ok(_) => panic!("expected input({url}) to error"),
+            Err(e) => e.kind(),
+        }
+    }
+    fn output_err_kind(url: &str, t: &DiscTitle) -> std::io::ErrorKind {
+        match output(url, t) {
+            Ok(_) => panic!("expected output({url}) to error"),
+            Err(e) => e.kind(),
+        }
+    }
+
+    /// The resolver doc table marks disc:// as input-only via the
+    /// `Drive::open` path — input("disc://") must surface DiscUrlNotDirect
+    /// (E9009 → Unsupported), never attempt to open a stream.
+    #[test]
+    fn input_disc_url_is_not_direct() {
+        assert_eq!(input_err_kind("disc://"), std::io::ErrorKind::Unsupported);
+    }
+
+    /// null:// is write-only per the table — input() must reject it with
+    /// StreamWriteOnly (E9001 → Unsupported), not hand back a dead reader.
+    #[test]
+    fn input_null_url_is_write_only() {
+        assert_eq!(input_err_kind("null://"), std::io::ErrorKind::Unsupported);
+    }
+
+    /// An unrecognized scheme on input() must surface StreamUrlInvalid
+    /// (E9002 → InvalidInput), carrying the raw URL — never silently succeed.
+    #[test]
+    fn input_unknown_url_is_invalid() {
+        assert_eq!(
+            input_err_kind("ftp://host/x"),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// iso:// with an empty path must fail validate_file_path with
+    /// StreamUrlMissingPath (E9003 → InvalidInput) before any File::open.
+    #[test]
+    fn input_iso_empty_path_missing_path_error() {
+        assert_eq!(input_err_kind("iso://"), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// disc:// and iso:// are input-only sources — output() to either must
+    /// return StreamReadOnly (E9000 → Unsupported).
+    #[test]
+    fn output_disc_and_iso_are_read_only() {
+        let t = DiscTitle::empty();
+        assert_eq!(
+            output_err_kind("disc://", &t),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            output_err_kind("iso://x.iso", &t),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+
+    /// output() to null:// must succeed (it's the canonical write sink).
+    #[test]
+    fn output_null_succeeds() {
+        let t = DiscTitle::empty();
+        assert!(output("null://", &t).is_ok());
+    }
+
+    /// output() to an unknown scheme must surface StreamUrlInvalid
+    /// (E9002 → InvalidInput).
+    #[test]
+    fn output_unknown_url_is_invalid() {
+        let t = DiscTitle::empty();
+        assert_eq!(
+            output_err_kind("gopher://x", &t),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// output() to network:// with no port must fail validation
+    /// (StreamUrlMissingPort, E9004 → InvalidInput) before any TcpStream.
+    #[test]
+    fn output_network_missing_port_invalid() {
+        let t = DiscTitle::empty();
+        assert_eq!(
+            output_err_kind("network://127.0.0.1", &t),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// mkv:// with an empty path must fail validate_file_path
+    /// (StreamUrlMissingPath) on the output side, before WritebackFile.
+    #[test]
+    fn output_mkv_empty_path_missing_path_error() {
+        let t = DiscTitle::empty();
+        assert_eq!(
+            output_err_kind("mkv://", &t),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    // ── build_demux_state: parser/PID table + demuxer selection ────────────
+
+    fn aac_audio_title(pid: u16) -> DiscTitle {
+        use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate, Stream};
+        let mut t = DiscTitle::empty();
+        t.streams.push(Stream::Audio(AudioStream {
+            pid,
+            codec: Codec::Aac, // → all-keyframe PassthroughParser (1 PES = 1 frame)
+            channels: AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        t
+    }
+
+    /// BdTs format must build a TsDemuxer (Some(ts), None(ps)) when there is
+    /// at least one PID, and one parser + pid_to_track entry per stream
+    /// keyed by the stream's own PID. (Mis-keying here is exactly the class
+    /// of bug that mis-routes PES into the wrong codec parser.)
+    #[test]
+    fn build_demux_state_bdts_builds_ts_demuxer_and_pid_table() {
+        let t = aac_audio_title(0x1100);
+        let (parsers, pid_to_track, ts, ps) = build_demux_state(&t, ContentFormat::BdTs);
+        assert_eq!(parsers.len(), 1);
+        assert_eq!(parsers[0].0, 0x1100, "parser keyed by the stream PID");
+        assert_eq!(pid_to_track, vec![(0x1100u16, 0usize)]);
+        assert!(ts.is_some(), "BdTs → TsDemuxer");
+        assert!(ps.is_none());
+    }
+
+    /// MpegPs format must build a PsDemuxer (None(ts), Some(ps)) regardless
+    /// of PIDs — DVD program streams demux via the PS path.
+    #[test]
+    fn build_demux_state_mpegps_builds_ps_demuxer() {
+        let t = aac_audio_title(0xBD80);
+        let (_parsers, _p2t, ts, ps) = build_demux_state(&t, ContentFormat::MpegPs);
+        assert!(ts.is_none());
+        assert!(ps.is_some(), "MpegPs → PsDemuxer");
+    }
+
+    /// An empty BdTs title (no streams) must NOT construct a TsDemuxer —
+    /// `TsDemuxer::new(&[])` is pointless, and the builder special-cases
+    /// empty PIDs to (None, None). pid_to_track/parsers also empty.
+    #[test]
+    fn build_demux_state_bdts_empty_streams_builds_no_demuxer() {
+        let t = DiscTitle::empty();
+        let (parsers, pid_to_track, ts, ps) = build_demux_state(&t, ContentFormat::BdTs);
+        assert!(parsers.is_empty());
+        assert!(pid_to_track.is_empty());
+        assert!(ts.is_none(), "no PIDs → no TsDemuxer");
+        assert!(ps.is_none());
+    }
+
+    // ── build_iso_pipeline: end-to-end highway wiring ──────────────────────
+
+    /// An in-memory SectorSource that serves a fixed byte image. Reads beyond
+    /// the image return zero-filled sectors (the prefetcher only reads within
+    /// the title's extents, so this is never hit in these tests).
+    struct MemSource {
+        data: Vec<u8>,
+    }
+    impl SectorSource for MemSource {
+        fn capacity_sectors(&self) -> u32 {
+            (self.data.len() / 2048) as u32
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let start = lba as usize * 2048;
+            let want = count as usize * 2048;
+            for (i, b) in buf[..want].iter_mut().enumerate() {
+                *b = self.data.get(start + i).copied().unwrap_or(0);
+            }
+            Ok(want)
+        }
+    }
+
+    /// Build a 192-byte BD-TS data packet on `pid` carrying `payload` as the
+    /// TS payload (payload-only adaptation). Layout: 4-byte TP_extra_header
+    /// (zeros) + 188-byte TS packet (sync 0x47, PID, PUSI, AFC=0b01).
+    /// Mirrors the BD-TS framing in ts.rs.
+    fn bdts_data_packet(pid: u16, pusi: bool, payload: &[u8]) -> [u8; 192] {
+        let mut pkt = [0u8; 192];
+        pkt[4] = 0x47; // sync byte
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40; // PUSI
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x10; // adaptation_field_control = 0b01 (payload only)
+        let room = 184; // 188 - 4-byte TS header
+        let n = payload.len().min(room);
+        pkt[8..8 + n].copy_from_slice(&payload[..n]);
+        pkt
+    }
+
+    /// A complete audio PES (stream_id 0xC0) with no PTS, carrying `es` as the
+    /// elementary-stream payload. Layout per ISO 13818-1: 00 00 01 C0
+    /// [len:2] [0x80 flags1] [0x00 flags2] [0x00 header_data_len] [es...].
+    fn audio_pes(es: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0xC0];
+        let len = (3 + es.len()) as u16; // flags(2)+hdl(1)+es
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(&[0x80, 0x00, 0x00]);
+        v.extend_from_slice(es);
+        v
+    }
+
+    /// Empty extents → the producer thread exits immediately, the demux
+    /// thread sees a clean channel close and emits the Eof sentinel, and the
+    /// PipelinedPesStream returns Ok(None) on the first read. The highway must
+    /// terminate cleanly (no panic, no hang) when there is nothing to read.
+    #[test]
+    fn build_iso_pipeline_empty_extents_clean_eof() {
+        let title = aac_audio_title(0x1100); // extents empty by default
+        let mut stream = build_iso_pipeline(
+            MemSource { data: Vec::new() },
+            title,
+            DecryptKeys::None,
+            8192,
+            ContentFormat::BdTs,
+            None,
+            None,
+        )
+        .expect("pipeline builds");
+        let first = stream.read().expect("read must not error on clean EOF");
+        assert!(
+            first.is_none(),
+            "no extents → immediate clean end-of-stream"
+        );
+        // Idempotent: a second read past EOF is still Ok(None), never an error.
+        assert!(stream.read().unwrap().is_none());
+    }
+
+    /// End-to-end: one BD-TS packet carrying a complete audio PES flows
+    /// read → decrypt(passthrough) → TS demux → codec parse → one PesFrame.
+    /// Proves the full highway wiring delivers the ES payload intact and
+    /// reaches a clean EOF afterward (never silently truncating the frame).
+    #[test]
+    fn build_iso_pipeline_delivers_one_frame_then_eof() {
+        let es = [0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22];
+        let pes = audio_pes(&es);
+        let pkt = bdts_data_packet(0x1100, true, &pes);
+        // One 2048-byte sector holding the 192-byte packet (rest zero — the
+        // demuxer skips non-sync packets). Extent = 3 sectors (one AACS unit,
+        // the prefetcher's alignment requirement).
+        let mut data = vec![0u8; 3 * 2048];
+        data[..192].copy_from_slice(&pkt);
+
+        let mut title = aac_audio_title(0x1100);
+        title.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 3,
+        }];
+
+        let mut stream = build_iso_pipeline(
+            MemSource { data },
+            title,
+            DecryptKeys::None,
+            8192,
+            ContentFormat::BdTs,
+            None,
+            None,
+        )
+        .expect("pipeline builds");
+
+        let frame = stream
+            .read()
+            .expect("read ok")
+            .expect("one frame emitted from the single PES");
+        // PassthroughParser routes the audio stream (PID 0x1100) to track 0.
+        assert_eq!(frame.track, 0);
+        // The TS PesAssembler delivers every payload byte AFTER the 9-byte PES
+        // header to the end of the 184-byte TS payload region (the bounded
+        // PES_packet_length is not used to trim within a single packet — the
+        // PES is closed by the next PUSI or by flush at EOF). So the frame is
+        // the ES bytes followed by the packet's zero padding: total = 184 - 9.
+        assert_eq!(
+            frame.data.len(),
+            184 - 9,
+            "frame spans the full TS payload after the PES header"
+        );
+        // Truncation guard: the ES bytes lead the frame, in order, unaltered —
+        // the highway must never drop or reorder the elementary-stream prefix.
+        assert_eq!(
+            &frame.data[..es.len()],
+            &es[..],
+            "ES payload prefix delivered intact and in order"
+        );
+        assert!(
+            frame.data[es.len()..].iter().all(|&b| b == 0),
+            "remainder is the packet's zero padding, not foreign data"
+        );
+        // After the single frame the stream reaches a clean EOF.
+        assert!(
+            stream.read().unwrap().is_none(),
+            "clean EOF after the frame"
+        );
+    }
+
+    /// build_iso_pipeline with batch_sectors = 0 must fail fast (the
+    /// prefetcher rejects a zero batch as a programming error — a zero batch
+    /// would spin the producer forever). Surfaced as an io error, not a hang.
+    #[test]
+    fn build_iso_pipeline_zero_batch_rejected() {
+        let title = aac_audio_title(0x1100);
+        let res = build_iso_pipeline(
+            MemSource { data: Vec::new() },
+            title,
+            DecryptKeys::None,
+            0,
+            ContentFormat::BdTs,
+            None,
+            None,
+        );
+        assert!(res.is_err(), "zero batch_sectors must be rejected");
+    }
+
+    /// info() on the assembled pipeline returns the title it was built with —
+    /// the consumer reads stream layout from here before muxing.
+    #[test]
+    fn build_iso_pipeline_info_returns_title() {
+        let mut title = aac_audio_title(0x1100);
+        title.playlist = "PipelineTitle".into();
+        let stream = build_iso_pipeline(
+            MemSource { data: Vec::new() },
+            title,
+            DecryptKeys::None,
+            8192,
+            ContentFormat::BdTs,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stream.info().playlist, "PipelineTitle");
     }
 }

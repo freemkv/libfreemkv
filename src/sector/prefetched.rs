@@ -721,4 +721,493 @@ mod tests {
             );
         });
     }
+
+    // ---------------------------------------------------------------
+    // Additional coverage below.
+    // ---------------------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    /// Records every (lba, count) the producer issued, in order, and
+    /// always satisfies the full request. Lets a test assert the exact
+    /// read schedule (LBA walk, batch sizing, unit trimming).
+    struct RecordingSource {
+        capacity: u32,
+        calls: Arc<Mutex<Vec<(u32, u16)>>>,
+    }
+    impl SectorSource for RecordingSource {
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.calls.lock().unwrap().push((lba, count));
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill((lba & 0xff) as u8);
+            Ok(bytes)
+        }
+    }
+
+    /// Always returns a typed I/O error on the first read. Verifies the
+    /// producer forwards the underlying error verbatim through the
+    /// channel instead of swallowing it / treating it as EOF.
+    struct ErrorSource;
+    impl SectorSource for ErrorSource {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            Err(crate::error::Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            })
+        }
+    }
+
+    /// Returns a byte count that is NOT a whole number of sectors
+    /// (n % 2048 != 0). The producer must reject this as a split-sector
+    /// short read rather than truncate-and-advance into a partial unit.
+    struct PartialSectorSource;
+    impl SectorSource for PartialSectorSource {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            // One sector plus 100 bytes — never a multiple of 2048.
+            let n = 2048 + 100;
+            buf[..n].fill(0xab);
+            Ok(n)
+        }
+    }
+
+    /// Drains a prefetch source via the direct `read_sectors` API into a
+    /// single contiguous Vec, stopping at the first EOF (Ok(0)) or the
+    /// first error. Returns (bytes, last_result).
+    fn drain_direct(
+        pf: &mut PrefetchedSectorSource,
+        buf_sectors: u16,
+        max_iters: usize,
+    ) -> (Vec<u8>, Result<usize>) {
+        let mut buf = vec![0u8; buf_sectors as usize * 2048];
+        let mut out = Vec::new();
+        let mut last: Result<usize> = Ok(0);
+        for _ in 0..max_iters {
+            let r = pf.read_sectors(0, buf_sectors, &mut buf, false);
+            match r {
+                Ok(0) => {
+                    last = Ok(0);
+                    break;
+                }
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    last = Ok(n);
+                }
+                Err(e) => {
+                    last = Err(e);
+                    break;
+                }
+            }
+        }
+        (out, last)
+    }
+
+    /// `capacity_sectors` returns the sum of all extents' sector_counts,
+    /// computed once at construction. Grounding: doc comment on
+    /// `total_sectors` — "the sum of each extent's sector_count".
+    #[test]
+    fn capacity_sectors_sums_all_extents() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![
+                Extent {
+                    start_lba: 0,
+                    sector_count: 9,
+                },
+                Extent {
+                    start_lba: 100,
+                    sector_count: 6,
+                },
+                Extent {
+                    start_lba: 500,
+                    sector_count: 3,
+                },
+            ];
+            let src = PatternSource { capacity: 9999 };
+            let pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            // 9 + 6 + 3 = 18, independent of inner source capacity.
+            assert_eq!(pf.capacity_sectors(), 18);
+            // Release the producer without draining: peel the channels
+            // and drop them so the producer observes disconnection
+            // (dropping `pf` directly would join while still holding the
+            // channels → deadlock; the production drain path always uses
+            // into_channels).
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell);
+        });
+    }
+
+    /// Total-sector accumulation must clamp at u32::MAX rather than
+    /// panic (debug overflow) or wrap (release) on a hostile extent set
+    /// whose summed sector_count exceeds u32. Grounding: the `new`
+    /// comment — "Accumulate in u64 then clamp ... a naive u32 sum()
+    /// could panic in debug / wrap in release".
+    #[test]
+    fn capacity_sectors_clamps_on_overflow() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![
+                Extent {
+                    start_lba: 0,
+                    sector_count: u32::MAX,
+                },
+                Extent {
+                    start_lba: 0,
+                    sector_count: u32::MAX,
+                },
+            ];
+            // batch=3 so the producer makes forward progress on the
+            // EndlessZeroSource; we only care about the construction-time
+            // capacity computation here, then we drop to join.
+            let pf =
+                PrefetchedSectorSource::new(EndlessZeroSource, extents, 3, None).expect("spawn");
+            assert_eq!(
+                pf.capacity_sectors(),
+                u32::MAX,
+                "summed total must saturate at u32::MAX, not wrap"
+            );
+            // Release the producer via into_channels + drop (a direct
+            // drop of `pf` would join while still holding the channels →
+            // deadlock against the still-running EndlessZeroSource).
+            let (rx, recycle_tx, shell) = pf.into_channels();
+            drop(rx);
+            drop(recycle_tx);
+            drop(shell);
+        });
+    }
+
+    /// The producer must walk extents in list order and start each
+    /// extent at its `start_lba` (plus running offset within the
+    /// extent), never reorder or merge them. Grounding: lifecycle doc
+    /// — "walks the supplied extent list in order" and
+    /// `lba = extent.start_lba.saturating_add(offset)`.
+    #[test]
+    fn producer_walks_extents_in_order_at_correct_lbas() {
+        with_watchdog(Duration::from_secs(10), || {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let extents = vec![
+                Extent {
+                    start_lba: 1000,
+                    sector_count: 6, // two 3-sector batches
+                },
+                Extent {
+                    start_lba: 50,
+                    sector_count: 3, // one batch — lower LBA, MUST stay second
+                },
+            ];
+            let src = RecordingSource {
+                capacity: 99999,
+                calls: calls.clone(),
+            };
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 3, 16);
+            assert_eq!(last.unwrap(), 0, "should reach EOF");
+            assert_eq!(got.len(), (6 + 3) * 2048);
+            drop(pf);
+            let recorded = calls.lock().unwrap().clone();
+            // Expect: extent0 at 1000 then 1003 (offset+3), then extent1 at 50.
+            assert_eq!(
+                recorded,
+                vec![(1000, 3), (1003, 3), (50, 3)],
+                "extents must be walked in list order at their start_lba+offset"
+            );
+        });
+    }
+
+    /// A batch larger than one unit must be trimmed DOWN to a whole
+    /// number of 3-sector units before issuing the read — never a
+    /// sub-unit count that decrypt would leave partially encrypted.
+    /// batch=5 → trimmed to 3 (5 - 5%3). Grounding: the unit-trim block
+    /// `sectors -= sectors % SECTOR_ALIGNMENT`.
+    #[test]
+    fn batch_trimmed_to_whole_units() {
+        with_watchdog(Duration::from_secs(10), || {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            // 9 sectors total = three 3-sector units.
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 9,
+            }];
+            let src = RecordingSource {
+                capacity: 9,
+                calls: calls.clone(),
+            };
+            // batch=5: each read must be trimmed to 3 (one unit), so
+            // 9 sectors take three reads of 3, never a 5/4-sector read.
+            let mut pf = PrefetchedSectorSource::new(src, extents, 5, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 5, 16);
+            assert_eq!(last.unwrap(), 0);
+            assert_eq!(got.len(), 9 * 2048);
+            drop(pf);
+            let recorded = calls.lock().unwrap().clone();
+            assert!(
+                recorded.iter().all(|&(_, c)| c % SECTOR_ALIGNMENT == 0),
+                "every issued read must be a whole number of units, got {recorded:?}"
+            );
+            assert!(
+                recorded.iter().all(|&(_, c)| c == 3),
+                "batch=5 must trim to one 3-sector unit per read, got {recorded:?}"
+            );
+        });
+    }
+
+    /// An extent whose sector_count IS a multiple of 3 must deliver
+    /// exactly that many sectors and then cleanly EOF (no error on the
+    /// final aligned batch). Grounding: the trailing-tail guard only
+    /// fires for sub-unit leftovers; a unit-aligned extent forms full
+    /// units on its own (the comment at line ~188).
+    #[test]
+    fn unit_aligned_extent_delivers_all_and_eofs() {
+        with_watchdog(Duration::from_secs(10), || {
+            // 12 sectors = exactly four 3-sector units.
+            let extents = vec![Extent {
+                start_lba: 7,
+                sector_count: 12,
+            }];
+            let src = PatternSource { capacity: 100 };
+            let mut pf = PrefetchedSectorSource::new(src, extents, 6, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 6, 16);
+            assert_eq!(
+                last.unwrap(),
+                0,
+                "unit-aligned extent must EOF cleanly, not error"
+            );
+            assert_eq!(got.len(), 12 * 2048);
+        });
+    }
+
+    /// The underlying reader's error must propagate to the consumer as
+    /// an error (not Ok(0)/EOF), and its ErrorKind must survive the
+    /// round-trip through the channel. Grounding: the producer's
+    /// `Err(e) => tx.send(Err(e.into()))` arm, and `read_sectors`'
+    /// `Ok(Err(e)) => Err(IoError{source:e})`.
+    #[test]
+    fn reader_error_propagates_with_kind() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 3,
+            }];
+            let mut pf = PrefetchedSectorSource::new(ErrorSource, extents, 3, None).expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            let r = pf.read_sectors(0, 3, &mut buf, false);
+            let err = r.expect_err("reader error must surface as Err, not EOF");
+            let io: std::io::Error = err.into();
+            assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "underlying ErrorKind must survive the channel round-trip"
+            );
+        });
+    }
+
+    /// A read returning a byte count that is not a whole number of
+    /// sectors (n % 2048 != 0) must be rejected — never truncated and
+    /// advanced, which would split a sector and hand decrypt a partial
+    /// unit. Grounding: the `if n % 2048 != 0 { send Err }` guard.
+    #[test]
+    fn non_sector_multiple_read_rejected() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 9,
+            }];
+            let mut pf =
+                PrefetchedSectorSource::new(PartialSectorSource, extents, 3, None).expect("spawn");
+            let mut buf = vec![0u8; 3 * 2048];
+            let r = pf.read_sectors(0, 3, &mut buf, false);
+            let err = r.expect_err("split-sector read must be rejected");
+            let io: std::io::Error = err.into();
+            assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "split-sector read maps to ExtentNotUnitAligned (InvalidInput)"
+            );
+        });
+    }
+
+    /// A too-small consumer buffer in the direct `read_sectors` path
+    /// must error (InvalidInput), never silently drop the bytes past
+    /// `buf.len()`. Grounding: the `if filled.len() > buf.len()` guard
+    /// in `read_sectors` ("would silently drop filled[buf.len()..],
+    /// desyncing the stream").
+    #[test]
+    fn direct_read_too_small_buffer_errors() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 6,
+            }];
+            let src = PatternSource { capacity: 6 };
+            // batch=3 → producer fills 3 sectors (6144 bytes) per batch.
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            // Caller buffer holds only 1 sector — far too small.
+            let mut tiny = vec![0u8; 2048];
+            let r = pf.read_sectors(0, 1, &mut tiny, false);
+            let err = r.expect_err("too-small buffer must error, not truncate");
+            let io: std::io::Error = err.into();
+            assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+            drop(pf);
+        });
+    }
+
+    /// The producer delivers exactly the bytes the inner source
+    /// produced, in order, byte-for-byte. PatternSource tags each
+    /// sector with `(lba & 0xff)`, so the assembled stream must match a
+    /// reconstruction from the extent's LBA range. Guards against
+    /// off-by-one/duplicate/reorder in the offset bookkeeping.
+    #[test]
+    fn delivered_bytes_match_source_exactly() {
+        with_watchdog(Duration::from_secs(10), || {
+            let start = 40u32;
+            let count = 9u32; // three units
+            let extents = vec![Extent {
+                start_lba: start,
+                sector_count: count,
+            }];
+            let src = PatternSource { capacity: 1000 };
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 3, 16);
+            assert_eq!(last.unwrap(), 0);
+            assert_eq!(got.len(), (count as usize) * 2048);
+            // Reconstruct expected: sector i carries byte ((start+i)&0xff).
+            for i in 0..count {
+                let tag = ((start + i) & 0xff) as u8;
+                let off = i as usize * 2048;
+                assert!(
+                    got[off..off + 2048].iter().all(|b| *b == tag),
+                    "sector {i} (lba {}) content mismatch",
+                    start + i
+                );
+            }
+        });
+    }
+
+    /// An empty extent list must EOF immediately (capacity 0, first
+    /// direct read returns Ok(0)) and must not deadlock. Grounding: the
+    /// producer's `while ext_idx < extents.len()` loop body never runs,
+    /// so `tx` drops and the consumer sees RecvError → Ok(0).
+    #[test]
+    fn empty_extents_eof_immediately() {
+        with_watchdog(Duration::from_secs(10), || {
+            let pf =
+                PrefetchedSectorSource::new(EndlessZeroSource, Vec::new(), 3, None).expect("spawn");
+            assert_eq!(pf.capacity_sectors(), 0);
+            let mut pf = pf;
+            let mut buf = vec![0u8; 3 * 2048];
+            let n = pf.read_sectors(0, 3, &mut buf, false).unwrap();
+            assert_eq!(n, 0, "empty extent list must EOF immediately");
+        });
+    }
+
+    /// A zero-length extent in the middle of the list must be skipped
+    /// (remaining == 0 → advance to next extent) without emitting a
+    /// batch and without stalling. Grounding: the `if remaining == 0 {
+    /// ext_idx += 1; continue }` branch.
+    #[test]
+    fn zero_length_extent_is_skipped() {
+        with_watchdog(Duration::from_secs(10), || {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let extents = vec![
+                Extent {
+                    start_lba: 10,
+                    sector_count: 3,
+                },
+                Extent {
+                    start_lba: 20,
+                    sector_count: 0, // empty — must be skipped
+                },
+                Extent {
+                    start_lba: 30,
+                    sector_count: 3,
+                },
+            ];
+            let src = RecordingSource {
+                capacity: 9999,
+                calls: calls.clone(),
+            };
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 3, 16);
+            assert_eq!(last.unwrap(), 0);
+            assert_eq!(got.len(), 6 * 2048, "two non-empty extents = 6 sectors");
+            drop(pf);
+            let recorded = calls.lock().unwrap().clone();
+            // No read should target LBA 20 (the empty extent).
+            assert_eq!(
+                recorded,
+                vec![(10, 3), (30, 3)],
+                "empty extent must produce no read"
+            );
+        });
+    }
+
+    /// A 4-sector extent (one full unit + a 1-sector tail) must
+    /// deliver the 3-sector unit and then error on the 1-sector
+    /// remainder — exercising the trim-within-batch path
+    /// (`sectors -= sectors % 3` lands on 3, leaving remaining=1) that
+    /// then hits the sub-unit guard on the next iteration. Distinct
+    /// control flow from the 8-sector case. Grounding: trailing-tail
+    /// guard plus the unit-trim block.
+    #[test]
+    fn four_sector_extent_errors_on_one_sector_tail() {
+        with_watchdog(Duration::from_secs(10), || {
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 4,
+            }];
+            let src = PatternSource { capacity: 100 };
+            // batch=9 (>4) so the first iter requests 4, trims to 3.
+            let mut pf = PrefetchedSectorSource::new(src, extents, 9, None).expect("spawn");
+            let mut buf = vec![0u8; 9 * 2048];
+            let n0 = pf.read_sectors(0, 9, &mut buf, false).unwrap();
+            assert_eq!(n0, 3 * 2048, "first batch must be exactly one unit");
+            let r = pf.read_sectors(0, 9, &mut buf, false);
+            let err = r.expect_err("1-sector tail must error");
+            let io: std::io::Error = err.into();
+            assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        });
+    }
+
+    /// Many sequential direct reads across MANY extents must all flow
+    /// through the fixed recycle pool without deadlock — a stronger
+    /// version of the pool-depth regression that also crosses extent
+    /// boundaries (offset reset to 0, ext_idx advance). Grounding: the
+    /// recycle-pool comment in `read_sectors`.
+    #[test]
+    fn many_extents_drain_without_deadlock() {
+        with_watchdog(Duration::from_secs(15), || {
+            // 10 extents of 3 sectors each = 30 sectors total, well past
+            // the 3-buffer pool, and 10 extent transitions.
+            let extents: Vec<Extent> = (0..10)
+                .map(|i| Extent {
+                    start_lba: i * 1000,
+                    sector_count: 3,
+                })
+                .collect();
+            let src = PatternSource { capacity: 999999 };
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            let (got, last) = drain_direct(&mut pf, 3, 64);
+            assert_eq!(last.unwrap(), 0);
+            assert_eq!(got.len(), 30 * 2048, "all 10 extents must be drained");
+        });
+    }
 }

@@ -1039,6 +1039,427 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    // ── status char round-trip (ddrescue alphabet ?*/-+) ──────────
+
+    /// Every SectorStatus must round-trip through to_char/from_char, and
+    /// the chars must be the exact ddrescue alphabet (header doc: `?` `*`
+    /// `/` `-` `+`). A swapped mapping would silently misclassify resume
+    /// state (e.g. a good sector read back as unreadable).
+    #[test]
+    fn status_char_round_trip_is_ddrescue_alphabet() {
+        let pairs = [
+            (SectorStatus::NonTried, '?'),
+            (SectorStatus::NonTrimmed, '*'),
+            (SectorStatus::NonScraped, '/'),
+            (SectorStatus::Unreadable, '-'),
+            (SectorStatus::Finished, '+'),
+        ];
+        for (st, ch) in pairs {
+            assert_eq!(st.to_char(), ch, "{st:?} must map to '{ch}'");
+            assert_eq!(SectorStatus::from_char(ch), Some(st));
+        }
+        // Any char outside the alphabet is rejected.
+        for bad in ['x', ' ', '0', '#', '?'.to_ascii_uppercase()] {
+            if "?*/-+".contains(bad) {
+                continue;
+            }
+            assert_eq!(
+                SectorStatus::from_char(bad),
+                None,
+                "'{bad}' is not a status"
+            );
+        }
+    }
+
+    // ── parse_hex / parse_uk_line / parse_vid_hex error paths ─────
+
+    /// parse_hex accepts both `0x`-prefixed and bare hex (ddrescue writes
+    /// `0x`-prefixed). A non-hex field is a MapfileInvalid{kind:"hex"}.
+    #[test]
+    fn parse_hex_accepts_prefixed_and_bare_rejects_garbage() {
+        assert_eq!(parse_hex("0x10").unwrap(), 16);
+        assert_eq!(parse_hex("10").unwrap(), 16);
+        assert_eq!(parse_hex("0xffffffff").unwrap(), 0xffff_ffff);
+        let err = parse_hex("0xzz").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A `# freemkv-uk:` line missing the `cps:hex` shape, with a bad cps,
+    /// or a wrong-length key, must parse to None (best-effort, never fatal).
+    #[test]
+    fn parse_uk_line_rejects_malformed() {
+        assert_eq!(parse_uk_line("no-colon"), None);
+        assert_eq!(
+            parse_uk_line("notanumber:11111111111111111111111111111111"),
+            None
+        );
+        // 30 hex chars (15 bytes) — wrong length.
+        assert_eq!(parse_uk_line("0:1111111111111111111111111111"), None);
+        // Valid.
+        assert_eq!(
+            parse_uk_line("3:000102030405060708090a0b0c0d0e0f"),
+            Some((3u32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]))
+        );
+    }
+
+    /// parse_vid_hex tolerates an optional `0x` prefix and uppercase hex,
+    /// but a 31- or 33-char string (not 32) is rejected — a VID is exactly
+    /// 16 bytes = 32 hex chars.
+    #[test]
+    fn parse_vid_hex_length_and_case() {
+        assert_eq!(
+            parse_vid_hex("0xAABBCCDDEEFF00112233445566778899"),
+            Some([
+                0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99
+            ])
+        );
+        assert_eq!(parse_vid_hex(&"a".repeat(31)), None);
+        assert_eq!(parse_vid_hex(&"a".repeat(33)), None);
+    }
+
+    // ── next_with / ranges_with semantics ─────────────────────────
+
+    /// next_with returns the first matching range AT OR AFTER `from`,
+    /// clipping the returned start to `from` when `from` lands inside a
+    /// matching range (the patch loop relies on resuming mid-range).
+    #[test]
+    fn next_with_clips_start_to_from() {
+        let p = tmpfile("next_with_clips");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(200, 300, SectorStatus::NonTrimmed).unwrap();
+        // from inside the NonTrimmed range [200,500): start clips to 350,
+        // size is 500-350 = 150.
+        assert_eq!(
+            mf.next_with(350, SectorStatus::NonTrimmed),
+            Some((350, 150))
+        );
+        // from before the range: returns the whole range from its pos.
+        assert_eq!(mf.next_with(0, SectorStatus::NonTrimmed), Some((200, 300)));
+        // from at/after the range end: no match.
+        assert_eq!(mf.next_with(500, SectorStatus::NonTrimmed), None);
+        // status with no entries: None.
+        assert_eq!(mf.next_with(0, SectorStatus::Unreadable), None);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ranges_with matches ANY of the supplied statuses, preserving
+    /// position order. Used to build the Pass-N retry queue (NonTrimmed +
+    /// NonScraped together).
+    #[test]
+    fn ranges_with_multiple_statuses_in_order() {
+        let p = tmpfile("ranges_with_multi");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(100, 100, SectorStatus::NonTrimmed).unwrap();
+        mf.record(300, 100, SectorStatus::NonScraped).unwrap();
+        mf.record(500, 100, SectorStatus::Unreadable).unwrap();
+        let retry = mf.ranges_with(&[SectorStatus::NonTrimmed, SectorStatus::NonScraped]);
+        assert_eq!(retry, vec![(100, 100), (300, 100)]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ── record edge cases ─────────────────────────────────────────
+
+    /// A zero-size record is a no-op (record() early-returns on size==0):
+    /// entries and stats are unchanged.
+    #[test]
+    fn record_zero_size_is_noop() {
+        let p = tmpfile("record_zero");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        let before = mf.entries().to_vec();
+        mf.record(500, 0, SectorStatus::Finished).unwrap();
+        assert_eq!(mf.entries(), before.as_slice());
+        assert_eq!(mf.stats().bytes_good, 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Recording the FULL disc with one status collapses to a single
+    /// coalesced entry (record splits then merges adjacent same-status).
+    #[test]
+    fn record_full_span_coalesces_to_one_entry() {
+        let p = tmpfile("record_full_span");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(0, 500, SectorStatus::Finished).unwrap();
+        mf.record(500, 500, SectorStatus::Finished).unwrap();
+        let es = mf.entries();
+        assert_eq!(es.len(), 1, "two adjacent Finished must coalesce");
+        assert_eq!((es[0].pos, es[0].size), (0, 1000));
+        assert_eq!(mf.stats().bytes_good, 1000);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A record that exactly overwrites the whole previous entry leaves the
+    /// partition disjoint and total coverage invariant. bytes_total stays
+    /// constant; good+pending+unreadable always sums to total.
+    #[test]
+    fn record_partition_invariant_total_coverage() {
+        let p = tmpfile("record_invariant");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(0, 250, SectorStatus::Finished).unwrap();
+        mf.record(250, 250, SectorStatus::Unreadable).unwrap();
+        mf.record(500, 250, SectorStatus::NonTrimmed).unwrap();
+        // NonTried (500..750? no) leftover is [750,1000).
+        let s = mf.stats();
+        assert_eq!(
+            s.bytes_good + s.bytes_unreadable + s.bytes_pending,
+            s.bytes_total,
+            "coverage must partition the disc exactly"
+        );
+        // Entries must be disjoint and sorted.
+        let es = mf.entries();
+        for w in es.windows(2) {
+            assert!(
+                w[0].pos + w[0].size <= w[1].pos,
+                "entries must stay disjoint and sorted"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ── load() current-line heuristic ─────────────────────────────
+
+    /// load() skips the ddrescue "current pos" status line (2nd field is a
+    /// status char, not a 0x size) and parses the data lines that follow.
+    /// The header doc shows `0x000000000  ?  1  0` as the status line.
+    #[test]
+    fn load_skips_current_status_line() {
+        let p = tmpfile("load_skips_current");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x00000100    +\n\
+             0x000000100  0x00000100    -\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        assert_eq!(mf.entries().len(), 2);
+        assert_eq!(mf.entries()[0].status, SectorStatus::Finished);
+        assert_eq!(mf.entries()[1].status, SectorStatus::Unreadable);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A mapfile written WITHOUT a current-line (first non-comment line is
+    /// already a data entry: 2nd field starts `0x`) must still parse that
+    /// first line as an entry — the heuristic detects it and falls through.
+    #[test]
+    fn load_treats_leading_data_line_as_entry() {
+        let p = tmpfile("load_leading_entry");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  0x00000200    +\n\
+             0x000000200  0x00000100    ?\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        // First line is NOT a status line; both lines are entries.
+        assert_eq!(mf.entries().len(), 2);
+        assert_eq!(mf.entries()[0].size, 0x200);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// load() parses the version from the `# Rescue Logfile. Created by`
+    /// header and exposes it (round-trips through write_to_disk).
+    #[test]
+    fn load_parses_version_header() {
+        let p = tmpfile("load_version");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by libfreemkv v9.9.9\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x00000100    +\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        assert_eq!(mf.version, "libfreemkv v9.9.9");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// load() rejects an entry with a non-hex pos/size field
+    /// (MapfileInvalid{kind:"hex"}) rather than silently skipping it —
+    /// a corrupt data line must not be dropped, masking missing coverage.
+    #[test]
+    fn load_rejects_non_hex_field() {
+        let p = tmpfile("load_nonhex");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0xZZZ  0x100    +\n",
+        )
+        .unwrap();
+        assert!(Mapfile::load(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// load() rejects an unknown status char (MapfileInvalid{kind:
+    /// "status_char"}). A `~` is not in the ddrescue alphabet.
+    #[test]
+    fn load_rejects_unknown_status_char() {
+        let p = tmpfile("load_badstatus");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x100    ~\n",
+        )
+        .unwrap();
+        let err = match Mapfile::load(&p) {
+            Ok(_) => panic!("unknown status char must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An empty mapfile (only comments / blank lines) loads with zero
+    /// entries and total_size 0 — never panics on the `entries.last()` None.
+    #[test]
+    fn load_empty_mapfile_is_zero_total() {
+        let p = tmpfile("load_empty");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, "# Rescue Logfile. Created by test\n\n   \n").unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        assert!(mf.entries().is_empty());
+        assert_eq!(mf.total_size(), 0);
+        assert_eq!(mf.stats().bytes_total, 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// load() sorts entries by pos even when the file lists them out of
+    /// order, and total_size derives from the highest end (entries are
+    /// sorted then last().pos+size).
+    #[test]
+    fn load_sorts_out_of_order_entries() {
+        let p = tmpfile("load_sort");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000200  0x00000100    -\n\
+             0x000000000  0x00000200    +\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        assert_eq!(mf.entries()[0].pos, 0);
+        assert_eq!(mf.entries()[1].pos, 0x200);
+        assert_eq!(mf.total_size(), 0x300);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // ── write_to_disk format ──────────────────────────────────────
+
+    /// write_to_disk emits each entry as `0x{pos:09x}  0x{size:09x}  {char}`
+    /// and a load() recovers identical entries (the canonical resume path).
+    /// Also verifies the fixed header block (Created by / Current pos /
+    /// column header) is present so external ddrescue tools parse it.
+    #[test]
+    fn write_to_disk_format_round_trips_and_has_headers() {
+        let p = tmpfile("write_format");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 0x1000, "vTEST").unwrap();
+        mf.record(0x100, 0x200, SectorStatus::Finished).unwrap();
+        mf.record(0x500, 0x100, SectorStatus::Unreadable).unwrap();
+        mf.flush().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# Rescue Logfile. Created by vTEST"));
+        assert!(text.contains("# Current pos / status / pass / pass_time"));
+        assert!(text.contains("0x000000100  0x000000200    +"));
+        assert!(text.contains("0x000000500  0x000000100    -"));
+        let reloaded = Mapfile::load(&p).unwrap();
+        assert_eq!(reloaded.entries(), mf.entries());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// create() persists immediately so a resume sees the fresh mapfile
+    /// even if record() is never called (load right after create matches).
+    #[test]
+    fn create_persists_eagerly() {
+        let p = tmpfile("create_eager");
+        let _ = std::fs::remove_file(&p);
+        let mf = Mapfile::create(&p, 4096, "test").unwrap();
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.entries(), mf.entries());
+        assert_eq!(loaded.total_size(), 4096);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// open_or_create returns a fresh NonTried mapfile when the path does
+    /// not exist (NotFound → create), not an error.
+    #[test]
+    fn open_or_create_creates_when_absent() {
+        let p = tmpfile("open_or_create_absent");
+        let _ = std::fs::remove_file(&p);
+        let mf = Mapfile::open_or_create(&p, 2048, "test").unwrap();
+        assert_eq!(mf.entries().len(), 1);
+        assert_eq!(mf.entries()[0].status, SectorStatus::NonTried);
+        assert_eq!(mf.total_size(), 2048);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// open_or_create loads an existing file (and does NOT reset it to
+    /// NonTried) even when the supplied total_size differs from the loaded
+    /// coverage — the warn path must still return the loaded state.
+    #[test]
+    fn open_or_create_loads_existing_despite_size_mismatch() {
+        let p = tmpfile("open_or_create_mismatch");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(0, 500, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        // Supply a DIFFERENT total; must still load the existing entries.
+        let reopened = Mapfile::open_or_create(&p, 999_999, "test").unwrap();
+        assert_eq!(reopened.stats().bytes_good, 500);
+        // Loaded total reflects the file, not the supplied arg.
+        assert_eq!(reopened.total_size(), 1000);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// set_unit_keys with an EMPTY slice must NOT clear an existing VID —
+    /// the keys-XOR-vid invariant only flips when keys are actually present
+    /// (mapfile.rs: `if !self.unit_keys.is_empty() { self.vid = None }`).
+    #[test]
+    fn set_unit_keys_empty_preserves_vid() {
+        let p = tmpfile("uk_empty_preserves_vid");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.set_vid([0x7Au8; 16]);
+        mf.set_unit_keys(&[]); // empty — must not clear vid
+        assert_eq!(mf.vid(), Some([0x7Au8; 16]));
+        assert!(mf.unit_keys().is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Drop flushes pending in-memory state (a sweep that returns early
+    /// must not lose records). After dropping a dirty Mapfile, a fresh
+    /// load() sees the last record.
+    #[test]
+    fn drop_flushes_pending_state() {
+        let p = tmpfile("drop_flush");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+            // record may or may not flush (time-batched); ensure dirty.
+            mf.record(0, 400, SectorStatus::Finished).unwrap();
+            // Drop here flushes.
+        }
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.stats().bytes_good, 400);
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn stats_consistent_after_split_record() {
         let p = tmpfile("stats_consistent_after_split");

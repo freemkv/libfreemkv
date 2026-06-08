@@ -1795,4 +1795,407 @@ mod tests {
         let (b, n) = track_vint(0x3FFF);
         assert_eq!(&b[..n], &[0x7F, 0xFF]);
     }
+
+    // ============================================================
+    // SimpleBlock byte layout (Matroska §6.2.3): the element's declared
+    // size must equal track_vint_len + 2 (rel ts) + 1 (flags) + data, and
+    // the rel-ts is a signed 16-bit big-endian field. A wrong size desyncs
+    // every following element; a wrong ts byte order corrupts A/V sync.
+    // ============================================================
+
+    /// Locate the first SimpleBlock and return (declared_size, track_vint_len,
+    /// rel_ts, flags, data_slice) by decoding its header inline.
+    fn first_simple_block_full(data: &[u8]) -> (u64, usize, i16, u8, Vec<u8>) {
+        let clusters = find_clusters(data);
+        let (body_start, body_size, _ts) = clusters[0];
+        let body = &data[body_start..body_start + body_size as usize];
+        let mut cursor = Cursor::new(body);
+        // Skip CLUSTER_TIMESTAMP.
+        let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+        assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+        cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+        loop {
+            let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+            if id == ebml::SIMPLE_BLOCK {
+                let p = cursor.position() as usize;
+                let b0 = body[p];
+                let vl = if b0 & 0x80 != 0 { 1 } else { 2 };
+                let rel = i16::from_be_bytes([body[p + vl], body[p + vl + 1]]);
+                let flags = body[p + vl + 2];
+                let dat = body[p + vl + 3..p + size as usize].to_vec();
+                return (size, vl, rel, flags, dat);
+            }
+            cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
+        }
+    }
+
+    /// A frame for `mux_with_durations`: (track, pts_ns, keyframe, data,
+    /// duration_ns). Aliased to keep clippy's type-complexity lint happy.
+    type DurFrame = (usize, i64, bool, Vec<u8>, Option<u64>);
+
+    /// Mux frames through a SharedWriter and return the finalized buffer, so
+    /// the final cluster is closed (size back-patched) before inspection.
+    fn mux_with_durations(tracks: &[MkvTrack], frames: &[DurFrame]) -> Vec<u8> {
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, tracks, None, 0.0, &[]).unwrap();
+        for (t, pts, kf, data, dur) in frames {
+            muxer.write_frame(*t, *pts, *kf, data, *dur).unwrap();
+        }
+        muxer.finish().unwrap();
+        shared.lock().unwrap().clone().into_inner()
+    }
+
+    #[test]
+    fn simple_block_declared_size_covers_exactly_the_payload() {
+        let tracks = [make_video_track()];
+        let payload = vec![0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let data = mux_with_durations(&tracks, &[(0, 0, true, payload.clone(), None)]);
+        let (size, vl, rel, flags, dat) = first_simple_block_full(&data);
+        // size = vint(vl) + ts(2) + flags(1) + data(5).
+        assert_eq!(size as usize, vl + 2 + 1 + payload.len());
+        assert_eq!(rel, 0, "first frame at cluster base → rel ts 0");
+        assert_eq!(flags & 0x80, 0x80, "keyframe flag set");
+        assert_eq!(dat, payload, "data must be the exact frame bytes");
+    }
+
+    #[test]
+    fn simple_block_rel_ts_is_signed_big_endian() {
+        // A frame 1000 ms after the keyframe-anchored cluster (within the 5s
+        // cluster window) must encode rel ts 1000 = 0x03E8 big-endian.
+        let tracks = [make_video_track()];
+        let data = mux_with_durations(
+            &tracks,
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 1_000_000_000, false, vec![0xBB], None),
+            ],
+        );
+        // The second block is in the same cluster (1000ms < 5000ms boundary).
+        let clusters = find_clusters(&data);
+        assert_eq!(clusters.len(), 1, "1s < 5s cluster window → one cluster");
+        let blocks = all_block_timestamps(&data);
+        // Two blocks: rel 0 and rel 1000.
+        let rels: Vec<i16> = blocks.iter().map(|(_, r, _)| *r).collect();
+        assert!(rels.contains(&1000), "second block rel ts must be 1000ms");
+    }
+
+    // ============================================================
+    // BlockGroup (Matroska §6.2.4): a Block inside a BlockGroup carries
+    // BlockDuration, and the Block's keyframe flag bit (0x80) MUST be 0
+    // (keyframe-ness is signalled by absence of ReferenceBlock). PGS
+    // subtitle frames take this path.
+    // ============================================================
+
+    fn first_block_group(data: &[u8]) -> (Vec<u8>, u64, u8) {
+        // Returns (inner BLOCK payload bytes after vint+ts+flags, block_duration_ms, flags).
+        let clusters = find_clusters(data);
+        for (body_start, body_size, _ts) in clusters {
+            let body = &data[body_start..body_start + body_size as usize];
+            let mut cursor = Cursor::new(body);
+            let (tid, tsize, _) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+            cursor.seek(io::SeekFrom::Current(tsize as i64)).unwrap();
+            while (cursor.position() as usize) < body.len() {
+                let (id, size, _) = ebml::read_element_header(&mut cursor).unwrap();
+                if id == ebml::BLOCK_GROUP {
+                    let bg_start = cursor.position() as usize;
+                    let bg = &body[bg_start..bg_start + size as usize];
+                    // Parse the BlockGroup children.
+                    let mut bc = Cursor::new(bg);
+                    let mut data_after = Vec::new();
+                    let mut dur = 0u64;
+                    let mut flags = 0xFFu8;
+                    while (bc.position() as usize) < bg.len() {
+                        let (cid, cs, _) = ebml::read_element_header(&mut bc).unwrap();
+                        let cstart = bc.position() as usize;
+                        if cid == ebml::BLOCK {
+                            let blk = &bg[cstart..cstart + cs as usize];
+                            let vl = if blk[0] & 0x80 != 0 { 1 } else { 2 };
+                            flags = blk[vl + 2];
+                            data_after = blk[vl + 3..].to_vec();
+                        } else if cid == ebml::BLOCK_DURATION {
+                            dur = ebml::read_uint_val(&mut bc, cs as usize).unwrap();
+                            continue;
+                        }
+                        bc.seek(io::SeekFrom::Current(cs as i64)).unwrap();
+                    }
+                    return (data_after, dur, flags);
+                }
+                cursor.seek(io::SeekFrom::Current(size as i64)).unwrap();
+            }
+        }
+        panic!("no BlockGroup found");
+    }
+
+    #[test]
+    fn block_group_emits_block_duration_and_clears_keyframe_flag() {
+        // A frame written with a duration becomes a BlockGroup. The inner Block
+        // MUST have flags 0x00 (the 0x80 keyframe bit is reserved/zero inside a
+        // BlockGroup per the spec), and BlockDuration must equal the ms value.
+        let tracks = [make_video_track()];
+        // Open a cluster with a keyframe (track 0), then a frame carrying a
+        // duration. Pass keyframe=true to prove the flag is still forced to 0.
+        let data = mux_with_durations(
+            &tracks,
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 40_000_000, true, vec![0xCC, 0xDD], Some(40_000_000)),
+            ],
+        );
+        let (block_data, dur_ms, flags) = first_block_group(&data);
+        assert_eq!(block_data, vec![0xCC, 0xDD]);
+        assert_eq!(dur_ms, 40, "BlockDuration must be 40 ms (40_000_000 ns)");
+        assert_eq!(
+            flags & 0x80,
+            0x00,
+            "Block inside BlockGroup must clear the keyframe flag (got 0x{flags:02X})"
+        );
+    }
+
+    #[test]
+    fn block_duration_floored_to_at_least_one_ms() {
+        // A sub-millisecond duration (e.g. 500_000 ns = 0.5 ms) must floor to 1
+        // ms, never 0 — a 0-duration BlockGroup would tell players to remove the
+        // artifact instantly.
+        let tracks = [make_video_track()];
+        let data = mux_with_durations(
+            &tracks,
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 10_000_000, true, vec![0xBB], Some(500_000)),
+            ],
+        );
+        let (_, dur_ms, _) = first_block_group(&data);
+        assert_eq!(dur_ms, 1, "sub-ms duration must floor to 1 ms, not 0");
+    }
+
+    // ============================================================
+    // Cluster boundary (CLUSTER_DURATION_MS = 5000): a new cluster opens
+    // on a video keyframe once >= 5000 ms have elapsed since the open
+    // cluster's timestamp. A keyframe exactly at the boundary opens a new
+    // cluster; one just under stays in the current cluster.
+    // ============================================================
+
+    #[test]
+    fn keyframe_at_5s_boundary_opens_new_cluster() {
+        let tracks = [make_video_track()];
+        // Keyframe at exactly 5000 ms (>= CLUSTER_DURATION_MS) → new cluster.
+        let data = mux_with_durations(
+            &tracks,
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 5_000_000_000, true, vec![0xBB], None),
+            ],
+        );
+        assert_eq!(
+            find_clusters(&data).len(),
+            2,
+            "keyframe at the 5s boundary must open a second cluster"
+        );
+    }
+
+    #[test]
+    fn keyframe_just_under_5s_stays_in_cluster() {
+        let tracks = [make_video_track()];
+        // Keyframe at 4999 ms (< 5000) → same cluster.
+        let data = mux_with_durations(
+            &tracks,
+            &[
+                (0, 0, true, vec![0xAA], None),
+                (0, 4_999_000_000, true, vec![0xBB], None),
+            ],
+        );
+        assert_eq!(
+            find_clusters(&data).len(),
+            1,
+            "keyframe under the 5s window must stay in the open cluster"
+        );
+    }
+
+    // ============================================================
+    // monotonic_ts saturating add — at i64::MAX the +1 must saturate, not
+    // overflow-panic. (The strictly-monotonic invariant relies on
+    // saturating_add.)
+    // ============================================================
+
+    #[test]
+    fn monotonic_ts_saturates_at_i64_max() {
+        // prev = i64::MAX, pts equal → saturating_add(1) caps at i64::MAX rather
+        // than wrapping to i64::MIN.
+        assert_eq!(monotonic_ts(Some(i64::MAX), i64::MAX), i64::MAX);
+        // A pts already above prev+1 is left alone.
+        assert_eq!(monotonic_ts(Some(10), 100), 100);
+    }
+
+    // ============================================================
+    // SeekHead encoding (Matroska §7.1): the muxer writes fixed-width
+    // entries — SeekID as a 4-byte binary element (size 0x84) and
+    // SeekPosition as an 8-byte uint (size 0x88) so they can be
+    // back-patched in place. Verify the declared SeekID matches the target
+    // element ID bytes.
+    // ============================================================
+
+    #[test]
+    fn seekhead_seek_id_values_match_target_element_ids() {
+        let tracks = [make_video_track(), make_audio_track()];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
+        let entries = parse_seekhead(&data);
+        // The decoded SeekID for each entry must equal a real Matroska element
+        // ID (Info, Tracks, Cues). parse_seekhead reads SeekID as a uint; the
+        // value is the big-endian element ID.
+        let ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&ebml::INFO));
+        assert!(ids.contains(&ebml::TRACKS));
+        assert!(ids.contains(&ebml::CUES));
+    }
+
+    // ============================================================
+    // dolby_vision_config (dvcC / DOVIDecoderConfigurationRecord) bit
+    // packing. Byte 2: profile(7 bits) << 1 | level high bit. Byte 3:
+    // level low 5 bits << 3 | rpu | el | bl. Byte 4: bl_compat_id << 4.
+    // ============================================================
+
+    #[test]
+    fn dolby_vision_config_packs_level_and_compat_id() {
+        // profile 7, level 6 (0b00110), bl_compat_id 1.
+        let c = dolby_vision_config(7, 6, 1);
+        assert_eq!(c.len(), 24);
+        // level high bit = (6 >> 5) & 1 = 0 → byte2 low bit 0; profile 7 in top.
+        // byte2 = profile(7) << 1 | level_high_bit(0).
+        assert_eq!(c[2], 7 << 1);
+        assert_eq!(c[2] & 0x01, 0, "level bit 5 is 0 for level 6");
+        // byte3: (6 & 0x1F) << 3 | rpu|el|bl = (6<<3) | 0b111 = 0x30 | 0x07.
+        assert_eq!(c[3], (6 << 3) | 0b111);
+        // byte4: bl_compat_id 1 in the top nibble.
+        assert_eq!(c[4], 1 << 4);
+        // Reserved tail is zero.
+        assert!(c[5..].iter().all(|&b| b == 0), "v[5..24] reserved = 0");
+    }
+
+    #[test]
+    fn dolby_vision_config_high_level_sets_byte2_low_bit() {
+        // A level with bit 5 set (>= 32) must place that bit in byte2's LSB.
+        // level 0x20 → (0x20 >> 5) & 1 = 1.
+        let c = dolby_vision_config(7, 0x20, 0);
+        assert_eq!(c[2] & 0x01, 1, "level bit 5 belongs in byte2 LSB");
+        // and byte3 carries the low 5 bits (0x20 & 0x1F = 0) << 3.
+        assert_eq!(c[3] >> 3, 0);
+    }
+
+    // ============================================================
+    // Full round-trip: mux frames → MKV bytes → MkvStream reader → frames.
+    // This is the strongest "never silently truncate" property: every
+    // written frame must be readable back with the same track, keyframe
+    // flag and data.
+    // ============================================================
+
+    #[test]
+    fn muxed_frames_round_trip_through_reader() {
+        use crate::pes::Stream as _;
+        let tracks = [make_video_track(), make_audio_track()];
+        // Two video keyframes + interleaved audio, all within one cluster.
+        let frames = vec![
+            (0usize, 0i64, true, vec![0x01, 0x02, 0x03]),
+            (1usize, 0i64, false, vec![0x0B, 0x77, 0x00]),
+            (0usize, 1_000_000_000i64, false, vec![0x04, 0x05]),
+        ];
+        let (data, count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(count, 3, "all three frames must be written");
+
+        let mut stream = super::super::mkvstream::MkvStream::open(Cursor::new(data)).unwrap();
+        let mut read_back = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            read_back.push((f.track, f.keyframe, f.data));
+        }
+        // All three frames survive the round trip (no silent drop/truncation).
+        assert_eq!(read_back.len(), 3, "every muxed frame must read back");
+        // Track 0 video keyframe with its exact bytes is present.
+        assert!(
+            read_back
+                .iter()
+                .any(|(t, kf, d)| *t == 0 && *kf && d == &[0x01, 0x02, 0x03])
+        );
+        // Track 1 audio frame bytes survive.
+        assert!(
+            read_back
+                .iter()
+                .any(|(t, _, d)| *t == 1 && d == &[0x0B, 0x77, 0x00])
+        );
+    }
+
+    #[test]
+    fn audio_track_emits_sampling_frequency_and_channels() {
+        // An audio TrackEntry must contain an Audio element (0xE1) with
+        // SamplingFrequency (0xB5, an 8-byte float) and Channels (0x9F).
+        // Without these, players can't configure the audio decoder.
+        let tracks = [make_video_track(), make_audio_track()];
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &tracks, None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::AUDIO).is_some(),
+            "Audio element present"
+        );
+        assert!(
+            find_id(&data, ebml::SAMPLING_FREQUENCY).is_some(),
+            "SamplingFrequency present"
+        );
+        assert!(find_id(&data, ebml::CHANNELS).is_some(), "Channels present");
+    }
+
+    #[test]
+    fn video_colour_element_emitted_only_when_hdr_metadata_present() {
+        // A video track with colour metadata (matrix/transfer) must emit the
+        // Colour element (0x55B0); a plain SDR track with all-zero colour must
+        // not. The conditional is `colour_matrix > 0 || colour_transfer > 0`.
+        let mut hdr_video = make_video_track();
+        hdr_video.colour_matrix = 9; // bt2020nc
+        hdr_video.colour_transfer = 16; // PQ
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[hdr_video], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::COLOUR).is_some(),
+            "Colour element must be emitted for HDR track"
+        );
+
+        // make_video_track has zero colour fields → no Colour element.
+        let muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::COLOUR).is_none(),
+            "no Colour element when colour metadata is all zero"
+        );
+    }
+
+    #[test]
+    fn dolby_vision_track_emits_block_addition_mapping() {
+        // A DV track (dv_config set) must emit BlockAdditionMapping (0x41E4)
+        // carrying the dvcC so players recognise Dolby Vision.
+        let mut dv = make_video_track();
+        dv.dv_config = Some(dolby_vision_config(7, 6, 0));
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[dv], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_some(),
+            "DV track must emit BlockAdditionMapping"
+        );
+        // Without dv_config, no mapping.
+        let muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_none());
+    }
 }

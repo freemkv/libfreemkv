@@ -494,4 +494,392 @@ mod tests {
         assert_eq!(r.ranges.len(), 1);
         assert_eq!(r.ranges[0].status, SectorStatus::Bad);
     }
+
+    // ── New comprehensive tests ────────────────────────────────────────────────
+
+    /// A SectorSource that fails exactly `fail_count` calls, then succeeds.
+    struct FailFirst {
+        remaining_fails: usize,
+    }
+    impl SectorSource for FailFirst {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize, Error> {
+            if self.remaining_fails > 0 {
+                self.remaining_fails -= 1;
+                Err(Error::ScsiError {
+                    opcode: 0x28,
+                    status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                    sense: None,
+                })
+            } else {
+                let n = count as usize * 2048;
+                buf[..n].fill(0);
+                Ok(n)
+            }
+        }
+    }
+
+    fn title_with_two_extents(s1: u32, c1: u32, s2: u32, c2: u32) -> DiscTitle {
+        DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![
+                Extent {
+                    start_lba: s1,
+                    sector_count: c1,
+                },
+                Extent {
+                    start_lba: s2,
+                    sector_count: c2,
+                },
+            ],
+            content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    /// readable_pct on a fully-good result is 100.0 (not NaN or < 100).
+    /// Mutation: changing the formula to `(total - bad - 1) / total` makes this fail.
+    #[test]
+    fn readable_pct_all_good_is_exactly_100() {
+        let r = VerifyResult {
+            total_sectors: 100,
+            good: 100,
+            slow: 0,
+            recovered: 0,
+            bad: 0,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        assert_eq!(r.readable_pct(), 100.0);
+    }
+
+    /// readable_pct with zero total_sectors must return 100.0, not NaN/inf
+    /// from a division by zero.
+    /// Spec: the doc-comment explicitly states "Returns 100.0 when there are no sectors."
+    /// Mutation: removing the `if self.total_sectors == 0` guard makes this panic or NaN.
+    #[test]
+    fn readable_pct_empty_disc_is_100() {
+        let r = VerifyResult {
+            total_sectors: 0,
+            good: 0,
+            slow: 0,
+            recovered: 0,
+            bad: 0,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        assert_eq!(r.readable_pct(), 100.0);
+    }
+
+    /// readable_pct counts slow and recovered as readable (not bad).
+    /// Spec: doc says "good + slow + recovered" are readable.
+    /// Mutation: omitting `slow` or `recovered` from the numerator reduces the result.
+    #[test]
+    fn readable_pct_counts_slow_and_recovered_as_readable() {
+        // 6 of 10 sectors are "lost" (bad); 4 are readable (slow + recovered).
+        let r = VerifyResult {
+            total_sectors: 10,
+            good: 0,
+            slow: 2,
+            recovered: 2,
+            bad: 6,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        // saturating_sub(6) = 4; 4/10 = 40.0
+        let got = r.readable_pct();
+        assert!((got - 40.0).abs() < 1e-9, "expected 40.0, got {got}");
+    }
+
+    /// is_perfect() is false when there are slow sectors, even if bad == 0.
+    /// Spec: doc says "no bad, no recovered-on-retry, and no slow sectors".
+    /// Mutation: removing `self.slow == 0` from is_perfect() makes this pass when it should fail.
+    #[test]
+    fn is_perfect_false_when_slow_present() {
+        let r = VerifyResult {
+            total_sectors: 10,
+            good: 9,
+            slow: 1,
+            recovered: 0,
+            bad: 0,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        assert!(!r.is_perfect());
+    }
+
+    /// is_perfect() is false when there are recovered sectors.
+    /// Mutation: removing `self.recovered == 0` from is_perfect() makes this fail.
+    #[test]
+    fn is_perfect_false_when_recovered_present() {
+        let r = VerifyResult {
+            total_sectors: 10,
+            good: 9,
+            slow: 0,
+            recovered: 1,
+            bad: 0,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        assert!(!r.is_perfect());
+    }
+
+    /// is_perfect() is false when there are bad sectors.
+    /// Mutation: removing `self.bad == 0` from is_perfect() makes this fail.
+    #[test]
+    fn is_perfect_false_when_bad_present() {
+        let r = VerifyResult {
+            total_sectors: 5,
+            good: 4,
+            slow: 0,
+            recovered: 0,
+            bad: 1,
+            ranges: Vec::new(),
+            elapsed_secs: 0.0,
+        };
+        assert!(!r.is_perfect());
+    }
+
+    /// chapter_at_offset returns None when chapters is empty.
+    /// Mutation: removing the `chapters.is_empty()` check makes this return Some.
+    #[test]
+    fn chapter_at_offset_empty_chapters_returns_none() {
+        let result = VerifyResult::chapter_at_offset(&[], 1024, 120.0, 100_000);
+        assert!(result.is_none());
+    }
+
+    /// chapter_at_offset returns None when total_bytes == 0 (division-by-zero guard).
+    /// Mutation: removing the `total_bytes == 0` guard makes this panic or NaN.
+    #[test]
+    fn chapter_at_offset_zero_total_bytes_returns_none() {
+        use crate::disc::Chapter;
+        let chapters = vec![Chapter {
+            time_secs: 0.0,
+            name: String::new(),
+        }];
+        let result = VerifyResult::chapter_at_offset(&chapters, 1024, 120.0, 0);
+        assert!(result.is_none());
+    }
+
+    /// chapter_at_offset maps byte offset to the correct chapter index (1-based).
+    /// Spec: time_secs = byte_offset / total_bytes * duration; chapter = last chapter
+    ///       whose time_secs <= computed time.
+    /// Mutation: off-by-one on chapter_idx (using `i` instead of `chapter_idx`) changes result.
+    #[test]
+    fn chapter_at_offset_selects_correct_chapter() {
+        use crate::disc::Chapter;
+        // 3 chapters at 0s, 30s, 60s; disc is 120s, 120,000 bytes.
+        let chapters = vec![
+            Chapter {
+                time_secs: 0.0,
+                name: String::new(),
+            },
+            Chapter {
+                time_secs: 30.0,
+                name: String::new(),
+            },
+            Chapter {
+                time_secs: 60.0,
+                name: String::new(),
+            },
+        ];
+        let total_bytes: u64 = 120_000;
+        let duration = 120.0_f64;
+
+        // Byte 90,000 → time 90.0s → chapter 3 (index 2, 1-based = 3).
+        let (ch, t) =
+            VerifyResult::chapter_at_offset(&chapters, 90_000, duration, total_bytes).unwrap();
+        assert_eq!(ch, 3, "expected chapter 3, got {ch}");
+        assert!((t - 90.0).abs() < 1e-6, "expected t≈90.0, got {t}");
+
+        // Byte 0 → time 0s → chapter 1 (first chapter).
+        let (ch0, _) =
+            VerifyResult::chapter_at_offset(&chapters, 0, duration, total_bytes).unwrap();
+        assert_eq!(ch0, 1);
+    }
+
+    /// A contiguous sequence of bad sectors in one extent must be coalesced
+    /// into a single SectorRange (not one entry per sector).
+    /// Mutation: removing the range-merge logic produces many small ranges.
+    #[test]
+    fn contiguous_bad_sectors_coalesce_into_one_range() {
+        // 4-sector extent, all bad. Batch size 1 forces per-sector path.
+        // With cancel-on-second-bad we'd stop early; we must let all 4 sectors
+        // run to check coalescing. Use no callback so they all complete.
+        // But AlwaysBad + no callback is slow (RETRY_PAUSE per sector × 4).
+        // Limit to 2 sectors to keep wall-clock reasonable.
+        let title = title_with_extent(100, 2);
+        let mut src = AlwaysBad;
+        // no callback → full 2 × RETRY_PAUSE, but only 2 sectors
+        let r = verify_title(&mut src, &title, 1, None);
+        // Both sectors are bad and contiguous; they must merge into one range.
+        assert_eq!(r.bad, 2);
+        assert_eq!(
+            r.ranges.len(),
+            1,
+            "contiguous bad sectors must coalesce: got {} ranges",
+            r.ranges.len()
+        );
+        assert_eq!(r.ranges[0].start_lba, 100);
+        assert_eq!(r.ranges[0].count, 2);
+        assert_eq!(r.ranges[0].status, SectorStatus::Bad);
+    }
+
+    /// A batch that fails, then each individual sector succeeds on the first
+    /// per-sector read, is counted as Good (not Recovered).
+    /// Mutation: counting per-sector-first-ok as Recovered instead of Good flips this.
+    #[test]
+    fn batch_fail_then_per_sector_ok_counts_as_good() {
+        // First read fails (batch), then all per-sector reads succeed.
+        let mut src = FailFirst { remaining_fails: 1 };
+        let title = title_with_extent(0, 2);
+        let r = verify_title(&mut src, &title, 2, None);
+        // Both sectors should be Good (or Slow if the read was slow — but
+        // FailFirst returns instantly, so they should be Good).
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.recovered, 0);
+        // Good ≥ 1: at least one sector was read clean on the per-sector path.
+        assert!(r.good >= 1, "expected some good sectors, got {}", r.good);
+    }
+
+    /// A recovered sector (batch fails, per-sector fails, retry succeeds)
+    /// appears in ranges with SectorStatus::Recovered.
+    /// This is exercised by FailFirst with remaining_fails=2: batch fails (1),
+    /// first per-sector attempt fails (2), retry succeeds (0 remaining).
+    /// Mutation: mapping recovered to Good removes the Recovered range entry.
+    #[test]
+    fn recovered_sector_appears_in_ranges_as_recovered() {
+        // Batch read of 1 sector: fail once (batch), fail once (per-sector),
+        // then succeed (retry). That yields Recovered status.
+        let mut src = FailFirst { remaining_fails: 2 };
+        let title = title_with_extent(0, 1);
+        // Provide a callback that never cancels so the retry pause can run.
+        // But we want the test to be fast — FailFirst returns immediately,
+        // so the cancel-during-pause path won't be hit. However, we still
+        // sleep RETRY_PAUSE here (2s). Use no-cancel callback.
+        let noop_cb = |_: &crate::progress::PassProgress| true;
+        let r = verify_title(&mut src, &title, 1, Some(&noop_cb));
+        assert_eq!(r.recovered, 1, "sector should be Recovered");
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.ranges.len(), 1);
+        assert_eq!(r.ranges[0].status, SectorStatus::Recovered);
+    }
+
+    /// total_sectors sums across multiple extents correctly.
+    /// Mutation: only summing the first extent makes total wrong.
+    #[test]
+    fn total_sectors_sums_multiple_extents() {
+        let title = title_with_two_extents(0, 3, 100, 5);
+        let mut src = AlwaysGood;
+        let r = verify_title(&mut src, &title, 4, None);
+        assert_eq!(r.total_sectors, 8, "expected 3+5=8 sectors");
+        assert_eq!(r.good, 8);
+    }
+
+    /// SectorRange byte_offset is zero for the very first sector of the first extent.
+    /// Mutation: starting byte_offset at 2048 instead of 0 shifts all offsets.
+    #[test]
+    fn sector_range_byte_offset_starts_at_zero_for_first_sector() {
+        // AlwaysBad with 1 sector: the range for LBA 0 must have byte_offset=0.
+        let title = title_with_extent(0, 1);
+        let mut src = AlwaysBad;
+        let r = verify_title(&mut src, &title, 1, None);
+        assert_eq!(r.ranges.len(), 1);
+        assert_eq!(
+            r.ranges[0].byte_offset, 0,
+            "first sector byte_offset must be 0"
+        );
+    }
+
+    /// SectorRange byte_offset for the second sector is 2048.
+    /// Spec: sector size = 2048 bytes on Blu-ray (ISO 9660 / ECMA-119 §7).
+    /// Mutation: computing offset as `i * 2049` changes the second sector offset.
+    #[test]
+    fn sector_range_byte_offset_increments_by_2048() {
+        // Force the second sector to be bad: fail twice (first two reads
+        // attempt LBA 0 in batch, then individually). That is complex.
+        // Simpler: use a source that only fails on LBA 1.
+        struct BadOnLba1;
+        impl SectorSource for BadOnLba1 {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize, Error> {
+                if lba == 1 && count == 1 {
+                    Err(Error::ScsiError {
+                        opcode: 0x28,
+                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                        sense: None,
+                    })
+                } else if lba == 0 && count == 2 {
+                    // Batch of 2 fails when it includes LBA 1 — simulate batch
+                    // failure so we fall to per-sector.
+                    Err(Error::ScsiError {
+                        opcode: 0x28,
+                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                        sense: None,
+                    })
+                } else {
+                    let n = count as usize * 2048;
+                    buf[..n].fill(0);
+                    Ok(n)
+                }
+            }
+        }
+        // Extent: LBA 0..1 (2 sectors), batch size 2 so we get a batch attempt first.
+        let title = title_with_extent(0, 2);
+        let mut src = BadOnLba1;
+        let noop_cb = |_: &crate::progress::PassProgress| true;
+        let r = verify_title(&mut src, &title, 2, Some(&noop_cb));
+        // We expect exactly one bad sector at LBA 1.
+        assert_eq!(r.bad, 1);
+        let bad_range = r
+            .ranges
+            .iter()
+            .find(|rng| rng.status == SectorStatus::Bad)
+            .unwrap();
+        // LBA 1 is the second sector → byte_offset = 1 * 2048 = 2048.
+        assert_eq!(
+            bad_range.byte_offset, 2048,
+            "second sector byte_offset must be 2048, got {}",
+            bad_range.byte_offset
+        );
+    }
+
+    /// cancellable_pause returns true when it completes the full duration
+    /// without cancellation.
+    /// Mutation: returning `false` unconditionally makes callers think they were cancelled.
+    #[test]
+    fn cancellable_pause_returns_true_when_not_cancelled() {
+        // Use a very short duration so the test runs fast.
+        let tiny = Duration::from_millis(10);
+        let result = cancellable_pause(tiny, &mut || false);
+        assert!(result, "not-cancelled pause must return true");
+    }
+
+    /// cancellable_pause returns false immediately when the callback requests cancel.
+    /// Mutation: ignoring the callback return and sleeping the full duration breaks this.
+    #[test]
+    fn cancellable_pause_returns_false_when_cancelled() {
+        let long = Duration::from_secs(60);
+        let started = Instant::now();
+        let result = cancellable_pause(long, &mut || true);
+        assert!(!result, "cancelled pause must return false");
+        // Must return well within the first poll interval, not after 60s.
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

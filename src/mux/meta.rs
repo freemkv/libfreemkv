@@ -615,4 +615,210 @@ mod tests {
             _ => panic!("expected video stream"),
         }
     }
+
+    // ============================================================
+    // Header byte-layout invariants
+    //
+    // Format: [8B magic][4B json_len BE][JSON][padding to 192B].
+    // The header MUST end on a 192-byte (BD-TS packet) boundary so the
+    // following TS data stays packet-aligned and other tools can resync
+    // by scanning for 0x47. A wrong padding calc silently misaligns the
+    // entire m2ts payload.
+    // ============================================================
+
+    #[test]
+    fn magic_bytes_exact_layout() {
+        // The magic is "FMKV" + reserved 0x00 + version 0x01 + 2 reserved.
+        // The version byte lives at index 5. A regression that shifted the
+        // version byte would make every header read the wrong version.
+        assert_eq!(&MAGIC[0..4], b"FMKV");
+        assert_eq!(MAGIC[VERSION_BYTE], SUPPORTED_VERSION);
+        assert_eq!(VERSION_BYTE, 5);
+        assert_eq!(MAGIC.len(), 8);
+    }
+
+    #[test]
+    fn write_header_pads_to_192_byte_boundary() {
+        // The total written length must always be a multiple of PACKET_SIZE
+        // (192). Test a range of JSON sizes by varying stream count.
+        for n_streams in 0..6 {
+            let mut t = DiscTitle::empty();
+            for _ in 0..n_streams {
+                t.streams.push(Stream::Video(VideoStream {
+                    pid: 0x1011,
+                    codec: Codec::Hevc,
+                    resolution: Resolution::R2160p,
+                    frame_rate: FrameRate::F23_976,
+                    hdr: HdrFormat::Hdr10,
+                    color_space: ColorSpace::Bt2020,
+                    secondary: false,
+                    label: "x".into(),
+                }));
+            }
+            let meta = M2tsMeta::from_title(&t);
+            let mut buf = Vec::new();
+            write_header(&mut buf, &meta).unwrap();
+            assert_eq!(
+                buf.len() % PACKET_SIZE,
+                0,
+                "header for {n_streams} streams (len {}) not 192-aligned",
+                buf.len()
+            );
+            // The declared json_len (bytes 8..12, big-endian) must equal the
+            // actual JSON byte length embedded.
+            let json_len = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+            let json_bytes = &buf[12..12 + json_len];
+            // Round-trips as valid JSON for M2tsMeta.
+            let parsed: M2tsMeta = serde_json::from_slice(json_bytes).unwrap();
+            assert_eq!(parsed.streams.len(), n_streams);
+        }
+    }
+
+    #[test]
+    fn json_length_field_is_big_endian() {
+        // The 4-byte length is stored big-endian (most-significant byte first).
+        // read_header decodes it the same way; a little-endian regression would
+        // request a wildly wrong JSON length.
+        let meta = M2tsMeta::from_title(&video_title(HdrFormat::Sdr, ColorSpace::Bt709));
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let json_len_be = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        // Reconstruct the JSON object directly and confirm the length matches.
+        let json = serde_json::to_vec(&meta).unwrap();
+        assert_eq!(json_len_be, json.len());
+    }
+
+    #[test]
+    fn oversized_json_len_field_rejected_not_allocated() {
+        // A header whose json_len field claims > 10 MiB must be rejected
+        // (NoMetadata → InvalidInput) BEFORE the reader allocates a 10 MiB+
+        // buffer for untrusted input.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        let huge = (10 * 1024 * 1024 + 1) as u32;
+        buf.extend_from_slice(&huge.to_be_bytes());
+        // No JSON body needed — the size check fires first.
+        let mut cur = io::Cursor::new(buf);
+        let err = read_header(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn truncated_json_body_errors_not_panics() {
+        // magic + a json_len of 100 but no body → read_exact must surface a
+        // UnexpectedEof error, never panic or return a half-filled meta.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&100u32.to_be_bytes());
+        // supply only 10 of the promised 100 JSON bytes.
+        buf.extend_from_slice(&[b'{'; 10]);
+        let mut cur = io::Cursor::new(buf);
+        let err = read_header(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn malformed_json_body_is_no_metadata() {
+        // Valid magic + valid length but the JSON itself is garbage → the
+        // parse must fail with the numeric NoMetadata code, not panic and not
+        // leak serde's English error into the io::Error.
+        let bad = b"not json at all!"; // 16 bytes
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&(bad.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bad);
+        let mut cur = io::Cursor::new(buf);
+        let err = read_header(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput); // NoMetadata
+    }
+
+    #[test]
+    fn second_magic_byte_mismatch_is_none_not_error() {
+        // First byte matches MAGIC[0] ('F') so we commit to reading 7 more,
+        // but the resulting 4-byte magic differs from "FMKV". Per the reader
+        // contract this is "not an FMKV stream" → Ok(None), letting the caller
+        // fall back to a PMT scan. (Only a truncated read after 'F' errors.)
+        let mut buf = vec![b'F', b'X', b'X', b'X', 0, 0, 0, 0];
+        // pad so the 8-byte magic read succeeds.
+        buf.extend_from_slice(&[0u8; 8]);
+        let mut cur = io::Cursor::new(buf);
+        let got = read_header(&mut cur).unwrap();
+        assert!(got.is_none(), "non-FMKV 4-byte magic must be Ok(None)");
+    }
+
+    #[test]
+    fn read_header_consumes_exactly_one_packet_boundary() {
+        // After a successful read_header, the reader must be positioned exactly
+        // at a 192-byte boundary AND nothing of the following data consumed.
+        // Append a sentinel TS sync byte (0x47) right after the header and
+        // confirm it is the very next byte available.
+        let meta = M2tsMeta::from_title(&video_title(HdrFormat::Hdr10, ColorSpace::Bt2020));
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let header_len = buf.len();
+        buf.push(0x47); // TS sync byte follows the header
+        let mut cur = io::Cursor::new(buf);
+        read_header(&mut cur).unwrap().expect("header present");
+        assert_eq!(cur.position() as usize, header_len);
+        assert_eq!(header_len % PACKET_SIZE, 0);
+        let mut next = [0u8; 1];
+        use std::io::Read as _;
+        cur.read_exact(&mut next).unwrap();
+        assert_eq!(next[0], 0x47, "byte after header must be the TS sync byte");
+    }
+
+    #[test]
+    fn invalid_base64_codec_private_decodes_to_none() {
+        // decode_codec_private treats invalid base64 as absent (None) rather
+        // than failing the whole metadata parse — a corrupt init blob must not
+        // sink an otherwise-good header.
+        assert_eq!(decode_codec_private(&None), None);
+        assert_eq!(
+            decode_codec_private(&Some("!!!not base64!!!".to_string())),
+            None
+        );
+        // Valid base64 round-trips to the raw bytes.
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD.encode([0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            decode_codec_private(&Some(enc)),
+            Some(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+    }
+
+    #[test]
+    fn video_codec_private_round_trips_through_header() {
+        // A video stream's HEVCDecoderConfigurationRecord must survive
+        // from_title → write_header → read_header → codec_privates(). Without
+        // this, an FMKV-driven remux loses the hvcC and the MKV video track is
+        // undecodable.
+        let mut t = video_title(HdrFormat::Hdr10, ColorSpace::Bt2020);
+        t.codec_privates = vec![Some(vec![0x01, 0x02, 0x20, 0x00])]; // fake hvcC
+        let meta = M2tsMeta::from_title(&t);
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let mut cur = io::Cursor::new(buf);
+        let back = read_header(&mut cur).unwrap().expect("header present");
+        assert_eq!(
+            back.codec_privates()[0].as_deref(),
+            Some(&[0x01, 0x02, 0x20, 0x00][..]),
+            "video codec_private (hvcC) must round-trip through the header"
+        );
+    }
+
+    #[test]
+    fn duration_and_title_round_trip() {
+        // Title string and duration must survive the JSON round-trip — these
+        // populate the MKV Info element on remux.
+        let mut t = video_title(HdrFormat::Sdr, ColorSpace::Bt709);
+        t.playlist = "The Movie".into();
+        t.duration_secs = 7384.5;
+        let meta = M2tsMeta::from_title(&t);
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let mut cur = io::Cursor::new(buf);
+        let back = read_header(&mut cur).unwrap().unwrap().to_title();
+        assert_eq!(back.playlist, "The Movie");
+        assert_eq!(back.duration_secs, 7384.5);
+    }
 }

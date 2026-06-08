@@ -405,6 +405,221 @@ mod tests {
         assert_eq!(annex_b[20], 0x44); // PPS first byte
     }
 
+    // --- hvcc_to_annex_b: truncation handling (ISO/IEC 14496-15 §8.3.3.1.2) ---
+
+    #[test]
+    fn hvcc_too_short_for_header_returns_none() {
+        // < 23 bytes (22 fixed + numArrays) can't be a valid hvcC → None.
+        assert!(hvcc_to_annex_b(&[0u8; 22]).is_none());
+        assert!(hvcc_to_annex_b(&[]).is_none());
+    }
+
+    #[test]
+    fn hvcc_zero_arrays_returns_none() {
+        // numArrays = 0 → no NALs extracted → None (out.is_empty()).
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(0); // numArrays = 0
+        assert!(hvcc_to_annex_b(&hvcc).is_none());
+    }
+
+    #[test]
+    fn hvcc_array_with_multiple_nalus() {
+        // One array, numNalus = 2: both NALs must be emitted, each with a start
+        // code. (The inner numNalus loop, not just one NAL per array.)
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(1); // numArrays
+        hvcc.push(33); // SPS
+        hvcc.extend_from_slice(&2u16.to_be_bytes()); // numNalus = 2
+        hvcc.extend_from_slice(&2u16.to_be_bytes()); // NAL0 len 2
+        hvcc.extend_from_slice(&[0x42, 0x01]);
+        hvcc.extend_from_slice(&3u16.to_be_bytes()); // NAL1 len 3
+        hvcc.extend_from_slice(&[0x44, 0x02, 0x03]);
+        let out = hvcc_to_annex_b(&hvcc).expect("two NALs");
+        let want = [
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, // NAL0
+            0x00, 0x00, 0x00, 0x01, 0x44, 0x02, 0x03, // NAL1
+        ];
+        assert_eq!(&out[..], &want[..]);
+    }
+
+    #[test]
+    fn hvcc_truncated_nal_length_stops_cleanly() {
+        // A NAL length field claiming more bytes than remain must stop parsing
+        // (truncated flag), emitting only the complete NALs — never a partial
+        // NAL nor garbage from re-interpreting mid-NAL bytes as an array header.
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(2); // numArrays = 2
+        // Array 0: one valid 3-byte NAL.
+        hvcc.push(32);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&3u16.to_be_bytes());
+        hvcc.extend_from_slice(&[0x40, 0x01, 0x02]);
+        // Array 1: one NAL declaring 100 bytes but only 2 present → truncated.
+        hvcc.push(33);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&100u16.to_be_bytes());
+        hvcc.extend_from_slice(&[0xAA, 0xBB]);
+        let out = hvcc_to_annex_b(&hvcc).expect("the one valid NAL");
+        // Only array 0's NAL is emitted.
+        assert_eq!(
+            &out[..],
+            &[0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x02],
+            "truncated trailing NAL dropped, valid prefix kept"
+        );
+    }
+
+    #[test]
+    fn hvcc_truncated_length_field_itself_stops() {
+        // The 2-byte NAL length field itself runs past the buffer end → truncated
+        // (offset + 2 > len guard). Emit only what completed.
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(1);
+        hvcc.push(33);
+        hvcc.extend_from_slice(&2u16.to_be_bytes()); // numNalus = 2
+        hvcc.extend_from_slice(&2u16.to_be_bytes()); // NAL0 len 2
+        hvcc.extend_from_slice(&[0x42, 0x01]);
+        hvcc.push(0x00); // dangling single byte — can't form NAL1's length field
+        let out = hvcc_to_annex_b(&hvcc).expect("NAL0");
+        assert_eq!(&out[..], &[0x00, 0x00, 0x00, 0x01, 0x42, 0x01]);
+    }
+
+    #[test]
+    fn hvcc_array_header_truncated_stops_outer_loop() {
+        // numArrays claims 3 but only one array's header fits (offset + 3 > len).
+        // The outer loop must break, not read out of bounds.
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(3); // numArrays = 3 (lie)
+        hvcc.push(32);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&2u16.to_be_bytes());
+        hvcc.extend_from_slice(&[0x40, 0x01]);
+        // No bytes for arrays 2 and 3 → outer loop's `offset + 3 > len` breaks.
+        let out = hvcc_to_annex_b(&hvcc).expect("the one present NAL");
+        assert_eq!(&out[..], &[0x00, 0x00, 0x00, 0x01, 0x40, 0x01]);
+    }
+
+    // --- length_prefixed_to_annex_b additional branches ---
+
+    #[test]
+    fn empty_input_yields_empty() {
+        // Empty input → empty output (no pass-through of nothing).
+        assert!(length_prefixed_to_annex_b(&[]).is_empty());
+    }
+
+    #[test]
+    fn single_nal_length_prefix() {
+        // One NAL: 4-byte len + body → one Annex B NAL.
+        let mut buf = 5u32.to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0x26, 0x01, 0xAA, 0xBB, 0xCC]);
+        let got = length_prefixed_to_annex_b(&buf);
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0x26, 0x01, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn non_length_prefixed_three_plus_bytes_passes_through() {
+        // A 4+ byte buffer that does NOT parse as length-prefixed (the first
+        // u32 length exceeds the remaining bytes on the very first NAL, parsing
+        // nothing) is passed through unchanged (parsed_any == false branch).
+        // 0xFFFFFFFF length with no body → parsed_any stays false → pass-through.
+        let raw = [0xFF, 0xFF, 0xFF, 0xFF, 0x11, 0x22];
+        let got = length_prefixed_to_annex_b(&raw);
+        assert_eq!(&got[..], &raw[..], "unparseable → passed through verbatim");
+    }
+
+    #[test]
+    fn append_into_caller_buffer_preserves_existing() {
+        // append_length_prefixed_as_annex_b writes into a caller buffer without
+        // clobbering its existing contents (hot-path no-alloc API).
+        let mut out = vec![0xDE, 0xAD];
+        let mut nal = 2u32.to_be_bytes().to_vec();
+        nal.extend_from_slice(&[0x11, 0x22]);
+        append_length_prefixed_as_annex_b(&mut out, &nal);
+        let mut want = vec![0xDE, 0xAD];
+        want.extend_from_slice(&START_CODE);
+        want.extend_from_slice(&[0x11, 0x22]);
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn starts_with_start_code_detects_both_forms() {
+        assert!(starts_with_start_code(&[0x00, 0x00, 0x00, 0x01, 0x42]));
+        assert!(starts_with_start_code(&[0x00, 0x00, 0x01, 0x42]));
+        assert!(!starts_with_start_code(&[0x00, 0x00, 0x02, 0x42]));
+        assert!(!starts_with_start_code(&[0x42, 0x00, 0x00, 0x01]));
+        assert!(!starts_with_start_code(&[]));
+    }
+
+    #[test]
+    fn three_byte_start_code_only_buffer_passes_through() {
+        // A buffer that is exactly a 3-byte start code prefix is passed through
+        // (the probe wins before length parsing).
+        let raw = [0x00, 0x00, 0x01, 0x40, 0x01];
+        assert_eq!(length_prefixed_to_annex_b(&raw), raw);
+    }
+
+    // --- HevcMux: params-once + error semantics ---
+
+    #[test]
+    fn mux_empty_codec_private_emits_no_params() {
+        // An EMPTY (not absent) hvcC: hvcc_to_annex_b returns None, but cp is
+        // empty so it's NOT a contract violation → no error, just no params.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = HevcMux::new(&mut sink);
+        mux.set_codec_private(Vec::new());
+        let mut frame = 2u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[0xAA, 0xBB]);
+        mux.write_frame(0, &frame).unwrap();
+        mux.finish().unwrap();
+        // Only the frame NAL, no parameter sets.
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(sink, want);
+    }
+
+    #[test]
+    fn mux_no_codec_private_writes_frames_only() {
+        // No hvcC set at all: frames pass through, no params, no error.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = HevcMux::new(&mut sink);
+        let mut frame = 2u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[0xAA, 0xBB]);
+        mux.write_frame(0, &frame).unwrap();
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(sink, want);
+    }
+
+    #[test]
+    fn mux_params_not_re_emitted_after_unparseable_error() {
+        // params_written is set BEFORE the write, so after an error on the first
+        // frame, a retry must NOT re-emit params (the comment's invariant).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = HevcMux::new(&mut sink);
+        mux.set_codec_private(vec![0xDE, 0xAD]); // unparseable, non-empty → error
+        assert!(mux.write_frame(0, &[]).is_err(), "first frame errors");
+        // A second frame must not retry the (already-marked) params.
+        let mut frame = 2u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[0xAA, 0xBB]);
+        mux.write_frame(0, &frame).unwrap();
+        // Sink holds only the frame NAL — no parameter bytes, no duplication.
+        let mut want = START_CODE.to_vec();
+        want.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(sink, want, "params not re-emitted after the error");
+    }
+
+    #[test]
+    fn mux_annex_b_frame_passes_through() {
+        // A frame already in Annex B (leading start code) is written verbatim,
+        // not re-framed as length-prefixed.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = HevcMux::new(&mut sink);
+        let frame = [0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xDE];
+        mux.write_frame(0, &frame).unwrap();
+        assert_eq!(sink, frame);
+    }
+
     #[test]
     fn mux_writes_params_then_frames() {
         // Build hvcC with one SPS to verify params-once semantics.

@@ -1088,4 +1088,327 @@ mod tests {
         assert_eq!(frame.track, 0);
         assert_eq!(frame.data, vec![0xAB, 0xCD]);
     }
+
+    // ============================================================
+    // block_vint — the (Simple)Block track-number VINT. Matroska §6.2:
+    // the leading-1 bit position selects the width (1-4 bytes here), and
+    // the value occupies the remaining bits. A width-selection bug would
+    // mis-attribute every block to the wrong track.
+    // ============================================================
+
+    #[test]
+    fn block_vint_width_selection_and_values() {
+        // 1-byte: 0x81 → track 1 (high bit is the marker, low 7 = value).
+        assert_eq!(block_vint(&[0x81]), (1, 1));
+        assert_eq!(block_vint(&[0xFF]), (0x7F, 1)); // max 1-byte track
+        // 2-byte: 0x40 marker, 14-bit value. 0x40 0x80 → 0x80.
+        assert_eq!(block_vint(&[0x40, 0x80]), (0x80, 2));
+        assert_eq!(block_vint(&[0x7F, 0xFF]), (0x3FFF, 2)); // max 2-byte
+        // 3-byte: 0x20 marker, 21-bit value.
+        assert_eq!(block_vint(&[0x20, 0x00, 0x01]), (1, 3));
+        assert_eq!(block_vint(&[0x3F, 0xFF, 0xFF]), (0x1F_FFFF, 3));
+        // 4-byte: 0x10 marker, 28-bit value.
+        assert_eq!(block_vint(&[0x10, 0x00, 0x00, 0x01]), (1, 4));
+        assert_eq!(block_vint(&[0x1F, 0xFF, 0xFF, 0xFF]), (0x0FFF_FFFF, 4));
+    }
+
+    #[test]
+    fn block_vint_unsupported_and_truncated_forms() {
+        // Empty input → (0, 0).
+        assert_eq!(block_vint(&[]), (0, 0));
+        // A 2-byte marker but only 1 byte available falls through to the
+        // catch-all (0, 1) — treated as track 0 (skipped by parse_block).
+        assert_eq!(block_vint(&[0x40]), (0, 1));
+        // A 5+ byte VINT (0x08 marker) is unsupported → (0, 1), so the block
+        // is skipped rather than mis-decoded.
+        assert_eq!(block_vint(&[0x08, 0, 0, 0, 0]), (0, 1));
+        // 0x00 first byte: no marker in bits 7..4 → unsupported → (0, 1).
+        assert_eq!(block_vint(&[0x00, 0x11]), (0, 1));
+    }
+
+    // ============================================================
+    // parse_block — turns a (Simple)Block payload into a PesFrame.
+    // Layout: [track VINT][rel_ts i16 BE][flags u8][data...].
+    // Guards: len<4 → None; vl+3 > len → None; track 0 → None;
+    // track_idx >= streams_len → None.
+    // ============================================================
+
+    #[test]
+    fn parse_block_too_short_is_none() {
+        // Fewer than 4 bytes can't hold vint(1)+ts(2)+flags(1); must be None.
+        assert!(parse_block(&[0x81, 0x00, 0x00], 0, 1_000_000, 1, None).is_none());
+        assert!(parse_block(&[], 0, 1_000_000, 1, None).is_none());
+    }
+
+    #[test]
+    fn parse_block_header_longer_than_payload_is_none() {
+        // A 2-byte track VINT (0x40 0x01) needs vl(2)+3 = 5 bytes minimum, but
+        // only 4 are supplied → vl+3 > len → None (no OOB index of data slice).
+        let block = [0x40u8, 0x01, 0x00, 0x00]; // len 4, vl 2 → 2+3=5 > 4
+        assert!(parse_block(&block, 0, 1_000_000, 2, None).is_none());
+    }
+
+    #[test]
+    fn parse_block_track_index_out_of_range_is_none() {
+        // track 2 → index 1, but only 1 stream exists → must skip (None),
+        // never index past the streams slice.
+        let block = [0x82u8, 0x00, 0x00, 0x80, 0xAA]; // track 2
+        assert!(parse_block(&block, 0, 1_000_000, 1, None).is_none());
+        // With 2 streams it resolves to index 1.
+        let f = parse_block(&block, 0, 1_000_000, 2, None).unwrap();
+        assert_eq!(f.track, 1);
+    }
+
+    #[test]
+    fn parse_block_pts_honours_timestamp_scale() {
+        // PTS = (cluster_ts_ticks + rel_ts) * ts_scale_ns. With a non-1ms scale
+        // the result must scale accordingly (foreign MKVs). rel_ts = 10 here.
+        let block = [0x81u8, 0x00, 0x0A, 0x80, 0xAA]; // track 1, rel 10, kf
+        // ts_scale 1_000_000 (1ms): cluster 100 + rel 10 = 110 ticks → 110ms.
+        let f = parse_block(&block, 100, 1_000_000, 1, None).unwrap();
+        assert_eq!(f.pts, 110 * 1_000_000);
+        assert!(f.keyframe);
+        // ts_scale 90_000 (90kHz): (100+10) * 90_000.
+        let f = parse_block(&block, 100, 90_000, 1, None).unwrap();
+        assert_eq!(f.pts, 110 * 90_000);
+    }
+
+    #[test]
+    fn parse_block_negative_rel_ts_is_signed() {
+        // rel_ts is a SIGNED 16-bit big-endian value. 0xFFFF = -1. The pts must
+        // go DOWN from the cluster timestamp, not jump to +65535.
+        let block = [0x81u8, 0xFF, 0xFF, 0x80, 0xAA]; // rel_ts = -1
+        let f = parse_block(&block, 100, 1_000_000, 1, None).unwrap();
+        assert_eq!(f.pts, 99 * 1_000_000, "rel_ts -1 must subtract one tick");
+    }
+
+    #[test]
+    fn parse_block_keyframe_flag_and_duration_propagate() {
+        // flags bit 0x80 = keyframe; a clear bit = delta frame. duration_ns is
+        // passed through unchanged (BlockGroup path supplies it).
+        let kf = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
+        let nkf = [0x81u8, 0x00, 0x00, 0x00, 0xAA];
+        assert!(parse_block(&kf, 0, 1_000_000, 1, None).unwrap().keyframe);
+        assert!(!parse_block(&nkf, 0, 1_000_000, 1, None).unwrap().keyframe);
+        let f = parse_block(&kf, 0, 1_000_000, 1, Some(40_000_000)).unwrap();
+        assert_eq!(f.duration_ns, Some(40_000_000));
+    }
+
+    #[test]
+    fn parse_block_pts_saturates_no_overflow() {
+        // A hostile cluster timestamp near i64::MAX must not panic on the
+        // ticks→ns multiply; saturating_mul caps it. (Guards the debug-build
+        // overflow the source comment calls out.)
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
+        let f = parse_block(&block, i64::MAX, 1_000_000, 1, None).unwrap();
+        assert_eq!(f.pts, i64::MAX, "ticks→ns must saturate, not wrap/panic");
+    }
+
+    // ============================================================
+    // ts_pid_for_track — mid-range mapping (the existing test covers the
+    // edges; this fills in a representative middle value to lock the
+    // 0x1100 + (tnum-2) formula).
+    // ============================================================
+
+    #[test]
+    fn ts_pid_for_track_mid_range_formula() {
+        // tnum 10 → 0x1100 + 8 = 0x1108.
+        assert_eq!(ts_pid_for_track(10).unwrap(), 0x1108);
+        // tnum 0x100 → 0x1100 + 0xFE = 0x11FE.
+        assert_eq!(ts_pid_for_track(0x100).unwrap(), 0x11FE);
+    }
+
+    // ============================================================
+    // CLUSTER_TIMESTAMP overflow guard — a value above i64::MAX would cast
+    // to a large negative i64 and poison every block PTS in the cluster.
+    // The reader must reject it.
+    // ============================================================
+
+    #[test]
+    fn cluster_timestamp_above_i64_max_is_rejected() {
+        // CLUSTER_TIMESTAMP encoded as an 8-byte uint with the top bit set
+        // (> i64::MAX). The reader must surface MkvInvalid on read().
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::CLUSTER_TIMESTAMP).unwrap();
+        ebml::write_size(&mut cluster, 8).unwrap();
+        cluster.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_be_bytes());
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let e = stream.read().unwrap_err();
+        assert!(is_mkv_invalid(&e));
+    }
+
+    // ============================================================
+    // parse_mkv_header — TimestampScale threading and clamping. The frame
+    // PTS path multiplies by ts_scale_ns; a zero or absurd scale must
+    // clamp to the 1ms default rather than zero out / overflow PTS.
+    // ============================================================
+
+    #[test]
+    fn zero_timestamp_scale_clamps_to_default() {
+        // A foreign/corrupt INFO with TimestampScale 0 must clamp to 1_000_000
+        // (1ms), so a rel_ts 5 block at cluster 100 still yields 105ms — not 0.
+        let mut info = Vec::new();
+        ebml::write_uint(&mut info, ebml::TIMESTAMP_SCALE, 0).unwrap();
+
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        let mut track_entry = Vec::new();
+        ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();
+        track_entry.extend_from_slice(&entry);
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_uint(&mut cluster, ebml::CLUSTER_TIMESTAMP, 100).unwrap();
+        let block = [0x81u8, 0x00, 0x05, 0x80, 0xAA];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, info.len() as u64).unwrap();
+        out.extend_from_slice(&info);
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, track_entry.len() as u64).unwrap();
+        out.extend_from_slice(&track_entry);
+        out.extend_from_slice(&cluster);
+
+        let mut stream = MkvStream::open(Cursor::new(out)).unwrap();
+        let f = stream.read().unwrap().expect("frame");
+        assert_eq!(f.pts, 105 * 1_000_000, "zero scale must clamp to 1ms");
+    }
+
+    #[test]
+    fn duration_uses_timestamp_scale_for_seconds() {
+        // DURATION is a float in TimestampScale TICKS, not ms. With scale
+        // 1_000_000 (1ms) and duration 5000 ticks → 5.0 s. The header parser
+        // must convert via ticks * scale_ns / 1e9.
+        let mut info = Vec::new();
+        ebml::write_uint(&mut info, ebml::TIMESTAMP_SCALE, 1_000_000).unwrap();
+        ebml::write_float(&mut info, ebml::DURATION, 5000.0).unwrap();
+
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        let mut track_entry = Vec::new();
+        ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();
+        track_entry.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, info.len() as u64).unwrap();
+        out.extend_from_slice(&info);
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, track_entry.len() as u64).unwrap();
+        out.extend_from_slice(&track_entry);
+
+        let stream = MkvStream::open(Cursor::new(out)).unwrap();
+        assert_eq!(stream.info().duration_secs, 5.0);
+    }
+
+    #[test]
+    fn missing_ebml_header_is_rejected() {
+        // A stream whose first element is not the EBML header (0x1A45DFA3) is
+        // not a Matroska file and must be rejected.
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap(); // wrong first element
+        ebml::write_size(&mut out, 0).unwrap();
+        let e = open_err(MkvStream::open(Cursor::new(out)));
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn segment_must_follow_ebml_header() {
+        // After a valid EBML header the next element must be the Segment; a
+        // different element is malformed.
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap(); // not SEGMENT
+        ebml::write_size(&mut out, 0).unwrap();
+        let e = open_err(MkvStream::open(Cursor::new(out)));
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn track_type_to_codec_and_pid_mapping_round_trips() {
+        // A video TRACK_ENTRY (type 1, codec HEVC) must map to a VideoStream
+        // with the V_MPEGH/ISO/HEVC → Codec::Hevc translation and track 1 → PID
+        // 0x1011. Confirms parse_track wiring end to end.
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        ebml::write_string(&mut entry, ebml::CODEC_ID, "V_MPEGH/ISO/HEVC").unwrap();
+        let mut track_entry = Vec::new();
+        ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();
+        track_entry.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, track_entry.len() as u64).unwrap();
+        out.extend_from_slice(&track_entry);
+
+        let stream = MkvStream::open(Cursor::new(out)).unwrap();
+        match &stream.info().streams[0] {
+            crate::disc::Stream::Video(v) => {
+                assert_eq!(v.codec, Codec::Hevc);
+                assert_eq!(v.pid, 0x1011);
+            }
+            _ => panic!("expected video stream"),
+        }
+    }
+
+    #[test]
+    fn block_group_unknown_size_is_rejected() {
+        // A BLOCK_GROUP declaring unknown size (u64::MAX) would loop draining
+        // the stream; the reader must reject it as MkvInvalid.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap(); // size = unknown
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let e = stream.read().unwrap_err();
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn read_then_eof_returns_none() {
+        // After the last block, a clean EOF on the next element header must
+        // return Ok(None) (end of stream), not an error.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, block.len() as u64).unwrap();
+        cluster.extend_from_slice(&block);
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        assert!(stream.read().unwrap().is_some(), "first frame");
+        assert!(stream.read().unwrap().is_none(), "clean EOF → None");
+    }
 }

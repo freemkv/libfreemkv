@@ -483,4 +483,155 @@ mod tests {
             Some("real".into())
         );
     }
+
+    // ── Additional hardening tests ─────────────────────────────────────────
+
+    /// Spec: BD-J XML attr names are case-insensitive.
+    /// Mutation: remove `.to_ascii_lowercase()` on attr name → uppercase fails.
+    #[test]
+    fn attr_fully_mixed_case_roundtrip() {
+        assert_eq!(attr(r#"<X LANG="fra" />"#, "lang"), Some("fra".into()));
+        assert_eq!(attr(r#"<x lAnG="fra" />"#, "LANG"), Some("fra".into()));
+    }
+
+    /// Spec: hyphenated attribute names include `-` as a name char.
+    /// Mutation: remove `-` from `is_name_char` → `lang-id` boundary broken.
+    #[test]
+    fn attr_hyphenated_name_exact_match() {
+        // Searching for `lang-id` must match exactly, not confuse with `lang`.
+        assert_eq!(
+            attr(r#"<x lang-id="eng" lang="fra" />"#, "lang-id"),
+            Some("eng".into())
+        );
+        assert_eq!(
+            attr(r#"<x lang-id="eng" lang="fra" />"#, "lang"),
+            Some("fra".into())
+        );
+    }
+
+    /// Spec: underscore-extended attr names must not match the base name.
+    /// Paramount format: `aud_com1_idx` must not match `aud`.
+    /// Mutation: remove the `is_name_char(bytes[after_name])` guard → prefix matched.
+    #[test]
+    fn attr_no_prefix_match_with_underscore_extension() {
+        assert_eq!(
+            attr(r#"<playlist aud_com1_idx="2" aud="eng" />"#, "aud"),
+            Some("eng".into())
+        );
+    }
+
+    /// Spec: `xml::text` must return `Some("")` for `<tag/>` (self-closing).
+    /// Mutation: return None for self-closing → callers break.
+    #[test]
+    fn text_self_closing_no_whitespace() {
+        assert_eq!(text("<x/>", "x"), Some("".into()));
+    }
+
+    /// Spec: self-closing with Unicode attr must not panic.
+    /// Mutation: use byte-offset self-close check → panic on multi-byte boundary.
+    #[test]
+    fn text_self_closing_with_unicode_attr_does_not_panic() {
+        assert_eq!(text(r#"<x attr="日本"/>  "#, "x"), Some("".into()));
+    }
+
+    /// Spec: namespace prefix in BOTH open and close tags must be stripped.
+    /// Mutation: only strip prefix from opening tag, not closing → None.
+    #[test]
+    fn text_namespace_prefix_on_both_open_and_close() {
+        assert_eq!(text("<a:tag>value</a:tag>", "tag"), Some("value".into()));
+    }
+
+    /// The first occurrence wins, not the last.
+    /// Mutation: use rfind instead of find → second value returned.
+    #[test]
+    fn text_returns_first_occurrence() {
+        let xml = "<x>first</x><x>second</x>";
+        assert_eq!(text(xml, "x"), Some("first".into()));
+    }
+
+    /// `find_element` must advance correctly past each matched element.
+    /// Mutation: advance from by 1 instead of end → elements double-counted.
+    #[test]
+    fn find_element_correctly_advances_past_each_element() {
+        let xml = "<a>1</a><a>2</a><a>3</a>";
+        let mut vals = Vec::new();
+        let mut from = 0;
+        while let Some((s, e)) = find_element(xml, "a", from) {
+            vals.push(text(&xml[s..e], "a").unwrap());
+            from = e;
+        }
+        assert_eq!(vals, vec!["1", "2", "3"]);
+    }
+
+    /// `>` inside a quoted attribute value must not end the open tag.
+    /// Mutation: don't skip quoted regions → `>` in attr value ends tag early.
+    #[test]
+    fn find_element_gt_in_attr_does_not_end_tag_prematurely() {
+        let xml = r#"<a cond="a>b">body</a>"#;
+        let (s, e) = find_element(xml, "a", 0).unwrap();
+        assert_eq!(&xml[s..e], r#"<a cond="a>b">body</a>"#);
+    }
+
+    /// Missing close tag must return None, not a truncated content.
+    /// Mutation: return text after the open tag unconditionally → wrong value.
+    #[test]
+    fn text_missing_close_is_none_never_truncated() {
+        assert_eq!(text("<x>incomplete", "x"), None);
+    }
+
+    /// `attr` with `name=""` (empty string value) returns Some(""), not None.
+    /// Mutation: filter out empty returns → empty attr becomes None.
+    #[test]
+    fn attr_returns_some_empty_string_for_empty_value() {
+        assert_eq!(
+            attr(r#"<x forced_sub="" />"#, "forced_sub"),
+            Some("".into())
+        );
+    }
+
+    /// Single-char attr name must not falsely match inside a word boundary.
+    /// Mutation: remove boundary check → `id` matches `pid`.
+    #[test]
+    fn attr_single_char_name_boundary() {
+        assert_eq!(
+            attr(r#"<x pid="1" hid="2" id="3" />"#, "id"),
+            Some("3".into())
+        );
+    }
+
+    /// `find_element` from a non-zero offset must start the search at that offset.
+    /// Mutation: always start from 0 → finds elements before `from`.
+    #[test]
+    fn find_element_respects_from_offset() {
+        let xml = "<p>a</p><p>b</p>";
+        let (s, e) = find_element(xml, "p", 8).unwrap();
+        assert_eq!(&xml[s..e], "<p>b</p>");
+    }
+
+    /// `text` trims surrounding whitespace from element content.
+    /// Mutation: remove `.trim()` call → whitespace included.
+    #[test]
+    fn text_trims_internal_whitespace() {
+        assert_eq!(text("<x>  hello  </x>", "x"), Some("hello".into()));
+        assert_eq!(
+            text("<x>\n  Aurora Drift\n</x>", "x"),
+            Some("Aurora Drift".into())
+        );
+    }
+
+    /// `attr` with single-quote value must match, same as double-quote.
+    /// Mutation: accept only double-quote → single-quote attrs fail.
+    #[test]
+    fn attr_single_quote_value() {
+        assert_eq!(attr(r#"<x a='hello' />"#, "a"), Some("hello".into()));
+    }
+
+    /// tag name with leading numeric char after namespace prefix is still matched
+    /// as long as the local name matches exactly (BD tools sometimes use namespace-prefixed tags).
+    #[test]
+    fn find_element_handles_namespace_with_numeric_prefix_class() {
+        let xml = r#"<root><di:name>Title</di:name></root>"#;
+        let (s, e) = find_element(xml, "name", 0).unwrap();
+        assert_eq!(&xml[s..e], "<di:name>Title</di:name>");
+    }
 }

@@ -212,4 +212,77 @@ mod tests {
         let frames = parser.parse(&pes_no_pts);
         assert_eq!(frames[0].pts_ns, 0);
     }
+
+    // --- BD strip offset boundary ---
+
+    #[test]
+    fn bd_five_bytes_yields_one_pcm_byte() {
+        // BD strips exactly BD_LPCM_HEADER_SIZE (4). The guard is
+        // `data.len() <= offset` (drop), so 5 bytes → 1 PCM byte emitted, not 0.
+        let mut parser = LpcmParser::new();
+        let f = parser.parse(&make_pes(vec![0x00, 0x01, 0x00, 0x91, 0xAB], Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, vec![0xAB], "5 BD bytes → 1 PCM byte");
+    }
+
+    #[test]
+    fn bd_exactly_four_bytes_dropped() {
+        // Exactly 4 bytes = header only: `len <= offset` (4 <= 4) → dropped.
+        let mut parser = LpcmParser::new();
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x00, 0x01, 0x00, 0x91], Some(0)))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bd_three_bytes_dropped() {
+        // Fewer than the 4-byte header → dropped, no panic / no underflow slice.
+        let mut parser = LpcmParser::new();
+        assert!(
+            parser
+                .parse(&make_pes(vec![0x00, 0x01, 0x00], Some(0)))
+                .is_empty()
+        );
+    }
+
+    // --- DVD strips nothing ---
+
+    #[test]
+    fn dvd_one_byte_payload_emitted() {
+        // DVD offset is 0, so even a single byte is real PCM and must be emitted
+        // (`len <= 0` is false for len 1).
+        let mut parser = LpcmParser::new_dvd();
+        let f = parser.parse(&make_pes(vec![0xAB], Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, vec![0xAB]);
+    }
+
+    #[test]
+    fn dvd_empty_payload_dropped() {
+        // DVD with an empty payload: `len <= 0` (0 <= 0) → dropped.
+        let mut parser = LpcmParser::new_dvd();
+        assert!(parser.parse(&make_pes(Vec::new(), Some(0))).is_empty());
+    }
+
+    #[test]
+    fn bd_default_constructor_strips_header() {
+        // Default::default() must build the BD (strip) variant, matching new().
+        let mut parser = LpcmParser::default();
+        let header = vec![0x00, 0x01, 0x00, 0x91];
+        let pcm = vec![0x11, 0x22, 0x33, 0x44];
+        let mut data = header;
+        data.extend_from_slice(&pcm);
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f[0].data, pcm, "default = BD variant, strips 4 bytes");
+    }
+
+    #[test]
+    fn lpcm_no_pts_defaults_zero_dvd() {
+        // DVD variant with no PTS → pts_ns 0 (unwrap_or(0)).
+        let mut parser = LpcmParser::new_dvd();
+        let f = parser.parse(&make_pes(vec![0xAA, 0xBB], None));
+        assert_eq!(f[0].pts_ns, 0);
+    }
 }

@@ -294,3 +294,1288 @@ impl Disc {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sector::SectorSource;
+    use std::collections::HashMap;
+
+    // ---------------------------------------------------------------
+    // In-memory disc backing store
+    // ---------------------------------------------------------------
+
+    /// In-memory SectorSource backed by an absolute-LBA → 2048-byte
+    /// sector map. Unmapped sectors read as zeroes (matches a freshly
+    /// formatted region). Mirrors the `MapReader` used in `udf.rs`
+    /// tests so fixtures are byte-for-byte interoperable.
+    struct MemDisc {
+        sectors: HashMap<u32, [u8; 2048]>,
+    }
+
+    impl MemDisc {
+        fn new() -> Self {
+            Self {
+                sectors: HashMap::new(),
+            }
+        }
+        fn put(&mut self, lba: u32, data: [u8; 2048]) {
+            self.sectors.insert(lba, data);
+        }
+        /// Write arbitrary-length bytes starting at `lba`, splitting across
+        /// consecutive 2048-byte sectors (zero-padded last sector).
+        fn put_bytes(&mut self, lba: u32, bytes: &[u8]) {
+            for (i, chunk) in bytes.chunks(2048).enumerate() {
+                let mut s = [0u8; 2048];
+                s[..chunk.len()].copy_from_slice(chunk);
+                self.put(lba + i as u32, s);
+            }
+        }
+    }
+
+    impl SectorSource for MemDisc {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let need = count as usize * 2048;
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+                buf[off..off + 2048].copy_from_slice(&s);
+            }
+            Ok(need)
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // UDF image builder — produces a disc image `udf::read_filesystem`
+    // can navigate. All field offsets are cited from ECMA-167 / the
+    // exact bytes `udf.rs::read_filesystem` reads.
+    // ---------------------------------------------------------------
+
+    /// Fixed layout. PART_START == META_START so file LBAs (physical
+    /// partition relative) and ICB/dir LBAs (metadata relative) share
+    /// one address space — both resolve to abs = PART_START + lba. This
+    /// keeps fixtures small; `read_filesystem` takes the single-partition
+    /// path (num_partition_maps == 1) so no metadata-partition file is
+    /// needed.
+    const PART_START: u32 = 2000;
+
+    /// One file's on-disc placement: metadata LBA of its ICB, the LBA of
+    /// its (single contiguous) data extent, byte length, and whether the
+    /// ICB encodes its allocation descriptor as a Long AD (16-byte, the
+    /// real BD-ROM .m2ts layout) vs Short AD (8-byte).
+    struct FileSpec {
+        name: String,
+        icb_lba: u32,
+        data_lba: u32,
+        size: u32,
+        long_ad: bool,
+        /// Optional explicit file contents written at `data_lba`.
+        contents: Vec<u8>,
+    }
+
+    /// A directory node for the builder: its ICB LBA, the LBA where its
+    /// FID list lives, child files, and child subdirectories.
+    struct DirSpec {
+        name: String,
+        icb_lba: u32,
+        dir_data_lba: u32,
+        files: Vec<FileSpec>,
+        subdirs: Vec<DirSpec>,
+    }
+
+    /// Build an Extended File Entry ICB (tag 266) with one allocation
+    /// descriptor. Offsets per `udf.rs`: tag@0, ICB-tag flags@34,
+    /// info_length(u64)@56, l_ea@208, l_ad@212, ADs@216.
+    fn build_file_icb(size: u32, data_lba: u32, long_ad: bool) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
+        if long_ad {
+            // ICB Tag flags low 3 bits = 1 → Long AD (16-byte stride).
+            s[34..36].copy_from_slice(&1u16.to_le_bytes());
+        }
+        s[56..64].copy_from_slice(&(size as u64).to_le_bytes()); // info_length
+        s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
+        let ad_size: u32 = if long_ad { 16 } else { 8 };
+        s[212..216].copy_from_slice(&ad_size.to_le_bytes()); // l_ad
+        // Short/Long AD share length(4)@216 | lba(4)@220. extent_type 0
+        // (recorded) is top 2 bits = 0, so raw == len.
+        s[216..220].copy_from_slice(&(size & 0x3FFF_FFFF).to_le_bytes());
+        s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+        // Long AD's part_ref(2)@224 + impl_use(6)@226 stay zero.
+        s
+    }
+
+    /// Build a directory ICB (tag 266) whose single short AD points at the
+    /// directory's FID data.
+    fn build_dir_icb(dir_data_lba: u32, dir_data_len: u32) -> [u8; 2048] {
+        build_file_icb(dir_data_len, dir_data_lba, false)
+    }
+
+    /// Append one File Identifier Descriptor (tag 257) to `buf`.
+    /// Layout per `read_directory`: tag@0, file_chars@18, l_fi@19,
+    /// ICB long_ad extent_location(LBA)@24, l_iu(u16)@36, name@(38+l_iu).
+    /// Name uses UDF compression-id 8 (8-bit ASCII), so the on-disc name
+    /// field is `[0x08, ascii_bytes...]` and l_fi = 1 + ascii.len().
+    fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
+        let start = buf.len();
+        let name_field: Vec<u8> = if is_parent {
+            Vec::new()
+        } else {
+            let mut v = vec![0x08u8];
+            v.extend_from_slice(name.as_bytes());
+            v
+        };
+        let l_fi = name_field.len();
+        let mut fid = vec![0u8; 38];
+        fid[0..2].copy_from_slice(&257u16.to_le_bytes()); // FID tag
+        let mut file_chars = 0u8;
+        if is_dir {
+            file_chars |= 0x02;
+        }
+        if is_parent {
+            file_chars |= 0x08;
+        }
+        fid[18] = file_chars;
+        fid[19] = l_fi as u8;
+        // ICB long_ad: extent_location LBA at offset 24.
+        fid[24..28].copy_from_slice(&icb_lba.to_le_bytes());
+        // l_iu (u16) at offset 36 = 0.
+        fid[36..38].copy_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&fid);
+        buf.extend_from_slice(&name_field);
+        // Pad to 4-byte alignment (FID stride = (38 + l_iu + l_fi + 3) & !3).
+        let used = buf.len() - start;
+        let pad = (used + 3) & !3;
+        buf.resize(start + pad, 0);
+    }
+
+    /// Recursively lay a DirSpec (and children) into the MemDisc, writing
+    /// directory ICBs, FID lists, file ICBs, and file data.
+    fn lay_dir(disc: &mut MemDisc, dir: &DirSpec) {
+        let mut fids = Vec::new();
+        // Parent entry first (file_chars bit 0x08) — skipped by the parser
+        // but present on real discs.
+        push_fid(&mut fids, "", dir.icb_lba, true, true);
+        for f in &dir.files {
+            push_fid(&mut fids, &f.name, f.icb_lba, false, false);
+            disc.put(
+                PART_START + f.icb_lba,
+                build_file_icb(f.size, f.data_lba, f.long_ad),
+            );
+            if !f.contents.is_empty() {
+                disc.put_bytes(PART_START + f.data_lba, &f.contents);
+            }
+        }
+        for sub in &dir.subdirs {
+            push_fid(&mut fids, &sub.name, sub.icb_lba, true, false);
+        }
+        disc.put(
+            PART_START + dir.icb_lba,
+            build_dir_icb(dir.dir_data_lba, fids.len() as u32),
+        );
+        disc.put_bytes(PART_START + dir.dir_data_lba, &fids);
+        for sub in &dir.subdirs {
+            lay_dir(disc, sub);
+        }
+    }
+
+    /// Build the static UDF anchor/VDS/FSD structure so `read_filesystem`
+    /// reaches `root_icb_lba`. Single partition map → metadata_start ==
+    /// partition_start == PART_START.
+    fn build_udf_skeleton(disc: &mut MemDisc, root_icb_lba: u32) {
+        // AVDP at sector 256, tag 2 (ECMA-167 §10.2).
+        let mut avdp = [0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        disc.put(256, avdp);
+
+        // Partition Descriptor (tag 5) at sector 32: partition_start@188.
+        let mut pd = [0u8; 2048];
+        pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+        disc.put(32, pd);
+
+        // Logical Volume Descriptor (tag 6) at sector 33:
+        // num_partition_maps(u32)@268 = 1 (single map → no metadata part).
+        let mut lvd = [0u8; 2048];
+        lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+        lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+        disc.put(33, lvd);
+
+        // Terminating Descriptor (tag 8) at sector 34 → ends VDS scan.
+        let mut td = [0u8; 2048];
+        td[0..2].copy_from_slice(&8u16.to_le_bytes());
+        disc.put(34, td);
+
+        // File Set Descriptor (tag 256) at metadata_start (== PART_START):
+        // root-dir ICB LBA at offset 404 (long_ad extent_location).
+        let mut fsd = [0u8; 2048];
+        fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+        fsd[404..408].copy_from_slice(&root_icb_lba.to_le_bytes());
+        disc.put(PART_START, fsd);
+    }
+
+    fn file(name: &str, icb_lba: u32, data_lba: u32, size: u32, long_ad: bool) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba,
+            size,
+            long_ad,
+            contents: Vec::new(),
+        }
+    }
+
+    fn file_with(
+        name: &str,
+        icb_lba: u32,
+        data_lba: u32,
+        contents: Vec<u8>,
+        long_ad: bool,
+    ) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba,
+            size: contents.len() as u32,
+            long_ad,
+            contents,
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // MPLS builder (BD-ROM PlayList spec). Mirrors the layout the
+    // `mpls::parse` consumer reads (header@0, PlayList@playlist_start,
+    // PlayListMark@mark_start). Offsets cited against mpls.rs.
+    // ---------------------------------------------------------------
+
+    struct PiSpec {
+        clip_id: [u8; 5],
+        in_time: u32,
+        out_time: u32,
+    }
+
+    struct MarkSpec {
+        mark_type: u8,
+        play_item_ref: u16,
+        timestamp: u32,
+    }
+
+    /// One STN stream entry: stream_entry (len(1)=3, type(1)=0x01, pid(2))
+    /// + stream_attributes (len(1) + coding_type(1) + payload). Matches
+    /// the mpls.rs test builders.
+    fn se_video(pid: u16, coding_type: u8) -> Vec<u8> {
+        let mut out = vec![3u8, 0x01];
+        out.extend_from_slice(&pid.to_be_bytes());
+        let attrs = vec![coding_type, 0x10]; // format/rate nibbles
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
+    fn se_audio(pid: u16, coding_type: u8, lang: &[u8; 3]) -> Vec<u8> {
+        let mut out = vec![3u8, 0x01];
+        out.extend_from_slice(&pid.to_be_bytes());
+        // PGS in an audio slot uses PG layout (coding_type + lang(3)); the
+        // builder only needs the non-PGS audio layout here.
+        let attrs = vec![coding_type, 0x21, lang[0], lang[1], lang[2]];
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
+    fn se_pg(pid: u16, coding_type: u8, lang: &[u8; 3]) -> Vec<u8> {
+        let mut out = vec![3u8, 0x01];
+        out.extend_from_slice(&pid.to_be_bytes());
+        let attrs = vec![coding_type, lang[0], lang[1], lang[2]];
+        out.push(attrs.len() as u8);
+        out.extend_from_slice(&attrs);
+        out
+    }
+
+    /// Build an MPLS playlist. `stn_counts` = (video, audio, pg, ig,
+    /// sec_audio, sec_video, pip_pg, dv); `stream_entries` are appended on
+    /// the FIRST play item in that order.
+    fn build_mpls(
+        items: &[PiSpec],
+        stn_counts: (u8, u8, u8, u8, u8, u8, u8, u8),
+        stream_entries: &[Vec<u8>],
+        marks: &[MarkSpec],
+    ) -> Vec<u8> {
+        let playlist_start: u32 = 40;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MPLS0200"); // type+version
+        buf.extend_from_slice(&playlist_start.to_be_bytes()); // [8..12]
+        buf.extend_from_slice(&[0u8; 28]); // mark_start placeholder + pad to 40
+
+        // PlayList section: length(4) + reserved(2) + num_play_items(2)
+        // + num_sub_paths(2) header.
+        let pl_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // length placeholder
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&[0u8; 2]); // num_sub_paths
+
+        for (idx, pi) in items.iter().enumerate() {
+            let mut item = Vec::new();
+            item.extend_from_slice(&pi.clip_id); // [0..5]
+            item.extend_from_slice(b"M2TS"); // [5..9] codec_id
+            item.push(0); // [9] connection_condition
+            item.extend_from_slice(&[0u8; 2]); // [10..12] reserved
+            item.extend_from_slice(&pi.in_time.to_be_bytes()); // [12..16]
+            item.extend_from_slice(&pi.out_time.to_be_bytes()); // [16..20]
+            item.extend_from_slice(&[0u8; 8]); // [20..28] UO_mask
+            item.push(0); // [28] misc
+            item.push(0); // [29] still_mode
+            item.extend_from_slice(&[0u8; 2]); // [30..32] still_time
+            if idx == 0 {
+                // STN table: length(2)+reserved(2)+counts(8)+reserved(4).
+                let stn_start = item.len();
+                item.extend_from_slice(&[0u8; 2]); // length placeholder
+                item.extend_from_slice(&[0u8; 2]); // reserved
+                item.push(stn_counts.0);
+                item.push(stn_counts.1);
+                item.push(stn_counts.2);
+                item.push(stn_counts.3);
+                item.push(stn_counts.4);
+                item.push(stn_counts.5);
+                item.push(stn_counts.6);
+                item.push(stn_counts.7);
+                item.extend_from_slice(&[0u8; 4]); // reserved
+                for se in stream_entries {
+                    item.extend_from_slice(se);
+                }
+                let stn_len = (item.len() - stn_start - 2) as u16;
+                item[stn_start..stn_start + 2].copy_from_slice(&stn_len.to_be_bytes());
+            }
+            buf.extend_from_slice(&(item.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&item);
+        }
+
+        let pl_len = (buf.len() - pl_start - 4) as u32;
+        buf[pl_start..pl_start + 4].copy_from_slice(&pl_len.to_be_bytes());
+
+        // PlayListMark section.
+        let mark_start = buf.len() as u32;
+        buf[12..16].copy_from_slice(&mark_start.to_be_bytes());
+        let mark_section_len = 2 + marks.len() * 14;
+        buf.extend_from_slice(&(mark_section_len as u32).to_be_bytes());
+        buf.extend_from_slice(&(marks.len() as u16).to_be_bytes());
+        for m in marks {
+            buf.push(0); // [0] reserved
+            buf.push(m.mark_type); // [1] mark_type
+            buf.extend_from_slice(&m.play_item_ref.to_be_bytes()); // [2..4]
+            buf.extend_from_slice(&m.timestamp.to_be_bytes()); // [4..8]
+            buf.extend_from_slice(&[0u8; 6]); // [8..14] PID + duration
+        }
+        buf
+    }
+
+    // ---------------------------------------------------------------
+    // CLPI builder. `clpi::parse` reads "HDMV" magic, prog_info_start@12,
+    // cpi_start@16, source_packet_count@56. Zeroing prog_info/cpi starts
+    // disables those sections cleanly.
+    // ---------------------------------------------------------------
+
+    fn build_clpi(source_packet_count: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 60];
+        d[0..4].copy_from_slice(b"HDMV");
+        d[4..8].copy_from_slice(b"0200");
+        // seq_info_start/prog_info_start/cpi_start all 0 → skipped.
+        d[56..60].copy_from_slice(&source_packet_count.to_be_bytes());
+        d
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: parse_playlist
+    // ---------------------------------------------------------------
+
+    /// A playlist whose summed PlayItem duration is < 30 s is a menu /
+    /// clip-info stub and must be dropped (bluray.rs: `duration_secs <
+    /// 30.0 → None`). 45000 ticks/s timebase: 29 s = 1_305_000 ticks.
+    #[test]
+    fn parse_playlist_drops_under_30_seconds() {
+        let mut disc = MemDisc::new();
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 29 * 45000, // 29 s < 30 s threshold
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let udf = make_min_fs(&mut disc);
+        assert!(
+            Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).is_none(),
+            "playlists shorter than 30s must be skipped"
+        );
+    }
+
+    /// At exactly 30 s the playlist is kept (`< 30.0` is strict).
+    #[test]
+    fn parse_playlist_keeps_exactly_30_seconds() {
+        let mut disc = MemDisc::new();
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 30 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let udf = make_min_fs(&mut disc);
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls)
+            .expect("30s playlist must be kept");
+        assert!((t.duration_secs - 30.0).abs() < 1e-6);
+    }
+
+    /// Garbage that isn't an MPLS must yield None (parse error path), not
+    /// panic. mpls::parse rejects on missing "MPLS" magic.
+    #[test]
+    fn parse_playlist_rejects_non_mpls() {
+        let mut disc = MemDisc::new();
+        let udf = make_min_fs(&mut disc);
+        let junk = vec![0u8; 100];
+        assert!(Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &junk).is_none());
+    }
+
+    /// Build a full BDMV tree with one STREAM/.m2ts (Long-AD ICB) and one
+    /// CLPINF/.clpi, returning the navigable UdfFs plus a populated disc.
+    /// This is the canonical 0.31.0 extent-assembly fixture.
+    fn make_min_fs(disc: &mut MemDisc) -> udf::UdfFs {
+        // Empty BDMV/PLAYLIST so directory navigation in parse_playlist's
+        // clip lookups still works even when no clip files exist.
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 12,
+                dir_data_lba: 13,
+                files: Vec::new(),
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        udf::read_filesystem(disc).expect("fs")
+    }
+
+    /// Full BDMV with STREAM + CLPINF for the listed clip ids. Each clip's
+    /// .m2ts gets a Long-AD ICB with `sectors` sectors at a distinct LBA;
+    /// each .clpi declares `packets` source packets. Returns the UdfFs.
+    fn make_bdmv_fs(
+        disc: &mut MemDisc,
+        clips: &[(
+            &str,
+            u32, /*sectors*/
+            u32, /*packets*/
+            u32, /*data_lba*/
+        )],
+    ) -> udf::UdfFs {
+        // Layout LBAs: pick widely separated values to avoid collisions.
+        let mut stream_files = Vec::new();
+        let mut clipinf_files = Vec::new();
+        let mut icb = 100u32;
+        for (name, sectors, packets, data_lba) in clips {
+            let m2ts = format!("{name}.m2ts");
+            // Size in bytes — file_extents derives sectors via div_ceil(2048).
+            let size = sectors * 2048;
+            stream_files.push(file(&m2ts, icb, *data_lba, size, true));
+            icb += 1;
+            let clpi = format!("{name}.clpi");
+            clipinf_files.push(file_with(
+                &clpi,
+                icb,
+                *data_lba + 1000,
+                build_clpi(*packets),
+                false,
+            ));
+            icb += 1;
+        }
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: stream_files,
+                    subdirs: vec![],
+                },
+                DirSpec {
+                    name: "CLIPINF".to_string(),
+                    icb_lba: 24,
+                    dir_data_lba: 25,
+                    files: clipinf_files,
+                    subdirs: vec![],
+                },
+            ],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        udf::read_filesystem(disc).expect("fs")
+    }
+
+    /// Single-clip playlist: size_bytes = source_packets * 192 and the
+    /// physical extent is pulled from the m2ts Long-AD ICB. Per bluray.rs:
+    /// `total_size += pkt_count * 192`; extents from file_extents.
+    #[test]
+    fn parse_playlist_single_clip_size_and_extent() {
+        let mut disc = MemDisc::new();
+        // 1000 sectors of m2ts at LBA 5000 (data_lba arg); 4000 packets.
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 1000, 4000, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000, // 60 s
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        // BD source packet = 192 bytes (188 TS + 4-byte timestamp header).
+        assert_eq!(t.size_bytes, 4000 * 192);
+        assert_eq!(t.extents.len(), 1, "one m2ts → one extent");
+        // file_extents absolute LBA = partition_start + data_lba.
+        assert_eq!(t.extents[0].start_lba, PART_START + 5000);
+        assert_eq!(t.extents[0].sector_count, 1000);
+        assert_eq!(t.clips.len(), 1);
+        assert_eq!(t.clips[0].source_packets, 4000);
+    }
+
+    /// THE 0.31.0 DEDUP PATH. A playlist that references the SAME clip_id
+    /// from multiple PlayItems (seamless split / looped segment) must count
+    /// the physical extents and packet bytes EXACTLY ONCE — mux reads
+    /// extents in order, so a duplicate would mux the A/V twice and inflate
+    /// size_bytes (bluray.rs: `first_ref = seen_clips.insert(...)` gates
+    /// both `total_size +=` and the `extents.push`). Per-PlayItem Clip
+    /// entries are still recorded for both.
+    #[test]
+    fn parse_playlist_dedups_repeated_clip_extents_and_size() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 1000, 4000, 5000)]);
+        let mpls = build_mpls(
+            &[
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: 0,
+                    out_time: 60 * 45000,
+                },
+                PiSpec {
+                    clip_id: *b"00001", // SAME clip — second reference
+                    in_time: 60 * 45000,
+                    out_time: 120 * 45000,
+                },
+            ],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        // Extent and size counted ONCE despite two PlayItems.
+        assert_eq!(
+            t.extents.len(),
+            1,
+            "repeated clip must not duplicate extent"
+        );
+        assert_eq!(
+            t.size_bytes,
+            4000 * 192,
+            "size counted once per unique clip"
+        );
+        // But BOTH PlayItems are recorded as Clip entries (differing times).
+        assert_eq!(t.clips.len(), 2, "each PlayItem still gets a Clip entry");
+        assert_eq!(t.clips[0].clip_id, "00001");
+        assert_eq!(t.clips[1].clip_id, "00001");
+    }
+
+    /// Distinct clips each contribute their own extent and bytes, in
+    /// PlayItem order (mux relies on extent order).
+    #[test]
+    fn parse_playlist_distinct_clips_accumulate_in_order() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(
+            &mut disc,
+            &[("00001", 1000, 4000, 5000), ("00002", 500, 2000, 9000)],
+        );
+        let mpls = build_mpls(
+            &[
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: 0,
+                    out_time: 60 * 45000,
+                },
+                PiSpec {
+                    clip_id: *b"00002",
+                    in_time: 0,
+                    out_time: 30 * 45000,
+                },
+            ],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(t.extents.len(), 2);
+        assert_eq!(t.extents[0].start_lba, PART_START + 5000);
+        assert_eq!(t.extents[1].start_lba, PART_START + 9000);
+        assert_eq!(t.size_bytes, (4000 + 2000) * 192);
+    }
+
+    /// A clip whose .clpi is missing contributes NO size and NO extent
+    /// (bluray.rs only fetches extents inside the `if let Ok(clpi_data)`
+    /// + `if let Ok(clip_info)` blocks), but the Clip entry is still
+    /// recorded with packet count 0. Never panics on the missing read.
+    #[test]
+    fn parse_playlist_missing_clpi_yields_no_extent_no_size() {
+        let mut disc = MemDisc::new();
+        // STREAM has the m2ts but CLIPINF is empty for this clip.
+        let udf = make_bdmv_fs(&mut disc, &[]); // no clips wired
+        // Re-lay a STREAM-only tree: put an m2ts but no clpi.
+        let udf = {
+            let _ = udf;
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![
+                    DirSpec {
+                        name: "STREAM".to_string(),
+                        icb_lba: 22,
+                        dir_data_lba: 23,
+                        files: vec![file("00009.m2ts", 100, 5000, 1000 * 2048, true)],
+                        subdirs: vec![],
+                    },
+                    DirSpec {
+                        name: "CLIPINF".to_string(),
+                        icb_lba: 24,
+                        dir_data_lba: 25,
+                        files: Vec::new(), // no .clpi
+                        subdirs: vec![],
+                    },
+                ],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            let mut d2 = MemDisc::new();
+            build_udf_skeleton(&mut d2, 10);
+            lay_dir(&mut d2, &root);
+            disc = d2;
+            udf::read_filesystem(&mut disc).expect("fs")
+        };
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00009",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00009.mpls", &mpls).expect("title");
+        assert_eq!(t.size_bytes, 0, "no clpi → no size contribution");
+        assert!(t.extents.is_empty(), "no clpi → no extent fetched");
+        assert_eq!(t.clips.len(), 1);
+        assert_eq!(t.clips[0].source_packets, 0);
+    }
+
+    /// `file_extents` filters extents with `lba == 0` or `sectors == 0`
+    /// (bluray.rs: `if sectors > 0 && lba > 0`). A clip whose data lands at
+    /// partition-relative LBA 0 would produce abs LBA == PART_START (> 0),
+    /// so to exercise the lba==0 guard we'd need partition_start 0; instead
+    /// verify a zero-length declared file produces no extent. A 0-byte
+    /// m2ts → sectors == 0 → dropped.
+    #[test]
+    fn parse_playlist_zero_length_extent_is_filtered() {
+        let mut disc = MemDisc::new();
+        // m2ts declared 0 bytes → file_extents sectors = div_ceil(0,2048)=0.
+        let udf = {
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![
+                    DirSpec {
+                        name: "STREAM".to_string(),
+                        icb_lba: 22,
+                        dir_data_lba: 23,
+                        files: vec![file("00001.m2ts", 100, 5000, 0, true)],
+                        subdirs: vec![],
+                    },
+                    DirSpec {
+                        name: "CLIPINF".to_string(),
+                        icb_lba: 24,
+                        dir_data_lba: 25,
+                        files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+                        subdirs: vec![],
+                    },
+                ],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            udf::read_filesystem(&mut disc).expect("fs")
+        };
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        // size still counted (from clpi packets) but the empty extent dropped.
+        assert_eq!(t.size_bytes, 4000 * 192);
+        assert!(t.extents.is_empty(), "zero-sector extent must be filtered");
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: STN stream mapping
+    // ---------------------------------------------------------------
+
+    /// stream_type 1 video (HEVC 0x24) → Stream::Video with the parsed PID
+    /// and codec. coding_type 0x24 maps to HEVC (Codec::from_coding_type).
+    #[test]
+    fn parse_playlist_maps_video_stream() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se_video(0x1011, 0x24)],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let videos: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Video(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].pid, 0x1011);
+        assert_eq!(videos[0].codec, Codec::Hevc);
+    }
+
+    /// A PGS coding_type (0x90) sitting in the AUDIO STN slot is a
+    /// misaligned-stream guard case: bluray.rs routes it to Subtitle, not
+    /// Audio (`if matches!(codec, Codec::Pgs)`). Wrong-title regression
+    /// guard: ensures audio slot data never silently becomes a fake audio
+    /// track when it is really PGS.
+    #[test]
+    fn parse_playlist_pgs_in_audio_slot_becomes_subtitle() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            // 1 audio entry, but its coding_type is PGS (0x90).
+            (0, 1, 0, 0, 0, 0, 0, 0),
+            &[se_pg(0x1100, 0x90, b"eng")],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert!(
+            t.streams.iter().all(|s| !matches!(s, Stream::Audio(_))),
+            "PGS in audio slot must NOT become an audio stream"
+        );
+        assert!(
+            t.streams
+                .iter()
+                .any(|s| matches!(s, Stream::Subtitle(sub) if sub.codec == Codec::Pgs)),
+            "PGS in audio slot must become a PGS subtitle"
+        );
+    }
+
+    /// A real audio entry (AC-3 0x81) in the audio slot → Stream::Audio.
+    #[test]
+    fn parse_playlist_maps_audio_stream() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 1, 0, 0, 0, 0, 0, 0),
+            &[se_audio(0x1100, 0x81, b"eng")],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let audios: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(audios.len(), 1);
+        assert_eq!(audios[0].codec, Codec::Ac3);
+        assert_eq!(audios[0].language, "eng");
+    }
+
+    /// stream_type 3 PG (PGS 0x90) → Stream::Subtitle with language.
+    #[test]
+    fn parse_playlist_maps_pg_subtitle() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 1, 0, 0, 0, 0, 0),
+            &[se_pg(0x1200, 0x90, b"fra")],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        let subs: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(sub) => Some(sub),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].codec, Codec::Pgs);
+        assert_eq!(subs[0].language, "fra");
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: chapters
+    // ---------------------------------------------------------------
+
+    /// Only mark_type 1 (entry-mark) becomes a chapter; type 2 (link
+    /// point) and type 0 (reserved) are dropped (bluray.rs filter
+    /// `m.mark_type == 1`).
+    #[test]
+    fn parse_playlist_only_entry_marks_become_chapters() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 120 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[
+                MarkSpec {
+                    mark_type: 1,
+                    play_item_ref: 0,
+                    timestamp: 0,
+                },
+                MarkSpec {
+                    mark_type: 2,
+                    play_item_ref: 0,
+                    timestamp: 30 * 45000,
+                }, // link → drop
+                MarkSpec {
+                    mark_type: 1,
+                    play_item_ref: 0,
+                    timestamp: 60 * 45000,
+                },
+                MarkSpec {
+                    mark_type: 0,
+                    play_item_ref: 0,
+                    timestamp: 90 * 45000,
+                }, // reserved → drop
+            ],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(
+            t.chapters.len(),
+            2,
+            "only the two type-1 marks are chapters"
+        );
+    }
+
+    /// In a multi-PlayItem playlist, a mark referencing PlayItem 1 is
+    /// placed at (sum of preceding PlayItem durations) + (mark offset
+    /// within its own PlayItem). Using play_items[0].in_time for every
+    /// mark would misplace it (bluray.rs `preceding + within`). PI0 = 60s,
+    /// mark in PI1 at its in_time → chapter at exactly 60 s.
+    #[test]
+    fn parse_playlist_chapter_time_accounts_for_preceding_play_items() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let pi1_in = 10 * 45000u32;
+        let mpls = build_mpls(
+            &[
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: 0,
+                    out_time: 60 * 45000, // PI0 lasts 60 s
+                },
+                PiSpec {
+                    clip_id: *b"00001",
+                    in_time: pi1_in,
+                    out_time: pi1_in + 60 * 45000,
+                },
+            ],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[MarkSpec {
+                mark_type: 1,
+                play_item_ref: 1,
+                timestamp: pi1_in, // at the very start of PI1
+            }],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(t.chapters.len(), 1);
+        // preceding (PI0 = 60s) + within (timestamp - pi1.in_time = 0) = 60s.
+        assert!(
+            (t.chapters[0].time_secs - 60.0).abs() < 1e-6,
+            "chapter must sit at 60s, got {}",
+            t.chapters[0].time_secs
+        );
+    }
+
+    /// A mark whose timestamp precedes its PlayItem's in_time would yield a
+    /// negative within-offset; bluray.rs clamps the chapter to 0.0 (`if
+    /// time_secs < 0.0 { 0.0 }`). Never emits a negative chapter time.
+    #[test]
+    fn parse_playlist_negative_chapter_time_clamped_to_zero() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 50 * 45000,
+                out_time: 110 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[MarkSpec {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 0, // before in_time → would be negative
+            }],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert_eq!(t.chapters.len(), 1);
+        assert_eq!(t.chapters[0].time_secs, 0.0);
+    }
+
+    /// A mark referencing a non-existent PlayItem index is dropped via the
+    /// `?` on `play_items.get(pi_idx)` — must not panic or index OOB.
+    #[test]
+    fn parse_playlist_mark_with_bad_play_item_ref_dropped() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[MarkSpec {
+                mark_type: 1,
+                play_item_ref: 99, // no such PlayItem
+                timestamp: 0,
+            }],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "00001.mpls", &mpls).expect("title");
+        assert!(
+            t.chapters.is_empty(),
+            "out-of-range mark ref must be dropped"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: playlist id parsing
+    // ---------------------------------------------------------------
+
+    /// playlist_id is the numeric stem of the filename with the .mpls
+    /// suffix stripped case-insensitively (bluray.rs `playlist_num`).
+    #[test]
+    fn parse_playlist_id_strips_suffix_case_insensitive() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        // Uppercase suffix must still parse the numeric stem.
+        let t = Disc::parse_playlist(&mut disc, &udf, "00800.MPLS", &mpls).expect("title");
+        assert_eq!(t.playlist_id, 800);
+        assert_eq!(
+            t.playlist, "00800.MPLS",
+            "playlist field keeps original name"
+        );
+    }
+
+    /// A non-numeric stem falls back to playlist_id 0 (`parse::<u16>()
+    /// .unwrap_or(0)`), never panics.
+    #[test]
+    fn parse_playlist_id_non_numeric_defaults_zero() {
+        let mut disc = MemDisc::new();
+        let udf = make_bdmv_fs(&mut disc, &[("00001", 100, 400, 5000)]);
+        let mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 60 * 45000,
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let t = Disc::parse_playlist(&mut disc, &udf, "MENU.mpls", &mpls).expect("title");
+        assert_eq!(t.playlist_id, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: scan_bluray_titles
+    // ---------------------------------------------------------------
+
+    /// scan_bluray_titles enumerates BDMV/PLAYLIST/*.mpls and keeps only
+    /// playlists that parse to a >= 30s title. A short one is dropped.
+    #[test]
+    fn scan_bluray_titles_keeps_long_drops_short() {
+        let mut disc = MemDisc::new();
+        // Build full tree with PLAYLIST holding two .mpls + STREAM/CLIPINF.
+        let long_mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 7200 * 45000, // 2 h
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        let short_mpls = build_mpls(
+            &[PiSpec {
+                clip_id: *b"00001",
+                in_time: 0,
+                out_time: 5 * 45000, // 5 s menu
+            }],
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            &[],
+            &[],
+        );
+        // m2ts (Long-AD) + clpi for clip 00001.
+        let stream = DirSpec {
+            name: "STREAM".to_string(),
+            icb_lba: 22,
+            dir_data_lba: 23,
+            files: vec![file("00001.m2ts", 100, 5000, 1000 * 2048, true)],
+            subdirs: vec![],
+        };
+        let clipinf = DirSpec {
+            name: "CLIPINF".to_string(),
+            icb_lba: 24,
+            dir_data_lba: 25,
+            files: vec![file_with("00001.clpi", 102, 8000, build_clpi(4000), false)],
+            subdirs: vec![],
+        };
+        let playlist = DirSpec {
+            name: "PLAYLIST".to_string(),
+            icb_lba: 26,
+            dir_data_lba: 27,
+            files: vec![
+                file_with("00800.mpls", 104, 30000, long_mpls, false),
+                file_with("00801.mpls", 110, 40000, short_mpls, false),
+            ],
+            subdirs: vec![],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![stream, clipinf, playlist],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_bluray_titles(&mut disc, &udf);
+        assert_eq!(titles.len(), 1, "only the 2h playlist should survive");
+        assert_eq!(titles[0].playlist_id, 800);
+    }
+
+    /// With no PLAYLIST directory, scan_bluray_titles returns an empty
+    /// vec (the `find_dir` is None) — never panics.
+    #[test]
+    fn scan_bluray_titles_no_playlist_dir_is_empty() {
+        let mut disc = MemDisc::new();
+        let udf = make_min_fs(&mut disc); // BDMV exists, no PLAYLIST
+        assert!(Disc::scan_bluray_titles(&mut disc, &udf).is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Tests: read_meta_title
+    // ---------------------------------------------------------------
+
+    /// read_meta_title extracts <di:name> from BDMV/META/DL/*eng*.xml and
+    /// prefers the English file (bluray.rs `eng.or_else(first)`).
+    #[test]
+    fn read_meta_title_extracts_english_di_name() {
+        let mut disc = MemDisc::new();
+        let xml = b"<x><di:name>My Movie</di:name></x>".to_vec();
+        let dl = DirSpec {
+            name: "DL".to_string(),
+            icb_lba: 30,
+            dir_data_lba: 31,
+            files: vec![file_with("bdmt_eng.xml", 104, 50000, xml, false)],
+            subdirs: vec![],
+        };
+        let meta = DirSpec {
+            name: "META".to_string(),
+            icb_lba: 28,
+            dir_data_lba: 29,
+            files: Vec::new(),
+            subdirs: vec![dl],
+        };
+        let bdmv = DirSpec {
+            name: "BDMV".to_string(),
+            icb_lba: 20,
+            dir_data_lba: 21,
+            files: Vec::new(),
+            subdirs: vec![meta],
+        };
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![bdmv],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::read_meta_title(&mut disc, &udf),
+            Some("My Movie".to_string())
+        );
+    }
+
+    /// The placeholder title "Blu-ray" and empty titles are rejected
+    /// (bluray.rs `!title.is_empty() && title != "Blu-ray"`).
+    #[test]
+    fn read_meta_title_rejects_placeholder_and_empty() {
+        for body in ["<di:name>Blu-ray</di:name>", "<di:name>   </di:name>"] {
+            let mut disc = MemDisc::new();
+            let dl = DirSpec {
+                name: "DL".to_string(),
+                icb_lba: 30,
+                dir_data_lba: 31,
+                files: vec![file_with(
+                    "bdmt_eng.xml",
+                    104,
+                    50000,
+                    body.as_bytes().to_vec(),
+                    false,
+                )],
+                subdirs: vec![],
+            };
+            let meta = DirSpec {
+                name: "META".to_string(),
+                icb_lba: 28,
+                dir_data_lba: 29,
+                files: Vec::new(),
+                subdirs: vec![dl],
+            };
+            let bdmv = DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![meta],
+            };
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![bdmv],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            let udf = udf::read_filesystem(&mut disc).expect("fs");
+            assert_eq!(
+                Disc::read_meta_title(&mut disc, &udf),
+                None,
+                "placeholder/empty title must be rejected for body {body:?}"
+            );
+        }
+    }
+
+    /// No META directory → None.
+    #[test]
+    fn read_meta_title_no_meta_dir_is_none() {
+        let mut disc = MemDisc::new();
+        let udf = make_min_fs(&mut disc);
+        assert_eq!(Disc::read_meta_title(&mut disc, &udf), None);
+    }
+}

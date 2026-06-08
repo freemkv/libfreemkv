@@ -410,4 +410,281 @@ mod tests {
         assert!(has_trak, "moov missing trak");
         assert!(has_mvex, "moov missing mvex");
     }
+
+    // ============================================================
+    // ISO/IEC 14496-12 box-tree structural invariants
+    //
+    // Every box is [size:u32-BE][type:4][body]. `size` covers the full
+    // box including the 8-byte header. The init segment must be a clean
+    // sequence of well-sized boxes — a wrong size silently desyncs every
+    // ISO BMFF / DASH parser. These tests walk the tree byte-exactly
+    // rather than scanning for fourCCs.
+    // ============================================================
+
+    /// Walk a flat sequence of top-level boxes, returning
+    /// (type, box_start, box_total_size). Asserts each declared size lands
+    /// exactly on a box boundary (no overlap, no gap, no overrun).
+    fn walk_boxes(buf: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= buf.len() {
+            let (size, bt) = read_box_header(&buf[pos..]);
+            let size = size as usize;
+            assert!(size >= 8, "box {bt:?} size {size} < 8-byte header");
+            assert!(
+                pos + size <= buf.len(),
+                "box {bt:?} at {pos} size {size} overruns buffer {}",
+                buf.len()
+            );
+            out.push((bt, pos, size));
+            pos += size;
+        }
+        assert_eq!(pos, buf.len(), "boxes did not tile the buffer exactly");
+        out
+    }
+
+    /// Find the immediate child box of the given type within a container's
+    /// payload (the bytes after the 8-byte header). Returns the child's full
+    /// box slice. Recurses one level only.
+    fn child<'a>(container_payload: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+        let mut pos = 0;
+        while pos + 8 <= container_payload.len() {
+            let (size, bt) = read_box_header(&container_payload[pos..]);
+            let size = size as usize;
+            if size < 8 || pos + size > container_payload.len() {
+                return None;
+            }
+            if &bt == want {
+                return Some(&container_payload[pos..pos + size]);
+            }
+            pos += size;
+        }
+        None
+    }
+
+    fn init_segment() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut mux = Fmp4Mux::new(&mut buf);
+        mux.write_init_segment().unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+        buf
+    }
+
+    #[test]
+    fn init_segment_box_sizes_tile_exactly() {
+        // Top level must be exactly [ftyp][moov] with no slack.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let types: Vec<[u8; 4]> = boxes.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(types, vec![*b"ftyp", *b"moov"]);
+    }
+
+    #[test]
+    fn ftyp_major_brand_and_compatible_brands() {
+        // ISO/IEC 14496-12 §4.3: ftyp = major_brand(4) + minor_version(4) +
+        // compatible_brands[]. The stub declares iso6 / minor 1 / {iso6, dash,
+        // msdh, hvc1}. A regression that dropped a brand or mis-ordered the
+        // header would break DASH brand negotiation.
+        let buf = init_segment();
+        let (ftyp_size, _) = read_box_header(&buf);
+        let body = &buf[8..ftyp_size as usize];
+        assert_eq!(&body[0..4], b"iso6", "major_brand");
+        assert_eq!(
+            u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+            1,
+            "minor_version"
+        );
+        // Remaining bytes are 4-byte compatible brands.
+        let brands = &body[8..];
+        assert_eq!(brands.len() % 4, 0, "compatible_brands must be 4-byte each");
+        let set: Vec<&[u8]> = brands.chunks(4).collect();
+        assert!(set.contains(&&b"iso6"[..]));
+        assert!(set.contains(&&b"dash"[..]));
+        assert!(set.contains(&&b"msdh"[..]));
+        assert!(set.contains(&&b"hvc1"[..]), "HEVC brand required for hvc1");
+    }
+
+    #[test]
+    fn moov_child_order_is_mvhd_trak_mvex() {
+        // §8.1: moov contains mvhd then track(s) then mvex (for fragmented).
+        // Order matters for some strict parsers; assert the exact child
+        // sequence rather than mere presence.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let children = walk_boxes(moov_payload);
+        let types: Vec<[u8; 4]> = children.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(types, vec![*b"mvhd", *b"trak", *b"mvex"]);
+    }
+
+    #[test]
+    fn mvhd_timescale_and_next_track_id() {
+        // §8.2.2 mvhd (version 0): after 4-byte version+flags, the fields are
+        // creation(4) modification(4) timescale(4) duration(4) ... and the box
+        // ends with next_track_ID(4). The stub uses 90000 Hz timescale and
+        // next_track_ID = 2 (track 1 reserved for video).
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let mvhd = child(moov_payload, b"mvhd").expect("mvhd present");
+        let body = &mvhd[8..]; // skip box header
+        assert_eq!(&body[0..4], &[0, 0, 0, 0], "mvhd version 0, flags 0");
+        // timescale is at body offset 12 (after version+flags, creation, mod).
+        let timescale = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+        assert_eq!(timescale, MOVIE_TIMESCALE);
+        assert_eq!(timescale, 90_000, "spec-fixed default timescale");
+        // next_track_ID is the last 4 bytes of the body.
+        let n = body.len();
+        let next_id = u32::from_be_bytes([body[n - 4], body[n - 3], body[n - 2], body[n - 1]]);
+        assert_eq!(next_id, 2, "next_track_ID must exceed the sole track ID");
+    }
+
+    #[test]
+    fn trex_references_video_track_id() {
+        // §8.8.3 trex: track_ID must match the trak's track_ID (1) so the
+        // fragment defaults bind to the right track. A mismatch would make
+        // every future moof default-sample lookup target a non-existent track.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let mvex = child(moov_payload, b"mvex").expect("mvex");
+        let trex = child(&mvex[8..], b"trex").expect("trex");
+        let body = &trex[8..];
+        // version+flags(4), then track_ID(4).
+        let track_id = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        assert_eq!(track_id, VIDEO_TRACK_ID);
+        assert_eq!(track_id, 1);
+        // default_sample_description_index(4) must be 1 (points at stsd entry 1).
+        let dsdi = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+        assert_eq!(dsdi, 1);
+    }
+
+    #[test]
+    fn tkhd_track_id_matches_trex() {
+        // §8.3.2 tkhd: the track_ID field (after version+flags, creation,
+        // modification) must equal VIDEO_TRACK_ID and the trex track_ID, or the
+        // fragment defaults never bind. tkhd is moov.trak.tkhd.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let trak = child(moov_payload, b"trak").expect("trak");
+        let tkhd = child(&trak[8..], b"tkhd").expect("tkhd");
+        let body = &tkhd[8..];
+        // version(1)+flags(3), creation(4), modification(4), then track_ID(4).
+        let track_id = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+        assert_eq!(track_id, VIDEO_TRACK_ID, "tkhd track_ID must match trex");
+        // flags = 0x000007 (enabled | in_movie | in_preview), §8.3.1.
+        assert_eq!(&body[0..4], &[0, 0, 0, 7]);
+    }
+
+    #[test]
+    fn stbl_present_with_empty_sample_tables() {
+        // The fragmented init segment carries no samples in moov, so stsd has
+        // entry_count 0 and stts/stsc/stsz/stco are all empty. Walk down
+        // moov.trak.mdia.minf.stbl and assert the stsd entry_count is 0
+        // (current stub state). If stsd ever gains an hvc1 entry, trex's
+        // default_sample_description_index=1 becomes meaningful — this test
+        // documents the coupling the source comment calls out.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let trak = child(moov_payload, b"trak").expect("trak");
+        let mdia = child(&trak[8..], b"mdia").expect("mdia");
+        let minf = child(&mdia[8..], b"minf").expect("minf");
+        let stbl = child(&minf[8..], b"stbl").expect("stbl");
+        let stsd = child(&stbl[8..], b"stsd").expect("stsd");
+        let body = &stsd[8..];
+        // version+flags(4), entry_count(4).
+        let entry_count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        assert_eq!(entry_count, 0, "stub stsd has no sample entries yet");
+        // All of stts/stsc/stsz/stco must be present children of stbl.
+        for fourcc in [b"stts", b"stsc", b"stsz", b"stco"] {
+            assert!(
+                child(&stbl[8..], fourcc).is_some(),
+                "stbl missing {:?}",
+                std::str::from_utf8(fourcc).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn hdlr_declares_video_handler() {
+        // §8.4.3 hdlr: handler_type must be 'vide' for a video track, else
+        // players won't route the track to the video decoder. Path:
+        // moov.trak.mdia.hdlr; handler_type is at body offset 8.
+        let buf = init_segment();
+        let boxes = walk_boxes(&buf);
+        let (_, moov_start, moov_size) = boxes.iter().find(|(t, _, _)| t == b"moov").unwrap();
+        let moov_payload = &buf[moov_start + 8..moov_start + moov_size];
+        let trak = child(moov_payload, b"trak").expect("trak");
+        let mdia = child(&trak[8..], b"mdia").expect("mdia");
+        let hdlr = child(&mdia[8..], b"hdlr").expect("hdlr");
+        let body = &hdlr[8..];
+        // version+flags(4), pre_defined(4), handler_type(4).
+        assert_eq!(&body[8..12], b"vide", "handler_type must be 'vide'");
+    }
+
+    #[test]
+    fn wrap_box_size_includes_header() {
+        // §4.2: a box's size field counts the full box including the 8-byte
+        // header. A body of N bytes yields size N+8 and the type at offset 4.
+        let body = [0xAAu8; 13];
+        let boxed = wrap_box(b"test", &body);
+        assert_eq!(boxed.len(), 13 + 8);
+        let (size, bt) = read_box_header(&boxed);
+        assert_eq!(size as usize, 13 + 8, "size must include the 8-byte header");
+        assert_eq!(&bt, b"test");
+        assert_eq!(&boxed[8..], &body);
+        // Empty body → just the 8-byte header.
+        let empty = wrap_box(b"free", &[]);
+        assert_eq!(empty.len(), 8);
+        assert_eq!(
+            u32::from_be_bytes([empty[0], empty[1], empty[2], empty[3]]),
+            8
+        );
+    }
+
+    #[test]
+    fn write_init_segment_is_idempotent() {
+        // The doc contract says a second write_init_segment is a no-op. A
+        // regression that re-emitted ftyp+moov would produce two init segments
+        // and corrupt the stream.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut mux = Fmp4Mux::new(&mut buf);
+        mux.write_init_segment().unwrap();
+        mux.write_init_segment().unwrap(); // second call must be a no-op
+        mux.finish().unwrap();
+        drop(mux);
+        // Exactly one ftyp + one moov.
+        let boxes = walk_boxes(&buf);
+        let ftyp_count = boxes.iter().filter(|(t, _, _)| t == b"ftyp").count();
+        let moov_count = boxes.iter().filter(|(t, _, _)| t == b"moov").count();
+        assert_eq!(ftyp_count, 1, "second write_init_segment must be a no-op");
+        assert_eq!(moov_count, 1);
+    }
+
+    #[test]
+    fn write_video_after_init_still_unimplemented_and_no_media() {
+        // Even after the init segment is already emitted, write_video must keep
+        // returning Unimplemented and must not append any media bytes (no
+        // moof/mdat), so a caller can't be fooled into thinking the second call
+        // succeeded.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut mux = Fmp4Mux::new(&mut buf);
+        mux.write_init_segment().unwrap();
+        let err = mux.write_video(0, true, &[0u8; 8]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        mux.finish().unwrap();
+        drop(mux);
+        // Still only ftyp + moov.
+        let boxes = walk_boxes(&buf);
+        let types: Vec<[u8; 4]> = boxes.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(types, vec![*b"ftyp", *b"moov"]);
+    }
 }

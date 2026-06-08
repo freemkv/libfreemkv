@@ -779,4 +779,268 @@ mod tests {
         };
         (recs, dk, kp, kmp)
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Hardening additions
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── walk_mkb framing: BE24 length incl. header, end markers ────────────
+
+    #[test]
+    fn walk_mkb_reports_offsets_and_be24_lengths() {
+        // Two records; the walker must report each record's byte offset and
+        // its full length (header + body). rec_len is the 3-byte BE field at
+        // bytes 1..4, and INCLUDES the 4-byte header.
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB]; // len 6 (2-byte body)
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 1, 2, 3, 4]); // len 8
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].offset, 0);
+        assert_eq!(recs[0].rec_len, 6);
+        assert_eq!(recs[0].body, vec![0xAA, 0xBB]);
+        assert_eq!(recs[1].offset, 6);
+        assert_eq!(recs[1].rec_len, 8);
+        assert_eq!(recs[1].body, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn walk_mkb_be24_high_byte_is_honored() {
+        // A record longer than 255 bytes needs the high BE24 byte. Build a
+        // 0x10 record of total length 0x000110 (272) and confirm the body is
+        // 268 bytes (a parser that read only the low byte would see len 0x10).
+        let total = 0x0110usize; // 272
+        let mut mkb = vec![0x10, 0x00, 0x01, 0x10];
+        mkb.resize(total, 0xAB);
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].rec_len, total);
+        assert_eq!(recs[0].body.len(), total - 4);
+    }
+
+    #[test]
+    fn walk_mkb_stops_at_type0_len0_end_marker() {
+        // A (type=0, len=0) record ends the walk; trailing bytes after it are
+        // not parsed.
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB];
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // end marker
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 9, 9, 9, 9]); // ignored
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].rec_type, 0x10);
+    }
+
+    #[test]
+    fn walk_mkb_stops_on_overrun_record() {
+        // rec_len running past the buffer ends the walk after the records that
+        // fit (no OOB, no partial body past the end).
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB];
+        mkb.extend_from_slice(&[0x05, 0x00, 0xFF, 0xFF]); // claims 65535 bytes
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 1, "overrun record must be dropped");
+    }
+
+    #[test]
+    fn walk_mkb_stops_on_sub_4_length() {
+        // A non-zero type with rec_len < 4 (and not the 0/0 marker) breaks the
+        // walk — otherwise pos would not advance (infinite loop guard).
+        let mkb = vec![0x10, 0x00, 0x00, 0x02, 0xAA];
+        assert!(walk_mkb(&mkb).is_empty());
+    }
+
+    #[test]
+    fn walk_mkb_handles_trailing_partial_header() {
+        // Fewer than 4 bytes left → loop condition `pos + 4 <= len` stops.
+        let mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB, 0x05, 0x00]; // 2 trailing
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 1);
+    }
+
+    // ── Record selectors ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_variant_mkb_true_for_0x82_alone_and_0x83_alone() {
+        // Either record type alone flags the MKB as variant.
+        let only82 = walk_mkb(&{
+            let mut m = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 0];
+            m.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]);
+            m.extend_from_slice(&[0xEE; 16]);
+            m
+        });
+        assert!(is_variant_mkb(&only82));
+        let only83 = walk_mkb(&{
+            let mut m = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 0];
+            m.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
+            m.extend_from_slice(&[0x55; 16]);
+            m
+        });
+        assert!(is_variant_mkb(&only83));
+    }
+
+    #[test]
+    fn variant_nonce_requires_16_byte_body() {
+        // A 0x83 record with < 16-byte body → None (no panic on the copy).
+        let recs = walk_mkb(&{
+            let mut m = vec![0x83, 0x00, 0x00, 0x0C]; // 8-byte body
+            m.extend_from_slice(&[0x11; 8]);
+            m
+        });
+        assert_eq!(variant_nonce(&recs), None);
+    }
+
+    #[test]
+    fn variant_key_data_requires_nonempty_multiple_of_16() {
+        // A 0x82 body that is NOT a multiple of 16 is rejected by
+        // variant_key_data (it needs whole 16-byte VKD slots).
+        let recs = walk_mkb(&{
+            let mut m = vec![0x82, 0x00, 0x00, 0x0E]; // 10-byte body (not %16)
+            m.extend_from_slice(&[0x22; 10]);
+            m
+        });
+        assert_eq!(variant_key_data(&recs), None);
+        // variant_data_record returns the body regardless of length.
+        assert_eq!(variant_data_record(&recs), Some(&[0x22u8; 10][..]));
+    }
+
+    // ── derive_media_key_variant: missing-record classification ────────────
+
+    #[test]
+    fn chain_reports_processing_key_unavailable_with_no_dks() {
+        // A complete variant MKB but an empty device-key pool → no uv covered
+        // → ProcessingKeyUnavailable (the walk_processing_key None branch).
+        let (recs, _dk, _, _) = synthetic_variant_setup(0x00);
+        let err = derive_media_key_variant(&recs, &[], &[0xAA; 16], &[0u8; 16])
+            .expect_err("no DK → ProcessingKeyUnavailable");
+        assert_eq!(err, MediaKeyVariantError::ProcessingKeyUnavailable);
+    }
+
+    #[test]
+    fn chain_reports_mkb_incomplete_when_nonce_missing() {
+        // Build a variant MKB (has 0x82 so is_variant true, and a DK can walk
+        // it) but WITHOUT a 0x83 nonce record → MkbIncomplete at the
+        // variant_nonce `?`.
+        // Start from the full setup, then rebuild the byte stream dropping
+        // the 0x83 record.
+        let (recs, dk, _, _) = synthetic_variant_setup(0x00);
+        // Reconstruct bytes without the 0x83 record.
+        let mut mkb = Vec::new();
+        for r in &recs {
+            if r.rec_type == 0x83 {
+                continue;
+            }
+            mkb.push(r.rec_type);
+            mkb.push(((r.rec_len >> 16) & 0xFF) as u8);
+            mkb.push(((r.rec_len >> 8) & 0xFF) as u8);
+            mkb.push((r.rec_len & 0xFF) as u8);
+            mkb.extend_from_slice(&r.body);
+        }
+        let recs2 = walk_mkb(&mkb);
+        assert!(is_variant_mkb(&recs2), "still variant via 0x82");
+        let err = derive_media_key_variant(&recs2, &[dk], &[0xAA; 16], &[0u8; 16])
+            .expect_err("missing nonce → MkbIncomplete");
+        assert_eq!(err, MediaKeyVariantError::MkbIncomplete);
+    }
+
+    // ── walk_processing_key: skips out-of-range u_mask_shift ───────────────
+
+    #[test]
+    fn walk_processing_key_skips_shift_32_to_63_without_panic() {
+        // A subset-difference u_mask_shift in 0x20..=0x3F passes the 0xC0
+        // revoke check but is out of range for a u32 shift. The walk must skip
+        // the slot (continue) and not panic / not match a wrong uv. With only
+        // that one bad slot, no match → None.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        // 0x04: u_mask_shift=0x20 (32), uv=2.
+        mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
+        mkb.extend_from_slice(&[0x20, 0x00, 0x00, 0x00, 0x02]);
+        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCD; 16]);
+        let recs = walk_mkb(&mkb);
+        let dk = DeviceKey {
+            key: [0x11; 16],
+            node: 4,
+            uv: 2,
+            u_mask_shift: 3,
+        };
+        assert!(
+            walk_processing_key(&recs, &[dk]).is_none(),
+            "out-of-range shift must be skipped, yielding no match"
+        );
+    }
+
+    #[test]
+    fn walk_processing_key_skips_uv_zero() {
+        // A uv == 0 slot is skipped (`if uv == 0 { continue }`). With only a
+        // zero-uv slot present, no DK can match → None.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
+        mkb.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x00]); // uv = 0
+        mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCD; 16]);
+        let recs = walk_mkb(&mkb);
+        let dk = DeviceKey {
+            key: [0x11; 16],
+            node: 4,
+            uv: 2,
+            u_mask_shift: 3,
+        };
+        assert!(walk_processing_key(&recs, &[dk]).is_none());
+    }
+
+    #[test]
+    fn walk_processing_key_returns_match_on_variant_mkb_without_magic() {
+        // On a variant MKB the per-match VERIFY_MAGIC check does not hold, but
+        // the walk still returns the (Kp, uv) match because variant_present is
+        // true. The synthetic_variant_setup fixture is exactly this case.
+        let (recs, dk, planted_kp, _) = synthetic_variant_setup(0x00);
+        let m = walk_processing_key(&recs, &[dk]).expect("variant MKB yields a match");
+        assert_eq!(m.uv, 2, "matched the planted uv");
+        assert_eq!(
+            m.kp, planted_kp,
+            "Kp equals aesg3_step(dk,1) for the no-op walk"
+        );
+        assert_eq!(m.cvalue_index, 0);
+    }
+
+    #[test]
+    fn aes_g_matches_decrypt_xor_relation() {
+        // AES-G(x1,x2) = AES-128D(x1,x2) XOR x2 — the same form as derive_vuk.
+        // Pin it explicitly so a dropped XOR or an encrypt-instead-of-decrypt
+        // is caught.
+        let x1 = [0x31u8; 16];
+        let x2 = [0x9Fu8; 16];
+        let mut expected = aes_ecb_decrypt(&x1, &x2);
+        for i in 0..16 {
+            expected[i] ^= x2[i];
+        }
+        assert_eq!(aes_g(&x1, &x2), expected);
+    }
+
+    #[test]
+    fn error_codes_are_unique_and_in_7100_range() {
+        // Each MediaKeyVariantError maps to a distinct E71xx code. A
+        // copy-paste collision (two variants sharing a code) would break
+        // operator triage; assert all nine are distinct.
+        use std::collections::HashSet;
+        let cases = [
+            MediaKeyVariantError::NotVariantMkb,
+            MediaKeyVariantError::MkbIncomplete,
+            MediaKeyVariantError::ProcessingKeyUnavailable,
+            MediaKeyVariantError::SoftCorrectionRequired,
+            MediaKeyVariantError::OnlineChallengeRequired,
+            MediaKeyVariantError::KcdNotProvided,
+            MediaKeyVariantError::VariantsTableUnavailable,
+            MediaKeyVariantError::VkdIndexOutOfRange,
+            MediaKeyVariantError::MediaKeyVerifyFailed,
+        ];
+        let codes: HashSet<String> = cases.iter().map(|e| e.to_string()).collect();
+        assert_eq!(codes.len(), cases.len(), "all error codes must be unique");
+    }
 }

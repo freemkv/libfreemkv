@@ -139,3 +139,111 @@ impl crate::pes::Stream for StdioStream {
         self.writer.is_some() || self.meta_parsed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pes::Stream as _;
+
+    fn title_with_codec_privates() -> DiscTitle {
+        use crate::disc::{Codec, Stream, VideoStream};
+        let mut t = DiscTitle::empty();
+        t.playlist = "StdioTitle".into();
+        t.streams.push(Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: crate::disc::Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr: crate::disc::HdrFormat::Hdr10,
+            color_space: crate::disc::ColorSpace::Bt2020,
+            secondary: false,
+            label: String::new(),
+        }));
+        // Index 0 = the video stream's codec init data.
+        t.codec_privates = vec![Some(vec![0xDE, 0xAD, 0xBE, 0xEF])];
+        t
+    }
+
+    /// write() on a read-opened (input) stdio stream must return
+    /// StreamReadOnly WITHOUT touching stdin/stdout — the writer.is_none()
+    /// guard returns before any header logic runs. (Returning Ok would let a
+    /// caller silently discard frames into a read-only stream.)
+    #[test]
+    fn write_on_input_stream_is_read_only_error() {
+        let mut s = StdioStream::input();
+        let frame = crate::pes::PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![1, 2, 3],
+            duration_ns: None,
+        };
+        let err = s.write(&frame).expect_err("write on input must error");
+        // E_STREAM_READ_ONLY (9000) maps to Unsupported.
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// read() on a write-opened (output) stdio stream must return
+    /// StreamWriteOnly. ensure_header_read is a no-op when reader is None,
+    /// so this never blocks on real stdin.
+    #[test]
+    fn read_on_output_stream_is_write_only_error() {
+        let mut s = StdioStream::output(&DiscTitle::empty());
+        let err = s.read().expect_err("read on output must error");
+        // E_STREAM_WRITE_ONLY (9001) maps to Unsupported.
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// The write side has the title up front, so headers_ready() must be
+    /// true immediately — the downstream MKV writer needs this to start
+    /// writing the container header without waiting for a (nonexistent)
+    /// read-side header parse.
+    #[test]
+    fn output_headers_ready_immediately() {
+        let s = StdioStream::output(&DiscTitle::empty());
+        assert!(s.headers_ready(), "write side is always header-ready");
+    }
+
+    /// A fresh read (input) side has NOT parsed any header yet, so
+    /// headers_ready() must be false (meta_parsed=false, writer=None).
+    /// Claiming readiness before the header is parsed would starve the MKV
+    /// writer of codec init data.
+    #[test]
+    fn input_not_header_ready_before_any_read() {
+        let s = StdioStream::input();
+        assert!(
+            !s.headers_ready(),
+            "read side not ready until header parsed"
+        );
+    }
+
+    /// codec_private(track) on the write side returns the title's own
+    /// codec_private for that track (single source of truth = the title).
+    #[test]
+    fn output_codec_private_comes_from_title() {
+        let s = StdioStream::output(&title_with_codec_privates());
+        assert_eq!(
+            s.codec_private(0).as_deref(),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]),
+            "track 0 codec_private must mirror title.codec_privates[0]"
+        );
+        // Out-of-range track → None (no panic, no wrong-track data).
+        assert_eq!(s.codec_private(99), None);
+    }
+
+    /// info() on the write side reflects the supplied title.
+    #[test]
+    fn output_info_reflects_title() {
+        let s = StdioStream::output(&title_with_codec_privates());
+        assert_eq!(s.info().playlist, "StdioTitle");
+    }
+
+    /// A fresh input stream defaults to an empty title until a header is
+    /// parsed — info() must not invent stream metadata.
+    #[test]
+    fn input_default_title_is_empty() {
+        let s = StdioStream::input();
+        assert!(s.info().streams.is_empty());
+        assert_eq!(s.codec_private(0), None);
+    }
+}

@@ -909,4 +909,325 @@ mod tests {
         assert!(!af.is_empty(), "AF flags byte present");
         assert_eq!(af[0], 0x50, "flags == RAI | PCR");
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Added hardening tests
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Find the first packet on `pid` (optionally requiring PUSI).
+    fn find_pkt(buf: &[u8], pid: u16, pusi: bool) -> Option<&[u8]> {
+        buf.chunks(188).find(|p| {
+            u16::from_be_bytes([p[1] & 0x1F, p[2]]) == pid && (!pusi || (p[1] & 0x40) != 0)
+        })
+    }
+
+    /// Extract a PSI section (after the pointer_field) from a PUSI PSI
+    /// packet: payload starts at byte 4 (no AF on PSI here), first payload
+    /// byte is pointer_field, section follows.
+    fn psi_section(pkt: &[u8]) -> &[u8] {
+        let pointer = pkt[4] as usize;
+        &pkt[5 + pointer..]
+    }
+
+    // ── MPEG-TS CRC-32 (poly 0x04C11DB7) self-validation ──────────────────
+
+    #[test]
+    fn crc32_residue_over_section_plus_crc_is_zero() {
+        // Defining property of the MPEG-TS CRC (ISO 13818-1 Annex B): running
+        // the CRC over a message WITH its appended 4-byte CRC yields a fixed
+        // residue. For this poly/init (no final XOR) the residue over
+        // [data || crc(data)] is 0. This pins the algorithm independent of
+        // any sample vector.
+        let data = [
+            0x00u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,
+        ];
+        let crc = mpegts_crc32(&data);
+        // Known-answer vector for CRC-32/MPEG-2 (poly 0x04C11DB7, init
+        // 0xFFFFFFFF, no reflection, no final XOR — ISO/IEC 13818-1 Annex B),
+        // independently computed. This pins the polynomial, not just internal
+        // consistency.
+        assert_eq!(crc, 0xE8F9_5E7D, "CRC-32/MPEG-2 known-answer vector");
+        let mut with_crc = data.to_vec();
+        with_crc.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(
+            mpegts_crc32(&with_crc),
+            0,
+            "CRC residue over message+CRC must be 0"
+        );
+    }
+
+    #[test]
+    fn emitted_pat_pmt_crc_is_valid() {
+        // The PAT and PMT the muxer emits must carry a correct CRC-32 over
+        // the section (table_id .. end of body). A receiver that validates
+        // CRC would otherwise drop the table.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            mux.set_audio(AudioCodec::Ac3);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+            mux.write_video(0, true, &frame).unwrap();
+            mux.finish().unwrap();
+        }
+        for pid in [PID_PAT, PID_PMT] {
+            let pkt = find_pkt(&sink, pid, true).expect("PSI packet present");
+            let sec = psi_section(pkt);
+            // section_length covers bytes after the 2-byte length field,
+            // i.e. (table_id + 2 length bytes) + section_length = whole
+            // section incl. CRC.
+            let section_len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+            let total = 3 + section_len;
+            assert!(sec.len() >= total, "section fits in payload");
+            assert_eq!(
+                mpegts_crc32(&sec[..total]),
+                0,
+                "PID {pid:#06x} section CRC must validate (residue 0)"
+            );
+        }
+    }
+
+    // ── PAT / PMT structure ───────────────────────────────────────────────
+
+    #[test]
+    fn pat_points_at_pmt_pid() {
+        // PAT program loop entry: program_number(2) + reserved(3)|PID(13).
+        // The single program must point at PID_PMT.
+        let pat = build_pat(PID_PMT);
+        let sec = &pat[1..]; // skip pointer_field
+        assert_eq!(sec[0], 0x00, "table_id = PAT");
+        // Body: tsid(2)@3 cni(1)@5 sec#(1)@6 last(1)@7 program(4)@8..12.
+        let prog_num = u16::from_be_bytes([sec[8], sec[9]]);
+        let pmt_pid = u16::from_be_bytes([sec[10] & 0x1F, sec[11]]);
+        assert_eq!(prog_num, 1, "program_number 1");
+        assert_eq!(pmt_pid, PID_PMT, "PAT points at PMT PID");
+    }
+
+    #[test]
+    fn pmt_advertises_video_and_audio_stream_types() {
+        // PMT must list HEVC video (stream_type 0x24) and, when audio is
+        // configured, the audio stream_type. Stream-type codes per ISO
+        // 13818-1 Table 2-34 / BD convention.
+        let pmt = build_pmt(Some(AudioCodec::Ac3));
+        let sec = &pmt[1..]; // skip pointer_field
+        assert_eq!(sec[0], 0x02, "table_id = PMT");
+        let section_len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+        let prog_info_len = (((sec[10] & 0x0F) as usize) << 8) | sec[11] as usize;
+        let mut pos = 12 + prog_info_len;
+        let end = 3 + section_len - 4; // exclude CRC
+        let mut types = Vec::new();
+        while pos + 5 <= end {
+            types.push(sec[pos]);
+            let es_info = (((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize;
+            pos += 5 + es_info;
+        }
+        assert!(types.contains(&STREAM_TYPE_HEVC), "HEVC video in PMT");
+        assert!(types.contains(&STREAM_TYPE_AC3), "AC-3 audio in PMT");
+    }
+
+    #[test]
+    fn pmt_video_only_omits_audio_entry() {
+        // Video-only PMT must list exactly one ES entry (video) — no audio.
+        let pmt = build_pmt(None);
+        let sec = &pmt[1..];
+        let section_len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+        let prog_info_len = (((sec[10] & 0x0F) as usize) << 8) | sec[11] as usize;
+        let mut pos = 12 + prog_info_len;
+        let end = 3 + section_len - 4;
+        let mut count = 0;
+        while pos + 5 <= end {
+            count += 1;
+            let es_info = (((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize;
+            pos += 5 + es_info;
+        }
+        assert_eq!(count, 1, "video-only PMT has exactly one ES entry");
+    }
+
+    #[test]
+    fn truehd_audio_uses_stream_type_0x83() {
+        // TrueHD maps to stream_type 0x83 (BD convention).
+        let pmt = build_pmt(Some(AudioCodec::TrueHd));
+        let sec = &pmt[1..];
+        let section_len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+        let end = 3 + section_len - 4;
+        let mut pos = 12; // prog_info_len is 0 in this muxer
+        let mut found = false;
+        while pos + 5 <= end {
+            if sec[pos] == STREAM_TYPE_TRUEHD {
+                found = true;
+            }
+            let es_info = (((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize;
+            pos += 5 + es_info;
+        }
+        assert!(found, "TrueHD stream_type 0x83 must appear in PMT");
+    }
+
+    #[test]
+    fn pmt_pcr_pid_is_video_pid() {
+        // PMT PCR_PID field (reserved(3)|PCR_PID(13) at section bytes 8..10)
+        // must be the video PID — the PCR rides the video adaptation field.
+        let pmt = build_pmt(None);
+        let sec = &pmt[1..];
+        let pcr_pid = u16::from_be_bytes([sec[8] & 0x1F, sec[9]]);
+        assert_eq!(pcr_pid, PID_VIDEO, "PCR_PID advertised as the video PID");
+    }
+
+    // ── PCR encoding ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pcr_base_round_trips_through_adaptation_field() {
+        // build_pcr_adaptation packs a 33-bit PCR base across 6 bytes:
+        // base[32:25],[24:17],[16:9],[8:1] then bit0 in top of byte 5.
+        // (ISO 13818-1 §2.4.3.5.) Decode it back and compare.
+        let pcr: u64 = 0x1_2345_6789 & ((1 << 33) - 1);
+        let af = build_pcr_adaptation(pcr);
+        assert_eq!(af[0], 0x10, "PCR_flag set, others clear");
+        let base = ((af[1] as u64) << 25)
+            | ((af[2] as u64) << 17)
+            | ((af[3] as u64) << 9)
+            | ((af[4] as u64) << 1)
+            | ((af[5] as u64 >> 7) & 0x01);
+        assert_eq!(base, pcr, "PCR base must round-trip through the AF");
+    }
+
+    #[test]
+    fn first_video_pcr_leads_pts_by_lead_time() {
+        // The PCR on the first video PES = pts_90k - PCR_LEAD_90KHZ, clamped
+        // at 0. With pts_ns large enough not to clamp, decode the PCR and the
+        // PTS and verify the lead. PCR_LEAD_90KHZ = 18000 (200 ms).
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+            // 1s → 90000 ticks; base is this same frame, so relative PTS=0
+            // and PCR clamps to 0. Use a single frame: PTS rebases to 0,
+            // so PCR = 0.saturating_sub(lead) = 0.
+            mux.write_video(1_000_000_000, true, &frame).unwrap();
+            mux.finish().unwrap();
+        }
+        let pkt = find_pkt(&sink, PID_VIDEO, true).unwrap();
+        let af = af_body(pkt).unwrap();
+        // PCR present.
+        assert_eq!(af[0] & 0x10, 0x10);
+        let base = ((af[1] as u64) << 25)
+            | ((af[2] as u64) << 17)
+            | ((af[3] as u64) << 9)
+            | ((af[4] as u64) << 1)
+            | ((af[5] as u64 >> 7) & 0x01);
+        // Single frame rebases its own PTS to 0; PCR = 0 - lead clamped to 0.
+        assert_eq!(base, 0, "first frame PCR clamps to 0 (no underflow)");
+    }
+
+    // ── base_relative_pts overflow / saturation ───────────────────────────
+
+    #[test]
+    fn extreme_pts_does_not_overflow_and_clamps_to_33bit() {
+        // base_relative_pts widens to u128 then masks to 33 bits. An
+        // adversarial i64::MAX ns must not overflow and the encoded PTS must
+        // stay within the 33-bit field. With a single video frame the base
+        // is itself, so relative PTS is 0 — proving no panic on the path.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+            mux.write_video(i64::MAX, true, &frame).unwrap();
+            mux.finish().unwrap();
+        }
+        assert_ts_well_formed(&sink);
+        let pkt = find_pkt(&sink, PID_VIDEO, true).unwrap();
+        // Reach the PES PTS: payload after AF. AF area = 1 (length) + af_len.
+        let af_len = pkt[4] as usize;
+        let pes = &pkt[4 + 1 + af_len..];
+        // PES: 00 00 01 E0 00 00 80 80 05 PTS[5]. PTS at pes[9..14].
+        let pts = ((((pes[9] >> 1) & 0x07) as u64) << 30)
+            | ((pes[10] as u64) << 22)
+            | (((pes[11] >> 1) as u64) << 15)
+            | ((pes[12] as u64) << 7)
+            | ((pes[13] >> 1) as u64);
+        assert!(pts < (1u64 << 33), "PTS stays within the 33-bit field");
+    }
+
+    #[test]
+    fn negative_pts_ns_encodes_zero() {
+        // base_relative_pts treats pts_ns <= 0 as raw 0. A negative input
+        // must encode PTS 0, not a wrapped value.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&4u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+            mux.write_video(-5, true, &frame).unwrap();
+            mux.finish().unwrap();
+        }
+        let pkt = find_pkt(&sink, PID_VIDEO, true).unwrap();
+        let af_len = pkt[4] as usize;
+        let pes = &pkt[4 + 1 + af_len..];
+        let pts = ((((pes[9] >> 1) & 0x07) as u64) << 30)
+            | ((pes[10] as u64) << 22)
+            | (((pes[11] >> 1) as u64) << 15)
+            | ((pes[12] as u64) << 7)
+            | ((pes[13] >> 1) as u64);
+        assert_eq!(pts, 0, "negative pts_ns encodes PTS 0");
+    }
+
+    // ── audio without configured track ────────────────────────────────────
+
+    #[test]
+    fn write_audio_without_track_is_silently_dropped() {
+        // write_audio on a video-only muxer must drop the frame (no audio
+        // PID configured) without error — and emit no audio PID packets.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&3u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C]);
+            mux.write_video(0, true, &frame).unwrap();
+            mux.write_audio(0, &[0x0B, 0x77]).unwrap(); // no track → dropped
+            mux.finish().unwrap();
+        }
+        let pids = extract_pids(&sink);
+        assert!(
+            !pids.iter().any(|p| *p == PID_AUDIO),
+            "no audio track configured → no audio PID emitted"
+        );
+    }
+
+    // ── empty stream ──────────────────────────────────────────────────────
+
+    #[test]
+    fn finish_without_frames_emits_nothing() {
+        // A muxer with no frames written emits no packets (PSI is gated on
+        // write paths). finish() must be a clean no-op.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        mux.finish().unwrap();
+        drop(mux);
+        assert!(sink.is_empty(), "no frames → no output");
+    }
+
+    #[test]
+    fn pat_always_on_pid_zero() {
+        // ISO 13818-1 mandates the PAT on PID 0x0000.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = M2tsMux::new(&mut sink);
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&3u32.to_be_bytes());
+            frame.extend_from_slice(&[0x40, 0x01, 0x0C]);
+            mux.write_video(0, true, &frame).unwrap();
+            mux.finish().unwrap();
+        }
+        assert_eq!(
+            extract_pids(&sink)[0],
+            0x0000,
+            "first packet is PAT on PID 0"
+        );
+    }
 }

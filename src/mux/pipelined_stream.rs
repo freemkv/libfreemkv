@@ -264,3 +264,430 @@ impl Stream for PipelinedPesStream {
             .and_then(|(_, parser)| parser.codec_private())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc::{
+        AudioChannels, AudioStream, Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat,
+        LabelPurpose, Resolution, SampleRate, VideoStream,
+    };
+    use crate::mux::demux_thread::{DemuxBatch, DemuxThread};
+    use crate::mux::ps::PsPacket;
+    use crate::mux::ts::PesPacket;
+    use crossbeam_channel::{Sender, bounded};
+
+    /// Build a real, cleanly-exiting `DemuxThread` whose own receiver we
+    /// discard. The worker exits immediately (its prefetch sender is dropped)
+    /// and joins on drop — it exists only to satisfy `new()`'s ownership of a
+    /// `DemuxThread`. The caller controls the SEPARATE `demux_rx` we hand to
+    /// `PipelinedPesStream::new`, so we can inject any `DemuxBatch` sequence
+    /// (or a bare disconnect) independent of the dummy worker.
+    fn dummy_demux_thread() -> DemuxThread {
+        let (_pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(1);
+        let (rec_tx, _rec_rx) = bounded::<Vec<u8>>(2);
+        // No TS/PS demuxer; the worker just drains (nothing) and exits Eof.
+        let (dt, _own_rx) =
+            DemuxThread::spawn_zero_copy(pf_rx, rec_tx, (), None, None, None).expect("spawn");
+        dt
+    }
+
+    /// Assemble a `PipelinedPesStream` over a caller-controlled demux channel.
+    /// Returns the stream plus the `Sender` so the test drives batches/EOF.
+    fn make_stream(
+        title: DiscTitle,
+        parsers: Vec<(u16, Box<dyn CodecParser>)>,
+        pid_to_track: Vec<(u16, usize)>,
+    ) -> (PipelinedPesStream, Sender<DemuxBatch>) {
+        let (tx, rx) = bounded::<DemuxBatch>(8);
+        let stream =
+            PipelinedPesStream::new(dummy_demux_thread(), rx, title, parsers, pid_to_track);
+        (stream, tx)
+    }
+
+    /// A parser that emits exactly `n` frames per PES, with a fixed
+    /// codec_private. Lets tests assert routing/flush without depending on a
+    /// real codec's byte parsing.
+    struct CountingParser {
+        per_pes: usize,
+        flush_n: usize,
+        cp: Option<Vec<u8>>,
+    }
+    impl CodecParser for CountingParser {
+        fn parse(&mut self, pes: &PesPacket) -> Vec<super::super::codec::Frame> {
+            (0..self.per_pes)
+                .map(|i| super::super::codec::Frame {
+                    pts_ns: pes.pts.unwrap_or(0) + i as i64,
+                    keyframe: i == 0,
+                    data: pes.data.clone(),
+                    duration_ns: None,
+                })
+                .collect()
+        }
+        fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+            (0..self.flush_n)
+                .map(|_| super::super::codec::Frame {
+                    pts_ns: 0,
+                    keyframe: false,
+                    data: vec![0xEE],
+                    duration_ns: None,
+                })
+                .collect()
+        }
+        fn codec_private(&self) -> Option<Vec<u8>> {
+            self.cp.clone()
+        }
+    }
+
+    fn ts_pes(pid: u16, data: Vec<u8>) -> PesPacket {
+        PesPacket {
+            pid,
+            pts: Some(90_000),
+            dts: None,
+            data,
+        }
+    }
+
+    /// CLEAN EOF: the demux worker sends the explicit `Eof` sentinel. The
+    /// consumer must return Ok(None) — a normal end-of-stream — and stay
+    /// Ok(None) on subsequent reads. (DemuxBatch::Eof doc: "explicit
+    /// clean-completion sentinel".)
+    #[test]
+    fn eof_sentinel_yields_clean_none() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        tx.send(DemuxBatch::Eof).unwrap();
+        assert!(stream.read().unwrap().is_none(), "Eof → Ok(None)");
+        // The eof flag latches: a further read is still Ok(None), not an error.
+        assert!(stream.read().unwrap().is_none());
+    }
+
+    /// PANIC / BARE DISCONNECT: the channel closes WITHOUT an Eof (or Err)
+    /// sentinel — exactly what happens when the demux worker panics and drops
+    /// its sender. The consumer MUST surface DemuxThreadPanicked, never a
+    /// clean Ok(None) (which would silently truncate the output). This is the
+    /// truncation guard the module docstring promises.
+    #[test]
+    fn bare_disconnect_is_error_not_silent_eof() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        drop(tx); // sender gone, no Eof sent → RecvError on the consumer side
+        let err = stream.read().expect_err("bare disconnect must be an error");
+        // E_DEMUX_THREAD_PANICKED (9013) maps to ErrorKind::Other.
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let e = crate::error::Error::DemuxThreadPanicked;
+        assert!(
+            err.to_string().contains(&e.code().to_string()),
+            "error must carry the DemuxThreadPanicked code, got: {err}"
+        );
+    }
+
+    /// A `DemuxBatch::Err` from the worker (underlying reader error) is
+    /// terminal and must propagate to the caller verbatim, not be masked as
+    /// EOF.
+    #[test]
+    fn demux_err_propagates() {
+        let (mut stream, tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        tx.send(DemuxBatch::Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap();
+        let err = stream.read().expect_err("Err batch must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// consume_ts must route a PES to the track mapped to its PID and emit
+    /// the parser's frames in order. A PES whose PID is NOT in pid_to_track
+    /// must be dropped (no frame), never mis-attributed to another track.
+    #[test]
+    fn ts_routing_maps_pid_to_track_and_drops_untracked() {
+        let title = DiscTitle::empty();
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1100,
+            Box::new(CountingParser {
+                per_pes: 2,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(0x1100u16, 3usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        // One tracked PES (PID 0x1100) and one untracked (PID 0x2222).
+        tx.send(DemuxBatch::Ts(vec![
+            ts_pes(0x1100, vec![0xAA, 0xBB]),
+            ts_pes(0x2222, vec![0xCC]),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        // Tracked PES → 2 frames on track 3, in order; untracked → nothing.
+        let f0 = stream.read().unwrap().expect("frame 0");
+        assert_eq!(f0.track, 3, "routed to the PID's mapped track");
+        assert_eq!(f0.data, vec![0xAA, 0xBB]);
+        let f1 = stream.read().unwrap().expect("frame 1");
+        assert_eq!(f1.track, 3);
+        // Only the two frames from the tracked PES exist, then clean EOF.
+        assert!(
+            stream.read().unwrap().is_none(),
+            "untracked PES dropped, EOF"
+        );
+    }
+
+    /// At EOF the consumer must call `flush()` on every parser and emit the
+    /// buffered tail frames — a parser that holds the final access unit (e.g.
+    /// DTS-HD) must NOT have it dropped. Without the flush the last frame is
+    /// silently truncated.
+    #[test]
+    fn flush_tail_emitted_at_eof() {
+        let title = DiscTitle::empty();
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1100,
+            Box::new(CountingParser {
+                per_pes: 0, // parse emits nothing; everything comes from flush
+                flush_n: 1,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(0x1100u16, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        tx.send(DemuxBatch::Ts(vec![ts_pes(0x1100, vec![0x01])]))
+            .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        // No frames from parse; the single flush() frame must surface at EOF.
+        let tail = stream.read().unwrap().expect("flush tail frame at EOF");
+        assert_eq!(tail.track, 0);
+        assert_eq!(tail.data, vec![0xEE], "flush() tail, not dropped");
+        assert!(stream.read().unwrap().is_none());
+    }
+
+    /// A flush parser whose PID is not in pid_to_track must be skipped at EOF
+    /// (the `continue` guard) — no panic, no frame attributed to a phantom
+    /// track.
+    #[test]
+    fn flush_skips_parser_with_unmapped_pid() {
+        let title = DiscTitle::empty();
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x9999, // PID present as a parser but absent from pid_to_track
+            Box::new(CountingParser {
+                per_pes: 0,
+                flush_n: 5,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![]; // nothing mapped
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+        tx.send(DemuxBatch::Eof).unwrap();
+        // The unmapped parser's 5 flush frames must be discarded, not emitted.
+        assert!(
+            stream.read().unwrap().is_none(),
+            "flush frames for an unmapped PID are skipped"
+        );
+    }
+
+    /// consume_ps must route by the REAL DVD PID (via PsPacket::dvd_pid).
+    /// An audio private-stream-1 packet (stream_id 0xBD, sub-id 0x80 → PID
+    /// 0xBD80) routes to the track mapped to 0xBD80. A packet with an
+    /// unmappable (stream_id, sub_id) is dropped, never mis-routed.
+    #[test]
+    fn ps_routing_uses_dvd_pid_and_drops_unmappable() {
+        let title = DiscTitle::empty();
+        // PID for AC-3 sub-id 0x80 is 0xBD00 | 0x80 = 0xBD80.
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0xBD80,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(0xBD80u16, 1usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        let mappable = PsPacket {
+            stream_id: 0xBD,
+            sub_stream_id: Some(0x80),
+            pts: Some(90_000),
+            dts: None,
+            data: vec![0x12, 0x34],
+        };
+        // stream_id 0xC0 (MPEG audio) has no DVD PID mapping → dropped.
+        let unmappable = PsPacket {
+            stream_id: 0xC0,
+            sub_stream_id: None,
+            pts: None,
+            dts: None,
+            data: vec![0xFF],
+        };
+        tx.send(DemuxBatch::Ps(vec![mappable, unmappable])).unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        let f = stream.read().unwrap().expect("one routed PS frame");
+        assert_eq!(f.track, 1, "routed by dvd_pid to track 1");
+        assert_eq!(f.data, vec![0x12, 0x34]);
+        assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    /// A batch with no trackable packets must NOT terminate the stream early:
+    /// pump_one_batch loops to the next batch. Here an empty-but-untracked
+    /// batch is followed by a real frame batch — the consumer must skip the
+    /// first and deliver the second (not return Ok(None) prematurely).
+    #[test]
+    fn empty_batch_does_not_end_stream_early() {
+        let title = DiscTitle::empty();
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1100,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(0x1100u16, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        // First batch: only an untracked PID → yields zero frames.
+        tx.send(DemuxBatch::Ts(vec![ts_pes(0x4444, vec![0x00])]))
+            .unwrap();
+        // Second batch: tracked PID → one frame.
+        tx.send(DemuxBatch::Ts(vec![ts_pes(0x1100, vec![0x55])]))
+            .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        let f = stream.read().unwrap().expect("frame from the second batch");
+        assert_eq!(f.data, vec![0x55], "did not stop on the empty first batch");
+    }
+
+    /// write() on the read-only pipeline must return StreamReadOnly
+    /// (E9000 → Unsupported) — the highway is input-only.
+    #[test]
+    fn write_is_read_only_error() {
+        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        let frame = PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: false,
+            data: vec![1],
+            duration_ns: None,
+        };
+        let err = stream.write(&frame).expect_err("write must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    fn video_title(secondary: bool) -> DiscTitle {
+        let mut t = DiscTitle::empty();
+        t.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Hdr10,
+            color_space: ColorSpace::Bt2020,
+            secondary,
+            label: String::new(),
+        }));
+        t
+    }
+
+    /// headers_ready() is false for a PRIMARY video track until its parser
+    /// produces codec_private — MKV can't write the container header without
+    /// init data, so the consumer must keep buffering.
+    #[test]
+    fn headers_not_ready_when_primary_video_lacks_codec_private() {
+        let title = video_title(false);
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1011,
+            Box::new(CountingParser {
+                per_pes: 0,
+                flush_n: 0,
+                cp: None, // no codec_private yet
+            }),
+        )];
+        let pid_to_track = vec![(0x1011u16, 0usize)];
+        let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+        assert!(
+            !stream.headers_ready(),
+            "primary video w/o codec_private not ready"
+        );
+    }
+
+    /// headers_ready() flips true once the primary video parser exposes
+    /// codec_private.
+    #[test]
+    fn headers_ready_when_primary_video_has_codec_private() {
+        let title = video_title(false);
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1011,
+            Box::new(CountingParser {
+                per_pes: 0,
+                flush_n: 0,
+                cp: Some(vec![0x01, 0x02, 0x03]),
+            }),
+        )];
+        let pid_to_track = vec![(0x1011u16, 0usize)];
+        let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+        assert!(stream.headers_ready(), "codec_private present → ready");
+        // codec_private(track) resolves track→PID→parser and returns the data.
+        assert_eq!(
+            stream.codec_private(0).as_deref(),
+            Some(&[0x01, 0x02, 0x03][..])
+        );
+    }
+
+    /// A SECONDARY video track without codec_private must NOT block
+    /// headers_ready() — the `!v.secondary` guard means PiP/secondary video
+    /// is exempt from the init-data gate.
+    #[test]
+    fn headers_ready_ignores_secondary_video_without_codec_private() {
+        let title = video_title(true); // secondary = true
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            0x1011,
+            Box::new(CountingParser {
+                per_pes: 0,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(0x1011u16, 0usize)];
+        let (stream, _tx) = make_stream(title, parsers, pid_to_track);
+        assert!(
+            stream.headers_ready(),
+            "secondary video is exempt from the codec_private gate"
+        );
+    }
+
+    /// codec_private(track) returns None for a track index not present in
+    /// pid_to_track — no panic, no wrong-track data.
+    #[test]
+    fn codec_private_none_for_unmapped_track() {
+        let (stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        assert_eq!(stream.codec_private(7), None);
+    }
+
+    /// An audio-only title (no video streams) is always headers_ready — the
+    /// codec_private gate only applies to primary video.
+    #[test]
+    fn headers_ready_true_for_audio_only_title() {
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Ac3,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        let (stream, _tx) = make_stream(title, vec![], vec![]);
+        assert!(stream.headers_ready(), "no video → always ready");
+    }
+
+    /// finish() on the read-only pipeline is a no-op that returns Ok — the
+    /// consumer drives termination via read() returning None.
+    #[test]
+    fn finish_is_ok_noop() {
+        let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
+        assert!(stream.finish().is_ok());
+    }
+}

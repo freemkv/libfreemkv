@@ -476,4 +476,251 @@ mod tests {
         data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
         assert_eq!(truehd_channels_from_stream(&data), Some(8));
     }
+
+    // --- truehd_channels: per-bit mask channel counts (MLP / FFmpeg table) ---
+
+    #[test]
+    fn truehd_channels_8ch_single_bit_counts() {
+        // THD_8CH = [2,1,1,2,2,2,2,1,1,2,2,1,1]. A single set bit must yield
+        // exactly that bit's channel count. Bit 0 → 2 (L/R pair), bit 1 → 1 (C),
+        // bit 2 → 1 (LFE), bit 7 → 1.
+        assert_eq!(truehd_channels(1 << 0), Some(2));
+        assert_eq!(truehd_channels(1 << 1), Some(1));
+        assert_eq!(truehd_channels(1 << 2), Some(1));
+        assert_eq!(truehd_channels(1 << 7), Some(1));
+    }
+
+    #[test]
+    fn truehd_channels_8ch_all_bits_set() {
+        // All 13 8ch bits set = 2+1+1+2+2+2+2+1+1+2+2+1+1 = 20. ch8 field is the
+        // low 13 bits (0x1FFF).
+        assert_eq!(truehd_channels(0x1FFF), Some(20));
+    }
+
+    #[test]
+    fn truehd_channels_6ch_used_only_when_8ch_zero() {
+        // The 8ch presentation takes priority; the 6ch field (bits 15-19) is read
+        // ONLY when ch8 == 0. THD_6CH = [2,1,1,2,1]. Set 6ch bit 0 (→2) while
+        // 8ch is zero: 6ch field value 1 at shift 15.
+        assert_eq!(truehd_channels(1 << 15), Some(2));
+        // All 5 6ch bits = 2+1+1+2+1 = 7. 0x1F << 15.
+        assert_eq!(truehd_channels(0x1F << 15), Some(7));
+    }
+
+    #[test]
+    fn truehd_channels_8ch_wins_over_6ch_when_both_present() {
+        // When BOTH fields are non-zero, the richer 8ch presentation is used.
+        // 8ch = bit0 (→2), 6ch = all bits (would be 7) → result must be 2, the
+        // 8ch count, proving the `if ch8 != 0` branch wins.
+        let fi = (1u32 << 0) | (0x1F << 15);
+        assert_eq!(truehd_channels(fi), Some(2));
+    }
+
+    #[test]
+    fn truehd_channels_none_when_both_fields_zero() {
+        // No presentation flags set → None (can't determine layout).
+        assert_eq!(truehd_channels(0), None);
+        // Bits outside both fields (e.g. bit 13, bit 14, bits 20-31) don't count
+        // as a presentation and must still yield None.
+        assert_eq!(truehd_channels(1 << 13), None);
+        assert_eq!(truehd_channels(1 << 20), None);
+    }
+
+    #[test]
+    fn truehd_channels_71_layout_low5_bits() {
+        // Standard 7.1: 8ch bits 0-4 = L/R(2)+C(1)+LFE(1)+Ls/Rs(2)+Lb/Rb(2) = 8.
+        assert_eq!(truehd_channels(0x1F), Some(8));
+    }
+
+    // --- truehd_channels_from_stream: major-sync variant bit + scan ---
+
+    #[test]
+    fn channels_from_stream_matches_variant_sync_0xfb() {
+        // The sync match masks the low bit: 0xF8726FBA & 0xFFFFFFFE == base, and
+        // 0xF8726FBB (the +1 variant) matches the same masked pattern. A stream
+        // carrying 0xF8726FBB must still be recognised.
+        let mut data = vec![0x00];
+        data.extend_from_slice(&0xF872_6FBBu32.to_be_bytes());
+        data.extend_from_slice(&0x0000_001Fu32.to_be_bytes());
+        assert_eq!(truehd_channels_from_stream(&data), Some(8));
+    }
+
+    #[test]
+    fn channels_from_stream_none_without_major_sync() {
+        // No major sync anywhere → None, no panic, scan terminates.
+        let data = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(truehd_channels_from_stream(&data), None);
+    }
+
+    #[test]
+    fn channels_from_stream_too_short_for_format_info() {
+        // Sync present but fewer than 8 bytes total → the `p + 8 <= len` guard
+        // prevents reading format_info out of bounds → None.
+        let data = 0xF872_6FBAu32.to_be_bytes().to_vec(); // 4 bytes only
+        assert_eq!(truehd_channels_from_stream(&data), None);
+    }
+
+    #[test]
+    fn channels_from_stream_unaligned_sync() {
+        // The scan advances 1 byte at a time, so a major sync at an odd offset
+        // is still found. Place it at offset 3.
+        let mut data = vec![0xAA, 0xBB, 0xCC];
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        data.extend_from_slice(&(0x1Fu32).to_be_bytes());
+        assert_eq!(truehd_channels_from_stream(&data), Some(8));
+    }
+
+    // --- AU length field: 12-bit mask, partial AU, is_major_sync keyframe ---
+
+    #[test]
+    fn au_length_uses_low_12_bits_only() {
+        // unit_words = ((b0<<8)|b1) & 0xFFF. The top 4 bits of b0 (the MLP
+        // check/access-unit nibble) must NOT inflate the length. b0 = 0xF1
+        // (nibble 0xF, low 0x1), b1 = 0x00 → words = 0x100 = 256 → 512 bytes.
+        let mut parser = TrueHdParser::new();
+        let mut unit = vec![0u8; 512];
+        unit[0] = 0xF1; // high nibble 0xF must be masked off
+        unit[1] = 0x00;
+        let f = parser.parse(&make_pes(unit, Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data.len(),
+            512,
+            "length sized from low 12 bits (0x100 words), nibble masked"
+        );
+    }
+
+    #[test]
+    fn au_with_major_sync_is_keyframe() {
+        // An AU whose bytes 4-7 hold the major sync (0xF8726FBA, low bit masked)
+        // is a restart point → keyframe. Build a >=8-byte AU with the sync at
+        // offset 4. words = 100 → 200 bytes.
+        let mut parser = TrueHdParser::new();
+        let mut unit = make_truehd_unit(200);
+        unit[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        let f = parser.parse(&make_pes(unit, Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].keyframe, "major-sync AU must be flagged keyframe");
+    }
+
+    #[test]
+    fn au_without_major_sync_is_not_keyframe() {
+        // A plain AU (no major sync at offset 4) is not a keyframe.
+        let mut parser = TrueHdParser::new();
+        let f = parser.parse(&make_pes(make_truehd_unit(200), Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].keyframe);
+    }
+
+    #[test]
+    fn major_sync_variant_bit_also_keyframe() {
+        // The keyframe check masks the low bit (0xFFFF_FFFE), so the 0xF8726FBB
+        // variant must also be detected as a major sync.
+        let mut parser = TrueHdParser::new();
+        let mut unit = make_truehd_unit(200);
+        unit[4..8].copy_from_slice(&0xF872_6FBBu32.to_be_bytes());
+        let f = parser.parse(&make_pes(unit, Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].keyframe, "major-sync variant 0xFB also a keyframe");
+    }
+
+    #[test]
+    fn incomplete_au_waits_does_not_emit_short() {
+        // The AU length declares more bytes than buffered → parser must wait, not
+        // emit a truncated AU. words=300 (0x12C) → 600 bytes declared, only 100
+        // present. 300 exercises both length bytes (high nibble 0x1, low 0x2C).
+        let mut parser = TrueHdParser::new();
+        let mut data = vec![0u8; 100];
+        let words = 300usize;
+        data[0] = ((words >> 8) & 0x0F) as u8; // 0x01
+        data[1] = (words & 0xFF) as u8; // 0x2C → 300 words = 600 bytes
+        let f = parser.parse(&make_pes(data, Some(90000)));
+        assert!(
+            f.is_empty(),
+            "must not emit fewer bytes than the length field"
+        );
+        assert_eq!(parser.buf.len(), 100, "partial AU retained");
+    }
+
+    #[test]
+    fn buffer_stays_bounded_across_many_partial_pes() {
+        // Malformed/never-completing input must keep the reassembly buffer
+        // bounded by MAX_TRUEHD_BUF. Repeatedly feed AU fragments whose declared
+        // length always exceeds what is buffered, so no AU ever completes; the
+        // post-loop cap guard must clear the buffer instead of letting it grow
+        // unbounded across many calls.
+        let mut parser = TrueHdParser::new();
+        // Each PES: a head declaring 0xFFF words (8190 bytes) but only 4096 bytes
+        // present → incomplete → retained. Across many PES this would accumulate
+        // without the cap.
+        for _ in 0..200 {
+            let mut frag = vec![0u8; 4096];
+            frag[0] = 0x0F; // 0x0FFF words = 4095 → 8190 bytes declared
+            frag[1] = 0xFF;
+            let _ = parser.parse(&make_pes(frag, Some(0)));
+            assert!(
+                parser.buf.len() <= MAX_TRUEHD_BUF,
+                "reassembly buffer exceeded cap: {} > {}",
+                parser.buf.len(),
+                MAX_TRUEHD_BUF
+            );
+        }
+    }
+
+    // --- ac3_boundary_corroborated: the AC-3-vs-TrueHD disambiguation ---
+
+    #[test]
+    fn ac3_corroborated_when_frame_fills_buffer() {
+        // frame_bytes >= buf.len() → the AC-3 frame ends the buffer → corroborated.
+        let buf = vec![0u8; 128];
+        assert!(ac3_boundary_corroborated(&buf, 128));
+        assert!(ac3_boundary_corroborated(&buf, 200));
+    }
+
+    #[test]
+    fn ac3_corroborated_when_next_is_ac3_sync() {
+        // Bytes after the frame begin with 0x0B 0x77 → another AC-3 frame →
+        // corroborated.
+        let mut buf = vec![0u8; 130];
+        buf[128] = 0x0B;
+        buf[129] = 0x77;
+        assert!(ac3_boundary_corroborated(&buf, 128));
+    }
+
+    #[test]
+    fn ac3_corroborated_when_next_is_plausible_truehd_au() {
+        // Bytes after the frame form a plausible TrueHD AU header (non-zero
+        // 12-bit length within 32 KiB) → corroborated. next_words = 0x100 = 256
+        // → 512 bytes <= 32768.
+        let mut buf = vec![0u8; 130];
+        buf[128] = 0x01; // (0x01<<8)|0x00 & 0xFFF = 0x100
+        buf[129] = 0x00;
+        assert!(ac3_boundary_corroborated(&buf, 128));
+    }
+
+    #[test]
+    fn ac3_not_corroborated_when_next_zero_length() {
+        // Bytes after the frame are zeros → next_words == 0 → NOT a plausible
+        // TrueHD AU and not an AC-3 sync → NOT corroborated (treat as TrueHD).
+        let buf = vec![0u8; 130]; // all zero after frame_bytes=128
+        assert!(!ac3_boundary_corroborated(&buf, 128));
+    }
+
+    #[test]
+    fn ac3_corroborated_when_too_few_trailing_bytes() {
+        // Fewer than 2 bytes follow the frame → can't judge → accept (next call
+        // sees the continuation). frame_bytes=128, buf=129 → 1 trailing byte.
+        let buf = vec![0u8; 129];
+        assert!(ac3_boundary_corroborated(&buf, 128));
+    }
+
+    #[test]
+    fn ac3_frame_at_head_needs_more_when_buffer_short() {
+        // < 6 bytes buffered → NeedMore (can't read the AC-3 header).
+        let mut parser = TrueHdParser::new();
+        parser.buf = vec![0x0B, 0x77, 0x00];
+        // Drive through parse: a short 0x0B77 head must wait, not emit.
+        let f = parser.parse(&make_pes(vec![0x0B, 0x77, 0x00], Some(0)));
+        assert!(f.is_empty());
+    }
 }

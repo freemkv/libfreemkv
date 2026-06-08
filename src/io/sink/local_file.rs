@@ -176,4 +176,71 @@ mod tests {
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(&bytes[..], b"hint-ok");
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    /// `create` must TRUNCATE an existing file (OpenOptions
+    /// `.truncate(true)`, lines 52-58). Pre-seed a long file, recreate
+    /// it via the sink, write a shorter payload — the old tail must be
+    /// gone. Mutation: dropping `.truncate(true)` would leave the stale
+    /// tail and the length assert fails.
+    #[test]
+    fn create_truncates_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("trunc.bin");
+        std::fs::write(&p, vec![0xFFu8; 4096]).unwrap();
+        let mut s = LocalFileSink::create(&p).unwrap();
+        s.write_all(b"short").unwrap();
+        s.sync_all().unwrap();
+        drop(s);
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(
+            bytes.len(),
+            5,
+            "create must truncate the pre-existing 4096 bytes"
+        );
+        assert_eq!(&bytes, b"short");
+    }
+
+    /// Seek must flush the BufWriter FIRST so buffered bytes land at
+    /// their intended offset, not the post-seek one (lines 121-128, and
+    /// the module doc's silent-corruption warning). We write into the
+    /// buffer (no explicit flush), seek backward, write again, and
+    /// confirm the first write stayed at offset 0. Mutation: removing
+    /// the `self.inner.flush()?` in `seek` would flush the first 4
+    /// bytes at the seeked offset, corrupting the file.
+    #[test]
+    fn seek_flushes_buffer_before_moving() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("seek-flush.bin");
+        let mut s = LocalFileSink::create(&p).unwrap();
+        // These bytes sit in the 4 MiB BufWriter, unflushed.
+        s.write_all(b"HEAD").unwrap();
+        // Seek forward to offset 10; the buffered HEAD must be flushed
+        // to offset 0 BEFORE the position moves.
+        s.seek(SeekFrom::Start(10)).unwrap();
+        s.write_all(b"TAIL").unwrap();
+        s.sync_all().unwrap();
+        drop(s);
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(
+            &bytes[0..4],
+            b"HEAD",
+            "buffered head landed at the wrong offset"
+        );
+        assert_eq!(&bytes[10..14], b"TAIL");
+    }
+
+    /// `write` (single call) returns the BufWriter's accepted count.
+    /// For a buffer under the 4 MiB capacity this is the full length
+    /// (lines 108-110). Mutation: a wrong count return would break
+    /// callers relying on `Write::write`'s contract.
+    #[test]
+    fn write_returns_full_count_under_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("count.bin");
+        let mut s = LocalFileSink::create(&p).unwrap();
+        let n = s.write(&[1u8; 1000]).unwrap();
+        assert_eq!(n, 1000);
+    }
 }

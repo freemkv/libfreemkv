@@ -321,6 +321,172 @@ mod tests {
         assert!(recover_title_key(&sector, &short_plain).is_none());
     }
 
+    // ── recover_title_key early-return guards ──────────────────────────────
+
+    /// recover_title_key requires a full 2048-byte sector. A sector exactly
+    /// one byte short of SECTOR_SIZE must be rejected (None) and must not
+    /// index out of bounds reading the seed at 0x54..0x59 or the body at
+    /// 0x80+.
+    ///
+    /// Grounding: `if sector.len() < SECTOR_SIZE { return None }` with
+    /// SECTOR_SIZE == 2048.
+    /// Mutation: change `< SECTOR_SIZE` to `< 0x80` -> a 2047-byte sector with
+    /// the flag set would proceed and (since seed slice 0x54..0x59 still fits)
+    /// could return Some/panic; the None assert fires.
+    #[test]
+    fn recover_rejects_sector_one_byte_short() {
+        let mut sector = vec![0u8; SECTOR_SIZE - 1];
+        sector[FLAG_BYTE] = 0x30;
+        let plain = [0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
+        assert!(recover_title_key(&sector, &plain).is_none());
+    }
+
+    /// A full-size but UNSCRAMBLED sector (flag bits 4-5 clear) must return
+    /// None before doing any attack work — there is nothing to recover.
+    ///
+    /// Grounding: `let flags = (sector[FLAG_BYTE] >> 4) & 0x03; if flags == 0
+    /// { return None }`.
+    /// Mutation: change the flag mask `& 0x03` to `& 0x00` (always 0) makes it
+    /// always return None — caught by the scrambled-path tests; conversely
+    /// removing the early return would let it run the attack on clear data.
+    /// Here we pin the clear-flag rejection: with flag byte 0x00 -> None.
+    #[test]
+    fn recover_rejects_unscrambled_sector() {
+        let sector = vec![0x00u8; SECTOR_SIZE];
+        let plain = [0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
+        assert!(recover_title_key(&sector, &plain).is_none());
+    }
+
+    /// recover_title_key's flag test uses bits 4-5 only (same field as the
+    /// descrambler). A sector whose byte 0x14 has only bit 6 (0x40) or bit 7
+    /// (0x80) set is NOT scrambled and must return None.
+    ///
+    /// Grounding: `(sector[FLAG_BYTE] >> 4) & 0x03` — 0x40>>4&3==0,
+    /// 0x80>>4&3==0.
+    /// Mutation: widen the mask to `& 0x0F` -> 0x40 would look scrambled and
+    /// the attack would run; this asserts None for 0x40/0x80.
+    #[test]
+    fn recover_high_flag_bits_are_not_scramble() {
+        let plain = [0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
+        for &flag in &[0x40u8, 0x80, 0xC0] {
+            let mut sector = vec![0x11u8; SECTOR_SIZE];
+            sector[FLAG_BYTE] = flag;
+            assert!(
+                recover_title_key(&sector, &plain).is_none(),
+                "flag {flag:#04x} has scramble bits clear; recover must return None"
+            );
+        }
+    }
+
+    /// recover_title_key with exactly 10 plaintext bytes is accepted at the
+    /// length guard (it may still return None from the attack, but must not be
+    /// rejected by the `plain.len() < 10` check). Pins the boundary at the
+    /// inclusive value 10.
+    ///
+    /// Grounding: `if sector.len() < SECTOR_SIZE || plain.len() < 10 { None }`
+    /// — 10 is the minimum accepted length.
+    /// Mutation: change `< 10` to `< 11` -> a 10-byte plaintext would be
+    /// rejected. We detect acceptance by observing the function runs the
+    /// attack (it returns None for this synthetic data, but a 9-byte plain
+    /// returns None *at the guard*; to distinguish, we assert a 9-byte input
+    /// is rejected and a 10-byte input is not panicking and consistent).
+    #[test]
+    fn recover_accepts_exactly_10_plain_bytes() {
+        let mut sector = vec![0x00u8; SECTOR_SIZE];
+        sector[FLAG_BYTE] = 0x30;
+        sector[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
+        let plain9 = [0u8; 9];
+        let plain10 = [0u8; 10];
+        // 9 bytes: rejected at the guard.
+        assert!(recover_title_key(&sector, &plain9).is_none());
+        // 10 bytes: passes the guard and runs to completion without panic.
+        let _ = recover_title_key(&sector, &plain10);
+    }
+
+    // ── crack_title_key early-return guards (flag uses bits 4-5) ────────────
+
+    /// crack_title_key uses the same bits-4-5 scramble field. A sector with
+    /// only bit 6/7 of byte 0x14 set is not scrambled -> None, without running
+    /// the 169-pattern search on clear data.
+    ///
+    /// Grounding: `(sector[FLAG_BYTE] >> 4) & 0x03`.
+    /// Mutation: widen mask -> 0x40 treated as scrambled; this asserts None.
+    #[test]
+    fn crack_high_flag_bits_are_not_scramble() {
+        for &flag in &[0x40u8, 0x80, 0xC0] {
+            let mut sector = vec![0x11u8; SECTOR_SIZE];
+            sector[FLAG_BYTE] = flag;
+            assert!(
+                crack_title_key(&sector).is_none(),
+                "flag {flag:#04x} clear scramble bits -> crack must return None"
+            );
+        }
+    }
+
+    /// crack_title_key on a sector exactly one byte short of 2048 returns None
+    /// at the size guard — no out-of-bounds read of the body/seed.
+    ///
+    /// Grounding: `if sector.len() < SECTOR_SIZE { return None }`.
+    /// Mutation: lower the guard to `< 0x80` -> a 2047-byte scrambled sector
+    /// would run the attack (and could panic indexing 0x800); None asserts it.
+    #[test]
+    fn crack_rejects_sector_one_byte_short() {
+        let mut sector = vec![0u8; SECTOR_SIZE - 1];
+        if sector.len() > FLAG_BYTE {
+            sector[FLAG_BYTE] = 0x30;
+        }
+        assert!(crack_title_key(&sector).is_none());
+    }
+
+    /// crack_title_key must never panic on a fully scrambled sector regardless
+    /// of seed/body content — it runs the 169-pattern Stevenson search, each
+    /// of which exercises the LFSR0 reconstruction arithmetic that previously
+    /// overflowed in debug. This drives the FULL crack entry point (not just
+    /// recover_title_key) across several pseudo-random scrambled sectors.
+    ///
+    /// Grounding: wrapping_* arithmetic in recover_title_key must hold for all
+    /// inputs; "never panic" property.
+    /// Mutation: replace a `wrapping_shl`/`wrapping_mul` with the plain
+    /// operator -> debug build panics on overflow for some seed, this test
+    /// fails.
+    #[test]
+    fn crack_full_path_never_panics() {
+        for seed in 0u32..3 {
+            let mut sector = vec![0u8; SECTOR_SIZE];
+            sector[FLAG_BYTE] = 0x30;
+            let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(7);
+            for b in sector.iter_mut().skip(0x80) {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *b = (x >> 16) as u8;
+            }
+            for (i, b) in sector[SEED_OFFSET..SEED_OFFSET + 5].iter_mut().enumerate() {
+                *b = (seed.wrapping_add(i as u32) ^ 0xA5) as u8;
+            }
+            let _ = crack_title_key(&sector);
+        }
+    }
+
+    /// recover_title_key, when it DOES return a key, XORs the sector seed into
+    /// the recovered raw key (the final step `result_key[i] ^= seed[i]`).
+    /// We cannot easily force a hit on this crate's (non-functional) attack,
+    /// so instead pin the structural guard that the seed is read from the
+    /// documented offset 0x54..0x59 and that a None result is returned for an
+    /// all-zero scrambled sector (the search exhausts without a match rather
+    /// than panicking on the seed XOR).
+    ///
+    /// Grounding: SEED_OFFSET == 0x54; seed slice is `sector[0x54..0x59]`.
+    /// Mutation: change SEED_OFFSET to 0x55 -> the seed slice shifts; the
+    /// search still completes (None) but on a functional path the recovered
+    /// key would be wrong. This test pins the no-panic completion only.
+    #[test]
+    fn recover_all_zero_scrambled_completes_none() {
+        let mut sector = vec![0x00u8; SECTOR_SIZE];
+        sector[FLAG_BYTE] = 0x30;
+        let plain = [0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05, 0x21];
+        // All-zero body: the textbook attack finds no consistent state.
+        assert!(recover_title_key(&sector, &plain).is_none());
+    }
+
     /// Build a scrambled sector with known plaintext (both an MPEG PES header
     /// at 0x80 and an exact-plaintext probe), then assert that the Stevenson
     /// recovery actually recovers a key whose descramble round-trips the body.

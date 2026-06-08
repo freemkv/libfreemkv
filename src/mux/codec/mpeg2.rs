@@ -620,6 +620,203 @@ mod tests {
 
     // --- Resolution helper methods ---
 
+    // --- parse_resolution: 12-bit field packing (ISO 13818-2 §6.2.2.1) ---
+
+    #[test]
+    fn resolution_packs_split_nibble_correctly() {
+        // h_size is bytes4-5[7:4] (12 bits), v_size is byte5[3:0]+byte6 (12 bits).
+        // Use a width/height whose nibbles differ so a swap would be caught:
+        // 0xABC x 0xDEF. byte4=0xAB, byte5=0xCD, byte6=0xEF.
+        let hdr = make_seq_header(0xABC, 0xDEF, 1, 1);
+        assert_eq!(parse_resolution(&hdr), Some((0xABC, 0xDEF)));
+    }
+
+    #[test]
+    fn resolution_max_12bit() {
+        // Max 12-bit dimension = 4095 (0xFFF) each.
+        let hdr = make_seq_header(4095, 4095, 1, 1);
+        assert_eq!(parse_resolution(&hdr), Some((4095, 4095)));
+    }
+
+    #[test]
+    fn resolution_too_short_none() {
+        // < 8 bytes → None, no panic.
+        assert_eq!(parse_resolution(&[0x00, 0x00, 0x01, 0xB3, 0x07]), None);
+    }
+
+    // --- parse_frame_rate: full table + reserved codes ---
+
+    #[test]
+    fn frame_rate_all_valid_codes() {
+        // ISO 13818-2 Table 6-4 frame_rate_code 1..=8.
+        let expect = [
+            (24000u32, 1001u32),
+            (24, 1),
+            (25, 1),
+            (30000, 1001),
+            (30, 1),
+            (50, 1),
+            (60000, 1001),
+            (60, 1),
+        ];
+        for (i, &want) in expect.iter().enumerate() {
+            let code = (i + 1) as u8;
+            let hdr = make_seq_header(720, 480, 1, code);
+            assert_eq!(parse_frame_rate(&hdr), Some(want), "frame_rate_code {code}");
+        }
+    }
+
+    #[test]
+    fn frame_rate_code_zero_forbidden_none() {
+        // Code 0 is forbidden → None.
+        let hdr = make_seq_header(720, 480, 1, 0);
+        assert_eq!(parse_frame_rate(&hdr), None);
+    }
+
+    #[test]
+    fn frame_rate_code_out_of_range_none() {
+        // Codes 9..=15 are reserved (table has 9 entries, index 9..). 0x0F → None.
+        let hdr = make_seq_header(720, 480, 1, 0x0F);
+        assert_eq!(parse_frame_rate(&hdr), None);
+    }
+
+    // --- parse_aspect_ratio: table + reserved codes ---
+
+    #[test]
+    fn aspect_ratio_all_valid_codes() {
+        // ISO 13818-2 Table 6-3 aspect_ratio_information 1..=4.
+        let expect = [(1u8, 1u8), (4, 3), (16, 9), (221, 100)];
+        for (i, &want) in expect.iter().enumerate() {
+            let code = (i + 1) as u8;
+            let hdr = make_seq_header(720, 480, code, 4);
+            assert_eq!(parse_aspect_ratio(&hdr), Some(want), "aspect code {code}");
+        }
+    }
+
+    #[test]
+    fn aspect_ratio_code_zero_none() {
+        let hdr = make_seq_header(720, 480, 0, 4);
+        assert_eq!(parse_aspect_ratio(&hdr), None);
+    }
+
+    #[test]
+    fn aspect_ratio_code_out_of_range_none() {
+        // Codes 5..=15 reserved. 0x0F → None.
+        let hdr = make_seq_header(720, 480, 0x0F, 4);
+        assert_eq!(parse_aspect_ratio(&hdr), None);
+    }
+
+    // --- picture_coding_type: byte position + bit field ---
+
+    #[test]
+    fn picture_coding_type_bits_5_3() {
+        // picture_coding_type is byte5 bits 5-3 (>> 3 & 0x07). I=1 (keyframe),
+        // P=2, B=3, all others (D=4, reserved) not keyframes.
+        for (ct, is_kf) in [(1u8, true), (2, false), (3, false), (4, false)] {
+            let mut parser = Mpeg2Parser::new();
+            let mut data = make_picture_header(ct);
+            data.extend_from_slice(&[0xFF; 8]);
+            let f = parser.parse(&make_pes(data, Some(0)));
+            assert_eq!(f.len(), 1);
+            assert_eq!(
+                f[0].keyframe, is_kf,
+                "picture_coding_type {ct}: keyframe={is_kf}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_header_too_short_not_keyframe() {
+        // A picture start code with too few following bytes to read byte5 must
+        // NOT panic and must NOT be flagged a keyframe (the `sc + 5 < len` guard
+        // is false). 00 00 01 00 + only 1 byte.
+        let mut parser = Mpeg2Parser::new();
+        let data = vec![0x00, 0x00, 0x01, PICTURE_CODE, 0x00];
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1, "picture present but header truncated");
+        assert!(!f[0].keyframe, "truncated picture header → not keyframe");
+    }
+
+    // --- seq-header exact-size calc when no following start code (quantizers) ---
+
+    #[test]
+    fn seq_header_without_following_sc_captures_base_when_no_quantizers() {
+        // When a sequence header has no following start code in the PES, the
+        // parser computes its exact byte length. With load_intra_quantiser_matrix
+        // = 0 and load_non_intra = 0 (byte11 bit1 clear), the header is the base
+        // size (no 64-byte quantizer blocks appended). make_seq_header sets
+        // byte11 (index sc+11) — our 8-byte tail's last byte is 0x00 → both flags
+        // clear. The captured codecPrivate must be the base header only.
+        let mut parser = Mpeg2Parser::new();
+        let seq = make_seq_header(1920, 1080, 3, 4);
+        let base_len = seq.len();
+        // Sequence header alone in the PES (no picture, no next SC). It is a
+        // parameter-set-only AU → no frame, but codecPrivate is captured.
+        let f = parser.parse(&make_pes(seq, Some(0)));
+        assert!(f.is_empty(), "seq-header-only PES emits no frame");
+        let cp = parser.codec_private().expect("seq header captured");
+        // The capture must not run past the buffer; length <= what we provided.
+        assert!(
+            cp.len() <= base_len,
+            "captured header bounded by provided bytes"
+        );
+        assert_eq!(&cp[..4], &[0x00, 0x00, 0x01, SEQ_HEADER_CODE]);
+    }
+
+    #[test]
+    fn picture_without_start_code_passes_through_keyframe_false() {
+        // A PES with neither a sequence header nor a picture start code (a slice
+        // continuation) passes through unchanged and is not a keyframe (the
+        // `!has_picture && saw_seq_header` drop only fires when a seq header was
+        // seen).
+        let mut parser = Mpeg2Parser::new();
+        // 00 00 01 01 is a slice start code (0x01), not picture/seq/ext.
+        let data = vec![0x00, 0x00, 0x01, 0x01, 0xAA, 0xBB, 0xCC];
+        let f = parser.parse(&make_pes(data.clone(), Some(0)));
+        assert_eq!(f.len(), 1, "slice continuation passes through");
+        assert!(!f[0].keyframe);
+        assert_eq!(f[0].data, data, "data passed through verbatim");
+    }
+
+    #[test]
+    fn mpeg2_dts_fallback_and_zero() {
+        let mut parser = Mpeg2Parser::new();
+        let mut data = make_picture_header(PICTURE_TYPE_I);
+        data.extend_from_slice(&[0xFF; 4]);
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: None,
+            dts: Some(90000),
+            data: data.clone(),
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f[0].pts_ns, 1_000_000_000, "DTS fallback");
+
+        let mut parser2 = Mpeg2Parser::new();
+        let pes2 = PesPacket {
+            pid: 0x1011,
+            pts: None,
+            dts: None,
+            data,
+        };
+        let f2 = parser2.parse(&pes2);
+        assert_eq!(f2[0].pts_ns, 0, "no PTS/DTS → 0");
+    }
+
+    #[test]
+    fn frame_data_is_whole_pes_not_just_picture() {
+        // The emitted frame data is the ENTIRE PES payload (pes.data.clone()),
+        // not just the picture NAL — MPEG-2 ES is muxed as-is. Confirm a seq
+        // header + picture PES emits the whole buffer.
+        let mut parser = Mpeg2Parser::new();
+        let mut data = make_seq_header(720, 480, 3, 4);
+        data.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
+        data.extend_from_slice(&[0x12, 0x34]);
+        let f = parser.parse(&make_pes(data.clone(), Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data, data, "frame data = whole PES payload");
+    }
+
     #[test]
     fn parser_resolution_method() {
         let mut parser = Mpeg2Parser::new();

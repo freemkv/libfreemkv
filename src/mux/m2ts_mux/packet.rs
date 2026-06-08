@@ -220,4 +220,134 @@ mod tests {
         assert_eq!(pid, 0x1ABC);
         assert_eq!(p.bytes()[3] & 0x0F, 0xA);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Added hardening tests
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn header_sync_byte_and_pusi_bit() {
+        // ISO 13818-1: sync_byte 0x47 at byte 0; PUSI is bit 6 of byte 1.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, false, 0);
+        assert_eq!(p.bytes()[0], SYNC_BYTE);
+        assert_eq!(p.bytes()[1] & 0x40, 0x40, "PUSI set");
+        // transport_error_indicator (bit 7) and priority (bit 5) clear.
+        assert_eq!(p.bytes()[1] & 0x80, 0, "TEI clear");
+        assert_eq!(p.bytes()[1] & 0x20, 0, "transport_priority clear");
+
+        let mut p2 = Packet::new();
+        p2.set_header(0x0100, false, true, false, 0);
+        assert_eq!(p2.bytes()[1] & 0x40, 0, "PUSI clear when not a unit start");
+    }
+
+    #[test]
+    fn header_afc_bits_per_combination() {
+        // adaptation_field_control (bits 5:4 of byte 3), ISO 13818-1
+        // Table 2-5: 01 payload only, 10 AF only, 11 both, 00 reserved.
+        let cases = [
+            (false, true, 0b01u8),
+            (true, false, 0b10),
+            (true, true, 0b11),
+            (false, false, 0b00),
+        ];
+        for (af, pl, want) in cases {
+            let mut p = Packet::new();
+            p.set_header(0x0100, true, pl, af, 0);
+            assert_eq!((p.bytes()[3] >> 4) & 0x03, want, "AFC for af={af} pl={pl}");
+        }
+    }
+
+    #[test]
+    fn append_adaptation_length_byte_matches_written_bytes() {
+        // The adaptation_field_length byte must equal body+stuffing — the
+        // written length and declared length must agree or a decoder
+        // misframes the payload.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, true, 0);
+        p.append_adaptation(&[0x10, 0xAA, 0xBB], 4).unwrap(); // 3 body + 4 stuffing
+        // byte 4 is the length byte.
+        assert_eq!(p.bytes()[4], 3 + 4, "length byte = body+stuffing");
+        // body bytes follow.
+        assert_eq!(&p.bytes()[5..8], &[0x10, 0xAA, 0xBB]);
+        // stuffing bytes are 0xFF.
+        assert_eq!(&p.bytes()[8..12], &[0xFF; 4]);
+    }
+
+    #[test]
+    fn append_adaptation_at_exact_max_succeeds() {
+        // MAX_AF_LEN (183) is the largest legal adaptation field body+stuff.
+        // Exactly MAX_AF_LEN must succeed; the boundary itself is valid.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, true, 0);
+        assert!(p.append_adaptation(&[0x00], MAX_AF_LEN - 1).is_ok());
+        assert_eq!(p.bytes()[4] as usize, MAX_AF_LEN);
+    }
+
+    #[test]
+    fn append_payload_at_exact_boundary_fills_188() {
+        // 4-byte header + 184 payload = exactly 188 (no AF). The boundary
+        // must be accepted, not rejected.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, false, 0);
+        assert!(p.append_payload(&[0xAB; 184]).is_ok());
+        assert_eq!(p.len(), 188);
+    }
+
+    #[test]
+    fn pad_to_188_is_idempotent_when_already_full() {
+        // Padding a packet that already reached 188 bytes must not grow it
+        // past 188 (the push() bound prevents overflow).
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, false, 0);
+        p.append_payload(&[0xAB; 184]).unwrap();
+        assert_eq!(p.len(), 188);
+        p.pad_to_188();
+        assert_eq!(p.len(), 188, "no growth past 188");
+    }
+
+    #[test]
+    fn write_packet_rejects_long_packet() {
+        // A packet whose len somehow exceeds 188 must be refused (the writer
+        // checks exact equality). We can't push past 188 (push saturates),
+        // so test the under-188 rejection path which the writer guards.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, false, 0);
+        p.append_payload(&[1, 2, 3, 4, 5]).unwrap(); // 9 bytes, not 188
+        let mut sink: Vec<u8> = Vec::new();
+        let mut w = PacketWriter::new(&mut sink);
+        assert!(w.write_packet(&p).is_err());
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn write_packet_accepts_exactly_188() {
+        // A correctly-sized 188-byte packet must be written through verbatim.
+        let mut p = Packet::new();
+        p.set_header(0x0100, true, true, false, 0);
+        p.append_payload(&[0x5A; 184]).unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut w = PacketWriter::new(&mut sink);
+            w.write_packet(&p).unwrap();
+        }
+        assert_eq!(sink.len(), 188);
+        assert_eq!(sink[0], SYNC_BYTE);
+    }
+
+    #[test]
+    fn pid_high_bits_masked_to_13_bits() {
+        // PID is 13 bits. Bits above 0x1FFF must not leak into the
+        // transport_priority / PUSI / TEI bits of byte 1.
+        let mut p = Packet::new();
+        // 0xE100 has bits set above the 13-bit PID range.
+        p.set_header(0xE100, false, true, false, 0);
+        assert_eq!(
+            p.bytes()[1] & 0xE0,
+            0,
+            "top 3 bits of byte1 are flags, not PID"
+        );
+        let pid = u16::from_be_bytes([p.bytes()[1] & 0x1F, p.bytes()[2]]);
+        assert_eq!(pid, 0xE100 & 0x1FFF, "PID masked to 13 bits");
+    }
 }

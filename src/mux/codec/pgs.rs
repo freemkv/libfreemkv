@@ -407,4 +407,151 @@ mod tests {
         let pes = make_pes(Vec::new(), Some(0));
         assert!(parser.parse(&pes).is_empty());
     }
+
+    // --- number_of_composition_objects lives at byte 13 ---
+
+    #[test]
+    fn num_objects_read_from_offset_13() {
+        // PCS_NUM_OBJECTS_OFFSET = 3-byte seg header + 10 PCS field bytes = 13.
+        // A byte at offset 13 of 0 = clear, > 0 = display. Build a PCS where
+        // every byte before 13 is non-zero noise and byte 13 alone decides.
+        let mut display = vec![SEGMENT_PCS];
+        display.extend_from_slice(&[0xFF; 12]); // bytes 1..=12 noise
+        display.push(1); // byte 13: num_objects = 1 → display
+        let mut parser = PgsParser::new();
+        assert!(
+            parser.parse(&make_pes(display, Some(90000))).is_empty(),
+            "byte 13 == 1 → display PCS (pending), no emit yet"
+        );
+        // Now a clear: byte 13 == 0.
+        let mut clear = vec![SEGMENT_PCS];
+        clear.extend_from_slice(&[0xFF; 12]);
+        clear.push(0); // byte 13 = 0 → clear
+        let f = parser.parse(&make_pes(clear, Some(270000)));
+        assert_eq!(f.len(), 1, "byte 13 == 0 closes the pending display");
+    }
+
+    // --- duration computation and clamping ---
+
+    #[test]
+    fn duration_is_clear_minus_display() {
+        // BlockDuration = clear_pts - display_pts (in ns). display @ 90000 (1s),
+        // clear @ 450000 (5s) → duration 4s.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(450000)));
+        assert_eq!(f[0].pts_ns, 1_000_000_000);
+        assert_eq!(f[0].duration_ns, Some(4_000_000_000));
+    }
+
+    #[test]
+    fn duration_clamps_to_zero_when_clear_precedes_display() {
+        // A clear PTS earlier than the display PTS (corrupt/out-of-order stream)
+        // must clamp duration to 0 via saturating_sub, never wrap to a huge u64.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(270000))); // display @ 3s
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(90000))); // clear @ 1s
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 3_000_000_000, "keeps display start");
+        assert_eq!(
+            f[0].duration_ns,
+            Some(0),
+            "clear-before-display clamps to 0, no u64 wrap"
+        );
+    }
+
+    #[test]
+    fn duration_zero_when_equal_pts() {
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(90000)));
+        assert_eq!(f[0].duration_ns, Some(0));
+    }
+
+    // --- clear / replace edge cases ---
+
+    #[test]
+    fn clear_with_no_pending_emits_nothing() {
+        // An empty PCS arriving with no pending display is a no-op.
+        let mut parser = PgsParser::new();
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(90000)));
+        assert!(f.is_empty(), "clear with nothing pending → no frame");
+        assert!(parser.pending.is_none());
+    }
+
+    #[test]
+    fn three_displays_each_close_the_previous() {
+        // Successive display PCS (no intervening clear) each emit the prior one
+        // timed to the new display's PTS. display@1s, display@2s, display@3s →
+        // emits [1s dur 1s], [2s dur 1s]; the last (3s) is held.
+        let mut parser = PgsParser::new();
+        let f0 = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        assert!(f0.is_empty());
+        let f1 = parser.parse(&make_pes(pcs_bytes(1), Some(180000)));
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f1[0].pts_ns, 1_000_000_000);
+        assert_eq!(f1[0].duration_ns, Some(1_000_000_000));
+        let f2 = parser.parse(&make_pes(pcs_bytes(1), Some(270000)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].pts_ns, 2_000_000_000);
+        assert_eq!(f2[0].duration_ns, Some(1_000_000_000));
+        // Third held; flush emits it undurated.
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].pts_ns, 3_000_000_000);
+        assert_eq!(tail[0].duration_ns, None);
+    }
+
+    #[test]
+    fn pcs_exactly_at_offset_boundary_is_truncated() {
+        // A PCS of EXACTLY PCS_NUM_OBJECTS_OFFSET (13) bytes has no byte at index
+        // 13 → treated as truncated (`<= PCS_NUM_OBJECTS_OFFSET`). With a pending
+        // display it flushes that undurated and resyncs.
+        let mut parser = PgsParser::new();
+        let display = pcs_bytes(1);
+        let _ = parser.parse(&make_pes(display.clone(), Some(90000)));
+        let exactly_13 = vec![SEGMENT_PCS; PCS_NUM_OBJECTS_OFFSET]; // 13 bytes
+        let f = parser.parse(&make_pes(exactly_13, Some(180000)));
+        assert_eq!(f.len(), 1, "13-byte PCS is truncated → flush pending");
+        assert_eq!(f[0].duration_ns, None);
+        assert!(parser.pending.is_none());
+    }
+
+    #[test]
+    fn pcs_one_byte_past_offset_reads_num_objects() {
+        // A PCS of PCS_NUM_OBJECTS_OFFSET + 1 (14) bytes is the minimum that can
+        // carry number_of_composition_objects (index 13 exists). It must be read
+        // as a real PCS, not truncated.
+        let mut parser = PgsParser::new();
+        let mut display = vec![SEGMENT_PCS; PCS_NUM_OBJECTS_OFFSET];
+        display.push(1); // index 13 = 1 → display, 14 bytes total
+        assert!(
+            parser.parse(&make_pes(display, Some(90000))).is_empty(),
+            "14-byte display PCS is pending (not truncated)"
+        );
+        assert!(parser.pending.is_some(), "stored as pending display");
+    }
+
+    #[test]
+    fn non_pcs_without_pending_with_pts_passes_through_keyframe() {
+        // A lone non-PCS segment (first byte != 0x16) with a PTS and no pending
+        // set passes through as a keyframe frame at its PTS.
+        let mut parser = PgsParser::new();
+        let f = parser.parse(&make_pes(vec![0x14, 0x00, 0x01, 0xAA], Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].keyframe);
+        assert_eq!(f[0].pts_ns, 1_000_000_000);
+        assert_eq!(f[0].duration_ns, None);
+    }
+
+    #[test]
+    fn display_pcs_data_preserved_verbatim() {
+        // The emitted frame data is the display PCS bytes (plus any appended
+        // non-PCS continuation), verbatim — the bitmap must not be altered.
+        let mut parser = PgsParser::new();
+        let display = pcs_bytes(2); // num_objects = 2
+        let _ = parser.parse(&make_pes(display.clone(), Some(90000)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(180000)));
+        assert_eq!(f[0].data, display, "display PCS data emitted verbatim");
+    }
 }

@@ -649,4 +649,332 @@ mod tests {
         // fscod=0 (48kHz), frmsizecod=2: 80 words = 160 bytes
         assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x02, 0x40]), 160);
     }
+
+    // --- ac3_frame_size: fscod-indexed table columns + reject paths ---
+
+    #[test]
+    fn ac3_frame_size_44100_uses_second_column() {
+        // ATSC A/52 Table 5.18: fscod=1 (44.1 kHz), frmsizecod=0 → 69 words.
+        // byte4 = fscod(2)<<6 | frmsizecod(6) = 0b01_000000 = 0x40.
+        assert_eq!(
+            ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x40, 0x00]),
+            69 * 2,
+            "44.1kHz column (index 1), 69 words = 138 bytes"
+        );
+    }
+
+    #[test]
+    fn ac3_frame_size_32000_uses_third_column() {
+        // A/52 Table 5.18: fscod=2 (32 kHz), frmsizecod=0 → 96 words.
+        // byte4 = 0b10_000000 = 0x80.
+        assert_eq!(
+            ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x80, 0x00]),
+            96 * 2,
+            "32kHz column (index 2), 96 words = 192 bytes"
+        );
+    }
+
+    #[test]
+    fn ac3_frame_size_reserved_fscod3_is_unmappable() {
+        // fscod=3 is RESERVED in AC-3 (A/52 §5.4.1.3). The size function must
+        // return 0 (unmappable), never index the table. byte4 = 0b11_000000.
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0xC0, 0x00]), 0);
+    }
+
+    #[test]
+    fn ac3_frame_size_frmsizecod_out_of_range_is_zero() {
+        // frmsizecod has 38 valid entries (0..=37). 38..=63 are reserved.
+        // frmsizecod=38 (0b100110) with fscod=0 → byte4 = 0x26. Must return 0.
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x26, 0x00]), 0);
+        // The largest reserved code (63 = 0x3F) likewise.
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x3F, 0x00]), 0);
+    }
+
+    #[test]
+    fn ac3_frame_size_short_input_is_zero() {
+        // Fewer than 5 bytes can't carry byte 4 → 0, no panic.
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0]), 0);
+        assert_eq!(ac3_frame_size(&[]), 0);
+    }
+
+    #[test]
+    fn ac3_frame_size_max_frmsizecod_37() {
+        // Last valid frmsizecod=37 (0b100101), fscod=0 → 1280 words = 2560 bytes.
+        // byte4 = 0x25.
+        assert_eq!(ac3_frame_size(&[0x0B, 0x77, 0, 0, 0x25, 0x00]), 1280 * 2);
+    }
+
+    // --- E-AC-3 frame sizing (frmsiz field bytes 2-3) ---
+
+    #[test]
+    fn eac3_frame_size_formula() {
+        // E-AC-3 (A/52 Annex E): frmsiz = byte2[2:0]<<8 | byte3; frame bytes =
+        // (frmsiz + 1) * 2. With byte2=0x07 (low 3 bits set) and byte3=0xFF,
+        // frmsiz = 0x7FF = 2047 → (2048)*2 = 4096 bytes.
+        assert_eq!(eac3_frame_size(&[0x0B, 0x77, 0x07, 0xFF]), 4096);
+        // frmsiz=2 → (3)*2 = 6 bytes (== MIN_FRAME_BYTES).
+        assert_eq!(eac3_frame_size(&[0x0B, 0x77, 0x00, 0x02]), 6);
+    }
+
+    #[test]
+    fn eac3_frame_size_short_input_zero() {
+        // < 4 bytes can't carry the frmsiz field → 0, no panic.
+        assert_eq!(eac3_frame_size(&[0x0B, 0x77, 0x00]), 0);
+    }
+
+    #[test]
+    fn eac3_frame_size_masks_byte2_to_three_bits() {
+        // Only the low 3 bits of byte 2 belong to frmsiz; the upper 5 bits
+        // (strmtyp/substreamid) must be masked off. byte2=0xFF, byte3=0x00 →
+        // frmsiz = (0xFF & 0x07)<<8 | 0 = 0x700 = 1792 → (1793)*2 = 3586.
+        assert_eq!(eac3_frame_size(&[0x0B, 0x77, 0xFF, 0x00]), (1792 + 1) * 2);
+    }
+
+    // --- get_bsid: byte 5 bits 7..3, the AC-3/E-AC-3 selector ---
+
+    #[test]
+    fn get_bsid_extracts_bits_7_3() {
+        // bsid lives in byte 5 bits 7..3 (A/52 §5.3.2 BSI). 0b10101_000 = 0xA8 →
+        // bsid = 0b10101 = 21.
+        assert_eq!(get_bsid(&[0x0B, 0x77, 0, 0, 0, 0xA8]), 21);
+        // Low 3 bits must be ignored: 0x0F (0b00001_111) → bsid = 1.
+        assert_eq!(get_bsid(&[0x0B, 0x77, 0, 0, 0, 0x0F]), 1);
+    }
+
+    #[test]
+    fn get_bsid_short_input_zero() {
+        assert_eq!(get_bsid(&[0x0B, 0x77, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn bsid_11_is_first_eac3_value() {
+        // The parser switches to E-AC-3 sizing at bsid >= 11. bsid=10 must use
+        // AC-3 sizing, bsid=11 E-AC-3. byte5 = bsid<<3.
+        assert_eq!(get_bsid(&[0x0B, 0x77, 0, 0, 0, 10 << 3]), 10);
+        assert_eq!(get_bsid(&[0x0B, 0x77, 0, 0, 0, 11 << 3]), 11);
+    }
+
+    // --- frame_sample_rate / frame_duration: per-fscod and fscod2 ---
+
+    #[test]
+    fn ac3_duration_44100() {
+        // Legacy AC-3 @ 44.1kHz: 1536 / 44100 s. fscod=1 → byte4 bits 7-6 = 01.
+        // Build a real frame so the sizing path validates too.
+        let frame = make_ac3_frame(1, 0); // fscod=1, frmsizecod=0
+        let bsid = get_bsid(&frame);
+        assert!(bsid < 11);
+        // (1536 * 1e9 + 44100/2) / 44100, rounded to nearest.
+        let expect = (1536u64 * 1_000_000_000 + 44_100 / 2) / 44_100;
+        assert_eq!(frame_duration_ns(&frame, bsid), expect);
+    }
+
+    #[test]
+    fn ac3_duration_32000() {
+        // 1536 / 32000 s = 48 ms exactly.
+        let frame = make_ac3_frame(2, 0); // fscod=2 (32kHz)
+        let bsid = get_bsid(&frame);
+        assert_eq!(frame_duration_ns(&frame, bsid), 48_000_000);
+    }
+
+    #[test]
+    fn eac3_fscod2_22050_reduced_rate() {
+        // E-AC-3 fscod==3, fscod2==1 → 22.05 kHz (EAC3_REDUCED_RATES[1]).
+        // byte4 = fscod(11) | fscod2(01) << 4 = 0b1101_0000 = 0xD0. fscod==3
+        // fixes numblks to 6 → 1536 samples.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xD0, 16 << 3];
+        let bsid = get_bsid(&data);
+        assert!(bsid >= 11);
+        let expect = (1536u64 * 1_000_000_000 + 22_050 / 2) / 22_050;
+        assert_eq!(frame_duration_ns(&data, bsid), expect);
+    }
+
+    #[test]
+    fn eac3_fscod2_16000_reduced_rate() {
+        // fscod==3, fscod2==2 → 16 kHz. byte4 = 0b1110_0000 = 0xE0.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xE0, 16 << 3];
+        let bsid = get_bsid(&data);
+        let expect = 1536u64 * 1_000_000_000 / 16_000; // exact
+        assert_eq!(frame_duration_ns(&data, bsid), expect);
+    }
+
+    #[test]
+    fn eac3_fscod2_reserved_index3_falls_back_48k() {
+        // fscod==3, fscod2==3 is RESERVED; the code falls back to 48 kHz
+        // (EAC3_REDUCED_RATES[3]). byte4 = 0b1111_0000 = 0xF0.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xF0, 16 << 3];
+        let bsid = get_bsid(&data);
+        let expect = 1536u64 * 1_000_000_000 / 48_000; // 32ms
+        assert_eq!(frame_duration_ns(&data, bsid), expect);
+    }
+
+    #[test]
+    fn ac3_fscod3_does_not_use_fscod2_path() {
+        // For LEGACY AC-3 (bsid < 11) fscod==3 is reserved; frame_sample_rate
+        // must NOT take the fscod2 branch (that is E-AC-3 only) and must index
+        // SAMPLE_RATES[3] = 48000 fallback. Duration = 1536/48000 = 32ms.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xC0, 8 << 3]; // bsid=8 (AC-3)
+        let bsid = get_bsid(&data);
+        assert!(bsid < 11);
+        assert_eq!(frame_duration_ns(&data, bsid), 32_000_000);
+    }
+
+    #[test]
+    fn frame_sample_rate_short_input_defaults_48k() {
+        // < 5 bytes → SAMPLE_RATES[0] = 48000 default (can't read fscod).
+        let short = [0x0B, 0x77, 0x00, 0x00];
+        let expect = 1536u64 * 1_000_000_000 / 48_000;
+        assert_eq!(frame_duration_ns(&short, 8), expect);
+    }
+
+    // --- eac3_samples_per_frame: numblkscod table ---
+
+    #[test]
+    fn eac3_numblkscod_block_counts() {
+        // A/52 Annex E numblkscod (byte4 bits 5-4 when fscod != 3):
+        //   0→1 block, 1→2, 2→3, 3→6 blocks; each block = 256 samples.
+        // fscod=0 keeps the fscod2 path off. byte4 = numblkscod << 4.
+        let mk = |numblkscod: u8| [0x0B, 0x77, 0x00, 0x00, numblkscod << 4, 0x00];
+        assert_eq!(
+            eac3_samples_per_frame(&mk(0)),
+            256,
+            "numblkscod 0 → 1 block"
+        );
+        assert_eq!(
+            eac3_samples_per_frame(&mk(1)),
+            512,
+            "numblkscod 1 → 2 blocks"
+        );
+        assert_eq!(
+            eac3_samples_per_frame(&mk(2)),
+            768,
+            "numblkscod 2 → 3 blocks"
+        );
+        assert_eq!(
+            eac3_samples_per_frame(&mk(3)),
+            1536,
+            "numblkscod 3 → 6 blocks"
+        );
+    }
+
+    #[test]
+    fn eac3_samples_fscod3_fixed_at_six_blocks() {
+        // When fscod==3 (reduced rate), numblks is fixed at 6 regardless of the
+        // numblkscod bits. byte4 = 0b11_xx_0000; set the numblkscod bits to 0
+        // (would otherwise be 1 block) to prove the fscod==3 override wins.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xC0, 0x00];
+        assert_eq!(eac3_samples_per_frame(&data), 6 * 256);
+    }
+
+    #[test]
+    fn eac3_samples_short_input_defaults_1536() {
+        // < 5 bytes → AC3_SAMPLES_PER_FRAME (1536) fallback.
+        assert_eq!(eac3_samples_per_frame(&[0x0B, 0x77, 0x00, 0x00]), 1536);
+    }
+
+    // --- frame acceptance / rejection at the size boundaries ---
+
+    #[test]
+    fn eac3_frame_at_min_frame_bytes_is_accepted() {
+        // The smallest acceptable (E-)AC-3 frame is MIN_FRAME_BYTES = 6.
+        // Build an E-AC-3 frame whose frmsiz sizes it to exactly 6 bytes
+        // (frmsiz=2). bsid >= 11 selects E-AC-3 sizing. The parser must emit it.
+        let mut parser = Ac3Parser::new();
+        // 0x0B 0x77 | byte2=0 byte3=2 (frmsiz=2 → 6 bytes) | byte4=0 | byte5 bsid
+        let mut data = vec![0x0B, 0x77, 0x00, 0x02, 0x00, 16 << 3];
+        // pad to exactly 6 bytes (already 6). Then a trailing real AC-3 frame so
+        // the 6-byte frame isn't a tail that needs more data.
+        data.truncate(6);
+        data.extend_from_slice(&make_ac3_frame(0, 2));
+        let f = parser.parse(&make_eac3_pes(data));
+        assert_eq!(f.len(), 2, "6-byte E-AC-3 frame accepted + following AC-3");
+        assert_eq!(f[0].data.len(), 6);
+    }
+
+    #[test]
+    fn eac3_max_frmsiz_frame_within_window_accepted() {
+        // E-AC-3 frmsiz is an 11-bit field (3 bits of byte2 + 8 bits of byte3),
+        // so its maximum value is 0x7FF = 2047 → (2048)*2 = 4096 bytes, which is
+        // inside the MIN_FRAME_BYTES..=8192 accept window and must be emitted.
+        let mut parser = Ac3Parser::new();
+        let mut frame = vec![0u8; 4096];
+        frame[0] = 0x0B;
+        frame[1] = 0x77;
+        frame[2] = 0x07; // frmsiz high
+        frame[3] = 0xFF; // frmsiz low → 0x7FF = 2047 → 4096 bytes
+        frame[5] = 16 << 3; // bsid 16 (E-AC-3)
+        let f = parser.parse(&make_eac3_pes(frame));
+        assert_eq!(f.len(), 1, "4096-byte E-AC-3 frame within window accepted");
+        assert_eq!(f[0].data.len(), 4096);
+    }
+
+    #[test]
+    fn undersized_sync_skips_two_bytes_and_resyncs() {
+        // A sync whose decoded size is below MIN_FRAME_BYTES (here an E-AC-3
+        // frmsiz=0 → 2-byte "frame") is rejected by skipping exactly 2 bytes
+        // past the sync, then resyncing to the next real frame.
+        let mut parser = Ac3Parser::new();
+        let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 16 << 3];
+        data.extend_from_slice(&make_ac3_frame(0, 2)); // real frame follows
+        let f = parser.parse(&make_eac3_pes(data));
+        assert_eq!(f.len(), 1, "junk sync skipped, real frame found");
+        assert_eq!(f[0].data.len(), 160);
+    }
+
+    // --- find_ac3_sync ---
+
+    #[test]
+    fn find_ac3_sync_locates_0b77() {
+        assert_eq!(find_ac3_sync(&[0xFF, 0x0B, 0x77, 0x00]), Some(1));
+        assert_eq!(find_ac3_sync(&[0x0B, 0x77]), Some(0));
+    }
+
+    #[test]
+    fn find_ac3_sync_lone_0b_at_end_not_matched() {
+        // A trailing lone 0x0B (no following 0x77) is not a complete syncword.
+        // saturating_sub(1) prevents an out-of-bounds read of data[i+1].
+        assert_eq!(find_ac3_sync(&[0xFF, 0xFF, 0x0B]), None);
+        assert_eq!(find_ac3_sync(&[0x0B]), None);
+        assert_eq!(find_ac3_sync(&[]), None);
+    }
+
+    #[test]
+    fn find_ac3_sync_0b_without_77_no_false_positive() {
+        // 0x0B followed by something other than 0x77 is not a sync.
+        assert_eq!(find_ac3_sync(&[0x0B, 0x76, 0x0B, 0x78]), None);
+    }
+
+    // --- flush rejects an oversized declared frame ---
+
+    #[test]
+    fn flush_rejects_frame_extending_past_buffer() {
+        // A buffered sync whose decoded frame size exceeds the buffered bytes
+        // must be dropped by flush (never emit fewer bytes than the size field
+        // declares). Build a real AC-3 header (160-byte frame) but only buffer
+        // 100 bytes.
+        let mut parser = Ac3Parser::new();
+        let frame = make_ac3_frame(0, 2); // sizes to 160
+        parser.buf = frame[..100].to_vec();
+        assert!(
+            parser.flush().is_empty(),
+            "incomplete frame must not be emitted truncated at flush"
+        );
+    }
+
+    #[test]
+    fn flush_with_no_sync_is_empty() {
+        // flush on a buffer with no syncword yields nothing and clears.
+        let mut parser = Ac3Parser::new();
+        parser.buf = vec![0xAA, 0xBB, 0xCC];
+        assert!(parser.flush().is_empty());
+    }
+
+    // helper: PES with a generic pts for E-AC-3 tests
+    fn make_eac3_pes(data: Vec<u8>) -> PesPacket {
+        PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data,
+        }
+    }
 }

@@ -663,4 +663,249 @@ mod tests {
             assert_ne!(len, 0, "0xBD PES must carry a bounded length");
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Added hardening tests
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Concatenate the ES payloads of all packets on `pid`, stripping the
+    /// PES header off each PUSI packet. A PUSI packet starts a PES whose
+    /// header is `00 00 01 stream_id len len 80 80 05` + 5 PTS bytes = 14
+    /// bytes for our muxer (always PTS-present, header_data_length 5).
+    fn reassemble_es(packets: &[TsPacket], pid: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in packets.iter().filter(|p| p.pid == pid) {
+            if p.pusi {
+                // Skip the 14-byte PES header (3 startcode + 1 stream_id +
+                // 2 length + 2 flags + 1 hdr_len + 5 PTS).
+                assert!(p.payload.len() >= 14, "PUSI payload holds a PES header");
+                out.extend_from_slice(&p.payload[14..]);
+            } else {
+                out.extend_from_slice(&p.payload);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_packet_is_exactly_192_bytes() {
+        // BD-TS packets are 192 bytes (4 TP_extra + 188 TS). The muxer must
+        // never emit a short or long packet — that would desync any reader.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            let idr = fake_hevc_nal(19, 500); // spans several packets
+            mux.write_frame(0, 0, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        assert!(!sink.is_empty());
+        assert_eq!(sink.len() % BD_PACKET_SIZE, 0, "output must be 192-aligned");
+        for chunk in sink.chunks(BD_PACKET_SIZE) {
+            assert_eq!(chunk.len(), BD_PACKET_SIZE);
+            assert_eq!(chunk[4], SYNC_BYTE, "TS sync byte at offset 4");
+        }
+    }
+
+    #[test]
+    fn audio_es_round_trips_byte_for_byte_through_demuxer() {
+        // The mux→demux round trip must preserve every audio ES byte. A
+        // muxer that dropped/duplicated payload on a packet boundary would
+        // silently corrupt the audio. Use a payload spanning many packets.
+        let es: Vec<u8> = (0..1000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 0, false, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let got = reassemble_es(&packets, AUDIO_PID);
+        assert_eq!(got, es, "audio ES must survive mux→demux unchanged");
+    }
+
+    #[test]
+    fn continuity_counter_wraps_modulo_16() {
+        // ISO 13818-1: continuity_counter is 4 bits, incrementing per packet
+        // on a PID and wrapping 15→0. A frame spanning >16 packets exercises
+        // the wrap.
+        let es: Vec<u8> = vec![0xAB; 20 * 184]; // 20 packets of audio payload
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 0, false, &es).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let ccs: Vec<u8> = packets
+            .iter()
+            .filter(|p| p.pid == AUDIO_PID)
+            .map(|p| p.cc)
+            .collect();
+        assert!(ccs.len() > 16, "need >16 packets to test the wrap");
+        for w in ccs.windows(2) {
+            assert_eq!(w[1], (w[0] + 1) & 0x0F, "CC increments mod 16");
+        }
+        // Prove a wrap actually occurred (a 15→0 transition exists).
+        assert!(
+            ccs.windows(2).any(|w| w[0] == 0x0F && w[1] == 0x00),
+            "CC must wrap 15→0 across >16 packets"
+        );
+    }
+
+    #[test]
+    fn pts_encoded_at_90khz_decodes_correctly() {
+        // pts_ns → 90 kHz ticks = pts_ns * 9 / 100_000. 1 second (1e9 ns)
+        // = 90_000 ticks. The first (base) video frame rebases to 0, so use
+        // a second frame at a known offset and check its encoded PTS.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            let idr = fake_hevc_nal(19, 50);
+            mux.write_frame(0, 0, true, &idr).unwrap(); // base = 0
+            let p = fake_hevc_nal(1, 50);
+            // +1 second relative to base.
+            mux.write_frame(0, 1_000_000_000, false, &p).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let video_pusi: Vec<&TsPacket> = packets
+            .iter()
+            .filter(|p| p.pid == VIDEO_PID && p.pusi)
+            .collect();
+        assert!(video_pusi.len() >= 2);
+        // Decode PTS of the SECOND video PES (the +1s frame).
+        let p = &video_pusi[1].payload;
+        let pts = ((((p[9] >> 1) & 0x07) as u64) << 30)
+            | ((p[10] as u64) << 22)
+            | (((p[11] >> 1) as u64) << 15)
+            | ((p[12] as u64) << 7)
+            | ((p[13] >> 1) as u64);
+        assert_eq!(pts, 90_000, "1s offset encodes to 90000 ticks @ 90 kHz");
+    }
+
+    #[test]
+    fn video_pes_uses_unbounded_length_field() {
+        // build_pes_header: video (stream_id 0xE0) always uses the unbounded
+        // (0x0000) PES_packet_length form — video PES can exceed u16.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            let idr = fake_hevc_nal(19, 50);
+            mux.write_frame(0, 0, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let pusi = packets
+            .iter()
+            .find(|p| p.pid == VIDEO_PID && p.pusi)
+            .unwrap();
+        // PES length field at payload[4..6].
+        let len = u16::from_be_bytes([pusi.payload[4], pusi.payload[5]]);
+        assert_eq!(len, 0, "video PES length field is the unbounded 0 form");
+        // stream_id (payload[3]) is 0xE0 for video.
+        assert_eq!(pusi.payload[3], 0xE0, "video stream_id 0xE0");
+    }
+
+    #[test]
+    fn audio_pes_stream_id_is_private_stream_1() {
+        // Non-video PIDs are carried as private_stream_1 (0xBD).
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 0, false, &[0x0B, 0x77, 0x01, 0x02])
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let pusi = packets
+            .iter()
+            .find(|p| p.pid == AUDIO_PID && p.pusi)
+            .unwrap();
+        assert_eq!(pusi.payload[3], 0xBD, "audio carried as private_stream_1");
+    }
+
+    #[test]
+    fn negative_relative_pts_saturates_to_zero() {
+        // A frame earlier than the base (negative relative PTS) must encode
+        // PTS 0, never an underflowed huge value. Audio at t=0 before a
+        // video keyframe at t=2s: base=video, audio relative = -2s → 0.
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID, AUDIO_PID]);
+            mux.write_frame(1, 0, false, &[0x0B, 0x77, 0x00, 0x00])
+                .unwrap();
+            let idr = fake_hevc_nal(19, 50);
+            mux.write_frame(0, 2_000_000_000, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        assert_eq!(
+            first_pts_90k(&packets, AUDIO_PID),
+            0,
+            "earlier audio saturates to 0"
+        );
+    }
+
+    #[test]
+    fn no_base_seeded_by_audio_only_stream() {
+        // If only audio frames are written (no video), base_pts_ns is never
+        // seeded by them; each frame rebases to itself via unwrap_or(pts_ns),
+        // so the first audio frame lands at relative 0. Proves audio never
+        // seeds the global base (which would corrupt later A/V offsets).
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            // First audio frame at 5s.
+            mux.write_frame(0, 5_000_000_000, false, &[0x01, 0x02])
+                .unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        // With no video base, base = unwrap_or(pts_ns) = this frame's pts,
+        // so relative PTS is 0.
+        assert_eq!(first_pts_90k(&packets, AUDIO_PID), 0);
+    }
+
+    #[test]
+    fn oversized_audio_split_preserves_all_bytes() {
+        // The oversized-0xBD split must not lose or reorder ES bytes across
+        // the multiple PES it produces. Reassembling all audio packets must
+        // reproduce the original frame exactly.
+        let big: Vec<u8> = (0..(MAX_BD_PES_PAYLOAD + 3000))
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[AUDIO_PID]);
+            mux.write_frame(0, 0, false, &big).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        let got = reassemble_es(&packets, AUDIO_PID);
+        assert_eq!(got.len(), big.len(), "no bytes lost in the PES split");
+        assert_eq!(got, big, "split audio reassembles byte-for-byte");
+    }
+
+    #[test]
+    fn af_plus_payload_always_fills_184() {
+        // Invariant from write_pes_chain: af_bytes + payload_len == 184 on
+        // every packet (so the 192-byte frame is exact). Verify for a video
+        // keyframe (which forces an RAI adaptation field on packet 1).
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+            let idr = fake_hevc_nal(19, 400);
+            mux.write_frame(0, 0, true, &idr).unwrap();
+            mux.finish().unwrap();
+        }
+        let packets = parse_bd_ts(&sink);
+        for p in packets.iter().filter(|p| p.pid == VIDEO_PID) {
+            let af_total = p.af.as_ref().map(|a| a.len() + 1).unwrap_or(0); // +1 length byte
+            assert_eq!(
+                af_total + p.payload.len(),
+                184,
+                "AF area + payload must fill the 184-byte TS body"
+            );
+        }
+    }
 }

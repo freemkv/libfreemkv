@@ -949,4 +949,412 @@ mod tests {
         assert_eq!(attr.channels, 2);
         assert_eq!(attr.language, "fr");
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Added hardening tests. Grounded in the DVD-Video IFO spec
+    // (dvd_udf / libdvdread ifo_types.h; http://dvd.sourceforge.net).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// BCD frame-rate flag: bits 7-6 of byte[3]. 0b01 = 25fps (PAL),
+    /// 0b11 = 29.97fps (NTSC). 0b00/0b10 are "unknown" → frames ignored.
+    /// Verify the 25fps branch contributes frames correctly.
+    #[test]
+    fn bcd_25fps_frame_contribution() {
+        // 0h 0m 0s, 12 frames at 25fps → 12/25 = 0.48s.
+        let bcd = [0x00, 0x00, 0x00, 0b01_010010]; // frame BCD 0x12 = 12
+        let secs = bcd_to_secs(&bcd);
+        assert!((secs - 12.0 / 25.0).abs() < 0.001, "got {secs}");
+    }
+
+    /// BCD rate_flag 0b00 (and 0b10) → fps 0.0 → frame count ignored
+    /// entirely (only H/M/S counted). Source: `_ => 0.0` arm.
+    #[test]
+    fn bcd_unknown_rate_ignores_frames() {
+        // 0h 1m 0s with frame bits set but rate_flag 0b00.
+        let bcd = [0x00, 0x01, 0x00, 0b00_011001]; // frames present, rate unknown
+        let secs = bcd_to_secs(&bcd);
+        assert!((secs - 60.0).abs() < 0.001, "got {secs}");
+        // rate_flag 0b10 also unknown.
+        let bcd2 = [0x00, 0x01, 0x00, 0b10_011001];
+        assert!((bcd_to_secs(&bcd2) - 60.0).abs() < 0.001);
+    }
+
+    /// BCD frame count is the LOW 6 bits of byte[3] (bits 5-0), decoded as
+    /// BCD. The 2 high bits (rate flag) must not leak into the frame value.
+    /// 0b11_100101: rate=29.97, frame BCD = 0x25 = 25 frames.
+    #[test]
+    fn bcd_frame_count_masks_rate_bits() {
+        let bcd = [0x00, 0x00, 0x00, 0b11_100101]; // 0x25 BCD = 25 frames
+        let secs = bcd_to_secs(&bcd);
+        assert!((secs - 25.0 / 29.97).abs() < 0.001, "got {secs}");
+    }
+
+    /// BCD hours can exceed 12 (long titles): 0x12 BCD = 12 → but test a
+    /// value where hi/lo are both valid digits, e.g. 0x10 = 10 hours.
+    /// Ensures hours aren't capped or treated as hex.
+    #[test]
+    fn bcd_double_digit_hours() {
+        let bcd = [0x10, 0x00, 0x00, 0x00]; // 10 hours BCD
+        let secs = bcd_to_secs(&bcd);
+        assert!((secs - 10.0 * 3600.0).abs() < 0.01, "got {secs}");
+    }
+
+    /// bcd_byte boundary: 0x9A has lo=0xA (>9) → invalid → 0. And 0xA0 has
+    /// hi=0xA (>9) → 0. Confirms BOTH nibbles are validated.
+    #[test]
+    fn bcd_byte_partial_invalid_nibble() {
+        assert_eq!(bcd_byte(0x9A), 0); // lo nibble invalid
+        assert_eq!(bcd_byte(0xA0), 0); // hi nibble invalid
+        assert_eq!(bcd_byte(0x90), 90); // both valid
+    }
+
+    /// sub_slice uses saturating_add so an offset near usize::MAX cannot
+    /// wrap and bypass the bounds check. Must return Err, not panic/OOB.
+    #[test]
+    fn sub_slice_no_overflow_wrap() {
+        let data = [0u8; 8];
+        assert!(sub_slice(&data, usize::MAX, 4).is_err());
+        assert!(sub_slice(&data, 4, 4).is_ok());
+        assert!(sub_slice(&data, 5, 4).is_err()); // 5+4 > 8
+    }
+
+    /// byte_at returns Err for an out-of-range index (uses .get()).
+    #[test]
+    fn byte_at_out_of_range() {
+        let data = [0xAA, 0xBB];
+        assert_eq!(byte_at(&data, 0).unwrap(), 0xAA);
+        assert_eq!(byte_at(&data, 1).unwrap(), 0xBB);
+        assert!(byte_at(&data, 2).is_err());
+    }
+
+    /// Video attr standard bits (b0 & 0x03): 0=NTSC, 1=PAL, else NTSC.
+    /// Value 2 and 3 fall into the NTSC default. Verify the catch-all.
+    #[test]
+    fn video_attr_reserved_standard_defaults_ntsc() {
+        let mut data = vec![0u8; 0x204];
+        data[0x200] = 0x02; // standard bits = 0b10 → default NTSC
+        let attr = parse_video_attr(&data).unwrap();
+        assert_eq!(attr.standard, "NTSC");
+        assert_eq!(attr.resolution, Resolution::R480i);
+    }
+
+    /// Video aspect bits ((b0>>2)&0x03): 0=4:3, 3=16:9, else 4:3.
+    /// Value 1/2 fall into the 4:3 default (catch-all arm).
+    #[test]
+    fn video_attr_reserved_aspect_defaults_4_3() {
+        let mut data = vec![0u8; 0x204];
+        data[0x200] = 0b00_01_00_00; // aspect bits = 0b01 → default 4:3
+        let attr = parse_video_attr(&data).unwrap();
+        assert_eq!(attr.aspect, "4:3");
+    }
+
+    /// Audio coding_mode (b0>>5 & 0x07): 0=AC3, 2=MPEG1, 3=MP2, 4=LPCM,
+    /// 6=DTS; everything else → Unknown(mode). Verify LPCM (4) and an
+    /// unknown mode (1) map per the spec table.
+    #[test]
+    fn audio_attr_lpcm_and_unknown_coding() {
+        let mut data = vec![0u8; 8];
+        // LPCM: coding=4 → b0 bits 7-5 = 0b100 → 0x80
+        data[0] = 0x80;
+        data[2] = b'e';
+        data[3] = b'n';
+        let attr = parse_audio_attr(&data, 0).unwrap();
+        assert_eq!(attr.codec, Codec::Lpcm);
+
+        // coding=1 (reserved/unknown) → Unknown(1)
+        let mut data2 = vec![0u8; 8];
+        data2[0] = 0b001_00000; // coding=1
+        let attr2 = parse_audio_attr(&data2, 0).unwrap();
+        assert_eq!(attr2.codec, Codec::Unknown(1));
+    }
+
+    /// Audio channels = (b1>>4 & 0x0F) + 1 (stored as channels-minus-1).
+    /// b1 = 0x70 → 7+1 = 8 channels (7.1). Verify the +1 and nibble.
+    #[test]
+    fn audio_attr_channel_count_plus_one() {
+        let mut data = vec![0u8; 8];
+        data[0] = 0x00; // AC3
+        data[1] = 0x70; // channels-1 = 7
+        let attr = parse_audio_attr(&data, 0).unwrap();
+        assert_eq!(attr.channels, 8);
+    }
+
+    /// Audio language bytes [offset+2..+4]: when both bytes are 0x00 the
+    /// language is the empty string (unspecified), per source.
+    #[test]
+    fn audio_attr_zero_language_is_empty() {
+        let mut data = vec![0u8; 8];
+        data[0] = 0x00;
+        data[2] = 0x00;
+        data[3] = 0x00;
+        let attr = parse_audio_attr(&data, 0).unwrap();
+        assert_eq!(attr.language, "");
+    }
+
+    /// Audio sample_rate flag (b0>>3 & 0x03): 0=48kHz, 1=96kHz, else 48kHz.
+    /// Verify flag 2/3 fall back to 48kHz (catch-all).
+    #[test]
+    fn audio_attr_reserved_rate_defaults_48k() {
+        let mut data = vec![0u8; 8];
+        data[0] = 0b000_10_000; // rate flag = 0b10
+        let attr = parse_audio_attr(&data, 0).unwrap();
+        assert_eq!(attr.sample_rate, 48000);
+    }
+
+    /// Subtitle language is at [offset+2..+4]. Verify a valid 2-letter code
+    /// and the all-zero → empty case.
+    #[test]
+    fn subtitle_attr_language() {
+        let mut data = vec![0u8; 6];
+        data[2] = b'd';
+        data[3] = b'e';
+        let attr = parse_subtitle_attr(&data, 0).unwrap();
+        assert_eq!(attr.language, "de");
+
+        let zero = vec![0u8; 6];
+        let attr2 = parse_subtitle_attr(&zero, 0).unwrap();
+        assert_eq!(attr2.language, "");
+    }
+
+    /// assign_audio_sub_stream_ids: MP1/MP2 and other non-private-stream-1
+    /// codecs must get `None` (regular MPEG-audio PES, not a sub-id).
+    /// Source maps only AC3/DTS/LPCM to Some(_).
+    #[test]
+    fn mp2_audio_gets_no_sub_stream_id() {
+        let mut streams = vec![
+            DvdAudioAttr {
+                codec: Codec::Mp2,
+                channels: 2,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+            DvdAudioAttr {
+                codec: Codec::Ac3,
+                channels: 6,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+        ];
+        assign_audio_sub_stream_ids(&mut streams);
+        assert_eq!(streams[0].sub_stream_id, None); // MP2 → no sub-id
+        assert_eq!(streams[1].sub_stream_id, Some(0x80)); // AC3 #0
+    }
+
+    /// assign_audio_sub_stream_ids saturates the per-codec ordinal at the
+    /// range ceiling (min(7)) so a malformed over-count never produces an
+    /// out-of-range sub-id. 9 AC-3 streams: the 9th still ≤ 0x87.
+    #[test]
+    fn audio_sub_stream_id_saturates_at_ceiling() {
+        let mut streams: Vec<DvdAudioAttr> = (0..9)
+            .map(|_| DvdAudioAttr {
+                codec: Codec::Ac3,
+                channels: 2,
+                sample_rate: 48000,
+                language: String::new(),
+                sub_stream_id: None,
+            })
+            .collect();
+        assign_audio_sub_stream_ids(&mut streams);
+        for s in &streams {
+            let id = s.sub_stream_id.unwrap();
+            assert!(
+                (0x80..=0x87).contains(&id),
+                "AC-3 sub-id out of range: {id:#x}"
+            );
+        }
+        // 8th and 9th both saturate at 0x87.
+        assert_eq!(streams[7].sub_stream_id, Some(0x87));
+        assert_eq!(streams[8].sub_stream_id, Some(0x87));
+    }
+
+    /// parse_pgc: cells are 24-byte records; first_sector at cell+8,
+    /// last_sector at cell+20 (both u32 BE). The cell table starts at
+    /// PGC + cell_playback_offset (read from PGC+0xE8 as u16 BE). Build a
+    /// PGC with a non-trivial cell_playback_offset and verify cells.
+    #[test]
+    fn pgc_cell_offsets_first_and_last_sector() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1; // nr_programs
+        pgc[0x03] = 1; // nr_cells = 1
+        // PGC-level BCD time zero so duration is recomputed from cells.
+        // cell_playback_offset at 0xE8 (u16 BE) = 0xEA.
+        pgc[0xE8] = 0x00;
+        pgc[0xE9] = 0xEA;
+        pgc.resize(0xEA + 24, 0);
+        let co = 0xEA;
+        // cell BCD time at +4..+8: 0h 0m 10s, no frames.
+        pgc[co + 6] = 0x10; // seconds BCD 10
+        // first_sector at +8 = 0x000004D2 = 1234
+        pgc[co + 8..co + 12].copy_from_slice(&1234u32.to_be_bytes());
+        // last_sector at +20 = 0x0000162E = 5678
+        pgc[co + 20..co + 24].copy_from_slice(&5678u32.to_be_bytes());
+
+        let title = parse_pgc(&pgc, 0, 3).unwrap();
+        assert_eq!(title.cells.len(), 1);
+        assert_eq!(title.cells[0].first_sector, 1234);
+        assert_eq!(title.cells[0].last_sector, 5678);
+        // PGC time was 0 → recomputed from cell time = 10s.
+        assert!(
+            (title.duration_secs - 10.0).abs() < 0.01,
+            "got {}",
+            title.duration_secs
+        );
+    }
+
+    /// parse_pgc requires `pgc_offset + 0xEA <= data.len()` (needs the cell
+    /// playback offset at 0xE8). A PGC shorter than 0xEA → IfoParse error,
+    /// not panic.
+    #[test]
+    fn pgc_too_short_errs() {
+        let pgc = vec![0u8; 0xE9]; // one byte short of 0xEA
+        assert!(parse_pgc(&pgc, 0, 1).is_err());
+    }
+
+    /// parse_pgc cell loop stops when a cell record runs past the buffer
+    /// (`co + 24 > data.len()` → break), parsing only complete cells.
+    /// Declare 3 cells but supply bytes for 2.
+    #[test]
+    fn pgc_truncated_cell_table_stops() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1;
+        pgc[0x03] = 3; // claims 3 cells
+        pgc[0xE8] = 0x00;
+        pgc[0xE9] = 0xEA;
+        // Only room for 2 full cells (48 bytes).
+        pgc.resize(0xEA + 48, 0);
+        pgc[0xEA + 8..0xEA + 12].copy_from_slice(&10u32.to_be_bytes());
+        pgc[0xEA + 24 + 8..0xEA + 24 + 12].copy_from_slice(&20u32.to_be_bytes());
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        // Only 2 cells parsed; the 3rd had no bytes.
+        assert_eq!(title.cells.len(), 2);
+        assert_eq!(title.cells[0].first_sector, 10);
+        assert_eq!(title.cells[1].first_sector, 20);
+    }
+
+    /// parse_pgc palette: at PGC+0xA4, 16 colors × 4 bytes [pad, Y, Cb, Cr].
+    /// A palette with at least one non-zero Y/Cb/Cr is returned as Some;
+    /// an all-zero palette returns None (source filters empty palettes).
+    #[test]
+    fn pgc_palette_present_and_empty() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x03] = 0; // no cells
+        // Set color 0's Y byte (offset 0xA4 + 1) non-zero.
+        pgc[0xA4 + 1] = 0x80;
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        let pal = title.palette.expect("non-empty palette should be Some");
+        assert_eq!(pal.len(), 16);
+        assert_eq!(pal[0], [0x00, 0x80, 0x00, 0x00]);
+
+        // All-zero palette → None.
+        let mut pgc2 = vec![0u8; 0xEA];
+        pgc2[0x03] = 0;
+        let title2 = parse_pgc(&pgc2, 0, 1).unwrap();
+        assert!(title2.palette.is_none());
+    }
+
+    /// parse_pgc palette layout: each color is [padding, Y, Cb, Cr] and the
+    /// "non-empty" test ignores the padding byte (index 0). A palette whose
+    /// ONLY non-zero bytes are padding must still be treated as empty (None).
+    #[test]
+    fn pgc_palette_padding_only_is_empty() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x03] = 0;
+        // Set padding byte (index 0) of color 0 non-zero, but Y/Cb/Cr zero.
+        pgc[0xA4] = 0xFF;
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        assert!(
+            title.palette.is_none(),
+            "padding-only palette must be treated as empty"
+        );
+    }
+
+    /// parse_pgc chapter_times: the program map (at PGC+0xE6) holds, per
+    /// program, the 1-based first cell number. chapter_time[p] = sum of
+    /// cell durations BEFORE that program's first cell. Verify a 2-program,
+    /// 3-cell layout: program 0 starts at cell 1 (time 0), program 1 starts
+    /// at cell 3 (time = dur(cell0)+dur(cell1)).
+    #[test]
+    fn pgc_chapter_times_from_program_map() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 2; // nr_programs = 2
+        pgc[0x03] = 3; // nr_cells = 3
+        // program map offset at 0xE6 (u16 BE)
+        let pgm_off: u16 = 0xEA;
+        pgc[0xE6] = (pgm_off >> 8) as u8;
+        pgc[0xE7] = pgm_off as u8;
+        // cell playback offset at 0xE8
+        let cell_off: u16 = 0xEA + 2; // after the 2-byte program map
+        pgc[0xE8] = (cell_off >> 8) as u8;
+        pgc[0xE9] = cell_off as u8;
+
+        // Layout: [0xEA..0xEC] = program map (2 bytes), then 3 cells × 24.
+        pgc.resize(cell_off as usize + 3 * 24, 0);
+        // Program map: program0 first cell = 1, program1 first cell = 3.
+        pgc[0xEA] = 1;
+        pgc[0xEB] = 3;
+        // Cell durations: cell0 = 5s, cell1 = 7s, cell2 = 9s (BCD seconds).
+        let cb = cell_off as usize;
+        pgc[cb + 6] = 0x05; // cell0 sec
+        pgc[cb + 24 + 6] = 0x07; // cell1 sec
+        pgc[cb + 48 + 6] = 0x09; // cell2 sec
+
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(title.chapter_times.len(), 2);
+        // Program 0 → before cell 1 → 0s.
+        assert!((title.chapter_times[0] - 0.0).abs() < 0.01);
+        // Program 1 → before cell 3 → dur(cell0)+dur(cell1) = 5+7 = 12s.
+        assert!(
+            (title.chapter_times[1] - 12.0).abs() < 0.01,
+            "got {}",
+            title.chapter_times[1]
+        );
+    }
+
+    /// parse_pgc duration: when the PGC-level BCD time is NON-zero it is
+    /// used directly and NOT overwritten by cell-sum recomputation
+    /// (the recompute only fires when duration_secs == 0.0).
+    #[test]
+    fn pgc_nonzero_duration_not_recomputed() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1;
+        pgc[0x03] = 1;
+        // PGC-level time = 1m 0s at 25fps.
+        pgc[0x05] = 0x01; // minutes BCD 1
+        pgc[0x07] = 0b01_000000; // 25fps, 0 frames
+        pgc[0xE8] = 0x00;
+        pgc[0xE9] = 0xEA;
+        pgc.resize(0xEA + 24, 0);
+        // Give the cell a bogus huge duration that must be IGNORED.
+        pgc[0xEA + 6] = 0x59; // 59s — would change result if recomputed
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        assert!(
+            (title.duration_secs - 60.0).abs() < 0.01,
+            "PGC-level 60s must win, got {}",
+            title.duration_secs
+        );
+    }
+
+    /// VMG magic check: parse_video_attr et al. aside, the top-level VMG
+    /// must start with "DVDVIDEO-VMG". We exercise the constant directly to
+    /// guard against an accidental edit to the 12-byte magic.
+    #[test]
+    fn vmg_vts_magic_constants() {
+        assert_eq!(VMG_MAGIC, b"DVDVIDEO-VMG");
+        assert_eq!(VTS_MAGIC, b"DVDVIDEO-VTS");
+        assert_eq!(SECTOR_SIZE, 2048);
+    }
+
+    /// parse_pgc with cell_playback_offset == 0 must produce NO cells (the
+    /// `cell_playback_offset > 0 && num_cells > 0` guard). Even with
+    /// nr_cells set, a zero offset means the table is absent.
+    #[test]
+    fn pgc_zero_cell_offset_no_cells() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x03] = 5; // claims 5 cells
+        // cell_playback_offset (0xE8) left 0.
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        assert!(title.cells.is_empty());
+    }
 }

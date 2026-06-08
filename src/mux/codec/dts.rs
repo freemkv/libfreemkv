@@ -745,4 +745,264 @@ mod tests {
         let parser = DtsParser::new();
         assert!(parser.codec_private().is_none());
     }
+
+    // --- dts_core_frame_size: 14-bit fsize extraction (ETSI TS 102 114) ---
+
+    #[test]
+    fn core_frame_size_bit_layout() {
+        // fsize is 14 bits at bits 46-59: byte5[1:0] (high 2), byte6 (mid 8),
+        // byte7[7:4] (low 4). Returned value is fsize + 1 (on-wire length-1).
+        // Set fsize = 0x1FFF (= 8191): byte5 low2 = 0b01, byte6 = 0xFF,
+        // byte7 high4 = 0xF (0xF0). (1<<12)|(0xFF<<4)|0xF = 0x1FFF → size 8192.
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[5] = 0x01;
+        d[6] = 0xFF;
+        d[7] = 0xF0;
+        assert_eq!(dts_core_frame_size(&d), 0x1FFF + 1);
+    }
+
+    #[test]
+    fn core_frame_size_ignores_unrelated_bits() {
+        // Only byte5[1:0] feed fsize; the upper 6 bits of byte5 and the low 4 of
+        // byte7 are unrelated. Set those to 1 and confirm they don't leak in.
+        // byte5 = 0xFC (low2 = 0), byte6 = 0x01, byte7 = 0x0F (high4 = 0).
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[5] = 0xFC; // low 2 bits zero
+        d[6] = 0x01;
+        d[7] = 0x0F; // high 4 bits zero
+        // fsize = (0<<12) | (1<<4) | 0 = 16 → size 17.
+        assert_eq!(dts_core_frame_size(&d), 17);
+    }
+
+    #[test]
+    fn core_frame_size_short_input_zero() {
+        // Below CORE_HEADER_MIN_BYTES → 0 (caller rejects via MIN floor).
+        assert_eq!(dts_core_frame_size(&[0x7F, 0xFE, 0x80, 0x01]), 0);
+        assert_eq!(dts_core_frame_size(&[]), 0);
+    }
+
+    #[test]
+    fn core_frame_size_max_14bit() {
+        // Max fsize 0x3FFF (all 14 bits set) → 16384, the documented upper
+        // range bound. byte5 low2 = 0x03, byte6 = 0xFF, byte7 high4 = 0xF0.
+        let mut d = vec![0u8; CORE_HEADER_MIN_BYTES];
+        d[5] = 0x03;
+        d[6] = 0xFF;
+        d[7] = 0xF0;
+        // wait — 0x03<<12 | 0xFF<<4 | 0x0F = 0x3FFF. byte7 high4 0xF0 >> 4 = 0xF.
+        assert_eq!(dts_core_frame_size(&d), 0x3FFF + 1);
+    }
+
+    // --- find_sync ---
+
+    #[test]
+    fn find_sync_locates_core() {
+        let mut d = vec![0xAA, 0xBB];
+        d.extend_from_slice(&DTS_CORE_SYNC);
+        assert_eq!(find_sync(&d, &DTS_CORE_SYNC), Some(2));
+    }
+
+    #[test]
+    fn find_sync_short_input_none() {
+        // < 4 bytes can't hold a 4-byte sync.
+        assert_eq!(find_sync(&[0x7F, 0xFE, 0x80], &DTS_CORE_SYNC), None);
+        assert_eq!(find_sync(&[], &DTS_CORE_SYNC), None);
+    }
+
+    #[test]
+    fn find_sync_partial_match_not_false_positive() {
+        // First 3 sync bytes then a wrong 4th must not match.
+        assert_eq!(find_sync(&[0x7F, 0xFE, 0x80, 0x00], &DTS_CORE_SYNC), None);
+    }
+
+    // --- next_core_boundary: candidate validation ---
+
+    #[test]
+    fn next_core_needs_more_when_candidate_header_truncated() {
+        // A second core sync appears but fewer than CORE_HEADER_MIN_BYTES follow
+        // it, so its size can't be judged → the access unit can't be closed yet
+        // (NeedMore → parse() breaks and waits). Build core(512) + a bare 2nd
+        // sync with only the 4 syncword bytes buffered (< CORE_HEADER_MIN_BYTES
+        // after it), so the candidate can't be validated.
+        let mut parser = DtsParser::new();
+        let mut data = make_dts_core(512);
+        data.extend_from_slice(&DTS_CORE_SYNC); // 2nd sync, header truncated
+        let f = parser.parse(&make_pes(data, Some(90000)));
+        assert!(
+            f.is_empty(),
+            "candidate sync with truncated header must NOT close the AU yet"
+        );
+        // The first core's bytes are still buffered awaiting the verdict — not
+        // dropped, not emitted.
+        assert!(
+            parser.buf.len() >= 512,
+            "core1 retained while candidate boundary is undecided"
+        );
+    }
+
+    #[test]
+    fn multiple_false_syncs_in_extension_all_skipped() {
+        // An extension body containing SEVERAL byte sequences that match the core
+        // syncword but decode to sub-spec sizes must ALL be skipped; the AU is
+        // closed only at the next real core. Guards the loop in
+        // next_core_boundary that advances `from = pos + 4` past each false sync.
+        let mut parser = DtsParser::new();
+        let mut ext = make_dts_ext(400);
+        // Embed three bogus tiny core syncs at offsets 50, 150, 250.
+        for &off in &[50usize, 150, 250] {
+            ext[off..off + 4].copy_from_slice(&DTS_CORE_SYNC);
+            // leave header bytes zero → fsize decodes to 1 → bogus.
+        }
+        let mut frame1 = make_dts_core(512);
+        frame1.extend_from_slice(&ext);
+        assert!(
+            parser.parse(&make_pes(frame1, Some(90000))).is_empty(),
+            "no real next core yet → AU held despite 3 false syncs"
+        );
+        let f = parser.parse(&make_pes(make_dts_core(640), Some(93000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data.len(),
+            512 + 400,
+            "AU spans the full extension, not split at any false sync"
+        );
+    }
+
+    #[test]
+    fn leading_junk_before_core_is_dropped() {
+        // Bytes before the first core sync are not part of any AU and must be
+        // dropped (drain_front(start)). Prepend junk, then core1 + core2.
+        let mut parser = DtsParser::new();
+        let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x12];
+        data.extend_from_slice(&make_dts_core(512));
+        data.extend_from_slice(&make_dts_core(640));
+        let f = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(f.len(), 1, "AU1 closes at core2");
+        assert_eq!(
+            f[0].data.len(),
+            512,
+            "leading junk dropped — AU is exactly the core, no prefix bytes"
+        );
+    }
+
+    #[test]
+    fn no_core_sync_keeps_only_three_byte_tail() {
+        // With no core sync at all, the parser retains at most a 3-byte tail so a
+        // sync split across PES packets can complete. Feed 4 junk bytes; tail
+        // must shrink to 3 (drain_front(len-3)).
+        let mut parser = DtsParser::new();
+        let f = parser.parse(&make_pes(vec![0x11, 0x22, 0x33, 0x44], Some(90000)));
+        assert!(f.is_empty());
+        assert_eq!(parser.buf.len(), 3, "only a 3-byte resync tail retained");
+        assert_eq!(parser.buf, vec![0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn core_sync_split_across_pes_reassembles() {
+        // The 4-byte core sync straddling a PES boundary must still be found:
+        // 3 sync bytes retained as tail, the 4th + body arrive next PES.
+        let mut parser = DtsParser::new();
+        let core = make_dts_core(512);
+        // PES 1: just the first 3 bytes of the sync.
+        assert!(
+            parser
+                .parse(&make_pes(core[..3].to_vec(), Some(90000)))
+                .is_empty()
+        );
+        assert_eq!(parser.buf.len(), 3, "3-byte sync prefix retained");
+        // PES 2: the 4th sync byte + the rest of core1, then a 2nd core to close.
+        let mut rest = core[3..].to_vec();
+        rest.extend_from_slice(&make_dts_core(640));
+        let f = parser.parse(&make_pes(rest, None));
+        assert_eq!(f.len(), 1, "split-sync core recovered and closed");
+        assert_eq!(f[0].data.len(), 512);
+        assert_eq!(
+            f[0].pts_ns,
+            pts_to_ns(90000),
+            "AU keeps the PTS of the PES that began the sync"
+        );
+    }
+
+    #[test]
+    fn core_header_incomplete_waits() {
+        // A core sync with fewer than CORE_HEADER_MIN_BYTES buffered can't be
+        // sized → parse() breaks and waits, emitting nothing.
+        let mut parser = DtsParser::new();
+        let mut data = DTS_CORE_SYNC.to_vec();
+        data.extend_from_slice(&[0x00, 0x00, 0x00]); // only 7 bytes total < 10
+        assert!(parser.parse(&make_pes(data, Some(90000))).is_empty());
+        assert!(!parser.buf.is_empty(), "partial core header retained");
+    }
+
+    #[test]
+    fn flush_rejects_sub_spec_core() {
+        // flush must reject a buffered "core" whose decoded size is below the
+        // 96-byte ETSI spec floor (a false sync), never emitting it.
+        let mut parser = DtsParser::new();
+        // A sync sized to 17 bytes (< MIN_CORE_FRAME_BYTES) with 17 bytes buffered.
+        let mut d = vec![0u8; 17];
+        d[0..4].copy_from_slice(&DTS_CORE_SYNC);
+        d[6] = 0x01; // fsize → 16 → size 17
+        parser.buf = d;
+        assert!(parser.flush().is_empty(), "sub-spec core rejected at flush");
+    }
+
+    #[test]
+    fn flush_rejects_core_extending_past_buffer() {
+        // A valid-sized core header but with fewer bytes buffered than the
+        // declared size must be dropped (never emit fewer bytes than declared).
+        let mut parser = DtsParser::new();
+        let core = make_dts_core(512);
+        parser.buf = core[..300].to_vec(); // header says 512, only 300 present
+        assert!(
+            parser.flush().is_empty(),
+            "incomplete core not emitted truncated"
+        );
+    }
+
+    #[test]
+    fn flush_empty_buffer_is_empty() {
+        let mut parser = DtsParser::new();
+        assert!(parser.flush().is_empty());
+    }
+
+    #[test]
+    fn flush_partial_sync_tail_dropped() {
+        // A bare partial-sync tail (not at offset 0 / not a full core) is dropped.
+        let mut parser = DtsParser::new();
+        parser.buf = vec![0x7F, 0xFE, 0x80]; // 3 of 4 sync bytes
+        assert!(parser.flush().is_empty());
+        assert!(parser.buf.is_empty(), "buffer cleared on flush");
+    }
+
+    #[test]
+    fn min_core_frame_bytes_boundary_accepts_96() {
+        // A core sized to exactly MIN_CORE_FRAME_BYTES (96) is the smallest
+        // valid core and must be accepted. core(96) + core(640) closes AU1=96.
+        let mut parser = DtsParser::new();
+        let mut data = make_dts_core(MIN_CORE_FRAME_BYTES);
+        data.extend_from_slice(&make_dts_core(640));
+        let f = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].data.len(), MIN_CORE_FRAME_BYTES);
+    }
+
+    #[test]
+    fn core_one_below_min_is_rejected() {
+        // A core decoding to 95 bytes (one below the 96-byte floor) is a false
+        // sync: skip its 4 syncword bytes and resync to the next real core.
+        let mut parser = DtsParser::new();
+        let mut data = make_dts_core(MIN_CORE_FRAME_BYTES - 1); // size 95, false
+        // Real core right after (so resync finds it).
+        data.extend_from_slice(&make_dts_core(512));
+        data.extend_from_slice(&make_dts_core(640)); // closes the real AU
+        let f = parser.parse(&make_pes(data, Some(90000)));
+        // The 95-byte false core is skipped; AU1 is the real 512 core.
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data.len(),
+            512,
+            "sub-floor sync skipped, real 512 core is AU1"
+        );
+    }
 }

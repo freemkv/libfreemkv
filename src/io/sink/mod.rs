@@ -164,4 +164,108 @@ mod tests {
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(&bytes[..], b"buffered-tail");
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    use std::io::{self, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A minimal `SequentialSink` that does NOT override `finish`, so it
+    /// exercises the trait's DEFAULT impl (lines 51-55), which must call
+    /// `Write::flush`. We record whether flush ran. This pins the
+    /// documented contract that the default `finish` is "correct for an
+    /// unbuffered destination" by flushing. Mutation: changing the
+    /// default `finish` body from `self.flush()` to `Ok(())` would set
+    /// `flushed=false` and fail.
+    struct FlushTracker {
+        flushed: Arc<AtomicBool>,
+        bytes: Arc<AtomicUsize>,
+    }
+    impl Write for FlushTracker {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.fetch_add(buf.len(), Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    // Uses the DEFAULT finish() — deliberately no override.
+    impl SequentialSink for FlushTracker {}
+
+    #[test]
+    fn default_finish_flushes() {
+        let flushed = Arc::new(AtomicBool::new(false));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let mut sink = FlushTracker {
+            flushed: flushed.clone(),
+            bytes: bytes.clone(),
+        };
+        sink.write_all(b"abc").unwrap();
+        assert!(
+            !flushed.load(Ordering::SeqCst),
+            "flush should not run before finish"
+        );
+        sink.finish().unwrap();
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "default SequentialSink::finish must call Write::flush"
+        );
+        assert_eq!(bytes.load(Ordering::SeqCst), 3);
+    }
+
+    /// Default `finish()` dispatched through a `dyn SequentialSink`
+    /// trait object must still reach the default `flush` (vtable path).
+    /// This guards that there is no accidental override that turns the
+    /// default into a no-op via dyn dispatch.
+    #[test]
+    fn default_finish_flushes_through_dyn() {
+        let flushed = Arc::new(AtomicBool::new(false));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let sink = FlushTracker {
+            flushed: flushed.clone(),
+            bytes: bytes.clone(),
+        };
+        let mut boxed: Box<dyn SequentialSink> = Box::new(sink);
+        boxed.write_all(b"xy").unwrap();
+        boxed.finish().unwrap();
+        assert!(flushed.load(Ordering::SeqCst));
+    }
+
+    /// `open_for_mkv` with `None` size hint must still produce a working
+    /// random-access sink (the `match size_hint { None => ... }` arm,
+    /// lines 103-106). Round-trip a seek-back patch through it to prove
+    /// both Write and Seek dispatch. Mutation: if the None arm returned
+    /// a sequential-only sink the seek would not compile / would fail.
+    #[test]
+    fn open_for_mkv_without_size_hint_is_random_access() {
+        use std::io::{Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nohint.bin");
+        let mut sink = open_for_mkv(&p, None).unwrap();
+        sink.write_all(b"AAAABBBB").unwrap();
+        sink.seek(SeekFrom::Start(4)).unwrap();
+        sink.write_all(b"CCCC").unwrap();
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(std::fs::read(&p).unwrap(), b"AAAACCCC");
+    }
+
+    /// finish() through a `dyn RandomAccessSink` (the supertrait of
+    /// SequentialSink) for a LocalFileSink must also flush+fsync. The
+    /// existing regression test boxes as `dyn SequentialSink`; this
+    /// pins the `dyn RandomAccessSink` vtable path too, since
+    /// `open_for_mkv` returns exactly that boxed type.
+    #[test]
+    fn finish_through_random_access_dyn_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ra-finish.bin");
+        let mut sink: Box<dyn RandomAccessSink> = open_for_mkv(&p, None).unwrap();
+        sink.write_all(b"durable").unwrap();
+        sink.finish().unwrap();
+        // Visible to a separate reader before drop.
+        assert_eq!(&std::fs::read(&p).unwrap()[..], b"durable");
+    }
 }

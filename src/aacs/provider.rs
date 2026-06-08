@@ -181,3 +181,229 @@ impl KeyProvider for SuppliedKey {
         self.disc_entry.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(hash: &str, vuk: u8) -> DiscEntry {
+        DiscEntry {
+            disc_hash: hash.to_string(),
+            title: "t".to_string(),
+            media_key: None,
+            disc_id: None,
+            vuk: Some([vuk; 16]),
+            unit_keys: Vec::new(),
+        }
+    }
+
+    fn dk(byte: u8, node: u16) -> DeviceKey {
+        DeviceKey {
+            key: [byte; 16],
+            node,
+            uv: 1,
+            u_mask_shift: 0,
+        }
+    }
+
+    /// A provider that returns fixed bulk material and an optional disc entry
+    /// keyed unconditionally (used to test array-order short-circuiting).
+    #[derive(Default)]
+    struct Fixed {
+        dks: Vec<DeviceKey>,
+        pks: Vec<[u8; 16]>,
+        mks: Vec<[u8; 16]>,
+        hash_hit: Option<DiscEntry>,
+        vid_hit: Option<DiscEntry>,
+    }
+    impl KeyProvider for Fixed {
+        fn device_keys(&self) -> Vec<DeviceKey> {
+            self.dks.clone()
+        }
+        fn processing_keys(&self) -> Vec<[u8; 16]> {
+            self.pks.clone()
+        }
+        fn media_keys(&self) -> Vec<[u8; 16]> {
+            self.mks.clone()
+        }
+        fn lookup_disc_by_hash(&self, _h: &[u8; 20]) -> Option<DiscEntry> {
+            self.hash_hit.clone()
+        }
+        fn lookup_disc_by_vid(&self, _v: &[u8; 16]) -> Option<DiscEntry> {
+            self.vid_hit.clone()
+        }
+    }
+
+    // ── KeyProvider default methods all return empty ───────────────────────
+
+    #[test]
+    fn default_provider_methods_return_empty() {
+        // A bare provider that overrides nothing must yield empty material so
+        // the resolver simply finds nothing through it (no surprise hits).
+        struct Empty;
+        impl KeyProvider for Empty {}
+        let e = Empty;
+        assert!(e.device_keys().is_empty());
+        assert!(e.processing_keys().is_empty());
+        assert!(e.media_keys().is_empty());
+        assert!(e.host_certs().is_empty());
+        assert!(e.lookup_disc_by_hash(&[0u8; 20]).is_none());
+        assert!(e.lookup_disc_by_vid(&[0u8; 16]).is_none());
+    }
+
+    // ── Providers::processing_keys: union + dedup ──────────────────────────
+
+    #[test]
+    fn providers_processing_keys_union_and_dedup() {
+        // Two providers each carrying overlapping PKs → the aggregate is the
+        // deduped union (the resolver must not re-validate identical material).
+        let a = Fixed {
+            pks: vec![[0x01u8; 16], [0x02u8; 16]],
+            ..Default::default()
+        };
+        let b = Fixed {
+            pks: vec![[0x02u8; 16], [0x03u8; 16]],
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let mut got = Providers(arr).processing_keys();
+        got.sort();
+        assert_eq!(got, vec![[0x01u8; 16], [0x02u8; 16], [0x03u8; 16]]);
+    }
+
+    #[test]
+    fn providers_media_keys_union_and_dedup() {
+        let a = Fixed {
+            mks: vec![[0xAAu8; 16]],
+            ..Default::default()
+        };
+        let b = Fixed {
+            mks: vec![[0xAAu8; 16], [0xBBu8; 16]],
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let mut got = Providers(arr).media_keys();
+        got.sort();
+        assert_eq!(got, vec![[0xAAu8; 16], [0xBBu8; 16]]);
+    }
+
+    #[test]
+    fn providers_device_keys_dedup_on_value_tuple() {
+        // DeviceKey has no Hash/Ord; dedup keys on (key,node,uv,u_mask_shift).
+        // Two identical DKs across providers collapse to one; a DK differing
+        // only in node is kept.
+        let a = Fixed {
+            dks: vec![dk(0x11, 5), dk(0x11, 5)],
+            ..Default::default()
+        };
+        let b = Fixed {
+            dks: vec![dk(0x11, 5), dk(0x11, 6)],
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let got = Providers(arr).device_keys();
+        assert_eq!(got.len(), 2, "identical DKs dedup; differing node kept");
+        let nodes: Vec<u16> = got.iter().map(|d| d.node).collect();
+        assert!(nodes.contains(&5) && nodes.contains(&6));
+    }
+
+    // ── Disc-keyed lookups: array-order short-circuit ──────────────────────
+
+    #[test]
+    fn providers_lookup_by_hash_first_hit_wins() {
+        // Querying providers in array order, the FIRST hit wins (closest /
+        // fastest first). Provider 0 hits → its entry is returned even though
+        // provider 1 also has one.
+        let a = Fixed {
+            hash_hit: Some(entry("first", 0x01)),
+            ..Default::default()
+        };
+        let b = Fixed {
+            hash_hit: Some(entry("second", 0x02)),
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let got = Providers(arr).lookup_disc_by_hash(&[0u8; 20]).unwrap();
+        assert_eq!(got.disc_hash, "first");
+        assert_eq!(got.vuk, Some([0x01u8; 16]));
+    }
+
+    #[test]
+    fn providers_lookup_by_hash_falls_through_to_later_provider() {
+        // Provider 0 misses, provider 1 hits → the later provider's entry is
+        // used (find_map continues past None).
+        let a = Fixed::default(); // hash_hit None
+        let b = Fixed {
+            hash_hit: Some(entry("second", 0x02)),
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let got = Providers(arr).lookup_disc_by_hash(&[0u8; 20]).unwrap();
+        assert_eq!(got.disc_hash, "second");
+    }
+
+    #[test]
+    fn providers_lookup_by_vid_first_hit_wins() {
+        let a = Fixed {
+            vid_hit: Some(entry("vid-a", 0x07)),
+            ..Default::default()
+        };
+        let b = Fixed {
+            vid_hit: Some(entry("vid-b", 0x08)),
+            ..Default::default()
+        };
+        let arr: &[&dyn KeyProvider] = &[&a, &b];
+        let got = Providers(arr).lookup_disc_by_vid(&[0u8; 16]).unwrap();
+        assert_eq!(got.disc_hash, "vid-a");
+    }
+
+    #[test]
+    fn providers_empty_array_yields_nothing() {
+        let arr: &[&dyn KeyProvider] = &[];
+        let p = Providers(arr);
+        assert!(p.device_keys().is_empty());
+        assert!(p.processing_keys().is_empty());
+        assert!(p.media_keys().is_empty());
+        assert!(p.lookup_disc_by_hash(&[0u8; 20]).is_none());
+        assert!(p.lookup_disc_by_vid(&[0u8; 16]).is_none());
+    }
+
+    // ── SuppliedKey: each level exposes only its own material ──────────────
+
+    #[test]
+    fn supplied_key_exposes_only_populated_fields() {
+        // A SuppliedKey filled at the DK level exposes DKs and nothing else,
+        // so the resolver runs the matching (DK→…) path and no other.
+        let sk = SuppliedKey {
+            device_keys: vec![dk(0x33, 9)],
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        assert_eq!(sk.device_keys().len(), 1);
+        assert!(sk.processing_keys().is_empty());
+        assert!(sk.media_keys().is_empty());
+        assert!(sk.lookup_disc_by_hash(&[0u8; 20]).is_none());
+        assert!(sk.lookup_disc_by_vid(&[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn supplied_key_disc_entry_returned_for_any_hash_or_vid() {
+        // decrypt_with already knows the disc, so a present disc_entry is
+        // returned regardless of the hash/VID argument (the lookup args are
+        // irrelevant in this bridge).
+        let sk = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(entry("supplied", 0x44)),
+        };
+        // Two unrelated hashes both return the same entry.
+        let h1 = sk.lookup_disc_by_hash(&[0x01u8; 20]).unwrap();
+        let h2 = sk.lookup_disc_by_hash(&[0xFFu8; 20]).unwrap();
+        assert_eq!(h1.disc_hash, "supplied");
+        assert_eq!(h2.disc_hash, "supplied");
+        // And by VID likewise.
+        assert!(sk.lookup_disc_by_vid(&[0x00u8; 16]).is_some());
+    }
+}

@@ -906,4 +906,353 @@ mod tests {
             .expect("happy-path finish_with_halt should succeed");
         assert_eq!(total, (0..10u64).sum::<u64>());
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    /// A sink that records the exact order of items it receives, so we
+    /// can prove the channel is FIFO (no reordering). `close` returns
+    /// the recorded vector.
+    struct OrderSink {
+        seen: Vec<u64>,
+    }
+    impl Sink<u64> for OrderSink {
+        type Output = Vec<u64>;
+        fn apply(&mut self, item: u64) -> Result<Flow, Error> {
+            self.seen.push(item);
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> Result<Vec<u64>, Error> {
+            Ok(self.seen)
+        }
+    }
+
+    /// FIFO ordering: items must be delivered to `apply` in send order.
+    /// crossbeam's `bounded` channel is FIFO; this pins that the
+    /// pipeline does not reorder. Mutation: if the consumer loop reused
+    /// a stale item or sorted, the equality fails.
+    #[test]
+    fn items_delivered_in_fifo_order() {
+        let pipe =
+            Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, OrderSink { seen: Vec::new() }).expect("spawn");
+        let input: Vec<u64> = (0..50).map(|i| i * 7 + 1).collect();
+        for &i in &input {
+            pipe.send(i).expect("send");
+        }
+        let seen = pipe.finish().expect("finish");
+        assert_eq!(seen, input, "pipeline reordered or dropped items");
+    }
+
+    /// Zero items sent: closing the pipeline immediately must still
+    /// call `close()` exactly once and return its Output. The consumer
+    /// loop's `while let Ok = rx.recv()` exits on the dropped tx with
+    /// zero iterations, then runs `sink.close()` (line 268). Mutation:
+    /// moving close() inside the loop would never call it here.
+    #[test]
+    fn empty_pipeline_still_calls_close() {
+        let close_called = Arc::new(AtomicUsize::new(0));
+        struct CountClose(Arc<AtomicUsize>);
+        impl Sink<u64> for CountClose {
+            type Output = ();
+            fn apply(&mut self, _: u64) -> Result<Flow, Error> {
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, CountClose(close_called.clone()))
+            .expect("spawn");
+        pipe.finish().expect("finish on empty pipeline");
+        assert_eq!(close_called.load(Ordering::SeqCst), 1);
+    }
+
+    /// `close()` returning Err must surface that error from `finish`,
+    /// not be swallowed. Doc lines 18-21: on a clean producer drop the
+    /// consumer "flushes via close() and returns its Output" — and an
+    /// Err Output is a valid return. Mutation: if the consumer ignored
+    /// close()'s Result and returned Ok, this fails.
+    #[test]
+    fn close_error_propagates_from_finish() {
+        struct CloseFails;
+        impl Sink<u64> for CloseFails {
+            type Output = ();
+            fn apply(&mut self, _: u64) -> Result<Flow, Error> {
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), Error> {
+                Err(Error::DecryptFailed)
+            }
+        }
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, CloseFails).expect("spawn");
+        pipe.send(1).expect("send");
+        let res = pipe.finish();
+        assert!(matches!(res, Err(Error::DecryptFailed)));
+    }
+
+    /// `try_send` must report `Full` when the channel is saturated and
+    /// the consumer is wedged, NOT block. Doc lines 325-329: "If the
+    /// channel is full ... the item is returned in Err." We wedge the
+    /// consumer on the first item (depth=1), fill the one buffer slot,
+    /// then try_send must return Full immediately. Mutation: routing
+    /// try_send to the blocking `send` would hang.
+    #[test]
+    fn try_send_reports_full_when_saturated() {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            1,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn");
+        pipe.send(0u64).expect("first send hands off to consumer");
+        wait_for_started(&started, Duration::from_secs(2));
+        pipe.send(1u64)
+            .expect("second send fills the depth-1 buffer");
+        // Channel is now full and the consumer is wedged.
+        let r = pipe.try_send(2u64);
+        assert!(
+            matches!(r, Err(TrySendError::Full(2))),
+            "expected Full(2), got {r:?}"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        let _ = pipe.finish();
+    }
+
+    /// `try_send` must report `Disconnected` once the consumer thread
+    /// has exited (here via a panic). The item is handed back inside
+    /// the `Disconnected` variant. Mutation: if try_send mapped
+    /// Disconnected→Full it would mis-signal a permanently-dead
+    /// consumer as transient backpressure.
+    #[test]
+    fn try_send_reports_disconnected_after_consumer_gone() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
+        // Drive the consumer to panic and fully exit. Spin until a
+        // try_send observes the closed channel.
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut saw_disconnect = false;
+        let mut last = None;
+        while Instant::now() < end {
+            match pipe.try_send(1u64) {
+                Err(TrySendError::Disconnected(_)) => {
+                    saw_disconnect = true;
+                    break;
+                }
+                other => last = Some(format!("{other:?}")),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::panic::set_hook(prev);
+        let _ = pipe.finish();
+        assert!(
+            saw_disconnect,
+            "try_send never reported Disconnected; last was {last:?}"
+        );
+    }
+
+    /// Plain `send` must hand the item back via `Err(item)` once the
+    /// consumer has gone away (panic). Doc lines 276-280: "Returns the
+    /// item back if the consumer thread is gone." The first send may
+    /// race the panic, so we loop until one fails and assert the
+    /// returned item identity. Mutation: if `send`'s Err arm returned a
+    /// different/default item, the identity assert fails.
+    #[test]
+    fn send_returns_item_after_consumer_panicked() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut returned = None;
+        while Instant::now() < end {
+            // Use a distinctive sentinel so we can prove identity.
+            if let Err(item) = pipe.send(0xDEAD_BEEF_u64) {
+                returned = Some(item);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::panic::set_hook(prev);
+        let _ = pipe.finish();
+        assert_eq!(
+            returned,
+            Some(0xDEAD_BEEF_u64),
+            "send did not hand back the exact item after consumer death"
+        );
+    }
+
+    /// `send_with_halt` must return the exact item via `Err(item)` when
+    /// the consumer has disconnected (the `Disconnected` arm, lines
+    /// 395-403). We panic the consumer, wait for it to fully exit, then
+    /// send_with_halt with a live halt + long deadline — the only way
+    /// it can return Err is the disconnect arm. Mutation: if that arm
+    /// returned a default item instead of `returned`, the identity
+    /// assert fails.
+    #[test]
+    fn send_with_halt_returns_item_on_disconnect() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
+        // Force the consumer to panic + exit: send until the channel
+        // closes (plain send returns Err).
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            if pipe.send(1u64).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let halt = crate::halt::Halt::new(); // never cancelled
+        let res = pipe.send_with_halt(0xABCD_u64, &halt, Duration::from_secs(5));
+        std::panic::set_hook(prev);
+        let _ = pipe.finish();
+        assert!(
+            matches!(res, Err(0xABCD)),
+            "expected disconnected item returned, got {res:?}"
+        );
+        assert!(!halt.is_cancelled(), "halt must not have been the cause");
+    }
+
+    /// `send_with_halt` happy path: when there is room in the channel
+    /// it must deliver the item (Ok) and the consumer must process it.
+    /// Pins the `Ok(()) => return Ok(())` arm (line 390). Mutation:
+    /// inverting that arm to Err would drop the item and the sum would
+    /// be wrong.
+    #[test]
+    fn send_with_halt_delivers_when_room_available() {
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
+        let halt = crate::halt::Halt::new();
+        for i in 1..=5u64 {
+            pipe.send_with_halt(i, &halt, Duration::from_secs(5))
+                .expect("send_with_halt should deliver when room is available");
+        }
+        let total = pipe.finish().expect("finish");
+        assert_eq!(total, 15, "1+2+3+4+5");
+    }
+
+    /// `send_with_halt` with a pre-cancelled halt must return the item
+    /// immediately without attempting to enqueue. Pins the pre-check at
+    /// line 365 (`if halt.is_cancelled()`). Mutation: removing that
+    /// pre-check would still likely deliver into an open channel (Ok),
+    /// flipping this assertion.
+    #[test]
+    fn send_with_halt_precancelled_returns_item_without_send() {
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let res = pipe.send_with_halt(77u64, &halt, Duration::from_secs(5));
+        assert!(
+            matches!(res, Err(77)),
+            "pre-cancelled halt must return item"
+        );
+        // The item must NOT have been enqueued: finishing yields sum 0.
+        let total = pipe.finish().expect("finish");
+        assert_eq!(total, 0, "item was enqueued despite pre-cancelled halt");
+    }
+
+    /// `finish_with_halt` must propagate a consumer panic as
+    /// `PipelineConsumerPanicked` — same as `finish`. The consumer
+    /// panics on the first apply; finish_with_halt sees `is_finished()`
+    /// true and joins, mapping the panic payload (lines 454-458).
+    #[test]
+    fn finish_with_halt_propagates_consumer_panic() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, PanickingSink).expect("spawn");
+        let _ = pipe.send(1);
+        for i in 0..5u64 {
+            let _ = pipe.send(i);
+        }
+        let res = pipe.finish_with_halt(None);
+        std::panic::set_hook(prev);
+        assert!(
+            matches!(res, Err(Error::PipelineConsumerPanicked)),
+            "expected PipelineConsumerPanicked, got {res:?}"
+        );
+    }
+
+    /// `finish_with_halt(None)` with a wedged consumer and NO halt
+    /// token must NOT return early — it must keep polling until the
+    /// JOIN_TIMEOUT_SECS deadline (it cannot observe a halt that was
+    /// never supplied). We can't wait 10 minutes, so we assert the
+    /// weaker but still-meaningful property: with a None halt and a
+    /// wedged consumer, finish_with_halt does not return within a short
+    /// window (it is genuinely blocked, not spuriously returning
+    /// Halted). Then we release the consumer and confirm it returns Ok.
+    /// Mutation: if the None branch erroneously treated None as
+    /// "cancelled", it would return Halted immediately and this fails.
+    #[test]
+    fn finish_with_halt_none_does_not_spuriously_halt() {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            NeverDrainsSink {
+                cancel: cancel.clone(),
+                started: started.clone(),
+            },
+        )
+        .expect("spawn");
+        pipe.send(0u64).expect("seed");
+        wait_for_started(&started, Duration::from_secs(2));
+
+        // Run finish_with_halt(None) on a helper thread; it should be
+        // blocked (not returning Halted) while the consumer is wedged.
+        let cancel2 = cancel.clone();
+        let (tx, rx) = bounded::<Result<(), Error>>(1);
+        std::thread::spawn(move || {
+            let r = pipe.finish_with_halt(None);
+            let _ = tx.send(r);
+        });
+        // It must NOT complete within 600 ms (consumer still wedged).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "finish_with_halt(None) returned while consumer was wedged"
+        );
+        // Release the consumer; finish_with_halt should now return Ok.
+        cancel2.store(true, Ordering::SeqCst);
+        let final_res = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("finish_with_halt should return after consumer unwedges");
+        assert!(
+            final_res.is_ok(),
+            "expected Ok after release, got {final_res:?}"
+        );
+    }
+
+    /// Multiple `Flow::Stop` returns: once a sink returns Stop, the
+    /// consumer must stop calling `apply` for all subsequent items
+    /// (lines 220-225 drain without applying) and call `close` exactly
+    /// once. We send far more items than the Stop index and assert
+    /// apply count never exceeds the Stop point and close ran once.
+    #[test]
+    fn stop_halts_further_apply_calls() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let close_called = Arc::new(AtomicUsize::new(0));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            StopOnNthSink {
+                n: 2,
+                seen: seen.clone(),
+                close_called: close_called.clone(),
+            },
+        )
+        .expect("spawn");
+        for i in 0..100u64 {
+            let _ = pipe.send(i);
+        }
+        let out = pipe.finish().expect("finish after stop");
+        assert_eq!(
+            close_called.load(Ordering::SeqCst),
+            1,
+            "close must run exactly once"
+        );
+        // apply ran for items 1 and 2 (item 2 returned Stop); never for
+        // the remaining 98 even though they were drained.
+        assert_eq!(out, 2, "apply was called after Stop");
+    }
 }

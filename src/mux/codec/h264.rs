@@ -586,6 +586,207 @@ mod tests {
         assert_eq!(fd[4], 0x41);
     }
 
+    // --- avcC exact byte layout (ISO 14496-15 §5.2.4.1) ---
+
+    #[test]
+    fn avcc_exact_length_fields_and_payload() {
+        // The AVCDecoderConfigurationRecord must encode SPS length and PPS length
+        // as 16-bit big-endian fields, followed by the verbatim NAL bodies.
+        // SPS = 0x67,profile,compat,level + 2 payload bytes (6 bytes total).
+        // PPS = 0x68 + 2 payload bytes (3 bytes total).
+        let mut parser = H264Parser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&[0x67, 0x64, 0x00, 0x28, 0xAB, 0xCD]); // SPS, 6 bytes
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&[0x68, 0xEE, 0x3C]); // PPS, 3 bytes
+        // A slice so a frame is produced (not required for codec_private though).
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x11]);
+        parser.parse(&make_pes(data, Some(0)));
+
+        let cp = parser.codec_private().expect("avcC");
+        // Fixed header.
+        assert_eq!(cp[0], 1, "configurationVersion");
+        assert_eq!(cp[1], 0x64, "AVCProfileIndication = SPS[1]");
+        assert_eq!(cp[2], 0x00, "profile_compatibility = SPS[2]");
+        assert_eq!(cp[3], 0x28, "AVCLevelIndication = SPS[3]");
+        assert_eq!(cp[4], 0xFF, "lengthSizeMinusOne nibble (4-byte prefix)");
+        assert_eq!(cp[5], 0xE1, "numSPS = 1");
+        // sequenceParameterSetLength (16-bit BE) = 6.
+        assert_eq!(u16::from_be_bytes([cp[6], cp[7]]), 6, "SPS length field");
+        // SPS body follows verbatim.
+        assert_eq!(&cp[8..14], &[0x67, 0x64, 0x00, 0x28, 0xAB, 0xCD]);
+        // numPPS = 1.
+        assert_eq!(cp[14], 1, "numPPS");
+        // pictureParameterSetLength (16-bit BE) = 3.
+        assert_eq!(u16::from_be_bytes([cp[15], cp[16]]), 3, "PPS length field");
+        // PPS body verbatim.
+        assert_eq!(&cp[17..20], &[0x68, 0xEE, 0x3C]);
+        // Record length is exactly the sum of its parts — no extra/missing bytes.
+        assert_eq!(cp.len(), 20);
+    }
+
+    #[test]
+    fn avcc_none_when_sps_shorter_than_four_bytes() {
+        // codec_private reads SPS[1..=3] for profile/compat/level, so an SPS
+        // shorter than 4 bytes can't form a valid avcC → None (guard
+        // `sps.len() < 4`). A 3-byte SPS (header + 2 bytes) triggers it.
+        let mut parser = H264Parser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42]); // SPS = 2 bytes
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0x11]); // PPS
+        parser.parse(&make_pes(data, Some(0)));
+        assert!(
+            parser.codec_private().is_none(),
+            "SPS < 4 bytes must not yield an avcC"
+        );
+    }
+
+    #[test]
+    fn avcc_none_with_sps_but_no_pps() {
+        // Both SPS and PPS are required. SPS only → None.
+        let mut parser = H264Parser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0xAA]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x10]); // IDR, no PPS
+        parser.parse(&make_pes(data, Some(0)));
+        assert!(parser.codec_private().is_none());
+    }
+
+    // --- NAL type extraction: forbidden_zero_bit + nal_ref_idc are masked ---
+
+    #[test]
+    fn nal_type_masks_high_three_bits() {
+        // nal_type = byte0 & 0x1F. The forbidden_zero_bit (bit 7) and
+        // nal_ref_idc (bits 6-5) must not affect type detection. An IDR (type 5)
+        // header is 0x65 (nal_ref_idc=3) or 0x25 (nal_ref_idc=1) — both type 5,
+        // both keyframes.
+        for idr_hdr in [0x65u8, 0x25, 0x05, 0x85] {
+            let mut parser = H264Parser::new();
+            let data = vec![0x00, 0x00, 0x01, idr_hdr, 0x10, 0x20];
+            let f = parser.parse(&make_pes(data, Some(0)));
+            assert_eq!(f.len(), 1);
+            assert!(
+                f[0].keyframe,
+                "header {idr_hdr:#x} is NAL type 5 (IDR) → keyframe"
+            );
+        }
+    }
+
+    #[test]
+    fn sps_recognized_regardless_of_ref_idc() {
+        // SPS is type 7; header 0x67 (ref_idc 3) and 0x27 (ref_idc 1) are both
+        // SPS and must seed codec_private identically.
+        for sps_hdr in [0x67u8, 0x27] {
+            let mut parser = H264Parser::new();
+            let mut data = vec![0x00, 0x00, 0x01, sps_hdr, 0x42, 0x00, 0x1E, 0xAA];
+            data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0x11]); // PPS
+            parser.parse(&make_pes(data, Some(0)));
+            let cp = parser.codec_private().expect("avcC");
+            assert_eq!(cp[1], 0x42, "profile from SPS[1] regardless of ref_idc");
+        }
+    }
+
+    // --- 4-byte start code handling ---
+
+    #[test]
+    fn four_byte_start_code_parsed() {
+        // A 4-byte start code (00 00 00 01) must be skipped correctly so the NAL
+        // body begins at the right offset (skip_start_code returns pos+4).
+        let mut parser = H264Parser::new();
+        let data = vec![0x00, 0x00, 0x00, 0x01, 0x41, 0xAA, 0xBB];
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        let len = u32::from_be_bytes([f[0].data[0], f[0].data[1], f[0].data[2], f[0].data[3]]);
+        // NAL = 0x41 0xAA 0xBB = 3 bytes (trailing 0xBB kept; not a zero).
+        assert_eq!(len, 3);
+        assert_eq!(&f[0].data[4..], &[0x41, 0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn trailing_zeros_of_next_start_code_stripped_from_nal() {
+        // The byte(s) before a following 4-byte start code (00 00 00 01) are
+        // leading zeros of that start code, not RBSP, and must be stripped from
+        // the current NAL. Two NALs separated by a 4-byte start code: NAL 1 must
+        // not absorb the extra 00.
+        let mut parser = H264Parser::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0x41, 0xAA]; // NAL1 = 0x41 0xAA
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x41, 0xBB]); // 4-byte SC
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        // Walk length-prefixed NALs; first must be exactly 2 bytes (0x41 0xAA),
+        // NOT 3 (it must not swallow the leading 0x00 of the next start code).
+        let len1 = u32::from_be_bytes([f[0].data[0], f[0].data[1], f[0].data[2], f[0].data[3]]);
+        assert_eq!(len1, 2, "NAL1 must not absorb the next start code's zeros");
+        assert_eq!(&f[0].data[4..6], &[0x41, 0xAA]);
+    }
+
+    #[test]
+    fn aud_dropped_but_following_slice_kept() {
+        // AUD (type 9) is dropped from frame data; a following slice survives.
+        let mut parser = H264Parser::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0x09, 0xF0]; // AUD
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x41, 0xAA, 0xBB]); // slice
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            frame_nal_types(&f[0].data),
+            vec![1],
+            "only the slice remains"
+        );
+    }
+
+    #[test]
+    fn param_set_only_pes_emits_no_frame() {
+        // A PES carrying ONLY SPS+PPS (both stripped into avcC) has no in-band
+        // NAL → frame_data empty → no frame emitted (mirrors HEVC/MPEG2/VC1).
+        let mut parser = H264Parser::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E, 0xAA];
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0x11]);
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert!(f.is_empty(), "param-set-only PES emits no frame");
+        // But the avcC is captured.
+        assert!(parser.codec_private().is_some());
+    }
+
+    #[test]
+    fn dts_fallback_when_pts_absent() {
+        // PTS absent → DTS is used (or().map). pts.or(dts) per the comment.
+        let mut parser = H264Parser::new();
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: None,
+            dts: Some(90000),
+            data: vec![0x00, 0x00, 0x01, 0x41, 0x10],
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 1_000_000_000, "falls back to DTS");
+    }
+
+    #[test]
+    fn no_pts_no_dts_defaults_zero() {
+        let mut parser = H264Parser::new();
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: None,
+            dts: None,
+            data: vec![0x00, 0x00, 0x01, 0x41, 0x10],
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 0);
+    }
+
+    #[test]
+    fn no_start_code_emits_nothing() {
+        // A PES with no Annex B start code yields no NAL → no frame (NalIterator
+        // starts at data.len()).
+        let mut parser = H264Parser::new();
+        let f = parser.parse(&make_pes(vec![0x41, 0xAA, 0xBB, 0xCC], Some(0)));
+        assert!(f.is_empty(), "no start code → no NAL → no frame");
+    }
+
     #[test]
     fn avcc_oversized_param_set_returns_none() {
         // A param set > 65535 bytes can't be length-encoded in avcC's 16-bit

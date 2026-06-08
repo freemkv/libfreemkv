@@ -423,4 +423,212 @@ mod tests {
             "clear exact-multiple buffer must be left unchanged"
         );
     }
+
+    // ── DecryptKeys::None and is_encrypted ─────────────────────────────────
+
+    /// DecryptKeys::None is a pure no-op: the buffer must be returned
+    /// byte-for-byte unchanged with Ok, regardless of content (even content
+    /// that looks scrambled).
+    ///
+    /// Grounding: the `DecryptKeys::None => {}` match arm does nothing.
+    /// Mutation: replace the empty arm with a call that mutates buf -> the
+    /// unchanged assert fails.
+    #[test]
+    fn none_keys_is_noop() {
+        let mut buf: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+        let snapshot = buf.clone();
+        decrypt_sectors(&mut buf, &DecryptKeys::None, 0).expect("None is always Ok");
+        assert_eq!(buf, snapshot, "None must not touch the buffer");
+    }
+
+    /// is_encrypted reflects the variant: None -> false, Css/Aacs -> true.
+    ///
+    /// Grounding: `!matches!(self, DecryptKeys::None)`.
+    /// Mutation: invert the `!` -> None reports true, this fails.
+    #[test]
+    fn is_encrypted_matches_variant() {
+        assert!(!DecryptKeys::None.is_encrypted());
+        assert!(DecryptKeys::Css { title_key: [0; 5] }.is_encrypted());
+        assert!(
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, [0; 16])],
+                read_data_key: None,
+            }
+            .is_encrypted()
+        );
+    }
+
+    // ── CSS dispatch (DecryptKeys::Css) ────────────────────────────────────
+
+    /// Build a CSS-scrambled 2048-byte sector by XORing the descramble
+    /// keystream over a known plaintext body (the keystream XOR is its own
+    /// inverse), with the scramble flag restored so decrypt_sectors will
+    /// re-descramble it back to the plaintext.
+    fn make_css_sector(title_key: &[u8; 5], seed: &[u8; 5], body_fill: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut sector = vec![body_fill; 2048];
+        sector[0x14] = 0x30; // scramble flag (bits 4-5)
+        sector[0x54..0x59].copy_from_slice(seed);
+        let plaintext = sector.clone();
+        // First descramble XORs the keystream in (producing "ciphertext"); it
+        // clears the flag, so restore it for the round-trip via decrypt_sectors.
+        css::lfsr::descramble_sector(title_key, &mut sector);
+        sector[0x14] = 0x30;
+        (sector, plaintext)
+    }
+
+    /// The CSS path descrambles each 2048-byte sector with the title key. A
+    /// scrambled sector run through decrypt_sectors must come back to its
+    /// plaintext body (keystream XOR is involutive), proving the title key is
+    /// actually applied.
+    ///
+    /// Grounding: `DecryptKeys::Css { title_key } => for chunk in
+    /// buf.chunks_mut(2048) { descramble_sector(title_key, chunk) }`.
+    /// Mutation: change `chunks_mut(2048)` to `chunks_mut(2049)` or pass a
+    /// fixed wrong key -> the body no longer matches the plaintext.
+    #[test]
+    fn css_descrambles_with_title_key() {
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        let (mut sector, plaintext) = make_css_sector(&title_key, &seed, 0xA5);
+        let keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut sector, &keys, 0).expect("CSS decrypt is Ok");
+        assert_eq!(
+            &sector[0x80..2048],
+            &plaintext[0x80..2048],
+            "CSS body must round-trip to plaintext"
+        );
+        // Flag cleared by the descrambler.
+        assert_eq!(
+            sector[0x14] & 0x30,
+            0,
+            "scramble flag cleared after CSS decrypt"
+        );
+    }
+
+    /// The CSS path processes EACH 2048-byte sector independently in a
+    /// multi-sector buffer. Two scrambled sectors (with different seeds) in
+    /// one buffer must both round-trip — pinning that the loop steps by 2048
+    /// and applies the key to every sector, not just the first.
+    ///
+    /// Grounding: `for chunk in buf.chunks_mut(2048)`.
+    /// Mutation: change the loop to descramble only the first chunk (e.g.
+    /// `.next()`) -> the second sector stays scrambled, assert fails.
+    #[test]
+    fn css_processes_every_sector_in_buffer() {
+        let title_key = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let (s0, p0) = make_css_sector(&title_key, &[0x11, 0x22, 0x33, 0x44, 0x55], 0x3C);
+        let (s1, p1) = make_css_sector(&title_key, &[0x66, 0x77, 0x88, 0x99, 0xAA], 0xC3);
+        let mut buf = s0;
+        buf.extend_from_slice(&s1);
+        let keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut buf, &keys, 0).expect("CSS multi-sector decrypt is Ok");
+        assert_eq!(
+            &buf[0x80..2048],
+            &p0[0x80..2048],
+            "sector 0 body must round-trip"
+        );
+        assert_eq!(
+            &buf[2048 + 0x80..4096],
+            &p1[0x80..2048],
+            "sector 1 body must round-trip (loop must reach the 2nd sector)"
+        );
+    }
+
+    /// The CSS path leaves UNSCRAMBLED sectors (flag clear) byte-for-byte
+    /// untouched — descramble_sector early-returns on a zero flag. A clear
+    /// sector mixed into the buffer must not be corrupted.
+    ///
+    /// Grounding: descramble_sector returns immediately when
+    /// `(sector[0x14] >> 4) & 0x03 == 0`.
+    /// Mutation: remove that early return in lfsr.rs -> a clear sector would
+    /// be XORed with a keystream and change; this fails.
+    #[test]
+    fn css_leaves_clear_sector_unchanged() {
+        let title_key = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut sector = vec![0x77u8; 2048];
+        sector[0x14] = 0x00; // not scrambled
+        let snapshot = sector.clone();
+        let keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut sector, &keys, 0).unwrap();
+        assert_eq!(sector, snapshot, "clear CSS sector must be left untouched");
+    }
+
+    /// CSS decrypt always returns Ok (it cannot fail — descrambling is XOR,
+    /// no key validity check), even for an empty buffer.
+    ///
+    /// Grounding: the CSS arm has no `return Err` path; `chunks_mut` over an
+    /// empty slice is a no-op; the function ends `Ok(())`.
+    /// Mutation: make the CSS arm return Err -> this fails.
+    #[test]
+    fn css_empty_buffer_is_ok() {
+        let mut buf: Vec<u8> = Vec::new();
+        let keys = DecryptKeys::Css { title_key: [0; 5] };
+        assert!(decrypt_sectors(&mut buf, &keys, 0).is_ok());
+    }
+
+    // ── AACS unit-key index selection ──────────────────────────────────────
+
+    /// AACS decrypt with an out-of-range unit_key_idx must fail loud with
+    /// DecryptFailed — never silently fall back to a wrong key or pass
+    /// encrypted data through as clear.
+    ///
+    /// Grounding: `let uk = match unit_keys.get(unit_key_idx) { Some => ...,
+    /// None => return Err(DecryptFailed) }`.
+    /// Mutation: change `unit_keys.get(unit_key_idx)` to `unit_keys.get(0)` or
+    /// `.unwrap_or` a default -> the out-of-range index would not error; this
+    /// fails.
+    #[test]
+    fn aacs_out_of_range_unit_key_idx_errors() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let err = decrypt_sectors(&mut buf, &keys, 5)
+            .expect_err("unit_key_idx 5 is out of range for a 1-key list");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::DecryptFailed.code(),
+            "out-of-range unit key index must be DecryptFailed"
+        );
+    }
+
+    /// AACS with an empty unit_keys list and any index errors (no key to use).
+    ///
+    /// Grounding: `unit_keys.get(0)` on an empty Vec is None -> DecryptFailed.
+    /// Mutation: defaulting to [0u8;16] on None would proceed; this fails.
+    #[test]
+    fn aacs_empty_unit_keys_errors() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![],
+            read_data_key: None,
+        };
+        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let err = decrypt_sectors(&mut buf, &keys, 0).expect_err("empty unit_keys must error");
+        assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+    }
+
+    // ── decrypt_threads resolution (read-only; no global mutation) ─────────
+
+    /// The default (auto) decrypt thread count is always a usable pool size:
+    /// at least 1 (a 0-thread rayon pool is invalid) and never above
+    /// MAX_THREADS (rayon stack-memory cap). This test reads the resolved
+    /// value without mutating the process-global override, so it is safe to
+    /// run in parallel with other tests.
+    ///
+    /// Grounding: `cores.clamp(1, MAX_THREADS)` in the default branch;
+    /// `env.min(MAX_THREADS)` in the env branch.
+    /// Mutation: change `.clamp(1, MAX_THREADS)` to `.clamp(0, MAX_THREADS)`
+    /// on a 0-core probe (unlikely) — more robustly, change the cap to
+    /// `MAX_THREADS * 2` -> on a many-core CI box the upper-bound assert can
+    /// fail. The lower-bound (>=1) guard is the load-bearing invariant.
+    #[test]
+    fn decrypt_threads_within_valid_pool_range() {
+        let n = decrypt_threads();
+        assert!(n >= 1, "decrypt thread count must be at least 1, got {n}");
+        assert!(
+            n <= MAX_THREADS,
+            "decrypt thread count must not exceed MAX_THREADS ({MAX_THREADS}), got {n}"
+        );
+    }
 }

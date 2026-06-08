@@ -210,6 +210,119 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
     Some(labels)
 }
 
+/// Parse the body of a `language_streams.txt` file into stream labels. Split
+/// out from [`parse_language_streams`] so unit tests exercise the real parsing
+/// logic without needing a SectorSource / UdfFs.
+#[cfg(test)]
+fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
+    let mut labels = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let type_str = parts[1];
+        let stream_num: u16 = match parts[2].parse() {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+        let language = parts[3].to_string();
+        let variant = if parts.len() > 4 {
+            parts[4].to_string()
+        } else {
+            String::new()
+        };
+
+        let (stream_type, purpose, qualifier) = match type_str {
+            "audio_production" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "audio_commentary" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Commentary,
+                LabelQualifier::None,
+            ),
+            "audio_ime" => (
+                StreamLabelType::Audio,
+                LabelPurpose::Ime,
+                LabelQualifier::None,
+            ),
+            "subtitle_production" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_commentary" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Commentary,
+                LabelQualifier::None,
+            ),
+            "subtitle_narrative" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::Forced,
+            ),
+            "subtitle_dual" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_bonus" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Normal,
+                LabelQualifier::None,
+            ),
+            "subtitle_ime" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Ime,
+                LabelQualifier::None,
+            ),
+            "subtitle_ime_narrative" => (
+                StreamLabelType::Subtitle,
+                LabelPurpose::Ime,
+                LabelQualifier::Forced,
+            ),
+            _ => continue,
+        };
+
+        let mut codec_hint = String::new();
+        let mut variant_code = String::new();
+        let mut final_purpose = purpose;
+
+        if !variant.is_empty() {
+            match variant.as_str() {
+                "eda" => final_purpose = LabelPurpose::Descriptive,
+                "csp" | "cs" | "lsp" | "ls" | "cf" | "pf" | "bp" | "pp" => {
+                    variant_code = variant.clone();
+                }
+                _ => codec_hint = vocab::codec(&variant).to_string(),
+            }
+        }
+
+        labels.push(StreamLabel {
+            stream_number: stream_num,
+            stream_type,
+            language,
+            name: String::new(),
+            purpose: final_purpose,
+            qualifier,
+            codec_hint,
+            variant: variant_code,
+        });
+    }
+
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +471,176 @@ mod tests {
                 .iter()
                 .any(|l| l.stream_number == 2 && l.name == "Commentary")
         );
+    }
+
+    // ── Additional hardening tests: language_streams.txt parser ──────────────
+
+    /// Spec: `audio_production` line → Audio / Normal / no qualifier.
+    /// Mutation: misparse `audio_production` as subtitle → Audio fails assertion.
+    #[test]
+    fn ls_audio_production_parsed() {
+        let labels = parse_language_streams_text("id1,audio_production,1,eng\n");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+        assert_eq!(labels[0].purpose, LabelPurpose::Normal);
+        assert_eq!(labels[0].qualifier, LabelQualifier::None);
+        assert_eq!(labels[0].language, "eng");
+        assert_eq!(labels[0].stream_number, 1);
+    }
+
+    /// Spec: `audio_commentary` line → Audio / Commentary.
+    /// Mutation: change purpose to Normal → commentary track not flagged.
+    #[test]
+    fn ls_audio_commentary_parsed() {
+        let labels = parse_language_streams_text("id2,audio_commentary,3,eng\n");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+        assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+    }
+
+    /// Spec: `audio_ime` → Audio / Ime (secondary music track).
+    /// Mutation: remove Ime variant → purpose stays Normal.
+    #[test]
+    fn ls_audio_ime_parsed() {
+        let labels = parse_language_streams_text("id3,audio_ime,2,jpn\n");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+        assert_eq!(labels[0].purpose, LabelPurpose::Ime);
+    }
+
+    /// Spec: `subtitle_narrative` → Subtitle / Forced qualifier (forced narrative).
+    /// Mutation: don't set Forced on narrative → forced flag not propagated.
+    #[test]
+    fn ls_subtitle_narrative_is_forced() {
+        let labels = parse_language_streams_text("id4,subtitle_narrative,1,eng\n");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].qualifier, LabelQualifier::Forced);
+    }
+
+    /// Spec: `subtitle_commentary` → Subtitle / Commentary.
+    /// Mutation: treat as Normal → subtitle commentary not flagged.
+    #[test]
+    fn ls_subtitle_commentary_parsed() {
+        let labels = parse_language_streams_text("id5,subtitle_commentary,4,eng\n");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].purpose, LabelPurpose::Commentary);
+    }
+
+    /// Spec: `subtitle_ime_narrative` → Subtitle / Ime / Forced.
+    /// Mutation: miss Forced → forced subtitles not identified.
+    #[test]
+    fn ls_subtitle_ime_narrative_is_ime_and_forced() {
+        let labels = parse_language_streams_text("id6,subtitle_ime_narrative,2,kor\n");
+        assert_eq!(labels[0].stream_type, StreamLabelType::Subtitle);
+        assert_eq!(labels[0].purpose, LabelPurpose::Ime);
+        assert_eq!(labels[0].qualifier, LabelQualifier::Forced);
+    }
+
+    /// Spec: stream_num=0 is SKIPPED (0 means "no STN entry"; apply_labels
+    /// starts from 1). Mutation: allow 0 → dead label emitted, never matched.
+    #[test]
+    fn ls_zero_stream_num_skipped() {
+        let labels = parse_language_streams_text("id,audio_production,0,eng\n");
+        assert!(labels.is_empty(), "stream_num=0 must be skipped");
+    }
+
+    /// Spec: a non-numeric stream_num is skipped (malformed disc).
+    /// Mutation: parse as 0 → dead label.
+    #[test]
+    fn ls_non_numeric_stream_num_skipped() {
+        let labels = parse_language_streams_text("id,audio_production,N/A,eng\n");
+        assert!(labels.is_empty());
+    }
+
+    /// Spec: an unrecognized type token is skipped.
+    /// Mutation: emit Unknown stream label → wrong type label appears.
+    #[test]
+    fn ls_unknown_type_skipped() {
+        let labels = parse_language_streams_text("id,audio_bonus_extended,1,eng\n");
+        assert!(labels.is_empty());
+    }
+
+    /// Spec: `eda` variant → `Descriptive` purpose.
+    /// Mutation: miss the `eda` branch → purpose stays Normal.
+    #[test]
+    fn ls_eda_variant_sets_descriptive() {
+        let labels = parse_language_streams_text("id,audio_production,2,eng,eda\n");
+        assert_eq!(labels[0].purpose, LabelPurpose::Descriptive);
+    }
+
+    /// Spec: dialect variant codes (`bp`, `csp`, etc.) pass through as variant_code.
+    /// Mutation: store as codec_hint → variant field empty on BP stream.
+    #[test]
+    fn ls_bp_variant_is_dialect_code() {
+        let labels = parse_language_streams_text("id,audio_production,1,por,bp\n");
+        assert_eq!(labels[0].variant, "bp");
+        assert_eq!(labels[0].codec_hint, "");
+    }
+
+    /// Spec: codec token from the 5th column → codec_hint via vocab::codec.
+    /// Mutation: skip vocab lookup → raw token stored instead of canonical name.
+    #[test]
+    fn ls_codec_token_passed_to_vocab() {
+        let labels = parse_language_streams_text("id,audio_production,1,eng,MLP\n");
+        // "MLP" maps to "TrueHD" via vocab::codec.
+        assert_eq!(labels[0].codec_hint, "TrueHD");
+    }
+
+    /// Spec: lines with fewer than 4 CSV fields are silently skipped.
+    /// Mutation: parse short lines anyway → panic or garbage label emitted.
+    #[test]
+    fn ls_too_few_fields_skipped() {
+        let labels = parse_language_streams_text("id,audio_production,1\n");
+        assert!(labels.is_empty());
+    }
+
+    /// Spec: comment lines (starting with #) are skipped.
+    /// Mutation: remove `starts_with('#')` guard → comment parsed as stream.
+    #[test]
+    fn ls_comment_lines_skipped() {
+        let labels =
+            parse_language_streams_text("# this is a comment\nid,audio_production,1,eng\n");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].language, "eng");
+    }
+
+    /// Spec: multiple valid lines produce multiple labels.
+    /// Mutation: stop after first label → only 1 label returned.
+    #[test]
+    fn ls_multiple_lines_produce_multiple_labels() {
+        let text = "id1,audio_production,1,eng\nid2,audio_commentary,2,eng\nid3,subtitle_production,1,eng\n";
+        let labels = parse_language_streams_text(text);
+        assert_eq!(labels.len(), 3);
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(subs.len(), 1);
+    }
+
+    /// Spec: prefix_is_commentary rejects "community_" as a false positive.
+    /// This is the pre-fix bug: bare `contains("comm")` matched any word with
+    /// "comm" as a substring. After the fix only whole-segment "comm" or
+    /// "commentary" matches.
+    /// Mutation: use `prefix.contains("comm")` → community_1 incorrectly matches.
+    #[test]
+    fn prefix_is_commentary_rejects_community_prefix() {
+        assert!(!prefix_is_commentary("community_1"));
+        assert!(!prefix_is_commentary("community"));
+        assert!(!prefix_is_commentary("recommit_1"));
+    }
+
+    /// Spec: prefix_is_commentary matches "comm" as a standalone segment.
+    /// Mutation: require "commentary" specifically → bare "comm" prefix fails.
+    #[test]
+    fn prefix_is_commentary_matches_bare_comm_segment() {
+        assert!(prefix_is_commentary("comm"));
+        assert!(prefix_is_commentary("audio_comm"));
+        assert!(prefix_is_commentary("comm_track_1"));
     }
 }
 

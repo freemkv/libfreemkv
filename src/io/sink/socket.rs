@@ -291,4 +291,107 @@ mod tests {
         let n2 = receiver.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n2], &[9, 9, 9]);
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    /// `SocketSink::finish` must signal a clean EOF to the peer via
+    /// `shutdown(Write)` (lines 91-97). The receiving side's
+    /// `read_to_end` only returns when it observes that EOF — if
+    /// `finish` merely flushed without the shutdown, `read_to_end`
+    /// would block forever (the socket stays half-open). We assert the
+    /// receiver completes promptly AND sees the buffered tail.
+    /// Mutation: replacing the `shutdown(Write)` line with `Ok(())`
+    /// makes the accept thread hang and the join times out.
+    #[test]
+    fn finish_signals_eof_to_peer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            // Returns only when the peer half-closes (shutdown Write).
+            sock.read_to_end(&mut buf).unwrap();
+            let _ = tx.send(buf);
+        });
+
+        let mut sink = SocketSink::connect(addr, None).unwrap();
+        sink.write_all(b"unflushed-tail").unwrap();
+        sink.finish().unwrap();
+
+        // read_to_end must complete because finish() shut down writes.
+        let received = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("peer never saw EOF — finish() did not shutdown(Write)");
+        assert_eq!(received, b"unflushed-tail");
+    }
+
+    /// `SocketSink::write` must report the exact byte count it accepted
+    /// into the BufWriter (forwarded from `BufWriter::write`, lines
+    /// 78-80). For a buffer smaller than the 1 MiB capacity this equals
+    /// the full length. Mutation: returning a wrong/clamped count would
+    /// break `Write::write_all`'s loop downstream; we pin the count
+    /// here directly.
+    #[test]
+    fn write_reports_accepted_count() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _accept = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let mut sink = SocketSink::connect(addr, None).unwrap();
+        let n = sink.write(&[7u8; 100]).unwrap();
+        assert_eq!(
+            n, 100,
+            "buffered write under capacity must accept all bytes"
+        );
+    }
+
+    /// UDP `write` must emit ONE datagram per call carrying exactly the
+    /// bytes passed — no buffering, no coalescing (doc lines 100-108).
+    /// Two writes of different lengths must arrive as two separate
+    /// datagrams of those exact lengths, in order. Mutation: adding a
+    /// BufWriter to UdpSocketSink (the doc explicitly forbids it) would
+    /// merge these into one datagram and the second `recv` would time
+    /// out.
+    #[test]
+    fn udp_write_is_one_datagram_per_call() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+        let mut sink = UdpSocketSink::connect(addr, None).unwrap();
+
+        // Distinct lengths so a merge would be detectable.
+        let n_a = sink.write(&[0xAA; 10]).unwrap();
+        let n_b = sink.write(&[0xBB; 20]).unwrap();
+        assert_eq!(n_a, 10);
+        assert_eq!(n_b, 20);
+
+        let mut buf = [0u8; 256];
+        let first = receiver.recv(&mut buf).unwrap();
+        assert_eq!(first, 10, "first datagram must be exactly 10 bytes");
+        assert!(buf[..first].iter().all(|&b| b == 0xAA));
+        let second = receiver.recv(&mut buf).unwrap();
+        assert_eq!(second, 20, "second datagram must be exactly 20 bytes");
+        assert!(buf[..second].iter().all(|&b| b == 0xBB));
+    }
+
+    /// UDP `finish` is a documented no-op (lines 157-165): there is no
+    /// EOF marker for UDP. Calling it must not error and must not
+    /// affect prior datagrams. Mutation: if `finish` tried to
+    /// `shutdown` the UDP socket it could error or close it
+    /// prematurely; here it must just return Ok.
+    #[test]
+    fn udp_finish_is_noop_ok() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = receiver.local_addr().unwrap();
+        let mut sink = UdpSocketSink::connect(addr, None).unwrap();
+        assert!(sink.finish().is_ok());
+        // A second finish is equally harmless.
+        assert!(sink.finish().is_ok());
+    }
 }

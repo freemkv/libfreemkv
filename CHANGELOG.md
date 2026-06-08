@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.31.2 (2026-06-08)
+
+Test-hardening release — no runtime changes. Adds a comprehensive,
+spec-grounded unit-test suite across the silent-corruption surfaces
+(UDF/MPLS/CLPI/IFO parsing, BD/DVD title + extent assembly, AACS/CSS key
+handling, TS/PS demux + codec parsers, MKV/EBML container output, the mux
+pipeline, sector prefetch + decrypt decorator, drive/SCSI sense decoding,
+disc-label extraction, and core I/O). Each test is grounded in the format
+spec or real on-disc behavior and verified to fail under a targeted source
+mutation, so a future refactor cannot silently regress these paths (the
+class of defect behind the 0.31.0 UDF allocation-descriptor truncation).
+~950 tests added; no behavior changed.
+
 ## 0.31.1 (2026-06-08)
 
 Correctness fixes for the file-backed mux and disc AACS-input read paths,

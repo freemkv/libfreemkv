@@ -243,4 +243,106 @@ mod tests {
         assert!(matches!(r, Ok("ok")));
         assert!(flag.load(Ordering::Relaxed));
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    /// Doc contract (lines 106-110): "If the caller already requested
+    /// halt, don't spawn (and leak) a worker that would run `op`."
+    /// When halt is pre-cancelled the op closure must NEVER run — the
+    /// short-circuit returns Halted before spawning the worker. We
+    /// prove the op did not execute by checking a side-effect flag.
+    #[test]
+    fn pre_cancelled_halt_never_runs_op() {
+        let halt = Halt::new();
+        halt.cancel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r2 = ran.clone();
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(2), move || {
+            r2.store(true, Ordering::SeqCst);
+            7u32
+        });
+        assert!(matches!(r, Err(BoundedError::Halted)));
+        // The op closure must not have been scheduled at all.
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "op ran despite pre-cancelled halt — short-circuit at line 108 broken"
+        );
+    }
+
+    /// Boundary: an op that finishes well within the deadline returns
+    /// Ok even when a (live, never-cancelled) halt token is supplied.
+    /// The halt-poll path must not spuriously convert a completed op
+    /// into Halted/Timeout. Grounds the `Ok(v) => return Ok(v)` arm of
+    /// the recv_timeout match (line 134) with a non-None halt.
+    #[test]
+    fn live_halt_token_does_not_interfere_with_fast_op() {
+        let halt = Halt::new(); // never cancelled
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(5), || 123u64);
+        assert!(matches!(r, Ok(123)));
+        assert!(!halt.is_cancelled());
+    }
+
+    /// The op's return value is propagated byte-for-byte, not just a
+    /// success flag. A non-Copy heap type proves the worker's
+    /// `tx.send(op())` moves the real value across the rendezvous
+    /// channel (line 125) to the receiver (line 134).
+    #[test]
+    fn returns_owned_value_unchanged() {
+        let r = bounded_syscall(None, Duration::from_secs(2), || vec![9u8, 8, 7, 6]);
+        match r {
+            Ok(v) => assert_eq!(v, vec![9u8, 8, 7, 6]),
+            other => panic!("expected Ok(vec), got {other:?}"),
+        }
+    }
+
+    /// Timeout boundary: with a tiny deadline and an op that sleeps
+    /// much longer, the helper must return Timeout and must do so
+    /// roughly at the deadline — NOT wait for the op to finish (that
+    /// is the whole point of the bounded wrapper; the worker is
+    /// leaked). Grounds the `Instant::now() >= deadline` arm (line 141)
+    /// and the leak contract (doc lines 84-88).
+    #[test]
+    fn timeout_returns_near_deadline_not_after_op() {
+        let started = Instant::now();
+        let r = bounded_syscall(None, Duration::from_millis(100), || {
+            thread::sleep(Duration::from_secs(3));
+            0u32
+        });
+        let elapsed = started.elapsed();
+        assert!(matches!(r, Err(BoundedError::Timeout)));
+        // Must bail near the 100ms deadline (one POLL_INTERVAL slack at
+        // most), not after the 3s op. Allow generous CI slack but stay
+        // well under the op's 3s sleep.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "timeout did not return near deadline: {elapsed:?} (op should be leaked, not awaited)"
+        );
+    }
+
+    /// A worker that returns a non-Copy value AND completes within the
+    /// deadline must hand the value back; the rendezvous channel has
+    /// capacity 0, so the worker's send blocks until the receiver is
+    /// ready — exercising the happy-path handshake rather than the
+    /// buffered-send path. Mutation: changing `sync_channel::<R>(0)` to
+    /// a buffered channel would still pass; changing the recv arm to
+    /// drop the value would fail here.
+    #[test]
+    fn zero_capacity_rendezvous_delivers_string() {
+        let r = bounded_syscall(None, Duration::from_secs(2), || String::from("rendezvous"));
+        assert!(matches!(r.as_deref(), Ok("rendezvous")));
+    }
+
+    /// Halt that fires AFTER the op has already completed must still
+    /// yield Ok — there is no race that turns a delivered result into
+    /// Halted. The op completes instantly; we cancel the halt
+    /// afterwards and confirm the earlier call returned Ok. This pins
+    /// the precedence: a value already in the channel wins over a
+    /// subsequent halt.
+    #[test]
+    fn op_completion_wins_over_later_halt() {
+        let halt = Halt::new();
+        let r = bounded_syscall(Some(&halt), Duration::from_secs(2), || 55u32);
+        halt.cancel();
+        assert!(matches!(r, Ok(55)));
+    }
 }

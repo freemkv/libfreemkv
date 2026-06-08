@@ -694,4 +694,498 @@ mod parse_sense_tests {
         let s = buf(0x7A, 0x77, 0x03); // MEDIUM ERROR via "fixed"
         assert_eq!(parse_sense_key(&s, 18), 3);
     }
+
+    // ── Additional parse_sense coverage ─────────────────────────────
+
+    /// Full 32-byte buffer to write arbitrary offsets into.
+    fn buf32() -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    #[test]
+    fn descriptor_format_reads_asc_byte2_ascq_byte3() {
+        // SPC-4 §4.5.2.1 descriptor format: ASC at offset 2, ASCQ at
+        // offset 3. Build 04/3E (NOT READY / logical unit not ready,
+        // command in progress) — the BU40N bad-sector signature.
+        let mut s = buf32();
+        s[0] = 0x72;
+        s[1] = 0x02; // NOT READY
+        s[2] = 0x3E; // ASC
+        s[3] = 0x01; // ASCQ
+        let d = parse_sense(&s, 8);
+        assert_eq!(d.sense_key, 2);
+        assert_eq!(d.asc, 0x3E, "descriptor ASC is byte 2");
+        assert_eq!(d.ascq, 0x01, "descriptor ASCQ is byte 3");
+    }
+
+    #[test]
+    fn descriptor_format_key_nibble_masked() {
+        // Descriptor byte 1 low nibble is the sense key. Even though the
+        // upper nibble of byte 1 is reserved in descriptor format, the
+        // parser masks &0x0F unconditionally; set the high nibble and
+        // confirm it doesn't leak.
+        let mut s = buf32();
+        s[0] = 0x72;
+        s[1] = 0xF3; // upper nibble garbage + key 3 (MEDIUM ERROR)
+        s[2] = 0x11;
+        s[3] = 0x05;
+        let d = parse_sense(&s, 8);
+        assert_eq!(d.sense_key, 3);
+    }
+
+    #[test]
+    fn descriptor_n_exactly_3_ascq_defaults_zero() {
+        // Descriptor needs byte 3 for ASCQ; with only 3 bytes written
+        // the doc contract says ASCQ defaults to 0 rather than reading
+        // uninitialised byte 3. ASC (byte 2) is still valid.
+        let mut s = buf32();
+        s[0] = 0x72;
+        s[1] = 0x03;
+        s[2] = 0x11;
+        s[3] = 0x05; // present in buffer but n=3 must NOT read it
+        let d = parse_sense(&s, 3);
+        assert_eq!(d.sense_key, 3);
+        assert_eq!(d.asc, 0x11);
+        assert_eq!(d.ascq, 0, "n=3 must not reach descriptor ASCQ at offset 3");
+    }
+
+    #[test]
+    fn fixed_format_full_reads_asc_byte12_ascq_byte13() {
+        // SPC-4 §4.5.3 fixed format: key at byte 2, ASC at byte 12,
+        // ASCQ at byte 13. Build 03/11/05 = MEDIUM ERROR / UNRECOVERED
+        // READ ERROR / L-EC UNCORRECTABLE.
+        let mut s = buf32();
+        s[0] = 0x70;
+        s[2] = 0x03;
+        s[12] = 0x11;
+        s[13] = 0x05;
+        let d = parse_sense(&s, 18);
+        assert_eq!(d.sense_key, 3);
+        assert_eq!(d.asc, 0x11, "fixed ASC is byte 12");
+        assert_eq!(d.ascq, 0x05, "fixed ASCQ is byte 13");
+    }
+
+    #[test]
+    fn fixed_format_short_buffer_asc_ascq_default_zero() {
+        // Fixed format needs n>=13 for ASC, n>=14 for ASCQ. A reply that
+        // only has the key byte (e.g. an 8-byte sense reply, common from
+        // some bridges) must yield asc=ascq=0, never read past the
+        // written region. Sense key must still decode.
+        let mut s = buf32();
+        s[0] = 0x70;
+        s[2] = 0x04; // HARDWARE ERROR
+        s[12] = 0xAA; // present in array but n must gate it off
+        s[13] = 0xBB;
+        let d = parse_sense(&s, 8);
+        assert_eq!(d.sense_key, 4);
+        assert_eq!(d.asc, 0, "n=8 < 13: ASC must default 0");
+        assert_eq!(d.ascq, 0, "n=8 < 14: ASCQ must default 0");
+    }
+
+    #[test]
+    fn fixed_format_n13_reads_asc_but_not_ascq() {
+        // Boundary: n==13 means bytes 0..12 inclusive are valid, so ASC
+        // (byte 12) is readable but ASCQ (byte 13) is not. Exercises the
+        // distinct n>=13 vs n>=14 guards.
+        let mut s = buf32();
+        s[0] = 0x70;
+        s[2] = 0x03;
+        s[12] = 0x11;
+        s[13] = 0x05; // must NOT be read at n=13
+        let d = parse_sense(&s, 13);
+        assert_eq!(d.asc, 0x11, "n=13 reaches ASC at offset 12");
+        assert_eq!(d.ascq, 0, "n=13 does not reach ASCQ at offset 13");
+    }
+
+    #[test]
+    fn fixed_format_n14_reads_both() {
+        // Boundary: n==14 is the minimum for a complete fixed ASC/ASCQ.
+        let mut s = buf32();
+        s[0] = 0x70;
+        s[2] = 0x03;
+        s[12] = 0x11;
+        s[13] = 0x05;
+        let d = parse_sense(&s, 14);
+        assert_eq!(d.asc, 0x11);
+        assert_eq!(d.ascq, 0x05, "n=14 reaches ASCQ at offset 13");
+    }
+
+    #[test]
+    fn sb_len_wr_clamped_to_slice_len() {
+        // Doc: n = min(sb_len_wr, sense.len()). A caller claiming 200
+        // bytes written into a 14-byte slice must not read out of bounds;
+        // the effective n is the slice length.
+        let mut s = [0u8; 14];
+        s[0] = 0x70;
+        s[2] = 0x03;
+        s[12] = 0x11;
+        s[13] = 0x05;
+        let d = parse_sense(&s, 200);
+        assert_eq!(d.sense_key, 3);
+        assert_eq!(d.asc, 0x11);
+        assert_eq!(d.ascq, 0x05);
+    }
+
+    #[test]
+    fn n_exactly_three_decodes_key_only() {
+        // n==3 is the minimum that passes the n<3 early-return. For fixed
+        // format the key (byte 2) is decodable; asc/ascq default to 0.
+        let s = buf(0x70, 0x77, 0x06); // UNIT ATTENTION
+        let d = parse_sense(&s, 3);
+        assert_eq!(d.sense_key, 6);
+        assert_eq!(d.asc, 0);
+        assert_eq!(d.ascq, 0);
+    }
+
+    #[test]
+    fn descriptor_high_bit_set_on_72_still_descriptor() {
+        // 0xF2 = VALID bit | 0x72. After masking 0x7F the response code
+        // is 0x72 (descriptor), so ASC/ASCQ come from bytes 2/3, not
+        // 12/13. Put a fixed-format ASC at byte 12 to prove it's ignored.
+        let mut s = buf32();
+        s[0] = 0xF2;
+        s[1] = 0x03;
+        s[2] = 0x11; // descriptor ASC
+        s[3] = 0x05;
+        s[12] = 0x99; // would be ASC if mis-parsed as fixed
+        let d = parse_sense(&s, 18);
+        assert_eq!(d.asc, 0x11, "VALID-bit masking must keep descriptor parse");
+    }
+
+    #[test]
+    fn empty_slice_returns_none() {
+        // Defense-in-depth: zero-length slice with any sb_len_wr must not
+        // panic and returns the all-zero triple.
+        let s: [u8; 0] = [];
+        let d = parse_sense(&s, 32);
+        assert_eq!(d, super::ScsiSense::NONE);
+    }
+}
+
+#[cfg(test)]
+mod scsi_sense_predicate_tests {
+    //! Classification of [`ScsiSense`] predicate methods against SPC-4
+    //! §4.5.6 Table 28 sense keys. These drive `Disc::copy` hysteresis
+    //! and `Disc::patch` routing; a misclassification here silently
+    //! changes which sectors get retried vs. marked unreadable.
+    use super::*;
+
+    fn s(key: u8) -> ScsiSense {
+        ScsiSense {
+            sense_key: key,
+            asc: 0,
+            ascq: 0,
+        }
+    }
+
+    #[test]
+    fn is_marginal_matches_exactly_the_recoverable_keys() {
+        // Doc contract: marginal == {NO SENSE(0), RECOVERED(1),
+        // NOT READY(2), MEDIUM ERROR(3), ABORTED COMMAND(B)}.
+        // Everything else is non-marginal. Walk every 4-bit key value.
+        let marginal: [u8; 5] = [
+            SENSE_KEY_NO_SENSE,
+            SENSE_KEY_RECOVERED_ERROR,
+            SENSE_KEY_NOT_READY,
+            SENSE_KEY_MEDIUM_ERROR,
+            SENSE_KEY_ABORTED_COMMAND,
+        ];
+        for key in 0u8..=0x0F {
+            let expect = marginal.contains(&key);
+            assert_eq!(
+                s(key).is_marginal(),
+                expect,
+                "key {key:#x} marginal classification"
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_error_is_not_marginal() {
+        // HARDWARE ERROR (4) is explicitly non-recoverable per doc.
+        assert!(!s(SENSE_KEY_HARDWARE_ERROR).is_marginal());
+        assert!(s(SENSE_KEY_HARDWARE_ERROR).is_hardware_error());
+    }
+
+    #[test]
+    fn data_protect_not_marginal() {
+        // DATA PROTECT (7) = AACS/region/write-protect; retry won't help.
+        assert!(!s(SENSE_KEY_DATA_PROTECT).is_marginal());
+        assert!(s(SENSE_KEY_DATA_PROTECT).is_data_protect());
+    }
+
+    #[test]
+    fn illegal_request_not_marginal() {
+        // ILLEGAL REQUEST (5) = bad CDB; not marginal.
+        assert!(!s(SENSE_KEY_ILLEGAL_REQUEST).is_marginal());
+        assert!(s(SENSE_KEY_ILLEGAL_REQUEST).is_illegal_request());
+    }
+
+    #[test]
+    fn unit_attention_not_marginal() {
+        // UNIT ATTENTION (6) = state change; caller rescans, not retries.
+        assert!(!s(SENSE_KEY_UNIT_ATTENTION).is_marginal());
+        assert!(s(SENSE_KEY_UNIT_ATTENTION).is_unit_attention());
+    }
+
+    #[test]
+    fn each_specific_predicate_is_exclusive() {
+        // Each is_* predicate matches exactly its one key and no other.
+        // Catches a copy-paste bug where e.g. is_not_ready compared the
+        // wrong constant.
+        let cases: &[(u8, fn(&ScsiSense) -> bool)] = &[
+            (SENSE_KEY_MEDIUM_ERROR, ScsiSense::is_medium_error),
+            (SENSE_KEY_HARDWARE_ERROR, ScsiSense::is_hardware_error),
+            (SENSE_KEY_NOT_READY, ScsiSense::is_not_ready),
+            (SENSE_KEY_UNIT_ATTENTION, ScsiSense::is_unit_attention),
+            (SENSE_KEY_DATA_PROTECT, ScsiSense::is_data_protect),
+            (SENSE_KEY_ILLEGAL_REQUEST, ScsiSense::is_illegal_request),
+            (SENSE_KEY_ABORTED_COMMAND, ScsiSense::is_aborted_command),
+        ];
+        for &(key, pred) in cases {
+            for other in 0u8..=0x0F {
+                let got = pred(&s(other));
+                assert_eq!(
+                    got,
+                    other == key,
+                    "predicate for key {key:#x} fired on {other:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn none_constant_and_default_agree_and_are_no_sense() {
+        // SPC-4 §4.5.3: empty sense reply is NO SENSE (key 0). Both the
+        // NONE constant and Default must be the all-zero triple and be
+        // classified marginal (NO SENSE is in the marginal set).
+        assert_eq!(ScsiSense::NONE, ScsiSense::default());
+        assert_eq!(ScsiSense::NONE.sense_key, SENSE_KEY_NO_SENSE);
+        assert!(ScsiSense::NONE.is_marginal());
+    }
+}
+
+#[cfg(test)]
+mod cdb_builder_tests {
+    //! CDB byte-layout tests grounded in MMC-6 / SPC-4 field definitions.
+    //! A wrong shift or byte index silently sends a malformed command to
+    //! the drive (wrong LBA, wrong length) — the 0.31.0 class of bug.
+    use super::*;
+
+    #[test]
+    fn read10_fua_opcode_and_fua_bit() {
+        // MMC-6 READ(10): byte 0 = opcode 0x28. FUA is byte 1 bit 3
+        // (0x08) per SBC-3 §5.20. Doc explicitly sets FUA.
+        let cdb = build_read10_fua(0, 1);
+        assert_eq!(cdb[0], SCSI_READ_10);
+        assert_eq!(cdb[0], 0x28);
+        assert_eq!(cdb[1], 0x08, "FUA bit (byte1 bit3) must be set");
+    }
+
+    #[test]
+    fn read10_fua_lba_big_endian_bytes_2_5() {
+        // READ(10) LOGICAL BLOCK ADDRESS occupies bytes 2..5, big-endian
+        // (MSB first). Use a value with all four bytes distinct so a
+        // swapped shift is caught.
+        let cdb = build_read10_fua(0x1122_3344, 0);
+        assert_eq!(cdb[2], 0x11);
+        assert_eq!(cdb[3], 0x22);
+        assert_eq!(cdb[4], 0x33);
+        assert_eq!(cdb[5], 0x44);
+    }
+
+    #[test]
+    fn read10_fua_transfer_length_big_endian_bytes_7_8() {
+        // READ(10) TRANSFER LENGTH is bytes 7..8 big-endian (number of
+        // logical blocks). Byte 6 (group number) and byte 9 (control)
+        // are zero.
+        let cdb = build_read10_fua(0, 0xABCD);
+        assert_eq!(cdb[6], 0x00, "byte 6 group number must be 0");
+        assert_eq!(cdb[7], 0xAB, "transfer length MSB");
+        assert_eq!(cdb[8], 0xCD, "transfer length LSB");
+        assert_eq!(cdb[9], 0x00, "byte 9 control must be 0");
+    }
+
+    #[test]
+    fn read10_fua_max_lba_and_count() {
+        // u32::MAX LBA and u16::MAX count must encode without truncation
+        // or panic (overflow on debug builds would be a bug).
+        let cdb = build_read10_fua(u32::MAX, u16::MAX);
+        assert_eq!(&cdb[2..6], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&cdb[7..9], &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn read_buffer_cdb_layout() {
+        // MMC-6 READ BUFFER (0x3C): byte0 opcode, byte1 mode, byte2
+        // buffer id, bytes 3..5 buffer offset (big-endian 24-bit),
+        // bytes 6..8 allocation length (big-endian 24-bit), byte9 control.
+        let cdb = build_read_buffer(0x02, 0xF1, 0x010203, 0x040506);
+        assert_eq!(cdb[0], SCSI_READ_BUFFER);
+        assert_eq!(cdb[1], 0x02, "mode");
+        assert_eq!(cdb[2], 0xF1, "buffer id");
+        assert_eq!(&cdb[3..6], &[0x01, 0x02, 0x03], "offset 24-bit BE");
+        assert_eq!(&cdb[6..9], &[0x04, 0x05, 0x06], "length 24-bit BE");
+        assert_eq!(cdb[9], 0x00, "control");
+    }
+
+    #[test]
+    fn read_buffer_offset_truncates_to_24_bits_low() {
+        // The CDB offset field is 24-bit; the builder takes the low three
+        // bytes of the u32. A value with a non-zero top byte must encode
+        // only the low 24 bits (matching the wire field width). This
+        // documents the actual contract, not a guess.
+        let cdb = build_read_buffer(0, 0, 0xFF01_0203, 0);
+        assert_eq!(&cdb[3..6], &[0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn set_cd_speed_cdb_layout() {
+        // MMC-6 SET CD SPEED (0xBB): byte0 opcode, bytes 2..3 read speed
+        // (big-endian kB/s), bytes 4..5 write speed = 0xFFFF (no change /
+        // max). Use a distinct read speed to verify byte order.
+        let cdb = build_set_cd_speed(0x1234);
+        assert_eq!(cdb[0], SCSI_SET_CD_SPEED);
+        assert_eq!(cdb[2], 0x12, "read speed MSB");
+        assert_eq!(cdb[3], 0x34, "read speed LSB");
+        assert_eq!(cdb[4], 0xFF, "write speed bytes set to 0xFFFF");
+        assert_eq!(cdb[5], 0xFF);
+    }
+
+    #[test]
+    fn set_cd_speed_zero_means_drive_default() {
+        // read_speed 0 encodes as 0x0000 (MMC: "use drive default").
+        let cdb = build_set_cd_speed(0);
+        assert_eq!(cdb[2], 0x00);
+        assert_eq!(cdb[3], 0x00);
+    }
+}
+
+#[cfg(test)]
+mod inquiry_tests {
+    //! [`inquiry`] standard-INQUIRY field parsing (SPC-4 §6.4.2 Table 142):
+    //!   - vendor identification: bytes 8..16 (8 ASCII chars)
+    //!   - product identification: bytes 16..32 (16 ASCII chars)
+    //!   - product revision level: bytes 32..36 (4 ASCII chars)
+    //! Fields are space-padded ASCII; the parser trims surrounding
+    //! whitespace.
+    use super::*;
+
+    /// Mock transport returning a scripted INQUIRY payload and recording
+    /// the CDB it was handed.
+    struct ScriptedTransport {
+        payload: Vec<u8>,
+        last_cdb: Vec<u8>,
+    }
+    impl ScsiTransport for ScriptedTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.last_cdb = cdb.to_vec();
+            let n = self.payload.len().min(data.len());
+            data[..n].copy_from_slice(&self.payload[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn inquiry_payload(vendor: &[u8], product: &[u8], rev: &[u8]) -> Vec<u8> {
+        // SPC-4 §6.4.2: identifier fields are left-aligned ASCII, padded
+        // with SPACE (0x20), not NUL — build the fixture that way so the
+        // parser's trim() is exercised on real-shaped padding.
+        let mut p = vec![0u8; 96];
+        // peripheral device type 5 (CD/DVD) in byte 0 low 5 bits — not
+        // parsed by inquiry() but realistic.
+        p[0] = 0x05;
+        for b in &mut p[8..36] {
+            *b = b' ';
+        }
+        p[8..8 + vendor.len()].copy_from_slice(vendor);
+        p[16..16 + product.len()].copy_from_slice(product);
+        p[32..32 + rev.len()].copy_from_slice(rev);
+        p
+    }
+
+    #[test]
+    fn parses_vendor_product_revision_offsets() {
+        // Real BU40N-style identity. Vendor "HL-DT-ST" (8 chars exactly),
+        // product padded to 16, revision "1.04".
+        let payload = inquiry_payload(b"HL-DT-ST", b"BD-RE BU40N     ", b"1.04");
+        let mut t = ScriptedTransport {
+            payload,
+            last_cdb: vec![],
+        };
+        let r = inquiry(&mut t).unwrap();
+        assert_eq!(r.vendor_id, "HL-DT-ST");
+        assert_eq!(r.model, "BD-RE BU40N");
+        assert_eq!(r.firmware, "1.04");
+    }
+
+    #[test]
+    fn fields_are_independent_no_bleed_across_offset_boundaries() {
+        // A wrong end-offset (e.g. vendor 8..17) would pull the first
+        // product char into the vendor string. Use a vendor that fills
+        // all 8 bytes and a product whose first byte is distinctive.
+        let payload = inquiry_payload(b"VENDOR12", b"XPRODUCT", b"REV0");
+        let mut t = ScriptedTransport {
+            payload,
+            last_cdb: vec![],
+        };
+        let r = inquiry(&mut t).unwrap();
+        assert_eq!(r.vendor_id, "VENDOR12", "vendor must stop at byte 16");
+        assert!(
+            !r.vendor_id.contains('X'),
+            "product byte must not bleed into vendor"
+        );
+        assert_eq!(r.model, "XPRODUCT");
+    }
+
+    #[test]
+    fn whitespace_padded_fields_trimmed() {
+        // SPC-4 pads identifiers with spaces; trim() removes them.
+        let payload = inquiry_payload(b"  ABC   ", b"  MODEL X       ", b" R1 ");
+        let mut t = ScriptedTransport {
+            payload,
+            last_cdb: vec![],
+        };
+        let r = inquiry(&mut t).unwrap();
+        assert_eq!(r.vendor_id, "ABC");
+        assert_eq!(r.model, "MODEL X");
+        assert_eq!(r.firmware, "R1");
+    }
+
+    #[test]
+    fn cdb_is_standard_inquiry_96_bytes() {
+        // The CDB must be INQUIRY (0x12) with allocation length 0x60 (96)
+        // in byte 4 — matching the 96-byte buffer the parser slices.
+        let payload = inquiry_payload(b"V", b"M", b"R");
+        let mut t = ScriptedTransport {
+            payload,
+            last_cdb: vec![],
+        };
+        let _ = inquiry(&mut t).unwrap();
+        assert_eq!(t.last_cdb[0], SCSI_INQUIRY);
+        assert_eq!(t.last_cdb[4], 0x60, "allocation length must be 96 bytes");
+    }
+
+    #[test]
+    fn raw_response_preserved_full_96_bytes() {
+        // raw must carry the entire 96-byte INQUIRY for downstream
+        // identity capture/masking — not just the parsed fields.
+        let payload = inquiry_payload(b"HL-DT-ST", b"BD-RE BU40N", b"1.04");
+        let mut t = ScriptedTransport {
+            payload,
+            last_cdb: vec![],
+        };
+        let r = inquiry(&mut t).unwrap();
+        assert_eq!(r.raw.len(), 96);
+        assert_eq!(r.raw[0], 0x05, "peripheral device type byte preserved");
+    }
 }

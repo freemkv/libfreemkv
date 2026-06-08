@@ -2190,4 +2190,555 @@ mod tests {
         assert_eq!(cc.version, AacsVersion::V20);
         assert!(cc.bus_encryption);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Hardening additions
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── VUK derivation: spec relation VUK = AES-D(MK, VID) XOR VID ─────────
+
+    #[test]
+    fn derive_vuk_matches_spec_relation_explicitly() {
+        // Independently compute AES-ECB-D(mk, vid) XOR vid and confirm
+        // derive_vuk produces the same 16 bytes. A mutation that dropped the
+        // XOR-VID step, or used encrypt instead of decrypt, fails this.
+        use super::super::decrypt::aes_ecb_decrypt as dec;
+        let mk = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
+        ];
+        let vid = [
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D,
+            0x2E, 0x2F,
+        ];
+        let mut expected = dec(&mk, &vid);
+        for i in 0..16 {
+            expected[i] ^= vid[i];
+        }
+        assert_eq!(derive_vuk(&mk, &vid), expected);
+    }
+
+    #[test]
+    fn decrypt_unit_key_is_plain_aes_ecb_decrypt_under_vuk() {
+        // The encrypted unit key in Unit_Key_RO.inf is AES-ECB-E(VUK, uk);
+        // decrypt_unit_key must be the matching ECB-decrypt. Round-trip via
+        // encrypt to pin the relation.
+        use super::super::decrypt::aes_ecb_encrypt as enc;
+        let vuk = [0x9Eu8; 16];
+        let uk = [0x3Cu8; 16];
+        let enc_uk = enc(&vuk, &uk);
+        assert_eq!(decrypt_unit_key(&vuk, &enc_uk), uk);
+    }
+
+    // ── Unit_Key_RO stride: 48 (V10) vs 64 (V20/V21) ──────────────────────
+
+    /// Build a Unit_Key_RO.inf carrying `num_uk` keys at a given stride,
+    /// where key `i` is filled with byte `0x10 + i`. uk_pos = 0x60.
+    fn build_unit_key_ro(num_uk: usize, stride: usize) -> Vec<u8> {
+        let uk_pos = 0x60usize;
+        let size = uk_pos + 48 + stride * num_uk + 64;
+        let mut data = vec![0u8; size];
+        // uk_pos BE32 at [0..4].
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[16] = 1; // app_type
+        data[17] = 1; // num_bdmv_dir
+        // num_unit_keys BE16 at uk_pos.
+        data[uk_pos..uk_pos + 2].copy_from_slice(&(num_uk as u16).to_be_bytes());
+        // Keys start at uk_pos + 48, stride apart.
+        let mut pos = uk_pos + 48;
+        for i in 0..num_uk {
+            for b in &mut data[pos..pos + 16] {
+                *b = 0x10 + i as u8;
+            }
+            pos += stride;
+        }
+        data
+    }
+
+    #[test]
+    fn stride_v10_is_48_v20_is_64_and_picks_distinct_keys() {
+        // AACS 1.0 stride = 48, AACS 2.0/2.1 stride = 64 (keys.rs:30-35).
+        // Lay keys at 64-byte stride. Parsing at V20 stride must pick exactly
+        // those keys; parsing the SAME bytes at V10 (48) stride would read the
+        // wrong (intermediate) bytes for key 2 onward — proving the stride
+        // selector matters.
+        let data = build_unit_key_ro(2, 64);
+        let v20 = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
+        assert_eq!(v20.encrypted_keys.len(), 2);
+        assert_eq!(v20.encrypted_keys[0].1, [0x10; 16]);
+        assert_eq!(v20.encrypted_keys[1].1, [0x11; 16]);
+
+        // Same buffer, V10 stride: key 1 still lands at uk_pos+48, but key 2
+        // is read at +48 (not +64) so it is NOT the planted 0x11 block.
+        let v10 = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert_eq!(v10.encrypted_keys[0].1, [0x10; 16]);
+        assert_ne!(
+            v10.encrypted_keys[1].1, [0x11; 16],
+            "48-byte stride must read different bytes than 64-byte stride"
+        );
+    }
+
+    #[test]
+    fn v21_uses_same_64_byte_stride_as_v20() {
+        // V21 shares V20's 64-byte stride (the enum match groups V20|V21).
+        let data = build_unit_key_ro(2, 64);
+        let v20 = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
+        let v21 = parse_unit_key_ro(&data, AacsVersion::V21).unwrap();
+        assert_eq!(v20.encrypted_keys, v21.encrypted_keys);
+        assert_eq!(v21.version, AacsVersion::V21);
+    }
+
+    // ── parse_unit_key_ro: early returns / boundaries ──────────────────────
+
+    #[test]
+    fn parse_unit_key_ro_rejects_too_short_header() {
+        // < 20 bytes → None (header fields at 16-18 would index OOB).
+        assert!(parse_unit_key_ro(&[0u8; 19], AacsVersion::V10).is_none());
+    }
+
+    #[test]
+    fn parse_unit_key_ro_rejects_uk_pos_past_end() {
+        // uk_pos points past the buffer → the `uk_pos + 2 > len` guard
+        // returns None rather than indexing OOB.
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&1000u32.to_be_bytes()); // uk_pos = 1000
+        assert!(parse_unit_key_ro(&data, AacsVersion::V10).is_none());
+    }
+
+    #[test]
+    fn parse_unit_key_ro_zero_keys_returns_empty_set() {
+        // num_unit_keys == 0 → a valid file with no encrypted keys (early
+        // Some(..) branch), NOT None.
+        let uk_pos = 0x60usize;
+        let mut data = vec![0u8; uk_pos + 48];
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[16] = 1;
+        // num_uk left 0.
+        let parsed = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert!(parsed.encrypted_keys.is_empty());
+        assert_eq!(parsed.app_type, 1);
+    }
+
+    #[test]
+    fn parse_unit_key_ro_truncated_key_region_returns_none() {
+        // keys_start + 16 > len → None (the first key can't fit).
+        let uk_pos = 0x60usize;
+        let mut data = vec![0u8; uk_pos + 48 + 8]; // only 8 of 16 key bytes
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[uk_pos + 1] = 1; // 1 key declared
+        assert!(parse_unit_key_ro(&data, AacsVersion::V10).is_none());
+    }
+
+    #[test]
+    fn parse_unit_key_ro_stops_early_when_keys_run_off_end() {
+        // 3 keys declared but the buffer is sized to hold only 2 strides plus
+        // 8 trailing bytes (not a full 3rd 16-byte key) → the loop's
+        // `pos + 16 > len` guard breaks and returns the keys that fit, never
+        // reading OOB.
+        let uk_pos = 0x60usize;
+        let stride = 48usize;
+        // Room for keys at uk_pos+48 and uk_pos+48+48, then only 8 spare bytes
+        // (key 3 would start at uk_pos+48+96 and need 16, but only 8 remain).
+        let size = uk_pos + 48 + stride + 16 + 8;
+        let mut data = vec![0u8; size];
+        data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        data[uk_pos + 1] = 3; // declare 3 keys
+        let parsed = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert_eq!(
+            parsed.encrypted_keys.len(),
+            2,
+            "must stop at the buffer end, not read past it"
+        );
+    }
+
+    #[test]
+    fn parse_unit_key_ro_app_type_and_skb_flag() {
+        // app_type at [16], num_bdmv_dir at [17], use_skb_mkb = bit 7 of [18].
+        let mut data = build_unit_key_ro(1, 48);
+        data[16] = 0x02;
+        data[17] = 0x05;
+        data[18] = 0x80; // bit 7 set
+        let p = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert_eq!(p.app_type, 0x02);
+        assert_eq!(p.num_bdmv_dir, 0x05);
+        assert!(p.use_skb_mkb, "bit 7 of byte 18 → use_skb_mkb true");
+        // Clearing bit 7 (other bits set) → false.
+        data[18] = 0x7F;
+        let p2 = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert!(!p2.use_skb_mkb);
+    }
+
+    #[test]
+    fn parse_unit_key_ro_cps_unit_numbers_are_1_based() {
+        // The disc's CPS unit numbers are emitted as (i+1) — keys.rs:162.
+        let data = build_unit_key_ro(3, 48);
+        let p = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
+        assert_eq!(
+            p.encrypted_keys.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn parse_unit_key_ro_title_cps_mapping_first_play_top_menu_then_titles() {
+        // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then
+        // per-title 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2.
+        let mut data = build_unit_key_ro(2, 64);
+        data[20..22].copy_from_slice(&7u16.to_be_bytes()); // first_play
+        data[22..24].copy_from_slice(&9u16.to_be_bytes()); // top_menu
+        data[24..26].copy_from_slice(&2u16.to_be_bytes()); // num_titles
+        data[28..30].copy_from_slice(&3u16.to_be_bytes()); // title 0 CPS
+        data[32..34].copy_from_slice(&4u16.to_be_bytes()); // title 1 CPS
+        let p = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
+        assert_eq!(p.title_cps_unit, vec![7, 9, 3, 4]);
+    }
+
+    // ── MKB record framing: rec_len is BE24 incl. 4-byte header ────────────
+
+    #[test]
+    fn mkb_version_uses_be24_length_and_reads_offset_8() {
+        // Type 0x10, BE24 length 0x0C (12), version u32 at body offset 8.
+        // Confirm a length encoded in the high BE24 byte is honored.
+        let mkb = [
+            0x10, 0x00, 0x00, 0x0C, 0x11, 0x22, 0x33, 0x44, 0x01, 0x02, 0x03, 0x04,
+        ];
+        // version = 0x01020304.
+        assert_eq!(mkb_version(&mkb), Some(0x0102_0304));
+    }
+
+    #[test]
+    fn mkb_find_mk_dv_skips_short_verify_record() {
+        // A 0x81 record with rec_len < 20 carries no full mk_dv; the finder
+        // must skip it and keep walking (here to a valid 0x86 after it).
+        let mut mkb = vec![0x81, 0x00, 0x00, 0x10]; // rec_len 16 (< 20)
+        mkb.extend_from_slice(&[0x00; 12]);
+        let expected = [0xC1u8; 16];
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&expected);
+        mkb.extend_from_slice(&[0x00; 4]);
+        assert_eq!(mkb_find_mk_dv(&mkb), Some(expected));
+    }
+
+    #[test]
+    fn mkb_find_mk_dv_stops_on_overrun_length() {
+        // A rec_len that runs past the buffer ends the walk (break), so no
+        // mk_dv is found and we get None rather than an OOB slice.
+        let mkb = [0x81, 0x00, 0xFF, 0xFF, 0x00, 0x00]; // claims 65535 bytes
+        assert_eq!(mkb_find_mk_dv(&mkb), None);
+    }
+
+    #[test]
+    fn mkb_find_mk_dv_stops_on_zero_length_record() {
+        // rec_len < 4 (here 0) breaks the walk — guards against an infinite
+        // loop on a malformed record (pos would never advance).
+        let mkb = [0x81, 0x00, 0x00, 0x00, 0x99];
+        assert_eq!(mkb_find_mk_dv(&mkb), None);
+    }
+
+    // ── mkb_content_len / trim_mkb ─────────────────────────────────────────
+
+    #[test]
+    fn mkb_content_len_stops_at_zero_type_padding_byte() {
+        // A type==0 byte marks the start of padding (records done). Two real
+        // records then a 0x00 type byte → content_len == sum of the two recs.
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1]; // 8-byte rec
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 9, 9, 9, 9]); // 8-byte rec
+        let content = mkb.len();
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]); // padding starts (type 0)
+        assert_eq!(mkb_content_len(&mkb), content);
+    }
+
+    #[test]
+    fn mkb_content_len_returns_full_len_when_no_padding() {
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 9, 9, 9, 9]);
+        assert_eq!(mkb_content_len(&mkb), mkb.len());
+    }
+
+    #[test]
+    fn trim_mkb_leaves_exactly_sized_buffer_untouched() {
+        // n == mkb.len() (no padding) → the `n < mkb.len()` guard is false,
+        // so the buffer is returned untouched (no spurious truncate).
+        let mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
+        assert_eq!(trim_mkb(mkb.clone()), mkb);
+    }
+
+    // ── Content Certificate parsing ────────────────────────────────────────
+
+    #[test]
+    fn parse_content_cert_rejects_short_buffer() {
+        // < 8 bytes → None (cc_id slice [2..8] would index OOB).
+        assert!(parse_content_cert(&[0x00; 7]).is_none());
+    }
+
+    #[test]
+    fn parse_content_cert_extracts_cc_id_and_nonzero_type_is_v20() {
+        // [0]=type, [1]=bus-enc bit0, [2..8]=cc_id. Any non-0x00 type → V20.
+        let mut data = vec![0u8; 8];
+        data[0] = 0x02; // not 0x00 and not 0x01 → still V20
+        data[1] = 0x00;
+        data[2..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let cc = parse_content_cert(&data).unwrap();
+        assert_eq!(cc.version, AacsVersion::V20);
+        assert_eq!(cc.cc_id, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert!(!cc.bus_encryption);
+    }
+
+    #[test]
+    fn parse_content_cert_bus_encryption_only_reads_bit0() {
+        // bus_encryption = (data[1] & 0x01) != 0. A high bit set (0x02) with
+        // bit0 clear → false. Pins the mask, not a truthiness of the byte.
+        let mut data = vec![0u8; 8];
+        data[1] = 0x02; // bit 1 set, bit 0 clear
+        assert!(!parse_content_cert(&data).unwrap().bus_encryption);
+        data[1] = 0x03; // bit 0 set
+        assert!(parse_content_cert(&data).unwrap().bus_encryption);
+    }
+
+    // ── resolve: version → stride wiring + V21 upgrade on variant MKB ──────
+
+    #[test]
+    fn resolve_keys_v2_upgrades_to_v21_on_variant_mkb() {
+        // resolve_keys_v2 parses with the V20 64-byte stride but upgrades the
+        // result's version to V21 if the MKB carries a 0x82/0x83 variant
+        // record. Path 4 (hash→VUK) supplies the actual keys.
+        let uk_ro = build_unit_key_ro(1, 64);
+        let hash = disc_hash(&uk_ro);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "fixture".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some([0x5Au8; 16]),
+                unit_keys: Vec::new(),
+            },
+        );
+
+        // MKB with a 0x83 variant record makes is_variant_mkb true.
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
+        mkb.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x55; 16]);
+
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: Some(&mkb),
+        };
+        let resolved = resolve_keys_v2(&ctx).expect("path 4 resolves");
+        assert_eq!(
+            resolved.version,
+            AacsVersion::V21,
+            "variant MKB must upgrade V20 result to V21"
+        );
+    }
+
+    #[test]
+    fn resolve_keys_v2_stays_v20_on_classical_mkb() {
+        // No variant records → version stays V20.
+        let uk_ro = build_unit_key_ro(1, 64);
+        let hash = disc_hash(&uk_ro);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "f".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some([0x5Au8; 16]),
+                unit_keys: Vec::new(),
+            },
+        );
+        let mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: Some(&mkb),
+        };
+        assert_eq!(resolve_keys_v2(&ctx).unwrap().version, AacsVersion::V20);
+    }
+
+    #[test]
+    fn resolve_keys_bus_encryption_flag_flows_from_content_cert() {
+        // The resolved.bus_encryption must reflect the content cert's bit0.
+        let uk_ro = build_unit_key_ro(1, 48);
+        let hash = disc_hash(&uk_ro);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "f".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some([1u8; 16]),
+                unit_keys: Vec::new(),
+            },
+        );
+        // Content cert: AACS2 + bus encryption enabled.
+        let mut cc = vec![0u8; 8];
+        cc[0] = 0x01;
+        cc[1] = 0x01;
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: Some(&cc),
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: None,
+        };
+        assert!(resolve_keys_v1(&ctx).unwrap().bus_encryption);
+    }
+
+    #[test]
+    fn resolve_keys_v21_path4_resolves_by_hash() {
+        // resolve_keys_v21 must hit path 4 (hash→VUK) and stamp version V21,
+        // deriving unit keys from the VUK.
+        use super::super::decrypt::aes_ecb_encrypt as enc;
+        let data = build_unit_key_ro(1, 64);
+        // The single encrypted key in build_unit_key_ro is [0x10;16].
+        let hash = disc_hash(&data);
+        let hash_hex = disc_hash_hex(&hash).to_lowercase();
+        let vuk = [0x77u8; 16];
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "f".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some(vuk),
+                unit_keys: Vec::new(),
+            },
+        );
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &data,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: None,
+        };
+        let r = resolve_keys_v21(&ctx).expect("v21 path 4");
+        assert_eq!(r.version, AacsVersion::V21);
+        assert_eq!(r.key_source, 4);
+        assert_eq!(r.vuk, Some(vuk));
+        // Unit key derived: AES-D(vuk, enc_key). enc_key here is [0x10;16].
+        assert_eq!(r.unit_keys[0].1, decrypt_unit_key(&vuk, &[0x10u8; 16]));
+        // Self-consistency: encrypting it back under VUK gives the stored block.
+        assert_eq!(enc(&vuk, &r.unit_keys[0].1), [0x10u8; 16]);
+    }
+
+    #[test]
+    fn resolve_keys_path3_derives_vuk_from_vid_match() {
+        // Path 3: an entry whose disc_id == ctx.volume_id supplies an MK;
+        // resolver derives VUK = derive_vuk(mk, vid). No hash match needed.
+        let uk_ro = minimal_unit_key_ro();
+        let vid = [0x42u8; 16];
+        let mk = [0x24u8; 16];
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            "0xnotthishash".to_string(),
+            DiscEntry {
+                disc_hash: "0xnotthishash".to_string(),
+                title: "sibling".to_string(),
+                media_key: Some(mk),
+                disc_id: Some(vid),
+                vuk: None,
+                unit_keys: Vec::new(),
+            },
+        );
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &vid,
+            providers,
+            mkb: None, // no MKB → paths 1/2/2.5 skipped, path 3 fires
+        };
+        let r = resolve_keys_v1(&ctx).expect("path 3 by VID");
+        assert_eq!(r.key_source, 3);
+        assert_eq!(r.vuk, Some(derive_vuk(&mk, &vid)));
+    }
+
+    #[test]
+    fn resolve_keys_returns_none_when_no_provider_has_anything() {
+        // Empty provider array + VID present + no MKB → all paths miss → None.
+        let uk_ro = minimal_unit_key_ro();
+        let providers: &[&dyn super::super::KeyProvider] = &[];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0x42u8; 16],
+            providers,
+            mkb: None,
+        };
+        assert!(resolve_keys_v1(&ctx).is_none());
+    }
+
+    #[test]
+    fn match_keydb_unit_keys_empty_keydb_returns_none() {
+        // match_keydb_unit_keys with empty keydb keys → None (so path 5 can't
+        // fire on an entry with no unit keys).
+        let uk_file = parse_unit_key_ro(&minimal_unit_key_ro(), AacsVersion::V10).unwrap();
+        assert!(match_keydb_unit_keys(&uk_file, &[]).is_none());
+    }
+
+    // ── derive_media_key_from_dk: revoked-marker stops the uv scan ─────────
+
+    #[test]
+    fn derive_media_key_from_dk_breaks_on_revoked_marker() {
+        // A subset-difference entry whose u_mask_shift has bit 0x40/0x80 set
+        // is a revoke marker; the scan must `break` (not derive a key from it
+        // and not panic). Pair it with a DK that would otherwise be tempting.
+        let mut mkb: Vec<u8> = Vec::new();
+        mkb.extend_from_slice(&[0x81, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        // 0x04 with one entry, u_mask_shift = 0xC0 (both top bits → revoked).
+        mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
+        mkb.extend_from_slice(&[0xC0, 0x00, 0x00, 0x00, 0x01]);
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCD; 16]);
+        let dk = DeviceKey {
+            key: [0x11; 16],
+            node: 1,
+            uv: 1,
+            u_mask_shift: 0,
+        };
+        // The 0xC0 entry is filtered by the num_uvs take_while, so the scan
+        // sees zero usable slots and returns None — never a wrong key.
+        assert!(derive_media_key_from_dk(&mkb, &[dk]).is_none());
+    }
+
+    #[test]
+    fn derive_media_key_from_dk_returns_none_when_records_missing() {
+        // No 0x04 / 0x05 records → the `?` short-circuits return None.
+        let mkb = vec![
+            0x81, 0x00, 0x00, 0x14, /* mk_dv */ 0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        assert!(derive_media_key_from_dk(&mkb, &[]).is_none());
+    }
+
+    #[test]
+    fn find_record_body_returns_none_for_empty_body_record() {
+        // find_record_body requires rec_len > 4 (non-empty body). A 4-byte
+        // record (header only, empty body) is treated as absent.
+        let mkb = [0x05, 0x00, 0x00, 0x04]; // type 0x05, no body
+        assert!(probe::mkb_record_body(&mkb, 0x05).is_none());
+    }
 }

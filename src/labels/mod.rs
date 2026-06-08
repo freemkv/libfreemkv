@@ -1727,4 +1727,162 @@ mod apply_tests {
             assert!(v.label.contains("HDR10"), "expected HDR10, got {}", v.label);
         }
     }
+
+    // ── codec_hint_consistent hardening ───────────────────────────────────────
+
+    /// Spec: a hint naming only "TrueHD" is consistent with a TrueHD stream;
+    /// inconsistent with AC-3, AC-3+, DTS, etc.
+    /// Mutation: make all hints consistent with every codec → the unshuffle logic stops working.
+    #[test]
+    fn codec_hint_consistent_truehd_families() {
+        assert!(codec_hint_consistent("TrueHD 7.1", &Codec::TrueHd));
+        assert!(codec_hint_consistent("Dolby TrueHD", &Codec::TrueHd));
+        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Ac3));
+        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Ac3Plus));
+        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Dts));
+        assert!(!codec_hint_consistent("TrueHD 7.1", &Codec::Lpcm));
+    }
+
+    /// Spec: "Dolby Digital" (AC-3) hint is consistent ONLY with AC-3 streams;
+    /// NOT with DD+ or TrueHD.
+    /// Mutation: accept "Dolby Digital" as consistent with AC-3+ → DD+ mislabeled.
+    #[test]
+    fn codec_hint_consistent_ac3_not_confused_with_ddp() {
+        assert!(codec_hint_consistent("Dolby Digital", &Codec::Ac3));
+        assert!(codec_hint_consistent("AC-3 5.1", &Codec::Ac3));
+        assert!(!codec_hint_consistent("Dolby Digital", &Codec::Ac3Plus));
+        assert!(!codec_hint_consistent("AC-3 5.1", &Codec::TrueHd));
+    }
+
+    /// Spec: "Dolby Digital Plus" (AC-3+) is consistent with DD+ streams,
+    /// NOT with plain AC-3.
+    /// Mutation: merge DD and DD+ into one family check → mismatch undetected.
+    #[test]
+    fn codec_hint_consistent_ddp_not_confused_with_ac3() {
+        assert!(codec_hint_consistent("Dolby Digital Plus", &Codec::Ac3Plus));
+        assert!(codec_hint_consistent("E-AC-3", &Codec::Ac3Plus));
+        assert!(codec_hint_consistent("DD+", &Codec::Ac3Plus));
+        assert!(!codec_hint_consistent("Dolby Digital Plus", &Codec::Ac3));
+    }
+
+    /// Spec: "DTS" hint consistent with DTS streams, NOT DTS-HD families.
+    /// Mutation: treat bare "DTS" hint as consistent with DtsHdMa → mismatch.
+    #[test]
+    fn codec_hint_consistent_dts_families_distinguished() {
+        assert!(codec_hint_consistent("DTS", &Codec::Dts));
+        assert!(!codec_hint_consistent("DTS", &Codec::DtsHdMa));
+        assert!(!codec_hint_consistent("DTS", &Codec::DtsHdHr));
+        assert!(codec_hint_consistent("DTS-HD MA", &Codec::DtsHdMa));
+        assert!(codec_hint_consistent("DTS-HD HR", &Codec::DtsHdHr));
+    }
+
+    /// Spec: "LPCM" hint consistent only with Lpcm codec.
+    /// Mutation: make PCM consistent with all → mismatch undetected.
+    #[test]
+    fn codec_hint_consistent_lpcm() {
+        assert!(codec_hint_consistent("LPCM 7.1", &Codec::Lpcm));
+        assert!(codec_hint_consistent("PCM", &Codec::Lpcm));
+        assert!(!codec_hint_consistent("LPCM", &Codec::TrueHd));
+        assert!(!codec_hint_consistent("LPCM", &Codec::Ac3));
+    }
+
+    /// Spec: empty codec hint → consistent (no assertion = no contradiction).
+    /// Mutation: return false for empty hint → streams with no hint lose their label.
+    #[test]
+    fn codec_hint_consistent_empty_hint() {
+        assert!(codec_hint_consistent("", &Codec::TrueHd));
+        assert!(codec_hint_consistent("", &Codec::Ac3));
+        assert!(codec_hint_consistent("", &Codec::Lpcm));
+    }
+
+    /// Spec: a pure-editorial hint (e.g. "Commentary") names no codec family
+    /// and is therefore consistent with any codec stream.
+    /// Mutation: parse "commentary" and return false → editorial labels discarded.
+    #[test]
+    fn codec_hint_consistent_editorial_hint_no_codec() {
+        assert!(codec_hint_consistent("Commentary", &Codec::TrueHd));
+        assert!(codec_hint_consistent("Commentary", &Codec::Ac3));
+        assert!(codec_hint_consistent("Commentary", &Codec::Dts));
+    }
+
+    // ── generate_audio_label hardening ─────────────────────────────────────────
+
+    /// Spec: `generate_audio_label` uses full marketing names, not abbreviations.
+    /// Mutation: use "DD" instead of "Dolby Digital" → abbreviated name returned.
+    #[test]
+    fn generate_audio_label_all_codecs() {
+        assert_eq!(
+            generate_audio_label(&Codec::TrueHd, &AudioChannels::Surround51, false),
+            "Dolby TrueHD 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Ac3, &AudioChannels::Surround51, false),
+            "Dolby Digital 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Ac3Plus, &AudioChannels::Surround51, false),
+            "Dolby Digital Plus 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::DtsHdMa, &AudioChannels::Surround51, false),
+            "DTS-HD Master Audio 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::DtsHdHr, &AudioChannels::Surround51, false),
+            "DTS-HD High Resolution 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Dts, &AudioChannels::Surround51, false),
+            "DTS 5.1"
+        );
+        assert_eq!(
+            generate_audio_label(&Codec::Lpcm, &AudioChannels::Surround51, false),
+            "LPCM 5.1"
+        );
+    }
+
+    /// Spec: Unknown codec → empty string (never "?", never panic).
+    /// Mutation: return "Unknown" for unrecognized codecs → non-empty string.
+    #[test]
+    fn generate_audio_label_unknown_codec_empty() {
+        assert_eq!(
+            generate_audio_label(&Codec::Pgs, &AudioChannels::Surround51, false),
+            ""
+        );
+    }
+
+    /// Spec: Unknown channel layout → codec name only (no channel suffix).
+    /// Mutation: append " Unknown" for unrecognized channels → spurious suffix.
+    #[test]
+    fn generate_audio_label_unknown_channels_no_suffix() {
+        assert_eq!(
+            generate_audio_label(&Codec::Ac3, &AudioChannels::Unknown, false),
+            "Dolby Digital"
+        );
+    }
+
+    /// Spec: all channel layouts produce the documented string suffixes.
+    /// Mutation: swap any two (e.g. Mono/Stereo) → wrong descriptor rendered.
+    #[test]
+    fn generate_audio_label_all_channel_layouts() {
+        let f = |ch| generate_audio_label(&Codec::Ac3, ch, false);
+        assert_eq!(f(&AudioChannels::Mono), "Dolby Digital 1.0");
+        assert_eq!(f(&AudioChannels::Stereo), "Dolby Digital 2.0");
+        assert_eq!(f(&AudioChannels::Surround51), "Dolby Digital 5.1");
+        assert_eq!(f(&AudioChannels::Surround71), "Dolby Digital 7.1");
+    }
+
+    /// Spec: codec_hint_adds_detail only returns true for Atmos and DTS:X.
+    /// Mutation: return true for all hints → plain hints kept verbatim, no normalization.
+    #[test]
+    fn codec_hint_adds_detail_atmos_and_dtsx_only() {
+        assert!(codec_hint_adds_detail("Dolby Atmos"));
+        assert!(codec_hint_adds_detail("DTS:X"));
+        assert!(codec_hint_adds_detail("DTS-X 7.1"));
+        assert!(codec_hint_adds_detail("dtsx"));
+        assert!(!codec_hint_adds_detail("Dolby TrueHD"));
+        assert!(!codec_hint_adds_detail("DTS-HD Master Audio"));
+        assert!(!codec_hint_adds_detail("Dolby Digital Plus 5.1"));
+        assert!(!codec_hint_adds_detail(""));
+    }
 }

@@ -1000,4 +1000,530 @@ mod tests {
         // build_mpls writes an empty mark section (0 marks)
         assert_eq!(playlist.marks.len(), 0);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Added hardening tests below. Grounded in the BD-ROM MPLS spec
+    // (https://github.com/lw/BluRay/wiki/MPLS) byte layout.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Header guard: parse() requires `playlist_start + 10 <= data.len()`
+    /// before reading the PlayList header (num_play_items at pl[6..8]).
+    /// A playlist_start that points past EOF must be rejected with
+    /// MplsParse, not panic.
+    #[test]
+    fn playlist_start_past_eof_errs() {
+        let mut data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
+        // Overwrite PlayList_start_address (bytes 8..12) with a huge offset.
+        data[8..12].copy_from_slice(&0xFFFF_0000u32.to_be_bytes());
+        assert!(parse(&data).is_err());
+    }
+
+    /// Spec: version field is bytes [4..8], copied verbatim. A "0300"
+    /// (UHD) playlist must report version "0300", not "0200".
+    #[test]
+    fn version_field_reflects_bytes_4_to_8() {
+        let mut data = build_mpls(&[(b"00001", 1, 0, 9000000)], (0, 0, 0, 0, 0, 0, 0, 0), &[]);
+        data[4..8].copy_from_slice(b"0300");
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.version, "0300");
+    }
+
+    /// Spec: num_play_items is a u16 at pl[6..8]. The loop must produce
+    /// exactly that many items when the buffer holds them. Tests that the
+    /// count is read from the right offset (not e.g. pl[4..6]).
+    #[test]
+    fn num_play_items_read_from_offset_6() {
+        // build_mpls writes num_play_items at pl[6..8]; supply 2 items.
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 4500000), (b"00002", 1, 4500000, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.play_items.len(), 2);
+    }
+
+    /// Spec: connection_condition is the LOW nibble of PlayItem byte[9]
+    /// (high nibble is reserved/flags). A byte 0xF5 must yield 5, not 0xF5.
+    #[test]
+    fn connection_condition_is_low_nibble_only() {
+        // Build a custom item where byte[9] = 0xF5 (high nibble set).
+        // build_mpls masks with &0x0F when writing, so write raw to verify
+        // the PARSER masks. We patch the item byte directly after building.
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let mut data = build_mpls(
+            &[(b"00001", 0, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        // Locate PlayItem byte[9]: header(40) + pl_header(10) + item_len(2) + 9.
+        let conn_idx = 40 + 10 + 2 + 9;
+        data[conn_idx] = 0xF5;
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.play_items[0].connection_condition, 0x05);
+    }
+
+    /// Spec: in_time/out_time are big-endian u32 at PlayItem [12..16] and
+    /// [16..20]. Verify byte order is BE (not LE).
+    #[test]
+    fn in_out_time_big_endian() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let data = build_mpls(
+            &[(b"00001", 1, 0x01020304, 0x05060708)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.play_items[0].in_time, 0x01020304);
+        assert_eq!(pl.play_items[0].out_time, 0x05060708);
+    }
+
+    /// Spec: streams come ONLY from the first PlayItem's STN table (doc'd
+    /// in parse()). A second item carrying STN counts must NOT contribute
+    /// streams. build_mpls only writes STN on idx 0, so we verify the
+    /// `item_idx == 0` guard by confirming a 2-item playlist with streams
+    /// on item 0 reports exactly item-0's streams.
+    #[test]
+    fn streams_only_from_first_play_item() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let audio = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng");
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 4500000), (b"00002", 1, 4500000, 9000000)],
+            (1, 1, 0, 0, 0, 0, 0, 0),
+            &[video, audio],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.play_items.len(), 2);
+        assert_eq!(pl.streams.len(), 2); // only from item 0
+    }
+
+    /// stream_entry() PID location for type 0x02 (stream in a SubPath
+    /// SubClip): subpath_id(1)+subclip_id(1) precede the PID, so PID is at
+    /// +4 within the entry. A parser that read +2 (type-1 layout) would
+    /// pick up the subpath/subclip bytes as the PID.
+    #[test]
+    fn stream_entry_type2_pid_at_offset_4() {
+        // Build a primary-audio entry with stream_entry type 0x02.
+        // se_len = 5: type(1) + subpath_id(1) + subclip_id(1) + pid(2)
+        let mut se = Vec::new();
+        se.push(5); // se_len
+        se.push(0x02); // type: SubPath SubClip
+        se.push(0xAA); // subpath_id (must NOT be read as PID hi)
+        se.push(0xBB); // subclip_id
+        se.extend_from_slice(&0x1100u16.to_be_bytes()); // real PID at +4
+        // stream_attributes: audio coding(1)+fmt(1)+lang(3)
+        let attrs = vec![0x83u8, (6 << 4) | 1, b'e', b'n', b'g'];
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (0, 1, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 1);
+        assert_eq!(pl.streams[0].pid, 0x1100);
+    }
+
+    /// stream_entry() PID for type 0x03/0x04 (SubPath clip; 0x04 = DV EL):
+    /// subpath_id(1) precedes PID, so PID is at +3. Cited in source:
+    /// DV EL PID e.g. 0x1015.
+    #[test]
+    fn stream_entry_type4_pid_at_offset_3() {
+        let mut se = Vec::new();
+        se.push(4); // se_len: type(1)+subpath_id(1)+pid(2)
+        se.push(0x04); // type 4 (DV EL)
+        se.push(0x07); // subpath_id (not PID)
+        se.extend_from_slice(&0x1015u16.to_be_bytes()); // PID at +3
+        let attrs = vec![0x24u8, (8 << 4) | 1, 0x12]; // HEVC video attrs
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+
+        // Put it in the primary-video slot so it's retained as a stream.
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 1);
+        assert_eq!(pl.streams[0].pid, 0x1015);
+    }
+
+    /// stream_entry() unknown type → pid_off match arm `_ => 0`, so PID is
+    /// left 0. A type byte of 0x09 (not 1/2/3/4) must yield pid 0, never an
+    /// out-of-spec read. Grounded in the explicit default arm in source.
+    #[test]
+    fn stream_entry_unknown_type_pid_zero() {
+        let mut se = Vec::new();
+        se.push(3);
+        se.push(0x09); // unknown stream_entry type
+        se.extend_from_slice(&0x1234u16.to_be_bytes());
+        let attrs = vec![0x24u8, (8 << 4) | 1];
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 1);
+        assert_eq!(pl.streams[0].pid, 0); // unknown type → PID not read
+    }
+
+    /// Video stream_attributes: byte[1] high nibble = video_format, low
+    /// nibble = video_rate (BD spec format/frame_rate packing). Verify the
+    /// split: 0x84 → format 8 (2160p), rate 4.
+    #[test]
+    fn video_attr_nibble_split() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 8, 4, None);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams[0].video_format, 8);
+        assert_eq!(pl.streams[0].video_rate, 4);
+    }
+
+    /// HDR byte (HEVC only, coding_type 0x24): sa[2] high nibble =
+    /// dynamic_range, low nibble = color_space. For a non-HEVC video
+    /// (e.g. H264 0x1B) the HDR byte must NOT be consumed even if present,
+    /// per the `coding_type == 0x24` guard.
+    #[test]
+    fn hdr_byte_only_for_hevc() {
+        // H264 video with a third attr byte present — must stay SDR/unknown.
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, Some(0x12));
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams[0].coding_type, 0x1B);
+        assert_eq!(pl.streams[0].dynamic_range, 0); // not parsed for H264
+        assert_eq!(pl.streams[0].color_space, 0);
+    }
+
+    /// Audio language is at sa[2..5] (after coding_type + format_rate),
+    /// EXCEPT when the audio slot carries a PG coding_type (0x90/0x91),
+    /// where the layout is coding_type(1)+language(3) → lang at sa[1..4].
+    /// This branch is explicit in source. Verify the PG-in-audio path.
+    #[test]
+    fn pg_coding_in_audio_slot_uses_pg_lang_offset() {
+        // Audio-slot entry but coding_type 0x90 (PGS): attrs = 0x90 + lang(3).
+        let mut se = Vec::new();
+        se.push(3);
+        se.push(0x01);
+        se.extend_from_slice(&0x1100u16.to_be_bytes());
+        let attrs = vec![0x90u8, b'j', b'p', b'n']; // PG layout: coding + lang
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (0, 1, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams[0].coding_type, 0x90);
+        assert_eq!(pl.streams[0].language, "jpn"); // read from sa[1..4]
+        // audio_format/rate not parsed in PG branch.
+        assert_eq!(pl.streams[0].audio_format, 0);
+    }
+
+    /// IG streams (count n_ig, stream_type 4) are consumed to keep the STN
+    /// cursor aligned but NEVER retained as StreamEntry (doc'd in source).
+    /// An STN with 1 video + 1 IG + 1 PG must report exactly the video and
+    /// PG, and the PG must keep its correct PID (proving IG advanced spos).
+    #[test]
+    fn ig_consumed_but_not_retained_and_dv_after_aligned() {
+        // STN parse order is video, audio, PG, IG, sec_audio, sec_video,
+        // pip_pg, DV. The IG entry must be consumed (advancing spos) but
+        // never retained. To PROVE IG advanced the cursor, place a Dolby
+        // Vision EL after the IG: if IG didn't advance spos, the DV parse
+        // would land on the IG bytes and read the wrong PID.
+        let video = build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12));
+        let ig = build_stream_entry_pg(0x1400, 0x91, b"eng"); // IG entry bytes
+        let dv = build_stream_entry_video(0x1015, 0x24, 8, 1, Some(0x12)); // DV EL
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 1, 0, 0, 0, 1), // 1 video, 1 ig, 1 dv
+            &[video, ig, dv],
+        );
+        let pl = parse(&data).expect("should parse");
+        // 2 retained streams: video + DV EL (IG dropped).
+        assert_eq!(pl.streams.len(), 2);
+        assert_eq!(pl.streams[0].stream_type, 1);
+        assert_eq!(pl.streams[0].pid, 0x1011);
+        // DV EL parsed at correct offset → IG advanced spos past 0x1400.
+        assert_eq!(pl.streams[1].stream_type, 7);
+        assert_eq!(pl.streams[1].pid, 0x1015);
+        assert!(pl.streams.iter().all(|s| s.pid != 0x1400));
+    }
+
+    /// parse_stream_entry short-circuits when the declared stream_entry
+    /// length runs past the item end (`se_end > item.len()` → None). The
+    /// STN count loop then `break`s, so a truncated entry yields fewer
+    /// streams without panicking. Build n_video=2 but only enough bytes
+    /// for 1 full entry plus a too-long second.
+    #[test]
+    fn truncated_stream_entry_stops_without_panic() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        // Second "entry" declares se_len=200 but supplies no body → None.
+        let bad = vec![200u8, 0x01];
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (2, 0, 0, 0, 0, 0, 0, 0), // claims 2 video
+            &[video, bad],
+        );
+        let pl = parse(&data).expect("should not panic on truncated entry");
+        // Only the first parsed; second aborted the loop.
+        assert_eq!(pl.streams.len(), 1);
+        assert_eq!(pl.streams[0].pid, 0x1011);
+    }
+
+    /// PID must be bounded by the entry's declared se_end, not item.len():
+    /// a short se_len must leave PID 0 rather than reading into the
+    /// following stream_attributes region (explicit in source comment).
+    /// se_len=1 (only the type byte) for a type-1 entry → PID read would
+    /// need bytes at +2/+3 which are inside attrs, so PID must be 0.
+    #[test]
+    fn short_se_len_does_not_read_pid_from_attrs() {
+        // se_len = 1: just the type byte, no PID bytes within the entry.
+        let mut se = Vec::new();
+        se.push(1); // se_len = 1
+        se.push(0x01); // type 1; PID would be at +2 but that's past se_end
+        // stream_attributes follow immediately.
+        let attrs = vec![0x1Bu8, (6 << 4) | 1];
+        se.push(attrs.len() as u8);
+        se.extend_from_slice(&attrs);
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 1);
+        // PID bytes lie outside the declared entry → must be 0, not attrs.
+        assert_eq!(pl.streams[0].pid, 0);
+    }
+
+    /// parse_stream_entry rejects sa_len == 0 (`sa_len < 1` → None). A
+    /// zero-length stream_attributes block means the entry is unusable and
+    /// the STN loop must break, not push a degenerate StreamEntry.
+    #[test]
+    fn zero_length_stream_attributes_yields_no_stream() {
+        let mut se = Vec::new();
+        se.push(3);
+        se.push(0x01);
+        se.extend_from_slice(&0x1011u16.to_be_bytes());
+        se.push(0); // sa_len = 0 → parse_stream_entry returns None
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[se],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 0);
+    }
+
+    /// PlayListMark timestamp is a big-endian u32 at entry offset +4..+8
+    /// (after reserved(1)+mark_type(1)+ref(2)). Verify BE decode and that
+    /// ref_to_PlayItem_id is read from +2..+4.
+    #[test]
+    fn mark_timestamp_and_ref_offsets() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let marks = vec![TestMark {
+            mark_type: 1,
+            play_item_ref: 0x0203,
+            timestamp: 0x0A0B0C0D,
+        }];
+        let data = build_mpls_with_marks(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+            &marks,
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.marks.len(), 1);
+        assert_eq!(pl.marks[0].play_item_ref, 0x0203);
+        assert_eq!(pl.marks[0].timestamp, 0x0A0B0C0D);
+    }
+
+    /// num_marks is read from ms[4..6] (after length(4)). Each entry is
+    /// strictly 14 bytes. The loop must stop when fewer than 14 bytes
+    /// remain (`mpos + 14 > ms.len()` → break) rather than panic, so a
+    /// num_marks that overshoots the actual byte count is safe.
+    #[test]
+    fn mark_count_overshoot_truncates_safely() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let marks = vec![
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 100,
+            },
+            TestMark {
+                mark_type: 1,
+                play_item_ref: 0,
+                timestamp: 200,
+            },
+        ];
+        let mut data = build_mpls_with_marks(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+            &marks,
+        );
+        // Find mark_start (header bytes 12..16) and bump num_marks to 99.
+        let mark_start = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        // num_marks at ms[4..6].
+        data[mark_start + 4] = 0;
+        data[mark_start + 5] = 99;
+        let pl = parse(&data).expect("should not panic on mark overshoot");
+        // Only the 2 real marks fit; the loop broke at the 3rd.
+        assert_eq!(pl.marks.len(), 2);
+    }
+
+    /// Mark section guard: `mark_start + 6 <= data.len()` is required before
+    /// reading num_marks at ms[4..6]. A mark_start pointing within 5 bytes
+    /// of EOF must yield zero marks, not panic.
+    #[test]
+    fn mark_start_near_eof_yields_no_marks() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let mut data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        // Point mark_start to len-3 (only 3 bytes remain < 6 needed).
+        let near = (data.len() - 3) as u32;
+        data[12..16].copy_from_slice(&near.to_be_bytes());
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.marks.len(), 0);
+    }
+
+    /// A PlayItem whose declared item_length leaves fewer than 20 bytes of
+    /// body is skipped (`item.len() < 20` → continue) — its clip_id/times
+    /// are not parsed, but the cursor advances and following items still
+    /// parse. Grounded in the `if item.len() < 20` guard.
+    #[test]
+    fn short_play_item_skipped_cursor_advances() {
+        // Construct two items manually: a short (10-byte) first item, then
+        // a valid second item. We can't use build_mpls (it always writes
+        // ≥32-byte items), so assemble directly.
+        let playlist_start: u32 = 40;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MPLS0200");
+        buf.extend_from_slice(&playlist_start.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 28]); // mark_start=0 + padding
+
+        let pl_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // pl length placeholder
+        buf.extend_from_slice(&[0u8; 2]); // reserved
+        buf.extend_from_slice(&2u16.to_be_bytes()); // num_play_items = 2
+        buf.extend_from_slice(&[0u8; 2]); // num_sub_paths
+
+        // Item 0: length 10 (< 20) → skipped.
+        let short = vec![0u8; 10];
+        buf.extend_from_slice(&(short.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&short);
+
+        // Item 1: a valid 32-byte item with clip_id "00009".
+        let mut item = Vec::new();
+        item.extend_from_slice(b"00009");
+        item.extend_from_slice(b"M2TS");
+        item.push(0x01); // connection_condition
+        item.extend_from_slice(&[0u8; 2]);
+        item.extend_from_slice(&90000u32.to_be_bytes()); // in_time
+        item.extend_from_slice(&180000u32.to_be_bytes()); // out_time
+        item.resize(32, 0); // pad through STN_OFFSET; item.len()==32 so no STN
+        buf.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&item);
+
+        let pl_len = (buf.len() - pl_start - 4) as u32;
+        buf[pl_start..pl_start + 4].copy_from_slice(&pl_len.to_be_bytes());
+
+        let pl = parse(&buf).expect("should parse with a short leading item");
+        // Only the valid second item is retained.
+        assert_eq!(pl.play_items.len(), 1);
+        assert_eq!(pl.play_items[0].clip_id, "00009");
+        assert_eq!(pl.play_items[0].in_time, 90000);
+    }
+
+    /// clip_id is the 5 ASCII bytes at PlayItem [0..5]. Verify exact decode
+    /// (e.g. "01234"), not a truncated/padded version.
+    #[test]
+    fn clip_id_five_bytes() {
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let data = build_mpls(
+            &[(b"01234", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.play_items[0].clip_id, "01234");
+    }
+
+    /// STN counts are read at STN_OFFSET+4..+12 in PlayItem order:
+    /// video, audio, pg, ig, sec_audio, sec_video, pip_pg, dv. Verify that
+    /// supplying 2 video + 2 audio + 1 PG retains all 5 in that order with
+    /// correct types — catches an off-by-one in the count-byte offsets.
+    #[test]
+    fn stn_counts_ordering_video_audio_pg() {
+        let v0 = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let v1 = build_stream_entry_video(0x1012, 0x1B, 6, 1, None);
+        let a0 = build_stream_entry_audio(0x1100, 0x83, 6, 1, b"eng");
+        let a1 = build_stream_entry_audio(0x1101, 0x81, 3, 1, b"fra");
+        let pg = build_stream_entry_pg(0x1200, 0x90, b"spa");
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (2, 2, 1, 0, 0, 0, 0, 0),
+            &[v0, v1, a0, a1, pg],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams.len(), 5);
+        assert_eq!(pl.streams[0].stream_type, 1);
+        assert_eq!(pl.streams[1].stream_type, 1);
+        assert_eq!(pl.streams[1].pid, 0x1012);
+        assert_eq!(pl.streams[2].stream_type, 2);
+        assert_eq!(pl.streams[3].stream_type, 2);
+        assert_eq!(pl.streams[3].pid, 0x1101);
+        assert_eq!(pl.streams[3].language, "fra");
+        assert_eq!(pl.streams[4].stream_type, 3);
+        assert_eq!(pl.streams[4].language, "spa");
+    }
+
+    /// Audio sample/channel nibbles: sa[1] high nibble = audio_format,
+    /// low nibble = audio_rate (BD spec audio format/sample_rate packing).
+    /// 0xC5 → format 12 (7.1), rate 5 (192kHz).
+    #[test]
+    fn audio_format_rate_nibble_split() {
+        let audio = build_stream_entry_audio(0x1100, 0x86, 12, 5, b"eng");
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (0, 1, 0, 0, 0, 0, 0, 0),
+            &[audio],
+        );
+        let pl = parse(&data).expect("should parse");
+        assert_eq!(pl.streams[0].audio_format, 12);
+        assert_eq!(pl.streams[0].audio_rate, 5);
+        assert_eq!(pl.streams[0].language, "eng");
+    }
+
+    /// data.len() exactly 40 with valid magic but playlist_start past the
+    /// header: parse() must hit the `playlist_start + 10 > data.len()`
+    /// guard. A 40-byte buffer with playlist_start=40 has no PlayList body.
+    #[test]
+    fn exactly_40_bytes_no_playlist_body_errs() {
+        let mut data = vec![0u8; 40];
+        data[0..4].copy_from_slice(b"MPLS");
+        data[4..8].copy_from_slice(b"0200");
+        data[8..12].copy_from_slice(&40u32.to_be_bytes()); // playlist_start = 40 = len
+        assert!(parse(&data).is_err());
+    }
 }

@@ -1223,6 +1223,402 @@ mod tests {
         assert_eq!(cp[18], 0xF8 | 2);
     }
 
+    // --- BitReader unit tests (exp-Golomb + bit reads) ---
+
+    #[test]
+    fn bitreader_read_bits_msb_first() {
+        // 0b1011_0010 read 4 bits → 0b1011 = 11, then 4 → 0b0010 = 2.
+        let mut r = BitReader::new(&[0b1011_0010]);
+        assert_eq!(r.read_bits(4), Some(11));
+        assert_eq!(r.read_bits(4), Some(2));
+        // Past end → None.
+        assert_eq!(r.read_bit(), None);
+    }
+
+    #[test]
+    fn bitreader_ue_golomb_values() {
+        // Exp-Golomb ue(v): codeNum 0 = "1", 1 = "010", 2 = "011", 3 = "00100",
+        // 4 = "00101". (H.264/HEVC §9.1.) Pack "1 010 011" = 1010011x.
+        // Byte 0b1010_0110: read ue → 0 (leading "1"), then "010" → 1, then
+        // "011" → 2.
+        let mut r = BitReader::new(&[0b1010_0110]);
+        assert_eq!(r.read_ue(), Some(0));
+        assert_eq!(r.read_ue(), Some(1));
+        assert_eq!(r.read_ue(), Some(2));
+    }
+
+    #[test]
+    fn bitreader_ue_large_value() {
+        // codeNum 4 = "00101". Byte 0b0010_1000 → ue = 4.
+        let mut r = BitReader::new(&[0b0010_1000]);
+        assert_eq!(r.read_ue(), Some(4));
+    }
+
+    #[test]
+    fn bitreader_ue_runaway_zeros_bounded() {
+        // A corrupt all-zero stream has unbounded leading zeros; read_ue caps at
+        // 31 zeros and returns None rather than looping/overflowing.
+        let zeros = [0u8; 8]; // 64 zero bits
+        let mut r = BitReader::new(&zeros);
+        assert_eq!(r.read_ue(), None, "runaway zero-run is bounded → None");
+    }
+
+    #[test]
+    fn bitreader_skip_bits_past_end_is_none() {
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.skip_bits(8), Some(()));
+        assert_eq!(r.skip_bits(1), None, "skipping past the buffer end → None");
+    }
+
+    // --- strip_emulation_prevention (00 00 03 → 00 00) ---
+
+    #[test]
+    fn strip_ep_removes_third_byte_after_two_zeros() {
+        // 00 00 03 XX → 00 00 XX. The 0x03 is removed only after exactly two
+        // zeros. (H.264/HEVC §7.4.)
+        assert_eq!(
+            strip_emulation_prevention(&[0x00, 0x00, 0x03, 0x42]),
+            vec![0x00, 0x00, 0x42]
+        );
+    }
+
+    #[test]
+    fn strip_ep_leaves_03_after_single_zero() {
+        // A 0x03 preceded by only ONE zero is real data, not an EP byte.
+        assert_eq!(
+            strip_emulation_prevention(&[0x00, 0x03, 0x42]),
+            vec![0x00, 0x03, 0x42]
+        );
+    }
+
+    #[test]
+    fn strip_ep_handles_consecutive_sequences() {
+        // 00 00 03 00 00 03 → 00 00 00 00. After dropping the first 0x03 the run
+        // resets to 0, so the next two zeros re-arm and drop the second 0x03.
+        assert_eq!(
+            strip_emulation_prevention(&[0x00, 0x00, 0x03, 0x00, 0x00, 0x03]),
+            vec![0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn strip_ep_03_not_dropped_when_not_preceded_by_zeros() {
+        // 0x03 after non-zero bytes is kept verbatim.
+        assert_eq!(
+            strip_emulation_prevention(&[0xAA, 0xBB, 0x03, 0xCC]),
+            vec![0xAA, 0xBB, 0x03, 0xCC]
+        );
+    }
+
+    // --- parse_sps_chroma: chroma_format_idc edge values ---
+
+    #[test]
+    fn hvcc_chroma_monochrome_idc0() {
+        // chroma_format_idc = 0 (monochrome). bit depths 8-bit (minus8=0).
+        let sps = make_sps_with_chroma(0, 0, 0);
+        let cp = codec_private_from_sps(&sps);
+        // chromaFormat byte = 0xFC (6 reserved bits) | chroma_format_idc(0) = 0xFC.
+        assert_eq!(cp[16], 0xFC, "chroma_format_idc = 0 (monochrome)");
+    }
+
+    #[test]
+    fn hvcc_chroma_422_idc2() {
+        // chroma_format_idc = 2 (4:2:2), 10-bit.
+        let sps = make_sps_with_chroma(2, 2, 2);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(cp[16], 0xFC | 2, "chroma_format_idc = 2 (4:2:2)");
+        assert_eq!(cp[17], 0xF8 | 2);
+    }
+
+    #[test]
+    fn hvcc_asymmetric_bit_depths() {
+        // luma and chroma bit depths can differ; both must be parsed
+        // independently. luma minus8 = 2 (10-bit), chroma minus8 = 4 (12-bit).
+        let sps = make_sps_with_chroma(1, 2, 4);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(cp[17], 0xF8 | 2, "bit_depth_luma_minus8 = 2");
+        assert_eq!(cp[18], 0xF8 | 4, "bit_depth_chroma_minus8 = 4");
+    }
+
+    /// Build a stored SPS NAL with sub-layers and a conformance window, so the
+    /// parser must skip sub-layer PTL and the 4 conformance-window ue(v) fields
+    /// before reaching the bit depths. max_sub_layers_minus1 controls the
+    /// sub-layer loop.
+    fn make_sps_full(
+        chroma_idc: u32,
+        bd_luma_m8: u32,
+        bd_chroma_m8: u32,
+        max_sub_layers_minus1: u32,
+        conformance_window: bool,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put_bits(0, 4); // sps_video_parameter_set_id
+        w.put_bits(max_sub_layers_minus1, 3);
+        w.put_bit(1); // sps_temporal_id_nesting_flag
+        // general profile_tier_level: 96 bits.
+        for _ in 0..96 {
+            w.put_bit(0);
+        }
+        // Sub-layer flags + sub-layer PTL when max_sub_layers_minus1 > 0.
+        if max_sub_layers_minus1 > 0 {
+            let mut profile_present = Vec::new();
+            let mut level_present = Vec::new();
+            for _ in 0..max_sub_layers_minus1 {
+                // sub_layer_profile_present_flag, sub_layer_level_present_flag.
+                w.put_bit(1); // profile present
+                w.put_bit(1); // level present
+                profile_present.push(true);
+                level_present.push(true);
+            }
+            if max_sub_layers_minus1 < 8 {
+                for _ in max_sub_layers_minus1..8 {
+                    w.put_bits(0, 2); // reserved_zero_2bits
+                }
+            }
+            for i in 0..max_sub_layers_minus1 as usize {
+                if profile_present[i] {
+                    for _ in 0..88 {
+                        w.put_bit(0); // sub-layer profile block
+                    }
+                }
+                if level_present[i] {
+                    w.put_bits(0, 8); // sub_layer_level_idc
+                }
+            }
+        }
+        w.put_ue(0); // sps_seq_parameter_set_id
+        w.put_ue(chroma_idc);
+        if chroma_idc == 3 {
+            w.put_bit(0); // separate_colour_plane_flag
+        }
+        w.put_ue(3840);
+        w.put_ue(2160);
+        if conformance_window {
+            w.put_bit(1); // conformance_window_flag
+            w.put_ue(0); // conf_win_left_offset
+            w.put_ue(0); // conf_win_right_offset
+            w.put_ue(0); // conf_win_top_offset
+            w.put_ue(0); // conf_win_bottom_offset
+        } else {
+            w.put_bit(0);
+        }
+        w.put_ue(bd_luma_m8);
+        w.put_ue(bd_chroma_m8);
+
+        let mut sps = hevc_nal_header(33).to_vec();
+        sps.extend_from_slice(&w.bytes);
+        sps
+    }
+
+    #[test]
+    fn hvcc_parses_chroma_through_sublayer_ptl() {
+        // With max_sub_layers_minus1 = 2 the parser must consume the sub-layer
+        // present-flag bits, reserved bits, and two sub-layer PTL blocks before
+        // reaching chroma_format_idc / bit depths. A wrong sub-layer skip would
+        // mis-read the bit depths.
+        let sps = make_sps_full(1, 2, 2, 2, false);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(cp[16], 0xFC | 1, "4:2:0 after sub-layer PTL skip");
+        assert_eq!(cp[17], 0xF8 | 2, "10-bit luma after sub-layer PTL skip");
+        assert_eq!(cp[18], 0xF8 | 2);
+        // byte 21: numTemporalLayers = max_sub_layers_minus1 + 1 = 3.
+        assert_eq!(
+            cp[21],
+            (3 << 3) | (1 << 2) | 0x03,
+            "numTemporalLayers = 3, temporalIdNested = 1, lengthSizeMinusOne = 3"
+        );
+    }
+
+    #[test]
+    fn hvcc_parses_chroma_through_conformance_window() {
+        // conformance_window_flag = 1 inserts 4 ue(v) fields the parser must skip
+        // before the bit depths. A correct skip lands on the right depths.
+        let sps = make_sps_full(1, 2, 2, 0, true);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(
+            cp[17],
+            0xF8 | 2,
+            "10-bit luma after conformance-window skip"
+        );
+        assert_eq!(cp[18], 0xF8 | 2);
+    }
+
+    #[test]
+    fn hvcc_parses_444_with_separate_colour_plane() {
+        // chroma_format_idc = 3 (4:4:4) inserts separate_colour_plane_flag (1
+        // bit) that the parser must consume before pic dimensions. 12-bit.
+        let sps = make_sps_full(3, 4, 4, 0, false);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(cp[16], 0xFC | 3, "4:4:4");
+        assert_eq!(cp[17], 0xF8 | 4, "12-bit luma");
+    }
+
+    // --- hvcC array structure (VPS/SPS/PPS arrays) ---
+
+    #[test]
+    fn hvcc_array_headers_and_lengths() {
+        // After the 23-byte fixed header + numOfArrays the record holds three
+        // arrays. Each: (0x20 | nal_type), numNalus(=1, u16-BE), nalLength(u16),
+        // NAL bytes. Verify the SPS array's nal_type byte and length encode
+        // correctly. (ISO/IEC 14496-15 §8.3.3.1.)
+        let mut parser = HevcParser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xA0, 0xA1, 0xA2]); // VPS, 5 bytes total
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]); // SPS, 11 bytes
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xC0, 0xC1]); // PPS, 4 bytes
+        parser.parse(&make_pes(data, Some(0)));
+        let cp = parser.codec_private().expect("hvcC");
+
+        // numOfArrays at index 22.
+        assert_eq!(cp[22], 3);
+        // VPS array begins at 23. array header byte = 0x20 | 32 = 0x40.
+        let mut o = 23;
+        assert_eq!(cp[o], 0x20 | 32, "VPS array nal_type byte");
+        assert_eq!(
+            u16::from_be_bytes([cp[o + 1], cp[o + 2]]),
+            1,
+            "numNalus VPS"
+        );
+        let vps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(vps_len, 5, "VPS NAL length = 2 hdr + 3 payload");
+        // skip to SPS array.
+        o += 5 + vps_len;
+        assert_eq!(cp[o], 0x20 | 33, "SPS array nal_type byte");
+        let sps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(sps_len, 11, "SPS NAL length = 2 hdr + 9 payload");
+        o += 5 + sps_len;
+        assert_eq!(cp[o], 0x20 | 34, "PPS array nal_type byte");
+        let pps_len = u16::from_be_bytes([cp[o + 3], cp[o + 4]]) as usize;
+        assert_eq!(pps_len, 4, "PPS NAL length = 2 hdr + 2 payload");
+    }
+
+    #[test]
+    fn hvcc_none_missing_vps() {
+        // VPS is required for hvcC; SPS + PPS only → None.
+        let mut parser = HevcParser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xDD, 0xEE]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(1)); // slice
+        data.extend_from_slice(&[0x10, 0x20]);
+        parser.parse(&make_pes(data, Some(0)));
+        assert!(parser.codec_private().is_none(), "no VPS → None");
+    }
+
+    // --- IRAP keyframe boundary values ---
+
+    #[test]
+    fn irap_lower_boundary_type_16_is_keyframe() {
+        // BLA_W_LP = 16, the inclusive lower boundary of NAL_BLA_W_LP..=23.
+        let mut parser = HevcParser::new();
+        let mut data = vec![0x00, 0x00, 0x01];
+        data.extend_from_slice(&hevc_nal_header(16));
+        data.extend_from_slice(&[0x10, 0x20]);
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert!(f[0].keyframe);
+    }
+
+    #[test]
+    fn type_15_just_below_irap_not_keyframe() {
+        // Type 15 (RASL_R) is one below the IRAP range and must NOT be a keyframe.
+        let mut parser = HevcParser::new();
+        let mut data = vec![0x00, 0x00, 0x01];
+        data.extend_from_slice(&hevc_nal_header(15));
+        data.extend_from_slice(&[0x10, 0x20]);
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].keyframe, "type 15 is below the IRAP range");
+    }
+
+    #[test]
+    fn type_24_just_above_irap_not_keyframe() {
+        // Type 24 (RSV_VCL24) is one above the IRAP range (..=23) → not keyframe.
+        let mut parser = HevcParser::new();
+        let mut data = vec![0x00, 0x00, 0x01];
+        data.extend_from_slice(&hevc_nal_header(24));
+        data.extend_from_slice(&[0x10, 0x20]);
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert!(!f[0].keyframe, "type 24 is above the IRAP range");
+    }
+
+    #[test]
+    fn hevc_nal_type_extraction_masks_correctly() {
+        // HEVC NAL type = (byte0 >> 1) & 0x3F. The forbidden_zero_bit (bit 7) and
+        // the low layer-id bit (bit 0) must not affect type. hevc_nal_header(19)
+        // = [(19<<1), 0x01] = [0x26, 0x01]; with the forbidden bit set (0xA6) it
+        // is still type 19.
+        let mut parser = HevcParser::new();
+        let data = vec![0x00, 0x00, 0x01, 0xA6, 0x01, 0x10, 0x20]; // 0xA6>>1&0x3F = 19
+        let f = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(f.len(), 1);
+        assert!(
+            f[0].keyframe,
+            "0xA6 decodes to NAL type 19 (IDR) → keyframe"
+        );
+    }
+
+    #[test]
+    fn hevc_dts_fallback_when_pts_absent() {
+        let mut parser = HevcParser::new();
+        let pes = PesPacket {
+            pid: 0x1011,
+            pts: None,
+            dts: Some(90000),
+            data: {
+                let mut d = vec![0x00, 0x00, 0x01];
+                d.extend_from_slice(&hevc_nal_header(1));
+                d.extend_from_slice(&[0x10, 0x20]);
+                d
+            },
+        };
+        let f = parser.parse(&pes);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 1_000_000_000, "falls back to DTS");
+    }
+
+    #[test]
+    fn parse_sps_chroma_too_short_returns_none() {
+        // An SPS shorter than 3 bytes can't carry the 2-byte NAL header + RBSP →
+        // parse_sps_chroma returns None (caller falls back to 8-bit 4:2:0).
+        assert!(parse_sps_chroma(&[0x42]).is_none());
+        assert!(parse_sps_chroma(&[0x42, 0x01]).is_none());
+    }
+
+    #[test]
+    fn hvcc_falls_back_to_8bit_420_on_unparseable_sps() {
+        // An SPS whose RBSP is truncated mid-parse (can't reach the bit depths)
+        // must fall back to the 8-bit 4:2:0 default, not panic. A 3-byte stored
+        // SPS (header + 1 RBSP byte) can't complete the PTL skip.
+        let mut parser = HevcParser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(32));
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(33));
+        data.extend_from_slice(&[0x00]); // 1 RBSP byte — unparseable
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(&hevc_nal_header(34));
+        data.extend_from_slice(&[0xDD]);
+        parser.parse(&make_pes(data, Some(0)));
+        let cp = parser.codec_private().expect("hvcC");
+        assert_eq!(cp[16], 0xFC | 1, "fallback chroma_format_idc = 1 (4:2:0)");
+        assert_eq!(cp[17], 0xF8, "fallback 8-bit luma");
+        assert_eq!(cp[18], 0xF8, "fallback 8-bit chroma");
+    }
+
     #[test]
     fn hvcc_oversized_param_set_returns_none() {
         // A param set larger than 65535 bytes cannot be length-encoded in hvcC's

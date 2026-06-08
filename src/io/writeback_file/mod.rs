@@ -358,4 +358,292 @@ mod tests {
         boxed.finish().unwrap();
         assert_eq!(read_back(&p), b"durable-tail");
     }
+
+    // ── Added hardening tests ───────────────────────────────────────
+
+    /// `write` (not write_all) must return the count the inner File
+    /// reported and advance `pos` by exactly that count (lines
+    /// 185-189). For a regular file a single `write` of a small buffer
+    /// writes all of it. We verify the returned count equals the buffer
+    /// length AND that a subsequent seek reports the right position.
+    /// Mutation: changing `self.pos += n` to `self.pos += buf.len()`
+    /// (lines 187 vs a hypothetical bug) would desync on a partial
+    /// write; here they coincide, but `Seek(Current(0))` reflecting `n`
+    /// still guards the count return value.
+    #[test]
+    fn write_returns_byte_count_and_advances_pos() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("wc.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        let n = w.write(b"twelve bytes").unwrap();
+        assert_eq!(n, 12, "write must report bytes written");
+        // pos is private; observe it via the public Seek impl's
+        // stream_position (which resolves to seek(Current(0))).
+        let pos = w.stream_position().unwrap();
+        assert_eq!(pos, 12, "pos not advanced by write count");
+        w.sync_all().unwrap();
+        drop(w);
+        assert_eq!(read_back(&p), b"twelve bytes");
+    }
+
+    /// Redundant seek to the CURRENT position must be a no-op for the
+    /// pipeline (lines 211-228 only act when `p != self.pos`). This is
+    /// the documented sweep optimisation: sweep does
+    /// `seek(Current(pos))` before every write and we must not treat it
+    /// as a boundary. We can only observe the public effect: the seek
+    /// returns the same offset and writes continue contiguously.
+    /// Mutation: removing the `if p != self.pos` guard (line 211) would
+    /// call handle_seek on every redundant seek — on the noop pipeline
+    /// (macOS) this stays correct for data, but the contiguity +
+    /// returned-offset invariant still must hold and is asserted here.
+    #[test]
+    fn seek_to_current_position_is_noop_for_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("noop-seek.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        w.write_all(b"AAAA").unwrap();
+        // Seek to the current end (offset 4) — a no-move seek.
+        let off = w.seek(SeekFrom::Start(4)).unwrap();
+        assert_eq!(off, 4);
+        w.write_all(b"BBBB").unwrap();
+        w.sync_all().unwrap();
+        drop(w);
+        assert_eq!(
+            read_back(&p),
+            b"AAAABBBB",
+            "redundant seek corrupted contiguous write"
+        );
+    }
+
+    /// `open` (no-truncate) must preserve existing file contents and
+    /// allow in-place patching from offset 0 — distinct from `create`
+    /// which truncates (lines 157-160 use OpenOptions write-only, no
+    /// truncate). We pre-seed a file, reopen with `open`, overwrite the
+    /// first bytes, and confirm the tail survives. Mutation: if `open`
+    /// used `File::create` (truncate) the tail would be lost.
+    #[test]
+    fn open_preserves_existing_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("reopen.bin");
+        std::fs::write(&p, b"ORIGINAL-CONTENT").unwrap();
+        let mut w = WritebackFile::open(&p).unwrap();
+        // open() does NOT truncate; pos starts at 0. Overwrite the
+        // first 8 bytes only.
+        w.write_all(b"PATCHED!").unwrap();
+        w.sync_all().unwrap();
+        drop(w);
+        // First 8 bytes overwritten; the rest of ORIGINAL-CONTENT
+        // ("-CONTENT") survives because there was no truncation.
+        assert_eq!(read_back(&p), b"PATCHED!-CONTENT");
+    }
+
+    /// `open` on a file whose position is queried must start tracking
+    /// from the file's current offset. `WritebackFile::new` calls
+    /// `stream_position()` (line 112); a freshly `open`ed file is at
+    /// offset 0. After writing, seeking Current(0) must reflect the
+    /// bytes written from 0. Mutation: if `new` hardcoded pos=0 instead
+    /// of querying, a non-zero starting offset would desync — covered
+    /// indirectly; here we assert the offset is exactly the write size.
+    #[test]
+    fn new_tracks_initial_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pos-init.bin");
+        std::fs::write(&p, b"0123456789").unwrap();
+        let mut w = WritebackFile::open(&p).unwrap();
+        let start = w.stream_position().unwrap();
+        assert_eq!(start, 0, "freshly opened file should start at offset 0");
+        w.write_all(b"XY").unwrap();
+        let after = w.stream_position().unwrap();
+        assert_eq!(after, 2, "pos must advance by written length");
+    }
+
+    /// Seek past EOF then write must create a sparse hole that reads
+    /// back as zeros — standard POSIX file semantics that the wrapper
+    /// must not break (it forwards seek to the inner File at line 205).
+    /// Mutation: if `seek` clamped or mishandled the offset, the hole
+    /// size/zero-fill would be wrong.
+    #[test]
+    fn seek_past_eof_creates_zero_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hole.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        w.write_all(b"head").unwrap(); // bytes 0..4
+        w.seek(SeekFrom::Start(20)).unwrap(); // jump past EOF
+        w.write_all(b"tail").unwrap(); // bytes 20..24
+        w.sync_all().unwrap();
+        drop(w);
+        let bytes = read_back(&p);
+        assert_eq!(
+            bytes.len(),
+            24,
+            "file should extend to the last written byte"
+        );
+        assert_eq!(&bytes[0..4], b"head");
+        // The 4..20 gap must read back as zeros (sparse hole).
+        assert!(bytes[4..20].iter().all(|&b| b == 0), "hole not zero-filled");
+        assert_eq!(&bytes[20..24], b"tail");
+    }
+
+    /// `SeekFrom::End` must resolve against the actual file length.
+    /// After writing 10 bytes, `seek(End(-2))` lands at offset 8;
+    /// overwriting 2 bytes there patches the tail. Mutation: forwarding
+    /// the wrong SeekFrom variant would land at the wrong offset.
+    #[test]
+    fn seek_from_end_resolves_against_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("end-seek.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        w.write_all(b"0123456789").unwrap();
+        let landed = w.seek(SeekFrom::End(-2)).unwrap();
+        assert_eq!(landed, 8, "End(-2) of a 10-byte file is offset 8");
+        w.write_all(b"XY").unwrap();
+        w.sync_all().unwrap();
+        drop(w);
+        assert_eq!(read_back(&p), b"01234567XY");
+    }
+
+    /// `create_with_size_hint` must produce a normal, writable file
+    /// whose *reported size* tracks bytes written (the hint only
+    /// reserves extents, per the doc lines 137-145 — it must NOT
+    /// pre-grow the logical file length). We write 5 bytes against a
+    /// 1 MiB hint and the file must be exactly 5 bytes long.
+    /// Mutation: if the hint path truncated/extended to size_bytes the
+    /// length would be 1 MiB and this fails.
+    #[test]
+    fn create_with_size_hint_does_not_inflate_logical_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hint-len.bin");
+        let mut w = WritebackFile::create_with_size_hint(&p, 1024 * 1024).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.sync_all().unwrap();
+        drop(w);
+        let bytes = read_back(&p);
+        assert_eq!(bytes.len(), 5, "size hint must not inflate logical length");
+        assert_eq!(&bytes, b"hello");
+    }
+
+    /// `flush` must not be a durability barrier nor reorder bytes, but
+    /// it also must not lose buffered data. We interleave write_all and
+    /// flush and confirm exact byte order survives to disk. (Distinct
+    /// from the existing `flush_is_observed_in_order` which uses 3
+    /// words; this exercises many small flushes to stress the
+    /// passthrough flush path at line 199-201.) Mutation: if `flush`
+    /// dropped pending bytes the reassembly fails.
+    #[test]
+    fn many_interleaved_flushes_preserve_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("many-flush.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        let mut expected = Vec::new();
+        for i in 0u8..32 {
+            let chunk = [i; 4];
+            w.write_all(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+            w.flush().unwrap();
+        }
+        w.sync_all().unwrap();
+        drop(w);
+        assert_eq!(read_back(&p), expected);
+    }
+
+    /// `sync_all` is idempotent: calling it twice (and then Drop, which
+    /// also finalizes) must not corrupt data or panic. Doc lines
+    /// 256-262: `finalize` is idempotent so explicit sync_all then drop
+    /// is safe. Mutation: a finalize that double-freed or advanced a
+    /// cursor would corrupt on the second call.
+    #[test]
+    fn double_sync_all_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("double-sync.bin");
+        let mut w = WritebackFile::create(&p).unwrap();
+        w.write_all(b"idempotent").unwrap();
+        w.sync_all().unwrap();
+        w.sync_all().unwrap(); // second call must be safe
+        drop(w); // Drop also finalizes
+        assert_eq!(read_back(&p), b"idempotent");
+    }
+
+    /// Env-var chunk override parsing (`writeback_chunk_bytes`, lines
+    /// 91-98). Out-of-range / unparseable values must fall back to the
+    /// 32 MiB default; valid in-range values are converted MiB→bytes.
+    /// We can't safely mutate process env in parallel tests for the
+    /// default-path branch, but we CAN assert the pure boundary logic
+    /// the function encodes by reconstructing it: the filter accepts
+    /// `0 < n <= WRITEBACK_CHUNK_MIB_MAX`. This pins the constants and
+    /// the MiB→byte multiply. Mutation: changing `* 1024 * 1024` to a
+    /// single `* 1024` would break this equality.
+    #[test]
+    fn writeback_chunk_constants_and_conversion() {
+        // Default is exactly 32 MiB.
+        assert_eq!(WRITEBACK_CHUNK_BYTES_DEFAULT, 32 * 1024 * 1024);
+        // Max MiB bound is 64 GiB expressed in MiB, and the byte value
+        // it maps to must not overflow u64.
+        assert_eq!(WRITEBACK_CHUNK_MIB_MAX, 64 * 1024);
+        let max_bytes = (WRITEBACK_CHUNK_MIB_MAX as u128) * 1024 * 1024;
+        assert!(
+            max_bytes <= u64::MAX as u128,
+            "max chunk MiB * 1MiB must fit in u64"
+        );
+    }
+
+    /// Env-var override parsing for `writeback_chunk_bytes` (lines
+    /// 91-98). All four branches in ONE test to avoid the data race of
+    /// several parallel tests mutating the same process-global env var.
+    ///
+    /// Branches: (1) valid in-range value → MiB→byte conversion; (2)
+    /// zero → `n > 0` filter rejects → default; (3) garbage → parse
+    /// fails → default; (4) over-max → `n <= MAX` filter rejects →
+    /// default.
+    ///
+    /// Mutations: `* 1024 * 1024` → `* 1024` breaks (1); dropping
+    /// `n > 0` breaks (2); `unwrap()` on parse panics (3); dropping
+    /// `n <= MAX` breaks (4).
+    #[test]
+    fn writeback_chunk_env_override_branches() {
+        // SAFETY: this is the only test touching this env var, and it
+        // sets+reads+clears synchronously within its own body.
+        let set = |v: &str| unsafe { std::env::set_var("FREEMKV_WRITEBACK_CHUNK_MIB", v) };
+        let clear = || unsafe { std::env::remove_var("FREEMKV_WRITEBACK_CHUNK_MIB") };
+
+        set("8");
+        assert_eq!(
+            writeback_chunk_bytes(),
+            8 * 1024 * 1024,
+            "in-range mis-converted"
+        );
+
+        set("0");
+        assert_eq!(
+            writeback_chunk_bytes(),
+            WRITEBACK_CHUNK_BYTES_DEFAULT,
+            "zero must fall back (n > 0 filter)"
+        );
+
+        set("not-a-number");
+        assert_eq!(
+            writeback_chunk_bytes(),
+            WRITEBACK_CHUNK_BYTES_DEFAULT,
+            "unparseable must fall back"
+        );
+
+        // One past the max: WRITEBACK_CHUNK_MIB_MAX + 1.
+        set(&(WRITEBACK_CHUNK_MIB_MAX + 1).to_string());
+        assert_eq!(
+            writeback_chunk_bytes(),
+            WRITEBACK_CHUNK_BYTES_DEFAULT,
+            "over-max must fall back (n <= MAX filter)"
+        );
+
+        // Exactly at the max boundary is accepted (inclusive bound).
+        set(&WRITEBACK_CHUNK_MIB_MAX.to_string());
+        assert_eq!(
+            writeback_chunk_bytes(),
+            WRITEBACK_CHUNK_MIB_MAX * 1024 * 1024,
+            "max boundary must be accepted (inclusive)"
+        );
+
+        clear();
+        // With the var cleared, the default is returned.
+        assert_eq!(writeback_chunk_bytes(), WRITEBACK_CHUNK_BYTES_DEFAULT);
+    }
 }

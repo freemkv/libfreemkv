@@ -371,4 +371,186 @@ mod tests {
             std::env::remove_var("FREEMKV_READ_DROP_CHUNK_MIB");
         }
     }
+
+    // ---------------------------------------------------------------
+    // Additional coverage.
+    // ---------------------------------------------------------------
+
+    /// `count == 0` must short-circuit to Ok(0) WITHOUT seeking or
+    /// reading, even at an out-of-range LBA — the early-return guard
+    /// runs before any I/O. Grounding: `if count == 0 { return Ok(0) }`.
+    #[test]
+    fn zero_count_returns_zero_no_io() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("zc.iso");
+        make_iso(&path, 4);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        // LBA far past EOF — must not matter because count==0 returns early.
+        let mut buf = [0u8; 1];
+        let n = src.read_sectors(1_000_000, 0, &mut buf, false).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Reading past EOF must ERROR (read_exact's UnexpectedEof), never
+    /// return a partial/short count. This is the core "never silently
+    /// truncate / never return fewer bytes than declared" property of
+    /// the SectorSource contract. Grounding: `self.file.read_exact(...)`
+    /// — read_exact fails if the file can't supply the full span.
+    #[test]
+    fn read_past_eof_errors_not_truncates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("eof.iso");
+        make_iso(&path, 4); // 4 sectors only
+        let mut src = FileSectorSource::open(&path).unwrap();
+        assert_eq!(src.capacity_sectors(), 4);
+
+        // Request 2 sectors starting at LBA 3 → sector 4 doesn't exist.
+        let mut buf = vec![0u8; 2 * SECTOR_SIZE];
+        let r = src.read_sectors(3, 2, &mut buf, false);
+        let err = r.expect_err("reading past EOF must error, not short-read");
+        let io: std::io::Error = err.into();
+        assert_eq!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "partial read at EOF must surface read_exact's UnexpectedEof"
+        );
+    }
+
+    /// Reading entirely beyond EOF (seek lands past the end) must also
+    /// error rather than silently return zeros. Grounding: read_exact
+    /// over an empty remainder is UnexpectedEof.
+    #[test]
+    fn read_wholly_beyond_eof_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("beyond.iso");
+        make_iso(&path, 4);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        let mut buf = vec![0u8; SECTOR_SIZE];
+        let r = src.read_sectors(10, 1, &mut buf, false);
+        assert!(r.is_err(), "read starting past EOF must error");
+    }
+
+    /// On a successful full read the returned count MUST equal
+    /// `count * 2048` exactly — the declared byte count. Grounding:
+    /// `Ok(bytes)` where `bytes = count * SECTOR_SIZE`.
+    #[test]
+    fn full_read_returns_exact_declared_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("exact.iso");
+        make_iso(&path, 16);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        let mut buf = vec![0u8; 5 * SECTOR_SIZE];
+        let n = src.read_sectors(2, 5, &mut buf, false).unwrap();
+        assert_eq!(n, 5 * SECTOR_SIZE, "must return exactly count*2048 bytes");
+    }
+
+    /// Capacity is `file_len / 2048` (floor); trailing bytes that don't
+    /// complete a sector are NOT counted. A file of 4 sectors + 100
+    /// extra bytes reports capacity 4. Grounding: `len / SECTOR_SIZE`
+    /// integer division in `open`.
+    #[test]
+    fn capacity_floors_partial_trailing_sector() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("partial.iso");
+        make_iso(&path, 4);
+        // Append 100 stray bytes (a torn final sector).
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&[0xee; 100]).unwrap();
+            f.flush().unwrap();
+        }
+        let src = FileSectorSource::open(&path).unwrap();
+        assert_eq!(
+            src.capacity_sectors(),
+            4,
+            "partial trailing bytes must not inflate the sector capacity"
+        );
+    }
+
+    /// An empty file opens cleanly with capacity 0. Grounding:
+    /// `0 / 2048 == 0`, and the IsoTooLarge guard only fires for
+    /// oversize files.
+    #[test]
+    fn empty_file_capacity_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.iso");
+        std::fs::File::create(&path).unwrap();
+        let src = FileSectorSource::open(&path).unwrap();
+        assert_eq!(src.capacity_sectors(), 0);
+    }
+
+    /// Opening a nonexistent path returns an IoError (NotFound), not a
+    /// panic. Grounding: `File::open(path).map_err(...)`.
+    #[test]
+    fn open_missing_file_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.iso");
+        let err = match FileSectorSource::open(&path) {
+            Ok(_) => panic!("missing file must error"),
+            Err(e) => e,
+        };
+        let io: std::io::Error = err.into();
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Repeated reads of the SAME sector must return identical bytes —
+    /// the per-read seek makes each call independent of prior position,
+    /// and the DONTNEED/prefetch hooks are advisory only (no data
+    /// effect). Grounding: `seek(SeekFrom::Start(offset))` before every
+    /// read.
+    #[test]
+    fn repeated_same_sector_is_stable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stable.iso");
+        make_iso(&path, 8);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        let mut a = vec![0u8; SECTOR_SIZE];
+        let mut b = vec![0u8; SECTOR_SIZE];
+        src.read_sectors(5, 1, &mut a, false).unwrap();
+        // Read a different sector in between to move the file cursor.
+        src.read_sectors(0, 1, &mut b, false).unwrap();
+        src.read_sectors(5, 1, &mut b, false).unwrap();
+        assert_eq!(a, b, "same-LBA reads must be position-independent");
+        assert!(a.iter().all(|x| *x == (5u8)));
+    }
+
+    /// A DONTNEED drop crossing the chunk threshold must not corrupt or
+    /// short subsequent reads — the eviction is a pure page-cache hint.
+    /// We read past the DEFAULT 32 MiB drop chunk (16384 sectors) so the
+    /// eviction block fires at least once, asserting every sector still
+    /// reads correctly. (Avoids mutating FREEMKV_READ_DROP_CHUNK_MIB to
+    /// sidestep a parallel-test env race with `drop_chunk_size_env_override`.)
+    /// Grounding: the `bytes_read_since_drop >= drop_chunk_bytes`
+    /// eviction block calls only `platform::drop_window` (advisory) and
+    /// resets counters — no data effect.
+    #[test]
+    fn dontneed_eviction_does_not_affect_data() {
+        // 32 MiB default chunk = 16384 sectors; read a bit past it.
+        let total = (READ_DROP_CHUNK_BYTES_DEFAULT / SECTOR_SIZE as u64) as u32 + 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("drop.iso");
+        make_iso(&path, total);
+        let mut src = FileSectorSource::open(&path).unwrap();
+        // Read in 16-sector batches to keep the loop fast while still
+        // crossing the drop boundary by byte count.
+        let batch = 16u16;
+        let mut got = vec![0u8; batch as usize * SECTOR_SIZE];
+        let mut lba = 0u32;
+        while lba + batch as u32 <= total {
+            src.read_sectors(lba, batch, &mut got, false).unwrap();
+            for i in 0..batch as u32 {
+                let expected = ((lba + i) & 0xff) as u8;
+                let off = i as usize * SECTOR_SIZE;
+                assert!(
+                    got[off..off + SECTOR_SIZE].iter().all(|x| *x == expected),
+                    "DONTNEED eviction corrupted sector {}",
+                    lba + i
+                );
+            }
+            lba += batch as u32;
+        }
+    }
 }

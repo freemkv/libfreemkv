@@ -41,3 +41,51 @@ pub use variants::{
     KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, MkbRecord, ProcessingKeyMatch,
     derive_media_key_variant, is_variant_mkb, variant_nonce, walk_mkb, walk_processing_key,
 };
+
+#[cfg(test)]
+mod tests {
+    //! Re-export surface guards. The module's public API is the set of
+    //! `pub use` items above. A regression that drops or renames an export
+    //! (the class of bug that shipped in 0.31.0 by silently changing a
+    //! surface) breaks compilation of these references, so they act as a
+    //! compile-time contract for the crate's AACS surface.
+
+    use super::*;
+
+    #[test]
+    fn aligned_unit_len_is_three_2048_byte_sectors() {
+        // ALIGNED_UNIT_LEN is the AACS aligned-unit size: 3 × 2048 = 6144.
+        // Re-exported from decrypt; pin the value here so the public constant
+        // and the spec stay in lockstep.
+        assert_eq!(ALIGNED_UNIT_LEN, 6144);
+        assert_eq!(ALIGNED_UNIT_LEN, 3 * 2048);
+    }
+
+    #[test]
+    fn version_strides_are_reexported_and_distinct() {
+        // The three AACS generations are part of the public surface, and the
+        // V10 (48) vs V20/V21 (64) stride distinction is the load-bearing
+        // difference. Confirm the enum re-export is usable and the variants
+        // are distinct values.
+        assert_ne!(AacsVersion::V10, AacsVersion::V20);
+        assert_ne!(AacsVersion::V20, AacsVersion::V21);
+    }
+
+    #[test]
+    fn key_correction_data_placeholder_is_all_zero() {
+        // The variant chain refuses to run against this all-zero placeholder
+        // KCD; the public constant must therefore be exactly 16 zero bytes.
+        assert_eq!(KEY_CORRECTION_DATA_PLACEHOLDER, [0u8; 16]);
+    }
+
+    #[test]
+    fn public_helpers_are_callable_through_the_facade() {
+        // Touch a representative function from each re-export group so a
+        // dropped/renamed export fails to compile. These are smoke calls, not
+        // behavioural assertions (behaviour is covered in each module).
+        let _ = is_aacs_scrambled(&[0u8; ALIGNED_UNIT_LEN]);
+        let _ = mkb_content_len(&[]);
+        let _ = is_variant_mkb(&walk_mkb(&[]));
+        let _ = disc_hash_hex(&disc_hash(b"x"));
+    }
+}

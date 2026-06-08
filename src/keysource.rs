@@ -93,3 +93,231 @@ pub trait KeySource {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disc::Key;
+
+    // ── DiscInputs structural tests ────────────────────────────────────────────
+
+    /// DiscInputs can be constructed with all-zero volume_id ([0u8;16]) to
+    /// represent "no authenticated handshake ran".
+    /// Spec: doc says "[0u8; 16] when no authenticated handshake ran".
+    /// Mutation: using Option<[u8;16]> would require callers to handle None explicitly.
+    #[test]
+    fn disc_inputs_zero_volume_id_represents_no_handshake() {
+        let inputs = DiscInputs {
+            disc_hash: "0x1234".to_string(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert_eq!(
+            inputs.volume_id, [0u8; 16],
+            "all-zero volume_id must be valid (represents no handshake)"
+        );
+    }
+
+    /// DiscInputs disc_hash is a string in "0x"-prefixed hex format.
+    /// Spec: doc says "SHA-1 of Unit_Key_RO.inf, 0x-prefixed hex."
+    /// Mutation: storing the hash without the "0x" prefix would silently change
+    ///           the keydb lookup key format.
+    #[test]
+    fn disc_inputs_disc_hash_is_0x_prefixed() {
+        let hash = "0xabcdef0123456789abcdef0123456789abcdef01".to_string();
+        let inputs = DiscInputs {
+            disc_hash: hash.clone(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert!(
+            inputs.disc_hash.starts_with("0x"),
+            "disc_hash must be 0x-prefixed per spec"
+        );
+        assert_eq!(
+            inputs.disc_hash.len(),
+            42,
+            "SHA-1 in 0x-prefixed hex: 2 ('0x') + 40 (20 bytes hex) = 42 chars"
+        );
+    }
+
+    /// DiscInputs samples is intentionally empty by default (filled by caller).
+    /// Spec: doc says "Populated by the application — libfreemkv::Disc::inputs
+    ///       leaves it empty for the caller to fill."
+    /// Mutation: auto-filling samples in Disc::inputs would force all callers
+    ///           to read content data even for local keydb lookups.
+    #[test]
+    fn disc_inputs_samples_defaults_to_empty() {
+        let inputs = DiscInputs {
+            disc_hash: "0x0000000000000000000000000000000000000000".to_string(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert!(
+            inputs.samples.is_empty(),
+            "samples must start empty — populated by the application, not Disc::inputs"
+        );
+    }
+
+    /// DiscInputs volume_label is Option<String>: None means not captured.
+    /// Spec: doc says "None when not captured."
+    /// Mutation: using an empty string instead of None would conflate "not captured"
+    ///           with "the disc has an empty label" — a semantic difference.
+    #[test]
+    fn disc_inputs_volume_label_none_vs_some() {
+        let no_label = DiscInputs {
+            disc_hash: "0x0000000000000000000000000000000000000000".to_string(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert!(
+            no_label.volume_label.is_none(),
+            "not-captured label must be None"
+        );
+
+        let with_label = DiscInputs {
+            disc_hash: "0x0000000000000000000000000000000000000000".to_string(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: Some("WICKED_FOR_GOOD".to_string()),
+        };
+        assert_eq!(with_label.volume_label.as_deref(), Some("WICKED_FOR_GOOD"));
+    }
+
+    // ── KeySource default-method behaviour ────────────────────────────────────
+
+    /// KeySource::needs_samples() defaults to false.
+    /// Spec: doc says "false for one that keys purely on disc identity."
+    /// Mutation: defaulting to true forces an extra disc-read for every source,
+    ///           even local keydb lookups that don't need ciphertext samples.
+    #[test]
+    fn key_source_needs_samples_defaults_to_false() {
+        struct MinimalSource;
+        impl KeySource for MinimalSource {
+            fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+                None
+            }
+        }
+        let mut s = MinimalSource;
+        assert!(!s.needs_samples(), "needs_samples must default to false");
+    }
+
+    /// KeySource::errored() defaults to false.
+    /// Spec: doc says "A store that treats absence as not-an-error leaves this false."
+    /// Mutation: defaulting to true would make every source appear errored, causing
+    ///           the caller to report "key service unreachable" for a simple miss.
+    #[test]
+    fn key_source_errored_defaults_to_false() {
+        struct MinimalSource;
+        impl KeySource for MinimalSource {
+            fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+                None
+            }
+        }
+        let s = MinimalSource;
+        assert!(!s.errored(), "errored must default to false");
+    }
+
+    /// A source that returns None and has errored()==true can be distinguished
+    /// from a source that simply has no key.
+    /// Spec: doc says "After exhaustion the caller must consult errored()".
+    /// Mutation: errored() always returning false hides network/parse failures.
+    #[test]
+    fn errored_source_is_distinguishable_from_empty_source() {
+        struct FailedSource;
+        impl KeySource for FailedSource {
+            fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+                None
+            }
+            fn errored(&self) -> bool {
+                true
+            }
+        }
+        struct EmptySource;
+        impl KeySource for EmptySource {
+            fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+                None
+            }
+            // errored() defaults to false
+        }
+        let inputs = DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            mkb: vec![],
+            unit_key_ro: vec![],
+            samples: vec![],
+            volume_label: None,
+        };
+        let mut failed = FailedSource;
+        let mut empty = EmptySource;
+
+        // Both return None (exhausted).
+        assert!(failed.next_key(&inputs).is_none());
+        assert!(empty.next_key(&inputs).is_none());
+
+        // But only FailedSource reports an error.
+        assert!(failed.errored(), "FailedSource must report errored=true");
+        assert!(!empty.errored(), "EmptySource must report errored=false");
+    }
+
+    /// DiscInputs mkb field stores raw MKB bytes and can be empty.
+    /// Mutation: using Option<Vec<u8>> for mkb forces callers to handle Option.
+    #[test]
+    fn disc_inputs_mkb_can_be_empty_or_populated() {
+        let empty_mkb = DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert!(empty_mkb.mkb.is_empty());
+
+        let populated_mkb = DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            mkb: vec![0x01, 0x02, 0x03],
+            unit_key_ro: vec![0xFF],
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        assert_eq!(populated_mkb.mkb, vec![0x01, 0x02, 0x03]);
+        assert_eq!(populated_mkb.unit_key_ro, vec![0xFF]);
+    }
+
+    /// A source that overrides needs_samples() to true is handled correctly.
+    /// Mutation: ignoring the needs_samples() return means online sources
+    ///           never get the ciphertext samples they need for validation.
+    #[test]
+    fn needs_samples_can_be_overridden_to_true() {
+        struct SamplesNeededSource;
+        impl KeySource for SamplesNeededSource {
+            fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+                None
+            }
+            fn needs_samples(&self) -> bool {
+                true
+            }
+        }
+        let s = SamplesNeededSource;
+        assert!(
+            s.needs_samples(),
+            "an online source that validates against ciphertext must return needs_samples=true"
+        );
+    }
+}

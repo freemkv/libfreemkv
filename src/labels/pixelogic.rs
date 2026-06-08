@@ -451,4 +451,217 @@ mod tests {
         assert_eq!(audio[1].stream_number, 2);
         assert_eq!(audio[1].language, "spa");
     }
+
+    // ── Additional hardening tests ─────────────────────────────────────────
+
+    /// Spec: `DDL` token → Dolby Digital Plus (via vocab::codec).
+    /// Mutation: remove "DDL" from AUDIO_CODECS → DDL falls to unknown branch.
+    #[test]
+    fn parse_token_ddl_maps_to_dolby_digital_plus() {
+        let l = parse_token_inner("eng_DDL_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.codec_hint, "Dolby Digital Plus");
+    }
+
+    /// Spec: `WAV` token → PCM (via vocab::codec).
+    /// Mutation: remove "WAV" from AUDIO_CODECS → WAV falls to unknown branch.
+    #[test]
+    fn parse_token_wav_maps_to_pcm() {
+        let l = parse_token_inner("eng_WAV_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.codec_hint, "PCM");
+    }
+
+    /// Spec: `SDLG` token marks a subtitle stream (dialogue).
+    /// Mutation: remove "SDLG" arm → is_subtitle stays false → None.
+    #[test]
+    fn parse_token_sdlg_is_subtitle() {
+        let l = parse_token_inner("eng_SDLG_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+        assert_eq!(l.language, "eng");
+    }
+
+    /// Spec: `SCOM` token marks a subtitle commentary stream.
+    /// Mutation: remove "SCOM" arm → is_subtitle stays false → None.
+    #[test]
+    fn parse_token_scom_is_subtitle_commentary() {
+        let l = parse_token_inner("eng_SCOM_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+        assert_eq!(l.purpose, LabelPurpose::Commentary);
+    }
+
+    /// Spec: `STRI` token marks a subtitle stream (trivia/bonus).
+    /// Mutation: remove "STRI" arm → None.
+    #[test]
+    fn parse_token_stri_is_subtitle() {
+        let l = parse_token_inner("fra_STRI_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+    }
+
+    /// Spec: `ADLG` token marks an audio stream (dialogue).
+    /// Mutation: remove "ADLG" → is_audio stays false → None.
+    #[test]
+    fn parse_token_adlg_is_audio() {
+        let l = parse_token_inner("eng_ADLG_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+    }
+
+    /// Spec: `ATRI` token marks an audio stream (trivia/bonus).
+    /// Mutation: remove "ATRI" → is_audio stays false → None.
+    #[test]
+    fn parse_token_atri_is_audio() {
+        let l = parse_token_inner("eng_ATRI_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+    }
+
+    /// Spec: `TXT` token marks a subtitle text stream.
+    /// Mutation: remove "TXT" arm → None.
+    #[test]
+    fn parse_token_txt_is_subtitle() {
+        let l = parse_token_inner("eng_TXT_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+    }
+
+    /// Spec: `PGSTREAM` prefix marks a subtitle (presentation-graphics) stream.
+    /// Mutation: change `starts_with("PGSTREAM")` to exact match → PGSTREAM1 fails.
+    #[test]
+    fn parse_token_pgstream_prefix_is_subtitle() {
+        let l = parse_token_inner("eng_PGSTREAM1_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+    }
+
+    /// Spec: all region tokens are recognized variants.
+    /// Mutation: remove a region from REGIONS → it falls to unknown branch.
+    #[test]
+    fn parse_token_all_regions_recognized() {
+        for region in REGIONS {
+            let token = format!("eng_MLP_{}_", region);
+            let l =
+                parse_token_inner(&token, None).expect(&format!("region {} should parse", region));
+            assert_eq!(l.variant, *region, "region {} should be in variant", region);
+        }
+    }
+
+    /// Spec: lang must be exactly 3 lowercase ASCII letters.
+    /// Mutation: allow length > 3 → "engl_MLP_" parsed as a stream.
+    #[test]
+    fn parse_token_rejects_four_char_lang() {
+        assert!(parse_token_inner("engl_MLP_", None).is_none());
+    }
+
+    /// Spec: lang must be exactly 3 lowercase ASCII letters.
+    /// Mutation: allow length < 3 → "en_MLP_" parsed.
+    #[test]
+    fn parse_token_rejects_two_char_lang() {
+        assert!(parse_token_inner("en_MLP_", None).is_none());
+    }
+
+    /// Spec: is_audio wins over is_subtitle when codec explicitly identified.
+    /// Tests the commentary audio case — `ACOM` sets both is_audio purpose and SDH-only-is-subtitle:
+    /// MLP codec wins → Audio.
+    /// Mutation: flip the tie-break → Subtitle returned when codec present.
+    #[test]
+    fn parse_token_codec_always_wins_type_tiebreak() {
+        let l = parse_token_inner("eng_AC3_SDH_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.codec_hint, "Dolby Digital");
+    }
+
+    /// Spec: an unknown component sets saw_unknown flag.
+    /// Mutation: remove the flag-setting → Medium confidence never triggered.
+    #[test]
+    fn parse_token_unknown_sets_saw_unknown_flag() {
+        let mut flag = false;
+        let _ = parse_token_inner("eng_MLP_FUTURETOKEN_", Some(&mut flag));
+        assert!(flag, "unknown component must set saw_unknown flag");
+    }
+
+    /// Spec: a known-only token leaves saw_unknown=false.
+    /// Mutation: always set the flag → all parses downgrade to Medium.
+    #[test]
+    fn parse_token_all_known_leaves_flag_false() {
+        let mut flag = false;
+        let _ = parse_token_inner("eng_MLP_ACOM_US_", Some(&mut flag));
+        assert!(!flag, "all-known token must NOT set saw_unknown flag");
+    }
+
+    /// Spec: `Audio Stream N` placeholder advances audio_num but emits no label.
+    /// Mutation: also emit a label for placeholder → audio#N+1 shifts to N+2.
+    #[test]
+    fn assign_labels_audio_placeholder_advances_counter_no_label() {
+        let mut flag = false;
+        let tokens = strs(&["FPL_MainFeature", "Audio Stream 1", "eng_MLP_"]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let a: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        assert_eq!(a.len(), 1, "only editorial token produces a label");
+        assert_eq!(a[0].stream_number, 2, "placeholder must advance counter");
+    }
+
+    /// Spec: FPL section ends when SEG_ or SF_ marker is encountered.
+    /// Mutation: don't end on SEG_ → tokens from a following segment are parsed.
+    #[test]
+    fn assign_labels_fpl_section_ends_on_seg_boundary() {
+        let mut flag = false;
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "eng_MLP_",
+            "SEG_Trailer", // must end the FPL section
+            "fra_AC3_",    // must NOT be parsed
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        assert_eq!(labels.len(), 1, "only eng from FPL section");
+        assert_eq!(labels[0].language, "eng");
+    }
+
+    /// Spec: MAX_STREAMS_PER_TYPE=512 caps the counter to prevent u16 overflow.
+    /// Mutation: remove the cap check → counter wraps past 512.
+    #[test]
+    fn assign_labels_max_streams_cap_prevents_overflow() {
+        let mut flag = false;
+        // Build 520 Audio Stream placeholders inside FPL, then an editorial token.
+        let mut tokens = vec!["FPL_MainFeature".to_string()];
+        for i in 1..=520 {
+            tokens.push(format!("Audio Stream {}", i));
+        }
+        tokens.push("eng_ACOM_".to_string());
+        // Must not panic. The editorial token after the cap should be silently dropped.
+        let labels = assign_labels(&tokens, &mut flag);
+        // The commentary must NOT be emitted (audio_num already at cap).
+        let audio: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Audio)
+            .collect();
+        // All editorial tokens past the cap are dropped.
+        assert!(audio.is_empty() || audio.iter().all(|l| l.stream_number <= 512));
+    }
+
+    /// Spec: subtitle placeholders (PG Stream N) do NOT advance the subtitle counter.
+    /// Only audio placeholders (`Audio Stream N`) do.
+    /// Mutation: also advance sub counter on PG placeholder → subtitle labels misnumbered.
+    #[test]
+    fn assign_labels_pg_placeholder_does_not_advance_sub_counter() {
+        // The spec comment says "Only audio is corrected here: subtitle (PG Stream N) numbering
+        // is left exactly as-is". PG Stream placeholders are not a token the parser recognizes
+        // as placeholders — they would only appear as real subtitle tokens with SDLG/SDH markers.
+        // This test verifies the audio-only correction behavior via a mixed sequence.
+        let mut flag = false;
+        let tokens = strs(&[
+            "FPL_MainFeature",
+            "Audio Stream 1",
+            "Audio Stream 2",
+            "eng_SDH_", // subtitle token — sub_num becomes 1
+            "fra_SDH_", // subtitle token — sub_num becomes 2
+        ]);
+        let labels = assign_labels(&tokens, &mut flag);
+        let subs: Vec<_> = labels
+            .iter()
+            .filter(|l| l.stream_type == StreamLabelType::Subtitle)
+            .collect();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].stream_number, 1);
+        assert_eq!(subs[1].stream_number, 2);
+    }
 }

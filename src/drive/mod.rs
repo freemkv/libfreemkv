@@ -1044,4 +1044,394 @@ mod command_tests {
         let mut d = drive_with(buf);
         assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
+
+    // ── Mocks for Drive::read single-shot semantics + CDB encoding ──
+
+    use std::sync::{Arc, Mutex};
+
+    /// Records the CDB of every execute() and returns a programmable
+    /// outcome. Lets a test assert both the bytes sent to the drive and
+    /// how the driver translates the transport result.
+    struct RecordingTransport {
+        last_cdb: Arc<Mutex<Vec<u8>>>,
+        last_timeout: Arc<Mutex<u32>>,
+        outcome: TransportOutcome,
+    }
+    enum TransportOutcome {
+        /// Report this many bytes transferred (data left as-is).
+        Ok(usize),
+        /// Fail with a ScsiError carrying this status + optional sense.
+        Scsi(u8, Option<crate::scsi::ScsiSense>),
+    }
+    impl ScsiTransport for RecordingTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            *self.last_cdb.lock().unwrap() = cdb.to_vec();
+            *self.last_timeout.lock().unwrap() = timeout_ms;
+            match self.outcome {
+                TransportOutcome::Ok(n) => Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                }),
+                TransportOutcome::Scsi(status, sense) => Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status,
+                    sense,
+                }),
+            }
+        }
+    }
+
+    fn recording(outcome: TransportOutcome) -> (Drive, Arc<Mutex<Vec<u8>>>, Arc<Mutex<u32>>) {
+        let cdb = Arc::new(Mutex::new(Vec::new()));
+        let to = Arc::new(Mutex::new(0u32));
+        let t = RecordingTransport {
+            last_cdb: cdb.clone(),
+            last_timeout: to.clone(),
+            outcome,
+        };
+        (Drive::from_transport_for_test(Box::new(t)), cdb, to)
+    }
+
+    #[test]
+    fn read_builds_read10_cdb_with_be_lba_and_count() {
+        // Drive::read issues READ(10) (0x28). LBA bytes 2..5 big-endian,
+        // transfer length bytes 7..8 big-endian (MMC-6). No FUA on this
+        // path (byte 1 == 0). Distinct nibbles catch a swapped shift.
+        let (mut d, cdb, _to) = recording(TransportOutcome::Ok(4096));
+        let mut buf = vec![0u8; 4096];
+        let n = d.read(0x00AB_CDEF, 2, &mut buf, false).unwrap();
+        assert_eq!(n, 4096, "returns transport bytes_transferred");
+        let c = cdb.lock().unwrap();
+        assert_eq!(c[0], crate::scsi::SCSI_READ_10);
+        assert_eq!(c[1], 0x00, "Drive::read path sets no FUA");
+        assert_eq!(&c[2..6], &[0x00, 0xAB, 0xCD, 0xEF], "LBA big-endian");
+        assert_eq!(&c[7..9], &[0x00, 0x02], "transfer length big-endian");
+    }
+
+    #[test]
+    fn read_recovery_flag_selects_60s_timeout() {
+        // recovery=true must use READ_RECOVERY_TIMEOUT_MS (60 s); false
+        // uses READ_TIMEOUT_MS (10 s). Doc: patch pass vs copy sweep.
+        let (mut d, _cdb, to) = recording(TransportOutcome::Ok(2048));
+        let mut buf = vec![0u8; 2048];
+        d.read(0, 1, &mut buf, true).unwrap();
+        assert_eq!(*to.lock().unwrap(), crate::scsi::READ_RECOVERY_TIMEOUT_MS);
+
+        let (mut d2, _c2, to2) = recording(TransportOutcome::Ok(2048));
+        d2.read(0, 1, &mut buf, false).unwrap();
+        assert_eq!(*to2.lock().unwrap(), crate::scsi::READ_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn read_maps_scsi_error_to_discread_preserving_status_and_sense() {
+        // On a non-Halted failure, Drive::read returns Error::DiscRead
+        // with sector=lba and the transport's status+sense carried
+        // through (extract_scsi_context). A 03/11/05 MEDIUM ERROR.
+        let sense = crate::scsi::ScsiSense {
+            sense_key: 3,
+            asc: 0x11,
+            ascq: 0x05,
+        };
+        let (mut d, _cdb, _to) = recording(TransportOutcome::Scsi(0x02, Some(sense)));
+        let mut buf = vec![0u8; 2048];
+        let err = d.read(0x1234, 1, &mut buf, false).unwrap_err();
+        match err {
+            Error::DiscRead {
+                sector,
+                status,
+                sense: s,
+            } => {
+                assert_eq!(sector, 0x1234, "sector must be the requested LBA");
+                assert_eq!(status, Some(0x02));
+                assert_eq!(s, Some(sense), "sense triple preserved");
+            }
+            other => panic!("expected DiscRead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_transport_failure_status_preserved_for_marginal_routing() {
+        // Status 0xFF (TRANSPORT_FAILURE) with no sense must surface in
+        // DiscRead.status so is_scsi_transport_failure() routes it.
+        let (mut d, _cdb, _to) = recording(TransportOutcome::Scsi(
+            crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            None,
+        ));
+        let mut buf = vec![0u8; 2048];
+        let err = d.read(7, 1, &mut buf, false).unwrap_err();
+        assert!(err.is_scsi_transport_failure());
+        assert!(err.scsi_sense().is_none());
+    }
+
+    #[test]
+    fn read_returns_halted_before_dispatch_without_touching_transport() {
+        // When the halt flag is set, checked_exec returns Halted BEFORE
+        // execute(); the error must be Halted (not DiscRead), so the
+        // recovery loop distinguishes user-stop from a read failure.
+        let (mut d, cdb, _to) = recording(TransportOutcome::Ok(2048));
+        d.halt();
+        let mut buf = vec![0u8; 2048];
+        let err = d.read(0, 1, &mut buf, false).unwrap_err();
+        assert!(matches!(err, Error::Halted));
+        assert!(
+            cdb.lock().unwrap().is_empty(),
+            "transport execute must not run when pre-halted"
+        );
+    }
+
+    #[test]
+    fn clear_halt_reenables_reads() {
+        // halt() then clear_halt() must allow reads again — the flag is
+        // not sticky.
+        let (mut d, _cdb, _to) = recording(TransportOutcome::Ok(2048));
+        d.halt();
+        d.clear_halt();
+        let mut buf = vec![0u8; 2048];
+        assert!(d.read(0, 1, &mut buf, false).is_ok());
+    }
+
+    #[test]
+    fn read_does_not_truncate_reported_bytes() {
+        // Single-shot contract: Drive::read returns exactly what the
+        // transport reported, never a smaller count silently. Transport
+        // says a full 32-sector batch (65536 bytes) succeeded.
+        let (mut d, _cdb, _to) = recording(TransportOutcome::Ok(65536));
+        let mut buf = vec![0u8; 65536];
+        assert_eq!(d.read(0, 32, &mut buf, false).unwrap(), 65536);
+    }
+
+    // ── drive_status branch coverage (GET EVENT STATUS byte 5) ──────
+
+    #[test]
+    fn drive_status_no_disc_maps_correctly() {
+        // media_status low bits 0b00 = tray closed, no disc.
+        let mut buf = vec![0u8; 8];
+        buf[5] = 0x00;
+        let mut d = drive_with(buf);
+        assert_eq!(d.drive_status(), DriveStatus::NoDisc);
+    }
+
+    #[test]
+    fn drive_status_tray_open_maps_correctly() {
+        // media_status low bits 0b01 = tray open, no media.
+        let mut buf = vec![0u8; 8];
+        buf[5] = 0x01;
+        let mut d = drive_with(buf);
+        assert_eq!(d.drive_status(), DriveStatus::TrayOpen);
+    }
+
+    #[test]
+    fn drive_status_high_bits_in_media_status_ignored() {
+        // Only the low 2 bits of byte 5 are the door/media state; upper
+        // bits (NEA, etc.) must be masked. 0xFE has low bits 0b10 =
+        // DiscPresent.
+        let mut buf = vec![0u8; 8];
+        buf[5] = 0xFE;
+        let mut d = drive_with(buf);
+        assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+    }
+
+    #[test]
+    fn drive_status_short_transfer_falls_back_to_tur() {
+        // bytes_transferred < 6 means the GET EVENT reply is unusable;
+        // the code falls back to a TUR. FixedTransport always returns
+        // Ok, so the TUR "succeeds" → DiscPresent. (Buffer length 8 but
+        // payload only 4 bytes → bytes_transferred = 4.)
+        let mut d = drive_with(vec![0u8; 4]);
+        assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
+    }
+
+    /// Transport that fails every command with a programmable error —
+    /// drives the TUR-fallback NotReady/Unknown branches of drive_status.
+    struct AlwaysErr {
+        err: fn() -> Error,
+    }
+    impl ScsiTransport for AlwaysErr {
+        fn execute(
+            &mut self,
+            _cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            Err((self.err)())
+        }
+    }
+
+    #[test]
+    fn drive_status_tur_not_ready_sense_maps_not_ready() {
+        // GET EVENT fails, fallback TUR fails with NOT READY sense →
+        // DriveStatus::NotReady (drive spinning up). Doc: drive_status
+        // fallback branch.
+        let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
+            err: || Error::ScsiError {
+                opcode: 0,
+                status: 0x02,
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: 2, // NOT READY
+                    asc: 0x04,
+                    ascq: 0x01,
+                }),
+            },
+        }));
+        assert_eq!(d.drive_status(), DriveStatus::NotReady);
+    }
+
+    #[test]
+    fn drive_status_tur_unit_attention_maps_not_ready() {
+        // UNIT ATTENTION (media changed) on the fallback TUR also maps to
+        // NotReady per the is_unit_attention() arm.
+        let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
+            err: || Error::ScsiError {
+                opcode: 0,
+                status: 0x02,
+                sense: Some(crate::scsi::ScsiSense {
+                    sense_key: 6, // UNIT ATTENTION
+                    asc: 0x28,
+                    ascq: 0x00,
+                }),
+            },
+        }));
+        assert_eq!(d.drive_status(), DriveStatus::NotReady);
+    }
+
+    #[test]
+    fn drive_status_tur_other_error_maps_unknown() {
+        // A fallback TUR failure that is neither NOT READY nor UNIT
+        // ATTENTION (e.g. transport failure, no sense) → Unknown.
+        let mut d = Drive::from_transport_for_test(Box::new(AlwaysErr {
+            err: || Error::ScsiError {
+                opcode: 0,
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            },
+        }));
+        assert_eq!(d.drive_status(), DriveStatus::Unknown);
+    }
+
+    // ── get_config_feature: header-strip threshold + clamp ──────────
+
+    #[test]
+    fn get_config_feature_strips_8_byte_header() {
+        // GET CONFIGURATION reply has an 8-byte Feature Header (MMC-6
+        // §5.2.2). get_config_feature returns buf[8..end]. Provide a
+        // 12-byte reply → returns the 4 payload bytes.
+        let mut payload = vec![0u8; 8];
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut d = drive_with(payload);
+        assert_eq!(
+            d.get_config_feature(0x010D),
+            Some(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+    }
+
+    #[test]
+    fn get_config_feature_at_exactly_8_bytes_returns_none() {
+        // end == 8 means header only, no descriptor → None (the `end > 8`
+        // guard). Boundary against an off-by-one that would return an
+        // empty Vec instead of None.
+        let mut d = drive_with(vec![0u8; 8]);
+        assert_eq!(d.get_config_feature(0x0000), None);
+    }
+
+    #[test]
+    fn get_config_feature_clamps_overlong_transfer_count() {
+        // Doc: a bridge reporting more bytes than the 256-byte buffer
+        // must be clamped (end = bytes_transferred.min(buf.len())) — no
+        // slice panic. FixedTransport reports min(payload,buf)=256 here,
+        // so we get buf[8..256] = 248 bytes, never a panic.
+        let mut d = drive_with(vec![0xAB; 1024]);
+        let got = d.get_config_feature(0x010C).unwrap();
+        assert_eq!(got.len(), 256 - 8, "clamped to buffer, header stripped");
+    }
+
+    // ── report_key / mode_sense / read_buffer empty-vs-some ─────────
+
+    #[test]
+    fn report_key_rpc_state_returns_transferred_prefix() {
+        // Returns buf[..end] where end = bytes_transferred. An 8-byte
+        // reply yields all 8 bytes.
+        let mut d = drive_with(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(d.report_key_rpc_state(), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn report_key_rpc_state_zero_transfer_returns_none() {
+        // end == 0 → None (the `end > 0` guard), never Some(empty).
+        let mut d = drive_with(vec![]);
+        assert_eq!(d.report_key_rpc_state(), None);
+    }
+
+    #[test]
+    fn mode_sense_zero_transfer_returns_none() {
+        let mut d = drive_with(vec![]);
+        assert_eq!(d.mode_sense_page(0x2A), None);
+    }
+
+    #[test]
+    fn read_buffer_returns_prefix_and_clamps() {
+        // read_buffer allocates `length` bytes; FixedTransport returns
+        // min(payload, length). Request 16 with a 4-byte payload → 4 bytes.
+        let mut d = drive_with(vec![9, 9, 9, 9]);
+        assert_eq!(d.read_buffer(0x02, 0xF1, 16), Some(vec![9, 9, 9, 9]));
+    }
+
+    #[test]
+    fn read_buffer_zero_transfer_returns_none() {
+        let mut d = drive_with(vec![]);
+        assert_eq!(d.read_buffer(0x02, 0xF1, 16), None);
+    }
+
+    // ── No-driver paths: init/probe surface UnsupportedDrive ────────
+
+    #[test]
+    fn init_without_driver_is_unsupported_drive() {
+        // from_transport_for_test has no platform driver; init() must
+        // return UnsupportedDrive, not panic or silently succeed.
+        let mut d = drive_with(vec![]);
+        assert!(matches!(d.init(), Err(Error::UnsupportedDrive { .. })));
+    }
+
+    #[test]
+    fn probe_disc_without_driver_is_unsupported_drive() {
+        let mut d = drive_with(vec![]);
+        assert!(matches!(
+            d.probe_disc(),
+            Err(Error::UnsupportedDrive { .. })
+        ));
+    }
+
+    #[test]
+    fn ready_predicates_false_without_driver() {
+        // is_ready / is_unlocked default false when no platform driver.
+        let d = drive_with(vec![]);
+        assert!(!d.is_ready());
+        assert!(!d.is_unlocked());
+        assert!(!d.has_profile());
+    }
+
+    // ── decode_read_capacity additional boundaries ──────────────────
+
+    #[test]
+    fn read_capacity_exactly_4_bytes_decodes() {
+        // bytes_transferred == 4 is the minimum that decodes (the guard
+        // is `< 4`). last_lba in bytes 0..4 big-endian.
+        let buf = [0x00, 0x00, 0x00, 0x05, 0, 0, 0, 0];
+        assert_eq!(decode_read_capacity(&buf, 4).unwrap(), 6);
+    }
+
+    #[test]
+    fn read_capacity_zero_last_lba_is_one_sector() {
+        // last_lba 0 → capacity 1 (a single-sector medium), distinct from
+        // the malformed/short-transfer rejection.
+        let buf = [0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode_read_capacity(&buf, 8).unwrap(), 1);
+    }
 }

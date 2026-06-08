@@ -123,3 +123,151 @@ pub use crate::io::file_sector_source::FileSectorSource;
 pub use decrypting::DecryptingSectorSource;
 pub use file::FileSectorSink;
 pub use prefetched::PrefetchedSectorSource;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A fully-instrumented SectorSource: records every read's
+    /// (lba, count, recovery), reports a known capacity, and records
+    /// set_speed calls. Lets the forwarding-impl tests prove each
+    /// trait method is delegated, not stubbed.
+    struct Spy {
+        capacity: u32,
+        reads: Arc<Mutex<Vec<(u32, u16, bool)>>>,
+        speeds: Arc<Mutex<Vec<u16>>>,
+    }
+
+    impl Spy {
+        fn new(
+            capacity: u32,
+        ) -> (
+            Self,
+            Arc<Mutex<Vec<(u32, u16, bool)>>>,
+            Arc<Mutex<Vec<u16>>>,
+        ) {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let speeds = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    capacity,
+                    reads: reads.clone(),
+                    speeds: speeds.clone(),
+                },
+                reads,
+                speeds,
+            )
+        }
+    }
+
+    impl SectorSource for Spy {
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            self.reads.lock().unwrap().push((lba, count, recovery));
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0xa5);
+            Ok(bytes)
+        }
+        fn set_speed(&mut self, kbs: u16) {
+            self.speeds.lock().unwrap().push(kbs);
+        }
+    }
+
+    /// The default `capacity_sectors` is 0 (unknown). Grounding: trait
+    /// default body `fn capacity_sectors(&self) -> u32 { 0 }`.
+    #[test]
+    fn default_capacity_is_zero() {
+        struct Minimal;
+        impl SectorSource for Minimal {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        assert_eq!(Minimal.capacity_sectors(), 0);
+    }
+
+    /// The default `set_speed` is a no-op that must not panic.
+    /// Grounding: trait default body `fn set_speed(&mut self, _kbs) {}`.
+    #[test]
+    fn default_set_speed_is_noop() {
+        struct Minimal;
+        impl SectorSource for Minimal {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                Ok(0)
+            }
+        }
+        let mut m = Minimal;
+        m.set_speed(12345); // must not panic
+    }
+
+    /// `Box<dyn SectorSource>` must forward ALL three trait methods to
+    /// the inner source (capacity, read_sectors args + return, speed) —
+    /// the blanket impl exists so boxed sources satisfy generic
+    /// decorator bounds. Grounding: `impl SectorSource for
+    /// Box<dyn SectorSource>` forwarding bodies.
+    #[test]
+    fn boxed_dyn_forwards_all_methods() {
+        let (spy, reads, speeds) = Spy::new(777);
+        let mut boxed: Box<dyn SectorSource> = Box::new(spy);
+
+        assert_eq!(boxed.capacity_sectors(), 777, "capacity must forward");
+
+        let mut buf = vec![0u8; 3 * 2048];
+        let n = boxed.read_sectors(99, 3, &mut buf, true).unwrap();
+        assert_eq!(n, 3 * 2048, "read return must forward");
+        assert!(buf.iter().all(|b| *b == 0xa5), "inner must have filled buf");
+
+        boxed.set_speed(5400);
+
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![(99, 3, true)],
+            "read args (lba/count/recovery) must forward unchanged"
+        );
+        assert_eq!(
+            *speeds.lock().unwrap(),
+            vec![5400],
+            "set_speed must forward"
+        );
+    }
+
+    /// `&mut dyn SectorSource` must likewise forward all three methods.
+    /// Grounding: `impl SectorSource for &mut (dyn SectorSource + '_)`.
+    #[test]
+    fn mut_ref_dyn_forwards_all_methods() {
+        let (mut spy, reads, speeds) = Spy::new(123);
+        let r: &mut dyn SectorSource = &mut spy;
+
+        assert_eq!(r.capacity_sectors(), 123);
+
+        let mut buf = vec![0u8; 2 * 2048];
+        let n = r.read_sectors(7, 2, &mut buf, false).unwrap();
+        assert_eq!(n, 2 * 2048);
+
+        r.set_speed(8800);
+
+        assert_eq!(*reads.lock().unwrap(), vec![(7, 2, false)]);
+        assert_eq!(*speeds.lock().unwrap(), vec![8800]);
+    }
+}

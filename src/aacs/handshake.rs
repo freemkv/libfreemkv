@@ -1526,4 +1526,294 @@ mod tests {
             }
         }
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Hardening additions
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── EC curve invariants: a, b chosen so 4a³+27b² != 0 (nonsingular) ────
+
+    #[test]
+    fn aacs1_curve_is_nonsingular() {
+        // A valid Weierstrass curve requires discriminant 4a³ + 27b² ≠ 0
+        // (mod p). A typo in EC_A or EC_B that singularised the curve would be
+        // caught here.
+        let p = BigUint::from_bytes_be(&EC_P);
+        let a = BigUint::from_bytes_be(&EC_A);
+        let b = BigUint::from_bytes_be(&EC_B);
+        let four = BigUint::from(4u32);
+        let twenty_seven = BigUint::from(27u32);
+        let disc = (&four * &a % &p * &a % &p * &a % &p + &twenty_seven * &b % &p * &b % &p) % &p;
+        assert!(!disc.is_zero(), "AACS 1.0 curve must be nonsingular");
+    }
+
+    #[test]
+    fn p256_curve_is_nonsingular() {
+        let p = BigUint::from_bytes_be(&P256_P);
+        let a = BigUint::from_bytes_be(&P256_A);
+        let b = BigUint::from_bytes_be(&P256_B);
+        let four = BigUint::from(4u32);
+        let twenty_seven = BigUint::from(27u32);
+        let disc = (&four * &a % &p * &a % &p * &a % &p + &twenty_seven * &b % &p * &b % &p) % &p;
+        assert!(!disc.is_zero(), "P-256 curve must be nonsingular");
+    }
+
+    // ── mod_inv ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mod_inv_round_trips() {
+        // a * a⁻¹ ≡ 1 (mod m). Pin against the AACS prime.
+        let m = BigUint::from_bytes_be(&EC_N);
+        let a = BigUint::from(123456789u64);
+        let inv = mod_inv(&a, &m).expect("inverse exists for a coprime to prime n");
+        assert_eq!((&a * &inv) % &m, BigUint::one());
+    }
+
+    #[test]
+    fn mod_inv_of_one_is_one() {
+        let m = BigUint::from(97u32);
+        assert_eq!(mod_inv(&BigUint::one(), &m), Some(BigUint::one()));
+    }
+
+    // ── to_bytes_be_padded ─────────────────────────────────────────────────
+
+    #[test]
+    fn to_bytes_be_padded_left_pads_short_values() {
+        // A small number must be left-zero-padded to the fixed width (keys are
+        // fixed-size big-endian; a short value left unpadded would shift bytes).
+        let n = BigUint::from(0x1234u32);
+        assert_eq!(to_bytes_be_padded(&n, 20), {
+            let mut v = vec![0u8; 18];
+            v.extend_from_slice(&[0x12, 0x34]);
+            v
+        });
+    }
+
+    #[test]
+    fn to_bytes_be_padded_truncates_to_low_bytes_when_longer() {
+        // When the encoding is longer than len, the low `len` bytes are kept
+        // (the function slices the tail) — this is how the 256-bit ECDH x is
+        // reduced to the low 128 bits for the bus key.
+        let n = BigUint::from(0x0102030405u64); // 5 bytes
+        assert_eq!(to_bytes_be_padded(&n, 2), vec![0x04, 0x05]);
+    }
+
+    // ── point_on_curve (via compute_bus_key acceptance) ────────────────────
+    // point_on_curve is private; exercise it through compute_bus_key, which
+    // calls it as the invalid-curve guard.
+
+    #[test]
+    fn off_curve_x_out_of_field_is_rejected() {
+        // A coordinate >= p is outside the field and must be rejected before
+        // the multiply (the `x >= p || y >= p` guard). Use x = p (== modulus).
+        let (host_priv, _, _) = generate_host_key_pair();
+        // EC_P itself as the x coordinate → x == p → out of field.
+        assert!(
+            compute_bus_key(&host_priv, &EC_P, &EC_GY).is_none(),
+            "x == p is out of field and must be rejected"
+        );
+    }
+
+    // ── CDB builders: REPORT KEY / SEND KEY / REPORT DISC STRUCTURE ────────
+
+    #[test]
+    fn cdb_report_key_layout() {
+        // 0xA4 opcode; AACS key class at byte 7; BE16 length at 8/9;
+        // (agid<<6)|format at byte 10. Pin the exact bit packing.
+        let cdb = cdb_report_key(0b10, 0x02, 0x0054);
+        assert_eq!(cdb[0], crate::scsi::SCSI_REPORT_KEY);
+        assert_eq!(cdb[7], crate::scsi::AACS_KEY_CLASS);
+        assert_eq!(cdb[8], 0x00);
+        assert_eq!(cdb[9], 0x54);
+        // agid=2 → bits 7:6 = 10b = 0x80; format 0x02 in low 6 bits.
+        assert_eq!(cdb[10], 0x80 | 0x02);
+    }
+
+    #[test]
+    fn cdb_report_key_format_masked_to_6_bits() {
+        // The format field is `format & 0x3F`; a value with bits 6/7 set must
+        // not bleed into the AGID field. 0xFF & 0x3F == 0x3F.
+        let cdb = cdb_report_key(0, 0xFF, 2);
+        assert_eq!(cdb[10], 0x3F, "format must be masked to its low 6 bits");
+    }
+
+    #[test]
+    fn cdb_send_key_layout() {
+        let cdb = cdb_send_key(0b11, 0x01, 116);
+        assert_eq!(cdb[0], crate::scsi::SCSI_SEND_KEY);
+        assert_eq!(cdb[7], crate::scsi::AACS_KEY_CLASS);
+        assert_eq!(cdb[8], (116u16 >> 8) as u8);
+        assert_eq!(cdb[9], (116u16 & 0xFF) as u8);
+        assert_eq!(cdb[10], (0b11 << 6) | 0x01);
+    }
+
+    #[test]
+    fn cdb_report_disc_structure_layout() {
+        // 0xAD opcode; byte 1 = 0x01 (Blu-ray); format at byte 7; BE16 length;
+        // agid<<6 at byte 10 (no format bits here).
+        let cdb = cdb_report_disc_structure(0b01, 0x80, 36);
+        assert_eq!(cdb[0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
+        assert_eq!(cdb[1], 0x01);
+        assert_eq!(cdb[7], 0x80);
+        assert_eq!(cdb[8], 0x00);
+        assert_eq!(cdb[9], 36);
+        assert_eq!(cdb[10], 0b01 << 6);
+    }
+
+    // ── verify_cert (AACS 1.0): length guard ───────────────────────────────
+
+    #[test]
+    fn verify_cert_v1_rejects_short_cert_no_panic() {
+        // < 92 bytes → false (the sig slices cert[52..72]/[72..92] would
+        // otherwise panic). Sweep the boundary.
+        for len in [0usize, 51, 52, 71, 72, 91] {
+            assert!(!verify_cert(&vec![0u8; len]), "len {len} must not panic");
+        }
+    }
+
+    #[test]
+    fn cert_pub_key_v1_zeroes_when_too_short() {
+        // < 52 bytes → zeroed (x,y) rather than an OOB slice on cert[12..52].
+        let (x, y) = cert_pub_key(&[0u8; 40]);
+        assert_eq!(x, [0u8; 20]);
+        assert_eq!(y, [0u8; 20]);
+    }
+
+    #[test]
+    fn cert_pub_key_v1_extracts_offsets_12_32_52() {
+        // pub_x at [12..32], pub_y at [32..52]. Build a 92-byte cert with
+        // distinct x/y regions.
+        let mut cert = vec![0u8; 92];
+        for b in &mut cert[12..32] {
+            *b = 0xA1;
+        }
+        for b in &mut cert[32..52] {
+            *b = 0xB2;
+        }
+        let (x, y) = cert_pub_key(&cert);
+        assert_eq!(x, [0xA1u8; 20]);
+        assert_eq!(y, [0xB2u8; 20]);
+    }
+
+    #[test]
+    fn cert_pub_key_p256_extracts_offsets_10_42_74() {
+        // AACS 2.0: pub_x at [10..42], pub_y at [42..74].
+        let mut cert = vec![0u8; 138];
+        for b in &mut cert[10..42] {
+            *b = 0xC3;
+        }
+        for b in &mut cert[42..74] {
+            *b = 0xD4;
+        }
+        let (x, y) = cert_pub_key_p256(&cert);
+        assert_eq!(x, [0xC3u8; 32]);
+        assert_eq!(y, [0xD4u8; 32]);
+    }
+
+    #[test]
+    fn cert_pub_key_p256_zeroes_when_too_short() {
+        // < 74 bytes → zeroed, matching the verify_cert_p256 >= 138 guard's
+        // safety contract (no OOB on cert[10..74]).
+        let (x, y) = cert_pub_key_p256(&[0u8; 73]);
+        assert_eq!(x, [0u8; 32]);
+        assert_eq!(y, [0u8; 32]);
+    }
+
+    // ── ECDSA sign produces 20/32-byte fixed-width outputs ─────────────────
+
+    #[test]
+    fn ecdsa_sign_outputs_are_fixed_width_and_verify() {
+        // Sign/verify already covered; here assert the (r,s) are full-width
+        // (the to_bytes_be_padded path must not emit short arrays — a fixed
+        // [u8;20] return enforces width, but verify the values are non-trivial
+        // and round-trip).
+        let (priv_key, px, py) = generate_host_key_pair();
+        let (r, s) = ecdsa_sign(&priv_key, b"payload");
+        assert_ne!(r, [0u8; 20]);
+        assert_ne!(s, [0u8; 20]);
+        assert!(ecdsa_verify(&px, &py, &r, &s, b"payload"));
+    }
+
+    #[test]
+    fn ecdsa_verify_rejects_out_of_range_signature_components() {
+        // r or s == 0, or >= n, must be rejected up front (standard ECDSA
+        // range check). Use r = 0.
+        let (_priv, px, py) = generate_host_key_pair();
+        let zero = [0u8; 20];
+        let some = [0x01u8; 20];
+        assert!(
+            !ecdsa_verify(&px, &py, &zero, &some, b"d"),
+            "r == 0 must be rejected"
+        );
+        assert!(
+            !ecdsa_verify(&px, &py, &some, &zero, b"d"),
+            "s == 0 must be rejected"
+        );
+        // r == n must be rejected (>= n).
+        assert!(!ecdsa_verify(&px, &py, &EC_N, &some, b"d"));
+    }
+
+    // ── ec_add / ec_double identities ──────────────────────────────────────
+
+    #[test]
+    fn ec_add_with_infinity_is_identity() {
+        let p = BigUint::from_bytes_be(&EC_P);
+        let a = BigUint::from_bytes_be(&EC_A);
+        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let inf = EcPoint::infinity();
+        let r1 = ec_add(&g, &inf, &a, &p);
+        let r2 = ec_add(&inf, &g, &a, &p);
+        assert_eq!((r1.x, r1.y), (g.x.clone(), g.y.clone()));
+        assert_eq!((r2.x, r2.y), (g.x, g.y));
+    }
+
+    #[test]
+    fn ec_add_point_and_its_negation_is_infinity() {
+        // P + (-P) = O. -P has y' = p - y. Same x, different y → infinity.
+        let p = BigUint::from_bytes_be(&EC_P);
+        let a = BigUint::from_bytes_be(&EC_A);
+        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let neg_y = (&p - &g.y) % &p;
+        let neg_g = EcPoint::new(g.x.clone(), neg_y);
+        let sum = ec_add(&g, &neg_g, &a, &p);
+        assert!(sum.infinity, "P + (-P) must be the point at infinity");
+    }
+
+    #[test]
+    fn ec_mul_two_g_equals_g_plus_g() {
+        // 2·G via scalar mul equals ec_double(G) and ec_add(G,G).
+        let p = BigUint::from_bytes_be(&EC_P);
+        let a = BigUint::from_bytes_be(&EC_A);
+        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let two = BigUint::from(2u32);
+        let mul2 = ec_mul(&two, &g, &a, &p);
+        let dbl = ec_double(&g, &a, &p);
+        let add = ec_add(&g, &g, &a, &p);
+        assert_eq!((mul2.x.clone(), mul2.y.clone()), (dbl.x, dbl.y));
+        assert_eq!((mul2.x, mul2.y), (add.x, add.y));
+    }
+
+    // ── AES-CMAC subkey: K1 doubling with Rb=0x87 ──────────────────────────
+
+    #[test]
+    fn aes_cmac_full_block_changes_with_one_input_bit() {
+        // A single-bit flip in the message must change the MAC (the K1 XOR +
+        // encrypt is sensitive to all input bits). Pairs with the NIST KAT.
+        let key = [0x2bu8; 16];
+        let m1 = [0x00u8; 16];
+        let mut m2 = m1;
+        m2[7] ^= 0x01;
+        assert_ne!(aes_cmac_16(&m1, &key), aes_cmac_16(&m2, &key));
+    }
+
+    // ── verify_cert_p256 boundary at exactly 138 ───────────────────────────
+
+    #[test]
+    fn verify_cert_p256_accepts_138_byte_length_without_panic() {
+        // 138 bytes is the minimum that satisfies the guard; the slices
+        // cert[74..106]/[106..138] are all in-bounds. The signature won't
+        // verify (random bytes) but it must NOT panic and must return false.
+        let cert = vec![0x00u8; 138];
+        assert!(!verify_cert_p256(&cert));
+    }
 }

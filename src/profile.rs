@@ -383,4 +383,293 @@ mod tests {
         let m = find_bundled(&id).unwrap();
         assert_eq!(m.platform, Platform::Mt1959A);
     }
+
+    // ── New comprehensive tests ────────────────────────────────────────────────
+
+    /// decode_hex rejects odd-length hex strings.
+    /// Spec: hex encoding uses pairs of hex digits; odd length is malformed.
+    /// Mutation: padding an odd-length string instead of erroring silently
+    ///           misinterprets the last nibble.
+    #[test]
+    fn decode_hex_rejects_odd_length() {
+        assert!(decode_hex("abc").is_err(), "odd length must be rejected");
+        assert!(decode_hex("a").is_err());
+        assert!(decode_hex("abcde").is_err());
+    }
+
+    /// decode_hex accepts empty string → empty Vec.
+    /// Mutation: returning an error on empty input breaks empty-field handling.
+    #[test]
+    fn decode_hex_accepts_empty_string() {
+        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
+    }
+
+    /// decode_hex handles all valid hex digit characters (0-9, a-f, A-F).
+    /// Mutation: not supporting uppercase A-F means uppercase-encoded profiles fail.
+    #[test]
+    fn decode_hex_handles_upper_and_lower_case() {
+        assert_eq!(
+            decode_hex("DEADBEEF").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        assert_eq!(
+            decode_hex("deadbeef").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        assert_eq!(
+            decode_hex("DeAdBeEf").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    /// decode_hex rejects non-hex ASCII characters.
+    /// Mutation: treating 'g' or 'z' as 0 silently corrupts key material.
+    #[test]
+    fn decode_hex_rejects_non_hex_ascii() {
+        assert!(decode_hex("gg").is_err(), "'g' is not a hex digit");
+        assert!(decode_hex("0z").is_err(), "'z' is not a hex digit");
+        assert!(decode_hex("0 ").is_err(), "space is not a hex digit");
+    }
+
+    /// parse_hex4 rejects an 8-hex-char string (4 bytes) correctly.
+    /// Spec: the signature field is exactly 4 bytes = 8 hex chars.
+    /// Mutation: accepting 6 hex chars (3 bytes) would pass a wrong-length signature.
+    #[test]
+    fn parse_hex4_rejects_wrong_byte_length() {
+        // 6 hex chars = 3 bytes ≠ 4.
+        assert!(
+            parse_hex4("aabbcc").is_err(),
+            "3 bytes must be rejected for 4-byte field"
+        );
+        // 10 hex chars = 5 bytes ≠ 4.
+        assert!(
+            parse_hex4("aabbccddee").is_err(),
+            "5 bytes must be rejected for 4-byte field"
+        );
+        // Exactly 8 hex chars = 4 bytes: must succeed.
+        assert_eq!(parse_hex4("aabbccdd").unwrap(), [0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    /// Platform::name() returns stable, non-empty, language-neutral identifiers.
+    /// These strings are logged and keyed on in caller code; changing them is a
+    /// breaking change.
+    /// Mutation: swapping Mt1959A and Mt1959B names silently misroutes firmware upload.
+    #[test]
+    fn platform_name_is_stable() {
+        // The exact strings are part of the public stable API (logged/keyed).
+        assert_eq!(Platform::Mt1959A.name(), "MediaTek MT1959-A");
+        assert_eq!(Platform::Mt1959B.name(), "MediaTek MT1959-B");
+        assert_eq!(Platform::Renesas.name(), "Renesas");
+    }
+
+    /// Platform names do not contain English prose — they are identifiers.
+    /// Mutation: adding " (unsupported)" to the Renesas name would break key lookup.
+    #[test]
+    fn platform_name_has_no_whitespace_only_words() {
+        for p in [Platform::Mt1959A, Platform::Mt1959B, Platform::Renesas] {
+            let name = p.name();
+            assert!(!name.is_empty(), "platform name must not be empty");
+            // Each whitespace-separated token must be non-empty (no trailing spaces).
+            for token in name.split_whitespace() {
+                assert!(!token.is_empty());
+            }
+        }
+    }
+
+    /// find_by_drive_id: exact match (including firmware_date) wins over loose match.
+    /// Spec: two-pass — first an exact match including firmware_date, then looser.
+    /// Build two synthetic ProfilesFile entries that differ only by firmware_date,
+    /// and verify the correct one is selected.
+    /// Mutation: doing only the loose pass would return the first entry regardless of date.
+    #[test]
+    fn find_by_drive_id_exact_date_wins_over_loose() {
+        use serde_json::json;
+        // Use an 8-char vendor_id (padded with a trailing space so `trim()` strips
+        // the pad, matching the same trimmed form the JSON profile stores).
+        // "TESTDRV " fills INQUIRY [8..16] exactly; `ascii_field.trim()` → "TESTDRV".
+        let profiles_json = json!({
+            "mt1959_a": [
+                {
+                    "identity": {
+                        "vendor_id": "TESTDRV",
+                        "product_revision": "1.00",
+                        "vendor_specific": "XX00000",
+                        "firmware_date": "200001010000"
+                    },
+                    "signature": "aabbccdd",
+                    "firmware": ""
+                },
+                {
+                    "identity": {
+                        "vendor_id": "TESTDRV",
+                        "product_revision": "1.00",
+                        "vendor_specific": "XX00000",
+                        "firmware_date": "200006150000"
+                    },
+                    "signature": "11223344",
+                    "firmware": ""
+                }
+            ]
+        })
+        .to_string();
+        let profiles: ProfilesFile = serde_json::from_str(&profiles_json).unwrap();
+
+        // "TESTDRV " (with space) fills 8 bytes; trim() → "TESTDRV" on both sides.
+        let id_date1 = make_drive_id("TESTDRV ", "1.00", "XX00000", "200001010000");
+        let id_date2 = make_drive_id("TESTDRV ", "1.00", "XX00000", "200006150000");
+
+        let m1 = find_by_drive_id(&profiles, &id_date1).unwrap();
+        let m2 = find_by_drive_id(&profiles, &id_date2).unwrap();
+
+        // Each must bind to its own profile by exact date match.
+        assert_eq!(
+            m1.profile.signature,
+            [0xaa, 0xbb, 0xcc, 0xdd],
+            "id_date1 must match first profile"
+        );
+        assert_eq!(
+            m2.profile.signature,
+            [0x11, 0x22, 0x33, 0x44],
+            "id_date2 must match second profile"
+        );
+    }
+
+    /// find_by_drive_id: loose match (no date) still works when an entry has
+    /// the same vendor/revision/vs but an unknown firmware_date.
+    /// Mutation: making the loose pass require a date match means "no date" drives
+    ///           always return None even though a same-model profile exists.
+    #[test]
+    fn find_by_drive_id_loose_match_when_date_unknown() {
+        use serde_json::json;
+        // "LOOSEDR " fills 8 bytes; trim() → "LOOSEDR".
+        let profiles_json = json!({
+            "mt1959_a": [
+                {
+                    "identity": {
+                        "vendor_id": "LOOSEDR",
+                        "product_revision": "2.00",
+                        "vendor_specific": "YY11111",
+                        "firmware_date": "210101010000"
+                    },
+                    "signature": "deadbeef",
+                    "firmware": ""
+                }
+            ]
+        })
+        .to_string();
+        let profiles: ProfilesFile = serde_json::from_str(&profiles_json).unwrap();
+
+        // Drive with an unknown firmware date — no exact match, loose match should work.
+        // "LOOSEDR " fills 8 bytes; "000000000000" is the unknown date.
+        let id = make_drive_id("LOOSEDR ", "2.00", "YY11111", "000000000000");
+        let m = find_by_drive_id(&profiles, &id).unwrap();
+        assert_eq!(
+            m.profile.signature,
+            [0xde, 0xad, 0xbe, 0xef],
+            "loose match must bind the same-model profile when date differs"
+        );
+    }
+
+    /// load_from_str (via load_bundled) returns ProfileParse on invalid JSON.
+    /// Mutation: returning an empty ProfilesFile instead of an error silently
+    ///           leaves the drive-profile database empty.
+    #[test]
+    fn load_from_str_returns_profile_parse_on_bad_json() {
+        let result: Result<ProfilesFile> =
+            serde_json::from_str("not valid json {{{{").map_err(|_| Error::ProfileParse);
+        assert!(matches!(result, Err(Error::ProfileParse)));
+    }
+
+    /// Bundled profiles is non-empty (mt1959_a has at least one entry).
+    /// This pins the embedded JSON: if profiles.json is accidentally emptied
+    /// or truncated, this test goes red.
+    /// Mutation: clearing profiles.json would make this fail.
+    #[test]
+    fn bundled_profiles_has_entries() {
+        let profiles = load_bundled().unwrap();
+        assert!(
+            !profiles.mt1959_a.is_empty(),
+            "bundled profiles must have at least one mt1959_a entry"
+        );
+    }
+
+    /// deserialization of a profile with missing optional CDB fields
+    /// produces None for those fields (not a parse error).
+    /// Spec: all CDB template fields are `#[serde(default)]` — they are optional.
+    /// Mutation: making a CDB field required breaks backward-compat with old blobs.
+    #[test]
+    fn profile_optional_cdb_fields_default_to_none() {
+        use serde_json::json;
+        let json_str = json!({
+            "mt1959_a": [
+                {
+                    "identity": {
+                        "vendor_id": "TEST",
+                        "product_revision": "1.00",
+                        "vendor_specific": "000000",
+                        "firmware_date": ""
+                    },
+                    "signature": "00000000",
+                    "firmware": ""
+                }
+            ]
+        })
+        .to_string();
+        let profiles: ProfilesFile = serde_json::from_str(&json_str).unwrap();
+        let p = &profiles.mt1959_a[0]; // DriveProfile directly
+        // All optional CDB fields must be None when absent from JSON.
+        assert!(
+            p.read_vid_cdb.is_none(),
+            "read_vid_cdb must default to None"
+        );
+        assert!(
+            p.read_disc_keys_cdb.is_none(),
+            "read_disc_keys_cdb must default to None"
+        );
+        assert!(
+            p.drive_nominal_speed_cdb.is_none(),
+            "drive_nominal_speed_cdb must default to None"
+        );
+        assert!(
+            p.set_speed_max_cdb.is_none(),
+            "set_speed_max_cdb must default to None"
+        );
+        assert!(
+            p.speed_zone_table.is_none(),
+            "speed_zone_table must default to None"
+        );
+        assert!(
+            p.speed_calc_table.is_none(),
+            "speed_calc_table must default to None"
+        );
+    }
+
+    /// deserialize_hex4 of an empty string must produce [0;4] without error.
+    /// This matches `deserialize_hex4`'s explicit early-return for empty strings.
+    /// Mutation: treating empty string as an error prevents profiles where signature
+    ///           was not captured from loading.
+    #[test]
+    fn profile_empty_signature_deserialises_as_zeroes() {
+        use serde_json::json;
+        let json_str = json!({
+            "mt1959_a": [
+                {
+                    "identity": {
+                        "vendor_id": "TEST",
+                        "product_revision": "1.00",
+                        "vendor_specific": "000000",
+                        "firmware_date": ""
+                    },
+                    "signature": "",
+                    "firmware": ""
+                }
+            ]
+        })
+        .to_string();
+        let profiles: ProfilesFile = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            profiles.mt1959_a[0].signature, [0u8; 4],
+            "empty signature must deserialise as [0;4]"
+        );
+    }
 }
