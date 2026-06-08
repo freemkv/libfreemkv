@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.31.5 (2026-06-08)
+
+### Fixed
+
+- MKV mux: stop forcing strictly-monotonic block timestamps on the **video**
+  track. The monotonic nudge (added for audio PES that collide on a
+  millisecond) was clobbering B-frame video PTS — which are legitimately
+  non-monotonic in decode/storage order — to prev+1ms. A `copy` remux
+  preserved the wrong value, but decoding derived DTS from the HEVC POC and
+  found them colliding, emitting thousands of "non monotonically increasing
+  dts" warnings per title. Video now keeps its true PES PTS (Matroska
+  SimpleBlock permits non-monotonic block timestamps); audio/subtitle tracks
+  still get the nudge. Verified: a re-mux drops the warning count to zero.
+
 ## 0.31.4 (2026-06-08)
 
 Test cleanup — no runtime changes. Removed 144 unit tests flagged in adversarial

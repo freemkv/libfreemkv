@@ -270,6 +270,26 @@ fn monotonic_ts(prev: Option<i64>, pts_ms: i64) -> i64 {
     }
 }
 
+/// Per-track block timestamp. The strictly-monotonic nudge is applied to
+/// AUDIO/SUBTITLE tracks only; VIDEO (track 0) is returned UNCHANGED.
+///
+/// With B-frames, a video frame's presentation PTS is legitimately
+/// non-monotonic in decode/storage order (a B-frame sits between its anchors,
+/// below the frame stored just before it). Forcing it strictly-increasing
+/// clobbers those PTS to prev+1ms — a `copy` remux preserves the (wrong) value,
+/// but a decoder derives DTS from the HEVC POC and finds them colliding
+/// ("non monotonically increasing dts", thousands per title). Matroska
+/// SimpleBlock permits non-monotonic block timestamps (signed block-relative
+/// offsets), so video keeps its true PES PTS; only no-reorder tracks (audio,
+/// subtitles), where a same-millisecond collision IS a real defect, get nudged.
+fn block_ts(track_idx: usize, prev: Option<i64>, pts_ms: i64) -> i64 {
+    if track_idx == 0 {
+        pts_ms
+    } else {
+        monotonic_ts(prev, pts_ms)
+    }
+}
+
 /// Encode a Matroska track number as an EBML VINT into a stack buffer,
 /// returning the buffer and the used length. Track numbers are small (1-based,
 /// a handful of tracks), so 1 byte covers `< 0x80` and 2 bytes covers the rest;
@@ -550,12 +570,19 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // kept keyframe are clamped to t=0 rather than corrupting the timeline.
         let pts_ms = (raw_ms - base).max(0);
 
-        // Enforce strictly-monotonic per-track block timestamps. Some audio PES
-        // PTS truncate to the same millisecond as the previous frame (or, rarely,
-        // tick back 1ms), which surfaces as "non-monotonic DTS" and is rejected
-        // by ffmpeg/strict players. Nudge to prev+1ms — sub-frame, inaudible,
-        // and A/V sync is unaffected at millisecond granularity.
-        let pts_ms = monotonic_ts(self.last_pts_ms.get(&track_idx).copied(), pts_ms);
+        // Strictly-monotonic block timestamps — AUDIO/SUBTITLE ONLY. Some audio
+        // PES PTS truncate to the same millisecond as the previous frame (or
+        // tick back 1ms); nudge those to prev+1ms (sub-frame, inaudible).
+        //
+        // VIDEO (track 0) is EXEMPT: with B-frames, presentation PTS is
+        // legitimately non-monotonic in decode/storage order (a B-frame's PTS
+        // sits between its anchors, below the frame stored before it). Forcing
+        // it strictly-increasing clobbers those PTS to prev+1ms, which a `copy`
+        // remux preserves but a decoder rejects — it derives DTS from the HEVC
+        // POC and finds them colliding ("non monotonically increasing dts").
+        // Matroska SimpleBlock permits non-monotonic block timestamps (negative
+        // block-relative offsets), so leave the true PES PTS intact for video.
+        let pts_ms = block_ts(track_idx, self.last_pts_ms.get(&track_idx).copied(), pts_ms);
 
         let needs_new_cluster = !self.cluster_open
             || (is_video_key && (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS);
@@ -972,6 +999,46 @@ mod tests {
             "not strictly monotonic: {out:?}"
         );
         assert_eq!(out, [1000, 1001, 1002, 1003, 1032, 1033, 1064]);
+    }
+
+    #[test]
+    fn block_ts_exempts_video_from_monotonic_nudge() {
+        // VIDEO (track 0) keeps its true PTS even when non-monotonic in storage
+        // order — a B-frame whose presentation PTS sits below the frame stored
+        // before it must NOT be nudged to prev+1ms (that clobbering is what
+        // produced the "non monotonically increasing dts" flood on decode).
+        assert_eq!(
+            block_ts(0, Some(1040), 1000),
+            1000,
+            "video B-frame PTS preserved"
+        );
+        assert_eq!(
+            block_ts(0, Some(1000), 1000),
+            1000,
+            "video dup-ms PTS preserved"
+        );
+        // A realistic decode-order GOP (I, then B-frames dipping below it):
+        // every value passes through untouched for video.
+        let gop = [1000i64, 960, 920, 1080, 1040];
+        let mut prev = None;
+        let out: Vec<i64> = gop
+            .iter()
+            .map(|&p| {
+                let t = block_ts(0, prev, p);
+                prev = Some(t);
+                t
+            })
+            .collect();
+        assert_eq!(out, gop, "video timestamps must be left exactly as-is");
+
+        // AUDIO/SUBTITLE (track != 0) still get the strictly-monotonic nudge —
+        // a same-ms collision there is a real defect.
+        assert_eq!(block_ts(1, Some(1000), 1000), 1001, "audio dup-ms nudged");
+        assert_eq!(
+            block_ts(2, Some(1001), 1000),
+            1002,
+            "subtitle back-tick nudged"
+        );
     }
 
     #[test]
