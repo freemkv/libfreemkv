@@ -34,11 +34,9 @@ impl Halt {
         Self(Arc::new(AtomicBool::new(false)))
     }
 
-    /// Wrap an existing `Arc<AtomicBool>` as a `Halt`. Useful as a
-    /// bridge during the 0.18 deprecation window: callers that already
-    /// hold an `Arc<AtomicBool>` (e.g. `Drive::halt_flag()`, the
-    /// deprecated `DiscStream::set_halt`) can adopt the new token API
-    /// without changing the underlying flag.
+    /// Wrap an existing `Arc<AtomicBool>` as a `Halt`. A bridge for
+    /// callers that already hold an `Arc<AtomicBool>` cancellation flag
+    /// and want to adopt the token API without allocating a new flag.
     ///
     /// Cancelling either side flips the same bit — the wrapping `Halt`
     /// and the original `Arc` are two views over one shared flag.
@@ -46,10 +44,9 @@ impl Halt {
         Self(flag)
     }
 
-    /// Borrow the underlying `Arc<AtomicBool>`. Used at boundaries with
-    /// pre-`Halt` APIs that still take an `Arc<AtomicBool>` directly
-    /// (`CopyOptions::halt`, the deprecated `DiscStream::set_halt`).
-    /// Round 3 deletes those boundaries and this accessor with them.
+    /// Borrow the underlying `Arc<AtomicBool>`. The inverse of
+    /// [`from_arc`](Self::from_arc): hand the shared flag to an API that
+    /// still takes a raw `Arc<AtomicBool>` rather than a `Halt`.
     pub fn as_arc(&self) -> &Arc<AtomicBool> {
         &self.0
     }

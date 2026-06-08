@@ -17,8 +17,20 @@
 use super::{DataDirection, ScsiResult, ScsiTransport};
 use crate::error::{Error, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const K_SENSE_DATA_SIZE: usize = 32;
+
+/// Max CDB length the SCSI commands this library issues ever use; also
+/// the clamp Linux applies. Used to bound the `cdb_len` passed to the
+/// shim so a pathological >255-byte slice can't wrap a `u8`.
+const K_MAX_CDB_SIZE: usize = 16;
+
+/// The C shim uses a single global IOKit handle (`g_handle`), so only one
+/// [`MacScsiTransport`] may exist at a time — a second `open()` would
+/// share that handle and the first `drop()` would tear it down out from
+/// under the other. This flag enforces single-instance ownership.
+static OPEN: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -66,13 +78,38 @@ impl MacScsiTransport {
             dev_str
         };
 
+        // Enforce single-instance: the shim's global handle can't back two
+        // live transports safely. Bail rather than corrupt shared state.
+        if OPEN.swap(true, Ordering::Acquire) {
+            return Err(Error::DeviceLocked {
+                path: bsd_name.to_string(),
+                kr: 0,
+            });
+        }
+
         let mut bsd_c = bsd_name.as_bytes().to_vec();
         bsd_c.push(0);
 
         let rc = unsafe { shim_open_exclusive(bsd_c.as_ptr()) };
         if rc != 0 {
-            return Err(Error::DeviceNotFound {
-                path: bsd_name.to_string(),
+            // Release the single-instance lock taken by the OPEN.swap above;
+            // a failed open must not leave it held or every later open wedges.
+            OPEN.store(false, Ordering::Release);
+            let path = bsd_name.to_string();
+            // The shim returns distinct negative sentinels per failure
+            // stage; map them to the typed variants that already exist
+            // rather than collapsing every failure to DeviceNotFound.
+            // These sentinels are not IOReturn codes, so kr is left 0.
+            return Err(match rc {
+                // -2/-3/-4: IOCreatePlugInInterfaceForService /
+                // QueryInterface MMCDeviceInterface /
+                // GetSCSITaskDeviceInterface failed.
+                -4..=-2 => Error::IoKitPluginFailed { path, kr: 0 },
+                // -5: ObtainExclusiveAccess failed (held by another
+                // process).
+                -5 => Error::DeviceLocked { path, kr: 0 },
+                // -1 and anything else: device not present.
+                _ => Error::DeviceNotFound { path },
             });
         }
 
@@ -85,6 +122,7 @@ impl MacScsiTransport {
 impl Drop for MacScsiTransport {
     fn drop(&mut self) {
         unsafe { shim_close() };
+        OPEN.store(false, Ordering::Release);
     }
 }
 
@@ -94,8 +132,25 @@ impl ScsiTransport for MacScsiTransport {
         cdb: &[u8],
         direction: DataDirection,
         data: &mut [u8],
+        // NOTE: timeout_ms is currently ignored on macOS. The C shim
+        // (`macos_shim.c`) hardcodes `SetTimeoutDuration(task, 30000)`, so
+        // every command uses a fixed 30 s budget regardless of the
+        // caller's READ_TIMEOUT_MS / READ_RECOVERY_TIMEOUT_MS / TUR value.
+        // Plumbing it through the shim signature is tracked separately;
+        // macOS is dev/test-only per the project rules.
         _timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        // Match the Linux guard: a >=4 GiB buffer would wrap when cast to
+        // u32 for the shim, producing a short transfer reported as success
+        // with the wrong byte count.
+        if data.len() > u32::MAX as usize {
+            return Err(Error::ScsiError {
+                opcode: cdb.first().copied().unwrap_or(0),
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            });
+        }
+
         let data_in = match direction {
             DataDirection::FromDevice => 1,
             DataDirection::ToDevice => 0,
@@ -106,10 +161,11 @@ impl ScsiTransport for MacScsiTransport {
         let mut task_status: u8 = 0xFF;
         let mut transfer_count: u64 = 0;
 
+        let cdb_len = cdb.len().min(K_MAX_CDB_SIZE) as u8;
         let kr = unsafe {
             shim_execute(
                 cdb.as_ptr(),
-                cdb.len() as u8,
+                cdb_len,
                 data.as_mut_ptr(),
                 data.len() as u32,
                 data_in,
@@ -122,7 +178,7 @@ impl ScsiTransport for MacScsiTransport {
 
         if kr != 0 {
             return Err(Error::ScsiError {
-                opcode: cdb[0],
+                opcode: cdb.first().copied().unwrap_or(0),
                 status: super::SCSI_STATUS_TRANSPORT_FAILURE,
                 sense: None,
             });
@@ -131,7 +187,7 @@ impl ScsiTransport for MacScsiTransport {
         if task_status != 0 {
             let parsed = super::parse_sense(&sense, K_SENSE_DATA_SIZE as u8);
             return Err(Error::ScsiError {
-                opcode: cdb[0],
+                opcode: cdb.first().copied().unwrap_or(0),
                 status: task_status,
                 sense: Some(parsed),
             });
@@ -139,7 +195,11 @@ impl ScsiTransport for MacScsiTransport {
 
         Ok(ScsiResult {
             status: 0,
-            bytes_transferred: transfer_count as usize,
+            // Clamp to the buffer length, matching the Linux transport's
+            // structural bound (data.len().saturating_sub(resid)). A lying
+            // drive/shim can't then produce a bytes_transferred that
+            // exceeds the buffer a future caller might slice with.
+            bytes_transferred: (transfer_count as usize).min(data.len()),
             sense,
         })
     }

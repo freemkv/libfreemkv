@@ -16,8 +16,6 @@
 // callers land. Tests below cover the API in isolation.
 #![allow(dead_code)]
 
-use std::fmt;
-
 const CLASS_MAGIC: u32 = 0xCAFEBABE;
 
 // ---------------------------------------------------------------------------
@@ -34,24 +32,10 @@ pub enum Error {
     BadInstruction { pc: usize, opcode: u8 },
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::UnexpectedEof { needed } => write!(f, "unexpected EOF reading {}", needed),
-            Error::BadMagic(m) => write!(f, "bad class file magic: 0x{:08X}", m),
-            Error::BadCpTag { index, tag } => {
-                write!(f, "unknown constant pool tag {} at index {}", tag, index)
-            }
-            Error::BadUtf8 { index } => write!(f, "invalid modified-UTF-8 at cp index {}", index),
-            Error::BadCodeAttribute => write!(f, "malformed Code attribute"),
-            Error::BadInstruction { pc, opcode } => {
-                write!(f, "unrecognized opcode 0x{:02X} at pc={}", opcode, pc)
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+// No Display/std::error::Error impl: this is a crate-internal, typed error
+// used only for `match`/`?` within the label parsers (callers discard it via
+// `let Ok(_) = ... else continue`). Per the library's zero-English rule there
+// is no user-facing text; the variant fields carry the structured detail.
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -673,8 +657,14 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
             if high < low {
                 return None;
             }
-            let entries = (high - low + 1) as usize;
-            Some(padded_start - pc + 12 + entries * 4)
+            // `high - low + 1` can overflow i32 for adversarial bytecode
+            // (e.g. low=i32::MIN/high=0, or low=0/high=i32::MAX), so widen
+            // to i64 before adding. The product and final sum are saturating
+            // so they cannot overflow usize on a 32-bit target either.
+            let entries = (high as i64 - low as i64 + 1) as u64;
+            let table_bytes = entries.saturating_mul(4);
+            let base = (padded_start - pc + 12) as u64;
+            usize::try_from(base.saturating_add(table_bytes)).ok()
         }
         LOOKUPSWITCH => {
             let padded_start = (pc + 1 + 3) & !3;
@@ -686,7 +676,11 @@ fn instruction_size(code: &[u8], pc: usize) -> Option<usize> {
             if npairs < 0 {
                 return None;
             }
-            Some(padded_start - pc + 8 + (npairs as usize) * 8)
+            // Saturating product/sum so an attacker-supplied npairs cannot
+            // overflow usize on a 32-bit target.
+            let pair_bytes = (npairs as u64).saturating_mul(8);
+            let base = (padded_start - pc + 8) as u64;
+            usize::try_from(base.saturating_add(pair_bytes)).ok()
         }
         WIDE => {
             // `wide` prefixes one of: iload/lload/fload/dload/aload/
@@ -958,7 +952,12 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             return Err(Error::UnexpectedEof { needed });
         }
-        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        let v = u32::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
         self.pos += 4;
         Ok(v)
     }
@@ -971,7 +970,16 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             return Err(Error::UnexpectedEof { needed });
         }
-        let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        let v = u64::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
         self.pos += 8;
         Ok(v)
     }
@@ -1026,9 +1034,9 @@ mod tests {
     }
 
     #[test]
-    fn modified_utf8_three_byte_bmp() {
-        // U+00E9 'é' as 3-byte BMP form is unusual but legal; the 2-byte
-        // form is normative. Test the 2-byte form (0xC3 0xA9).
+    fn modified_utf8_two_byte() {
+        // U+00E9 'é' in the standard 2-byte modified-UTF-8 encoding
+        // (0xC3 0xA9), exercising the decoder's 2-byte branch.
         let s = decode_modified_utf8(&[0xC3, 0xA9]).unwrap();
         assert_eq!(s, "é");
     }
@@ -1067,6 +1075,39 @@ mod tests {
         code.extend_from_slice(&[0, 0, 0, 2]); // npairs = 2
         code.extend_from_slice(&[0; 16]); // 2 pairs
         assert_eq!(instruction_size(&code, 0), Some(28));
+    }
+
+    #[test]
+    fn instruction_size_tableswitch_overflow_does_not_panic() {
+        // Adversarial low/high spanning the full i32 range. `high - low + 1`
+        // overflows i32; the widened i64 count then saturates the byte
+        // products. Must return a value (possibly None on a 32-bit usize)
+        // without panicking.
+        for (low, high) in [
+            (i32::MIN, 0i32),
+            (0i32, i32::MAX),
+            (i32::MIN, i32::MAX),
+            (-1i32, i32::MAX),
+        ] {
+            let mut code = vec![TABLESWITCH];
+            code.extend_from_slice(&[0, 0, 0]); // padding
+            code.extend_from_slice(&[0, 0, 0, 0]); // default offset
+            code.extend_from_slice(&low.to_be_bytes());
+            code.extend_from_slice(&high.to_be_bytes());
+            // No need to supply the (enormous) jump table; size computation
+            // must not read it.
+            let _ = instruction_size(&code, 0);
+        }
+    }
+
+    #[test]
+    fn instruction_size_lookupswitch_overflow_does_not_panic() {
+        // Maximal npairs; `npairs * 8` must saturate rather than overflow.
+        let mut code = vec![LOOKUPSWITCH];
+        code.extend_from_slice(&[0, 0, 0]); // padding
+        code.extend_from_slice(&[0, 0, 0, 0]); // default
+        code.extend_from_slice(&i32::MAX.to_be_bytes()); // npairs = i32::MAX
+        let _ = instruction_size(&code, 0);
     }
 
     #[test]

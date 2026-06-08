@@ -2,10 +2,14 @@
 //!
 //! DVD subtitles are carried in PS private stream 1 with sub-stream IDs 0x20-0x3F.
 //! A single subpicture unit (SPU — one displayed bitmap) may span multiple PES
-//! packets: only the first PES carries a PTS, continuations carry PTS=0. The SPU
-//! begins with a 2-byte big-endian `SPU_size` giving the total byte length of the
-//! whole unit. We reassemble across PES boundaries into one Frame so large
-//! subtitles aren't split/garbled, inheriting the head PES's PTS.
+//! packets: only the first PES carries a PTS; continuation PES packets have no
+//! PTS field (the PS demuxer leaves `pts` as `None`). The SPU begins with a
+//! 2-byte big-endian `SPU_size` giving the total byte length of the whole unit.
+//! We reassemble across PES boundaries into one Frame so large subtitles aren't
+//! split/garbled, inheriting the head PES's PTS. The presence of a PTS — not
+//! merely an open `pending` — is the authoritative SPU-boundary signal, so a
+//! lost continuation or a corrupt SPU_size can't merge the next subtitle into
+//! the stuck unit.
 //!
 //! For MKV: codec ID "S_VOBSUB".
 //! All frames are keyframes (each is a complete bitmap).
@@ -35,7 +39,7 @@ impl DvdSubParser {
     /// Emit `pending` as a Frame if it is complete (or `force` at EOF),
     /// returning it and clearing the buffer. Returns None if nothing to emit.
     fn take_if_complete(&mut self, force: bool) -> Option<Frame> {
-        let (pts_ns, size, buf) = self.pending.as_ref()?;
+        let (_, size, buf) = self.pending.as_ref()?;
         if force || buf.len() >= *size {
             let (pts_ns, _, data) = self.pending.take().unwrap();
             return Some(Frame {
@@ -45,7 +49,6 @@ impl DvdSubParser {
                 duration_ns: None,
             });
         }
-        let _ = pts_ns;
         None
     }
 }
@@ -58,32 +61,63 @@ impl CodecParser for DvdSubParser {
 
         let mut out = Vec::new();
 
-        if self.pending.is_some() {
-            // Continuation of an in-progress SPU (PTS=0 on these). Append,
-            // bounded by MAX_SPU_BYTES.
-            if let Some((_, _, buf)) = self.pending.as_mut() {
-                let room = MAX_SPU_BYTES.saturating_sub(buf.len());
-                let take = room.min(pes.data.len());
-                buf.extend_from_slice(&pes.data[..take]);
+        // A PES carrying a real PTS is the START of a new SPU; continuations of
+        // an in-progress SPU carry no PTS (the PS demuxer leaves `pts` None when
+        // the PES has no PTS field — see the module doc). PTS is therefore the
+        // authoritative SPU-boundary signal, NOT merely `pending.is_some()`.
+        //
+        // Append-as-continuation ONLY when this PES has no PTS. When it has a
+        // PTS but a stale `pending` is still open (a lost continuation, or a
+        // corrupt/oversized declared SPU_size that real data never reaches),
+        // force-emit the stuck unit truncated and fall through to start a fresh
+        // SPU from this PES. Without this, one bad SPU_size would swallow every
+        // later subtitle until EOF — exactly the damaged-disc case we target.
+        if pes.pts.is_none() {
+            if self.pending.is_some() {
+                // Continuation: append, bounded by MAX_SPU_BYTES.
+                if let Some((_, _, buf)) = self.pending.as_mut() {
+                    let room = MAX_SPU_BYTES.saturating_sub(buf.len());
+                    let take = room.min(pes.data.len());
+                    buf.extend_from_slice(&pes.data[..take]);
+                }
+                if let Some(frame) = self.take_if_complete(false) {
+                    out.push(frame);
+                }
+                return out;
             }
-            if let Some(frame) = self.take_if_complete(false) {
-                out.push(frame);
-            }
-            return out;
+            // No pending and no PTS: nothing to attach this to. Pass it through
+            // as a lone frame (PTS unknown → 0) rather than drop it.
+        } else if let Some(frame) = self.take_if_complete(true) {
+            // New SPU starting while a previous one is still open → flush stale.
+            out.push(frame);
         }
 
         // Start of a new SPU. The first 2 bytes are the big-endian total size.
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
         let declared = if pes.data.len() >= 2 {
-            ((pes.data[0] as usize) << 8) | pes.data[1] as usize
+            // SPU_size includes the 2-byte header, so a declared size < 2 is
+            // always malformed; treat it like the too-short path (lone frame)
+            // rather than emit an immediate oversized unit.
+            let d = ((pes.data[0] as usize) << 8) | pes.data[1] as usize;
+            if d < 2 {
+                out.push(Frame {
+                    pts_ns,
+                    keyframe: true,
+                    data: pes.data.clone(),
+                    duration_ns: None,
+                });
+                return out;
+            }
+            d
         } else {
             // Too short to carry SPU_size — pass through as a lone frame.
-            return vec![Frame {
+            out.push(Frame {
                 pts_ns,
                 keyframe: true,
                 data: pes.data.clone(),
                 duration_ns: None,
-            }];
+            });
+            return out;
         };
 
         let mut buf = pes.data.clone();
@@ -114,6 +148,18 @@ impl CodecParser for DvdSubParser {
 ///
 /// Input: `[padding, Y, Cb, Cr]` (as stored in DVD IFO PGC data).
 /// Returns `[R, G, B]`.
+///
+/// Range convention (deliberate): this uses the **full-range (JFIF) BT.601**
+/// coefficients with no 16/235 luma scaling. DVD IFO palette YCbCr is nominally
+/// studio-swing BT.601, so studio-swing math would be more colorimetrically
+/// "correct" in isolation. But the output here is a VobSub `.idx` `palette:`
+/// line, and the entire VobSub ecosystem (the original tooling, mkvtoolnix,
+/// players that read the .idx palette) is built around this full-range formula —
+/// it is the de-facto on-disk convention. Emitting studio-swing-scaled RGB here
+/// would make freemkv's palettes inconsistent with every other tool and wrong in
+/// players that assume the VobSub convention. We therefore intentionally keep
+/// full-range; do NOT "fix" this to studio-swing without changing the consuming
+/// side in lockstep.
 pub fn ycbcr_to_rgb(color: &[u8; 4]) -> [u8; 3] {
     let y = color[1] as f64;
     let cb = color[2] as f64;
@@ -240,9 +286,10 @@ mod tests {
 
         let f = parser.parse(&make_pes(head.clone(), Some(90000)));
         assert!(f.is_empty(), "incomplete SPU should not emit yet");
-        let f = parser.parse(&make_pes(cont1.clone(), Some(0)));
+        // Continuations carry NO PTS (None), per the PS demuxer.
+        let f = parser.parse(&make_pes(cont1.clone(), None));
         assert!(f.is_empty(), "still incomplete");
-        let frames = parser.parse(&make_pes(cont2.clone(), Some(0)));
+        let frames = parser.parse(&make_pes(cont2.clone(), None));
         assert_eq!(frames.len(), 1, "completed SPU emits exactly one frame");
 
         // Reassembled bytes = head + cont1 + cont2, in order.
@@ -266,6 +313,67 @@ mod tests {
         assert_eq!(frames.len(), 1, "EOF flush emits the partial SPU");
         assert_eq!(frames[0].data, head);
         assert_eq!(frames[0].pts_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn real_pts_pes_force_emits_stale_pending_and_starts_new_spu() {
+        // A lost continuation leaves an incomplete pending SPU. The NEXT real
+        // subtitle arrives with its own PTS — it must force-emit the stuck unit
+        // (truncated) and begin a fresh SPU, not be appended as a continuation.
+        let mut parser = DvdSubParser::new(None);
+
+        // SPU 1 declares 100 bytes but only 6 arrive; the continuation is lost.
+        let head1 = vec![0x00, 0x64, 0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(
+            parser
+                .parse(&make_pes(head1.clone(), Some(90000)))
+                .is_empty(),
+            "SPU 1 incomplete, held pending"
+        );
+
+        // SPU 2 arrives with a real PTS — declares 4 bytes, fully present.
+        let head2 = vec![0x00, 0x04, 0x11, 0x22];
+        let frames = parser.parse(&make_pes(head2.clone(), Some(180000)));
+        // First the truncated stale SPU 1, then complete SPU 2.
+        assert_eq!(frames.len(), 2, "stale flushed + new emitted");
+        assert_eq!(frames[0].data, head1, "stale SPU 1 emitted truncated");
+        assert_eq!(frames[0].pts_ns, 1_000_000_000, "SPU 1 keeps its PTS");
+        assert_eq!(frames[1].data, head2, "SPU 2 emitted fresh");
+        assert_eq!(frames[1].pts_ns, 2_000_000_000, "SPU 2 keeps its own PTS");
+    }
+
+    #[test]
+    fn corrupt_oversized_size_recovers_on_next_real_pts() {
+        // A corrupt SPU_size that real data never reaches must not swallow every
+        // later subtitle. The next real-PTS PES resets pending and recovers the
+        // track.
+        let mut parser = DvdSubParser::new(None);
+
+        // Declares 0xFFFF but only a few bytes ever arrive (corrupt size).
+        let bad = vec![0xFF, 0xFF, 0x01, 0x02, 0x03];
+        assert!(parser.parse(&make_pes(bad.clone(), Some(90000))).is_empty());
+        // A no-PTS stray continuation appends (still stuck under the bad size).
+        assert!(parser.parse(&make_pes(vec![0x04, 0x05], None)).is_empty());
+
+        // Next real subtitle (PTS present) recovers: stale flushed + new SPU.
+        let good = vec![0x00, 0x04, 0xAA, 0xBB];
+        let frames = parser.parse(&make_pes(good.clone(), Some(270000)));
+        assert_eq!(frames.len(), 2, "track recovers, not swallowed to EOF");
+        assert_eq!(frames[1].data, good);
+        assert_eq!(frames[1].pts_ns, 3_000_000_000);
+    }
+
+    #[test]
+    fn declared_size_below_two_passes_through_as_lone_frame() {
+        // SPU_size includes its own 2-byte header, so a declared size < 2 is
+        // malformed. It must pass through as a lone frame, not emit an oversized
+        // unit or get stuck pending.
+        let mut parser = DvdSubParser::new(None);
+        let data = vec![0x00, 0x00, 0xAB, 0xCD]; // declared = 0
+        let frames = parser.parse(&make_pes(data.clone(), Some(90000)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, data, "passed through whole");
+        assert!(parser.pending.is_none(), "no pending left open");
     }
 
     // ── YCbCr → RGB conversion tests ──────────────────────────────────────

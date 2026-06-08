@@ -1,6 +1,8 @@
 //! Drive session — open, identify, and read from optical drives.
 //!
-//!   4. `probe_disc()` — probe disc surface. Drive learns optimal speeds.
+//! A `Drive` is opened from a device path, identifies itself via INQUIRY,
+//! optionally unlocks/initializes via a platform driver, and reads sectors.
+//! `probe_disc()` primes the firmware's per-region speed table.
 
 pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
@@ -23,7 +25,7 @@ pub(crate) mod macos;
 pub(crate) mod windows;
 
 use crate::error::{Error, Result};
-use crate::event::{Event, EventKind};
+use crate::event::Event;
 use crate::identity::DriveId;
 use crate::platform::PlatformDriver;
 use crate::platform::mt1959::Mt1959;
@@ -114,6 +116,35 @@ impl Drive {
         })
     }
 
+    /// Test-only constructor: build a `Drive` over an arbitrary
+    /// [`ScsiTransport`] (no profile, no platform driver, no block-device
+    /// fallback) so command-builder/response-parser logic can be exercised
+    /// against a scripted mock transport.
+    #[cfg(test)]
+    fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
+        Drive {
+            scsi,
+            driver: None,
+            profile: None,
+            platform: None,
+            drive_id: DriveId {
+                vendor_id: String::new(),
+                product_id: String::new(),
+                product_revision: String::new(),
+                vendor_specific: String::new(),
+                firmware_date: String::new(),
+                serial_number: String::new(),
+                raw_inquiry: Vec::new(),
+                raw_gc_010c: Vec::new(),
+            },
+            device_path: "test".to_string(),
+            halt: Arc::new(AtomicBool::new(false)),
+            event_fn: None,
+            #[cfg(target_os = "linux")]
+            block_dev_fd: None,
+        }
+    }
+
     /// Get a clone of the halt flag. Set to true to interrupt Drive::read().
     pub fn halt_flag(&self) -> Arc<AtomicBool> {
         self.halt.clone()
@@ -132,15 +163,6 @@ impl Drive {
     /// Set an event handler for read recovery events.
     pub fn on_event(&mut self, f: impl Fn(Event) + Send + 'static) {
         self.event_fn = Some(Box::new(f));
-    }
-
-    #[allow(dead_code)] // public on_event registration kept; Drive currently
-    // has no internal emission sites after the 0.13.6 recovery strip.
-    // DiscStream is the BytesRead source. Plan to drop on_event in 0.14.
-    fn emit(&self, kind: EventKind) {
-        if let Some(ref f) = self.event_fn {
-            f(Event { kind });
-        }
     }
 
     fn is_halted(&self) -> bool {
@@ -168,7 +190,7 @@ impl Drive {
         Ok(r)
     }
 
-    /// Close the drive cleanly. Unlocks tray, flushes SCSI state, closes fd.
+    /// Close the drive cleanly. Unlocks the tray and closes the fd.
     /// Also runs automatically on Drop as a safety net.
     pub fn close(self) {
         // cleanup() runs here via Drop
@@ -245,9 +267,13 @@ impl Drive {
                 // Bit 1: media present, Bit 0: tray open
                 match media_status & 0x03 {
                     0x00 => DriveStatus::NoDisc,      // tray closed, no disc
-                    0x01 => DriveStatus::TrayOpen,    // tray open
+                    0x01 => DriveStatus::TrayOpen,    // tray open, no media
                     0x02 => DriveStatus::DiscPresent, // tray closed, disc present
-                    0x03 => DriveStatus::DiscPresent, // tray closed, disc present
+                    // 0x03 = tray-open bit AND media-present bit both set:
+                    // a contradictory/transient state. Don't report it as
+                    // ready — autorip must not start a rip on a drive that
+                    // is still settling. Treat as tray-open.
+                    0x03 => DriveStatus::TrayOpen,
                     _ => DriveStatus::Unknown,
                 }
             }
@@ -338,8 +364,12 @@ impl Drive {
                 5_000,
             )
             .ok()?;
-        if r.bytes_transferred > 8 {
-            Some(buf[8..r.bytes_transferred].to_vec())
+        // Clamp the transport-reported count to the buffer length: a
+        // misbehaving driver/bridge could report more bytes than the
+        // buffer holds, which would panic the slice.
+        let end = r.bytes_transferred.min(buf.len());
+        if end > 8 {
+            Some(buf[8..end].to_vec())
         } else {
             None
         }
@@ -372,8 +402,9 @@ impl Drive {
                 5_000,
             )
             .ok()?;
-        if r.bytes_transferred > 0 {
-            Some(buf[..r.bytes_transferred].to_vec())
+        let end = r.bytes_transferred.min(buf.len());
+        if end > 0 {
+            Some(buf[..end].to_vec())
         } else {
             None
         }
@@ -404,8 +435,9 @@ impl Drive {
                 5_000,
             )
             .ok()?;
-        if r.bytes_transferred > 0 {
-            Some(buf[..r.bytes_transferred].to_vec())
+        let end = r.bytes_transferred.min(buf.len());
+        if end > 0 {
+            Some(buf[..end].to_vec())
         } else {
             None
         }
@@ -425,8 +457,9 @@ impl Drive {
                 5_000,
             )
             .ok()?;
-        if r.bytes_transferred > 0 {
-            Some(buf[..r.bytes_transferred].to_vec())
+        let end = r.bytes_transferred.min(buf.len());
+        if end > 0 {
+            Some(buf[..end].to_vec())
         } else {
             None
         }
@@ -465,8 +498,7 @@ impl Drive {
     ///
     /// `recovery=true` uses [`crate::scsi::READ_RECOVERY_TIMEOUT_MS`] (60 s,
     /// matches sg_dd) for the `Disc::patch` pass; `recovery=false` uses
-    /// [`crate::scsi::READ_TIMEOUT_MS`] (30 s, matches the kernel's
-    /// `/sys/block/sr*/device/timeout` default) for `Disc::copy`'s fast
+    /// [`crate::scsi::READ_TIMEOUT_MS`] (10 s) for `Disc::copy`'s fast
     /// skip-forward sweep. Both budgets are generous enough that the drive
     /// can finish ECC recovery on a marginal sector — pre-0.13.21 this was
     /// 1.5 s on the fast path which forced the kernel mid-layer to time
@@ -475,12 +507,10 @@ impl Drive {
     /// `DiscStream` adaptive batch halving) handles retry policy.
     ///
     /// Inline retry phases (5× gentle + reset+reopen + 5× more) were
-    /// removed in 0.13.6. Per
-    /// the stop-wedge postmortem (2026-04-25),
-    /// the inline reset on the LG BU40N (Initio bridge) wedged drive
-    /// firmware without ever recovering a sector. The remaining recovery
-    /// layers (Disc::patch multi-pass, DiscStream batch halving) do not
-    /// touch the wedge-prone reset path.
+    /// removed in 0.13.6: on some USB-SATA bridges the inline reset wedged
+    /// drive firmware without ever recovering a sector. The remaining
+    /// recovery layers (Disc::patch multi-pass, DiscStream batch halving)
+    /// do not touch the wedge-prone reset path.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
         let timeout_ms = if recovery {
             crate::scsi::READ_RECOVERY_TIMEOUT_MS
@@ -598,14 +628,13 @@ impl Drive {
             0x00,
         ];
         let mut buf = [0u8; 8];
-        self.scsi.as_mut().execute(
+        let result = self.scsi.as_mut().execute(
             &cdb,
             crate::scsi::DataDirection::FromDevice,
             &mut buf,
             5_000,
         )?;
-        let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        Ok(last_lba + 1)
+        decode_read_capacity(&buf, result.bytes_transferred)
     }
 
     pub fn set_speed(&mut self, speed_kbs: u16) {
@@ -762,6 +791,22 @@ pub fn find_drive() -> Option<Drive> {
         .find_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
 }
 
+/// Decode a READ CAPACITY (10) response into a sector count.
+///
+/// A short transfer (`bytes_transferred < 4`, which would leave the high
+/// bytes zero-initialised and decode to a bogus 1-sector disc) is rejected
+/// as [`Error::DiscCapacityMalformed`]. The `0xFFFF_FFFF` "capacity exceeds
+/// 32-bit" sentinel, whose `last_lba + 1` overflows `u32`, is reported as the
+/// distinct [`Error::DiscCapacityOverflow`] so callers can tell an unusable
+/// response apart from an over-large disc.
+fn decode_read_capacity(buf: &[u8; 8], bytes_transferred: usize) -> Result<u32> {
+    if bytes_transferred < 4 {
+        return Err(Error::DiscCapacityMalformed);
+    }
+    let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    last_lba.checked_add(1).ok_or(Error::DiscCapacityOverflow)
+}
+
 /// Halt-aware sleep primitive — wakes within ~100 ms of `halt` flipping
 /// to true. Kept for the unit tests that cover the slicing behaviour;
 /// production code paths no longer sleep on the recovery hot path
@@ -799,9 +844,25 @@ fn discover_drives() -> Vec<(String, DriveId)> {
     }
 }
 
-/// Resolve a device path to its raw SCSI device, with optional warning message.
+/// Structured outcome of [`resolve_device`] — a machine-readable signal
+/// (no English prose) the application layer can render however it likes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceResolution {
+    /// Path resolved directly to a SCSI-generic device; no substitution.
+    Direct,
+    /// A `/dev/sr*` block path was substituted with the matching
+    /// `/dev/sg*` SCSI-generic device for raw access (Linux only).
+    SrToSg,
+    /// A `/dev/sr*` block path was given but no matching `/dev/sg*`
+    /// device could be found; the original path is returned (Linux only).
+    SrNoSgMatch,
+}
+
+/// Resolve a device path to its raw SCSI device. Returns the resolved
+/// path plus a structured [`DeviceResolution`] signal describing whether
+/// any substitution happened; the application layer maps that to UX text.
 #[allow(dead_code)]
-pub(crate) fn resolve_device(path: &str) -> Result<(String, Option<String>)> {
+pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     #[cfg(target_os = "linux")]
     {
         linux::resolve_device(path)
@@ -876,5 +937,111 @@ mod halt_tests {
         let flag = AtomicBool::new(false);
         let r = sleep_until_halted(&flag, Duration::ZERO);
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn read_capacity_short_transfer_is_rejected() {
+        // bytes_transferred < 4 must NOT decode to capacity=1 from
+        // zero-init bytes.
+        let buf = [0u8; 8];
+        assert!(matches!(
+            decode_read_capacity(&buf, 0),
+            Err(Error::DiscCapacityMalformed)
+        ));
+        assert!(matches!(
+            decode_read_capacity(&buf, 3),
+            Err(Error::DiscCapacityMalformed)
+        ));
+    }
+
+    #[test]
+    fn read_capacity_full_transfer_decodes_last_lba_plus_one() {
+        // last_lba = 0x00012344 -> capacity 0x00012345.
+        let buf = [0x00, 0x01, 0x23, 0x44, 0, 0, 0, 0];
+        assert_eq!(decode_read_capacity(&buf, 8).unwrap(), 0x0001_2345);
+    }
+
+    #[test]
+    fn read_capacity_overflow_is_rejected() {
+        // last_lba = u32::MAX (the "capacity exceeds 32-bit" sentinel) -> +1
+        // overflows; reported as the distinct DiscCapacityOverflow, not the
+        // short-transfer DiscCapacityMalformed.
+        let buf = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_read_capacity(&buf, 8),
+            Err(Error::DiscCapacityOverflow)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+    /// Mock transport: returns a fixed data payload (copied into the
+    /// caller's buffer, truncated to fit) on every `execute()`.
+    struct FixedTransport {
+        payload: Vec<u8>,
+    }
+
+    impl ScsiTransport for FixedTransport {
+        fn execute(
+            &mut self,
+            _cdb: &[u8],
+            _direction: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            let n = self.payload.len().min(data.len());
+            data[..n].copy_from_slice(&self.payload[..n]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: n,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn drive_with(payload: Vec<u8>) -> Drive {
+        Drive::from_transport_for_test(Box::new(FixedTransport { payload }))
+    }
+
+    #[test]
+    fn read_capacity_normal_adds_one() {
+        // last_lba = 0x0000_0063 (99) → capacity 100 sectors.
+        let mut d = drive_with(vec![0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x08, 0x00]);
+        assert_eq!(d.read_capacity().unwrap(), 100);
+    }
+
+    #[test]
+    fn read_capacity_sentinel_does_not_overflow() {
+        // last_lba = 0xFFFF_FFFF is the "capacity exceeds 32-bit" sentinel;
+        // +1 would overflow. Must surface DiscCapacityOverflow, not panic
+        // (debug) or wrap to 0 (release).
+        let mut d = drive_with(vec![0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x08, 0x00]);
+        assert!(matches!(
+            d.read_capacity(),
+            Err(Error::DiscCapacityOverflow)
+        ));
+    }
+
+    #[test]
+    fn drive_status_tray_open_and_media_present_is_not_ready_to_rip() {
+        // GET EVENT STATUS reply: byte 5 (media_status) low bits = 0b11
+        // (tray-open AND media-present, contradictory). Must NOT report
+        // DiscPresent. Buffer is 8 bytes; bytes_transferred >= 6.
+        let mut buf = vec![0u8; 8];
+        buf[5] = 0x03;
+        let mut d = drive_with(buf);
+        assert_eq!(d.drive_status(), DriveStatus::TrayOpen);
+    }
+
+    #[test]
+    fn drive_status_disc_present_maps_correctly() {
+        let mut buf = vec![0u8; 8];
+        buf[5] = 0x02; // media present, tray closed
+        let mut d = drive_with(buf);
+        assert_eq!(d.drive_status(), DriveStatus::DiscPresent);
     }
 }

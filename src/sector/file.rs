@@ -57,11 +57,17 @@ impl FileSectorSink {
 
 impl SectorSink for FileSectorSink {
     fn write_sectors(&mut self, lba: u32, buf: &[u8]) -> Result<()> {
-        debug_assert!(
-            buf.len() % 2048 == 0,
-            "FileSectorSink::write_sectors: buf len {} not a multiple of 2048",
-            buf.len()
-        );
+        // SectorSink's contract requires a 2048-multiple buffer. Enforce
+        // it in all build modes (a `debug_assert!` is a no-op in release):
+        // a misaligned buffer would `write_all` partial bytes at
+        // lba*2048 and silently corrupt the ISO. Current in-tree callers
+        // always pass aligned buffers; this guards the public trait
+        // contract against any (including future external) caller.
+        if buf.len() % 2048 != 0 {
+            return Err(Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            });
+        }
         let offset = lba as u64 * 2048;
         self.inner
             .seek(SeekFrom::Start(offset))

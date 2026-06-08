@@ -14,8 +14,9 @@
 //!
 //! This module is intentionally separate from the BD-J `StreamLabel`
 //! parsers under `labels/*.rs`. The XML here is disc-level (title,
-//! description, set position), not per-stream — wiring into the main
-//! parser registry happens elsewhere.
+//! description, set position), not per-stream. It is invoked from the
+//! disc-scan path in [`labels`](super) ([`detect`] then [`parse`]),
+//! and [`DiscMetadata`] is re-exported there.
 //!
 //! Real-world XML is irregular: missing description elements, multiple
 //! title elements (first one wins), and occasional malformed content.
@@ -23,12 +24,16 @@
 //! metadata" (returns `None` from the helper), and the caller can
 //! still get metadata from sibling-language XML files.
 
-// The module wiring (registry hook + public re-export) is added
-// separately. Until then the parse/detect entry points have no
 use super::xml;
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
+
+/// Upper bound on the size of a single `bdmt_<lang>.xml` we will read.
+/// The size comes from attacker-controlled UDF metadata; real files are
+/// a few KB, so 1 MiB is generous while preventing a crafted huge-size
+/// entry from triggering an oversized allocation in `read_file`.
+const MAX_BDMT_BYTES: u64 = 1024 * 1024;
 
 /// Disc-level metadata extracted from `/BDMV/META/DL/bdmt_*.xml`.
 ///
@@ -71,6 +76,13 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata>
         let Some(lang) = lang_code_from_filename(&entry.name) else {
             continue;
         };
+        // entry.size is attacker-controlled UDF metadata and flows into
+        // a Vec::with_capacity in read_file. A real BDMV bdmt XML is a
+        // few KB; cap well above that so a crafted multi-GB size can't
+        // trigger a huge allocation before any parsing.
+        if !bdmt_size_acceptable(entry.size) {
+            continue;
+        }
         let path = format!("/BDMV/META/DL/{}", entry.name);
         let Ok(bytes) = udf.read_file(reader, &path) else {
             continue;
@@ -78,7 +90,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata>
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        let Some((title, description, disc_set)) = parse_bdmt_xml(&lang, text) else {
+        let Some((title, description, disc_set)) = parse_bdmt_xml(text) else {
             continue;
         };
         out.titles.insert(lang.clone(), title);
@@ -100,6 +112,13 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<DiscMetadata>
     } else {
         Some(out)
     }
+}
+
+/// Gate a `bdmt_<lang>.xml` file by its declared (untrusted) UDF size
+/// before reading it. Anything over [`MAX_BDMT_BYTES`] is skipped to
+/// avoid an oversized allocation in `read_file`.
+fn bdmt_size_acceptable(size: u64) -> bool {
+    size <= MAX_BDMT_BYTES
 }
 
 /// True if `name` matches the `bdmt_<lang>.xml` convention with a
@@ -134,13 +153,13 @@ pub(crate) type BdmtFields = (String, Option<String>, Option<(u32, u32)>);
 /// Title-element preference: `<di:name>` → `<di:title>` →
 /// `<di:tableOfContents>/<di:titleName>` (first match wins, per the
 /// authoring-tool conventions documented at the module level).
-pub(crate) fn parse_bdmt_xml(_lang_code: &str, xml_text: &str) -> Option<BdmtFields> {
+pub(crate) fn parse_bdmt_xml(xml_text: &str) -> Option<BdmtFields> {
     let title = extract_title(xml_text)?;
+    // xml::text already returns a trimmed string (see xml::text), so the
+    // description is only filtered for emptiness and XML-fragment noise.
     let description = xml::text(xml_text, "description")
         .filter(|s| !s.is_empty())
-        .filter(|s| !looks_like_xml(s))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !looks_like_xml(s));
     let disc_set = extract_disc_set(xml_text);
     Some((title, description, disc_set))
 }
@@ -162,11 +181,12 @@ fn extract_title(xml_text: &str) -> Option<String> {
     // Order matches the module-level convention: <di:name> first
     // (Paramount-style), then <di:title>, then the nested
     // tableOfContents/titleName form.
+    // xml::text already trims its result, so an empty string after
+    // extraction means a genuinely empty element.
     for tag in ["name", "title"] {
         if let Some(s) = xml::text(xml_text, tag) {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            if !s.is_empty() {
+                return Some(s);
             }
         }
     }
@@ -175,9 +195,8 @@ fn extract_title(xml_text: &str) -> Option<String> {
     if let Some((s, e)) = xml::find_element(xml_text, "tableOfContents", 0) {
         let block = &xml_text[s..e];
         if let Some(t) = xml::text(block, "titleName") {
-            let trimmed = t.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            if !t.is_empty() {
+                return Some(t);
             }
         }
     }
@@ -197,6 +216,12 @@ fn extract_disc_set(xml_text: &str) -> Option<(u32, u32)> {
         .trim()
         .parse::<u32>()
         .ok()?;
+    // Reject nonsensical "Disc N of M" values: (0,0), (0,5), (5,2)...
+    // These serialize to JSON and reach downstream consumers as
+    // meaningless metadata.
+    if n < 1 || total < 1 || n > total {
+        return None;
+    }
     Some((n, total))
 }
 
@@ -212,7 +237,7 @@ mod tests {
 <discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
   <di:name>Aurora Drift</di:name>
 </discInfo>"#;
-        let (title, desc, set) = parse_bdmt_xml("eng", xml).expect("title should parse");
+        let (title, desc, set) = parse_bdmt_xml(xml).expect("title should parse");
         assert_eq!(title, "Aurora Drift");
         assert_eq!(desc, None);
         assert_eq!(set, None);
@@ -226,7 +251,7 @@ mod tests {
   <di:title>Echo Chamber</di:title>
   <di:description>A film about machines.</di:description>
 </discInfo>"#;
-        let (title, desc, _) = parse_bdmt_xml("eng", xml).unwrap();
+        let (title, desc, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Echo Chamber");
         assert_eq!(desc.as_deref(), Some("A film about machines."));
     }
@@ -241,8 +266,52 @@ mod tests {
     <di:titleName>Feelings Two</di:titleName>
   </di:tableOfContents>
 </discInfo>"#;
-        let (title, _, _) = parse_bdmt_xml("eng", xml).unwrap();
+        let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Feelings Two");
+    }
+
+    #[test]
+    fn bdmt_size_gate_rejects_oversized_entries() {
+        assert!(bdmt_size_acceptable(0));
+        assert!(bdmt_size_acceptable(4096));
+        assert!(bdmt_size_acceptable(MAX_BDMT_BYTES));
+        assert!(!bdmt_size_acceptable(MAX_BDMT_BYTES + 1));
+        // A crafted multi-GB size is rejected before any allocation.
+        assert!(!bdmt_size_acceptable(8 * 1024 * 1024 * 1024));
+        assert!(!bdmt_size_acceptable(u64::MAX));
+    }
+
+    #[test]
+    fn disc_set_rejects_nonsensical_pairs() {
+        // n > total, zero numerator, zero denominator → all None.
+        let over = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+  <di:name>X</di:name>
+  <di:discNumber>5</di:discNumber>
+  <di:numSets>2</di:numSets>
+</discInfo>"#;
+        assert_eq!(parse_bdmt_xml(over).unwrap().2, None);
+
+        let zero_n = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+  <di:name>X</di:name>
+  <di:discNumber>0</di:discNumber>
+  <di:numSets>5</di:numSets>
+</discInfo>"#;
+        assert_eq!(parse_bdmt_xml(zero_n).unwrap().2, None);
+
+        let zero_total = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+  <di:name>X</di:name>
+  <di:discNumber>1</di:discNumber>
+  <di:numSets>0</di:numSets>
+</discInfo>"#;
+        assert_eq!(parse_bdmt_xml(zero_total).unwrap().2, None);
+
+        // A valid pair still passes.
+        let ok = r#"<discInfo xmlns:di="urn:BDA:bdmv;disclibmeta">
+  <di:name>X</di:name>
+  <di:discNumber>2</di:discNumber>
+  <di:numSets>3</di:numSets>
+</discInfo>"#;
+        assert_eq!(parse_bdmt_xml(ok).unwrap().2, Some((2, 3)));
     }
 
     #[test]
@@ -252,7 +321,7 @@ mod tests {
   <di:discNumber>2</di:discNumber>
   <di:numSets>5</di:numSets>
 </discInfo>"#;
-        let (_, _, set) = parse_bdmt_xml("eng", xml).unwrap();
+        let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((2, 5)));
     }
 
@@ -264,7 +333,7 @@ mod tests {
   <di:discNumber>3</di:discNumber>
   <di:numberOfSets>6</di:numberOfSets>
 </discInfo>"#;
-        let (_, _, set) = parse_bdmt_xml("eng", xml).unwrap();
+        let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, Some((3, 6)));
     }
 
@@ -276,7 +345,7 @@ mod tests {
   <di:name>X</di:name>
   <di:discNumber>1</di:discNumber>
 </discInfo>"#;
-        let (_, _, set) = parse_bdmt_xml("eng", xml).unwrap();
+        let (_, _, set) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(set, None);
     }
 
@@ -296,7 +365,7 @@ mod tests {
 
         let mut meta = DiscMetadata::default();
         for (lang, blob) in [("eng", eng_xml), ("fra", fra_xml)] {
-            let (title, desc, ds) = parse_bdmt_xml(lang, blob).unwrap();
+            let (title, desc, ds) = parse_bdmt_xml(blob).unwrap();
             meta.titles.insert(lang.to_string(), title);
             if let Some(d) = desc {
                 meta.descriptions.insert(lang.to_string(), d);
@@ -333,20 +402,20 @@ mod tests {
         // surfaces as None to its caller. Either is documented as
         // acceptable per the module spec.
         let bad = "this is not xml &&& <<< nope";
-        assert!(parse_bdmt_xml("eng", bad).is_none());
+        assert!(parse_bdmt_xml(bad).is_none());
 
         // Half-open tag, no body, no close: also yields no title.
         let truncated = "<discInfo><di:name>";
-        assert!(parse_bdmt_xml("eng", truncated).is_none());
+        assert!(parse_bdmt_xml(truncated).is_none());
     }
 
     #[test]
     fn description_with_only_child_xml_is_dropped() {
-        // Real-world bug from a captured disc (2026-05-11
-        // capture): <di:description> contained only <di:thumbnail/>
-        // child elements with no actual prose. The previous parser
-        // surfaced the raw XML fragment as the description string.
-        // Now we reject candidates that begin with `<`.
+        // Real-world bug: <di:description> contained only
+        // <di:thumbnail/> child elements with no actual prose. The
+        // previous parser surfaced the raw XML fragment as the
+        // description string. Now we reject candidates that begin
+        // with `<`.
         let xml = r#"<discInfo>
             <di:name>Skyline Run</di:name>
             <di:description>
@@ -355,7 +424,7 @@ mod tests {
             </di:description>
         </discInfo>"#;
         let (title, description, _) =
-            parse_bdmt_xml("eng", xml).expect("title is present so parse must succeed");
+            parse_bdmt_xml(xml).expect("title is present so parse must succeed");
         assert_eq!(title, "Skyline Run");
         assert!(
             description.is_none(),
@@ -371,7 +440,7 @@ mod tests {
             <di:name>Some Movie</di:name>
             <di:description>An epic tale of one man's quest for tea.</di:description>
         </discInfo>"#;
-        let (_, description, _) = parse_bdmt_xml("eng", xml).expect("must parse");
+        let (_, description, _) = parse_bdmt_xml(xml).expect("must parse");
         assert_eq!(
             description.as_deref(),
             Some("An epic tale of one man's quest for tea.")
@@ -383,7 +452,7 @@ mod tests {
         let xml = r#"<discInfo><di:name>
             Aurora Drift
         </di:name></discInfo>"#;
-        let (title, _, _) = parse_bdmt_xml("eng", xml).unwrap();
+        let (title, _, _) = parse_bdmt_xml(xml).unwrap();
         assert_eq!(title, "Aurora Drift");
     }
 

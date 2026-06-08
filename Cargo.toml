@@ -1,6 +1,6 @@
 [package]
 name = "libfreemkv"
-version = "0.30.7"
+version = "0.31.0"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -9,7 +9,11 @@ repository = "https://github.com/freemkv/libfreemkv"
 keywords = ["bluray", "uhd", "optical", "scsi", "disc"]
 categories = ["hardware-support", "multimedia"]
 # Keep internal AI-instruction / private notes out of the published crate.
-exclude = []
+exclude = ["CLAUDE.md"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +31,7 @@ cmac = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22.1"
 # Trace-level instrumentation for Disc::copy + SgIoTransport::execute. Permitted
-# under project docs ("Acceptable strings: debug/trace logging"). Consumers (autorip)
+# under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
 # wire a tracing subscriber and pipe events into the JSONL debug log.
 tracing = "0.1"
 # Bounded MPSC channel with kernel-wakeup send_timeout. Used by `io::pipeline`

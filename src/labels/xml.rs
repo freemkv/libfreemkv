@@ -37,6 +37,19 @@ pub fn attr(element: &str, name: &str) -> Option<String> {
     let name_bytes = name_lower.as_bytes();
     let mut i = 0;
     while i + name_bytes.len() < bytes.len() {
+        // Skip over a quoted attribute value entirely so a name token
+        // embedded inside another attribute's value (e.g.
+        // `y="name='inner'"`) is never matched as a real attribute.
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            // Step past the closing quote (or to EOF).
+            i += 1;
+            continue;
+        }
         // Find the next position where `name=` could start. We need
         // a word boundary before the name (whitespace or `<` or `:`).
         if i > 0 && is_name_char(bytes[i - 1]) {
@@ -96,17 +109,13 @@ pub fn attr(element: &str, name: &str) -> Option<String> {
 /// handled — the first close encountered wins (this matches the
 /// prior behavior in criterion.rs).
 pub fn text(xml: &str, tag: &str) -> Option<String> {
-    let (open_end, body_start) = find_open_tag(xml, tag, 0)?;
-    // Self-closing — already consumed in find_open_tag if `/>`.
-    if open_end == body_start {
-        // Means find_open_tag returned the same offset twice for
-        // self-closing form. (Not currently the case in our impl,
-        // but defensive.)
-        return Some(String::new());
-    }
-    // For self-closing tags, body_start is past `/>` and we have no
-    // content. Detect by checking the char at body_start - 1 was `/`.
-    if body_start >= 2 && &xml[body_start - 2..body_start] == "/>" {
+    let (_open_end, body_start) = find_open_tag(xml, tag, 0)?;
+    // For self-closing tags, body_start is past `/>` and there is no
+    // content. Detect with a *byte* comparison: slicing `&xml[..]` two
+    // bytes back can land inside a multi-byte UTF-8 char and panic
+    // (untrusted on-disc XML), but indexing the byte slice never does.
+    let b = xml.as_bytes();
+    if body_start >= 2 && b[body_start - 2] == b'/' && b[body_start - 1] == b'>' {
         return Some(String::new());
     }
     // Find the matching close tag. Case-insensitive + namespace-aware.
@@ -121,9 +130,9 @@ pub fn text(xml: &str, tag: &str) -> Option<String> {
 /// iterating over repeated elements like `<playlist>` blocks in
 /// `paramount`.
 ///
-/// Self-closing elements return the same offset for body_end as the
-/// element_end (i.e. `element_end - element_start` includes only the
-/// `<tag .../>` text).
+/// For self-closing elements, `element_end` points just past `/>` and
+/// there is no separate body range (`element_end - element_start`
+/// spans only the `<tag .../>` text).
 pub fn find_element(xml: &str, tag: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = xml.as_bytes();
     let mut i = from;
@@ -190,8 +199,9 @@ pub fn find_element(xml: &str, tag: &str, from: usize) -> Option<(usize, usize)>
 /// The character after the tag name must not be a name-continuation
 /// (so `<player>` doesn't match `<play>`).
 fn matches_tag_name_at(bytes: &[u8], start: usize, tag: &str) -> bool {
-    let tag_lower = tag.to_ascii_lowercase();
-    let tag_bytes = tag_lower.as_bytes();
+    // Compare case-insensitively without allocating a lowercased copy
+    // of `tag` on every call (hot path: once per `<`/`</`).
+    let tag_bytes = tag.as_bytes();
     // Skip optional `prefix:` (one or more name chars + `:`).
     let mut name_start = start;
     let mut scan = start;
@@ -204,7 +214,7 @@ fn matches_tag_name_at(bytes: &[u8], start: usize, tag: &str) -> bool {
     if name_start + tag_bytes.len() > bytes.len() {
         return false;
     }
-    if !slice_eq_ignore_case(&bytes[name_start..name_start + tag_bytes.len()], tag_bytes) {
+    if !bytes[name_start..name_start + tag_bytes.len()].eq_ignore_ascii_case(tag_bytes) {
         return false;
     }
     // Boundary: char after the tag name must be `>`, `/`, whitespace.
@@ -448,5 +458,29 @@ mod tests {
         let xml = r#"<root><ns:item id="1" /></root>"#;
         let (s, e) = find_element(xml, "item", 0).unwrap();
         assert_eq!(&xml[s..e], r#"<ns:item id="1" />"#);
+    }
+
+    #[test]
+    fn text_multibyte_before_self_close_does_not_panic() {
+        // A multi-byte UTF-8 char ending right before the `/>` used to
+        // panic on a non-char-boundary str slice in `text()`. The
+        // byte-level self-closing check must handle it cleanly.
+        // 'é' (0xC3 0xA9) directly precedes the `/>`.
+        assert_eq!(text("<x>é</x>", "x"), Some("é".into()));
+        // Self-closing form with a multi-byte char in an attr value.
+        assert_eq!(text(r#"<x a="é"/>"#, "x"), Some("".into()));
+        assert_eq!(text("<x>日本語</x>", "x"), Some("日本語".into()));
+    }
+
+    #[test]
+    fn attr_not_matched_inside_quoted_value() {
+        // `name` appears only inside another attribute's quoted value;
+        // it must NOT be returned as a real attribute.
+        assert_eq!(attr(r#"<x y="name='inner'"/>"#, "name"), None);
+        // A real `name` attribute after a decoy value still resolves.
+        assert_eq!(
+            attr(r#"<x y="name='inner'" name="real"/>"#, "name"),
+            Some("real".into())
+        );
     }
 }

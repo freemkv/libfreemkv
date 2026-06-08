@@ -77,6 +77,14 @@ pub struct DvdAudioAttr {
     pub channels: u8,
     pub sample_rate: u32,
     pub language: String,
+    /// The PES `private_stream_1` sub-stream id this audio stream carries
+    /// on the wire (AC-3: `0x80..=0x87`, DTS: `0x88..=0x8F`, LPCM:
+    /// `0xA0..=0xA7`), assigned by per-codec ordinal during the scan.
+    /// `None` for codecs carried as a regular MPEG-audio PES (MP1/MP2,
+    /// stream_id `0xC0..`) which don't use a private-stream-1 sub-id.
+    /// This is the single routing key shared with the muxer's `dvd_pid()`
+    /// so the two never disagree on a mixed-codec title.
+    pub sub_stream_id: Option<u8>,
 }
 
 /// DVD subtitle stream attributes.
@@ -301,6 +309,12 @@ fn parse_vts(
         }
         audio_streams.push(parse_audio_attr(&vts_data, aoff)?);
     }
+    // Assign each audio stream its on-wire private_stream_1 sub-stream id
+    // by per-codec ordinal — the same convention DVD authoring uses (AC-3
+    // 0x80+, DTS 0x88+, LPCM 0xA0+). This is the routing key shared with
+    // the muxer; per-codec ordinals (not the positional index) are what
+    // keep mixed-codec titles from colliding.
+    assign_audio_sub_stream_ids(&mut audio_streams);
 
     // Subtitle streams: count at 0x254 (u16 BE), then 6 bytes each starting at 0x256
     let num_subs = if vts_data.len() >= 0x256 {
@@ -415,7 +429,47 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
         channels,
         sample_rate,
         language,
+        // Assigned by `assign_audio_sub_stream_ids` once all streams in the
+        // title set are known (the sub-id is a per-codec ordinal).
+        sub_stream_id: None,
     })
+}
+
+/// Assign the on-wire `private_stream_1` sub-stream id to each audio
+/// stream by per-codec ordinal, matching DVD authoring convention and the
+/// muxer's `dvd_pid()` routing:
+///   - AC-3  → `0x80 + n` (n = 0-based index among AC-3 streams)
+///   - DTS   → `0x88 + n`
+///   - LPCM  → `0xA0 + n`
+///   - MP1/MP2 and anything else → `None` (regular MPEG-audio PES, not a
+///     private-stream-1 sub-id).
+///
+/// Indices saturate at the codec range ceiling (8 AC-3/DTS, 8 LPCM) so a
+/// malformed over-count never produces an out-of-range sub-id.
+fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
+    let mut n_ac3 = 0u8;
+    let mut n_dts = 0u8;
+    let mut n_lpcm = 0u8;
+    for s in streams.iter_mut() {
+        s.sub_stream_id = match s.codec {
+            Codec::Ac3 => {
+                let id = 0x80 + n_ac3.min(7);
+                n_ac3 = n_ac3.saturating_add(1);
+                Some(id)
+            }
+            Codec::Dts => {
+                let id = 0x88 + n_dts.min(7);
+                n_dts = n_dts.saturating_add(1);
+                Some(id)
+            }
+            Codec::Lpcm => {
+                let id = 0xA0 + n_lpcm.min(7);
+                n_lpcm = n_lpcm.saturating_add(1);
+                Some(id)
+            }
+            _ => None,
+        };
+    }
 }
 
 /// Parse one subtitle stream attribute block (6 bytes at `offset`).
@@ -481,7 +535,10 @@ fn parse_pgcit(
 
         match parse_pgc(data, pgc_abs, chapter_count) {
             Ok(title) => titles.push(title),
-            Err(_) => continue, // skip malformed PGCs
+            // By design: a single unparseable PGC (truncated/corrupt entry,
+            // authoring-tool quirk) must not lose the whole title list.
+            // Skip it and keep collecting the titles that do parse.
+            Err(_) => continue,
         }
     }
 
@@ -707,6 +764,7 @@ mod tests {
             channels: 6,
             sample_rate: 48000,
             language: "en".to_string(),
+            sub_stream_id: Some(0x80),
         };
         assert_eq!(audio.channels, 6);
 
@@ -824,6 +882,54 @@ mod tests {
         assert_eq!(attr.sample_rate, 48000);
         assert_eq!(attr.channels, 6);
         assert_eq!(attr.language, "en");
+    }
+
+    #[test]
+    fn mixed_codec_sub_stream_ids_are_distinct() {
+        // A title mixing AC-3, DTS and LPCM must get per-codec ordinal
+        // sub-ids (0x80, 0x88, 0xA0...), all distinct — this is the
+        // routing key that keeps mixed-codec audio from colliding.
+        let mut streams = vec![
+            DvdAudioAttr {
+                codec: Codec::Ac3,
+                channels: 6,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+            DvdAudioAttr {
+                codec: Codec::Dts,
+                channels: 6,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+            DvdAudioAttr {
+                codec: Codec::Lpcm,
+                channels: 2,
+                sample_rate: 48000,
+                language: "fr".into(),
+                sub_stream_id: None,
+            },
+            DvdAudioAttr {
+                codec: Codec::Ac3,
+                channels: 2,
+                sample_rate: 48000,
+                language: "es".into(),
+                sub_stream_id: None,
+            },
+        ];
+        assign_audio_sub_stream_ids(&mut streams);
+        assert_eq!(streams[0].sub_stream_id, Some(0x80)); // AC-3 #0
+        assert_eq!(streams[1].sub_stream_id, Some(0x88)); // DTS  #0
+        assert_eq!(streams[2].sub_stream_id, Some(0xA0)); // LPCM #0
+        assert_eq!(streams[3].sub_stream_id, Some(0x81)); // AC-3 #1
+        // All sub-ids unique.
+        let ids: Vec<u8> = streams.iter().filter_map(|s| s.sub_stream_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
     }
 
     #[test]

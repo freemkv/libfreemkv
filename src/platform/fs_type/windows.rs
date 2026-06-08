@@ -2,9 +2,10 @@
 //!
 //! Heuristic-only: any UNC path (`\\server\share\...`) is treated as a
 //! network mount and bucketed into `Nfs`. Strictly, SMB is not NFS, but
-//! the buffering-policy outcome for our purposes is the same — there is
-//! no platform `WritebackFile` machinery on Windows yet, so the worst
-//! case of a false positive is using `LocalFileSink` regardless. A
+//! the buffering-policy outcome is the same here — there is no platform
+//! `WritebackFile` machinery on Windows yet, so both `Nfs` and `Local`
+//! select `LocalFileSink`. A misclassification in either direction is
+//! therefore harmless on Windows today: the sink choice does not change. A
 //! proper `GetVolumeInformation` query is a Phase 4 concern.
 
 use std::path::Path;

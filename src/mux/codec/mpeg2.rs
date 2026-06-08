@@ -9,6 +9,7 @@
 //! - Sequence extension: 00 00 01 B5
 //! - Picture header: 00 00 01 00
 
+use super::startcode::find_start_code;
 use super::{CodecParser, Frame, pts_to_ns};
 use crate::mux::ts::PesPacket;
 
@@ -61,6 +62,7 @@ impl Default for Mpeg2Parser {
 }
 
 impl Mpeg2Parser {
+    /// Create a new MPEG-2 parser with no captured sequence-header state.
     pub fn new() -> Self {
         Self {
             seq_header: None,
@@ -102,8 +104,13 @@ impl CodecParser for Mpeg2Parser {
         // PTS-based seeking. Fall back to DTS only if PTS is absent.
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
-        let mut keyframe = false;
+        // Keyframe-ness is a property of the coded PICTURE, not of a sequence
+        // header. A PES may carry a sequence header followed by a P/B-frame
+        // (open-GOP / re-encoded MPEG-2); the picture, not the seq header,
+        // decides the cue point. Set this only from the PICTURE_CODE arm.
+        let mut picture_is_keyframe = false;
         let mut has_picture = false;
+        let mut saw_seq_header = false;
 
         // Scan for start codes in the elementary stream data.
         let mut pos = 0;
@@ -165,7 +172,19 @@ impl CodecParser for Mpeg2Parser {
                     };
 
                     self.seq_header = Some(data[hdr_start..hdr_end].to_vec());
-                    keyframe = true;
+                    // A NEW sequence header replaces the stored one, so its B5
+                    // sequence extension must be re-captured. Reset the flag the
+                    // SEQ_EXT_CODE arm guards on; otherwise, once the first
+                    // header's B3+B5 pair was seen, every later header (channel
+                    // change, title boundary, parser reuse) would be stored
+                    // without its extension bytes — corrupting codecPrivate
+                    // (interlace, chroma format, progressive-sequence flags).
+                    self.has_extension = false;
+                    // NOTE: a sequence header does NOT make the access unit a
+                    // keyframe — that is decided solely by the PICTURE_CODE arm
+                    // (picture_is_keyframe). Setting it here would mis-cue a
+                    // seq-header-followed-by-P/B-frame PES.
+                    saw_seq_header = true;
                     pos = if next_sc.is_some() { hdr_end } else { sc + 4 };
                 }
                 SEQ_EXT_CODE if self.seq_header.is_some() && !self.has_extension => {
@@ -185,7 +204,7 @@ impl CodecParser for Mpeg2Parser {
                     if sc + 5 < data.len() {
                         let picture_coding_type = (data[sc + 5] >> 3) & 0x07;
                         if picture_coding_type == PICTURE_TYPE_I {
-                            keyframe = true;
+                            picture_is_keyframe = true;
                         }
                     }
                     pos = sc + 4;
@@ -209,13 +228,15 @@ impl CodecParser for Mpeg2Parser {
         // header and no picture. A PES with neither (e.g. a slice
         // continuation) still passes through unchanged, preserving real
         // keyframe detection.
-        if !has_picture && contains_seq_header(data) {
+        // `saw_seq_header` is set by the scan loop's SEQ_HEADER_CODE arm above,
+        // so this reuses that single pass instead of re-scanning the PES bytes.
+        if !has_picture && saw_seq_header {
             return Vec::new();
         }
 
         vec![Frame {
             pts_ns,
-            keyframe,
+            keyframe: picture_is_keyframe,
             data: pes.data.clone(),
             duration_ns: None,
         }]
@@ -262,29 +283,6 @@ fn parse_aspect_ratio(hdr: &[u8]) -> Option<(u8, u8)> {
         return None;
     }
     Some(ASPECT_RATIOS[ar_code])
-}
-
-/// Returns true if `data` contains a sequence-header start code (00 00 01 B3).
-fn contains_seq_header(data: &[u8]) -> bool {
-    let mut pos = 0;
-    while let Some(sc) = find_start_code(data, pos) {
-        if sc + 3 >= data.len() {
-            break;
-        }
-        if data[sc + 3] == SEQ_HEADER_CODE {
-            return true;
-        }
-        pos = sc + 4;
-    }
-    false
-}
-
-/// Find the position of the next start code (00 00 01) at or after `from`.
-fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
-    if data.len() < from + 3 {
-        return None;
-    }
-    (from..data.len() - 2).find(|&i| data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01)
 }
 
 #[cfg(test)]
@@ -487,6 +485,33 @@ mod tests {
         assert!(parser.codec_private().is_some());
     }
 
+    // --- seq-header keyframe flag must not leak into a P/B-frame ---
+
+    #[test]
+    fn seq_header_then_p_frame_is_not_keyframe() {
+        // A PES carrying a sequence header followed by a P-frame (open-GOP /
+        // re-encoded MPEG-2) must NOT be flagged a keyframe — the keyframe-ness
+        // belongs to the coded picture, not the sequence header. A spurious
+        // keyframe here produces a bad MKV cue point.
+        let mut parser = Mpeg2Parser::new();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&make_seq_header(720, 480, 3, 4));
+        data.extend_from_slice(&make_picture_header(2)); // P-frame
+        data.extend_from_slice(&[0xFF; 16]);
+
+        let pes = make_pes(data, Some(0));
+        let frames = parser.parse(&pes);
+
+        assert_eq!(frames.len(), 1);
+        assert!(
+            !frames[0].keyframe,
+            "seq-header + P-frame must not be a keyframe"
+        );
+        // The sequence header is still captured for codecPrivate.
+        assert!(parser.codec_private().is_some());
+    }
+
     // --- parameter-set-only PES (seq header, no picture) emits no frame ---
 
     #[test]
@@ -520,6 +545,49 @@ mod tests {
         let frames2 = parser.parse(&make_pes(data2, Some(3600)));
         assert_eq!(frames2.len(), 1);
         assert!(frames2[0].keyframe);
+    }
+
+    // --- a SECOND sequence header re-captures its extension ---
+
+    #[test]
+    fn new_sequence_header_recaptures_extension() {
+        // Regression: has_extension was never reset when a new sequence header
+        // replaced the stored one, so a second header (channel change / title
+        // boundary) was stored WITHOUT its B5 sequence extension. To exercise
+        // the SEQ_EXT_CODE arm (which the has_extension flag guards), each
+        // header and its extension arrive in SEPARATE PES packets.
+        let mut parser = Mpeg2Parser::new();
+
+        // Header A (no trailing start code → captured alone), then its B5
+        // extension in the next PES.
+        let _ = parser.parse(&make_pes(make_seq_header(1920, 1080, 3, 4), Some(0)));
+        let mut ext_a = vec![0x00, 0x00, 0x01, SEQ_EXT_CODE];
+        ext_a.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        let _ = parser.parse(&make_pes(ext_a, Some(0)));
+        assert!(
+            parser
+                .codec_private()
+                .unwrap()
+                .windows(6)
+                .any(|w| w == [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+            "first header's extension captured (has_extension now true)"
+        );
+
+        // A NEW header B, then ITS extension in a separate PES. With the bug,
+        // has_extension stayed true and this extension would be dropped.
+        let _ = parser.parse(&make_pes(make_seq_header(720, 480, 2, 4), Some(3600)));
+        let mut ext_b = vec![0x00, 0x00, 0x01, SEQ_EXT_CODE];
+        ext_b.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let _ = parser.parse(&make_pes(ext_b, Some(3600)));
+
+        let cp2 = parser.codec_private().unwrap();
+        assert!(
+            cp2.windows(6)
+                .any(|w| w == [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+            "second header's extension must be re-captured, not dropped"
+        );
+        // It is header B (720x480), not stale header A.
+        assert_eq!(parser.resolution(), Some((720, 480)));
     }
 
     // --- PTS conversion ---

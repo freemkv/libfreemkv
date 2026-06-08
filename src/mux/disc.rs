@@ -5,7 +5,7 @@
 //!
 //! Read-only. For disc→ISO (raw sector copy), use `Disc::copy()`.
 
-use crate::disc::{Disc, DiscTitle, Extent};
+use crate::disc::{DiscTitle, Extent};
 use crate::drive::extract_scsi_context;
 use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
@@ -107,7 +107,6 @@ pub struct DiscStream {
     /// (raw / unencrypted disc) makes the decorator a pass-through.
     reader: DecryptingSectorSource<Box<dyn SectorSource>>,
     title: DiscTitle,
-    disc: Option<Disc>,
     /// Mirror of the keys handed in at construction. The decorator
     /// owns the cryptographic state; this field is kept for
     /// metadata-side callers (`info()` and friends) that want to
@@ -159,6 +158,17 @@ pub struct DiscStream {
     parsers: Vec<(u16, Box<dyn super::codec::CodecParser>)>,
     pending_frames: std::collections::VecDeque<crate::pes::PesFrame>,
     pid_to_track: Vec<(u16, usize)>,
+    /// Cached `FREEMKV_SKIP_PARSE` profiling flag. The env var cannot
+    /// change at runtime, and `std::env::var_os` takes a process-wide
+    /// lock; reading it once at construction keeps it out of the
+    /// per-batch read() hot loop.
+    skip_parse: bool,
+    /// Cached `FREEMKV_PROFILE` presence, read once at construction. When
+    /// false, the read() loop skips the four `Instant::now()` captures and the
+    /// `prof_tick` calls entirely, so profiling-off runs pay no per-iteration
+    /// timestamp cost or `prof_active()` env-var lookup (which takes a
+    /// process-wide lock).
+    profiling: bool,
 }
 
 impl DiscStream {
@@ -177,11 +187,15 @@ impl DiscStream {
         let extents = title.extents.clone();
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
-        // Debug log reader type at construction — critical for diagnosing mux reading from drive instead of ISO
+        // Debug log reader type at construction — critical for diagnosing mux
+        // reading from drive instead of ISO. `type_name_of_val(&*reader)`
+        // resolves the CONCRETE type behind the box (Drive / FileSectorSource),
+        // unlike `type_name::<dyn SectorSource>()` which always prints the
+        // trait-object name regardless of the underlying source.
         tracing::debug!(
             target: "mux",
             "DiscStream constructed with reader type: {}",
-            std::any::type_name::<dyn SectorSource>()
+            std::any::type_name_of_val(&*reader)
         );
 
         let mut pids = Vec::new();
@@ -220,7 +234,6 @@ impl DiscStream {
             // the decorator is a pass-through.
             reader: DecryptingSectorSource::new(reader, decrypt_keys.clone()),
             title,
-            disc: None,
             decrypt_keys,
             extents,
             current_extent: 0,
@@ -240,6 +253,8 @@ impl DiscStream {
             parsers,
             pending_frames: std::collections::VecDeque::new(),
             pid_to_track,
+            skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
+            profiling: std::env::var_os("FREEMKV_PROFILE").is_some(),
         }
     }
 
@@ -298,11 +313,6 @@ impl DiscStream {
         self.reader.set_keys(crate::decrypt::DecryptKeys::None);
     }
 
-    /// Get the scanned Disc (for listing all titles).
-    pub fn disc(&self) -> Option<&Disc> {
-        self.disc.as_ref()
-    }
-
     fn fill_extents(&mut self) -> io::Result<bool> {
         if self.current_extent >= self.extents.len() {
             return Ok(false);
@@ -317,7 +327,10 @@ impl DiscStream {
             return self.fill_extents();
         }
 
-        let lba = ext_start + self.current_offset;
+        // start_lba comes from UDF/MPLS extents; a malformed extent near
+        // u32::MAX would overflow (debug panic / release wrap to a wrong LBA).
+        // Saturate for consistency with the rest of the file's arithmetic.
+        let lba = ext_start.saturating_add(self.current_offset);
 
         // Adaptive sizer: start at current (preferred until a failure), shrink
         // on failure, advance on success. One 5s read attempt per try — no
@@ -349,15 +362,20 @@ impl DiscStream {
             let bytes = sectors as usize * 2048;
             self.read_buf.resize(bytes, 0);
 
-            let ok = self
+            let res = self
                 .reader
-                .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false)
-                .is_ok();
+                .read_sectors(lba, sectors, &mut self.read_buf[..bytes], false);
 
-            if ok {
+            if let Ok(&got) = res.as_ref() {
+                // SectorSource::read_sectors returns the number of bytes
+                // written into buf. All in-tree sources return full-or-error,
+                // but a short count would leave the stale/zeroed tail of
+                // read_buf in place; trust the returned count, not `bytes`.
+                debug_assert!(got <= bytes, "read_sectors over-reported byte count");
                 if let Some(ev) = self.adaptive.on_success(sectors) {
                     self.emit(ev);
                 }
+                let bytes = got.min(bytes);
                 self.buf_valid = bytes;
                 self.current_offset += sectors as u32;
                 self.bytes_read_total = self.bytes_read_total.saturating_add(bytes as u64);
@@ -379,10 +397,14 @@ impl DiscStream {
                     self.current_offset += 1;
                     break;
                 } else {
-                    let err = self
-                        .reader
-                        .read_sectors(lba, sectors, &mut self.read_buf[..2048], false)
-                        .err();
+                    // Build the error from the failure we ALREADY hold.
+                    // Re-reading the same known-bad LBA here doubled drive
+                    // abuse (hard rule #2: repeated failed reads on the
+                    // same LBA push the BU40N into fast-fail) and, if the
+                    // retry transiently succeeded, dropped the good data
+                    // and returned a bogus status=0/sense=None error for a
+                    // readable sector.
+                    let err = res.err();
                     let (status, sense) =
                         err.as_ref().map(extract_scsi_context).unwrap_or((0, None));
                     return Err(crate::error::Error::DiscRead {
@@ -409,9 +431,9 @@ impl DiscStream {
 }
 
 /// Per-stage profiling state — populated only when `FREEMKV_PROFILE`
-/// is set. Dumps a percentage breakdown to stderr every
-/// [`PROFILE_INTERVAL`]. Zero overhead in normal runs (Option check
-/// is the only added cost).
+/// is set. Logs a percentage breakdown via `tracing` (target "mux")
+/// every [`PROFILE_INTERVAL`]. Zero overhead in normal runs (the
+/// `DiscStream::profiling` check is the only added cost).
 struct StageProf {
     started: std::time::Instant,
     last_dump: std::time::Instant,
@@ -465,7 +487,8 @@ fn prof_tick(stage: &str, ns: u128, bytes: u64) {
         let feed_pct = p.feed_ns / 10_000 / elapsed_ms;
         let consume_pct = p.consume_ns / 10_000 / elapsed_ms;
         let mbps = p.bytes_in as u128 * 1000 / 1_000_000 / elapsed_ms;
-        eprintln!(
+        tracing::debug!(
+            target: "mux",
             "[profile] elapsed={}ms in={}MB/s fill={}% feed={}% consume={}%",
             elapsed_ms, mbps, fill_pct, feed_pct, consume_pct,
         );
@@ -484,7 +507,9 @@ impl crate::pes::Stream for DiscStream {
         }
 
         loop {
-            let t0 = std::time::Instant::now();
+            // Profiling timestamps only when FREEMKV_PROFILE is set; otherwise
+            // these stay None and no Instant::now() is taken in the hot loop.
+            let t0 = self.profiling.then(std::time::Instant::now);
             if !self.fill_extents()? {
                 self.eof = true;
                 // Flush demuxer — last PES packet may still be in the assembler
@@ -565,8 +590,10 @@ impl crate::pes::Stream for DiscStream {
             }
 
             let bytes = self.buf_valid;
-            let t1 = std::time::Instant::now();
-            prof_tick("fill", t1.duration_since(t0).as_nanos(), bytes as u64);
+            let t1 = self.profiling.then(std::time::Instant::now);
+            if let (Some(t0), Some(t1)) = (t0, t1) {
+                prof_tick("fill", t1.duration_since(t0).as_nanos(), bytes as u64);
+            }
             // Plaintext: the wrapped reader (DecryptingSectorSource)
             // applied AACS / CSS in-place during fill_extents'
             // read_sectors call. The pre-0.18 inline decrypt step
@@ -574,9 +601,11 @@ impl crate::pes::Stream for DiscStream {
 
             if let Some(ref mut demuxer) = self.ts_demuxer {
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
-                let t2 = std::time::Instant::now();
-                prof_tick("feed", t2.duration_since(t1).as_nanos(), 0);
-                let skip_parse = std::env::var_os("FREEMKV_SKIP_PARSE").is_some();
+                let t2 = self.profiling.then(std::time::Instant::now);
+                if let (Some(t1), Some(t2)) = (t1, t2) {
+                    prof_tick("feed", t2.duration_since(t1).as_nanos(), 0);
+                }
+                let skip_parse = self.skip_parse;
                 for pes in packets {
                     if let Some((_, track)) = self
                         .pid_to_track
@@ -608,8 +637,10 @@ impl crate::pes::Stream for DiscStream {
                         }
                     }
                 }
-                let t3 = std::time::Instant::now();
-                prof_tick("consume", t3.duration_since(t2).as_nanos(), 0);
+                let t3 = self.profiling.then(std::time::Instant::now);
+                if let (Some(t2), Some(t3)) = (t2, t3) {
+                    prof_tick("consume", t3.duration_since(t2).as_nanos(), 0);
+                }
             } else if let Some(ref mut demuxer) = self.ps_demuxer {
                 let packets = demuxer.feed(&self.read_buf[..bytes]);
                 for ps in &packets {
@@ -691,7 +722,7 @@ impl crate::pes::Stream for DiscStream {
         // bottleneck profiling, so codec_private is never populated.
         // Pretend headers are ready immediately in that mode so the
         // CLI loop doesn't hang waiting for them.
-        if std::env::var_os("FREEMKV_SKIP_PARSE").is_some() {
+        if self.skip_parse {
             return true;
         }
         for (idx, s) in self.title.streams.iter().enumerate() {

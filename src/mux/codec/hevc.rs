@@ -4,7 +4,7 @@
 //! Detects keyframes (IRAP pictures: IDR, CRA, BLA).
 //! Each PES packet = one access unit = one frame.
 
-use super::h264::{find_start_code, skip_start_code};
+use super::startcode::{find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 // HEVC NAL unit types
@@ -20,6 +20,9 @@ const _NAL_UNSPEC62_DV_RPU: u8 = 62;
 const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
 
+/// HEVC (H.265) Annex B → MKV codec parser: extracts VPS/SPS/PPS for the hvcC
+/// codecPrivate, detects IRAP keyframes, and converts each PES access unit into
+/// length-prefixed NAL units. Implements [`CodecParser`].
 pub struct HevcParser {
     // First-seen parameter set of each type → seeds the MKV codecPrivate (hvcC).
     // This is the ONLY copy the player gets out-of-band, and a player re-applies
@@ -42,6 +45,7 @@ impl Default for HevcParser {
 }
 
 impl HevcParser {
+    /// Create a fresh HEVC parser with no parameter sets captured yet.
     pub fn new() -> Self {
         Self {
             vps: None,
@@ -71,10 +75,28 @@ fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Ve
         Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
         Some(_) => {
             // Differs from codecPrivate → emit in-band so it wins at this AU.
-            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            // A NAL longer than u32::MAX can't be length-prefixed in the 4-byte
+            // field; skip it rather than mis-frame the output. Unreachable in
+            // practice (no real access unit is >4 GiB).
+            let Ok(len) = u32::try_from(nal.len()) else {
+                return;
+            };
+            frame_data.extend_from_slice(&len.to_be_bytes());
             frame_data.extend_from_slice(nal);
         }
     }
+}
+
+/// Append `nal` to `out` as a 4-byte big-endian length prefix followed by the
+/// NAL body. A NAL longer than `u32::MAX` can't be length-prefixed in the
+/// 4-byte field, so it is skipped rather than mis-framed. Unreachable in
+/// practice (no real access unit is >4 GiB).
+fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
+    let Ok(len) = u32::try_from(nal.len()) else {
+        return;
+    };
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(nal);
 }
 
 impl CodecParser for HevcParser {
@@ -112,7 +134,12 @@ impl CodecParser for HevcParser {
                     end -= 1;
                 }
 
-                if nal_start < data.len() {
+                // Skip empty NALs entirely. When the trailing-zero strip reduces
+                // `end` back to `nal_start` (e.g. `00 00 01 00 00 01`, or a
+                // zero-filled bad sector between two start codes), the slice is
+                // empty; emitting a 4-byte 0x00000000 length prefix with no NAL
+                // body produces a structurally invalid NALU a decoder rejects.
+                if nal_start < data.len() && end > nal_start {
                     // HEVC NAL header: 2 bytes. Type is bits 1-6 of first byte.
                     let nal_type = (data[nal_start] >> 1) & 0x3F;
 
@@ -126,18 +153,18 @@ impl CodecParser for HevcParser {
                         NAL_PPS => {
                             handle_param_set(&mut self.pps, &data[nal_start..end], &mut frame_data)
                         }
-                        NAL_AUD => {} // Skip access unit delimiters
+                        // Drop Access Unit Delimiters. This is intentional and
+                        // spec-correct: Matroska HEVC frame data omits AUDs
+                        // (the container delimits access units), so carrying
+                        // them in-band is redundant. H.264 does the same below.
+                        NAL_AUD => {}
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;
-                            let nal = &data[nal_start..end];
-                            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                            frame_data.extend_from_slice(nal);
+                            push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                         }
                         _ => {
                             // All other NAL types (slices, SEI, DV RPU, etc.) pass through
-                            let nal = &data[nal_start..end];
-                            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                            frame_data.extend_from_slice(nal);
+                            push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                         }
                     }
                 }
@@ -173,8 +200,9 @@ impl CodecParser for HevcParser {
             return None;
         }
 
-        // Simplified: store as arrays in Annex B format
-        // Full HEVCDecoderConfigurationRecord is complex — for now, concatenate
+        // Build a conforming HEVCDecoderConfigurationRecord: fixed header
+        // (configurationVersion, profile_tier_level fields, parallelism, parsed
+        // chroma/bit depths) followed by numOfArrays length-prefixed NAL arrays.
         let mut record = Vec::new();
 
         // Minimal HEVCDecoderConfigurationRecord header.
@@ -198,17 +226,17 @@ impl CodecParser for HevcParser {
         if sps.len() > 7 {
             record.extend_from_slice(&sps[4..8]);
         } else {
-            let avail = sps.len().saturating_sub(4).min(4);
+            let target = record.len() + 4;
             record.extend_from_slice(&sps[sps.len().min(4)..sps.len().min(8)]);
-            record.extend_from_slice(&vec![0u8; 4 - avail]);
+            record.resize(target, 0u8); // zero-pad the missing bytes in place
         }
         // general_constraint_indicator_flags (6 bytes) — SPS bytes 8..14
         if sps.len() > 13 {
             record.extend_from_slice(&sps[8..14]);
         } else {
-            let avail = sps.len().saturating_sub(8).min(6);
+            let target = record.len() + 6;
             record.extend_from_slice(&sps[sps.len().min(8)..sps.len().min(14)]);
-            record.extend_from_slice(&vec![0u8; 6 - avail]);
+            record.resize(target, 0u8); // zero-pad the missing bytes in place
         }
         // general_level_idc — SPS byte 14
         record.push(if sps.len() > 14 { sps[14] } else { 0 });
@@ -224,6 +252,8 @@ impl CodecParser for HevcParser {
             chroma_format_idc: 1,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
+            max_sub_layers_minus1: 0,
+            temporal_id_nesting_flag: 0,
         });
         // chromaFormat (6 reserved bits set + 2-bit chroma_format_idc)
         record.push(0xFC | (chroma.chroma_format_idc & 0x03));
@@ -233,8 +263,14 @@ impl CodecParser for HevcParser {
         record.push(0xF8 | (chroma.bit_depth_chroma_minus8 & 0x07));
         // avgFrameRate
         record.extend_from_slice(&[0, 0]);
-        // constantFrameRate + numTemporalLayers + temporalIdNested + lengthSizeMinusOne
-        record.push(0x03); // lengthSizeMinusOne = 3 (4 bytes)
+        // Byte 21 packs four fields (ISO/IEC 14496-15):
+        //   constantFrameRate u(2) = 0 (unknown / not constant)
+        //   numTemporalLayers u(3) = sps_max_sub_layers_minus1 + 1
+        //   temporalIdNested  u(1) = sps_temporal_id_nesting_flag
+        //   lengthSizeMinusOne u(2) = 3 (4-byte length prefix)
+        let num_temporal_layers = (chroma.max_sub_layers_minus1 + 1) & 0x07;
+        let temporal_id_nested = chroma.temporal_id_nesting_flag & 0x01;
+        record.push((num_temporal_layers << 3) | (temporal_id_nested << 2) | 0x03);
         // numOfArrays
         record.push(3); // VPS, SPS, PPS
 
@@ -271,6 +307,10 @@ struct SpsChroma {
     chroma_format_idc: u8,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
+    /// sps_max_sub_layers_minus1 (u3): numTemporalLayers = this + 1 for hvcC.
+    max_sub_layers_minus1: u8,
+    /// sps_temporal_id_nesting_flag (u1) for hvcC temporalIdNested.
+    temporal_id_nesting_flag: u8,
 }
 
 /// Minimal MSB-first bit reader over a byte slice.
@@ -365,7 +405,7 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
     // sps_max_sub_layers_minus1 u(3)
     let max_sub_layers_minus1 = r.read_bits(3)?;
     // sps_temporal_id_nesting_flag u(1)
-    r.skip_bits(1)?;
+    let temporal_id_nesting_flag = r.read_bit()?;
 
     // profile_tier_level( 1, sps_max_sub_layers_minus1 )
     parse_profile_tier_level(&mut r, max_sub_layers_minus1)?;
@@ -396,17 +436,18 @@ fn parse_sps_chroma(sps: &[u8]) -> Option<SpsChroma> {
         chroma_format_idc,
         bit_depth_luma_minus8,
         bit_depth_chroma_minus8,
+        max_sub_layers_minus1: max_sub_layers_minus1 as u8,
+        temporal_id_nesting_flag: temporal_id_nesting_flag as u8,
     })
 }
 
 /// Consume a profile_tier_level(profilePresentFlag=1, maxNumSubLayersMinus1)
 /// structure from the bit reader (HEVC 7.3.3).
 fn parse_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Option<()> {
-    // general: profile_space u(2) + tier u(1) + profile_idc u(5) = 8 bits,
-    // profile_compatibility_flags u(32), 4× constraint/flags + reserved = 44
-    // bits, general_inbld/reserved = 1 bit (total constraint area 48 bits),
-    // general_level_idc u(8). 88 bits = 11 bytes... but the spec packs the
-    // general PTL as 8 + 32 + 48 + 8 = 96 bits = 12 bytes. Skip 96 bits.
+    // general PTL fixed layout (HEVC 7.3.3): profile_space u(2) + tier u(1) +
+    // profile_idc u(5) = 8, general_profile_compatibility_flags u(32),
+    // constraint-flags/reserved area = 48, general_level_idc u(8).
+    // Total = 8 + 32 + 48 + 8 = 96 bits = 12 bytes. Skip 96 bits.
     r.skip_bits(96)?;
 
     if max_sub_layers_minus1 > 0 {
@@ -859,6 +900,30 @@ mod tests {
         );
     }
 
+    // --- empty NAL between adjacent start codes is skipped ---
+
+    #[test]
+    fn empty_nal_between_start_codes_emits_no_bare_prefix() {
+        // `00 00 01 00 00 01 <real NAL>`: the first start code is immediately
+        // followed by another, so the in-between NAL is empty after the
+        // trailing-zero strip. It must be skipped, NOT written as a bare
+        // 0x00000000 length prefix (which a decoder treats as malformed).
+        let mut parser = HevcParser::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]); // start code, empty NAL
+        data.extend_from_slice(&[0x00, 0x00, 0x01]); // next start code
+        data.extend_from_slice(&hevc_nal_header(1)); // TRAIL_R
+        data.extend_from_slice(&[0x10, 0x20]);
+
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        assert_eq!(frames.len(), 1);
+        let fd = &frames[0].data;
+        // Exactly one length-prefixed NAL — no zero-length entry.
+        let len = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]) as usize;
+        assert!(len > 0, "no bare zero-length prefix emitted");
+        assert_eq!(len + 4, fd.len(), "exactly one NAL in frame data");
+    }
+
     // --- empty PES ---
 
     #[test]
@@ -1127,6 +1192,20 @@ mod tests {
         assert_eq!(cp[16], 0xFC | 3, "chroma_format_idc = 3 (4:4:4)");
         assert_eq!(cp[17], 0xF8 | 4, "bit_depth_luma_minus8 = 4 (12-bit)");
         assert_eq!(cp[18], 0xF8 | 4);
+    }
+
+    #[test]
+    fn hvcc_byte21_from_sps_temporal_layers() {
+        // make_sps_with_chroma sets sps_max_sub_layers_minus1 = 0 and
+        // sps_temporal_id_nesting_flag = 1, so byte 21 must encode
+        // numTemporalLayers = 1, temporalIdNested = 1, lengthSizeMinusOne = 3:
+        //   (1 << 3) | (1 << 2) | 3 = 0x0F.
+        let sps = make_sps_with_chroma(1, 2, 2);
+        let cp = codec_private_from_sps(&sps);
+        assert_eq!(
+            cp[21], 0x0F,
+            "byte 21: numTemporalLayers=1, temporalIdNested=1, lengthSizeMinusOne=3"
+        );
     }
 
     #[test]

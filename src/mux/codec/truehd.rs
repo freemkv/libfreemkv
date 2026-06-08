@@ -4,9 +4,10 @@
 //! Access units span PES boundaries — must buffer and reassemble.
 //!
 //! TrueHD access unit header (4 bytes):
-//!   [0..1] upper 4 bits = parity, lower 12 bits = length in 2-byte words
-//!   [2..3] timing value
-//!   [4..]  substream data (major sync 0xF8726FBA may appear at offset 4)
+//!   bytes 0-1: top nibble = MLP check/access-unit nibble, lower 12 bits =
+//!              access-unit length in 2-byte words
+//!   bytes 2-3: timing value
+//!   bytes 4..: substream data (major sync 0xF8726FBA may appear at offset 4)
 //!
 //! AC-3 frames (interleaved, same PID): start with sync word 0x0B77.
 //! We skip AC-3 frames and only emit TrueHD access units.
@@ -41,53 +42,68 @@ impl TrueHdParser {
         }
     }
 
-    /// Skip an AC-3 frame starting at the current buffer position.
-    /// Returns number of bytes consumed, or 0 if not enough data.
-    fn skip_ac3_frame(&self) -> usize {
+    /// Size (bytes) of the AC-3 frame at the buffer head.
+    ///
+    /// Distinguishes three cases the caller must treat differently:
+    /// - `Unmappable`: the header's fscod/frmsizecod don't map to a real frame
+    ///   size (reserved fscod==3, or frmsizecod >= 38). The caller must drain
+    ///   and resync, NOT wait for more data — waiting would stall forever.
+    /// - `NeedMore`: a valid size, but the frame isn't fully buffered yet.
+    /// - `Frame(n)`: a complete `n`-byte AC-3 frame is buffered.
+    ///
+    /// Frame sizing reuses `ac3::ac3_frame_size` so the AC-3 size table has a
+    /// single source of truth shared with the AC-3 parser; a returned `0` there
+    /// (reserved fscod or out-of-range frmsizecod) is the unmappable case.
+    fn ac3_frame_at_head(&self) -> Ac3Size {
         if self.buf.len() < 6 {
-            return 0;
+            return Ac3Size::NeedMore;
         }
-        // AC-3 frame size from frmsizcod + fscod
-        // Byte 4: [fscod:2][frmsizecod:6]
-        let fscod = (self.buf[4] >> 6) & 0x03;
-        let frmsizecod = (self.buf[4] & 0x3F) as usize;
-        // Frame size in 16-bit words per fscod (simplified table for common rates)
-        let frame_words = match fscod {
-            0 => {
-                // 48 kHz
-                static SIZES: [usize; 38] = [
-                    64, 64, 80, 80, 96, 96, 112, 112, 128, 128, 160, 160, 192, 192, 224, 224, 256,
-                    256, 320, 320, 384, 384, 448, 448, 512, 512, 640, 640, 768, 768, 896, 896,
-                    1024, 1024, 1152, 1152, 1280, 1280,
-                ];
-                SIZES.get(frmsizecod).copied().unwrap_or(0)
-            }
-            1 => {
-                // 44.1 kHz
-                static SIZES: [usize; 38] = [
-                    69, 70, 87, 88, 104, 105, 121, 122, 139, 140, 174, 175, 208, 209, 243, 244,
-                    278, 279, 348, 349, 417, 418, 487, 488, 557, 558, 696, 697, 835, 836, 975, 976,
-                    1114, 1115, 1253, 1254, 1393, 1394,
-                ];
-                SIZES.get(frmsizecod).copied().unwrap_or(0)
-            }
-            2 => {
-                // 32 kHz
-                static SIZES: [usize; 38] = [
-                    96, 96, 120, 120, 144, 144, 168, 168, 192, 192, 240, 240, 288, 288, 336, 336,
-                    384, 384, 480, 480, 576, 576, 672, 672, 768, 768, 960, 960, 1152, 1152, 1344,
-                    1344, 1536, 1536, 1728, 1728, 1920, 1920,
-                ];
-                SIZES.get(frmsizecod).copied().unwrap_or(0)
-            }
-            _ => 0,
-        };
-        let frame_bytes = frame_words * 2;
-        if frame_bytes == 0 || self.buf.len() < frame_bytes {
-            return 0;
+        let frame_bytes = super::ac3::ac3_frame_size(&self.buf);
+        if frame_bytes == 0 {
+            // Reserved fscod or out-of-range frmsizecod → unmappable header.
+            return Ac3Size::Unmappable;
         }
-        frame_bytes
+        if self.buf.len() < frame_bytes {
+            return Ac3Size::NeedMore;
+        }
+        Ac3Size::Frame(frame_bytes)
     }
+}
+
+/// Secondary validation for an AC-3 frame of `frame_bytes` at the buffer head:
+/// is its computed end a plausible boundary? Accept when the frame fills the
+/// rest of the buffer, or the bytes that follow start another AC-3 sync
+/// (0x0B77) or a plausible TrueHD access unit (non-zero 12-bit length within
+/// the 32 KiB cap). If none holds, the leading 0x0B77 is more likely a TrueHD
+/// AU header that happens to look like AC-3, so the AC-3 reading is rejected.
+fn ac3_boundary_corroborated(buf: &[u8], frame_bytes: usize) -> bool {
+    if frame_bytes >= buf.len() {
+        // The AC-3 frame is fully buffered and ends the data — consistent.
+        return true;
+    }
+    let tail = &buf[frame_bytes..];
+    if tail.len() < 2 {
+        // Not enough following bytes to judge; accept (the next call will see
+        // the continuation).
+        return true;
+    }
+    // Another AC-3 sync immediately after?
+    if tail[0] == 0x0B && tail[1] == 0x77 {
+        return true;
+    }
+    // A plausible TrueHD AU header after? (non-zero 12-bit length, <= 32 KiB)
+    let next_words = (((tail[0] as usize) << 8) | tail[1] as usize) & 0xFFF;
+    next_words != 0 && next_words * 2 <= 32768
+}
+
+/// Outcome of sizing the AC-3 frame at the TrueHD buffer head.
+enum Ac3Size {
+    /// fscod/frmsizecod don't map to a real frame size — resync, don't wait.
+    Unmappable,
+    /// A valid size, but the frame is not fully buffered yet.
+    NeedMore,
+    /// A complete `n`-byte AC-3 frame is buffered.
+    Frame(usize),
 }
 
 impl CodecParser for TrueHdParser {
@@ -118,29 +134,48 @@ impl CodecParser for TrueHdParser {
                 break;
             }
 
-            // AC-3 frame (interleaved): starts with sync word 0x0B77
+            // AC-3 frame (interleaved): starts with sync word 0x0B77.
+            //
+            // 0x0B 0x77 is also a legal TrueHD AU header (check-nibble 0,
+            // length-high-bits 0xB → length 0xB77 words). To avoid an AC-3
+            // misread stealing a real TrueHD AU, an AC-3 frame is only accepted
+            // when its computed end is corroborated by what follows: end of
+            // buffer (frame fills the rest), another AC-3 sync, or a plausible
+            // TrueHD AU header. If none holds, this is treated as a TrueHD AU.
             if self.buf[0] == 0x0B && self.buf[1] == 0x77 {
-                let skip = self.skip_ac3_frame();
-                if skip == 0 {
-                    break; // incomplete AC-3 frame, wait for more data
+                match self.ac3_frame_at_head() {
+                    Ac3Size::Unmappable => {
+                        // Permanently unmappable header at the head would stall
+                        // the parser forever; resync by dropping 2 bytes so one
+                        // bad frame costs one frame, not the whole buffer.
+                        self.buf.drain(..2);
+                        continue;
+                    }
+                    Ac3Size::NeedMore => break, // wait for the rest of the frame
+                    Ac3Size::Frame(skip) => {
+                        if ac3_boundary_corroborated(&self.buf, skip) {
+                            self.buf.drain(..skip);
+                            continue;
+                        }
+                        // Not corroborated — fall through and interpret the
+                        // 0x0B77 bytes as a TrueHD access unit instead.
+                    }
                 }
-                self.buf.drain(..skip);
-                continue;
             }
 
             // TrueHD access unit: lower 12 bits of first 2 bytes = length in words
             let unit_words = (((self.buf[0] as usize) << 8) | self.buf[1] as usize) & 0xFFF;
             if unit_words == 0 {
-                self.buf.drain(..2);
+                // A zero-length AU is malformed/padding. The AU header is 4 bytes
+                // (length + timing); drain the whole header, not just the length
+                // word, otherwise the timing bytes get misread as the next
+                // length word and produce a spurious parse on the next iteration.
+                self.buf.drain(..4);
                 continue;
             }
+            // unit_words is masked to 12 bits, so unit_bytes <= 4095 * 2 = 8190;
+            // no separate oversize-resync guard is reachable.
             let unit_bytes = unit_words * 2;
-            if unit_bytes > 32768 {
-                // Likely misaligned — try to resync by scanning for AC-3 sync or
-                // a valid TrueHD length
-                self.buf.drain(..2);
-                continue;
-            }
             if self.buf.len() < unit_bytes {
                 break; // incomplete access unit, wait for more data
             }
@@ -349,6 +384,67 @@ mod tests {
             f2[0].pts_ns,
             pts_to_ns(180000),
             "new AU after empty buffer adopts the new PES PTS"
+        );
+    }
+
+    #[test]
+    fn zero_length_au_drains_full_header() {
+        // A zero-length AU header (4 bytes: length=0 + timing) must be skipped
+        // whole. If only 2 bytes were drained the timing bytes would be misread
+        // as a bogus length word. Here the timing bytes are 0x01 0x90 (= 0x190 =
+        // 400 words = 800 bytes) which, if misread, would stall the parser
+        // waiting for 800 bytes that never come. Draining 4 lets the following
+        // real unit parse.
+        let mut parser = TrueHdParser::new();
+        let mut data = vec![0x00, 0x00, 0x01, 0x90]; // length=0, timing=0x0190
+        data.extend_from_slice(&make_truehd_unit(200));
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 1, "real unit parses after zero-length header");
+        assert_eq!(frames[0].data.len(), 200);
+    }
+
+    #[test]
+    fn unmappable_ac3_header_resyncs_not_stalls() {
+        // A permanently unmappable 0x0B77 header at the buffer head (reserved
+        // fscod==3) must NOT stall the parser. It used to be treated as
+        // "incomplete, wait" and break forever, dropping every following AU.
+        // Now it resyncs (drains 2 bytes) so a clean TrueHD unit behind it is
+        // eventually emitted.
+        let mut parser = TrueHdParser::new();
+        // Unmappable AC-3-looking head: 0x0B77, byte4 fscod=3 (0xC0).
+        let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0xC0, 0x00];
+        // A clean TrueHD AU follows.
+        data.extend_from_slice(&make_truehd_unit(200));
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(
+            frames.len(),
+            1,
+            "TrueHD AU behind a bad header is recovered"
+        );
+        assert_eq!(frames[0].data.len(), 200);
+        assert!(parser.buf.is_empty(), "buffer fully consumed, no stall");
+    }
+
+    #[test]
+    fn truehd_au_with_0b77_head_not_stolen_by_ac3() {
+        // A TrueHD AU whose first two bytes are 0x0B 0x77 (length 0xB77 = 2935
+        // words = 5870 bytes) must NOT be misrouted to the AC-3 path. The AC-3
+        // size for this header (fscod from byte4) would close the boundary in
+        // the wrong place; the secondary corroboration rejects it because the
+        // computed AC-3 end is not followed by another AC-3 sync / TrueHD AU.
+        let mut parser = TrueHdParser::new();
+        // 5870-byte AU starting with 0x0B 0x77. Byte 4 = 0x00 → AC-3 would
+        // size it as fscod=0, frmsizecod=0 → 128 bytes. The bytes at offset 128
+        // are zeros (next_words==0) → not corroborated → kept as TrueHD.
+        let mut unit = vec![0u8; 5870];
+        unit[0] = 0x0B; // 0xB high nibble of the 12-bit length, check nibble 0
+        unit[1] = 0x77; // low byte of length 0xB77
+        let frames = parser.parse(&make_pes(unit, Some(90000)));
+        assert_eq!(frames.len(), 1, "0x0B77-headed TrueHD AU kept whole");
+        assert_eq!(
+            frames[0].data.len(),
+            5870,
+            "AU sized by TrueHD length, not AC-3 frame size"
         );
     }
 

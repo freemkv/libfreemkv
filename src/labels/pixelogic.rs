@@ -1,7 +1,7 @@
 //! Pixelogic — `bluray_project.bin`
 //!
 //! Binary file with embedded UTF-8 token strings in STN order per
-//! playlist section. Most common format (5/10 test discs).
+//! playlist section. A common Pixelogic layout.
 //!
 //! Token format: `{lang}_{codec?}_{purpose?}_{region?}_`
 
@@ -11,10 +11,15 @@ use super::{
 };
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Known audio codec tokens
 const AUDIO_CODECS: &[&str] = &["MLP", "AC3", "DTS", "DDL", "WAV", "AC"];
+/// Sane upper bound on streams of one type within a single feature
+/// section. The BD STN table caps audio at 32; this generous ceiling
+/// stops a crafted blob with tens of thousands of stream tokens from
+/// overflowing the u16 STN counters (panic in debug, wrap-to-0 in
+/// release, which would misnumber subsequent labels).
+const MAX_STREAMS_PER_TYPE: u16 = 512;
 /// Known region tokens
 const REGIONS: &[&str] = &[
     "US", "UK", "CF", "PF", "CS", "LS", "BP", "PP", "SM", "TM", "CAN", "DUM", "FLE",
@@ -34,15 +39,16 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // Tracked across all parse_token calls in this run: did any stream
     // hit an unrecognized token component (skip-unknown path)? If yes
     // we downgrade confidence to Medium — the labels are still valid
-    // but the corpus surfaced something we don't catalogue.
-    let saw_unknown = AtomicBool::new(false);
+    // but the corpus surfaced something we don't catalogue. Parsing is
+    // single-threaded and sequential, so a plain bool suffices.
+    let mut saw_unknown = false;
 
-    let labels = assign_labels(&strings, &saw_unknown);
+    let labels = assign_labels(&strings, &mut saw_unknown);
 
     if labels.is_empty() {
         return None;
     }
-    let confidence = if saw_unknown.load(Ordering::Relaxed) {
+    let confidence = if saw_unknown {
         Confidence::Medium
     } else {
         Confidence::High
@@ -54,7 +60,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// `StreamLabel` per editorial token, numbered in STN order. Split out
 /// from `parse` so the section/numbering logic is unit-testable without
 /// a `SectorSource`/`UdfFs`.
-fn assign_labels(strings: &[String], saw_unknown: &AtomicBool) -> Vec<StreamLabel> {
+fn assign_labels(strings: &[String], saw_unknown: &mut bool) -> Vec<StreamLabel> {
     // The authoritative per-feature stream list lives in the `FPL_`
     // (FeaturePLaylist) section, in STN order. `SEG_*` entries are menu
     // segments (intros, logos, disclaimers, previews) that can also carry
@@ -109,14 +115,25 @@ fn assign_labels(strings: &[String], saw_unknown: &AtomicBool) -> Vec<StreamLabe
         // left exactly as-is — the corpus snapshots show forced/commentary
         // subtitle tokens already align with STN without counting the
         // placeholders, and counting them regresses several discs.
+        // Stop accumulating once both counters reach the sane cap — a
+        // crafted blob can't drive them to u16 overflow.
+        if audio_num >= MAX_STREAMS_PER_TYPE && sub_num >= MAX_STREAMS_PER_TYPE {
+            break;
+        }
+
         if s.starts_with("Audio Stream") {
-            audio_num += 1;
+            if audio_num < MAX_STREAMS_PER_TYPE {
+                audio_num += 1;
+            }
             continue;
         }
 
-        if let Some(label) = parse_token_inner(s, Some(saw_unknown)) {
+        if let Some(label) = parse_token_inner(s, Some(&mut *saw_unknown)) {
             match label.stream_type {
                 StreamLabelType::Audio => {
+                    if audio_num >= MAX_STREAMS_PER_TYPE {
+                        continue;
+                    }
                     audio_num += 1;
                     labels.push(StreamLabel {
                         stream_number: audio_num,
@@ -124,6 +141,9 @@ fn assign_labels(strings: &[String], saw_unknown: &AtomicBool) -> Vec<StreamLabe
                     });
                 }
                 StreamLabelType::Subtitle => {
+                    if sub_num >= MAX_STREAMS_PER_TYPE {
+                        continue;
+                    }
                     sub_num += 1;
                     labels.push(StreamLabel {
                         stream_number: sub_num,
@@ -137,7 +157,7 @@ fn assign_labels(strings: &[String], saw_unknown: &AtomicBool) -> Vec<StreamLabe
     labels
 }
 
-fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<StreamLabel> {
+fn parse_token_inner(s: &str, mut saw_unknown: Option<&mut bool>) -> Option<StreamLabel> {
     let clean = s.trim().trim_start_matches('\t').trim_end_matches('_');
     let parts: Vec<&str> = clean.split('_').collect();
     if parts.len() < 2 {
@@ -156,10 +176,18 @@ fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<Stream
     let mut is_subtitle = false;
     let mut is_audio = false;
 
-    for &part in &parts[1..] {
-        if part.is_empty() {
+    for &raw_part in &parts[1..] {
+        if raw_part.is_empty() {
             continue;
         }
+        // Token components are spec-uppercase (codec IDs, ADES/ACOM/SDH,
+        // region codes). vocab elsewhere is deliberately case-insensitive,
+        // so normalize each component to uppercase before the gate to
+        // avoid silently dropping a lowercase-authored token (which would
+        // fall through to the unknown branch and, with no is_audio/
+        // is_subtitle set, get the whole stream discarded below).
+        let part_up = raw_part.to_ascii_uppercase();
+        let part = part_up.as_str();
         if AUDIO_CODECS.contains(&part) {
             codec = vocab::codec(part).to_string();
             is_audio = true;
@@ -182,10 +210,16 @@ fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<Stream
         } else if part == "STRI" || part == "TXT" {
             is_subtitle = true;
         } else if part == "FOR" {
+            // `FOR` (forced) is a subtitle-domain qualifier. A token whose
+            // only non-language component is FOR (e.g. `eng_FOR_`) would
+            // otherwise classify as neither audio nor subtitle and be
+            // dropped at the `!is_audio && !is_subtitle` guard below. Treat
+            // a forced marker as a subtitle signal so the stream survives.
             qualifier = LabelQualifier::Forced;
+            is_subtitle = true;
         } else if REGIONS.contains(&part) {
             variant = part.to_string();
-        } else if part.starts_with("PGStream") {
+        } else if part.starts_with("PGSTREAM") {
             is_subtitle = true;
         } else {
             // Unknown token component — skip this single part rather
@@ -197,8 +231,8 @@ fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<Stream
             // but flag the parse as Medium-confidence so callers know
             // some data was elided.
             tracing::debug!(part = %part, "pixelogic: unrecognized token component, skipping");
-            if let Some(flag) = saw_unknown {
-                flag.store(true, Ordering::Relaxed);
+            if let Some(flag) = saw_unknown.as_deref_mut() {
+                *flag = true;
             }
         }
     }
@@ -207,7 +241,14 @@ fn parse_token_inner(s: &str, saw_unknown: Option<&AtomicBool>) -> Option<Stream
         return None;
     }
 
-    let stream_type = if is_subtitle {
+    // Tie-break for tokens that signal both domains (e.g. `eng_MLP_SDH_`
+    // sets is_audio via the codec and is_subtitle via SDH). An audio
+    // codec hint is the stronger, audio-domain signal, so prefer Audio
+    // when one is present (keeps the parsed codec_hint instead of
+    // discarding it); otherwise file as Subtitle. Pure-subtitle and
+    // pure-audio tokens are unaffected.
+    let has_audio_codec = is_audio && !codec.is_empty();
+    let stream_type = if is_subtitle && !has_audio_codec {
         StreamLabelType::Subtitle
     } else {
         StreamLabelType::Audio
@@ -294,6 +335,52 @@ mod tests {
         assert!(parse_token_inner("ENG_MLP_", None).is_none()); // uppercase not accepted as ISO 639-2
     }
 
+    #[test]
+    fn parse_token_dual_type_with_codec_prefers_audio() {
+        // `eng_MLP_SDH_` sets the audio codec (MLP) and the subtitle SDH
+        // qualifier. Policy: a codec hint wins -> Audio, and codec_hint is
+        // preserved rather than discarded.
+        let l = parse_token_inner("eng_MLP_SDH_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.codec_hint, "TrueHD");
+        assert_eq!(l.qualifier, LabelQualifier::Sdh);
+    }
+
+    #[test]
+    fn parse_token_solo_forced_is_subtitle() {
+        // A token whose only non-language component is FOR must survive as
+        // a forced subtitle rather than being dropped.
+        let l = parse_token_inner("eng_FOR_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+        assert_eq!(l.language, "eng");
+        assert_eq!(l.qualifier, LabelQualifier::Forced);
+    }
+
+    #[test]
+    fn parse_token_components_are_case_insensitive() {
+        // Regression for the case-sensitive gate: a lowercase codec/
+        // qualifier component must classify identically to uppercase
+        // rather than falling through to the unknown branch and getting
+        // the whole stream dropped. The ISO 639-2 lang prefix is still
+        // required lowercase.
+        let l = parse_token_inner("eng_mlp_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.codec_hint, "TrueHD");
+
+        let l = parse_token_inner("eng_ac3_acom_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Audio);
+        assert_eq!(l.purpose, LabelPurpose::Commentary);
+        assert_eq!(l.codec_hint, "Dolby Digital");
+
+        let l = parse_token_inner("eng_sdh_", None).unwrap();
+        assert_eq!(l.stream_type, StreamLabelType::Subtitle);
+        assert_eq!(l.qualifier, LabelQualifier::Sdh);
+
+        // Mixed-case region token still recognized as a variant.
+        let l = parse_token_inner("eng_MLP_us_", None).unwrap();
+        assert_eq!(l.variant, "US");
+    }
+
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -305,7 +392,7 @@ mod tests {
         // `eng_ACOM_` commentary at STN slot 4. The commentary must land on
         // audio #4, not collapse onto #1 (which would tag the main feature
         // track as commentary).
-        let flag = AtomicBool::new(false);
+        let mut flag = false;
         let tokens = strs(&[
             "FPL_MainFeature",
             "Audio Stream 1",
@@ -313,7 +400,7 @@ mod tests {
             "Audio Stream 3",
             "eng_ACOM_",
         ]);
-        let labels = assign_labels(&tokens, &flag);
+        let labels = assign_labels(&tokens, &mut flag);
         let audio: Vec<_> = labels
             .iter()
             .filter(|l| l.stream_type == StreamLabelType::Audio)
@@ -330,7 +417,7 @@ mod tests {
         // token, but the real playlist is `FPL_MainFeature`. When an FPL_
         // section exists, the SEG_ one must be ignored as an anchor — so we
         // number from the FPL playlist, putting the commentary at slot 2.
-        let flag = AtomicBool::new(false);
+        let mut flag = false;
         let tokens = strs(&[
             "SEG_MainFeature",
             "eng_ACOM_", // stray token in the menu segment — must be ignored
@@ -338,7 +425,7 @@ mod tests {
             "Audio Stream 1",
             "eng_ACOM_",
         ]);
-        let labels = assign_labels(&tokens, &flag);
+        let labels = assign_labels(&tokens, &mut flag);
         let audio: Vec<_> = labels
             .iter()
             .filter(|l| l.stream_type == StreamLabelType::Audio)
@@ -351,9 +438,9 @@ mod tests {
     #[test]
     fn assign_labels_falls_back_to_seg_without_fpl() {
         // Discs with no FPL_ playlist still anchor on SEG_MainFeature.
-        let flag = AtomicBool::new(false);
+        let mut flag = false;
         let tokens = strs(&["SEG_MainFeature", "eng_MLP_", "spa_AC3_"]);
-        let labels = assign_labels(&tokens, &flag);
+        let labels = assign_labels(&tokens, &mut flag);
         let audio: Vec<_> = labels
             .iter()
             .filter(|l| l.stream_type == StreamLabelType::Audio)

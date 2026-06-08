@@ -1,10 +1,10 @@
 //! Pipeline-progress reporting for the rip pipeline.
 //!
-//! v0.13.16 architecture rule: ONE progress signal type. Every long-running
-//! pipeline operation (`Disc::copy`, `Disc::patch`, `verify_title`) emits the same
-//! `PassProgress` shape via the `Progress` trait. Consumers (autorip) compute
-//! a single `PipelineStats` derived view and never reach into per-pass
-//! internals.
+//! Architecture rule: ONE progress signal type. Every long-running
+//! pipeline operation (`Disc::copy`, `Disc::patch`, `verify_title`) emits the
+//! same [`PassProgress`] shape via the [`Progress`] trait. Consumers (autorip)
+//! compute their own single derived view from these fields and never reach
+//! into per-pass internals.
 //!
 //! Why this matters: pre-0.13.16 the API leaked `pos`, `bytes_good`,
 //! `work_done`, `bytes_pending`, `Finished/NonTrimmed` mapfile semantics —
@@ -26,7 +26,10 @@ pub enum PassKind {
     /// `Disc::patch` final pass at 1 sector per block.
     Scrape { reverse: bool },
     /// Demux ISO → output (MKV / M2TS / network). Single phase that runs
-    /// after all rip passes complete.
+    /// after all rip passes complete. The library's mux pipeline does not
+    /// currently emit `PassProgress` itself, so this variant exists for
+    /// consumers (e.g. autorip) that label their own mux phase with the
+    /// same `PassKind` vocabulary.
     Mux,
     /// Sector verification — reads every sector and classifies health.
     Verify,
@@ -70,21 +73,24 @@ impl PassProgress {
     /// Percentage of work completed for this pass (0..=100).
     ///
     /// Returns `100.0` if `work_total` is zero to avoid division by zero.
+    /// Clamped to `0..=100` so a transient `work_done > work_total`
+    /// (e.g. a count that briefly overshoots) never reports above 100%.
     pub fn work_pct(&self) -> f64 {
         if self.work_total == 0 {
             return 100.0;
         }
-        self.work_done as f64 / self.work_total as f64 * 100.0
+        (self.work_done as f64 / self.work_total as f64 * 100.0).clamp(0.0, 100.0)
     }
 
     /// Percentage of the disc that is confirmed clean (0..=100).
     ///
-    /// Computed from `bytes_good_total / bytes_total_disc`.
+    /// Computed from `bytes_good_total / bytes_total_disc`, clamped to
+    /// `0..=100`.
     pub fn good_pct(&self) -> f64 {
         if self.bytes_total_disc == 0 {
             return 100.0;
         }
-        self.bytes_good_total as f64 / self.bytes_total_disc as f64 * 100.0
+        (self.bytes_good_total as f64 / self.bytes_total_disc as f64 * 100.0).clamp(0.0, 100.0)
     }
 
     /// Percentage of the disc that is unreadable (0..=100).
@@ -92,7 +98,8 @@ impl PassProgress {
         if self.bytes_total_disc == 0 {
             return 0.0;
         }
-        self.bytes_unreadable_total as f64 / self.bytes_total_disc as f64 * 100.0
+        (self.bytes_unreadable_total as f64 / self.bytes_total_disc as f64 * 100.0)
+            .clamp(0.0, 100.0)
     }
 
     /// Percentage of the disc that is still pending (not yet attempted or needs retry).
@@ -100,7 +107,7 @@ impl PassProgress {
         if self.bytes_total_disc == 0 {
             return 0.0;
         }
-        self.bytes_pending_total as f64 / self.bytes_total_disc as f64 * 100.0
+        (self.bytes_pending_total as f64 / self.bytes_total_disc as f64 * 100.0).clamp(0.0, 100.0)
     }
 }
 

@@ -12,14 +12,18 @@
 //! size patch, Cues index, segment header backpatch) to land on the
 //! right offset.
 //!
-//! `RandomAccessSink` is satisfied via the blanket impl in
-//! [`super::mod`]; no explicit impl needed here.
+//! [`SequentialSink`](super::SequentialSink) is implemented explicitly
+//! (not via a blanket impl) so its `finish()` flushes the `BufWriter`
+//! and `fsync`s the file even when called through a `dyn` trait object;
+//! [`RandomAccessSink`](super::RandomAccessSink) is implemented over the
+//! `Seek` impl below.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use super::preallocate;
+use super::{RandomAccessSink, SequentialSink};
 
 const BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -80,12 +84,25 @@ impl LocalFileSink {
     /// Drain the internal buffer and `fsync` the underlying file.
     /// Idempotent with `Drop` (the `BufWriter` also flushes on drop;
     /// this call additionally surfaces fsync errors to the caller).
-    #[allow(dead_code)] // exposed for parity with WritebackFile::sync_all
+    /// [`SequentialSink::finish`](super::SequentialSink::finish)
+    /// delegates here so the durable flush happens through a trait
+    /// object too.
     pub fn sync_all(&mut self) -> io::Result<()> {
         self.inner.flush()?;
         self.inner.get_ref().sync_all()
     }
 }
+
+impl SequentialSink for LocalFileSink {
+    /// Flush the 4 MiB `BufWriter` and `fsync` the file. Overriding the
+    /// trait default is what makes a `dyn SequentialSink` / `dyn
+    /// RandomAccessSink` `finish()` actually durable instead of a no-op.
+    fn finish(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+impl RandomAccessSink for LocalFileSink {}
 
 impl Write for LocalFileSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

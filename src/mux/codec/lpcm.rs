@@ -18,7 +18,10 @@
 //! DVD = leave intact. The raw PCM data is otherwise one complete audio frame
 //! per PES; no framing is needed.
 //!
-//! For MKV: codec ID "A_PCM/INT/BIG" (BD) or "A_PCM/INT/LIT" (DVD).
+//! For MKV: both BD and DVD LPCM map to codec ID "A_PCM/INT/BIG" (big-endian).
+//! DVD-Video LPCM is big-endian per the DVD-Video spec, and `mkv.rs` emits
+//! "A_PCM/INT/BIG" unconditionally for `Codec::Lpcm` — there is no DVD/BD branch
+//! and no "A_PCM/INT/LIT" path, so no byte-swap or alternate codec ID applies.
 //! All frames are keyframes (uncompressed audio).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
@@ -131,8 +134,9 @@ mod tests {
     fn dvd_lpcm_preserves_all_pcm_bytes() {
         // DVD-PS LPCM: PsDemuxer already removed the 7-byte private sub-header,
         // so the payload handed to this parser is raw PCM. The DVD parser must
-        // NOT strip any further bytes (the round-2 audit Finding 3 bug: the BD
-        // 4-byte strip dropped one sample pair per PES, drifting the audio).
+        // NOT strip any further bytes — applying the BD 4-byte strip to a DVD
+        // payload would drop one sample pair per PES and progressively drift
+        // the audio.
         let mut parser = LpcmParser::new_dvd();
         let pcm = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x01, 0x02];
         let frames = parser.parse(&make_pes(pcm.clone(), Some(90000)));

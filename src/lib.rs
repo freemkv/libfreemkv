@@ -16,16 +16,27 @@
 //! for title in &disc.titles {
 //!     println!("{} -- {} streams", title.duration_display(), title.streams.len());
 //! }
+//! ```
 //!
-//! // Stream via PES pipeline
+//! Muxing to an output container runs through the PES pipeline. A live
+//! `disc://` cannot be opened via [`input`] — it returns
+//! [`Error::DiscUrlNotDirect`] by design (use `Drive` + `Disc::scan` +
+//! `DiscStream::new` directly for a live drive). Any file-backed source
+//! (`iso://`, `m2ts://`) opens through [`input`]:
+//!
+//! ```no_run
+//! # fn run() -> std::io::Result<()> {
 //! let opts = libfreemkv::InputOptions::default();
-//! let mut input = libfreemkv::input("disc://", &opts).unwrap();
+//! let mut input = libfreemkv::input("iso://disc.iso", &opts)?;
 //! let title = input.info().clone();
-//! let mut output = libfreemkv::output("mkv://Movie.mkv", &title).unwrap();
-//! while let Ok(Some(frame)) = input.read() {
-//!     output.write(&frame).unwrap();
+//! let mut output = libfreemkv::output("mkv://Movie.mkv", &title)?;
+//! // Propagate read errors instead of silently stopping on the first one.
+//! while let Some(frame) = input.read()? {
+//!     output.write(&frame)?;
 //! }
-//! output.finish().unwrap();
+//! output.finish()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Architecture
@@ -70,6 +81,8 @@
 //! | E5xxx | I/O errors |
 //! | E6xxx | Disc format errors |
 //! | E7xxx | AACS errors |
+//! | E8xxx | Keydb errors (fetch, parse, load) |
+//! | E9xxx | Stream / mux errors (URL, PES, pipeline) |
 
 pub mod aacs;
 pub(crate) mod clpi;
@@ -145,7 +158,7 @@ pub use io::pipeline::{
 };
 
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
-pub use event::{Event, EventKind};
+pub use event::{BatchSizeReason, Event, EventKind};
 pub use identity::DriveId;
 pub use profile::DriveProfile;
 // Platform trait is pub(crate) — callers use Drive, not Platform directly.
@@ -184,7 +197,7 @@ pub use keysource::{DiscInputs, KeySource};
 //
 // - `DiscStream` — physical drive or ISO (any `SectorSource`). Read-only.
 // - `MkvStream`  — Matroska container. Read on `open()`, write on `create()`.
-// - `M2tsStream` — Blu-ray Transport Stream. Read on `open()`, write on `create()`.
+// - `M2tsStream` — Blu-ray Transport Stream. Write-only sink (`create()`).
 // - `NetworkStream` — TCP. Read on `listen()`, write on `connect()`.
 // - `NullStream` — write-only black-hole sink. Useful for benchmarks.
 // - `StdioStream` — pipe to/from stdin/stdout. Read or write.
@@ -204,6 +217,7 @@ pub use mux::MkvStream;
 pub use mux::NetworkStream;
 pub use mux::NullStream;
 pub use mux::StdioStream;
+pub use mux::WriteSeek;
 pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 
 // ─── Lower-level surfaces ───────────────────────────────────────────────────

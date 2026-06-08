@@ -4,7 +4,13 @@ Cargo.lock
 *.swo
 .DS_Store
 .cargo/
-.claude/worktrees/
 
 # session scratch — never track (may contain RE breadcrumbs)
 scratch/
+
+# stray local build artifact
+/rust_out
+
+# internal agent context — never publish (path AND dir; leak-guard blocks both)
+CLAUDE.md
+.claude/

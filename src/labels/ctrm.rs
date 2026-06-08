@@ -9,11 +9,17 @@ use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::HashMap;
 
+/// Cheap signature check: a CTRM disc ships `menu_base.prop` and/or
+/// `language_streams.txt` inside a `/BDMV/JAR/*` archive.
 pub fn detect(udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "menu_base.prop")
         || super::jar_file_exists(udf, "language_streams.txt")
 }
 
+/// Full extraction: parses `language_streams.txt` (structured types) and
+/// `menu_base.prop` (stream numbers + button names), merging when both
+/// are present. Returns `None` when neither file is present/parseable or
+/// no labels result.
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     // Try language_streams.txt first (richer structured data)
     let ls_labels = parse_language_streams(reader, udf);
@@ -50,7 +56,30 @@ fn merge(ls: Vec<StreamLabel>, mb: Vec<StreamLabel>) -> Vec<StreamLabel> {
             }
         }
     }
+    // Append any menu_base-only stream (present in mb but not in ls by
+    // (stream_type, stream_number)). Without this the both-files path
+    // silently drops streams the menu_base-only path would have emitted:
+    // language_streams is authoritative for type/purpose but is not
+    // necessarily a superset of menu_base.
+    for mb_label in mb {
+        let already = result.iter().any(|l| {
+            l.stream_type == mb_label.stream_type && l.stream_number == mb_label.stream_number
+        });
+        if !already {
+            result.push(mb_label);
+        }
+    }
     result
+}
+
+/// True if a property-key prefix denotes a commentary stream group.
+/// Tightened from a bare `prefix.contains("comm")` substring scan, which
+/// over-matched unrelated prefixes like `common_*` / `community_*`. We
+/// split on `_` and require a `commentary` (or `comm`) segment.
+fn prefix_is_commentary(prefix: &str) -> bool {
+    prefix
+        .split('_')
+        .any(|seg| seg.eq_ignore_ascii_case("commentary") || seg.eq_ignore_ascii_case("comm"))
 }
 
 // ── language_streams.txt parser ────────────────────────────────────────────
@@ -73,9 +102,12 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
         }
 
         let type_str = parts[1];
+        // STN indices are 1-based; apply_labels pre-increments from 0 and
+        // never matches a 0, so a 0 here would emit a dead label. Skip it
+        // (matching the `n > 0` guard in parse_menu_base).
         let stream_num: u16 = match parts[2].parse() {
-            Ok(n) => n,
-            Err(_) => continue,
+            Ok(n) if n > 0 => n,
+            _ => continue,
         };
         let language = parts[3].to_string();
         let variant = if parts.len() > 4 {
@@ -145,18 +177,18 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
 
         if !variant.is_empty() {
             match variant.as_str() {
-                // Codec variants — use shared label vocab
-                "atmos" | "MLP" | "AC3" | "DTS" | "DDL" => {
-                    codec_hint = vocab::codec(&variant).to_string();
-                }
                 // Purpose variants
                 "eda" => final_purpose = LabelPurpose::Descriptive,
                 // Dialect variants — pass through raw code from disc
                 "csp" | "cs" | "lsp" | "ls" | "cf" | "pf" | "bp" | "pp" => {
                     variant_code = variant.clone();
                 }
-                // Unknown — store as-is in codec_hint
-                _ => codec_hint = variant.clone(),
+                // Everything else: defer to vocab::codec as the single
+                // source of codec-name truth. If it recognizes the token
+                // (returns something other than the input) it's a known
+                // codec — store the canonical name. Otherwise it's an
+                // unknown token, stored as-is.
+                _ => codec_hint = vocab::codec(&variant).to_string(),
             }
         }
 
@@ -182,85 +214,10 @@ fn parse_language_streams(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<
 mod tests {
     use super::*;
 
-    /// Build a minimal menu_base.prop text and run `parse_menu_base`'s
-    /// inner logic via a temporary closure. This isolates the prop
-    /// parsing without needing a SectorSource.
+    /// Run the real shipping parser ([`parse_menu_base_text`]) on a
+    /// menu_base.prop body so tests exercise production code directly.
     fn parse_props(text: &str) -> Vec<StreamLabel> {
-        // Mirror the inner loop of parse_menu_base exactly. Kept
-        // separate so the test doesn't need disc fixtures.
-        use std::collections::HashMap;
-        let mut entries: HashMap<String, HashMap<String, String>> = HashMap::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some(eq_pos) = line.find('=') else {
-                continue;
-            };
-            let full_key = &line[..eq_pos];
-            let value = &line[eq_pos + 1..];
-            if let Some(dot_pos) = full_key.rfind('.') {
-                entries
-                    .entry(full_key[..dot_pos].to_string())
-                    .or_default()
-                    .insert(full_key[dot_pos + 1..].to_string(), value.to_string());
-            }
-        }
-        let mut labels = Vec::new();
-        for (prefix, props) in &entries {
-            let is_audio = props
-                .get("class")
-                .is_some_and(|c| c.contains("AudioButton"))
-                || prefix.starts_with("audio_");
-            let is_subtitle = props
-                .get("class")
-                .is_some_and(|c| c.contains("SubtitleButton"))
-                || prefix.starts_with("subtitle_");
-            let stream_num_str = props
-                .get("streamNumber")
-                .or_else(|| props.get("audioStream"))
-                .or_else(|| props.get("subtitleStream"));
-            let stream_num: u16 = match stream_num_str.and_then(|s| s.parse().ok()) {
-                Some(n) if n > 0 => n,
-                _ => continue,
-            };
-            if !is_audio && !is_subtitle {
-                continue;
-            }
-            let name = props.get("name").cloned().unwrap_or_default();
-            let purpose = match vocab::purpose(&name) {
-                LabelPurpose::Normal if prefix.contains("comm") => LabelPurpose::Commentary,
-                p => p,
-            };
-            let qualifier = if is_subtitle {
-                vocab::qualifier(&name)
-            } else {
-                LabelQualifier::None
-            };
-            let stream_type = if is_audio {
-                StreamLabelType::Audio
-            } else {
-                StreamLabelType::Subtitle
-            };
-            let language = props
-                .get("audioLanguage")
-                .or_else(|| props.get("subtitleLanguage"))
-                .cloned()
-                .unwrap_or_default();
-            labels.push(StreamLabel {
-                stream_number: stream_num,
-                stream_type,
-                language,
-                name,
-                purpose,
-                qualifier,
-                codec_hint: String::new(),
-                variant: String::new(),
-            });
-        }
-        labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
-        labels
+        parse_menu_base_text(text)
     }
 
     #[test]
@@ -334,6 +291,74 @@ mod tests {
         );
         assert_eq!(labels[0].qualifier, LabelQualifier::None);
     }
+
+    #[test]
+    fn dual_flag_entry_resolves_to_audio_with_no_subtitle_qualifier() {
+        // An entry tripping BOTH flags (audio_ prefix sets is_audio,
+        // class "SubtitleButton" sets is_subtitle). Audio wins the type,
+        // and the subtitle qualifier (SDH) must NOT be carried onto the
+        // resulting Audio label. Regression for the type/qualifier split.
+        let labels = parse_props(
+            "audio_1.class=SubtitleButton\n\
+             audio_1.streamNumber=6\n\
+             audio_1.name=English SDH\n",
+        );
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].stream_type, StreamLabelType::Audio);
+        assert_eq!(labels[0].qualifier, LabelQualifier::None);
+    }
+
+    #[test]
+    fn prefix_commentary_segment_match_not_substring() {
+        // Genuine commentary group segments match.
+        assert!(prefix_is_commentary("audio_commentary"));
+        assert!(prefix_is_commentary("audio_commentary_1"));
+        assert!(prefix_is_commentary("comm"));
+        // Substring-only prefixes must NOT match (the over-match bug).
+        assert!(!prefix_is_commentary("common"));
+        assert!(!prefix_is_commentary("audio_common_1"));
+        assert!(!prefix_is_commentary("community"));
+        assert!(!prefix_is_commentary("audio_1"));
+    }
+
+    fn lbl(t: StreamLabelType, n: u16, name: &str) -> StreamLabel {
+        StreamLabel {
+            stream_number: n,
+            stream_type: t,
+            language: String::new(),
+            name: name.to_string(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_preserves_menu_base_only_streams() {
+        // language_streams covers audio 1; menu_base has audio 1 (name)
+        // AND a menu_base-only audio 2. The merge must keep audio 2 —
+        // the both-files path previously dropped it.
+        let ls = vec![lbl(StreamLabelType::Audio, 1, "")];
+        let mb = vec![
+            lbl(StreamLabelType::Audio, 1, "Main"),
+            lbl(StreamLabelType::Audio, 2, "Commentary"),
+        ];
+        let merged = merge(ls, mb);
+        assert_eq!(merged.len(), 2, "menu_base-only stream must survive");
+        // ls audio 1 takes its name from mb.
+        let a1 = merged
+            .iter()
+            .find(|l| l.stream_type == StreamLabelType::Audio && l.stream_number == 1)
+            .unwrap();
+        assert_eq!(a1.name, "Main");
+        // mb-only audio 2 is appended.
+        assert!(
+            merged
+                .iter()
+                .any(|l| l.stream_number == 2 && l.name == "Commentary")
+        );
+    }
 }
 
 // ── menu_base.prop parser ──────────────────────────────────────────────────
@@ -341,7 +366,18 @@ mod tests {
 fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>> {
     let data = super::read_jar_file(reader, udf, "menu_base.prop")?;
     let text = std::str::from_utf8(&data).ok()?;
+    let labels = parse_menu_base_text(text);
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels)
+}
 
+/// Parse the body of a `menu_base.prop` file into stream labels. Split
+/// out from [`parse_menu_base`] (which only handles file I/O + UTF-8
+/// decode) so unit tests exercise the real parsing logic instead of a
+/// hand-copied duplicate. Returns the labels sorted by (type, number).
+fn parse_menu_base_text(text: &str) -> Vec<StreamLabel> {
     // Parse key=value, group by prefix
     let mut entries: HashMap<String, HashMap<String, String>> = HashMap::new();
 
@@ -394,6 +430,15 @@ fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<Str
             continue;
         }
 
+        // Resolve the stream type FIRST: when an entry trips both flags
+        // (e.g. an `audio_` prefix with a class containing
+        // "SubtitleButton"), audio wins the type.
+        let stream_type = if is_audio {
+            StreamLabelType::Audio
+        } else {
+            StreamLabelType::Subtitle
+        };
+
         let name = props.get("name").cloned().unwrap_or_default();
 
         // Purpose: ask vocab first (word-boundary matched — avoids the
@@ -402,21 +447,17 @@ fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<Str
         // (`audio_commentary.foo`-style keys group commentary streams
         // regardless of display name).
         let purpose = match vocab::purpose(&name) {
-            LabelPurpose::Normal if prefix.contains("comm") => LabelPurpose::Commentary,
+            LabelPurpose::Normal if prefix_is_commentary(prefix) => LabelPurpose::Commentary,
             p => p,
         };
 
-        // Qualifier: only apply to subtitles (SDH is a subtitle concept).
-        let qualifier = if is_subtitle {
+        // Qualifier (SDH/Forced) is a subtitle-only concept. Gate on the
+        // RESOLVED type, not the raw is_subtitle flag, so an entry that
+        // resolved to Audio never carries a subtitle qualifier.
+        let qualifier = if stream_type == StreamLabelType::Subtitle {
             vocab::qualifier(&name)
         } else {
             LabelQualifier::None
-        };
-
-        let stream_type = if is_audio {
-            StreamLabelType::Audio
-        } else {
-            StreamLabelType::Subtitle
         };
 
         // Try to extract language from audioLanguage/subtitleLanguage prop
@@ -438,9 +479,6 @@ fn parse_menu_base(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<Str
         });
     }
 
-    if labels.is_empty() {
-        return None;
-    }
     labels.sort_by_key(|l| (l.stream_type as u8, l.stream_number));
-    Some(labels)
+    labels
 }

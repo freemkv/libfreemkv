@@ -76,9 +76,14 @@ const PCR_INTERVAL_PACKETS: u64 = 40;
 /// the picture it timestamps. 200 ms in 90 kHz ticks.
 const PCR_LEAD_90KHZ: u64 = 90_000 / 5;
 
-/// Stream-type codes from ISO/IEC 13818-1 Table 2-29 + later amendments.
+/// HEVC stream-type code, ISO/IEC 13818-1 Table 2-34 (2015 amendment).
 const STREAM_TYPE_HEVC: u8 = 0x24;
+/// AC-3 / E-AC-3. Not an ISO assignment — sits in the user-private
+/// 0x80-0xFF range and is the Blu-ray Disc Association / ATSC A/52
+/// convention.
 const STREAM_TYPE_AC3: u8 = 0x81;
+/// Dolby TrueHD. Also a private/BD-conventional value in the
+/// user-private 0x80-0xFF range, not an ISO assignment.
 const STREAM_TYPE_TRUEHD: u8 = 0x83;
 
 /// Audio codec hint for [`M2tsMux::new`] / [`M2tsMux::set_audio`]. The
@@ -126,6 +131,10 @@ pub struct M2tsMux<W: Write> {
     packets_written: u64,
     /// Video packets written since last PCR, used to gate PCR cadence.
     video_packets_since_pcr: u64,
+    /// Set once the first video TS packet has been emitted. Forces a PCR
+    /// onto the very first video PES so a receiver tuning at stream start
+    /// has a clock reference (the PMT advertises the video PID as PCR_PID).
+    first_video_written: bool,
 }
 
 impl<W: Write> M2tsMux<W> {
@@ -145,6 +154,7 @@ impl<W: Write> M2tsMux<W> {
             cc_pmt: 0,
             packets_written: 0,
             video_packets_since_pcr: 0,
+            first_video_written: false,
         }
     }
 
@@ -166,7 +176,7 @@ impl<W: Write> M2tsMux<W> {
     /// PES (and gates codec_private NAL prepending — those only attach to
     /// the first keyframe).
     pub fn write_video(&mut self, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
-        let pts_90k = self.base_relative_pts(pts_ns);
+        let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ true);
         // PCR comes "before" the PTS it timestamps; clamp at 0 for the
         // first frame so we don't underflow.
         let pcr = pts_90k.saturating_sub(PCR_LEAD_90KHZ);
@@ -177,16 +187,15 @@ impl<W: Write> M2tsMux<W> {
         let mut es = Vec::with_capacity(data.len() + 64);
         if keyframe && !self.params_written {
             if let Some(cp) = &self.video_codec_private {
-                let payload = hvcc_payload(cp);
-                if !payload.is_empty() {
-                    let params = super::hevc::length_prefixed_to_annex_b(&payload);
+                if let Some(params) = super::hevc::hvcc_to_annex_b(cp) {
                     es.extend_from_slice(&params);
                 }
             }
             self.params_written = true;
         }
-        let annex_b = super::hevc::length_prefixed_to_annex_b(data);
-        es.extend_from_slice(&annex_b);
+        // Append the Annex-B form directly into the pre-sized `es`
+        // buffer rather than materializing an intermediate Vec.
+        super::hevc::append_length_prefixed_as_annex_b(&mut es, data);
 
         let pes = build_video_pes(pts_90k, &es);
         self.write_pes(PID_VIDEO, &pes, Some(pcr), keyframe)
@@ -200,7 +209,7 @@ impl<W: Write> M2tsMux<W> {
         if self.audio.is_none() {
             return Ok(());
         }
-        let pts_90k = self.base_relative_pts(pts_ns);
+        let pts_90k = self.base_relative_pts(pts_ns, /* may_seed_base */ false);
         let pes = build_audio_pes(pts_90k, data);
         self.write_pes(PID_AUDIO, &pes, None, false)
     }
@@ -212,15 +221,24 @@ impl<W: Write> M2tsMux<W> {
     }
 
     /// Convert input PTS (nanoseconds) to 90 kHz ticks rebased on the
-    /// first frame's PTS. Saturating at 0 keeps the math friendly when
-    /// frames arrive slightly out of decode order.
-    fn base_relative_pts(&mut self, pts_ns: i64) -> u64 {
+    /// stream's PTS origin. The origin is seeded ONLY by the first video
+    /// frame (`may_seed_base == true`); audio frames never seed it. This
+    /// keeps the audio/video offset intact: a leading audio frame can't
+    /// pull the base up and collapse the first/lowest-PTS video frame to 0.
+    /// Frames earlier than the base saturate to 0.
+    fn base_relative_pts(&mut self, pts_ns: i64, may_seed_base: bool) -> u64 {
         let raw_90k = if pts_ns > 0 {
-            (pts_ns as u64) * 9 / 100_000
+            // Widen to u128 so adversarial timestamps can't overflow the
+            // intermediate multiply (pts_ns * 9 exceeds u64 above
+            // ~2.05e18 ns), then clamp to the 33-bit PTS range.
+            (((pts_ns as u128) * 9 / 100_000) as u64) & 0x1_FFFF_FFFF
         } else {
             0
         };
-        let base = *self.base_pts_90k.get_or_insert(raw_90k);
+        if may_seed_base {
+            self.base_pts_90k.get_or_insert(raw_90k);
+        }
+        let base = self.base_pts_90k.unwrap_or(raw_90k);
         raw_90k.saturating_sub(base)
     }
 
@@ -255,10 +273,13 @@ impl<W: Write> M2tsMux<W> {
         while offset < pes.len() {
             self.maybe_emit_psi()?;
 
+            // Force a PCR on the FIRST video PES (PAT+PMT precede it, so
+            // `packets_written` is never 0 here) so a receiver tuning at
+            // stream start has the clock reference the PMT promises.
             let attach_pcr = first
                 && (pid == PID_VIDEO)
                 && (pcr.is_some())
-                && (self.packets_written == 0
+                && (!self.first_video_written
                     || self.video_packets_since_pcr >= PCR_INTERVAL_PACKETS);
 
             // RAI rides only the FIRST packet of a keyframe video PES.
@@ -282,9 +303,16 @@ impl<W: Write> M2tsMux<W> {
             // When AF body is empty we can still skip the AF entirely
             // and get the full 184 B; only invoke the AF when we'd
             // otherwise need stuffing.
+            //
+            // Per ISO/IEC 13818-1 Table 2-6, when an adaptation field is
+            // present its first body byte is the mandatory 8-bit flags
+            // byte. A stuffing-only field still needs that flags byte
+            // (all flags 0) — omitting it would make a strict decoder
+            // read the first 0xFF stuffing byte as flags (PCR_flag=1,
+            // …) and parse a phantom PCR out of the stuffing/payload.
             let (af_present, payload_len, stuffing): (bool, usize, usize) = if !af_body.is_empty() {
-                // AF is mandatory (PCR). 1 byte length + body + stuffing
-                // + payload = 184.
+                // AF is mandatory (PCR, RAI, …). 1 byte length + body +
+                // stuffing + payload = 184.
                 let max_payload = 184 - 1 - af_body.len();
                 let p = remaining.min(max_payload);
                 let s = max_payload - p;
@@ -293,11 +321,13 @@ impl<W: Write> M2tsMux<W> {
                 // Full payload packet — no AF at all.
                 (false, 184, 0)
             } else {
-                // Last (small) packet — stuff via empty AF.
-                // 1 byte length + 0 body + stuffing + payload = 184.
-                let max_payload = 183;
+                // Last (small) packet — stuff via an AF whose body is a
+                // single zero-flags byte. 1 byte length + 1 flags byte +
+                // stuffing + payload = 184, so payload caps at 182.
+                let max_payload = 182;
                 let p = remaining.min(max_payload);
                 let s = max_payload - p;
+                af_body.push(0x00); // zero-flags byte
                 (true, p, s)
             };
 
@@ -305,14 +335,14 @@ impl<W: Write> M2tsMux<W> {
             let mut packet = Packet::new();
             packet.set_header(pid, first, true, af_present, cc);
             if af_present {
-                packet.append_adaptation(&af_body, stuffing);
+                packet.append_adaptation(&af_body, stuffing)?;
             }
-            packet.append_payload(&pes[offset..offset + payload_len]);
-            debug_assert_eq!(packet.len(), 188, "packet not 188 bytes");
+            packet.append_payload(&pes[offset..offset + payload_len])?;
             self.out.write_packet(&packet)?;
 
             self.packets_written += 1;
             if pid == PID_VIDEO {
+                self.first_video_written = true;
                 if attach_pcr {
                     self.video_packets_since_pcr = 0;
                 } else {
@@ -351,7 +381,7 @@ impl<W: Write> M2tsMux<W> {
         let cc = self.advance_cc(PID_PAT);
         let mut packet = Packet::new();
         packet.set_header(PID_PAT, true, true, false, cc);
-        packet.append_payload(&payload);
+        packet.append_payload(&payload)?;
         packet.pad_to_188();
         self.out.write_packet(&packet)?;
         self.packets_written += 1;
@@ -363,48 +393,12 @@ impl<W: Write> M2tsMux<W> {
         let cc = self.advance_cc(PID_PMT);
         let mut packet = Packet::new();
         packet.set_header(PID_PMT, true, true, false, cc);
-        packet.append_payload(&payload);
+        packet.append_payload(&payload)?;
         packet.pad_to_188();
         self.out.write_packet(&packet)?;
         self.packets_written += 1;
         Ok(())
     }
-}
-
-/// Extract the raw hvcC bytes for handoff to `length_prefixed_to_annex_b`.
-/// hvcC layout: 22-byte fixed header, then `numOfArrays` arrays of
-/// `(nalType, numNalus, [nalLength:u16, NAL bytes]…)`. We convert this
-/// directly to a length-prefixed byte stream (NAL length is u16 in
-/// hvcC; widen to u32 for the standard length-prefixed encoding).
-fn hvcc_payload(hvcc: &[u8]) -> Vec<u8> {
-    if hvcc.len() < 23 {
-        return Vec::new();
-    }
-    let num_arrays = hvcc[22] as usize;
-    let mut out = Vec::new();
-    let mut offset = 23;
-    for _ in 0..num_arrays {
-        if offset + 3 > hvcc.len() {
-            break;
-        }
-        offset += 1;
-        let num_nalus = u16::from_be_bytes([hvcc[offset], hvcc[offset + 1]]) as usize;
-        offset += 2;
-        for _ in 0..num_nalus {
-            if offset + 2 > hvcc.len() {
-                break;
-            }
-            let nal_len = u16::from_be_bytes([hvcc[offset], hvcc[offset + 1]]) as usize;
-            offset += 2;
-            if offset + nal_len > hvcc.len() {
-                break;
-            }
-            out.extend_from_slice(&(nal_len as u32).to_be_bytes());
-            out.extend_from_slice(&hvcc[offset..offset + nal_len]);
-            offset += nal_len;
-        }
-    }
-    out
 }
 
 /// Build a PES packet for a video access unit.
@@ -414,9 +408,11 @@ fn build_video_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
 
 /// Build a PES packet for an audio access unit.
 fn build_audio_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
-    // Audio PES: length is fillable when it fits in u16. We always
-    // write the length so receivers don't have to scan for the next
-    // start code.
+    // Audio PES: a bounded length is written whenever the PES fits in a
+    // u16 (the common case), so receivers don't have to scan for the next
+    // start code. For an access unit larger than ~64 KiB (rare — e.g. a
+    // large TrueHD frame) the length field falls back to the unbounded
+    // (0x0000) form, which most demuxers tolerate for private_stream_1.
     build_pes_packet(0xBD, pts_90k, es, /* length_in_header */ true)
 }
 
@@ -632,6 +628,30 @@ mod tests {
     }
 
     #[test]
+    fn first_video_pes_carries_pcr() {
+        // A receiver tuning at stream start needs the clock reference the
+        // PMT promises (video PID = PCR_PID). The very first video PES must
+        // therefore carry a PCR even though PAT+PMT precede it.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&4u32.to_be_bytes());
+        frame.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+        mux.write_video(0, true, &frame).unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+
+        // First PUSI video packet must carry an AF with the PCR flag (0x10).
+        let pkt = sink
+            .chunks(188)
+            .find(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
+            .expect("video PUSI packet exists");
+        let af = af_body(pkt).expect("first video PES must carry an adaptation field");
+        assert!(!af.is_empty(), "AF flags byte present");
+        assert_eq!(af[0] & 0x10, 0x10, "PCR flag set on first video PES");
+    }
+
+    #[test]
     fn audio_track_appears_in_pmt_and_stream() {
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
@@ -715,6 +735,69 @@ mod tests {
     }
 
     #[test]
+    fn stuffing_only_tail_packet_is_spec_valid() {
+        // A short final PES packet must stuff via an adaptation field
+        // whose first body byte is the mandatory zero-flags byte (per
+        // ISO/IEC 13818-1 Table 2-6), never a bare 0xFF stuffing byte
+        // that a decoder would misread as PCR/OPCR/etc. flags.
+        //
+        // Use an AUDIO PES (no PCR, no RAI on its tail) so the only AF on
+        // the last packet is the stuffing-only field under test. The PES
+        // is sized so its final TS packet is short (< 184 payload bytes).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        mux.set_audio(AudioCodec::Ac3);
+        // Drive a keyframe first so the stream is well-formed, then the
+        // audio frame whose tail is short.
+        let mut vframe = Vec::new();
+        vframe.extend_from_slice(&4u32.to_be_bytes());
+        vframe.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
+        mux.write_video(0, true, &vframe).unwrap();
+        // 200-byte audio payload → PES > 184 → spills into a short tail.
+        let audio: Vec<u8> = (0..200u32).map(|i| (i & 0xFF) as u8).collect();
+        mux.write_audio(20_000_000, &audio).unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+
+        assert_ts_well_formed(&sink);
+
+        // Find every audio packet that carries an adaptation field; the
+        // short tail packet is one of them. Each such AF must have a
+        // length >= 1 and a zero-flags body byte (not 0xFF).
+        let mut saw_stuffing_af = false;
+        for pkt in sink.chunks(188) {
+            let pid = u16::from_be_bytes([pkt[1] & 0x1F, pkt[2]]);
+            if pid != PID_AUDIO {
+                continue;
+            }
+            let afc = (pkt[3] >> 4) & 0x03;
+            if afc & 0b10 == 0 {
+                continue; // no AF on this packet
+            }
+            let af_len = pkt[4] as usize;
+            assert!(
+                af_len >= 1,
+                "stuffing AF must include the mandatory flags byte"
+            );
+            // First AF body byte is the flags byte — must be zero, never
+            // a 0xFF stuffing byte masquerading as flags.
+            assert_eq!(
+                pkt[5], 0x00,
+                "stuffing-only AF flags byte must be 0x00, not 0x{:02X}",
+                pkt[5]
+            );
+            // adaptation_field_length + payload must fill exactly 184.
+            // (4 header + 1 AF-length + af_len + payload = 188.)
+            assert!(af_len <= 183, "AF length overflows the 184-byte body");
+            saw_stuffing_af = true;
+        }
+        assert!(
+            saw_stuffing_af,
+            "expected at least one audio packet with a stuffing AF"
+        );
+    }
+
+    #[test]
     fn rai_set_on_keyframe_pes_packet() {
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
@@ -792,11 +875,12 @@ mod tests {
 
     #[test]
     fn keyframe_video_with_pcr_combines_flags() {
-        // PCR attaches only when video_packets_since_pcr >=
-        // PCR_INTERVAL_PACKETS (40). The very first video packet emits a
-        // PAT+PMT first, so packets_written != 0 and attach_pcr is false on
-        // frame 0. We push: keyframe (no PCR) → many non-key (drives the
-        // PCR counter past the interval) → second keyframe (PCR + RAI).
+        // The first video PES carries a PCR (and RAI) and resets the PCR
+        // counter. After that, PCR re-attaches only when
+        // video_packets_since_pcr >= PCR_INTERVAL_PACKETS (40). We push:
+        // keyframe (PCR+RAI, counter reset) → many non-key (drives the
+        // counter past the interval) → second keyframe whose PUSI combines
+        // RAI (keyframe) and PCR (counter exceeded).
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
         let mut small = Vec::new();

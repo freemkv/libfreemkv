@@ -15,6 +15,11 @@ const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
 #[cfg(test)]
 const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 
+/// DTS / DTS-HD elementary-stream parser. Buffers DTS across PES boundaries so
+/// a core frame plus all of its trailing DTS-HD extension substreams are
+/// emitted together as one access unit, delimited by the next valid core sync.
+/// This preserves the lossless extension data instead of downgrading to lossy
+/// core (the Dunkirk / Fight Club lossy-core bug).
 pub struct DtsParser {
     buf: Vec<u8>,
     /// PTS of the access unit currently being assembled in `buf` (the unit
@@ -92,11 +97,22 @@ impl DtsParser {
 /// this without a clean boundary we resync rather than stall or balloon.
 const MAX_AU_BYTES: usize = 65536;
 
-/// Minimum plausible DTS core frame size. The core header alone is ~10-14
-/// bytes; a decoded `core_size` below this means we matched a false/corrupt
-/// core sync (the 14-bit `fsize` field decoded to a tiny value) rather than a
-/// real frame, so we resync instead of emitting a junk access unit.
-const MIN_CORE_FRAME_BYTES: usize = 10;
+/// Number of leading bytes that must be buffered before the core `fsize` field
+/// (bytes 5-7) can be decoded. This is a HEADER-LAYOUT minimum — "enough bytes
+/// to read the size field" — and is deliberately distinct from
+/// `MIN_CORE_FRAME_BYTES` (the decoded-frame-size validity floor). They must not
+/// be conflated: this one gates buffer reads of the header, the other rejects
+/// implausible decoded sizes.
+const CORE_HEADER_MIN_BYTES: usize = 10;
+
+/// Minimum plausible decoded DTS core frame size, per ETSI TS 102 114: the
+/// on-wire FSIZE floor is 95, so a real core frame is at least 96 bytes. A
+/// decoded `core_size` below this means we matched a false/corrupt core sync
+/// (a lucky 0x7FFE8001 in extension-substream payload whose 14-bit `fsize`
+/// decoded to a tiny value) rather than a real frame, so we resync instead of
+/// closing an access unit at a junk boundary and dropping the DTS-HD extension
+/// tail.
+const MIN_CORE_FRAME_BYTES: usize = 96;
 
 /// Sentinel for "no valid PTS base captured yet". Real PTS-in-ns values are
 /// non-negative (derived from the unsigned 90 kHz PES timestamp), so a negative
@@ -156,25 +172,30 @@ impl CodecParser for DtsParser {
             };
             if start > 0 {
                 self.drain_front(start);
-                if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) {
-                    // Shouldn't happen, but never loop forever.
-                    break;
-                }
+                // The sync `find_sync` located at offset `start` is now at
+                // offset 0 by construction, so a re-scan would be a redundant
+                // O(buf_len) walk per iteration; assert the invariant instead.
+                debug_assert_eq!(
+                    find_sync(&self.buf, &DTS_CORE_SYNC),
+                    Some(0),
+                    "drain_front(start) must leave the core sync at offset 0"
+                );
             }
 
             // Need the core header to size the core frame.
-            if self.buf.len() < 10 {
+            if self.buf.len() < CORE_HEADER_MIN_BYTES {
                 break;
             }
             let core_size = dts_core_frame_size(&self.buf);
             // `dts_core_frame_size` returns a 14-bit `fsize + 1`, so it is
             // always in [1, 16384]; the bare `== 0` / `> MAX_AU_BYTES` checks
-            // can never fire. A real DTS core header is at least ~10-14 bytes,
-            // so any decoded size below that came from a false/corrupt sync.
-            // Reject it (drain the 4 syncword bytes and resync) instead of
-            // letting a tiny bogus size close the current access unit at a junk
-            // boundary and drop the trailing extension substreams. The
-            // `> MAX_AU_BYTES` upper bound is kept as a harmless guard.
+            // can never fire. A real DTS core frame is at least
+            // MIN_CORE_FRAME_BYTES (96, the ETSI spec floor), so any decoded
+            // size below that came from a false/corrupt sync. Reject it (drain
+            // the 4 syncword bytes and resync) instead of letting a tiny bogus
+            // size close the current access unit at a junk boundary and drop the
+            // trailing extension substreams. The `> MAX_AU_BYTES` upper bound is
+            // kept as a harmless guard.
             if !(MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&core_size) {
                 // Bogus core sync — skip past it and resync.
                 self.drain_front(4);
@@ -257,7 +278,8 @@ impl CodecParser for DtsParser {
         // core + its extension substreams, which had no following core sync to
         // close it during streaming). Require a complete core frame; drop a
         // bare partial sync tail.
-        if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) || self.buf.len() < 10 {
+        if find_sync(&self.buf, &DTS_CORE_SYNC) != Some(0) || self.buf.len() < CORE_HEADER_MIN_BYTES
+        {
             self.buf.clear();
             return Vec::new();
         }
@@ -315,7 +337,7 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
     while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
         let pos = from + rel;
         // Need the candidate's core header to judge it.
-        if buf.len() - pos < 10 {
+        if buf.len() - pos < CORE_HEADER_MIN_BYTES {
             return NextCore::NeedMore;
         }
         let sz = dts_core_frame_size(&buf[pos..]);
@@ -328,10 +350,17 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
     NextCore::None
 }
 
-/// DTS core frame size from header bits.
-/// fsize is at bits 46-59 (14 bits) of the header: bytes 5-7.
+/// DTS core frame size from header bits. `fsize` is the 14-bit field at bits
+/// 46-59 of the header (bytes 5-7). On the wire `fsize` is the frame length
+/// minus one, so this returns `fsize + 1`, i.e. the core frame length in bytes
+/// (range 1..=16384). Callers treat the result as the actual byte length and
+/// the MIN..=MAX range checks assume so.
+///
+/// Returns `0` when `data` is shorter than `CORE_HEADER_MIN_BYTES` — every call
+/// site rejects that via the minimum-frame lower bound, so a `0` is never
+/// mistaken for a valid tiny frame.
 fn dts_core_frame_size(data: &[u8]) -> usize {
-    if data.len() < 10 {
+    if data.len() < CORE_HEADER_MIN_BYTES {
         return 0;
     }
     // fsize field: 14 bits starting at bit 46
@@ -627,6 +656,43 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 640);
+    }
+
+    #[test]
+    fn sub_spec_core_size_is_rejected_as_false_sync() {
+        // A core sync whose decoded fsize+1 lands in [CORE_HEADER_MIN_BYTES,
+        // MIN_CORE_FRAME_BYTES) — i.e. a "frame" smaller than the 96-byte ETSI
+        // spec minimum — is a false sync inside extension payload and must NOT
+        // close an access unit. Pick a decoded size of 64 (well inside the old
+        // 10..96 false-positive window the raised floor now rejects).
+        let false_size = 64usize;
+        assert!(
+            (CORE_HEADER_MIN_BYTES..MIN_CORE_FRAME_BYTES).contains(&false_size),
+            "test fixture must sit in the widened reject window"
+        );
+        let mut parser = DtsParser::new();
+
+        // Frame 1: real core(512) + extension that embeds a sub-spec "core sync"
+        // whose fsize decodes to 64 bytes.
+        let mut ext = make_dts_ext(256);
+        let bogus = make_dts_core(false_size); // valid-looking sync, size 64
+        ext[64..64 + bogus.len()].copy_from_slice(&bogus);
+        let mut frame1 = make_dts_core(512);
+        frame1.extend_from_slice(&ext);
+
+        assert!(
+            parser.parse(&make_pes(frame1, Some(90000))).is_empty(),
+            "sub-spec core size must not close the AU"
+        );
+
+        // Real next core closes frame 1 as core + full extension.
+        let f = parser.parse(&make_pes(make_dts_core(640), Some(93000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].data.len(),
+            512 + 256,
+            "AU must not be split at the sub-spec false sync"
+        );
     }
 
     #[test]

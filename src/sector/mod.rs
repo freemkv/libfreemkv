@@ -8,7 +8,7 @@
 //! - [`SectorSource`] is implemented by `Drive` (hardware) and
 //!   [`FileSectorSource`] (file-backed).
 //! - [`SectorSink`] is implemented by [`FileSectorSink`]
-//!   (ISO-backed) and sweep/patch consumer adapters.
+//!   (ISO-backed).
 //! - [`DecryptingSectorSource`] is a decorator that wraps any
 //!   `SectorSource` and applies AACS / CSS in-place decrypt to
 //!   yield plaintext sectors.
@@ -37,6 +37,14 @@ pub trait SectorSource: Send {
     /// the flag.
     ///
     /// Returns the number of bytes written into `buf` on success.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if `buf.len() < count * 2048`. This
+    /// is a caller contract enforced via `debug_assert!` in the
+    /// primary impl ([`FileSectorSource`]); in release builds an
+    /// undersized buffer panics on the slice. Callers must size `buf`
+    /// to at least `count * 2048` bytes.
     fn read_sectors(
         &mut self,
         lba: u32,
@@ -102,7 +110,8 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
 pub trait SectorSink: Send {
     /// Write the sectors in `buf` starting at `lba`. `buf.len()`
     /// must be a multiple of 2048; the implementation seeks to
-    /// `lba * 2048` before writing.
+    /// `lba as u64 * 2048` before writing (the `u64` cast is required —
+    /// a bare `u32` `lba * 2048` wraps past ~4 GB on UHD-scale images).
     fn write_sectors(&mut self, lba: u32, buf: &[u8]) -> Result<()>;
 
     /// Flush, fsync, and close. Consumes the sink. Always called

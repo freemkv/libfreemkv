@@ -6,7 +6,9 @@
 use super::mkv::{MkvMuxer, MkvTrack};
 use super::{WriteSeek, ebml};
 
-type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>)>;
+/// (title, codec_privates, ts_scale_ns) — `ts_scale_ns` is the
+/// TimestampScale in nanoseconds per tick, threaded into the frame read path.
+type MkvHeaderResult = io::Result<(crate::disc::DiscTitle, Vec<(u16, Vec<u8>)>, i64)>;
 
 /// Skip `n` bytes on a forward-only reader (no Seek required).
 fn skip_bytes(r: &mut impl Read, n: u64) -> io::Result<()> {
@@ -62,7 +64,14 @@ use std::io::{self, Read};
 
 struct ReadState {
     reader: Box<dyn Read + Send>,
-    cluster_ts_ms: i64,
+    /// Current cluster timestamp in TimestampScale *ticks* (not ms). Combined
+    /// with each block's relative tick offset and scaled to nanoseconds via
+    /// `ts_scale_ns`.
+    cluster_ts_ticks: i64,
+    /// TimestampScale in nanoseconds per tick (Matroska INFO/TimestampScale,
+    /// default 1_000_000 = 1 ms). Foreign MKVs may use a different scale; the
+    /// frame PTS must honour it, not assume milliseconds.
+    ts_scale_ns: i64,
     /// Codec private data per track (track_number, hvcC/avcC bytes).
     codec_privates: Vec<(u16, Vec<u8>)>,
 }
@@ -123,12 +132,13 @@ impl MkvStream {
 
     /// Open an MKV file for reading → PES frames.
     pub fn open(mut reader: impl Read + Send + 'static) -> io::Result<Self> {
-        let (disc_title, codec_privates) = parse_mkv_header(&mut reader)?;
+        let (disc_title, codec_privates, ts_scale_ns) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
             mode: Mode::Read(ReadState {
                 reader: Box::new(reader),
-                cluster_ts_ms: 0,
+                cluster_ts_ticks: 0,
+                ts_scale_ns,
                 codec_privates,
             }),
         })
@@ -137,6 +147,7 @@ impl MkvStream {
 
 impl crate::pes::Stream for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
+        let streams_len = self.disc_title.streams.len();
         let rs = match self.mode {
             Mode::Read(ref mut rs) => rs,
             Mode::Write { .. } => return Err(crate::error::Error::StreamWriteOnly.into()),
@@ -145,47 +156,95 @@ impl crate::pes::Stream for MkvStream {
         loop {
             let (id, size, _) = match ebml::read_element_header(&mut rs.reader) {
                 Ok(h) => h,
-                Err(_) => return Ok(None),
+                // Only a genuine premature/clean EOF ends the stream. Any other
+                // error (disc read failure, corrupt sector, network drop) must
+                // propagate, or a mid-mux I/O failure would silently truncate
+                // the output with no error signal.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e),
             };
 
             match id {
                 ebml::CLUSTER => continue,
                 ebml::CLUSTER_TIMESTAMP => {
-                    rs.cluster_ts_ms = read_uint_bounded(&mut rs.reader, size)? as i64;
+                    let raw = read_uint_bounded(&mut rs.reader, size)?;
+                    // The cluster timestamp is an untrusted u64; a value above
+                    // i64::MAX would cast to a large negative i64 and poison
+                    // every block PTS in the cluster. Reject it, mirroring the
+                    // EBML-size guard in parse_mkv_header.
+                    if raw > i64::MAX as u64 {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
+                    rs.cluster_ts_ticks = raw as i64;
                     continue;
                 }
                 ebml::SIMPLE_BLOCK => {
                     let block =
                         ebml::read_binary_val(&mut rs.reader, checked_size(size, MAX_BLOCK_SIZE)?)?;
-                    if block.len() < 4 {
-                        continue;
+                    if let Some(frame) = parse_block(
+                        &block,
+                        rs.cluster_ts_ticks,
+                        rs.ts_scale_ns,
+                        streams_len,
+                        None,
+                    ) {
+                        return Ok(Some(frame));
                     }
-
-                    let (track, vl) = block_vint(&block);
-                    if vl + 3 > block.len() {
-                        continue;
+                    continue;
+                }
+                ebml::BLOCK_GROUP => {
+                    // MkvMuxer emits a BlockGroup (BLOCK + BLOCK_DURATION) for
+                    // every frame carrying a duration — i.e. all AC3 audio and
+                    // PGS subtitle frames. Descend into the group, read the
+                    // inner BLOCK (0xA1) and BLOCK_DURATION (0x9B), and yield a
+                    // frame so a round-trip through this muxer does not silently
+                    // drop those tracks. A non-u64::MAX size bounds the children.
+                    if size == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
                     }
-
-                    let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
-                    let keyframe = block[vl + 2] & 0x80 != 0;
-                    let data = block[vl + 3..].to_vec();
-                    let pts_ms = rs.cluster_ts_ms + rel_ts as i64;
-                    let track_idx = (track as usize).saturating_sub(1); // MKV tracks are 1-based
-
-                    // Skip blocks for non-existent tracks
-                    if track_idx >= self.disc_title.streams.len() {
-                        continue;
+                    let mut remaining = size;
+                    let mut block: Option<Vec<u8>> = None;
+                    let mut duration_ms: Option<u64> = None;
+                    while remaining > 0 {
+                        let (cid, cs, hlen) = ebml::read_element_header(&mut rs.reader)?;
+                        if cs == u64::MAX {
+                            return Err(crate::error::Error::MkvInvalid.into());
+                        }
+                        remaining = remaining.saturating_sub(hlen as u64 + cs);
+                        match cid {
+                            ebml::BLOCK => {
+                                block = Some(ebml::read_binary_val(
+                                    &mut rs.reader,
+                                    checked_size(cs, MAX_BLOCK_SIZE)?,
+                                )?);
+                            }
+                            ebml::BLOCK_DURATION => {
+                                duration_ms = Some(read_uint_bounded(&mut rs.reader, cs)?);
+                            }
+                            _ => skip_bytes(&mut rs.reader, cs)?,
+                        }
                     }
-
-                    return Ok(Some(crate::pes::PesFrame {
-                        track: track_idx,
-                        pts: pts_ms * 1_000_000, // ms → ns
-                        keyframe,
-                        data,
-                        duration_ns: None,
-                    }));
+                    if let Some(block) = block {
+                        let dur_ns = duration_ms.map(|ms| ms.saturating_mul(1_000_000));
+                        if let Some(frame) = parse_block(
+                            &block,
+                            rs.cluster_ts_ticks,
+                            rs.ts_scale_ns,
+                            streams_len,
+                            dur_ns,
+                        ) {
+                            return Ok(Some(frame));
+                        }
+                    }
+                    continue;
                 }
                 _ => {
+                    // An unknown-size element here would drain the whole stream
+                    // (take(u64::MAX)) and silently drop all later frames;
+                    // reject it like the rest of the parser.
+                    if size == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
                     skip_bytes(&mut rs.reader, size)?;
                     continue;
                 }
@@ -272,14 +331,27 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
         }
         let (id, size, _) = match ebml::read_element_header(r) {
             Ok(h) => h,
-            Err(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
         };
 
         match id {
             ebml::INFO => {
+                // An unknown-size (u64::MAX) parent would drain children until
+                // an EOF read error instead of a clean MkvInvalid; reject it for
+                // parity with the segment loop guard below.
+                if size == u64::MAX {
+                    return Err(crate::error::Error::MkvInvalid.into());
+                }
                 let mut remaining = size;
                 while remaining > 0 {
                     let (cid, cs, hlen) = ebml::read_element_header(r)?;
+                    // An inner child declaring EBML unknown size (cs == u64::MAX)
+                    // would overflow `hlen + cs` (debug panic) and is meaningless
+                    // for a sized parent — reject it.
+                    if cs == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
                     remaining = remaining.saturating_sub(hlen as u64 + cs);
                     match cid {
                         ebml::TIMESTAMP_SCALE => ts_scale = read_uint_bounded(r, cs)?,
@@ -293,9 +365,15 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
                 got_info = true;
             }
             ebml::TRACKS => {
+                if size == u64::MAX {
+                    return Err(crate::error::Error::MkvInvalid.into());
+                }
                 let mut remaining = size;
                 while remaining > 0 {
                     let (cid, cs, hlen) = ebml::read_element_header(r)?;
+                    if cs == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
                     remaining = remaining.saturating_sub(hlen as u64 + cs);
                     if cid == ebml::TRACK_ENTRY {
                         let (stream, tnum, cp) = parse_track(r, cs)?;
@@ -325,7 +403,38 @@ fn parse_mkv_header(r: &mut impl Read) -> MkvHeaderResult {
         streams,
         ..DiscTitle::empty()
     };
-    Ok((disc_title, codec_privates))
+    // Clamp the (untrusted) scale to a positive i64 for the tick→ns multiply on
+    // the read path; default to 1 ms if absent or absurd.
+    let ts_scale_ns = if ts_scale == 0 || ts_scale > i64::MAX as u64 {
+        1_000_000
+    } else {
+        ts_scale as i64
+    };
+    Ok((disc_title, codec_privates, ts_scale_ns))
+}
+
+/// Largest valid 13-bit MPEG-TS PID.
+const MAX_TS_PID: u32 = 0x1FFF;
+
+/// Map an MKV track number to a synthetic BD-TS PID, rejecting any value that
+/// would overflow the 13-bit PID space. Track 1 is the video PID (0x1011);
+/// every other track maps to `0x1100 + (tnum - 2)`. Computed in `u32` so the
+/// addition can never wrap, unlike the prior `u16` arithmetic.
+fn ts_pid_for_track(tnum: u16) -> io::Result<u16> {
+    // MKV track numbers are 1-based; 0 is invalid (and would underflow the
+    // `tnum - 2` below).
+    if tnum == 0 {
+        return Err(crate::error::Error::MkvInvalid.into());
+    }
+    let pid: u32 = if tnum == 1 {
+        0x1011
+    } else {
+        0x1100u32 + (tnum as u32 - 2)
+    };
+    if pid > MAX_TS_PID {
+        return Err(crate::error::Error::MkvInvalid.into());
+    }
+    Ok(pid as u16)
 }
 
 /// Returns (stream, track_number, codec_private_bytes)
@@ -341,9 +450,21 @@ fn parse_track(
     let mut remaining = size;
     while remaining > 0 {
         let (cid, cs, hlen) = ebml::read_element_header(r)?;
+        if cs == u64::MAX {
+            return Err(crate::error::Error::MkvInvalid.into());
+        }
         remaining = remaining.saturating_sub(hlen as u64 + cs);
         match cid {
-            ebml::TRACK_NUMBER => tnum = read_uint_bounded(r, cs)? as u16,
+            ebml::TRACK_NUMBER => {
+                // Reject a TRACK_NUMBER above u16::MAX rather than truncating
+                // with `as u16` (which would alias 65536→0, 65537→1, … onto
+                // existing small track numbers and corrupt PID/codec lookup).
+                let n = read_uint_bounded(r, cs)?;
+                if n > u16::MAX as u64 {
+                    return Err(crate::error::Error::MkvInvalid.into());
+                }
+                tnum = n as u16;
+            }
             ebml::TRACK_TYPE => ttype = read_uint_bounded(r, cs)?,
             ebml::CODEC_ID => codec_id = read_string_bounded(r, cs)?,
             ebml::CODEC_PRIVATE => {
@@ -359,6 +480,9 @@ fn parse_track(
                 let mut vrem = cs;
                 while vrem > 0 {
                     let (vid, vs, vhlen) = ebml::read_element_header(r)?;
+                    if vs == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
                     vrem = vrem.saturating_sub(vhlen as u64 + vs);
                     if vid == ebml::PIXEL_HEIGHT {
                         ph = read_uint_bounded(r, vs)? as u32;
@@ -371,6 +495,9 @@ fn parse_track(
                 let mut arem = cs;
                 while arem > 0 {
                     let (aid, as_, ahlen) = ebml::read_element_header(r)?;
+                    if as_ == u64::MAX {
+                        return Err(crate::error::Error::MkvInvalid.into());
+                    }
                     arem = arem.saturating_sub(ahlen as u64 + as_);
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
@@ -409,12 +536,11 @@ fn parse_track(
         SampleRate::S48
     };
 
-    // Map MKV track numbers to BD-TS PIDs
-    let ts_pid = if tnum == 1 {
-        0x1011
-    } else {
-        0x1100 + (tnum - 2)
-    };
+    // Map MKV track numbers to BD-TS PIDs. A 13-bit TS PID tops out at
+    // 0x1FFF; compute in u32 so the `0x1100 + (tnum - 2)` arithmetic can't
+    // wrap u16 for large track numbers, and reject anything that would land
+    // outside the valid PID space.
+    let ts_pid = ts_pid_for_track(tnum)?;
 
     let stream = match ttype {
         1 => {
@@ -453,6 +579,58 @@ fn parse_track(
     Ok((stream, tnum, codec_priv))
 }
 
+/// Parse a (Simple)Block payload into a PesFrame, or `None` if it should be
+/// skipped (too short, track 0, or a track index out of range).
+///
+/// `cluster_ts_ticks` is the open cluster's timestamp in TimestampScale ticks
+/// and `ts_scale_ns` is that scale (ns per tick); the block PTS is computed as
+/// `(cluster_ts_ticks + rel_ts) * ts_scale_ns` so foreign MKVs whose scale
+/// isn't 1 ms are honoured (freemkv's own output uses 1_000_000 and round-trips
+/// unchanged). `streams_len` bounds the resolved track index; `duration_ns` is
+/// propagated for BlockGroup blocks (None for SimpleBlock).
+fn parse_block(
+    block: &[u8],
+    cluster_ts_ticks: i64,
+    ts_scale_ns: i64,
+    streams_len: usize,
+    duration_ns: Option<u64>,
+) -> Option<crate::pes::PesFrame> {
+    if block.len() < 4 {
+        return None;
+    }
+    let (track, vl) = block_vint(block);
+    if vl + 3 > block.len() {
+        return None;
+    }
+    // Track 0 is invalid (MKV track numbers are 1-based). block_vint also
+    // returns 0 for an unsupported 5+ byte VINT, so a corrupt/zero-track block
+    // must be skipped rather than attributed to the first stream.
+    if track == 0 {
+        return None;
+    }
+
+    let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
+    let keyframe = block[vl + 2] & 0x80 != 0;
+    let data = block[vl + 3..].to_vec();
+    let pts_ticks = cluster_ts_ticks + rel_ts as i64;
+    let track_idx = (track as usize) - 1; // track >= 1 checked above
+
+    // Skip blocks for non-existent tracks.
+    if track_idx >= streams_len {
+        return None;
+    }
+
+    Some(crate::pes::PesFrame {
+        track: track_idx,
+        // saturating_mul: a hostile CLUSTER_TIMESTAMP could push pts_ticks near
+        // i64::MAX, where ticks→ns would overflow and panic in debug builds.
+        pts: pts_ticks.saturating_mul(ts_scale_ns),
+        keyframe,
+        data,
+        duration_ns,
+    })
+}
+
 fn block_vint(d: &[u8]) -> (u64, usize) {
     if d.is_empty() {
         return (0, 0);
@@ -489,10 +667,36 @@ mod tests {
 
     // `From<Error> for io::Error` encodes the numeric code into the
     // Display string as "E{code}: ...". Check the prefix.
+    /// Extract the error from a `MkvStream::open` result without requiring
+    /// `MkvStream: Debug` (which `unwrap_err` would).
+    fn open_err(r: io::Result<MkvStream>) -> io::Error {
+        match r {
+            Ok(_) => panic!("expected MkvStream::open to fail"),
+            Err(e) => e,
+        }
+    }
+
     fn is_mkv_invalid(e: &io::Error) -> bool {
         e.kind() == io::ErrorKind::InvalidData
             && e.to_string()
                 .starts_with(&format!("E{}", crate::error::E_MKV_INVALID))
+    }
+
+    #[test]
+    fn ts_pid_for_track_maps_and_rejects_overflow() {
+        // Track 1 → video PID; track 2 → first audio PID base.
+        assert_eq!(ts_pid_for_track(1).unwrap(), 0x1011);
+        assert_eq!(ts_pid_for_track(2).unwrap(), 0x1100);
+        assert_eq!(ts_pid_for_track(3).unwrap(), 0x1101);
+        // Highest track that still lands inside the 13-bit PID space.
+        // 0x1100 + (tnum-2) <= 0x1FFF  ⇒  tnum <= 0xF01.
+        assert_eq!(ts_pid_for_track(0xF01).unwrap(), 0x1FFF);
+        // One past the edge must be rejected, not wrap u16.
+        assert!(is_mkv_invalid(&ts_pid_for_track(0xF02).unwrap_err()));
+        // Former overflow case (debug panic / release garbage PID) is rejected.
+        assert!(is_mkv_invalid(&ts_pid_for_track(u16::MAX).unwrap_err()));
+        // Track 0 is invalid (1-based) and would underflow tnum-2.
+        assert!(is_mkv_invalid(&ts_pid_for_track(0).unwrap_err()));
     }
 
     #[test]
@@ -613,5 +817,275 @@ mod tests {
         assert_eq!(frame.track, 0);
         assert!(frame.keyframe);
         assert_eq!(frame.data, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+    #[test]
+    fn truncated_simple_block_body_errors_not_panics() {
+        // A SIMPLE_BLOCK that declares a 64-byte payload but supplies none.
+        // read_exact_bounded must surface a clean typed MkvInvalid error
+        // (a truncated declared element is malformed input), never panic,
+        // and never allocate the full declared size up front.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, 64).unwrap();
+        // No body bytes follow → short read.
+        let bytes = minimal_mkv_with_cluster(&cluster);
+
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let e = stream.read().unwrap_err();
+        assert!(is_mkv_invalid(&e));
+    }
+
+    /// Build a minimal MKV header + Segment + Info, then a Tracks element with a
+    /// single TRACK_ENTRY of the given track number/type, then the cluster bytes.
+    fn mkv_with_track_and_cluster(tnum: u64, ttype: u64, cluster_body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, tnum).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, ttype).unwrap();
+        let mut track_entry = Vec::new();
+        ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();
+        track_entry.extend_from_slice(&entry);
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, track_entry.len() as u64).unwrap();
+        out.extend_from_slice(&track_entry);
+
+        out.extend_from_slice(cluster_body);
+        out
+    }
+
+    #[test]
+    fn oversized_codec_private_is_rejected() {
+        // A TRACK_ENTRY whose CODEC_PRIVATE declares a payload above
+        // MAX_CODEC_PRIVATE must be rejected (MkvInvalid) before any
+        // multi-MB allocation, while parsing the header.
+        let mut entry = Vec::new();
+        ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
+        ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
+        // CODEC_PRIVATE header claiming a huge size (no body needed — the
+        // size check fires first).
+        ebml::write_id(&mut entry, ebml::CODEC_PRIVATE).unwrap();
+        ebml::write_size(&mut entry, MAX_CODEC_PRIVATE + 1).unwrap();
+        let mut track_entry = Vec::new();
+        ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();
+        track_entry.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, track_entry.len() as u64).unwrap();
+        out.extend_from_slice(&track_entry);
+
+        let e = match MkvStream::open(Cursor::new(out)) {
+            Ok(_) => panic!("expected MkvInvalid, got Ok"),
+            Err(e) => e,
+        };
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn block_group_frame_round_trips_with_duration() {
+        // MkvMuxer emits AC3/PGS frames as a BlockGroup (BLOCK + BLOCK_DURATION).
+        // The reader must descend into the group and yield the frame (with its
+        // duration) rather than skipping it — otherwise every AC3/PGS frame this
+        // muxer writes is lost on read-back.
+        let block = [0x82u8, 0x00, 0x05, 0x00, 0x11, 0x22, 0x33]; // track 2, rel 5, not-kf, 3 data
+        let mut bg_body = Vec::new();
+        ebml::write_id(&mut bg_body, ebml::BLOCK).unwrap();
+        ebml::write_size(&mut bg_body, block.len() as u64).unwrap();
+        bg_body.extend_from_slice(&block);
+        ebml::write_uint(&mut bg_body, ebml::BLOCK_DURATION, 40).unwrap(); // 40 ms
+
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        // CLUSTER_TIMESTAMP = 100 ms so pts = (100 + 5) ms.
+        ebml::write_uint(&mut cluster, ebml::CLUSTER_TIMESTAMP, 100).unwrap();
+        ebml::write_id(&mut cluster, ebml::BLOCK_GROUP).unwrap();
+        ebml::write_size(&mut cluster, bg_body.len() as u64).unwrap();
+        cluster.extend_from_slice(&bg_body);
+
+        // Track 2 (audio) so track_idx 1 needs two streams; give two TRACK_ENTRYs.
+        // Reuse the helper for track 1, then a manual second entry would be
+        // simpler — instead build directly with two entries.
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        let mut tracks = Vec::new();
+        for (n, t) in [(1u64, 1u64), (2u64, 2u64)] {
+            let mut entry = Vec::new();
+            ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, n).unwrap();
+            ebml::write_uint(&mut entry, ebml::TRACK_TYPE, t).unwrap();
+            ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+            ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+            tracks.extend_from_slice(&entry);
+        }
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+        out.extend_from_slice(&cluster);
+
+        let mut stream = MkvStream::open(Cursor::new(out)).unwrap();
+        let frame = stream
+            .read()
+            .unwrap()
+            .expect("BlockGroup frame must be read");
+        assert_eq!(frame.track, 1, "track 2 → index 1");
+        assert!(!frame.keyframe);
+        assert_eq!(frame.data, vec![0x11, 0x22, 0x33]);
+        assert_eq!(frame.pts, 105 * 1_000_000, "pts = (cluster 100 + rel 5) ms");
+        assert_eq!(frame.duration_ns, Some(40 * 1_000_000));
+    }
+
+    #[test]
+    fn track_number_zero_is_rejected() {
+        // A TRACK_ENTRY with TRACK_NUMBER 0 must be rejected (the ts_pid
+        // computation would underflow `tnum - 2`).
+        let bytes = mkv_with_track_and_cluster(0, 1, &[]);
+        let e = open_err(MkvStream::open(Cursor::new(bytes)));
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn track_number_above_u16_is_rejected() {
+        // 65536 would truncate to 0 via `as u16` and then underflow.
+        let bytes = mkv_with_track_and_cluster(65536, 1, &[]);
+        let e = open_err(MkvStream::open(Cursor::new(bytes)));
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn unknown_size_inner_child_in_tracks_is_rejected() {
+        // A TRACK_ENTRY child declaring EBML unknown size (cs == u64::MAX) must
+        // be rejected, not used in `hlen + cs` (which would overflow → debug
+        // panic). Hand-build a TRACK_ENTRY whose first child carries the
+        // unknown-size marker.
+        let mut entry = Vec::new();
+        ebml::write_id(&mut entry, ebml::TRACK_NUMBER).unwrap();
+        ebml::write_unknown_size(&mut entry).unwrap(); // child size = unknown
+
+        let mut tracks = Vec::new();
+        ebml::write_id(&mut tracks, ebml::TRACK_ENTRY).unwrap();
+        ebml::write_size(&mut tracks, entry.len() as u64).unwrap();
+        tracks.extend_from_slice(&entry);
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::TRACKS).unwrap();
+        ebml::write_size(&mut out, tracks.len() as u64).unwrap();
+        out.extend_from_slice(&tracks);
+
+        let e = open_err(MkvStream::open(Cursor::new(out)));
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn oversized_title_string_is_rejected() {
+        // INFO/TITLE declaring a string above MAX_STRING_LEN must be
+        // rejected during header parse, not allocated.
+        let mut info = Vec::new();
+        ebml::write_id(&mut info, ebml::TITLE).unwrap();
+        ebml::write_size(&mut info, MAX_STRING_LEN + 1).unwrap();
+
+        let mut out = Vec::new();
+        ebml::write_id(&mut out, ebml::EBML).unwrap();
+        ebml::write_size(&mut out, 0).unwrap();
+        ebml::write_id(&mut out, ebml::SEGMENT).unwrap();
+        ebml::write_unknown_size(&mut out).unwrap();
+        ebml::write_id(&mut out, ebml::INFO).unwrap();
+        ebml::write_size(&mut out, info.len() as u64).unwrap();
+        out.extend_from_slice(&info);
+
+        let e = match MkvStream::open(Cursor::new(out)) {
+            Ok(_) => panic!("expected MkvInvalid, got Ok"),
+            Err(e) => e,
+        };
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn read_uint_val_len_nine_errors_not_panics() {
+        // Direct helper test: an EBML uint cannot exceed 8 bytes. len=9
+        // would index past the fixed 8-byte stack buffer and panic on
+        // untrusted input; it must return MkvInvalid instead.
+        let mut data = Cursor::new(vec![0u8; 16]);
+        let e = ebml::read_uint_val(&mut data, 9).unwrap_err();
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn read_float_val_bad_width_errors() {
+        // EBML floats are exactly 0, 4, or 8 bytes. Any other width is
+        // malformed and must error rather than over- or under-read.
+        let mut data = Cursor::new(vec![0u8; 16]);
+        let e = ebml::read_float_val(&mut data, 5).unwrap_err();
+        assert!(is_mkv_invalid(&e));
+        // 0/4/8 remain valid widths.
+        let mut z = Cursor::new(vec![0u8; 16]);
+        assert_eq!(ebml::read_float_val(&mut z, 0).unwrap(), 0.0);
+        let mut f4 = Cursor::new(vec![0u8; 16]);
+        assert!(ebml::read_float_val(&mut f4, 4).is_ok());
+        let mut f8 = Cursor::new(vec![0u8; 16]);
+        assert!(ebml::read_float_val(&mut f8, 8).is_ok());
+    }
+
+    #[test]
+    fn non_utf8_string_element_is_rejected() {
+        // A string element with invalid UTF-8 bytes must surface a numeric
+        // MkvInvalid error, not an io::Error wrapping the FromUtf8Error
+        // English message (library no-English rule).
+        let mut data = Cursor::new(vec![0xFF, 0xFE, 0xFD, 0xFC]);
+        let e = ebml::read_string_val(&mut data, 4).unwrap_err();
+        assert!(is_mkv_invalid(&e));
+    }
+
+    #[test]
+    fn simple_block_track_zero_is_skipped() {
+        // A SimpleBlock with track vint 0 must be skipped, not attributed to
+        // track 0. Build one track, then a cluster whose only block is track 0
+        // followed by a valid track-1 block; read() must return the track-1 one.
+        let mut cluster = Vec::new();
+        ebml::write_id(&mut cluster, ebml::CLUSTER).unwrap();
+        ebml::write_unknown_size(&mut cluster).unwrap();
+        // track vint 0 is not directly encodable (0x80 is track 0 → block_vint
+        // returns (0,1)); use 0x80 as the track byte.
+        let bad = [0x80u8, 0x00, 0x00, 0x80, 0xEE];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, bad.len() as u64).unwrap();
+        cluster.extend_from_slice(&bad);
+        let good = [0x81u8, 0x00, 0x00, 0x80, 0xAB, 0xCD];
+        ebml::write_id(&mut cluster, ebml::SIMPLE_BLOCK).unwrap();
+        ebml::write_size(&mut cluster, good.len() as u64).unwrap();
+        cluster.extend_from_slice(&good);
+
+        let bytes = mkv_with_track_and_cluster(1, 1, &cluster);
+        let mut stream = MkvStream::open(Cursor::new(bytes)).unwrap();
+        let frame = stream.read().unwrap().expect("track-1 frame expected");
+        assert_eq!(frame.track, 0);
+        assert_eq!(frame.data, vec![0xAB, 0xCD]);
     }
 }

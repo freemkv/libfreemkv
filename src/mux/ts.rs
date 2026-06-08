@@ -128,6 +128,14 @@ impl TsDemuxer {
     /// limits. Empty `pids` yields max_pid 0; the floor still produces a
     /// valid (wholly-unused) table.
     pub fn new(pids: &[u16]) -> Self {
+        // The PID→assembler index is stored as i16 (-1 = untracked), so a
+        // 32768th+ tracked PID would truncate to a negative value and be
+        // silently treated as untracked. Callers pass a handful of PIDs
+        // (BD-TS has at most ~8192), so this is a programmer-error guard.
+        debug_assert!(
+            pids.len() <= i16::MAX as usize,
+            "TsDemuxer: too many PIDs for an i16 index table"
+        );
         let max_pid = pids.iter().copied().max().unwrap_or(0) as usize;
         let table_size = (max_pid + 1).max(8192);
         let mut pid_index = vec![-1i16; table_size];
@@ -222,6 +230,13 @@ impl TsDemuxer {
         if idx < 0 {
             return;
         }
+        // adaptation_field_control == 0b00 is reserved (ISO 13818-1) and
+        // carries no payload; discard so a corrupt/desynced packet can't
+        // inject its 184 bytes into the PES assembler.
+        if adaptation == 0x00 {
+            return;
+        }
+
         let asm = &mut self.assemblers[idx as usize];
 
         let payload_start = if adaptation == 0x03 || adaptation == 0x02 {
@@ -309,23 +324,24 @@ fn parse_pes_header(data: &[u8]) -> (Option<i64>, Option<i64>, usize) {
 
     let stream_id = data[3];
 
-    // Some stream IDs don't have the standard PES header extension
-    // (program_stream_map, padding, private_stream_2, ECM, EMM, etc.)
+    // Some stream IDs don't carry the standard PES header extension
+    // (ISO 13818-1 Table 2-22: program_stream_map, padding, private_stream_2,
+    // ECM, EMM, DSMCC_stream 0xF2, H.222.1 type E 0xF8, program_stream_directory).
     if stream_id == 0xBC
         || stream_id == 0xBE
         || stream_id == 0xBF
         || stream_id == 0xF0
         || stream_id == 0xF1
+        || stream_id == 0xF2
+        || stream_id == 0xF8
         || stream_id == 0xFF
     {
         return (None, None, 6);
     }
 
-    // Standard PES header: [6] = flags1, [7] = flags2, [8] = header_data_length
-    if data.len() < 9 {
-        return (None, None, 6);
-    }
-
+    // Standard PES header: [6] = flags1, [7] = flags2, [8] = header_data_length.
+    // The `data.len() < 9` precondition was already checked at the top of
+    // this function and nothing shrinks `data` since, so no re-check here.
     let pts_dts_flags = (data[7] >> 6) & 0x03;
     let header_data_len = data[8] as usize;
     // Full, uncapped header length. PTS/DTS (if present) live in the
@@ -352,8 +368,9 @@ fn parse_timestamp(data: &[u8]) -> Option<i64> {
     if data.len() < 5 {
         return None;
     }
-    // Validate marker bits: byte 2 bit 0 and byte 4 bit 0 must be 1
-    if (data[2] & 0x01) == 0 || (data[4] & 0x01) == 0 {
+    // Validate marker bits: per MPEG-2 Systems (Table 2-17) bit 0 of
+    // bytes 0, 2 and 4 of the 5-byte PTS/DTS field must all be 1.
+    if (data[0] & 0x01) == 0 || (data[2] & 0x01) == 0 || (data[4] & 0x01) == 0 {
         return None;
     }
     let b0 = data[0] as i64;
@@ -369,167 +386,252 @@ fn parse_timestamp(data: &[u8]) -> Option<i64> {
 // Stream scanning (PAT/PMT → stream list)
 // ============================================================
 
+/// Whether `offset` is a credible BD-TS packet boundary in the PSI scanner.
+///
+/// Requires the sync byte at `data[offset + 4]`, and — to avoid latching onto
+/// a stray 0x47 inside a TP_extra_header or payload during a desync — also
+/// requires the next 192-spaced position to carry a sync byte when one exists
+/// in the buffer. A lone trailing packet (no follower in range) is accepted on
+/// its single sync byte.
+fn is_resync_point(data: &[u8], offset: usize) -> bool {
+    if data.get(offset + 4) != Some(&SYNC_BYTE) {
+        return false;
+    }
+    match data.get(offset + BD_TS_PACKET_SIZE + 4) {
+        Some(&b) => b == SYNC_BYTE,
+        None => true, // last packet in the buffer — no follower to corroborate
+    }
+}
+
+/// Compute the byte offset of the PSI payload (the pointer_field) for a BD-TS
+/// packet starting at `pkt` (the 4-byte TP_extra_header + 188-byte TS packet).
+///
+/// Accounts for the adaptation_field_control (bits 5:4 of the 4th TS header
+/// byte). Returns `None` when the packet carries no payload (AFC 0b10 = AF
+/// only, or the reserved 0b00) or when the adaptation field length runs past
+/// the packet. `pkt` must be at least [`BD_TS_PACKET_SIZE`] bytes.
+fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
+    // TS header is pkt[4..]; byte pkt[7] holds AFC in bits 5:4.
+    let afc = (pkt[7] >> 4) & 0x03;
+    match afc {
+        0x01 => Some(8), // payload only: 4 (TP_extra) + 4 (TS header)
+        0x03 => {
+            // Adaptation field present + payload. AF length byte is pkt[8];
+            // payload starts after it.
+            let af_len = pkt[8] as usize;
+            let base = 9 + af_len; // 4 + 4 + 1(length byte) + af_len
+            if base < BD_TS_PACKET_SIZE {
+                Some(base)
+            } else {
+                None // AF overruns the packet
+            }
+        }
+        // 0x02 = AF only (no payload), 0x00 = reserved.
+        _ => None,
+    }
+}
+
+/// Reassemble a single PSI section (PAT / PMT) for `target_pid` with
+/// the expected `table_id`, respecting TS-packet boundaries.
+///
+/// The section pointed at by `pointer_field` in the PUSI packet may be
+/// longer than the 184-byte TS payload (PSI sections can reach 1021
+/// bytes; a PMT with many ES entries spans 2+ packets). Reading a flat
+/// slice of the input would walk straight through the next packet's
+/// TP_extra_header + TS header as if it were table content, yielding a
+/// wrong PID / garbage stream_type. This walks the PUSI packet, applies
+/// `pointer_field` bounded to within that packet's payload, then appends
+/// the payload of each subsequent continuation packet (same PID, no
+/// PUSI) until `3 + section_length` bytes have been collected.
+///
+/// The PUSI packet's payload base is computed with [`psi_payload_base`]
+/// so a PSI section carried behind an adaptation field is located
+/// correctly rather than assuming the payload starts at `offset + 8`.
+///
+/// Returns the section bytes (starting at the table_id) or `None` if no
+/// matching section is found.
+fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
+    let mut offset = 0;
+    while offset + BD_TS_PACKET_SIZE <= data.len() {
+        if !is_resync_point(data, offset) {
+            offset += 1;
+            continue;
+        }
+        let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
+        let pusi = data[offset + 5] & 0x40 != 0;
+
+        if pid == target_pid && pusi {
+            // Locate the payload (pointer_field) accounting for any
+            // adaptation field. A packet with no payload (AF only) or an
+            // AF that overruns the packet is skipped.
+            let Some(payload_off) = psi_payload_base(&data[offset..offset + BD_TS_PACKET_SIZE])
+            else {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            };
+            let payload = &data[offset + payload_off..offset + BD_TS_PACKET_SIZE];
+            // pointer_field is the FIRST payload byte; the section starts
+            // pointer_field bytes after it. Bound the start to within
+            // THIS packet's payload — a pointer that runs into the next
+            // packet is malformed.
+            let pointer = payload[0] as usize;
+            let sec_start = 1 + pointer;
+            if sec_start + 3 > payload.len() || payload[sec_start] != table_id {
+                offset += BD_TS_PACKET_SIZE;
+                continue;
+            }
+            let section_len =
+                (((payload[sec_start + 1] & 0x0F) as usize) << 8) | payload[sec_start + 2] as usize;
+            let total = 3 + section_len; // table_id + 2 length bytes + body
+            let mut section = Vec::with_capacity(total);
+            section.extend_from_slice(&payload[sec_start..]);
+            if section.len() >= total {
+                section.truncate(total);
+                return Some(section);
+            }
+            // Need continuation packets: same PID, no PUSI.
+            let mut scan = offset + BD_TS_PACKET_SIZE;
+            while scan + BD_TS_PACKET_SIZE <= data.len() && section.len() < total {
+                if data[scan + 4] != SYNC_BYTE {
+                    scan += 1;
+                    continue;
+                }
+                let cpid = (((data[scan + 5] & 0x1F) as u16) << 8) | data[scan + 6] as u16;
+                let cpusi = data[scan + 5] & 0x40 != 0;
+                if cpid == target_pid && !cpusi {
+                    // Continuation packets may also carry an adaptation
+                    // field; compute their payload base the same way.
+                    if let Some(cbase) = psi_payload_base(&data[scan..scan + BD_TS_PACKET_SIZE]) {
+                        section.extend_from_slice(&data[scan + cbase..scan + BD_TS_PACKET_SIZE]);
+                    }
+                }
+                scan += BD_TS_PACKET_SIZE;
+            }
+            if section.len() >= total {
+                section.truncate(total);
+                return Some(section);
+            }
+            // Incomplete section (truncated input) — stop looking.
+            return None;
+        }
+        offset += BD_TS_PACKET_SIZE;
+    }
+    None
+}
+
 /// Scan BD-TS data for streams by parsing PAT and PMT tables.
 /// Returns None if no valid program is found.
 pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
     use crate::disc::*;
 
-    // Pass 1: find PMT PID from PAT
+    // Pass 1: find PMT PID from PAT (table_id 0x00 on PID 0).
+    let pat = collect_psi_section(data, 0, 0x00)?;
+    let pat_section_len = (((pat[1] & 0x0F) as usize) << 8) | pat[2] as usize;
+    if pat_section_len < 4 {
+        return None;
+    }
     let mut pat_pmt_pid: Option<u16> = None;
-    let mut offset = 0;
-    while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE {
-            offset += 1;
-            continue;
-        }
-        let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
-        let pusi = data[offset + 5] & 0x40 != 0;
-
-        if pid == 0 && pusi {
-            let payload_start = offset + 4 + 4;
-            if payload_start + 12 < data.len() {
-                let pointer = data[payload_start] as usize;
-                let pat_start = payload_start + 1 + pointer;
-                if pat_start + 12 < data.len() && data[pat_start] == 0x00 {
-                    let section_len = (((data[pat_start + 1] & 0x0F) as usize) << 8)
-                        | data[pat_start + 2] as usize;
-                    let entries_start = pat_start + 8;
-                    if section_len < 4 {
-                        offset += BD_TS_PACKET_SIZE;
-                        continue;
-                    }
-                    let entries_end = pat_start + 3 + section_len - 4;
-                    let mut e = entries_start;
-                    while e + 4 <= data.len() && e < entries_end {
-                        let prog_num = ((data[e] as u16) << 8) | data[e + 1] as u16;
-                        let p = (((data[e + 2] & 0x1F) as u16) << 8) | data[e + 3] as u16;
-                        if prog_num != 0 {
-                            pat_pmt_pid = Some(p);
-                            break;
-                        }
-                        e += 4;
-                    }
-                }
+    {
+        let entries_start = 8;
+        // section_length counts bytes after the length field, incl. the
+        // 4-byte CRC; the program loop stops before the CRC.
+        let entries_end = (3 + pat_section_len - 4).min(pat.len());
+        let mut e = entries_start;
+        while e + 4 <= entries_end {
+            let prog_num = ((pat[e] as u16) << 8) | pat[e + 1] as u16;
+            let p = (((pat[e + 2] & 0x1F) as u16) << 8) | pat[e + 3] as u16;
+            if prog_num != 0 {
+                pat_pmt_pid = Some(p);
+                break;
             }
+            e += 4;
         }
-        offset += BD_TS_PACKET_SIZE;
     }
 
     let pmt_pid = pat_pmt_pid?;
 
-    // Pass 2: parse PMT for stream entries
+    // Pass 2: parse PMT for stream entries (table_id 0x02 on pmt_pid).
     let mut streams = Vec::new();
-    offset = 0;
-    while offset + BD_TS_PACKET_SIZE <= data.len() {
-        if data[offset + 4] != SYNC_BYTE {
-            offset += 1;
-            continue;
+    let pmt = collect_psi_section(data, pmt_pid, 0x02)?;
+    if pmt.len() >= 12 {
+        let section_len = (((pmt[1] & 0x0F) as usize) << 8) | pmt[2] as usize;
+        // section_length counts the bytes after this field, including the
+        // trailing 4-byte CRC; `< 4` would underflow `end` below.
+        if section_len < 4 {
+            return None;
         }
-        let pid = (((data[offset + 5] & 0x1F) as u16) << 8) | data[offset + 6] as u16;
-        let pusi = data[offset + 5] & 0x40 != 0;
+        let prog_info_len = (((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize;
+        let mut pos = 12 + prog_info_len;
+        // Clamp the section end to the reassembled bytes; a malformed
+        // section_len or prog_info_len must never drive reads past `pmt`.
+        let end = (3 + section_len - 4).min(pmt.len());
 
-        if pid == pmt_pid && pusi {
-            let payload_start = offset + 4 + 4;
-            if payload_start + 1 >= data.len() {
-                offset += BD_TS_PACKET_SIZE;
-                continue;
-            }
-            let pointer = data[payload_start] as usize;
-            let pmt_start = payload_start + 1 + pointer;
-            if pmt_start + 12 >= data.len() {
-                offset += BD_TS_PACKET_SIZE;
-                continue;
-            }
-            if data[pmt_start] != 0x02 {
-                offset += BD_TS_PACKET_SIZE;
-                continue;
-            }
+        while pos + 5 <= end {
+            let stream_type = pmt[pos];
+            let es_pid = (((pmt[pos + 1] & 0x1F) as u16) << 8) | pmt[pos + 2] as u16;
+            let es_info_len = (((pmt[pos + 3] & 0x0F) as usize) << 8) | pmt[pos + 4] as usize;
 
-            let section_len =
-                (((data[pmt_start + 1] & 0x0F) as usize) << 8) | data[pmt_start + 2] as usize;
-            // section_length counts the bytes after this field, including the
-            // trailing 4-byte CRC; `< 4` would underflow `end` below. Guard it
-            // exactly like the PAT parser above.
-            if section_len < 4 {
-                offset += BD_TS_PACKET_SIZE;
-                continue;
-            }
-            let prog_info_len =
-                (((data[pmt_start + 10] & 0x0F) as usize) << 8) | data[pmt_start + 11] as usize;
-            let mut pos = pmt_start + 12 + prog_info_len;
-            // Clamp the section end to the buffer; a malformed section_len or
-            // prog_info_len must never drive reads past `data`.
-            let end = (pmt_start + 3 + section_len - 4).min(data.len());
-
-            while pos + 5 <= data.len() && pos < end {
-                let stream_type = data[pos];
-                let es_pid = (((data[pos + 1] & 0x1F) as u16) << 8) | data[pos + 2] as u16;
-                let es_info_len = (((data[pos + 3] & 0x0F) as usize) << 8) | data[pos + 4] as usize;
-
-                // Single source of truth for stream_type → Codec: reuse
-                // `Codec::from_coding_type` (the same table the BD STN /
-                // disc scanner uses) so the two mappings can never drift.
-                // We only retain the category (video/audio/subtitle) and
-                // per-kind default attribute logic here.
-                let codec = Codec::from_coding_type(stream_type);
-                let stream = match codec.kind() {
-                    CodecKind::Video => {
-                        // Default resolution by codec generation (HEVC →
-                        // UHD, MPEG-2 → 1080i, else 1080p); refined later
-                        // from the actual elementary stream.
-                        let resolution = match codec {
-                            Codec::Hevc => Resolution::R2160p,
-                            Codec::Mpeg2 => Resolution::R1080i,
-                            _ => Resolution::R1080p,
-                        };
-                        Some(Stream::Video(VideoStream {
-                            pid: es_pid,
-                            codec,
-                            resolution,
-                            frame_rate: FrameRate::Unknown,
-                            hdr: HdrFormat::Sdr,
-                            color_space: ColorSpace::Bt709,
-                            secondary: false,
-                            label: String::new(),
-                        }))
-                    }
-                    CodecKind::Audio => Some(Stream::Audio(AudioStream {
+            // Single source of truth for stream_type → Codec: reuse
+            // `Codec::from_coding_type` (the same table the BD STN /
+            // disc scanner uses) so the two mappings can never drift.
+            // We only retain the category (video/audio/subtitle) and
+            // per-kind default attribute logic here.
+            let codec = Codec::from_coding_type(stream_type);
+            let stream = match codec.kind() {
+                CodecKind::Video => {
+                    // Default resolution by codec generation (HEVC →
+                    // UHD, MPEG-2 → 1080i, else 1080p); refined later
+                    // from the actual elementary stream.
+                    let resolution = match codec {
+                        Codec::Hevc => Resolution::R2160p,
+                        Codec::Mpeg2 => Resolution::R1080i,
+                        _ => Resolution::R1080p,
+                    };
+                    Some(Stream::Video(VideoStream {
                         pid: es_pid,
                         codec,
-                        channels: AudioChannels::Surround51,
-                        language: "und".into(),
-                        sample_rate: SampleRate::S48,
+                        resolution,
+                        frame_rate: FrameRate::Unknown,
+                        hdr: HdrFormat::Sdr,
+                        color_space: ColorSpace::Bt709,
                         secondary: false,
-                        purpose: crate::disc::LabelPurpose::Normal,
                         label: String::new(),
-                    })),
-                    CodecKind::Subtitle => Some(Stream::Subtitle(SubtitleStream {
-                        pid: es_pid,
-                        codec,
-                        language: "und".into(),
-                        forced: false,
-                        qualifier: crate::disc::LabelQualifier::None,
-                        codec_data: None,
-                    })),
-                    CodecKind::Unknown => {
-                        tracing::warn!(
-                            target: "mux",
-                            "dropping PMT stream entry with unknown stream_type {:#04x} (PID {:#06x})",
-                            stream_type,
-                            es_pid,
-                        );
-                        None
-                    }
-                };
-
-                if let Some(s) = stream {
-                    streams.push(s);
+                    }))
                 }
-                pos += 5 + es_info_len;
+                CodecKind::Audio => Some(Stream::Audio(AudioStream {
+                    pid: es_pid,
+                    codec,
+                    channels: AudioChannels::Surround51,
+                    language: "und".into(),
+                    sample_rate: SampleRate::S48,
+                    secondary: false,
+                    purpose: crate::disc::LabelPurpose::Normal,
+                    label: String::new(),
+                })),
+                CodecKind::Subtitle => Some(Stream::Subtitle(SubtitleStream {
+                    pid: es_pid,
+                    codec,
+                    language: "und".into(),
+                    forced: false,
+                    qualifier: crate::disc::LabelQualifier::None,
+                    codec_data: None,
+                })),
+                CodecKind::Unknown => {
+                    tracing::warn!(
+                        target: "mux",
+                        "dropping PMT stream entry with unknown stream_type {:#04x} (PID {:#06x})",
+                        stream_type,
+                        es_pid,
+                    );
+                    None
+                }
+            };
+
+            if let Some(s) = stream {
+                streams.push(s);
             }
-            break;
+            pos += 5 + es_info_len;
         }
-        offset += BD_TS_PACKET_SIZE;
     }
 
     if streams.is_empty() {
@@ -646,6 +748,139 @@ mod tests {
         bdts_packet(body, pmt_pid, true)
     }
 
+    /// Build a 192-byte BD-TS data packet on `pid` carrying `payload`
+    /// (payload-only adaptation, truncated/padded to fit one packet).
+    fn data_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40;
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x10; // payload only, no adaptation field
+        let room = TS_PACKET_SIZE - 4; // 184 ES bytes after the 4-byte TS header
+        let n = payload.len().min(room);
+        pkt[8..8 + n].copy_from_slice(&payload[..n]);
+        pkt
+    }
+
+    /// Like `pmt_packet` but with a 2-byte adaptation field (AFC=0b11) of
+    /// stuffing before the payload, to exercise the adaptation-field-aware
+    /// payload base computation in scan_streams.
+    fn pmt_packet_with_af(pmt_pid: u16, entries: &[(u8, u16)]) -> Vec<u8> {
+        let af_len: u8 = 2; // 1 flags byte + 1 stuffing byte
+        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = (((pmt_pid >> 8) as u8) & 0x1F) | 0x40; // PUSI set
+        pkt[6] = (pmt_pid & 0xFF) as u8;
+        pkt[7] = 0x30; // AFC = 0b11 (adaptation + payload)
+        pkt[8] = af_len; // adaptation_field_length
+        pkt[9] = 0x00; // AF flags
+        pkt[10] = 0xFF; // stuffing
+        // Payload (PSI) begins at 4 + 4 + 1 + af_len = 11.
+        let payload_off = 4 + 4 + 1 + af_len as usize;
+        let mut body = vec![0xFFu8; BD_TS_PACKET_SIZE - payload_off];
+        body[0] = 0x00; // pointer_field
+        let s = 1;
+        body[s] = 0x02; // table_id = PMT
+        let entries_len = entries.len() * 5;
+        let section_length = 9 + entries_len + 4;
+        body[s + 1] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        body[s + 2] = (section_length & 0xFF) as u8;
+        body[s + 3] = 0x00;
+        body[s + 4] = 0x01;
+        body[s + 5] = 0xC1;
+        body[s + 6] = 0x00;
+        body[s + 7] = 0x00;
+        body[s + 8] = 0xE0;
+        body[s + 9] = 0x00;
+        body[s + 10] = 0xF0;
+        body[s + 11] = 0x00;
+        let mut p = s + 12;
+        for &(stype, es_pid) in entries {
+            body[p] = stype;
+            body[p + 1] = 0xE0 | (((es_pid >> 8) as u8) & 0x1F);
+            body[p + 2] = (es_pid & 0xFF) as u8;
+            body[p + 3] = 0xF0;
+            body[p + 4] = 0x00;
+            p += 5;
+        }
+        pkt[payload_off..].copy_from_slice(&body);
+        pkt
+    }
+
+    #[test]
+    fn short_pes_payload_injects_no_header_bytes() {
+        // A PUSI packet whose payload is NOT a valid PES start
+        // (no 00 00 01 start code / too short) must contribute ZERO bytes to
+        // the assembled elementary stream — otherwise a stray 00 00 01 in the
+        // garbage masquerades as an Annex-B NAL / PES start code in the codec
+        // parser. Only the following well-formed continuation bytes survive.
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // Garbage PUSI payload with NO valid PES start code (no leading
+        // 00 00 01). It must parse as malformed → header_len 0 → nothing
+        // pushed. The bytes include a 00 00 01 03 sequence mid-payload that,
+        // if leaked, would masquerade as an Annex-B NAL / PES start code.
+        let mut garbage = vec![0xAAu8; 32];
+        garbage[8] = 0x00;
+        garbage[9] = 0x00;
+        garbage[10] = 0x01;
+        garbage[11] = 0x03;
+        let mut stream = demux.feed(&data_packet(pid, true, &garbage));
+        assert!(
+            stream.is_empty(),
+            "garbage PUSI packet must not complete a PES on its own"
+        );
+
+        // Continuation packet (no PUSI) carrying real ES bytes.
+        let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        stream.extend(demux.feed(&data_packet(pid, false, &es)));
+        stream.extend(demux.flush());
+
+        assert_eq!(stream.len(), 1, "one PES assembled from the continuation");
+        let pes = &stream[0];
+        // The continuation ES bytes survive…
+        assert!(
+            pes.data.windows(es.len()).any(|w| w == es),
+            "continuation ES bytes present, got {:02X?}",
+            pes.data
+        );
+        // …but none of the garbage PUSI payload leaked in. In particular the
+        // 0xAA filler and the embedded 00 00 01 sequence must be absent — the
+        // malformed PES header contributed ZERO bytes to the elementary stream.
+        assert!(
+            !pes.data.iter().any(|&b| b == 0xAA),
+            "garbage PES-header bytes must not appear in the elementary stream"
+        );
+        assert!(
+            !pes.data.windows(3).any(|w| w == [0x00, 0x00, 0x01]),
+            "no injected start code leaked from the malformed PES header"
+        );
+    }
+
+    #[test]
+    fn scan_streams_handles_adaptation_field_in_pmt() {
+        use crate::disc::{Codec, Stream};
+        let pmt_pid = 0x0100;
+        let mut data = pat_packet(pmt_pid);
+        // PMT carried in a packet with an adaptation field — payload base must
+        // account for af_len, not assume offset+8.
+        data.extend(pmt_packet_with_af(pmt_pid, &[(0x1B, 0x1011)]));
+        // Follower sync byte so is_resync_point corroborates the PMT packet.
+        data.extend(pat_packet(pmt_pid));
+
+        let streams = scan_streams(&data).expect("PMT with AF should parse");
+        assert!(
+            streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "H.264 video must be found past the adaptation field"
+        );
+    }
+
     #[test]
     fn scan_streams_maps_lpcm_via_from_coding_type() {
         use crate::disc::{Codec, Stream};
@@ -671,6 +906,88 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
             "H.264 video present"
+        );
+    }
+
+    /// Build a PMT whose reassembled section spans MORE than one 184-byte
+    /// TS payload, returned as two BD-TS packets: a PUSI packet carrying
+    /// the section head and a continuation (no-PUSI) packet carrying the
+    /// tail. The reassembler must stitch them back together; a flat-slice
+    /// parser would read the continuation packet's TS header as table
+    /// content and mis-type or drop the trailing entries.
+    fn pmt_two_packets(pmt_pid: u16, entries: &[(u8, u16)]) -> Vec<u8> {
+        // Assemble the raw PSI section (table_id + length + body + CRC).
+        let entries_len = entries.len() * 5;
+        let section_length = 9 + entries_len + 4; // fixed PMT fields + entries + CRC
+        let mut section = Vec::new();
+        section.push(0x02); // table_id
+        section.push(0xB0 | (((section_length >> 8) as u8) & 0x0F));
+        section.push((section_length & 0xFF) as u8);
+        section.extend_from_slice(&[0x00, 0x01]); // program_number
+        section.push(0xC1); // version/current_next
+        section.push(0x00); // section_number
+        section.push(0x00); // last_section_number
+        section.extend_from_slice(&[0xE0, 0x00]); // PCR PID
+        section.extend_from_slice(&[0xF0, 0x00]); // program_info_length = 0
+        for &(stype, es_pid) in entries {
+            section.push(stype);
+            section.push(0xE0 | (((es_pid >> 8) as u8) & 0x1F));
+            section.push((es_pid & 0xFF) as u8);
+            section.extend_from_slice(&[0xF0, 0x00]); // ES_info_length = 0
+        }
+        section.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // CRC (unchecked)
+
+        // First packet payload: pointer_field(0) + as much section as fits.
+        let first_cap = 184 - 1; // minus pointer_field
+        let head_len = first_cap.min(section.len());
+        let mut p0 = [0xFFu8; 184];
+        p0[0] = 0x00; // pointer_field
+        p0[1..1 + head_len].copy_from_slice(&section[..head_len]);
+        let pkt0 = bdts_packet(p0, pmt_pid, true);
+
+        // Continuation packet (no PUSI) carries the rest.
+        let mut p1 = [0xFFu8; 184];
+        let tail = &section[head_len..];
+        assert!(!tail.is_empty(), "test must actually span two packets");
+        p1[..tail.len()].copy_from_slice(tail);
+        let pkt1 = bdts_packet(p1, pmt_pid, false);
+
+        let mut out = pkt0;
+        out.extend(pkt1);
+        out
+    }
+
+    #[test]
+    fn scan_streams_reassembles_pmt_across_packets() {
+        use crate::disc::{Codec, Stream};
+        let pmt_pid = 0x0100;
+        // Enough entries that the section exceeds one 183-byte payload:
+        // 12 fixed + 4*N*... at 5 bytes/entry; 40 entries = 200 bytes of
+        // entries alone, forcing a continuation packet.
+        let mut entries: Vec<(u8, u16)> = Vec::new();
+        entries.push((0x1B, 0x1011)); // H.264 video
+        for i in 0..40u16 {
+            entries.push((0x80, 0x1100 + i)); // LPCM audio tracks
+        }
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pmt_two_packets(pmt_pid, &entries));
+
+        let streams = scan_streams(&data).expect("multi-packet PMT should parse");
+        // All entries must survive reassembly (video + 40 audio).
+        assert_eq!(streams.len(), entries.len(), "every PMT entry reassembled");
+        assert!(
+            streams
+                .iter()
+                .any(|s| matches!(s, Stream::Video(v) if v.codec == Codec::H264)),
+            "video survives the split"
+        );
+        // The LAST audio entry lives in the continuation packet — proves
+        // the tail was stitched in, not read from a TS header.
+        assert!(
+            streams.iter().any(
+                |s| matches!(s, Stream::Audio(a) if a.pid == 0x1100 + 39 && a.codec == Codec::Lpcm)
+            ),
+            "trailing audio entry from the continuation packet survives"
         );
     }
 }

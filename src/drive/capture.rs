@@ -25,8 +25,14 @@ pub struct DriveCapture {
 /// A single GET CONFIGURATION feature response from the drive.
 #[derive(Debug, Clone)]
 pub struct CapturedFeature {
+    /// MMC-6 GET CONFIGURATION feature code (e.g. `0x010D` = AACS).
     pub code: u16,
+    /// Static human-readable label from the internal `FEATURES` table —
+    /// not a device-reported string.
     pub name: &'static str,
+    /// Raw feature-descriptor payload bytes, with the 8-byte GET
+    /// CONFIGURATION header stripped (i.e. `buf[8..]`). Unlike
+    /// [`DriveCapture::gc_010c`], which retains the full header.
     pub data: Vec<u8>,
 }
 

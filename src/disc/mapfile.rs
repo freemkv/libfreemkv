@@ -6,7 +6,7 @@
 //!
 //! Format:
 //! ```text
-//! # Rescue Logfile. Created by libfreemkv v0.11.21
+//! # Rescue Logfile. Created by libfreemkv vX.Y.Z
 //! # Current pos / status / pass / pass_time (ddrescue state machine — we only populate pos)
 //! 0x000000000  ?  1  0
 //! #      pos        size  status
@@ -50,6 +50,8 @@ pub enum SectorStatus {
 }
 
 impl SectorStatus {
+    /// The single ddrescue status character for this status
+    /// (`?`/`*`/`/`/`-`/`+`).
     pub fn to_char(self) -> char {
         match self {
             Self::NonTried => '?',
@@ -59,6 +61,8 @@ impl SectorStatus {
             Self::Finished => '+',
         }
     }
+    /// Parse a ddrescue status character into a `SectorStatus`. Returns
+    /// `None` for any character that is not one of `?*/-+`.
     pub fn from_char(c: char) -> Option<Self> {
         Some(match c {
             '?' => Self::NonTried,
@@ -102,8 +106,8 @@ pub struct MapStats {
     /// retry" UI bucket; `bytes_pending` over-counts because it folds
     /// in `bytes_nontried`.
     pub bytes_retryable: u64,
-    /// Number of unreadable ranges (for UI display). Computed from
-    /// `ranges_with(&[Unreadable])`.
+    /// Number of distinct `Unreadable` ranges (for UI display).
+    /// Computed by `compute_stats` (counts coalesced `-` entries).
     pub num_bad_ranges: u32,
     /// Largest gap among unreadable ranges in milliseconds. Computed as
     /// largest range size / bytes_per_sec * 1000. Set by caller (autorip)
@@ -231,6 +235,16 @@ impl Mapfile {
             }
             let pos = parse_hex(fields[0])?;
             let size = parse_hex(fields[1])?;
+            // Reject an entry whose pos+size overflows u64 up front. The
+            // downstream overlap/coalesce/next_with code adds pos+size
+            // freely; a crafted/corrupt line like
+            // `0xfffffffffffffff0 0x20 +` would otherwise panic (debug)
+            // or wrap to a tiny range (release), corrupting stats and
+            // resume logic.
+            if pos.checked_add(size).is_none() {
+                let e: io::Error = crate::error::Error::MapfileInvalid { kind: "range" }.into();
+                return Err(e);
+            }
             let status = fields[2]
                 .chars()
                 .next()
@@ -247,7 +261,31 @@ impl Mapfile {
             entries.push(MapEntry { pos, size, status });
         }
         entries.sort_by_key(|e| e.pos);
-        let total_size = entries.last().map(|e| e.pos + e.size).unwrap_or(0);
+        // Reject overlapping ranges. A well-formed ddrescue mapfile is a
+        // disjoint partition; overlaps (from a corrupt/hand-edited file)
+        // would make compute_stats double-count, so bytes_good /
+        // bytes_unreadable / bytes_pending could exceed bytes_total and
+        // inflate resume / abort-on-loss decisions and >100% progress.
+        for pair in entries.windows(2) {
+            let prev_end = pair[0].pos.saturating_add(pair[0].size);
+            if prev_end > pair[1].pos {
+                let e: io::Error = crate::error::Error::MapfileInvalid { kind: "overlap" }.into();
+                return Err(e);
+            }
+        }
+        let total_size = entries
+            .last()
+            .map(|e| e.pos.saturating_add(e.size))
+            .unwrap_or(0);
+        // Enforce the keys-XOR-vid invariant that set_unit_keys()
+        // guarantees: a corrupt/hand-edited file carrying both comment
+        // types would otherwise load with vid=Some AND non-empty
+        // unit_keys, violating the invariant downstream code relies on.
+        // Unit keys win, matching the setter (it clears vid when keys
+        // are present).
+        if !unit_keys.is_empty() {
+            vid = None;
+        }
         let stats = Self::compute_stats(&entries, total_size);
         Ok(Self {
             path: path.to_path_buf(),
@@ -265,7 +303,26 @@ impl Mapfile {
     /// Load if the file exists, otherwise create a fresh mapfile.
     pub fn open_or_create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         match Self::load(path) {
-            Ok(mf) => Ok(mf),
+            Ok(mf) => {
+                // load() derives total_size from the last entry's
+                // pos+size; if that disagrees with the caller's
+                // expected disc size (different disc, edited/partial
+                // file, trimmed trailing region) the downstream
+                // resume/progress math keys off the wrong basis. Surface
+                // it so an operator can spot a mismatched mapfile rather
+                // than failing the resume outright.
+                if mf.total_size != total_size {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "mapfile_total_size_mismatch",
+                        loaded_total = mf.total_size,
+                        supplied_total = total_size,
+                        path = %path.display(),
+                        "loaded mapfile coverage differs from supplied disc size"
+                    );
+                }
+                Ok(mf)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 Self::create(path, total_size, version)
             }
@@ -280,11 +337,18 @@ impl Mapfile {
         if size == 0 {
             return Ok(());
         }
-        let end = pos.saturating_add(size);
+        // Mirror load()'s overflow contract: reject a range that would
+        // wrap u64 rather than storing a saturated entry narrower than
+        // its size, which load() would then reject on the next resume
+        // (making the mapfile unreadable).
+        let Some(end) = pos.checked_add(size) else {
+            let e: io::Error = crate::error::Error::MapfileInvalid { kind: "range" }.into();
+            return Err(e);
+        };
         let mut new_entries = Vec::with_capacity(self.entries.len() + 2);
 
         for e in self.entries.drain(..) {
-            let e_end = e.pos + e.size;
+            let e_end = e.pos.saturating_add(e.size);
             if e_end <= pos || e.pos >= end {
                 // entirely before or after — keep
                 new_entries.push(e);
@@ -313,8 +377,8 @@ impl Mapfile {
         let mut merged: Vec<MapEntry> = Vec::with_capacity(new_entries.len());
         for e in new_entries {
             if let Some(last) = merged.last_mut() {
-                if last.pos + last.size == e.pos && last.status == e.status {
-                    last.size += e.size;
+                if last.pos.saturating_add(last.size) == e.pos && last.status == e.status {
+                    last.size = last.size.saturating_add(e.size);
                     continue;
                 }
             }
@@ -383,10 +447,13 @@ impl Mapfile {
         &self.unit_keys
     }
 
+    /// All map entries, sorted ascending by `pos` and (after load)
+    /// guaranteed disjoint and non-overflowing.
     pub fn entries(&self) -> &[MapEntry] {
         &self.entries
     }
 
+    /// Total image size in bytes, i.e. the end byte of the last entry.
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -397,7 +464,7 @@ impl Mapfile {
             if e.status != status {
                 continue;
             }
-            let e_end = e.pos + e.size;
+            let e_end = e.pos.saturating_add(e.size);
             if e_end <= from {
                 continue;
             }
@@ -416,6 +483,8 @@ impl Mapfile {
             .collect()
     }
 
+    /// Snapshot of the incrementally-maintained summary statistics.
+    /// O(1) — returns the cached `MapStats`.
     pub fn stats(&self) -> MapStats {
         self.stats
     }
@@ -428,7 +497,10 @@ impl Mapfile {
         for e in entries {
             match e.status {
                 SectorStatus::Finished => s.bytes_good += e.size,
-                SectorStatus::Unreadable => s.bytes_unreadable += e.size,
+                SectorStatus::Unreadable => {
+                    s.bytes_unreadable += e.size;
+                    s.num_bad_ranges += 1;
+                }
                 SectorStatus::NonTried => {
                     s.bytes_pending += e.size;
                     s.bytes_nontried += e.size;
@@ -514,14 +586,34 @@ impl Drop for Mapfile {
 /// error, so a corrupt header never fails a mapfile load.
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 32 {
+    // Parse on bytes, not on the &str: slicing a &str by byte index
+    // (`&s[i*2..i*2+2]`) panics when the cut lands inside a multi-byte
+    // UTF-8 char. A hand-edited/corrupt `# freemkv-vid:` comment of
+    // exactly 32 bytes containing a multi-byte char would otherwise
+    // kill the whole load. ASCII hex is one byte per char, so anything
+    // non-ASCII is simply rejected here as malformed.
+    let bytes = s.as_bytes();
+    if bytes.len() != 32 {
         return None;
     }
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        *b = (hi << 4) | lo;
     }
     Some(out)
+}
+
+/// Map a single ASCII hex digit byte to its 0-15 value. Returns `None`
+/// for any non-hex byte (including any non-ASCII / multi-byte lead byte).
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`. Returns
@@ -557,7 +649,9 @@ mod tests {
             tag,
             n
         );
-        std::env::temp_dir().join(name)
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
     }
 
     #[test]
@@ -759,6 +853,54 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_entry_whose_range_overflows_u64() {
+        let p = tmpfile("load_overflow");
+        let _ = std::fs::remove_file(&p);
+        // pos near u64::MAX with a nonzero size overflows pos+size.
+        let body = format!("0x{:x} 0x10 +\n", u64::MAX - 4);
+        std::fs::write(&p, body).unwrap();
+        let kind = match Mapfile::load(&p) {
+            Ok(_) => panic!("overflowing entry must be rejected"),
+            Err(e) => e.kind(),
+        };
+        assert_eq!(kind, io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn record_rejects_range_overflowing_u64() {
+        let p = tmpfile("record_overflow");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        let err = mf
+            .record(u64::MAX - 4, 16, SectorStatus::Finished)
+            .expect_err("overflowing record must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn load_enforces_keys_xor_vid_on_malformed_file() {
+        let p = tmpfile("load_keys_xor_vid");
+        let _ = std::fs::remove_file(&p);
+        // Hand-craft a file carrying BOTH a vid comment and a uk comment
+        // (which write_to_disk would never emit together). load() must
+        // resolve to keys-only, matching set_unit_keys()'s invariant.
+        let body = "# freemkv-vid:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    # freemkv-uk: 0:11111111111111111111111111111111\n\
+                    0x0 0x200 +\n";
+        std::fs::write(&p, body).unwrap();
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(
+            loaded.vid(),
+            None,
+            "load() must clear vid when unit keys are present"
+        );
+        assert_eq!(loaded.unit_keys(), &[(0u32, [0x11u8; 16])]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn vid_round_trips_and_data_lines_unaffected() {
         let p = tmpfile("vid_round_trips");
         let _ = std::fs::remove_file(&p);
@@ -829,6 +971,72 @@ mod tests {
         let _ = std::fs::remove_file(&p2);
         let _ = std::fs::remove_file(&pbad);
         let _ = std::fs::remove_file(&resaved);
+    }
+
+    #[test]
+    fn parse_vid_hex_does_not_panic_on_multibyte_32_byte_input() {
+        // A 32-BYTE comment containing a multi-byte char would make the
+        // old `&s[i*2..i*2+2]` slice fall inside a char boundary and
+        // panic. Must return None instead.
+        let s = "中".to_string() + &"a".repeat(29); // 3 + 29 = 32 bytes
+        assert_eq!(s.len(), 32);
+        assert_eq!(parse_vid_hex(&s), None);
+        // A valid 32-char ASCII hex string still parses.
+        assert_eq!(
+            parse_vid_hex("00112233445566778899aabbccddeeff"),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ])
+        );
+    }
+
+    #[test]
+    fn load_rejects_overflowing_pos_plus_size() {
+        let p = tmpfile("load_rejects_overflow");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0xfffffffffffffff0  0x20    +\n",
+        )
+        .unwrap();
+        assert!(
+            Mapfile::load(&p).is_err(),
+            "a pos+size that overflows u64 must be rejected, not wrap"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn load_rejects_overlapping_ranges() {
+        let p = tmpfile("load_rejects_overlap");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x00000100    +\n\
+             0x000000080  0x00000100    -\n",
+        )
+        .unwrap();
+        assert!(
+            Mapfile::load(&p).is_err(),
+            "overlapping ranges must be rejected so stats can't double-count"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn num_bad_ranges_counts_unreadable_entries() {
+        let p = tmpfile("num_bad_ranges");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(100, 50, SectorStatus::Unreadable).unwrap();
+        mf.record(300, 50, SectorStatus::Unreadable).unwrap();
+        assert_eq!(mf.stats().num_bad_ranges, 2);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

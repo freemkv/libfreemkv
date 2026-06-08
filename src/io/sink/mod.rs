@@ -35,14 +35,22 @@ pub use socket::{SocketSink, UdpSocketSink};
 /// trait does not impose or hide any buffering of its own.
 ///
 /// `finish` drains any internal buffering and signals end-of-stream to
-/// the underlying transport (close-write on a socket, flush on a
-/// buffered writer, etc.). The default impl is a no-op; concrete
-/// implementations that need explicit shutdown can override it but the
-/// blanket impl below keeps it optional for adapter types like
-/// `&mut File`.
+/// the underlying transport (close-write on a socket, flush + fsync on
+/// a buffered file, etc.). The default impl flushes via [`Write::flush`]
+/// — correct for an unbuffered destination — but every concrete sink in
+/// this module overrides it to drain its own buffer and run its
+/// transport-specific finalisation (socket `shutdown(Write)`, file
+/// `fsync`). There is deliberately NO blanket `impl SequentialSink for
+/// T`: a blanket impl would force the no-op-style default on every
+/// concrete sink (a blanket impl cannot be overridden per-type without a
+/// coherence conflict), so a `Box<dyn SequentialSink>` / `&mut dyn
+/// SequentialSink` `finish()` call would silently skip the flush and
+/// transport shutdown. With explicit per-type impls the vtable dispatches
+/// `finish` to the real implementation, so flush + durable-finish
+/// actually happen through a trait object.
 pub trait SequentialSink: Write + Send {
     fn finish(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.flush()
     }
 }
 
@@ -50,15 +58,6 @@ pub trait SequentialSink: Write + Send {
 /// with a working `Seek`. Inherits the `SequentialSink` contract — a
 /// random-access sink is always usable as a sequential sink.
 pub trait RandomAccessSink: SequentialSink + Seek {}
-
-// Blanket impls so any `Write + Send` type acts as a `SequentialSink`
-// (with default `finish`), and any sink that also impls `Seek` is
-// automatically a `RandomAccessSink`. Keeps call-site ergonomics simple
-// — `&mut File`, `LocalFileSink`, `WritebackFile`, `BufWriter<File>`,
-// and `Cursor<Vec<u8>>` all satisfy the right trait without per-type
-// boilerplate.
-impl<T: Write + Send + ?Sized> SequentialSink for T {}
-impl<T: SequentialSink + Seek + ?Sized> RandomAccessSink for T {}
 
 /// Pick the right `RandomAccessSink` impl for `dest` based on its
 /// filesystem type.
@@ -82,13 +81,9 @@ pub fn open_for_mkv(
     dest: &std::path::Path,
     size_hint: Option<u64>,
 ) -> std::io::Result<Box<dyn RandomAccessSink>> {
-    #[cfg(not(target_os = "linux"))]
-    use crate::platform::fs_type::detect;
-    #[cfg(target_os = "linux")]
-    use crate::platform::fs_type::{FsType, detect};
-
     #[cfg(target_os = "linux")]
     {
+        use crate::platform::fs_type::{FsType, detect};
         if detect(dest) == FsType::Nfs {
             let wf = match size_hint {
                 Some(n) => crate::io::WritebackFile::create_with_size_hint(dest, n)?,
@@ -97,12 +92,13 @@ pub fn open_for_mkv(
             return Ok(Box::new(wf));
         }
     }
-    // Silence the unused-binding warning on non-Linux where the only
-    // branch above is cfg-gated out.
+    // Only Linux differentiates the sink by filesystem type (NFS gets
+    // the WritebackFile machinery); every other OS always uses
+    // `LocalFileSink`. Reference `detect` as a value (no call, no
+    // `statfs` syscall) so it isn't flagged dead on non-Linux while
+    // still avoiding the wasted probe whose result we'd discard.
     #[cfg(not(target_os = "linux"))]
-    {
-        let _ = detect(dest);
-    }
+    let _ = crate::platform::fs_type::detect;
 
     let sink = match size_hint {
         Some(n) => LocalFileSink::with_size_hint(dest, n)?,
@@ -114,32 +110,25 @@ pub fn open_for_mkv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
 
-    // Type-level assertion: the blanket impls cover the shapes we care
-    // about. These functions never run; they just have to type-check.
-    fn _assert_file_is_sequential(_: &mut dyn SequentialSink) {}
-    fn _assert_file_is_random_access(_: &mut dyn RandomAccessSink) {}
+    // Type-level assertion: the concrete sinks satisfy the trait
+    // objects. These functions never run; they just have to type-check.
+    fn _assert_is_sequential(_: &mut dyn SequentialSink) {}
+    fn _assert_is_random_access(_: &mut dyn RandomAccessSink) {}
 
     #[test]
-    fn blanket_impls_cover_file_and_localfilesink() {
-        // `File` directly via blanket impls.
+    fn concrete_sinks_satisfy_traits() {
         let dir = tempfile::tempdir().unwrap();
-        let mut f = File::create(dir.path().join("a.bin")).unwrap();
-        _assert_file_is_sequential(&mut f);
-        _assert_file_is_random_access(&mut f);
 
-        // `LocalFileSink` ditto.
+        // `LocalFileSink` is a random-access (and thus sequential) sink.
         let mut s = LocalFileSink::create(&dir.path().join("b.bin")).unwrap();
-        _assert_file_is_sequential(&mut s);
-        _assert_file_is_random_access(&mut s);
+        _assert_is_sequential(&mut s);
+        _assert_is_random_access(&mut s);
 
-        // `WritebackFile` — confirms the Phase 1 type still satisfies
-        // the trait via the blanket impl without needing an explicit
-        // `impl RandomAccessSink for WritebackFile {}`.
+        // `WritebackFile` ditto, via its explicit per-type impls.
         let mut wf = crate::io::WritebackFile::create(&dir.path().join("c.bin")).unwrap();
-        _assert_file_is_sequential(&mut wf);
-        _assert_file_is_random_access(&mut wf);
+        _assert_is_sequential(&mut wf);
+        _assert_is_random_access(&mut wf);
     }
 
     #[test]
@@ -154,5 +143,25 @@ mod tests {
         drop(sink);
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(&bytes[..5], b"hello");
+    }
+
+    /// finish() through a `dyn SequentialSink` trait object must
+    /// dispatch to the concrete sink's override (flush + fsync), not a
+    /// no-op default. This is the regression test for the silent-no-op
+    /// finish() bug.
+    #[test]
+    fn finish_through_trait_object_flushes_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("trait-finish.bin");
+        let sink = LocalFileSink::create(&p).unwrap();
+        // Box as the trait object the production path uses.
+        let mut boxed: Box<dyn SequentialSink> = Box::new(sink);
+        boxed.write_all(b"buffered-tail").unwrap();
+        // finish() through the vtable must drain the 4 MiB BufWriter and
+        // fsync; the bytes must be visible to a separate reader BEFORE
+        // we drop the sink (drop-flush must not be what saves us).
+        boxed.finish().unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[..], b"buffered-tail");
     }
 }

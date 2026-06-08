@@ -11,17 +11,22 @@ use crate::error::{Error, Result};
 
 /// Parsed CLPI clip info.
 #[derive(Debug)]
-#[allow(dead_code)]
-pub struct ClipInfo {
+pub(crate) struct ClipInfo {
+    /// CLPI version string. Parsed for completeness; not yet consumed.
+    #[allow(dead_code)]
     pub version: String,
     /// Total source packets in the m2ts (each 192 bytes)
     pub source_packet_count: u32,
-    /// Coarse EP entries for the primary video stream
+    /// Coarse EP entries for the primary video stream. Populated for the
+    /// EP-map → sector-extent lookup (`get_extents`), which is exercised by
+    /// tests and reserved for the timestamp-range read path.
+    #[allow(dead_code)]
     pub ep_coarse: Vec<EpCoarse>,
-    /// Fine EP entries for the primary video stream
+    /// Fine EP entries for the primary video stream (see `ep_coarse`).
+    #[allow(dead_code)]
     pub ep_fine: Vec<EpFine>,
     /// Per-stream metadata from the ProgramInfo section (BD spec).
-    /// Cross-validates the MPLS STN view — see `labels/clpi.rs`.
+    /// Cross-validates the MPLS STN view — see `labels/clpi_audit.rs`.
     /// Empty when program_info is missing or malformed.
     pub streams: Vec<ClpiStream>,
 }
@@ -30,57 +35,82 @@ pub struct ClipInfo {
 /// table. Mirrors the same fields the MPLS STN table carries — see
 /// `mpls::StreamEntry` for the playlist-side equivalent.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ClpiStream {
+pub(crate) struct ClpiStream {
     /// PID of the stream in the MPEG-TS (matches MPLS).
     pub pid: u16,
-    /// SCSI/BD coding type byte (0x80 LPCM, 0x83 TrueHD, 0x86 DTS-HD MA,
+    /// BD stream coding type byte (0x80 LPCM, 0x83 TrueHD, 0x86 DTS-HD MA,
     /// 0x90 PG, etc.). See `labels::mpls_universal::coding_type_to_codec_hint`.
     pub coding_type: u8,
     /// ISO 639-2 3-char language code. Empty for video streams.
     pub language: String,
+    // The CLPI cross-validation consumer (labels/clpi_audit.rs) reads only
+    // pid/coding_type/language. The codec sub-fields below are parsed from
+    // the BD stream_coding_info for completeness but have no reader yet.
     /// Audio format byte (1=mono, 3=stereo, 6=5.1, 12=7.1).
     /// Zero for non-audio streams.
+    #[allow(dead_code)]
     pub audio_format: u8,
     /// Audio sample rate (1=48kHz, 4=96kHz, 5=192kHz). Zero for non-audio.
+    #[allow(dead_code)]
     pub audio_rate: u8,
     /// Video format byte (1=480i, 4=1080i, 5=720p, 6=1080p, 8=2160p).
     /// Zero for non-video.
+    #[allow(dead_code)]
     pub video_format: u8,
     /// Video rate (1=23.976, 2=24, 3=25, 4=29.97, 6=50, 7=59.94).
+    #[allow(dead_code)]
     pub video_rate: u8,
 }
 
+/// Coarse EP-map entry. Fields feed the EP-map resolution used by
+/// `get_extents` (test-exercised; reserved for the timestamp-range path).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct EpCoarse {
+pub(crate) struct EpCoarse {
     pub ref_to_fine_id: u32,
     pub pts_coarse: u32,
     pub spn_coarse: u32,
 }
 
+/// Fine EP-map entry (see `EpCoarse`).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct EpFine {
+pub(crate) struct EpFine {
     pub pts_fine: u32,
     pub spn_fine: u32,
 }
 
+// EP-map → sector-extent resolution. Exercised by the unit tests and
+// reserved for the timestamp-range read path; no production caller yet.
 #[allow(dead_code)]
 impl ClipInfo {
     /// Reconstruct full PTS from coarse + fine entry.
-    pub fn full_pts(coarse: &EpCoarse, fine: &EpFine) -> u32 {
-        (coarse.pts_coarse << 19) + (fine.pts_fine << 8)
+    ///
+    /// The BD spec PTS is 33-bit: `pts_coarse` is 14 bits (max 16383) and
+    /// `16383 << 19` exceeds `u32::MAX`, so the result must be `u64` to
+    /// avoid overflow (panic in debug, silent wrap in release).
+    pub fn full_pts(coarse: &EpCoarse, fine: &EpFine) -> u64 {
+        ((coarse.pts_coarse as u64) << 19) + ((fine.pts_fine as u64) << 8)
     }
 
     /// Reconstruct full SPN from coarse + fine entry.
     pub fn full_spn(coarse: &EpCoarse, fine: &EpFine) -> u32 {
-        (coarse.spn_coarse & 0xFFFE_0000) + fine.spn_fine
+        // The two operands occupy non-overlapping bit ranges (coarse holds
+        // the high bits, fine the low 17), so OR expresses intent and is
+        // robust to a hand-constructed EpFine.
+        debug_assert!(fine.spn_fine <= 0x1_FFFF);
+        (coarse.spn_coarse & 0xFFFE_0000) | fine.spn_fine
     }
 
     /// Get all EP entries as (PTS, SPN) pairs, fully resolved.
-    pub fn resolved_ep_map(&self) -> Vec<(u32, u32)> {
-        let mut entries = Vec::new();
+    ///
+    /// PTS resets at each coarse-group boundary on disc, so the raw
+    /// concatenation is not globally monotonic. The returned vector is
+    /// sorted by PTS so callers (e.g. [`get_extents`]) can binary-search it.
+    ///
+    /// [`get_extents`]: ClipInfo::get_extents
+    pub fn resolved_ep_map(&self) -> Vec<(u64, u32)> {
+        let mut entries = Vec::with_capacity(self.ep_fine.len());
 
         for (ci, coarse) in self.ep_coarse.iter().enumerate() {
             let fine_start = coarse.ref_to_fine_id as usize;
@@ -98,6 +128,12 @@ impl ClipInfo {
             }
         }
 
+        // get_extents binary-searches by PTS, so the map must be ordered.
+        // Real discs have globally increasing PTS in coarse order; sort by
+        // (pts, spn) so a cross-group PTS collision can't leave the search
+        // landing on the wrong group's SPN.
+        entries.sort_by_key(|&(pts, spn)| (pts, spn));
+
         entries
     }
 
@@ -105,7 +141,9 @@ impl ClipInfo {
     ///
     /// Converts PTS timestamps to SPN ranges, then SPN to LBA
     /// using the file's starting LBA on disc.
-    pub fn get_extents(&self, in_time: u32, out_time: u32) -> Vec<Extent> {
+    pub fn get_extents(&self, in_time: u64, out_time: u64) -> Vec<Extent> {
+        // resolved_ep_map() returns entries sorted by PTS, so binary search
+        // is valid here.
         let ep_map = self.resolved_ep_map();
         if ep_map.is_empty() {
             return Vec::new();
@@ -122,7 +160,7 @@ impl ClipInfo {
         let end_spn = match ep_map.binary_search_by_key(&out_time, |(pts, _)| *pts) {
             Ok(i) => ep_map[i].1,
             Err(i) if i < ep_map.len() => ep_map[i].1,
-            _ => ep_map.last().unwrap().1 + 1,
+            _ => ep_map.last().unwrap().1.saturating_add(1),
         };
 
         if end_spn <= start_spn {
@@ -162,7 +200,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 
     // ClipInfo section at offset 40
     // source_packet_count at offset 40 + 4(len) + 2(reserved) + 1(stream_type) + 1(app_type) + 4(reserved) + 4(ts_rate)
-    let source_packet_count = if data.len() > 56 {
+    let source_packet_count = if data.len() >= 60 {
         u32::from_be_bytes([data[56], data[57], data[58], data[59]])
     } else {
         0
@@ -322,8 +360,17 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
         return Ok((Vec::new(), Vec::new()));
     }
 
+    // Bound all EP-map reads to this CPI section. The length field counts
+    // bytes after itself, so the section spans data[..cpi_length + 4]. A
+    // bogus ep_map_offset within data.len() but past the CPI section would
+    // otherwise read into an adjacent CLPI section; clamp first.
+    let data = &data[..(cpi_length + 4).min(data.len())];
+
     // CPI type at bits 44-47 (byte 5, lower 4 bits)
     // Skip to EP map: offset 4 (after length) + 2 (reserved/type)
+    if data.len() < 6 {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let ep_map = &data[6..];
     if ep_map.len() < 4 {
         return Ok((Vec::new(), Vec::new()));
@@ -351,9 +398,6 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
     //   num_EP_coarse: 16 bits        │ (10+4+16+18+32 = 80)
     //   num_EP_fine: 18 bits          │
     //   EP_map_start_address: 32 bits ┘
-    if ep_map.len() < 16 {
-        return Ok((Vec::new(), Vec::new()));
-    }
     let _stream_pid = u16::from_be_bytes([ep_map[2], ep_map[3]]);
 
     // Read 10 bytes (80 bits) from ep_map[4..14] for bit extraction
@@ -389,7 +433,10 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
 
     // Coarse entries start at offset 4, 8 bytes each
     let coarse_data = &stream_ep[4..];
-    let mut ep_coarse = Vec::with_capacity(num_coarse);
+    // Cap the pre-reservation by what the slice can actually hold:
+    // num_coarse is a 16-bit disc field, so a hostile value would
+    // otherwise reserve up to ~0.5 MB for an entry table that doesn't exist.
+    let mut ep_coarse = Vec::with_capacity(num_coarse.min(coarse_data.len() / 8));
     for i in 0..num_coarse {
         let off = i * 8;
         if off + 8 > coarse_data.len() {
@@ -419,7 +466,13 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
     }
 
     // Fine entries at fine_start, 4 bytes each
-    let mut ep_fine = Vec::with_capacity(num_fine);
+    // Cap the pre-reservation: num_fine is an 18-bit disc field (max
+    // 262143), so reserve only what the slice can actually hold.
+    let mut ep_fine = if fine_start < stream_ep.len() {
+        Vec::with_capacity(num_fine.min((stream_ep.len() - fine_start) / 4))
+    } else {
+        Vec::new()
+    };
     if fine_start < stream_ep.len() {
         let fine_data = &stream_ep[fine_start..];
         for i in 0..num_fine {
@@ -643,8 +696,47 @@ mod tests {
         };
         // full_pts = (100 << 19) + (50 << 8) = 52_428_800 + 12_800 = 52_441_600
         let pts = ClipInfo::full_pts(&coarse, &fine);
-        assert_eq!(pts, (100 << 19) + (50 << 8));
+        assert_eq!(pts, (100u64 << 19) + (50u64 << 8));
         assert_eq!(pts, 52_441_600);
+    }
+
+    #[test]
+    fn full_pts_no_u32_overflow() {
+        // pts_coarse is a 14-bit field (max 0x3FFF = 16383); 16383 << 19
+        // overflows u32, so full_pts must use u64.
+        let coarse = EpCoarse {
+            ref_to_fine_id: 0,
+            pts_coarse: 0x3FFF,
+            spn_coarse: 0,
+        };
+        let fine = EpFine {
+            pts_fine: 0x7FF,
+            spn_fine: 0,
+        };
+        let pts = ClipInfo::full_pts(&coarse, &fine);
+        assert_eq!(pts, (0x3FFFu64 << 19) + (0x7FFu64 << 8));
+        assert!(pts > u32::MAX as u64);
+    }
+
+    #[test]
+    fn resolved_ep_map_sorted_for_binary_search() {
+        // Two coarse groups whose fine PTS reset across the boundary
+        // (50,100 then 25,75) produce a non-monotonic raw concatenation.
+        // resolved_ep_map must sort so get_extents' binary search is valid.
+        let cpi = build_cpi(
+            0x1011,
+            &[(0, 0, 0x00020000), (2, 0, 0x00040000)],
+            &[(50, 1024), (100, 2048), (25, 512), (75, 1536)],
+        );
+        let data = build_clpi(1_000_000, Some(&cpi));
+        let clip = parse(&data).expect("should parse");
+
+        let resolved = clip.resolved_ep_map();
+        assert_eq!(resolved.len(), 4);
+        // Strictly sorted by PTS.
+        for w in resolved.windows(2) {
+            assert!(w[0].0 <= w[1].0, "ep_map not sorted: {resolved:?}");
+        }
     }
 
     #[test]
@@ -672,6 +764,22 @@ mod tests {
         let spn2 = ClipInfo::full_spn(&coarse2, &fine);
         // 0x00FF0000 & 0xFFFE0000 = 0x00FE0000, so low 17 bits of coarse are zeroed
         assert_eq!(spn2, 0x00FE0000 + 0x1234);
+    }
+
+    #[test]
+    fn parse_truncated_clipinfo_no_panic() {
+        // 57/58/59-byte CLPI with valid magic: passes the data.len() < 40
+        // guard but data[56..60] needs 60 bytes. Must not panic.
+        for len in 40..60usize {
+            let mut data = vec![0u8; len];
+            data[0..4].copy_from_slice(b"HDMV");
+            if len >= 8 {
+                data[4..8].copy_from_slice(b"0200");
+            }
+            let clip = parse(&data).expect("short CLPI should parse, not panic");
+            // source_packet_count is unreadable below 60 bytes → 0.
+            assert_eq!(clip.source_packet_count, 0);
+        }
     }
 
     #[test]

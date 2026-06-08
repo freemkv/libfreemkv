@@ -14,6 +14,11 @@
 //!
 //! Bare paths without a scheme are rejected.
 //! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
+//!
+//! Note: `disc://` cannot be opened through [`input`]; it returns
+//! [`crate::error::Error::DiscUrlNotDirect`]. Live-disc input must go
+//! through `Drive::open()` + `Disc::scan()` + `DiscStream::new()`, not
+//! the URL resolver.
 
 use super::network::NetworkStream;
 use super::null::NullStream;
@@ -29,6 +34,7 @@ use std::path::{Path, PathBuf};
 const IO_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Parsed stream URL.
+#[derive(Debug, Clone)]
 pub enum StreamUrl {
     /// Optical disc drive. Device path is optional (auto-detect if None).
     Disc { device: Option<PathBuf> },
@@ -109,11 +115,18 @@ pub fn parse_url(url: &str) -> StreamUrl {
             addr: rest.to_string(),
         };
     }
-    if url == "null://" || url.starts_with("null://") {
-        return StreamUrl::Null;
+    if let Some(rest) = url.strip_prefix("null://") {
+        // null:// / stdio:// are scheme-only; a trailing path is
+        // malformed and must fall through to Unknown rather than be
+        // silently discarded.
+        if rest.is_empty() {
+            return StreamUrl::Null;
+        }
     }
-    if url == "stdio://" || url.starts_with("stdio://") {
-        return StreamUrl::Stdio;
+    if let Some(rest) = url.strip_prefix("stdio://") {
+        if rest.is_empty() {
+            return StreamUrl::Stdio;
+        }
     }
     if let Some(rest) = url.strip_prefix("iso://") {
         return StreamUrl::Iso {
@@ -150,6 +163,16 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
         }
         .into());
     }
+    // A bare IPv6 literal ("::1", "2001:db8::1") contains ':' yet has no port,
+    // so the simple `contains(':')` check would wrongly pass it and TcpListener
+    // would later return an untyped io::Error. Treat anything that parses as a
+    // bare IpAddr (v4 or v6) as port-less.
+    if addr.parse::<std::net::IpAddr>().is_ok() {
+        return Err(crate::error::Error::StreamUrlMissingPort {
+            addr: addr.to_string(),
+        }
+        .into());
+    }
     if !addr.contains(':') {
         return Err(crate::error::Error::StreamUrlMissingPort {
             addr: addr.to_string(),
@@ -160,13 +183,15 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
 }
 
 /// Options for opening an input stream.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InputOptions {
     /// Caller-resolved per-CPS-unit AACS keys to apply to the scanned disc
     /// (`(cps_unit, 16-byte key)`). Empty for an unencrypted disc or when the
     /// caller has no key. The library does no lookup — a key source resolves
     /// these and the caller passes them here.
     pub unit_keys: Vec<(u32, [u8; 16])>,
+    /// 0-based title index to open; `None` selects title 0. An
+    /// out-of-range index yields [`crate::error::Error::DiscTitleRange`].
     pub title_index: Option<usize>,
     /// Skip decryption — return raw encrypted bytes.
     pub raw: bool,
@@ -253,19 +278,36 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             }
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
-            // A fresh reader avoids disturbing the mux reader below.
+            // A fresh reader avoids disturbing the mux reader below. Skipped in
+            // --raw mode: the probe would re-open + decrypt for nothing (on an
+            // AACS disc with no key the correction is a no-op on ciphertext, and
+            // raw output isn't decoded anyway).
             let keys = disc.decrypt_keys();
-            if let Ok(probe) = crate::io::file_sector_source::FileSectorSource::open(path) {
-                let mut dec = crate::sector::DecryptingSectorSource::new(probe, keys.clone());
-                crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
+            if !opts.raw {
+                match crate::io::file_sector_source::FileSectorSource::open(path) {
+                    Ok(probe) => {
+                        let mut dec =
+                            crate::sector::DecryptingSectorSource::new(probe, keys.clone());
+                        crate::disc::correct_truehd_channels(&mut dec, &mut disc.titles[idx]);
+                    }
+                    Err(e) => {
+                        // Non-fatal: a failed re-open just leaves MPLS 7.1/Atmos
+                        // channel counts uncorrected (understated as 5.1). Log so
+                        // the uncorrected path is diagnosable rather than silent.
+                        tracing::debug!(
+                            target: "mux",
+                            "TrueHD channel-correction probe re-open failed: {e}"
+                        );
+                    }
+                }
             }
             let title = disc.titles[idx].clone();
             let format = disc.content_format;
-            // ISO file: 16 MiB batch — sequential read from fast
-            // storage, no bad sectors. Measured optimum on the rip1
-            // testbed; bumping to 32 MiB regressed (more cache
-            // pressure, longer per-batch latency starves the consumer
-            // between iterations). Physical drives keep smaller
+            // ISO file: 8192-sector batch (16 MiB at 2048 B/sector) —
+            // sequential read from fast storage, no bad sectors. Measured
+            // optimum on the rip1 testbed; bumping to 16384 sectors (32 MiB)
+            // regressed (more cache pressure, longer per-batch latency starves
+            // the consumer between iterations). Physical drives keep smaller
             // batches for adaptive error handling.
             const ISO_MUX_BATCH_SECTORS: u16 = 8192;
 
@@ -286,7 +328,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 format,
                 None,
                 None,
-            );
+            )?;
             Ok(Box::new(stream))
         }
         StreamUrl::M2ts { ref path } => {
@@ -403,6 +445,21 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// Assemble the ISO mux pipeline (read+decrypt → demux → parse) for
 /// a `FileSectorSource`-backed reader. Returns the resulting
 /// `PipelinedPesStream`.
+///
+/// # Parameters
+/// - `reader`: the sector source to read from (typically a
+///   `FileSectorSource` over the ISO image).
+/// - `title`: the selected title; its `extents` drive the read range and its
+///   `streams` build the demux/parse tables.
+/// - `keys`: decryption keys applied per sector batch. Pass
+///   [`crate::decrypt::DecryptKeys::None`] for raw / unencrypted reads (the
+///   decrypt decorator then becomes a pass-through).
+/// - `batch_sectors`: read batch size in logical (2048-byte) sectors — a
+///   throughput/latency tuning knob, not a correctness parameter.
+/// - `format`: container format (`BdTs` → TS demuxer, `MpegPs` → PS demuxer).
+/// - `halt`: cooperative cancel token (not a timeout); when cancelled the
+///   pipeline stops at the next boundary. `None` disables cancellation.
+/// - `event_fn`: optional progress/event callback invoked by the prefetcher.
 pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     reader: S,
     title: DiscTitle,
@@ -411,7 +468,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     format: ContentFormat,
     halt: Option<crate::halt::Halt>,
     event_fn: Option<crate::sector::prefetched::EventFn>,
-) -> PipelinedPesStream {
+) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
     let decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
@@ -421,13 +478,21 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         batch_sectors,
         halt.clone(),
         event_fn,
-    );
+    )
+    .map_err(|e| -> io::Error { e.into() })?;
     let (rx, recycle_tx, shell) = prefetched.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, format);
     let (demux_thread, demux_rx) =
-        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps);
-    PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
+        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps)
+            .map_err(|e| -> io::Error { e.into() })?;
+    Ok(PipelinedPesStream::new(
+        demux_thread,
+        demux_rx,
+        title,
+        parsers,
+        pid_to_track,
+    ))
 }
 
 /// Assemble the M2TS file mux pipeline (read → demux → parse) for a
@@ -455,19 +520,32 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
     };
     head.truncate(head_len);
 
-    // Try FMKV metadata header first; fall back to PMT scan.
+    // Try FMKV metadata header first; fall back to PMT scan. Only a
+    // genuine absence of the FMKV magic (`Ok(None)`) falls through to
+    // the PMT path — a corrupt/truncated FMKV header (`Err`) propagates
+    // instead of being misreported as a PMT-derived title or NoStreams.
     let mut cursor = io::Cursor::new(&head);
-    let (title, head_consumed) = if let Ok(Some(m)) = meta::read_header(&mut cursor) {
-        (m.to_title(), cursor.position() as usize)
-    } else {
-        let streams = super::ts::scan_streams(&head)
-            .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
-        let t = DiscTitle {
-            duration_secs: 0.0,
-            streams,
-            ..DiscTitle::empty()
-        };
-        (t, 0)
+    let (title, head_consumed) = match meta::read_header(&mut cursor)? {
+        Some(m) => {
+            let t = m.to_title();
+            // Guard the FMKV branch the same way the ISO and PMT paths
+            // do: a header carrying zero streams yields an empty title
+            // that would mux nothing — surface NoStreams instead.
+            if t.streams.is_empty() {
+                return Err(crate::error::Error::NoStreams.into());
+            }
+            (t, cursor.position() as usize)
+        }
+        None => {
+            let streams = super::ts::scan_streams(&head)
+                .ok_or_else(|| -> io::Error { crate::error::Error::NoStreams.into() })?;
+            let t = DiscTitle {
+                duration_secs: 0.0,
+                streams,
+                ..DiscTitle::empty()
+            };
+            (t, 0)
+        }
     };
 
     // Chain: any un-consumed head bytes + the remainder of the
@@ -479,12 +557,13 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
         chained,
         crate::io::byte_prefetcher::DEFAULT_CHUNK_BYTES,
         None,
-    );
+    )?;
     let (rx, recycle_tx, shell) = prefetcher.into_channels();
 
     let (parsers, pid_to_track, ts, ps) = build_demux_state(&title, ContentFormat::BdTs);
     let (demux_thread, demux_rx) =
-        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, None, ts, ps);
+        super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, None, ts, ps)
+            .map_err(|e| -> io::Error { e.into() })?;
     Ok(PipelinedPesStream::new(
         demux_thread,
         demux_rx,
@@ -497,7 +576,20 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::aacs_key_missing;
+    use super::validate_network_addr;
     use crate::decrypt::DecryptKeys;
+
+    #[test]
+    fn validate_network_addr_rejects_portless() {
+        // Empty, bare IPv4, and bare IPv6 (which contains ':') must all fail.
+        assert!(validate_network_addr("").is_err());
+        assert!(validate_network_addr("127.0.0.1").is_err());
+        assert!(validate_network_addr("::1").is_err());
+        assert!(validate_network_addr("2001:db8::1").is_err());
+        // host:port and ip:port forms pass.
+        assert!(validate_network_addr("127.0.0.1:9000").is_ok());
+        assert!(validate_network_addr("host:9000").is_ok());
+    }
 
     fn aacs_keys() -> DecryptKeys {
         DecryptKeys::Aacs {

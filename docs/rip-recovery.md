@@ -161,8 +161,8 @@ recoveries to show for it. Recovery responsibility is now layered: layer 1
 handles ranges, layer 3 handles request size, neither touches the
 wedge-prone reset path.
 
-**No `MODE SELECT` to disable drive retries.** Research showed neither ddrescue
-nor MakeMKV does this. Drive firmware has access to raw analog signal, laser
+**No `MODE SELECT` to disable drive retries.** Neither ddrescue
+nor any consumer ripper does this. Drive firmware has access to raw analog signal, laser
 power control, and drive-specific ECC tuning that userspace can't replicate —
 disabling it throws away recovery headroom on marginal sectors. We fail fast
 via short SG_IO timeouts in pass 1 and let the firmware work the long timeout

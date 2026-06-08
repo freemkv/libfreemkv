@@ -67,10 +67,12 @@ pub(crate) enum BoundedError {
     /// The deadline elapsed before the syscall returned. Same leak
     /// semantics as `Halted`.
     Timeout,
-    /// The worker thread panicked, or its sender disconnected before
-    /// sending a result. Treat as a benign no-op (callers usually
-    /// log and continue) rather than a hard error — by definition no
-    /// syscall observably ran to completion in this case.
+    /// The worker thread panicked, the OS rejected the thread spawn,
+    /// or its sender disconnected before sending a result. Treat as a
+    /// benign no-op (callers usually log and continue) rather than a
+    /// hard error — by definition no syscall observably ran to
+    /// completion in this case. In the spawn-failure case no thread is
+    /// leaked.
     WorkerLost,
 }
 
@@ -101,6 +103,12 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // If the caller already requested halt, don't spawn (and leak) a
+    // worker that would run `op` to completion in the background.
+    if halt.is_some_and(|h| h.is_cancelled()) {
+        return Err(BoundedError::Halted);
+    }
+
     // Rendezvous channel: the worker sends exactly one value (the
     // op's return) and then exits. Capacity-0 means the send blocks
     // until we receive — fine on the happy path; on the timeout /

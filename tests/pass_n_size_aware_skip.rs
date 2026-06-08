@@ -13,6 +13,7 @@
 
 use libfreemkv::disc::CopyOptions;
 use libfreemkv::disc::DiscRegion;
+use libfreemkv::disc::PatchOptions;
 use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
 use libfreemkv::error::Result;
 use libfreemkv::{ContentFormat, Disc, DiscFormat, SectorSource};
@@ -220,6 +221,84 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         min_acceptable,
         pr.bytes_good,
         pr.bytes_total,
+    );
+}
+
+/// Regression: `PatchOptions::block_sectors == Some(0)` must not
+/// busy-spin. `block_sectors` is a public `Option<u16>` field; a zero
+/// value would compute a zero-length read every iteration, never
+/// advance `block_end`, and burn a CPU core until the per-range
+/// watchdog fired (up to 30 min on a large range). The entry-point
+/// `.max(1)` clamp turns Some(0) into a single-sector batch so the
+/// range recovers and the call returns promptly.
+#[test]
+fn patch_block_sectors_zero_does_not_busy_spin() {
+    let capacity_sectors: u32 = 256;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+
+    // Small NonTrimmed range that is entirely readable (no bad LBAs), so
+    // single-sector patch reads recover it immediately. Without the
+    // clamp the loop would never progress regardless of readability.
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, HashSet::new());
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let finished = [
+        (0, 100 * 2048),
+        (110 * 2048, (capacity_sectors as u64 - 110) * 2048),
+    ];
+    let nontrimmed = [(100 * 2048, 10 * 2048)];
+    prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
+
+    // A halt watchdog bounds the run: the inner loop polls `halt` every
+    // iteration, so even a busy-spin regression breaks out within the
+    // window instead of hanging the test binary. With the clamp the run
+    // finishes long before the watchdog fires; without it the watchdog
+    // trips and the bytes_good assertion below fails loudly.
+    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let halt_for_watchdog = halt.clone();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        halt_for_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let opts = PatchOptions {
+        decrypt: false,
+        block_sectors: Some(0),
+        full_recovery: false,
+        reverse: false,
+        wedged_threshold: 0,
+        progress: None,
+        halt: Some(halt.clone()),
+    };
+
+    let outcome = disc.patch(&mut reader, &iso_path, &opts);
+    // Stop the watchdog regardless of outcome.
+    halt.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watchdog.join();
+
+    let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(&map_path);
+
+    let outcome = outcome.expect("patch returns Ok");
+    assert!(
+        !outcome.halted,
+        "patch with block_sectors=Some(0) must complete on its own \
+         (clamped to a 1-sector batch), not be cut off by the watchdog"
+    );
+    let bytes_good = outcome.bytes_good;
+    // The 10-sector NonTrimmed range was fully readable; clamped to a
+    // 1-sector batch it must recover. Initial good = 100 + (256-110) =
+    // 246 sectors; after patch the 10-sector range is also Finished.
+    let initial_good_sectors: u64 = 100 + (capacity_sectors as u64 - 110);
+    assert!(
+        bytes_good >= (initial_good_sectors + 10) * 2048,
+        "block_sectors=Some(0) clamped to 1 should recover the readable range; \
+         bytes_good={bytes_good}"
     );
 }
 

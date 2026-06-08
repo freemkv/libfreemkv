@@ -8,17 +8,25 @@
 //! | [`DrmScheme::Css`]  | DVD probe sector flagged scrambled             |
 //! | [`DrmScheme::Aacs10`] | Content cert type byte `0x00`                |
 //! | [`DrmScheme::Aacs20`] | Content cert type byte `!= 0x00`, no Variant |
-//! | [`DrmScheme::Aacs21`] | Content cert + MKB records `0x82` / `0x83`   |
+//! | [`DrmScheme::Aacs21`] | as Aacs20 + MKB Variant records `0x82`/`0x83` |
+//!
+//! The content cert type byte only ever decodes to V10 (`0x00`) or V20
+//! (`!= 0x00`); the V21 promotion is decided solely by the MKB Variant
+//! walk in [`DrmScheme::detect`], never by the cert byte.
 //!
 //! Detection happens from a [`DrmProbe`] (raw inputs the caller has
 //! already extracted from the disc); resolution runs through a
 //! [`DrmContext`] (the full set of inputs the loaders need).
 //!
-//! The AACS 2.1 arm is wired but disabled. The dispatcher leaves
-//! [`crate::aacs::resolve_keys_v21`] reachable as a library entry point
-//! for fixture-driven validation, but production consumers go through
-//! [`DrmScheme::load`], which short-circuits V21 to `None` until the
-//! Variant chain has a real Variant-scheme disc to validate against.
+//! AACS 2.1 discs that are fully keyed in `keydb.cfg` decrypt through
+//! the same classical Media Key chain as AACS 2.0, so [`DrmScheme::load`]
+//! routes the `Aacs21` arm to [`crate::aacs::resolve_keys_v2`] — the
+//! KEYDB lookup paths (MK+VID, disc-hash VUK, pre-decrypted unit keys)
+//! succeed for any disc present in the keydb. The dedicated Variant/KCD
+//! chain ([`crate::aacs::resolve_keys_v21`]) stays reachable as a
+//! library entry point for fixture-driven validation but is not yet on
+//! the dispatch path; it is enabled once KCD validation against a real
+//! Variant-scheme disc lands.
 
 use crate::aacs;
 use crate::css;
@@ -101,9 +109,15 @@ impl DrmScheme {
     /// Run key resolution for this scheme against `ctx`.
     ///
     /// Returns `None` when the scheme's resolver could not produce keys
-    /// (missing context, KEYDB miss, failed crypto walk, etc.) or when
-    /// the scheme itself is gated off (see the inline comment on the
-    /// `Aacs21` arm).
+    /// (missing context, KEYDB miss, failed crypto walk, etc.).
+    ///
+    /// The `Aacs21` arm resolves through the classical [`aacs::resolve_keys_v2`]
+    /// chain: AACS 2.1 discs already keyed in `keydb.cfg` decrypt identically
+    /// to AACS 2.0 (the KEYDB MK+VID / disc-hash VUK / pre-decrypted unit-key
+    /// paths succeed for any disc in the keydb), and `resolve_keys_v2` promotes
+    /// the resolved version to V21 when Variant MKB records are present. The
+    /// dedicated Variant/KCD chain ([`aacs::resolve_keys_v21`]) is kept opt-in
+    /// until KCD validation against a real Variant-scheme disc lands.
     pub fn load(self, ctx: &mut DrmContext<'_>) -> Option<ResolvedScheme> {
         match self {
             DrmScheme::Css => ctx
@@ -116,20 +130,14 @@ impl DrmScheme {
                 .as_ref()
                 .and_then(aacs::resolve_keys_v1)
                 .map(ResolvedScheme::Aacs),
-            DrmScheme::Aacs20 => ctx
+            // Both Aacs20 and Aacs21 route through the classical V2 chain.
+            // The Variant/KCD chain (resolve_keys_v21) is wired but gated;
+            // a keyed-in V21 disc resolves via the KEYDB paths here.
+            DrmScheme::Aacs20 | DrmScheme::Aacs21 => ctx
                 .aacs
                 .as_ref()
                 .and_then(aacs::resolve_keys_v2)
                 .map(ResolvedScheme::Aacs),
-            // AACS 2.1 derivation is wired but disabled. KCD validation
-            // against a Variant-scheme disc is pending. To enable,
-            // uncomment the line below.
-            // DrmScheme::Aacs21 => ctx
-            //     .aacs
-            //     .as_ref()
-            //     .and_then(aacs::resolve_keys_v21)
-            //     .map(ResolvedScheme::Aacs),
-            DrmScheme::Aacs21 => None,
         }
     }
 }
@@ -240,25 +248,34 @@ mod tests {
     }
 
     #[test]
-    fn load_aacs21_returns_none() {
-        // The Aacs21 dispatch arm is commented out; load() must
-        // return None until KCD validation lands.
+    fn load_aacs21_routes_through_v2_resolver() {
+        // The Aacs21 arm shares the classical V2 resolver with Aacs20, so a
+        // V21 disc keyed in keydb.cfg resolves instead of being short-circuited
+        // to None at the dispatcher. With an EMPTY keydb both schemes fail key
+        // resolution identically — proving Aacs21 takes the resolver path
+        // rather than an unconditional `None` gate.
         let uk_ro = vec![0u8; 256];
         let vid = [0u8; 16];
         let keydb = aacs::KeyDb::empty();
         let providers: &[&dyn aacs::KeyProvider] = &[&keydb];
-        let ctx_aacs = aacs::ResolveContext {
-            unit_key_ro: &uk_ro,
-            content_cert: None,
-            volume_id: &vid,
-            providers,
-            mkb: None,
-        };
-        let mut ctx = DrmContext {
-            aacs: Some(ctx_aacs),
+
+        let make_ctx = || DrmContext {
+            aacs: Some(aacs::ResolveContext {
+                unit_key_ro: &uk_ro,
+                content_cert: None,
+                volume_id: &vid,
+                providers,
+                mkb: None,
+            }),
             css: None,
         };
-        assert!(DrmScheme::Aacs21.load(&mut ctx).is_none());
+
+        let v20 = DrmScheme::Aacs20.load(&mut make_ctx());
+        let v21 = DrmScheme::Aacs21.load(&mut make_ctx());
+        // Same resolver, same (empty-keydb) outcome.
+        assert_eq!(v20.is_none(), v21.is_none());
+        // Empty keydb -> no keys for either.
+        assert!(v21.is_none());
     }
 
     /// Exercises the V21 helper directly. Gated `#[ignore]` because

@@ -106,7 +106,7 @@ const CRYPT_TAB2: [u8; 256] = [
     0x45, 0x78, 0xA9, 0xA8, 0xEA, 0xC9, 0x6A, 0xF7, 0x29, 0x91, 0xF0, 0x02, 0x18, 0x3A, 0x4E, 0x7C,
 ];
 
-const CRYPT_TAB3: [u8; 288] = [
+const CRYPT_TAB3: [u8; 256] = [
     0x73, 0x51, 0x95, 0xE1, 0x12, 0xE4, 0xC0, 0x58, 0xEE, 0xF2, 0x08, 0x1B, 0xA9, 0xFA, 0x98, 0x4C,
     0xA7, 0x33, 0xE2, 0x1B, 0xA7, 0x6D, 0xF5, 0x30, 0x97, 0x1D, 0xF3, 0x02, 0x60, 0x5A, 0x82, 0x0F,
     0x91, 0xD0, 0x9C, 0x10, 0x39, 0x7A, 0x83, 0x85, 0x3B, 0xB2, 0xB8, 0xAE, 0x0C, 0x09, 0x52, 0xEA,
@@ -123,8 +123,6 @@ const CRYPT_TAB3: [u8; 288] = [
     0xBD, 0xC1, 0x0E, 0x56, 0x54, 0x3E, 0x14, 0x5F, 0x8C, 0x8F, 0x6E, 0x75, 0x1C, 0x07, 0x39, 0x7B,
     0x4B, 0xDB, 0xD3, 0x4B, 0x1E, 0xC8, 0x7E, 0xFE, 0x3E, 0x72, 0x16, 0x83, 0x7D, 0xEE, 0xF5, 0xCA,
     0xC5, 0x18, 0xF9, 0xD8, 0x68, 0xAB, 0x38, 0x85, 0xA8, 0xF0, 0xA1, 0x73, 0x9F, 0x5D, 0x19, 0x0B,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x72, 0x39, 0x25, 0x67, 0x26, 0x6D, 0x71,
-    0x36, 0x77, 0x3C, 0x20, 0x62, 0x23, 0x68, 0x74, 0xC3, 0x82, 0xC9, 0x15, 0x57, 0x16, 0x5D, 0x81,
 ];
 
 const VARIANTS: [u8; 32] = [
@@ -152,10 +150,6 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
         0x05, 0x0D,
     ],
 ];
-
-// ── SCSI constants ────────────────────────────────────────────────────────
-
-const SCSI_READ_DVD_STRUCTURE: u8 = 0xAD;
 
 // ── Public API ────────────────────────────────────────────────────────────
 
@@ -307,7 +301,7 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
     // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
     let alloc_len: u16 = 2048 + 4;
     let mut cdb = [0u8; 12];
-    cdb[0] = SCSI_READ_DVD_STRUCTURE;
+    cdb[0] = crate::scsi::SCSI_READ_DISC_STRUCTURE;
     // bytes 2-5: address = 0
     cdb[6] = 0; // layer
     cdb[7] = 0x02; // format = disc key
@@ -333,12 +327,23 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
     }
 
     // Try each player key against each of 408 disc key entries.
-    // Each entry in the block is the disc key encrypted with a specific player key.
-    // We try all known player keys and verify by checking that two different
-    // entries produce the same disc key.
-    let mut candidates: Vec<([u8; 5], usize, usize)> = Vec::new(); // (disc_key, pk_idx, pos)
+    // Each entry in the block is the disc key encrypted with a specific player
+    // key. We collect every decryption and accept the disc key as soon as two
+    // independent decryptions agree on the same 5-byte value (the agreement may
+    // come from two different player keys or from one player key decrypting two
+    // different entries to the same value).
+    //
+    // NOTE: this is a collision heuristic, not the canonical CSS disc-key
+    // self-verification (which decrypts the verification entry with the
+    // candidate and checks the result equals the candidate). A coincidental
+    // collision among the ~12,648 candidate decryptions could in principle
+    // accept a wrong disc key; in practice a chance collision on 5 bytes is
+    // improbable enough to serve as the validity check, and this path is the
+    // production DVD disc-key recovery. Left as-is to avoid regressing it
+    // without a real disc-key-block test vector to validate against.
+    let mut candidates: Vec<[u8; 5]> = Vec::new();
 
-    for (pk_idx, player_key) in PLAYER_KEYS.iter().enumerate() {
+    for player_key in PLAYER_KEYS.iter() {
         for pos in 0..408 {
             let offset = pos * 5;
             if offset + 5 > disc_key_block.len() {
@@ -348,13 +353,11 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
             enc.copy_from_slice(&disc_key_block[offset..offset + 5]);
             let candidate = super::lfsr::decrypt_key(0x00, player_key, &enc);
 
-            // Check if any previous candidate matches (same disc key from different entry/pk)
-            for (prev, _, _) in &candidates {
-                if *prev == candidate {
-                    return Ok(candidate);
-                }
+            // Accept on the first agreement between two independent decryptions.
+            if candidates.contains(&candidate) {
+                return Ok(candidate);
             }
-            candidates.push((candidate, pk_idx, pos));
+            candidates.push(candidate);
         }
     }
 
@@ -392,65 +395,16 @@ fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<[u8; 5]> 
     Ok(key)
 }
 
-#[allow(dead_code)]
-fn read_title_key(
-    drive: &mut Drive,
-    agid: u8,
-    lba: u32,
-    bus_key: &[u8; 5],
-    disc_key: &[u8; 5],
-) -> Result<[u8; 5]> {
-    let scsi = drive.scsi_mut();
-
-    let mut cdb = [0u8; 12];
-    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
-    cdb[2] = (lba >> 24) as u8;
-    cdb[3] = (lba >> 16) as u8;
-    cdb[4] = (lba >> 8) as u8;
-    cdb[5] = lba as u8;
-    cdb[8] = 0x00;
-    cdb[9] = 0x0C;
-    cdb[10] = (agid << 6) | 0x04;
-
-    let mut buf = [0u8; 12];
-    let tk_result = scsi.execute(
-        &cdb,
-        crate::scsi::DataDirection::FromDevice,
-        &mut buf,
-        5_000,
-    );
-    tk_result.map_err(|_| Error::CssAuthFailed)?;
-
-    // Title key at bytes 5..10, byte-reversed
-    let mut title_key = [0u8; 5];
-    for i in 0..5 {
-        title_key[i] = buf[5 + (4 - i)];
-    }
-
-    // XOR with reversed bus key (same pattern as disc key block)
-    for i in 0..5 {
-        title_key[i] ^= bus_key[4 - i];
-    }
-
-    // Check for null key (title not encrypted)
-    if title_key == [0u8; 5] {
-        return Ok(title_key);
-    }
-
-    // Decrypt with disc key (invert=0xFF for title keys)
-    let title_key = super::lfsr::decrypt_key(0xFF, disc_key, &title_key);
-
-    Ok(title_key)
-}
-
 // ── CSSCryptKey ───────────────────────────────────────────────────────────
 
-/// Exposed for testing only.
-pub fn test_crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
-    crypt_key(key_type, variant, challenge)
-}
-
 fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
+    // key_type indexes PERM_CHALLENGE ([_;3]); variant indexes
+    // VARIANTS/PERM_VARIANT ([_;32]). All internal callers pass key_type in
+    // 0..3 and variant in 0..32; the asserts document the contract for the
+    // pub(crate) test entry point test_crypt_key and turn a would-be
+    // out-of-bounds panic into an explicit precondition violation.
+    debug_assert!(key_type < 3, "crypt_key: key_type out of range");
+    debug_assert!((variant as usize) < 32, "crypt_key: variant out of range");
     let perm = &PERM_CHALLENGE[key_type];
     let mut scratch = [0u8; 10];
     for i in 0..10 {

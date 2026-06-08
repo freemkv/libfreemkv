@@ -7,17 +7,24 @@
 //! Methods come in two flavors:
 //!
 //! - **Bulk material** ([`device_keys`], [`processing_keys`],
-//!   [`host_certs`]) — the resolver unions results across all
-//!   providers and tries each candidate.
+//!   [`media_keys`]) — the resolver unions (and dedups) results
+//!   across all providers and tries each candidate.
 //! - **Disc-keyed lookup** ([`lookup_disc_by_hash`],
 //!   [`lookup_disc_by_vid`]) — the resolver short-circuits on the
 //!   first hit, so providers are queried in array order with
 //!   fastest/closest first.
 //!
+//! [`host_certs`] is a sixth method but is NOT consumed by the
+//! resolver chain: the SCSI handshake reads host certs directly from
+//! the caller-supplied credentials, not from the provider array. A
+//! provider that overrides `host_certs` today has no effect on the
+//! handshake; the method is retained as a forward-looking extension
+//! point only.
+//!
 //! Default impls return empty / `None` so backends only override
 //! the methods they actually support — an external key service might
 //! implement only `lookup_disc_by_hash`, while a local file might
-//! implement all five.
+//! implement all six.
 //!
 //! Calls may block (disk I/O, network round-trips). The resolver
 //! invokes each method at most a handful of times per scan; for
@@ -25,6 +32,7 @@
 //!
 //! [`device_keys`]: KeyProvider::device_keys
 //! [`processing_keys`]: KeyProvider::processing_keys
+//! [`media_keys`]: KeyProvider::media_keys
 //! [`host_certs`]: KeyProvider::host_certs
 //! [`lookup_disc_by_hash`]: KeyProvider::lookup_disc_by_hash
 //! [`lookup_disc_by_vid`]: KeyProvider::lookup_disc_by_vid
@@ -58,6 +66,11 @@ pub trait KeyProvider: Send + Sync {
 
     /// AACS host certificates (with their private keys) for drive
     /// authentication. Multiple in case some are revoked.
+    ///
+    /// NOTE: not consumed by the resolver chain — the handshake reads
+    /// host certs from the caller-supplied credentials directly, so
+    /// overriding this method has no effect on drive authentication
+    /// today. Retained as a forward-looking extension point.
     fn host_certs(&self) -> Vec<HostCert> {
         Vec::new()
     }
@@ -78,19 +91,28 @@ pub trait KeyProvider: Send + Sync {
 
 /// Resolver-side helpers that aggregate across a provider array.
 ///
-/// The resolver consumes `&[&dyn KeyProvider]` directly; these
-/// helpers wrap the union-vs-short-circuit policy per method.
+/// The resolver wraps `ctx.providers` (`&[&dyn KeyProvider]`) in this
+/// struct; these helpers apply the union-vs-short-circuit policy per
+/// method. The bulk unions dedup so overlapping providers don't make
+/// the resolver re-walk/re-validate identical material.
 pub(crate) struct Providers<'a>(pub &'a [&'a dyn KeyProvider]);
 
 impl Providers<'_> {
-    /// Union — gather DKs from every provider.
+    /// Union (deduped) — gather DKs from every provider.
     pub fn device_keys(&self) -> Vec<DeviceKey> {
-        self.0.iter().flat_map(|p| p.device_keys()).collect()
+        let mut v: Vec<DeviceKey> = self.0.iter().flat_map(|p| p.device_keys()).collect();
+        // DeviceKey has no Ord/Hash; dedup on the value-defining tuple.
+        v.sort_unstable_by_key(|d| (d.key, d.node, d.uv, d.u_mask_shift));
+        v.dedup_by_key(|d| (d.key, d.node, d.uv, d.u_mask_shift));
+        v
     }
 
-    /// Union — gather PKs from every provider.
+    /// Union (deduped) — gather PKs from every provider.
     pub fn processing_keys(&self) -> Vec<[u8; 16]> {
-        self.0.iter().flat_map(|p| p.processing_keys()).collect()
+        let mut v: Vec<[u8; 16]> = self.0.iter().flat_map(|p| p.processing_keys()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// Union of distinct Media Keys across every provider, for the MK-pool
@@ -102,9 +124,9 @@ impl Providers<'_> {
         v
     }
 
-    /// Union — gather host certs from every provider. Not yet wired into
-    /// the SCSI handshake (which still reads `KeyDb.host_certs` directly);
-    /// kept here so a provider-aware handshake refactor is a drop-in.
+    /// Union — gather host certs from every provider. The SCSI handshake
+    /// reads host certs from the caller-supplied credentials directly and
+    /// does not call this, so it is currently unused by the resolver chain.
     #[allow(dead_code)]
     pub fn host_certs(&self) -> Vec<HostCert> {
         self.0.iter().flat_map(|p| p.host_certs()).collect()

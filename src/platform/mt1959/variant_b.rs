@@ -2,13 +2,11 @@
 //!
 //! MODE SELECT (0x55) → read metadata → WRITE_BUFFER → vendor verify (0xF1) → unlock × 5+1
 
-use super::Mt1959;
+use super::{Mt1959, SCSI_READ_BUFFER, SCSI_WRITE_BUFFER};
 use crate::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 
 const SCSI_MODE_SELECT: u8 = 0x55;
-const SCSI_WRITE_BUFFER: u8 = 0x3B;
-const SCSI_READ_BUFFER: u8 = 0x3C;
 const FIRMWARE_MAX_SIZE: usize = 0x9C0;
 const FIRMWARE_EXTRA: [u8; 16] = [0; 16];
 const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3, 0xAD, 0x23];
@@ -19,7 +17,13 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         return Err(crate::error::Error::UnlockFailed);
     }
 
-    // Step 1: Upload firmware via MODE SELECT
+    // Step 1: Upload firmware via MODE SELECT. Variant-B firmware blobs are
+    // exactly FIRMWARE_MAX_SIZE; a larger blob means a corrupt/wrong profile,
+    // and silently truncating it would upload a partial image that can't
+    // unlock. Reject it explicitly instead.
+    if firmware.len() > FIRMWARE_MAX_SIZE {
+        return Err(crate::error::Error::UnlockFailed);
+    }
     let write_len = FIRMWARE_MAX_SIZE.min(firmware.len());
     let mode_select_cdb = [
         SCSI_MODE_SELECT,
@@ -77,7 +81,11 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut dummy = [0u8; 0];
     let _ = scsi.execute(&VENDOR_VERIFY, DataDirection::None, &mut dummy, 5_000);
 
-    // Step 5: Unlock retries (up to 5, then final attempt)
+    // Step 5: Unlock retries (up to 5, then a final fatal attempt). On a
+    // successful unlock we issue one confirmation pass; its result is
+    // intentionally best-effort — the first call already established the
+    // unlock state, so a hiccup on the redundant confirmation must not fail
+    // an otherwise-good unlock.
     for _attempt in 0..5 {
         if mt.do_unlock(scsi).is_ok() {
             let _ = mt.do_unlock(scsi);

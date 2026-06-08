@@ -6,6 +6,12 @@
 //! disc.read()  → PES frame (sectors → decrypt → demux internally)
 //! mkv.write(frame) → MKV file (mux internally)
 
+/// Maximum frame payload size, shared by `serialize` and `deserialize`
+/// so the wire format round-trips: any frame that serializes can be read
+/// back. A frame larger than this is rejected on write rather than written
+/// and then hard-erroring mid-stream on read.
+const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+
 /// One frame of elementary stream data.
 #[derive(Debug, Clone)]
 pub struct PesFrame {
@@ -27,9 +33,11 @@ impl PesFrame {
     /// Serialize to bytes: track(1) | pts(8) | keyframe(1) | len(4) | data
     pub fn serialize(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         if self.track > 255 {
-            return Err(crate::error::Error::PesInvalidMagic.into());
+            return Err(crate::error::Error::PesTrackTooLarge { track: self.track }.into());
         }
-        if self.data.len() > u32::MAX as usize {
+        // Enforce the same ceiling the reader uses, so a frame that writes
+        // can always be read back (round-trippable wire format).
+        if self.data.len() > MAX_FRAME_SIZE {
             return Err(crate::error::Error::PesFrameTooLarge {
                 size: self.data.len(),
             }
@@ -42,16 +50,35 @@ impl PesFrame {
         w.write_all(&self.data)
     }
 
-    /// Deserialize from bytes. Returns None at EOF.
+    /// Deserialize from bytes. Returns None at a clean end of stream.
+    ///
+    /// A clean EOF is exactly zero bytes available before the next frame.
+    /// A partial header (1-13 bytes, e.g. a crash or short write) is a real
+    /// error (`UnexpectedEof`), not silently treated as EOF — otherwise
+    /// truncated `.pes` data would be accepted as a graceful end.
     pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
-        const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024; // 256 MB
-
-        let mut header = [0u8; 14]; // 1 + 8 + 1 + 4
-        match r.read_exact(&mut header) {
+        // Probe one byte first to distinguish clean EOF from a truncated
+        // header.
+        let mut first = [0u8; 1];
+        match r.read(&mut first) {
+            Ok(0) => return Ok(None), // clean EOF, no frame started
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Retry-once on EINTR before committing to the header read.
+                match r.read(&mut first) {
+                    Ok(0) => return Ok(None),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         }
+
+        let mut header = [0u8; 14]; // 1 + 8 + 1 + 4
+        header[0] = first[0];
+        // The remaining 13 header bytes must be present; a short read here is
+        // a truncated frame, propagated as UnexpectedEof.
+        r.read_exact(&mut header[1..])?;
         let track = header[0] as usize;
         let pts = i64::from_le_bytes([
             header[1], header[2], header[3], header[4], header[5], header[6], header[7], header[8],
@@ -73,7 +100,10 @@ impl PesFrame {
     }
 
     /// Create from a codec::Frame with a track index.
-    pub fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
+    ///
+    /// `pub(crate)`: takes the internal `mux::codec::Frame` type, so it
+    /// can't be part of the public API surface.
+    pub(crate) fn from_codec_frame(track: usize, frame: crate::mux::codec::Frame) -> Self {
         Self {
             track,
             pts: frame.pts_ns,
@@ -167,8 +197,11 @@ impl Stream for CountingStream {
     }
 
     fn write(&mut self, frame: &PesFrame) -> std::io::Result<()> {
+        // Only count bytes that actually made it to the inner sink, so a
+        // failed write doesn't permanently inflate bytes_written().
+        self.inner.write(frame)?;
         self.written += frame.data.len() as u64;
-        self.inner.write(frame)
+        Ok(())
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -185,6 +218,10 @@ impl Stream for CountingStream {
 
     fn headers_ready(&self) -> bool {
         self.inner.headers_ready()
+    }
+
+    fn errors(&self) -> u64 {
+        self.inner.errors()
     }
 }
 
@@ -279,5 +316,88 @@ mod tests {
         s.write(&frame).unwrap();
         let _ = s.info();
         s.finish().unwrap();
+    }
+
+    #[test]
+    fn frame_roundtrips_through_bytes() {
+        let frame = make_frame(3, 123_456);
+        let mut buf = Vec::new();
+        frame.serialize(&mut buf).expect("serialize");
+        let mut cursor = std::io::Cursor::new(buf);
+        let got = PesFrame::deserialize(&mut cursor)
+            .expect("deserialize")
+            .expect("frame present");
+        assert_eq!(got.track, frame.track);
+        assert_eq!(got.pts, frame.pts);
+        assert_eq!(got.keyframe, frame.keyframe);
+        assert_eq!(got.data, frame.data);
+        // Next read is a clean EOF.
+        assert!(PesFrame::deserialize(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_input_is_clean_eof() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        assert!(PesFrame::deserialize(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn truncated_header_is_error_not_eof() {
+        // A partial 14-byte header (here 5 bytes) must surface as an error,
+        // not be swallowed as a graceful end of stream.
+        let mut cursor = std::io::Cursor::new(vec![1u8, 2, 3, 4, 5]);
+        let err = PesFrame::deserialize(&mut cursor).expect_err("partial header must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn oversize_track_rejected_on_serialize() {
+        let frame = make_frame(256, 0);
+        let mut buf = Vec::new();
+        let err = frame
+            .serialize(&mut buf)
+            .expect_err("track > 255 must fail");
+        let code = format!("E{}", crate::error::E_PES_TRACK_TOO_LARGE);
+        assert!(err.to_string().contains(&code), "got: {err}");
+    }
+
+    /// Output stream whose `write` always fails — for CountingStream tests.
+    struct FailingWriteStream {
+        title: DiscTitle,
+    }
+
+    impl Stream for FailingWriteStream {
+        fn read(&mut self) -> std::io::Result<Option<PesFrame>> {
+            Ok(None)
+        }
+        fn write(&mut self, _frame: &PesFrame) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn finish(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> &DiscTitle {
+            &self.title
+        }
+    }
+
+    #[test]
+    fn counting_stream_does_not_count_failed_writes() {
+        let mut cs = CountingStream::new(Box::new(FailingWriteStream {
+            title: DiscTitle::empty(),
+        }));
+        let frame = make_frame(0, 0);
+        assert!(cs.write(&frame).is_err());
+        // Failed write must not inflate the byte count.
+        assert_eq!(cs.bytes_written(), 0);
+    }
+
+    #[test]
+    fn counting_stream_counts_successful_writes() {
+        let frame = make_frame(0, 0);
+        let payload = frame.data.len() as u64;
+        let mut cs = CountingStream::new(Box::new(MockStream::new(Vec::new())));
+        cs.write(&frame).unwrap();
+        assert_eq!(cs.bytes_written(), payload);
     }
 }

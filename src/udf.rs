@@ -21,6 +21,19 @@
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 
+/// Upper bound on a single metadata file read (`read_file`). BD-ROM
+/// metadata files (.mpls/.clpi/.inf/.bdmv) are a few KiB to tens of MiB;
+/// 64 MiB is a generous ceiling. Caps the allocation so a crafted ICB
+/// info_length / extent length cannot force a huge zeroed reservation
+/// before any data is read.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Upper bound on a single directory's on-disc data. Real BD-ROM
+/// directories are a few KiB; 1 MiB is well above any legitimate value.
+/// Caps the allocation so a corrupt 30-bit directory ICB allocation
+/// length cannot force a ~1 GiB zeroed allocation per recursion level.
+const MAX_DIR_BYTES: u32 = 1024 * 1024;
+
 /// A UDF filesystem parsed from disc.
 #[derive(Debug)]
 pub struct UdfFs {
@@ -80,9 +93,7 @@ impl UdfFs {
         Some(current)
     }
 
-    /// Read a file by path, returning its raw bytes.
-    /// Reads sector by sector from disc — no buffering.
-    /// Get the absolute starting LBA of a file on disc.
+    /// Get the absolute starting LBA of a file's first data extent on disc.
     /// Used by the rip pipeline to locate m2ts content sectors.
     pub fn file_start_lba(&self, reader: &mut dyn SectorSource, path: &str) -> Result<u32> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -112,9 +123,17 @@ impl UdfFs {
                 path: path.to_string(),
             })?;
         let (data_lba, _) = self.read_icb_extent(reader, entry.meta_lba)?;
-        Ok(self.partition_start + data_lba)
+        self.partition_start
+            .checked_add(data_lba)
+            .ok_or(Error::DiscRead {
+                sector: self.partition_start as u64,
+                status: None,
+                sense: None,
+            })
     }
 
+    /// Read a file by path, returning its raw bytes.
+    /// Reads all data extents sector by sector from disc — no buffering.
     pub fn read_file(&self, reader: &mut dyn SectorSource, path: &str) -> Result<Vec<u8>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
@@ -147,22 +166,76 @@ impl UdfFs {
                 path: path.to_string(),
             })?;
 
-        // Read the file's ICB to get its data extent
-        let (data_lba, data_len) = self.read_icb_extent(reader, entry.meta_lba)?;
+        // Read ALL the file's data extents. Multi-extent files (fragmented or
+        // split across dual layers) would otherwise be silently truncated to
+        // the first extent, since the buffer is sized to entry.size and
+        // truncate() can't grow it.
+        let extents = self.read_icb_extents(reader, entry.meta_lba)?;
 
-        // Read file data sector by sector
-        // File DATA is in the physical partition (partition_start + lba),
-        // NOT the metadata partition. ICBs are in metadata, data is in physical.
-        let sector_count = (data_len as u64).div_ceil(2048) as u32;
-        let mut data = vec![0u8; (sector_count as usize) * 2048];
-        let abs_start = self.partition_start + data_lba;
-
-        for i in 0..sector_count {
-            let offset = (i as usize) * 2048;
-            read_sector(reader, abs_start + i, &mut data[offset..offset + 2048])?;
+        // Reject an oversized declared total before allocating: entry.size is
+        // a raw u64 off the ICB, so a crafted file could otherwise force a
+        // multi-hundred-MiB / GiB allocation across its extents.
+        if entry.size > MAX_FILE_BYTES {
+            return Err(Error::DiscRead {
+                sector: self.partition_start as u64,
+                status: None,
+                sense: None,
+            });
         }
 
-        data.truncate(entry.size as usize);
+        // Read ALL the file's data extents. File DATA is in the physical
+        // partition (partition_start + lba), NOT the metadata partition: ICBs
+        // are in metadata, data is in physical.
+        let mut data = Vec::with_capacity(entry.size as usize);
+        let mut sector = [0u8; 2048];
+        for (data_lba, data_len) in extents {
+            // Cumulative guard: entry.size and each per-extent data_len are
+            // capped individually above, but a crafted ICB can chain many
+            // small extents (read_icb_extents follows type-3 chains up to
+            // MAX_AD_BLOCKS) whose running total grows `data` into GiB. Reject
+            // once the accumulated bytes would exceed MAX_FILE_BYTES.
+            if data.len() as u64 + data_len as u64 > MAX_FILE_BYTES {
+                return Err(Error::DiscRead {
+                    sector: self.partition_start as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            // data_len is the disc-controlled 30-bit extent length; reject an
+            // oversized extent before reading so a crafted ICB can't grow the
+            // buffer past MAX_FILE_BYTES.
+            if data_len as u64 > MAX_FILE_BYTES {
+                return Err(Error::DiscRead {
+                    sector: self.partition_start as u64,
+                    status: None,
+                    sense: None,
+                });
+            }
+            let abs_start = self
+                .partition_start
+                .checked_add(data_lba)
+                .ok_or(Error::DiscRead {
+                    sector: self.partition_start as u64,
+                    status: None,
+                    sense: None,
+                })?;
+            let sector_count = (data_len as u64).div_ceil(2048) as u32;
+            for i in 0..sector_count {
+                let abs = abs_start.checked_add(i).ok_or(Error::DiscRead {
+                    sector: abs_start as u64,
+                    status: None,
+                    sense: None,
+                })?;
+                read_sector(reader, abs, &mut sector)?;
+                data.extend_from_slice(&sector);
+            }
+        }
+
+        // Trim to the real file size; if extents under-covered the file (e.g.
+        // sparse), leave what we have rather than over-reporting.
+        if data.len() > entry.size as usize {
+            data.truncate(entry.size as usize);
+        }
         Ok(data)
     }
 
@@ -170,17 +243,19 @@ impl UdfFs {
     ///
     /// Returns a list of (start_lba, sector_count) ranges covering:
     ///   - UDF structure (AVDP, VDS, metadata partition, directories)
-    ///   - BDMV/PLAYLIST/*.mpls, CLIPINF/*.clpi, JAR/*, META/*, *.bdmv
-    ///   - AACS/* (Content*.cer, Unit_Key_RO.inf, CPSUnit*.cci)
+    ///   - every non-STREAM file the tree walk reaches that is <= 50 MB
     ///
-    /// Skips: STREAM/ (video), BACKUP/, DUPLICATE/,
-    ///   MKB_RO.inf, ContentHash*, ContentRevocation*
+    /// Skip policy (actual): directories named `STREAM` (case-insensitive)
+    /// are not descended, and individual files larger than 50 MB are
+    /// omitted. Nothing else is filtered by name — `BACKUP`/`DUPLICATE`
+    /// are traversed, and `MKB_RO.inf` is excluded only because it exceeds
+    /// the 50 MB cap.
     pub fn metadata_sector_ranges(&self, reader: &mut dyn SectorSource) -> Result<Vec<(u32, u32)>> {
         let mut ranges = Vec::new();
 
         // UDF structure: sector 0 through end of metadata partition
         // Covers AVDP, VDS, partition descriptor, metadata ICB, FSD, all directories
-        let meta_end = self.metadata_start + self.metadata_sectors;
+        let meta_end = self.metadata_start.saturating_add(self.metadata_sectors);
         ranges.push((0, meta_end));
 
         // Walk tree, collect ranges for each metadata file
@@ -198,7 +273,7 @@ impl UdfFs {
         let mut ranges = Vec::new();
 
         // UDF structure sectors
-        let meta_end = self.metadata_start + self.metadata_sectors;
+        let meta_end = self.metadata_start.saturating_add(self.metadata_sectors);
         ranges.push((0, meta_end));
 
         // Walk entire tree including STREAM directories
@@ -221,12 +296,15 @@ impl UdfFs {
                 self.collect_all_file_ranges(reader, child, ranges)?;
             } else {
                 // Include the ICB sector
-                ranges.push((self.meta_to_abs(child.meta_lba), 1));
+                ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
 
                 // Include ALL file data extents (large m2ts files have many)
                 if let Ok(extents) = self.read_icb_extents(reader, child.meta_lba) {
                     for (data_lba, data_len) in extents {
-                        let abs_start = self.partition_start + data_lba;
+                        let abs_start = match self.partition_start.checked_add(data_lba) {
+                            Some(v) => v,
+                            None => continue,
+                        };
                         let sector_count = (data_len as u64).div_ceil(2048) as u32;
                         ranges.push((abs_start, sector_count));
                     }
@@ -251,17 +329,25 @@ impl UdfFs {
                 self.collect_file_ranges(reader, child, ranges)?;
             } else {
                 // Include the ICB sector itself (in metadata partition)
-                ranges.push((self.meta_to_abs(child.meta_lba), 1));
+                ranges.push((self.meta_to_abs(child.meta_lba)?, 1));
 
                 // Include file data — skip only truly huge files (MKB_RO.inf = 134MB)
                 if child.size > 50_000_000 {
                     continue;
                 }
 
-                if let Ok((data_lba, data_len)) = self.read_icb_extent(reader, child.meta_lba) {
-                    let abs_start = self.partition_start + data_lba;
-                    let sector_count = (data_len as u64).div_ceil(2048) as u32;
-                    ranges.push((abs_start, sector_count));
+                // Push every extent: a fragmented AACS cert / MPLS / CLPI can
+                // span multiple extents, and key readers downstream need all
+                // of them (mirror collect_all_file_ranges).
+                if let Ok(extents) = self.read_icb_extents(reader, child.meta_lba) {
+                    for (data_lba, data_len) in extents {
+                        let abs_start = match self.partition_start.checked_add(data_lba) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let sector_count = (data_len as u64).div_ceil(2048) as u32;
+                        ranges.push((abs_start, sector_count));
+                    }
                 }
             }
         }
@@ -269,8 +355,16 @@ impl UdfFs {
     }
 
     /// Convert a metadata-partition-relative LBA to an absolute sector number.
-    fn meta_to_abs(&self, meta_lba: u32) -> u32 {
-        self.metadata_start + meta_lba
+    /// `meta_lba` is disc-controlled, so the sum is checked to avoid a
+    /// wrap-to-wrong-sector on a crafted ICB.
+    fn meta_to_abs(&self, meta_lba: u32) -> Result<u32> {
+        self.metadata_start
+            .checked_add(meta_lba)
+            .ok_or(Error::DiscRead {
+                sector: self.metadata_start as u64,
+                status: None,
+                sense: None,
+            })
     }
 
     /// Read an Extended File Entry (tag 266) or File Entry (tag 261)
@@ -279,7 +373,10 @@ impl UdfFs {
     fn read_icb_extent(&self, reader: &mut dyn SectorSource, meta_lba: u32) -> Result<(u32, u32)> {
         let extents = self.read_icb_extents(reader, meta_lba)?;
         extents.first().copied().ok_or(Error::DiscRead {
-            sector: 0,
+            // Diagnostic sector only; meta_to_abs can overflow on a crafted
+            // meta_lba, in which case 0 is a harmless placeholder for the
+            // error-context field.
+            sector: self.meta_to_abs(meta_lba).unwrap_or(0) as u64,
             status: None,
             sense: None,
         })
@@ -287,14 +384,17 @@ impl UdfFs {
 
     /// Read ALL allocation extents for a file from its ICB.
     /// Returns Vec of (partition_relative_lba, byte_length) pairs.
-    /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents).
+    /// Handles files with many extents (e.g. 88 GB m2ts files have ~90 extents)
+    /// including files whose allocation descriptors span multiple blocks via
+    /// continuation (extent_type 3) descriptors.
     fn read_icb_extents(
         &self,
         reader: &mut dyn SectorSource,
         meta_lba: u32,
     ) -> Result<Vec<(u32, u32)>> {
+        let icb_abs = self.meta_to_abs(meta_lba)?;
         let mut icb = [0u8; 2048];
-        read_sector(reader, self.meta_to_abs(meta_lba), &mut icb)?;
+        read_sector(reader, icb_abs, &mut icb)?;
 
         let tag = u16::from_le_bytes([icb[0], icb[1]]);
 
@@ -307,7 +407,7 @@ impl UdfFs {
                 let ad_offset = 216 + l_ea;
                 if ad_offset + l_ad > icb.len() {
                     return Err(Error::DiscRead {
-                        sector: self.meta_to_abs(meta_lba) as u64,
+                        sector: icb_abs as u64,
                         status: None,
                         sense: None,
                     });
@@ -321,7 +421,7 @@ impl UdfFs {
                 let ad_offset = 176 + l_ea;
                 if ad_offset + l_ad > icb.len() {
                     return Err(Error::DiscRead {
-                        sector: self.meta_to_abs(meta_lba) as u64,
+                        sector: icb_abs as u64,
                         status: None,
                         sense: None,
                     });
@@ -330,7 +430,7 @@ impl UdfFs {
             }
             _ => {
                 return Err(Error::DiscRead {
-                    sector: 0,
+                    sector: icb_abs as u64,
                     status: None,
                     sense: None,
                 });
@@ -338,25 +438,72 @@ impl UdfFs {
         };
 
         let mut extents = Vec::new();
-        let num_descriptors = l_ad / 8; // Short Allocation Descriptor = 8 bytes
 
-        for i in 0..num_descriptors {
-            let off = ad_offset + i * 8;
-            if off + 8 > icb.len() {
-                break;
+        // Parse the first allocation-descriptor list from the ICB. A type-3
+        // descriptor ("next extent of allocation descriptors") points at a
+        // continuation block in the metadata partition holding more ADs; we
+        // follow the chain. The hop count is bounded to avoid looping on a
+        // crafted/corrupt disc.
+        let mut block = icb;
+        let mut ad_start = ad_offset;
+        let mut ad_bytes = l_ad;
+        const MAX_AD_BLOCKS: usize = 256;
+
+        for _ in 0..MAX_AD_BLOCKS {
+            let num_descriptors = ad_bytes / 8; // Short Allocation Descriptor = 8 bytes
+            let mut next_block: Option<u32> = None;
+
+            for i in 0..num_descriptors {
+                let off = ad_start + i * 8;
+                if off + 8 > block.len() {
+                    break;
+                }
+
+                let raw_len = u32::from_le_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+                let extent_type = raw_len >> 30;
+                let data_len = raw_len & 0x3FFF_FFFF;
+                let data_lba = u32::from_le_bytes([
+                    block[off + 4],
+                    block[off + 5],
+                    block[off + 6],
+                    block[off + 7],
+                ]);
+
+                match extent_type {
+                    // Recorded and allocated. A zero-length type-0
+                    // descriptor is the AD-list terminator (continuation
+                    // blocks are scanned to the end of the sector, so the
+                    // trailing zero padding must not be read as extents).
+                    0 if data_len == 0 => break,
+                    0 => extents.push((data_lba, data_len)),
+                    1 => {} // allocated but not recorded (sparse)
+                    3 => {
+                        // Continuation: the rest of the ADs live in the block
+                        // at data_lba (metadata-partition-relative). Stop
+                        // scanning this block and follow the pointer.
+                        if data_len > 0 {
+                            next_block = Some(data_lba);
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
             }
 
-            let raw_len = u32::from_le_bytes([icb[off], icb[off + 1], icb[off + 2], icb[off + 3]]);
-            let extent_type = raw_len >> 30;
-            let data_len = raw_len & 0x3FFF_FFFF;
-            let data_lba =
-                u32::from_le_bytes([icb[off + 4], icb[off + 5], icb[off + 6], icb[off + 7]]);
-
-            match extent_type {
-                0 => extents.push((data_lba, data_len)), // recorded and allocated
-                1 => {}     // allocated but not recorded (sparse) — skip
-                3 => break, // next extent of allocation descriptors — TODO
-                _ => break,
+            match next_block {
+                Some(cont_lba) => {
+                    read_sector(reader, self.meta_to_abs(cont_lba)?, &mut block)?;
+                    // A continuation block is a list of Short ADs from byte 0,
+                    // spanning the whole sector.
+                    ad_start = 0;
+                    ad_bytes = block.len();
+                }
+                None => break,
             }
         }
 
@@ -398,9 +545,16 @@ impl UdfFs {
             })?;
 
         let alloc_extents = self.read_icb_extents(reader, entry.meta_lba)?;
-        let mut disc_extents = Vec::new();
+        let mut disc_extents = Vec::with_capacity(alloc_extents.len());
         for (lba, byte_len) in alloc_extents {
-            let abs_lba = self.partition_start + lba;
+            let abs_lba = self
+                .partition_start
+                .checked_add(lba)
+                .ok_or(Error::DiscRead {
+                    sector: self.partition_start as u64,
+                    status: None,
+                    sense: None,
+                })?;
             let sectors = (byte_len as u64).div_ceil(2048) as u32;
             disc_extents.push((abs_lba, sectors));
         }
@@ -426,7 +580,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     let tag_id = u16::from_le_bytes([avdp[0], avdp[1]]);
     if tag_id != 2 {
         return Err(Error::DiscRead {
-            sector: 0,
+            sector: 256,
             status: None,
             sense: None,
         });
@@ -538,7 +692,11 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
                         meta_icb[ad_off + 7],
                     ]);
                     // Metadata content starts at partition_start + ad_pos
-                    partition_start + ad_pos
+                    partition_start.checked_add(ad_pos).ok_or(Error::DiscRead {
+                        sector: partition_start as u64,
+                        status: None,
+                        sense: None,
+                    })?
                 } else {
                     // Fallback: no metadata partition, use physical partition directly
                     partition_start
@@ -562,7 +720,7 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     let fsd_tag = u16::from_le_bytes([fsd[0], fsd[1]]);
     if fsd_tag != 256 {
         return Err(Error::DiscRead {
-            sector: 0,
+            sector: metadata_start as u64,
             status: None,
             sense: None,
         });
@@ -586,11 +744,17 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     })
 }
 
-/// Read a UDF directory and its children (up to max_depth levels).
+/// Maximum directory nesting depth followed when building the tree.
+/// Bounds recursion on a corrupt/looping disc; real BD-ROM and DVD trees
+/// are far shallower (BDMV/BACKUP/BDJO is the deepest standard path at 3).
+const MAX_DIR_DEPTH: u32 = 8;
+
+/// Read a UDF directory and its children (up to [`MAX_DIR_DEPTH`] levels).
 ///
 /// Each directory is an ICB (Extended File Entry) pointing to directory data
 /// containing File Identifier Descriptors (FIDs). Each FID names a file/subdir
-/// and points to its ICB.
+/// and points to its ICB. Directories deeper than [`MAX_DIR_DEPTH`] are
+/// recorded as entries but not descended into.
 #[allow(clippy::only_used_in_recursion)]
 fn read_directory(
     reader: &mut dyn SectorSource,
@@ -601,8 +765,13 @@ fn read_directory(
     depth: u32,
 ) -> Result<DirEntry> {
     // Read ICB for this directory
+    let icb_abs = meta_start.checked_add(meta_lba).ok_or(Error::DiscRead {
+        sector: meta_start as u64,
+        status: None,
+        sense: None,
+    })?;
     let mut icb = [0u8; 2048];
-    read_sector(reader, meta_start + meta_lba, &mut icb)?;
+    read_sector(reader, icb_abs, &mut icb)?;
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
 
@@ -613,7 +782,7 @@ fn read_directory(
             let ad_off = 216 + l_ea;
             if ad_off + 8 > icb.len() {
                 return Err(Error::DiscRead {
-                    sector: (meta_start + meta_lba) as u64,
+                    sector: icb_abs as u64,
                     status: None,
                     sense: None,
                 });
@@ -637,7 +806,7 @@ fn read_directory(
             let ad_off = 176 + l_ea;
             if ad_off + 8 > icb.len() {
                 return Err(Error::DiscRead {
-                    sector: (meta_start + meta_lba) as u64,
+                    sector: icb_abs as u64,
                     status: None,
                     sense: None,
                 });
@@ -667,14 +836,36 @@ fn read_directory(
         }
     };
 
+    // Reject an oversized directory before allocating: ad_len is the
+    // disc-controlled 30-bit ICB allocation length, so a corrupt value
+    // could otherwise force a ~1 GiB zeroed allocation (amplified by
+    // recursion). Real directories are a few KiB; the 1 MiB cap still
+    // covers a large STREAM/ dir with thousands of .m2ts FIDs.
+    if ad_len > MAX_DIR_BYTES {
+        return Err(Error::DiscRead {
+            sector: meta_start as u64,
+            status: None,
+            sense: None,
+        });
+    }
+
     // Read directory data
-    let dir_abs = meta_start + ad_pos;
-    let sector_count = ad_len.div_ceil(2048).min(64);
+    let dir_abs = meta_start.checked_add(ad_pos).ok_or(Error::DiscRead {
+        sector: meta_start as u64,
+        status: None,
+        sense: None,
+    })?;
+    let sector_count = ad_len.div_ceil(2048);
     let mut dir_data = vec![0u8; sector_count as usize * 2048];
     for i in 0..sector_count {
+        let abs = dir_abs.checked_add(i).ok_or(Error::DiscRead {
+            sector: dir_abs as u64,
+            status: None,
+            sense: None,
+        })?;
         read_sector(
             reader,
-            dir_abs + i,
+            abs,
             &mut dir_data[(i as usize) * 2048..(i as usize + 1) * 2048],
         )?;
     }
@@ -720,8 +911,11 @@ fn read_directory(
                 // Read the ICB to get file size
                 let file_size = read_file_size(reader, meta_start, icb_lba).unwrap_or(0);
 
-                if is_dir && depth < 3 {
-                    // Recurse into subdirectory (max 3 levels: BDMV/PLAYLIST/*.mpls)
+                if is_dir && depth < MAX_DIR_DEPTH {
+                    // Recurse into subdirectory. The cap guards against
+                    // pathological/looping directory trees on a corrupt disc
+                    // while comfortably covering real BD-ROM nesting
+                    // (e.g. BDMV/BACKUP/BDJO/*.bdjo is 3 levels deep).
                     let subdir = read_directory(
                         reader,
                         part_start,
@@ -759,8 +953,13 @@ fn read_directory(
 
 /// Read file size (info_length) from an Extended File Entry ICB.
 fn read_file_size(reader: &mut dyn SectorSource, meta_start: u32, meta_lba: u32) -> Result<u64> {
+    let abs = meta_start.checked_add(meta_lba).ok_or(Error::DiscRead {
+        sector: meta_start as u64,
+        status: None,
+        sense: None,
+    })?;
     let mut icb = [0u8; 2048];
-    read_sector(reader, meta_start + meta_lba, &mut icb)?;
+    read_sector(reader, abs, &mut icb)?;
 
     let tag = u16::from_le_bytes([icb[0], icb[1]]);
     match tag {
@@ -814,10 +1013,13 @@ fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut result = vec![ranges[0]];
     for &(start, count) in &ranges[1..] {
         let last = result.last_mut().unwrap();
-        let last_end = last.0 + last.1;
-        if start <= last_end + 1 {
+        // Saturating arithmetic: ranges derive from disc-controlled ICB
+        // LBAs/lengths, so a corrupt disc could otherwise overflow u32
+        // (panic in debug, wrap in release).
+        let last_end = last.0.saturating_add(last.1);
+        if start <= last_end.saturating_add(1) {
             // Overlapping or adjacent — extend
-            let new_end = (start + count).max(last_end);
+            let new_end = start.saturating_add(count).max(last_end);
             last.1 = new_end - last.0;
         } else {
             result.push((start, count));
@@ -868,11 +1070,11 @@ fn parse_dstring(data: &[u8]) -> String {
     }
 }
 
-/// Read a single 2048-byte sector from the drive.
-/// Uses standard READ(10) — no unlock required.
-/// Buffered sector reader — reduces SCSI round-trips by pre-fetching blocks.
-/// Each SCSI command has ~500ms overhead on USB drives, so reading 32 sectors
-/// at once (one command) is 32x faster than 32 individual reads.
+/// Buffered sector reader — reduces SCSI round-trips by coalescing
+/// single-sector reads into `batch`-sized SCSI commands. Per-command
+/// latency dominates on USB drives, so serving many adjacent single-sector
+/// reads from one bulk read is substantially faster than issuing each
+/// individually. `batch` is a runtime field, not a fixed count.
 pub(crate) struct BufferedSectorReader<'a> {
     inner: &'a mut dyn SectorSource,
     cache_start: u32,
@@ -961,6 +1163,11 @@ impl SectorSource for BufferedSectorReader<'_> {
         _recovery: bool,
     ) -> std::result::Result<usize, crate::error::Error> {
         if count == 1 {
+            // Contract: a single-sector read needs at least one sector of
+            // destination. Return an error rather than panicking on the slice.
+            if buf.len() < 2048 {
+                return Err(crate::error::Error::UdfBufferTooSmall);
+            }
             // Check permanent prefetch cache first (HashMap)
             if let Some(data) = self.prefetched.get(&lba) {
                 buf[..2048].copy_from_slice(data);
@@ -980,7 +1187,12 @@ impl SectorSource for BufferedSectorReader<'_> {
                     self.cache_sectors = block as u32;
                 }
                 Err(_) => {
-                    // Near end of disc or error — single sector fallback
+                    // By design: a `block`-sector batch read that starts
+                    // valid but runs past the last recorded sector fails as
+                    // a unit. Retry the one sector actually requested so a
+                    // batch overrunning the disc tail still serves the live
+                    // LBA instead of erroring; a genuinely bad single sector
+                    // then propagates via `?`.
                     self.cache.resize(2048, 0);
                     self.inner.read_sectors(lba, 1, &mut self.cache, true)?;
                     self.cache_start = lba;
@@ -996,7 +1208,367 @@ impl SectorSource for BufferedSectorReader<'_> {
     }
 }
 
+/// Read a single 2048-byte sector from the drive.
+/// Uses standard READ(10) — no unlock required.
 fn read_sector(reader: &mut dyn SectorSource, lba: u32, buf: &mut [u8]) -> Result<()> {
     reader.read_sectors(lba, 1, buf, true)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// In-memory SectorSource backed by an explicit absolute-LBA → sector map.
+    /// Unmapped sectors read as zeroes.
+    struct MapReader {
+        sectors: HashMap<u32, [u8; 2048]>,
+    }
+
+    impl MapReader {
+        fn new() -> Self {
+            Self {
+                sectors: HashMap::new(),
+            }
+        }
+        fn put(&mut self, lba: u32, data: [u8; 2048]) {
+            self.sectors.insert(lba, data);
+        }
+    }
+
+    impl SectorSource for MapReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let need = count as usize * 2048;
+            if buf.len() < need {
+                return Err(Error::UdfBufferTooSmall);
+            }
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+                buf[off..off + 2048].copy_from_slice(&s);
+            }
+            Ok(need)
+        }
+    }
+
+    /// Build an Extended File Entry (tag 266) ICB sector with the given
+    /// info_length and a list of (extent_type, data_len, data_lba) short ADs.
+    fn build_efe(info_length: u64, ads: &[(u32, u32, u32)]) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // tag
+        s[56..64].copy_from_slice(&info_length.to_le_bytes()); // info_length
+        let l_ea: u32 = 0;
+        let l_ad: u32 = (ads.len() * 8) as u32;
+        s[208..212].copy_from_slice(&l_ea.to_le_bytes());
+        s[212..216].copy_from_slice(&l_ad.to_le_bytes());
+        let mut off = 216 + l_ea as usize;
+        for &(etype, dlen, dlba) in ads {
+            let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
+            s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&dlba.to_le_bytes());
+            off += 8;
+        }
+        s
+    }
+
+    /// A continuation block: a bare list of short ADs from byte 0.
+    fn build_cont_block(ads: &[(u32, u32, u32)]) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        let mut off = 0usize;
+        for &(etype, dlen, dlba) in ads {
+            let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
+            s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&dlba.to_le_bytes());
+            off += 8;
+        }
+        s
+    }
+
+    fn fs_with(part_start: u32, meta_start: u32, root: DirEntry) -> UdfFs {
+        UdfFs {
+            root,
+            volume_id: String::new(),
+            partition_start: part_start,
+            metadata_start: meta_start,
+            metadata_sectors: 0,
+        }
+    }
+
+    fn file_entry(name: &str, meta_lba: u32, size: u64) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            is_dir: false,
+            meta_lba,
+            size,
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn icb_extents_follow_type3_continuation() {
+        let part_start = 1000;
+        let meta_start = 100;
+        // ICB at meta_lba 5: one real extent + a type-3 continuation pointer.
+        let icb = build_efe(
+            6144,
+            &[
+                (0, 4096, 10), // recorded extent at part-rel lba 10
+                (3, 2048, 50), // continuation block at meta-rel lba 50
+            ],
+        );
+        // Continuation block holds the tail extent.
+        let cont = build_cont_block(&[(0, 2048, 20)]);
+
+        let mut reader = MapReader::new();
+        reader.put(meta_start + 5, icb);
+        reader.put(meta_start + 50, cont);
+
+        let fs = fs_with(part_start, meta_start, file_entry("X", 5, 6144));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        assert_eq!(extents, vec![(10, 4096), (20, 2048)]);
+    }
+
+    #[test]
+    fn read_file_spans_multiple_extents() {
+        let part_start = 0;
+        let meta_start = 0;
+        // Two extents of one sector each; distinct fill bytes per data sector.
+        let icb = build_efe(4096, &[(0, 2048, 10), (0, 2048, 30)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(10, [0xAA; 2048]);
+        reader.put(30, [0xBB; 2048]);
+
+        let root = DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![file_entry("F", 5, 4096)],
+        };
+        let fs = fs_with(part_start, meta_start, root);
+        let data = fs.read_file(&mut reader, "/F").expect("read");
+        assert_eq!(data.len(), 4096);
+        assert!(data[..2048].iter().all(|&b| b == 0xAA));
+        assert!(data[2048..].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn merge_ranges_saturates_near_u32_max() {
+        // Adjacent ranges near u32::MAX must not panic (debug) or wrap.
+        let ranges = [(u32::MAX - 1, 2), (u32::MAX, 5)];
+        let merged = merge_ranges(&ranges);
+        // No panic; result is a single merged range starting at the first.
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, u32::MAX - 1);
+    }
+
+    #[test]
+    fn buffered_reader_short_buf_errors_not_panics() {
+        let mut inner = MapReader::new();
+        inner.put(0, [0u8; 2048]);
+        let mut br = BufferedSectorReader::new(&mut inner, 8);
+        let mut tiny = [0u8; 100];
+        let err = br.read_sectors(0, 1, &mut tiny, true);
+        assert!(matches!(err, Err(Error::UdfBufferTooSmall)));
+    }
+
+    /// Minimal in-memory SectorSource that serves pre-loaded 2048-byte
+    /// sectors by LBA. Unmapped LBAs read as zeros.
+    struct MemReader {
+        sectors: HashMap<u32, [u8; 2048]>,
+    }
+
+    impl MemReader {
+        fn new() -> Self {
+            Self {
+                sectors: HashMap::new(),
+            }
+        }
+        fn put(&mut self, lba: u32, sector: [u8; 2048]) {
+            self.sectors.insert(lba, sector);
+        }
+    }
+
+    impl SectorSource for MemReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                let dst = &mut buf[off..off + 2048];
+                match self.sectors.get(&(lba + i)) {
+                    Some(s) => dst.copy_from_slice(s),
+                    None => dst.fill(0),
+                }
+            }
+            Ok(count as usize * 2048)
+        }
+    }
+
+    /// Build an Extended File Entry (tag 266) ICB sector with a single
+    /// short allocation descriptor declaring `data_len` bytes at `data_lba`.
+    /// `info_length` (offset 56) is set to `info_len`.
+    fn build_efe_icb(info_len: u64, data_len: u32, data_lba: u32) -> [u8; 2048] {
+        let mut icb = [0u8; 2048];
+        // tag identifier 266 (Extended File Entry)
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        // info_length at offset 56
+        icb[56..64].copy_from_slice(&info_len.to_le_bytes());
+        // l_ea = 0 at offset 208, l_ad = 8 (one short AD) at offset 212
+        icb[208..212].copy_from_slice(&0u32.to_le_bytes());
+        icb[212..216].copy_from_slice(&8u32.to_le_bytes());
+        // ad_offset = 216 + l_ea = 216. Short AD: len(4) | lba(4).
+        // extent_type 0 (recorded) is the top 2 bits = 0, so raw == len.
+        icb[216..220].copy_from_slice(&(data_len & 0x3FFF_FFFF).to_le_bytes());
+        icb[220..224].copy_from_slice(&data_lba.to_le_bytes());
+        icb
+    }
+
+    /// Build a UdfFs with a single file entry under root, for read_file tests.
+    fn fs_with_file(meta_lba: u32, size: u64) -> UdfFs {
+        UdfFs {
+            root: DirEntry {
+                name: String::new(),
+                is_dir: true,
+                meta_lba: 0,
+                size: 0,
+                entries: vec![DirEntry {
+                    name: "F".to_string(),
+                    is_dir: false,
+                    meta_lba,
+                    size,
+                    entries: Vec::new(),
+                }],
+            },
+            volume_id: String::new(),
+            partition_start: 0,
+            metadata_start: 0,
+            metadata_sectors: 0,
+        }
+    }
+
+    #[test]
+    fn read_file_rejects_oversized_extent_before_allocating() {
+        // data_len just over the 64 MiB cap must error, not allocate.
+        let oversized = MAX_FILE_BYTES as u32 + 2048;
+        let icb = build_efe_icb(oversized as u64, oversized, 100);
+        let mut reader = MemReader::new();
+        reader.put(10, icb); // ICB at meta_lba 10 (metadata_start 0)
+
+        let fs = fs_with_file(10, oversized as u64);
+        let err = fs.read_file(&mut reader, "/F").unwrap_err();
+        assert!(matches!(err, Error::DiscRead { .. }));
+    }
+
+    /// Build an Extended File Entry ICB with multiple inline short ADs, each
+    /// `(data_len, data_lba)`. Lets a test chain extents whose individual
+    /// lengths are all under the per-extent cap but whose running total
+    /// exceeds MAX_FILE_BYTES.
+    fn build_efe_icb_multi(info_len: u64, ads: &[(u32, u32)]) -> [u8; 2048] {
+        let mut icb = [0u8; 2048];
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        icb[56..64].copy_from_slice(&info_len.to_le_bytes());
+        let l_ad = (ads.len() * 8) as u32;
+        icb[208..212].copy_from_slice(&0u32.to_le_bytes());
+        icb[212..216].copy_from_slice(&l_ad.to_le_bytes());
+        for (i, (data_len, data_lba)) in ads.iter().enumerate() {
+            let off = 216 + i * 8;
+            icb[off..off + 4].copy_from_slice(&(data_len & 0x3FFF_FFFF).to_le_bytes());
+            icb[off + 4..off + 8].copy_from_slice(&data_lba.to_le_bytes());
+        }
+        icb
+    }
+
+    #[test]
+    fn read_file_rejects_cumulative_extents_over_cap() {
+        // Two extents, each individually within MAX_FILE_BYTES, that together
+        // exceed it. The cumulative guard must fire on the second extent
+        // (before reading it) rather than growing `data` past the cap.
+        // First extent: a single sector (read, data.len() = 2048). Second
+        // extent: exactly MAX_FILE_BYTES (passes the per-extent cap) — the
+        // 2048 already buffered pushes the running total over the cap.
+        let big = MAX_FILE_BYTES as u32;
+        let icb = build_efe_icb_multi(MAX_FILE_BYTES * 2, &[(2048, 100), (big, 200_000)]);
+        let mut reader = MemReader::new();
+        reader.put(10, icb);
+        let mut data_sector = [0u8; 2048];
+        data_sector[0] = 0xCD;
+        reader.put(100, data_sector);
+
+        // entry.size declared small so the entry.size cap passes; the
+        // cumulative extent total is what must trip the guard.
+        let fs = fs_with_file(10, 2048);
+        let err = fs.read_file(&mut reader, "/F").unwrap_err();
+        assert!(matches!(err, Error::DiscRead { .. }));
+    }
+
+    #[test]
+    fn read_file_rejects_oversized_info_length() {
+        // Small extent but a crafted huge info_length (entry.size) must also
+        // be rejected before truncate could be reached.
+        let icb = build_efe_icb(0, 2048, 100);
+        let mut reader = MemReader::new();
+        reader.put(10, icb);
+
+        let fs = fs_with_file(10, MAX_FILE_BYTES + 1);
+        let err = fs.read_file(&mut reader, "/F").unwrap_err();
+        assert!(matches!(err, Error::DiscRead { .. }));
+    }
+
+    #[test]
+    fn read_file_accepts_small_file() {
+        // A 1-sector file within the cap reads back its declared size.
+        let icb = build_efe_icb(2048, 2048, 100);
+        let mut reader = MemReader::new();
+        reader.put(10, icb);
+        // file data sector at partition_start + data_lba = 0 + 100
+        let mut data_sector = [0u8; 2048];
+        data_sector[0] = 0xAB;
+        reader.put(100, data_sector);
+
+        let fs = fs_with_file(10, 2048);
+        let data = fs
+            .read_file(&mut reader, "/F")
+            .expect("small file should read");
+        assert_eq!(data.len(), 2048);
+        assert_eq!(data[0], 0xAB);
+    }
+
+    #[test]
+    fn read_directory_rejects_oversized_dir_before_allocating() {
+        // A directory ICB declaring an allocation length above the 1 MiB
+        // ceiling must error rather than allocate a huge buffer.
+        let oversized = MAX_DIR_BYTES + 2048;
+        let icb = build_efe_icb(oversized as u64, oversized, 50);
+        let mut reader = MemReader::new();
+        reader.put(5, icb); // directory ICB at meta_start(0) + meta_lba(5)
+
+        let err = read_directory(&mut reader, 0, 0, 5, "DIR", 0).unwrap_err();
+        assert!(matches!(err, Error::DiscRead { .. }));
+    }
+
+    #[test]
+    fn read_directory_accepts_small_empty_dir() {
+        // ad_len within the cap, pointing at zeroed directory data → an empty
+        // (no valid FID) directory parses without error.
+        let icb = build_efe_icb(2048, 2048, 50);
+        let mut reader = MemReader::new();
+        reader.put(5, icb);
+        // directory data at meta_start(0) + ad_pos(50) = 50 reads as zeros.
+        let dir = read_directory(&mut reader, 0, 0, 5, "DIR", 0).expect("small dir parses");
+        assert!(dir.entries.is_empty());
+        assert!(dir.is_dir);
+    }
 }

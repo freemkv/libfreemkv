@@ -8,15 +8,13 @@
 //! during the post-read work; throughput tops out at the *sum* of
 //! both costs.
 //!
-//! 0.17.11 introduced a bespoke producer/consumer split (the now-
-//! removed `disc/sweep_pipeline.rs`) to overlap the two stages. 0.18
-//! collapses that split — together with the analogous splits patch
-//! and mux need — onto the generic [`crate::io::Pipeline`] +
-//! [`crate::io::Sink`] primitive. This module is the sweep-specific
-//! `Sink` impl; the producer-side state machine (read_error context,
-//! decrypt, set_speed, halt) stays in `Disc::sweep` in `disc/mod.rs`.
+//! A producer/consumer split overlaps the two stages on the generic
+//! [`crate::io::Pipeline`] + [`crate::io::Sink`] primitive. This module
+//! is the sweep-specific `Sink` impl; the producer-side state machine
+//! (read_error context, decrypt, set_speed, halt) stays in
+//! `Disc::sweep` in `disc/mod.rs`.
 //!
-//! Correctness invariants preserved (same as 0.17.11):
+//! Correctness invariants preserved:
 //! - Mapfile is single-writer (consumer-only). No locking.
 //! - All `read_error::ReadCtx` state stays on the producer thread.
 //! - `set_speed` calls happen on the producer thread (same thread that
@@ -25,9 +23,8 @@
 //!   intact in the consumer (write before record), so the on-disk
 //!   invariant "mapfile only marks Finished what the file has
 //!   received" survives a crash mid-pass.
-//! - The BU40N+Initio bridge wedge concern is unchanged: only one
-//!   SCSI command in flight at a time, error-path timing identical,
-//!   no new retry logic.
+//! - Only one SCSI command is in flight at a time; error-path timing
+//!   is identical and no new retry logic is introduced.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -40,7 +37,7 @@ use super::mapfile::{MapStats, Mapfile, SectorStatus};
 /// Reusable zero buffer for SkipFill / GapFill / BisectBad. 64 KB
 /// matches the existing zero_gap chunk size used by the pre-split
 /// sweep loop.
-const ZERO_CHUNK: usize = 65 * 1024;
+const ZERO_CHUNK: usize = 64 * 1024;
 
 /// Producer → Consumer messages. The consumer applies these in FIFO
 /// order; ordering of file writes and mapfile records across items is
@@ -151,55 +148,31 @@ impl Sink<WorkItem> for SweepSink {
             WorkItem::Good { pos, buf } => {
                 // Decrypt is on the producer; consumer assumes plaintext.
                 let len = buf.len() as u64;
-                self.file
-                    .seek(SeekFrom::Start(pos))
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.file
-                    .write_all(&buf)
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.map
-                    .record(pos, len, SectorStatus::Finished)
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.file.seek(SeekFrom::Start(pos))?;
+                self.file.write_all(&buf)?;
+                self.map.record(pos, len, SectorStatus::Finished)?;
             }
             WorkItem::BisectGood { pos, buf } => {
-                self.file
-                    .seek(SeekFrom::Start(pos))
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.file
-                    .write_all(&buf[..])
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.map
-                    .record(pos, 2048, SectorStatus::Finished)
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.file.seek(SeekFrom::Start(pos))?;
+                self.file.write_all(&buf[..])?;
+                self.map.record(pos, 2048, SectorStatus::Finished)?;
             }
             WorkItem::BisectBad { pos } => {
-                self.file
-                    .seek(SeekFrom::Start(pos))
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.file
-                    .write_all(&self.zero[..2048])
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.map
-                    .record(pos, 2048, SectorStatus::NonTrimmed)
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.file.seek(SeekFrom::Start(pos))?;
+                self.file.write_all(&self.zero[..2048])?;
+                self.map.record(pos, 2048, SectorStatus::NonTrimmed)?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
-                self.file
-                    .seek(SeekFrom::Start(pos))
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.file.seek(SeekFrom::Start(pos))?;
                 // Subsequent writes are sequential; `WritebackFile`'s
                 // seek-elision keeps them on the writeback pipeline path.
                 let mut filled = 0u64;
                 while filled < len {
                     let chunk = (len - filled).min(self.zero.len() as u64) as usize;
-                    self.file
-                        .write_all(&self.zero[..chunk])
-                        .map_err(|e| Error::IoError { source: e })?;
+                    self.file.write_all(&self.zero[..chunk])?;
                     filled += chunk as u64;
                 }
-                self.map
-                    .record(pos, len, SectorStatus::NonTrimmed)
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.map.record(pos, len, SectorStatus::NonTrimmed)?;
             }
             WorkItem::StatsRequest => {
                 let stats = self.map.stats();
@@ -230,7 +203,7 @@ impl Sink<WorkItem> for SweepSink {
             // Non-regular outputs (/dev/null, pipes) always fail
             // sync_all; that's not a real error.
         }
-        self.map.flush().map_err(|e| Error::IoError { source: e })?;
+        self.map.flush()?;
 
         Ok(ConsumerSummary {
             stats: self.map.stats(),

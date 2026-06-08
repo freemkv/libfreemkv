@@ -49,7 +49,6 @@ const EC_A: [u8; 20] = [
     0x9D, 0xC9, 0xD8, 0x13, 0x55, 0xEC, 0xCE, 0xB5, 0x60, 0xBD, 0xB0, 0x9E, 0xF9, 0xEA, 0xE7, 0xC4,
     0x79, 0xA7, 0xD7, 0xDC,
 ];
-#[cfg(test)]
 const EC_B: [u8; 20] = [
     0x40, 0x2D, 0xAD, 0x3E, 0xC1, 0xCB, 0xCD, 0x16, 0x52, 0x48, 0xD6, 0x8E, 0x12, 0x45, 0xE0, 0xC4,
     0xDA, 0xAC, 0xB1, 0xD8,
@@ -77,7 +76,6 @@ const P256_A: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC,
 ];
-#[cfg(test)]
 const P256_B: [u8; 32] = [
     0x5A, 0xC6, 0x35, 0xD8, 0xAA, 0x3A, 0x93, 0xE7, 0xB3, 0xEB, 0xBD, 0x55, 0x76, 0x98, 0x86, 0xBC,
     0x65, 0x1D, 0x06, 0xB0, 0xCC, 0x53, 0xB0, 0xF6, 0x3B, 0xCE, 0x3C, 0x3E, 0x27, 0xD2, 0x60, 0x4B,
@@ -293,6 +291,20 @@ fn ec_double(pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
 }
 
 /// Scalar multiplication using double-and-add.
+///
+/// NOTE (constant-time tradeoff): this branches on `scalar.bit(0)` and
+/// clones BigUints per iteration, so its timing is data-dependent on the
+/// secret scalar (the long-term host private key in `ecdsa_sign`, the
+/// ephemeral key in ECDH). This is a deliberate tradeoff: the handshake
+/// runs once per disc against a local optical drive, so throughput and
+/// the narrow local-timing surface do not justify pulling in a vetted
+/// constant-time backend. Revisit if this ever signs in a remote/shared
+/// context.
+///
+/// NOTE (cofactor): both AACS curves used here have cofactor 1, so a
+/// point that lies on the curve is automatically in the prime-order
+/// subgroup — no small-subgroup defense / `n·P == O` check is required
+/// for the inputs this is called with.
 fn ec_mul(k: &BigUint, pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
     if k.is_zero() {
         return EcPoint::infinity();
@@ -311,6 +323,20 @@ fn ec_mul(k: &BigUint, pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
     }
 
     result
+}
+
+/// True if the point (x, y) satisfies y² ≡ x³ + ax + b (mod p) and lies
+/// in the field (x, y < p). Guards the ECDH multiply against the classic
+/// invalid-curve attack: a drive that supplies an off-curve key point can
+/// otherwise steer the scalar multiply onto a weak curve and leak the host
+/// scalar. Caller must reject the point when this returns false.
+fn point_on_curve(x: &BigUint, y: &BigUint, a: &BigUint, b: &BigUint, p: &BigUint) -> bool {
+    if x >= p || y >= p {
+        return false;
+    }
+    let lhs = (y * y) % p;
+    let rhs = (((x * x) % p) * x + a * x + b) % p;
+    lhs == rhs
 }
 
 /// Convert BigUint to fixed-size big-endian bytes, zero-padded.
@@ -341,12 +367,15 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
     let z = BigUint::from_bytes_be(&hash);
 
     loop {
-        // Generate random k
+        // Generate random k via rejection sampling. Reducing raw RNG bytes
+        // modulo n would bias k toward small values (n is not a power of
+        // two); a biased ECDSA nonce is a known key-recovery weakness, so
+        // we reject and redraw any candidate >= n instead.
         let mut k_bytes = [0u8; 20];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut k_bytes);
-        let k = BigUint::from_bytes_be(&k_bytes) % &n;
-        if k.is_zero() {
+        let k = BigUint::from_bytes_be(&k_bytes);
+        if k.is_zero() || k >= n {
             continue;
         }
 
@@ -438,11 +467,14 @@ fn ecdsa_sign_p256(priv_key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
     let z = BigUint::from_bytes_be(&hash);
 
     loop {
+        // Rejection sampling for the nonce — see ecdsa_sign for rationale
+        // (avoid the modulo bias that reducing raw RNG bytes mod n would
+        // introduce).
         let mut k_bytes = [0u8; 32];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut k_bytes);
-        let k = BigUint::from_bytes_be(&k_bytes) % &n;
-        if k.is_zero() {
+        let k = BigUint::from_bytes_be(&k_bytes);
+        if k.is_zero() || k >= n {
             continue;
         }
 
@@ -512,28 +544,38 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
     &r_point.x % &n == r
 }
 
-/// Verify an AACS 2.0 certificate (type 0x11, 132 bytes) against AACS 2.0 LA key.
+/// Verify an AACS 2.0 certificate (type 0x11) against the AACS 2.0 LA key.
+///
+/// Layout: type(1) + flags(1) + padding(2) + serial(6) + pub_x(32) +
+/// pub_y(32) + sig_r(32) + sig_s(32) = 138 bytes. The signature covers
+/// the first 74 bytes (everything up to and including the public key).
+///
+/// The full P-256 certificate is 138 bytes, so the entire 138-byte
+/// length must be present before any signature slice is taken — checking
+/// `>= 138` up front (rather than the old `>= 132`, which left the
+/// `cert[106..138]` slice able to panic on a 132-byte input) keeps this
+/// safe against the truncated 132-byte cert the handshake actually
+/// passes in (`&response[24..156]`).
 fn verify_cert_p256(cert: &[u8]) -> bool {
-    if cert.len() < 132 {
+    if cert.len() < 138 {
         return false;
     }
-    // AACS 2.0 cert: type(1) + flags(1) + padding(2) + serial(6) + pub_x(32) + pub_y(32) + sig_r(32) + sig_s(32)
-    // Signature is over the first 74 bytes
     let sig_r = &cert[74..106];
-    let sig_s = &cert[106..138]; // some certs may be padded differently
-
-    // Use what we have — verify over the signed portion
-    if cert.len() >= 138 {
-        ecdsa_verify_p256(&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y, sig_r, sig_s, &cert[..74])
-    } else {
-        false
-    }
+    let sig_s = &cert[106..138];
+    ecdsa_verify_p256(&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y, sig_r, sig_s, &cert[..74])
 }
 
 /// Extract public key from an AACS 2.0 certificate (32-byte x,y).
+///
+/// Returns a zeroed key pair if `cert` is too short to hold the fixed
+/// offsets (matches the `>= 138` guard in `verify_cert_p256`), so a
+/// short/hostile cert cannot panic on the slice index.
 fn cert_pub_key_p256(cert: &[u8]) -> ([u8; 32], [u8; 32]) {
     let mut x = [0u8; 32];
     let mut y = [0u8; 32];
+    if cert.len() < 74 {
+        return (x, y);
+    }
     x.copy_from_slice(&cert[10..42]);
     y.copy_from_slice(&cert[42..74]);
     (x, y)
@@ -544,15 +586,20 @@ fn compute_bus_key_p256(
     host_priv: &[u8; 32],
     drive_key_point_x: &[u8],
     drive_key_point_y: &[u8],
-) -> [u8; 16] {
+) -> Option<[u8; 16]> {
     let p = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
+    let b = BigUint::from_bytes_be(&P256_B);
 
     let d = BigUint::from_bytes_be(host_priv);
-    let dkp = EcPoint::new(
-        BigUint::from_bytes_be(drive_key_point_x),
-        BigUint::from_bytes_be(drive_key_point_y),
-    );
+    let dx = BigUint::from_bytes_be(drive_key_point_x);
+    let dy = BigUint::from_bytes_be(drive_key_point_y);
+
+    // Reject an off-curve drive point before the multiply (invalid-curve attack).
+    if !point_on_curve(&dx, &dy, &a, &b, &p) {
+        return None;
+    }
+    let dkp = EcPoint::new(dx, dy);
 
     let shared = ec_mul(&d, &dkp, &a, &p);
 
@@ -560,7 +607,7 @@ fn compute_bus_key_p256(
     let x_bytes = to_bytes_be_padded(&shared.x, 32);
     let mut bus_key = [0u8; 16];
     bus_key.copy_from_slice(&x_bytes[16..32]);
-    bus_key
+    Some(bus_key)
 }
 
 // ── AACS certificate handling ───────────────────────────────────────────────
@@ -581,9 +628,16 @@ fn verify_cert(cert: &[u8]) -> bool {
 }
 
 /// Extract public key from certificate.
+///
+/// Returns a zeroed key pair if `cert` is too short to hold the fixed
+/// offsets (matches the `>= 92` guard in `verify_cert`), so a
+/// short/hostile cert cannot panic on the slice index.
 fn cert_pub_key(cert: &[u8]) -> ([u8; 20], [u8; 20]) {
     let mut x = [0u8; 20];
     let mut y = [0u8; 20];
+    if cert.len() < 52 {
+        return (x, y);
+    }
     x.copy_from_slice(&cert[12..32]);
     y.copy_from_slice(&cert[32..52]);
     (x, y)
@@ -596,12 +650,20 @@ fn compute_bus_key(
     host_priv: &[u8; 20],
     drive_key_point_x: &[u8; 20],
     drive_key_point_y: &[u8; 20],
-) -> [u8; 16] {
+) -> Option<[u8; 16]> {
     let p = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
+    let b = BigUint::from_bytes_be(&EC_B);
 
     let d = BigUint::from_bytes_be(host_priv);
-    let dkp = EcPoint::from_bytes(drive_key_point_x, drive_key_point_y);
+    let dx = BigUint::from_bytes_be(drive_key_point_x);
+    let dy = BigUint::from_bytes_be(drive_key_point_y);
+
+    // Reject an off-curve drive point before the multiply (invalid-curve attack).
+    if !point_on_curve(&dx, &dy, &a, &b, &p) {
+        return None;
+    }
+    let dkp = EcPoint::new(dx, dy);
 
     let shared = ec_mul(&d, &dkp, &a, &p);
 
@@ -609,7 +671,7 @@ fn compute_bus_key(
     let x_bytes = to_bytes_be_padded(&shared.x, 20);
     let mut bus_key = [0u8; 16];
     bus_key.copy_from_slice(&x_bytes[4..20]); // last 16 of 20
-    bus_key
+    Some(bus_key)
 }
 
 /// Generate ephemeral host key pair: (private_key, public_point_x, public_point_y).
@@ -620,12 +682,20 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
     let n = BigUint::from_bytes_be(&P256_N);
     let g = EcPoint::from_bytes(&P256_GX, &P256_GY);
 
-    let mut priv_bytes = [0u8; 32];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut priv_bytes);
-    let d = BigUint::from_bytes_be(&priv_bytes) % &n;
-
-    let q = ec_mul(&d, &g, &a, &p_mod);
+    let (d, q) = loop {
+        let mut priv_bytes = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut priv_bytes);
+        // d == 0 (prob ~1/n) would yield the point at infinity / an
+        // all-zero key and degenerate the bus key — reject and retry,
+        // matching the AACS 1.0 sibling generate_host_key_pair.
+        let d = BigUint::from_bytes_be(&priv_bytes) % &n;
+        if d.is_zero() {
+            continue;
+        }
+        let q = ec_mul(&d, &g, &a, &p_mod);
+        break (d, q);
+    };
 
     let mut key = [0u8; 32];
     let mut pub_x = [0u8; 32];
@@ -672,7 +742,14 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
 
 // ── AES-CMAC (for MAC verification) ────────────────────────────────────────
 
-/// AES-128-CMAC over 16 bytes of data.
+/// AES-128-CMAC, single-complete-block case ONLY.
+///
+/// Implements just the exactly-16-byte message path: it derives subkey
+/// K1 and XORs the one full block. It does NOT derive K2 or apply the
+/// `0x80` 10*-padding, so it is correct only for a 16-byte input — the
+/// `&[u8; 16]` signature enforces that at compile time. Do NOT generalize
+/// this to multi-block or short-final-block messages without adding K2 +
+/// padding.
 fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
     use aes::Aes128;
     use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
@@ -746,7 +823,10 @@ fn cdb_report_disc_structure(agid: u8, format: u8, len: u16) -> [u8; 12] {
 // ── High-level handshake ────────────────────────────────────────────────────
 
 /// Result of a successful AACS authentication handshake.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually so the session key material
+/// (`bus_key`, `volume_id`, `read_data_key`) is never rendered into logs
+/// or `dbg!` output — only its presence is reported.
 pub struct AacsAuth {
     /// Bus key (16 bytes) — derived from ECDH
     pub bus_key: [u8; 16],
@@ -756,8 +836,25 @@ pub struct AacsAuth {
     pub volume_id: Option<[u8; 16]>,
     /// Read data key (16 bytes) — for AACS 2.0 bus decryption
     pub read_data_key: Option<[u8; 16]>,
-    /// Drive certificate (92 bytes)
+    /// Drive certificate (first 92 bytes of the drive's certificate;
+    /// an AACS 2.0 P-256 cert is 132 bytes and is truncated to fit this
+    /// fixed-size field — see [`aacs2_authenticate_p256`]).
     pub drive_cert: [u8; 92],
+}
+
+// Manual Debug: bus_key, volume_id, and read_data_key are key material (the
+// VID feeds VUK derivation), so they are redacted — a `dbg!`/tracing of
+// AacsAuth must never dump them in plaintext.
+impl std::fmt::Debug for AacsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AacsAuth")
+            .field("bus_key", &"[redacted]")
+            .field("agid", &self.agid)
+            .field("volume_id", &self.volume_id.map(|_| "[redacted]"))
+            .field("read_data_key", &self.read_data_key.map(|_| "[redacted]"))
+            .field("drive_cert", &self.drive_cert)
+            .finish()
+    }
 }
 
 /// Perform the full AACS authentication handshake.
@@ -873,7 +970,7 @@ pub fn aacs_authenticate(
     dkp_x.copy_from_slice(&drive_key_point[..20]);
     dkp_y.copy_from_slice(&drive_key_point[20..40]);
 
-    let bus_key = compute_bus_key(&host_key, &dkp_x, &dkp_y);
+    let bus_key = compute_bus_key(&host_key, &dkp_x, &dkp_y).ok_or(Error::AacsKeyVerify)?;
 
     Ok(AacsAuth {
         bus_key,
@@ -904,9 +1001,11 @@ pub fn aacs2_authenticate(
         }
     }
 
-    // AACS 2.0 native P-256 handshake
-    let host_priv_v2 = host_priv_key_v2.ok_or(Error::AacsCertShort)?;
-    let host_cert_v2 = host_cert_v2.ok_or(Error::AacsCertShort)?;
+    // AACS 2.0 native P-256 handshake. Absent v2 credentials are "no AACS
+    // 2.0 keys configured" (AacsNoKeys), distinct from a malformed/too-short
+    // cert (AacsCertShort) — so callers can tell "not provided" from "bad".
+    let host_priv_v2 = host_priv_key_v2.ok_or(Error::AacsNoKeys)?;
+    let host_cert_v2 = host_cert_v2.ok_or(Error::AacsNoKeys)?;
 
     aacs2_authenticate_p256(session, host_priv_v2, host_cert_v2)
 }
@@ -963,8 +1062,14 @@ fn aacs2_authenticate_p256(
     // uses certificate formats that differ from the spec, and rejecting them
     // would break otherwise working drives. The drive is still authenticated
     // through the ECDH key exchange and P-256 signature verification below.
+    // The outcome is surfaced as a trace event rather than discarded so the
+    // trust decision is observable (and so the call is not dead code).
     if drive_cert[0] == 0x11 && !verify_cert_p256(drive_cert) {
-        // Certificate verification failed but proceeding for backward compatibility.
+        tracing::debug!(
+            target: "freemkv::disc",
+            phase = "aacs2_cert_verify_skipped",
+            "drive cert failed P-256 LA verification; proceeding for backward compat"
+        );
     }
 
     // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
@@ -1013,7 +1118,8 @@ fn aacs2_authenticate_p256(
     scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsKeyRejected)?;
 
     // Step 9: Compute bus key via P-256 ECDH
-    let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y);
+    let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y)
+        .ok_or(Error::AacsKeyVerify)?;
 
     Ok(AacsAuth {
         bus_key,
@@ -1142,9 +1248,11 @@ mod tests {
         let (priv_b, pub_bx, pub_by) = generate_host_key_pair();
 
         // A computes: priv_a × pub_B
-        let shared_a = compute_bus_key(&priv_a, &pub_bx, &pub_by);
+        let shared_a = compute_bus_key(&priv_a, &pub_bx, &pub_by)
+            .expect("on-curve generated point must be accepted");
         // B computes: priv_b × pub_A
-        let shared_b = compute_bus_key(&priv_b, &pub_ax, &pub_ay);
+        let shared_b = compute_bus_key(&priv_b, &pub_ax, &pub_ay)
+            .expect("on-curve generated point must be accepted");
 
         assert_eq!(shared_a, shared_b, "ECDH shared secrets should match");
     }
@@ -1224,12 +1332,14 @@ mod tests {
             &priv_a,
             &to_bytes_be_padded(&pub_b.x, 32),
             &to_bytes_be_padded(&pub_b.y, 32),
-        );
+        )
+        .expect("on-curve generated point must be accepted");
         let key_b = compute_bus_key_p256(
             &priv_b,
             &to_bytes_be_padded(&pub_a.x, 32),
             &to_bytes_be_padded(&pub_a.y, 32),
-        );
+        )
+        .expect("on-curve generated point must be accepted");
 
         assert_eq!(key_a, key_b, "P-256 ECDH shared secrets should match");
     }
@@ -1333,6 +1443,62 @@ mod tests {
         ];
         let calc_mac = aes_cmac_16(&vid, &bus_key);
         assert_ne!(calc_mac, [0u8; 16], "real CMAC must not be all zeros");
+    }
+
+    #[test]
+    fn test_verify_cert_p256_short_cert_no_panic() {
+        // Regression: verify_cert_p256 used to slice cert[106..138] after only
+        // a `len < 132` guard. The drive cert the handshake passes in is
+        // exactly 132 bytes (&response[24..156]), so the slice panicked OOB.
+        // It must now return false (cannot verify) rather than panic.
+        let cert_132 = [0x11u8; 132];
+        assert!(
+            !verify_cert_p256(&cert_132),
+            "132-byte cert must be rejected, not panic"
+        );
+        // Boundary lengths around the slice requirement.
+        for len in [0usize, 73, 74, 105, 106, 131, 137] {
+            let cert = vec![0x11u8; len];
+            assert!(!verify_cert_p256(&cert), "len {len} must not panic");
+        }
+    }
+
+    #[test]
+    fn test_compute_bus_key_rejects_off_curve_point() {
+        // An off-curve drive point must be rejected (invalid-curve guard),
+        // while an on-curve point (here the generator G) is accepted.
+        let (host_priv, _, _) = generate_host_key_pair();
+
+        // On-curve: G itself.
+        assert!(
+            compute_bus_key(&host_priv, &EC_GX, &EC_GY).is_some(),
+            "on-curve point must be accepted"
+        );
+
+        // Off-curve: G with y flipped by one bit almost never stays on the curve.
+        let mut bad_y = EC_GY;
+        bad_y[19] ^= 0x01;
+        assert!(
+            compute_bus_key(&host_priv, &EC_GX, &bad_y).is_none(),
+            "off-curve point must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_compute_bus_key_p256_rejects_off_curve_point() {
+        let (host_priv, _, _) = generate_host_key_pair_p256();
+
+        assert!(
+            compute_bus_key_p256(&host_priv, &P256_GX, &P256_GY).is_some(),
+            "on-curve P-256 point must be accepted"
+        );
+
+        let mut bad_y = P256_GY;
+        bad_y[31] ^= 0x01;
+        assert!(
+            compute_bus_key_p256(&host_priv, &P256_GX, &bad_y).is_none(),
+            "off-curve P-256 point must be rejected"
+        );
     }
 
     #[test]

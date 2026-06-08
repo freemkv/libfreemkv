@@ -8,11 +8,17 @@
 //! disc.rip(&mut session, 0, output, |event| {
 //!     match event.kind {
 //!         EventKind::BytesRead { bytes, total } => update_progress(bytes, total),
-//!         EventKind::ReadError { sector, .. } => log_error(sector),
+//!         EventKind::SectorSkipped { sector } => log_skip(sector),
+//!         EventKind::BatchSizeChanged { new_size, .. } => note_recovery(new_size),
 //!         _ => {}
 //!     }
 //! });
 //! ```
+//!
+//! Note: the library currently emits only `BytesRead`, `SectorSkipped`,
+//! and `BatchSizeChanged`. The other [`EventKind`] variants are part of
+//! the stable event vocabulary for consumers (and future emit sites) but
+//! are not produced by the library today.
 
 use crate::error::Error;
 

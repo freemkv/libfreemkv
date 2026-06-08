@@ -4,7 +4,9 @@
 //! To add a new format:
 //!   1. Create `src/labels/myformat.rs`
 //!   2. Implement `pub fn detect(udf: &UdfFs) -> bool`
-//!   3. Implement `pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<Vec<StreamLabel>>`
+//!   3. Implement `pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult>`
+//!      (set [`ParseResult::confidence`]; it drives parser selection on
+//!      a tie)
 //!   4. Add `mod myformat;` below and one line to `PARSERS` array
 
 mod bdmt;
@@ -69,6 +71,9 @@ pub enum LabelPurpose {
     Commentary,
     Descriptive,
     Score,
+    /// Alternate music track (e.g. an alternate end-credits / closing-
+    /// theme music stream), tagged by the `ime` token some BD-J
+    /// authoring tools emit on the secondary music audio.
     Ime,
 }
 
@@ -377,12 +382,19 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
     let says_dts = !says_dts_ma && !says_dts_hr && h.contains("dts");
     let says_lpcm = h.contains("lpcm") || h.contains("pcm");
     let says_atmos = h.contains("atmos");
+    // DTS:X is an object-audio extension carried on a DTS-HD MA (or HR)
+    // core, exactly as Atmos rides TrueHD / DD+. The spec Codec enum has
+    // no DtsX variant, so a correctly-authored DTS:X hint must be judged
+    // consistent with its DtsHdMa/DtsHdHr carrier rather than discarded.
+    let says_dtsx = h.contains("dts:x") || h.contains("dts-x") || h.contains("dtsx");
 
     let names_family =
         says_truehd || says_ddp || says_ac3 || says_dts_ma || says_dts_hr || says_dts || says_lpcm;
 
     // Pure-editorial hint (no codec family named) isn't asserting a codec →
     // consistent. "Atmos" alone implies a lossless carrier (TrueHD or DD+).
+    // ("DTS:X" always also matches the "dts" family above, so it never
+    // reaches this branch — it is handled in the DtsHdMa/DtsHdHr arms.)
     if !names_family {
         return if says_atmos {
             matches!(codec, Codec::TrueHd | Codec::Ac3Plus)
@@ -395,8 +407,8 @@ fn codec_hint_consistent(hint: &str, codec: &crate::disc::Codec) -> bool {
         Codec::TrueHd => says_truehd || says_atmos,
         Codec::Ac3Plus => says_ddp || says_atmos,
         Codec::Ac3 => says_ac3,
-        Codec::DtsHdMa => says_dts_ma,
-        Codec::DtsHdHr => says_dts_hr,
+        Codec::DtsHdMa => says_dts_ma || says_dtsx,
+        Codec::DtsHdHr => says_dts_hr || says_dtsx,
         Codec::Dts => says_dts,
         Codec::Lpcm => says_lpcm,
         // Unknown / other stream codec — don't second-guess the parser's hint.
@@ -512,9 +524,9 @@ fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     }
 
     // CLPI orphan streams: PIDs in /BDMV/CLIPINF/*.clpi ProgramInfo
-    // that no MPLS playlist references. Empirical (2026-05-11): ~5%
-    // of streams across the 11-disc corpus are CLPI-only — physically
-    // on disc, not menu-reachable. Append them as Low-confidence
+    // that no MPLS playlist references. Empirically a small fraction of
+    // streams are CLPI-only — physically on disc, not menu-reachable.
+    // Append them as Low-confidence
     // labels at the tail of each stream_type (next slot after the
     // highest existing stream_number).
     let _orphans_added = append_clpi_orphans(&mut labels, reader, udf);
@@ -616,10 +628,13 @@ fn append_clpi_orphans(
                 continue;
             }
             // Translate CLPI coding_type → label stream_type.
+            // 0x90 = Presentation Graphics (PG subtitle). 0x91 =
+            // Interactive Graphics (BD-J menu overlay), NOT a user-facing
+            // subtitle — skip it, matching the MPLS path which drops IG.
             let stype = match s.coding_type {
                 0x80..=0x86 | 0xA1 | 0xA2 => StreamLabelType::Audio,
-                0x90 | 0x91 => StreamLabelType::Subtitle,
-                _ => continue, // video / unknown — skip
+                0x90 => StreamLabelType::Subtitle,
+                _ => continue, // 0x91 IG / video / unknown — skip
             };
             // Same dedup logic as MPLS: normalize language, build codec
             // hint, check against existing label set.
@@ -689,6 +704,26 @@ fn append_clpi_orphans(
     added
 }
 
+/// Pick the winning parser result from `results` (built in PARSERS
+/// order): highest [`Confidence`] among non-empty results, with the
+/// earliest array position winning on a tie — matching `extract()`'s
+/// strict-`>` first-wins scan.
+///
+/// `Iterator::max_by_key` returns the LAST maximal element, so the key
+/// is `(confidence, Reverse(index))`: among equal-confidence entries the
+/// one with the smallest index has the largest `Reverse(index)` and is
+/// selected, i.e. first wins.
+fn select_result<'a>(
+    results: &'a [(&'static str, ParseResult)],
+) -> Option<&'a (&'static str, ParseResult)> {
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, r))| !r.labels.is_empty())
+        .max_by_key(|(idx, (_, r))| (r.confidence, std::cmp::Reverse(*idx)))
+        .map(|(_, entry)| entry)
+}
+
 /// Diagnostic introspection — returns the parser that matched, the
 /// labels it emitted, and the inventory of files under `/BDMV/JAR/*/`
 /// that the discriminators looked at. Intended for `freemkv-tools
@@ -714,18 +749,8 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     }
 
     // Selection logic mirrors `extract`: highest confidence + non-empty,
-    // array order tiebreaker.
-    let chosen = all_results
-        .iter()
-        .filter(|(_, r)| !r.labels.is_empty())
-        .max_by(|(_, a), (_, b)| {
-            // Cmp first by confidence (higher first), then position
-            // (earlier first). max_by yields the maximum, so we
-            // invert the index comparison.
-            a.confidence
-                .cmp(&b.confidence)
-                .then(std::cmp::Ordering::Equal)
-        });
+    // with first-in-array-order winning on a confidence tie.
+    let chosen = select_result(&all_results);
 
     let (parser, confidence, mut labels) = match chosen {
         Some((name, r)) => (Some(*name), Some(r.confidence), r.labels.clone()),
@@ -974,6 +999,65 @@ mod registry_tests {
              file-presence gated detect) stay first, and mpls_universal \
              stays LAST as the universal Low-confidence fallback."
         );
+    }
+
+    fn one_label() -> StreamLabel {
+        StreamLabel {
+            stream_number: 1,
+            stream_type: StreamLabelType::Audio,
+            language: "eng".into(),
+            name: String::new(),
+            purpose: LabelPurpose::Normal,
+            qualifier: LabelQualifier::None,
+            codec_hint: String::new(),
+            variant: String::new(),
+        }
+    }
+
+    fn result(conf: Confidence) -> ParseResult {
+        ParseResult {
+            labels: vec![one_label()],
+            confidence: conf,
+        }
+    }
+
+    /// `select_result` must pick the highest-confidence non-empty result
+    /// and, on a confidence tie, the FIRST in array order — matching
+    /// `extract()`'s strict-`>` first-wins scan (regression for the old
+    /// `analyze()` `max_by(...then(Equal))` no-op that picked the LAST).
+    #[test]
+    fn select_result_first_wins_on_tie() {
+        // Two parsers, equal (Medium) confidence: the first must win.
+        let results = vec![
+            ("alpha", result(Confidence::Medium)),
+            ("beta", result(Confidence::Medium)),
+        ];
+        assert_eq!(select_result(&results).map(|(n, _)| *n), Some("alpha"));
+    }
+
+    #[test]
+    fn select_result_highest_confidence_wins() {
+        let results = vec![
+            ("low", result(Confidence::Low)),
+            ("high", result(Confidence::High)),
+            ("medium", result(Confidence::Medium)),
+        ];
+        assert_eq!(select_result(&results).map(|(n, _)| *n), Some("high"));
+    }
+
+    #[test]
+    fn select_result_skips_empty_and_handles_none() {
+        let empty = ParseResult {
+            labels: Vec::new(),
+            confidence: Confidence::High,
+        };
+        // High-confidence but empty must be skipped in favour of a
+        // non-empty lower-confidence result.
+        let results = vec![("empty", empty), ("real", result(Confidence::Low))];
+        assert_eq!(select_result(&results).map(|(n, _)| *n), Some("real"));
+        // No non-empty results → None.
+        let none: Vec<(&'static str, ParseResult)> = Vec::new();
+        assert!(select_result(&none).is_none());
     }
 
     /// Per-parser sanity: every parser has both detect and parse
@@ -1337,6 +1421,44 @@ mod apply_tests {
         } else {
             panic!("expected audio stream");
         }
+    }
+
+    #[test]
+    fn apply_keeps_consistent_dtsx_hint_on_dts_hd_ma() {
+        // DTS:X rides a DTS-HD MA core just as Atmos rides TrueHD. A
+        // correctly-authored "DTS:X" hint on a DtsHdMa stream is richer
+        // than the spec codec yet consistent, so it's kept verbatim —
+        // not discarded and regenerated to "DTS-HD Master Audio".
+        let mut titles = vec![title_with(vec![audio(
+            0x1100,
+            Codec::DtsHdMa,
+            AudioChannels::Surround71,
+            "eng",
+        )])];
+        let labels = vec![audio_label(1, "eng", "DTS:X", "")];
+        apply_labels(&labels, &mut titles);
+        if let Stream::Audio(a) = &titles[0].streams[0] {
+            assert_eq!(a.label, "DTS:X");
+        } else {
+            panic!("expected audio stream");
+        }
+    }
+
+    #[test]
+    fn dtsx_hint_consistent_with_dts_hd_carriers() {
+        use crate::disc::Codec;
+        // The MED fix: a DTS:X hint must now be judged consistent with
+        // its DTS-HD lossless carriers (previously it was rejected,
+        // because says_dts_ma/says_dts_hr were both false for "DTS:X").
+        assert!(codec_hint_consistent("DTS:X", &Codec::DtsHdMa));
+        assert!(codec_hint_consistent("DTS-X 7.1", &Codec::DtsHdHr));
+        assert!(codec_hint_consistent("dtsx", &Codec::DtsHdMa));
+        // It still names the DTS family, so plain-DTS streams remain
+        // consistent (family match) — never discarded.
+        assert!(codec_hint_consistent("DTS:X", &Codec::Dts));
+        // But a DTS:X hint on a non-DTS stream is a genuine mismatch.
+        assert!(!codec_hint_consistent("DTS:X", &Codec::TrueHd));
+        assert!(!codec_hint_consistent("DTS:X", &Codec::Ac3Plus));
     }
 
     #[test]

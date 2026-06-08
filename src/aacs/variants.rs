@@ -14,6 +14,19 @@
 //! a disc carries neither, callers should fall back to the classical
 //! single-stage derivation in [`super::keys`].
 //!
+//! **Status: the chain cannot yet produce a key on a real disc.** Two
+//! sub-fields are unfinished:
+//!   - [`variants_for_uv`] (the `VARIANTS[uv]` lookup in the `0x83`
+//!     record) is a stub that always returns `None`, so the chain
+//!     short-circuits with [`MediaKeyVariantError::VariantsTableUnavailable`].
+//!   - The Encrypted Media Key Variant Data (C) and the Variant Key
+//!     Data (VKD) table are *distinct* sub-fields of the `0x82` record
+//!     per AACS 2.1, but [`variant_data_record`] (C) and
+//!     [`variant_key_data`] (VKD) both currently return the *whole*
+//!     first `0x82` body — so on a single-`0x82` disc they alias. The
+//!     `0x82` sub-field offsets must be fixed against a real Variant
+//!     disc before this chain is wired into `resolve_keys`.
+//!
 //! The chain follows the published spec:
 //!
 //! ```text
@@ -28,6 +41,19 @@
 //! Two condition bits on `Kmp[15]` route off the hardcoded-KCD path
 //! (Soft Correction and Online Challenge). The chain refuses to run in
 //! either case — callers must handle those modes out of band.
+//!
+//! # Status: Kp verification
+//!
+//! On the classical path [`walk_processing_key`] gates each match on
+//! the VERIFY_MAGIC relation, which authenticates the Processing Key.
+//! On a variant MKB that magic check does NOT hold (the walk yields a
+//! Media Key *Precursor*, not the Media Key), so the walk accepts a
+//! variant match without it. The replacement gate lives at the END of
+//! [`derive_media_key_variant`]: the derived final `Km` is verified
+//! against the MKB's Verify-Media-Key record before any `(Km, Kvu)` is
+//! returned. A future implementer wiring [`variants_for_uv`] must keep
+//! that final gate — the per-match magic check no longer protects the
+//! variant path.
 
 use super::decrypt::aes_ecb_decrypt;
 use super::keydb::DeviceKey;
@@ -94,7 +120,13 @@ pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
 }
 
 /// Body of the Encrypted Media Key Variant Data record (type `0x82`).
-pub fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
+///
+/// Returns the whole first `0x82` body; the internal C / VKD sub-field
+/// split is not yet decoded, so this aliases [`variant_key_data`] on a
+/// single-`0x82` disc. `pub(crate)` until the sub-field offsets are fixed
+/// against a real variant disc — it is not part of the public surface
+/// because it knowingly returns an undecoded composite.
+pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
         .find(|r| r.rec_type == 0x82)
@@ -115,7 +147,11 @@ pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
 
 /// Body of the Variant Key Data record. Returns the first `0x82` body
 /// that is a non-empty multiple of 16 bytes.
-pub fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
+///
+/// Like [`variant_data_record`], this returns the whole `0x82` body and
+/// aliases it on a single-`0x82` disc; the C / VKD sub-field split is
+/// undecoded. `pub(crate)` until fixed against a real variant disc.
+pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
         .find(|r| r.rec_type == 0x82 && !r.body.is_empty() && r.body.len() % 16 == 0)
@@ -167,7 +203,17 @@ fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> 
     let mut right_child = aesg3_step(dk, 2);
     let mut current_v_mask = dev_key_v_mask;
 
+    // Bound the walk to the 32-level depth of a u32 subset-difference tree.
+    // `current_v_mask` advances via an arithmetic `>> 1` which sign-extends, so
+    // a disc-supplied v_mask coarser than dev_key_v_mask would otherwise drive
+    // current_v_mask up to 0xFFFF_FFFF and spin forever — a crafted MKB must
+    // not hang the rip thread (this runs before the KCD placeholder gate).
+    let mut steps = 0u32;
     while current_v_mask != v_mask {
+        if steps >= 32 {
+            break;
+        }
+        steps += 1;
         let mut bit_pos: i32 = -1;
         for i in (0..32).rev() {
             if (current_v_mask & (1u32 << i)) == 0 {
@@ -243,10 +289,22 @@ pub fn walk_processing_key(
 
         for uvs_idx in 0..num_uvs {
             let p_uv = &uvs[1 + 5 * uvs_idx..];
+            // `num_uvs` was computed by `take_while(.. (c[0] & 0xC0) == 0)`, so
+            // every chunk in `0..num_uvs` already has its revoked-marker bits
+            // clear — that `take_while` is the single authoritative place the
+            // parse stops, no inner re-check needed.
             let u_mask_shift = uvs[5 * uvs_idx];
 
             if u_mask_shift & 0xC0 != 0 {
                 break;
+            }
+            // 0x20..=0x3F (32..=63) pass the 0xC0 revoked-marker check but are
+            // out of range for a u32 shift. `wrapping_shl` would silently
+            // compute shift % 32 (e.g. 32 → no shift → 0xFFFF_FFFF), matching a
+            // wrong uv slot and deriving a wrong key. Disc-controlled byte:
+            // skip the slot instead.
+            if u_mask_shift >= 32 {
+                continue;
             }
 
             let uv = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
@@ -260,6 +318,11 @@ pub fn walk_processing_key(
             if ((device_number & u_mask) == (uv & u_mask))
                 && ((device_number & v_mask) != (uv & v_mask))
             {
+                // dk.u_mask_shift is a u8 from keydb with no range check; guard
+                // it the same way before the wrapping_shl below.
+                if dk.u_mask_shift >= 32 {
+                    continue;
+                }
                 let dev_key_v_mask = calc_v_mask(dk.uv);
                 let dev_key_u_mask: u32 = 0xFFFF_FFFFu32.wrapping_shl(dk.u_mask_shift as u32);
 
@@ -334,6 +397,10 @@ pub enum MediaKeyVariantError {
     VariantsTableUnavailable,
     /// VKD index resolved out of the supplied `vkd_table`.
     VkdIndexOutOfRange,
+    /// The derived Media Key failed the MKB's Verify-Media-Key relation.
+    /// On the variant path this final gate replaces the per-match magic
+    /// check (which does not hold for a Precursor).
+    MediaKeyVerifyFailed,
 }
 
 impl std::fmt::Display for MediaKeyVariantError {
@@ -347,6 +414,7 @@ impl std::fmt::Display for MediaKeyVariantError {
             MediaKeyVariantError::KcdNotProvided => 7105,
             MediaKeyVariantError::VariantsTableUnavailable => 7106,
             MediaKeyVariantError::VkdIndexOutOfRange => 7107,
+            MediaKeyVariantError::MediaKeyVerifyFailed => 7108,
         };
         write!(f, "E{code}")
     }
@@ -356,11 +424,15 @@ impl std::error::Error for MediaKeyVariantError {}
 
 // ── Chain ─────────────────────────────────────────────────────────────────
 
-/// Look up `VARIANTS[uv]` for the matched uv. The byte layout of the
-/// per-uv slot in the Variant Number record is undocumented and is
-/// disc-specific; this helper returns `None` until a Variant disc is
-/// available to fix the layout against.
-fn variants_for_uv(_records: &[MkbRecord], _uv_index: usize) -> Option<u16> {
+/// Look up the per-slot `VARIANTS` value for the matched subset-difference
+/// slot. AACS 2.1 keys the VARIANTS table by the matched SD slot (the same
+/// index that selected the cvalue), so the caller passes
+/// [`ProcessingKeyMatch::cvalue_index`]. The byte layout of the per-slot entry
+/// in the Variant Number record is undocumented and disc-specific; this helper
+/// returns `None` until a Variant disc is available to fix the layout against.
+///
+/// `sd_slot_index` is the matched subset-difference slot (== cvalue index).
+fn variants_for_uv(_records: &[MkbRecord], _sd_slot_index: usize) -> Option<u16> {
     None
 }
 
@@ -377,6 +449,12 @@ fn variants_for_uv(_records: &[MkbRecord], _uv_index: usize) -> Option<u16> {
 ///   the final VUK alongside the Media Key.
 ///
 /// Returns `(Km, Kvu)` on success.
+///
+/// NOTE: the `VARIANTS[uv]` lookup ([`variants_for_uv`]) is not yet
+/// implemented, so on a real Variant disc this always returns
+/// `Err(`[`MediaKeyVariantError::VariantsTableUnavailable`]`)` before a
+/// key is produced. The chain can only succeed against synthetic test
+/// fixtures today.
 pub fn derive_media_key_variant(
     mkb_records: &[MkbRecord],
     device_keys: &[DeviceKey],
@@ -446,6 +524,17 @@ pub fn derive_media_key_variant(
         km[12 + i] ^= uv_bytes[i];
     }
 
+    // Gate: verify the derived Media Key against the MKB's Verify-Media-Key
+    // record. On the variant path the per-match magic check in
+    // `walk_processing_key` does NOT hold (it only saw the Precursor), so this
+    // is the authoritative Kp/Km verification — it MUST run before returning a
+    // real key.
+    let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
+        return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
+    }
+
     // Step: Kvu = AES-G(Km, VID).
     let kvu = aes_g(&km, vid);
 
@@ -455,6 +544,19 @@ pub fn derive_media_key_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
+        // Regression for the unbounded-loop hang: pick a (dev_key_v_mask,
+        // v_mask) pair the arithmetic `>> 1` walk can never reconcile.
+        // dev_key_v_mask has the MSB set, so `>> 1` sign-extends and the
+        // mask saturates at 0xFFFF_FFFF, never reaching a coarser v_mask.
+        // The 32-step bound must let this return rather than spin forever.
+        let dk = [0x11u8; 16];
+        let pk = calc_pk_from_dk(&dk, 0x0000_0002, 0x0000_0000, 0xFFFF_FFFE);
+        // Bounded exit yields *some* key; we only assert it terminated.
+        let _ = pk;
+    }
 
     // ── Helpers ──
 
@@ -575,6 +677,7 @@ mod tests {
             MediaKeyVariantError::KcdNotProvided,
             MediaKeyVariantError::VariantsTableUnavailable,
             MediaKeyVariantError::VkdIndexOutOfRange,
+            MediaKeyVariantError::MediaKeyVerifyFailed,
         ];
         for e in cases {
             let s = e.to_string();
@@ -626,7 +729,7 @@ mod tests {
         mkb.extend_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x02]);
 
         // Pick a known DK; with dk.uv == MKB.uv (==2) and
-        // dk.u_mask_shift == MKB.u_mask_shift (==1), dev_key_v_mask
+        // dk.u_mask_shift == MKB.u_mask_shift (==3), dev_key_v_mask
         // equals the MKB's v_mask and the calc_pk_from_dk loop is a
         // no-op — Kp = aesg3_step(dk, 1).
         let dk_bytes: [u8; 16] = [

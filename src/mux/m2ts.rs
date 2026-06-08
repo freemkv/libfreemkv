@@ -22,11 +22,13 @@ impl M2tsStream {
     /// Create for writing PES frames → BD-TS output.
     /// Writes FMKV metadata header, then muxes PES frames into BD transport stream.
     pub fn create(mut writer: impl Write + Send + 'static, title: &DiscTitle) -> io::Result<Self> {
-        // Write FMKV metadata header
-        if !title.streams.is_empty() {
-            let m = meta::M2tsMeta::from_title(title);
-            meta::write_header(&mut writer, &m)?;
-        }
+        // Write FMKV metadata header unconditionally. An empty streams
+        // array is valid JSON and round-trips fine; skipping the header
+        // for a zero-stream title would make the output indistinguishable
+        // from a non-FMKV file on read-back (read_header returns
+        // Ok(None) → PMT fallback) even though M2tsStream produced it.
+        let m = meta::M2tsMeta::from_title(title);
+        meta::write_header(&mut writer, &m)?;
         let pids: Vec<u16> = title
             .streams
             .iter()
@@ -39,8 +41,14 @@ impl M2tsStream {
         let boxed: Box<dyn Write + Send> = Box::new(writer);
         let mut muxer = super::tsmux::TsMuxer::new(boxed, &pids);
         for (i, cp) in title.codec_privates.iter().enumerate() {
+            // codec_privates is parallel to streams/pids; ignore any
+            // trailing entries that exceed the track count rather than
+            // surfacing a track-range error for a benign metadata overrun.
+            if i >= pids.len() {
+                break;
+            }
             if let Some(data) = cp {
-                muxer.set_codec_private(i, data.clone());
+                muxer.set_codec_private(i, data.clone())?;
             }
         }
         Ok(Self {
@@ -178,8 +186,11 @@ mod tests {
         let ts_bytes = &buf[header_end..];
 
         // Find first PUSI packet on VIDEO_PID; verify RAI in AF flags.
+        // chunks_exact drops any partial trailing chunk — only whole
+        // 192-byte BD-TS packets are valid, and it avoids OOB indexing on a
+        // short final chunk.
         let pkt = ts_bytes
-            .chunks(192)
+            .chunks_exact(192)
             .find(|p| {
                 let h = &p[4..];
                 let pid = (((h[1] & 0x1F) as u16) << 8) | h[2] as u16;

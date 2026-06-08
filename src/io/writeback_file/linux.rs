@@ -19,14 +19,10 @@ use std::time::Duration;
 pub(super) fn preallocate(file: &File, size_bytes: u64) {
     // FALLOC_FL_KEEP_SIZE = 0x01 — keep the reported file size at 0
     // (writes grow it normally) while still pre-reserving the extents.
-    let rc = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_KEEP_SIZE,
-            0,
-            size_bytes as i64,
-        )
-    };
+    // Clamp to the signed `off_t` range; an unchecked `as i64` cast
+    // would wrap a >= 2^63 size to a negative length (EINVAL no-op).
+    let len = i64::try_from(size_bytes).unwrap_or(i64::MAX);
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
     tracing::debug!(
         target: "mux",
         "WritebackFile fallocate size_hint={size_bytes} rc={rc} ok={}",
@@ -34,10 +30,14 @@ pub(super) fn preallocate(file: &File, size_bytes: u64) {
     );
 }
 
-/// Run `fsync` on `file` with a 60 s deadline. On timeout we log loudly
-/// and return `Ok(())` — the kernel will still flush on close, so the
-/// data is best-effort durable; the alternative (trap the thread for
-/// the rest of the rip) defeats `/api/stop`.
+/// Run `fsync` on `file` with a 60 s deadline. On timeout — and
+/// likewise on halt or a lost worker — we log and return `Ok(())`: the
+/// kernel will still flush on close, so the data is best-effort durable.
+/// The alternative (trap the thread for the rest of the rip, or return
+/// an error that aborts an otherwise-complete mux) is worse, so all
+/// three fallbacks return `Ok(())`. `Ok(())` from these paths is NOT a
+/// durability barrier — the durable flush did not complete; only the
+/// hang is bounded.
 pub(super) fn durable_sync(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
     match crate::io::bounded::bounded_syscall(
@@ -60,7 +60,19 @@ pub(super) fn durable_sync(file: &File) -> io::Result<()> {
             );
             Ok(())
         }
-        Err(crate::io::bounded::BoundedError::Halted) => Ok(()),
-        Err(crate::io::bounded::BoundedError::WorkerLost) => Ok(()),
+        Err(crate::io::bounded::BoundedError::Halted) => {
+            tracing::warn!(
+                target: "mux",
+                "WritebackFile::sync_all fsync skipped (halt requested); data not durably flushed, kernel will flush on close"
+            );
+            Ok(())
+        }
+        Err(crate::io::bounded::BoundedError::WorkerLost) => {
+            tracing::error!(
+                target: "mux",
+                "WritebackFile::sync_all fsync worker lost before completion; data not durably flushed, kernel will flush on close"
+            );
+            Ok(())
+        }
     }
 }

@@ -31,6 +31,8 @@ const MAX_PGS_PENDING_BYTES: usize = 4 * 1024 * 1024;
 // palette_id_ref) = 13.
 const PCS_NUM_OBJECTS_OFFSET: usize = 13;
 
+/// Stateful parser that collapses PGS display/clear PCS pairs into
+/// duration-bearing Matroska frames. Implements [`CodecParser`].
 pub struct PgsParser {
     pending: Option<(i64, Vec<u8>)>,
 }
@@ -42,8 +44,24 @@ impl Default for PgsParser {
 }
 
 impl PgsParser {
+    /// Create a fresh PGS parser with no pending display set.
     pub fn new() -> Self {
         Self { pending: None }
+    }
+
+    /// Take the pending display set (if any) and emit it as a Frame whose
+    /// duration runs from its start PTS to `end_pts_ns` (the PTS of the PCS that
+    /// closes or replaces it), clamped to >= 0. Shared by the clear-PCS and
+    /// replace-PCS arms so the Frame shape stays in one place.
+    fn emit_pending(&mut self, end_pts_ns: i64) -> Option<Frame> {
+        let (start_pts, data) = self.pending.take()?;
+        let duration = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
+        Some(Frame {
+            pts_ns: start_pts,
+            keyframe: true,
+            data,
+            duration_ns: Some(duration),
+        })
     }
 }
 
@@ -52,10 +70,36 @@ impl CodecParser for PgsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        // Keep PTS as Option: a PCS with no PTS has an UNKNOWN start/clear time.
+        // Collapsing it to a 0 sentinel produces a frame with a wrong start time
+        // and an absurd duration (the full elapsed time of the disc). PGS PCS
+        // packets carry a PTS on well-formed BD streams, so a missing PTS is a
+        // malformed-stream path that we skip cleanly rather than corrupt.
+        let pts = pes.pts.map(pts_to_ns);
 
         let is_pcs = pes.data[0] == SEGMENT_PCS;
-        let pcs_num_objects = if is_pcs && pes.data.len() > PCS_NUM_OBJECTS_OFFSET {
+
+        // A PCS too short to carry number_of_composition_objects is malformed.
+        // Don't let it fall through to the non-PCS arm (where it would pollute
+        // the pending display set or pass through as a lone frame): close any
+        // pending set undurated (mirroring the no-PTS display path) and drop
+        // the truncated header so the parser resyncs on the next PCS.
+        if is_pcs && pes.data.len() <= PCS_NUM_OBJECTS_OFFSET {
+            return self
+                .pending
+                .take()
+                .map(|(start_pts, data)| {
+                    vec![Frame {
+                        pts_ns: start_pts,
+                        keyframe: true,
+                        data,
+                        duration_ns: None,
+                    }]
+                })
+                .unwrap_or_default();
+        }
+
+        let pcs_num_objects = if is_pcs {
             Some(pes.data[PCS_NUM_OBJECTS_OFFSET])
         } else {
             None
@@ -65,33 +109,40 @@ impl CodecParser for PgsParser {
         match pcs_num_objects {
             // Clear/empty PCS — closes any pending display. Drop the
             // clear segment itself; BlockDuration covers the screen
-            // wipe.
+            // wipe. A clear PCS with no PTS can't time the duration, so
+            // emit the pending set with no duration (it lingers to EOF).
             Some(0) => {
-                if let Some((start_pts, data)) = self.pending.take() {
-                    let duration = pts_ns.saturating_sub(start_pts).max(0) as u64;
-                    out.push(Frame {
+                let frame = match pts {
+                    Some(end) => self.emit_pending(end),
+                    None => self.pending.take().map(|(start_pts, data)| Frame {
                         pts_ns: start_pts,
                         keyframe: true,
                         data,
-                        duration_ns: Some(duration),
-                    });
-                }
+                        duration_ns: None,
+                    }),
+                };
+                out.extend(frame);
             }
             // Display PCS — start a new pending. If a prior display
             // was never explicitly cleared (replace-without-clear),
             // emit it with the new PCS's PTS as its end.
-            Some(_) => {
-                if let Some((start_pts, data)) = self.pending.take() {
-                    let duration = pts_ns.saturating_sub(start_pts).max(0) as u64;
-                    out.push(Frame {
+            Some(_) => match pts {
+                Some(start) => {
+                    out.extend(self.emit_pending(start));
+                    self.pending = Some((start, pes.data.clone()));
+                }
+                // A display PCS with no PTS has an unknown start time. Don't
+                // store it with a 0 sentinel (wrong start, absurd duration).
+                // Flush any prior pending undurated and skip storing this one.
+                None => {
+                    out.extend(self.pending.take().map(|(start_pts, data)| Frame {
                         pts_ns: start_pts,
                         keyframe: true,
                         data,
-                        duration_ns: Some(duration),
-                    });
+                        duration_ns: None,
+                    }));
                 }
-                self.pending = Some((pts_ns, pes.data.clone()));
-            }
+            },
             // Non-PCS first segment — either a continuation of the
             // current display set, or non-standard layout. If we have
             // a pending display, append; otherwise emit as-is.
@@ -103,14 +154,21 @@ impl CodecParser for PgsParser {
                     if buf.len() + pes.data.len() <= MAX_PGS_PENDING_BYTES {
                         buf.extend_from_slice(&pes.data);
                     }
-                } else {
+                } else if pes.pts.is_some() {
+                    // A lone non-PCS segment with a real PTS — pass it through.
+                    // (A missing PTS falls through to the drop path below: a
+                    // bitmap with no timing reference would land at 00:00:00.)
                     out.push(Frame {
-                        pts_ns,
+                        pts_ns: pts.unwrap_or(0),
                         keyframe: true,
                         data: pes.data.clone(),
                         duration_ns: None,
                     });
                 }
+                // No pending set AND no PTS: drop it. Emitting at pts_ns=0 would
+                // place a stray bitmap at 00:00:00.000 with no timing reference;
+                // the no-PTS PCS arms above avoid the 0 sentinel for the same
+                // reason.
             }
         }
 
@@ -253,6 +311,82 @@ mod tests {
         assert_eq!(frames[0].data, display);
         // Trailing block lingers to EOF — no duration per module doc.
         assert_eq!(frames[0].duration_ns, None);
+    }
+
+    #[test]
+    fn display_pcs_without_pts_is_not_stored_with_zero_start() {
+        // A display PCS with no PTS has an unknown start time. It must NOT be
+        // stored with a 0 sentinel — otherwise a later clear PCS at real PTS T
+        // would emit a frame with pts_ns=0 and duration_ns=T (hours of ns for a
+        // mid-disc subtitle). The malformed display PCS is skipped instead.
+        let mut parser = PgsParser::new();
+        let frames = parser.parse(&make_pes(pcs_bytes(1), None));
+        assert!(frames.is_empty(), "no-PTS display PCS emits nothing");
+        assert!(
+            parser.pending.is_none(),
+            "no-PTS display PCS must not be stored as pending"
+        );
+
+        // A subsequent well-formed display + clear pair must time correctly,
+        // unpolluted by the skipped no-PTS PCS.
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), Some(270000)));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 1_000_000_000);
+        assert_eq!(f[0].duration_ns, Some(2_000_000_000));
+    }
+
+    #[test]
+    fn clear_pcs_without_pts_emits_pending_undurated() {
+        // A clear PCS that lacks a PTS can't compute a duration; the pending
+        // display is still emitted, but with no duration (lingers to EOF)
+        // instead of a bogus absurd one.
+        let mut parser = PgsParser::new();
+        let _ = parser.parse(&make_pes(pcs_bytes(1), Some(90000)));
+        let f = parser.parse(&make_pes(pcs_bytes(0), None));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].pts_ns, 1_000_000_000, "pending keeps its real start");
+        assert_eq!(f[0].duration_ns, None, "no duration without a clear PTS");
+    }
+
+    #[test]
+    fn truncated_pcs_flushes_pending_and_resyncs() {
+        // A PCS too short to carry number_of_composition_objects arriving with a
+        // pending display must close that display (undurated) and drop the
+        // truncated header, not append its bytes into the pending bitmap.
+        let mut parser = PgsParser::new();
+        let display = pcs_bytes(1);
+        assert!(
+            parser
+                .parse(&make_pes(display.clone(), Some(90000)))
+                .is_empty()
+        );
+
+        // A 13-byte (<= PCS_NUM_OBJECTS_OFFSET) PCS: truncated.
+        let truncated = vec![SEGMENT_PCS; PCS_NUM_OBJECTS_OFFSET];
+        let frames = parser.parse(&make_pes(truncated, Some(180000)));
+        assert_eq!(frames.len(), 1, "pending display flushed on truncated PCS");
+        assert_eq!(frames[0].data, display, "pending bitmap not polluted");
+        assert_eq!(frames[0].duration_ns, None, "flushed undurated");
+        assert!(parser.pending.is_none(), "parser resynced");
+    }
+
+    #[test]
+    fn lone_non_pcs_without_pts_is_dropped() {
+        // A non-PCS segment with no pending set and no PTS must be dropped, not
+        // emitted at pts_ns = 0 (which would land a stray bitmap at time zero).
+        let mut parser = PgsParser::new();
+        let frames = parser.parse(&make_pes(vec![0x15, 0x00, 0x02, 0xAA], None));
+        assert!(frames.is_empty(), "no pending + no PTS → dropped");
+    }
+
+    #[test]
+    fn lone_non_pcs_with_pts_passes_through() {
+        // A lone non-PCS segment WITH a PTS still passes through.
+        let mut parser = PgsParser::new();
+        let frames = parser.parse(&make_pes(vec![0x15, 0x00, 0x02, 0xAA], Some(90000)));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000);
     }
 
     #[test]

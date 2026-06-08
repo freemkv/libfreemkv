@@ -11,16 +11,21 @@
 //! conventional choice). `finish()` is a no-op; UDP has no end-of-stream
 //! marker.
 //!
-//! Both types satisfy [`SequentialSink`] via the blanket impl in
-//! `super::mod`. Neither implements `Seek`, so neither satisfies
-//! [`RandomAccessSink`] — using one with `MkvMux` is a compile error,
-//! which is the design intent.
+//! Both types implement [`SequentialSink`] explicitly so their
+//! `finish()` dispatches correctly through a `dyn SequentialSink` trait
+//! object (the `SocketSink` override drains the buffer and
+//! `shutdown(Write)`s; the `UdpSocketSink` override flushes only).
+//! Neither implements `Seek`, so neither satisfies [`RandomAccessSink`]
+//! — using one with `MkvMux` is a compile error, which is the design
+//! intent.
 //!
 //! [`SequentialSink`]: super::SequentialSink
 //! [`RandomAccessSink`]: super::RandomAccessSink
 
 use std::io::{self, BufWriter, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+
+use super::SequentialSink;
 
 /// `BufWriter` capacity for [`SocketSink`]. 1 MiB matches the typical
 /// kernel send-buffer ceiling and keeps small-write amplification from
@@ -54,8 +59,10 @@ impl SocketSink {
         // `set_nodelay(true)` keeps small writes (TS packet trains, fMP4
         // moof headers) from sitting in Nagle's algorithm until the buffer
         // fills. The BufWriter already absorbs syscall overhead; Nagle
-        // would just add latency without coalescing more.
-        stream.set_nodelay(true)?;
+        // would just add latency without coalescing more. It is a latency
+        // hint, not a correctness requirement, so a platform that rejects
+        // TCP_NODELAY must not fail the connect — demote the error.
+        let _ = stream.set_nodelay(true);
         if let Some(n) = sndbuf_bytes {
             set_send_buffer(&stream, n)?;
         }
@@ -76,17 +83,12 @@ impl Write for SocketSink {
     }
 }
 
-impl SocketSink {
+impl SequentialSink for SocketSink {
     /// Drain the BufWriter and `shutdown(Write)` the underlying socket
-    /// so the peer sees a clean EOF.
-    ///
-    /// Note: [`SequentialSink::finish`](super::SequentialSink::finish)'s
-    /// blanket-impl default is a no-op. Trait-object call sites that
-    /// need socket shutdown should call this inherent method directly
-    /// before dropping the sink, or hold the concrete `SocketSink` type
-    /// (typical pattern: each muxer's `finish()` calls the appropriate
-    /// inherent close method on its captured concrete sink).
-    pub fn finish(&mut self) -> io::Result<()> {
+    /// so the peer sees a clean EOF. Overriding the trait default is
+    /// what makes a `dyn SequentialSink` `finish()` send the buffered
+    /// tail and the EOF instead of silently dropping them.
+    fn finish(&mut self) -> io::Result<()> {
         self.buf.flush()?;
         // `shutdown(Write)` signals clean EOF to the peer. Errors here
         // are non-fatal — the connection may have already been torn down
@@ -117,10 +119,22 @@ impl UdpSocketSink {
     ///
     /// `sndbuf_bytes`, when present, is a hint to `SO_SNDBUF`.
     pub fn connect<A: ToSocketAddrs>(peer: A, sndbuf_bytes: Option<usize>) -> io::Result<Self> {
-        // Bind to all-zeros / any port. The kernel picks an ephemeral
-        // source port and the source IP at first send.
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.connect(peer)?;
+        // Resolve the peer first so the local bind matches its address
+        // family. Binding `0.0.0.0:0` (IPv4) and then connecting to an
+        // IPv6 peer fails with EAFNOSUPPORT, so pick the wildcard that
+        // matches the resolved family.
+        let peer_addr = peer
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))?;
+        let bind_addr = match peer_addr {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => "[::]:0",
+        };
+        // Bind to the matching wildcard / any port. The kernel picks an
+        // ephemeral source port and the source IP at first send.
+        let socket = UdpSocket::bind(bind_addr)?;
+        socket.connect(peer_addr)?;
         if let Some(n) = sndbuf_bytes {
             set_udp_send_buffer(&socket, n)?;
         }
@@ -140,10 +154,12 @@ impl Write for UdpSocketSink {
     }
 }
 
-impl UdpSocketSink {
-    /// No-op — UDP has no end-of-stream marker. Provided for parity
-    /// with [`SocketSink::finish`] so call sites can treat them uniformly.
-    pub fn finish(&mut self) -> io::Result<()> {
+impl SequentialSink for UdpSocketSink {
+    /// UDP has no end-of-stream marker, so there is nothing to shut
+    /// down; `write` already sent each datagram unbuffered. Flush is a
+    /// no-op but kept explicit so the trait-object `finish()` matches
+    /// the concrete behaviour.
+    fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
 }

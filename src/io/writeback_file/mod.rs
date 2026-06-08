@@ -24,29 +24,32 @@
 //! ## Platform split
 //!
 //! The platform-specific pieces of this wrapper — extent preallocation
-//! (Linux `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows
-//! `SetFileValidData`) and the durable-flush primitive (Linux/macOS
-//! `fsync`/`F_FULLFSYNC` wrapped in a bounded syscall, Windows
-//! `FlushFileBuffers`) — live in per-OS sibling modules. The dispatch
-//! happens once at the bottom of this file via cfg-gated `mod` decls.
-//! No inline `#[cfg(target_os = "...")]` in the business-logic above.
+//! (Linux `fallocate(KEEP_SIZE)`, macOS `F_PREALLOCATE`, Windows no-op
+//! today) and the durable-flush primitive (Linux/macOS
+//! `fsync`/`F_FULLFSYNC` wrapped in a bounded syscall; Windows plain
+//! `FlushFileBuffers`, unbounded) — live in per-OS sibling modules. The
+//! dispatch happens once at the bottom of this file via cfg-gated `mod`
+//! decls. No inline `#[cfg(target_os = "...")]` in the business-logic
+//! above.
 //!
 //! ## Write path
 //!
 //! Writes are direct passthrough to the underlying `File` (no writer
-//! thread, no ring, no batching). Empirically the Phase-2.5
-//! writer-thread architecture introduced a ~60% mux throughput
-//! regression on NFS bidirectional workloads; reverting the write path
-//! to direct passthrough restores the 0.20.7 baseline. The writeback
-//! pipeline still runs (it's called inline from `write` / `write_all` /
-//! `seek`) so the bounded-cache invariant on Linux is preserved.
+//! thread, no ring, no batching). Empirically a writer-thread
+//! architecture introduced a ~60% mux throughput regression on NFS
+//! bidirectional workloads; the direct-passthrough write path is faster.
+//! The writeback pipeline still runs (it's called inline from `write` /
+//! `write_all` / `seek`) so the bounded-cache invariant on Linux is
+//! preserved.
 //!
 //! ## Halt-safety
 //!
-//! `sync_all` runs the per-OS durable-flush primitive, which on
-//! Linux/macOS is wrapped in [`crate::io::bounded::bounded_syscall`]
-//! with a 60 s deadline. A wedged NFS server cannot trap the muxer
-//! indefinitely on the final fsync.
+//! `sync_all` runs the per-OS durable-flush primitive. On Linux/macOS
+//! it is wrapped in [`crate::io::bounded::bounded_syscall`] with a 60 s
+//! deadline, so a wedged NFS server cannot trap the muxer indefinitely
+//! on the final fsync. Windows is a known deviation: its `durable_sync`
+//! calls `File::sync_all` (`FlushFileBuffers`) directly and is NOT
+//! bounded — a wedged UNC/SMB share can block the final flush there.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -73,18 +76,23 @@ use std::path::Path;
 use super::writeback::WritebackPipeline;
 
 /// Granularity at which the Linux writeback pipeline issues
-/// `sync_file_range` pairs. 32 MiB is the empirically best value on
-/// the rip1 test bed (NFS to unraid-1 over 1 GbE, single-disk SAS):
-/// 8 MiB / 64 MiB / 128 MiB all measured worse in the 0.21.x mux
-/// iteration runs. Override via `FREEMKV_WRITEBACK_CHUNK_MIB` —
-/// faster backends (NVMe, RAID) may tolerate larger windows.
+/// `sync_file_range` pairs. 32 MiB is the empirically best value on a
+/// 1 GbE NFS mount backed by a single spinning disk: 8 MiB / 64 MiB /
+/// 128 MiB all measured worse. Override via `FREEMKV_WRITEBACK_CHUNK_MIB`
+/// — faster backends (NVMe, RAID) may tolerate larger windows.
 const WRITEBACK_CHUNK_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
+
+/// Upper bound (in MiB) accepted from `FREEMKV_WRITEBACK_CHUNK_MIB`.
+/// 64 GiB — far above `CHUNK_BYTES_MAX` (256 MiB), generous for any
+/// real backend, and small enough that `n * 1024 * 1024` cannot wrap
+/// `u64`. Out-of-range values fall back to the default.
+const WRITEBACK_CHUNK_MIB_MAX: u64 = 64 * 1024;
 
 fn writeback_chunk_bytes() -> u64 {
     std::env::var("FREEMKV_WRITEBACK_CHUNK_MIB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
+        .filter(|&n| n > 0 && n <= WRITEBACK_CHUNK_MIB_MAX)
         .map(|n| n * 1024 * 1024)
         .unwrap_or(WRITEBACK_CHUNK_BYTES_DEFAULT)
 }
@@ -160,6 +168,13 @@ impl WritebackFile {
     /// trap the calling thread indefinitely. On timeout the page cache
     /// is left to the kernel's normal flush-on-close path — best
     /// effort, but bounded.
+    ///
+    /// IMPORTANT: on Linux/macOS a successful `Ok(())` does NOT
+    /// guarantee the data is durable if the bounded fsync timed out or
+    /// was halted — only the hang is bounded, the fsync may not have
+    /// completed. Callers needing crash-consistency (e.g. mux-finish
+    /// then external commit/DB update) must not treat `Ok(())` as a
+    /// durability barrier.
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
         self.pipeline.finalize();
         platform::durable_sync(&self.file)
@@ -214,6 +229,21 @@ impl Seek for WritebackFile {
         Ok(p)
     }
 }
+
+impl super::sink::SequentialSink for WritebackFile {
+    /// Drain the writeback pipeline and run the bounded durable flush —
+    /// the same work [`Self::sync_all`] does. Implemented explicitly (no
+    /// blanket impl) so a `dyn SequentialSink` / `dyn RandomAccessSink`
+    /// `finish()` actually finalises + fsyncs instead of hitting a no-op
+    /// default. Note the bounded-fsync caveat from [`Self::sync_all`]
+    /// applies: `Ok(())` is not a durability barrier if the fsync timed
+    /// out or was halted.
+    fn finish(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+impl super::sink::RandomAccessSink for WritebackFile {}
 
 impl Drop for WritebackFile {
     fn drop(&mut self) {
@@ -311,5 +341,21 @@ mod tests {
         w.sync_all().unwrap();
         drop(w);
         assert_eq!(read_back(&p), b"onetwothree");
+    }
+
+    /// finish() through a `dyn RandomAccessSink` trait object must
+    /// dispatch to WritebackFile's override (finalize + durable_sync),
+    /// not a no-op default. Bytes must be visible to a separate reader
+    /// before drop.
+    #[test]
+    fn finish_through_trait_object_persists() {
+        use crate::io::sink::RandomAccessSink;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("finish-dyn.bin");
+        let w = WritebackFile::create(&p).unwrap();
+        let mut boxed: Box<dyn RandomAccessSink> = Box::new(w);
+        boxed.write_all(b"durable-tail").unwrap();
+        boxed.finish().unwrap();
+        assert_eq!(read_back(&p), b"durable-tail");
     }
 }

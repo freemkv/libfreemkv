@@ -1,12 +1,12 @@
 //! `DecryptingSectorSource` — wrap any [`SectorSource`] to apply
 //! AACS / CSS in-place decryption on every read.
 //!
-//! This is the 0.18 single-source-of-truth for decrypt-on-read. The
-//! actual cipher code lives in [`crate::aacs`] and [`crate::css`];
-//! we just call the existing [`crate::decrypt::decrypt_sectors`]
-//! helper that already drives both of them. In follow-up commits
-//! `sweep_pipeline` and `DiscStream` migrate onto this decorator
-//! and delete their duplicate decrypt call sites.
+//! This is the single source of truth for decrypt-on-read: every
+//! decrypt-on-read caller (e.g. `DiscStream`) wraps its source in this
+//! decorator. The actual cipher code lives in [`crate::aacs`] and
+//! [`crate::css`]; we just call the existing
+//! [`crate::decrypt::decrypt_sectors`] helper that drives both of them
+//! in-place after each read (a no-op for [`DecryptKeys::None`]).
 //!
 //! Composition: `Drive` → `DecryptingSectorSource` → caller sees
 //! plaintext. For `DecryptKeys::None` discs the decorator is a
@@ -94,10 +94,8 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
     ) -> Result<usize> {
         let n = self.inner.read_sectors(lba, count, buf, recovery)?;
-        // Reuse the existing crate-wide decrypt entry point — same
-        // path the 0.17 sweep_pipeline and DiscStream call, so we
-        // inherit their AACS / CSS / None semantics verbatim. The
-        // helper is a no-op for DecryptKeys::None.
+        // Apply the crate-wide AACS/CSS/None decrypt entry point in-place
+        // over the bytes just read. No-op for DecryptKeys::None.
         decrypt_sectors(&mut buf[..n], &self.keys, self.unit_key_idx)?;
         Ok(n)
     }

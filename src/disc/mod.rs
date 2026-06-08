@@ -364,8 +364,17 @@ pub enum ColorSpace {
 pub struct Chapter {
     /// Chapter start time in seconds
     pub time_secs: f64,
-    /// Chapter name (e.g. "Chapter 1", "Chapter 2")
+    /// Chapter name — a bare 1-based index ("1", "2", …). The library
+    /// emits no localized prose; consuming apps prepend any "Chapter "
+    /// prefix in the user's language.
     pub name: String,
+}
+
+/// Default chapter name for the 0-based chapter index `i`: the bare
+/// 1-based ordinal as a string. Keeps chapter labelling language-neutral
+/// (apps localize) and gives BD and DVD a single source of truth.
+pub(crate) fn chapter_name(i: usize) -> String {
+    (i + 1).to_string()
 }
 
 /// A contiguous range of sectors on disc.
@@ -454,24 +463,24 @@ pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
     if bad_ranges.is_empty() || title.extents.is_empty() {
         return 0;
     }
-    let t_start = title.extents.first().map(|e| (e.start_lba as u64) * 2048);
-    let t_end = title
-        .extents
-        .last()
-        .map(|e| ((e.start_lba as u64) + (e.sector_count as u64)) * 2048);
-    let (Some(ts), Some(te)) = (t_start, t_end) else {
-        return 0;
-    };
-    bad_ranges
-        .iter()
-        .map(|(pos, size)| {
+    // Overlap each bad range against every extent individually. A single
+    // bounding box (first extent start → last extent end) would count
+    // bad sectors in inter-extent gaps (other titles' data, BDMV
+    // metadata) as bad bytes in this title, over-counting lost_ms for
+    // titles with non-contiguous clips.
+    let mut total: u64 = 0;
+    for ext in &title.extents {
+        let es = (ext.start_lba as u64) * 2048;
+        let ee = ((ext.start_lba as u64) + (ext.sector_count as u64)) * 2048;
+        for (pos, size) in bad_ranges {
             let r_start = *pos;
-            let r_end = *pos + *size;
-            let overlap_start = r_start.max(ts);
-            let overlap_end = r_end.min(te);
-            overlap_end.saturating_sub(overlap_start)
-        })
-        .sum()
+            let r_end = pos.saturating_add(*size);
+            let overlap_start = r_start.max(es);
+            let overlap_end = r_end.min(ee);
+            total = total.saturating_add(overlap_end.saturating_sub(overlap_start));
+        }
+    }
+    total
 }
 
 // ─── Display helpers ────────────────────────────────────────────────────────
@@ -535,7 +544,10 @@ impl Codec {
             0x81 => Codec::Ac3,
             0x84 | 0xA1 => Codec::Ac3Plus,
             0x80 => Codec::Lpcm,
-            0xA2 => Codec::DtsHdHr,
+            // 0x86 (primary) / 0xA2 (secondary) are the DTS-HD MA
+            // lossless pair, parallel to 0x81/0xA1 for AC-3. 0xA2 is
+            // lossless MA, not lossy HR.
+            0xA2 => Codec::DtsHdMa,
             0x90 | 0x91 => Codec::Pgs,
             ct => Codec::Unknown(ct),
         }
@@ -693,7 +705,6 @@ impl AudioChannels {
             3 => AudioChannels::Stereo,
             6 => AudioChannels::Surround51,
             12 => AudioChannels::Surround71,
-            _ if af > 0 => AudioChannels::Unknown,
             _ => AudioChannels::Unknown,
         }
     }
@@ -1176,21 +1187,19 @@ impl Disc {
         Ok((capacity, buffered, udf_fs))
     }
 
-    /// Scan a disc -- parse filesystem, playlists, streams, and set up AACS decryption.
+    /// Scan a disc — parse filesystem, playlists, streams, and set up
+    /// AACS decryption. This is the main entry point; after `scan()` the
+    /// Disc is ready (titles populated with streams, AACS inputs
+    /// captured, content readable and decryptable transparently).
     ///
-    /// This is the main entry point. After scan(), the Disc is ready:
-    ///   - titles are populated with streams
-    ///   - AACS keys are derived (if KEYDB available)
-    ///   - content can be read and decrypted transparently
-    ///
-    /// Scan a disc. One pipeline, one order:
+    /// One pipeline, one order:
     ///   1. Read capacity + UDF filesystem
     ///   2. AACS handshake + key resolution
     ///   3. Parse playlists + streams
     ///   4. Apply labels
     ///
-    /// The session must be open and unlocked (Drive::open handles this).
-    /// All disc reads use standard READ(10) via UDF -- no vendor SCSI commands.
+    /// The session must be open and unlocked (`Drive::open` handles this).
+    /// All disc reads use standard READ(10) via UDF — no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
         // AACS handshake (Blu-ray/UHD). Routes through Disc::read_vid,
         // which prefers the per-drive OEM CDB path when the drive is
@@ -1280,58 +1289,52 @@ impl Disc {
         Self::scan_with(reader, capacity, None, None, opts, udf_fs)
     }
 
+    /// Read a disc's AACS key-input files from a sector source: returns
+    /// `(Unit_Key_RO.inf, MKB)` raw bytes. Shared body for
+    /// [`Disc::read_aacs_inputs`] (ISO) and
+    /// [`Disc::read_aacs_inputs_from_drive`] (live drive).
+    ///
+    /// Prefers MKB_RO, falls back to MKB_RW, then TRIMS to the real
+    /// record length. Both files are allocated to a fixed ~128 MiB and
+    /// zero-padded, so reading either ships up to ~124 MiB of nothing —
+    /// trim to the record stream so callers send/store a few MB, not
+    /// 128 MiB.
+    fn read_aacs_inputs_from_reader(
+        reader: &mut dyn SectorSource,
+        udf_fs: &udf::UdfFs,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let inf = udf_fs
+            .read_file(reader, "/AACS/Unit_Key_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let mut mkb = udf_fs
+            .read_file(reader, "/AACS/MKB_RO.inf")
+            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
+            .map_err(|_| Error::AacsNoKeys)?;
+        let n = crate::aacs::mkb_content_len(&mkb);
+        mkb.truncate(n);
+        Ok((inf, mkb))
+    }
+
     /// Read a disc's AACS key-input files from an ISO image: returns
     /// `(Unit_Key_RO.inf, MKB)` raw bytes. For callers that resolve a Unit Key
-    /// out-of-band: obtain the key however you like, then scan with
-    /// `ScanOptions { unit_key: Some(uk), .. }`. libfreemkv never makes a
-    /// network call.
+    /// out-of-band: obtain the key however you like, then apply it via
+    /// [`Disc::decrypt_with`]. libfreemkv never makes a network call.
     pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut reader = crate::io::file_sector_source::FileSectorSource::open(iso_path)
             .map_err(|_| Error::AacsNoKeys)?;
         let udf_fs = udf::read_filesystem(&mut reader)?;
-        let inf = udf_fs
-            .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        // Prefer MKB_RO, fall back to MKB_RW, then TRIM to the real record
-        // length. Both files are allocated to a fixed ~128 MiB and zero-padded,
-        // so reading either ships up to ~124 MiB of nothing — trim to the
-        // record stream so callers send/store a few MB, not 128 MiB.
-        let mut mkb = udf_fs
-            .read_file(&mut reader, "/AACS/MKB_RO.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        let n = crate::aacs::mkb_content_len(&mkb);
-        if n > 0 && n < mkb.len() {
-            mkb.truncate(n);
-        }
-        Ok((inf, mkb))
+        Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
     /// Same as [`Disc::read_aacs_inputs`] but reads from a live drive. The
     /// out-of-band Unit Key path fetches the disc's key files from the drive,
-    /// resolves a key from them however it likes, then scans with
-    /// `ScanOptions { unit_key: Some(uk), .. }`. These files are plaintext UDF
-    /// metadata — no AACS handshake or keys are required to read them.
+    /// resolves a key from them however it likes, then applies it via
+    /// [`Disc::decrypt_with`]. These files are plaintext UDF metadata — no
+    /// AACS handshake or keys are required to read them.
     pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>)> {
         let (_, mut reader, udf_fs) = Self::read_udf(drive)?;
-        let inf = udf_fs
-            .read_file(&mut reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        // Prefer MKB_RO, fall back to MKB_RW, then TRIM to the real record
-        // length. Both files are allocated to a fixed ~128 MiB and zero-padded,
-        // so reading either ships up to ~124 MiB of nothing — trim to the
-        // record stream so callers send/store a few MB, not 128 MiB.
-        let mut mkb = udf_fs
-            .read_file(&mut reader, "/AACS/MKB_RO.inf")
-            .or_else(|_| udf_fs.read_file(&mut reader, "/AACS/MKB_RW.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        let n = crate::aacs::mkb_content_len(&mkb);
-        if n > 0 && n < mkb.len() {
-            mkb.truncate(n);
-        }
-        Ok((inf, mkb))
+        Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
 
     /// Core scan pipeline — works with any SectorSource.
@@ -2119,13 +2122,11 @@ impl Disc {
         let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
             Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
 
-        // Translate `Pipeline::send` failure (consumer gone) into the
-        // same `Error` shape the 0.17.x `send_or_abort` produced, so
-        // the producer-error semantics are unchanged.
+        // Translate `Pipeline::send` failure (consumer gone) into a
+        // numeric library error so the producer-error semantics are
+        // unchanged but no English leaks into an io::Error.
         fn consumer_gone() -> Error {
-            Error::IoError {
-                source: std::io::Error::other("sweep consumer terminated unexpectedly"),
-            }
+            Error::PipelineConsumerGone
         }
 
         let mut buf = vec![0u8; batch as usize * 2048];
@@ -2637,6 +2638,10 @@ pub(crate) fn sleep_secs_or_halt(
     }
 }
 
+/// Mapfile path for a regular output file: appends `.mapfile` to the
+/// output path. For `/dev/null` (benchmark) output use
+/// [`Disc::mapfile_for`], which special-cases it to a temp-dir path
+/// derived from the disc title.
 pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
     let mut s = iso_path.as_os_str().to_os_string();
     s.push(".mapfile");
@@ -2646,8 +2651,10 @@ pub fn mapfile_path_for(iso_path: &std::path::Path) -> std::path::PathBuf {
 impl Disc {
     /// Path to the mapfile for a given output path.
     ///
-    /// For `/dev/null` output, returns `/tmp/{volume_id_or_title}.mapfile`.
-    /// For regular files, returns `{path}.mapfile`.
+    /// For `/dev/null` output, returns
+    /// `{temp_dir}/{volume_id_or_title}.mapfile` (temp dir is
+    /// `TMPDIR`-aware and cross-platform). For regular files, returns
+    /// `{path}.mapfile`.
     pub fn mapfile_for(&self, path: &std::path::Path) -> std::path::PathBuf {
         if path.as_os_str() == "/dev/null" {
             let name: String = self
@@ -2663,7 +2670,7 @@ impl Disc {
                     }
                 })
                 .collect();
-            std::path::PathBuf::from(format!("/tmp/{name}.mapfile"))
+            std::env::temp_dir().join(format!("{name}.mapfile"))
         } else {
             mapfile_path_for(path)
         }
@@ -2755,25 +2762,25 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
         return DEFAULT_BATCH_SECTORS_OPTICAL;
     }
 
-    // Check if optical drive (0x05 = CD/DVD)
-    let is_optical = (|| -> bool {
-        use std::path::Path;
-        let scsi_device_dir = "/sys/class/scsi_device/".to_string();
-        if let Ok(entries) = std::fs::read_dir(&scsi_device_dir) {
-            for entry in entries.flatten() {
-                let device_type_path = entry.path().join("device/type");
-                if Path::new(&device_type_path).exists() {
-                    if let Ok(content) = std::fs::read_to_string(&device_type_path) {
-                        // Type 0x05 (decimal 5) = CD/DVD drive
-                        if content.trim().parse::<u32>() == Ok(5) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    })();
+    // Check whether THIS device (not any device on the host) is an
+    // optical drive: read the SCSI peripheral type of the target node
+    // only. Type 0x05 (decimal 5) = CD/DVD. A previous version scanned
+    // every /sys/class/scsi_device entry and returned true if any was
+    // optical, misclassifying a block device as optical on a host that
+    // also has an optical drive.
+    let is_optical = {
+        // For an sg node the type lives at scsi_generic/<sg>/device/type;
+        // for a block node (sr0/sdX) at /sys/block/<name>/device/type.
+        let type_path = if dev_name.starts_with("sg") {
+            format!("/sys/class/scsi_generic/{dev_name}/device/type")
+        } else {
+            format!("/sys/block/{dev_name}/device/type")
+        };
+        std::fs::read_to_string(&type_path)
+            .ok()
+            .map(|c| c.trim().parse::<u32>() == Ok(5))
+            .unwrap_or(false)
+    };
 
     if is_optical {
         // For sg devices, find the corresponding block device name
@@ -3417,7 +3424,6 @@ mod tests {
 
     #[test]
     fn sweep_to_dev_null_real() {
-        let _cleanup = CleanupGuard(std::path::PathBuf::from("/tmp/T2.mapfile"));
         let sectors: u32 = 1000;
         let bad: std::collections::HashSet<u32> = [500u32, 501, 502].into_iter().collect();
         let mut reader = MockReader {
@@ -3425,6 +3431,7 @@ mod tests {
             bad_sectors: bad,
         };
         let disc = make_test_disc(sectors, "T2");
+        let _cleanup = CleanupGuard(disc.mapfile_for(std::path::Path::new("/dev/null")));
         let opts = CopyOptions {
             decrypt: false,
             multipass: true,
@@ -3450,13 +3457,13 @@ mod tests {
 
     #[test]
     fn sweep_dev_null_full_good() {
-        let _cleanup = CleanupGuard(std::path::PathBuf::from("/tmp/T3.mapfile"));
         let sectors: u32 = 2000;
         let mut reader = MockReader {
             total_sectors: sectors,
             bad_sectors: std::collections::HashSet::new(),
         };
         let disc = make_test_disc(sectors, "T3");
+        let _cleanup = CleanupGuard(disc.mapfile_for(std::path::Path::new("/dev/null")));
         let opts = CopyOptions {
             decrypt: false,
             multipass: false,
@@ -3614,5 +3621,52 @@ mod tests {
         // wrote everything before fsync.
         let meta = std::fs::metadata(&iso_path).unwrap();
         assert_eq!(meta.len(), sectors as u64 * 2048);
+    }
+
+    /// bytes_bad_in_title must overlap per-extent, not against a single
+    /// bounding box: a bad range in the gap between two extents of the
+    /// same title must NOT be counted.
+    #[test]
+    fn bytes_bad_in_title_ignores_inter_extent_gap() {
+        let mut title = title_with_video(Codec::Hevc, Resolution::R2160p);
+        // Two extents: sectors [0,10) and [100,110). Gap = [10,100).
+        title.extents = vec![
+            Extent {
+                start_lba: 0,
+                sector_count: 10,
+            },
+            Extent {
+                start_lba: 100,
+                sector_count: 10,
+            },
+        ];
+        // A bad range entirely inside the gap (sector 50 == byte 50*2048).
+        let gap = vec![(50 * 2048, 2048)];
+        assert_eq!(
+            bytes_bad_in_title(&title, &gap),
+            0,
+            "bad bytes in the inter-extent gap must not be counted"
+        );
+        // A bad range overlapping the first extent counts.
+        let in_first = vec![(0, 4096)];
+        assert_eq!(bytes_bad_in_title(&title, &in_first), 4096);
+        // A bad range spanning both extents plus the gap counts only the
+        // bytes that fall inside the two extents (10 + 10 sectors).
+        let spanning = vec![(0, 110 * 2048)];
+        assert_eq!(bytes_bad_in_title(&title, &spanning), 20 * 2048);
+    }
+
+    /// 0xA2 is secondary DTS-HD MA (lossless), not lossy HR.
+    #[test]
+    fn coding_type_a2_is_dts_hd_ma() {
+        assert_eq!(Codec::from_coding_type(0xA2), Codec::DtsHdMa);
+        assert_eq!(Codec::from_coding_type(0x86), Codec::DtsHdMa);
+    }
+
+    /// chapter_name emits a bare 1-based ordinal (no localized prose).
+    #[test]
+    fn chapter_name_is_bare_ordinal() {
+        assert_eq!(chapter_name(0), "1");
+        assert_eq!(chapter_name(41), "42");
     }
 }

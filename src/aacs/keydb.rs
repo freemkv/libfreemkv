@@ -55,14 +55,22 @@ pub struct DiscEntry {
 }
 
 /// Parse a hex string like "0xABCD..." into bytes.
+///
+/// Operates on bytes, not `&str` char boundaries: the keydb is
+/// third-party content, so a non-ASCII scalar (e.g. a 4-byte UTF-8
+/// codepoint) must not panic on a mid-codepoint slice. Any non-hex
+/// byte yields `None`.
 pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if s.len() % 2 != 0 {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
         return None;
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        out.push(u8::from_str_radix(&s[i..i + 2], 16).ok()?);
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
     }
     Some(out)
 }
@@ -142,12 +150,26 @@ impl KeyDb {
                 continue;
             }
 
-            // Host Certificate (AACS 2.0)
+            // Host Certificate (AACS 2.0).
+            //
+            // An HC2 row normally augments the preceding HC (AACS 1.0) row.
+            // KEYDB line ordering is third-party, so an HC2 row may appear
+            // before any HC row; rather than silently dropping the AACS 2.0
+            // credentials, carry them on a fresh HostCert with an empty v1
+            // cert (the v1 private_key/certificate stay zero/empty and are
+            // ignored by the v1 handshake, which guards on cert length).
             if line.starts_with("| HC2") {
-                if let Some(hc) = db.host_certs.last_mut() {
-                    if let Some((pk, cert)) = Self::parse_host_cert_v2(line) {
+                if let Some((pk, cert)) = Self::parse_host_cert_v2(line) {
+                    if let Some(hc) = db.host_certs.last_mut() {
                         hc.private_key_v2 = Some(pk);
                         hc.certificate_v2 = Some(cert);
+                    } else {
+                        db.host_certs.push(HostCert {
+                            private_key: [0u8; 20],
+                            certificate: Vec::new(),
+                            private_key_v2: Some(pk),
+                            certificate_v2: Some(cert),
+                        });
                     }
                 }
                 continue;
@@ -173,8 +195,18 @@ impl KeyDb {
     }
 
     /// Load a KEYDB.cfg from disk.
-    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
+    ///
+    /// A read failure (missing/unreadable file, non-UTF-8 content) surfaces
+    /// as [`crate::error::Error::KeydbLoad`] carrying the path, per the
+    /// library contract that a missing/unparseable keydb is a structured
+    /// error and not a raw `io::Error`. Note that [`Self::parse`] itself is
+    /// lenient: a syntactically valid but key-less file parses to an empty
+    /// [`KeyDb`] rather than an error — callers needing a non-empty db must
+    /// check the parsed contents.
+    pub fn load(path: &std::path::Path) -> crate::error::Result<Self> {
+        let data = std::fs::read_to_string(path).map_err(|_| crate::error::Error::KeydbLoad {
+            path: path.display().to_string(),
+        })?;
         Ok(Self::parse(&data))
     }
 
@@ -234,10 +266,14 @@ impl super::provider::KeyProvider for KeyDb {
         self.host_certs.clone()
     }
     fn lookup_disc_by_hash(&self, disc_hash: &[u8; 20]) -> Option<DiscEntry> {
+        use std::fmt::Write;
+        // Lowercase hex written straight into the pre-sized buffer: find_disc
+        // lowercases its input anyway, so emitting 'x' here avoids a wasted
+        // to_lowercase() round-trip, and write! avoids 20 temporary Strings.
         let mut hex = String::with_capacity(42);
         hex.push_str("0x");
         for b in disc_hash {
-            hex.push_str(&format!("{b:02X}"));
+            let _ = write!(hex, "{b:02x}");
         }
         self.find_disc(&hex).cloned()
     }
@@ -324,9 +360,17 @@ impl KeyDb {
             .next()?
             .trim();
 
+        let certificate = parse_hex(cert_str)?;
+        // AACS 1.0 host certs are 92 bytes; drop malformed/short rows at
+        // parse time so the handshake never attempts junk (mirrors the v2
+        // path, which enforces >= 132).
+        if certificate.len() < 92 {
+            return None;
+        }
+
         Some(HostCert {
             private_key: parse_hex20(priv_str)?,
-            certificate: parse_hex(cert_str)?,
+            certificate,
             private_key_v2: None,
             certificate_v2: None,
         })
@@ -371,15 +415,16 @@ impl KeyDb {
 
         // Extract title (before first |)
         let title_part = rest.split(" | ").next().unwrap_or("").trim();
-        // Clean title: "TITLE_NAME (Display Title)" → use display title if present
-        let title = if let Some(start) = title_part.find('(') {
-            if let Some(end) = title_part.rfind(')') {
-                title_part[start + 1..end].to_string()
-            } else {
-                title_part.to_string()
-            }
-        } else {
-            title_part.to_string()
+        // Clean title: "TITLE_NAME (Display Title)" → use display title if
+        // present. keydb.cfg is untrusted third-party content, so a title with
+        // ')' before '(' (e.g. "FILM) (X") would make start+1 > end; guard the
+        // slice and fall back to the whole title.
+        let title = match (title_part.find('('), title_part.rfind(')')) {
+            (Some(start), Some(end)) => title_part
+                .get(start + 1..end)
+                .map(str::to_string)
+                .unwrap_or_else(|| title_part.to_string()),
+            _ => title_part.to_string(),
         };
 
         // Parse fields by tag
@@ -534,6 +579,69 @@ mod tests {
         let hc = KeyDb::parse_host_cert(&line).unwrap();
         assert_eq!(hc.private_key, [0u8; 20]);
         assert_eq!(hc.certificate.len(), 92);
+    }
+
+    #[test]
+    fn test_parse_hex_rejects_non_ascii_without_panic() {
+        // A 4-byte UTF-8 scalar has byte-len 4 (passes the even check); the
+        // old &str-slice path panicked on the mid-codepoint boundary. The
+        // byte-wise parser must instead return None.
+        assert!(parse_hex("😀").is_none());
+        // Mixed: leading hex then a 2-byte UTF-8 scalar (byte-len even).
+        assert!(parse_hex("ABé").is_none());
+        // Sanity: well-formed hex still parses.
+        assert_eq!(parse_hex("0x00FF"), Some(vec![0x00, 0xFF]));
+        // Odd byte length still rejected.
+        assert!(parse_hex("ABC").is_none());
+    }
+
+    #[test]
+    fn test_hc2_before_hc_is_not_dropped() {
+        // An HC2 row appearing before any HC row must still land its AACS 2.0
+        // credentials on a HostCert rather than being silently discarded.
+        let cfg = format!(
+            "| HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(32),
+            "00".repeat(132)
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(
+            db.host_certs.len(),
+            1,
+            "HC2-only row must create a HostCert"
+        );
+        assert!(db.host_certs[0].private_key_v2.is_some());
+        assert!(db.host_certs[0].certificate_v2.is_some());
+        assert!(
+            db.host_certs[0].certificate.is_empty(),
+            "v1 cert stays empty for an HC2-only carrier"
+        );
+    }
+
+    #[test]
+    fn test_hc2_after_hc_augments_existing() {
+        let cfg = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n| HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(20),
+            "00".repeat(92),
+            "00".repeat(32),
+            "00".repeat(132)
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 1, "HC2 augments the preceding HC");
+        assert_eq!(db.host_certs[0].certificate.len(), 92);
+        assert!(db.host_certs[0].certificate_v2.is_some());
+    }
+
+    #[test]
+    fn test_parse_host_cert_rejects_short_v1_cert() {
+        // A too-short AACS 1.0 cert must be dropped at parse time.
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}",
+            "00".repeat(20),
+            "00".repeat(10)
+        );
+        assert!(KeyDb::parse_host_cert(&line).is_none());
     }
 
     #[test]

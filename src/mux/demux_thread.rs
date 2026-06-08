@@ -18,13 +18,14 @@
 //!
 //! ## Lifecycle
 //!
-//! [`DemuxThread::spawn`] takes ownership of the inner reader and the
-//! demuxer state, returns a handle plus a `Receiver<DemuxBatch>`.
-//! Dropping the handle closes the channel which signals the thread
-//! to exit; the join in `Drop::drop` is bounded.
+//! [`DemuxThread::spawn_zero_copy`] consumes the prefetch channels and
+//! the demuxer state, returning a handle plus a `Receiver<DemuxBatch>`.
+//! Dropping the handle closes the channel which signals the worker to
+//! exit; the join in `Drop::drop` blocks until the worker observes
+//! channel closure and returns (no timeout — a wedged downstream would
+//! block the drop until it releases the channel).
 
 use crate::halt::Halt;
-use crate::sector::SectorSource;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::thread::JoinHandle;
 
@@ -39,6 +40,13 @@ pub enum DemuxBatch {
     Ps(Vec<super::ps::PsPacket>),
     /// Underlying reader returned an error. Terminal.
     Err(std::io::Error),
+    /// Explicit clean-completion sentinel. The worker sends this as its
+    /// LAST message on every non-error exit (input exhausted, or halt
+    /// cancelled) so the consumer can distinguish a normal end-of-stream
+    /// from a bare channel disconnection. A worker that panics mid-stream
+    /// drops `tx` without sending this, so the consumer sees `RecvError`
+    /// and reports the panic rather than silently truncating output.
+    Eof,
 }
 
 /// Spawned demux thread. Drop joins.
@@ -56,158 +64,7 @@ pub struct DemuxThread {
 }
 
 impl DemuxThread {
-    /// Spawn the demux thread. Returns the thread handle and a
-    /// receiver for [`DemuxBatch`] items.
-    ///
-    /// `reader` is the fully-composed read+decrypt stack (e.g.
-    /// [`PrefetchedSectorSource`](crate::sector::PrefetchedSectorSource)
-    /// wrapping
-    /// [`DecryptingSectorSource`](crate::sector::DecryptingSectorSource)).
-    /// `extents` is what the thread walks; it issues one
-    /// `read_sectors` per batch of `batch_sectors` sectors (aligned
-    /// to 3-sector AACS units when possible).
-    pub fn spawn<S: SectorSource + Send + 'static>(
-        mut reader: S,
-        extents: Vec<crate::disc::Extent>,
-        batch_sectors: u16,
-        halt: Option<Halt>,
-        ts: Option<super::ts::TsDemuxer>,
-        ps: Option<super::ps::PsDemuxer>,
-    ) -> (Self, Receiver<DemuxBatch>) {
-        let (tx, rx) = bounded::<DemuxBatch>(DEMUX_CHANNEL_DEPTH);
-        let mut ts = ts;
-        let mut ps = ps;
-
-        let handle = std::thread::Builder::new()
-            .name("freemkv-demux".into())
-            .spawn(move || {
-                let mut buf = vec![0u8; batch_sectors as usize * 2048];
-                let mut ext_idx = 0usize;
-                let mut offset: u32 = 0;
-                let prof = std::env::var_os("FREEMKV_PROFILE").is_some();
-                let mut prof_started = std::time::Instant::now();
-                let mut prof_last_dump = prof_started;
-                let mut prof_read_ns: u128 = 0;
-                let mut prof_feed_ns: u128 = 0;
-                let mut prof_send_ns: u128 = 0;
-                let mut prof_bytes: u64 = 0;
-                while ext_idx < extents.len() {
-                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                        return;
-                    }
-                    let ext = &extents[ext_idx];
-                    let remaining = ext.sector_count.saturating_sub(offset);
-                    if remaining == 0 {
-                        ext_idx += 1;
-                        offset = 0;
-                        continue;
-                    }
-                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                    if sectors >= 3 {
-                        sectors -= sectors % 3;
-                    }
-                    let bytes = sectors as usize * 2048;
-                    if buf.len() < bytes {
-                        buf.resize(bytes, 0);
-                    }
-                    let lba = ext.start_lba + offset;
-                    let t0 = if prof {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    let n = match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = tx.send(DemuxBatch::Err(e.into()));
-                            return;
-                        }
-                    };
-                    let t1 = if prof {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    offset += sectors as u32;
-
-                    // Demux this batch immediately so the channel
-                    // carries already-parsed PesPackets, not raw
-                    // sector bytes.
-                    if let Some(ref mut d) = ts {
-                        let pkts = d.feed(&buf[..n]);
-                        let t2 = if prof {
-                            Some(std::time::Instant::now())
-                        } else {
-                            None
-                        };
-                        if !pkts.is_empty() && tx.send(DemuxBatch::Ts(pkts)).is_err() {
-                            return; // consumer dropped
-                        }
-                        let t3 = if prof {
-                            Some(std::time::Instant::now())
-                        } else {
-                            None
-                        };
-                        if prof {
-                            prof_read_ns += t1.unwrap().duration_since(t0.unwrap()).as_nanos();
-                            prof_feed_ns += t2.unwrap().duration_since(t1.unwrap()).as_nanos();
-                            prof_send_ns += t3.unwrap().duration_since(t2.unwrap()).as_nanos();
-                            prof_bytes += n as u64;
-                            let now = t3.unwrap();
-                            if now.duration_since(prof_last_dump)
-                                >= std::time::Duration::from_secs(5)
-                            {
-                                let el = now.duration_since(prof_started).as_millis().max(1);
-                                let mbps = prof_bytes as u128 * 1000 / 1_000_000 / el;
-                                eprintln!(
-                                    "[demux] elapsed={}ms in={}MB/s read={}% feed={}% send={}%",
-                                    el,
-                                    mbps,
-                                    prof_read_ns / 10_000 / el,
-                                    prof_feed_ns / 10_000 / el,
-                                    prof_send_ns / 10_000 / el,
-                                );
-                                prof_last_dump = now;
-                                prof_started = now;
-                                prof_read_ns = 0;
-                                prof_feed_ns = 0;
-                                prof_send_ns = 0;
-                                prof_bytes = 0;
-                            }
-                        }
-                    } else if let Some(ref mut d) = ps {
-                        let pkts = d.feed(&buf[..n]);
-                        if !pkts.is_empty() && tx.send(DemuxBatch::Ps(pkts)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                // EOF — emit any flushed packets too.
-                if let Some(ref mut d) = ts {
-                    let tail = d.flush();
-                    if !tail.is_empty() {
-                        let _ = tx.send(DemuxBatch::Ts(tail));
-                    }
-                } else if let Some(ref mut d) = ps {
-                    let tail = d.flush();
-                    if !tail.is_empty() {
-                        let _ = tx.send(DemuxBatch::Ps(tail));
-                    }
-                }
-                // Sender drops here -> consumer sees RecvError → EOF.
-            })
-            .expect("freemkv-demux thread spawn failed");
-
-        (
-            Self {
-                handle: Some(handle),
-                producer_shell: None,
-            },
-            rx,
-        )
-    }
-
-    /// Zero-copy variant. Instead of taking a `SectorSource` and
+    /// Spawn the demux thread. Instead of taking a `SectorSource` and
     /// memcpy-ing through its `read_sectors` API, this constructor
     /// consumes the prefetch channels directly: filled buffers come
     /// in via `prefetch_rx`, the demux thread feeds them, then
@@ -230,7 +87,7 @@ impl DemuxThread {
         halt: Option<Halt>,
         ts: Option<super::ts::TsDemuxer>,
         ps: Option<super::ps::PsDemuxer>,
-    ) -> (Self, Receiver<DemuxBatch>) {
+    ) -> crate::error::Result<(Self, Receiver<DemuxBatch>)> {
         let (tx, rx) = bounded::<DemuxBatch>(DEMUX_CHANNEL_DEPTH);
         let mut ts = ts;
         let mut ps = ps;
@@ -246,6 +103,10 @@ impl DemuxThread {
                 let mut prof_bytes: u64 = 0;
                 loop {
                     if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
+                        // Caller-initiated stop is a clean termination —
+                        // send the Eof sentinel so the consumer doesn't
+                        // mistake it for a worker panic.
+                        let _ = tx.send(DemuxBatch::Eof);
                         return;
                     }
                     let t0 = if prof {
@@ -328,16 +189,21 @@ impl DemuxThread {
                         let _ = tx.send(DemuxBatch::Ps(tail));
                     }
                 }
+                // Clean end-of-stream sentinel. Reaching here means no
+                // panic occurred; a panic during `feed`/`flush` skips
+                // this and drops `tx`, which the consumer reads as an
+                // error rather than a clean EOF.
+                let _ = tx.send(DemuxBatch::Eof);
             })
-            .expect("freemkv-demux thread spawn failed");
+            .map_err(|e| crate::error::Error::IoError { source: e })?;
 
-        (
+        Ok((
             Self {
                 handle: Some(handle),
                 producer_shell: Some(Box::new(producer_shell)),
             },
             rx,
-        )
+        ))
     }
 }
 

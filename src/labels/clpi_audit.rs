@@ -1,33 +1,20 @@
 //! CLPI vs MPLS cross-validation diagnostic.
 //!
-//! Empirical question (raised 2026-05-11): is CLPI's per-stream
-//! language and codec data truly redundant with MPLS's STN-table data
-//! on real-world Blu-rays?
+//! Walks both per-clip CLPI program info and per-playlist MPLS STN
+//! tables, normalizes their stream lists by `(PID, language,
+//! coding_type)`, and classifies each PID into one of four buckets:
 //!
-//! Build a quick audit that walks both sources, normalizes their stream
-//! lists by (PID, language, coding_type), and flags any disagreement.
+//! 1. **CLPI only** — a stream present in a `.clpi` ProgramInfo that no
+//!    playlist STN table references (orphan on disc).
+//! 2. **MPLS only** — a stream a playlist references that no `.clpi`
+//!    ProgramInfo lists (indicates a parser disagreement).
+//! 3. **Match** — both sources agree on coding_type and language.
+//! 4. **Divergent** — both sources see the PID but disagree on
+//!    coding_type or language.
 //!
-//! Three classes of mismatch we want to detect:
-//!
-//! 1. **CLPI has streams MPLS doesn't reference.** Orphan streams in
-//!    the .m2ts that no playlist's STN table includes. Means the user
-//!    can't reach them through the menu but they're physically on the
-//!    disc.
-//! 2. **MPLS has streams CLPI doesn't list.** Should never happen if
-//!    both parsers are correct — playlists reference clips which
-//!    reference streams. If it happens, one of our parsers has a bug.
-//! 3. **Same PID, different language / coding_type.** The playlist re-
-//!    tagged a stream's metadata. Rare but spec-permitted. Means CLPI
-//!    and MPLS disagree about the same physical stream's properties.
-//!
-//! If audits across the corpus show zero mismatches of any class, CLPI
-//! program_info extraction is **empirically redundant** for labels and
-//! we can leave it out of the registry. If even one mismatch surfaces,
-//! we add a CLPI label parser to the registry as belt-and-suspenders.
-//!
-//! This module exposes `audit(reader, udf)` returning a structured
-//! report. Surfaced via the labels-analyze tool — not part of the
-//! `analyze()` pipeline (no impact on the label output).
+//! [`audit`] returns a structured [`ClpiVsMplsAudit`] report. This is a
+//! diagnostic surface only; it does not feed the label-selection
+//! pipeline.
 
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
@@ -45,11 +32,14 @@ pub struct ClpiVsMplsRow {
 }
 
 impl ClpiVsMplsRow {
-    /// Three rules for classification:
-    /// - both sources missing (impossible — caller wouldn't insert)
-    /// - one source missing → class A or B (orphan-on-disc / playlist-only)
-    /// - both present but fields differ → class C (metadata divergence)
-    /// - both present and identical → no mismatch
+    /// Classification rules:
+    /// - one coding_type present, the other missing → `ClpiOnly` /
+    ///   `MplsOnly`
+    /// - both coding_types present, fields differ → `Divergent`
+    /// - both coding_types present and identical → `Match`
+    /// - both coding_types missing (`audit` never builds this, but a
+    ///   caller can construct such a row) → compare the language fields:
+    ///   `Divergent` if they differ, else `Match`
     pub fn class(&self) -> ClpiVsMplsClass {
         match (
             self.clpi_coding_type.is_some(),
@@ -66,7 +56,13 @@ impl ClpiVsMplsRow {
                     ClpiVsMplsClass::Divergent
                 }
             }
-            (false, false) => ClpiVsMplsClass::Match,
+            (false, false) => {
+                if self.clpi_language == self.mpls_language {
+                    ClpiVsMplsClass::Match
+                } else {
+                    ClpiVsMplsClass::Divergent
+                }
+            }
         }
     }
 }
@@ -95,6 +91,9 @@ pub struct ClpiVsMplsAudit {
 }
 
 impl ClpiVsMplsAudit {
+    /// Count rows by class, returned in the fixed order
+    /// `(clpi_only, mpls_only, matches, divergent)` matching the
+    /// [`ClpiVsMplsClass`] variants.
     pub fn class_counts(&self) -> (usize, usize, usize, usize) {
         let mut clpi_only = 0;
         let mut mpls_only = 0;
@@ -138,6 +137,11 @@ pub fn audit(reader: &mut dyn SectorSource, udf: &UdfFs) -> ClpiVsMplsAudit {
                 continue;
             };
             for s in clip.streams {
+                if s.pid == 0 {
+                    // PID 0 means "no PID in stream entry" — skip rather
+                    // than collide, mirroring the MPLS side below.
+                    continue;
+                }
                 clpi_by_pid
                     .entry(s.pid)
                     .or_insert((s.coding_type, s.language));
@@ -246,6 +250,32 @@ mod tests {
             mpls_language: Some("und".into()),
         };
         assert_eq!(r.class(), ClpiVsMplsClass::Divergent);
+    }
+
+    #[test]
+    fn class_both_coding_missing_divergent_on_lang() {
+        // Caller-built row with neither coding_type but disagreeing
+        // languages must classify Divergent, not Match.
+        let r = ClpiVsMplsRow {
+            pid: 0x1100,
+            clpi_coding_type: None,
+            clpi_language: Some("eng".into()),
+            mpls_coding_type: None,
+            mpls_language: Some("fra".into()),
+        };
+        assert_eq!(r.class(), ClpiVsMplsClass::Divergent);
+    }
+
+    #[test]
+    fn class_both_coding_missing_match_on_equal_lang() {
+        let r = ClpiVsMplsRow {
+            pid: 0x1100,
+            clpi_coding_type: None,
+            clpi_language: Some("eng".into()),
+            mpls_coding_type: None,
+            mpls_language: Some("eng".into()),
+        };
+        assert_eq!(r.class(), ClpiVsMplsClass::Match);
     }
 
     #[test]

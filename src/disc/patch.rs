@@ -319,14 +319,14 @@ const CACHE_PRIME_SECTORS: u32 = 3;
 /// scatter its sample LBAs across the failing region rather than
 /// hammering the same neighborhood.
 pub(super) fn skip_sectors_for_probe(idx: usize) -> u64 {
-    let base = PASSN_SKIP_SECTORS_BASE as i64;
-    let escalation = (idx * 3) as i64;
-    let shifted = if escalation < 64 {
-        base << escalation
-    } else {
-        base
-    };
-    shifted.min(PASSN_SKIP_SECTORS_CAP as i64) as u64
+    let escalation = (idx.saturating_mul(3)).min(u32::MAX as usize) as u32;
+    // Saturating shift: a large `idx` would overflow a fixed-width shift
+    // (32 << 60 = 2^65), so fall back to the cap instead of panicking
+    // (debug) or wrapping to 0 (release).
+    PASSN_SKIP_SECTORS_BASE
+        .checked_shl(escalation)
+        .unwrap_or(PASSN_SKIP_SECTORS_CAP)
+        .min(PASSN_SKIP_SECTORS_CAP)
 }
 
 /// Send a `PatchItem` and translate a `SendError` (consumer thread died
@@ -336,9 +336,7 @@ pub(super) fn send_or_abort(
     pipe: &Pipeline<PatchItem, PatchSummary>,
     item: PatchItem,
 ) -> Result<()> {
-    pipe.send(item).map_err(|_| Error::IoError {
-        source: std::io::Error::other("patch consumer terminated unexpectedly"),
-    })
+    pipe.send(item).map_err(|_| Error::PipelineConsumerGone)
 }
 
 /// Phase A pre-snapshot. Loads the mapfile, captures the fields the
@@ -667,21 +665,21 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     state.damage_window.push(true);
     if state.damage_window.len() > PASSN_DAMAGE_WINDOW {
         state.damage_window.remove(0);
-
-        tracing::info!(
-            target: "freemkv::disc",
-            phase = "patch_read_ok",
-            lba,
-            count,
-            bytes,
-            blocks_read_ok = state.blocks_read_ok,
-            consecutive_failures = state.consecutive_failures,
-            read_duration_ms,
-            range_idx = frame.range_idx,
-            pos,
-            "Read succeeded"
-        );
     }
+
+    tracing::info!(
+        target: "freemkv::disc",
+        phase = "patch_read_ok",
+        lba,
+        count,
+        bytes,
+        blocks_read_ok = state.blocks_read_ok,
+        consecutive_failures = state.consecutive_failures,
+        read_duration_ms,
+        range_idx = frame.range_idx,
+        pos,
+        "Read succeeded"
+    );
     // Plaintext: DecryptingSectorSource applied AACS / CSS in-place
     // during the read_sectors call above. The pre-0.18 inline
     // decrypt_sectors call lived here.
@@ -909,8 +907,12 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     // Check if this is a NOT_READY error that should be retried
     let sense = err.scsi_sense();
 
-    // ASC values indicating temporary drive unresponsiveness:
-    // 0x02 = medium not present, 0x03 = becoming ready, 0x04 = initialization required
+    // ASC values (under NOT READY, sense_key 0x02) indicating temporary
+    // drive unresponsiveness worth retrying:
+    //   0x02 = LUN not ready, no reference position (mechanism still seeking)
+    //   0x03 = LUN not ready, manual intervention required
+    //   0x04 = LUN not ready, in process of becoming ready / initializing
+    // (Medium-not-present is ASC 0x3A, not handled here — nothing to retry.)
     let is_not_ready_retryable = sense
         .map(|s| s.sense_key == 0x02 && (s.asc == 0x02 || s.asc == 0x03 || s.asc == 0x04))
         .unwrap_or(false);
@@ -923,7 +925,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             lba,
             consecutive_failures = state.consecutive_failures,
             err_asc = sense.map(|s| s.asc as u32).unwrap_or(0),
-            "NOT_READY with ASC=0x03/0x04; pausing for drive recovery before retry"
+            "NOT_READY with ASC in 0x02/0x03/0x04; pausing for drive recovery before retry"
         );
 
         // Extended pause for NOT_READY - let drive complete internal mechanical recovery
@@ -1020,17 +1022,30 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         );
     }
 
-    // Probe good sectors to differentiate wedge vs bad sector
+    // Probe good sectors to differentiate wedge vs bad sector.
+    // `skip_sectors_for_probe` returns a SECTOR distance; scale to bytes
+    // before adding to `pos` (a byte offset). The previous code compared
+    // a sector count against `block_bytes` and added a sector count to a
+    // byte offset, so the only probe that ran landed back on the failing
+    // LBA — the responsive-vs-wedged heuristic never scattered.
     if state.consecutive_failures >= 3 && state.consecutive_failures % 5 == 0 {
-        let probe_offsets: [u64; 3] = [0, skip_sectors_for_probe(1), skip_sectors_for_probe(2)];
+        let probe_offsets_sectors: [u64; 3] =
+            [0, skip_sectors_for_probe(1), skip_sectors_for_probe(2)];
         let mut probes_ok = 0;
 
-        for (probe_idx, &offset) in probe_offsets.iter().enumerate() {
-            if offset >= block_bytes || (offset == 0 && state.consecutive_failures < 5) {
+        for (probe_idx, &offset_sectors) in probe_offsets_sectors.iter().enumerate() {
+            let offset = offset_sectors.saturating_mul(2048);
+            let probe_pos = pos.saturating_add(offset);
+            // Skip the zero-distance re-read until failures are well
+            // established (it just re-confirms the current LBA), and
+            // never probe past the end of the current bad range (the
+            // probe scatters sample LBAs across the failing region —
+            // `block_bytes`, one block, was the wrong bound and in the
+            // wrong units).
+            if probe_pos >= frame.end || (offset == 0 && state.consecutive_failures < 5) {
                 continue;
             }
 
-            let probe_pos = pos + offset;
             let probe_lba = (probe_pos / 2048) as u32;
             let probe_count = 1u16;
             let mut probe_buf = [0u8; 2048];
@@ -1229,20 +1244,11 @@ pub(super) fn check_range_watchdog(
     frame: &RangeFrame,
     shared: &Mutex<SharedPatchState>,
 ) -> bool {
-    if state.range_start.elapsed().as_secs() > frame.range_budget_secs {
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "patch_range_timeout",
-            range_lba = frame.range_pos / 2048,
-            range_sectors = frame.range_sectors,
-            elapsed_secs = state.range_start.elapsed().as_secs(),
-            budget_secs = frame.range_budget_secs,
-            bytes_recovered = state.range_bytes_good.saturating_sub(state.bytes_good_before),
-            "Range timeout - moving to next range"
-        );
-        return true;
-    }
-
+    // Refresh the forward-progress baseline FIRST, then do a single
+    // elapsed-vs-budget check. Reading bytes_good before the budget
+    // test means a range that committed a recovered sector since the
+    // previous tick resets its clock instead of being abandoned in the
+    // budget-boundary window.
     let bytes_good_now = {
         let g = shared
             .lock()
@@ -1292,28 +1298,40 @@ pub(super) fn handle_skip_limit(
     // them on a later pass when state has evolved (cache, mechanical
     // settle). 2026-05-07 dd-as-oracle test confirmed ~36% of patch-
     // marked Unreadable sectors are actually readable.
-    let unmarked_bytes = frame.block_end.saturating_sub(frame.range_pos);
-    if opts.reverse {
-        send_or_abort(
-            pipe,
-            PatchItem::NonTrimmed {
-                pos: frame.range_pos,
-                len: unmarked_bytes,
-            },
-        )?;
-    } else {
-        let remaining_start = frame.range_pos + (frame.end - frame.block_end);
-        if remaining_start < frame.end {
-            send_or_abort(
-                pipe,
-                PatchItem::NonTrimmed {
-                    pos: remaining_start,
-                    len: frame.end - remaining_start,
-                },
-            )?;
-        }
+    if let Some((pos, len)) =
+        skip_limit_remainder(opts.reverse, frame.range_pos, frame.end, frame.block_end)
+    {
+        send_or_abort(pipe, PatchItem::NonTrimmed { pos, len })?;
     }
     Ok(())
+}
+
+/// The never-attempted remainder of a range when the skip limit is
+/// reached, as `Some((pos, len))` or `None` if nothing is left.
+///
+/// `block_end` is the per-iteration cursor. In reverse mode it moved
+/// DOWN from `end` toward `range_pos`, so the attempted region is
+/// `[block_end, end)` and the remainder is `[range_pos, block_end)`. In
+/// forward mode it moved UP from `range_pos` toward `end`, so the
+/// attempted region is `[range_pos, block_end)` and the remainder is
+/// `[block_end, end)`. The pre-fix forward formula
+/// `range_pos + (end - block_end)` was a mirror reflection that, once
+/// `block_end` passed the midpoint, produced a start BELOW `block_end`
+/// and overlapped the already-recovered region — downgrading Finished
+/// sectors to NonTrimmed.
+fn skip_limit_remainder(
+    reverse: bool,
+    range_pos: u64,
+    end: u64,
+    block_end: u64,
+) -> Option<(u64, u64)> {
+    if reverse {
+        let len = block_end.saturating_sub(range_pos);
+        (len > 0).then_some((range_pos, len))
+    } else {
+        let len = end.saturating_sub(block_end);
+        (len > 0).then_some((block_end, len))
+    }
 }
 
 /// Damage-cluster size-aware skip decision. Inspects `state.damage_window`
@@ -1348,7 +1366,9 @@ pub(super) fn compute_damage_skip(
     };
     let range_remaining_sectors = range_remaining_bytes / 2048;
     let range_quarter = (range_remaining_sectors / 4).max(1);
-    let escalated = (PASSN_SKIP_SECTORS_BASE << state.consecutive_skips_without_recovery)
+    let escalated = PASSN_SKIP_SECTORS_BASE
+        .checked_shl(state.consecutive_skips_without_recovery)
+        .unwrap_or(PASSN_SKIP_SECTORS_CAP)
         .min(PASSN_SKIP_SECTORS_CAP);
     let skip_sectors = escalated.min(range_quarter);
     let skip_bytes = skip_sectors * 2048;
@@ -1539,7 +1559,11 @@ impl Disc {
         //     "split decisions", not recorded failures
         //   - drop-to-1 retries the SAME starting position, so every
         //     sector in the failed batch is individually probed
-        let initial_batch = opts.block_sectors.unwrap_or(1);
+        // Clamp to at least 1 sector. block_sectors is public
+        // (Option<u16>); Some(0) would compute a zero-length read per
+        // iteration, never advance block_end, and busy-spin the range
+        // until its watchdog fired.
+        let initial_batch = opts.block_sectors.unwrap_or(1).max(1);
         let recovery = opts.full_recovery;
         let mut state = PatchLoopState::new(
             bytes_good_before,
@@ -1783,5 +1807,53 @@ impl Disc {
             bad_ranges.len(),
             opts.wedged_threshold,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_sectors_for_probe_does_not_overflow_for_large_idx() {
+        // idx=20 (escalation 60) and idx=21 (63) previously overflowed
+        // i64 via `32i64 << escalation`. Must saturate to the cap.
+        for idx in [0usize, 1, 2, 20, 21, 100, usize::MAX] {
+            let v = skip_sectors_for_probe(idx);
+            assert!(
+                v <= PASSN_SKIP_SECTORS_CAP,
+                "idx {idx}: {v} exceeds cap {PASSN_SKIP_SECTORS_CAP}"
+            );
+        }
+        // Small indices still escalate as before.
+        assert_eq!(skip_sectors_for_probe(0), PASSN_SKIP_SECTORS_BASE);
+        assert_eq!(skip_sectors_for_probe(1), PASSN_SKIP_SECTORS_BASE << 3);
+    }
+
+    #[test]
+    fn skip_limit_remainder_forward_does_not_overlap_recovered_region() {
+        // Forward mode: range [1000, 2000), cursor advanced past the
+        // midpoint to block_end=1700. The recovered region is
+        // [1000, 1700); the never-attempted remainder must be exactly
+        // [1700, 2000) — NOT a mirror start below block_end.
+        let r = skip_limit_remainder(false, 1000, 2000, 1700);
+        assert_eq!(r, Some((1700, 300)));
+        // The pre-fix mirror formula would have produced start =
+        // 1000 + (2000 - 1700) = 1300, which overlaps [1000, 1700).
+        assert!(r.unwrap().0 >= 1700, "must not overlap recovered region");
+    }
+
+    #[test]
+    fn skip_limit_remainder_forward_none_when_fully_attempted() {
+        assert_eq!(skip_limit_remainder(false, 1000, 2000, 2000), None);
+    }
+
+    #[test]
+    fn skip_limit_remainder_reverse_marks_low_unattempted_region() {
+        // Reverse mode: cursor moved down to block_end=1300, so
+        // [1300, 2000) was attempted and [1000, 1300) is the remainder.
+        let r = skip_limit_remainder(true, 1000, 2000, 1300);
+        assert_eq!(r, Some((1000, 300)));
+        assert_eq!(skip_limit_remainder(true, 1000, 2000, 1000), None);
     }
 }

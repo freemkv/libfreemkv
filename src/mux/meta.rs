@@ -21,8 +21,16 @@ fn color_space_from_hdr(hdr: HdrFormat) -> ColorSpace {
     }
 }
 
-/// Magic bytes: "FMKV" + version 1 + 2 reserved bytes.
+/// Magic bytes: "FMKV" + 1 reserved byte + version (=1) + 2 reserved bytes.
 const MAGIC: [u8; 8] = [b'F', b'M', b'K', b'V', 0x00, 0x01, 0x00, 0x00];
+
+/// Highest header format version this build understands. A header tagged with
+/// a newer version is rejected so older readers cleanly refuse incompatible
+/// formats instead of silently mis-parsing them as v1.
+const SUPPORTED_VERSION: u8 = 1;
+
+/// Index of the version byte within [`MAGIC`].
+const VERSION_BYTE: usize = 5;
 
 /// BD-TS packet size (header must be padded to this boundary).
 const PACKET_SIZE: usize = 192;
@@ -83,6 +91,11 @@ pub enum MetaStream {
         label: String,
         #[serde(default)]
         secondary: bool,
+        /// Base64-encoded codec initialization data. Absent for codecs that
+        /// carry none. Without this, a remux driven from an FMKV header would
+        /// emit audio tracks missing their init data versus a direct rip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec_private: Option<String>,
     },
     #[serde(rename = "subtitle")]
     Subtitle {
@@ -92,6 +105,9 @@ pub enum MetaStream {
         language: String,
         #[serde(default)]
         forced: bool,
+        /// Base64-encoded codec initialization data (e.g. VobSub idx palette).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec_private: Option<String>,
     },
 }
 
@@ -99,6 +115,16 @@ impl M2tsMeta {
     /// Build metadata from a DiscTitle. Codec privates come from title.codec_privates.
     pub fn from_title(title: &DiscTitle) -> Self {
         use base64::Engine;
+        // Per-stream codec init data, base64-encoded. Preserved for ALL stream
+        // kinds (video/audio/subtitle) so an FMKV-header-driven remux matches a
+        // direct disc rip — previously only video round-tripped.
+        let codec_private_b64 = |i: usize| -> Option<String> {
+            title
+                .codec_privates
+                .get(i)
+                .and_then(|cp| cp.as_ref())
+                .map(|cp| base64::engine::general_purpose::STANDARD.encode(cp))
+        };
         let streams = title
             .streams
             .iter()
@@ -113,11 +139,7 @@ impl M2tsMeta {
                     color_space: v.color_space.id().into(),
                     label: v.label.clone(),
                     secondary: v.secondary,
-                    codec_private: title
-                        .codec_privates
-                        .get(i)
-                        .and_then(|cp| cp.as_ref())
-                        .map(|cp| base64::engine::general_purpose::STANDARD.encode(cp)),
+                    codec_private: codec_private_b64(i),
                 },
                 Stream::Audio(a) => MetaStream::Audio {
                     pid: a.pid,
@@ -127,12 +149,14 @@ impl M2tsMeta {
                     sample_rate: a.sample_rate.to_string(),
                     label: a.label.clone(),
                     secondary: a.secondary,
+                    codec_private: codec_private_b64(i),
                 },
                 Stream::Subtitle(s) => MetaStream::Subtitle {
                     pid: s.pid,
                     codec: s.codec.id().into(),
                     language: s.language.clone(),
                     forced: s.forced,
+                    codec_private: codec_private_b64(i),
                 },
             })
             .collect();
@@ -197,6 +221,7 @@ impl M2tsMeta {
                     sample_rate,
                     label,
                     secondary,
+                    codec_private: _,
                 } => Stream::Audio(AudioStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
@@ -216,13 +241,14 @@ impl M2tsMeta {
                     codec,
                     language,
                     forced,
+                    codec_private,
                 } => Stream::Subtitle(SubtitleStream {
                     pid: *pid,
                     codec: codec.parse().unwrap_or(crate::disc::Codec::Unknown(0)),
                     language: language.clone(),
                     forced: *forced,
                     qualifier: crate::disc::LabelQualifier::None,
-                    codec_data: None,
+                    codec_data: decode_codec_private(codec_private),
                 }),
             })
             .collect();
@@ -243,32 +269,44 @@ impl M2tsMeta {
 
     /// Extract codec_private data per stream (from FMKV header).
     /// Returns a Vec matching stream order — None for streams without codec_private.
+    /// Covers all three stream kinds so audio/subtitle init data round-trips,
+    /// not just video.
     pub fn codec_privates(&self) -> Vec<Option<Vec<u8>>> {
         self.streams
             .iter()
             .map(|s| {
-                if let MetaStream::Video {
-                    codec_private: Some(b64),
-                    ..
-                } = s
-                {
-                    {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
-                    }
-                } else {
-                    None
-                }
+                let b64 = match s {
+                    MetaStream::Video { codec_private, .. }
+                    | MetaStream::Audio { codec_private, .. }
+                    | MetaStream::Subtitle { codec_private, .. } => codec_private,
+                };
+                decode_codec_private(b64)
             })
             .collect()
     }
 }
 
+/// Decode an optional base64 codec_private string into raw bytes. Invalid
+/// base64 decodes to `None` (treated as absent) rather than erroring — a
+/// corrupt init blob shouldn't fail the whole metadata parse.
+fn decode_codec_private(b64: &Option<String>) -> Option<Vec<u8>> {
+    use base64::Engine;
+    b64.as_ref()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+}
+
 /// Write the metadata header to a writer. Padded to 192-byte boundary.
 pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
-    let json = serde_json::to_vec(meta).map_err(io::Error::other)?;
+    // Serializing our own struct effectively cannot fail, but map the
+    // error to a numeric crate variant rather than embedding serde's
+    // English string into an io::Error (no-English rule).
+    let json = serde_json::to_vec(meta).map_err(|_| crate::error::Error::NoMetadata)?;
 
-    let json_len = json.len() as u32;
+    // Guard the length field against truncation: the read side rejects
+    // anything over MAX_JSON_SIZE, and `as u32` would silently wrap a
+    // >=4 GiB JSON into a wrong, smaller length. Near-impossible for
+    // real stream metadata, but a v1.0 primitive shouldn't truncate.
+    let json_len = u32::try_from(json.len()).map_err(|_| crate::error::Error::NoMetadata)?;
     let raw_len = 8 + 4 + json.len(); // magic + len + json
     let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
     let padding = padded_len - raw_len;
@@ -277,7 +315,9 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
     w.write_all(&json_len.to_be_bytes())?;
     w.write_all(&json)?;
     if padding > 0 {
-        w.write_all(&vec![0u8; padding])?;
+        // Padding is at most PACKET_SIZE-1 bytes — stack buffer, no heap alloc.
+        let pad = [0u8; PACKET_SIZE];
+        w.write_all(&pad[..padding])?;
     }
     Ok(())
 }
@@ -288,13 +328,36 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
 pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     const MAX_JSON_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
-    let mut magic = [0u8; 8];
-    if r.read_exact(&mut magic).is_err() {
-        return Ok(None);
+    // Read the first byte alone so a zero-byte stream (a legitimate
+    // headerless file) stays Ok(None), while a stream that begins with some
+    // magic bytes then truncates mid-magic surfaces as an error rather than
+    // being masked as "no header".
+    let mut first = [0u8; 1];
+    if let Err(e) = r.read_exact(&mut first) {
+        // A clean EOF (no header at all) means "no FMKV header" — the caller
+        // falls back to a PMT scan. Any OTHER I/O failure (broken pipe,
+        // permission denied, mid-read disc error) is a real error and must
+        // propagate, not masquerade as a headerless stream.
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(e);
     }
+    if first[0] != MAGIC[0] {
+        return Ok(None); // not an FMKV stream
+    }
+    let mut rest = [0u8; 7];
+    r.read_exact(&mut rest)?; // started with 'F' but truncated → error
+    let magic = [
+        first[0], rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6],
+    ];
 
     if magic[..4] != MAGIC[..4] {
         return Ok(None);
+    }
+    if magic[VERSION_BYTE] > SUPPORTED_VERSION {
+        // Newer, incompatible format — refuse rather than mis-parse as v1.
+        return Err(crate::error::Error::NoMetadata.into());
     }
 
     let mut len_buf = [0u8; 4];
@@ -307,16 +370,17 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let mut json_buf = vec![0u8; json_len];
     r.read_exact(&mut json_buf)?;
 
-    let meta: M2tsMeta = serde_json::from_slice(&json_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let meta: M2tsMeta =
+        serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
 
-    // Skip padding to next 192-byte boundary
+    // Skip padding to next 192-byte boundary (at most PACKET_SIZE-1 bytes →
+    // a stack buffer, no heap allocation).
     let raw_len = 8 + 4 + json_len;
     let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
     let padding = padded_len - raw_len;
     if padding > 0 {
-        let mut skip = vec![0u8; padding];
-        r.read_exact(&mut skip)?;
+        let mut skip = [0u8; PACKET_SIZE];
+        r.read_exact(&mut skip[..padding])?;
     }
 
     Ok(Some(meta))
@@ -404,6 +468,133 @@ mod tests {
             }
             _ => panic!("expected video stream"),
         }
+    }
+
+    #[test]
+    fn read_header_empty_is_none_not_error() {
+        // No bytes at all → clean EOF on the magic read → Ok(None), the
+        // "no FMKV header, fall back" signal.
+        let empty: &[u8] = &[];
+        let mut cursor = io::Cursor::new(empty);
+        let got = read_header(&mut cursor).expect("clean EOF must be Ok(None)");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn read_header_propagates_non_eof_error() {
+        // A reader that fails with a non-EOF error must surface that
+        // error, not be swallowed as Ok(None).
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        let mut r = BrokenReader;
+        let err = read_header(&mut r).expect_err("broken pipe must propagate");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn write_header_then_read_header_round_trips() {
+        let title = video_title(HdrFormat::Hdr10, ColorSpace::Bt2020);
+        let meta = M2tsMeta::from_title(&title);
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).expect("write");
+        let mut cursor = io::Cursor::new(&buf);
+        let back = read_header(&mut cursor)
+            .expect("read")
+            .expect("header present");
+        assert_eq!(back.streams.len(), 1);
+        // Header is padded to a 192-byte boundary; the cursor must land
+        // exactly there so the following BD-TS data stays aligned.
+        assert_eq!(cursor.position() as usize % PACKET_SIZE, 0);
+    }
+
+    #[test]
+    fn audio_and_subtitle_codec_private_round_trip() {
+        use crate::disc::{AudioChannels, AudioStream, LabelPurpose, SampleRate, SubtitleStream};
+        let mut t = DiscTitle::empty();
+        t.streams.push(Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Dts,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        t.streams.push(Stream::Subtitle(SubtitleStream {
+            pid: 0x1200,
+            codec: Codec::DvdSub,
+            language: "eng".into(),
+            forced: false,
+            qualifier: crate::disc::LabelQualifier::None,
+            codec_data: None,
+        }));
+        // codec_privates: index 0 = audio init data, index 1 = subtitle init data.
+        t.codec_privates = vec![Some(vec![0xAA, 0xBB, 0xCC]), Some(vec![0x01, 0x02])];
+
+        let meta = M2tsMeta::from_title(&t);
+        // Must serialize for both audio and subtitle (not just video).
+        let cps = meta.codec_privates();
+        assert_eq!(cps[0].as_deref(), Some(&[0xAA, 0xBB, 0xCC][..]));
+        assert_eq!(cps[1].as_deref(), Some(&[0x01, 0x02][..]));
+
+        // And to_title restores the subtitle codec_data from the header.
+        let back = meta.to_title();
+        match &back.streams[1] {
+            Stream::Subtitle(s) => {
+                assert_eq!(s.codec_data.as_deref(), Some(&[0x01, 0x02][..]))
+            }
+            _ => panic!("expected subtitle stream"),
+        }
+        // The round-tripped title also carries all codec_privates.
+        assert_eq!(
+            back.codec_privates[0].as_deref(),
+            Some(&[0xAA, 0xBB, 0xCC][..])
+        );
+        assert_eq!(back.codec_privates[1].as_deref(), Some(&[0x01, 0x02][..]));
+    }
+
+    #[test]
+    fn newer_version_header_rejected() {
+        // A header tagged with a version above SUPPORTED_VERSION must be
+        // refused, not silently parsed as v1.
+        let meta = M2tsMeta::from_title(&video_title(HdrFormat::Sdr, ColorSpace::Bt709));
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        buf[VERSION_BYTE] = SUPPORTED_VERSION + 1; // bump version byte
+        let mut cur = io::Cursor::new(buf);
+        let err = read_header(&mut cur).unwrap_err();
+        // NoMetadata (E9008) maps to InvalidInput.
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn empty_stream_is_clean_none_but_partial_magic_errors() {
+        // Zero bytes → no header (Ok(None)).
+        let mut empty = io::Cursor::new(Vec::<u8>::new());
+        assert!(read_header(&mut empty).unwrap().is_none());
+
+        // Begins with 'F' (MAGIC[0]) then truncates → error, not None.
+        let mut partial = io::Cursor::new(vec![b'F', b'M', b'K']);
+        assert!(read_header(&mut partial).is_err());
+
+        // Does not begin with the FMKV magic at all → Ok(None) (headerless).
+        let mut other = io::Cursor::new(vec![0x47u8; 16]);
+        assert!(read_header(&mut other).unwrap().is_none());
+    }
+
+    #[test]
+    fn header_round_trips_through_write_read() {
+        let meta = M2tsMeta::from_title(&video_title(HdrFormat::Hdr10, ColorSpace::Bt2020));
+        let mut buf = Vec::new();
+        write_header(&mut buf, &meta).unwrap();
+        let mut cur = io::Cursor::new(buf);
+        let back = read_header(&mut cur).unwrap().expect("header present");
+        assert_eq!(back.streams.len(), 1);
     }
 
     #[test]

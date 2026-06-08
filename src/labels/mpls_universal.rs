@@ -66,7 +66,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
     // canonical "same physical stream" key; type+lang+codec round
     // out the rare case where two distinct logical streams happen
     // to share a PID across playlists with different metadata.
-    let mut seen: Vec<(u8, String, String, u16)> = Vec::new();
+    let mut seen: Vec<(StreamLabelType, String, String, u16)> = Vec::new();
 
     // Global 1-based counters keyed by StreamLabelType. Incremented
     // only when an entry survives dedup, so stream_numbers are dense
@@ -101,8 +101,7 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
             let name = language_display_name(&language);
             let codec_hint = build_codec_hint(label_type, entry);
 
-            let type_tag = type_tag(label_type);
-            let key = (type_tag, language.clone(), codec_hint.clone(), entry.pid);
+            let key = (label_type, language.clone(), codec_hint.clone(), entry.pid);
             if seen.contains(&key) {
                 continue;
             }
@@ -147,11 +146,12 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 fn has_mpls_extension(name: &str) -> bool {
     // Case-insensitive ".mpls" suffix. Some discs use uppercase,
     // some lowercase; UDF filenames preserve case but we don't.
-    let n = name.len();
-    if n < 5 {
-        return false;
-    }
-    name[n - 5..].eq_ignore_ascii_case(".mpls")
+    //
+    // UDF names are decoded via from_utf8_lossy, so a multi-byte
+    // replacement char (EF BF BD) can straddle byte index n-5; a raw
+    // byte slice there panics on a non-char-boundary. `ends_with` on a
+    // lowercased copy is char-boundary-safe and still case-insensitive.
+    name.len() >= 5 && name.to_ascii_lowercase().ends_with(".mpls")
 }
 
 /// Lowercase + trim the raw 3-char ISO 639-2 code. If the lowered
@@ -236,7 +236,7 @@ pub(crate) fn codec_name(coding_type: u8) -> &'static str {
         0x82 => "DTS",
         0x83 => "TrueHD",
         0x84 => "AC-3+",
-        0x85 => "DTS-HD",
+        0x85 => "DTS-HD HR", // BD-ROM Part 3-1: 0x85 = DTS-HD High Resolution
         0x86 => "DTS-HD MA",
         0x90 => "PG",
         0x91 => "IG",
@@ -285,17 +285,6 @@ fn build_codec_hint(label_type: StreamLabelType, entry: &crate::mpls::StreamEntr
     }
 
     out
-}
-
-/// Dedup-tag for the label type. `u8` instead of `StreamLabelType`
-/// itself because the enum does not derive `Hash` / `Eq`-by-discriminant
-/// in a way that we want to couple to (and `==` works fine for the
-/// linear `Vec::contains` lookup we do).
-fn type_tag(t: StreamLabelType) -> u8 {
-    match t {
-        StreamLabelType::Audio => 1,
-        StreamLabelType::Subtitle => 2,
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -351,18 +340,32 @@ mod tests {
     /// don't have to synthesize valid MPLS bytes.
     fn labels_from_playlists(playlists: &[Playlist]) -> Vec<StreamLabel> {
         let mut labels: Vec<StreamLabel> = Vec::new();
-        let mut seen: Vec<(u8, String, String, u16)> = Vec::new();
+        let mut seen: Vec<(StreamLabelType, String, String, u16)> = Vec::new();
+
+        // Global counters hoisted OUT of the playlist loop to match
+        // production `parse()` (lines 77-78): stream_numbers are dense
+        // per type across the whole disc, not reset per playlist.
+        let mut audio_idx: u16 = 0;
+        let mut sub_idx: u16 = 0;
 
         for playlist in playlists {
-            let mut audio_idx: u16 = 0;
-            let mut sub_idx: u16 = 0;
-
             for entry in &playlist.streams {
                 let label_type = match entry.stream_type {
                     2 | 5 => StreamLabelType::Audio,
                     3 => StreamLabelType::Subtitle,
                     _ => continue,
                 };
+                // Dedup BEFORE consuming a counter value, matching prod
+                // parse() ordering so a deduped duplicate does not burn a
+                // stream number.
+                let language = normalize_language(&entry.language);
+                let name = language_display_name(&language);
+                let codec_hint = build_codec_hint(label_type, entry);
+                let key = (label_type, language.clone(), codec_hint.clone(), entry.pid);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
                 let stream_number = match label_type {
                     StreamLabelType::Audio => {
                         audio_idx += 1;
@@ -373,19 +376,6 @@ mod tests {
                         sub_idx
                     }
                 };
-                let language = normalize_language(&entry.language);
-                let name = language_display_name(&language);
-                let codec_hint = build_codec_hint(label_type, entry);
-                let key = (
-                    type_tag(label_type),
-                    language.clone(),
-                    codec_hint.clone(),
-                    entry.pid,
-                );
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
                 labels.push(StreamLabel {
                     stream_number,
                     stream_type: label_type,
@@ -474,6 +464,43 @@ mod tests {
         let mut langs: Vec<String> = labels.iter().map(|l| l.language.clone()).collect();
         langs.sort();
         assert_eq!(langs, vec!["deu", "eng", "fra"]);
+
+        // Stream numbers must be DENSE and GLOBAL across playlists, not
+        // reset per playlist. eng (pl1) = 1, fra (pl1) = 2, the duplicate
+        // eng in pl2 is deduped (no number consumed), and deu (pl2) = 3.
+        // Regression guard for the per-playlist counter-reset divergence.
+        let num = |lang: &str| {
+            labels
+                .iter()
+                .find(|l| l.language == lang)
+                .map(|l| l.stream_number)
+        };
+        assert_eq!(num("eng"), Some(1));
+        assert_eq!(num("fra"), Some(2));
+        assert_eq!(num("deu"), Some(3));
+    }
+
+    #[test]
+    fn has_mpls_extension_handles_short_and_non_ascii_names() {
+        // Short names: no panic, just false.
+        assert!(!has_mpls_extension(""));
+        assert!(!has_mpls_extension("a"));
+        assert!(!has_mpls_extension(".mpl"));
+        // Exact-length and longer valid suffixes, case-insensitive.
+        assert!(has_mpls_extension("0.mpls"));
+        assert!(has_mpls_extension("00000.MPLS"));
+        assert!(has_mpls_extension("Movie.MpLs"));
+        // Non-matching suffix.
+        assert!(!has_mpls_extension("file.clpi"));
+        // Multi-byte char near the tail must NOT panic on a byte-slice
+        // boundary (from_utf8_lossy U+FFFD = EF BF BD is the real-disc
+        // case). A name ending in such a char is simply not ".mpls".
+        assert!(!has_mpls_extension("na\u{FFFD}me"));
+        // And a name where a multi-byte char sits exactly at the n-5
+        // boundary used by the old slice index.
+        assert!(!has_mpls_extension("ab\u{FFFD}cd"));
+        // A genuine .mpls preceded by a multi-byte char still matches.
+        assert!(has_mpls_extension("f\u{FFFD}.mpls"));
     }
 
     #[test]
@@ -490,7 +517,7 @@ mod tests {
             (0x82, "DTS"),
             (0x83, "TrueHD"),
             (0x84, "AC-3+"),
-            (0x85, "DTS-HD"),
+            (0x85, "DTS-HD HR"),
             (0x86, "DTS-HD MA"),
             (0x90, "PG"),
             (0x91, "IG"),

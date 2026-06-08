@@ -54,7 +54,6 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -94,13 +93,11 @@ pub(crate) struct WritebackPipeline {
     is_nfs: bool,
     /// Set the first time WAIT_AFTER exceeds [`WAIT_AFTER_TIMEOUT`].
     /// Once set, behaviour matches the NFS path for the rest of the
-    /// pipeline's life. Wrapped in `Arc` only because both this
-    /// struct and the spawned worker thread (which itself doesn't
-    /// touch the flag) share-via-fd patterns might one day need it;
-    /// today it's effectively a single-owner cell — the `Arc` shape
-    /// keeps the door open for moving the read side into a worker
-    /// without re-plumbing types.
-    degraded: Arc<AtomicBool>,
+    /// pipeline's life. A plain `AtomicBool`: the flag is only ever
+    /// touched on the owning thread (the spawned WAIT_AFTER worker never
+    /// reads or writes it). `AtomicBool` over `bool` only because the
+    /// load/store sites read cleanly; no sharing is needed today.
+    degraded: AtomicBool,
 }
 
 impl WritebackPipeline {
@@ -124,7 +121,7 @@ impl WritebackPipeline {
             wait_after_window: VecDeque::with_capacity(ADAPTIVE_WINDOW),
             chunk_count: 0,
             is_nfs,
-            degraded: Arc::new(AtomicBool::new(false)),
+            degraded: AtomicBool::new(false),
         }
     }
 
@@ -143,8 +140,12 @@ impl WritebackPipeline {
         if pos < self.last_flush_pos.saturating_add(self.chunk_bytes) {
             return;
         }
-        let chunk_off = self.last_flush_pos as i64;
-        let chunk_len = (pos - self.last_flush_pos) as i64;
+        // Byte offsets are unsigned throughout; the signed cast happens
+        // only at the libc call boundary where the kernel ABI requires
+        // `i64`. `saturating_sub` documents and hardens the line-above
+        // guard that `pos >= last_flush_pos`.
+        let chunk_off: u64 = self.last_flush_pos;
+        let chunk_len: u64 = pos.saturating_sub(self.last_flush_pos);
         let mut wait_ms: u64 = 0;
         let mut fadvise_ms: u64 = 0;
         // Async kickoff for the just-completed chunk runs on every
@@ -152,7 +153,12 @@ impl WritebackPipeline {
         // by spec and gives the kernel an early hint that this range
         // is ready to flush.
         unsafe {
-            libc::sync_file_range(self.fd, chunk_off, chunk_len, libc::SYNC_FILE_RANGE_WRITE);
+            libc::sync_file_range(
+                self.fd,
+                chunk_off as i64,
+                chunk_len as i64,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
             if self.skip_wait() {
@@ -198,12 +204,12 @@ impl WritebackPipeline {
                 }
             }
         }
-        self.pending = Some((chunk_off as u64, chunk_len as u64));
+        self.pending = Some((chunk_off, chunk_len));
         self.last_flush_pos = pos;
         self.chunk_count += 1;
         tracing::trace!(
             target: "mux",
-            "WritebackPipeline chunk off={} len={} sync_file_range_ms={wait_ms} fadvise_ms={fadvise_ms} chunk_bytes={} skip_wait={}",
+            "WritebackPipeline chunk off={} len={} wait_after_ms={wait_ms} fadvise_ms={fadvise_ms} chunk_bytes={} skip_wait={}",
             chunk_off,
             chunk_len,
             self.chunk_bytes,
@@ -231,10 +237,14 @@ impl WritebackPipeline {
         if self.wait_after_window.len() < ADAPTIVE_WINDOW {
             return;
         }
-        // p95 of 16 samples ≈ sorted[14] (5 % of 16 = 0.8 ≈ 1 above).
+        // p95 index, derived from the window size so it stays valid if
+        // ADAPTIVE_WINDOW changes (a hard-coded `[14]` would panic OOB
+        // for a window <= 14). For the default 16 this is index 15
+        // (ceil(16 * 95 / 100) - 1 = 15), i.e. the top sample.
         let mut sorted: Vec<u64> = self.wait_after_window.iter().copied().collect();
         sorted.sort_unstable();
-        let p95 = sorted[14];
+        let p95_idx = (ADAPTIVE_WINDOW * 95).div_ceil(100).min(ADAPTIVE_WINDOW) - 1;
+        let p95 = sorted[p95_idx];
         let old = self.chunk_bytes;
         let new = if p95 > ADAPTIVE_GROW_MS && self.chunk_bytes < CHUNK_BYTES_MAX {
             (self.chunk_bytes * 2).min(CHUNK_BYTES_MAX)
@@ -321,11 +331,14 @@ fn detect_nfs(fd: RawFd) -> bool {
 /// Run `sync_file_range(WAIT_AFTER)` on a worker thread and wait up
 /// to [`WAIT_AFTER_TIMEOUT`] for it to return. `Some(elapsed_ms)` on
 /// success; `None` on timeout. On timeout the worker thread is
-/// 0.20.6 generalizes the worker-thread + recv_timeout pattern into
-/// [`crate::io::bounded::bounded_syscall`]; this helper now just adapts
-/// the generic primitive to the WAIT_AFTER call shape (returns elapsed_ms
-/// instead of the syscall's `()` return, treats `WorkerLost` as a benign
-/// no-op to match the original semantics).
+/// intentionally leaked — it unwinds whenever the syscall eventually
+/// returns or the process exits.
+///
+/// This delegates to [`crate::io::bounded::bounded_syscall`], the
+/// generic worker-thread + `recv_timeout` primitive, and just adapts it
+/// to the WAIT_AFTER call shape: it returns `elapsed_ms` instead of the
+/// syscall's `()`, and treats `WorkerLost` as a benign no-op to match
+/// the original semantics.
 fn wait_after_with_timeout(fd: RawFd, off: u64, len: u64) -> Option<u64> {
     let started = Instant::now();
     match crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {

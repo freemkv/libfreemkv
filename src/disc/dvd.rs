@@ -34,15 +34,27 @@ impl Disc {
                 label: String::new(),
             });
 
-            // Map DvdAudioAttr to Stream::Audio
+            // Map DvdAudioAttr to Stream::Audio. The PID is derived from the
+            // stream's REAL on-wire private_stream_1 sub-stream id (assigned
+            // by per-codec ordinal in the IFO scan) via the same
+            // `dvd_audio_pid` table the demuxer's `PsPacket::dvd_pid` uses,
+            // so a mixed-codec title (AC-3 + DTS + LPCM) routes correctly
+            // instead of colliding on 0xBD00. Streams carried as a regular
+            // MPEG-audio PES (MP1/MP2, no sub-id) fall back to a distinct
+            // 0xBD00+ordinal PID — disjoint from the 0xBD80+ canonical audio
+            // space — though they are not routed via `dvd_pid` today.
             let audio_streams: Vec<Stream> = ts
                 .audio_streams
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let codec = a.codec;
+                    let pid = a
+                        .sub_stream_id
+                        .and_then(crate::mux::ps::dvd_audio_pid)
+                        .unwrap_or(0xBD00 + i as u16);
                     Stream::Audio(AudioStream {
-                        pid: 0xBD00 + i as u16, // DVD private stream 1 sub-IDs
+                        pid,
                         codec,
                         channels: AudioChannels::from_count(a.channels),
                         language: a.language.clone(),
@@ -88,8 +100,13 @@ impl Disc {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
+                        // VobSub sub-stream ids run 0x20..=0x3F; PID = sub-id
+                        // (identity), shared with the demuxer via
+                        // `dvd_subtitle_pid`.
+                        let sub_id = 0x20u8.saturating_add(i.min(0x1F) as u8);
+                        let pid = crate::mux::ps::dvd_subtitle_pid(sub_id).unwrap_or(sub_id as u16);
                         Stream::Subtitle(SubtitleStream {
-                            pid: 0x20 + i as u16, // DVD sub-stream IDs 0x20-0x3F
+                            pid,
                             codec: Codec::DvdSub,
                             language: s.language.clone(),
                             forced: false,
@@ -109,7 +126,7 @@ impl Disc {
                     .enumerate()
                     .map(|(i, &t)| Chapter {
                         time_secs: t,
-                        name: format!("Chapter {}", i + 1),
+                        name: chapter_name(i),
                     })
                     .collect();
 

@@ -87,9 +87,9 @@ pub struct SptiTransport {
     handle: isize,
 }
 
-// SptiTransport's only field is the isize HANDLE — Send is auto-derived
-// and intentional. Sync is NOT: handle mutation in execute() requires
-// &mut, enforced by the trait object dispatch.
+// SptiTransport's only field is an isize HANDLE, so the compiler
+// auto-derives BOTH Send and Sync. Exclusive use of the raw handle is
+// enforced by `&mut self` on `execute()`, not by any absence of Sync.
 
 /// Normalize a device path to Windows \\.\X: format.
 ///
@@ -307,7 +307,7 @@ impl ScsiTransport for SptiTransport {
             // is at best redundant and at worst deepens the wedge. Caller
             // surfaces the failure to UX.
             return Err(Error::ScsiError {
-                opcode: cdb[0],
+                opcode: cdb.first().copied().unwrap_or(0),
                 status: super::SCSI_STATUS_TRANSPORT_FAILURE,
                 sense: None,
             });
@@ -324,7 +324,7 @@ impl ScsiTransport for SptiTransport {
             // `ScsiSense::is_medium_error()` etc.
             let parsed = super::parse_sense(&sptwb.sense, K_SENSE_SIZE as u8);
             return Err(Error::ScsiError {
-                opcode: cdb[0],
+                opcode: cdb.first().copied().unwrap_or(0),
                 status: sptwb.spt.ScsiStatus,
                 sense: Some(parsed),
             });

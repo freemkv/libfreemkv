@@ -40,6 +40,13 @@ pub fn write_size(w: &mut impl Write, size: u64) -> io::Result<()> {
             (size >> 8) as u8,
             size as u8,
         ])
+    } else if size >= 0x00FF_FFFF_FFFF_FFFF {
+        // 0x00FF_FFFF_FFFF_FFFF (max 56-bit) encodes byte-for-byte
+        // identical to write_unknown_size (the EBML all-ones
+        // "unknown/open-ended" sentinel), and anything larger doesn't fit
+        // the 7-byte payload. Reject so a finite size can never be emitted
+        // as the unknown-size marker.
+        Err(crate::error::Error::MkvInvalid.into())
     } else {
         // 8-byte size for large elements
         w.write_all(&[
@@ -119,9 +126,23 @@ pub fn start_master<W: Write + Seek>(w: &mut W, id: u32) -> io::Result<u64> {
 }
 
 /// End a master element: seek back and write the actual size.
+///
+/// `size_pos` must be the offset returned by [`start_master`], which always
+/// writes the 8-byte size placeholder before any body bytes. Therefore
+/// `end_pos >= size_pos + 8` always holds, and the resulting `data_size`
+/// fits the 7-byte VINT payload (a single MKV element exceeding 2^56 bytes
+/// is not representable and never produced here).
 pub fn end_master<W: Write + Seek>(w: &mut W, size_pos: u64) -> io::Result<()> {
     let end_pos = w.stream_position()?;
+    debug_assert!(
+        end_pos >= size_pos + 8,
+        "end_master: end_pos {end_pos} < size_pos {size_pos} + 8 (placeholder not written?)"
+    );
     let data_size = end_pos - size_pos - 8; // subtract the 8-byte size field itself
+    debug_assert!(
+        data_size < 0x0100_0000_0000_0000,
+        "end_master: data_size {data_size} exceeds the 7-byte VINT payload"
+    );
     w.seek(SeekFrom::Start(size_pos))?;
     // Write as 8-byte VINT: 0x01 followed by 7 bytes of size
     w.write_all(&[
@@ -216,6 +237,9 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
             | (b[1] as u64) << 16
             | (b[2] as u64) << 8
             | b[3] as u64;
+        if val == 0x07_FFFF_FFFF {
+            return Ok((u64::MAX, 5));
+        }
         Ok((val, 5))
     } else if b0 & 0x04 != 0 {
         let mut b = [0u8; 5];
@@ -226,6 +250,9 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
             | (b[2] as u64) << 16
             | (b[3] as u64) << 8
             | b[4] as u64;
+        if val == 0x3FF_FFFF_FFFF {
+            return Ok((u64::MAX, 6));
+        }
         Ok((val, 6))
     } else if b0 & 0x02 != 0 {
         let mut b = [0u8; 6];
@@ -237,8 +264,11 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
             | (b[3] as u64) << 16
             | (b[4] as u64) << 8
             | b[5] as u64;
+        if val == 0x01_FFFF_FFFF_FFFF {
+            return Ok((u64::MAX, 7));
+        }
         Ok((val, 7))
-    } else {
+    } else if b0 & 0x01 != 0 {
         let mut b = [0u8; 7];
         r.read_exact(&mut b)?;
         let val = (b[0] as u64) << 48
@@ -252,6 +282,13 @@ pub fn read_size(r: &mut impl Read) -> io::Result<(u64, usize)> {
             return Ok((u64::MAX, 8));
         }
         Ok((val, 8))
+    } else {
+        // b0 == 0x00: no length marker in the first byte. A VINT wider than
+        // 8 bytes is not representable by Matroska's size encoding, so this
+        // is a malformed/over-long size field rather than a valid 8-byte
+        // length. Reject it instead of silently building a size from the
+        // following 7 bytes (which would desync the parse).
+        Err(crate::error::Error::MkvInvalid.into())
     }
 }
 
@@ -280,13 +317,10 @@ pub fn read_uint_val(r: &mut impl Read, len: usize) -> io::Result<u64> {
     Ok(val)
 }
 
-/// Read a float value. EBML floats are exactly 0, 4, or 8 bytes.
-///
-/// The previous `else` branch read a fixed 8 bytes for ANY non-4 length,
-/// so a malformed element with `len > 8` left `len - 8` unconsumed bytes
-/// (mis-read as the next EBML header → desync of the rest of the parent
-/// element) and `len < 4` over-read. Consume exactly `len` bytes and
-/// reject anything that isn't a valid float width.
+/// Read a float value. EBML floats are exactly 0, 4, or 8 bytes; any other
+/// length is rejected as [`Error::MkvInvalid`] and exactly the float width is
+/// consumed (so a malformed element never under- or over-reads and desyncs the
+/// rest of the parent element).
 pub fn read_float_val(r: &mut impl Read, len: usize) -> io::Result<f64> {
     match len {
         0 => Ok(0.0),
@@ -311,7 +345,9 @@ pub fn read_string_val(r: &mut impl Read, len: usize) -> io::Result<String> {
     while buf.last() == Some(&0) {
         buf.pop();
     }
-    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // Library rule: errors are numeric variants, never English strings.
+    // A non-UTF-8 string element is malformed input → MkvInvalid.
+    String::from_utf8(buf).map_err(|_| crate::error::Error::MkvInvalid.into())
 }
 
 /// Read binary data of `len` bytes.
@@ -330,7 +366,10 @@ fn read_exact_bounded(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let got = r.take(len as u64).read_to_end(&mut buf)?;
     if got != len {
-        return Err(io::ErrorKind::UnexpectedEof.into());
+        // A truncated element is malformed input. Use the typed crate error
+        // so callers matching on Error::MkvInvalid catch short reads rather
+        // than a bare io::ErrorKind that bypasses the numeric-code identity.
+        return Err(crate::error::Error::MkvInvalid.into());
     }
     Ok(buf)
 }
@@ -454,6 +493,25 @@ mod tests {
         buf.clear();
         write_size(&mut buf, 126).unwrap();
         assert_eq!(buf, [126 | 0x80]); // 126 < 0x7F, uses 1 byte
+    }
+
+    #[test]
+    fn write_size_rejects_unknown_size_sentinel() {
+        // 0x00FF_FFFF_FFFF_FFFF would encode byte-for-byte identical to the
+        // EBML unknown-size marker; it must be rejected, not silently emitted.
+        let mut buf = Vec::new();
+        let e = write_size(&mut buf, 0x00FF_FFFF_FFFF_FFFF).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(buf.is_empty(), "no bytes should be written on rejection");
+
+        // One below the boundary still encodes as a normal 8-byte size whose
+        // payload is NOT all-ones, so read_size yields the finite value back.
+        buf.clear();
+        let v = 0x00FF_FFFF_FFFF_FFFE;
+        write_size(&mut buf, v).unwrap();
+        let (back, consumed) = read_size(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(consumed, 8);
+        assert_eq!(back, v);
     }
 
     #[test]
@@ -630,6 +688,79 @@ mod tests {
                 val
             );
         }
+    }
+
+    #[test]
+    fn read_size_unknown_sentinel_all_widths() {
+        // The all-ones VINT of each width is the EBML "unknown size" marker
+        // and must read back as u64::MAX. write_size never emits the 5/6/7-byte
+        // widths, so these are hand-crafted. Each entry is (bytes, expected_len).
+        let cases: &[(&[u8], usize)] = &[
+            // 1-byte: 0x80 | 0x7F
+            (&[0xFF], 1),
+            // 2-byte: 0x40 marker, value bits all 1
+            (&[0x7F, 0xFF], 2),
+            // 3-byte
+            (&[0x3F, 0xFF, 0xFF], 3),
+            // 4-byte
+            (&[0x1F, 0xFF, 0xFF, 0xFF], 4),
+            // 5-byte (0x08 marker)
+            (&[0x0F, 0xFF, 0xFF, 0xFF, 0xFF], 5),
+            // 6-byte (0x04 marker)
+            (&[0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 6),
+            // 7-byte (0x02 marker)
+            (&[0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 7),
+            // 8-byte (0x01 marker)
+            (&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 8),
+        ];
+        for (bytes, expected_len) in cases {
+            let mut cursor = Cursor::new(*bytes);
+            let (size, consumed) = read_size(&mut cursor).unwrap();
+            assert_eq!(
+                size,
+                u64::MAX,
+                "all-ones {}-byte VINT should be unknown-size",
+                expected_len
+            );
+            assert_eq!(consumed, *expected_len);
+        }
+    }
+
+    #[test]
+    fn read_size_concrete_5_6_7_byte_values() {
+        // A non-sentinel 5/6/7-byte size must read back as its concrete value,
+        // not be mistaken for unknown-size.
+        // 5-byte: marker 0x08, value 0x01 (0x0800000001 with width bit only).
+        let mut c = Cursor::new(&[0x08u8, 0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(read_size(&mut c).unwrap(), (1, 5));
+        // 6-byte
+        let mut c = Cursor::new(&[0x04u8, 0x00, 0x00, 0x00, 0x00, 0x05]);
+        assert_eq!(read_size(&mut c).unwrap(), (5, 6));
+        // 7-byte
+        let mut c = Cursor::new(&[0x02u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09]);
+        assert_eq!(read_size(&mut c).unwrap(), (9, 7));
+    }
+
+    #[test]
+    fn read_size_rejects_zero_first_byte() {
+        // b0 == 0x00 has no width marker — an over-long/invalid VINT. It must
+        // be rejected, not silently treated as an 8-byte size.
+        let mut c = Cursor::new(&[0x00u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let e = read_size(&mut c).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_size_rejects_at_or_above_2_56() {
+        // 2^56 cannot be encoded in the 7-payload-byte 8-byte VINT and must
+        // error rather than silently truncate.
+        let mut buf = Vec::new();
+        let e = write_size(&mut buf, 0x0100_0000_0000_0000).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // The largest encodable size still succeeds.
+        let mut buf = Vec::new();
+        write_size(&mut buf, 0x00FF_FFFF_FFFF_FFFE).unwrap();
+        assert_eq!(buf.len(), 8);
     }
 
     #[test]

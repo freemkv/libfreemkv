@@ -30,6 +30,12 @@ impl Disc {
         titles
     }
 
+    /// Parse one MPLS playlist into a [`DiscTitle`].
+    ///
+    /// Sums PlayItem durations; returns `None` if the playlist is under
+    /// 30 seconds (skips menu / clip-info stub playlists) or fails to
+    /// parse. Physical sector extents are pulled from the UDF allocation
+    /// descriptors of each referenced `.m2ts` (deduplicated by clip_id).
     pub(super) fn parse_playlist(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
@@ -55,27 +61,41 @@ impl Disc {
         let mut extents = Vec::new();
         let mut total_size: u64 = 0;
         let mut clips = Vec::with_capacity(parsed.play_items.len());
+        // BD playlists legally reference the same .m2ts clip_id from
+        // multiple PlayItems (multi-angle, seamless splits, looped
+        // segments). The physical extents and packet count must be
+        // counted ONCE per unique clip — mux reads extents in order, so
+        // a duplicate would mux the A/V twice and inflate size_bytes.
+        // Per-PlayItem Clip entries (differing in/out times) still get
+        // recorded.
+        let mut seen_clips: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for play_item in &parsed.play_items {
             let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
             let mut pkt_count: u32 = 0;
+            let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
             if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path) {
                 if let Ok(clip_info) = clpi::parse(&clpi_data) {
                     pkt_count = clip_info.source_packet_count;
-                    total_size += pkt_count as u64 * 192;
 
-                    // Get m2ts file extents from UDF allocation descriptors.
-                    // Dual-layer discs split files across layers — UDF knows the real layout.
-                    let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
-                    if let Ok(file_exts) = udf_fs.file_extents(reader, &m2ts_path) {
-                        for (lba, sectors) in file_exts {
-                            if sectors > 0 && lba > 0 {
-                                extents.push(Extent {
-                                    start_lba: lba,
-                                    sector_count: sectors,
-                                });
+                    // Only fetch/push the physical extents and add to the
+                    // total size the first time this clip_id is seen.
+                    if first_ref {
+                        total_size += pkt_count as u64 * 192;
+
+                        // Get m2ts file extents from UDF allocation descriptors.
+                        // Dual-layer discs split files across layers — UDF knows the real layout.
+                        let m2ts_path = format!("/BDMV/STREAM/{}.m2ts", play_item.clip_id);
+                        if let Ok(file_exts) = udf_fs.file_extents(reader, &m2ts_path) {
+                            for (lba, sectors) in file_exts {
+                                if sectors > 0 && lba > 0 {
+                                    extents.push(Extent {
+                                        start_lba: lba,
+                                        sector_count: sectors,
+                                    });
+                                }
                             }
                         }
                     }
@@ -170,23 +190,49 @@ impl Disc {
             })
             .collect();
 
-        // Convert marks to chapters (mark_type 0 or 1 = chapter entry, 2 = link)
-        let first_in_time = parsed.play_items.first().map(|pi| pi.in_time).unwrap_or(0);
+        // Convert marks to chapters. mark_type == 1 is an entry-mark
+        // (chapter); type 2 is a link point and type 0 is reserved, so
+        // neither is a chapter.
+        //
+        // Each mark's timestamp is in the timebase of the PlayItem it
+        // references (play_item_ref). The chapter's position on the
+        // muxed timeline is the summed duration of every preceding
+        // PlayItem plus the mark's offset within its own PlayItem. Using
+        // play_items[0].in_time for every mark would misplace chapters in
+        // multi-PlayItem playlists.
         let chapters: Vec<Chapter> = parsed
             .marks
             .iter()
-            .filter(|m| m.mark_type <= 1)
-            .enumerate()
-            .map(|(i, m)| {
-                let time_secs = (m.timestamp as f64 - first_in_time as f64) / 45000.0;
-                Chapter {
+            .filter(|m| m.mark_type == 1)
+            .filter_map(|m| {
+                let pi_idx = m.play_item_ref as usize;
+                let pi = parsed.play_items.get(pi_idx)?;
+                let preceding: f64 = parsed.play_items[..pi_idx]
+                    .iter()
+                    .map(|p| p.out_time.saturating_sub(p.in_time) as f64 / 45000.0)
+                    .sum();
+                let within = (m.timestamp as f64 - pi.in_time as f64) / 45000.0;
+                let time_secs = preceding + within;
+                Some(Chapter {
                     time_secs: if time_secs < 0.0 { 0.0 } else { time_secs },
-                    name: format!("Chapter {}", i + 1),
-                }
+                    name: String::new(), // filled with the ordinal below
+                })
+            })
+            .enumerate()
+            .map(|(i, mut ch)| {
+                ch.name = super::chapter_name(i);
+                ch
             })
             .collect();
 
-        let playlist_num = filename.trim_end_matches(".mpls").trim_end_matches(".MPLS");
+        // Strip the .mpls suffix case-insensitively before parsing the
+        // numeric playlist id (the dir scan accepts any-case .mpls).
+        let playlist_num = filename
+            .get(..filename.len().saturating_sub(5))
+            .filter(|_| {
+                filename.len() >= 5 && filename[filename.len() - 5..].eq_ignore_ascii_case(".mpls")
+            })
+            .unwrap_or(filename);
         let playlist_id = playlist_num.parse::<u16>().unwrap_or(0);
 
         Some(DiscTitle {

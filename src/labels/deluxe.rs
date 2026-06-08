@@ -16,11 +16,13 @@
 //! | Purpose | 8 ldcs starting `Normal, Commentary, PiP, Trivia, ...` |
 //! | VideoFormat | 7 ldcs starting `HD, HDR10 Plus, HD Dolby, ...` |
 //! | Region | 22 ldcs starting `USA_D1, LIC1, LIC2, LIC3, ...` |
-//! | Studio | 6 ldcs starting `Disney, Marvel, Pixar, ...` |
-//! | Codec | many `new` instructions, 0 ldcs in `<clinit>` (codec strings live in subclasses) |
+//! | Studio | 6 ldcs in `<clinit>` |
 //!
 //! Matching on the shape rather than the class name keeps the parser
-//! working across obfuscation variants.
+//! working across obfuscation variants. Codec strings come from the
+//! standard BD-J `org/bluray/ti/CodingType` enum referenced directly by
+//! the binding constructors (see [`StackVal::CodingType`]), not from a
+//! Deluxe-internal enum.
 //!
 //! ## Implementation phases
 //!
@@ -28,14 +30,6 @@
 //!   Walks every `.class`'s `<clinit>` ldc sequence and matches against
 //!   the framework-stable fingerprints. Output: `Vec<(label, MasterEnum)>`
 //!   with full ordinal → string-value tables.
-//!
-//! - **Phase B** — codec enum subclass walk (`decode_codec_enum`).
-//!   The codec enum's `<clinit>` has many `new` instructions and zero
-//!   string ldcs — codec name strings live in the subclasses each
-//!   `new` constructs. Walks every referenced subclass's constant
-//!   pool, extracts the codec name string, following the standard Java
-//!   enum compilation convention (each enum value's `<init>` is called
-//!   with its name string as the first arg).
 //!
 //! - **Phase C** — binding-class identification (`find_binding_classes`).
 //!   The per-stream table is built by some class via repeated
@@ -104,21 +98,6 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 
         // Build a fast-lookup table for Phase D's bytecode decoder.
         let master_table = MasterEnumTable::from(&enums);
-
-        // Phase B — codec enum (structural + subclass walk).
-        let codec_shape = find_codec_enum(archive);
-        let codec_table = match codec_shape.as_ref() {
-            Some(shape) => decode_codec_enum(archive, shape),
-            None => CodecTable::default(),
-        };
-        if let Some(shape) = &codec_shape {
-            tracing::info!(
-                jar = %entry_name,
-                class = %shape.class_name,
-                count = codec_table.codecs.len(),
-                "deluxe codec enum decoded",
-            );
-        }
 
         // Phase C — find ALL binding-class candidates (audio + subtitle
         // are often split across two classes on Deluxe). Each gets its
@@ -323,203 +302,6 @@ fn ldcs_match_prefix(ldcs: &[String], prefix: &[&str]) -> bool {
         .all(|(got, want)| got == want)
 }
 
-/// Phase B (structural): identify the codec enum class. The codec
-/// enum's `<clinit>` has many `new` instructions (one per codec value)
-/// and zero string ldcs — codec name strings live in the subclasses
-/// each `new` constructs, not in the enum class itself. This function
-/// returns the candidate enum's class name + the ordered list of
-/// subclass class names; [`decode_codec_enum`] walks those subclasses
-/// to extract the codec strings.
-pub(crate) fn find_codec_enum(archive: &mut jar::Jar) -> Option<CodecEnumShape> {
-    let mut best: Option<(String, Vec<String>)> = None;
-    jar::for_each_class(archive, |class_name, class| {
-        let Some((news, ldcs)) = clinit_news_and_ldcs(class) else {
-            return;
-        };
-        // Codec enum's <clinit> has many `new` ops, 0 string ldcs.
-        if news.len() < 20 || !ldcs.is_empty() {
-            return;
-        }
-        match &best {
-            None => best = Some((class_name.to_string(), news)),
-            Some((_, prev)) => {
-                if news.len() > prev.len() {
-                    best = Some((class_name.to_string(), news));
-                }
-            }
-        }
-    });
-    best.map(|(class_name, subclass_news)| CodecEnumShape {
-        class_name,
-        subclass_news,
-    })
-}
-
-#[derive(Debug)]
-pub(crate) struct CodecEnumShape {
-    pub class_name: String,
-    /// Ordered list of class names referenced by `new` in <clinit>.
-    /// One entry per codec enum value; subclass walking resolves
-    /// each to a codec string.
-    pub subclass_news: Vec<String>,
-}
-
-/// Phase B (subclass walk): given the codec enum's structural shape,
-/// walk each referenced subclass's constant pool to extract its
-/// codec name string. Output is ordinal-indexed: `codecs[i]` is the
-/// codec name for the i-th `new` instruction in the enum's `<clinit>`.
-///
-/// The codec name extraction heuristic: each subclass's constant
-/// pool typically contains a small number of Utf8 entries; the
-/// codec-name-shaped one is uppercase, ≥4 chars, optionally with
-/// underscores or digits. We pick the first matching Utf8 entry that
-/// isn't a method-descriptor sigil, class-name fragment, or attribute
-/// name. Empty string when no candidate is found — the parser can
-/// surface "unknown codec at ordinal N" via tracing.
-pub(crate) fn decode_codec_enum(archive: &mut jar::Jar, shape: &CodecEnumShape) -> CodecTable {
-    // Two-pass: first pass extracts the codec-name candidate from
-    // every class in the jar (cheap to do all at once, cache for the
-    // ordinal-ordered second pass).
-    let mut name_by_class: HashMap<String, String> = HashMap::new();
-    let wanted: HashSet<&str> = shape.subclass_news.iter().map(String::as_str).collect();
-    jar::for_each_class(archive, |class_name, class| {
-        if !wanted.contains(class_name) {
-            return;
-        }
-        if let Some(name) = extract_codec_name(class) {
-            name_by_class.insert(class_name.to_string(), name);
-        }
-    });
-
-    let codecs: Vec<String> = shape
-        .subclass_news
-        .iter()
-        .map(|c| name_by_class.get(c).cloned().unwrap_or_default())
-        .collect();
-    CodecTable { codecs }
-}
-
-/// Per-codec name table — `codecs[ordinal]` is the codec string for
-/// that enum value. Empty string for ordinals where Phase B couldn't
-/// extract a name (rare; logged via tracing).
-#[derive(Debug, Default, Clone)]
-pub(crate) struct CodecTable {
-    pub codecs: Vec<String>,
-}
-
-impl CodecTable {
-    /// Resolve a codec enum ordinal to its name string. Returns None
-    /// for out-of-range ordinals or for entries Phase B couldn't
-    /// extract (those slots are stored as empty strings, which this
-    /// helper normalizes to None).
-    #[allow(dead_code)] // surface for callers; interpret_streams uses
-    // binding_type substring match for now (codec-ordinal wiring
-    // deferred until corpus bytecode confirms the codec arg position).
-    pub fn get(&self, ordinal: u16) -> Option<&str> {
-        let s = self.codecs.get(ordinal as usize)?;
-        if s.is_empty() { None } else { Some(s.as_str()) }
-    }
-}
-
-/// Heuristic: extract the codec-name string from a codec-enum
-/// subclass's constant pool. Codec names are uppercase tokens with
-/// optional underscores/digits, ≥4 chars (e.g. "ATMOS_HD_AUDIO",
-/// "DOLBY_AC3_AUDIO", "DTS_HD_MA", "PCM_5_1"). We scan the pool's
-/// Utf8 entries and pick the first that:
-///   - is ≥4 chars
-///   - contains only A-Z, 0-9, and _
-///   - contains at least one underscore OR is a known codec token
-///     (the underscore signal is what separates "ATMOS_HD_AUDIO"
-///     from "Utf8" / "Code" / "Object" attribute names).
-///
-/// Returns `None` when no candidate matches — the caller's `codecs[i]`
-/// will be empty for that ordinal.
-fn extract_codec_name(class: &ClassFile) -> Option<String> {
-    for (_, entry) in class.constant_pool.iter() {
-        let CpInfo::Utf8(s) = entry else {
-            continue;
-        };
-        if s.len() < 4 {
-            continue;
-        }
-        if !s
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        {
-            continue;
-        }
-        if !s.contains('_') {
-            // Single-token all-caps strings might still be valid
-            // (e.g. "ATMOS", "DTS"). Require at least one of the
-            // known codec token roots to avoid false positives like
-            // attribute names that happen to be uppercase. For now
-            // we only accept these as a fallback.
-            let is_known_root = [
-                "ATMOS", "DOLBY", "DTS", "TRUEHD", "MLP", "AC3", "EAC3", "PCM",
-            ]
-            .iter()
-            .any(|root| s == *root);
-            if !is_known_root {
-                continue;
-            }
-        }
-        return Some(s.clone());
-    }
-    None
-}
-
-/// Walk `<clinit>` and return `(new_class_names, ldc_strings)`. Used
-/// for the codec-enum shape match where we care about both counts.
-#[allow(dead_code)]
-fn clinit_news_and_ldcs(
-    class: &super::class_reader::ClassFile,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let mut news = Vec::new();
-    let mut ldcs = Vec::new();
-    let mut found = false;
-    let mut _aastore = 0u32;
-    for m in &class.methods {
-        let Some(name) = class.member_name(m) else {
-            continue;
-        };
-        if name != "<clinit>" {
-            continue;
-        }
-        found = true;
-        let Some(code) = m.code(&class.constant_pool) else {
-            continue;
-        };
-        for insn in code.instructions() {
-            match insn.opcode {
-                NEW => {
-                    if let Some(idx) = insn.cp_index() {
-                        if let Some(n) = class.constant_pool.class_name(idx) {
-                            news.push(n.to_string());
-                        }
-                    }
-                }
-                LDC | LDC_W => {
-                    if let Some(idx) = insn.cp_index() {
-                        let s = match class.constant_pool.get(idx) {
-                            Some(CpInfo::String { string_index }) => {
-                                class.constant_pool.utf8(*string_index).map(str::to_string)
-                            }
-                            Some(CpInfo::Utf8(s)) => Some(s.clone()),
-                            _ => None,
-                        };
-                        if let Some(s) = s {
-                            ldcs.push(s);
-                        }
-                    }
-                }
-                AASTORE => _aastore += 1,
-                _ => {}
-            }
-        }
-    }
-    if found { Some((news, ldcs)) } else { None }
-}
-
 // ── Phase C: find the binding class ─────────────────────────────────────────
 
 /// Phase C: identify the class that builds the per-stream label table.
@@ -647,15 +429,18 @@ pub(crate) fn decode_binding(
     binding_class_name: &str,
     master: &MasterEnumTable,
 ) -> Vec<Construction> {
-    let mut out: Vec<Construction> = Vec::new();
     let target_name = binding_class_name.to_string();
-    jar::for_each_class(archive, |class_name, class| {
+    // Short-circuit on the name match: try_each_class stops iterating
+    // (and stops decompressing/parsing remaining .class entries) as soon
+    // as the closure returns Some, instead of walking the whole jar past
+    // the target.
+    jar::try_each_class(archive, |class_name, class| {
         if class_name != target_name {
-            return;
+            return None;
         }
-        out = decode_binding_class(class, master);
-    });
-    out
+        Some(decode_binding_class(class, master))
+    })
+    .unwrap_or_default()
 }
 
 /// Walk every method named `<clinit>` (typically only one) on this
@@ -1563,25 +1348,6 @@ mod tests {
             coding_type_to_codec_hint("FUTURE_CODEC_X"),
             "FUTURE_CODEC_X"
         );
-    }
-
-    #[test]
-    fn extract_codec_name_picks_uppercase_with_underscore() {
-        // Synthetic class file built via ClassFile::parse would be
-        // overkill; here we directly invoke extract_codec_name via a
-        // minimal hand-built ClassFile. Skip — covered indirectly by
-        // the end-to-end Phase B tests at corpus runtime. Tested
-        // signal: the matcher logic itself.
-        // (Helper inlined for clarity rather than spinning up a fake
-        // class.)
-        let candidate_strings = ["Code", "Utf8", "ATMOS_HD_AUDIO", "MyVar"];
-        let result = candidate_strings.iter().find(|s| {
-            s.len() >= 4
-                && s.chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                && s.contains('_')
-        });
-        assert_eq!(result, Some(&"ATMOS_HD_AUDIO"));
     }
 
     #[test]

@@ -19,11 +19,14 @@
 //! recycled buffer pools — no allocations or memcpys in the steady-
 //! state hot loop.
 //!
-//! This is the *only* read-side `Stream` impl in tree. Both ISO file
-//! mux ([`crate::mux::resolve`]) and BD-TS file mux ([`crate::mux::M2tsStream`])
-//! return a `PipelinedPesStream`; the differences are in how the
-//! producer thread (A) is configured — sector-aligned reads with
-//! AACS decrypt for ISO, raw byte reads for M2TS.
+//! This is the *only* read-side `Stream` impl in tree. Both the ISO
+//! file mux and the BD-TS (`m2ts://`) file mux input paths are built by
+//! [`crate::mux::resolve`] (`build_iso_pipeline` / the m2ts pipeline
+//! builder) and hand back a `PipelinedPesStream`; the differences are
+//! in how the producer thread (A) is configured — sector-aligned reads
+//! with AACS decrypt for ISO, raw byte reads for M2TS.
+//! ([`crate::mux::M2tsStream`] itself is a write-only sink and does not
+//! construct this type.)
 
 use super::codec::CodecParser;
 use super::demux_thread::{DemuxBatch, DemuxThread};
@@ -48,6 +51,11 @@ pub struct PipelinedPesStream {
 
     pending_frames: std::collections::VecDeque<PesFrame>,
     eof: bool,
+    /// Cached `FREEMKV_SKIP_PARSE` profiling flag. Read once in `new()`
+    /// — the env var cannot change for the life of the stream, and
+    /// `std::env::var_os` takes a process-wide lock, so the per-batch /
+    /// per-poll reads it replaces were needless hot-path overhead.
+    skip_parse: bool,
 }
 
 impl PipelinedPesStream {
@@ -55,7 +63,12 @@ impl PipelinedPesStream {
     /// `DemuxThread` (which in turn owns the producer); we take the
     /// receiver end + the join handle bundle so cleanup is bounded
     /// on drop.
-    pub fn new(
+    ///
+    /// `pub(crate)`: the signature takes the internal `DemuxThread` /
+    /// `DemuxBatch` / `CodecParser` types, so external callers reach this
+    /// stream via [`super::resolve::input`] / `build_iso_pipeline`
+    /// instead.
+    pub(crate) fn new(
         demux_thread: DemuxThread,
         demux_rx: Receiver<DemuxBatch>,
         title: DiscTitle,
@@ -70,6 +83,7 @@ impl PipelinedPesStream {
             demux_thread,
             pending_frames: std::collections::VecDeque::new(),
             eof: false,
+            skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
         }
     }
 
@@ -88,12 +102,19 @@ impl PipelinedPesStream {
                 Ok(true)
             }
             Ok(DemuxBatch::Err(e)) => Err(e),
-            Err(_) => Ok(false),
+            // Explicit clean-completion sentinel from the demux worker.
+            Ok(DemuxBatch::Eof) => Ok(false),
+            // The channel disconnected WITHOUT the worker first sending
+            // an `Eof` (or `Err`) sentinel — the worker panicked or was
+            // dropped mid-stream. Surface this as an error so a parser /
+            // demux panic is never reported to the caller as a clean
+            // end-of-stream (which would silently truncate output).
+            Err(_) => Err(crate::error::Error::DemuxThreadPanicked.into()),
         }
     }
 
     fn consume_ts(&mut self, packets: Vec<PesPacket>) {
-        let skip_parse = std::env::var_os("FREEMKV_SKIP_PARSE").is_some();
+        let skip_parse = self.skip_parse;
         for pes in packets {
             if let Some((_, track)) = self
                 .pid_to_track
@@ -218,7 +239,7 @@ impl Stream for PipelinedPesStream {
         // codec_private before the consumer can write the container
         // header. FREEMKV_SKIP_PARSE forces ready (no parser ever
         // populates codec_private in that mode).
-        if std::env::var_os("FREEMKV_SKIP_PARSE").is_some() {
+        if self.skip_parse {
             return true;
         }
         for (idx, s) in self.title.streams.iter().enumerate() {

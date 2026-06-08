@@ -34,14 +34,20 @@ pub struct ReadCtx {
     /// Sliding window of recent read outcomes (true=ok, false=fail).
     /// Capped at `damage_window_max`. Drives damage-jump decisions.
     pub damage_window: Vec<bool>,
+    /// Maximum number of outcome entries kept in `damage_window`; the
+    /// oldest is evicted once this is exceeded. A whole count (e.g. 16).
     pub damage_window_max: usize,
+    /// Fraction of `damage_window` entries that must be failures before
+    /// the window-based damage-jump fires, as a whole-number percentage
+    /// (e.g. `12` = 12%).
     pub damage_threshold_pct: usize,
     /// Trigger a damage-jump after this many consecutive outer-batch
     /// failures, even when the damage_window isn't full yet. Pass 1
-    /// uses a small value (4) so we don't spend ~40 minutes grinding
-    /// to fill a 16-block window before the first jump on a damage
-    /// zone we entered cleanly. Pass N uses a larger value (or
-    /// disables this — see `bisect_on_marginal`) because Pass N's
+    /// uses a small value (1 — jump on the first outer failure; see
+    /// the 2026-05-11 rewrite in `for_sweep`) so we don't spend ~40
+    /// minutes grinding to fill a 16-block window before the first jump
+    /// on a damage zone we entered cleanly. Pass N uses a larger value
+    /// (or disables this — see `bisect_on_marginal`) because Pass N's
     /// whole job IS to grind on the bad ranges.
     pub fast_jump_threshold: u64,
     /// Multiplier applied to damage-jump distance. Doubles each jump,
@@ -240,6 +246,13 @@ impl ReadCtx {
         // drive recovered, so further wedges should reset the skip
         // budget instead of accumulating toward a real abort.
         self.wedge_count = 0;
+        // A successful read also means the bridge recovered, so the
+        // 15s-cooldown retry budget should be available again for the
+        // next bridge-degradation event. Without this reset the budget
+        // saturates permanently after 5 cumulative events across the
+        // whole pass and later degradations skip the cooldown retry,
+        // needlessly losing data.
+        self.bridge_degradation_count = 0;
         // Outer-success only: a good single-sector read inside a
         // bisect doesn't mean we've left the damaged batch. Only an
         // outer-batch success resets the outer-failure counter.
@@ -259,6 +272,13 @@ impl ReadCtx {
         if self.in_damage_zone && self.consecutive_good >= self.damage_window_max as u64 {
             self.in_damage_zone = false;
             self.last_error_family = None;
+            // Reset the damage-jump multiplier so the NEXT zone starts
+            // from the base jump distance. Without this the multiplier
+            // stays at whatever the prior zone inflated it to (up to
+            // MAX_JUMP_MULTIPLIER=64), so the next zone's first jump is
+            // 64x oversized and skips recoverable data. The field doc
+            // promises this reset.
+            self.jump_multiplier = 1;
         }
     }
 
@@ -375,9 +395,9 @@ const JUMP_BASE_SECTORS: u64 = 1024;
 // When the BU40N (or similar drives) hits a physical-damage cluster,
 // its firmware can transition into a "wedge" state where it returns
 // HARDWARE_ERROR or ILLEGAL_REQUEST for every subsequent read —
-// often for many LBAs after the actual bad sector. Per project docs
-// "Bad-sector handling" rule #2: "Recovery requires eject+reload OR
-// significant cool-down."
+// often for many LBAs after the actual bad sector. Once wedged,
+// recovery requires either a physical eject + reload or a significant
+// cool-down period; hammering the same LBA only deepens the state.
 //
 // Pass 1's pre-fix behavior was to immediately AbortPass on the
 // first HARDWARE_ERROR / ILLEGAL_REQUEST, killing the rip at
@@ -396,10 +416,10 @@ const JUMP_BASE_SECTORS: u64 = 1024;
 /// One-gigabyte jump (1024 MiB) on each wedge. Big enough to clear
 /// almost any single-cluster damage zone we've seen.
 const WEDGE_JUMP_SECTORS: u64 = 524_288;
-/// Cooldown pause after each wedge. Per project docs the drive needs
-/// "significant cool-down"; 30 s strikes a balance between giving
-/// the drive a chance to recover and not stalling the rip if the
-/// drive is permanently stuck.
+/// Cooldown pause after each wedge. A wedged drive needs a
+/// significant cool-down to leave fast-fail; 30 s strikes a balance
+/// between giving the drive a chance to recover and not stalling the
+/// rip if the drive is permanently stuck.
 const WEDGE_PAUSE_SECS: u64 = 30;
 /// Bail after this many consecutive wedges with no good read in
 /// between. At 1 GB jumps this lets us scan ~16 GB worth of fully
@@ -463,8 +483,13 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         .unwrap_or(SenseFamily::Other);
 
     // Zone-entry tracking: this is the first error after a clean run
-    // (or the first error of the sweep).
-    if !ctx.in_damage_zone && !ctx.bisecting {
+    // (or the first error of the sweep). Capture the genuine
+    // clean->damaged transition here, BEFORE mutating in_damage_zone,
+    // so the 30s zone-entry cooldown below keys off the real
+    // transition rather than re-deriving it from a counter that the
+    // fast-jump path resets after every jump.
+    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting;
+    if is_zone_entry_transition {
         ctx.in_damage_zone = true;
         ctx.zones_entered += 1;
     }
@@ -569,9 +594,13 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    AbortPass after N consecutive wedges with no successful
     //    read in between.
     if sense_key == scsi::SENSE_KEY_HARDWARE_ERROR || sense_key == scsi::SENSE_KEY_ILLEGAL_REQUEST {
-        if !ctx.bisecting {
-            ctx.wedge_count += 1;
-        }
+        // Count every wedge, including bisect-inner ones. A wedge is a
+        // firmware fast-fail state regardless of whether we're inside a
+        // bisect; if we did NOT count bisect-inner wedges, a drive that
+        // wedges mid-bisect would burn a 30s WEDGE_PAUSE cooldown per
+        // inner sector and never reach WEDGE_ABORT_THRESHOLD from inside
+        // the bisect — ~16 min of cooldown sleeping on a batch=32 bisect.
+        ctx.wedge_count += 1;
         if ctx.wedge_count >= WEDGE_ABORT_THRESHOLD {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -665,8 +694,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     // branch for future tuning. Pass N (bisect_on_marginal=true)
     // uses the standard pauses — it's running single-sector retries
     // on already-known-bad LBAs by design.
-    let is_zone_entry =
-        ctx.consecutive_outer_failures == 1 && !ctx.bisecting && !ctx.bisect_on_marginal;
+    let is_zone_entry = is_zone_entry_transition && !ctx.bisecting && !ctx.bisect_on_marginal;
     let pause_secs = if is_zone_entry {
         ZONE_ENTRY_COOLDOWN_SECS
     } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
@@ -692,7 +720,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    Two triggers, evaluated in order:
     //
     //    a. **Fast-entry** — `consecutive_outer_failures >= fast_jump_threshold`.
-    //       Fires on Pass 1 (threshold=4) so we don't spend ~40 min
+    //       Fires on Pass 1 (threshold=1) so we don't spend ~40 min
     //       grinding to fill a 16-block damage window before the
     //       first jump on a damage zone we entered cleanly. Doesn't
     //       fire on Pass N (threshold=u64::MAX).
@@ -1030,6 +1058,43 @@ mod tests {
     }
 
     #[test]
+    fn pass_1_subsequent_in_zone_errors_skip_long_cooldown() {
+        // Regression: the fast-jump path resets consecutive_outer_failures
+        // to 0 after each jump, so the next in-zone error re-increments it
+        // to 1. Zone-entry must key off the genuine clean->damaged
+        // transition (in_damage_zone), not the counter, otherwise every
+        // error in a damaged region pays the 30 s cooldown.
+        let mut ctx = ReadCtx::for_sweep(32);
+        // First error: genuine zone entry, gets the long cooldown.
+        let first = handle_read_error(&medium_err(), &mut ctx);
+        match first {
+            ReadAction::JumpAhead { pause_secs, .. } => assert_eq!(
+                pause_secs,
+                ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS
+            ),
+            other => panic!("expected JumpAhead on first error, got {other:?}"),
+        }
+        // We are now still in the damage zone; the jump reset the outer
+        // counter. A second error must NOT re-arm the 30 s cooldown.
+        assert!(ctx.in_damage_zone);
+        let second = handle_read_error(&medium_err(), &mut ctx);
+        let pause = match second {
+            ReadAction::JumpAhead { pause_secs, .. } => pause_secs,
+            ReadAction::SkipBlock { pause_secs } => pause_secs,
+            other => panic!("expected pausing action, got {other:?}"),
+        };
+        assert_ne!(
+            pause,
+            ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
+            "subsequent in-zone error must not pay the 30 s zone-entry cooldown"
+        );
+        assert!(
+            pause <= FAIL_PAUSE_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
+            "subsequent in-zone pause should be the standard fail pause, got {pause}"
+        );
+    }
+
+    #[test]
     fn pass_n_pauses_uniformly_on_failed_read() {
         // Pass N (bisect_on_marginal=true) is exempt from the
         // zone-entry long pause — its whole job is to retry single
@@ -1064,6 +1129,66 @@ mod tests {
         assert!(
             saw_jump,
             "expected at least one JumpAhead in 6 failures with 50% threshold"
+        );
+    }
+
+    #[test]
+    fn jump_multiplier_resets_after_damage_zone_exit() {
+        // A zone that doubles the multiplier must not carry the inflated
+        // value into the next zone — otherwise the next zone's first
+        // jump is up to 64x oversized and skips recoverable data.
+        let mut ctx = ReadCtx::for_sweep(32);
+        // First zone: a few errors push jumps and double the multiplier.
+        for _ in 0..4 {
+            handle_read_error(&medium_err(), &mut ctx);
+        }
+        assert!(
+            ctx.jump_multiplier > 1,
+            "expected the multiplier to inflate inside a damage zone"
+        );
+        // Exit the zone: damage_window_max consecutive good reads.
+        ctx.bisecting = false;
+        for _ in 0..ctx.damage_window_max {
+            ctx.on_success();
+        }
+        assert!(!ctx.in_damage_zone, "zone should have exited");
+        assert_eq!(
+            ctx.jump_multiplier, 1,
+            "jump_multiplier must reset to 1 on zone exit"
+        );
+    }
+
+    #[test]
+    fn bridge_degradation_count_resets_on_success() {
+        // After a good read the bridge recovered; the 15s-cooldown retry
+        // budget must be available again instead of staying saturated
+        // for the whole pass.
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bridge_degradation_count = BRIDGE_DEGRADATION_MAX_RETRIES;
+        ctx.on_success();
+        assert_eq!(ctx.bridge_degradation_count, 0);
+    }
+
+    #[test]
+    fn wedge_abort_reachable_during_bisect() {
+        // A drive that wedges mid-bisect must still reach the abort
+        // threshold rather than burning a WEDGE_PAUSE cooldown per inner
+        // sector forever.
+        let mut ctx = ReadCtx::for_patch(32);
+        ctx.bisecting = true;
+        let mut aborted = false;
+        for _ in 0..WEDGE_ABORT_THRESHOLD {
+            if matches!(
+                handle_read_error(&hardware_err(), &mut ctx),
+                ReadAction::AbortPass
+            ) {
+                aborted = true;
+                break;
+            }
+        }
+        assert!(
+            aborted,
+            "wedge abort threshold must be reachable from inside a bisect"
         );
     }
 

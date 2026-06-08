@@ -5,10 +5,9 @@
 //! The consumer's behaviour is supplied by a [`Sink`] implementation:
 //! `apply` is called once per item, `close` is called once at the end.
 //!
-//! Three call sites in libfreemkv want a producer/consumer split —
-//! sweep (migrated to `disc/sweep.rs::SweepSink`), patch, and mux.
-//! 0.18 collapses all three onto this primitive; sweep is in,
-//! patch and mux migrate in later 0.18 slices.
+//! Call sites in libfreemkv that want a producer/consumer split —
+//! sweep (`disc/sweep.rs::SweepSink`) and the file-backed mux highway
+//! — are built on this primitive.
 //!
 //! ## Cancellation and error semantics
 //!
@@ -24,7 +23,8 @@
 //!   blocks on a dead receiver, and the first error is propagated as
 //!   the `JoinHandle` result.
 //! - Consumer panic is converted into
-//!   `Error::IoError { source: io::Error::other(...) }`.
+//!   [`Error::PipelineConsumerPanicked`] (the panic message is logged,
+//!   not embedded in the error value).
 //!
 //! ## Debug logging
 //!
@@ -32,7 +32,6 @@
 //! logging throughout the pipeline (channel sends/receives, backpressure,
 //! consumer lag detection). This is critical for diagnosing stalls.
 
-use std::io;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -41,15 +40,14 @@ use crossbeam_channel::{Sender, TrySendError, bounded};
 use crate::error::Error;
 use crate::halt::Halt;
 
-/// Deadline for [`Pipeline::finish_with_halt`]'s polling join. Chosen
-/// to be comfortably longer than the autorip hard watchdog
-/// (`HARD_WATCHDOG_STALL_SECS = 300s`) so the watchdog's `exit(1)`
-/// fires first when both are racing on the same wedged consumer.
+/// Deadline for [`Pipeline::finish_with_halt`]'s polling join.
 ///
 /// 10 minutes is a backstop, not a normal timeout — the consumer is
 /// expected to drain in seconds. If we hit this, something is wedged
-/// inside a kernel call the consumer thread can't unwind from, and the
-/// caller has already lost the rip.
+/// inside a kernel call the consumer thread can't unwind from. It is
+/// deliberately long so a consuming application's own (shorter) stall
+/// watchdog gets the first chance to escalate; this join only fires
+/// when no such watchdog intervenes.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
 /// Halt-check cadence for the send loop. Producer blocks on
@@ -72,11 +70,40 @@ use crate::halt::POLL_INTERVAL;
 const SEND_HALT_CHECK_INTERVAL: Duration = POLL_INTERVAL;
 
 /// Check if verbose debug logging is enabled via FREEMKV_DEBUG env var.
+///
+/// The value cannot change mid-run, and this is called multiple times
+/// per item on the mux highway hot loop, so the env lookup (a String
+/// allocation behind the global env lock) is cached after the first
+/// call.
 pub fn debug_enabled() -> bool {
-    std::env::var("FREEMKV_DEBUG")
-        .ok()
-        .map(|v| v == "1" || v == "true" || v == "yes")
-        .unwrap_or(false)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FREEMKV_DEBUG")
+            .ok()
+            .map(|v| v == "1" || v == "true" || v == "yes")
+            .unwrap_or(false)
+    })
+}
+
+/// Turn a consumer-thread panic payload into the numeric
+/// [`Error::PipelineConsumerPanicked`] variant. The original panic
+/// message (the two stdlib formats `panic!` produces: `&str` /
+/// `String`) is logged at the join site for diagnostics — it is NOT
+/// baked into the error value, since the library carries no English
+/// text in its errors. Callers discriminate on the variant.
+fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
+    let msg = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+        .unwrap_or("(no message)");
+    tracing::error!(
+        target: "freemkv::pipeline",
+        phase = "consumer_panicked",
+        panic_message = msg,
+        "pipeline consumer thread panicked"
+    );
+    Error::PipelineConsumerPanicked
 }
 
 /// Default channel depth for callers without a specific reason to
@@ -104,11 +131,12 @@ pub const WRITE_THROUGH_DEPTH: usize = 1;
 /// ([`Flow::Continue`]), or stop the pipeline early and run `close()`
 /// ([`Flow::Stop`]).
 ///
-/// `Stop` has no in-tree caller in this slice — sweep never returns
-/// it (it always processes the producer's full work-list before the
-/// channel is dropped). Patch and mux are the intended consumers and
-/// migrate in later 0.18 slices. The variant ships now so the contract
-/// is fixed; the targeted `#[allow]` is removed when patch lands.
+/// `Stop` currently has no in-tree caller — sweep never returns it (it
+/// always processes the producer's full work-list before the channel
+/// is dropped), and the mux highway drains to EOF. The variant is part
+/// of the fixed `Sink` contract for early-stop consumers, so the
+/// `#[allow(dead_code)]` is intentional and permanent until such a
+/// consumer lands.
 pub enum Flow {
     Continue,
     #[allow(dead_code)]
@@ -184,11 +212,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 let mut stopped = false;
 
                 while let Ok(item) = rx.recv() {
-                    if debug_enabled() {
+                    let debug = debug_enabled();
+                    if debug {
                         tracing::debug!("Pipeline receive: item={}", std::any::type_name::<I>());
                     }
-
-                    let apply_start = std::time::Instant::now();
 
                     if first_err.is_some() || stopped {
                         // Drain remaining items so the producer never
@@ -196,35 +223,43 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                         // called once we've decided to stop.
                         continue;
                     }
+
+                    // Only pay for the timestamp when debug tracing is
+                    // on — this runs per item on the mux highway hot
+                    // path.
+                    let apply_start = debug.then(Instant::now);
+
                     match sink.apply(item) {
                         Ok(Flow::Continue) => {}
                         Ok(Flow::Stop) => {
                             stopped = true;
-                            if debug_enabled() {
+                            if debug {
                                 tracing::debug!("Pipeline: consumer returned Flow::Stop");
                             }
                         }
                         Err(e) => {
-                            if debug_enabled() {
+                            if debug {
                                 tracing::debug!("Pipeline: apply error, stopping, err={:?}", e);
                             }
                             first_err = Some(e);
                         }
                     }
 
-                    let apply_elapsed = apply_start.elapsed();
-                    if debug_enabled() && apply_elapsed > std::time::Duration::from_millis(100) {
-                        tracing::debug!(
-                            "Pipeline apply: took {:.2}s, item={}",
-                            apply_elapsed.as_secs_f64(),
-                            std::any::type_name::<I>()
-                        );
-                    } else if debug_enabled() {
-                        tracing::debug!(
-                            "Pipeline apply: OK in {:.3}ms, item={}",
-                            apply_elapsed.as_micros(),
-                            std::any::type_name::<I>()
-                        );
+                    if let Some(start) = apply_start {
+                        let apply_elapsed = start.elapsed();
+                        if apply_elapsed > Duration::from_millis(100) {
+                            tracing::debug!(
+                                "Pipeline apply: took {:.2}s, item={}",
+                                apply_elapsed.as_secs_f64(),
+                                std::any::type_name::<I>()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Pipeline apply: OK in {:.3}ms, item={}",
+                                apply_elapsed.as_micros(),
+                                std::any::type_name::<I>()
+                            );
+                        }
                     }
                 }
 
@@ -250,31 +285,37 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// independent signal (e.g. `Halt`) — `send` alone is not the
     /// notification edge.
     pub fn send(&self, item: I) -> Result<(), I> {
-        let start = std::time::Instant::now();
+        // Only timestamp when debug tracing is on — `send` runs per
+        // item on the mux highway hot path.
+        let start = debug_enabled().then(Instant::now);
         match self.tx.send(item) {
             Ok(()) => {
-                let elapsed = start.elapsed();
-                if debug_enabled() && elapsed > std::time::Duration::from_millis(10) {
-                    tracing::debug!(
-                        "Pipeline send: blocked {:.2}s, item={}",
-                        elapsed.as_secs_f64(),
-                        std::any::type_name::<I>()
-                    );
-                } else if debug_enabled() {
-                    tracing::debug!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
+                if let Some(start) = start {
+                    let elapsed = start.elapsed();
+                    if elapsed > Duration::from_millis(10) {
+                        tracing::debug!(
+                            "Pipeline send: blocked {:.2}s, item={}",
+                            elapsed.as_secs_f64(),
+                            std::any::type_name::<I>()
+                        );
+                    } else {
+                        tracing::debug!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
+                    }
                 }
                 Ok(())
             }
             Err(e) => {
-                let elapsed = start.elapsed();
-                if debug_enabled() && elapsed > std::time::Duration::from_millis(10) {
-                    tracing::debug!(
-                        "Pipeline send: blocked {:.2}s before channel closed, item={}",
-                        elapsed.as_secs_f64(),
-                        std::any::type_name::<I>()
-                    );
-                } else if debug_enabled() {
-                    tracing::debug!("Pipeline send: failed after {:.3}ms", elapsed.as_micros());
+                if let Some(start) = start {
+                    let elapsed = start.elapsed();
+                    if elapsed > Duration::from_millis(10) {
+                        tracing::debug!(
+                            "Pipeline send: blocked {:.2}s before channel closed, item={}",
+                            elapsed.as_secs_f64(),
+                            std::any::type_name::<I>()
+                        );
+                    } else {
+                        tracing::debug!("Pipeline send: failed after {:.3}ms", elapsed.as_micros());
+                    }
                 }
                 Err(e.0)
             }
@@ -367,9 +408,9 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// Drop the producer-side channel and wait for the consumer
     /// thread to finish. Returns whatever the consumer's `close()`
     /// produced, or the first `apply` error, or — on consumer panic —
-    /// an `Error::IoError` whose source is `io::Error::other(...)`
-    /// with a "pipeline consumer panicked: <payload>" message
-    /// (callers can match on the constant prefix).
+    /// [`Error::PipelineConsumerPanicked`]. The panic payload is
+    /// logged at the join site (the library carries no English in its
+    /// error values), so callers discriminate on the variant.
     pub fn finish(self) -> Result<R, Error> {
         let Pipeline { tx, handle } = self;
         // Explicit drop, although the destructure already drops `tx`
@@ -377,20 +418,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         drop(tx);
         match handle.join() {
             Ok(result) => result,
-            Err(payload) => {
-                // Preserve the original panic message when the
-                // consumer's panic payload was a `&str` or `String`
-                // (the two stdlib formats that `panic!` produces).
-                // Anything else falls back to "(no message)".
-                let msg = payload
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("(no message)");
-                Err(Error::IoError {
-                    source: io::Error::other(format!("pipeline consumer panicked: {msg}")),
-                })
-            }
+            Err(payload) => Err(consumer_panicked(payload)),
         }
     }
 
@@ -402,19 +430,18 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// [`JOIN_TIMEOUT_SECS`] deadline. Returns:
     ///
     /// - `Ok(R)` on a clean consumer exit.
-    /// - `Err(Error::IoError)` with one of three message prefixes for
-    ///   wedge cases:
-    ///   - `"pipeline join halted"` — halt fired while waiting.
-    ///   - `"pipeline join timed out"` — `JOIN_TIMEOUT_SECS` elapsed.
-    ///   - `"pipeline consumer panicked"` — same as `finish()`.
+    /// - One of three numeric error variants for the wedge cases:
+    ///   - [`Error::Halted`] — halt fired while waiting.
+    ///   - [`Error::PipelineJoinTimeout`] — `JOIN_TIMEOUT_SECS` elapsed.
+    ///   - [`Error::PipelineConsumerPanicked`] — same as `finish()`.
     ///
     /// In the `halted` and `timed out` branches the consumer thread is
     /// intentionally leaked — exactly the same trade-off the
     /// `bounded_syscall` primitive makes. The wedged kernel call
     /// inside the consumer will unwind whenever it does, or at
     /// process exit. The caller is free to fall back to a degraded
-    /// path (in autorip's case: `exit(1)` after the hard watchdog
-    /// escalation, letting Docker restart the container).
+    /// path (e.g. abort the session and let a supervisor restart the
+    /// process).
     ///
     /// Plain [`Pipeline::finish`] is preserved for callers without a
     /// halt-token plumbed through; that path still blocks indefinitely
@@ -427,31 +454,18 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             if handle.is_finished() {
                 return match handle.join() {
                     Ok(result) => result,
-                    Err(payload) => {
-                        let msg = payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                            .unwrap_or("(no message)");
-                        Err(Error::IoError {
-                            source: io::Error::other(format!("pipeline consumer panicked: {msg}")),
-                        })
-                    }
+                    Err(payload) => Err(consumer_panicked(payload)),
                 };
             }
             if let Some(h) = halt {
                 if h.is_cancelled() {
                     // Consumer thread is intentionally leaked.
-                    return Err(Error::IoError {
-                        source: io::Error::other("pipeline join halted"),
-                    });
+                    return Err(Error::Halted);
                 }
             }
             if Instant::now() >= deadline {
                 // Consumer thread is intentionally leaked.
-                return Err(Error::IoError {
-                    source: io::Error::other("pipeline join timed out"),
-                });
+                return Err(Error::PipelineJoinTimeout);
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -700,25 +714,13 @@ mod tests {
 
         std::panic::set_hook(prev);
 
-        match res {
-            Err(Error::IoError { source }) => {
-                let msg = source.to_string();
-                // Constant prefix lets callers match without parsing
-                // the variable payload tail.
-                assert!(
-                    msg.contains("pipeline consumer panicked"),
-                    "expected constant panic prefix, got: {msg}"
-                );
-                // The original `panic!` payload (a `&'static str`) must
-                // be preserved — without the downcast the message
-                // would just be the prefix.
-                assert!(
-                    msg.contains("synthetic test panic"),
-                    "expected original panic payload, got: {msg}"
-                );
-            }
-            other => panic!("expected Err(IoError), got {other:?}"),
-        }
+        // A consumer panic surfaces as the numeric variant, not an
+        // English-carrying io::Error. The original panic payload is
+        // logged at the join site, not embedded in the error value.
+        assert!(
+            matches!(res, Err(Error::PipelineConsumerPanicked)),
+            "expected Err(PipelineConsumerPanicked), got {res:?}"
+        );
     }
 
     /// Never-completing sink — `apply` blocks until cancelled. Signals
@@ -810,8 +812,8 @@ mod tests {
     #[test]
     fn send_with_halt_returns_item_on_halt() {
         // Same setup, but the halt fires before the deadline elapses.
-        // The send loop must observe the halt within ~50 ms (the
-        // SEND_POLL_INTERVAL) and return the item.
+        // The send loop must observe the halt within ~250 ms (the
+        // SEND_HALT_CHECK_INTERVAL) and return the item.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pipe = Pipeline::spawn(
@@ -850,8 +852,7 @@ mod tests {
     #[test]
     fn finish_with_halt_returns_halted_when_consumer_wedged() {
         // Consumer wedges on the first apply; halt fires; finish
-        // returns the documented "pipeline join halted" error rather
-        // than blocking forever.
+        // returns Error::Halted rather than blocking forever.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pipe = Pipeline::spawn(
@@ -879,15 +880,10 @@ mod tests {
         // Release the leaked consumer so the test process exits cleanly.
         cancel.store(true, Ordering::SeqCst);
 
-        match res {
-            Err(Error::IoError { source }) => {
-                assert!(
-                    source.to_string().contains("pipeline join halted"),
-                    "expected halt-prefix error, got: {source}"
-                );
-            }
-            other => panic!("expected Err(IoError) halted, got {other:?}"),
-        }
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "expected Err(Halted), got {res:?}"
+        );
         // Bailed out within ~1 second of the halt firing (worst case
         // one POLL_INTERVAL = 250 ms of slack).
         assert!(

@@ -3,7 +3,8 @@
 //! VC-1 uses start codes similar to MPEG-2.
 //! Sequence header (0x0F) contains codec initialization data.
 //! Frame start = Frame header start code (0x0D).
-//! I-frames (keyframes) are identified from the frame header.
+//! I-frames (keyframes) are signalled by the presence of a Sequence Header
+//! (0x0F) in the PES, per the BD VC-1 convention (see `parse`).
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
@@ -164,25 +165,54 @@ fn parse_vc1_resolution(sh: &[u8]) -> Option<(u32, u32)> {
         // Simple/Main profile: resolution not in sequence header
         return None;
     }
-    // Advanced profile layout (bit-level starting from sh[4]):
-    // profile(2) + level(3) + chroma_format(2) + quantizer_spec(3) +
-    // postproc_flag(1) + max_coded_width(12) + max_coded_height(12) ...
-    // Total bits before width: 2+3+2+3+1 = 11 bits
-    // We need at least 11+12+12 = 35 bits = 5 bytes from sh[4..]
+    // Advanced profile sequence-header layout (SMPTE 421M, bit-level from sh[4]):
+    // PROFILE(2) + LEVEL(3) + COLORDIFF_FORMAT(2) + FRMRTQ_POSTPROC(3) +
+    // BITRTQ_POSTPROC(5) + POSTPROCFLAG(1) + MAX_CODED_WIDTH(12) +
+    // MAX_CODED_HEIGHT(12) ...
+    // Total bits before MAX_CODED_WIDTH: 2+3+2+3+5+1 = 16 bits.
+    // We need 16+12+12 = 40 bits = 5 de-escaped bytes from sh[4..].
     if sh.len() < 9 {
         return None;
     }
-    // Build a u64 from bytes 4..9 for easy bit extraction
-    let mut bits: u64 = 0;
-    for j in 0..5 {
-        bits = (bits << 8) | sh[4 + j] as u64;
+    // VC-1 Annex-B EBDU payload may carry emulation-prevention bytes (an
+    // inserted 0x03 after a 00 00 run). De-escape the payload before bit
+    // extraction so an EP byte landing within the first few bytes can't shift
+    // every subsequent bit and corrupt MAX_CODED_WIDTH/HEIGHT. Collect just the
+    // 5 de-escaped bytes the bit fields need.
+    let payload = &sh[4..];
+    let mut deesc = Vec::with_capacity(5);
+    let mut zeros = 0u8;
+    for &b in payload {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0; // drop the emulation-prevention byte
+            continue;
+        }
+        deesc.push(b);
+        if deesc.len() == 5 {
+            break;
+        }
+        zeros = if b == 0x00 { zeros + 1 } else { 0 };
     }
-    // bits has 40 bits. Skip first 11 bits, then read 12+12.
-    let coded_width = ((bits >> (40 - 11 - 12)) & 0xFFF) as u32 + 1;
-    let coded_height = ((bits >> (40 - 11 - 24)) & 0xFFF) as u32 + 1;
+    if deesc.len() < 5 {
+        return None;
+    }
+    // Build a u64 from the 5 de-escaped bytes for easy bit extraction.
+    let mut bits: u64 = 0;
+    for &b in &deesc {
+        bits = (bits << 8) | b as u64;
+    }
+    // bits holds 40 significant bits laid out as:
+    //   [16 leading bits][MAX_CODED_WIDTH:12][MAX_CODED_HEIGHT:12]
+    // so MAX_CODED_WIDTH starts 12 bits from the LSB end and MAX_CODED_HEIGHT
+    // occupies the low 12 bits (shift 0).
+    const WIDTH_SHIFT: u64 = 12; // 40 - 16 - 12
+    let coded_width = ((bits >> WIDTH_SHIFT) & 0xFFF) as u32 + 1;
+    let coded_height = (bits & 0xFFF) as u32 + 1;
+    // coded_width/height are `(bits & 0xFFF) + 1`, so always >= 1; after the
+    // ×2 both are always >= 2. Only the upper bound can fail.
     let w = coded_width * 2;
     let h = coded_height * 2;
-    if w > 0 && h > 0 && w <= 8192 && h <= 8192 {
+    if w <= 8192 && h <= 8192 {
         Some((w, h))
     } else {
         None
@@ -442,6 +472,59 @@ mod tests {
         assert_eq!(frames.len(), 1);
         // PTS must be used — MKV block timecodes are presentation timestamps.
         assert_eq!(frames[0].pts_ns, 2_000_000_000);
+    }
+
+    // --- advanced-profile resolution parsing (bit-offset regression) ---
+
+    /// Build an advanced-profile VC-1 sequence header encoding the given
+    /// width/height. Layout from sh[4]: PROFILE(2)=3, LEVEL(3), COLORDIFF(2),
+    /// FRMRTQ(3), BITRTQ(5), POSTPROCFLAG(1) = 16 bits, then
+    /// MAX_CODED_WIDTH(12) = width/2 - 1, MAX_CODED_HEIGHT(12) = height/2 - 1.
+    fn make_ap_seq_header(width: u32, height: u32) -> Vec<u8> {
+        let coded_w = (width / 2) - 1;
+        let coded_h = (height / 2) - 1;
+        // Accumulate 40 bits MSB-first: 16 leading bits then 12+12.
+        let mut acc: u64 = 0;
+        let mut nbits = 0u32;
+        let put = |val: u64, n: u32, acc: &mut u64, nbits: &mut u32| {
+            *acc = (*acc << n) | (val & ((1u64 << n) - 1));
+            *nbits += n;
+        };
+        // PROFILE = 3 (advanced), then 14 more leading bits (all zero here).
+        put(0b11, 2, &mut acc, &mut nbits);
+        put(0, 14, &mut acc, &mut nbits); // level+colordiff+frmrtq+bitrtq+postproc
+        put(coded_w as u64, 12, &mut acc, &mut nbits);
+        put(coded_h as u64, 12, &mut acc, &mut nbits);
+        // 40 bits → 5 bytes, MSB-first.
+        let mut payload = Vec::with_capacity(5);
+        for i in (0..5).rev() {
+            payload.push(((acc >> (i * 8)) & 0xFF) as u8);
+        }
+        let mut sh = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER];
+        sh.extend_from_slice(&payload);
+        sh
+    }
+
+    #[test]
+    fn advanced_profile_resolution_uses_16bit_offset() {
+        // Regression: the parser skipped 11 bits (omitting BITRTQ_POSTPROC's 5
+        // bits) instead of 16, reading width/height 5 bits too early. Encode a
+        // non-default 1280x720 and confirm it round-trips, proving the 16-bit
+        // pre-width offset.
+        let mut parser = Vc1Parser::new();
+        let mut data = make_ap_seq_header(1280, 720);
+        // A frame so the parser emits and stores the header.
+        data.extend_from_slice(&[0x00, 0x00, 0x01, SC_FRAME]);
+        data.extend_from_slice(&[0x55, 0x66]);
+        parser.parse(&make_pes(data, Some(0)));
+
+        let cp = parser.codec_private();
+        // codec_private needs an entry point too; resolution is in width/height
+        // fields regardless. Read them off the parser via codec_private when
+        // available, else assert the internal fields directly.
+        assert_eq!(parser.width, 1280, "width parsed at the 16-bit offset");
+        assert_eq!(parser.height, 720, "height parsed at the 16-bit offset");
+        let _ = cp;
     }
 
     // --- find_next_sc utility ---

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.31.0 (2026-06-08)
+
+Hardening and correctness release: a library-wide review-and-fix pass across
+the mux pipeline, codec parsers, AACS/CSS decryption, UDF/MPLS/CLPI parsing,
+sector prefetch, multi-pass recovery, drive/SCSI, disc labels, and I/O.
+
+### Fixed
+
+- AACS: hardened keydb title parsing, redacted secrets from handshake debug
+  output, and tightened the media-key variant verification gate. A trailing
+  partial aligned unit is now tolerated when clear and rejected (fail-loud)
+  when scrambled, rather than passed through.
+- Parsers: corrected the MPLS playlist-mark type offset, added per-extent and
+  cumulative allocation bounds in the UDF reader, and made the drive identity
+  probe best-effort on a CHECK CONDITION.
+- Mux/codec: start-code de-duplication, framing fixes, M2TS packet hardening,
+  and bounds guards across the HEVC/H.264/VC-1/MPEG-2/TrueHD/DTS/PGS paths.
+- Recovery/drive/SCSI: guarded READ CAPACITY short transfers, unified the
+  error-code / io-kind mapping, and hardened the platform unlock path.
+- Robustness: overflow/underflow guards on values derived from untrusted disc
+  input, deterministic prefetch shutdown, and error display remains code-only.
+
+### Changed
+
+- Release profile now builds with thin LTO and a single codegen unit.
+
 ## 0.29.0 (2026-06-06)
 
 ### Fixed
@@ -90,14 +116,14 @@
 
 ### Changed
 
-- `Drive::is_libredrive_active()` renamed to `Drive::is_raw_read_active()`.
-  Same semantics; old name removed. Mirrored on the internal
-  `PlatformDriver::is_libredrive_active()` trait method (now
-  `is_raw_read_active()`).
-- `Error::AacsLibredriveUnsupported` renamed to
-  `Error::AacsRawReadUnsupported`; the underlying numeric code (E7016)
-  is unchanged. The `E_AACS_LIBREDRIVE_UNSUPPORTED` constant is
-  renamed to `E_AACS_RAW_READ_UNSUPPORTED`.
+- `Drive::is_raw_read_active()` is the current name for the
+  raw-read-capability probe (an older internal name was retired in this
+  pass). Same semantics; the old name was removed. Mirrored on the
+  internal `PlatformDriver::is_raw_read_active()` trait method.
+- `Error::AacsRawReadUnsupported` is the current name for the
+  raw-read-unsupported variant; the underlying numeric code (E7016)
+  is unchanged. The corresponding constant is
+  `E_AACS_RAW_READ_UNSUPPORTED`.
 
 No behavioural change — purely a rename pass.
 
@@ -131,26 +157,26 @@ No behavioural change — purely a rename pass.
 
 ### Fixed
 
-- **Libredrive raw-read VID shortcut deleted.** v0.25.11 introduced a
-  `do_handshake` branch that, on libredrive-active drives, skipped the
+- **Raw-read VID shortcut deleted.** v0.25.11 introduced a
+  `do_handshake` branch that, on raw-read-capable drives, skipped the
   AACS cert handshake and issued `READ_DISC_STRUCTURE` format 0x80
-  with AGID=0 directly. The hypothesis was that unlocked
+  with AGID=0 directly. The hypothesis was that raw-read-capable
   drives would serve VID without auth. Empirical test (BU40N
   + UHD disc, 2026-05-21) showed the drive returns
   `0x05 / 0x6F / 0x02` (`ILLEGAL_REQUEST / Copy protection key
   exchange failure: KEY NOT ESTABLISHED`) to that CDB regardless of
-  drive-unlock state. The AACS spec requires a successful
+  raw-read state. The AACS spec requires a successful
   `REPORT_KEY` / `SEND_KEY` exchange to establish an AGID before
   format 0x80 returns VID; that requirement is enforced by the drive
-  itself and isn't bypassed by libredrive firmware. The shortcut
-  fired for every libredrive-active drive, so v0.25.11 / v0.25.12
+  itself and isn't bypassed by raw-read mode. The shortcut
+  fired for every raw-read-capable drive, so v0.25.11 / v0.25.12
   MOVIE scans were stuck at E7017 instead of progressing to the
   real wall (no DK walks MKB v77).
 - `Disc::do_handshake` now always routes through `do_handshake_cert`.
-  `Drive::is_libredrive_active()` and the Mt1959 MMkv+LbDr marker
+  `Drive::is_raw_read_active()` and the Mt1959 marker
   detection are kept as informational signals (logged in the
   `handshake_entry` warn line) but no longer steer the auth path.
-- `read_volume_id_libredrive` deleted (~50 LOC).
+- The raw-read VID read helper was deleted (~50 LOC).
 
 The corollary: AACS resolution on HRL-burned drives + UHD discs now
 fails honestly. Either cert auth succeeds (drive unlock may or
@@ -170,15 +196,15 @@ v0.25.12 release for details.
 
 ### Added
 
-- **Libredrive raw-read VID path.** When the Mt1959 unlock response
-  confirms both the active-mode (`MMkv`) and mode-ID (`LbDr`) markers,
-  `Drive::is_libredrive_active()` returns true and `do_handshake`
+- **Raw-read VID path.** When the Mt1959 unlock response
+  confirms both the active-mode and mode-ID markers,
+  `Drive::is_raw_read_active()` returns true and `do_handshake`
   skips the AACS cert dance entirely — VID is retrieved via
   `READ_DISC_STRUCTURE` format 0x80 with AGID=0, and bus encryption
   is already off. This is what unblocks UHD ripping on drives whose
-  leaked host cert is on the AACS HRL.
+  host cert is on the AACS HRL.
 - New `Error` variants for finer-grained AACS failure reporting:
-  `AacsHostCertRejected` (E7015), `AacsLibredriveUnsupported`
+  `AacsHostCertRejected` (E7015), `AacsRawReadUnsupported`
   (E7016), `AacsVidUnavailable` (E7017), `AacsMkUnavailable`
   (E7018), `AacsVukNotInKeydb` (E7019). Lets CLIs/UIs render which
   piece of the AACS chain failed instead of always saying "no keys."
@@ -1190,9 +1216,8 @@ LUN/BUS/HOST reset. `READ_RECOVERY_TIMEOUT_MS` (60 s) unchanged.
 + close-on-timeout in bg thread` to a single synchronous blocking
 `ioctl(fd, SG_IO, &hdr)`. The old pattern abandoned slow-but-alive
 commands faster than the drive could drain its internal queue,
-deepening the BU40N wedge. Per the audit at
-internal SCSI-architecture research,
-no reference project (MakeMKV / sg_dd / ddrescue) does what we did —
+deepening the BU40N wedge. Per the SCSI-architecture review,
+no existing consumer ripper or dd-based tool does what we did —
 all use sync blocking SG_IO with 8-60 s timeouts and let the kernel's
 mid-layer (`scsi_eh.rst`) run ABORT TASK / LUN RESET / BUS RESET /
 HOST RESET escalation internally.
@@ -1377,7 +1402,7 @@ at the SCSI + Disc::copy boundaries we can't diagnose where the time goes.
 
 This release adds the telemetry. No behavior change; instrumentation only.
 
-- New dep: `tracing = "0.1"`. Per project docs, debug/trace logging is permitted
+- New dep: `tracing = "0.1"`. Per CLAUDE.md, debug/trace logging is permitted
   in libfreemkv (the no-English rule applies to errors, not telemetry).
   Consumers (autorip) wire a tracing subscriber and pipe events into the
   JSONL debug log automatically.
@@ -1835,7 +1860,7 @@ have recovered tonight's BU40N without operator intervention.
 
 ### Zero English in library — typed variants for every error path
 
-Audit pass against the `project docs` rule (no English text in library code).
+Audit pass against the `CLAUDE.md` rule (no English text in library code).
 Found nine call sites that violated the contract by stuffing English into
 `io::Error::new(kind, "…")` or by abusing `Error::DeviceNotFound { path }`
 as a free-form description field. Each is now a typed variant with
@@ -1916,7 +1941,7 @@ the caller's convenience.
   Streams, Lower-level surfaces) so `cargo doc` tells callers when to
   reach for what.
 - **Dropped `ScanOptions::with_keydb()`**. The `_with_X` constructor
-  pattern was banned by `project docs` (one method per action). Use the
+  pattern was banned by `CLAUDE.md` (one method per action). Use the
   struct literal: `ScanOptions { keydb_path: Some(p.into()) }`. Five
   external call sites (autorip ×3, freemkv CLI ×3) and three test
   fixtures migrated.

@@ -56,8 +56,7 @@ pub(crate) const TUR_TIMEOUT_MS: u32 = 5_000;
 ///
 /// 10 s catches every legitimate slow read with comfortable margin and
 /// short-circuits truly bad sectors at ~10 s rather than letting the
-/// kernel mid-layer escalate for 30 s+. See the SCSI architecture audit
-/// (2026-04-26) for primary-source references.
+/// kernel mid-layer escalate for 30 s+.
 ///
 /// Pre-0.13.21 this was 1.5 s, which forced the kernel mid-layer to
 /// time out *normal* reads (cold-start often takes ~1.5 s) and run its
@@ -245,9 +244,9 @@ impl ScsiSense {
 /// `sb_len_wr` is the number of bytes the transport actually wrote into
 /// `sense`. When the buffer is too short for the relevant fields we
 /// return [`ScsiSense::NONE`] for the missing pieces rather than reading
-/// uninitialised memory. The minimum useful sense reply per SPC-4 is 8
-/// bytes (descriptor) or 14 bytes (fixed, to reach ASC/ASCQ at offsets
-/// 12/13).
+/// uninitialised memory. The minimum useful sense reply is 4 bytes
+/// (descriptor, to reach ASCQ at offset 3) or 14 bytes (fixed, to reach
+/// ASC/ASCQ at offsets 12/13).
 ///
 /// Pure function — same parse on every platform backend (Linux SG_IO,
 /// macOS IOKit, Windows SPTI) so a regression here would silently
@@ -261,7 +260,9 @@ pub(crate) fn parse_sense(sense: &[u8], sb_len_wr: u8) -> ScsiSense {
     let descriptor = response_code == 0x72 || response_code == 0x73;
     if descriptor {
         // Descriptor format: key/asc/ascq are at fixed offsets 1/2/3.
-        let asc = if n >= 3 { sense[2] } else { 0 };
+        // n >= 3 is guaranteed by the early return above, so byte 2 is
+        // always in bounds; only ascq (byte 3) needs a length check.
+        let asc = sense[2];
         let ascq = if n >= 4 { sense[3] } else { 0 };
         ScsiSense {
             sense_key: sense[1] & 0x0F,
@@ -449,13 +450,15 @@ pub fn list_drives() -> Vec<DriveInfo> {
 /// other ready/not-ready response → `Ok(true)` or interpreted ready
 /// state. Suitable for poll-loop tick (~50 ms / drive on a healthy bus).
 ///
-/// **Internal wedge recovery.** When the kernel's response indicates a
-/// wedged target — the `0xff` status pattern that means "no answer from
-/// the device" — this function transparently escalates: SCSI bus reset
-/// → if still wedged → USB device reset (`USBDEVFS_RESET` on Linux) →
-/// retry TUR. Callers never see wedge errors and never need to know
-/// about the escalation; if even the recovery path can't get a response,
-/// `Err(DeviceResetFailed)` surfaces. **No SCSI primitive is exposed to
+/// **No internal recovery.** A single TUR is issued; nothing else. When
+/// the transport reports a wedged target (the `0xff` "no answer from the
+/// device" pattern synthesised by the backend from a non-zero
+/// `host_status` / `driver_status`), that failure surfaces directly to
+/// the caller as `Err(Error::ScsiError)` with
+/// `status == SCSI_STATUS_TRANSPORT_FAILURE (0xFF)` and `sense: None`. No
+/// SCSI bus reset, no USB device reset, no retry is attempted in-library
+/// (the USB-reset escalation was removed in 0.13.4 after it was shown to
+/// deepen rather than clear the wedge). **No SCSI primitive is exposed to
 /// outside crates** — autorip / freemkv CLI / bdemu use this single
 /// function for the entire "is there a disc?" decision.
 pub fn drive_has_disc(path: &Path) -> Result<bool> {
@@ -561,8 +564,11 @@ pub fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
     ]
 }
 
-/// Build a READ(10) CDB with the raw read flag.
-pub fn build_read10_raw(lba: u32, count: u16) -> [u8; 10] {
+/// Build a READ(10) CDB with Force Unit Access (FUA) set — byte 1 bit 3
+/// (0x08). FUA bypasses the drive cache and reads directly from the
+/// medium. (Note: this is *not* a "raw" read; raw optical reads require
+/// READ CD, opcode 0xBE.)
+pub fn build_read10_fua(lba: u32, count: u16) -> [u8; 10] {
     [
         SCSI_READ_10,
         0x08,
@@ -579,7 +585,7 @@ pub fn build_read10_raw(lba: u32, count: u16) -> [u8; 10] {
 
 #[cfg(test)]
 mod parse_sense_tests {
-    //! Unit tests for `parse_sense_key`. Covers both SPC-4 sense data
+    //! Unit tests for [`parse_sense`]. Covers both SPC-4 sense data
     //! formats (descriptor / fixed) and the short-buffer fallback. The
     //! same helper runs on every platform backend so a regression here
     //! would silently miscategorize SCSI errors on Linux, macOS, and

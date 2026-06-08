@@ -1,10 +1,12 @@
 //! macOS platform impl for [`super::WritebackFile`].
 //!
 //! - `preallocate`: `fcntl(F_PREALLOCATE)` — macOS's fallocate-equiv.
-//!   Reserves a contiguous extent when possible, falling back to a
-//!   non-contiguous reservation if the FS can't satisfy it. Reported
-//!   file size is unchanged (`F_ALLOCATEALL` is not set, so allocation
-//!   is "best effort up to length"; growth happens via writes).
+//!   First attempt requests `F_ALLOCATECONTIG | F_ALLOCATEALL` (prefer a
+//!   contiguous run but accept scattered extents to satisfy the full
+//!   length), falling back to `F_ALLOCATEALL` alone on failure.
+//!   `F_PREALLOCATE` never advances EOF regardless of the flags — only
+//!   `ftruncate`/writes grow the file — so the reported file size is
+//!   unchanged; `F_ALLOCATEALL` governs the contiguity fallback, not size.
 //! - `durable_sync`: `fcntl(F_FULLFSYNC)` wrapped in
 //!   [`crate::io::bounded::bounded_syscall`] with a 60 s deadline.
 //!   F_FULLFSYNC is HFS+/APFS's true-fsync (flushes the disk's own
@@ -25,11 +27,14 @@ use crate::io::platform_macos::{
 const F_FULLFSYNC: libc::c_int = 51;
 
 pub(super) fn preallocate(file: &File, size_bytes: u64) {
+    // Clamp to the signed `off_t` range; an unchecked `as off_t` cast
+    // would wrap a >= 2^63 size to a negative length.
+    let len = i64::try_from(size_bytes).unwrap_or(i64::MAX) as libc::off_t;
     let mut fst = Fstore {
         fst_flags: F_ALLOCATECONTIG | F_ALLOCATEALL,
         fst_posmode: F_PEOFPOSMODE,
         fst_offset: 0,
-        fst_length: size_bytes as libc::off_t,
+        fst_length: len,
         fst_bytesalloc: 0,
     };
     // First attempt: contiguous.

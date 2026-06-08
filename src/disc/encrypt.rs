@@ -88,7 +88,7 @@ impl Disc {
         }
         let mut vid = [0u8; 16];
         vid.copy_from_slice(&buf[4..20]);
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "oem_vid_ok",
             "OEM VID retrieved"
@@ -119,10 +119,10 @@ impl Disc {
     ///
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
-    ///   * `(None, Some(_))`  — specific failure mode (see
-    ///     `AacsHostCertRejected` / `AacsRawReadUnsupported` /
-    ///     `AacsVidUnavailable` / `DriveProfileMissing` /
-    ///     `VidCdbUnavailable` variants in `error.rs`)
+    ///   * `(None, Some(_))`  — specific failure mode; only
+    ///     `AacsHostCertRejected` and `AacsVidUnavailable` are returned
+    ///     here (the OEM-path `DriveProfileMissing` / `VidCdbUnavailable`
+    ///     errors are caught internally and fall through to cert auth)
     ///   * `(None, None)`     — handshake not attempted (no keydb;
     ///     resolution will proceed with VID=zero and rely on path 1
     ///     disc-hash → VUK lookup)
@@ -131,7 +131,7 @@ impl Disc {
         opts: &ScanOptions,
     ) -> (Option<HandshakeResult>, Option<Error>) {
         let unlocked = session.is_unlocked();
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "handshake_entry",
             unlocked,
@@ -199,25 +199,24 @@ impl Disc {
         };
 
         let host_cert_count = host_certs.len();
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "handshake_start",
             host_cert_count,
             "handshake starting"
         );
 
-        // v0.25.7 wedge fix. Pre-0.25.7 this loop fired up to 16 AACS
-        // authenticate attempts back-to-back with no pause. Each attempt
-        // is 5-10 SCSI REPORT_KEY/SEND_KEY exchanges. On a disc whose
-        // host cert isn't in our KEYDB (or one the drive rejects),
-        // that's 80-160 SCSI commands hammered at the drive in a
-        // few hundred milliseconds — and the BU40N (and most consumer
-        // optical drives) responds by entering a fast-fail firmware
-        // wedge state where every subsequent CDB returns
-        // ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB (sense 05/24) until
-        // power-cycled. Hit live on rip1 2026-05-20 during a MOVIE
-        // UHD scan: KEYDB miss → 16 cert attempts in a tight loop →
-        // wedge → forced host reboot + drive disconnect to recover.
+        // Cert-attempt wedge guard. An earlier version fired up to 16
+        // AACS authenticate attempts back-to-back with no pause. Each
+        // attempt is 5-10 SCSI REPORT_KEY/SEND_KEY exchanges. On a disc
+        // whose host cert isn't in the KEYDB (or one the drive rejects),
+        // that's 80-160 SCSI commands hammered at the drive in a few
+        // hundred milliseconds — and consumer optical drives can respond
+        // by entering a fast-fail firmware wedge state where every
+        // subsequent CDB returns ILLEGAL_REQUEST/INVALID_FIELD_IN_CDB
+        // (sense 05/24) until power-cycled. Observed live on a UHD scan:
+        // KEYDB miss → many cert attempts in a tight loop → wedge →
+        // forced power cycle to recover.
         //
         // Defense-in-depth: cap attempts, sleep between, and bail
         // early on the drive's wedge sense so any later regression
@@ -262,20 +261,31 @@ impl Disc {
                     );
                 }
                 Err(e) => {
-                    let code = e.code();
-                    last_err_code = Some(code);
-                    // Drive wedge senses (any with high byte 0x05 =
-                    // ILLEGAL_REQUEST). The drive isn't merely
-                    // rejecting our cert — it's saying "I won't talk
-                    // to you anymore." Trying more certs makes the
-                    // wedge worse. Bail out immediately.
-                    let sense_key = ((code >> 8) & 0xFF) as u8;
-                    if sense_key == 0x05 {
+                    last_err_code = Some(e.code());
+                    // Log the real SCSI sense triple, not `e.code()` —
+                    // `code()` collapses every ScsiError to the flat
+                    // E_SCSI_ERROR constant and carries no sense key,
+                    // so it has no diagnostic value for auth-failure
+                    // routing.
+                    let sense = e.scsi_sense();
+                    // Drive wedge senses (ILLEGAL_REQUEST, sense key
+                    // 0x05). The drive isn't merely rejecting our
+                    // cert — it's signalling it won't talk to us
+                    // anymore. Trying more certs makes the wedge worse,
+                    // so bail out immediately. NOTE: this must read the
+                    // sense key off the structured ScsiSense, NOT off
+                    // `e.code()`; `code()` is a flat constant for every
+                    // ScsiError so the old `(code >> 8) & 0xFF` guard
+                    // never matched and was dead code (the very wedge
+                    // this defense exists to prevent could recur).
+                    if sense.map(|s| s.is_illegal_request()).unwrap_or(false) {
                         tracing::warn!(
                             target: "freemkv::disc",
                             phase = "handshake_wedge_detected",
                             cert_index = idx,
-                            error_code = code,
+                            sense_key = sense.map(|s| s.sense_key),
+                            asc = sense.map(|s| s.asc),
+                            ascq = sense.map(|s| s.ascq),
                             "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
                         );
                         return (None, Some(Error::AacsHostCertRejected));
@@ -339,13 +349,15 @@ impl Disc {
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
             .ok()
             .unwrap_or_default();
+        // Trim to the real record length. truncate is a no-op when n >=
+        // len and correctly empties the vec when n == 0 (zeroed/corrupt
+        // MKB), so it never leaves the full ~128 MiB zero-pad on
+        // AacsState.mkb.
         let n = aacs::mkb_content_len(&mkb_bytes);
-        if n > 0 && n < mkb_bytes.len() {
-            mkb_bytes.truncate(n);
-        }
+        mkb_bytes.truncate(n);
         let mkb_ver = aacs::mkb_version(&mkb_bytes);
 
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "scan_aacs_vid_only",
             disc_hash = %aacs::disc_hash_hex(&dh),

@@ -10,9 +10,7 @@
 //!
 //! This matches what every reference project does: MakeMKV (8 s sync
 //! ioctl), sg_dd (60 s sync ioctl), the kernel default for SCSI block
-//! devices (30 s `/sys/.../timeout`). See
-//! the SCSI architecture audit (2026-04-26) for the full primary-source
-//! references.
+//! devices (30 s `/sys/.../timeout`).
 //!
 //! Pre-0.13.20 we ran an async `write() + poll(1.5s) + close-on-timeout +
 //! bg reopen` pattern. That abandoned slow-but-alive commands faster than
@@ -90,23 +88,10 @@ impl SgIoTransport {
         })
     }
 
-    /// Clean up kernel SG_IO state and unlock the tray. NOT a hardware
-    /// reset — purely software cleanup before this process opens the
-    /// device for real work.
-    ///
-    /// When a previous process is killed (SIGKILL) mid-SG_IO, the kernel
-    /// may hold queued commands against the dead fd, and `Drop` never
-    /// ran so the tray may still be locked via PREVENT MEDIUM REMOVAL.
-    /// This routine handles both: open + close flushes the kernel SG
-    /// queue (sg_release cancels commands tied to the fd), the 2 s sleep
-    /// gives the kernel time to finish that cleanup, then a fresh fd
-    /// sends ALLOW MEDIUM REMOVAL to clear any stale tray lock.
-    ///
-    /// We do NOT verify the drive with TUR or escalate to SG_SCSI_RESET /
-    /// STOP+START UNIT. Both escalations were tried in 0.13.0–0.13.5
-    /// against the LG BU40N (Initio USB-SATA bridge); both failed to
-    /// recover wedged drives and made the wedge worse — see
-    /// the BU40N wedge recovery postmortem (2026-04-25).
+    /// Map the current `errno` (from a failed `libc::open`) to a typed
+    /// [`Error`]: `EACCES`/`EPERM` → [`Error::DevicePermission`], anything
+    /// else → [`Error::DeviceNotFound`]. The device path is carried in the
+    /// error; no English commentary (the app layer localizes).
     fn open_error<T>(device: &Path) -> Result<T> {
         let err = std::io::Error::last_os_error();
         Err(if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -186,6 +171,17 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
             unsafe { libc::close(self.fd) };
         }
+        // A failed execute() spawns a detached thread that opens a fresh
+        // fd into fd_recovery; that slot is normally drained at the top of
+        // the next execute(). If the transport is dropped before another
+        // execute() runs (the common abort-on-wedge path), the recovered
+        // fd would otherwise leak. Claim and close it here.
+        let recovered = self
+            .fd_recovery
+            .swap(-1, std::sync::atomic::Ordering::Acquire);
+        if recovered >= 0 {
+            unsafe { libc::close(recovered) };
+        }
     }
 }
 
@@ -224,6 +220,17 @@ impl ScsiTransport for SgIoTransport {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult> {
+        // Guard the entry point: `ScsiTransport` is a pub trait, so an
+        // external caller could pass an empty CDB. Indexing cdb[0] below
+        // (and in the error paths) would panic. In-crate callers always
+        // pass non-empty literal CDBs.
+        if cdb.is_empty() {
+            return Err(Error::ScsiError {
+                opcode: 0,
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            });
+        }
         let exec_t0 = std::time::Instant::now();
         let opcode = cdb[0];
         tracing::trace!(
@@ -342,14 +349,36 @@ impl ScsiTransport for SgIoTransport {
             });
 
             std::thread::spawn(move || {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // Don't unwrap: a device path with an interior NUL would
+                // panic this detached thread (silently swallowed). Bail
+                // and leave fd_recovery untouched instead.
+                let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
                 let new_fd = unsafe {
                     libc::open(
                         c_path.as_ptr() as *const libc::c_char,
                         libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
                     )
                 };
-                recovery.store(new_fd, std::sync::atomic::Ordering::Release);
+                if new_fd < 0 {
+                    return;
+                }
+                // Publish only into an empty (-1) slot. If two recovery
+                // threads race, the loser closes its own fd rather than
+                // overwriting (and leaking) the winner's.
+                if recovery
+                    .compare_exchange(
+                        -1,
+                        new_fd,
+                        std::sync::atomic::Ordering::Release,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    unsafe { libc::close(new_fd) };
+                }
             });
 
             return Err(Error::ScsiError {
@@ -383,7 +412,12 @@ impl ScsiTransport for SgIoTransport {
             });
         }
 
-        let bytes_transferred = (data.len() as i32).saturating_sub(hdr.resid).max(0) as usize;
+        // Compute in usize so transfers in the 2–4 GiB range (permitted by
+        // the `> u32::MAX` guard above) don't wrap through an i32 cast and
+        // report a large successful read as ~0 bytes. A negative resid is
+        // clamped to 0 before subtracting.
+        let resid = hdr.resid.max(0) as usize;
+        let bytes_transferred = data.len().saturating_sub(resid);
         tracing::trace!(
             target: "freemkv::scsi",
             phase = "ok",
@@ -504,10 +538,15 @@ fn enumerate_sg_names() -> Vec<String> {
                 continue;
             }
             let type_path = format!("/sys/class/scsi_generic/{name}/device/type");
+            // By design: only type-5 (optical) sg nodes are collected.
+            // A non-optical `type` value, or an unreadable `type` file
+            // (race against device teardown, restricted sysfs in a minimal
+            // container), is silently skipped — neither is a fatal
+            // enumeration error, the node simply is not an optical target.
             match std::fs::read_to_string(&type_path) {
                 Ok(s) if s.trim() == SCSI_TYPE_OPTICAL => names.push(name),
-                Ok(_) => {} // not optical
-                Err(_) => {}
+                Ok(_) => {}  // not optical
+                Err(_) => {} // type file unreadable
             }
         }
     } else {
@@ -553,12 +592,14 @@ pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
     hdr.flags = SG_FLAG_Q_AT_HEAD;
 
     let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
+    // Capture the ioctl errno BEFORE close(): POSIX permits close() to
+    // set errno (e.g. EIO on a flaky USB path), which would otherwise
+    // clobber the ioctl failure reason reported below.
+    let ioctl_err = std::io::Error::last_os_error();
     unsafe { libc::close(fd) };
 
     if ret < 0 {
-        return Err(Error::IoError {
-            source: std::io::Error::last_os_error(),
-        });
+        return Err(Error::IoError { source: ioctl_err });
     }
 
     let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;

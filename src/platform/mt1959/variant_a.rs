@@ -6,8 +6,13 @@ use super::Mt1959;
 use crate::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 
-const SCSI_WRITE_BUFFER: u8 = 0x3B;
+use super::SCSI_WRITE_BUFFER;
+
 const VERIFY_BUFFER_ID: u8 = 0x45;
+
+/// WRITE_BUFFER carries a 24-bit transfer length, so a firmware blob
+/// larger than this cannot be uploaded in one command.
+const WRITE_BUFFER_MAX_LEN: usize = 0x00FF_FFFF;
 
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
@@ -15,8 +20,14 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         return Err(crate::error::Error::UnlockFailed);
     }
 
-    // Upload firmware via WRITE_BUFFER
+    // Upload firmware via WRITE_BUFFER. The CDB's length is a 24-bit field;
+    // if the blob exceeds that, the encoded length would silently disagree
+    // with the bytes actually sent (`data`). Reject rather than upload a
+    // length-mismatched command.
     let len = firmware.len();
+    if len > WRITE_BUFFER_MAX_LEN {
+        return Err(crate::error::Error::UnlockFailed);
+    }
     let cdb = [
         SCSI_WRITE_BUFFER,
         0x06,
@@ -53,8 +64,11 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         5_000,
     );
 
-    // Double unlock after firmware upload
+    // Double unlock after firmware upload. The first establishes the
+    // unlock and is fatal on failure; the second is a confirmation pass and
+    // is best-effort (matching variant B), so a benign hiccup on the
+    // redundant call doesn't fail an already-successful unlock.
     mt.do_unlock(scsi)?;
-    mt.do_unlock(scsi)?;
+    let _ = mt.do_unlock(scsi);
     Ok(())
 }

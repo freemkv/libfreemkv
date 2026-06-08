@@ -8,32 +8,22 @@
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
-/// `F_RDADVISE` opcode — not in libc's named constants on all SDKs.
-const F_RDADVISE: libc::c_int = 44;
-
 /// Cap on the byte length we pass to `F_RDADVISE`. Asking for a
 /// multi-GB readahead window is counterproductive — the OS doesn't
 /// have that much cache to throw at one fd. 64 MiB is generous for
-/// our use case (sweep, mux) and matches the byte-channel cap so the
-/// kernel's prefetch ≥ our app-level pipeline depth.
+/// our use case (sweep, mux) so the kernel's prefetch ≥ our app-level
+/// pipeline depth.
 const RDADVISE_MAX_BYTES: i64 = 64 * 1024 * 1024;
-
-/// `radvisory` per `<sys/fcntl.h>`. repr(C) layout is stable.
-#[repr(C)]
-struct RadAdvisory {
-    ra_offset: libc::off_t,
-    ra_count: libc::c_int,
-}
 
 pub(super) fn hint_sequential(file: &File, len_bytes: u64) {
     let bytes = (len_bytes as i64).min(RDADVISE_MAX_BYTES);
-    let mut ra = RadAdvisory {
+    let mut ra = libc::radvisory {
         ra_offset: 0,
         ra_count: bytes as libc::c_int,
     };
     // Best-effort.
     unsafe {
-        libc::fcntl(file.as_raw_fd(), F_RDADVISE, &mut ra);
+        libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &mut ra);
     }
 }
 
@@ -52,11 +42,12 @@ pub(super) fn drop_window(_file: &File, _start: u64, _len: u64) {}
 /// returns immediately.
 pub(super) fn prefetch(file: &File, offset: u64, len: u64) {
     let bytes = (len as i64).min(RDADVISE_MAX_BYTES);
-    let mut ra = RadAdvisory {
+    let mut ra = libc::radvisory {
         ra_offset: offset as libc::off_t,
         ra_count: bytes as libc::c_int,
     };
+    // Best-effort — kernel hint only.
     unsafe {
-        libc::fcntl(file.as_raw_fd(), F_RDADVISE, &mut ra);
+        libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &mut ra);
     }
 }

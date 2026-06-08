@@ -1,7 +1,13 @@
 //! Drive speed constants.
 
 /// Common optical drive speeds with KB/s values for SET_CD_SPEED.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Ordering is by [`to_kbps`](Self::to_kbps) throughput, not declaration
+/// order — `PartialOrd`/`Ord` are implemented manually so e.g.
+/// `DVD1x < BD1x` (1385 < 4500 KB/s) holds. A naive derive would have
+/// ordered by variant position, making the slow DVD speeds sort above the
+/// fast BD speeds. `Max` (0xFFFF) sorts highest, as intended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveSpeed {
     BD1x,
     BD2x,
@@ -19,6 +25,8 @@ pub enum DriveSpeed {
 }
 
 impl DriveSpeed {
+    /// Throughput in KB/s for the SET_CD_SPEED CDB. `Max` maps to the
+    /// 0xFFFF sentinel that tells the drive to use its maximum speed.
     pub fn to_kbps(self) -> u16 {
         match self {
             DriveSpeed::BD1x => 4_500,
@@ -38,8 +46,46 @@ impl DriveSpeed {
     }
 }
 
+impl PartialOrd for DriveSpeed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DriveSpeed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_kbps().cmp(&other.to_kbps())
+    }
+}
+
 impl std::fmt::Display for DriveSpeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?} ({} KB/s)", self, self.to_kbps())
+        // `Max` is the "let the drive pick its maximum" sentinel; printing
+        // its 0xFFFF KB/s value would read as a real (absurd) throughput.
+        match self {
+            DriveSpeed::Max => write!(f, "Max"),
+            _ => write!(f, "{:?} ({} KB/s)", self, self.to_kbps()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordering_is_by_throughput_not_declaration() {
+        assert!(DriveSpeed::DVD1x < DriveSpeed::BD1x);
+        assert!(DriveSpeed::DVD16x < DriveSpeed::BD8x);
+        assert!(DriveSpeed::BD12x < DriveSpeed::Max);
+        let mut v = [DriveSpeed::Max, DriveSpeed::DVD1x, DriveSpeed::BD4x];
+        v.sort();
+        assert_eq!(v, [DriveSpeed::DVD1x, DriveSpeed::BD4x, DriveSpeed::Max]);
+    }
+
+    #[test]
+    fn max_display_omits_sentinel_value() {
+        assert_eq!(DriveSpeed::Max.to_string(), "Max");
+        assert!(DriveSpeed::BD1x.to_string().contains("4500 KB/s"));
     }
 }

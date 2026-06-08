@@ -7,9 +7,21 @@
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// Sample rates indexed by fscod (0=48kHz, 1=44.1kHz, 2=32kHz). fscod=3 is
-/// reserved in AC-3 and signals "fscod2" (reduced rates) in E-AC-3; we treat
-/// the base rate as 48 kHz in that case for duration purposes.
+/// reserved in AC-3; in E-AC-3 it signals "fscod2" (reduced rates: 24/22.05/16
+/// kHz, selected by byte-4 bits [5:4]). `frame_sample_rate` decodes fscod2 in
+/// the E-AC-3 case; this table's index-3 entry (48 kHz) is only the fallback
+/// when the header is too short to read fscod2.
 const SAMPLE_RATES: [u32; 4] = [48_000, 44_100, 32_000, 48_000];
+
+/// E-AC-3 reduced sample rates indexed by fscod2 (byte-4 bits [5:4]), used when
+/// fscod==3. Index 3 is reserved; we fall back to 48 kHz for it.
+const EAC3_REDUCED_RATES: [u32; 4] = [24_000, 22_050, 16_000, 48_000];
+
+/// Minimum byte length of a valid (E-)AC-3 frame. A real E-AC-3 frame must carry
+/// at least the syncword (2) + BSI header (~4) before any audio. `eac3_frame_size`
+/// returns `(frmsiz + 1) * 2`, so frmsiz=0/1 yield 2/4-byte "frames" that are
+/// sub-header junk; rejecting anything below this guards against emitting them.
+const MIN_FRAME_BYTES: usize = 6;
 
 /// AC-3 (legacy) always carries 6 audio blocks × 256 samples = 1536 samples.
 const AC3_SAMPLES_PER_FRAME: u32 = 1536;
@@ -89,8 +101,9 @@ impl CodecParser for Ac3Parser {
                 ac3_frame_size(remaining)
             };
 
-            if frame_size == 0 || frame_size > 8192 {
-                // Invalid frame size — skip this sync word
+            if !(MIN_FRAME_BYTES..=8192).contains(&frame_size) {
+                // Invalid/sub-header frame size (e.g. an E-AC-3 frmsiz of 0/1
+                // sizing to a 2/4-byte fragment) — skip this sync word.
                 pos = start + 2;
                 continue;
             }
@@ -112,13 +125,15 @@ impl CodecParser for Ac3Parser {
         }
 
         // Keep unconsumed data for the next call. `pos` is the start of the
-        // unconsumed region: either a partial frame that straddles this PES
-        // boundary — which, by construction, begins at a syncword (every byte
-        // before `pos` was emitted as a frame or skipped as pre-sync junk) — or
-        // trailing bytes too short to size/complete a frame. Carry from `pos`,
-        // NOT from the next syncword: discarding bytes between `pos` and the
-        // next sync would drop the partial frame we are deliberately keeping
-        // across the boundary.
+        // last unprocessed search region. On the `start + frame_size > len`
+        // break it sits exactly at the straddling frame's syncword; on the
+        // `remaining.len() < 6` break it is the value from the top of that
+        // iteration, with the syncword possibly sitting after some pre-sync
+        // junk — so the re-scan below (from `pos`, NOT a recomputed sync) is
+        // required to locate the carry-over syncword. Carry from `pos`, NOT
+        // from the next syncword: discarding bytes between `pos` and the next
+        // sync would drop the partial frame we are deliberately keeping across
+        // the boundary.
         let keep_from = if pos < data.len() {
             // A syncword at/after `pos` marks the carry-over start (anything
             // before it is junk with no sync). With no full sync, retain the
@@ -139,6 +154,11 @@ impl CodecParser for Ac3Parser {
                 // No frame could be parsed out of a buffer this large — this is
                 // not valid AC-3 here. Drop it and resync on the next PES rather
                 // than grow without bound on pathological input.
+                tracing::debug!(
+                    target: "mux",
+                    "ac3: carry-over buffer exceeded {} bytes without a frame; dropping and resyncing",
+                    MAX_AC3_BUF
+                );
                 self.buf.clear();
             } else {
                 self.buf = tail.to_vec();
@@ -174,7 +194,7 @@ impl CodecParser for Ac3Parser {
         } else {
             ac3_frame_size(frame)
         };
-        if frame_size == 0 || frame_size > 8192 || off + frame_size > buf.len() {
+        if !(MIN_FRAME_BYTES..=8192).contains(&frame_size) || off + frame_size > buf.len() {
             return Vec::new();
         }
         let duration_ns = frame_duration_ns(frame, bsid);
@@ -212,12 +232,20 @@ fn eac3_samples_per_frame(data: &[u8]) -> u32 {
     numblks * 256
 }
 
-/// Sample rate (Hz) of an AC-3/E-AC-3 frame from its fscod field (byte 4 bits 7-6).
-fn frame_sample_rate(data: &[u8]) -> u32 {
+/// Sample rate (Hz) of an AC-3/E-AC-3 frame from its fscod field (byte 4 bits
+/// 7-6). For E-AC-3 (`bsid >= 11`) an fscod of 3 selects a reduced rate via
+/// fscod2 (byte 4 bits [5:4]); decoding it keeps the frame duration correct
+/// instead of mistiming reduced-rate frames at 48 kHz (A/V drift).
+fn frame_sample_rate(data: &[u8], bsid: u8) -> u32 {
     if data.len() < 5 {
         return SAMPLE_RATES[0];
     }
-    SAMPLE_RATES[((data[4] >> 6) & 0x03) as usize]
+    let fscod = (data[4] >> 6) & 0x03;
+    if fscod == 0x03 && bsid >= 11 {
+        let fscod2 = (data[4] >> 4) & 0x03;
+        return EAC3_REDUCED_RATES[fscod2 as usize];
+    }
+    SAMPLE_RATES[fscod as usize]
 }
 
 /// Duration of one AC-3/E-AC-3 frame in nanoseconds: samples_per_frame /
@@ -228,7 +256,7 @@ fn frame_duration_ns(data: &[u8], bsid: u8) -> u64 {
     } else {
         AC3_SAMPLES_PER_FRAME
     } as u64;
-    let rate = frame_sample_rate(data) as u64;
+    let rate = frame_sample_rate(data, bsid) as u64;
     // samples / rate seconds → ns, rounded to nearest.
     (samples * 1_000_000_000 + rate / 2) / rate
 }
@@ -240,7 +268,7 @@ fn find_ac3_sync(data: &[u8]) -> Option<usize> {
 
 /// Extract bsid from an AC-3/E-AC-3 frame starting at the syncword.
 /// bsid is at byte 5, bits 7..3.
-pub fn get_bsid(data: &[u8]) -> u8 {
+fn get_bsid(data: &[u8]) -> u8 {
     if data.len() < 6 {
         return 0;
     }
@@ -256,8 +284,11 @@ fn eac3_frame_size(data: &[u8]) -> usize {
     (frmsiz + 1) * 2
 }
 
-/// Calculate AC-3 frame size in bytes from fscod and frmsizecod.
-fn ac3_frame_size(data: &[u8]) -> usize {
+/// Calculate AC-3 frame size in bytes from fscod and frmsizecod. Returns 0 for
+/// an unmappable header (reserved fscod==3, or frmsizecod out of table range).
+/// `pub(crate)` so the TrueHD parser can reuse it when skipping interleaved AC-3
+/// frames instead of duplicating the size table.
+pub(crate) fn ac3_frame_size(data: &[u8]) -> usize {
     if data.len() < 5 {
         return 0;
     }
@@ -439,7 +470,7 @@ mod tests {
 
     #[test]
     fn buffer_stays_bounded_across_many_garbage_pes() {
-        // Finding 14: the carry-over buffer must never grow without bound. Feed
+        // The carry-over buffer must never grow without bound. Feed
         // many large PES packets that contain no usable frame and assert the
         // retained buffer stays tiny — carry-from-`pos` drops all pre-sync junk,
         // and a never-completing frame is bounded by the 8192-byte frame cap and
@@ -571,6 +602,44 @@ mod tests {
         let bsid = get_bsid(&frame);
         assert!(bsid < 11, "test frame is legacy AC-3");
         assert_eq!(frame_duration_ns(&frame, bsid), 32_000_000);
+    }
+
+    #[test]
+    fn eac3_subheader_sized_frame_is_rejected() {
+        // An E-AC-3 sync with frmsiz=0 sizes to a 2-byte "frame"; frmsiz=1 to
+        // 4 bytes. Both are sub-header junk that must NOT be emitted as audio.
+        // bsid must be >= 11 for the E-AC-3 sizing path. Byte 5 bits 7..3 = bsid.
+        let mut parser = Ac3Parser::new();
+        // Build an E-AC-3 sync: 0x0B 0x77, frmsiz=0 (bytes 2-3 low bits = 0),
+        // bsid=16 (>=11) at byte 5. Pad to a few bytes so find_ac3_sync + sizing
+        // run. eac3_frame_size = (0 + 1) * 2 = 2 < MIN_FRAME_BYTES.
+        let mut data = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 16 << 3, 0x00, 0x00];
+        // Append a real AC-3 frame after the junk so we can confirm the parser
+        // resyncs past the junk and still emits the valid frame.
+        let good = make_ac3_frame(0, 2);
+        data.extend_from_slice(&good);
+        let pes = PesPacket {
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data,
+        };
+        let frames = parser.parse(&pes);
+        assert_eq!(frames.len(), 1, "only the real AC-3 frame is emitted");
+        assert_eq!(frames[0].data.len(), 160);
+    }
+
+    #[test]
+    fn eac3_fscod2_reduced_rate_duration() {
+        // E-AC-3 with fscod==3 (reduced rate) and fscod2==0 → 24 kHz, not 48.
+        // bsid>=11 selects the E-AC-3 path. When fscod==3 the block count is
+        // fixed at 6 → 1536 samples. Byte 4 layout: fscod(2)|fscod2(2)|...
+        // fscod=3 (0b11), fscod2=0 (0b00) → byte4 = 0b1100_0000 = 0xC0.
+        let data = [0x0B, 0x77, 0x00, 0x00, 0xC0, 16 << 3];
+        let bsid = get_bsid(&data);
+        assert!(bsid >= 11, "test frame is E-AC-3");
+        // 1536 samples / 24000 Hz = 64 ms.
+        assert_eq!(frame_duration_ns(&data, bsid), 64_000_000);
     }
 
     #[test]

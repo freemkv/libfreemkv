@@ -10,9 +10,10 @@ use crate::error::{Error, Result};
 
 /// Parsed MPLS playlist.
 #[derive(Debug)]
-#[allow(dead_code)]
-pub struct Playlist {
-    /// MPLS version (e.g. "0200" or "0300")
+pub(crate) struct Playlist {
+    /// MPLS version (e.g. "0200" or "0300"). Parsed for completeness;
+    /// no production reader yet.
+    #[allow(dead_code)]
     pub version: String,
     /// Play items in playback order
     pub play_items: Vec<PlayItem>,
@@ -24,11 +25,15 @@ pub struct Playlist {
 
 /// A playlist mark entry from the PlayListMark section.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PlaylistMark {
-    /// Mark type: 1 = chapter entry mark
+pub(crate) struct PlaylistMark {
+    /// PlayListMark mark_type (BD-ROM PlayListMark spec):
+    ///   0 = reserved, 1 = entry mark (chapter), 2 = link point.
+    /// Chapter filters should test `== 1`, not `<= 1`.
     pub mark_type: u8,
-    /// Which play item this mark belongs to
+    /// Which play item this mark belongs to. Carries the per-PlayItem
+    /// timebase needed to place a mark in a multi-PlayItem playlist;
+    /// the chapter builder does not consume it yet.
+    #[allow(dead_code)]
     pub play_item_ref: u16,
     /// Timestamp in 45kHz PTS ticks
     pub timestamp: u32,
@@ -36,22 +41,25 @@ pub struct PlaylistMark {
 
 /// A play item — one clip reference with in/out times.
 #[derive(Debug)]
-#[allow(dead_code)]
-pub struct PlayItem {
+pub(crate) struct PlayItem {
     /// Clip filename without extension (e.g. "00001")
     pub clip_id: String,
     /// In-time in 45kHz ticks
     pub in_time: u32,
     /// Out-time in 45kHz ticks
     pub out_time: u32,
-    /// Connection condition (1=seamless, 5/6=non-seamless)
+    /// Connection condition (1=seamless, 5/6=non-seamless). Parsed for
+    /// completeness; no production reader yet.
+    #[allow(dead_code)]
     pub connection_condition: u8,
 }
 
 /// A stream entry from the STN table.
 #[derive(Debug, Clone)]
 pub struct StreamEntry {
-    /// Stream category: 1=video, 2=audio, 3=PG subtitle, 4=IG, 5=secondary audio, 6=secondary video, 7=DV EL
+    /// Stream category: 1=video, 2=audio, 3=PG subtitle, 5=secondary audio,
+    /// 6=secondary video, 7=DV EL. IG (4) is consumed during parsing to keep
+    /// the STN cursor aligned but is never retained as a StreamEntry.
     pub stream_type: u8,
     /// MPEG-TS PID
     pub pid: u16,
@@ -76,6 +84,14 @@ pub struct StreamEntry {
 }
 
 /// Parse an MPLS file from raw bytes.
+///
+/// `data` is the raw contents of a `BDMV/PLAYLIST/*.mpls` file. Returns
+/// [`Error::MplsParse`] on malformed or truncated input.
+///
+/// Note: [`Playlist::streams`] is extracted ONLY from the first play
+/// item's STN table. Multi-item playlists whose later items carry a
+/// different codec/track set are not fully represented by `streams`;
+/// callers selecting tracks for mux should account for this.
 pub fn parse(data: &[u8]) -> Result<Playlist> {
     if data.len() < 40 {
         return Err(Error::MplsParse);
@@ -95,7 +111,10 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
     let pl = &data[playlist_start..];
     let num_play_items = u16::from_be_bytes([pl[6], pl[7]]) as usize;
 
-    let mut play_items = Vec::with_capacity(num_play_items);
+    // num_play_items is an untrusted u16 (max 65535); cap the pre-allocation
+    // so a truncated/fuzz input can't force a large reservation that the
+    // bounds-checked loop never fills. 256 covers any realistic playlist.
+    let mut play_items = Vec::with_capacity(num_play_items.min(256));
     let mut streams = Vec::new();
     let mut pos = 10;
 
@@ -198,8 +217,12 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
                     entry.stream_type = 6;
                     entry.secondary = true;
                     streams.push(entry);
-                    // Skip extra ref bytes (audio refs + PG refs)
-                    if next + 2 < item.len() {
+                    // Skip extra ref bytes (audio refs + PG refs).
+                    // Use `next < item.len()` to match the sibling secondary
+                    // blocks; the inner `after_arefs < item.len()` re-guards
+                    // the second read, so the stricter `+2` only mis-aligned
+                    // spos when the aref count sits in the last 1-2 bytes.
+                    if next < item.len() {
                         let n_arefs = item[next] as usize;
                         let after_arefs = next + 2 + n_arefs + (n_arefs % 2);
                         if after_arefs < item.len() {
@@ -256,16 +279,21 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
     // Parse PlayListMark section
     let mut marks = Vec::new();
-    if mark_start > 0 && mark_start + 4 <= data.len() {
+    // The first real read is num_marks at ms[4..6], so the section needs
+    // at least 6 bytes (length(4) + num_marks(2)).
+    if mark_start > 0 && mark_start + 6 <= data.len() {
         let ms = &data[mark_start..];
-        if ms.len() >= 6 {
+        {
             let num_marks = u16::from_be_bytes([ms[4], ms[5]]) as usize;
             let mut mpos = 6;
             for _ in 0..num_marks {
                 if mpos + 14 > ms.len() {
                     break;
                 }
-                let mark_type = ms[mpos];
+                // PlayListMark entry: reserved(1) + mark_type(1) +
+                // ref_to_PlayItem_id(2) + mark_time_stamp(4) +
+                // entry_ES_PID(2) + duration(4). mark_type is at +1, not +0.
+                let mark_type = ms[mpos + 1];
                 let play_item_ref = u16::from_be_bytes([ms[mpos + 2], ms[mpos + 3]]);
                 let timestamp =
                     u32::from_be_bytes([ms[mpos + 4], ms[mpos + 5], ms[mpos + 6], ms[mpos + 7]]);
@@ -314,7 +342,10 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
         0x03 | 0x04 => 3,
         _ => 0,
     };
-    let pid = if pid_off != 0 && pos + pid_off + 2 <= item.len() {
+    // Bound the PID read by the entry's declared end (se_end), not just by
+    // item.len(): a short se_len must not let us read PID bytes out of the
+    // following stream_attributes region.
+    let pid = if pid_off != 0 && pos + pid_off + 2 <= se_end {
         u16::from_be_bytes([item[pos + pid_off], item[pos + pid_off + 1]])
     } else {
         0
@@ -370,8 +401,10 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
                 }
             }
         }
-        3 | 4 => {
-            // PG/IG: coding_type(1) + language(3)
+        3 => {
+            // PG: coding_type(1) + language(3).
+            // IG (type 4) is parsed only to advance spos and is then
+            // discarded by the caller, so it deliberately has no arm here.
             if sa.len() >= 4 {
                 language = String::from_utf8_lossy(&sa[1..4]).to_string();
             }
@@ -552,11 +585,11 @@ mod tests {
         buf.extend_from_slice(&(mark_section_len as u32).to_be_bytes());
         buf.extend_from_slice(&(marks.len() as u16).to_be_bytes());
         for m in marks {
-            buf.push(m.mark_type); // [0] mark_type
-            buf.push(0); // [1] reserved
+            buf.push(0); // [0] reserved
+            buf.push(m.mark_type); // [1] mark_type
             buf.extend_from_slice(&m.play_item_ref.to_be_bytes()); // [2-3] play_item_ref
             buf.extend_from_slice(&m.timestamp.to_be_bytes()); // [4-7] timestamp
-            buf.extend_from_slice(&[0u8; 6]); // [8-13] padding (entry_ES_PID + duration + mark_data)
+            buf.extend_from_slice(&[0u8; 6]); // [8-13] entry_ES_PID(2) + duration(4)
         }
 
         buf
@@ -784,6 +817,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_secondary_video_then_dv_alignment() {
+        // Regression: the secondary-video ref-skip must use the same
+        // `next < item.len()` guard as the sibling secondary blocks so spos
+        // stays aligned for a following stream (here a Dolby Vision EL).
+        let video = build_stream_entry_video(0x1011, 0x24, 8, 1, Some(0x12));
+
+        // Secondary video with audio-ref + PG-ref blocks present.
+        let mut sec_video_with_refs = build_stream_entry_video(0x1B00, 0x1B, 4, 1, None);
+        sec_video_with_refs.push(0); // n_arefs = 0
+        sec_video_with_refs.push(0); // reserved
+        sec_video_with_refs.push(0); // n_prefs = 0
+        sec_video_with_refs.push(0); // reserved
+
+        // Dolby Vision enhancement layer immediately after.
+        let dv_el = build_stream_entry_video(0x1015, 0x24, 8, 1, Some(0x12));
+
+        let data = build_mpls(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 1, 0, 1), // 1 video, 1 sec_video, 1 dv
+            &[video, sec_video_with_refs, dv_el],
+        );
+
+        let playlist = parse(&data).expect("should parse");
+        assert_eq!(playlist.streams.len(), 3);
+        // Secondary video
+        assert_eq!(playlist.streams[1].stream_type, 6);
+        assert_eq!(playlist.streams[1].pid, 0x1B00);
+        // DV EL parsed at the correct offset → correct PID and type 7.
+        assert_eq!(playlist.streams[2].stream_type, 7);
+        assert_eq!(playlist.streams[2].pid, 0x1015);
+        assert!(playlist.streams[2].secondary);
+    }
+
+    #[test]
     fn parse_marks_chapter_entries() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
         let marks = vec![
@@ -872,6 +939,52 @@ mod tests {
         assert!((ch0_secs - 0.0).abs() < 0.001);
         assert!((ch1_secs - 100.0).abs() < 0.001);
         assert!((ch2_secs - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn mark_type_read_from_correct_offset() {
+        // Regression for the mark_type off-by-one: each PlayListMark entry is
+        // reserved(1) + mark_type(1) + .... The parser must read byte[1], not
+        // byte[0]. build_mpls_with_marks writes reserved=0 at byte[0] and the
+        // mark_type at byte[1], so a parser that read byte[0] would see 0 for
+        // every mark. Use distinct non-zero, non-1 types to make the offset
+        // error unmistakable.
+        let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
+        let marks = vec![
+            TestMark {
+                mark_type: 1, // entry mark (chapter)
+                play_item_ref: 0,
+                timestamp: 90000,
+            },
+            TestMark {
+                mark_type: 2, // link point (not a chapter)
+                play_item_ref: 0,
+                timestamp: 180000,
+            },
+            TestMark {
+                mark_type: 3, // arbitrary other type
+                play_item_ref: 0,
+                timestamp: 270000,
+            },
+        ];
+
+        let data = build_mpls_with_marks(
+            &[(b"00001", 1, 0, 9000000)],
+            (1, 0, 0, 0, 0, 0, 0, 0),
+            &[video],
+            &marks,
+        );
+
+        let playlist = parse(&data).expect("should parse marks");
+        assert_eq!(playlist.marks.len(), 3);
+        // If the parser read the reserved byte (byte[0] == 0) these would all
+        // be 0; reading byte[1] yields the real types.
+        assert_eq!(playlist.marks[0].mark_type, 1);
+        assert_eq!(playlist.marks[1].mark_type, 2);
+        assert_eq!(playlist.marks[2].mark_type, 3);
+        // Only the type-1 mark is a chapter under the corrected convention.
+        let chapters = playlist.marks.iter().filter(|m| m.mark_type == 1).count();
+        assert_eq!(chapters, 1);
     }
 
     #[test]

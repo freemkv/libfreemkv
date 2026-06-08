@@ -60,8 +60,8 @@ static DECRYPT_POOL: RwLock<Option<Arc<rayon::ThreadPool>>> = RwLock::new(None);
 
 /// Configure how many threads to use for AACS unit decryption. A value
 /// of `0` resets to the env / default resolution. `1` forces serial.
-/// `N > 1` builds a new rayon pool of size N and atomically replaces
-/// the live pool.
+/// `N > 1` builds a new rayon pool of size N (capped at [`MAX_THREADS`])
+/// and atomically replaces the live pool.
 ///
 /// Thread-safe. Live decrypt calls keep their previously-acquired
 /// pool reference for the rest of the call — no mid-call pool
@@ -82,29 +82,36 @@ pub fn set_decrypt_threads(n: usize) {
 /// Get (or lazily build) the active rayon thread pool. Returns an
 /// `Arc` so in-flight work survives a concurrent
 /// [`set_decrypt_threads`] swap.
-fn decrypt_pool() -> Arc<rayon::ThreadPool> {
-    // Fast path: pool already built.
-    if let Ok(guard) = DECRYPT_POOL.read() {
+///
+/// Returns `None` if the pool cannot be built (e.g. the OS refuses the
+/// worker threads under a pid/thread limit). The caller falls back to
+/// the serial decrypt path — library code never panics here.
+fn decrypt_pool() -> Option<Arc<rayon::ThreadPool>> {
+    // Fast path: pool already built. A poisoned read lock still yields a
+    // usable guard (the pool Arc is immutable once stored).
+    {
+        let guard = DECRYPT_POOL.read().unwrap_or_else(|e| e.into_inner());
         if let Some(pool) = guard.as_ref() {
-            return Arc::clone(pool);
+            return Some(Arc::clone(pool));
         }
     }
-    // Slow path: build a new one under the write lock. Double-check
-    // after acquiring in case another caller built it first.
-    let mut guard = DECRYPT_POOL.write().expect("DECRYPT_POOL RwLock poisoned");
+    // Slow path: build a new one under the write lock. Recover the guard
+    // on poisoning (a prior panic) rather than propagating a secondary
+    // panic — we simply rebuild. Double-check after acquiring in case
+    // another caller built it first.
+    let mut guard = DECRYPT_POOL.write().unwrap_or_else(|e| e.into_inner());
     if let Some(pool) = guard.as_ref() {
-        return Arc::clone(pool);
+        return Some(Arc::clone(pool));
     }
     let n = decrypt_threads();
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .thread_name(|i| format!("freemkv-decrypt-{i}"))
-            .build()
-            .expect("rayon decrypt pool build failed"),
-    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|i| format!("freemkv-decrypt-{i}"))
+        .build()
+        .ok()
+        .map(Arc::new)?;
     *guard = Some(Arc::clone(&pool));
-    pool
+    Some(pool)
 }
 
 /// Current effective decrypt thread count. Resolution order:
@@ -181,9 +188,46 @@ pub fn decrypt_sectors(
             };
             let rdk: Option<[u8; 16]> = *read_data_key;
             let unit_len = aacs::ALIGNED_UNIT_LEN;
+            // AACS decrypts whole 6144-byte aligned units. The live mux path
+            // (mux/disc.rs::fill_extents) issues 1- or 2-sector reads at every
+            // extent tail, so a buffer is commonly NOT a multiple of the unit
+            // length. We process the whole leading units exactly as a fully
+            // aligned buffer would be, then make a deliberate decision about any
+            // trailing partial unit.
+            //
+            // Trailing-partial contract:
+            //   * A clear partial (incomplete final unit / clear nav-TS tail) is
+            //     what AACS legitimately leaves in the clear on disc, so we leave
+            //     it untouched and return Ok. This is the proven, shipped
+            //     behavior every production UHD MKV was made with — no regression
+            //     on conformant discs.
+            //   * A *scrambled* partial can only arise from a structurally
+            //     malformed UDF layout that splits an encrypted unit across an
+            //     extent boundary. Those bytes are encrypted content that cannot
+            //     be decrypted standalone; passing them through as clear would be
+            //     silent corruption. We fail loud (Error::DecryptFailed), matching
+            //     the highway path's Error::ExtentNotUnitAligned policy.
+            //
+            // Detection: is_aacs_scrambled() short-circuits to false for any
+            // buffer shorter than a full unit, so it cannot judge a partial. We
+            // instead apply the same TS-sync-intactness test it uses internally
+            // (ts_sync_count vs ts_packet_total) directly to the available
+            // partial bytes. A clear TS tail carries 0x47 syncs at the 192-byte
+            // stride (> half the packets) → intact → not scrambled → tolerate. An
+            // encrypted tail has those syncs destroyed (≤ half) → scrambled →
+            // reject. If the partial is too short to hold even one TS packet
+            // (< 192 bytes, ts_packet_total == 0) we cannot judge confidently and
+            // tolerate rather than risk a false positive on conformant tails.
+            let partial_len = buf.len() % unit_len;
+            if partial_len != 0 {
+                let partial = &buf[buf.len() - partial_len..];
+                let packets = aacs::ts_packet_total(partial);
+                if packets > 0 && aacs::ts_sync_count(partial) <= packets / 2 {
+                    return Err(crate::error::Error::DecryptFailed);
+                }
+            }
             let nthreads = decrypt_threads();
-            let chunks: Vec<&mut [u8]> = buf.chunks_mut(unit_len).collect();
-            let nunits = chunks.len();
+            let nunits = buf.len() / unit_len;
 
             // Per-unit decrypt closure. The is_aacs_scrambled check reads the
             // raw TS syncs; a non-m2ts unit (e.g. MPLS/CLPI nav file) can look
@@ -202,22 +246,34 @@ pub fn decrypt_sectors(
             if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
                 // Serial path: avoids thread-pool overhead for tiny
                 // buffers; also the only path when caller pinned
-                // single-threaded via FREEMKV_THREADS=1.
-                for chunk in chunks {
+                // single-threaded via FREEMKV_THREADS=1. Iterate the
+                // chunks directly — no Vec of slice pointers needed.
+                for chunk in buf.chunks_mut(unit_len) {
                     decrypt_one(chunk);
                 }
             } else {
-                // Parallel path via rayon's persistent global pool.
-                // The pool is built once on first use (lazy_static-style)
-                // and reused across every decrypt_sectors call — no
-                // per-call OS thread spawn, no thread-creation latency
-                // amortised per batch. Each unit decrypts independently
-                // (own key derivation), so par_iter is sound.
-                decrypt_pool().install(|| {
-                    chunks.into_par_iter().for_each(|chunk| {
-                        decrypt_one(chunk);
-                    });
-                });
+                // Parallel path via rayon's persistent thread pool.
+                // The pool is built once on first use and reused across
+                // every decrypt_sectors call — no per-call OS thread
+                // spawn. Each unit decrypts independently (own key
+                // derivation), so par_iter is sound. On a pool-build
+                // failure (e.g. thread/pid-limit exhaustion) we fall
+                // back to the serial path rather than panic.
+                match decrypt_pool() {
+                    Some(pool) => {
+                        let chunks: Vec<&mut [u8]> = buf.chunks_mut(unit_len).collect();
+                        pool.install(|| {
+                            chunks.into_par_iter().for_each(|chunk| {
+                                decrypt_one(chunk);
+                            });
+                        });
+                    }
+                    None => {
+                        for chunk in buf.chunks_mut(unit_len) {
+                            decrypt_one(chunk);
+                        }
+                    }
+                }
             }
         }
         DecryptKeys::Css { title_key } => {
@@ -258,6 +314,113 @@ mod tests {
         assert_eq!(
             unit, snapshot,
             "non-m2ts unit must be restored after failed decrypt"
+        );
+    }
+
+    /// Build a clear-TS region: a 0x47 sync byte at offset 4 of every 192-byte
+    /// BD-TS packet (matching `ts_sync_count`'s probe stride), filler elsewhere.
+    /// Reads as NOT scrambled.
+    fn clear_ts_region(len: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let mut off = 4;
+        while off < len {
+            v[off] = 0x47;
+            off += 192;
+        }
+        v
+    }
+
+    /// Build a scrambled region: the 192-byte-stride sync positions are NOT
+    /// 0x47 (encrypted content destroys them), so it reads as scrambled.
+    fn scrambled_region(len: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let mut off = 4;
+        while off < len {
+            // Force a non-sync byte at every probe position.
+            v[off] = 0xA5;
+            off += 192;
+        }
+        v
+    }
+
+    /// Whole leading units plus a CLEAR trailing partial (the benign,
+    /// conformant case): AACS leaves an incomplete final unit / clear nav-TS
+    /// tail in the clear on disc. We must return `Ok` and leave the partial
+    /// bytes byte-for-byte unchanged — no regression on real discs.
+    #[test]
+    fn aacs_clear_trailing_partial_is_tolerated_unchanged() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        // One full scrambled unit + a 2048-byte (single-sector) CLEAR tail.
+        let unit = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let tail = clear_ts_region(2048);
+        let mut buf = unit;
+        buf.extend_from_slice(&tail);
+
+        decrypt_sectors(&mut buf, &keys, 0).expect("clear trailing partial is Ok");
+
+        assert_eq!(
+            &buf[aacs::ALIGNED_UNIT_LEN..],
+            &tail[..],
+            "clear trailing partial unit must be left unchanged"
+        );
+    }
+
+    /// Whole leading units plus a SCRAMBLED trailing partial (the malformed
+    /// danger case): an encrypted unit split across an extent boundary cannot be
+    /// decrypted standalone. Passing it through as clear would be silent
+    /// corruption, so we must fail loud with `DecryptFailed`.
+    #[test]
+    fn aacs_scrambled_trailing_partial_is_rejected() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        // One full unit + a 4096-byte (two-sector) SCRAMBLED tail.
+        let unit = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let tail = scrambled_region(4096);
+        let mut buf = unit;
+        buf.extend_from_slice(&tail);
+
+        let err = decrypt_sectors(&mut buf, &keys, 0)
+            .expect_err("scrambled trailing partial must be rejected");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::DecryptFailed.code(),
+            "scrambled trailing partial must fail with DecryptFailed"
+        );
+    }
+
+    /// An empty buffer is a valid no-op (zero units), not an error.
+    #[test]
+    fn aacs_empty_buffer_is_ok() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(decrypt_sectors(&mut buf, &keys, 0).is_ok());
+    }
+
+    /// An exact multiple of the unit length has no trailing partial: behavior
+    /// is unchanged — clear units stay clear, scrambled units are decrypt-
+    /// attempted. Two clear units must round-trip untouched and return `Ok`.
+    #[test]
+    fn aacs_exact_multiple_unchanged() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN * 2);
+        let snapshot = buf.clone();
+
+        decrypt_sectors(&mut buf, &keys, 0).expect("exact-multiple buffer is Ok");
+
+        assert_eq!(
+            buf, snapshot,
+            "clear exact-multiple buffer must be left unchanged"
         );
     }
 }

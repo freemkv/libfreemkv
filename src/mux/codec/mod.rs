@@ -7,15 +7,27 @@
 //! - Determine keyframe status
 //! - Convert PTS from 90kHz to nanoseconds
 
+/// AC-3 / E-AC-3 (Dolby Digital / Digital Plus) elementary-stream parser.
 pub mod ac3;
+/// DTS / DTS-HD elementary-stream parser.
 pub mod dts;
+/// DVD bitmap subtitle (VobSub) parser.
 pub mod dvdsub;
+/// H.264 (AVC) Annex-B elementary-stream parser.
 pub mod h264;
+/// HEVC (H.265) Annex-B elementary-stream parser.
 pub mod hevc;
+/// BD/DVD LPCM (Linear PCM) audio parser.
 pub mod lpcm;
+/// MPEG-2 Video elementary-stream parser.
 pub mod mpeg2;
+/// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
+/// Shared MPEG/Annex-B start-code scanning helpers.
+pub(crate) mod startcode;
+/// Dolby TrueHD / Atmos elementary-stream parser.
 pub mod truehd;
+/// VC-1 (SMPTE 421M) elementary-stream parser.
 pub mod vc1;
 
 use super::ts::PesPacket;
@@ -70,12 +82,20 @@ pub trait CodecParser: Send {
 }
 
 /// Passthrough parser — treats each PES as one frame, no parsing.
-/// Used for codecs where PES = frame (AC3, DTS, PGS).
+///
+/// Used for the audio codecs that have no dedicated parser and whose PES
+/// boundaries already line up with frame boundaries (Aac, Mp2, Mp3, Flac,
+/// Opus). AC3/DTS/TrueHD have their own parsers; PGS/DvdSub have their own
+/// subtitle parsers. Video codecs must NOT use the all-keyframe form of this
+/// parser — see `parser_for_codec`.
 pub struct PassthroughParser {
     keyframe: bool,
 }
 
 impl PassthroughParser {
+    /// Create a passthrough parser. Pass `true` for codecs where every PES is
+    /// independently decodable (audio / subtitle keyframes), `false` for the
+    /// video fallback where no frame-boundary or keyframe detection occurs.
     pub fn new(always_keyframe: bool) -> Self {
         Self {
             keyframe: always_keyframe,
@@ -124,6 +144,69 @@ pub fn parser_for_codec(
         Codec::Lpcm if is_dvd_ps => Box::new(lpcm::LpcmParser::new_dvd()),
         Codec::Lpcm => Box::new(lpcm::LpcmParser::new()),
         Codec::DvdSub => Box::new(dvdsub::DvdSubParser::new(codec_data)),
-        _ => Box::new(PassthroughParser::new(true)),
+        // Video codecs with no dedicated parser. There is no frame-boundary
+        // detection here, so a PES carrying multiple access units is emitted as
+        // one oversized block — but marking every frame a keyframe (as the
+        // audio passthrough does) would explode Cues density and mislead
+        // seeking. Use the non-keyframe passthrough and warn that framing is
+        // approximate. Mpeg1/Av1 are real Codec variants without a parser yet.
+        Codec::Mpeg1 | Codec::Av1 => {
+            tracing::warn!(
+                target: "mux",
+                "no dedicated parser for video codec {:?}; using non-keyframe passthrough (frame boundaries/keyframes not detected)",
+                codec
+            );
+            Box::new(PassthroughParser::new(false))
+        }
+        // Remaining audio-only codecs (Aac, Mp2, Mp3, Flac, Opus) where PES =
+        // frame: all-keyframe passthrough is correct. Subtitle/Unknown also land
+        // here; keyframe flag is irrelevant for them.
+        Codec::Aac | Codec::Mp2 | Codec::Mp3 | Codec::Flac | Codec::Opus => {
+            Box::new(PassthroughParser::new(true))
+        }
+        Codec::Srt | Codec::Ssa | Codec::Unknown(_) => Box::new(PassthroughParser::new(true)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pes(pts: Option<i64>, data: Vec<u8>) -> PesPacket {
+        PesPacket {
+            pid: 0x1011,
+            pts,
+            dts: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn unhandled_video_codecs_use_non_keyframe_passthrough() {
+        // Mpeg1/Av1 have no dedicated parser. They must NOT be marked
+        // all-keyframe (that would explode Cues density and mislead seeking);
+        // the non-keyframe passthrough is the safe fallback.
+        for codec in [Codec::Mpeg1, Codec::Av1] {
+            let mut parser = parser_for_codec(codec, None, false);
+            let frames = parser.parse(&pes(Some(9000), vec![0xDE, 0xAD, 0xBE, 0xEF]));
+            assert_eq!(frames.len(), 1, "{codec:?}");
+            assert!(
+                !frames[0].keyframe,
+                "{codec:?} must not be flagged keyframe by the fallback parser"
+            );
+            assert_eq!(frames[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        }
+    }
+
+    #[test]
+    fn unhandled_audio_codecs_use_keyframe_passthrough() {
+        // PES = frame audio codecs: every frame is independently decodable, so
+        // all-keyframe passthrough is correct.
+        for codec in [Codec::Aac, Codec::Mp2, Codec::Mp3, Codec::Flac, Codec::Opus] {
+            let mut parser = parser_for_codec(codec, None, false);
+            let frames = parser.parse(&pes(Some(0), vec![0x01, 0x02]));
+            assert_eq!(frames.len(), 1, "{codec:?}");
+            assert!(frames[0].keyframe, "{codec:?} should be keyframe");
+        }
     }
 }

@@ -76,8 +76,17 @@ pub fn detect_fd(fd: std::os::unix::io::RawFd) -> FsType {
     detect_fd_impl(fd)
 }
 
+/// Non-Linux stub for [`detect_fd`].
+///
+/// Always returns [`FsType::Unknown`]: only Linux keys its writeback
+/// policy off this classification, so other platforms have nothing to
+/// detect. The `fd` parameter is a bare `i32` rather than
+/// `std::os::unix::io::RawFd` because this arm also compiles on Windows,
+/// which has no `RawFd` — the universal integer keeps one signature across
+/// all non-Linux targets. Unused on these targets (no caller invokes it),
+/// hence `allow(dead_code)`.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)] // API parity with the linux impl; callers cfg-gate.
+#[allow(dead_code)]
 pub fn detect_fd(_fd: i32) -> FsType {
     FsType::Unknown
 }

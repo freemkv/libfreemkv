@@ -60,14 +60,20 @@ pub struct DiscInputs {
 /// cache hold exactly one. The caller drives the loop: `next_key` →
 /// `Disc::decrypt_with` → on `Err`, ask again → until a key decrypts or the
 /// source returns `None` (a genuine "no key for this disc"). Compose several
-/// sources, in the caller's chosen order, with [`crate`]'s `MultiSource`.
+/// sources, in the caller's chosen order, with the companion
+/// `freemkv-keysources` crate's `MultiSource`.
 pub trait KeySource {
     /// Hand the NEXT candidate key for this disc, or `None` once this source is
     /// exhausted. Stateful: the source tracks what it already handed out this
     /// session, so asking again after a rejected key yields the next candidate
     /// (or `None`) — it never re-offers a key or re-hits a one-shot backend (an
-    /// online service is asked at most once). A source failure (I/O, network,
-    /// parse) surfaces as `None` — there is simply nothing more to try.
+    /// online service is asked at most once).
+    ///
+    /// `None` means only "no more candidates from this source"; it does NOT by
+    /// itself distinguish a genuine "no key for this disc" from a source
+    /// failure (I/O, network, parse). After exhaustion the caller must consult
+    /// [`KeySource::errored`] to tell the two apart — a failed source records
+    /// the failure there and still returns `None` here.
     fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key>;
 
     /// Whether this source needs [`DiscInputs::samples`] populated (encrypted

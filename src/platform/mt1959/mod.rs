@@ -18,6 +18,8 @@ const BUFFER_ID_B: u8 = 0x77;
 // ── SCSI opcodes ──────────────────────────────────────────────────────
 const SCSI_READ_BUFFER: u8 = 0x3C;
 const SCSI_READ_CAPACITY: u8 = 0x25;
+/// Shared by both firmware-upload variants (see `variant_a` / `variant_b`).
+pub(super) const SCSI_WRITE_BUFFER: u8 = 0x3B;
 
 // ── Sub-commands (shared A/B) ─────────────────────────────────────────
 const SUB_CMD_UNLOCK: u8 = 0x00;
@@ -111,6 +113,14 @@ impl Mt1959 {
         buf: &mut [u8],
         expected: usize,
     ) -> Result<usize> {
+        // The READ_BUFFER CDB transfer-length is a single byte; an
+        // `expected` above 255 cannot be expressed and would silently
+        // truncate. All in-crate callers pass small fixed sizes (4); guard
+        // the invariant rather than emit a malformed CDB.
+        debug_assert!(
+            expected <= u8::MAX as usize,
+            "read_buffer_probe expected exceeds 1-byte CDB length field"
+        );
         let cdb = self.read_buffer_sub(sub_cmd, address, expected as u8);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
         if result.bytes_transferred != expected {
@@ -146,16 +156,23 @@ impl Mt1959 {
             0x00,
         ];
         let mut response = vec![0u8; UNLOCK_RESPONSE_SIZE as usize];
-        scsi.execute(&cdb, DataDirection::FromDevice, &mut response, 30_000)?;
+        let result = scsi.execute(&cdb, DataDirection::FromDevice, &mut response, 30_000)?;
 
-        if response.len() >= 4 && response[0..4] != self.profile.signature {
+        // `response` is a fixed 64-byte buffer, so `response.len()` is
+        // always >= every offset below — the meaningful bound is how many
+        // bytes the drive actually delivered. Validate against
+        // `bytes_transferred` so a short/partial transfer (stale trailing
+        // zeros) can't be read as if the drive sent real marker bytes.
+        let n = result.bytes_transferred.min(response.len());
+
+        if n >= 4 && response[0..4] != self.profile.signature {
             return Err(Error::SignatureMismatch {
                 expected: self.profile.signature,
                 got: response[0..4].try_into().unwrap_or([0; 4]),
             });
         }
 
-        if response.len() >= FIRMWARE_ACTIVE_OFFSET + 4
+        if n >= FIRMWARE_ACTIVE_OFFSET + 4
             && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] != FIRMWARE_ACTIVE_SIG
         {
             return Err(Error::UnlockFailed);
@@ -170,7 +187,7 @@ impl Mt1959 {
         // the rest of the response. Requiring both before we tell the
         // upper layer "OEM path is live" keeps any partial / corrupted
         // response from steering us off the cert-auth fallback.
-        self.unlocked = response.len() >= FIRMWARE_MODE_OFFSET + 4
+        self.unlocked = n >= FIRMWARE_MODE_OFFSET + 4
             && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] == FIRMWARE_ACTIVE_SIG
             && response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
@@ -272,7 +289,11 @@ impl Mt1959 {
             .execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000)
             .is_ok()
         {
-            u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]) + 1
+            // last_lba + 1 = sector count. A 0xFFFFFFFF last-LBA is the
+            // READ CAPACITY(10) "capacity exceeds 32 bits" sentinel; saturate
+            // rather than wrap to 0 (which would misclassify a huge disc as
+            // BD). A saturated count stays above the UHD threshold -> UHD.
+            u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]).saturating_add(1)
         } else {
             0
         };

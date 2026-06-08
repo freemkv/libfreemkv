@@ -18,15 +18,16 @@
 //! consumed window so an 85 GB streaming ISO read doesn't fill the
 //! page cache and starve the concurrent MKV write.
 //!
-//! `Pipeline` + `Sink` (0.18) is the generic producer/consumer primitive
+//! `Pipeline` + `Sink` is the generic producer/consumer primitive
 //! used by sweep, patch, and mux to overlap reads with writes via a
 //! bounded channel + dedicated consumer thread.
 //!
-//! `byte_channel` is a byte-sized producer/consumer channel for the
-//! mux pipeline, sized to absorb worst-case input read stalls.
+//! `byte_prefetcher` is the read-ahead producer feeding the mux
+//! pipeline for `io::Read`-backed sources: a worker thread fills a
+//! recycled pool of buffers and ships them through a channel, exposing
+//! `BytePrefetcher` / `PrefetchShell`.
 
 pub(crate) mod bounded;
-pub mod byte_channel;
 pub mod byte_prefetcher;
 pub mod file_sector_source;
 pub mod sink;
@@ -40,8 +41,6 @@ pub mod pipeline;
 
 pub(crate) use writeback_file::WritebackFile;
 
-// Re-exports for the 0.18 redesign. Sweep, patch, and mux are all
-// wired up (disc/sweep.rs, disc/patch.rs, autorip's ripper/mux.rs).
 pub use pipeline::{
     DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH,
     WRITE_THROUGH_DEPTH,

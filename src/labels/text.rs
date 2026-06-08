@@ -1,13 +1,14 @@
 //! Text-extraction helpers used by parsers that scan binary blobs for
 //! embedded label strings.
 //!
-//! Promoted from two near-duplicate implementations:
-//! - `pixelogic::extract_strings` (`bluray_project.bin`, min_len=4)
-//! - `dbp::extract_printable` (`.class` files in jars, min_len=5)
+//! Promoted from a byte-scanning helper (`bluray_project.bin`,
+//! min_len=4). Single implementation, threshold passed in.
 //!
-//! Single implementation, threshold passed in. Callers that have a
-//! more structured parse path (e.g. `class_reader` for .class) should
-//! prefer that — this helper is for genuinely unstructured input.
+//! `dbp` no longer uses a byte-scanning helper — it iterates
+//! `class_reader::CpInfo::Utf8` constant-pool entries directly. Callers
+//! that have a more structured parse path (e.g. `class_reader` for
+//! `.class`) should prefer that; this helper is for genuinely
+//! unstructured input.
 
 /// Walk `data`, emit every maximal run of printable-ASCII bytes
 /// (`0x20..=0x7E`) whose length is at least `min_len`.
@@ -21,13 +22,13 @@ pub fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
     for &b in data {
         if (0x20..=0x7E).contains(&b) {
             current.push(b as char);
-        } else if current.len() >= min_len {
+        } else if !current.is_empty() && current.len() >= min_len {
             out.push(std::mem::take(&mut current));
         } else {
             current.clear();
         }
     }
-    if current.len() >= min_len {
+    if !current.is_empty() && current.len() >= min_len {
         out.push(current);
     }
     out
@@ -85,5 +86,15 @@ mod tests {
         // Pathological but well-defined.
         let got = extract_ascii_strings(b"a\0b", 0);
         assert_eq!(got, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn min_len_zero_skips_empty_runs_on_consecutive_separators() {
+        // Consecutive separators must NOT emit empty strings even at
+        // min_len=0 — an empty string is not a "run of printable bytes".
+        let got = extract_ascii_strings(b"\0\0abc", 0);
+        assert_eq!(got, vec!["abc"]);
+        let got = extract_ascii_strings(b"ab\0\0\0cd\0\0", 0);
+        assert_eq!(got, vec!["ab", "cd"]);
     }
 }

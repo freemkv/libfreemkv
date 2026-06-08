@@ -55,6 +55,11 @@ pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> 
 }
 
 impl MkvTrack {
+    /// Build a video track from a [`VideoStream`]. Language defaults to `"und"`;
+    /// colour metadata is derived from the stream's colour space and HDR format
+    /// (PQ for HDR10/HDR10+/DV, HLG for HLG). When `hdr == DolbyVision` a dvcC
+    /// BlockAdditionMapping is attached automatically so players recognise the
+    /// Dolby Vision layer.
     pub fn video(v: &VideoStream) -> Self {
         let codec_id = match v.codec {
             Codec::H264 => "V_MPEG4/ISO/AVC",
@@ -111,6 +116,9 @@ impl MkvTrack {
         }
     }
 
+    /// Build an audio track from an [`AudioStream`]. The codec ID follows the
+    /// Matroska registry; every DTS family member (core, DTS-HD HR, DTS-HD MA)
+    /// maps to the single registered `A_DTS` ID (see the note below).
     pub fn audio(a: &AudioStream) -> Self {
         // The Matroska codec-ID registry defines `A_DTS` for the entire
         // DTS family — the spec text for `A_DTS` explicitly states it
@@ -160,6 +168,10 @@ impl MkvTrack {
         }
     }
 
+    /// Build a subtitle track from a [`SubtitleStream`]. PGS maps to
+    /// `S_HDMV/PGS` and DVD VobSub to `S_VOBSUB`; the stream's `codec_data`
+    /// (the VobSub `.idx` palette header for DVD) becomes the track's
+    /// CodecPrivate. The forced-display flag is propagated from the stream.
     pub fn subtitle(s: &SubtitleStream) -> Self {
         let codec_id = match s.codec {
             Codec::DvdSub => "S_VOBSUB",
@@ -219,6 +231,12 @@ pub struct MkvMuxer<W: Write + Seek> {
     last_pts_ms: std::collections::HashMap<usize, i64>,
     cues: Vec<CuePoint>,
     frame_count: u64,
+    /// Frames handed to `write_frame` that were dropped because no cluster was
+    /// open yet (a cluster only opens on a track-0 video keyframe). If this is
+    /// non-zero at `finish()` and not a single frame was ever written, the
+    /// caller produced an empty MKV — surfaced as an error rather than a
+    /// silently empty file. See `write_frame` for the track-0 invariant.
+    dropped_pre_cluster: u64,
     seek_fixups: Vec<SeekPositionFixup>,
     info_offset: u64,
     tracks_offset: u64,
@@ -229,10 +247,15 @@ pub struct MkvMuxer<W: Write + Seek> {
 const CLUSTER_DURATION_MS: i64 = 5000;
 
 /// Maximum block-relative timestamp expressible in the signed 16-bit
-/// SimpleBlock/Block field (`i16::MAX` ms). A frame further than this from
-/// the open cluster's timestamp forces a new cluster (see `write_frame`) so
-/// the `as i16` cast can never wrap.
+/// SimpleBlock/Block field (`i16::MAX` ms). A frame whose offset from the open
+/// cluster's timestamp falls outside `i16::MIN..=i16::MAX` ms forces a new
+/// cluster (see `write_frame`) so the `as i16` cast can never wrap — in EITHER
+/// direction. PES timestamps come from untrusted disc/file bytes and can
+/// back-jump on discontinuities, so the lower bound matters as much as the
+/// upper one.
 const MAX_BLOCK_REL_MS: i64 = i16::MAX as i64;
+/// Minimum block-relative timestamp expressible in the signed 16-bit field.
+const MIN_BLOCK_REL_MS: i64 = i16::MIN as i64;
 
 /// Force a per-track block timestamp to be strictly later than the previous one
 /// written for that track. `prev` is the last timestamp for the track (`None`
@@ -244,6 +267,28 @@ fn monotonic_ts(prev: Option<i64>, pts_ms: i64) -> i64 {
     match prev {
         Some(p) => pts_ms.max(p.saturating_add(1)),
         None => pts_ms,
+    }
+}
+
+/// Encode a Matroska track number as an EBML VINT into a stack buffer,
+/// returning the buffer and the used length. Track numbers are small (1-based,
+/// a handful of tracks), so 1 byte covers `< 0x80` and 2 bytes covers the rest;
+/// no heap allocation, called once per block on the mux hot path.
+///
+/// The 2-byte form holds 14 payload bits (max 0x3FFF). The `debug_assert`
+/// guards the 0x4000 bound: at or above it, `(track_num >> 8)` is >= 0x40 and
+/// OR-ing the 0x40 length marker would clobber it, corrupting the track
+/// number. Not reachable today (track numbers are `i+1` over a few streams),
+/// so this documents the bound rather than handling 3-byte VINTs.
+fn track_vint(track_num: usize) -> ([u8; 2], usize) {
+    if track_num < 0x80 {
+        ([(track_num as u8) | 0x80, 0], 1)
+    } else {
+        debug_assert!(
+            track_num < 0x4000,
+            "track number {track_num} exceeds the 14-bit 2-byte EBML VINT range"
+        );
+        ([0x40 | ((track_num >> 8) as u8), track_num as u8], 2)
     }
 }
 
@@ -446,6 +491,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             last_pts_ms: std::collections::HashMap::new(),
             cues: Vec::new(),
             frame_count: 0,
+            dropped_pre_cluster: 0,
             seek_fixups,
             info_offset,
             tracks_offset,
@@ -469,8 +515,40 @@ impl<W: Write + Seek> MkvMuxer<W> {
         duration_ns: Option<u64>,
     ) -> io::Result<()> {
         let raw_ms = pts_ns / 1_000_000;
-        let base = *self.base_pts_ms.get_or_insert(raw_ms);
-        let pts_ms = raw_ms - base;
+
+        // Cluster boundaries normally coincide with a video keyframe so every
+        // Cues entry resolves to a seekable IDR at the cluster start.
+        let is_video_key = keyframe && track_idx == 0;
+
+        // Derive the timestamp base from the first *kept* keyframe (the frame
+        // that opens the first cluster), NOT the first frame merely seen. The
+        // first frame seen can have a higher display PTS than the subsequent
+        // I-frame (B-frame reordering / a PTS discontinuity), which would make
+        // later cluster/cue timestamps negative and wrap to ~u64::MAX on the
+        // `as u64` cast in `start_cluster`/`finish`. Anchoring on the first kept
+        // keyframe guarantees the open cluster's timestamp is 0 and all later
+        // relative offsets are computed from a frame we actually wrote.
+        let base = match self.base_pts_ms {
+            Some(b) => b,
+            None => {
+                if !is_video_key {
+                    // No cluster can open yet (clusters start on a track-0
+                    // keyframe). Drop this frame as before, but count it so an
+                    // all-dropped run surfaces as an error at finish().
+                    self.dropped_pre_cluster += 1;
+                    return Ok(());
+                }
+                self.base_pts_ms = Some(raw_ms);
+                raw_ms
+            }
+        };
+        // Floor at 0: base is the first kept keyframe, so any frame with an
+        // earlier PTS (audio/subtitle arriving with a pre-keyframe timestamp, or
+        // a back-jump on a stream discontinuity) would compute negative here,
+        // which would wrap to ~u64::MAX on the `as u64` cluster/cue write and
+        // could overflow the i16 block-relative cast. Frames before the first
+        // kept keyframe are clamped to t=0 rather than corrupting the timeline.
+        let pts_ms = (raw_ms - base).max(0);
 
         // Enforce strictly-monotonic per-track block timestamps. Some audio PES
         // PTS truncate to the same millisecond as the previous frame (or, rarely,
@@ -479,14 +557,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // and A/V sync is unaffected at millisecond granularity.
         let pts_ms = monotonic_ts(self.last_pts_ms.get(&track_idx).copied(), pts_ms);
 
-        // Cluster boundaries normally coincide with a video keyframe so every
-        // Cues entry resolves to a seekable IDR at the cluster start.
-        let is_video_key = keyframe && track_idx == 0;
         let needs_new_cluster = !self.cluster_open
             || (is_video_key && (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS);
 
         if needs_new_cluster {
             if !is_video_key {
+                // A cluster is open but this non-keyframe wants a fresh one only
+                // because !cluster_open is false here — so this branch is the
+                // "no cluster open and not a keyframe" case. Drop and count.
+                if !self.cluster_open {
+                    self.dropped_pre_cluster += 1;
+                }
                 return Ok(());
             }
             self.start_cluster(pts_ms)?;
@@ -495,17 +576,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 track: track_idx + 1,
                 cluster_pos: self.cluster_pos - self.segment_start,
             });
-        } else if (pts_ms - self.cluster_ts_ms) > MAX_BLOCK_REL_MS {
-            // The block-relative timestamp is a signed 16-bit value, so a
-            // frame more than i16::MAX ms (~32.767 s) past the current
-            // cluster's timestamp would silently wrap on the `as i16` cast,
-            // corrupting A/V sync. The keyframe-driven boundary above only
-            // fires on a video keyframe — a long audio-only stretch, or a
-            // very long GOP with no intervening keyframe, can drift past the
-            // i16 range. Force a fresh cluster here even without a keyframe
-            // to keep the cast in range. This cluster is not keyframe-aligned
-            // so it gets no Cues entry (Cues stay IDR-only for seekability).
-            self.start_cluster(pts_ms)?;
+        } else {
+            let rel = pts_ms - self.cluster_ts_ms;
+            if !(MIN_BLOCK_REL_MS..=MAX_BLOCK_REL_MS).contains(&rel) {
+                // The block-relative timestamp is a signed 16-bit value, so a
+                // frame whose offset from the current cluster's timestamp falls
+                // outside i16::MIN..=i16::MAX ms (~±32.767 s) would silently wrap
+                // on the `as i16` cast, corrupting A/V sync. The keyframe-driven
+                // boundary above only fires on a video keyframe — a long
+                // audio-only stretch, a very long GOP with no intervening
+                // keyframe (positive direction), or an audio/subtitle PES whose
+                // PTS back-jumps below the open cluster (negative direction, e.g.
+                // a stream discontinuity) can drift past the i16 range. Force a
+                // fresh cluster here even without a keyframe to keep the cast in
+                // range. pts_ms is already floored at 0 above, so the new
+                // cluster timestamp never wraps on the `as u64` write in
+                // start_cluster. This cluster is not keyframe-aligned so it gets
+                // no Cues entry (Cues stay IDR-only for seekability).
+                self.start_cluster(pts_ms)?;
+            }
         }
 
         // Committed to writing this frame — record its (monotonic) timestamp so
@@ -528,7 +617,24 @@ impl<W: Write + Seek> MkvMuxer<W> {
     }
 
     /// Finish the MKV file: write Cues element.
+    ///
+    /// # Track-0 invariant
+    ///
+    /// A cluster only opens on a track-0 video keyframe, so the caller must
+    /// supply track 0 as the video track and deliver a keyframe on it before
+    /// (or alongside) other-track data. If no track-0 keyframe ever arrives,
+    /// every `write_frame` is silently dropped; rather than emit a structurally
+    /// valid but empty MKV (zero clusters, zero frames), `finish` returns
+    /// `Error::MkvInvalid` when frames were submitted but none were written.
     pub fn finish(mut self) -> io::Result<()> {
+        // A title that produced no frames (e.g. fully unreadable, or every
+        // frame dropped before the first track-0 keyframe opened a cluster)
+        // would otherwise yield a structurally-empty MKV with no clusters or
+        // cues. Surface that as an error rather than writing valid-but-empty
+        // output.
+        if self.frame_count == 0 {
+            return Err(crate::error::Error::MkvInvalid.into());
+        }
         // Close final cluster
         self.end_cluster()?;
 
@@ -558,7 +664,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
             let offset = match fixup.target_id {
                 ebml::INFO => self.info_offset,
                 ebml::TRACKS => self.tracks_offset,
-                ebml::CHAPTERS => self.chapters_offset.unwrap_or(0),
+                ebml::CHAPTERS => self
+                    .chapters_offset
+                    .expect("CHAPTERS seek fixup present => chapters_offset is Some"),
                 ebml::CUES => cues_offset,
                 _ => 0,
             };
@@ -601,19 +709,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
         data: &[u8],
     ) -> io::Result<()> {
         // SimpleBlock: [track_number VINT] [relative_ts i16] [flags u8] [data]
-        // Track number as EBML VINT
-        let track_vint = if track_num < 0x80 {
-            vec![(track_num as u8) | 0x80]
-        } else {
-            vec![0x40 | ((track_num >> 8) as u8), track_num as u8]
-        };
+        let (tv, tv_len) = track_vint(track_num);
+        let track_vint = &tv[..tv_len];
 
         let flags: u8 = if keyframe { 0x80 } else { 0x00 };
 
         let block_size = track_vint.len() + 2 + 1 + data.len(); // vint + ts(2) + flags(1) + data
         ebml::write_id(&mut self.writer, ebml::SIMPLE_BLOCK)?;
         ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(&track_vint)?;
+        self.writer.write_all(track_vint)?;
         self.writer.write_all(&relative_ts.to_be_bytes())?;
         self.writer.write_all(&[flags])?;
         self.writer.write_all(data)?;
@@ -629,18 +733,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
         data: &[u8],
         duration_ms: u64,
     ) -> io::Result<()> {
-        let track_vint = if track_num < 0x80 {
-            vec![(track_num as u8) | 0x80]
-        } else {
-            vec![0x40 | ((track_num >> 8) as u8), track_num as u8]
-        };
-        let flags: u8 = if keyframe { 0x80 } else { 0x00 };
+        let (tv, tv_len) = track_vint(track_num);
+        let track_vint = &tv[..tv_len];
+        // The 0x80 Keyframe flag is defined only for SimpleBlock; inside a
+        // Block within a BlockGroup that high bit is reserved and MUST be 0
+        // (keyframe-ness is signalled by the absence of a ReferenceBlock
+        // child). `keyframe` is intentionally unused here — every Block this
+        // path emits is intra (PGS subtitle frames carrying a duration).
+        let _ = keyframe;
+        let flags: u8 = 0x00;
         let block_size = track_vint.len() + 2 + 1 + data.len();
 
         let bg_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_GROUP)?;
         ebml::write_id(&mut self.writer, ebml::BLOCK)?;
         ebml::write_size(&mut self.writer, block_size as u64)?;
-        self.writer.write_all(&track_vint)?;
+        self.writer.write_all(track_vint)?;
         self.writer.write_all(&relative_ts.to_be_bytes())?;
         self.writer.write_all(&[flags])?;
         self.writer.write_all(data)?;
@@ -820,28 +927,9 @@ mod tests {
 
     #[test]
     fn mkv_finish_writes_cues_element() {
-        // Use a Vec wrapped in Cursor, then check after finish
+        // finish() consumes self and flushes the writer, so use the
+        // module-level SharedWriter to inspect the buffer afterwards.
         use std::sync::{Arc, Mutex};
-
-        // We'll write to a Cursor, but finish() consumes self.
-        // The trick: Cursor<Vec<u8>> - we can get data back via into_inner chain.
-        // But MkvMuxer::finish consumes self and flushes writer.
-        // We need a way to inspect the output. Let's use a wrapper.
-
-        struct SharedWriter(Arc<Mutex<Cursor<Vec<u8>>>>);
-        impl Write for SharedWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().write(buf)
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                self.0.lock().unwrap().flush()
-            }
-        }
-        impl Seek for SharedWriter {
-            fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-                self.0.lock().unwrap().seek(pos)
-            }
-        }
 
         let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let writer = SharedWriter(shared.clone());
@@ -1596,5 +1684,115 @@ mod tests {
             cursor.seek(io::SeekFrom::Current(sz as i64)).unwrap();
         }
         assert_eq!(sb_count, 1, "expected exactly one SimpleBlock in output");
+    }
+
+    #[test]
+    fn no_track0_keyframe_yields_error_not_empty_file() {
+        // If track 0 never delivers a keyframe, every frame is dropped. finish()
+        // must surface this rather than emitting a structurally valid empty MKV.
+        let tracks = [make_video_track(), make_audio_track()];
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
+        // Audio frames (track 1) and non-keyframe video — no track-0 keyframe.
+        muxer.write_frame(1, 0, true, &[0xAA; 8], None).unwrap();
+        muxer
+            .write_frame(0, 10_000_000, false, &[0xBB; 8], None)
+            .unwrap();
+        muxer
+            .write_frame(1, 20_000_000, true, &[0xCC; 8], None)
+            .unwrap();
+        let err = muxer.finish().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn finish_with_no_frames_errors() {
+        // A muxer that received no frames at all must surface MkvInvalid on
+        // finish() rather than writing a structurally-empty MKV.
+        let buf = Cursor::new(Vec::new());
+        let tracks = [make_video_track()];
+        let muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
+        let err = muxer.finish().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn negative_relative_audio_forces_new_cluster_no_i16_wrap() {
+        // An audio frame whose PTS back-jumps far below the open cluster (a
+        // discontinuity) must force a fresh cluster rather than wrap the i16
+        // block-relative cast. Build: keyframe at t=0 opening a cluster, a video
+        // keyframe far later (so cluster ts is large), then an audio frame whose
+        // PTS lands before that cluster's start by more than i16::MIN ms.
+        let tracks = [make_video_track(), make_audio_track()];
+        // base = 0 (first kept keyframe). Cluster opens at 0; a later keyframe at
+        // 40s opens a second cluster at ts=40000. Then audio at t=0 → relative
+        // 0-40000 = -40000 ms, below i16::MIN (-32768) → must open a new cluster.
+        let frames = vec![
+            (0usize, 0i64, true, vec![0x01; 16]),
+            (0usize, 40_000_000_000i64, true, vec![0x02; 16]), // 40s
+            (1usize, 0i64, true, vec![0x03; 16]),              // back-jumped audio
+        ];
+        let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(frame_count, 3);
+        let clusters = find_clusters(&data);
+        // Three clusters: t=0 (video kf), t=40000 (video kf), t=0 (forced for the
+        // back-jumped audio, no Cues entry).
+        assert!(
+            clusters.len() >= 3,
+            "back-jumped audio must force a fresh cluster, got {} clusters",
+            clusters.len()
+        );
+        // Every SimpleBlock's relative timestamp must round-trip through i16
+        // without the block landing outside the cluster (verified implicitly by
+        // the muxer never panicking on the `as i16` cast; here we assert the
+        // forced cluster's timestamp is non-negative so the `as u64` write is
+        // also safe).
+        for (_, _, ts) in &clusters {
+            assert!(*ts <= i64::MAX as u64, "cluster ts must not have wrapped");
+        }
+    }
+
+    #[test]
+    fn negative_pts_audio_after_keyframe_does_not_wrap() {
+        // Stream order: video keyframe at 5s (anchors base=5000ms, opens cluster
+        // at ts 0), then an audio frame with raw PTS 4s — earlier than base.
+        // raw_ms - base = -1000ms (negative). It must be floored to 0 rather
+        // than wrapping the `as u64` cluster/cue write or overflowing the i16
+        // relative cast.
+        let tracks = [make_video_track(), make_audio_track()];
+        let frames_in_order = [
+            (0usize, 5_000_000_000i64, true, vec![0xBB; 16]), // video kf at 5s
+            (1usize, 4_000_000_000i64, true, vec![0xAA; 8]),  // audio at 4s (< base)
+        ];
+        // Do NOT sort — preserve the out-of-order arrival.
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
+        for (t, pts, kf, data) in &frames_in_order {
+            muxer.write_frame(*t, *pts, *kf, data, None).unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+        let clusters = find_clusters(&data);
+        assert!(!clusters.is_empty());
+        for (_, _, ts) in &clusters {
+            // A wrapped negative would be a huge near-u64::MAX value.
+            assert!(*ts < 1_000_000_000, "cluster timestamp wrapped: {}", ts);
+        }
+    }
+
+    #[test]
+    fn track_vint_encodes_one_and_two_byte_forms() {
+        // 1-byte form for track numbers < 0x80, high bit set.
+        let (b, n) = track_vint(1);
+        assert_eq!(&b[..n], &[0x81]);
+        let (b, n) = track_vint(0x7F);
+        assert_eq!(&b[..n], &[0xFF]);
+        // 2-byte form at/above 0x80, 0x40 length marker in the top byte.
+        let (b, n) = track_vint(0x80);
+        assert_eq!(&b[..n], &[0x40, 0x80]);
+        let (b, n) = track_vint(0x3FFF);
+        assert_eq!(&b[..n], &[0x7F, 0xFF]);
     }
 }

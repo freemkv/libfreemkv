@@ -17,9 +17,17 @@
 //! Without page-cache eviction an 85 GB streaming ISO read pins the
 //! entire file in memory, starves the concurrent writer, and collapses
 //! mux throughput (observed: 2.7 MB/s mux on 0.21.5 vs. 70 MB/s
-//! isolated NFS reads). Every [`READ_DROP_CHUNK_BYTES`] of consumed
-//! bytes we call `posix_fadvise(DONTNEED)` over that window, mirroring
-//! the write-side [`crate::io::writeback::WritebackPipeline`] policy.
+//! isolated NFS reads). Every [`READ_DROP_CHUNK_BYTES_DEFAULT`] of
+//! consumed bytes we call `posix_fadvise(DONTNEED)` over that window,
+//! mirroring the write-side [`crate::io::writeback::WritebackPipeline`]
+//! policy.
+//!
+//! The drop window is accounted by a monotonic forward byte counter,
+//! which matches the sequential streaming pattern the mux highway
+//! drives. Under random or backward access the dropped range no longer
+//! lines up with the bytes actually read — but `DONTNEED` is purely an
+//! advisory cache hint with no correctness impact, so this degrades to
+//! a slightly imprecise hint rather than a bug.
 //!
 //! ## Platform open hint
 //!
@@ -102,7 +110,10 @@ pub struct FileSectorSource {
     bytes_read_since_drop: u64,
     /// File offset at which the current drop window starts. The next
     /// DONTNEED drops from `drop_window_start` for
-    /// `bytes_read_since_drop` bytes.
+    /// `bytes_read_since_drop` bytes. This advances monotonically with
+    /// the byte count, so it tracks the actual reads only under the
+    /// forward-sequential access the mux highway uses; under random
+    /// access it degrades to a harmless, imprecise advisory hint.
     drop_window_start: u64,
     /// Cached drop chunk size (resolved from env once at open).
     drop_chunk_bytes: u64,
@@ -116,16 +127,18 @@ impl FileSectorSource {
     ///
     /// Issues the platform's "sequential access expected" hint on the
     /// fd (Linux `posix_fadvise(SEQUENTIAL)`, macOS `fcntl(F_RDADVISE)`,
-    /// Windows TODO stub) so the kernel's readahead widens.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
+    /// Windows no-op) so the kernel's readahead widens.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).map_err(|e| Error::IoError { source: e })?;
+        let len = file
+            .metadata()
+            .map_err(|e| Error::IoError { source: e })?
+            .len();
         let sectors = len / SECTOR_SIZE as u64;
         if sectors > u32::MAX as u64 {
             return Err(Error::IsoTooLarge {
                 path: path.to_string_lossy().into_owned(),
-            }
-            .into());
+            });
         }
         let capacity = sectors as u32;
 

@@ -57,27 +57,48 @@ impl DriveId {
         let cdb_inq = [0x12, 0x00, 0x00, 0x00, 0x60, 0x00];
         transport.execute(&cdb_inq, DataDirection::FromDevice, &mut inquiry, 5000)?;
 
-        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6
+        // GET CONFIGURATION Feature 010Ch — MMC-6 §6.6.
+        // Best-effort: 010Ch (Firmware Information) is an optional feature.
+        // A drive that lacks it may CHECK CONDITION rather than return an
+        // empty descriptor, so a failure here is treated as feature-absent
+        // (empty firmware date + empty raw bytes) instead of aborting the
+        // whole identity probe.
         let mut gc = vec![0u8; 256];
         let cdb_gc = [0x46, 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-        let result = transport.execute(&cdb_gc, DataDirection::FromDevice, &mut gc, 5000)?;
+        // `bytes_transferred` is device-reported and untrusted; clamp every
+        // slice end to the actual buffer length before indexing.
+        let (firmware_date, raw_gc_010c) =
+            match transport.execute(&cdb_gc, DataDirection::FromDevice, &mut gc, 5000) {
+                Ok(result) => {
+                    let end = result.bytes_transferred.min(gc.len());
+                    let date = if end > 12 {
+                        String::from_utf8_lossy(&gc[12..24.min(end)])
+                            .trim()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    (date, gc[..end].to_vec())
+                }
+                Err(_) => (String::new(), Vec::new()),
+            };
 
-        let firmware_date = if result.bytes_transferred > 12 {
-            String::from_utf8_lossy(&gc[12..24.min(result.bytes_transferred)])
-                .trim()
-                .to_string()
-        } else {
-            String::new()
-        };
-
-        // GET CONFIGURATION Feature 0108h — Serial Number
+        // GET CONFIGURATION Feature 0108h — Serial Number.
+        // Best-effort, like 010Ch above: the serial-number feature is
+        // optional, so a drive that lacks it (CHECK CONDITION) or reports
+        // too few bytes deliberately yields an empty serial rather than
+        // failing the identity probe.
         let mut gc_serial = vec![0u8; 256];
         let cdb_serial = [0x46, 0x02, 0x01, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
         let serial_number = if let Ok(r) =
             transport.execute(&cdb_serial, DataDirection::FromDevice, &mut gc_serial, 5000)
         {
             if r.bytes_transferred > 12 {
-                String::from_utf8_lossy(&gc_serial[12..r.bytes_transferred])
+                // `bytes_transferred` is device-reported and untrusted; clamp
+                // the slice end to the buffer length to avoid an out-of-range
+                // panic on an oversized reported count.
+                let end = r.bytes_transferred.min(gc_serial.len());
+                String::from_utf8_lossy(&gc_serial[12..end])
                     .trim()
                     .to_string()
             } else {
@@ -94,8 +115,8 @@ impl DriveId {
             vendor_specific: ascii_field(&inquiry, 36, 43),
             firmware_date,
             serial_number,
-            raw_inquiry: inquiry.to_vec(),
-            raw_gc_010c: gc[..result.bytes_transferred].to_vec(),
+            raw_inquiry: inquiry,
+            raw_gc_010c,
         })
     }
 
@@ -155,6 +176,49 @@ fn ascii_field(data: &[u8], start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scsi::{ScsiResult, ScsiTransport};
+
+    /// Transport that returns the requested data length but reports a
+    /// bytes_transferred larger than the caller's buffer — models a drive
+    /// that lies about its transfer count. The old slicing code panicked
+    /// on this; the clamps must keep it from indexing out of range.
+    struct OversizedCountTransport;
+
+    impl ScsiTransport for OversizedCountTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            buf: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            // Fill plausible ASCII so the from_utf8_lossy paths run.
+            for b in buf.iter_mut() {
+                *b = b'A';
+            }
+            // INQUIRY (0x12): honest count. GET CONFIGURATION (0x46): lie.
+            let bytes_transferred = if cdb.first() == Some(&0x12) {
+                buf.len()
+            } else {
+                buf.len() + 4096
+            };
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    #[test]
+    fn from_drive_clamps_oversized_bytes_transferred() {
+        // Must not panic despite the transport reporting a transfer count
+        // far beyond the 256-byte GET CONFIGURATION buffers.
+        let mut t = OversizedCountTransport;
+        let id = DriveId::from_drive(&mut t).expect("from_drive must not error");
+        // raw_gc_010c is clamped to the 256-byte buffer, never the lie.
+        assert_eq!(id.raw_gc_010c.len(), 256);
+    }
 
     #[test]
     fn test_bu40n_identity() {

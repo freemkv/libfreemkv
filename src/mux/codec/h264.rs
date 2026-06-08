@@ -4,6 +4,7 @@
 //! Detects keyframes (IDR slices).
 //! Each PES packet = one access unit = one frame.
 
+use super::startcode::{find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// H.264 NAL unit types we care about.
@@ -12,6 +13,9 @@ const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
 
+/// H.264 (AVC) Annex B → MKV codec parser: extracts SPS/PPS for the avcC
+/// codecPrivate, detects IDR keyframes, and converts each PES access unit into
+/// length-prefixed NAL units. Implements [`CodecParser`].
 pub struct H264Parser {
     // First-seen SPS/PPS seed the MKV codecPrivate (avcC) — the only out-of-band
     // copy the player gets. BD H.264 repeats the parameter sets at every IDR;
@@ -32,6 +36,7 @@ impl Default for H264Parser {
 }
 
 impl H264Parser {
+    /// Create a fresh H.264 parser with no parameter sets captured yet.
     pub fn new() -> Self {
         Self {
             sps: None,
@@ -56,7 +61,14 @@ fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Ve
         Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
         Some(_) => {
             // Differs from codecPrivate → emit in-band so it wins at this AU.
-            frame_data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            // A NAL longer than u32::MAX cannot be length-prefixed in the
+            // 4-byte field; skip it rather than emit a truncated length over
+            // the full body (mis-framed NALU). Unreachable in practice — no
+            // real access unit is >4 GiB.
+            let Ok(len) = u32::try_from(nal.len()) else {
+                return;
+            };
+            frame_data.extend_from_slice(&len.to_be_bytes());
             frame_data.extend_from_slice(nal);
         }
     }
@@ -78,7 +90,10 @@ impl CodecParser for H264Parser {
         // Annex B (start-code prefixed) NALUs to length-prefixed NALUs (MKV with
         // AVCDecoderConfigurationRecord expects a 4-byte length prefix per NAL).
         let mut keyframe = false;
-        let mut frame_data = Vec::new();
+        // Pre-size: output is ~input bytes plus a few 4-byte NAL length prefixes.
+        // The unsized Vec growth chain otherwise reallocs several times per
+        // frame in the mux hot path (mirrors the HEVC parser).
+        let mut frame_data = Vec::with_capacity(pes.data.len() + 64);
 
         for nal in NalIterator::new(&pes.data) {
             let nal_type = nal[0] & 0x1F;
@@ -88,13 +103,21 @@ impl CodecParser for H264Parser {
                 // mid-title redefinition differs from the avcC copy.
                 NAL_SPS => handle_param_set(&mut self.sps, nal, &mut frame_data),
                 NAL_PPS => handle_param_set(&mut self.pps, nal, &mut frame_data),
-                // Access unit delimiters: drop.
+                // Access unit delimiters: drop. Intentional and spec-correct —
+                // Matroska H.264 frame data omits AUDs (the container delimits
+                // access units), so keeping them in-band is redundant. Mirrors
+                // the HEVC parser.
                 NAL_AUD => {}
                 _ => {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
                     }
-                    let len = nal.len() as u32;
+                    // A NAL longer than u32::MAX can't be length-prefixed in the
+                    // 4-byte field; skip it rather than mis-frame the output.
+                    // Unreachable in practice (no real AU is >4 GiB).
+                    let Ok(len) = u32::try_from(nal.len()) else {
+                        continue;
+                    };
                     frame_data.extend_from_slice(&len.to_be_bytes());
                     frame_data.extend_from_slice(nal);
                 }
@@ -182,59 +205,40 @@ impl<'a> Iterator for NalIterator<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<&'a [u8]> {
-        if self.pos >= self.data.len() {
-            return None;
-        }
+        // Loop (not tail-recursion) over empty NALs: a crafted/garbled Annex B
+        // stream with many adjacent start codes (e.g. 00 00 01 00 00 01 ...)
+        // yields empty NALs back-to-back; recursing once per empty NAL would
+        // overflow the stack. `self.pos` advances to `nal_end` each iteration,
+        // so the loop always terminates. Mirrors the HEVC parser's while-scan.
+        loop {
+            if self.pos >= self.data.len() {
+                return None;
+            }
 
-        // Skip the start code at current position
-        let nal_start = skip_start_code(self.data, self.pos)?;
+            // Skip the start code at current position
+            let nal_start = skip_start_code(self.data, self.pos)?;
 
-        // Find next start code (or end of data)
-        let nal_end = find_start_code(self.data, nal_start).unwrap_or(self.data.len());
+            // Find next start code (or end of data)
+            let nal_end = find_start_code(self.data, nal_start).unwrap_or(self.data.len());
 
-        // Remove trailing zeros (part of next start code's zero prefix)
-        let mut end = nal_end;
-        while end > nal_start && self.data[end - 1] == 0x00 {
-            end -= 1;
-        }
+            // Strip the leading zeros of the following start code. For a
+            // conforming bitstream this is lossless: rbsp_trailing_bits() sets a
+            // stop-one bit, so the final byte of any RBSP is never 0x00 — the only
+            // trailing zeros here belong to the next 00 00 (00) 01 prefix, never to
+            // the NAL's RBSP payload. (Mirrors the HEVC parser.)
+            let mut end = nal_end;
+            while end > nal_start && self.data[end - 1] == 0x00 {
+                end -= 1;
+            }
 
-        self.pos = nal_end;
+            self.pos = nal_end;
 
-        if end > nal_start {
-            Some(&self.data[nal_start..end])
-        } else {
-            self.next()
-        }
-    }
-}
-
-/// Find the position of the next start code (00 00 01) at or after `from`.
-///
-/// Backed by `memchr::memmem::find` for SIMD-accelerated bytestring
-/// search. On AVX2-capable x86_64 this runs ~5–10× the byte-by-byte
-/// scan that preceded it; on a 200 KB UHD HEVC frame the saving is
-/// in the hundreds of microseconds per call.
-pub fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
-    if data.len() < from + 3 {
-        return None;
-    }
-    memchr::memmem::find(&data[from..], b"\x00\x00\x01").map(|rel| from + rel)
-}
-
-/// Skip past the start code at position `pos`, returning the first byte after it.
-pub fn skip_start_code(data: &[u8], pos: usize) -> Option<usize> {
-    if pos + 2 >= data.len() {
-        return None;
-    }
-    if data[pos] == 0x00 && data[pos + 1] == 0x00 {
-        if pos + 3 < data.len() && data[pos + 2] == 0x00 && data[pos + 3] == 0x01 {
-            return Some(pos + 4); // 4-byte start code
-        }
-        if data[pos + 2] == 0x01 {
-            return Some(pos + 3); // 3-byte start code
+            if end > nal_start {
+                return Some(&self.data[nal_start..end]);
+            }
+            // Empty NAL — continue scanning instead of recursing.
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -249,39 +253,6 @@ mod tests {
             dts: None,
             data,
         }
-    }
-
-    // --- find_start_code tests ---
-
-    #[test]
-    fn find_start_code_3byte() {
-        let data = [0x00, 0x00, 0x01, 0x65];
-        assert_eq!(find_start_code(&data, 0), Some(0));
-    }
-
-    #[test]
-    fn find_start_code_4byte() {
-        let data = [0x00, 0x00, 0x00, 0x01, 0x65];
-        // find_start_code looks for 00 00 01 pattern, which starts at offset 1 in a 4-byte start code
-        assert_eq!(find_start_code(&data, 0), Some(1));
-    }
-
-    #[test]
-    fn find_start_code_offset() {
-        let data = [0xFF, 0xFF, 0x00, 0x00, 0x01, 0x09];
-        assert_eq!(find_start_code(&data, 0), Some(2));
-    }
-
-    #[test]
-    fn find_start_code_none() {
-        let data = [0x00, 0x00, 0x00, 0x00];
-        assert_eq!(find_start_code(&data, 0), None);
-    }
-
-    #[test]
-    fn find_start_code_too_short() {
-        let data = [0x00, 0x00];
-        assert_eq!(find_start_code(&data, 0), None);
     }
 
     // --- parse SPS+PPS → codec_private ---
@@ -588,6 +559,31 @@ mod tests {
             vec![5],
             "repeated identical SPS/PPS stay in avcC, not duplicated in-band"
         );
+    }
+
+    #[test]
+    fn many_empty_nals_do_not_overflow_stack() {
+        // Regression: NalIterator::next must iterate, not recurse, over empty
+        // NALs. A crafted Annex B stream of tens of thousands of adjacent start
+        // codes (each producing an empty NAL) would blow the stack under the old
+        // tail-recursive implementation. Iterating handles it in bounded stack.
+        let mut data = Vec::new();
+        // 50_000 back-to-back 3-byte start codes → 50_000 empty NALs.
+        for _ in 0..50_000 {
+            data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        }
+        // One real NAL at the end so the iterator yields something.
+        data.extend_from_slice(&[0x41, 0xAA, 0xBB]);
+
+        let mut parser = H264Parser::new();
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        // Exactly one populated frame; the empty NALs are skipped without
+        // overflowing.
+        assert_eq!(frames.len(), 1);
+        let fd = &frames[0].data;
+        let len = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]) as usize;
+        assert_eq!(len, 3, "the single real NAL is length-prefixed");
+        assert_eq!(fd[4], 0x41);
     }
 
     #[test]

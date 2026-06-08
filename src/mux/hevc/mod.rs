@@ -69,19 +69,32 @@ impl<W: Write> HevcMux<W> {
     ///   - Length-prefixed: `[u32-BE len][NAL bytes]` repeated. This is
     ///     the form emitted by libfreemkv's HEVC parser (the MKV-native
     ///     layout). Converted to Annex B.
-    ///   - Already Annex B: bytes containing `00 00 00 01` start codes
-    ///     anywhere in the buffer. Passed through unchanged.
+    ///   - Already Annex B: a buffer beginning with a `00 00 00 01` or
+    ///     `00 00 01` start code. Passed through unchanged.
     ///
     /// `_pts_ns` is accepted for symmetry with other muxers but ignored
     /// — Annex B has no timing layer.
     pub fn write_frame(&mut self, _pts_ns: i64, data: &[u8]) -> io::Result<()> {
         if !self.params_written {
+            // Mark written *before* the write: a partial write that then
+            // errors must not cause a later re-entry to re-emit the full
+            // parameter set on top of the bytes the sink already
+            // received (duplicate/split VPS/SPS/PPS). Callers discard the
+            // mux on any write error.
+            self.params_written = true;
             if let Some(cp) = &self.codec_private {
-                if let Some(params) = hvcc_to_annex_b(cp) {
-                    self.writer.write_all(&params)?;
+                match hvcc_to_annex_b(cp) {
+                    Some(params) => self.writer.write_all(&params)?,
+                    // A non-empty hvcC that yields no NAL is a caller
+                    // contract violation: emitting the stream without
+                    // VPS/SPS/PPS produces undecodable output. Surface it
+                    // rather than dropping the parameter sets silently.
+                    None if !cp.is_empty() => {
+                        return Err(crate::error::Error::HevcParamParse.into());
+                    }
+                    None => {}
                 }
             }
-            self.params_written = true;
         }
         let annex_b = length_prefixed_to_annex_b(data);
         self.writer.write_all(&annex_b)
@@ -107,15 +120,22 @@ impl<W: Write> HevcMux<W> {
 ///
 /// We don't filter on NAL type — VPS (32), SPS (33), PPS (34), and any
 /// SEI arrays included in hvcC all get the same Annex B treatment.
-fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
+///
+/// This is the single source of truth for hvcC → Annex B across all
+/// muxers (HEVC ES, BD-TS, standard MPEG-TS). Do not reimplement it.
+pub(crate) fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
     if hvcc.len() < 23 {
         return None;
     }
     let num_arrays = hvcc[22] as usize;
     let mut out = Vec::new();
     let mut offset = 23;
+    // Set when an inner loop exits on truncation so the outer loop stops
+    // too — otherwise it would re-interpret mid-NAL bytes as the next
+    // array header and synthesize spurious parameter-set NALs.
+    let mut truncated = false;
     for _ in 0..num_arrays {
-        if offset + 3 > hvcc.len() {
+        if truncated || offset + 3 > hvcc.len() {
             break;
         }
         offset += 1; // array_completeness + nal_type byte
@@ -123,12 +143,19 @@ fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
         offset += 2;
         for _ in 0..num_nalus {
             if offset + 2 > hvcc.len() {
+                truncated = true;
                 break;
             }
             let nal_len = u16::from_be_bytes([hvcc[offset], hvcc[offset + 1]]) as usize;
             offset += 2;
             if offset + nal_len > hvcc.len() {
+                truncated = true;
                 break;
+            }
+            // ISO/IEC 14496-15 disallows zero-length NAL entries; emitting
+            // a bare start code with no RBSP yields an invalid Annex B NAL.
+            if nal_len == 0 {
+                continue;
             }
             out.extend_from_slice(&START_CODE);
             out.extend_from_slice(&hvcc[offset..offset + nal_len]);
@@ -141,13 +168,42 @@ fn hvcc_to_annex_b(hvcc: &[u8]) -> Option<Vec<u8>> {
 /// Convert length-prefixed NAL units (`[u32-BE len][NAL]` repeated) to
 /// Annex B (`00 00 00 01 [NAL]` repeated).
 ///
-/// If the input doesn't parse as length-prefixed (no valid lengths
-/// extracted), it's returned unchanged on the assumption that it's
-/// already Annex B — some upstream paths (raw HEVC ES from disc) pass
-/// Annex B straight through the PES layer.
+/// Already-Annex-B input (a buffer beginning with a `00 00 00 01` or
+/// `00 00 01` start code) is detected up front and passed through
+/// unchanged — some upstream paths (raw HEVC ES from disc) hand Annex B
+/// straight through the PES layer, and a genuine start code would
+/// otherwise be misread as a u32-BE length prefix.
+///
+/// Truncation policy (single source of truth across all muxers): if a
+/// length prefix runs past the end of the buffer (e.g. a NAL truncated
+/// by a bad disc sector), the truncated trailing NAL is dropped and only
+/// the valid Annex-B prefix accumulated so far is emitted. We never emit
+/// a half-NAL nor leak raw length-prefixed bytes into the Annex-B stream.
 pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
+    // Probe for a leading Annex B start code before attempting to parse
+    // length prefixes: `00 00 00 01` would otherwise parse as length 1.
+    if starts_with_start_code(data) {
+        return data.to_vec();
+    }
     let mut out = Vec::with_capacity(data.len() + (data.len() / 32));
+    append_length_prefixed_as_annex_b(&mut out, data);
+    out
+}
+
+/// Append the Annex B form of `data` (length-prefixed NALs) into `out`.
+///
+/// Same conversion as [`length_prefixed_to_annex_b`] but writes directly
+/// into a caller-owned buffer, avoiding an intermediate allocation on
+/// hot paths (e.g. per-frame video muxing). If `data` doesn't parse as
+/// length-prefixed (no NALs extracted), it's appended unchanged on the
+/// assumption it's already Annex B.
+pub(crate) fn append_length_prefixed_as_annex_b(out: &mut Vec<u8>, data: &[u8]) {
     let mut offset = 0;
+    // True once we've consumed at least one well-formed length prefix
+    // (even a zero-length one). Distinguishes "parsed as length-prefixed,
+    // all NALs empty" (emit nothing) from "not length-prefixed at all"
+    // (pass through as already-Annex B).
+    let mut parsed_any = false;
     while offset + 4 <= data.len() {
         let len = u32::from_be_bytes([
             data[offset],
@@ -157,19 +213,39 @@ pub(crate) fn length_prefixed_to_annex_b(data: &[u8]) -> Vec<u8> {
         ]) as usize;
         offset += 4;
         if offset + len > data.len() {
-            // Mid-NAL truncation — fall through to the pass-through path
-            // rather than emitting a half-NAL.
-            return data.to_vec();
+            // Mid-NAL truncation (e.g. a NAL cut by a bad disc sector) —
+            // drop the truncated trailing NAL and emit only the valid
+            // Annex-B prefix accumulated so far. We never emit a half-NAL
+            // nor leak raw length-prefixed bytes into the Annex-B stream.
+            break;
+        }
+        parsed_any = true;
+        if len == 0 {
+            // A zero-length prefix (e.g. pad bytes read off a damaged
+            // sector) would otherwise emit a bare start code with no
+            // RBSP — an invalid empty Annex B NAL. Skip it, mirroring
+            // the `nal_len == 0` guard in `hvcc_to_annex_b` (ISO/IEC
+            // 14496-15).
+            continue;
         }
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(&data[offset..offset + len]);
         offset += len;
     }
-    if out.is_empty() && !data.is_empty() {
-        // No length prefixes found — input is likely already Annex B.
-        return data.to_vec();
+    if !parsed_any && !data.is_empty() {
+        // No length prefixes parsed at all and no leading start code:
+        // pass the bytes through rather than discard them (recover-100%
+        // goal — a decoder can attempt its own resync; dropping them
+        // guarantees loss). This is distinct from "parsed as length-
+        // prefixed but every NAL was zero-length", which emits nothing.
+        out.extend_from_slice(data);
     }
-    out
+}
+
+/// Whether `data` begins with a 4-byte (`00 00 00 01`) or 3-byte
+/// (`00 00 01`) Annex B start code.
+fn starts_with_start_code(data: &[u8]) -> bool {
+    data.starts_with(&START_CODE) || data.starts_with(&[0x00, 0x00, 0x01])
 }
 
 #[cfg(test)]
@@ -203,16 +279,101 @@ mod tests {
     }
 
     #[test]
-    fn mid_nal_truncation_returns_original() {
-        // `[u32-BE 100][only 3 bytes]` — length prefix claims 100 bytes
-        // but the input only has 3 after the prefix. We treat that as
-        // malformed and pass the original buffer through so receivers
-        // can attempt their own recovery.
+    fn mid_nal_truncation_drops_trailing_nal_keeps_prefix() {
+        // First NAL is valid (2-byte payload), second has a length prefix
+        // claiming 100 bytes with only 3 present. Policy: emit the valid
+        // first NAL as Annex B, drop the truncated trailing NAL — never
+        // leak raw length-prefixed bytes into the Annex B stream.
         let mut raw = Vec::new();
+        raw.extend_from_slice(&2u32.to_be_bytes());
+        raw.extend_from_slice(&[0x11, 0x22]);
         raw.extend_from_slice(&100u32.to_be_bytes());
         raw.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         let got = length_prefixed_to_annex_b(&raw);
+        let want = [0x00, 0x00, 0x00, 0x01, 0x11, 0x22];
+        assert_eq!(&got[..], &want[..]);
+    }
+
+    #[test]
+    fn leading_annex_b_start_code_passes_through() {
+        // Genuine Annex B beginning with 00 00 00 01 must NOT be reframed:
+        // the start code would otherwise parse as a u32-BE length of 1.
+        let raw = [
+            0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xDE, 0xAD, // NAL 1
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0xBE, 0xEF, // NAL 2
+        ];
+        let got = length_prefixed_to_annex_b(&raw);
+        assert_eq!(
+            &got[..],
+            &raw[..],
+            "Annex B input must pass through verbatim"
+        );
+    }
+
+    #[test]
+    fn leading_three_byte_start_code_passes_through() {
+        let raw = [0x00, 0x00, 0x01, 0x26, 0x01, 0xDE, 0xAD];
+        let got = length_prefixed_to_annex_b(&raw);
         assert_eq!(&got[..], &raw[..]);
+    }
+
+    #[test]
+    fn hvcc_skips_zero_length_nal_entries() {
+        // hvcC with one array containing a zero-length NAL followed by a
+        // valid one: the zero-length entry must be skipped, not emitted as
+        // a bare start code.
+        let mut hvcc = vec![0u8; 22];
+        hvcc.push(1); // numArrays
+        hvcc.push(33); // SPS
+        hvcc.extend_from_slice(&2u16.to_be_bytes()); // numNalus = 2
+        hvcc.extend_from_slice(&0u16.to_be_bytes()); // NAL 0: length 0
+        hvcc.extend_from_slice(&3u16.to_be_bytes()); // NAL 1: length 3
+        hvcc.extend_from_slice(&[0x42, 0x01, 0x01]);
+        let annex_b = hvcc_to_annex_b(&hvcc).expect("one valid NAL");
+        let want = [0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01];
+        assert_eq!(&annex_b[..], &want[..]);
+    }
+
+    #[test]
+    fn write_frame_errors_on_unparseable_non_empty_hvcc() {
+        // A non-empty hvcC that yields no NAL must surface an error
+        // instead of silently producing a parameter-set-less stream.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = HevcMux::new(&mut sink);
+        mux.set_codec_private(vec![0xDE, 0xAD]); // too short to be valid hvcC
+        let err = mux.write_frame(0, &[]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn zero_length_nal_is_skipped_not_bare_start_code() {
+        // A zero-length prefix between two real NALs must be skipped, not
+        // turned into a bare `00 00 00 01` with no RBSP.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        buf.extend_from_slice(&0u32.to_be_bytes()); // zero-length NAL
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&[0xDD, 0xEE]);
+
+        let got = length_prefixed_to_annex_b(&buf);
+        let want = [
+            0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC, // first NAL
+            0x00, 0x00, 0x00, 0x01, 0xDD, 0xEE, // second NAL (zero-length skipped)
+        ];
+        assert_eq!(&got[..], &want[..]);
+    }
+
+    #[test]
+    fn all_zero_length_nals_emit_nothing() {
+        // A buffer of only zero-length prefixes parses as length-prefixed
+        // but yields no NALs — output must be empty, not a pass-through of
+        // the raw zero bytes.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let got = length_prefixed_to_annex_b(&buf);
+        assert!(got.is_empty(), "expected empty output, got {got:?}");
     }
 
     #[test]

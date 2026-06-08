@@ -45,8 +45,15 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 }
 
 /// AES-128-CBC decrypt in-place with the fixed AACS IV.
-/// AES-128-CBC decrypt in-place with the fixed AACS IV.
+///
+/// Precondition: `data.len()` is a multiple of 16. Any trailing partial
+/// block is silently ignored; all callers pass aligned regions (6128 and
+/// 2032 bytes), and the assert documents/enforces that contract.
 pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
+    debug_assert!(
+        data.len() % 16 == 0,
+        "aes_cbc_decrypt requires a block-aligned slice"
+    );
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let num_blocks = data.len() / 16;
     // Process blocks in reverse to avoid clobbering ciphertext needed for XOR
@@ -87,14 +94,11 @@ pub fn is_aacs_scrambled(unit: &[u8]) -> bool {
     unit.len() >= ALIGNED_UNIT_LEN && !ts_syncs_intact(unit)
 }
 
-/// Most TS packet positions in `unit` carry the `0x47` sync byte — i.e. the
-/// unit looks like clear MPEG-TS. Syncs sit at offset 4 and every 192 bytes
-/// after (4-byte TP_extra_header + 188-byte TS packet). An encrypted body
-/// scrambles all but the first (which lives in the clear 16-byte seed).
 /// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
-/// (offset 4 and every 192 bytes after). A clear or correctly-decrypted m2ts
-/// unit shows ~one per packet; an encrypted unit, or a non-content unit
-/// decrypted under a key that doesn't apply, shows ~none.
+/// (offset 4 and every 192 bytes after — 4-byte TP_extra_header + 188-byte
+/// TS packet). A clear or correctly-decrypted m2ts unit shows ~one per
+/// packet; an encrypted unit, or a non-content unit decrypted under a key
+/// that doesn't apply, shows ~none.
 pub fn ts_sync_count(unit: &[u8]) -> usize {
     let mut count = 0;
     let mut offset = 4;
@@ -220,19 +224,39 @@ pub fn unit_key_validates(unit: &[u8], unit_key: &[u8; 16]) -> bool {
     decrypt_unit(&mut full, unit_key)
 }
 
-/// Decrypt one aligned unit trying multiple unit keys. Returns the key index that worked.
-pub fn decrypt_unit_try_keys(unit: &mut [u8], unit_keys: &[[u8; 16]]) -> Option<usize> {
+/// Outcome of [`decrypt_unit_try_keys`].
+///
+/// Distinguishes "the unit was already clear, no key was consumed" from "key
+/// at index `i` decrypted it" — the bare `Option<usize>` form conflated the two
+/// (a clear unit reported `Some(0)`, indistinguishable from key index 0, and
+/// possibly out of range when `unit_keys` is empty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitKeyResult {
+    /// The unit was not scrambled; it was left untouched and no key was used.
+    AlreadyClear,
+    /// The unit was decrypted in place by `unit_keys[index]`.
+    DecryptedWith(usize),
+}
+
+/// Decrypt one aligned unit trying multiple unit keys.
+///
+/// Returns [`UnitKeyResult::AlreadyClear`] if the unit was not scrambled (no key
+/// consumed), [`UnitKeyResult::DecryptedWith(i)`] if key `i` decrypted it, or
+/// `None` if no key worked (the unit is restored to its original bytes).
+pub fn decrypt_unit_try_keys(unit: &mut [u8], unit_keys: &[[u8; 16]]) -> Option<UnitKeyResult> {
     if !is_aacs_scrambled(unit) {
-        return Some(0);
+        return Some(UnitKeyResult::AlreadyClear);
     }
 
-    // Save original for retry
-    let original = unit[..ALIGNED_UNIT_LEN].to_vec();
+    // Save original for retry. Stack-backed buffer — no heap allocation, and the
+    // restore-on-failure contract holds uniformly regardless of key count.
+    let mut original = [0u8; ALIGNED_UNIT_LEN];
+    original.copy_from_slice(&unit[..ALIGNED_UNIT_LEN]);
 
     for (i, key) in unit_keys.iter().enumerate() {
         unit[..ALIGNED_UNIT_LEN].copy_from_slice(&original);
         if decrypt_unit(unit, key) {
-            return Some(i);
+            return Some(UnitKeyResult::DecryptedWith(i));
         }
     }
 
@@ -299,6 +323,70 @@ mod tests {
         let key = [0u8; 16];
         assert!(!is_aacs_scrambled(&unit));
         assert!(decrypt_unit(&mut unit, &key));
+    }
+
+    #[test]
+    fn ts_packet_total_no_off_by_one() {
+        // The maximum sync count is exactly the number of stride
+        // positions the counting loop visits (offset 4, 196, ...), i.e.
+        // len / 192, NOT (len - 4) / 192 + 1. For the 6144-byte aligned unit
+        // the loop checks offsets 4..=5956 → 32 positions.
+        let unit = vec![0u8; ALIGNED_UNIT_LEN];
+        assert_eq!(ts_packet_total(&unit), 32);
+        // Confirm the loop visits exactly that many stride positions.
+        let visited = (4..ALIGNED_UNIT_LEN).step_by(TS_PACKET_LEN).count();
+        assert_eq!(visited, ts_packet_total(&unit));
+    }
+
+    #[test]
+    fn scramble_detection_at_16_32_boundary() {
+        // With 32 stride positions the majority threshold is
+        // total/2 = 16. A unit with EXACTLY half its syncs intact (16) must
+        // NOT be over-counted into the "scrambled" bucket by an inflated
+        // total: 16 > 16 is false → not-intact → scrambled. 17 intact → clear.
+        // The fix is that `total` is 32 (not 33), so the boundary sits cleanly
+        // at the real midpoint.
+        let set_syncs = |n: usize| {
+            let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+            let mut off = 4;
+            let mut placed = 0;
+            while off < ALIGNED_UNIT_LEN && placed < n {
+                unit[off] = TS_SYNC;
+                off += TS_PACKET_LEN;
+                placed += 1;
+            }
+            unit
+        };
+
+        assert_eq!(ts_sync_count(&set_syncs(16)), 16);
+        assert_eq!(ts_sync_count(&set_syncs(17)), 17);
+
+        // Exactly half intact → classified scrambled (16 > 16 is false).
+        assert!(is_aacs_scrambled(&set_syncs(16)));
+        // One past half → classified clear.
+        assert!(!is_aacs_scrambled(&set_syncs(17)));
+    }
+
+    #[test]
+    fn scramble_detection_extremes() {
+        // Detection semantics for the clear-cut cases must be preserved:
+        // a fully-clear unit (all 32 syncs) is NOT scrambled; a unit with no
+        // syncs (fully scrambled body) IS scrambled.
+        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            clear[off] = TS_SYNC;
+            off += TS_PACKET_LEN;
+        }
+        assert_eq!(ts_sync_count(&clear), 32);
+        assert!(
+            !is_aacs_scrambled(&clear),
+            "fully-clear unit → not scrambled"
+        );
+
+        let scrambled = vec![0u8; ALIGNED_UNIT_LEN];
+        assert_eq!(ts_sync_count(&scrambled), 0);
+        assert!(is_aacs_scrambled(&scrambled), "no syncs → scrambled");
     }
 
     #[test]
@@ -388,6 +476,8 @@ mod tests {
             }
             off += TS_PACKET_LEN;
         }
-        assert_eq!(count, (ALIGNED_UNIT_LEN - 4) / TS_PACKET_LEN + 1);
+        // Assert against the single canonical packet count, not the old
+        // `(len - 4) / 192 + 1` form that `ts_packet_total` corrected away from.
+        assert_eq!(count, ts_packet_total(&unit));
     }
 }

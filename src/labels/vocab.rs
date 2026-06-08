@@ -32,16 +32,19 @@ use super::{LabelPurpose, LabelQualifier};
 /// Map a codec identifier found in label data to its display name.
 ///
 /// These are well-known codec identifiers used across multiple BD-J
-/// authoring tools. Unknown codes pass through unchanged so callers
-/// can still surface vendor-specific tokens we haven't catalogued.
+/// authoring tools. Matching is case-insensitive (on-disc tokens vary:
+/// `ATMOS`, `Atmos`, `atmos`). Unknown codes pass through unchanged (in
+/// their original casing) so callers can still surface vendor-specific
+/// tokens we haven't catalogued.
 pub fn codec(code: &str) -> &str {
-    match code {
+    match code.to_ascii_uppercase().as_str() {
         "MLP" => "TrueHD",
         "AC3" | "AC" => "Dolby Digital",
-        "DTS" => "DTS",
         "DDL" => "Dolby Digital Plus",
         "WAV" => "PCM",
-        "atmos" => "Dolby Atmos",
+        "ATMOS" => "Dolby Atmos",
+        // "DTS" is recognized but has no distinct display alias — return
+        // the original token rather than a re-cased copy.
         _ => code,
     }
 }
@@ -54,10 +57,9 @@ pub fn codec(code: &str) -> &str {
 /// `variant` is the regional dialect as a human-readable English word
 /// (`"Brazilian"`, `"Castilian"`, `"Canadian"`, `"Simplified"`, ...)
 /// or `""` when the input names just a bare language without
-/// dialect ("Spanish" → variant=""). The variant matches the
-/// convention pixelogic / ctrm / criterion already use for their
-/// `StreamLabel::variant` field: a short display token the UI can
-/// surface verbatim.
+/// dialect ("Spanish" → variant=""). It is a short display token
+/// suitable for the [`StreamLabel::variant`](super::StreamLabel) field,
+/// to be surfaced verbatim by the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LangInfo {
     pub code: &'static str,
@@ -70,10 +72,14 @@ pub struct LangInfo {
 /// Handles both bare English names ("English", "Spanish") and the
 /// multi-word vendor variants we've seen in the corpus ("Brazilian
 /// Portuguese", "Castilian Spanish", "Canadian French"). Match is
-/// case-insensitive; longer compound phrases win over their bare
-/// counterparts (so "Brazilian Portuguese" returns
-/// `LangInfo { code: "por", variant: "Brazilian" }`, not consumed by
-/// the bare "Portuguese" entry).
+/// case-insensitive. Compound phrases are scanned BEFORE bare names, so
+/// "Brazilian Portuguese" returns
+/// `LangInfo { code: "por", variant: "Brazilian" }` rather than being
+/// consumed by the bare "Portuguese" entry. Within `COMPOUND_LANGS` the
+/// scan is positional (first `contains` hit wins), so that table MUST be
+/// maintained longest-first — a longer phrase must precede any shorter
+/// phrase it contains (e.g. "latin american spanish" before
+/// "latin spanish").
 ///
 /// Bare-name matches return `variant: ""`.
 ///
@@ -81,15 +87,16 @@ pub struct LangInfo {
 /// fall back to MPLS spec codes, pass through raw, or drop the stream.
 /// Never guesses.
 ///
-/// Why the variant: the prior `lang() -> Option<&str>` shape silently
-/// dropped regional dialect info. "Brazilian Portuguese 5.1" became
-/// `language="por", variant=""` — UI displayed plain "Portuguese"
-/// even though the disc had explicitly labeled this stream Brazilian.
-/// Capturing the variant here parallels how pixelogic and ctrm
-/// populate `StreamLabel::variant` from their own region tables.
+/// Why the variant: returning only the ISO code would silently drop
+/// regional dialect info — "Brazilian Portuguese 5.1" would become
+/// `language="por", variant=""` and the UI would display plain
+/// "Portuguese" even though the disc explicitly labeled the stream
+/// Brazilian. Returning the variant lets callers populate
+/// [`StreamLabel::variant`](super::StreamLabel) with the dialect.
 pub fn lang(text: &str) -> Option<LangInfo> {
     let lower = text.to_lowercase();
-    // Multi-word compounds first — longest-match wins.
+    // Multi-word compounds first. Scan is positional (first hit wins),
+    // so COMPOUND_LANGS MUST stay ordered longest-first.
     for (needle, code, variant) in COMPOUND_LANGS {
         if lower.contains(needle) {
             return Some(LangInfo { code, variant });
@@ -250,22 +257,26 @@ fn has_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let bytes = haystack.as_bytes();
-    let nb = needle.as_bytes();
-    let mut i = 0;
-    while i + nb.len() <= bytes.len() {
-        if &bytes[i..i + nb.len()] == nb {
-            let before = if i == 0 { None } else { Some(bytes[i - 1]) };
-            let after = bytes.get(i + nb.len()).copied();
-            let bound = |c: Option<u8>| match c {
-                None => true,
-                Some(b) => !b.is_ascii_alphanumeric(),
-            };
-            if bound(before) && bound(after) {
-                return true;
-            }
+    // Boundary check is char-aware (not byte-level): a non-ASCII letter
+    // adjacent to the match (e.g. an accented or CJK char, which is
+    // multiple UTF-8 bytes) is alphanumeric and so is NOT a boundary,
+    // preventing false positives like "sdh" inside "cafésch". Needles
+    // are ASCII tokens, so a byte-offset match aligns with char
+    // boundaries in `haystack`.
+    for (idx, _) in haystack.match_indices(needle) {
+        // Char immediately before the match.
+        let before_is_alnum = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        // Char immediately after the match.
+        let after_is_alnum = haystack[idx + needle.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        if !before_is_alnum && !after_is_alnum {
+            return true;
         }
-        i += 1;
     }
     false
 }
@@ -283,12 +294,26 @@ mod tests {
         assert_eq!(codec("AC"), "Dolby Digital");
         assert_eq!(codec("DDL"), "Dolby Digital Plus");
         assert_eq!(codec("atmos"), "Dolby Atmos");
+        assert_eq!(codec("WAV"), "PCM");
+        assert_eq!(codec("DTS"), "DTS");
+    }
+
+    #[test]
+    fn codec_case_insensitive() {
+        // On-disc casing varies; all forms must canonicalize.
+        assert_eq!(codec("ATMOS"), "Dolby Atmos");
+        assert_eq!(codec("Atmos"), "Dolby Atmos");
+        assert_eq!(codec("atmos"), "Dolby Atmos");
+        assert_eq!(codec("mlp"), "TrueHD");
+        assert_eq!(codec("ac3"), "Dolby Digital");
     }
 
     #[test]
     fn codec_unknown_passes_through() {
         assert_eq!(codec("FX9"), "FX9");
         assert_eq!(codec(""), "");
+        // Unknown tokens keep their original casing.
+        assert_eq!(codec("Vendor_X"), "Vendor_X");
     }
 
     fn li(code: &'static str, variant: &'static str) -> LangInfo {
@@ -388,6 +413,26 @@ mod tests {
     fn purpose_unknown_is_normal() {
         assert_eq!(purpose("English Dolby Atmos"), LabelPurpose::Normal);
         assert_eq!(purpose(""), LabelPurpose::Normal);
+    }
+
+    #[test]
+    fn purpose_recognizes_ime() {
+        assert_eq!(purpose("IME"), LabelPurpose::Ime);
+        assert_eq!(purpose("English ime"), LabelPurpose::Ime);
+        // Word-boundary: "ime" inside "time" must not match.
+        assert_eq!(purpose("Showtime audio"), LabelPurpose::Normal);
+    }
+
+    #[test]
+    fn has_word_treats_non_ascii_letter_as_a_letter_boundary() {
+        // A non-ASCII (multi-byte) letter glued to the needle is NOT a
+        // word boundary, so the needle must not match there.
+        assert!(!has_word("cafésdh", "sdh")); // 'é' precedes "sdh"
+        assert!(!has_word("日本sdh", "sdh"));
+        // But a real boundary (space / punctuation / non-letter) matches.
+        assert!(has_word("café sdh", "sdh"));
+        assert!(has_word("日本 sdh", "sdh"));
+        assert!(has_word("sdh", "sdh"));
     }
 
     #[test]

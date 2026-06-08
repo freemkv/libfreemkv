@@ -227,10 +227,19 @@ pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Opt
 /// Set to 0 to disable walking (entries tried only as terminal PKs).
 const PK_WALK_MAX_DEPTH: u8 = 3;
 
+/// Hard ceiling on the requested walk depth. The BFS frontier holds `2^depth`
+/// 16-byte node keys, so an uncapped `max_depth` (e.g. 26+) would exhaust
+/// memory; the walk silently clamps to this. 5 (32-wide frontier) covers every
+/// realistic leaked-label case with margin.
+const PK_WALK_MAX_DEPTH_CAP: u8 = 5;
+
 /// Same as [`derive_media_key_from_pk`] but with explicit walk depth.
 /// Each entry is tried as a terminal PK at depth 0, then as a node-key
 /// whose PK and children are derived via `AES-G3(K, 0|1|2)` for up to
 /// `max_depth` additional levels.
+///
+/// The BFS frontier grows as `2^max_depth`; `max_depth` is clamped to
+/// [`PK_WALK_MAX_DEPTH_CAP`] so a large value cannot exhaust memory.
 pub fn derive_media_key_from_pk_walked(
     mkb: &[u8],
     processing_keys: &[[u8; 16]],
@@ -252,6 +261,9 @@ fn walk_pk_against_tables_impl(
     mk_dv: &[u8; 16],
     max_depth: u8,
 ) -> Option<[u8; 16]> {
+    // Clamp the frontier depth (2^depth node keys) so a caller-supplied value
+    // cannot OOM the process.
+    let max_depth = max_depth.min(PK_WALK_MAX_DEPTH_CAP);
     let num_uvs = uvs
         .chunks(5)
         .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
@@ -415,7 +427,8 @@ pub mod probe {
     /// (16-byte entries); `mk_dv` is from the verify record. Each entry in
     /// `keys` is tried as a terminal PK and as an SD node-key descending via
     /// `AES-G3(K, 0|1|2)` for `max_depth` levels — identical logic to the
-    /// production walk. Returns the verified Media Key, if any.
+    /// production walk (`max_depth` is clamped to the same internal cap to
+    /// bound the `2^depth` frontier). Returns the verified Media Key, if any.
     pub fn walk_pk_against_tables(
         keys: &[[u8; 16]],
         subdiff: &[u8],
@@ -446,7 +459,7 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
             // mk_dv is at offset 4 of the record (after the 4-byte header)
             let mut dv = [0u8; 16];
             dv.copy_from_slice(&mkb[pos + 4..pos + 20]);
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "mkb_mk_dv_found",
                 rec_type,
@@ -523,9 +536,6 @@ fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
         }
         if rec_type == rec_type_wanted && rec_len > 4 {
             return Some(mkb[pos + 4..pos + rec_len].to_vec());
-        }
-        if rec_len == 0 {
-            break;
         }
         pos += rec_len;
     }
@@ -613,7 +623,17 @@ fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> 
     let mut right_child = aesg3(dk, 2);
     let mut current_v_mask = dev_key_v_mask;
 
+    // The subset-difference tree is at most 32 levels deep (u32 mask), so the
+    // walk must converge in <= 32 steps. The arithmetic `>> 1` sign-extends
+    // current_v_mask, so a v_mask coarser than dev_key_v_mask (reachable from
+    // a crafted/corrupt MKB) would otherwise saturate at 0xFFFF_FFFF and spin
+    // forever — bound the loop to keep a bad disc from hanging the rip thread.
+    let mut steps = 0u32;
     while current_v_mask != v_mask {
+        if steps >= 32 {
+            break;
+        }
+        steps += 1;
         // Find the highest unset bit in current_v_mask
         let mut bit_pos: i32 = -1;
         for i in (0..32).rev() {
@@ -662,6 +682,13 @@ pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option
             if u_mask_shift & 0xC0 != 0 {
                 break; // device revoked
             }
+            // Shifts of 32..=63 (0x20..=0x3F pass the 0xC0 mask above) would
+            // panic in debug / wrap to a wrong mask in release. The MKB byte
+            // is disc-controlled, so a crafted/corrupt MKB must not crash the
+            // ripper: skip an out-of-range slot rather than `<<` it.
+            if u_mask_shift >= 32 {
+                continue;
+            }
 
             let uv = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
             if uv == 0 {
@@ -674,7 +701,12 @@ pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option
             if ((device_number & u_mask) == (uv & u_mask))
                 && ((device_number & v_mask) != (uv & v_mask))
             {
-                // Found matching subset-difference — find the right device key
+                // Found matching subset-difference — find the right device key.
+                // dk.u_mask_shift is a u8 from keydb with no range check;
+                // guard the shift the same way as the MKB byte above.
+                if dk.u_mask_shift >= 32 {
+                    continue;
+                }
                 let dev_key_v_mask = calc_v_mask(dk.uv);
                 let dev_key_u_mask: u32 = 0xFFFF_FFFF << dk.u_mask_shift;
 
@@ -928,7 +960,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
             }
         };
 
-    tracing::warn!(
+    tracing::info!(
         target: "freemkv::disc",
         phase = "resolve_keys_v21_start",
         bus_encryption,
@@ -953,7 +985,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
                 ctx.volume_id,
             ) {
                 Ok((_km, kvu)) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "freemkv::disc",
                         phase = "resolve_keys_v21_path1_hit",
                         "Variant chain produced Km + Kvu"
@@ -961,7 +993,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
                     return Some(build(Some(kvu), derive_uks(&kvu), 1));
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "freemkv::disc",
                         phase = "resolve_keys_v21_path1_miss",
                         error_code = %e,
@@ -974,14 +1006,18 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         // Path 3: pre-computed MK + matching VID → derived VUK.
         // Short-circuit: first provider with a matching VID wins.
         if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
-            if let (Some(mk), Some(_)) = (entry.media_key, entry.disc_id) {
+            // The entry already matched by VID and derive_vuk needs only mk +
+            // ctx.volume_id, so a provider that matches by VID without
+            // populating disc_id (e.g. a webservice) must not have its MK
+            // dropped — gate on the MK alone.
+            if let Some(mk) = entry.media_key {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
+                tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_v21_path3_hit", "MK+VID entry matched volume_id");
                 return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "resolve_keys_v21_no_vid",
             "VID unavailable; paths 1/3 skipped"
@@ -991,10 +1027,10 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     // Paths 4 and 5: hash lookup, prefer V over U on the same entry.
     if let Some(entry) = providers.lookup_disc_by_hash(&uk_file.disc_hash) {
         if let Some(vuk) = entry.vuk {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_v21_path4_hit", "VUK from KEYDB");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_v21_path4_hit", "VUK from KEYDB");
             return Some(build(Some(vuk), derive_uks(&vuk), 4));
         } else if let Some(unit_keys) = match_keydb_unit_keys(&uk_file, &entry.unit_keys) {
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "resolve_keys_v21_path5_hit",
                 uk_count = unit_keys.len(),
@@ -1055,7 +1091,7 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             }
         };
 
-    tracing::warn!(
+    tracing::info!(
         target: "freemkv::disc",
         phase = "resolve_keys_start",
         version = ?version,
@@ -1075,7 +1111,7 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             let mk_dv = mkb_find_mk_dv(mkb);
             let subdiff = mkb_find_subdiff_records(mkb);
             let cvalues = mkb_find_cvalues(mkb);
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "resolve_keys_mkb_records",
                 mk_dv_found = mk_dv.is_some(),
@@ -1090,59 +1126,68 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
             let all_dks = providers.device_keys();
             if let Some(mk) = derive_media_key_from_dk(mkb, &all_dks) {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_hit", "media key derived from device key");
+                tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path1_hit", "media key derived from device key");
                 return Some(build(Some(vuk), derive_uks(&vuk), 1));
             }
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", dk_count = all_dks.len(), "DK derivation failed");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path1_miss", dk_count = all_dks.len(), "DK derivation failed");
 
             // Path 2: MKB + processing keys → media key → VUK
             let all_pks = providers.processing_keys();
             if let Some(mk) = derive_media_key_from_pk(mkb, &all_pks) {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "media key derived from processing key");
+                tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_hit", "media key derived from processing key");
                 return Some(build(Some(vuk), derive_uks(&vuk), 2));
             }
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = all_pks.len(), "PK derivation failed");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_miss", pk_count = all_pks.len(), "PK derivation failed");
 
             // Path 2.5: MK-pool brute. keydb stores Media Keys per-disc, but an
             // MK is MKB-scoped (shared across a pressing/MKB-family). A disc
             // whose own hash/VID isn't keyed can still resolve if ANY stored MK
             // verifies against its MKB. Try every distinct MK via km_verifies;
             // a UNIQUE pass is this disc's Km → derive VUK (needs VID) → UK.
-            // km_verifies is one AES-D + magic check per candidate (cheap).
+            // One AES-D + magic check per candidate (cheap). mk_dv is hoisted
+            // out of the loop so the MKB is not re-walked per candidate.
             let mks = providers.media_keys();
             let mut mk_hits: Vec<[u8; 16]> = Vec::new();
-            for mk in &mks {
-                if probe::km_verifies(mkb, mk) && !mk_hits.contains(mk) {
-                    mk_hits.push(*mk);
-                    if mk_hits.len() > 1 {
-                        break; // ambiguous — bail to avoid a wrong key
+            if let Some(mk_dv) = mkb_find_mk_dv(mkb) {
+                for mk in &mks {
+                    let verifies = aes_ecb_decrypt(mk, &mk_dv)[..8]
+                        == [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+                    if verifies && !mk_hits.contains(mk) {
+                        mk_hits.push(*mk);
+                        if mk_hits.len() > 1 {
+                            break; // ambiguous — bail to avoid a wrong key
+                        }
                     }
                 }
             }
             if mk_hits.len() == 1 {
                 let vuk = derive_vuk(&mk_hits[0], ctx.volume_id);
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_5_hit", mk_pool = mks.len(), "media key from keydb MK-pool brute (km_verifies)");
+                tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_5_hit", mk_pool = mks.len(), "media key from keydb MK-pool brute (km_verifies)");
                 // Same class as path 3 (KEYDB MK → derived VUK).
                 return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path2_5_miss", mk_pool = mks.len(), mk_hits = mk_hits.len(), "MK-pool brute: no unique verifying MK");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path2_5_miss", mk_pool = mks.len(), mk_hits = mk_hits.len(), "MK-pool brute: no unique verifying MK");
         } else {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_no_mkb", "no MKB; paths 1/2 skipped");
         }
 
         // Path 3: pre-computed MK + matching VID → derived VUK.
         // Short-circuit: first provider with a matching VID wins.
         if let Some(entry) = providers.lookup_disc_by_vid(ctx.volume_id) {
-            if let (Some(mk), Some(_)) = (entry.media_key, entry.disc_id) {
+            // The entry already matched by VID and derive_vuk needs only mk +
+            // ctx.volume_id, so a provider that matches by VID without
+            // populating disc_id (e.g. a webservice) must not have its MK
+            // dropped — gate on the MK alone.
+            if let Some(mk) = entry.media_key {
                 let vuk = derive_vuk(&mk, ctx.volume_id);
-                tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
+                tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path3_hit", "MK+VID entry matched volume_id");
                 return Some(build(Some(vuk), derive_uks(&vuk), 3));
             }
         }
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", "no MK+VID entry matched volume_id");
+        tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path3_miss", "no MK+VID entry matched volume_id");
     } else {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "resolve_keys_no_vid",
             "VID unavailable; paths 1/2/3 require VID and are skipped"
@@ -1153,12 +1198,12 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     // U (path 5). They are not independent checks — path 5 only fires
     // because path 4 had no VUK on the same entry.
     if let Some(entry) = providers.lookup_disc_by_hash(&uk_file.disc_hash) {
-        tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_keydb_hit_entry", "disc hash found in provider");
+        tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_keydb_hit_entry", "disc hash found in provider");
         if let Some(vuk) = entry.vuk {
-            tracing::warn!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "VUK from provider");
+            tracing::debug!(target: "freemkv::disc", phase = "resolve_keys_path4_hit", "VUK from provider");
             return Some(build(Some(vuk), derive_uks(&vuk), 4));
         } else if let Some(unit_keys) = match_keydb_unit_keys(&uk_file, &entry.unit_keys) {
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "resolve_keys_path5_hit",
                 uk_count = unit_keys.len(),
@@ -1204,6 +1249,36 @@ mod tests {
     fn keydb_path() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
         if path.exists() { Some(path) } else { None }
+    }
+
+    #[test]
+    fn derive_media_key_from_dk_survives_out_of_range_u_mask_shift() {
+        // Regression: a crafted/corrupt MKB with a Subset-Difference
+        // u_mask_shift of 32..=63 (passes the 0xC0 revoked-marker check but
+        // overflows `0xFFFF_FFFF << shift`) used to panic in debug / compute a
+        // wrong mask in release. The walk must now skip the bad slot and
+        // return cleanly (no panic) on disc-controlled bytes.
+        let mut mkb: Vec<u8> = Vec::new();
+        // 0x81 record: 4-byte header + 16-byte mk_dv body (rec_len = 20).
+        mkb.extend_from_slice(&[0x81, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        // 0x04 Subset-Difference: one 5-byte entry with u_mask_shift = 0x30
+        // (48 — out of range, but 0x30 & 0xC0 == 0 so the revoke check passes).
+        mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
+        mkb.extend_from_slice(&[0x30, 0x00, 0x00, 0x00, 0x01]);
+        // 0x05 cvalues: one 16-byte entry (rec_len = 20).
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCD; 16]);
+
+        let dk = DeviceKey {
+            key: [0x11; 16],
+            node: 1,
+            uv: 1,
+            u_mask_shift: 0x30, // also out of range on the device-key side
+        };
+
+        // Must not panic; no valid derivation is expected from this junk.
+        let _ = derive_media_key_from_dk(&mkb, &[dk]);
     }
 
     #[test]
@@ -1284,12 +1359,17 @@ mod tests {
         // Try decrypting a real encrypted aligned unit from a UHD sample.
         // This disc is AACS 2.0 (BEE) so unit key alone won't work —
         // we need bus decryption first. But this verifies the pipeline.
-        let unit_path = std::path::Path::new("/tmp/encrypted_unit.bin");
+        // Path comes from ENCRYPTED_UNIT_PATH (same env-driven pattern as the
+        // KEYDB_PATH / MKB_SAMPLE_DIR fixtures); no-ops in CI when unset.
+        let unit_path = match std::env::var("ENCRYPTED_UNIT_PATH").ok() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => return,
+        };
         if !unit_path.exists() {
             return;
         }
 
-        let original = std::fs::read(unit_path).unwrap();
+        let original = std::fs::read(&unit_path).unwrap();
         assert_eq!(original.len(), ALIGNED_UNIT_LEN);
         assert!(
             super::super::decrypt::is_aacs_scrambled(&original),
@@ -1316,10 +1396,10 @@ mod tests {
             let keys: Vec<[u8; 16]> = entry.unit_keys.iter().map(|(_, k)| *k).collect();
             let mut unit = original.clone();
 
-            if let Some(idx) = super::super::decrypt::decrypt_unit_try_keys(&mut unit, &keys) {
+            if let Some(res) = super::super::decrypt::decrypt_unit_try_keys(&mut unit, &keys) {
                 eprintln!(
-                    "SUCCESS: Decrypted with entry {} key {}",
-                    entry.disc_hash, idx
+                    "SUCCESS: Decrypted with entry {} ({res:?})",
+                    entry.disc_hash
                 );
                 // Count TS sync bytes
                 let ts = (0..32).filter(|&i| unit[4 + i * 192] == 0x47).count();

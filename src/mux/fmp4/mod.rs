@@ -1,18 +1,20 @@
-//! Fragmented MP4 muxer — **stub** for Phase 3.
+//! Fragmented MP4 muxer — **STUB**: fragment emission is not implemented.
 //!
 //! Goal: ISO/IEC 14496-12 fragmented MP4 (`ftyp` + `moov` init segment,
 //! then a sequence of `moof+mdat` media fragments) targeting a
 //! [`SequentialSink`](crate::io::sink::SequentialSink). DASH-friendly,
 //! no Cues backpatch.
 //!
-//! Status (v0.21.0 Phase 3): **STUB**. We ship the init segment
-//! (`ftyp` + a minimal HEVC `moov` skeleton with one video track) so
-//! the muxer's shape and call site are validated, but media fragments
-//! are NOT yet emitted — calls to [`Fmp4Mux::write_video`] currently
-//! accumulate frames into an internal buffer and discard them on
-//! [`Fmp4Mux::finish`].
+//! Status: **STUB**. The muxer can emit the init segment (`ftyp` + a
+//! minimal HEVC `moov` skeleton with one video track) via
+//! [`Fmp4Mux::write_init_segment`], so the shape and call site are
+//! validated, but media fragments (`moof`/`mdat`) are NOT emitted.
+//! [`Fmp4Mux::write_video`] therefore returns
+//! [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented)
+//! rather than silently accepting and discarding frames. It buffers
+//! nothing, so it cannot accumulate memory.
 //!
-//! ## What's TODO (tracked in Phase 4 / v0.22.0 scope)
+//! ## Not yet implemented
 //!
 //! - `moof` box: `mfhd` (sequence_number) + `traf` (`tfhd` + `tfdt`
 //!   + `trun` with sample sizes, durations, flags, composition offsets).
@@ -20,7 +22,7 @@
 //! - Fragment cadence: one fragment per GOP or every N seconds,
 //!   whichever comes first.
 //! - HEVC `hvcC` box inside `moov.trak.mdia.minf.stbl.stsd` so the
-//!   init segment is self-describing.
+//!   init segment is self-describing (`stsd` currently has zero entries).
 //! - Sample-flags computation (sync vs. delta, depends_on, etc.).
 //! - Edit lists / fragment_duration for accurate seeking.
 //!
@@ -64,27 +66,17 @@ const VIDEO_TRACK_ID: u32 = 1;
 /// Fragmented MP4 muxer — stub.
 ///
 /// See the module-level doc comment for what is and isn't shipped in
-/// this stub.
+/// this stub. Fragment emission is not implemented:
+/// [`write_video`](Self::write_video) returns
+/// [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented)
+/// rather than discarding media.
 pub struct Fmp4Mux<W: Write> {
     writer: W,
     header_written: bool,
-    /// Pending frames — held for the future fragment-emit path. The
-    /// stub drops these on `finish` but keeping them around lets the
-    /// post-stub work re-attach without changing the public API.
-    pending: Vec<PendingSample>,
     /// hvcC bytes, if provided. Embedded in the `moov.…stsd.hvc1.hvcC`
-    /// box once that path lands.
+    /// box once the emission path lands.
     #[allow(dead_code)]
     codec_private: Option<Vec<u8>>,
-}
-
-struct PendingSample {
-    #[allow(dead_code)]
-    pts_ns: i64,
-    #[allow(dead_code)]
-    keyframe: bool,
-    #[allow(dead_code)]
-    data: Vec<u8>,
 }
 
 impl<W: Write> Fmp4Mux<W> {
@@ -92,54 +84,47 @@ impl<W: Write> Fmp4Mux<W> {
         Self {
             writer,
             header_written: false,
-            pending: Vec::new(),
             codec_private: None,
         }
     }
 
     /// Provide the `HEVCDecoderConfigurationRecord` for the video track.
     /// The stub stores it but doesn't yet embed it in `moov` — that's
-    /// part of the post-stub work.
+    /// part of the unimplemented emission path.
     pub fn set_video_codec_private(&mut self, hvcc: Vec<u8>) {
         self.codec_private = Some(hvcc);
     }
 
-    /// Write one video PES frame.
-    ///
-    /// **Stub behaviour:** the first call emits the init segment
-    /// (`ftyp` + `moov`) so any consumer that just wants the shape can
-    /// receive it. Subsequent calls accumulate frames in memory for
-    /// the future fragmenting path; **no media bytes are written yet**.
-    pub fn write_video(&mut self, pts_ns: i64, keyframe: bool, data: &[u8]) -> io::Result<()> {
-        if !self.header_written {
-            self.write_init_segment()?;
-            self.header_written = true;
+    /// Emit the init segment (`ftyp` + `moov`) once. Idempotent — a
+    /// second call is a no-op. Lets a consumer that just wants the
+    /// container shape obtain a valid (if sample-less) init segment.
+    pub fn write_init_segment(&mut self) -> io::Result<()> {
+        if self.header_written {
+            return Ok(());
         }
-        // TODO(0.22.0): emit one `moof+mdat` per GOP. For now stash the
-        // frame so the future patch can hot-wire emission without API
-        // churn.
-        self.pending.push(PendingSample {
-            pts_ns,
-            keyframe,
-            data: data.to_vec(),
-        });
-        Ok(())
-    }
-
-    /// Flush. The stub additionally drops accumulated `pending` frames.
-    pub fn finish(&mut self) -> io::Result<()> {
-        // TODO(0.22.0): emit final fragment from pending; today the
-        // stub just clears the buffer to release memory.
-        self.pending.clear();
-        self.writer.flush()
-    }
-
-    fn write_init_segment(&mut self) -> io::Result<()> {
         let ftyp = build_ftyp();
         let moov = build_moov();
         self.writer.write_all(&ftyp)?;
         self.writer.write_all(&moov)?;
+        self.header_written = true;
         Ok(())
+    }
+
+    /// Write one video PES frame.
+    ///
+    /// **Stub:** `moof`/`mdat` emission is not implemented. To avoid
+    /// silently dropping media (and avoid unbounded buffering), this
+    /// emits the init segment on the first call and then returns
+    /// [`Error::Fmp4Unimplemented`](crate::error::Error::Fmp4Unimplemented).
+    /// No frame bytes are buffered or written.
+    pub fn write_video(&mut self, _pts_ns: i64, _keyframe: bool, _data: &[u8]) -> io::Result<()> {
+        self.write_init_segment()?;
+        Err(crate::error::Error::Fmp4Unimplemented.into())
+    }
+
+    /// Flush the underlying writer.
+    pub fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
@@ -218,7 +203,9 @@ fn build_tkhd() -> Vec<u8> {
     for v in [0x1_0000u32, 0, 0, 0, 0x1_0000, 0, 0, 0, 0x4000_0000] {
         body.extend_from_slice(&v.to_be_bytes());
     }
-    // width / height in 16.16 fixed point — placeholder 1920x1080.
+    // width / height in 16.16 fixed point — placeholder; replace with
+    // SPS-derived dimensions (and matching stsd visual width/height) when
+    // fragment emission lands.
     body.extend_from_slice(&(1920u32 << 16).to_be_bytes());
     body.extend_from_slice(&(1080u32 << 16).to_be_bytes());
     wrap_box(&TKHD, &body)
@@ -291,7 +278,9 @@ fn build_dinf() -> Vec<u8> {
 fn build_stbl() -> Vec<u8> {
     // Stub stsd: empty sample description (zero entries). Replace with
     // hvc1+hvcC once the fragmenting path lands so the init segment is
-    // actually decodable.
+    // actually decodable. Must be populated together with build_mvex:
+    // when the hvc1+hvcC sample entry lands and entry_count becomes 1,
+    // the trex default_sample_description_index=1 becomes valid.
     let mut stsd_body = Vec::new();
     stsd_body.extend_from_slice(&[0, 0, 0, 0]);
     stsd_body.extend_from_slice(&0u32.to_be_bytes()); // entry_count
@@ -317,6 +306,9 @@ fn build_stbl() -> Vec<u8> {
 
 fn build_mvex() -> Vec<u8> {
     // trex: track_ID=1, default_sample_description_index=1, others=0.
+    // dsdi=1 only becomes valid once build_stbl's stsd carries the
+    // matching hvc1 sample entry (entry_count=1) — keep the two in sync
+    // when fragment emission lands.
     let mut trex_body = Vec::new();
     trex_body.extend_from_slice(&[0, 0, 0, 0]); // version + flags
     trex_body.extend_from_slice(&VIDEO_TRACK_ID.to_be_bytes());
@@ -331,9 +323,19 @@ fn build_mvex() -> Vec<u8> {
 /// Wrap a box body in `[size:u32-BE][type:4]`. Suitable for any body
 /// that fits in u32; oversized boxes (size > 4 GiB) need the 64-bit
 /// large-size extension which we don't generate in the stub.
+///
+/// All callers build tiny init-segment boxes (kilobytes at most), so the
+/// `u32` size never overflows; the saturating cast plus the debug assert
+/// documents and guards that invariant rather than silently emitting a
+/// truncated, structurally corrupt size field. `body` is always internally
+/// constructed here, never untrusted input — a future caller feeding a
+/// multi-gigabyte body trips the debug assert instead of writing a malformed
+/// box.
 fn wrap_box(box_type: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let size = (body.len() + 8) as u32;
-    let mut out = Vec::with_capacity(body.len() + 8);
+    let total = body.len() + 8;
+    debug_assert!(total <= u32::MAX as usize, "fMP4 box exceeds u32 size");
+    let size = u32::try_from(total).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&size.to_be_bytes());
     out.extend_from_slice(box_type);
     out.extend_from_slice(body);
@@ -355,9 +357,7 @@ mod tests {
     fn init_segment_starts_with_ftyp_then_moov() {
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = Fmp4Mux::new(&mut sink);
-        // Trigger init emission via a single (stubbed) write.
-        mux.write_video(0, true, &[0x00, 0x00, 0x00, 0x01, 0x40])
-            .unwrap();
+        mux.write_init_segment().unwrap();
         mux.finish().unwrap();
         drop(mux);
 
@@ -375,17 +375,26 @@ mod tests {
     }
 
     #[test]
-    fn moov_contains_trak_mvex() {
+    fn write_video_reports_unimplemented_and_buffers_nothing() {
+        // write_video must NOT silently accept-and-drop media: it emits the
+        // init segment, then signals that fragment emission is unimplemented.
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = Fmp4Mux::new(&mut sink);
-        mux.write_video(0, true, &[]).unwrap();
+        let err = mux.write_video(0, true, &[0xDE; 4096]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         mux.finish().unwrap();
-        drop(sink);
+        drop(mux);
+        // Only the init segment (ftyp + moov) was written — no media bytes.
+        let (ftyp_size, _) = read_box_header(&sink);
+        let (moov_size, _) = read_box_header(&sink[ftyp_size as usize..]);
+        assert_eq!(sink.len(), ftyp_size as usize + moov_size as usize);
+    }
 
-        // Re-emit into a fresh buffer for parsing.
+    #[test]
+    fn moov_contains_trak_mvex() {
         let mut buf: Vec<u8> = Vec::new();
         let mut mux2 = Fmp4Mux::new(&mut buf);
-        mux2.write_video(0, true, &[]).unwrap();
+        mux2.write_init_segment().unwrap();
         mux2.finish().unwrap();
         drop(mux2);
 

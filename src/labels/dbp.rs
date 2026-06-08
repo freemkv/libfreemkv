@@ -1,8 +1,6 @@
-//! "dbp" framework — Magnolia Pictures BD-J authoring shop (per
-//! `bd-live.magpictures.com` referenced in the disc's
-//! `com/dbp/bluray.MenuXlet.perm`). Detected on UHD discs whose
-//! `/BDMV/JAR/<x>.jar` (top-level, not in a subdir) contains
-//! `com/dbp/` package paths.
+//! "dbp" framework — a BD-J authoring framework identified by
+//! `com/dbp/` package paths in a top-level `/BDMV/JAR/<x>.jar` (not in
+//! a subdir). Seen on UHD discs.
 //!
 //! Stream labels live as plain ASCII strings inside compiled `.class`
 //! files in the jar — a quirk of the menu-rendering layer encoding
@@ -16,21 +14,20 @@
 //! ATextField,Subtitle0,None,Fontstrip_Composite,...
 //! ```
 //!
-//! The single uppercase letter before `TextField` is string-pool
-//! prefix noise — the parser anchors on `TextField,` regardless of
-//! what precedes it. `Subtitle0` is the disable-subtitles menu
-//! button and is skipped (not a real subtitle stream).
+//! The parser ignores any prefix before the first `TextField,`
+//! occurrence — whatever string-pool ordering placed ahead of it is
+//! irrelevant. `Subtitle0` is the disable-subtitles menu button and is
+//! skipped (not a real subtitle stream).
 //!
 //! ## Implementation
 //!
-//! v2 (2026-05-10): rewritten on top of [`super::class_reader`] —
-//! iterates `CpInfo::Utf8` constant-pool entries instead of raw byte
-//! scanning each class file. Equivalent label coverage (the literal
-//! `TextField,...` strings live in the CP as Utf8 entries), but
-//! structurally cleaner: no false-positive risk from method bytecode
-//! or attribute names happening to contain `TextField,`. Language /
-//! purpose / qualifier classification moved to [`super::vocab`] so all
-//! Java-parser families share one source of truth.
+//! Iterates `CpInfo::Utf8` constant-pool entries rather than raw
+//! byte-scanning each class file. Equivalent label coverage (the literal
+//! `TextField,...` strings live in the CP as Utf8 entries) with no
+//! false-positive risk from method bytecode or attribute names that
+//! happen to contain `TextField,`. Language / purpose / qualifier
+//! classification lives in [`super::vocab`] so all Java-parser families
+//! share one source of truth.
 
 use super::class_reader::CpInfo;
 use super::{ParseResult, StreamLabel, StreamLabelType, jar, vocab};
@@ -48,6 +45,9 @@ pub fn detect(udf: &UdfFs) -> bool {
     jar::has_any_top_level_jar(udf)
 }
 
+/// Scan every top-level `/BDMV/JAR/*.jar` for the dbp framework and
+/// extract its stream labels. Returns `None` if no jar carries a
+/// `com/dbp/` package path or none yields any labels.
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {
     jar::for_each_jar(reader, udf, |_entry_name, archive| {
         if !jar::has_path_prefix(archive, "com/dbp/") {
