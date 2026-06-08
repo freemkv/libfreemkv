@@ -152,8 +152,8 @@ mod tests {
     fn path_str_returns_address_for_network() {
         // network:// path_str is the host:port address verbatim.
         assert_eq!(
-            parse_url("network://192.168.1.1:9000").path_str(),
-            "192.168.1.1:9000"
+            parse_url("network://203.0.113.5:9000").path_str(),
+            "203.0.113.5:9000"
         );
     }
 

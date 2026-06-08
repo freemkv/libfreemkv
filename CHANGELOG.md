@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.31.3 (2026-06-08)
+
+Test fixture hygiene — no runtime changes. Replaced a private-range example
+address in a `network://` URL test with an RFC 5737 documentation address so
+the public-repo leak-guard stays green.
+
 ## 0.31.2 (2026-06-08)
 
 Test-hardening release — no runtime changes. Adds a comprehensive,
