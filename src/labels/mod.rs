@@ -1358,7 +1358,7 @@ mod apply_tests {
 
     #[test]
     fn apply_rejects_mismatched_codec_hint_and_uses_stream_codec() {
-        // Paddington case: a TrueHD+Atmos main track the parser mislabeled
+        // TrueHD+Atmos relabel case: a TrueHD+Atmos main track the parser mislabeled
         // "AC-3 2.0" (a compat-core hint bound to the wrong stream). The hint
         // contradicts the stream's real codec → discard it, use the stream's own.
         let mut titles = vec![title_with(vec![audio(
@@ -1378,7 +1378,7 @@ mod apply_tests {
 
     #[test]
     fn apply_unshuffles_cross_labeled_streams() {
-        // Wicked case: hints fully cross-bound — a TrueHD stream wears "AC-3 5.1"
+        // Cross-bound hints case: hints fully cross-bound — a TrueHD stream wears "AC-3 5.1"
         // and a DD+ stream wears "TrueHD 5.1". Each is corrected from its own
         // stream codec, eliminating the shuffle.
         let mut titles = vec![title_with(vec![
@@ -1463,7 +1463,7 @@ mod apply_tests {
 
     #[test]
     fn apply_normalizes_plain_consistent_hint_to_marketing() {
-        // Wicked's French track: a DD+ stream whose hint "AC-3+ 5.1" is correct
+        // A French DD+ track: a DD+ stream whose hint "AC-3+ 5.1" is correct
         // but short-form. A sibling DD+ track that fell back uses the marketing
         // form — keeping the short form here would read inconsistently, so a
         // plain (non-richer) consistent hint is normalized to the stream's own.

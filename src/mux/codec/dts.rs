@@ -19,7 +19,7 @@ const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 /// a core frame plus all of its trailing DTS-HD extension substreams are
 /// emitted together as one access unit, delimited by the next valid core sync.
 /// This preserves the lossless extension data instead of downgrading to lossy
-/// core (the Dunkirk / Fight Club lossy-core bug).
+/// core (the lossy-core downgrade bug).
 pub struct DtsParser {
     buf: Vec<u8>,
     /// PTS of the access unit currently being assembled in `buf` (the unit
@@ -140,8 +140,8 @@ impl CodecParser for DtsParser {
         // sync. Emitting on the core boundary keeps the core + every following
         // extension substream together (the lossless data), instead of the
         // old per-PES emit that dropped the extension PES packets and
-        // downgraded the track to lossy DTS core (the Dunkirk / Fight Club
-        // bug). The PTS is the core frame's PTS, captured when the unit began.
+        // downgraded the track to lossy DTS core (the lossy-core
+        // downgrade bug). The PTS is the core frame's PTS, captured when the unit began.
         // Capture the access unit's PTS base on a fresh buffer, or whenever a
         // prior forced (safety-valve) flush left it invalidated — in the
         // forced case the bytes still in `buf` are not a real core frame, so
@@ -534,12 +534,12 @@ mod tests {
 
     #[test]
     fn keeps_dts_hd_extension_in_separate_pes_packets() {
-        // The real Blu-ray layout (ground-truthed on Dunkirk): the DTS core
+        // The real Blu-ray layout (ground-truthed on real UHD discs): the DTS core
         // arrives in one PES, then its DTS-HD MA extension substreams arrive
         // in SEPARATE following PES packets on the same PID. The parser must
         // stitch core + all trailing extensions into one access unit — not
         // emit a core-only (lossy) frame and drop the extension PES packets
-        // (the Dunkirk / Fight Club lossy-core bug).
+        // (the lossy-core downgrade bug).
         let mut parser = DtsParser::new();
 
         // Frame 1: core (512) + two extension substreams (256 + 200).

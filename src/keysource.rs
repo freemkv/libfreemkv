@@ -36,7 +36,7 @@ pub struct DiscInputs {
     /// [`crate::Disc::inputs`] leaves it empty for the caller to fill.
     pub samples: Vec<Vec<u8>>,
     /// The disc's human title — the UDF/ISO volume identifier (e.g.
-    /// `WICKED_FOR_GOOD`), falling back to the BDMV `<di:name>` when present.
+    /// `TITLE_2024`), falling back to the BDMV `<di:name>` when present.
     /// `None` when not captured. Identity only, no secret; a key service may
     /// record it (keyed by `disc_hash`) to build a hash→title catalog. Not used
     /// in any AACS derivation.

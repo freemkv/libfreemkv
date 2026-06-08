@@ -2113,7 +2113,7 @@ mod tests {
 
     #[test]
     fn resolve_keys_path2_5_mk_pool_brute_resolves_unkeyed_disc() {
-        // The Dunkirk case: this disc's own hash/VID are NOT in keydb, but its
+        // The keyless-disc case: this disc's own hash/VID are NOT in keydb, but its
         // Media Key IS — filed under a sibling disc that shares its MKB. Path
         // 2.5 must km_verifies that MK against the MKB and resolve.
         use super::super::decrypt::aes_ecb_encrypt as enc;

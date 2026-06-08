@@ -1461,7 +1461,7 @@ mod tests {
         // Regression for BOTH 0.31.0 bugs through `read_file`: this is the
         // exact path `Disc::read_aacs_inputs_from_reader` uses to read
         // `/AACS/MKB_RO.inf` + `Unit_Key_RO.inf`. A Long-AD, multi-extent
-        // file (Dunkirk-class UHD layout) must return ALL its bytes. With the
+        // file (large UHD/Blu-ray layout) must return ALL its bytes. With the
         // pre-fix Short-AD-only parser this read stopped after the first
         // extent, which (a) truncated the mux and (b) made autorip's
         // `key_files()` see a short/garbage AACS file → `MissingInputs` →
@@ -1489,6 +1489,56 @@ mod tests {
         assert!(data[..2048].iter().all(|&b| b == 0xAA));
         assert!(data[2048..4096].iter().all(|&b| b == 0xBB));
         assert!(data[4096..].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn read_aacs_inputs_reads_long_ad_files_in_full() {
+        // PRECOMMIT proof for the autorip online-keyserver path (no disc / no
+        // deploy). autorip's key request is gated on Disc::read_aacs_inputs
+        // (keysource.rs key_files()): it reads /AACS/Unit_Key_RO.inf and
+        // /AACS/MKB_RO.inf. On a Long-AD disc (UHD / large Blu-ray) the
+        // pre-0.31.1 Short-AD-only reader truncated those files at their first
+        // extent, breaking key derivation. This
+        // fixture lays a Long-AD, multi-extent Unit_Key_RO.inf under /AACS and
+        // asserts read_aacs_inputs returns its FULL content — i.e. the keyserver
+        // inputs are complete, so the request is built correctly.
+        let aacs = DirEntry {
+            name: "AACS".to_string(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![
+                file_entry("Unit_Key_RO.inf", 5, 4096), // Long-AD, 2 extents
+                file_entry("MKB_RO.inf", 7, 2048),
+            ],
+        };
+        let root = DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![aacs],
+        };
+        let mut reader = MapReader::new();
+        // Unit_Key_RO.inf: Long-AD ICB with two recorded extents.
+        reader.put(5, build_efe_long(4096, &[(0, 2048, 10), (0, 2048, 30)]));
+        reader.put(10, [0xAA; 2048]);
+        reader.put(30, [0xBB; 2048]);
+        // MKB_RO.inf: single Long-AD extent (content is opaque to this test).
+        reader.put(7, build_efe_long(2048, &[(0, 2048, 50)]));
+        reader.put(50, [0xCC; 2048]);
+
+        let fs = fs_with(0, 0, root);
+        let (inf, _mkb) = crate::disc::Disc::read_aacs_inputs_from_reader(&mut reader, &fs)
+            .expect("read_aacs_inputs must succeed for a Long-AD disc");
+        assert_eq!(
+            inf.len(),
+            4096,
+            "Unit_Key_RO.inf (Long-AD, multi-extent) must read in full — the \
+             pre-0.31.1 Short-AD parser truncated it to the first 2048-byte extent"
+        );
+        assert!(inf[..2048].iter().all(|&b| b == 0xAA));
+        assert!(inf[2048..].iter().all(|&b| b == 0xBB));
     }
 
     #[test]

@@ -1299,7 +1299,7 @@ impl Disc {
     /// zero-padded, so reading either ships up to ~124 MiB of nothing —
     /// trim to the record stream so callers send/store a few MB, not
     /// 128 MiB.
-    fn read_aacs_inputs_from_reader(
+    pub(crate) fn read_aacs_inputs_from_reader(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Result<(Vec<u8>, Vec<u8>)> {

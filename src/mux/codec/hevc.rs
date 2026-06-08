@@ -28,7 +28,7 @@ pub struct HevcParser {
     // This is the ONLY copy the player gets out-of-band, and a player re-applies
     // it at every keyframe (ffmpeg's hvcC→Annex-B insertion). A stream may
     // redefine a parameter set mid-title under the SAME id with a different body
-    // (Fight Club redefines PPS id 0 partway through). Any occurrence whose body
+    // (some discs redefine PPS id 0 partway through). Any occurrence whose body
     // DIFFERS from this codecPrivate copy must therefore be emitted IN-BAND at
     // each point it appears (i.e. at every keyframe of the redefined segment) so
     // it overrides the re-applied codecPrivate set; otherwise those frames decode
@@ -65,7 +65,7 @@ impl HevcParser {
 ///   same id) → emitted IN-BAND (length-prefixed) at EVERY occurrence, so it
 ///   overrides the hvcC copy the player re-applies at each keyframe. Emitting it
 ///   only once is not enough — the next keyframe's hvcC re-insertion would revert
-///   it. This matches what a conforming muxer produces and fixes the Fight Club
+///   it. This matches what a conforming muxer produces and fixes mid-title
 ///   PPS-id-0 redefinition.
 fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Vec<u8>) {
     match first {
@@ -829,10 +829,10 @@ mod tests {
         );
     }
 
-    // --- parameter-set redefinition (Fight Club bug) ---
+    // --- parameter-set redefinition (mid-title redefinition bug) ---
 
     /// A parameter set REDEFINED mid-stream (same id, different body) must be
-    /// emitted INLINE so the decoder re-activates it. Fight Club redefines PPS
+    /// emitted INLINE so the decoder re-activates it. Some discs redefine PPS
     /// id 0 partway through the title; the old parser kept only the first PPS,
     /// so the second segment decoded against the wrong PPS (CABAC desync).
     #[test]
