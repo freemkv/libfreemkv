@@ -437,6 +437,33 @@ impl UdfFs {
             }
         };
 
+        // Allocation-descriptor type lives in the ICB Tag flags (low 3
+        // bits). The ICB Tag immediately follows the 16-byte descriptor
+        // tag, and its `flags` u16 is the last field at ICB-tag offset 18
+        // → absolute offset 34, for both File Entry (261) and Extended
+        // File Entry (266). 0 = Short AD (8 bytes), 1 = Long AD (16 bytes),
+        // 2 = Extended AD (20 bytes), 3 = data embedded inline in the ICB.
+        //
+        // This MUST be honoured: a Short AD and a Long AD both carry
+        // length+lba in their first 8 bytes, so hardcoding an 8-byte
+        // stride reads descriptor #0 of a Long-AD file correctly but lands
+        // descriptor #1 in the middle of the first Long AD (its impl_use
+        // bytes) — garbage that trips the terminator/unknown-type break.
+        // Large BD-ROM .m2ts streams use Long ADs, so that bug truncated
+        // every multi-extent title at its first extent (~973 MB-1 GiB).
+        let icb_flags = u16::from_le_bytes([icb[34], icb[35]]);
+        let ad_type = (icb_flags & 0x07) as usize;
+        let ad_size: usize = match ad_type {
+            0 => 8,  // Short AD
+            1 => 16, // Long AD
+            2 => 20, // Extended AD
+            // 3 = inline/embedded data (no out-of-line extents) — never
+            // used for large stream files. Anything else is unexpected;
+            // fall back to the historical 8-byte stride rather than fail
+            // the whole title.
+            _ => 8,
+        };
+
         let mut extents = Vec::new();
 
         // Parse the first allocation-descriptor list from the ICB. A type-3
@@ -450,12 +477,12 @@ impl UdfFs {
         const MAX_AD_BLOCKS: usize = 256;
 
         for _ in 0..MAX_AD_BLOCKS {
-            let num_descriptors = ad_bytes / 8; // Short Allocation Descriptor = 8 bytes
+            let num_descriptors = ad_bytes / ad_size;
             let mut next_block: Option<u32> = None;
 
             for i in 0..num_descriptors {
-                let off = ad_start + i * 8;
-                if off + 8 > block.len() {
+                let off = ad_start + i * ad_size;
+                if off + ad_size > block.len() {
                     break;
                 }
 
@@ -467,11 +494,15 @@ impl UdfFs {
                 ]);
                 let extent_type = raw_len >> 30;
                 let data_len = raw_len & 0x3FFF_FFFF;
+                // Short and Long ADs carry the extent LBA at off+4. Extended
+                // ADs (20 bytes) place their extent_location lb_addr after
+                // three length fields, at off+12.
+                let lba_off = if ad_size == 20 { off + 12 } else { off + 4 };
                 let data_lba = u32::from_le_bytes([
-                    block[off + 4],
-                    block[off + 5],
-                    block[off + 6],
-                    block[off + 7],
+                    block[lba_off],
+                    block[lba_off + 1],
+                    block[lba_off + 2],
+                    block[lba_off + 3],
                 ]);
 
                 match extent_type {
@@ -1278,6 +1309,35 @@ mod tests {
         s
     }
 
+    /// Build an Extended File Entry (tag 266) ICB whose allocation
+    /// descriptors are LONG ADs (16 bytes: len(4) | lba(4) | part_ref(2) |
+    /// impl_use(6)). Sets the ICB Tag flags (abs offset 34) low bits to 1
+    /// so the parser must select the 16-byte stride. This is the layout
+    /// large BD-ROM .m2ts streams actually use.
+    fn build_efe_long(info_length: u64, ads: &[(u32, u32, u32)]) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // tag
+        // ICB Tag flags at abs offset 34: AD type 1 = Long AD.
+        s[34..36].copy_from_slice(&1u16.to_le_bytes());
+        s[56..64].copy_from_slice(&info_length.to_le_bytes());
+        let l_ea: u32 = 0;
+        let l_ad: u32 = (ads.len() * 16) as u32;
+        s[208..212].copy_from_slice(&l_ea.to_le_bytes());
+        s[212..216].copy_from_slice(&l_ad.to_le_bytes());
+        let mut off = 216 + l_ea as usize;
+        for &(etype, dlen, dlba) in ads {
+            let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
+            s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
+            s[off + 4..off + 8].copy_from_slice(&dlba.to_le_bytes());
+            // off+8..off+10 = partition reference (0), off+10..off+16 =
+            // impl_use (0). Leaving these zero is what trips the old
+            // 8-byte-stride parser into reading a bogus zero-length
+            // terminator as descriptor #1.
+            off += 16;
+        }
+        s
+    }
+
     /// A continuation block: a bare list of short ADs from byte 0.
     fn build_cont_block(ads: &[(u32, u32, u32)]) -> [u8; 2048] {
         let mut s = [0u8; 2048];
@@ -1336,6 +1396,42 @@ mod tests {
     }
 
     #[test]
+    fn icb_extents_long_ad_returns_all_extents_not_just_first() {
+        // Regression: BD-ROM large .m2ts files use Long ADs (16-byte
+        // descriptors). The pre-fix parser hardcoded an 8-byte stride, so
+        // it read descriptor #0 (length+lba align in both layouts) then
+        // misread descriptor #1 from the middle of the first Long AD —
+        // a zero terminator — and returned ONLY the first extent. That
+        // truncated every multi-extent title at ~973 MB-1 GiB.
+        //
+        // Four Long ADs, each a near-max Short-AD-sized extent. The fix
+        // must return all four; the old code returned exactly one.
+        let icb = build_efe_long(
+            4 * 1_000_000_000,
+            &[
+                (0, 0x3FFF_F800, 100),     // ~1 GiB extent
+                (0, 0x3FFF_F800, 600_000), // next extent
+                (0, 0x3FFF_F800, 1_100_000),
+                (0, 0x1000_0000, 1_600_000), // shorter tail extent
+            ],
+        );
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        let fs = fs_with(0, 0, file_entry("BIG", 5, 4 * 1_000_000_000));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        assert_eq!(
+            extents,
+            vec![
+                (100, 0x3FFF_F800),
+                (600_000, 0x3FFF_F800),
+                (1_100_000, 0x3FFF_F800),
+                (1_600_000, 0x1000_0000),
+            ],
+            "Long-AD file must return ALL extents, not just the first"
+        );
+    }
+
+    #[test]
     fn read_file_spans_multiple_extents() {
         let part_start = 0;
         let meta_start = 0;
@@ -1358,6 +1454,41 @@ mod tests {
         assert_eq!(data.len(), 4096);
         assert!(data[..2048].iter().all(|&b| b == 0xAA));
         assert!(data[2048..].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn read_file_long_ad_returns_full_content_not_truncated() {
+        // Regression for BOTH 0.31.0 bugs through `read_file`: this is the
+        // exact path `Disc::read_aacs_inputs_from_reader` uses to read
+        // `/AACS/MKB_RO.inf` + `Unit_Key_RO.inf`. A Long-AD, multi-extent
+        // file (Dunkirk-class UHD layout) must return ALL its bytes. With the
+        // pre-fix Short-AD-only parser this read stopped after the first
+        // extent, which (a) truncated the mux and (b) made autorip's
+        // `key_files()` see a short/garbage AACS file → `MissingInputs` →
+        // the online key request was never sent.
+        let icb = build_efe_long(6144, &[(0, 2048, 10), (0, 2048, 30), (0, 2048, 50)]);
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(10, [0xAA; 2048]);
+        reader.put(30, [0xBB; 2048]);
+        reader.put(50, [0xCC; 2048]);
+        let root = DirEntry {
+            name: String::new(),
+            is_dir: true,
+            meta_lba: 0,
+            size: 0,
+            entries: vec![file_entry("MKB", 5, 6144)],
+        };
+        let fs = fs_with(0, 0, root);
+        let data = fs.read_file(&mut reader, "/MKB").expect("read");
+        assert_eq!(
+            data.len(),
+            6144,
+            "Long-AD file must not truncate at extent #0"
+        );
+        assert!(data[..2048].iter().all(|&b| b == 0xAA));
+        assert!(data[2048..4096].iter().all(|&b| b == 0xBB));
+        assert!(data[4096..].iter().all(|&b| b == 0xCC));
     }
 
     #[test]

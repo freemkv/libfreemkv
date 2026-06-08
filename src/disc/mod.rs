@@ -1307,13 +1307,15 @@ impl Disc {
             .read_file(reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
-        let mut mkb = udf_fs
+        let mkb = udf_fs
             .read_file(reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
-        let n = crate::aacs::mkb_content_len(&mkb);
-        mkb.truncate(n);
-        Ok((inf, mkb))
+        // Trim trailing padding to the real MKB content length, never zeroing
+        // an unrecognised MKB (see `crate::aacs::trim_mkb` — restores the
+        // pre-0.31.0 guard so the online key service never receives an empty
+        // MKB).
+        Ok((inf, crate::aacs::trim_mkb(mkb)))
     }
 
     /// Read a disc's AACS key-input files from an ISO image: returns

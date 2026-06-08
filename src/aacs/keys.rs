@@ -563,6 +563,21 @@ pub fn mkb_content_len(mkb: &[u8]) -> usize {
     pos
 }
 
+/// Trim an MKB's trailing fixed-region padding to its real content length —
+/// but ONLY when [`mkb_content_len`] actually found one. It returns 0 for an
+/// MKB whose first record cannot be parsed; truncating to 0 in that case would
+/// hand downstream consumers (and the online key service) an EMPTY MKB that can
+/// never resolve. So a 0 (or a length that isn't strictly inside the buffer)
+/// leaves the MKB untouched. A 0.31.0 regression dropped this guard and
+/// `truncate`-d unconditionally, zeroing unrecognised MKBs.
+pub fn trim_mkb(mut mkb: Vec<u8>) -> Vec<u8> {
+    let n = mkb_content_len(&mkb);
+    if n > 0 && n < mkb.len() {
+        mkb.truncate(n);
+    }
+    mkb
+}
+
 /// Get MKB version from Type and Version Record (type 0x10).
 /// Version is a BE u32 at offset 8 of the record body (offset 12 from `pos`).
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
@@ -1517,6 +1532,44 @@ mod tests {
         assert_eq!(mkb_content_len(&mkb[..records_len]), records_len);
         // Empty → 0.
         assert_eq!(mkb_content_len(&[]), 0);
+    }
+
+    #[test]
+    fn trim_mkb_never_zeroes_an_unrecognised_mkb() {
+        // Regression: the 0.31.0 read_aacs_inputs path truncated the MKB to
+        // mkb_content_len() unconditionally. For an MKB whose first record the
+        // parser can't read, mkb_content_len() returns 0 → an unconditional
+        // truncate zeroed the MKB, so autorip sent an EMPTY MKB to the key
+        // service (or skipped the request). trim_mkb must leave it intact.
+        let unrecognised = vec![0xFFu8; 4096]; // first "rec_type" 0xFF, rec_len huge → content_len 0
+        assert_eq!(
+            mkb_content_len(&unrecognised),
+            0,
+            "precondition: unparseable → 0"
+        );
+        assert_eq!(
+            trim_mkb(unrecognised.clone()),
+            unrecognised,
+            "unrecognised MKB must be returned untouched, never zeroed"
+        );
+
+        // A parseable MKB with trailing padding IS trimmed to its records.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x18]);
+        mkb.extend_from_slice(&[0xAB; 16]);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let records_len = mkb.len();
+        mkb.extend(std::iter::repeat(0u8).take(1024));
+        assert_eq!(
+            trim_mkb(mkb).len(),
+            records_len,
+            "padded MKB trims to records"
+        );
+
+        // Empty stays empty (n==0 → untouched).
+        assert!(trim_mkb(Vec::new()).is_empty());
     }
 
     #[test]
