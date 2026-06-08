@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.31.1 (2026-06-08)
+
+Correctness fixes for the file-backed mux and disc AACS-input read paths,
+plus regression tests.
+
+### Fixed
+
+- UDF: honor the ICB allocation-descriptor type flag. The extent reader
+  hardcoded an 8-byte Short-AD stride, so files using 16-byte Long ADs (large
+  BD-ROM `.m2ts` streams) were mis-strided: descriptor #0 read correctly, then
+  the allocation-list terminator tripped on the zero bytes mid-descriptor and
+  parsing stopped after the first extent. Every multi-extent title truncated
+  at ~1 GiB. Short/Long/Extended ADs are now strided correctly (8/16/20 bytes;
+  Extended ADs carry the extent LBA at offset +12). This repaired both the
+  file mux (`iso://`) and the disc AACS-input read (`/AACS/*.inf`).
+- AACS: never zero an MKB whose content length the parser cannot determine
+  (`mkb_content_len == 0` now leaves the buffer intact instead of truncating
+  it to empty).
+
+### Tests
+
+- Long-AD `read_icb_extents` and `read_file` coverage, Extended-AD stride,
+  sparse/terminator handling, continuation-loop bound, UDF name decoding, and
+  `trim_mkb` empty-guard; bad-sector recovery damage-skip range bounds and
+  bridge-degradation budget. Each verified to fail under a targeted mutation.
+
 ## 0.31.0 (2026-06-08)
 
 Hardening and correctness release: a library-wide review-and-fix pass across
