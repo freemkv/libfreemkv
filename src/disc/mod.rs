@@ -1307,15 +1307,40 @@ impl Disc {
             .read_file(reader, "/AACS/Unit_Key_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
             .map_err(|_| Error::AacsNoKeys)?;
-        let mkb = udf_fs
-            .read_file(reader, "/AACS/MKB_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
-            .map_err(|_| Error::AacsNoKeys)?;
-        // Trim trailing padding to the real MKB content length, never zeroing
-        // an unrecognised MKB (see `crate::aacs::trim_mkb` — restores the
-        // pre-0.31.0 guard so the online key service never receives an empty
-        // MKB).
-        Ok((inf, crate::aacs::trim_mkb(mkb)))
+        let mkb = Self::read_mkb_content(reader, udf_fs)?;
+        Ok((inf, mkb))
+    }
+
+    /// Read the AACS MKB's real record stream — NOT its zero padding.
+    ///
+    /// `MKB_RO.inf` / `MKB_RW.inf` are allocated to a fixed ~128 MiB and
+    /// zero-padded; the actual record stream is a few MiB. We read a bounded
+    /// prefix, find the record-stream length via [`crate::aacs::mkb_content_len`]
+    /// and return exactly that, growing the prefix if the records run past it.
+    /// This avoids reading 100+ MiB of padding on every scan AND avoids the
+    /// `read_file` `MAX_FILE_BYTES` cap that (since 0.31.0) rejected the padded
+    /// 128 MiB MKB outright — which made `read_aacs_inputs` fail and autorip
+    /// report "could not read this disc's key files" without ever contacting
+    /// the keyserver.
+    fn read_mkb_content(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Result<Vec<u8>> {
+        const START_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        let mut want = START_BYTES;
+        loop {
+            let buf = udf_fs
+                .read_file_prefix(reader, "/AACS/MKB_RO.inf", want)
+                .or_else(|_| udf_fs.read_file_prefix(reader, "/AACS/MKB_RW.inf", want))
+                .map_err(|_| Error::AacsNoKeys)?;
+            let n = crate::aacs::mkb_content_len(&buf);
+            // `n` strictly inside `buf` => the record walk reached the padding
+            // boundary (full content captured). `buf` shorter than `want` =>
+            // the whole file is already read. Otherwise the records may run
+            // past the prefix — grow and retry, bounded by MAX_BYTES.
+            if (n > 0 && n < buf.len()) || buf.len() < want || want >= MAX_BYTES {
+                return Ok(crate::aacs::trim_mkb(buf));
+            }
+            want = (want * 2).min(MAX_BYTES);
+        }
     }
 
     /// Read a disc's AACS key-input files from an ISO image: returns

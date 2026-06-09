@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.31.6 (2026-06-09)
+
+### Fixed
+
+- UDF `read_file`: the AACS Media Key Block (`MKB_RO.inf`) is allocated to a
+  fixed ~128 MiB on UHD discs and zero-padded, but the real record stream is
+  only a few MiB. 0.31.0 added a 64 MiB `MAX_FILE_BYTES` cap on `read_file`,
+  which rejected the padded MKB outright — so `read_aacs_inputs` failed and the
+  online key-resolve path reported "could not read this disc's key files" and
+  **never contacted the keyserver** (a regression on every disc whose MKB
+  exceeds 64 MiB). The MKB is now read length-aware: a bounded prefix is read,
+  the real record length is found via the MKB header, and exactly that is
+  returned — never the padding, and never tripping the cap. Validated
+  end-to-end against a real UHD ISO (MKB reads and trims to its record length).
+- UDF `read_file`: honor inline/embedded allocation descriptors (ICB Tag flags
+  low bits == 3). Tiny files (some AACS `*.inf` key files) store their data
+  embedded directly in the ICB with no out-of-line extents; these are now read
+  from the ICB payload instead of misparsing the embedded bytes as allocation
+  descriptors (which could hard-error since 0.31.0).
+
 ## 0.31.5 (2026-06-08)
 
 ### Fixed

@@ -21,11 +21,19 @@
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 
-/// Upper bound on a single metadata file read (`read_file`). BD-ROM
-/// metadata files (.mpls/.clpi/.inf/.bdmv) are a few KiB to tens of MiB;
-/// 64 MiB is a generous ceiling. Caps the allocation so a crafted ICB
-/// info_length / extent length cannot force a huge zeroed reservation
-/// before any data is read.
+/// Upper bound on a single UNBOUNDED metadata file read (`read_file`).
+/// BD-ROM metadata files (.mpls/.clpi/.bdmv/.inf) are a few KiB to a few
+/// MiB; 64 MiB is a generous ceiling that bounds the allocation a crafted
+/// ICB info_length / extent length can force.
+///
+/// The one legitimately huge file — the AACS `MKB_RO.inf`, allocated to a
+/// fixed ~128 MiB and zero-padded — is NOT read through the unbounded path:
+/// `read_aacs_inputs_from_reader` reads a bounded prefix via
+/// `read_file_prefix` and trims to the real record length, so it never
+/// trips this cap (and never reads 100+ MiB of padding). A 0.31.0
+/// regression added this cap and read the MKB unbounded, so the cap
+/// rejected it → `read_aacs_inputs` failed → autorip reported "could not
+/// read this disc's key files" and never contacted the keyserver.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Upper bound on a single directory's on-disc data. Real BD-ROM
@@ -135,6 +143,35 @@ impl UdfFs {
     /// Read a file by path, returning its raw bytes.
     /// Reads all data extents sector by sector from disc — no buffering.
     pub fn read_file(&self, reader: &mut dyn SectorSource, path: &str) -> Result<Vec<u8>> {
+        self.read_file_limited(reader, path, None)
+    }
+
+    /// Read at most `max_bytes` of a file (rounded up to a whole sector),
+    /// stopping early rather than reading the whole file.
+    ///
+    /// Used to read only the real, record-length portion of the AACS
+    /// `MKB_RO.inf` — allocated to a fixed ~128 MiB and zero-padded — instead
+    /// of reading 100+ MiB of padding (and tripping `MAX_FILE_BYTES`). The
+    /// caller trims the returned prefix to the MKB record length.
+    pub fn read_file_prefix(
+        &self,
+        reader: &mut dyn SectorSource,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        self.read_file_limited(reader, path, Some(max_bytes))
+    }
+
+    /// Shared implementation of [`read_file`] / [`read_file_prefix`]. When
+    /// `max_bytes` is `Some`, reads at most that many bytes and the whole-file
+    /// `MAX_FILE_BYTES` anti-DoS cap on the declared size / extent lengths is
+    /// not applied (the read is already bounded by `max_bytes`).
+    fn read_file_limited(
+        &self,
+        reader: &mut dyn SectorSource,
+        path: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<Vec<u8>> {
         let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut current = &self.root;
 
@@ -166,16 +203,34 @@ impl UdfFs {
                 path: path.to_string(),
             })?;
 
-        // Read ALL the file's data extents. Multi-extent files (fragmented or
-        // split across dual layers) would otherwise be silently truncated to
-        // the first extent, since the buffer is sized to entry.size and
-        // truncate() can't grow it.
+        // `max_bytes == None` => read the whole file; `Some(n)` => read at most
+        // n bytes (rounded up to a sector) and skip the anti-DoS caps below.
+        let limit = max_bytes.unwrap_or(usize::MAX);
+
+        // Tiny files (notably the AACS `*.inf` key files) may store their data
+        // embedded inline in the ICB (AD type 3), with no out-of-line extents.
+        // Honor that before the extent path, which would otherwise misparse the
+        // embedded bytes as allocation descriptors and (since 0.31.0) hard-error
+        // on the resulting bogus extent length.
+        if let Some(mut inline) = self.read_inline_data(reader, entry.meta_lba)? {
+            let want = (entry.size as usize).min(limit);
+            if inline.len() > want {
+                inline.truncate(want);
+            }
+            return Ok(inline);
+        }
+
+        // Read the file's data extents. Multi-extent files (fragmented or split
+        // across dual layers) would otherwise be silently truncated to the
+        // first extent, since the buffer is sized to entry.size and truncate()
+        // can't grow it.
         let extents = self.read_icb_extents(reader, entry.meta_lba)?;
 
-        // Reject an oversized declared total before allocating: entry.size is
-        // a raw u64 off the ICB, so a crafted file could otherwise force a
-        // multi-hundred-MiB / GiB allocation across its extents.
-        if entry.size > MAX_FILE_BYTES {
+        // Reject an oversized declared total before allocating: entry.size is a
+        // raw u64 off the ICB, so a crafted file could otherwise force a
+        // multi-hundred-MiB / GiB allocation. Only for the UNBOUNDED path — a
+        // bounded read is limited by `limit` regardless of the declared size.
+        if max_bytes.is_none() && entry.size > MAX_FILE_BYTES {
             return Err(Error::DiscRead {
                 sector: self.partition_start as u64,
                 status: None,
@@ -183,33 +238,30 @@ impl UdfFs {
             });
         }
 
-        // Read ALL the file's data extents. File DATA is in the physical
-        // partition (partition_start + lba), NOT the metadata partition: ICBs
-        // are in metadata, data is in physical.
-        let mut data = Vec::with_capacity(entry.size as usize);
+        // Read the file DATA from the physical partition (partition_start +
+        // lba), NOT the metadata partition: ICBs are in metadata, data is in
+        // physical. Pre-allocate to the smaller of declared size and the
+        // requested prefix (capped so a bogus entry.size can't reserve GiB).
+        let cap_hint = (entry.size as usize)
+            .min(limit)
+            .min(MAX_FILE_BYTES as usize);
+        let mut data = Vec::with_capacity(cap_hint);
         let mut sector = [0u8; 2048];
-        for (data_lba, data_len) in extents {
-            // Cumulative guard: entry.size and each per-extent data_len are
-            // capped individually above, but a crafted ICB can chain many
-            // small extents (read_icb_extents follows type-3 chains up to
-            // MAX_AD_BLOCKS) whose running total grows `data` into GiB. Reject
-            // once the accumulated bytes would exceed MAX_FILE_BYTES.
-            if data.len() as u64 + data_len as u64 > MAX_FILE_BYTES {
-                return Err(Error::DiscRead {
-                    sector: self.partition_start as u64,
-                    status: None,
-                    sense: None,
-                });
-            }
-            // data_len is the disc-controlled 30-bit extent length; reject an
-            // oversized extent before reading so a crafted ICB can't grow the
-            // buffer past MAX_FILE_BYTES.
-            if data_len as u64 > MAX_FILE_BYTES {
-                return Err(Error::DiscRead {
-                    sector: self.partition_start as u64,
-                    status: None,
-                    sense: None,
-                });
+        'extents: for (data_lba, data_len) in extents {
+            if max_bytes.is_none() {
+                // Anti-DoS guards for the unbounded path: a crafted ICB can
+                // chain many extents whose running total grows `data` into GiB,
+                // or declare a single oversized extent. (Skipped when bounded —
+                // `limit` already caps the read.)
+                if data.len() as u64 + data_len as u64 > MAX_FILE_BYTES
+                    || data_len as u64 > MAX_FILE_BYTES
+                {
+                    return Err(Error::DiscRead {
+                        sector: self.partition_start as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
             }
             let abs_start = self
                 .partition_start
@@ -221,6 +273,9 @@ impl UdfFs {
                 })?;
             let sector_count = (data_len as u64).div_ceil(2048) as u32;
             for i in 0..sector_count {
+                if data.len() >= limit {
+                    break 'extents;
+                }
                 let abs = abs_start.checked_add(i).ok_or(Error::DiscRead {
                     sector: abs_start as u64,
                     status: None,
@@ -231,10 +286,12 @@ impl UdfFs {
             }
         }
 
-        // Trim to the real file size; if extents under-covered the file (e.g.
-        // sparse), leave what we have rather than over-reporting.
-        if data.len() > entry.size as usize {
-            data.truncate(entry.size as usize);
+        // Trim to the real file size, or to the requested prefix — whichever is
+        // smaller. If extents under-covered the file (e.g. sparse), leave what
+        // we have rather than over-reporting.
+        let trim_to = (entry.size as usize).min(limit);
+        if data.len() > trim_to {
+            data.truncate(trim_to);
         }
         Ok(data)
     }
@@ -380,6 +437,54 @@ impl UdfFs {
             status: None,
             sense: None,
         })
+    }
+
+    /// If this ICB stores its file data INLINE (embedded — ICB Tag flags low
+    /// 3 bits == 3) rather than via out-of-line extents, return the embedded
+    /// bytes. Tiny files such as the AACS `*.inf` key files are routinely
+    /// embedded directly in the ICB; `read_icb_extents` finds no real extents
+    /// for them (it would misparse the embedded payload as allocation
+    /// descriptors), so `read_file` must read the inline payload here. Returns
+    /// `Ok(None)` for the normal extent-backed case.
+    ///
+    /// (Regression guard: 0.31.0 added a per-extent `MAX_FILE_BYTES` cap that
+    /// turned the misparsed-embedded case into a hard error, which surfaced as
+    /// autorip "could not read this disc's key files" on discs whose AACS
+    /// `.inf` files are ICB-embedded — the keyserver was then never called.)
+    fn read_inline_data(
+        &self,
+        reader: &mut dyn SectorSource,
+        meta_lba: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let icb_abs = self.meta_to_abs(meta_lba)?;
+        let mut icb = [0u8; 2048];
+        read_sector(reader, icb_abs, &mut icb)?;
+        let tag = u16::from_le_bytes([icb[0], icb[1]]);
+        let (ad_offset, l_ad) = match tag {
+            // Extended File Entry (266) / standard File Entry (261): the
+            // allocation-descriptors field (which, for embedded files, holds
+            // the data itself) begins after the extended attributes.
+            266 => {
+                let l_ea = u32::from_le_bytes([icb[208], icb[209], icb[210], icb[211]]) as usize;
+                let l_ad = u32::from_le_bytes([icb[212], icb[213], icb[214], icb[215]]) as usize;
+                (216 + l_ea, l_ad)
+            }
+            261 => {
+                let l_ea = u32::from_le_bytes([icb[168], icb[169], icb[170], icb[171]]) as usize;
+                let l_ad = u32::from_le_bytes([icb[172], icb[173], icb[174], icb[175]]) as usize;
+                (176 + l_ea, l_ad)
+            }
+            _ => return Ok(None),
+        };
+        // ICB Tag flags: u16 at absolute offset 34, low 3 bits select the AD
+        // type. 3 == data embedded inline in the ICB.
+        let icb_flags = u16::from_le_bytes([icb[34], icb[35]]);
+        if (icb_flags & 0x07) != 3 {
+            return Ok(None);
+        }
+        let start = ad_offset.min(icb.len());
+        let end = ad_offset.saturating_add(l_ad).min(icb.len());
+        Ok(Some(icb[start..end].to_vec()))
     }
 
     /// Read ALL allocation extents for a file from its ICB.
