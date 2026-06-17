@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.31.9 (2026-06-17)
+
+### Performance
+- Subset-difference PK walk (`calc_pk_from_dk`): at each tree level derive only
+  the child actually descended into (not both siblings) and compute the
+  Processing Key once at the final node — ~3x fewer AES block ops per walk.
+  Bit-for-bit identical output; speeds every Device-Key → Media-Key derivation
+  (disc decryption AND unpositioned-DK recovery).
+
+
 ## 0.31.8 (2026-06-17)
 
 ### Added

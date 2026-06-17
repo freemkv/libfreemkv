@@ -616,10 +616,13 @@ pub(super) fn calc_pk_from_dk(
     v_mask: u32,
     dev_key_v_mask: u32,
 ) -> [u8; 16] {
-    // Initial derivation: left_child = aesg3(dk, 0), pk = aesg3(dk, 1), right_child = aesg3(dk, 2)
-    let mut left_child = aesg3(dk, 0);
-    let mut pk = aesg3(dk, 1);
-    let mut right_child = aesg3(dk, 2);
+    // Descend from the device node to the record node, following the record's
+    // `uv` bits. At each level only the child we descend INTO is needed (the
+    // sibling is computed but never used), and the Processing Key is the
+    // `aesg3(.,1)` of the FINAL node — so we derive ONE child per level and the
+    // PK once at the end, instead of left/pk/right at every level. Identical
+    // result, ~3x fewer block ops. (left child = `aesg3(node,0)`, right = `,2`.)
+    let mut node = *dk;
     let mut current_v_mask = dev_key_v_mask;
 
     // The subset-difference tree is at most 32 levels deep (u32 mask), so the
@@ -642,20 +645,17 @@ pub(super) fn calc_pk_from_dk(
             }
         }
 
-        let curr_key = if bit_pos < 0 || (uv & (1u32 << bit_pos as u32)) == 0 {
-            left_child
+        let inc = if bit_pos < 0 || (uv & (1u32 << bit_pos as u32)) == 0 {
+            0 // left child
         } else {
-            right_child
+            2 // right child
         };
-
-        left_child = aesg3(&curr_key, 0);
-        pk = aesg3(&curr_key, 1);
-        right_child = aesg3(&curr_key, 2);
+        node = aesg3(&node, inc);
 
         current_v_mask = ((current_v_mask as i32) >> 1) as u32;
     }
 
-    pk
+    aesg3(&node, 1)
 }
 
 /// Derive Media Key from MKB using device keys (subset-difference tree).
