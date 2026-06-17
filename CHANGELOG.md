@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.31.8 (2026-06-17)
+
+### Added
+- `recover_dk_position(mkb, key) -> Option<DeviceKey>`: recover an unpositioned
+  device key's subset-difference position (`node`/`uv`/`u_mask_shift`) by
+  scanning a disc MKB — the zero-descent slot probe and ancestor walk-up, with
+  the verify reduced to the hoisted terminal Processing Key. Lets a caller boil
+  a position-less device key against a real disc.
+
+### Changed
+- Consolidate the SD walk surface: remove the research-only
+  `probe::walk_pk_against_tables` (the single PK→MK engine is reached via
+  `derive_media_key_from_pk`); make `derive_media_key_from_pk_walked` internal.
+
+
 ## 0.31.7 (2026-06-17)
 
 ### Added

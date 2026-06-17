@@ -240,7 +240,7 @@ const PK_WALK_MAX_DEPTH_CAP: u8 = 5;
 ///
 /// The BFS frontier grows as `2^max_depth`; `max_depth` is clamped to
 /// [`PK_WALK_MAX_DEPTH_CAP`] so a large value cannot exhaust memory.
-pub fn derive_media_key_from_pk_walked(
+pub(crate) fn derive_media_key_from_pk_walked(
     mkb: &[u8],
     processing_keys: &[[u8; 16]],
     max_depth: u8,
@@ -251,9 +251,8 @@ pub fn derive_media_key_from_pk_walked(
     walk_pk_against_tables_impl(processing_keys, &uvs, &cvalues, &mk_dv, max_depth)
 }
 
-/// Core Subset-Difference PK walk over explicit record bodies. Shared by
-/// [`derive_media_key_from_pk_walked`] (production, records auto-selected) and
-/// [`probe::walk_pk_against_tables`] (harness, records caller-pinned).
+/// Core Subset-Difference PK walk over explicit record bodies. The single PK→MK
+/// walk engine, reached in production via [`derive_media_key_from_pk`].
 fn walk_pk_against_tables_impl(
     processing_keys: &[[u8; 16]],
     uvs: &[u8],
@@ -413,30 +412,6 @@ pub mod probe {
             }
             None => false,
         }
-    }
-
-    /// Run the exact production Subset-Difference PK walk
-    /// ([`super::derive_media_key_from_pk_walked`]) but against
-    /// CALLER-SUPPLIED record bodies — so a harness can pin a specific
-    /// Media-Key-Data table (record `0x05` on AACS 2.x UHD MKBs, which the
-    /// production `mkb_find_cvalues` now selects) and the matching `0x04`
-    /// Subset-Difference Index, across ALL entries.
-    ///
-    /// `subdiff` is the type-0x04 body (5-byte entries
-    /// `[u_mask_shift][uv:be32]`); `cvalues` is the chosen cvalue table
-    /// (16-byte entries); `mk_dv` is from the verify record. Each entry in
-    /// `keys` is tried as a terminal PK and as an SD node-key descending via
-    /// `AES-G3(K, 0|1|2)` for `max_depth` levels — identical logic to the
-    /// production walk (`max_depth` is clamped to the same internal cap to
-    /// bound the `2^depth` frontier). Returns the verified Media Key, if any.
-    pub fn walk_pk_against_tables(
-        keys: &[[u8; 16]],
-        subdiff: &[u8],
-        cvalues: &[u8],
-        mk_dv: &[u8; 16],
-        max_depth: u8,
-    ) -> Option<[u8; 16]> {
-        super::walk_pk_against_tables_impl(keys, subdiff, cvalues, mk_dv, max_depth)
     }
 }
 
@@ -771,6 +746,108 @@ pub fn derive_media_key_and_pk_from_dk(
         }
     }
     None
+}
+
+/// Recover the subset-difference position (`node`, `uv`, `u_mask_shift`) of an
+/// UNPOSITIONED device key by scanning a disc MKB. A device key alone (just the
+/// 16 bytes) cannot be walked — the walk needs its tree node. This finds that
+/// node empirically: for each MKB subset-difference record, it tries the device
+/// at the record's node AND at every ancestor v-position (the device may sit one
+/// or more levels ABOVE the record, descending via AES-G to reach it), deriving
+/// the candidate Processing Key DIRECTLY (one [`calc_pk_from_dk`] per candidate,
+/// no full re-walk) and checking it validates against that record's cvalue.
+///
+/// On the first verifying candidate it pins `(uv, u_mask_shift)` — invariant for
+/// the key across all discs — and resolves a gate-passing `node` (a one-time
+/// ≤32-try search at the single hit). Returns a [`DeviceKey`] ready to bank and
+/// reuse on every future disc via [`derive_media_key_from_dk`]. `None` if the
+/// key does not apply to this MKB.
+///
+/// Cost is `O(slots × tree_depth)` — linear in the MKB's subset-difference
+/// index, not the quartic cost of re-deriving per candidate.
+pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
+    let mk_dv = mkb_find_mk_dv(mkb)?;
+    let uvs = mkb_find_subdiff_records(mkb)?;
+    let cvalues = mkb_find_cvalues(mkb)?;
+    let num_uvs = uvs
+        .chunks(5)
+        .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
+        .count();
+    let n_cv = cvalues.len() / 16;
+
+    // Hoisted ONCE for the whole scan: the Processing Key the device produces if
+    // it sits EXACTLY at a record (zero descent) is `AES-G3(key, 1)` — it does
+    // not depend on the record, so the zero-descent probe of every slot reuses
+    // this single value instead of re-deriving it per slot.
+    let pk_zero_descent = aesg3(key, 1);
+
+    for i in 0..num_uvs {
+        if i >= n_cv {
+            break;
+        }
+        let u_mask_shift = uvs[5 * i];
+        if u_mask_shift >= 32 {
+            continue;
+        }
+        let p_uv = &uvs[1 + 5 * i..];
+        let uv_r = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
+        if uv_r == 0 {
+            continue;
+        }
+        let v_mask = calc_v_mask(uv_r);
+        let cv = &cvalues[i * 16..(i + 1) * 16];
+        let uv_bytes = &uvs[1 + i * 5..];
+
+        // Zero descent (device sits at this slot's node): the cheapest, most
+        // common case — one verify against the hoisted PK, no descent.
+        if validate_processing_key(&pk_zero_descent, cv, uv_bytes, &mk_dv).is_some() {
+            return resolve_dk_node(mkb, key, uv_r, u_mask_shift);
+        }
+
+        // Descent: the device is an ANCESTOR of the slot. Walk the depth bit up
+        // from the slot's lowest set bit; each level descends from the device's
+        // node to the slot's node. (k = p is the zero-descent case handled
+        // above, so start one above it.)
+        let p = uv_r.trailing_zeros();
+        for k in (p + 1)..32 {
+            let uv_d = if k + 1 >= 32 {
+                1u32 << k
+            } else {
+                (uv_r & (0xFFFF_FFFFu32 << (k + 1))) | (1u32 << k)
+            };
+            let pk = calc_pk_from_dk(key, uv_r, v_mask, calc_v_mask(uv_d));
+            if validate_processing_key(&pk, cv, uv_bytes, &mk_dv).is_some() {
+                return resolve_dk_node(mkb, key, uv_d, u_mask_shift);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a positioned [`DeviceKey`] for an orphan `key` known to sit at
+/// `(uv, u_mask_shift)`: find a `device_number` (node) that passes the walk's
+/// subset-difference gate on `mkb`. The derived key is independent of the exact
+/// node (it only gates), so any gating node yields the same Media Key — a
+/// one-time ≤32-try search, run only once at the recovered position.
+fn resolve_dk_node(mkb: &[u8], key: &[u8; 16], uv: u32, u_mask_shift: u8) -> Option<DeviceKey> {
+    for b in 0..u_mask_shift {
+        let dk = DeviceKey {
+            key: *key,
+            node: ((uv ^ (1u32 << b)) & 0xFFFF) as u16,
+            uv,
+            u_mask_shift,
+        };
+        if derive_media_key_from_dk(mkb, std::slice::from_ref(&dk)).is_some() {
+            return Some(dk);
+        }
+    }
+    // Degenerate MKB (no gating bit): fall back to the node itself.
+    Some(DeviceKey {
+        key: *key,
+        node: (uv & 0xFFFF) as u16,
+        uv,
+        u_mask_shift,
+    })
 }
 
 /// MKB disc structure format code.
@@ -1630,12 +1707,11 @@ mod tests {
 
     #[test]
     fn probe_walk_pk_against_tables_accepts_planted_pk_rejects_corrupt() {
-        // Lock in the shared SD walk used by both production
-        // (`derive_media_key_from_pk_walked`) and the independent-reproduction
-        // harness (`probe::walk_pk_against_tables`). Plant a terminal PK whose
-        // derived Media Key satisfies a synthetic verify record; confirm the
-        // walk ACCEPTS it against caller-supplied SD/cvalue tables and REJECTS a
-        // 1-byte corruption.
+        // Lock in the shared SD walk (`walk_pk_against_tables_impl`) used by the
+        // production PK path (`derive_media_key_from_pk`). Plant a terminal PK
+        // whose derived Media Key satisfies a synthetic verify record; confirm
+        // the walk ACCEPTS it against caller-supplied SD/cvalue tables and
+        // REJECTS a 1-byte corruption.
         use super::super::decrypt::aes_ecb_encrypt as enc;
 
         let pk: [u8; 16] = [
@@ -1662,14 +1738,14 @@ mod tests {
         subdiff.extend_from_slice(&uv);
 
         assert_eq!(
-            probe::walk_pk_against_tables(std::slice::from_ref(&pk), &subdiff, &cv, &mk_dv, 1),
+            walk_pk_against_tables_impl(std::slice::from_ref(&pk), &subdiff, &cv, &mk_dv, 1),
             Some(mk),
             "planted terminal PK must verify"
         );
         let mut bad = pk;
         bad[0] ^= 0xFF;
         assert_eq!(
-            probe::walk_pk_against_tables(std::slice::from_ref(&bad), &subdiff, &cv, &mk_dv, 1),
+            walk_pk_against_tables_impl(std::slice::from_ref(&bad), &subdiff, &cv, &mk_dv, 1),
             None,
             "corrupted PK must be rejected"
         );
