@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.31.7 (2026-06-17)
+
+### Added
+- `derive_media_key_and_pk_from_dk(mkb, dks) -> Option<(media_key, processing_key)>`:
+  expose the intermediate Processing Key the subset-difference walk already
+  computes, so callers can record the full key lineage on a Device-Key walk.
+
+### Changed
+- Unify the subset-difference walk: the duplicate `aesg3`/`calc_v_mask`/
+  `calc_pk_from_dk` copies are consolidated to one definition. No behavior change.
+
+
 ## 0.31.6 (2026-06-09)
 
 ### Fixed
