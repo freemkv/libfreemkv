@@ -177,66 +177,11 @@ fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {
 
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
-/// AES-G3 seed register initial value.
-const AESG3_SEED: [u8; 16] = [
-    0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
-];
-
-/// AES-G3 single step: AES-G against the seed register at offset `inc`.
-fn aesg3_step(key: &[u8; 16], inc: u8) -> [u8; 16] {
-    let mut seed = AESG3_SEED;
-    seed[15] = seed[15].wrapping_add(inc);
-    aes_g(key, &seed)
-}
-
-fn calc_v_mask(uv: u32) -> u32 {
-    let mut v_mask: u32 = 0xFFFF_FFFF;
-    while (uv & !v_mask) == 0 && v_mask != 0 {
-        v_mask <<= 1;
-    }
-    v_mask
-}
-
-fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> [u8; 16] {
-    let mut left_child = aesg3_step(dk, 0);
-    let mut pk = aesg3_step(dk, 1);
-    let mut right_child = aesg3_step(dk, 2);
-    let mut current_v_mask = dev_key_v_mask;
-
-    // Bound the walk to the 32-level depth of a u32 subset-difference tree.
-    // `current_v_mask` advances via an arithmetic `>> 1` which sign-extends, so
-    // a disc-supplied v_mask coarser than dev_key_v_mask would otherwise drive
-    // current_v_mask up to 0xFFFF_FFFF and spin forever — a crafted MKB must
-    // not hang the rip thread (this runs before the KCD placeholder gate).
-    let mut steps = 0u32;
-    while current_v_mask != v_mask {
-        if steps >= 32 {
-            break;
-        }
-        steps += 1;
-        let mut bit_pos: i32 = -1;
-        for i in (0..32).rev() {
-            if (current_v_mask & (1u32 << i)) == 0 {
-                bit_pos = i;
-                break;
-            }
-        }
-
-        let curr_key = if bit_pos < 0 || (uv & (1u32 << bit_pos as u32)) == 0 {
-            left_child
-        } else {
-            right_child
-        };
-
-        left_child = aesg3_step(&curr_key, 0);
-        pk = aesg3_step(&curr_key, 1);
-        right_child = aesg3_step(&curr_key, 2);
-
-        current_v_mask = ((current_v_mask as i32) >> 1) as u32;
-    }
-
-    pk
-}
+// `calc_v_mask` and `calc_pk_from_dk` (and the AES-G3 seed step they ride
+// on) are shared with the classical walk in [`super::keys`] — a single
+// definition keeps the variant SD tree byte-identical to the classical one.
+// (`aesg3` itself is imported separately in the test module.)
+use super::keys::{calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
 /// processing key and the matching `uv` slot — both needed as inputs
@@ -271,6 +216,27 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 
 /// Walk an MKB and return the first `(Kp, uv, cvalue)` that
 /// `device_keys` covers. Returns `None` if no DK walks any uv.
+///
+/// This is the AACS-2.1 **variant** walk; the classical walk lives in
+/// [`super::keys::derive_media_key_and_pk_from_dk`]. The two are kept
+/// separate on purpose and select MKB records in DELIBERATELY different
+/// order:
+///
+///   - cvalues: this variant walk tries record `0x07`-then-`0x05`; the
+///     classical walk tries `0x05`-then-`0x07`. On a variant MKB the
+///     small `0x07` Explicit-Subset-Difference record carries the
+///     cvalue the Precursor chain consumes, whereas a classical UHD MKB
+///     keeps its 1:1 cvalue table in the large `0x05` record (see the
+///     note on [`super::keys::probe::mkb_cvalues`]). They must NOT be
+///     unified to one order — each is correct for its own MKB shape.
+///   - finders: this walk operates on parsed [`MkbRecord`]s (needed
+///     because the variant chain also reads `0x82`/`0x83`); the
+///     classical walk operates on raw MKB bytes. Same framing, different
+///     input type.
+///
+/// Consequence: do NOT route the classical DK path through this function
+/// — on a classical MKB the `0x07`-first selection picks the wrong (or
+/// missing) cvalue and the magic check fails, so it returns `None`.
 pub fn walk_processing_key(
     records: &[MkbRecord],
     device_keys: &[DeviceKey],
@@ -544,6 +510,10 @@ pub fn derive_media_key_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These three live in `super::keys` now (consolidated SD-walk helpers);
+    // `use super::*` does not re-export the parent module's private `use`
+    // imports, so pull them in directly for the tests below.
+    use super::super::keys::{aesg3, calc_pk_from_dk};
 
     #[test]
     fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
@@ -708,7 +678,7 @@ mod tests {
     ///   agreeing with uv on bits 3+ (the u_mask=1 region). dk.uv ==
     ///   MKB.uv and dk.u_mask_shift == MKB.u_mask_shift make
     ///   `dev_key_v_mask == v_mask`, so `calc_pk_from_dk` loops zero
-    ///   times — Kp = aesg3_step(dk, 1).
+    ///   times — Kp = aesg3(dk, 1).
     /// - one cvalue in record 0x07 chosen so AES-D(Kp, C) ⊕ uv produces a
     ///   Kmp whose byte-15 is exactly `kmp15`.
     /// - record 0x82 with a 16-byte body (acts as both Variant Data
@@ -731,12 +701,12 @@ mod tests {
         // Pick a known DK; with dk.uv == MKB.uv (==2) and
         // dk.u_mask_shift == MKB.u_mask_shift (==3), dev_key_v_mask
         // equals the MKB's v_mask and the calc_pk_from_dk loop is a
-        // no-op — Kp = aesg3_step(dk, 1).
+        // no-op — Kp = aesg3(dk, 1).
         let dk_bytes: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
             0xFF, 0x00,
         ];
-        let kp = aesg3_step(&dk_bytes, 1);
+        let kp = aesg3(&dk_bytes, 1);
 
         // Plant Kmp with chosen byte-15, then compute C such that
         // AES-D(Kp, C) ⊕ uv == Kmp. uv=2 → low-4 bytes XOR is 00 00 00 02.
@@ -1002,10 +972,7 @@ mod tests {
         let (recs, dk, planted_kp, _) = synthetic_variant_setup(0x00);
         let m = walk_processing_key(&recs, &[dk]).expect("variant MKB yields a match");
         assert_eq!(m.uv, 2, "matched the planted uv");
-        assert_eq!(
-            m.kp, planted_kp,
-            "Kp equals aesg3_step(dk,1) for the no-op walk"
-        );
+        assert_eq!(m.kp, planted_kp, "Kp equals aesg3(dk,1) for the no-op walk");
         assert_eq!(m.cvalue_index, 0);
     }
 

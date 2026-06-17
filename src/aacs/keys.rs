@@ -611,7 +611,10 @@ const AESG3_SEED: [u8; 16] = [
 
 /// AACS-G3: derive a subkey from a parent key.
 /// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
-fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
+///
+/// Shared with [`super::variants`] (its variant chain runs the same SD
+/// tree); a single definition keeps the two walks byte-identical.
+pub(super) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
     let mut seed = AESG3_SEED;
     seed[15] = seed[15].wrapping_add(inc);
     let mut out = aes_ecb_decrypt(key, &seed);
@@ -621,8 +624,8 @@ fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
     out
 }
 
-/// Compute v_mask from a UV value.
-fn calc_v_mask(uv: u32) -> u32 {
+/// Compute v_mask from a UV value. Shared with [`super::variants`].
+pub(super) fn calc_v_mask(uv: u32) -> u32 {
     let mut v_mask: u32 = 0xFFFF_FFFF;
     while (uv & !v_mask) == 0 && v_mask != 0 {
         v_mask <<= 1;
@@ -631,7 +634,13 @@ fn calc_v_mask(uv: u32) -> u32 {
 }
 
 /// Derive processing key from device key using subset-difference tree traversal.
-fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> [u8; 16] {
+/// Shared with [`super::variants`].
+pub(super) fn calc_pk_from_dk(
+    dk: &[u8; 16],
+    uv: u32,
+    v_mask: u32,
+    dev_key_v_mask: u32,
+) -> [u8; 16] {
     // Initial derivation: left_child = aesg3(dk, 0), pk = aesg3(dk, 1), right_child = aesg3(dk, 2)
     let mut left_child = aesg3(dk, 0);
     let mut pk = aesg3(dk, 1);
@@ -675,7 +684,26 @@ fn calc_pk_from_dk(dk: &[u8; 16], uv: u32, v_mask: u32, dev_key_v_mask: u32) -> 
 }
 
 /// Derive Media Key from MKB using device keys (subset-difference tree).
+///
+/// Thin wrapper over [`derive_media_key_and_pk_from_dk`] that drops the
+/// intermediate Processing Key. Callers that need the PK lineage (e.g.
+/// the key service banking DK·PK·MK) should call the `_and_pk_` form.
 pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option<[u8; 16]> {
+    derive_media_key_and_pk_from_dk(mkb, device_keys).map(|(mk, _pk)| mk)
+}
+
+/// Derive both the Media Key and the intermediate Processing Key from an
+/// MKB using device keys (subset-difference tree).
+///
+/// Identical walk to [`derive_media_key_from_dk`]; this form additionally
+/// returns the Processing Key `Kp` derived at the matching subset-difference
+/// node — the value `calc_pk_from_dk` produces immediately before it
+/// validates into the Media Key. Returns `Some((mk, pk))` for the first DK
+/// that walks a uv slot whose Processing Key validates against the MKB.
+pub fn derive_media_key_and_pk_from_dk(
+    mkb: &[u8],
+    device_keys: &[DeviceKey],
+) -> Option<([u8; 16], [u8; 16])> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
     let cvalues = mkb_find_cvalues(mkb)?;
@@ -735,7 +763,7 @@ pub fn derive_media_key_from_dk(mkb: &[u8], device_keys: &[DeviceKey]) -> Option
                         if let Some(mk) =
                             validate_processing_key(&pk, cv, &uvs[1 + uvs_idx * 5..], &mk_dv)
                         {
-                            return Some(mk);
+                            return Some((mk, pk));
                         }
                     }
                 }
@@ -2740,5 +2768,86 @@ mod tests {
         // record (header only, empty body) is treated as absent.
         let mkb = [0x05, 0x00, 0x00, 0x04]; // type 0x05, no body
         assert!(probe::mkb_record_body(&mkb, 0x05).is_none());
+    }
+
+    #[test]
+    fn derive_media_key_and_pk_from_dk_returns_intermediate_pk() {
+        // Regression: a classical DK boil must yield the intermediate
+        // Processing Key, not just the Media Key. The key service banks the
+        // PK lineage (DK·PK·MK·VUK·UK); before the `_and_pk_` form existed it
+        // recovered the MK here but lost the PK silently.
+        //
+        // Build a minimal classical MKB (no 0x82/0x83) with:
+        //   - 0x04 Subset-Difference: u_mask_shift=3, uv=0x00000002
+        //   - 0x05 cvalues: one cvalue C planted so AES-D(Kp, C) XOR uv == mk
+        //   - 0x86 Verify Media Key: mk_dv = AES-E(mk, magic || pad)
+        // and a DK with node=4, uv=2, u_mask_shift=3 so dev_key_v_mask ==
+        // v_mask: the calc_pk_from_dk loop is a no-op and Kp == aesg3(dk, 1).
+        use super::super::decrypt::aes_ecb_encrypt as enc;
+
+        let dk_bytes: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        // Expected Processing Key for the no-op walk.
+        let expected_pk = aesg3(&dk_bytes, 1);
+
+        // Plant a known Media Key.
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        // uv (big-endian) = 0x00000002; validate XORs uv into mk[12..16].
+        let uv_bytes: [u8; 4] = [0x00, 0x00, 0x00, 0x02];
+
+        // cvalue C = AES-E(Kp, mk_raw) where mk_raw = mk with the uv XOR
+        // pre-undone, so the validate step XORs uv back in and recovers mk.
+        let mut mk_raw = mk;
+        for a in 0..4 {
+            mk_raw[12 + a] ^= uv_bytes[a];
+        }
+        let cvalue = enc(&expected_pk, &mk_raw);
+
+        // mk_dv = AES-E(mk, magic || pad); validate decrypts it under mk and
+        // checks the leading 8 bytes against the verify magic.
+        let mut plaintext_vd = [0u8; 16];
+        plaintext_vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        plaintext_vd[8..].copy_from_slice(&[0x11; 8]);
+        let mk_dv = enc(&mk, &plaintext_vd);
+
+        // Assemble the MKB. Type/Version (0x10) header first.
+        let mut mkb = vec![
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x4D,
+        ];
+        // 0x04 Subset-Difference: body = u_mask_shift(0x03) || uv(4 bytes).
+        mkb.extend_from_slice(&[0x04, 0x00, 0x00, 0x09]);
+        mkb.extend_from_slice(&[0x03]);
+        mkb.extend_from_slice(&uv_bytes);
+        // 0x05 cvalues: one 16-byte cvalue (mkb_find_cvalues prefers 0x05).
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&cvalue);
+        // 0x86 Verify Media Key: mk_dv.
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&mk_dv);
+
+        let dk = DeviceKey {
+            key: dk_bytes,
+            node: 4,
+            uv: 2,
+            u_mask_shift: 3,
+        };
+
+        // The new `_and_pk_` form returns BOTH the MK and the intermediate PK.
+        let dks = [dk];
+        let (got_mk, got_pk) = derive_media_key_and_pk_from_dk(&mkb, &dks)
+            .expect("classical DK boil must derive (mk, pk)");
+        assert_eq!(got_mk, mk, "recovered Media Key must match the planted MK");
+        assert_eq!(
+            got_pk, expected_pk,
+            "returned Processing Key must equal aesg3(dk, 1) for the no-op walk"
+        );
+
+        // And the thin wrapper must still return just the MK.
+        assert_eq!(derive_media_key_from_dk(&mkb, &dks), Some(mk));
     }
 }
