@@ -781,33 +781,31 @@ pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
     // this single value instead of re-deriving it per slot.
     let pk_zero_descent = aesg3(key, 1);
 
-    for i in 0..num_uvs {
-        if i >= n_cv {
-            break;
-        }
+    // The slots are independent, so the scan parallelises — a UHD MKB has ~181k
+    // slots (~26s single-threaded). `find_map_any` returns the first matching
+    // node found by any thread and cancels the rest; a valid MKB has exactly one
+    // matching subset-difference, so which thread finds it is immaterial.
+    use rayon::prelude::*;
+    let found = (0..num_uvs.min(n_cv)).into_par_iter().find_map_any(|i| {
         let u_mask_shift = uvs[5 * i];
         if u_mask_shift >= 32 {
-            continue;
+            return None;
         }
         let p_uv = &uvs[1 + 5 * i..];
         let uv_r = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
         if uv_r == 0 {
-            continue;
+            return None;
         }
         let v_mask = calc_v_mask(uv_r);
         let cv = &cvalues[i * 16..(i + 1) * 16];
         let uv_bytes = &uvs[1 + i * 5..];
 
-        // Zero descent (device sits at this slot's node): the cheapest, most
-        // common case — one verify against the hoisted PK, no descent.
+        // Zero descent (device sits at this slot's node): cheapest, most common.
         if validate_processing_key(&pk_zero_descent, cv, uv_bytes, &mk_dv).is_some() {
-            return resolve_dk_node(mkb, key, uv_r, u_mask_shift);
+            return Some((uv_r, u_mask_shift));
         }
-
-        // Descent: the device is an ANCESTOR of the slot. Walk the depth bit up
-        // from the slot's lowest set bit; each level descends from the device's
-        // node to the slot's node. (k = p is the zero-descent case handled
-        // above, so start one above it.)
+        // Descent: device is an ANCESTOR of the slot. Walk the depth bit up from
+        // the slot's lowest set bit; each level descends to the slot's node.
         let p = uv_r.trailing_zeros();
         for k in (p + 1)..32 {
             let uv_d = if k + 1 >= 32 {
@@ -817,11 +815,12 @@ pub fn recover_dk_position(mkb: &[u8], key: &[u8; 16]) -> Option<DeviceKey> {
             };
             let pk = calc_pk_from_dk(key, uv_r, v_mask, calc_v_mask(uv_d));
             if validate_processing_key(&pk, cv, uv_bytes, &mk_dv).is_some() {
-                return resolve_dk_node(mkb, key, uv_d, u_mask_shift);
+                return Some((uv_d, u_mask_shift));
             }
         }
-    }
-    None
+        None
+    });
+    found.and_then(|(uv, mask)| resolve_dk_node(mkb, key, uv, mask))
 }
 
 /// Resolve a positioned [`DeviceKey`] for an orphan `key` known to sit at

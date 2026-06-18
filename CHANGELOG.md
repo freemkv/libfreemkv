@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.31.10 (2026-06-18)
+
+### Performance
+- `recover_dk_position`: parallelise the subset-difference slot scan with rayon
+  (`find_map_any`, first match cancels the rest). A UHD MKB's ~181k-slot
+  no-match scan drops from ~26s to ~4.6s on an 8-core box. Identical result.
+
+
 ## 0.31.9 (2026-06-17)
 
 ### Performance
