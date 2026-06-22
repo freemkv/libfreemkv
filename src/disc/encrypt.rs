@@ -65,6 +65,23 @@ impl Disc {
     /// read_data_key for bus decryption must still use the cert path, so an
     /// unlocker with no OEM VID capability returns `None` and we fall through
     /// to cert auth unchanged.
+    /// Collect every AACS host cert the caller carries, from BOTH the explicit
+    /// [`DriveCredentials`] and the key-source layer
+    /// ([`crate::KeySource::host_certs`] across each source), unioned. Host certs
+    /// are keysource-served, never compiled in; this is the one place the OEM
+    /// cert route gathers them. An empty result is the graceful no-cert signal
+    /// (the caller turns it into [`Error::AacsNoHostCert`]).
+    fn collect_host_certs(opts: &ScanOptions) -> Vec<crate::aacs::HostCert> {
+        let mut host_certs: Vec<crate::aacs::HostCert> = Vec::new();
+        if let Some(c) = &opts.credentials {
+            host_certs.extend(c.host_certs.iter().cloned());
+        }
+        for src in &opts.key_sources {
+            host_certs.extend(src.host_certs());
+        }
+        host_certs
+    }
+
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -105,21 +122,33 @@ impl Disc {
             }
         }
 
-        // Host certs come from the caller's DriveCredentials (e.g. the keydb's
-        // host_certs(), sourced app-side) — the library does not load a keydb.
-        // Absent ⇒ no cert auth: resolution proceeds with VID=zero and relies
-        // on the path-1 disc-hash → VUK lookup.
-        let host_certs: &[aacs::HostCert] = match &opts.credentials {
-            Some(c) if !c.host_certs.is_empty() => &c.host_certs,
-            _ => {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "handshake_no_credentials",
-                    "no drive credentials supplied; cert handshake skipped"
-                );
-                return (None, None);
-            }
-        };
+        // Host certs are keysource-served, never compiled in. Collect them from
+        // BOTH places the caller may carry them:
+        //   1. the explicit `DriveCredentials` (certs the app pre-extracted), and
+        //   2. the key-source layer (`KeySource::host_certs()` across every
+        //      registered source — the keydb source exposes its `| HC |`/`| HC2 |`
+        //      rows here; an online source whose cert-serving isn't yet designed
+        //      contributes none).
+        // The two are unioned so either wiring works. With ZERO certs from any
+        // source the OEM cert route cannot run: we fail GRACEFULLY with
+        // `AacsNoHostCert` (no panic, no generic failure). Resolution then
+        // proceeds with VID=zero and relies on the path-1 disc-hash → VUK lookup,
+        // which drops the error when it hits.
+        let host_certs = Self::collect_host_certs(opts);
+        if host_certs.is_empty() {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "handshake_no_host_cert",
+                "no host cert from credentials or any key source; OEM cert route unavailable"
+            );
+            return (
+                None,
+                Some(Error::AacsNoHostCert {
+                    path: "<no host cert>".into(),
+                }),
+            );
+        }
+        let host_certs: &[aacs::HostCert] = &host_certs;
 
         let host_cert_count = host_certs.len();
         tracing::debug!(
@@ -743,4 +772,83 @@ mod tests {
     // construction requires a live transport; the parsing branches are
     // exercised through `read_vid_oem`'s callers in integration.
     // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Tests: collect_host_certs — the OEM cert route's cert-gathering.
+    // Unions DriveCredentials with the key-source layer; empty means
+    // the route fails gracefully (AacsNoHostCert), never panics.
+    // ---------------------------------------------------------------
+
+    fn fake_cert(tag: u8) -> aacs::HostCert {
+        aacs::HostCert {
+            private_key: [tag; 20],
+            certificate: vec![tag; 92],
+            private_key_v2: None,
+            certificate_v2: None,
+        }
+    }
+
+    /// A minimal in-test KeySource that yields no keys but a fixed cert list.
+    struct CertSource(Vec<aacs::HostCert>);
+    impl crate::KeySource for CertSource {
+        fn next_key(&mut self, _inputs: &crate::keysource::DiscInputs) -> Option<crate::disc::Key> {
+            None
+        }
+        fn host_certs(&self) -> Vec<aacs::HostCert> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn collect_host_certs_empty_when_no_credentials_no_sources() {
+        let opts = ScanOptions::default();
+        assert!(Disc::collect_host_certs(&opts).is_empty());
+    }
+
+    #[test]
+    fn collect_host_certs_from_credentials_only() {
+        let opts = ScanOptions {
+            credentials: Some(crate::DriveCredentials {
+                host_certs: vec![fake_cert(1)],
+            }),
+            ..Default::default()
+        };
+        let certs = Disc::collect_host_certs(&opts);
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].private_key, [1u8; 20]);
+    }
+
+    #[test]
+    fn collect_host_certs_from_key_source_only() {
+        let opts = ScanOptions {
+            key_sources: vec![Box::new(CertSource(vec![fake_cert(2)]))],
+            ..Default::default()
+        };
+        let certs = Disc::collect_host_certs(&opts);
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].private_key, [2u8; 20]);
+    }
+
+    /// The two routes union: a cert in credentials AND one in a key source both
+    /// reach the handshake.
+    #[test]
+    fn collect_host_certs_unions_credentials_and_sources() {
+        let opts = ScanOptions {
+            credentials: Some(crate::DriveCredentials {
+                host_certs: vec![fake_cert(1)],
+            }),
+            key_sources: vec![
+                Box::new(CertSource(vec![fake_cert(2)])),
+                Box::new(CertSource(vec![])), // a source with no cert (e.g. online stub)
+                Box::new(CertSource(vec![fake_cert(3)])),
+            ],
+            ..Default::default()
+        };
+        let mut tags: Vec<u8> = Disc::collect_host_certs(&opts)
+            .iter()
+            .map(|c| c.private_key[0])
+            .collect();
+        tags.sort_unstable();
+        assert_eq!(tags, vec![1, 2, 3]);
+    }
 }

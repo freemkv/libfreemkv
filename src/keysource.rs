@@ -11,6 +11,7 @@
 //! out of the library while all key *mechanism* (the AACS derivation chain)
 //! stays in it.
 
+use crate::aacs::HostCert;
 use crate::disc::Key;
 
 /// The public AACS inputs a key source needs to look a disc up. Captured at
@@ -91,6 +92,25 @@ pub trait KeySource {
     /// leaves this `false`.
     fn errored(&self) -> bool {
         false
+    }
+
+    /// The AACS host certificate(s) this source can supply for the live-drive
+    /// SCSI mutual-auth handshake (the OEM/AACS baseline route). A host cert is
+    /// the *second* kind of AACS material a source may hold, distinct from the
+    /// decryption keys handed out by [`KeySource::next_key`]: it unlocks the
+    /// authenticated bus so the drive will report the Volume ID and bus key,
+    /// whereas the keys decrypt content once the disc is read.
+    ///
+    /// Returned, never compiled in: a host cert is **perishable** — it can be
+    /// revoked on a given drive's Host Revocation List (carried forward by newer
+    /// discs' MKBs), so it must be rotatable, hence served by a source rather
+    /// than baked into the binary. A source that holds no cert (a mapfile, or an
+    /// online service whose cert-serving isn't yet designed) returns the empty
+    /// vec — the default. The handshake collects across every source and tries
+    /// each candidate; with no candidate from any source the OEM route fails
+    /// gracefully ([`crate::Error::AacsNoHostCert`]), it never panics.
+    fn host_certs(&self) -> Vec<HostCert> {
+        Vec::new()
     }
 }
 

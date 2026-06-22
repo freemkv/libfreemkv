@@ -1135,7 +1135,22 @@ pub struct DriveCredentials {
 pub struct ScanOptions {
     /// Host credentials for the live-drive AACS handshake. `None` for ISO
     /// scans, or a live drive where cert auth should be skipped.
+    ///
+    /// Host certs may ALSO be supplied through [`Self::key_sources`]: the
+    /// handshake unifies certs from both, so the app can pass its already-built
+    /// keysource layer rather than (or in addition to) pre-extracting certs into
+    /// `DriveCredentials`. Either route is keysource-served — certs are never
+    /// compiled into the library.
     pub credentials: Option<DriveCredentials>,
+    /// The application's key-source layer. The handshake collects host certs
+    /// across these (via [`crate::KeySource::host_certs`]) for the OEM/AACS
+    /// cert-auth route, unioned with [`Self::credentials`]. Empty by default —
+    /// an ISO scan supplies none, and a live-drive caller that pre-extracted
+    /// certs into `credentials` may leave it empty too. The library still
+    /// resolves NO keys from these at scan time; they are consulted only for
+    /// their host certs here (key *resolution* stays out-of-band via
+    /// `Disc::decrypt_with`).
+    pub key_sources: Vec<Box<dyn crate::KeySource>>,
     /// Optional cooperative-cancellation token. When set, long scan-time
     /// loops (notably the CSS known-plaintext crack, which can scan up to
     /// 50_000 sectors on a live DVD) poll it and bail out cleanly so a

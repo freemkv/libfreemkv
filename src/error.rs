@@ -86,6 +86,7 @@ pub const E_DRIVE_PROFILE_MISSING: u16 = 7020;
 pub const E_VID_CDB_UNAVAILABLE: u16 = 7021;
 pub const E_NO_DISC_KEY: u16 = 7022;
 pub const E_CSS_KEY_MISSING: u16 = 7023;
+pub const E_AACS_NO_HOST_CERT: u16 = 7024;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -311,6 +312,18 @@ pub enum Error {
     /// re-cracked). Muxing would emit scrambled ciphertext, so the caller
     /// fails fast instead. CSS analogue of [`Error::NoDiscKey`].
     CssKeyMissing,
+    /// The live-drive AACS cert-auth handshake (the OEM/AACS baseline route)
+    /// could not run because NO host certificate was available from any key
+    /// source. Host certs are keysource-served, never compiled in, so without
+    /// a keysource that supplies one the OEM route fails gracefully here — this
+    /// is the intended outcome, not a panic. Resolution still proceeds with a
+    /// zero Volume ID and relies on the path-1 disc-hash → VUK lookup, so the
+    /// error is dropped when that lookup hits. `path` carries the sentinel
+    /// `<no host cert>` (mirroring [`Error::KeydbLoad`]'s sentinel) so a CLI can
+    /// render "No Host Certs Found."
+    AacsNoHostCert {
+        path: String,
+    },
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -487,6 +500,7 @@ impl Error {
             Error::VidCdbUnavailable => E_VID_CDB_UNAVAILABLE,
             Error::NoDiscKey { .. } => E_NO_DISC_KEY,
             Error::CssKeyMissing => E_CSS_KEY_MISSING,
+            Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
@@ -632,6 +646,7 @@ impl std::fmt::Display for Error {
             Error::KeydbHttp { status } => write!(f, "E{}: {}", self.code(), status),
             Error::KeydbWrite { path } => write!(f, "E{}: {}", self.code(), path),
             Error::KeydbLoad { path } => write!(f, "E{}: {}", self.code(), path),
+            Error::AacsNoHostCert { path } => write!(f, "E{}: {}", self.code(), path),
             Error::KeydbUnsupportedScheme { scheme } => {
                 write!(f, "E{}: {}", self.code(), scheme)
             }
@@ -1078,6 +1093,8 @@ mod tests {
             E_DRIVE_PROFILE_MISSING,
             E_VID_CDB_UNAVAILABLE,
             E_NO_DISC_KEY,
+            E_CSS_KEY_MISSING,
+            E_AACS_NO_HOST_CERT,
             E_KEYDB_CONNECT,
             E_KEYDB_HTTP,
             E_KEYDB_INVALID,
@@ -1476,6 +1493,14 @@ mod tests {
         assert!(
             e_load.to_string().contains("<no keydb in search paths>"),
             "KeydbLoad display must include the sentinel path"
+        );
+
+        let e_no_cert = Error::AacsNoHostCert {
+            path: "<no host cert>".into(),
+        };
+        assert!(
+            e_no_cert.to_string().contains("<no host cert>"),
+            "AacsNoHostCert display must include the sentinel path"
         );
 
         let e_scheme = Error::KeydbUnsupportedScheme {
