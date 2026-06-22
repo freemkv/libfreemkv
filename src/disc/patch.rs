@@ -926,6 +926,26 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     shared: &Mutex<SharedPatchState>,
     reader: &mut R,
 ) -> Result<FailureAction> {
+    // Transport failure (status=0xFF: USB-bridge crash / disconnect) is not a
+    // recoverable bad sector — the bridge is wedged and every further read fails
+    // identically. Abort the pass immediately (symmetric with the sweep's
+    // read_error::handle_read_error AbortPass and single-pass mux's fill_extents),
+    // so autorip can drop and re-enumerate the bridge instead of hammering a
+    // crashed device sector-by-sector until the per-range watchdog expires.
+    // Checked before the batch-split below: a 0xFF on a batch read is still a
+    // bridge crash, not an ambiguous bad sector.
+    if err.is_scsi_transport_failure() {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "patch_transport_failure",
+            lba,
+            count,
+            "transport failure (bridge crash) during patch — aborting pass"
+        );
+        state.wedged_exit = true;
+        return Ok(FailureAction::BreakOuter);
+    }
+
     // Adaptive batching split decision: a batch-read failure
     // (count > 1) is NOT a recorded failure. We don't yet know which
     // sector in the batch was actually bad — could be one, could be
@@ -1678,6 +1698,12 @@ impl Disc {
         // inline decrypt_sectors call sites that all keyed off the
         // same `keys`. `DecryptKeys::None` keeps the unencrypted /
         // --raw path a pass-through.
+        // AACS reads must start on a 3-sector unit boundary and span whole
+        // units (DecryptingSectorSource rejects mid-unit reads as DecryptFailed).
+        // The patch cursor derives from arbitrary mapfile byte offsets, so a
+        // single-sector recovery read can land mid-unit — see the aligned read
+        // at the read call site below.
+        let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
         let mut reader = DecryptingSectorSource::new(reader, keys);
         let reader = &mut reader;
 
@@ -1887,8 +1913,38 @@ impl Disc {
                 // sr_mod driver run its own auto-retries (which don't
                 // pay per-attempt escalation in the same way).
                 let read_start = std::time::Instant::now();
-                let read_result =
-                    reader.read_sectors(lba, count, &mut buf[..bytes], state.recovery);
+                let read_result = if decrypt_is_aacs && (lba % 3 != 0 || count % 3 != 0) {
+                    // Mid-unit recovery read on an AACS disc: the decrypting
+                    // reader would reject it (DecryptFailed) and the sector would
+                    // be abandoned without the drive ever being asked. Read the
+                    // enclosing whole-unit window instead (units anchor at offset
+                    // 0, so the start MUST be unit-aligned), decrypt that, then
+                    // copy out the originally-requested [lba, count) window. All
+                    // recovery accounting (pos, block_bytes, the dispatched
+                    // lba/count) stays exactly as computed — only the physical
+                    // read is widened, so the cursor cannot desync.
+                    const U: u32 = 3;
+                    let aligned_lba = lba - (lba % U);
+                    let head = (lba - aligned_lba) as usize; // lead-in sectors
+                    let span = head + count as usize;
+                    let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
+                    let mut scratch = vec![0u8; aligned_count * 2048];
+                    match reader.read_sectors(
+                        aligned_lba,
+                        aligned_count as u16,
+                        &mut scratch,
+                        state.recovery,
+                    ) {
+                        Ok(_) => {
+                            buf[..bytes]
+                                .copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
+                            Ok(bytes)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    reader.read_sectors(lba, count, &mut buf[..bytes], state.recovery)
+                };
                 let read_duration_ms = read_start.elapsed().as_millis();
 
                 match read_result {
@@ -2757,5 +2813,56 @@ mod tests {
                 state.wedge_count
             );
         }
+    }
+
+    /// Transport failure (status=0xFF, USB-bridge crash) must be recognised by
+    /// the gate `handle_read_failure` now checks FIRST, so it aborts the pass
+    /// (wedged_exit + BreakOuter) instead of treating the bridge crash as an
+    /// ordinary bad sector and hammering the crashed device for up to the
+    /// per-range watchdog budget. `handle_read_failure` is not unit-testable in
+    /// isolation, so this guards the classification predicate the production
+    /// early-return keys off, and the contrast that an ordinary read error is
+    /// NOT misclassified as a transport failure.
+    #[test]
+    fn transport_failure_is_recognised_for_patch_abort() {
+        use crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE;
+
+        // The exact shape Drive::read surfaces on a bridge crash.
+        let tf = Error::DiscRead {
+            sector: 1_392_314,
+            status: Some(SCSI_STATUS_TRANSPORT_FAILURE),
+            sense: None,
+        };
+        assert!(
+            tf.is_scsi_transport_failure(),
+            "a DiscRead with status=0xFF must classify as a transport failure so \
+             patch aborts the pass"
+        );
+
+        // The raw ScsiError form (e.g. straight from the transport) too.
+        let tf_raw = Error::ScsiError {
+            opcode: 0x28,
+            status: SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        };
+        assert!(tf_raw.is_scsi_transport_failure());
+
+        // An ordinary recoverable bad sector (CHECK CONDITION with sense) must
+        // NOT trip the transport-failure abort — it should still be retried /
+        // marked NonTrimmed, not abort the whole pass.
+        let bad_sector = Error::DiscRead {
+            sector: 1_392_314,
+            status: Some(crate::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: 0x03,
+                asc: 0x11,
+                ascq: 0x00,
+            }),
+        };
+        assert!(
+            !bad_sector.is_scsi_transport_failure(),
+            "an ordinary bad-sector CHECK CONDITION must not be misclassified as \
+             a transport failure"
+        );
     }
 }
