@@ -17,11 +17,12 @@ impl Disc {
     /// SCSI handshake — drives the VID-acquisition flow and returns
     /// a structured `HandshakeResult` for downstream key resolution.
     ///
-    /// Drive unlock now lives behind the pluggable
-    /// [`crate::unlock::Unlocker`] seam, which reports no extended-access
-    /// marker back to libfreemkv. VID is therefore always acquired via the
-    /// cert-based mutual-auth handshake (the OEM route); the cert path also
-    /// yields `read_data_key`, required for AACS 2.0 bus decryption.
+    /// VID acquisition runs through [`Self::do_handshake_cert`], which first
+    /// asks the pluggable [`crate::unlock::Unlocker`] seam for the OEM VID
+    /// (a drive-functionality capability decoupled from the host cert + HRL)
+    /// and falls back to the cert-based mutual-auth handshake when no
+    /// unlocker serves one. The cert path also yields `read_data_key`,
+    /// required for AACS 2.0 bus decryption.
     ///
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
@@ -36,9 +37,9 @@ impl Disc {
     ) -> (Option<HandshakeResult>, Option<Error>) {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "do_handshake", "begin");
-        // Drive unlock moved behind the pluggable `Unlocker` seam, which
-        // reports no extended-access marker — so VID always comes via the
-        // cert-based handshake (the OEM route).
+        // VID comes from the unlocker's OEM path when available (decoupled
+        // from the host cert + HRL), else the cert-based handshake — both
+        // resolved inside `do_handshake_cert`.
         let (result, err) = Self::do_handshake_cert(session, opts);
         tracing::info!(
             target: "freemkv::scan",
@@ -51,12 +52,58 @@ impl Disc {
         (result, err)
     }
 
-    /// Cert-based AACS handshake — the OEM route for VID acquisition.
+    /// Cert-based AACS handshake — the cert route for VID acquisition.
+    ///
+    /// Before running the cert mutual-auth, this asks the pluggable
+    /// [`crate::unlock::Unlocker`] seam for the OEM Volume ID. An unlocker
+    /// unlocks *drive functionality*, not just the disc: VID retrieval via
+    /// the drive's OEM CDB is a capability separate from `unlock`. When the
+    /// matching unlocker serves a VID, we use it and SKIP the cert handshake
+    /// entirely — the OEM path gets the VID *without* the host certificate +
+    /// HRL, decoupling VID from the cert chain. The OEM path yields no
+    /// `read_data_key` (no bus-key is derived); AACS 2.0 content needing
+    /// read_data_key for bus decryption must still use the cert path, so an
+    /// unlocker with no OEM VID capability returns `None` and we fall through
+    /// to cert auth unchanged.
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
     ) -> (Option<HandshakeResult>, Option<Error>) {
         use crate::aacs;
+
+        // OEM VID shortcut. Resolve the SAME unlocker that would unlock this
+        // drive and ask it for the VID via its OEM mechanism. Cloning the
+        // DriveId first releases the immutable borrow before we hand the
+        // mutable transport to the registry.
+        let drive_id = session.drive_id.clone();
+        match crate::unlock::unlocker_read_vid(session.scsi_mut(), &drive_id) {
+            Ok(Some(volume_id)) => {
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "oem_vid_ok",
+                    "VID acquired via unlocker OEM path; skipping cert handshake"
+                );
+                return (
+                    Some(HandshakeResult {
+                        volume_id,
+                        read_data_key: None,
+                    }),
+                    None,
+                );
+            }
+            Ok(None) => {
+                // No unlocker matched, or the matching unlocker has no OEM
+                // VID path — fall through to the cert handshake unchanged.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "oem_vid_failed",
+                    error_code = e.code(),
+                    "unlocker OEM VID retrieval failed; falling back to cert handshake"
+                );
+            }
+        }
 
         // Host certs come from the caller's DriveCredentials (e.g. the keydb's
         // host_certs(), sourced app-side) — the library does not load a keydb.

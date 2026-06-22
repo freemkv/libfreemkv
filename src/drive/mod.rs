@@ -573,15 +573,16 @@ impl Drive {
 
     /// Whether libfreemkv should take the OEM extended-access read path.
     ///
-    /// The pluggable [`crate::unlock::Unlocker`] seam reports only
-    /// success/failure from `unlock()` — it carries no extended-access
-    /// marker back into libfreemkv. With no marker channel, libfreemkv
-    /// always uses the standard host-certificate AACS handshake to acquire
-    /// the Volume ID (the OEM route), so this is always `false`. A firmware
-    /// unlocker still removes riplock / enables BD-UHD reads at `init()`;
-    /// VID acquisition just stays on the cert path.
+    /// Whether a registered [`crate::unlock::Unlocker`] matches this drive.
+    ///
+    /// An unlocker unlocks *drive functionality* — firmware unlock, OEM VID
+    /// retrieval, and other vendor capabilities. When one matches, libfreemkv
+    /// routes both `unlock` and OEM VID through it (VID via the OEM path is
+    /// decoupled from the host cert + HRL). This mirrors [`Self::has_profile`]
+    /// — the honest signal is "a registered unlocker claims this drive" —
+    /// rather than the old const `false`.
     pub fn is_unlocked(&self) -> bool {
-        false
+        crate::unlock::matching_name(&self.drive_id).is_some()
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no

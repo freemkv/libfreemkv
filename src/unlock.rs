@@ -32,6 +32,24 @@ pub trait Unlocker: Send + Sync {
     /// Unlock the drive. The unlocker issues its own CDBs through `scsi`.
     /// Returns `Ok(())` once the drive is prepared for reads.
     fn unlock(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()>;
+
+    /// Read the AACS Volume ID via this unlocker's OEM mechanism, if it
+    /// has one.
+    ///
+    /// An [`Unlocker`] unlocks *drive functionality*, not just the disc:
+    /// `unlock` is one capability, OEM VID retrieval is another. Once the
+    /// matching unlocker is identified for a drive, libfreemkv uses it for
+    /// BOTH unlock and VID. The OEM path returns the VID *without* the host
+    /// certificate + HRL, decoupling VID from the cert handshake.
+    ///
+    /// Default is a no-op: an unlocker that provides no OEM VID path (or
+    /// any unlocker that doesn't override this) returns `Ok(None)`, and
+    /// libfreemkv falls back to the cert-based VID read. Implementors that
+    /// can serve the VID directly (e.g. a per-drive OEM CDB) return
+    /// `Ok(Some(vid))`.
+    fn read_vid(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<Option<[u8; 16]>> {
+        Ok(None)
+    }
 }
 
 /// Process-wide ordered registry of unlockers.
@@ -70,6 +88,35 @@ pub(crate) fn route_unlock(scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result
             let name = u.name().to_string();
             u.unlock(scsi, id)?;
             return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Walk the registry in order and ask the first matching unlocker for the
+/// OEM Volume ID.
+///
+/// Mirrors [`route_unlock`]'s resolution so the SAME identified unlocker
+/// that unlocks the drive is the one consulted for VID. Returns:
+///   * `Ok(Some(vid))` — a matching unlocker served the VID via its OEM
+///     path (no cert handshake needed; VID is decoupled from the HRL).
+///   * `Ok(None)` — no unlocker matched, or the matching unlocker has no
+///     OEM VID path; the caller falls through to the cert-based VID read.
+///   * `Err(_)` — the matching unlocker's `read_vid` failed (e.g. the OEM
+///     CDB returned a malformed response).
+pub(crate) fn unlocker_read_vid(
+    scsi: &mut dyn ScsiTransport,
+    id: &DriveId,
+) -> Result<Option<[u8; 16]>> {
+    let reg = match REGISTRY.read() {
+        Ok(r) => r,
+        // Poisoned lock ⇒ treat as "no unlocker available" so the cert
+        // fallback still runs.
+        Err(_) => return Ok(None),
+    };
+    for u in reg.iter() {
+        if u.matches(id) {
+            return u.read_vid(scsi, id);
         }
     }
     Ok(None)
@@ -122,10 +169,31 @@ mod tests {
         DriveId::from_inquiry(&inquiry, "")
     }
 
-    /// Fake unlocker that records whether it ran, and matches on vendor id.
+    /// Fake unlocker that records whether it ran, matches on vendor id, and
+    /// optionally serves an OEM VID (mirroring the read_vid capability).
     struct FakeUnlocker {
         want_vendor: String,
         ran: Arc<AtomicBool>,
+        /// VID this unlocker's OEM path returns: `Some(vid)` (capability
+        /// present), `None` (no OEM path → cert fallback). `vid_ran` records
+        /// whether read_vid was consulted.
+        vid: Option<[u8; 16]>,
+        vid_ran: Arc<AtomicBool>,
+    }
+    impl FakeUnlocker {
+        fn new(vendor: &str, ran: Arc<AtomicBool>) -> Self {
+            Self {
+                want_vendor: vendor.into(),
+                ran,
+                vid: None,
+                vid_ran: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn with_vid(mut self, vid: Option<[u8; 16]>, vid_ran: Arc<AtomicBool>) -> Self {
+            self.vid = vid;
+            self.vid_ran = vid_ran;
+            self
+        }
     }
     impl Unlocker for FakeUnlocker {
         fn name(&self) -> &str {
@@ -138,6 +206,14 @@ mod tests {
             self.ran.store(true, Ordering::SeqCst);
             Ok(())
         }
+        fn read_vid(
+            &self,
+            _scsi: &mut dyn ScsiTransport,
+            _id: &DriveId,
+        ) -> Result<Option<[u8; 16]>> {
+            self.vid_ran.store(true, Ordering::SeqCst);
+            Ok(self.vid)
+        }
     }
 
     /// A registered, matching unlocker runs; a non-matching identity leaves
@@ -149,10 +225,7 @@ mod tests {
     #[test]
     fn registry_routes_match_else_oem() {
         let ran = Arc::new(AtomicBool::new(false));
-        register_unlocker(Box::new(FakeUnlocker {
-            want_vendor: "MATCHVND".into(),
-            ran: ran.clone(),
-        }));
+        register_unlocker(Box::new(FakeUnlocker::new("MATCHVND", ran.clone())));
 
         // Matching identity → unlocker runs, returns its name.
         let mut scsi = NoopTransport;
@@ -168,5 +241,52 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "unlock() not invoked on no-match"
         );
+    }
+
+    /// `unlocker_read_vid` consults the FIRST matching unlocker's `read_vid`.
+    /// A matching unlocker that returns `Some(vid)` yields that VID (the OEM
+    /// path — cert handshake skipped). A matching unlocker that returns
+    /// `None`, or no match at all, yields `Ok(None)` (cert fallback).
+    ///
+    /// Distinct vendor ids keep this independent of the other registry test
+    /// despite the process-wide shared registry.
+    #[test]
+    fn unlocker_read_vid_routes_match_else_cert() {
+        let mut scsi = NoopTransport;
+
+        // Unlocker WITH an OEM VID capability. Vendor ids are exactly 8
+        // chars: INQUIRY field [8..16] has no null padding to trim, so the
+        // trimmed compare in `matches` is exact.
+        let vid = [0x5Au8; 16];
+        let vid_ran = Arc::new(AtomicBool::new(false));
+        register_unlocker(Box::new(
+            FakeUnlocker::new("VIDVNDOR", Arc::new(AtomicBool::new(false)))
+                .with_vid(Some(vid), vid_ran.clone()),
+        ));
+
+        // Matching identity → read_vid consulted, its VID used.
+        let got = unlocker_read_vid(&mut scsi, &fake_id("VIDVNDOR")).unwrap();
+        assert_eq!(got, Some(vid), "matching unlocker's OEM VID is used");
+        assert!(vid_ran.load(Ordering::SeqCst), "read_vid() was consulted");
+
+        // Unlocker that MATCHES but has NO OEM VID path (read_vid → None).
+        let none_ran = Arc::new(AtomicBool::new(false));
+        register_unlocker(Box::new(
+            FakeUnlocker::new("NOVIDVND", Arc::new(AtomicBool::new(false)))
+                .with_vid(None, none_ran.clone()),
+        ));
+        let got = unlocker_read_vid(&mut scsi, &fake_id("NOVIDVND")).unwrap();
+        assert!(
+            got.is_none(),
+            "unlocker without OEM VID falls through to cert"
+        );
+        assert!(
+            none_ran.load(Ordering::SeqCst),
+            "read_vid() consulted even when it returns None"
+        );
+
+        // No matching unlocker → Ok(None), nothing consulted.
+        let got = unlocker_read_vid(&mut scsi, &fake_id("UNKNWNVD")).unwrap();
+        assert!(got.is_none(), "no match → cert fallback");
     }
 }
