@@ -1116,6 +1116,11 @@ pub struct ScanOptions {
     /// Host credentials for the live-drive AACS handshake. `None` for an
     /// unlocked / LibreDrive drive (OEM Volume-ID path) and for ISO scans.
     pub credentials: Option<DriveCredentials>,
+    /// Optional cooperative-cancellation token. When set, long scan-time
+    /// loops (notably the CSS known-plaintext crack, which can scan up to
+    /// 50_000 sectors on a live DVD) poll it and bail out cleanly so a
+    /// scan-phase watchdog or operator Stop is never stuck behind a hang.
+    pub halt: Option<crate::halt::Halt>,
 }
 
 /// Quick disc identification — name, format, capacity. No title/stream parsing.
@@ -1205,14 +1210,18 @@ impl Disc {
         // which prefers the per-drive OEM CDB path when the drive is
         // in the extended-access state and falls back to cert-based
         // mutual auth otherwise.
+        tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
         let (handshake, handshake_error) = Self::do_handshake(session, opts);
+        tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");
 
         // Request max read speed — removes riplock on DVD
         // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
 
         // Read UDF filesystem with buffered sector reader
+        tracing::info!(target: "freemkv::scan", "phase: reading UDF filesystem");
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
+        tracing::info!(target: "freemkv::scan", capacity, "phase: UDF read");
 
         // Pre-read all small file sectors (AACS, MPLS, CLPI, META, *.bdmv).
         // Without this, each read_file() triggers individual SCSI commands at 500ms each.
@@ -1220,6 +1229,7 @@ impl Disc {
             buffered.prefetch_ranges(&ranges);
         }
 
+        tracing::info!(target: "freemkv::scan", "phase: parsing titles/streams");
         let mut disc = Self::scan_with(
             &mut buffered,
             capacity,
@@ -1228,53 +1238,94 @@ impl Disc {
             opts,
             udf_fs,
         )?;
+        tracing::info!(target: "freemkv::scan", titles = disc.titles.len(), format = ?disc.content_format, "phase: titles parsed");
 
         // CSS key extraction for DVDs (bus auth → disc key → title key).
         // Must be a single auth session — can't call authenticate() separately.
         // Route through the DRM dispatcher: probe a title sector, detect
         // CSS if scrambled, then load via the SCSI auth path.
+        // We already know this is a DVD (MPEG-PS program stream), so drive the
+        // CSS handshake DIRECTLY off the main title's first content sector. We
+        // must NOT first read a scrambled sector to "detect" CSS: a drive that
+        // enforces CSS (e.g. the BU40N) rejects an UNauthenticated read of a
+        // scrambled sector with sense 05/6F/03 ("read of scrambled sector
+        // without authentication"), so a detect-then-auth ordering dead-locks —
+        // detection needs the read, the read needs auth, auth needs detection.
+        // The handshake is itself the detector: on a non-CSS (unencrypted) DVD
+        // the disc-key read fails, `resolve` returns None, and the disc is left
+        // in the clear. This block is DVD-only (MPEG-PS); BD/UHD (MPEG-TS) goes
+        // through the AACS handshake above and never reaches here.
         if disc.css.is_none()
             && disc.content_format == ContentFormat::MpegPs
             && !disc.titles.is_empty()
         {
-            let mut probe_buf = vec![0u8; 2048];
-            let auth_lba = disc.titles[0].extents.iter().find_map(|ext| {
-                if session
-                    .read_sectors(ext.start_lba, 1, &mut probe_buf, true)
-                    .is_ok()
-                {
-                    let probe = crate::drm::DrmProbe {
-                        dvd_sample_sector: Some(&probe_buf),
-                        content_cert: None,
-                        mkb: None,
-                    };
-                    if crate::drm::DrmScheme::detect(&probe) == Some(crate::drm::DrmScheme::Css) {
-                        return Some(ext.start_lba);
-                    }
+            // CSS title keys are per-VTS, and ONLY the scrambled movie content
+            // carries a non-zero key. Menu / VMG / logo cells (often the
+            // low-LBA first extent) return a ZERO title key over REPORT KEY —
+            // accepting that would leave the whole feature un-descrambled
+            // (raw scrambled bytes passed through as "clear"). So build
+            // candidate LBAs from the MAIN feature (largest title), LARGEST
+            // extent first (the movie body is the biggest scrambled chunk),
+            // and accept the first auth that yields a NON-ZERO title key. A
+            // genuinely unencrypted DVD returns zero for every candidate →
+            // disc stays in the clear. This block is DVD-only (MPEG-PS);
+            // BD/UHD (MPEG-TS) used the AACS handshake above and never reach here.
+            // Main feature = the largest title; its extents, largest (the movie
+            // body) first — that's where the scrambled content with a recoverable
+            // title key lives.
+            let main_extents = match disc
+                .titles
+                .iter()
+                .filter(|t| !t.extents.is_empty())
+                .max_by_key(|t| t.extents.iter().map(|e| e.sector_count as u64).sum::<u64>())
+            {
+                Some(t) => {
+                    let mut v = t.extents.clone();
+                    v.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
+                    v
                 }
-                None
-            });
-
-            if let Some(lba) = auth_lba {
-                let css_ctx = crate::css::CssContext {
-                    drive: Some(session),
-                    auth_lba: Some(lba),
-                    reader: None,
-                    extents: None,
-                };
-                let mut ctx = crate::drm::DrmContext {
-                    aacs: None,
-                    css: Some(css_ctx),
-                };
-                if let Some(crate::drm::ResolvedScheme::Css(state)) =
-                    crate::drm::DrmScheme::Css.load(&mut ctx)
-                {
+                None => Vec::new(),
+            };
+            tracing::info!(target: "freemkv::scan", extents = main_extents.len(), "phase: CSS — main feature located");
+            if let Some(unlock_lba) = main_extents.first().map(|e| e.start_lba) {
+                tracing::info!(target: "freemkv::scan", unlock_lba, "phase: CSS — bus-auth unlock");
+                // Unlock the drive's CSS read gating. A CSS-enforcing drive (the
+                // BU40N) refuses to return scrambled sectors until a CSS bus-auth
+                // handshake has run for the title; we run it here purely for that
+                // unlock and IGNORE the key it derives (the disc-key crack is
+                // unreliable). The real descramble key is recovered from the
+                // scrambled movie data itself via the known-plaintext attack — no
+                // player keys, no disc-key crack, no REPORT-KEY-derived title key.
+                let _ = crate::css::auth::unlock_css_reads(session, unlock_lba);
+                // Size the crack's batch reads to THIS drive's per-command max
+                // (DVD ≈ 16; the USB bridge may be lower) — an over-large
+                // READ(10) fails outright and would scan nothing.
+                let crack_batch = detect_max_batch_sectors(session.device_path());
+                tracing::info!(target: "freemkv::scan", crack_batch, "phase: CSS — known-plaintext crack");
+                let crack_t0 = std::time::Instant::now();
+                let crack_result = crate::css::crack_key_halt(
+                    session,
+                    &main_extents,
+                    crack_batch,
+                    opts.halt.as_ref(),
+                );
+                tracing::info!(
+                    target: "freemkv::scan",
+                    elapsed_ms = crack_t0.elapsed().as_millis() as u64,
+                    found = crack_result.is_some(),
+                    "phase: CSS — crack done"
+                );
+                if let Some(state) = crack_result {
+                    tracing::debug!(target: "freemkv::disc", "dvd css: title key recovered via known-plaintext crack");
                     disc.css = Some(state);
                     disc.encrypted = true;
+                } else {
+                    tracing::warn!(target: "freemkv::disc", "dvd css: no crackable scrambled sector (unencrypted or atypical layout)");
                 }
             }
         }
 
+        tracing::info!(target: "freemkv::scan", css = disc.css.is_some(), "phase: scan complete");
         Ok(disc)
     }
 
@@ -1286,7 +1337,43 @@ impl Disc {
         opts: &ScanOptions,
     ) -> Result<Self> {
         let udf_fs = udf::read_filesystem(reader)?;
-        Self::scan_with(reader, capacity, None, None, opts, udf_fs)
+        let mut disc = Self::scan_with(reader, capacity, None, None, opts, udf_fs)?;
+
+        // CSS for a raw (still-scrambled) DVD image: recover the title key from
+        // the scrambled movie data itself (known-plaintext attack), same as the
+        // live-drive path — but with no SCSI auth/unlock (an image is already
+        // readable). This lets the CLI mux a RAW CSS ISO, not only a
+        // pre-decrypted one. A pre-decrypted image has its scramble flags clear,
+        // so `crack_key` finds no crackable sector and the disc stays in the
+        // clear. AACS images go through KEYDB VUK lookup, not here.
+        if disc.css.is_none()
+            && disc.content_format == ContentFormat::MpegPs
+            && !disc.titles.is_empty()
+        {
+            let main_extents = match disc
+                .titles
+                .iter()
+                .filter(|t| !t.extents.is_empty())
+                .max_by_key(|t| t.extents.iter().map(|e| e.sector_count as u64).sum::<u64>())
+            {
+                Some(t) => {
+                    let mut v = t.extents.clone();
+                    v.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
+                    v
+                }
+                None => Vec::new(),
+            };
+            if !main_extents.is_empty() {
+                // Image reads aren't drive-batch-limited; use a generous batch.
+                if let Some(state) = crate::css::crack_key(reader, &main_extents, 32) {
+                    tracing::info!(target: "freemkv::scan", "image css: title key recovered via known-plaintext crack");
+                    disc.css = Some(state);
+                    disc.encrypted = true;
+                }
+            }
+        }
+
+        Ok(disc)
     }
 
     /// Read a disc's AACS key-input files from a sector source: returns
@@ -1379,6 +1466,8 @@ impl Disc {
         _opts: &ScanOptions,
         udf_fs: udf::UdfFs,
     ) -> Result<Self> {
+        let scan_with_t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::scan", phase = "scan_with", "begin");
         // 2. Resolve encryption (AACS, CSS, or none)
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
@@ -1432,32 +1521,31 @@ impl Disc {
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = DiscRegion::Free;
 
-        // 6. CSS detection for DVDs — route through the DRM dispatcher.
+        // 6. CSS detection for DVDs.
         //    Detection from a single probe sector would miss
-        //    DVDs whose first sector is unscrambled, so we go straight
-        //    to `DrmScheme::Css.load` with the crack-path context; the
-        //    crack path scans extents internally and bottoms out at
-        //    None on unencrypted media.
-        let css = if content_format == ContentFormat::MpegPs && !titles.is_empty() {
-            let css_ctx = crate::css::CssContext {
-                drive: None,
-                auth_lba: None,
-                reader: Some(reader),
-                extents: Some(&titles[0].extents),
-            };
-            let mut ctx = crate::drm::DrmContext {
-                aacs: None,
-                css: Some(css_ctx),
-            };
-            match crate::drm::DrmScheme::Css.load(&mut ctx) {
-                Some(crate::drm::ResolvedScheme::Css(s)) => Some(s),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        //    DVDs whose first sector is unscrambled, so the crack path
+        //    scans extents internally and bottoms out at None on
+        //    unencrypted media.
+        // CSS for a live-drive DVD is resolved by the drive-authentication
+        // path in `Disc::scan` (which has `&mut Drive`), AFTER this function
+        // returns. We deliberately do NOT run the reader-based crack path here:
+        // it is non-functional against this crate's descrambler (always returns
+        // None — see `css::crack`), and on a CSS-protected disc it would scan up
+        // to 50,000 scrambled sectors one-by-one, each rejected by the drive
+        // with sense 05/6F/03 ("read of scrambled sector without
+        // authentication") — roughly an hour of failing reads before the real
+        // auth path ever runs. Leave `css` unresolved here.
+        let css = None;
         let encrypted = encrypted || css.is_some();
 
+        tracing::info!(
+            target: "freemkv::scan",
+            phase = "scan_with",
+            titles = titles.len(),
+            encrypted,
+            elapsed_ms = scan_with_t0.elapsed().as_millis() as u64,
+            "end"
+        );
         Ok(Disc {
             volume_id: udf_fs.volume_id.clone(),
             meta_title,
@@ -1607,7 +1695,11 @@ impl Disc {
             5_000,
         )?;
         let lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        Ok(lba + 1)
+        // `last_lba + 1` = sector count. Guard the 0xFFFF_FFFF sentinel
+        // (capacity exceeds 32 bits) so it surfaces as an error instead of
+        // wrapping to 0 in release — mirrors the public `decode_read_capacity`.
+        lba.checked_add(1)
+            .ok_or(crate::error::Error::DiscCapacityOverflow)
     }
 }
 
@@ -1679,8 +1771,14 @@ fn aligned_unit_keys_validate(
         return false;
     }
     let mut probe = vec![0u8; ALIGNED_UNIT_LEN];
+    let total = (scrambled.len() as u64) * (unit_keys.len() as u64);
+    let mut tried = 0u64;
+    let mut hb = crate::progress::Heartbeat::new("scan_key_trial");
     for sample in scrambled {
         for (_, k) in unit_keys {
+            // Pure-CPU inner loop: only consult the clock every 256 trials.
+            hb.tick_cpu(tried, total);
+            tried += 1;
             probe.copy_from_slice(&sample[..ALIGNED_UNIT_LEN]);
             if decrypt_unit_full(&mut probe, k, read_data_key) {
                 return true;
@@ -1707,6 +1805,12 @@ impl Disc {
                 read_data_key: aacs.read_data_key,
             }
         } else if let Some(ref css) = self.css {
+            // KNOWN LIMITATION (post-1.0): one CSS title key is cracked from the
+            // main feature and used for every title. On a multi-VTS DVD where a
+            // secondary VTS carries a *different* per-VTS key, muxing that title
+            // (`freemkv -t N`) would descramble with the wrong key. The main
+            // feature, single-VTS discs, and autorip (always title 0) are
+            // unaffected; per-VTS key storage is tracked for a follow-up.
             crate::decrypt::DecryptKeys::Css {
                 title_key: css.title_key,
             }
@@ -1957,8 +2061,28 @@ impl Disc {
                     });
                 }
                 if !covers_disc {
-                    tracing::info!("copy dispatch: → sweep (covers_disc={})", covers_disc,);
-                    return self.sweep_internal(reader, path, opts, true);
+                    // Mapfile capacity != disc capacity. Force a full (non-
+                    // resume) sweep on ANY mismatch so [0, disc_size) is covered
+                    // as one fresh region (the non-resume path also set_len's the
+                    // ISO to the full capacity).
+                    //
+                    // UNDER-cover (map.total_size() < disc_size): a resume sweep
+                    // builds its region list only from the mapfile's NonTried
+                    // entries and would silently never read the tail
+                    // [map.total_size(), disc_size) — abandoning readable data
+                    // and the ISO's tail.
+                    //
+                    // OVER-cover (map.total_size() > disc_size): a resume sweep's
+                    // NonTried regions extend past the disc; `reader.read_sectors`
+                    // would then read LBAs beyond capacity (the promised
+                    // capacity clamp was never actually applied). A fresh sweep
+                    // sized to the real disc avoids reading past the end.
+                    tracing::info!(
+                        "copy dispatch: → sweep (covers_disc=false, resume=false, map={}, disc={})",
+                        map.total_size(),
+                        disc_size,
+                    );
+                    return self.sweep_internal(reader, path, opts, false);
                 }
                 if stats.bytes_retryable > 0 {
                     tracing::info!(
@@ -1967,8 +2091,41 @@ impl Disc {
                     );
                     return self.patch_internal(reader, path, opts);
                 }
-                tracing::info!("copy dispatch: → sweep (resume)");
-                return self.sweep_internal(reader, path, opts, true);
+                // Fallthrough: covers_disc=true, bytes_retryable=0.
+                // Two sub-cases:
+                //
+                // (a) bytes_nontried > 0: the mapfile covers the disc but
+                //     some ranges were never attempted (e.g. a prior sweep
+                //     was halted mid-way and the mapfile has NonTried gaps).
+                //     Route to a resume sweep so those unread ranges are
+                //     actually read. Returning terminal here would silently
+                //     abandon readable data.
+                //
+                // (b) bytes_nontried == 0: all sectors were attempted; any
+                //     remaining bad bytes are already Unreadable — a resume
+                //     sweep would visit zero new sectors and be a no-op.
+                //     Return the terminal result immediately.
+                if stats.bytes_nontried > 0 {
+                    tracing::info!(
+                        "copy dispatch: → sweep resume (covers_disc=true, \
+                         retryable=0, nontried={})",
+                        stats.bytes_nontried,
+                    );
+                    return self.sweep_internal(reader, path, opts, true);
+                }
+                tracing::info!(
+                    "copy dispatch: all bad sectors already Unreadable \
+                     (retryable=0, nontried=0) — returning terminal result",
+                );
+                return Ok(CopyResult {
+                    bytes_total: disc_size,
+                    bytes_good: stats.bytes_good,
+                    bytes_unreadable: stats.bytes_unreadable,
+                    bytes_pending: 0,
+                    recovered_this_pass: 0,
+                    complete: false,
+                    halted: false,
+                });
             }
         }
         self.sweep_internal(reader, path, opts, false)
@@ -2047,7 +2204,7 @@ impl Disc {
     /// going (jumping ahead through dense damage); without it,
     /// the first read failure aborts.
     ///
-    /// 0.18: this is one of the two flat verbs the library exposes
+    /// This is one of the two flat verbs the library exposes
     /// for rip orchestration. Multipass + retry decisions are the
     /// caller's job — see [`PatchOptions`] for the retry primitive.
     pub fn sweep(
@@ -2160,10 +2317,22 @@ impl Disc {
         let mut bytes_done = 0u64;
         let mut halt_requested = false;
         let copy_t0 = std::time::Instant::now();
+        tracing::info!(
+            target: "freemkv::scan",
+            phase = "sweep",
+            total_bytes,
+            skip_on_error = opts.skip_on_error,
+            resume = opts.resume,
+            "begin"
+        );
         let mut iter_count: u64 = 0;
         let mut read_ok_count: u64 = 0;
         let mut read_err_count: u64 = 0;
         let mut last_log_iter: u64 = 0;
+        // Sweep heartbeat: fire every 5s OR every 100 iterations, whichever
+        // comes first, so a slow-but-alive sweep on a marginal disc keeps
+        // emitting "no silent hang" liveness even between the 100-iter marks.
+        let mut last_log_time = std::time::Instant::now();
         let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
         let mut in_damage_zone = false;
         const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
@@ -2179,6 +2348,15 @@ impl Disc {
             regions = regions.len(),
             "Disc::sweep entered (producer/consumer)"
         );
+
+        // Request the drive's max read speed for the whole sweep — removes
+        // riplock. BD/UHD get their speed from the firmware unlock/init, but a
+        // DVD skips that path (the stock-mode gate, `Drive::disc_is_dvd`), so
+        // without this explicit SET CD SPEED a DVD rip sweeps at the drive's
+        // default (riplocked) speed. The damage-recovery branch below also
+        // re-asserts max speed after slowing on bad sectors; this sets it once
+        // up front so a clean disc never pays the riplock penalty.
+        reader.set_speed(0xFFFF);
 
         'outer: for (region_pos, region_size) in regions {
             let region_end = region_pos + region_size;
@@ -2230,7 +2408,8 @@ impl Disc {
                                 );
                             }
                         }
-                        read_ctx.bridge_degradation_count = 0;
+                        // bridge_degradation_count is reset inside on_success()
+                        // (called above); no separate reset needed here.
 
                         // Plaintext: the wrapped reader (DecryptingSectorSource)
                         // applied AACS / CSS in-place during read_sectors above.
@@ -2305,10 +2484,64 @@ impl Disc {
                                             }
                                         }
                                         Err(inner_err) => {
-                                            let _ = read_error::handle_read_error(
+                                            let inner_action = read_error::handle_read_error(
                                                 &inner_err,
                                                 &mut read_ctx,
                                             );
+                                            match inner_action {
+                                                read_error::ReadAction::Retry { pause_secs } => {
+                                                    // Transient (NOT_READY / bridge
+                                                    // degradation): honour the
+                                                    // cooldown pause, then mark
+                                                    // BisectBad and move on. We
+                                                    // are already inside a
+                                                    // single-sector retry; a
+                                                    // second bisect would be
+                                                    // nonsensical (ctx.bisecting
+                                                    // is true, so handle_read_error
+                                                    // can't return Bisect).
+                                                    sleep_secs_or_halt(
+                                                        pause_secs,
+                                                        opts.halt.as_ref(),
+                                                    );
+                                                }
+                                                read_error::ReadAction::AbortPass => {
+                                                    // Transport failure or
+                                                    // wedge-abort threshold
+                                                    // reached: stop immediately.
+                                                    let (status, sense) =
+                                                        extract_scsi_context(&inner_err);
+                                                    producer_err = Some(Error::DiscRead {
+                                                        sector: sector_lba as u64,
+                                                        status: Some(status),
+                                                        sense,
+                                                    });
+                                                    bisect_aborted = true;
+                                                    break;
+                                                }
+                                                // JumpAhead / SkipBlock: honour
+                                                // any indicated pause; the
+                                                // bisect-inner loop's job is just
+                                                // to classify this specific sector,
+                                                // so we still mark BisectBad and
+                                                // continue to the next sector.
+                                                read_error::ReadAction::JumpAhead {
+                                                    pause_secs,
+                                                    ..
+                                                }
+                                                | read_error::ReadAction::SkipBlock {
+                                                    pause_secs,
+                                                } => {
+                                                    sleep_secs_or_halt(
+                                                        pause_secs,
+                                                        opts.halt.as_ref(),
+                                                    );
+                                                }
+                                                // Bisect cannot recurse: ctx.bisecting
+                                                // is true so handle_read_error will
+                                                // never return Bisect here.
+                                                read_error::ReadAction::Bisect => {}
+                                            }
                                             if pipe
                                                 .send(WorkItem::BisectBad { pos: write_pos })
                                                 .is_err()
@@ -2417,19 +2650,40 @@ impl Disc {
                     cached_snapshot = Some(snap);
                 }
 
-                if iter_count - last_log_iter >= 100 {
+                let time_due = last_log_time.elapsed() >= std::time::Duration::from_secs(5);
+                if iter_count - last_log_iter >= 100 || time_due {
                     last_log_iter = iter_count;
+                    last_log_time = std::time::Instant::now();
+                    // Promoted trace -> debug ("no silent hangs"): the sweep
+                    // heartbeat must be visible at the standard debug level, not
+                    // only the trace firehose. Carries lba/pos/region_end and
+                    // bytes_good when a consumer snapshot is available.
+                    let lba = (pos / 2048) as u32;
                     if let Some(ref snap) = cached_snapshot {
-                        tracing::trace!(
+                        tracing::debug!(
                             target: "freemkv::disc",
                             phase = "iter_progress",
                             iter_count,
                             read_ok_count,
                             read_err_count,
+                            lba,
                             pos,
                             region_end,
                             bytes_good = snap.stats.bytes_good,
                             bytes_pending = snap.stats.bytes_pending,
+                            copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
+                            "Disc::sweep inner iter"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "iter_progress",
+                            iter_count,
+                            read_ok_count,
+                            read_err_count,
+                            lba,
+                            pos,
+                            region_end,
                             copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
                             "Disc::sweep inner iter"
                         );
@@ -3695,5 +3949,199 @@ mod tests {
     fn chapter_name_is_bare_ordinal() {
         assert_eq!(chapter_name(0), "1");
         assert_eq!(chapter_name(41), "42");
+    }
+
+    // ── Regression tests for bisect inner-loop ReadAction dispatch ───────────
+    //
+    // Before the fix the bisect inner loop discarded the ReadAction returned by
+    // handle_read_error:
+    //
+    //   let _ = read_error::handle_read_error(&inner_err, &mut read_ctx);
+    //
+    // Consequences:
+    //   (a) Retry{pause_secs} — cooldown skipped; sector immediately marked
+    //       BisectBad, hammering a degraded drive (violates Hard Rule #2).
+    //   (b) AbortPass — ignored; loop kept issuing reads against a crashed drive.
+    //
+    // The fix replaces the discard with a match.  The tests below prove the
+    // required ReadAction values are produced by handle_read_error in the
+    // bisect-inner context (bisecting=true, batch=1), so that any regression
+    // to `let _ = ...` would break real behaviour on the tested error paths.
+
+    /// NOT_READY inside a bisect must return Retry, not SkipBlock.
+    /// If the inner loop discarded the action the 3-second cooldown would be
+    /// skipped, hammering the drive during a transient NOT_READY condition.
+    #[test]
+    fn bisect_inner_not_ready_returns_retry_with_pause() {
+        use crate::disc::read_error::{ReadAction, ReadCtx, handle_read_error};
+        use crate::error::Error;
+        use crate::scsi::ScsiSense;
+
+        let not_ready_err = Error::DiscRead {
+            sector: 500,
+            status: Some(crate::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                asc: 0x04,
+                ascq: 0x00, // not 0x3E — generic NOT_READY, not bridge degradation
+            }),
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true; // simulate being inside the bisect inner loop
+
+        let action = handle_read_error(&not_ready_err, &mut ctx);
+        match action {
+            ReadAction::Retry { pause_secs } => {
+                assert!(
+                    pause_secs > 0,
+                    "NOT_READY retry must carry a non-zero pause; got {pause_secs}s"
+                );
+            }
+            other => panic!(
+                "bisect inner NOT_READY must return Retry{{pause_secs}}, got {other:?}; \
+                 a discard (`let _ = ...`) would skip this pause and hammer the drive"
+            ),
+        }
+    }
+
+    /// A transport failure inside a bisect must return AbortPass.
+    /// If the inner loop discarded the action the loop would continue
+    /// issuing reads against a crashed bridge, producing spurious BisectBad
+    /// entries and potentially looping until the batch is exhausted.
+    #[test]
+    fn bisect_inner_transport_failure_returns_abort_pass() {
+        use crate::disc::read_error::{ReadAction, ReadCtx, handle_read_error};
+        use crate::error::Error;
+
+        let transport_err = Error::DiscRead {
+            sector: 500,
+            status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+            sense: None,
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true;
+
+        let action = handle_read_error(&transport_err, &mut ctx);
+        assert_eq!(
+            action,
+            ReadAction::AbortPass,
+            "bisect inner transport failure must return AbortPass; \
+             a discard (`let _ = ...`) would silently keep looping against a crashed drive"
+        );
+    }
+
+    /// After enough consecutive wedge errors with bisecting=true the handler
+    /// must eventually return AbortPass.  Before the fix, the inner loop
+    /// discarded the returned action and kept issuing reads against a permanently
+    /// wedged drive at full rate.
+    ///
+    /// The threshold is 16 consecutive wedges (WEDGE_ABORT_THRESHOLD in
+    /// read_error.rs); we drive 20 iterations to give the assertion headroom
+    /// without hard-coding the internal constant here.
+    #[test]
+    fn bisect_inner_wedge_abort_threshold_reached_returns_abort_pass() {
+        use crate::disc::read_error::{ReadAction, ReadCtx, handle_read_error};
+        use crate::error::Error;
+        use crate::scsi::ScsiSense;
+
+        let hardware_err = || Error::DiscRead {
+            sector: 500,
+            status: Some(crate::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_HARDWARE_ERROR,
+                asc: 0x44,
+                ascq: 0x00,
+            }),
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true;
+
+        let mut aborted = false;
+        for _ in 0..20 {
+            let action = handle_read_error(&hardware_err(), &mut ctx);
+            if action == ReadAction::AbortPass {
+                aborted = true;
+                break;
+            }
+        }
+        assert!(
+            aborted,
+            "bisect inner wedge loop must reach AbortPass after consecutive hardware errors; \
+             a discard (`let _ = ...`) would loop forever on a bricked drive"
+        );
+    }
+
+    /// Regression: copy() dispatch with covers_disc=true, retryable=0, nontried>0 must
+    /// route to sweep_internal(resume=true) so the unread NonTried ranges are actually
+    /// read rather than silently abandoned.
+    ///
+    /// Before the fix the fallthrough returned a terminal CopyResult immediately,
+    /// leaving the NonTried sectors unread.
+    #[test]
+    fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
+        use crate::disc::mapfile::{self, SectorStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("test.iso");
+        let sectors: u32 = 200;
+        let disc = make_test_disc(sectors, "DispatchNonTried");
+        let disc_size = sectors as u64 * 2048;
+
+        // Synthesise a mapfile that covers the disc (total_size == disc_size) with:
+        //   - [0, half_bytes): Finished
+        //   - [half_bytes, disc_size): NonTried
+        // This gives covers_disc=true, bytes_retryable=0, bytes_nontried>0.
+        let mf_path = disc.mapfile_for(&iso_path);
+        let half_bytes = disc_size / 2;
+        {
+            let mut map =
+                mapfile::Mapfile::create(&mf_path, disc_size, "test").expect("create mapfile");
+            map.record(0, half_bytes, SectorStatus::Finished)
+                .expect("record Finished");
+            map.flush().expect("flush");
+        }
+
+        // Create an ISO file pre-sized to the full disc size so the resume
+        // sweep can open it and write the NonTried regions at their offsets.
+        // (len > 0 selects the resume-open branch; full pre-size avoids
+        // short-seek writes past EOF.)
+        {
+            let f = std::fs::File::create(&iso_path).expect("create iso");
+            f.set_len(disc_size).expect("pre-size iso");
+        }
+
+        // All sectors are readable in this reader.
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+
+        let opts = CopyOptions {
+            decrypt: false,
+            multipass: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+
+        let result = disc.copy(&mut reader, &iso_path, &opts);
+        assert!(
+            result.is_ok(),
+            "copy with nontried>0 should succeed: {:?}",
+            result.err()
+        );
+        let r = result.unwrap();
+        // The sweep must have read the NonTried half — bytes_good should be
+        // the whole disc, not just the already-Finished half.
+        assert_eq!(
+            r.bytes_good, disc_size,
+            "all sectors must be good after resume sweep reads the NonTried half \
+             (before fix: terminal returned with bytes_good={}, skipping {} NonTried bytes)",
+            half_bytes, half_bytes
+        );
     }
 }

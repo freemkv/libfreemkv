@@ -130,6 +130,24 @@ impl Disc {
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
     ) -> (Option<HandshakeResult>, Option<Error>) {
+        let t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::scan", phase = "do_handshake", "begin");
+        let (result, err) = Self::do_handshake_inner(session, opts);
+        tracing::info!(
+            target: "freemkv::scan",
+            phase = "do_handshake",
+            ok = result.is_some(),
+            error_code = err.as_ref().map(|e| e.code()),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "end"
+        );
+        (result, err)
+    }
+
+    fn do_handshake_inner(
+        session: &mut crate::drive::Drive,
+        opts: &ScanOptions,
+    ) -> (Option<HandshakeResult>, Option<Error>) {
         let unlocked = session.is_unlocked();
         tracing::debug!(
             target: "freemkv::disc",

@@ -55,6 +55,18 @@ struct PesAssembler {
 /// boundary.
 const PES_BUFFER_INIT_CAP: usize = 16 * 1024;
 
+/// Hard cap on a single PID's PES reassembly buffer.
+///
+/// A complete HEVC/UHD access unit (I-frame) is typically 1–3 MiB;
+/// 64 MiB is an order of magnitude above any real disc's largest AU
+/// and well below the memory a process can reasonably spare. If a
+/// stream pumps continuation packets that never produce a PUSI (e.g.
+/// a corrupt or crafted m2ts), the buffer would otherwise grow
+/// without bound and exhaust RAM. When a `push` would push the buffer
+/// past this limit the assembler drops the partial PES and resyncs on
+/// the next PUSI.
+const MAX_PES_BUFFER: usize = 64 * 1024 * 1024; // 64 MiB
+
 impl PesAssembler {
     fn new(pid: u16) -> Self {
         Self {
@@ -87,8 +99,25 @@ impl PesAssembler {
     }
 
     /// Append payload data to the current PES packet.
+    ///
+    /// If the buffer would exceed [`MAX_PES_BUFFER`] the partial PES is
+    /// silently dropped and the assembler is reset. Normal traffic resumes
+    /// on the next PUSI; a crafted/corrupt stream that never sends one can
+    /// no longer drive unbounded allocation.
     fn push(&mut self, data: &[u8]) {
         if self.active {
+            if self.buffer.len().saturating_add(data.len()) > MAX_PES_BUFFER {
+                tracing::trace!(
+                    target: "mux",
+                    pid = self.pid,
+                    bytes = self.buffer.len(),
+                    "PES buffer cap exceeded; dropping partial PES and resyncing on next PUSI",
+                );
+                self.buffer.clear();
+                self.active = false;
+                self.header_remaining = 0;
+                return;
+            }
             self.buffer.extend_from_slice(data);
         }
     }
@@ -560,11 +589,16 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
         if section_len < 4 {
             return None;
         }
-        let prog_info_len = (((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize;
-        let mut pos = 12 + prog_info_len;
         // Clamp the section end to the reassembled bytes; a malformed
-        // section_len or prog_info_len must never drive reads past `pmt`.
+        // section_len must never drive reads past `pmt`.
         let end = (3 + section_len - 4).min(pmt.len());
+        // Clamp prog_info_len so it cannot push `pos` past `end`.
+        // ISO 13818-1 requires program_info to fit within the PMT section;
+        // a crafted value larger than the remaining section would skip all
+        // ES entries and, in pathological cases, wrap or mis-index.
+        let prog_info_len =
+            ((((pmt[10] & 0x0F) as usize) << 8) | pmt[11] as usize).min(end.saturating_sub(12));
+        let mut pos = 12 + prog_info_len;
 
         while pos + 5 <= end {
             let stream_type = pmt[pos];
@@ -1581,5 +1615,116 @@ mod tests {
             })
             .expect("video present");
         assert_eq!(v.resolution, Resolution::R1080i, "MPEG-2 defaults to 1080i");
+    }
+
+    #[test]
+    fn scan_streams_oversized_prog_info_len_does_not_panic() {
+        // Regression: a PMT with prog_info_len larger than the section body
+        // must not panic, index out of bounds, or silently corrupt `pos`.
+        // The parser must clamp it and still return None (no valid ES entries
+        // past the inflated descriptor region).
+        let pmt_pid = 0x0100u16;
+
+        // Build a minimal PAT pointing at pmt_pid.
+        let mut data = pat_packet(pmt_pid);
+
+        // Craft a raw PMT TS packet with prog_info_len = 0x0FFF (4095),
+        // which is far larger than the actual section content.  The section
+        // itself only holds a single H.264 ES entry (5 bytes) so the real
+        // prog_info_len must be 0.
+        let mut body = [0xFFu8; 184];
+        body[0] = 0x00; // pointer_field
+        let s = 1;
+        body[s] = 0x02; // table_id = PMT
+        // section_length = 9 (fixed fields) + 5 (one ES entry) + 4 (CRC) = 18
+        let section_length: usize = 9 + 5 + 4;
+        body[s + 1] = 0xB0 | (((section_length >> 8) as u8) & 0x0F);
+        body[s + 2] = (section_length & 0xFF) as u8;
+        body[s + 3] = 0x00; // program_number hi
+        body[s + 4] = 0x01; // program_number lo
+        body[s + 5] = 0xC1; // version/current_next
+        body[s + 6] = 0x00; // section_number
+        body[s + 7] = 0x00; // last_section_number
+        body[s + 8] = 0xE0; // PCR PID hi
+        body[s + 9] = 0x00; // PCR PID lo
+        // prog_info_len = 0x0FFF — crafted oversized value
+        body[s + 10] = 0xFF; // 0xF0 reserved | 0x0F high nibble of 0xFFF
+        body[s + 11] = 0xFF; // low byte of 0xFFF
+        // ES entry: H.264 (0x1B) on PID 0x1011, es_info_len=0
+        let p = s + 12;
+        body[p] = 0x1B;
+        body[p + 1] = 0xE0 | ((0x1011u16 >> 8) as u8 & 0x1F);
+        body[p + 2] = (0x1011u16 & 0xFF) as u8;
+        body[p + 3] = 0xF0; // es_info_len hi = 0
+        body[p + 4] = 0x00; // es_info_len lo = 0
+        data.extend(bdts_packet(body, pmt_pid, true));
+        data.extend(pat_packet(pmt_pid)); // corroboration packet
+
+        // Must not panic.  The oversized prog_info_len causes the ES entry to
+        // be skipped after clamping, so the result is None or an empty stream
+        // list (both are acceptable; the critical invariant is no panic/OOB).
+        let _ = scan_streams(&data);
+    }
+
+    // ── PES reassembly buffer cap (DoS hardening) ─────────────────────────
+
+    #[test]
+    fn pes_buffer_cap_resets_on_overflow_and_recovers_on_next_pusi() {
+        // Feed continuation-only packets that would exceed MAX_PES_BUFFER if
+        // allowed to accumulate, then verify:
+        //   (a) the assembler buffer never grows past the cap,
+        //   (b) a subsequent valid PUSI + continuation produces a correct PES.
+        //
+        // Each continuation packet carries 184 ES bytes.  We need enough packets
+        // to exceed MAX_PES_BUFFER even after the cap resets the buffer between
+        // overflows.  Sending (MAX_PES_BUFFER / 184) + 2 packets guarantees at
+        // least one cap-trigger regardless of internal doubling.
+        let pid = 0x1011u16;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // Start a PES so the assembler is `active` before we hammer it.
+        let mut pes_start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        pes_start.extend_from_slice(&[0xAB; 10]);
+        demux.feed(&es_packet_exact(pid, true, &pes_start));
+
+        // Continuation packets with 184-byte payloads, no PUSI.  Each call to
+        // feed() processes one 192-byte BD-TS packet.
+        let payload = [0xCCu8; 184];
+        let cont_pkt = data_packet(pid, false, &payload);
+        let packets_needed = MAX_PES_BUFFER / 184 + 2;
+        let mut mid_out: Vec<PesPacket> = Vec::new();
+        for _ in 0..packets_needed {
+            mid_out.extend(demux.feed(&cont_pkt));
+            // Verify the internal buffer is bounded: no assembler may hold
+            // more than MAX_PES_BUFFER bytes at any point.
+            for asm in &demux.assemblers {
+                assert!(
+                    asm.buffer.len() <= MAX_PES_BUFFER,
+                    "assembler buffer exceeded cap: {} > {MAX_PES_BUFFER}",
+                    asm.buffer.len()
+                );
+            }
+        }
+        // The demuxer must not have completed any PES during the flood
+        // (the cap resets the partial PES rather than emitting garbage).
+        assert!(
+            mid_out.is_empty(),
+            "no PES must be emitted during a cap-overflow continuation flood"
+        );
+
+        // Recovery: a new valid PUSI followed by a continuation packet must
+        // produce exactly one well-formed PES with the correct ES bytes.
+        let mut good_start = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        good_start.extend_from_slice(&[0x11u8, 0x22]);
+        let mut out = demux.feed(&es_packet_exact(pid, true, &good_start));
+        out.extend(demux.feed(&es_packet_exact(pid, false, &[0x33u8, 0x44])));
+        // Flush to complete the in-progress PES.
+        out.extend(demux.flush());
+        assert_eq!(out.len(), 1, "exactly one PES after recovery");
+        assert_eq!(
+            out[0].data,
+            vec![0x11, 0x22, 0x33, 0x44],
+            "recovered PES carries only the post-reset ES bytes"
+        );
     }
 }

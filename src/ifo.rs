@@ -625,8 +625,11 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
                     break;
                 }
                 let first_cell = data[pgm_base + p] as usize;
-                // Chapter time = sum of cell durations before this program's first cell
-                let time: f64 = cell_durations[..first_cell.saturating_sub(1)].iter().sum();
+                // Chapter time = sum of cell durations before this program's first cell.
+                // Clamp to cell_durations.len(): a crafted/corrupt IFO can set first_cell
+                // beyond the actual cell count, which would panic the slice index.
+                let end = first_cell.saturating_sub(1).min(cell_durations.len());
+                let time: f64 = cell_durations[..end].iter().sum();
                 times.push(time);
             }
         }
@@ -1292,5 +1295,50 @@ mod tests {
         // cell_playback_offset (0xE8) left 0.
         let title = parse_pgc(&pgc, 0, 1).unwrap();
         assert!(title.cells.is_empty());
+    }
+
+    /// Regression: a crafted IFO whose program-map byte names a first_cell
+    /// index larger than the actual cell count must NOT panic. Before the fix,
+    /// `cell_durations[..first_cell.saturating_sub(1)]` would panic with an
+    /// out-of-bounds slice index when first_cell > cell_durations.len().
+    ///
+    /// Layout: 1 real cell, but the program map byte is 0xFF (255) — an
+    /// attacker-controlled value that exceeds the cell_durations Vec length.
+    /// Expected: parse_pgc returns Ok (the clamped sum is simply the full
+    /// cell duration) without panicking.
+    #[test]
+    fn pgc_program_map_oob_cell_index_no_panic() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1; // nr_programs = 1
+        pgc[0x03] = 1; // nr_cells = 1
+
+        // program map offset at PGC+0xE6 (u16 BE) → right after the header
+        let pgm_off: u16 = 0xEA;
+        pgc[0xE6] = (pgm_off >> 8) as u8;
+        pgc[0xE7] = pgm_off as u8;
+
+        // cell playback offset at PGC+0xE8 → after the 1-byte program map
+        let cell_off: u16 = 0xEA + 1;
+        pgc[0xE8] = (cell_off >> 8) as u8;
+        pgc[0xE9] = cell_off as u8;
+
+        // Allocate space: 1 program-map byte + 1 cell × 24 bytes
+        pgc.resize(cell_off as usize + 24, 0);
+
+        // Craft: program 0's first_cell = 0xFF (255) — far past the 1 real cell
+        pgc[0xEA] = 0xFF;
+
+        // Cell 0 duration = 10s (BCD seconds byte at cell_base + 6)
+        pgc[cell_off as usize + 6] = 0x10; // BCD 0x10 = 10 seconds
+
+        // Must return Ok; must not panic.
+        let title = parse_pgc(&pgc, 0, 1).unwrap();
+        // With first_cell=255, end = min(254, 1) = 1, so chapter_times[0] = dur(cell0) = 10s.
+        assert_eq!(title.chapter_times.len(), 1);
+        assert!(
+            (title.chapter_times[0] - 10.0).abs() < 0.01,
+            "got {}",
+            title.chapter_times[0]
+        );
     }
 }

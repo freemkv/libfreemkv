@@ -98,7 +98,7 @@ drive.probe_disc()?;
 let disc = Disc::scan(&mut drive, &ScanOptions::default())?;
 
 // Stream pipeline — PES frames from any source to any output.
-// 0.18: input() returns Box<dyn FrameSource>, output() returns Box<dyn FrameSink>;
+// input() returns Box<dyn FrameSource>, output() returns Box<dyn FrameSink>;
 // direction is type-checked, so calling .write() on an input is a compile error.
 let opts = InputOptions::default();
 let mut input = libfreemkv::input("disc:///dev/sg4", &opts)?;

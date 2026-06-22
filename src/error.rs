@@ -41,6 +41,7 @@ pub const E_SIGNATURE_MISMATCH: u16 = 3001;
 
 // SCSI (4xxx)
 pub const E_SCSI_ERROR: u16 = 4000;
+pub const E_INVALID_CDB_LENGTH: u16 = 4001;
 
 // I/O (5xxx)
 pub const E_IO_ERROR: u16 = 5000;
@@ -117,6 +118,10 @@ pub const E_PES_TRACK_TOO_LARGE: u16 = 9017;
 pub const E_PIPELINE_CONSUMER_GONE: u16 = 9018;
 pub const E_DISC_CAPACITY_OVERFLOW: u16 = 9020;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
+/// A `network://` output target resolved to no address that is safe to
+/// connect to (every resolved IP was loopback / private / link-local /
+/// multicast / unspecified). Closes the DNS-rebinding SSRF window.
+pub const E_NETWORK_ADDR_BLOCKED: u16 = 9022;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
@@ -206,6 +211,12 @@ pub enum Error {
         opcode: u8,
         status: u8,
         sense: Option<crate::scsi::ScsiSense>,
+    },
+    /// CDB supplied to the transport exceeded the maximum supported length.
+    /// `len` is the supplied CDB length; `max` is the transport's limit.
+    InvalidCdbLength {
+        len: usize,
+        max: usize,
     },
 
     // I/O (5xxx)
@@ -330,6 +341,13 @@ pub enum Error {
     StreamUrlMissingPort {
         addr: String,
     },
+    /// A `network://` output host resolved to no connectable address —
+    /// every resolved IP was loopback / private / link-local / multicast /
+    /// unspecified. Carries the offending `host:port`. Re-checked at
+    /// connect time to close the DNS-rebinding TOCTOU.
+    NetworkAddrBlocked {
+        addr: String,
+    },
     PesFrameTooLarge {
         size: usize,
     },
@@ -426,6 +444,7 @@ impl Error {
             Error::UnlockFailed => E_UNLOCK_FAILED,
             Error::SignatureMismatch { .. } => E_SIGNATURE_MISMATCH,
             Error::ScsiError { .. } => E_SCSI_ERROR,
+            Error::InvalidCdbLength { .. } => E_INVALID_CDB_LENGTH,
             Error::IoError { .. } => E_IO_ERROR,
             Error::DiscRead { .. } => E_DISC_READ,
             Error::Halted => E_HALTED,
@@ -473,6 +492,7 @@ impl Error {
             Error::StreamUrlInvalid { .. } => E_STREAM_URL_INVALID,
             Error::StreamUrlMissingPath { .. } => E_STREAM_URL_MISSING_PATH,
             Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
+            Error::NetworkAddrBlocked { .. } => E_NETWORK_ADDR_BLOCKED,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -610,6 +630,7 @@ impl std::fmt::Display for Error {
             Error::StreamUrlInvalid { url } => write!(f, "E{}: {}", self.code(), url),
             Error::StreamUrlMissingPath { scheme } => write!(f, "E{}: {}", self.code(), scheme),
             Error::StreamUrlMissingPort { addr } => write!(f, "E{}: {}", self.code(), addr),
+            Error::NetworkAddrBlocked { addr } => write!(f, "E{}: {}", self.code(), addr),
             Error::PesFrameTooLarge { size } => write!(f, "E{}: {}", self.code(), size),
             Error::PesTrackTooLarge { track } => write!(f, "E{}: {}", self.code(), track),
             Error::IsoTooLarge { path } => write!(f, "E{}: {}", self.code(), path),
@@ -622,6 +643,9 @@ impl std::fmt::Display for Error {
             }
             Error::MuxTrackRange { track, tracks } => {
                 write!(f, "E{}: {}/{}", self.code(), track, tracks)
+            }
+            Error::InvalidCdbLength { len, max } => {
+                write!(f, "E{}: {}/{}", self.code(), len, max)
             }
             _ => write!(f, "E{}", self.code()),
         }
@@ -689,6 +713,9 @@ impl From<Error> for std::io::Error {
             // 9021 M2tsPacketMalformed: a muxer invariant break produced
             // a non-188-byte packet — treat as invalid data.
             9021 => std::io::ErrorKind::InvalidData,
+            // 9022 NetworkAddrBlocked: the output host resolved only to
+            // blocked (loopback/private/link-local) addresses — refuse.
+            E_NETWORK_ADDR_BLOCKED => std::io::ErrorKind::PermissionDenied,
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
             9030 => std::io::ErrorKind::InvalidInput,
@@ -1008,6 +1035,7 @@ mod tests {
             E_UNLOCK_FAILED,
             E_SIGNATURE_MISMATCH,
             E_SCSI_ERROR,
+            E_INVALID_CDB_LENGTH,
             E_IO_ERROR,
             E_DISC_READ,
             E_MPLS_PARSE,
@@ -1055,6 +1083,7 @@ mod tests {
             E_STREAM_URL_INVALID,
             E_STREAM_URL_MISSING_PATH,
             E_STREAM_URL_MISSING_PORT,
+            E_NETWORK_ADDR_BLOCKED,
             E_PES_FRAME_TOO_LARGE,
             E_PES_INVALID_MAGIC,
             E_PES_TRACK_TOO_LARGE,
@@ -1144,6 +1173,12 @@ mod tests {
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),
+            (
+                Error::NetworkAddrBlocked {
+                    addr: String::new(),
+                },
+                E_NETWORK_ADDR_BLOCKED,
+            ),
         ];
         for (e, expected_code) in cases {
             assert_eq!(

@@ -114,6 +114,15 @@ pub struct DiscStream {
     /// the wrapper.
     decrypt_keys: crate::decrypt::DecryptKeys,
 
+    /// Sector granularity the decrypt step requires each read buffer to start
+    /// on and span a multiple of. AACS decrypts whole 6144-byte (3-sector)
+    /// units keyed off the buffer's first 16 bytes, so every `read_sectors`
+    /// buffer must begin on a real on-disc unit boundary — hence reads and
+    /// error-skips must stay aligned to this. `3` for AACS, `1` for CSS /
+    /// unencrypted (per-sector, self-synchronizing). Mirrors the file-backed
+    /// highway's `PrefetchedSectorSource` guard; this is the inline live path.
+    unit_align: u16,
+
     // Extents to read
     extents: Vec<Extent>,
 
@@ -227,6 +236,15 @@ impl DiscStream {
             }
         }
 
+        // AACS decrypts whole 6144-byte (3-sector) units keyed off each read
+        // buffer's first 16 bytes, so reads/skips must stay 3-sector aligned.
+        // CSS and unencrypted content are per-2048-byte and self-synchronizing
+        // (align 1). Same rule the file-backed highway applies in resolve.rs.
+        let unit_align: u16 = match &decrypt_keys {
+            crate::decrypt::DecryptKeys::Aacs { .. } => 3,
+            _ => 1,
+        };
+
         Self {
             // Wrap the input reader in DecryptingSectorSource so the
             // internal fill_extents path sees plaintext bytes. For
@@ -235,6 +253,7 @@ impl DiscStream {
             reader: DecryptingSectorSource::new(reader, decrypt_keys.clone()),
             title,
             decrypt_keys,
+            unit_align,
             extents,
             current_extent: 0,
             current_offset: 0,
@@ -285,7 +304,7 @@ impl DiscStream {
     /// `fill_extents`. Calling `set_halt` after `with_halt` (or vice
     /// versa) replaces the previous token with the new one.
     #[deprecated(
-        since = "0.18.0",
+        since = "1.0.0",
         note = "use `DiscStream::with_halt(Halt)` at construction instead"
     )]
     pub fn set_halt(&mut self, flag: Arc<AtomicBool>) {
@@ -353,12 +372,24 @@ impl DiscStream {
                 tracing::debug!(target: "mux", "fill_extents waiting at LBA {} ({}s elapsed, sectors={})", lba, start_time.elapsed().as_secs(), remaining);
             }
 
-            let mut sectors = remaining.min(self.adaptive.current() as u32) as u16;
-            // Align to 3-sector AACS units when possible. Partial units at
-            // extent boundaries are safely handled by decrypt_sectors().
-            if sectors >= 3 {
-                sectors -= sectors % 3;
-            }
+            // Keep every read buffer starting on a real on-disc unit boundary.
+            // AACS (unit_align=3) decrypts whole 6144-byte units keyed off the
+            // buffer's first bytes, so a sub-unit read mid-extent desyncs the
+            // rest of the title; always read at least one full unit. Only the
+            // final partial unit at the extent tail (remaining < align) is read
+            // short — nothing follows it to desync. CSS/raw (align=1) is
+            // per-sector and self-synchronizing, so this is a no-op there.
+            let align = self.unit_align.max(1) as u32;
+            let want = remaining.min(self.adaptive.current() as u32);
+            let sectors: u16 = if align <= 1 {
+                want as u16
+            } else if remaining < align {
+                remaining as u16
+            } else if want < align {
+                align as u16
+            } else {
+                (want - want % align) as u16
+            };
             let bytes = sectors as usize * 2048;
             self.read_buf.resize(bytes, 0);
 
@@ -386,15 +417,21 @@ impl DiscStream {
                 break;
             }
 
-            if sectors == 1 {
-                // Bottomed out. Skip this sector or bail.
+            if (sectors as u32) <= align {
+                // Bottomed out at one unit (AACS) / one sector (CSS) / the
+                // extent tail. Skip the WHOLE failed unit or bail. Zero-filling
+                // and advancing by the full unit keeps current_offset
+                // unit-aligned, so the next read still begins on a real AACS
+                // unit boundary (a 1-sector skip here would desync the rest of
+                // the title — the bug this guards).
                 if self.skip_errors {
-                    self.read_buf.resize(2048, 0);
-                    self.read_buf[..2048].fill(0);
-                    self.buf_valid = 2048;
+                    let zb = sectors as usize * 2048;
+                    self.read_buf.resize(zb, 0);
+                    self.read_buf[..zb].fill(0);
+                    self.buf_valid = zb;
                     self.errors += 1;
                     self.emit(EventKind::SectorSkipped { sector: lba as u64 });
-                    self.current_offset += 1;
+                    self.current_offset += sectors as u32;
                     break;
                 } else {
                     // Build the error from the failure we ALREADY hold.
@@ -855,6 +892,170 @@ mod tests {
             stream.is_halted(),
             "with_halt token cancellation must be observed by is_halted()"
         );
+    }
+
+    /// Recording `SectorSource`: logs every `(lba, count)` request and
+    /// returns `Err` whenever the requested range covers `bad_sector`.
+    /// Successful reads return zeroed sectors (which are NOT
+    /// `is_aacs_scrambled`, so `DecryptingSectorSource` passes them through
+    /// even with synthetic AACS keys — no real decrypt is attempted).
+    struct RecordingReader {
+        capacity: u32,
+        bad_sector: u32,
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
+    }
+
+    impl crate::sector::SectorSource for RecordingReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.log.lock().unwrap().push((lba, count));
+            let end = lba + count as u32;
+            if self.bad_sector >= lba && self.bad_sector < end {
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// AACS unit-alignment skip (the #1 coverage gap). With `unit_align=3`
+    /// (DecryptKeys::Aacs) and `skip_errors=true`, a single bad mid-extent
+    /// sector must NOT desync the rest of the title: every `read_sectors`
+    /// request must start on a 3-sector unit boundary relative to the extent
+    /// start, and the skip over the failed unit must advance the cursor by a
+    /// whole 3-sector unit (never a single sector).
+    #[test]
+    fn aacs_reads_stay_unit_aligned_and_skip_whole_units() {
+        const COUNT: u32 = 30;
+        const ALIGN: u32 = 3;
+        // Bad sector at offset 13 — inside unit 4 (offsets 12,13,14). The
+        // whole unit must be skipped, keeping the cursor unit-aligned.
+        let bad = 13u32;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            capacity: COUNT,
+            bad_sector: bad,
+            log: log.clone(),
+        };
+        let title = synthetic_title(COUNT);
+        let keys = crate::decrypt::DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0u8; 16])],
+            read_data_key: None,
+        };
+        let mut stream = DiscStream::new(Box::new(reader), title, keys, 8, ContentFormat::BdTs);
+        stream.skip_errors = true;
+        assert_eq!(
+            stream.unit_align, ALIGN as u16,
+            "AACS keys must set unit_align=3"
+        );
+
+        // Drive fill_extents to EOF (no PES demux needed — we observe the
+        // raw read pattern directly).
+        let ext_start = 0u32;
+        let mut guard = 0;
+        loop {
+            match stream.fill_extents() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => panic!("fill_extents errored unexpectedly: {e}"),
+            }
+            guard += 1;
+            assert!(guard < 1000, "fill_extents did not reach EOF");
+        }
+
+        let reads = log.lock().unwrap();
+        assert!(!reads.is_empty(), "expected at least one read");
+        for &(lba, count) in reads.iter() {
+            assert_eq!(
+                (lba - ext_start) % ALIGN,
+                0,
+                "read at lba {lba} is not unit-aligned (offset {} % {ALIGN} != 0)",
+                lba - ext_start
+            );
+            // Non-tail reads must be a whole number of units; the only
+            // permitted short read is the final partial unit (here COUNT is a
+            // multiple of ALIGN, so every read should be unit-multiple unless
+            // it shrank below one unit — which is itself a single unit).
+            let _ = count;
+        }
+
+        // At least one error was skipped (the bad unit) and a SectorSkipped
+        // event was emitted; errors counter advanced by exactly the bad units.
+        assert!(stream.errors >= 1, "expected the bad unit to be skipped");
+
+        // Crucial anti-desync assertion: the read that bottomed out and was
+        // skipped must have been a single 3-sector unit starting at offset 12
+        // (the unit boundary at or below the bad sector 13), NOT a 1-sector
+        // read at 13. Find a recorded read of (12, 3).
+        assert!(
+            reads
+                .iter()
+                .any(|&(lba, count)| lba == 12 && count == ALIGN as u16),
+            "expected a unit-aligned (lba=12,count=3) read over the bad unit; got {reads:?}"
+        );
+        // And NO single-sector read at the bad sector itself (would be a desync).
+        assert!(
+            !reads.iter().any(|&(lba, count)| lba == bad && count == 1),
+            "a 1-sector read at the bad sector {bad} would desync the AACS unit stream"
+        );
+    }
+
+    /// `unit_align == 1` (DecryptKeys::None) variant: single-sector skips
+    /// still work (CSS/raw is self-synchronizing, so a 1-sector skip is
+    /// correct there — contrast with the AACS whole-unit skip above).
+    #[test]
+    fn unencrypted_single_sector_skip_works() {
+        const COUNT: u32 = 10;
+        let bad = 4u32;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecordingReader {
+            capacity: COUNT,
+            bad_sector: bad,
+            log: log.clone(),
+        };
+        let mut stream = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+        );
+        stream.skip_errors = true;
+        assert_eq!(stream.unit_align, 1, "None keys must leave unit_align=1");
+
+        let mut guard = 0;
+        loop {
+            match stream.fill_extents() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => panic!("fill_extents errored unexpectedly: {e}"),
+            }
+            guard += 1;
+            assert!(guard < 1000, "fill_extents did not reach EOF");
+        }
+
+        let reads = log.lock().unwrap();
+        // The bad sector must have been retried down to a single sector and
+        // skipped at count==1 — the self-synchronizing per-sector path.
+        assert!(
+            reads.iter().any(|&(lba, count)| lba == bad && count == 1),
+            "align=1 must bottom out at a 1-sector read over the bad sector; got {reads:?}"
+        );
+        assert!(stream.errors >= 1);
     }
 
     #[test]

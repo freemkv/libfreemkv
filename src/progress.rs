@@ -111,6 +111,93 @@ impl PassProgress {
     }
 }
 
+/// Throttled liveness beacon for long-running loops.
+///
+/// "No silent hangs": every loop that can block for a long time (sector
+/// sweep, CSS crack, UDF prefetch, mux feed, key trials, drive poll) holds a
+/// `Heartbeat` and calls [`tick`](Heartbeat::tick) each iteration. `tick`
+/// emits a `DEBUG` event on target `freemkv::heartbeat` at most once per
+/// interval (default 5s), so a stalled loop is visible in the log as the
+/// absence of a beat, and a slow-but-alive loop shows steady progress.
+///
+/// `tick` is cheap on the hot path: it reads one `Instant` and compares. For
+/// pure-CPU inner loops where even that is too much, use
+/// [`tick_cpu`](Heartbeat::tick_cpu), which only consults the clock every 256
+/// calls.
+#[derive(Debug)]
+pub struct Heartbeat {
+    phase: &'static str,
+    interval: std::time::Duration,
+    start: std::time::Instant,
+    last: std::time::Instant,
+    /// Counter for the CPU-loop fast path (clock read every 256 calls).
+    cpu_counter: u32,
+}
+
+impl Heartbeat {
+    /// Default heartbeat interval.
+    pub const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Construct a heartbeat for `phase` with the default 5s interval.
+    pub fn new(phase: &'static str) -> Self {
+        Self::with_interval(phase, Self::DEFAULT_INTERVAL)
+    }
+
+    /// Construct a heartbeat with an explicit interval (used by tests).
+    pub fn with_interval(phase: &'static str, interval: std::time::Duration) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            phase,
+            interval,
+            start: now,
+            last: now,
+            cpu_counter: 0,
+        }
+    }
+
+    /// Record a heartbeat at position `pos` of `total`. Emits at most once per
+    /// interval. Returns `true` if a beat was actually emitted (mostly useful
+    /// for tests).
+    pub fn tick(&mut self, pos: u64, total: u64) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last) < self.interval {
+            return false;
+        }
+        self.last = now;
+        self.emit(pos, total, now);
+        true
+    }
+
+    /// CPU-loop variant: only consults the clock every 256 calls, so the cost
+    /// on a tight pure-CPU inner loop is a single increment + compare most
+    /// iterations. Otherwise identical to [`tick`](Heartbeat::tick).
+    pub fn tick_cpu(&mut self, pos: u64, total: u64) -> bool {
+        self.cpu_counter = self.cpu_counter.wrapping_add(1);
+        if self.cpu_counter % 256 != 0 {
+            return false;
+        }
+        self.tick(pos, total)
+    }
+
+    fn emit(&self, pos: u64, total: u64, now: std::time::Instant) {
+        let pct = if total == 0 {
+            0.0
+        } else {
+            (pos as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
+        };
+        let elapsed_ms = now.duration_since(self.start).as_millis() as u64;
+        tracing::debug!(
+            target: "freemkv::heartbeat",
+            phase = self.phase,
+            pos,
+            total,
+            pct,
+            elapsed_ms,
+            "alive"
+        );
+    }
+}
+
 /// A consumer of pipeline progress events. Library code calls
 /// `Progress::report` once per inner-loop iteration (throttling is the
 /// consumer's job — `report` is cheap; the library doesn't gate it).
@@ -128,5 +215,44 @@ pub trait Progress {
 impl<F: Fn(&PassProgress) -> bool> Progress for F {
     fn report(&self, p: &PassProgress) -> bool {
         (self)(p)
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::Heartbeat;
+    use std::time::Duration;
+
+    /// A fresh heartbeat does not beat on the first tick — the interval has not
+    /// elapsed — so a fast loop is not spammed.
+    #[test]
+    fn first_tick_does_not_beat() {
+        let mut hb = Heartbeat::with_interval("test", Duration::from_secs(60));
+        assert!(!hb.tick(0, 100));
+        assert!(!hb.tick(50, 100));
+    }
+
+    /// Once the interval elapses, exactly one beat fires, then the throttle
+    /// resets.
+    #[test]
+    fn beats_once_per_interval() {
+        let mut hb = Heartbeat::with_interval("test", Duration::from_millis(10));
+        assert!(!hb.tick(1, 100));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(hb.tick(2, 100), "should beat after interval elapsed");
+        // Immediately after, throttle suppresses the next.
+        assert!(!hb.tick(3, 100));
+    }
+
+    /// tick_cpu only consults the clock every 256 calls: the first 255 calls
+    /// never beat even with a zero interval.
+    #[test]
+    fn tick_cpu_throttles_clock_reads() {
+        let mut hb = Heartbeat::with_interval("test", Duration::from_nanos(0));
+        for _ in 0..255 {
+            assert!(!hb.tick_cpu(0, 100));
+        }
+        // 256th call consults the clock; with a zero interval it beats.
+        assert!(hb.tick_cpu(0, 100));
     }
 }

@@ -50,6 +50,15 @@ use crate::halt::Halt;
 /// when no such watchdog intervenes.
 pub const JOIN_TIMEOUT_SECS: u64 = 600;
 
+/// Short grace period after a halt or 10-min timeout fires in
+/// [`Pipeline::finish_with_halt`]. Most wedged consumers that are
+/// "about to return" when the halt fires will unblock within a few
+/// seconds (e.g. their bounded_syscall timeout returns and the consumer
+/// drains). Spinning here converts those into clean joins and releases
+/// the output file handle, at the cost of at most this much extra
+/// latency on a genuinely stuck consumer before we accept the leak.
+const FINISH_GRACE_SECS: u64 = 5;
+
 /// Halt-check cadence for the send loop. Producer blocks on
 /// [`crossbeam_channel::Sender::send_timeout`] for this slice — the
 /// kernel wakes it the instant the consumer drains a slot, so on the
@@ -104,6 +113,44 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
         "pipeline consumer thread panicked"
     );
     Error::PipelineConsumerPanicked
+}
+
+/// After a halt or deadline fires, spin-poll `handle.is_finished()` for
+/// [`FINISH_GRACE_SECS`] before accepting the thread leak. This converts
+/// the common "nearly-done" consumer (whose own bounded_syscall just
+/// returned and is about to drop its output file) into a clean join,
+/// releasing the file handle without waiting the full grace period.
+///
+/// If the consumer is still running when the grace expires, dropping the
+/// `JoinHandle` detaches from the thread — the consumer keeps running
+/// until its kernel call returns or the process exits.
+fn finish_with_grace<R: Send + 'static>(
+    handle: thread::JoinHandle<Result<R, Error>>,
+    leak_err: Error,
+) -> Result<R, Error> {
+    let grace = Instant::now() + Duration::from_secs(FINISH_GRACE_SECS);
+    while Instant::now() < grace {
+        if handle.is_finished() {
+            return match handle.join() {
+                Ok(result) => result,
+                Err(payload) => Err(consumer_panicked(payload)),
+            };
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    // Grace expired. Log and leak.
+    tracing::warn!(
+        target: "freemkv::pipeline",
+        phase = "finish_with_halt_grace_expired",
+        "pipeline consumer did not finish within {}s grace period; leaking thread",
+        FINISH_GRACE_SECS
+    );
+    // Dropping `handle` without joining detaches from the thread — the
+    // consumer keeps running until its kernel call returns or the process
+    // exits. This is the intentional "leak" documented in
+    // `finish_with_halt`'s contract.
+    drop(handle);
+    Err(leak_err)
 }
 
 /// Default channel depth for callers without a specific reason to
@@ -436,12 +483,13 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     ///   - [`Error::PipelineConsumerPanicked`] — same as `finish()`.
     ///
     /// In the `halted` and `timed out` branches the consumer thread is
-    /// intentionally leaked — exactly the same trade-off the
-    /// `bounded_syscall` primitive makes. The wedged kernel call
-    /// inside the consumer will unwind whenever it does, or at
-    /// process exit. The caller is free to fall back to a degraded
-    /// path (e.g. abort the session and let a supervisor restart the
-    /// process).
+    /// intentionally leaked after a short grace period — exactly the
+    /// same trade-off the `bounded_syscall` primitive makes. A
+    /// [`FINISH_GRACE_SECS`] spin-poll is attempted first so that
+    /// consumers that are "nearly done" (e.g. their own bounded syscall
+    /// just timed out and is about to unblock) can join cleanly and
+    /// release their output file handle. Only if the consumer is still
+    /// running after the grace period does the leak occur.
     ///
     /// Plain [`Pipeline::finish`] is preserved for callers without a
     /// halt-token plumbed through; that path still blocks indefinitely
@@ -459,13 +507,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             }
             if let Some(h) = halt {
                 if h.is_cancelled() {
-                    // Consumer thread is intentionally leaked.
-                    return Err(Error::Halted);
+                    return finish_with_grace(handle, Error::Halted);
                 }
             }
             if Instant::now() >= deadline {
-                // Consumer thread is intentionally leaked.
-                return Err(Error::PipelineJoinTimeout);
+                return finish_with_grace(handle, Error::PipelineJoinTimeout);
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -884,10 +930,15 @@ mod tests {
             matches!(res, Err(Error::Halted)),
             "expected Err(Halted), got {res:?}"
         );
-        // Bailed out within ~1 second of the halt firing (worst case
-        // one POLL_INTERVAL = 250 ms of slack).
+        // Bailed out within the grace period plus a healthy margin.
+        // The grace spin-poll adds up to FINISH_GRACE_SECS (5s) of
+        // extra wait for a truly wedged consumer; the test's consumer
+        // is deliberately never released before this assert so we
+        // exercise the "grace expires → leak" path. 15s is well under
+        // the 10-minute JOIN_TIMEOUT backstop and proves the new code
+        // doesn't block forever.
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_secs(15),
             "halt observation took too long: {elapsed:?}"
         );
     }
@@ -1200,5 +1251,93 @@ mod tests {
         // apply ran for items 1 and 2 (item 2 returned Stop); never for
         // the remaining 98 even though they were drained.
         assert_eq!(out, 2, "apply was called after Stop");
+    }
+
+    // ── Bug-fix regression tests ────────────────────────────────────────
+
+    /// Regression for the "consumer thread / output-file leak on halt"
+    /// fix. When the halt fires but the consumer finishes WITHIN the
+    /// grace period, `finish_with_halt` must join cleanly and return `Ok`
+    /// — not leak the thread or return `Err(Halted)`.
+    ///
+    /// Setup: a sink that sleeps briefly (well inside `FINISH_GRACE_SECS`)
+    /// after the producer drops the channel. We fire the halt immediately,
+    /// so `finish_with_halt` enters the grace spin. The consumer finishes
+    /// during the grace window and the result is `Ok`.
+    ///
+    /// Without the fix (old behaviour: immediate leak on halt), this
+    /// would have returned `Err(Halted)` and the SumSink total would
+    /// be unobservable.
+    #[test]
+    fn finish_with_halt_joins_cleanly_when_consumer_finishes_in_grace() {
+        // A sink that adds a short artificial delay in `close` to
+        // simulate a consumer that is "nearly done" when halt fires.
+        struct SlowCloseSink {
+            close_delay: Duration,
+            total: u64,
+        }
+        impl Sink<u64> for SlowCloseSink {
+            type Output = u64;
+            fn apply(&mut self, item: u64) -> Result<Flow, Error> {
+                self.total += item;
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<u64, Error> {
+                std::thread::sleep(self.close_delay);
+                Ok(self.total)
+            }
+        }
+
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            SlowCloseSink {
+                // close() sleeps 500ms — well inside the 5s grace period.
+                close_delay: Duration::from_millis(500),
+                total: 0,
+            },
+        )
+        .expect("spawn");
+        for i in 0..5u64 {
+            pipe.send(i).expect("send");
+        }
+
+        // Fire halt immediately (before the consumer has had a chance
+        // to finish its close() delay).
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+
+        let start = Instant::now();
+        // finish_with_halt drops tx (signalling EOF), then observes the
+        // pre-cancelled halt and enters the grace spin. The consumer
+        // finishes close() within 500ms, so finish_with_halt must join
+        // cleanly and return Ok with the correct total.
+        let res = pipe.finish_with_halt(Some(&halt));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(res, Ok(10)),
+            "expected Ok(10) from clean grace join, got {res:?}"
+        );
+        // Must return well before the full grace timeout (the consumer
+        // finishes in ~500ms, so total elapsed should be well under 3s).
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "grace join took too long: {elapsed:?}"
+        );
+    }
+
+    /// Regression: `finish_with_halt` with no halt token and a consumer
+    /// that completes normally must still return `Ok` (the None-halt
+    /// polling path is unchanged by the grace-period fix). This is the
+    /// pre-existing happy-path test reproduced with an explicit timing
+    /// floor to guard against spurious early returns.
+    #[test]
+    fn finish_with_halt_no_halt_token_normal_completion() {
+        let pipe = Pipeline::spawn(DEFAULT_PIPELINE_DEPTH, SumSink { total: 0 }).expect("spawn");
+        for i in 0..20u64 {
+            pipe.send(i).expect("send");
+        }
+        let res = pipe.finish_with_halt(None);
+        assert!(matches!(res, Ok(190)), "expected Ok(190), got {res:?}");
     }
 }

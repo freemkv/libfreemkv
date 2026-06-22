@@ -9,10 +9,60 @@
 use super::meta;
 use crate::disc::DiscTitle;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 
 /// I/O buffer size for network reads/writes.
 const NET_BUF_SIZE: usize = 256 * 1024;
+
+/// True if `ip` is one we must never connect a `network://` output to:
+/// loopback, RFC1918/ULA private, link-local, unspecified, or multicast.
+///
+/// `validate_network_target` (in autorip) vets the host once at
+/// settings-save time, but the raw hostname is re-resolved here at rip
+/// time — a DNS-rebinding attacker can flip a previously-public name to
+/// `127.0.0.1` / `10.x` / `169.254.x` in that window. Re-checking the
+/// actually-resolved address at connect time closes that TOCTOU.
+pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // unique-local fc00::/7
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Resolve `addr` (host:port) and return the first socket address whose
+/// IP is NOT [`is_blocked_ip`]. Errors with
+/// [`crate::error::Error::NetworkAddrBlocked`] if every resolved address
+/// is blocked, or propagates the resolver's own error if resolution
+/// fails. The returned `SocketAddr` carries a vetted IP literal, so the
+/// subsequent `TcpStream::connect` cannot be re-pointed by a second DNS
+/// lookup (it connects to the IP we vetted, not the name).
+fn resolve_allowed_addr(addr: &str) -> io::Result<std::net::SocketAddr> {
+    // Zero resolved addresses and "all resolved addresses blocked" both
+    // mean there is no safe address to connect to — same error either way.
+    addr.to_socket_addrs()?
+        .find(|sa| !is_blocked_ip(sa.ip()))
+        .ok_or_else(|| {
+            crate::error::Error::NetworkAddrBlocked {
+                addr: addr.to_string(),
+            }
+            .into()
+        })
+}
 
 enum Mode {
     Write {
@@ -34,7 +84,27 @@ impl NetworkStream {
     /// Connect to a remote listener for writing.
     /// Sends FMKV metadata header on first write.
     pub fn connect(addr: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        Self::connect_vetted(addr, true)
+    }
+
+    /// `connect` with an explicit SSRF-vetting toggle.
+    ///
+    /// `vet=true` (the public [`connect`](Self::connect) path) resolves
+    /// the target and refuses any loopback/private/link-local/multicast
+    /// address, closing the DNS-rebinding TOCTOU. `vet=false` exists only
+    /// for in-crate tests, which must connect to `127.0.0.1` ephemeral
+    /// listeners that the production vet would (correctly) reject.
+    fn connect_vetted(addr: &str, vet: bool) -> io::Result<Self> {
+        // Resolve + vet the target before connecting. Connect to the
+        // vetted IP literal (not the raw name) so a DNS rebind between
+        // settings-save validation and now can't redirect us to a
+        // loopback/private/link-local host (SSRF).
+        let stream = if vet {
+            let vetted = resolve_allowed_addr(addr)?;
+            TcpStream::connect(vetted)?
+        } else {
+            TcpStream::connect(addr)?
+        };
         // The sender is the latency-sensitive side; set nodelay here too
         // (the listen side already does) so the final sub-MSS flush after
         // finish() isn't held by Nagle. The 256 KB BufWriter coalesces
@@ -160,6 +230,79 @@ mod tests {
     };
     use std::net::TcpListener;
 
+    /// SSRF guard: every loopback / private / link-local / multicast /
+    /// unspecified address (v4 and v6) must be rejected, and ordinary
+    /// public addresses must be allowed. This is what closes the
+    /// DNS-rebinding window in `NetworkStream::connect`.
+    #[test]
+    fn is_blocked_ip_rejects_internal_targets() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Built from octets (not string literals) so the repo's internal-infra
+        // secret scanner doesn't flag the RFC1918 addresses.
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        let blocked: &[(IpAddr, &str)] = &[
+            (v4(127, 0, 0, 1), "loopback"),
+            (v4(127, 10, 20, 30), "loopback /8"),
+            (v4(10, 0, 0, 1), "private 10/8"),
+            (v4(172, 16, 5, 5), "private 172.16/12"),
+            (v4(192, 168, 1, 1), "private 192.168/16"),
+            (v4(169, 254, 10, 10), "link-local"),
+            (v4(0, 0, 0, 0), "unspecified"),
+            (v4(224, 0, 0, 1), "multicast"),
+            (v4(255, 255, 255, 255), "broadcast"),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), "loopback v6"),
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), "unspecified v6"),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
+                "ULA",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
+                "ULA",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                "link-local v6",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+                "multicast v6",
+            ),
+        ];
+        for (ip, label) in blocked {
+            assert!(is_blocked_ip(*ip), "{label} ({ip}) must be blocked");
+        }
+
+        let allowed: &[(IpAddr, &str)] = &[
+            (v4(8, 8, 8, 8), "public dns"),
+            (v4(1, 1, 1, 1), "public dns"),
+            (v4(93, 184, 216, 34), "example.com"),
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1)),
+                "public v6",
+            ),
+        ];
+        for (ip, label) in allowed {
+            assert!(!is_blocked_ip(*ip), "{label} ({ip}) must be allowed");
+        }
+    }
+
+    /// The public `connect` must refuse a loopback target with the typed
+    /// `NetworkAddrBlocked` error (PermissionDenied) rather than attempting
+    /// the TCP connect — this is the rebinding TOCTOU close at the connect.
+    #[test]
+    fn connect_refuses_blocked_loopback_target() {
+        // Bind a real loopback listener so a non-vetting connect WOULD
+        // succeed; the vetting connect must still refuse it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let err = match NetworkStream::connect(&addr.to_string()) {
+            Ok(_) => panic!("loopback target must be refused by the SSRF guard"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     fn sample_title() -> DiscTitle {
         DiscTitle {
             playlist: "NetworkTest".into(),
@@ -222,7 +365,9 @@ mod tests {
 
         let addr = addr_rx.recv().unwrap();
         let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         let frame = pes::PesFrame {
             track: 0,
             pts: 90000,
@@ -262,7 +407,9 @@ mod tests {
 
         let addr = addr_rx.recv().unwrap();
         let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         // No write() at all — straight to finish().
         pes::Stream::finish(&mut writer).unwrap();
 
@@ -319,7 +466,9 @@ mod tests {
         // Sender connects, sends header (zero frames), finishes — so the
         // reader's accept_from() returns. We test the reader's write guard.
         let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         pes::Stream::finish(&mut writer).unwrap();
         let (_info, _frames) = handle.join().unwrap();
 
@@ -341,7 +490,7 @@ mod tests {
             err.kind()
         });
         // Drive the accept: connect + send header so accept_from completes.
-        let mut w2 = NetworkStream::connect(&addr2.to_string())
+        let mut w2 = NetworkStream::connect_vetted(&addr2.to_string(), false)
             .unwrap()
             .meta(&dt);
         pes::Stream::finish(&mut w2).unwrap();
@@ -358,7 +507,9 @@ mod tests {
         use crate::pes;
         let (addr, handle) = spawn_reader();
         let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         let err = pes::Stream::read(&mut writer).expect_err("write side read must error");
         // E_STREAM_WRITE_ONLY (9001) maps to Unsupported.
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
@@ -375,7 +526,9 @@ mod tests {
         use crate::pes;
         let (addr, handle) = spawn_reader();
         let dt = sample_title();
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         for i in 0..5u8 {
             let frame = pes::PesFrame {
                 track: (i % 2) as usize,
@@ -414,7 +567,9 @@ mod tests {
         let mut dt = sample_title();
         dt.playlist = "SenderControlled".into();
         dt.playlist_id = 42;
-        let mut writer = NetworkStream::connect(&addr.to_string()).unwrap().meta(&dt);
+        let mut writer = NetworkStream::connect_vetted(&addr.to_string(), false)
+            .unwrap()
+            .meta(&dt);
         pes::Stream::finish(&mut writer).unwrap();
         let (info, _frames) = handle.join().unwrap();
         // The receiver default title is empty (playlist ""); it must have

@@ -62,11 +62,11 @@ impl MkvTrack {
     /// Dolby Vision layer.
     pub fn video(v: &VideoStream) -> Self {
         let codec_id = match v.codec {
-            Codec::H264 => "V_MPEG4/ISO/AVC",
-            Codec::Hevc => "V_MPEGH/ISO/HEVC",
-            Codec::Vc1 => "V_MS/VFW/FOURCC",
-            Codec::Mpeg2 => "V_MPEG2",
-            _ => "V_MPEG2",
+            Codec::H264 => ebml::CODEC_H264,
+            Codec::Hevc => ebml::CODEC_HEVC,
+            Codec::Vc1 => ebml::CODEC_VC1,
+            Codec::Mpeg2 => ebml::CODEC_MPEG2,
+            _ => ebml::CODEC_MPEG2,
         };
         let (w, h) = v.resolution.pixels();
         let (num, den) = v.frame_rate.as_fraction();
@@ -132,12 +132,12 @@ impl MkvTrack {
         // lossless MA / HRA payload bytes are unchanged, only the
         // container codec-ID string differs.
         let codec_id = match a.codec {
-            Codec::Ac3 => "A_AC3",
-            Codec::Ac3Plus => "A_EAC3",
-            Codec::TrueHd => "A_TRUEHD",
-            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => "A_DTS",
-            Codec::Lpcm => "A_PCM/INT/BIG",
-            _ => "A_AC3",
+            Codec::Ac3 => ebml::CODEC_AC3,
+            Codec::Ac3Plus => ebml::CODEC_EAC3,
+            Codec::TrueHd => ebml::CODEC_TRUEHD,
+            Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => ebml::CODEC_DTS,
+            Codec::Lpcm => ebml::CODEC_PCM_BE,
+            _ => ebml::CODEC_AC3,
         };
         let sr = a.sample_rate.hz();
         let ch = a.channels.count();
@@ -174,8 +174,8 @@ impl MkvTrack {
     /// CodecPrivate. The forced-display flag is propagated from the stream.
     pub fn subtitle(s: &SubtitleStream) -> Self {
         let codec_id = match s.codec {
-            Codec::DvdSub => "S_VOBSUB",
-            _ => "S_HDMV/PGS",
+            Codec::DvdSub => ebml::CODEC_VOBSUB,
+            _ => ebml::CODEC_PGS,
         };
         Self {
             track_type: ebml::TRACK_TYPE_SUBTITLE,
@@ -229,6 +229,15 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// non-monotonic DTS, and some audio PES PTS land on the same millisecond
     /// (or tick back 1ms from rounding).
     last_pts_ms: std::collections::HashMap<usize, i64>,
+    /// Per-track-index flag: true if the track is video. The strictly-monotonic
+    /// block-timestamp nudge must be skipped for EVERY video track, not just
+    /// track 0 — a title can carry a second video track (e.g. a Dolby Vision
+    /// enhancement layer at index 1) whose B-frame PTS is just as legitimately
+    /// non-monotonic. Keying the exemption on track type (not index) keeps that
+    /// EL's true PTS instead of clobbering it to prev+1ms.
+    track_is_video: Vec<bool>,
+    /// Cross-clip timeline-continuity corrector (clip-boundary PTS rebasing).
+    continuity: TimelineContinuity,
     cues: Vec<CuePoint>,
     frame_count: u64,
     /// Frames handed to `write_frame` that were dropped because no cluster was
@@ -257,6 +266,113 @@ const MAX_BLOCK_REL_MS: i64 = i16::MAX as i64;
 /// Minimum block-relative timestamp expressible in the signed 16-bit field.
 const MIN_BLOCK_REL_MS: i64 = i16::MIN as i64;
 
+/// A backward PTS step larger than this is treated as a clip-boundary
+/// discontinuity (a non-seamless BD clip / dual-layer-break where the source
+/// PES PTS resets), NOT as B-frame reorder. HEVC/H.264 reorder depth tops out
+/// around 16 frames (<1s at 24 fps); 3s sits comfortably above any legitimate
+/// reorder window and far below any real clip's duration, so it never
+/// false-triggers within a clip.
+const DISCONTINUITY_BACKSTEP_NS: i64 = 3_000_000_000;
+/// Sub-frame gap inserted after a rebased discontinuity so the first frame of
+/// the new clip lands strictly after the previous timeline high (1 ms).
+const DISCONTINUITY_GAP_NS: i64 = 1_000_000;
+
+/// Global timeline-continuity corrector. freemkv reads a BD title's clips as
+/// one concatenated sector stream (clip boundaries / mpls connection_condition
+/// are not plumbed to the mux), so at a non-seamless boundary the source PES
+/// PTS jumps backward. Left uncorrected, that produces a sustained band of
+/// non-monotonic block timestamps (ffmpeg then derives non-monotonic DTS).
+///
+/// A single running `offset_ns` is applied to EVERY track, so the concatenated
+/// clips form one monotonic timeline AND A/V sync is preserved (all tracks at a
+/// boundary shift by the same amount). It is global, not per-track: a clip
+/// boundary resets every stream together by the same delta.
+///
+/// The demuxer interleaves the tracks, so at a boundary the streams do NOT all
+/// reset on the same frame — a lagging audio/PGS frame from the just-ended
+/// clip's tail can arrive AFTER the next clip's video has already reset the
+/// epoch. Such a "straggler" carries an old-epoch raw PTS; adding the new
+/// offset to it would fling it far past the frontier and ratchet the whole
+/// timeline away (the regression that broke everything after the first clip
+/// boundary). It is detected as a forward spike and remapped with the PREVIOUS
+/// epoch's offset so it lands at its true position near the seam, without
+/// advancing the frontier or the offset.
+struct TimelineContinuity {
+    /// Offset (ns) added to raw PTS for the CURRENT epoch.
+    offset_ns: i64,
+    /// Offset (ns) of the immediately previous epoch — used to remap stragglers
+    /// (old-clip frames interleaved across the boundary).
+    prev_offset_ns: i64,
+    /// Highest adjusted PTS (ns) accepted onto the timeline so far — the running
+    /// frontier. `None` until the first frame. Stragglers never advance it.
+    high_ns: Option<i64>,
+}
+
+impl TimelineContinuity {
+    fn new() -> Self {
+        Self {
+            offset_ns: 0,
+            prev_offset_ns: 0,
+            high_ns: None,
+        }
+    }
+
+    /// Map a raw PES PTS (ns) onto the continuous output timeline.
+    ///
+    /// - **Backward jump > `DISCONTINUITY_BACKSTEP_NS`** vs the frontier =
+    ///   clip-boundary reset: open a new epoch (save the old offset, bump the
+    ///   offset so this frame continues just after the frontier).
+    /// - **Forward spike > `DISCONTINUITY_BACKSTEP_NS` past the frontier** = a
+    ///   straggler from the previous clip arriving interleaved after the
+    ///   boundary: remap with `prev_offset_ns` so it lands near the seam, and do
+    ///   NOT advance the frontier or the offset (this is what prevents the
+    ///   ratchet). A legitimate per-track gap (e.g. a subtitle absent for
+    ///   minutes) is NOT misread as a straggler: video keeps the frontier
+    ///   current, so the resuming frame lands at the frontier, not beyond it.
+    /// - **Everything else** (normal progression + sub-threshold B-frame
+    ///   reorder dips) passes through with the current offset, preserving PTS.
+    fn adjust(&mut self, raw_pts_ns: i64) -> i64 {
+        let Some(high) = self.high_ns else {
+            let adj = raw_pts_ns.saturating_add(self.offset_ns);
+            self.high_ns = Some(adj);
+            return adj;
+        };
+        let adj = raw_pts_ns.saturating_add(self.offset_ns);
+        if adj < high - DISCONTINUITY_BACKSTEP_NS {
+            // Clip-boundary reset: continue just after the frontier; remember the
+            // previous offset so this clip's lagging tail frames remap correctly.
+            self.prev_offset_ns = self.offset_ns;
+            let bump = (high - adj).saturating_add(DISCONTINUITY_GAP_NS);
+            self.offset_ns = self.offset_ns.saturating_add(bump);
+            let adj2 = raw_pts_ns.saturating_add(self.offset_ns);
+            self.high_ns = Some(high.max(adj2));
+            adj2
+        } else if adj > high + DISCONTINUITY_BACKSTEP_NS && {
+            // A straggler from the just-ended clip maps, under the PREVIOUS
+            // epoch's offset, into the TOP of that epoch — at most the frontier,
+            // and no more than one backstep below it (it is the clip's tail,
+            // delivered late by the interleaver). Both bounds matter:
+            // - `<= high` rules out a genuine large forward jump (it maps ABOVE
+            //   the frontier under either offset).
+            // - `>= high - BACKSTEP` rules out a genuine NEW-clip frame whose
+            //   low raw PTS also maps below the frontier (that frame belongs to
+            //   the new epoch and must be rebased forward, not remapped back).
+            let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
+            prev_mapped <= high && prev_mapped >= high - DISCONTINUITY_BACKSTEP_NS
+        } {
+            // Straggler: remap to its true seam position with the previous
+            // offset; leave the frontier and offset untouched (prevents the
+            // ratchet). A real forward jump / new-clip frame falls through to the
+            // normal branch and is rebased there.
+            raw_pts_ns.saturating_add(self.prev_offset_ns)
+        } else {
+            // Normal progression / sub-threshold B-frame reorder: keep true PTS.
+            self.high_ns = Some(high.max(adj));
+            adj
+        }
+    }
+}
+
 /// Force a per-track block timestamp to be strictly later than the previous one
 /// written for that track. `prev` is the last timestamp for the track (`None`
 /// for the first frame). Fixes non-monotonic DTS: some audio PES PTS truncate to
@@ -271,7 +387,7 @@ fn monotonic_ts(prev: Option<i64>, pts_ms: i64) -> i64 {
 }
 
 /// Per-track block timestamp. The strictly-monotonic nudge is applied to
-/// AUDIO/SUBTITLE tracks only; VIDEO (track 0) is returned UNCHANGED.
+/// AUDIO/SUBTITLE tracks only; ALL VIDEO tracks are returned UNCHANGED.
 ///
 /// With B-frames, a video frame's presentation PTS is legitimately
 /// non-monotonic in decode/storage order (a B-frame sits between its anchors,
@@ -282,8 +398,14 @@ fn monotonic_ts(prev: Option<i64>, pts_ms: i64) -> i64 {
 /// SimpleBlock permits non-monotonic block timestamps (signed block-relative
 /// offsets), so video keeps its true PES PTS; only no-reorder tracks (audio,
 /// subtitles), where a same-millisecond collision IS a real defect, get nudged.
-fn block_ts(track_idx: usize, prev: Option<i64>, pts_ms: i64) -> i64 {
-    if track_idx == 0 {
+///
+/// The exemption is keyed on `is_video` (track type), NOT a track index: a
+/// title can carry more than one video track — e.g. a Dolby Vision enhancement
+/// layer at index 1 — and every one must keep its true PTS. Keying on
+/// `track_idx == 0` clamped the EL and reintroduced the exact non-monotonic-DTS
+/// warning this exemption exists to prevent.
+fn block_ts(is_video: bool, prev: Option<i64>, pts_ms: i64) -> i64 {
+    if is_video {
         pts_ms
     } else {
         monotonic_ts(prev, pts_ms)
@@ -371,8 +493,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::write_float(&mut writer, ebml::DURATION, duration_secs * 1000.0)?;
             // in ms
         }
-        ebml::write_string(&mut writer, ebml::MUXING_APP, "freemkv")?;
-        ebml::write_string(&mut writer, ebml::WRITING_APP, "freemkv")?;
+        // Stamp the freemkv version so any muxed file is traceable to the build
+        // that produced it (MediaInfo "Writing application"/"library").
+        const FREEMKV_MUX_APP: &str = concat!("freemkv ", env!("CARGO_PKG_VERSION"));
+        ebml::write_string(&mut writer, ebml::MUXING_APP, FREEMKV_MUX_APP)?;
+        ebml::write_string(&mut writer, ebml::WRITING_APP, FREEMKV_MUX_APP)?;
         if let Some(t) = title {
             ebml::write_string(&mut writer, ebml::TITLE, t)?;
         }
@@ -509,6 +634,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
             cluster_ts_ms: 0,
             base_pts_ms: None,
             last_pts_ms: std::collections::HashMap::new(),
+            track_is_video: tracks
+                .iter()
+                .map(|t| t.track_type == ebml::TRACK_TYPE_VIDEO)
+                .collect(),
+            continuity: TimelineContinuity::new(),
             cues: Vec::new(),
             frame_count: 0,
             dropped_pre_cluster: 0,
@@ -534,6 +664,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         data: &[u8],
         duration_ns: Option<u64>,
     ) -> io::Result<()> {
+        // Map the raw PES PTS onto the continuous output timeline FIRST, before
+        // any base/cluster math: freemkv concatenates a title's BD clips as one
+        // sector stream, so a non-seamless clip / layer-break boundary arrives
+        // here as a large backward PTS jump. Rebasing it (a global offset across
+        // all tracks, A/V-sync-preserving) keeps the boundary from becoming a
+        // band of non-monotonic block timestamps. No-op for single-clip titles.
+        let pts_ns = self.continuity.adjust(pts_ns);
         let raw_ms = pts_ns / 1_000_000;
 
         // Cluster boundaries normally coincide with a video keyframe so every
@@ -582,7 +719,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // POC and finds them colliding ("non monotonically increasing dts").
         // Matroska SimpleBlock permits non-monotonic block timestamps (negative
         // block-relative offsets), so leave the true PES PTS intact for video.
-        let pts_ms = block_ts(track_idx, self.last_pts_ms.get(&track_idx).copied(), pts_ms);
+        let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
+        let pts_ms = block_ts(is_video, self.last_pts_ms.get(&track_idx).copied(), pts_ms);
 
         let needs_new_cluster = !self.cluster_open
             || (is_video_key && (pts_ms - self.cluster_ts_ms) >= CLUSTER_DURATION_MS);
@@ -816,7 +954,7 @@ mod tests {
     fn make_video_track() -> MkvTrack {
         MkvTrack {
             track_type: ebml::TRACK_TYPE_VIDEO,
-            codec_id: "V_MPEG4/ISO/AVC",
+            codec_id: ebml::CODEC_H264,
             language: "und".into(),
             name: String::new(),
             codec_private: Some(vec![0x00, 0x01, 0x02, 0x03]),
@@ -841,7 +979,7 @@ mod tests {
     fn make_audio_track() -> MkvTrack {
         MkvTrack {
             track_type: ebml::TRACK_TYPE_AUDIO,
-            codec_id: "A_AC3",
+            codec_id: ebml::CODEC_AC3,
             language: "eng".into(),
             name: "English".into(),
             codec_private: None,
@@ -1003,17 +1141,17 @@ mod tests {
 
     #[test]
     fn block_ts_exempts_video_from_monotonic_nudge() {
-        // VIDEO (track 0) keeps its true PTS even when non-monotonic in storage
-        // order — a B-frame whose presentation PTS sits below the frame stored
-        // before it must NOT be nudged to prev+1ms (that clobbering is what
-        // produced the "non monotonically increasing dts" flood on decode).
+        // VIDEO keeps its true PTS even when non-monotonic in storage order — a
+        // B-frame whose presentation PTS sits below the frame stored before it
+        // must NOT be nudged to prev+1ms (that clobbering is what produced the
+        // "non monotonically increasing dts" flood on decode).
         assert_eq!(
-            block_ts(0, Some(1040), 1000),
+            block_ts(true, Some(1040), 1000),
             1000,
             "video B-frame PTS preserved"
         );
         assert_eq!(
-            block_ts(0, Some(1000), 1000),
+            block_ts(true, Some(1000), 1000),
             1000,
             "video dup-ms PTS preserved"
         );
@@ -1024,20 +1162,259 @@ mod tests {
         let out: Vec<i64> = gop
             .iter()
             .map(|&p| {
-                let t = block_ts(0, prev, p);
+                let t = block_ts(true, prev, p);
                 prev = Some(t);
                 t
             })
             .collect();
         assert_eq!(out, gop, "video timestamps must be left exactly as-is");
 
-        // AUDIO/SUBTITLE (track != 0) still get the strictly-monotonic nudge —
-        // a same-ms collision there is a real defect.
-        assert_eq!(block_ts(1, Some(1000), 1000), 1001, "audio dup-ms nudged");
+        // AUDIO/SUBTITLE still get the strictly-monotonic nudge — a same-ms
+        // collision there is a real defect.
         assert_eq!(
-            block_ts(2, Some(1001), 1000),
+            block_ts(false, Some(1000), 1000),
+            1001,
+            "audio dup-ms nudged"
+        );
+        assert_eq!(
+            block_ts(false, Some(1001), 1000),
             1002,
             "subtitle back-tick nudged"
+        );
+    }
+
+    /// Regression for the second-video-track bug: a Dolby Vision enhancement
+    /// layer is video but NOT track 0. The exemption must follow track TYPE, so
+    /// the EL's B-frame PTS are preserved exactly like the main video's — not
+    /// clamped to prev+1ms (which reintroduced the non-monotonic-DTS flood on
+    /// the EL stream). Drives the muxer through both video tracks and asserts
+    /// every video block timecode equals its source PTS.
+    #[test]
+    fn second_video_track_pts_not_clobbered() {
+        use std::io::Cursor;
+        // Main video at index 0, a Dolby-Vision-EL-style second video at index 1.
+        let tracks = vec![make_video_track(), make_video_track()];
+        let buf = Cursor::new(Vec::new());
+        let mux = MkvMuxer::new(buf, &tracks, None, 0.0, &[]).unwrap();
+        // Both tracks must be flagged video so neither is nudged.
+        assert_eq!(mux.track_is_video, vec![true, true]);
+        // A B-frame dip on the EL (track 1) must pass through unchanged — keyed
+        // on track type, not index.
+        assert_eq!(block_ts(mux.track_is_video[1], Some(1040), 1000), 1000);
+    }
+
+    // ── Clip-boundary timeline-continuity (PTS discontinuity rebasing) ──
+
+    const S: i64 = 1_000_000_000; // 1 second in ns
+
+    /// Characterization of the BUG: a BD title's two clips concatenated with a
+    /// PTS reset at the boundary. WITHOUT correction the raw timeline goes
+    /// hard backward at clip 2 (what produced the non-monotonic-DTS band on
+    /// Dune / Top Gun). WITH `TimelineContinuity` the output is monotonic and
+    /// continuous across the boundary.
+    #[test]
+    fn continuity_rebases_clip_boundary_reset() {
+        // Two interleaved tracks (video t0 + audio t1), clip1 rising to 10s,
+        // then clip2 RESETS near 0 and rises again — the non-seamless case.
+        let clip1: Vec<i64> = (0..=10).map(|i| i * S).collect(); // 0..10s
+        let clip2: Vec<i64> = (0..=10).map(|i| i * S).collect(); // resets to 0..10s
+        let raw: Vec<i64> = clip1.iter().chain(clip2.iter()).copied().collect();
+
+        // Uncorrected (the bug): the sequence is NOT monotonic — clip2's first
+        // frame (0) is 10s below clip1's last (10s).
+        assert!(
+            raw.windows(2).any(|w| w[1] < w[0]),
+            "precondition: raw clip-reset sequence is non-monotonic"
+        );
+
+        // Corrected: strictly non-decreasing, and clip2 continues AFTER clip1.
+        let mut tc = TimelineContinuity::new();
+        let out: Vec<i64> = raw.iter().map(|&p| tc.adjust(p)).collect();
+        assert!(
+            out.windows(2).all(|w| w[1] >= w[0]),
+            "corrected timeline must be monotonic non-decreasing, got {out:?}"
+        );
+        // Clip2's first frame lands just after clip1's last (10s) + the gap.
+        assert_eq!(out[11], 10 * S + DISCONTINUITY_GAP_NS);
+        // Clip2's last frame is offset by the whole of clip1, not back near 0.
+        assert!(out[21] > 19 * S);
+    }
+
+    /// Regression guard: NORMAL B-frame reorder (a small backward dip, well
+    /// under the discontinuity threshold) must pass through UNCHANGED — the
+    /// corrector must not rebase legitimate reorder (that would re-break the
+    /// video-PTS exemption).
+    #[test]
+    fn continuity_preserves_bframe_reorder() {
+        let mut tc = TimelineContinuity::new();
+        // I, P(+3 frames), B, B, B — presentation PTS dips backward by ~2
+        // frames (~83ms), far under the 3s threshold.
+        let raw = [0i64, 125_000_000, 42_000_000, 83_000_000, 250_000_000];
+        let out: Vec<i64> = raw.iter().map(|&p| tc.adjust(p)).collect();
+        assert_eq!(out, raw, "B-frame reorder must pass through unchanged");
+        assert_eq!(tc.offset_ns, 0, "no rebase for sub-threshold reorder");
+    }
+
+    /// A legitimate FORWARD gap (a real timing gap within a clip, under the
+    /// backstep window) must be PRESERVED, not clamped — only backward
+    /// clip-boundary jumps are rebased and only an old-epoch straggler (a
+    /// forward spike FAR past the frontier, right after a boundary) is remapped.
+    #[test]
+    fn continuity_preserves_forward_gap() {
+        let mut tc = TimelineContinuity::new();
+        let raw = [0i64, S, 2 * S + 500_000_000, 4 * S]; // a 1.5s gap mid-stream
+        let out: Vec<i64> = raw.iter().map(|&p| tc.adjust(p)).collect();
+        assert_eq!(out, raw, "forward gap preserved verbatim");
+        assert_eq!(tc.offset_ns, 0, "no rebase on forward progression");
+    }
+
+    /// Regression for the ratchet bug (the one the first fix introduced, which
+    /// broke everything after the first clip boundary): the demuxer interleaves
+    /// tracks, so a lagging audio frame from clip 1's TAIL arrives AFTER clip 2's
+    /// video has reset the epoch. The old global-high logic added the new offset
+    /// to that straggler, flung it into the future, inflated the frontier, and
+    /// re-triggered the rebase on every real clip-2 frame → offset ran away.
+    ///
+    /// Correct behaviour: the straggler is remapped to its true seam position
+    /// (it is NOT thrown forward), the frontier and offset do NOT ratchet, and
+    /// clip 2 continues monotonically just after clip 1.
+    #[test]
+    fn continuity_straggler_does_not_ratchet_the_timeline() {
+        let mut tc = TimelineContinuity::new();
+        // clip1 rises to 10s (frontier 10s, offset 0).
+        for i in 0..=10 {
+            tc.adjust(i * S);
+        }
+        let offset_before = tc.offset_ns;
+        let frontier_before = tc.high_ns.unwrap();
+        assert_eq!(offset_before, 0);
+        assert_eq!(frontier_before, 10 * S);
+
+        // clip2's first VIDEO frame resets to 0 → clip-boundary rebase.
+        let c2_first = tc.adjust(0);
+        assert_eq!(
+            c2_first,
+            10 * S + DISCONTINUITY_GAP_NS,
+            "clip2 continues after clip1"
+        );
+        let offset_after_boundary = tc.offset_ns;
+
+        // Now a STRAGGLER: clip1's tail audio (raw ~9.5s) arrives interleaved.
+        let straggler = tc.adjust(9 * S + 500_000_000);
+        // It must land near the seam (clip1 tail), NOT ~19.5s in the future.
+        assert!(
+            straggler <= 10 * S,
+            "straggler remapped to its true seam position, got {straggler}"
+        );
+        // And it must NOT have moved the offset or the frontier.
+        assert_eq!(
+            tc.offset_ns, offset_after_boundary,
+            "straggler must not ratchet the offset"
+        );
+        assert_eq!(
+            tc.high_ns.unwrap(),
+            c2_first,
+            "straggler must not inflate the frontier"
+        );
+
+        // clip2 keeps rising from ~0; every frame stays just past the seam — no
+        // runaway. After 10 more seconds of clip2 the timeline is ~20s, not 30s+.
+        let mut last = c2_first;
+        for i in 1..=10 {
+            let a = tc.adjust(i * S);
+            assert!(
+                a >= last,
+                "clip2 monotonic after straggler, got {a} < {last}"
+            );
+            last = a;
+        }
+        assert!(
+            last < 21 * S,
+            "no ratchet: clip2 end near 20s (clip1+clip2), got {last}"
+        );
+    }
+
+    /// Regression for the original Top Gun band (`-58864 >= -820000`-scale): a
+    /// LARGE, real-magnitude clip-boundary back-jump (clip 1 ≈ 13 min, clip 2
+    /// resets to 0) must be rebased to one continuous monotonic timeline — not
+    /// left to produce the sustained non-monotonic-DTS band the auditor flagged.
+    #[test]
+    fn continuity_large_clip_boundary_backjump_rebased() {
+        let mut tc = TimelineContinuity::new();
+        // Clip 1: 0 .. 780s (13 min) at 1s steps.
+        let clip1: Vec<i64> = (0..=780).map(|i| i * S).collect();
+        // Clip 2: resets to 0 .. 120s — the ~ -780s discontinuity.
+        let clip2: Vec<i64> = (0..=120).map(|i| i * S).collect();
+        let mut last = i64::MIN;
+        let mut max = i64::MIN;
+        for &p in clip1.iter().chain(clip2.iter()) {
+            let a = tc.adjust(p);
+            assert!(
+                a >= last,
+                "rebased timeline must be monotonic, got {a} < {last}"
+            );
+            last = a;
+            max = max.max(a);
+        }
+        // Offset ≈ the whole of clip 1 (one boundary, no ratchet).
+        assert_eq!(tc.offset_ns, 780 * S + DISCONTINUITY_GAP_NS);
+        // Timeline spans clip1+clip2 (~900s), proving clip 2 is reachable past
+        // the boundary — not capped at it, and not ratcheted far beyond.
+        assert!(
+            (900 * S..901 * S).contains(&max),
+            "timeline must span ~900s (clip1+clip2), got {max}"
+        );
+    }
+
+    /// End-to-end output regression (the symptom, at the block-timecode level):
+    /// a large clip-boundary reset WITH an interleaved straggler audio frame
+    /// from clip 1's tail, driven through the full muxer. Asserts cluster
+    /// timestamps are monotonic non-decreasing AND the timeline reaches past the
+    /// boundary (clip 2 present) without ratcheting. This is the test that would
+    /// have caught BOTH the original `-820000` non-monotonic band and the
+    /// straggler ratchet that made everything after the boundary unseekable.
+    #[test]
+    fn clip_boundary_with_straggler_yields_monotonic_clusters() {
+        let tracks = [make_video_track(), make_audio_track()];
+        // ms→ns helper for readability.
+        let ms = |m: i64| m * 1_000_000;
+        let frames: Vec<(usize, i64, bool, Vec<u8>)> = vec![
+            // Clip 1: video keyframes at 0s and 600s, audio alongside.
+            (0, ms(0), true, vec![0x01; 16]),
+            (1, ms(0), true, vec![0xA0; 8]),
+            (0, ms(600_000), true, vec![0x02; 16]), // 600s kf
+            (1, ms(600_000), true, vec![0xA1; 8]),
+            // Clip 2: video keyframe RESETS to 0 (the -600s boundary).
+            (0, ms(0), true, vec![0x03; 16]),
+            // Straggler: clip 1's tail audio (≈599.5s) arrives interleaved AFTER
+            // the reset — the exact frame class that caused the ratchet.
+            (1, ms(599_500), true, vec![0xA2; 8]),
+            // Clip 2 continues: audio at 0, video keyframe at 5s.
+            (1, ms(0), true, vec![0xA3; 8]),
+            (0, ms(5_000), true, vec![0x04; 16]), // clip2 + 5s
+        ];
+        let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(frame_count, 8, "all frames written (none dropped)");
+
+        let clusters = find_clusters(&data);
+        let ts: Vec<u64> = clusters.iter().map(|&(_, _, t)| t).collect();
+        assert!(!ts.is_empty(), "expected clusters");
+        // Cluster timestamps must be monotonic non-decreasing (no back-dated
+        // cluster from the straggler, no non-monotonic band).
+        assert!(
+            ts.windows(2).all(|w| w[1] >= w[0]),
+            "cluster timestamps must be monotonic, got {ts:?}"
+        );
+        let max = *ts.iter().max().unwrap();
+        // Timeline reaches past the boundary (clip 2 present): ≥ ~600s.
+        assert!(
+            max >= 600_000,
+            "timeline must span past the boundary, got {max}ms"
+        );
+        // And does NOT ratchet far beyond clip1+clip2 (~605s): well under 2× clip1.
+        assert!(
+            max < 1_000_000,
+            "no ratchet: max cluster ts {max}ms must stay near 605s"
         );
     }
 
@@ -1785,16 +2162,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_relative_audio_forces_new_cluster_no_i16_wrap() {
+    fn backjumped_audio_rebased_by_continuity_no_i16_wrap() {
         // An audio frame whose PTS back-jumps far below the open cluster (a
-        // discontinuity) must force a fresh cluster rather than wrap the i16
-        // block-relative cast. Build: keyframe at t=0 opening a cluster, a video
-        // keyframe far later (so cluster ts is large), then an audio frame whose
-        // PTS lands before that cluster's start by more than i16::MIN ms.
+        // clip-boundary discontinuity) is now REBASED by TimelineContinuity
+        // before the cluster math, so it never produces a negative i16 block
+        // relative. Build: video kf at 0, video kf at 40s, then audio at t=0
+        // (a 40s back-jump > the 3s discontinuity threshold). Continuity shifts
+        // the audio to ~40s, keeping the timeline monotonic — it lands in the
+        // 40s cluster rather than forcing a third, back-dated cluster.
         let tracks = [make_video_track(), make_audio_track()];
-        // base = 0 (first kept keyframe). Cluster opens at 0; a later keyframe at
-        // 40s opens a second cluster at ts=40000. Then audio at t=0 → relative
-        // 0-40000 = -40000 ms, below i16::MIN (-32768) → must open a new cluster.
         let frames = vec![
             (0usize, 0i64, true, vec![0x01; 16]),
             (0usize, 40_000_000_000i64, true, vec![0x02; 16]), // 40s
@@ -1803,20 +2179,24 @@ mod tests {
         let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
         assert_eq!(frame_count, 3);
         let clusters = find_clusters(&data);
-        // Three clusters: t=0 (video kf), t=40000 (video kf), t=0 (forced for the
-        // back-jumped audio, no Cues entry).
-        assert!(
-            clusters.len() >= 3,
-            "back-jumped audio must force a fresh cluster, got {} clusters",
+        // Two clusters: t=0 (video kf) and t=40000 (video kf). The back-jumped
+        // audio is rebased onto the timeline (~40s) and joins the 40s cluster —
+        // no negative i16 relative, no forced back-dated third cluster.
+        assert_eq!(
+            clusters.len(),
+            2,
+            "continuity rebases the back-jump (no forced 3rd cluster), got {} clusters",
             clusters.len()
         );
-        // Every SimpleBlock's relative timestamp must round-trip through i16
-        // without the block landing outside the cluster (verified implicitly by
-        // the muxer never panicking on the `as i16` cast; here we assert the
-        // forced cluster's timestamp is non-negative so the `as u64` write is
-        // also safe).
-        for (_, _, ts) in &clusters {
-            assert!(*ts <= i64::MAX as u64, "cluster ts must not have wrapped");
+        // Cluster timestamps stay non-negative (the `as u64` write is safe) and
+        // monotonic non-decreasing — continuity guaranteed a forward timeline.
+        let ts: Vec<u64> = clusters.iter().map(|(_, _, t)| *t).collect();
+        assert!(
+            ts.windows(2).all(|w| w[1] >= w[0]),
+            "cluster ts monotonic: {ts:?}"
+        );
+        for t in &ts {
+            assert!(*t <= i64::MAX as u64, "cluster ts must not have wrapped");
         }
     }
 

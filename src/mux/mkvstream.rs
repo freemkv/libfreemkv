@@ -78,7 +78,9 @@ struct ReadState {
 
 enum Mode {
     Write {
-        muxer: Option<MkvMuxer<Box<dyn WriteSeek + Send>>>,
+        // Boxed: MkvMuxer is large relative to the Read variant; boxing keeps
+        // the Mode enum small (avoids clippy::large_enum_variant).
+        muxer: Option<Box<MkvMuxer<Box<dyn WriteSeek + Send>>>>,
     },
     Read(ReadState),
 }
@@ -126,7 +128,9 @@ impl MkvStream {
 
         Ok(Self {
             disc_title: title.clone(),
-            mode: Mode::Write { muxer: Some(muxer) },
+            mode: Mode::Write {
+                muxer: Some(Box::new(muxer)),
+            },
         })
     }
 
@@ -225,7 +229,12 @@ impl crate::pes::Stream for MkvStream {
                         }
                     }
                     if let Some(block) = block {
-                        let dur_ns = duration_ms.map(|ms| ms.saturating_mul(1_000_000));
+                        // BLOCK_DURATION is expressed in TimestampScale ticks,
+                        // not milliseconds. Scale by the segment's ts_scale_ns
+                        // (1_000_000 for freemkv's own 1 ms scale; non-default
+                        // in foreign MKVs) — same scaling PTS uses.
+                        let dur_ns =
+                            duration_ms.map(|ticks| ticks.saturating_mul(rs.ts_scale_ns as u64));
                         if let Some(frame) = parse_block(
                             &block,
                             rs.cluster_ts_ticks,
@@ -514,19 +523,33 @@ fn parse_track(
         }
     }
 
-    let codec = match codec_id.as_str() {
-        "V_MPEGH/ISO/HEVC" => Codec::Hevc,
-        "V_MPEG4/ISO/AVC" => Codec::H264,
-        "V_MS/VFW/FOURCC" => Codec::Vc1,
-        "V_MPEG2" => Codec::Mpeg2,
-        "A_AC3" => Codec::Ac3,
-        "A_EAC3" => Codec::Ac3Plus,
-        "A_TRUEHD" => Codec::TrueHd,
-        "A_DTS" => Codec::Dts,
-        "A_PCM/INT/BIG" => Codec::Lpcm,
-        "S_HDMV/PGS" => Codec::Pgs,
-        "S_VOBSUB" => Codec::DvdSub,
-        _ => Codec::Unknown(0),
+    // &str consts can't be `match` patterns, so compare via guards — this keeps
+    // the single source of truth in `ebml::CODEC_*` shared with the muxer.
+    let cid = codec_id.as_str();
+    let codec = if cid == ebml::CODEC_HEVC {
+        Codec::Hevc
+    } else if cid == ebml::CODEC_H264 {
+        Codec::H264
+    } else if cid == ebml::CODEC_VC1 {
+        Codec::Vc1
+    } else if cid == ebml::CODEC_MPEG2 {
+        Codec::Mpeg2
+    } else if cid == ebml::CODEC_AC3 {
+        Codec::Ac3
+    } else if cid == ebml::CODEC_EAC3 {
+        Codec::Ac3Plus
+    } else if cid == ebml::CODEC_TRUEHD {
+        Codec::TrueHd
+    } else if cid == ebml::CODEC_DTS {
+        Codec::Dts
+    } else if cid == ebml::CODEC_PCM_BE {
+        Codec::Lpcm
+    } else if cid == ebml::CODEC_PGS {
+        Codec::Pgs
+    } else if cid == ebml::CODEC_VOBSUB {
+        Codec::DvdSub
+    } else {
+        Codec::Unknown(0)
     };
     let res = Resolution::from_height(ph);
     let chs = AudioChannels::from_count(ch);
@@ -1345,7 +1368,7 @@ mod tests {
         let mut entry = Vec::new();
         ebml::write_uint(&mut entry, ebml::TRACK_NUMBER, 1).unwrap();
         ebml::write_uint(&mut entry, ebml::TRACK_TYPE, 1).unwrap();
-        ebml::write_string(&mut entry, ebml::CODEC_ID, "V_MPEGH/ISO/HEVC").unwrap();
+        ebml::write_string(&mut entry, ebml::CODEC_ID, ebml::CODEC_HEVC).unwrap();
         let mut track_entry = Vec::new();
         ebml::write_id(&mut track_entry, ebml::TRACK_ENTRY).unwrap();
         ebml::write_size(&mut track_entry, entry.len() as u64).unwrap();

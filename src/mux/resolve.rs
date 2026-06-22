@@ -388,6 +388,13 @@ pub fn output(
             Ok(Box::new(M2tsStream::create(writer, title)?))
         }
         StreamUrl::Network { ref addr } => {
+            // Format-validate, then connect. `NetworkStream::connect`
+            // re-resolves the host and refuses any address that is
+            // loopback / private / link-local / multicast — this is the
+            // SSRF / DNS-rebinding guard, applied at the actual connect
+            // (not just at settings-save time). It is deliberately NOT in
+            // `validate_network_addr`, which is shared with the listen
+            // (receiver) path where binding loopback is legitimate.
             validate_network_addr(addr)?;
             Ok(Box::new(NetworkStream::connect(addr)?.meta(title)))
         }
@@ -470,12 +477,22 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     event_fn: Option<crate::sector::prefetched::EventFn>,
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
+    // Unit alignment is an AACS concept: AACS decrypts whole 6144-byte (3-sector)
+    // units, so the producer must hand the decrypt step 3-sector-aligned batches.
+    // CSS (DVD) and unencrypted content decrypt per 2048-byte sector — forcing
+    // 3-sector alignment there rejects any extent whose sector count isn't a
+    // multiple of 3 (DVD IFO cells routinely aren't) with ExtentNotUnitAligned.
+    let unit_align: u16 = match &keys {
+        crate::decrypt::DecryptKeys::Aacs { .. } => 3,
+        _ => 1,
+    };
     let decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,
         extents,
         batch_sectors,
+        unit_align,
         halt.clone(),
         event_fn,
     )

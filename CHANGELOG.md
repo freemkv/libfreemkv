@@ -1,5 +1,93 @@
 # Changelog
 
+## [1.0.0-rc.1] - UNRELEASED
+
+First release candidate for 1.0.
+
+### Added
+
+- **Keyless DVD/CSS title-key recovery.** The CSS title key is now recovered
+  directly from the scrambled disc data via the Stevenson known-plaintext
+  attack (ported from libdvdcss), so a CSS-protected DVD decrypts with no key
+  database. The recovered key is validated by descrambling a scrambled sector
+  and confirming the known plaintext reappears, so a wrong key fails cleanly
+  instead of producing silent garbage (`src/css/stevenson.rs`, `lfsr.rs`,
+  `tables.rs`). The bus-authentication handshake in `src/css/auth.rs` is
+  retained solely to unlock scrambled-sector reads on CSS-enforcing drives;
+  its result is not used for title-key derivation.
+- **MPEG-2 Program-Stream access-unit reassembler** (`src/mux/codec/mpeg2.rs`).
+  Buffers elementary-stream bytes across PES packets and emits exactly one
+  coded picture per MKV block. Reconstructs presentation timestamps from
+  `temporal_reference` and the sequence-header frame rate, anchored to the
+  PES PTS; frames emitted before the first timestamp anchor are buffered and
+  back-anchored. Includes an 8 MiB buffer cap so a corrupt stream cannot
+  exhaust memory.
+- `Disc::scan_image` recovers the CSS title key from a raw, still-scrambled
+  DVD image, so a raw CSS ISO can be muxed without pre-decryption.
+
+### Changed
+
+- DVD CSS authentication is now driven directly off the main title's first
+  sector instead of detecting CSS via an unauthenticated scrambled read, which
+  a CSS-enforcing drive rejects before auth can run. UHD/Blu-ray is unaffected.
+- Drive initialization skips the firmware unlock when the loaded disc is a DVD
+  profile, running the drive in stock mode so CSS authentication succeeds.
+  Blu-ray/UHD is unchanged (`src/drive/mod.rs`).
+- Param-set application emits self-contained keyframes: the active VPS/SPS/PPS
+  (HEVC), SPS/PPS (H.264), and sequence/entry headers (VC-1) are re-asserted
+  at every keyframe/RAP, and any param-set change (including a revert to the
+  codecPrivate set) is emitted in-band. Fixes whole-segment HEVC/H.264/VC-1
+  corruption when a source stops repeating an unchanged param set or reverts
+  one mid-title.
+- Strictly-monotonic block-timestamp adjustment is keyed on track type rather
+  than index, so a second video track (e.g. a Dolby Vision enhancement layer)
+  keeps its true B-frame presentation timestamps instead of being clobbered.
+- Mux unit alignment is scheme-aware (AACS = 3 sectors, CSS/none = 1 sector),
+  so DVD IFO extents that are not 3-sector multiples are no longer rejected
+  with `ExtentNotUnitAligned`.
+- MKV output records `freemkv <version>` in the Muxing/Writing application
+  fields, making every output file traceable to its build.
+- Matroska codec-ID literals are centralized as `ebml::CODEC_*` constants
+  (single source of truth for both mux encode and demux decode).
+- `MkvStream` `BlockDuration` values are scaled by the segment's `ts_scale_ns`
+  before being written, so subtitle display durations are correct when the
+  timecode scale is not 1 ms.
+- The keydb decompressed-plaintext reader is capped at 64 MiB, preventing a
+  malformed or zip-bombed download from exhausting memory.
+- The NOT_READY retry pause in the patch (Pass N) loop is now halt-responsive:
+  a stop request interrupts the 15-second drive-recovery wait immediately
+  instead of blocking the shutdown path.
+- CSS Stevenson attack: periodic-extension crib and first-match-and-break on
+  a valid key candidate, matching the libdvdcss reference implementation.
+
+### Fixed
+
+- A `READ(10)` that returns GOOD status with a residual underrun is now treated
+  as a failed read (routed to NonTrimmed/retry) instead of committing the stale
+  buffer tail as recovered data — closing a silent-corruption hole in both the
+  sweep and patch paths.
+- `raw_command` on Linux now masks the `DRIVER_SENSE` bit (0x08) from
+  `driver_status` before treating the result as an error. `DRIVER_SENSE` only
+  signals that sense data is present, not that the command failed; masking it
+  prevents false transport errors on commands that return sense alongside a
+  GOOD response.
+- `decode_read_capacity` rejects a `READ CAPACITY (10)` response whose
+  `last_lba` field is `u32::MAX` (the "capacity exceeds 32-bit" sentinel),
+  returning `Error::DiscCapacityOverflow` instead of silently wrapping to 0
+  and misreporting disc size.
+
+### Security
+
+- CSS disc/title keys are redacted in log output (logged as `<redacted>` with
+  a 1-byte fingerprint); a test guards against any key field (`title_key`,
+  `disc_key`, `player_key`, `unit_key`, `vuk`, `bus_key`) being logged with a
+  raw value.
+- The macOS SCSI shim (`src/scsi/macos_shim.c`) no longer shells out via
+  `system()` / `sh -c` to invoke `diskutil unmountDisk`. It now uses
+  `posix_spawn` directly, eliminating a command-injection vector for a
+  device-path string that contains shell metacharacters.
+
+
 ## 0.31.10 (2026-06-18)
 
 ### Performance

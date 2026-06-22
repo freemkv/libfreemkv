@@ -108,8 +108,8 @@ lines of `Mapfile::stats()` checks.
 2. On success: write data to ISO, mark `+`, advance.
 3. On failure (with `multipass`): zero-fill, mark `*`, advance.
 4. Track a sliding window of the last 16 ECC block results. When ≥12% are failures
-   → **damage-jump**: skip ahead by `256×batch×multiplier` sectors (8 MB base for
-   UHD). Double the multiplier on each jump (8→16→32→64 MB...). Zero-fill the gap as `*`.
+   → **damage-jump**: skip ahead by `1024×batch×multiplier` sectors (64 MB base for
+   UHD). Double the multiplier on each jump (64→128→256→512 MB...). Zero-fill the gap as `*`.
 5. On 16 consecutive good reads: reset jump multiplier to 1, restore max read speed.
 6. Speed control: damage zone entry → minimum speed, exit → maximum speed.
 7. Only transport failures (USB bridge crash) abort the pass.
@@ -178,7 +178,7 @@ explicitly by callers that need an eject-cycle escape hatch — it is never
 reached from a read path.
 
 **ISO intermediate, even for single-pass.** Pass 1 always writes an ISO. The
-mux stage reads the ISO via `IsoSectorReader`. For single-pass (no retries),
+mux stage reads the ISO via `FileSectorSource`. For single-pass (no retries),
 this adds ~2-3 min (local disk mux) but gains resumability across crashes,
 re-muxability without re-ripping, and a persistent forensic artifact. Callers
 who need pure speed can bypass and use `DiscStream::new(Box::new(drive), …)`
@@ -198,4 +198,4 @@ scrape vs. retry with direction reversal) if there's measured benefit.
 
 - [ddrescue manual, Algorithm chapter](https://www.gnu.org/software/ddrescue/manual/ddrescue_manual.html)
 - [ddrescue optical media notes](https://www.electric-spoon.com/doc/gddrescue/html/Optical-media.html)
-- Source: [`src/disc/mapfile.rs`](../src/disc/mapfile.rs), [`src/disc/sweep.rs`](../src/disc/sweep.rs) (`Disc::sweep`), [`src/disc/patch.rs`](../src/disc/patch.rs) (`Disc::patch`), [`src/drive/mod.rs`](../src/drive/mod.rs) (`Drive::read`), [`src/mux/disc.rs`](../src/mux/disc.rs) (`DiscStream::fill_extents`).
+- Source: [`src/disc/mapfile.rs`](../src/disc/mapfile.rs), [`src/disc/mod.rs`](../src/disc/mod.rs) (`Disc::sweep`), [`src/disc/patch.rs`](../src/disc/patch.rs) (`Disc::patch`), [`src/drive/mod.rs`](../src/drive/mod.rs) (`Drive::read`), [`src/mux/disc.rs`](../src/mux/disc.rs) (`DiscStream::fill_extents`).

@@ -176,8 +176,8 @@ libfreemkv/src/
 │   ├── macos.rs        macOS drive discovery
 │   └── windows.rs      Windows drive discovery
 ├── disc/               Disc (scan, titles, AACS setup, sweep, patch)
-│   ├── mod.rs          Disc struct, scan, titles, formats
-│   ├── sweep.rs        Disc::sweep (Pass 1 forward sweep)
+│   ├── mod.rs          Disc struct, scan, titles, formats; Disc::copy + Disc::sweep (Pass 1)
+│   ├── sweep.rs        Pass 1 internal helpers (pub(super))
 │   ├── patch.rs        Disc::patch (Pass N retry over mapfile)
 │   ├── mapfile.rs      ddrescue-format mapfile
 │   └── read_error.rs   ReadCtx / ReadAction state machine
@@ -187,7 +187,7 @@ libfreemkv/src/
 ├── css/                DVD CSS cipher
 ├── decrypt.rs          Unified decrypt dispatcher (AACS/CSS/None)
 ├── pes.rs              PES frame types, FrameSource / FrameSink traits
-├── sector/             Sector I/O (was sector.rs in 0.17)
+├── sector/             Sector I/O
 │   ├── mod.rs          SectorSource, SectorSink traits
 │   ├── file.rs         FileSectorSource, FileSectorSink (ISO-backed)
 │   └── decrypting.rs   DecryptingSectorSource decorator

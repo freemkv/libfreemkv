@@ -165,7 +165,10 @@ impl DecryptKeys {
 /// For CSS: processes per 2048-byte sector.
 /// For None: no-op.
 ///
-/// `unit_key_idx` selects which AACS unit key to use (0 for most discs).
+/// `unit_key_idx` is the initial AACS unit-key hint (0 for most discs). On a
+/// multi-CPS-unit disc every key is tried per unit until the TS-sync verify
+/// passes; `unit_key_idx` is tried first so single-CPS-unit discs pay zero
+/// overhead. An out-of-range `unit_key_idx` is always an error.
 ///
 /// Returns `Err` if decryption was expected but keys are missing or invalid.
 /// Never produces silently corrupted output.
@@ -180,12 +183,15 @@ pub fn decrypt_sectors(
             unit_keys,
             read_data_key,
         } => {
-            let uk = match unit_keys.get(unit_key_idx) {
-                Some((_, k)) => *k,
-                None => {
-                    return Err(crate::error::Error::DecryptFailed);
-                }
-            };
+            // Validate that unit_key_idx is in-range before doing anything else.
+            // This preserves the existing contract: an out-of-range explicit index
+            // is always an error (tested by `aacs_out_of_range_unit_key_idx_errors`).
+            if unit_keys.get(unit_key_idx).is_none() {
+                return Err(crate::error::Error::DecryptFailed);
+            }
+
+            // Strip CPS-unit IDs — the decrypt primitives only want the raw key bytes.
+            let raw_keys: Vec<[u8; 16]> = unit_keys.iter().map(|(_, k)| *k).collect();
             let rdk: Option<[u8; 16]> = *read_data_key;
             let unit_len = aacs::ALIGNED_UNIT_LEN;
             // AACS decrypts whole 6144-byte aligned units. The live mux path
@@ -229,18 +235,60 @@ pub fn decrypt_sectors(
             let nthreads = decrypt_threads();
             let nunits = buf.len() / unit_len;
 
-            // Per-unit decrypt closure. The is_aacs_scrambled check reads the
-            // raw TS syncs; a non-m2ts unit (e.g. MPLS/CLPI nav file) can look
-            // scrambled and trigger a decrypt attempt, so on a verify miss we
-            // snapshot+restore the original bytes so it survives. See test
-            // `nav_file_unit_survives_decrypt_attempt`.
+            // Cache the last successfully-validated key index so that runs of
+            // units under the same CPS unit hit on the first try. Initialised to
+            // unit_key_idx (the caller's hint — 0 for almost all discs). An
+            // AtomicUsize lets the parallel path share it cheaply; relaxed
+            // ordering is fine because a stale read just causes one extra try,
+            // never a wrong result (TS-sync verify gates correctness).
+            let last_key_idx = AtomicUsize::new(unit_key_idx);
+
+            // Per-unit decrypt closure. For a scrambled full aligned unit:
+            //   1. Try the cached key index first (avoids scanning all keys on the
+            //      common case where a disc run uses one CPS unit throughout).
+            //   2. On miss, try every key in order (multi-CPS-unit discs).
+            //   3. Accept the first key whose output passes the TS-sync verify.
+            //   4. Only restore-to-original if NO key validates (non-m2ts unit or
+            //      genuine decrypt failure). See test
+            //      `nav_file_unit_survives_decrypt_attempt`.
+            //
+            // If a read_data_key is present (AACS 2.0 bus encryption), bus-decrypt
+            // must happen first — it's a shared layer on top that is key-independent
+            // across all CPS units on the disc.
             let decrypt_one = |chunk: &mut [u8]| {
-                if chunk.len() == unit_len && aacs::is_aacs_scrambled(chunk) {
-                    let original: Vec<u8> = chunk.to_vec();
-                    if !aacs::decrypt_unit_full(chunk, &uk, rdk.as_ref()) {
-                        chunk.copy_from_slice(&original);
+                if chunk.len() != unit_len || !aacs::is_aacs_scrambled(chunk) {
+                    return;
+                }
+                // Save original bytes so we can restore if no key validates.
+                let original: Vec<u8> = chunk.to_vec();
+
+                // Build a bus-decrypted copy to try unit keys against, or work
+                // in-place when there is no bus layer.
+                if let Some(ref rdk_key) = rdk {
+                    aacs::decrypt_bus(chunk, rdk_key);
+                }
+
+                // Reorder the key iterator: try the cached hint first, then fall
+                // back to the full list skipping the hint.
+                let hint = last_key_idx.load(Ordering::Relaxed);
+                let try_order =
+                    std::iter::once(hint).chain((0..raw_keys.len()).filter(move |&i| i != hint));
+
+                for idx in try_order {
+                    if let Some(key) = raw_keys.get(idx) {
+                        // Work on a per-key copy so a failing attempt doesn't
+                        // clobber the bus-decrypted base we'll retry on.
+                        let mut attempt: Vec<u8> = chunk.to_vec();
+                        if aacs::decrypt_unit(&mut attempt, key) {
+                            chunk.copy_from_slice(&attempt);
+                            last_key_idx.store(idx, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
+
+                // No key validated — restore the original encrypted bytes.
+                chunk.copy_from_slice(&original);
             };
 
             if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
@@ -460,19 +508,18 @@ mod tests {
 
     // ── CSS dispatch (DecryptKeys::Css) ────────────────────────────────────
 
-    /// Build a CSS-scrambled 2048-byte sector by XORing the descramble
-    /// keystream over a known plaintext body (the keystream XOR is its own
-    /// inverse), with the scramble flag restored so decrypt_sectors will
-    /// re-descramble it back to the plaintext.
+    /// Build a CSS-scrambled 2048-byte sector by scrambling a known plaintext
+    /// body with the exact inverse of `descramble_sector`, so decrypt_sectors
+    /// will descramble it back to the plaintext. The content cipher applies
+    /// TAB1 to the ciphertext (`plain = TAB1[cipher] ^ ks`), so it is NOT a
+    /// self-inverse XOR — `scramble_sector` is the true inverse and sets the
+    /// scramble flag.
     fn make_css_sector(title_key: &[u8; 5], seed: &[u8; 5], body_fill: u8) -> (Vec<u8>, Vec<u8>) {
         let mut sector = vec![body_fill; 2048];
         sector[0x14] = 0x30; // scramble flag (bits 4-5)
         sector[0x54..0x59].copy_from_slice(seed);
         let plaintext = sector.clone();
-        // First descramble XORs the keystream in (producing "ciphertext"); it
-        // clears the flag, so restore it for the round-trip via decrypt_sectors.
-        css::lfsr::descramble_sector(title_key, &mut sector);
-        sector[0x14] = 0x30;
+        css::lfsr::scramble_sector(title_key, &mut sector);
         (sector, plaintext)
     }
 
@@ -606,6 +653,126 @@ mod tests {
         let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
         let err = decrypt_sectors(&mut buf, &keys, 0).expect_err("empty unit_keys must error");
         assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
+    }
+
+    // ── Multi-CPS-unit key selection ──────────────────────────────────────
+
+    /// Encrypt an aligned unit with the AACS algorithm run in reverse so that
+    /// `aacs::decrypt_unit` with the same key recovers the plaintext. Mirrors
+    /// the `aacs_encrypt_unit` helper in `aacs::decrypt::tests`.
+    fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
+        use aes::Aes128;
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let header: [u8; 16] = unit[..16].try_into().unwrap();
+        let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
+        let mut k = [0u8; 16];
+        for i in 0..16 {
+            k[i] = derived[i] ^ header[i];
+        }
+        let cipher = Aes128::new(GenericArray::from_slice(&k));
+        let mut prev = crate::aacs::decrypt::AACS_IV;
+        let num_blocks = (aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        for i in 0..num_blocks {
+            let off = 16 + i * 16;
+            for j in 0..16 {
+                unit[off + j] ^= prev[j];
+            }
+            let mut block = GenericArray::clone_from_slice(&unit[off..off + 16]);
+            cipher.encrypt_block(&mut block);
+            unit[off..off + 16].copy_from_slice(&block);
+            prev.copy_from_slice(&unit[off..off + 16]);
+        }
+    }
+
+    /// Build a clear aligned unit with TS sync bytes placed at the BD-TS stride
+    /// (offset 4 + k*192) so `is_aacs_scrambled` reports false and
+    /// `decrypt_unit` verifies it as clear after decryption.
+    fn clear_ts_unit() -> Vec<u8> {
+        let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < aacs::ALIGNED_UNIT_LEN {
+            unit[off] = 0x47;
+            off += 192;
+        }
+        unit
+    }
+
+    /// A unit encrypted under unit_keys[1] (the second CPS unit) on a
+    /// two-key disc must be correctly decrypted — not left as garbage —
+    /// when `decrypt_sectors` is called with unit_key_idx=0 (the default).
+    ///
+    /// Before the fix, `decrypt_one` used only `unit_keys[unit_key_idx]`
+    /// (i.e. always key 0). On a multi-CPS-unit disc this produced silent
+    /// garbage for content under key ≥ 1. The fix tries every key and
+    /// accepts the one whose output passes the TS-sync verify.
+    ///
+    /// Grounding: `for idx in try_order { … if aacs::decrypt_unit(&mut attempt, key) { … } }`
+    /// Mutation: revert to the pre-fix `decrypt_unit_full(chunk, &uk, …)` where
+    /// `uk = raw_keys[unit_key_idx]` (always key 0) → the unit comes out as
+    /// garbled bytes that still look scrambled, failing the `!is_aacs_scrambled`
+    /// assert.
+    #[test]
+    fn aacs_multi_cps_unit_disc_decrypts_under_non_zero_key() {
+        let key0 = [0x11u8; 16]; // CPS unit 0 key — NOT the correct key for this unit
+        let key1 = [0x22u8; 16]; // CPS unit 1 key — the correct key
+
+        // Build and encrypt a clear unit under key1 (the non-default CPS unit).
+        let mut unit = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit, &key1);
+        assert!(
+            aacs::is_aacs_scrambled(&unit),
+            "encrypted unit must look scrambled before decrypt"
+        );
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key0), (1, key1)], // two CPS units
+            read_data_key: None,
+        };
+
+        // Call with the default hint (idx 0) — the fix must fall back to key1.
+        let mut buf = unit;
+        decrypt_sectors(&mut buf, &keys, 0).expect("multi-CPS decrypt must succeed");
+
+        assert!(
+            !aacs::is_aacs_scrambled(&buf),
+            "unit encrypted under key1 must be fully decrypted (TS syncs restored)"
+        );
+        // Every sync position must carry 0x47.
+        assert_eq!(
+            aacs::ts_sync_count(&buf),
+            aacs::ts_packet_total(&buf),
+            "all TS sync bytes must be restored after decrypting under key1"
+        );
+    }
+
+    /// Single-key disc: the common case is unaffected — the single key is
+    /// tried first (via the hint) and validates, so no second-pass overhead.
+    ///
+    /// Grounding: the `hint = last_key_idx.load(…)` path returns on the first
+    /// `try_order` iteration. A regression that always tried all keys (instead
+    /// of accepting the first hit) would still pass this test — correctness is
+    /// the invariant here, not the performance shortcut.
+    #[test]
+    fn aacs_single_key_disc_still_decrypts_correctly() {
+        let key = [0x55u8; 16];
+        let mut unit = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit, &key);
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+        };
+        let mut buf = unit;
+        decrypt_sectors(&mut buf, &keys, 0).expect("single-key disc must decrypt");
+        assert!(
+            !aacs::is_aacs_scrambled(&buf),
+            "single-key disc: TS syncs must be restored"
+        );
+        assert_eq!(
+            aacs::ts_sync_count(&buf),
+            aacs::ts_packet_total(&buf),
+            "all TS sync bytes must be restored for single-key disc"
+        );
     }
 
     // ── decrypt_threads resolution (read-only; no global mutation) ─────────

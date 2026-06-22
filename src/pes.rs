@@ -23,14 +23,22 @@ pub struct PesFrame {
     pub keyframe: bool,
     /// Raw elementary stream data (NAL units, audio samples, etc).
     pub data: Vec<u8>,
-    /// Optional duration in nanoseconds. In-memory only; not part of
-    /// the on-wire serialization. Currently set by the PGS parser so
-    /// the MKV muxer can emit `BlockDuration`.
+    /// Optional duration in nanoseconds. Carried on the wire (8 bytes
+    /// little-endian, `u64::MAX` as the sentinel for `None`). Set by
+    /// the PGS parser so the MKV muxer can emit `BlockDuration`; also
+    /// preserved across network:// and stdio:// hops.
     pub duration_ns: Option<u64>,
 }
 
+/// Sentinel value for `duration_ns` on the wire: `u64::MAX` means `None`.
+/// Valid durations are always much smaller (u64::MAX ns ≈ 584 years).
+const DURATION_NONE_SENTINEL: u64 = u64::MAX;
+
 impl PesFrame {
-    /// Serialize to bytes: track(1) | pts(8) | keyframe(1) | len(4) | data
+    /// Serialize to bytes:
+    /// track(1) | pts(8 LE) | keyframe(1) | duration_ns(8 LE) | len(4 LE) | data
+    ///
+    /// `duration_ns` is encoded as `u64::MAX` when `None`, or the value when `Some`.
     pub fn serialize(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         if self.track > 255 {
             return Err(crate::error::Error::PesTrackTooLarge { track: self.track }.into());
@@ -43,9 +51,11 @@ impl PesFrame {
             }
             .into());
         }
+        let duration_wire = self.duration_ns.unwrap_or(DURATION_NONE_SENTINEL);
         w.write_all(&[self.track as u8])?;
         w.write_all(&self.pts.to_le_bytes())?;
         w.write_all(&[if self.keyframe { 1 } else { 0 }])?;
+        w.write_all(&duration_wire.to_le_bytes())?;
         w.write_all(&(self.data.len() as u32).to_le_bytes())?;
         w.write_all(&self.data)
     }
@@ -53,7 +63,7 @@ impl PesFrame {
     /// Deserialize from bytes. Returns None at a clean end of stream.
     ///
     /// A clean EOF is exactly zero bytes available before the next frame.
-    /// A partial header (1-13 bytes, e.g. a crash or short write) is a real
+    /// A partial header (1-21 bytes, e.g. a crash or short write) is a real
     /// error (`UnexpectedEof`), not silently treated as EOF — otherwise
     /// truncated `.pes` data would be accepted as a graceful end.
     pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
@@ -74,9 +84,9 @@ impl PesFrame {
             Err(e) => return Err(e),
         }
 
-        let mut header = [0u8; 14]; // 1 + 8 + 1 + 4
+        let mut header = [0u8; 22]; // 1 + 8 + 1 + 8 + 4
         header[0] = first[0];
-        // The remaining 13 header bytes must be present; a short read here is
+        // The remaining 21 header bytes must be present; a short read here is
         // a truncated frame, propagated as UnexpectedEof.
         r.read_exact(&mut header[1..])?;
         let track = header[0] as usize;
@@ -84,7 +94,16 @@ impl PesFrame {
             header[1], header[2], header[3], header[4], header[5], header[6], header[7], header[8],
         ]);
         let keyframe = header[9] != 0;
-        let len = u32::from_le_bytes([header[10], header[11], header[12], header[13]]) as usize;
+        let duration_wire = u64::from_le_bytes([
+            header[10], header[11], header[12], header[13], header[14], header[15], header[16],
+            header[17],
+        ]);
+        let duration_ns = if duration_wire == DURATION_NONE_SENTINEL {
+            None
+        } else {
+            Some(duration_wire)
+        };
+        let len = u32::from_le_bytes([header[18], header[19], header[20], header[21]]) as usize;
         if len > MAX_FRAME_SIZE {
             return Err(crate::error::Error::PesFrameTooLarge { size: len }.into());
         }
@@ -95,7 +114,7 @@ impl PesFrame {
             pts,
             keyframe,
             data,
-            duration_ns: None,
+            duration_ns,
         }))
     }
 
@@ -343,7 +362,7 @@ mod tests {
 
     #[test]
     fn truncated_header_is_error_not_eof() {
-        // A partial 14-byte header (here 5 bytes) must surface as an error,
+        // A partial 22-byte header (here 5 bytes) must surface as an error,
         // not be swallowed as a graceful end of stream.
         let mut cursor = std::io::Cursor::new(vec![1u8, 2, 3, 4, 5]);
         let err = PesFrame::deserialize(&mut cursor).expect_err("partial header must error");
@@ -403,23 +422,24 @@ mod tests {
 
     // ── New comprehensive tests ────────────────────────────────────────────────
 
-    /// PesFrame serialize layout: track(1) | pts(8 LE) | keyframe(1) | len(4 LE) | data.
+    /// PesFrame serialize layout:
+    /// track(1) | pts(8 LE) | keyframe(1) | duration_ns(8 LE) | len(4 LE) | data.
     /// Mutation: using big-endian for pts changes bytes [1..9] and deserialization fails.
     #[test]
     fn serialize_wire_format_matches_spec() {
-        // Wire format: [track(1)][pts_le(8)][keyframe(1)][len_le(4)][data...]
+        // Wire format: [track(1)][pts_le(8)][keyframe(1)][duration_le(8)][len_le(4)][data...]
         let frame = PesFrame {
             track: 2,
             pts: 0x0102030405060708_i64,
             keyframe: true,
             data: vec![0xAA, 0xBB, 0xCC],
-            duration_ns: None,
+            duration_ns: Some(0xDEADBEEF_u64),
         };
         let mut buf = Vec::new();
         frame.serialize(&mut buf).unwrap();
         // Byte 0: track
         assert_eq!(buf[0], 2, "byte 0 must be track");
-        // Bytes 1..9: pts as little-endian i64 (ECMA-262 serialisation convention)
+        // Bytes 1..9: pts as little-endian i64
         let pts_bytes = 0x0102030405060708_i64.to_le_bytes();
         assert_eq!(
             &buf[1..9],
@@ -428,16 +448,23 @@ mod tests {
         );
         // Byte 9: keyframe flag (1 = true)
         assert_eq!(buf[9], 1, "byte 9 must be 1 for keyframe=true");
-        // Bytes 10..14: data length as little-endian u32
+        // Bytes 10..18: duration_ns as little-endian u64
+        let dur_bytes = 0xDEADBEEF_u64.to_le_bytes();
+        assert_eq!(
+            &buf[10..18],
+            &dur_bytes,
+            "bytes 10..18 must be duration_ns in little-endian"
+        );
+        // Bytes 18..22: data length as little-endian u32
         let len_bytes = 3_u32.to_le_bytes();
         assert_eq!(
-            &buf[10..14],
+            &buf[18..22],
             &len_bytes,
-            "bytes 10..14 must be data length LE u32"
+            "bytes 18..22 must be data length LE u32"
         );
-        // Bytes 14..: data
+        // Bytes 22..: data
         assert_eq!(
-            &buf[14..],
+            &buf[22..],
             &[0xAA, 0xBB, 0xCC],
             "data must follow header verbatim"
         );
@@ -536,25 +563,63 @@ mod tests {
         );
     }
 
-    /// duration_ns is not serialized — deserialized frames always have duration_ns=None.
-    /// Spec: doc says "In-memory only; not part of the on-wire serialization."
-    /// Mutation: serializing duration_ns would add bytes and break deserialization.
+    /// duration_ns is serialized as 8 LE bytes; None encodes as u64::MAX sentinel.
+    /// Spec: duration_ns is part of the wire format so network/stdio hops preserve it.
+    /// Mutation: dropping duration_ns from serialize would zero-fill the field and
+    ///           silently lose PGS subtitle durations on the network:// path.
     #[test]
-    fn deserialize_duration_ns_is_always_none() {
-        let frame = PesFrame {
+    fn deserialize_duration_ns_roundtrips() {
+        // None encodes as u64::MAX sentinel and decodes back to None.
+        let frame_none = PesFrame {
             track: 0,
             pts: 0,
             keyframe: false,
             data: vec![1, 2, 3],
-            duration_ns: Some(999_999),
+            duration_ns: None,
         };
         let mut buf = Vec::new();
-        frame.serialize(&mut buf).unwrap();
+        frame_none.serialize(&mut buf).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         let got = PesFrame::deserialize(&mut cursor).unwrap().unwrap();
         assert!(
             got.duration_ns.is_none(),
-            "duration_ns must not be on the wire — deserialized frame must have None"
+            "None duration_ns must round-trip as None"
+        );
+
+        // Some(0) must survive — 0 is a valid zero-length duration, not the sentinel.
+        let frame_zero = PesFrame {
+            track: 1,
+            pts: 1000,
+            keyframe: false,
+            data: vec![4, 5],
+            duration_ns: Some(0),
+        };
+        let mut buf2 = Vec::new();
+        frame_zero.serialize(&mut buf2).unwrap();
+        let mut cursor2 = std::io::Cursor::new(buf2);
+        let got2 = PesFrame::deserialize(&mut cursor2).unwrap().unwrap();
+        assert_eq!(
+            got2.duration_ns,
+            Some(0),
+            "Some(0) duration_ns must round-trip as Some(0)"
+        );
+
+        // Some(N) for a typical PGS duration (~3 seconds).
+        let frame_n = PesFrame {
+            track: 2,
+            pts: 5_000_000_000,
+            keyframe: false,
+            data: vec![6],
+            duration_ns: Some(3_000_000_000),
+        };
+        let mut buf3 = Vec::new();
+        frame_n.serialize(&mut buf3).unwrap();
+        let mut cursor3 = std::io::Cursor::new(buf3);
+        let got3 = PesFrame::deserialize(&mut cursor3).unwrap().unwrap();
+        assert_eq!(
+            got3.duration_ns,
+            Some(3_000_000_000),
+            "Some(3_000_000_000) duration_ns must round-trip"
         );
     }
 

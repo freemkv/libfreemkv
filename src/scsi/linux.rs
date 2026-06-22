@@ -65,6 +65,11 @@ pub struct SgIoTransport {
     pub fd: i32,
     device_path: std::path::PathBuf,
     pub fd_recovery: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    /// Set to `true` by `Drop` before the transport is torn down. The
+    /// recovery thread checks this after a successful `compare_exchange`
+    /// and closes `new_fd` itself when the transport is already gone,
+    /// preventing an fd leak when Drop races the recovery thread.
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SgIoTransport {
@@ -85,6 +90,7 @@ impl SgIoTransport {
             fd,
             device_path: device,
             fd_recovery: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            dead: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -122,7 +128,12 @@ impl SgIoTransport {
         hdr.flags = SG_FLAG_Q_AT_HEAD;
 
         let ret = unsafe { libc::ioctl(fd, SG_IO as _, &mut hdr as *mut sg_io_hdr) };
-        if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || hdr.driver_status != 0 {
+        // Mask DRIVER_SENSE (0x08): it only signals "sense data present", not a
+        // failure, and a command can complete-with-sense. Matches execute()'s
+        // `driver_status_real` handling (0.13.23) so a benign sense response
+        // here is not misread as a transport error.
+        let driver_status_real = hdr.driver_status & !super::DRIVER_SENSE;
+        if ret < 0 || hdr.status != 0 || hdr.host_status != 0 || driver_status_real != 0 {
             Err(())
         } else {
             Ok(())
@@ -171,6 +182,11 @@ impl Drop for SgIoTransport {
             let _ = Self::raw_command(self.fd, &[0x1E, 0, 0, 0, 0, 0], 3_000);
             unsafe { libc::close(self.fd) };
         }
+        // Signal the recovery thread that this transport is gone. Must
+        // be set before the fd_recovery swap so the recovery thread
+        // cannot observe dead=false and then store into an fd_recovery
+        // slot that Drop is no longer going to drain.
+        self.dead.store(true, std::sync::atomic::Ordering::Release);
         // A failed execute() spawns a detached thread that opens a fresh
         // fd into fd_recovery; that slot is normally drained at the top of
         // the next execute(). If the transport is dropped before another
@@ -341,6 +357,7 @@ impl ScsiTransport for SgIoTransport {
             self.fd = -1;
             let path = self.device_path.clone();
             let recovery = self.fd_recovery.clone();
+            let dead = self.dead.clone();
 
             std::thread::spawn(move || {
                 if old_fd >= 0 {
@@ -377,7 +394,22 @@ impl ScsiTransport for SgIoTransport {
                     )
                     .is_err()
                 {
+                    // Another recovery thread already stored its fd; ours
+                    // was not stored so it's our responsibility to close it.
                     unsafe { libc::close(new_fd) };
+                    return;
+                }
+                // We stored new_fd into fd_recovery. Check whether Drop
+                // raced us: if the transport is already dead it won't
+                // drain fd_recovery, so we must close new_fd ourselves.
+                // Use a swap to atomically claim the slot we just stored;
+                // if Drop already swapped it to -1 the swap returns -1
+                // and Drop already closed it, so we do nothing.
+                if dead.load(std::sync::atomic::Ordering::Acquire) {
+                    let claimed = recovery.swap(-1, std::sync::atomic::Ordering::AcqRel);
+                    if claimed >= 0 {
+                        unsafe { libc::close(claimed) };
+                    }
                 }
             });
 

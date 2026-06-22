@@ -90,7 +90,6 @@ pub mod css;
 pub mod decrypt;
 pub mod disc;
 pub mod drive;
-pub mod drm;
 pub mod error;
 pub mod event;
 pub mod halt;
@@ -132,13 +131,11 @@ pub use drive::{Drive, DriveStatus, find_drive};
 // codes to localized messages. See `error.rs` for the full taxonomy.
 pub use error::{Error, Result};
 
-// ─── 0.18 primitives ────────────────────────────────────────────────────────
+// ─── Cooperative cancellation ───────────────────────────────────────────────
 //
 // One-bit cooperative cancellation token, shared by every long-running loop
-// in libfreemkv (sweep, patch, mux). Replaces the ad-hoc `Arc<AtomicBool>`
-// flags scattered across 0.17 (`DiscStream::set_halt`, autorip's
-// `HALT_FLAGS` registry). Clone it cheaply; pass it by value into each
-// component; poll `is_cancelled()` inside the loop body.
+// in libfreemkv (sweep, patch, mux). Clone it cheaply; pass it by value into
+// each component; poll `is_cancelled()` inside the loop body.
 pub use halt::Halt;
 
 // Generic bounded producer/consumer primitive used by sweep, patch, and

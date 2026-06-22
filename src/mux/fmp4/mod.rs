@@ -143,7 +143,7 @@ fn build_ftyp() -> Vec<u8> {
 }
 
 /// Build the `moov` box — minimal skeleton. Single video trak, no
-/// hvcC inside stsd yet (TODO: full hvc1 sample entry).
+/// hvcC inside stsd yet (stub: hvcC/hvc1 stsd entry not yet implemented).
 fn build_moov() -> Vec<u8> {
     let mvhd = build_mvhd();
     let trak = build_video_trak();

@@ -76,8 +76,10 @@ pub trait RandomAccessSink: SequentialSink + Seek {}
 ///
 /// Returns a boxed trait object so the call site (mux construction)
 /// stays agnostic of which concrete sink got picked.
-#[allow(dead_code)] // wiring to mux::resolve is a follow-up commit
-pub fn open_for_mkv(
+// Not yet wired into mux::resolve (follow-up commit). Kept `pub(crate)` until
+// then so an unfinished signature isn't frozen into the public 1.0 API.
+#[allow(dead_code)]
+pub(crate) fn open_for_mkv(
     dest: &std::path::Path,
     size_hint: Option<u64>,
 ) -> std::io::Result<Box<dyn RandomAccessSink>> {

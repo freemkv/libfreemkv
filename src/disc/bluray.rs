@@ -138,10 +138,12 @@ impl Disc {
                             _ => ColorSpace::Unknown,
                         },
                         secondary: s.secondary,
-                        label: match s.stream_type {
-                            7 => "Dolby Vision EL".to_string(),
-                            _ => String::new(),
-                        },
+                        // No user-facing English in the library (numeric-code
+                        // rule): the Dolby Vision enhancement layer is signalled
+                        // structurally (secondary video + DolbyVision hdr) and
+                        // the CLI/UI render the localized descriptor. `label`
+                        // stays empty for disc video streams.
+                        label: String::new(),
                     })),
                     2 | 5 => {
                         // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),

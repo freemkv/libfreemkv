@@ -78,6 +78,15 @@ pub(crate) struct WritebackPipeline {
     /// `WritebackFile` and never exposed outside that wrapper, which
     /// is what keeps the alias sound.
     fd: RawFd,
+    /// An owned clone of the file descriptor, held so that any
+    /// leaked WAIT_AFTER worker thread retains a valid reference to
+    /// the underlying file description for the duration of its
+    /// syscall — even if the original `WritebackFile` is closed first
+    /// and the OS reuses its fd number. `None` only when `try_clone`
+    /// failed at construction (rare); the pipeline falls back to the
+    /// pre-clone `fd` integer in that case, which carries the original
+    /// fd-reuse risk but is no worse than the previous behaviour.
+    wait_file: Option<File>,
     chunk_bytes: u64,
     last_flush_pos: u64,
     pending: Option<(u64, u64)>,
@@ -108,6 +117,19 @@ impl WritebackPipeline {
     pub(crate) fn new(file: &File, start_pos: u64, chunk_bytes: u64) -> Self {
         let fd = file.as_raw_fd();
         let is_nfs = detect_nfs(fd);
+        // Clone the fd so any leaked WAIT_AFTER worker thread keeps the
+        // file description alive. Log but continue on clone failure.
+        let wait_file = match file.try_clone() {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(
+                    target: "mux",
+                    "WritebackPipeline fd={fd}: try_clone failed ({e}), WAIT_AFTER workers \
+                     will use raw fd (fd-reuse risk on timeout)"
+                );
+                None
+            }
+        };
         tracing::info!(
             target: "mux",
             "WritebackPipeline fd={fd} is_nfs={is_nfs} chunk_bytes={chunk_bytes} strategy={}",
@@ -115,6 +137,7 @@ impl WritebackPipeline {
         );
         Self {
             fd,
+            wait_file,
             chunk_bytes,
             last_flush_pos: start_pos,
             pending: None,
@@ -131,6 +154,22 @@ impl WritebackPipeline {
     #[inline]
     fn skip_wait(&self) -> bool {
         self.is_nfs || self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Produce a fresh per-call `File` clone for the WAIT_AFTER worker.
+    ///
+    /// Each call to `wait_after_with_timeout` needs its own owned clone
+    /// so the worker thread keeps the file description alive for the
+    /// duration of the syscall. We clone from `self.wait_file` (itself a
+    /// clone taken at construction) rather than from the original file.
+    ///
+    /// Returns `None` only if `wait_file` is `None` (construction
+    /// try_clone failed) or if the second-level try_clone fails — both
+    /// rare; the fallback raw-fd path in `wait_after_with_timeout`
+    /// handles that case.
+    #[inline]
+    fn clone_for_worker(&self) -> Option<File> {
+        self.wait_file.as_ref().and_then(|f| f.try_clone().ok())
     }
 
     /// Caller advanced the file position to `pos`. If a chunk boundary
@@ -172,7 +211,8 @@ impl WritebackPipeline {
                 // we mark the pipeline degraded, log a loud error,
                 // and fall through to the skip path on subsequent
                 // calls.
-                match wait_after_with_timeout(self.fd, prev_off, prev_len) {
+                match wait_after_with_timeout(self.clone_for_worker(), self.fd, prev_off, prev_len)
+                {
                     Some(ms) => {
                         wait_ms = ms;
                         let t_fadv = Instant::now();
@@ -288,7 +328,7 @@ impl WritebackPipeline {
                 // paths.
                 return;
             }
-            match wait_after_with_timeout(self.fd, prev_off, prev_len) {
+            match wait_after_with_timeout(self.clone_for_worker(), self.fd, prev_off, prev_len) {
                 Some(_ms) => unsafe {
                     libc::posix_fadvise(
                         self.fd,
@@ -339,11 +379,48 @@ fn detect_nfs(fd: RawFd) -> bool {
 /// to the WAIT_AFTER call shape: it returns `elapsed_ms` instead of the
 /// syscall's `()`, and treats `WorkerLost` as a benign no-op to match
 /// the original semantics.
-fn wait_after_with_timeout(fd: RawFd, off: u64, len: u64) -> Option<u64> {
+///
+/// ## fd lifetime / fd-reuse safety
+///
+/// `worker_file` is an *owned* `File` (produced by `File::try_clone` at
+/// pipeline construction). It is moved into the worker closure so the
+/// file description stays alive for exactly as long as the worker thread
+/// lives — even if the original `WritebackFile` is closed and the OS
+/// reuses its fd number before the worker's syscall returns.
+///
+/// `fallback_fd` is used only when `worker_file` is `None` (i.e. the
+/// `try_clone` at construction failed). In that case the worker captures
+/// the raw fd integer, which carries the original fd-reuse risk but is
+/// no worse than the pre-fix behaviour.
+fn wait_after_with_timeout(
+    worker_file: Option<File>,
+    fallback_fd: RawFd,
+    off: u64,
+    len: u64,
+) -> Option<u64> {
     let started = Instant::now();
-    match crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
-        libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER);
-    }) {
+    let result = if let Some(owned) = worker_file {
+        // Happy path: the closure owns a cloned File that keeps the
+        // file description alive until the worker drops it.
+        crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
+            let fd = owned.as_raw_fd();
+            libc::sync_file_range(fd, off as i64, len as i64, libc::SYNC_FILE_RANGE_WAIT_AFTER);
+            // `owned` drops here, closing the cloned fd.
+        })
+    } else {
+        // Fallback: try_clone failed at construction; use the raw fd.
+        // This carries the pre-fix fd-reuse risk on timeout, but is no
+        // regression from the original behaviour.
+        crate::io::bounded::bounded_syscall(None, WAIT_AFTER_TIMEOUT, move || unsafe {
+            libc::sync_file_range(
+                fallback_fd,
+                off as i64,
+                len as i64,
+                libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            );
+        })
+    };
+    match result {
         Ok(()) => Some(started.elapsed().as_millis() as u64),
         Err(crate::io::bounded::BoundedError::Timeout)
         | Err(crate::io::bounded::BoundedError::Halted) => None,
@@ -468,5 +545,65 @@ mod tests {
         p.note_progress(1024); // < 32 MiB
         assert_eq!(p.chunk_count, before);
         assert!(p.pending.is_none());
+    }
+
+    // ── Bug-fix regression tests ────────────────────────────────────────
+
+    /// Regression for the fd-reuse / use-after-close fix. Verifies that
+    /// `WritebackPipeline::new` successfully clones the fd into
+    /// `wait_file` (i.e. `try_clone` doesn't fail for a normal
+    /// tempfile) and that `clone_for_worker` returns `Some` — meaning
+    /// the WAIT_AFTER worker will capture an owned `File` rather than a
+    /// raw fd integer.
+    ///
+    /// A deterministic test for the actual fd-reuse race is not clean to
+    /// write (it would require simultaneously closing the original File
+    /// and re-opening a new one to steal the fd number while the worker
+    /// is mid-syscall, which is inherently racy). This test instead pins
+    /// the structural invariant: on a normal local file, the pipeline
+    /// holds a valid clone and will give the worker an owned File.
+    #[test]
+    fn wait_file_clone_is_present_for_local_tempfile() {
+        let (_f, p) = local_pipeline(32 * 1024 * 1024);
+        assert!(
+            p.wait_file.is_some(),
+            "wait_file must be Some for a normal local tempfile (try_clone should not fail)"
+        );
+        // clone_for_worker must return Some — the worker will get an
+        // owned File, not fall through to the raw-fd fallback.
+        let worker_clone = p.clone_for_worker();
+        assert!(
+            worker_clone.is_some(),
+            "clone_for_worker must return Some when wait_file is Some"
+        );
+    }
+
+    /// Structural: the worker `File` clone returned by `clone_for_worker`
+    /// is a distinct file descriptor (different fd number) that refers to
+    /// the same underlying file. Closing the original tempfile must not
+    /// affect the clone's validity — the OS keeps the file description
+    /// alive until all file descriptors referring to it are closed.
+    ///
+    /// We verify "distinct fd number" and "still usable as a raw fd"
+    /// without actually racing a syscall.
+    #[test]
+    fn worker_clone_has_distinct_fd_from_original() {
+        let f = NamedTempFile::new().expect("tempfile create");
+        let original_fd = f.as_file().as_raw_fd();
+        let pipeline = WritebackPipeline::new(f.as_file(), 0, 32 * 1024 * 1024);
+
+        let clone = pipeline
+            .clone_for_worker()
+            .expect("clone_for_worker returned None");
+        let clone_fd = clone.as_raw_fd();
+
+        // The clone must have a different fd number — it is a separate
+        // open file description (dup'd by try_clone).
+        assert_ne!(
+            clone_fd, original_fd,
+            "worker clone must have a distinct fd number from the original"
+        );
+        // The clone fd must be valid (non-negative on Unix).
+        assert!(clone_fd >= 0, "clone fd must be non-negative");
     }
 }

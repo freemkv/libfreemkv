@@ -95,7 +95,14 @@ impl BytePrefetcher {
             .name("freemkv-byte-prefetch".into())
             .spawn(move || {
                 let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
+                // Liveness heartbeat: the producer blocks on the recycle and
+                // forward channels; a stalled consumer or a wedged reader shows
+                // up as the beat going silent. Total is unknown, so `pos` is
+                // cumulative bytes read.
+                let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
+                let mut produced_bytes: u64 = 0;
                 loop {
+                    hb.tick(produced_bytes, 0);
                     if cancelled() {
                         return;
                     }
@@ -138,6 +145,7 @@ impl BytePrefetcher {
                             return;
                         }
                     };
+                    produced_bytes += n as u64;
                     buf.truncate(n);
                     // Hand off the filled buffer, re-polling halt on
                     // each timeout slice so a cancel can interrupt a

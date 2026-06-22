@@ -475,6 +475,21 @@ pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;
 pub const TRACK_TYPE_SUBTITLE: u64 = 17;
 
+// Matroska CodecID strings (the `CodecID` element value per the Matroska codec
+// registry). Single source of truth for both the muxer (Codec -> string) and
+// the demuxer (string -> Codec), so the two can never drift.
+pub const CODEC_HEVC: &str = "V_MPEGH/ISO/HEVC";
+pub const CODEC_H264: &str = "V_MPEG4/ISO/AVC";
+pub const CODEC_VC1: &str = "V_MS/VFW/FOURCC";
+pub const CODEC_MPEG2: &str = "V_MPEG2";
+pub const CODEC_AC3: &str = "A_AC3";
+pub const CODEC_EAC3: &str = "A_EAC3";
+pub const CODEC_TRUEHD: &str = "A_TRUEHD";
+pub const CODEC_DTS: &str = "A_DTS";
+pub const CODEC_PCM_BE: &str = "A_PCM/INT/BIG";
+pub const CODEC_PGS: &str = "S_HDMV/PGS";
+pub const CODEC_VOBSUB: &str = "S_VOBSUB";
+
 #[cfg(test)]
 mod tests {
     use super::*;

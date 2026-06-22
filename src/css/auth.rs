@@ -1,51 +1,15 @@
-//! CSS drive authentication — full key hierarchy.
+//! CSS drive bus-authentication — read-unlock primitive.
 //!
-//! Protocol:
-//!   1. Bus authentication (challenge-response) → bus key
-//!   2. Read disc key block (READ DVD STRUCTURE) → XOR with bus key → decrypt with player keys → disc key
-//!   3. Read title key (REPORT KEY format 0x04) → XOR with bus key → decrypt with disc key → title key
+//! A CSS-enforcing DVD drive refuses to return scrambled sectors until a
+//! CSS bus-auth handshake has run for the title. [`unlock_css_reads`]
+//! issues that classic handshake (bus auth → disc-key REPORT KEY → bus
+//! auth → title-key REPORT KEY) purely for its SCSI side effect of
+//! unlocking scrambled-sector reads. The bytes the handshake returns are
+//! NOT used as keys: the descramble title key is recovered keylessly by
+//! the Stevenson known-plaintext attack (see [`super::crack_key`]).
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
-
-// ── Built-in public DVD CSS player keys ────────────────────────────────────
-//
-// These 31 5-byte player keys are long-public CSS inputs. With them
-// compiled in, DVD ripping works with no external key file required.
-
-const PLAYER_KEYS: [[u8; 5]; 31] = [
-    [0x01, 0xaf, 0xe3, 0x12, 0x80],
-    [0x12, 0x11, 0xca, 0x04, 0x3b],
-    [0x14, 0x0c, 0x9e, 0xd0, 0x09],
-    [0x14, 0x71, 0x35, 0xba, 0xe2],
-    [0x1a, 0xa4, 0x33, 0x21, 0xa6],
-    [0x26, 0xec, 0xc4, 0xa7, 0x4e],
-    [0x2c, 0xb2, 0xc1, 0x09, 0xee],
-    [0x2f, 0x25, 0x9e, 0x96, 0xdd],
-    [0x33, 0x2f, 0x49, 0x6c, 0xe0],
-    [0x35, 0x5b, 0xc1, 0x31, 0x0f],
-    [0x36, 0x67, 0xb2, 0xe3, 0x85],
-    [0x39, 0x3d, 0xf1, 0xf1, 0xbd],
-    [0x3b, 0x31, 0x34, 0x0d, 0x91],
-    [0x45, 0xed, 0x28, 0xeb, 0xd3],
-    [0x48, 0xb7, 0x6c, 0xce, 0x69],
-    [0x4b, 0x65, 0x0d, 0xc1, 0xee],
-    [0x4c, 0xbb, 0xf5, 0x5b, 0x23],
-    [0x51, 0x67, 0x67, 0xc5, 0xe0],
-    [0x53, 0x94, 0xe1, 0x75, 0xbf],
-    [0x57, 0x2c, 0x8b, 0x31, 0xae],
-    [0x63, 0xdb, 0x4c, 0x5b, 0x4a],
-    [0x7b, 0x1e, 0x5e, 0x2b, 0x57],
-    [0x85, 0xf3, 0x85, 0xa0, 0xe0],
-    [0xab, 0x1e, 0xe7, 0x7b, 0x72],
-    [0xab, 0x36, 0xe3, 0xeb, 0x76],
-    [0xb1, 0xb8, 0xf9, 0x38, 0x03],
-    [0xb8, 0x5d, 0xd8, 0x53, 0xbd],
-    [0xbf, 0x92, 0xc3, 0xb0, 0xe2],
-    [0xcf, 0x1a, 0xb2, 0xf8, 0x0a],
-    [0xec, 0xa0, 0xcf, 0xb3, 0xff],
-    [0xfc, 0x95, 0xa9, 0x87, 0x35],
-];
 
 // ── CryptKey tables ───────────────────────────────────────────────────────
 
@@ -153,34 +117,51 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Perform CSS bus authentication only.
-pub fn authenticate(drive: &mut Drive) -> Result<()> {
-    let (_, _) = bus_auth(drive)?;
-    Ok(())
+/// CSS bus-auth **unlock** primitive.
+///
+/// Issues the full classic CSS handshake (bus auth → disc-key REPORT KEY →
+/// bus auth → title-key REPORT KEY) purely to unlock the drive's
+/// scrambled-sector read gating. The bytes returned by the handshake are
+/// discarded — the descramble title key is recovered keylessly elsewhere
+/// (the Stevenson known-plaintext attack in [`super::crack_key`]).
+pub fn unlock_css_reads(drive: &mut Drive, lba: u32) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    tracing::info!(target: "freemkv::css", phase = "unlock_css_reads", lba, "begin");
+    let r = unlock_css_reads_inner(drive, lba);
+    tracing::info!(
+        target: "freemkv::css",
+        phase = "unlock_css_reads",
+        lba,
+        ok = r.is_ok(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "end"
+    );
+    r
 }
 
-/// Full CSS key extraction: bus auth → disc key → title key.
-pub fn authenticate_and_read_title_key(drive: &mut Drive, lba: u32) -> Result<[u8; 5]> {
-    // Session 1: bus auth → disc key (AGID consumed by READ_DVD_STRUCTURE)
-    let (agid, bus_key) = bus_auth(drive)?;
-    let disc_key = read_disc_key(drive, agid, &bus_key)?;
+fn unlock_css_reads_inner(drive: &mut Drive, lba: u32) -> Result<()> {
+    tracing::debug!(target: "freemkv::css", lba, "css unlock: begin");
+    // Session 1: bus auth → disc-key REPORT KEY (AGID consumed by
+    // READ_DVD_STRUCTURE). The block contents are unused; this is issued
+    // purely for the bus-auth unlock side effect.
+    let (agid, _bus_key) = bus_auth(drive).inspect_err(|e| {
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth(1) failed");
+    })?;
+    tracing::debug!(target: "freemkv::css", agid, "css unlock: bus_auth(1) ok");
+    read_disc_key(drive, agid).inspect_err(|e| {
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: read_disc_key failed");
+    })?;
+    tracing::debug!(target: "freemkv::css", "css unlock: disc-key REPORT KEY ok");
 
-    // Session 2: fresh bus auth → title key (needs separate AGID)
-    let (agid2, bus_key2) = bus_auth(drive)?;
-    let encrypted_title = read_raw_title_key(drive, agid2, lba)?;
-
-    // Decrypt title key: XOR with bus key, then decrypt with disc key
-    let mut title_key = [0u8; 5];
-    for i in 0..5 {
-        title_key[i] = encrypted_title[i] ^ bus_key2[i];
-    }
-
-    if title_key == [0u8; 5] {
-        return Ok(title_key);
-    }
-
-    let title_key = super::lfsr::decrypt_key(0xFF, &disc_key, &title_key);
-    Ok(title_key)
+    // Session 2: fresh bus auth → title-key REPORT KEY (needs separate AGID).
+    let (agid2, _bus_key2) = bus_auth(drive).inspect_err(|e| {
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth(2) failed");
+    })?;
+    read_raw_title_key(drive, agid2, lba).inspect_err(|e| {
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: read_raw_title_key failed");
+    })?;
+    tracing::debug!(target: "freemkv::css", "css unlock: ok");
+    Ok(())
 }
 
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
@@ -295,7 +276,10 @@ fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
-fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 5]> {
+/// Issue the disc-key REPORT KEY (READ DVD STRUCTURE, format 0x02) purely
+/// for the bus-auth unlock side effect. The returned block contents are
+/// not used — the descramble title key is recovered keylessly elsewhere.
+fn read_disc_key(drive: &mut Drive, agid: u8) -> Result<()> {
     let scsi = drive.scsi_mut();
 
     // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
@@ -318,56 +302,14 @@ fn read_disc_key(drive: &mut Drive, agid: u8, bus_key: &[u8; 5]) -> Result<[u8; 
     );
     dvd_result.map_err(|_| Error::CssAuthFailed)?;
 
-    // Disc key block starts at offset 4 (skip 4-byte header)
-    let disc_key_block = &mut buf[4..4 + 2048];
-
-    // XOR with reversed bus key (per libdvdcss)
-    for (i, byte) in disc_key_block.iter_mut().enumerate() {
-        *byte ^= bus_key[4 - (i % 5)];
-    }
-
-    // Try each player key against each of 408 disc key entries.
-    // Each entry in the block is the disc key encrypted with a specific player
-    // key. We collect every decryption and accept the disc key as soon as two
-    // independent decryptions agree on the same 5-byte value (the agreement may
-    // come from two different player keys or from one player key decrypting two
-    // different entries to the same value).
-    //
-    // NOTE: this is a collision heuristic, not the canonical CSS disc-key
-    // self-verification (which decrypts the verification entry with the
-    // candidate and checks the result equals the candidate). A coincidental
-    // collision among the ~12,648 candidate decryptions could in principle
-    // accept a wrong disc key; in practice a chance collision on 5 bytes is
-    // improbable enough to serve as the validity check, and this path is the
-    // production DVD disc-key recovery. Left as-is to avoid regressing it
-    // without a real disc-key-block test vector to validate against.
-    let mut candidates: Vec<[u8; 5]> = Vec::new();
-
-    for player_key in PLAYER_KEYS.iter() {
-        for pos in 0..408 {
-            let offset = pos * 5;
-            if offset + 5 > disc_key_block.len() {
-                break;
-            }
-            let mut enc = [0u8; 5];
-            enc.copy_from_slice(&disc_key_block[offset..offset + 5]);
-            let candidate = super::lfsr::decrypt_key(0x00, player_key, &enc);
-
-            // Accept on the first agreement between two independent decryptions.
-            if candidates.contains(&candidate) {
-                return Ok(candidate);
-            }
-            candidates.push(candidate);
-        }
-    }
-
-    Err(Error::CssAuthFailed)
+    Ok(())
 }
 
 // ── Step 3: Title Key ─────────────────────────────────────────────────────
 
-/// Read the raw (bus-encrypted) title key bytes from the drive.
-fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<[u8; 5]> {
+/// Issue the title-key REPORT KEY (format 0x04) purely for the bus-auth
+/// unlock side effect. The returned key bytes are not used.
+fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<()> {
     let scsi = drive.scsi_mut();
     let mut cdb = [0u8; 12];
     cdb[0] = crate::scsi::SCSI_REPORT_KEY;
@@ -388,11 +330,7 @@ fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<[u8; 5]> 
     );
     result.map_err(|_| Error::CssAuthFailed)?;
 
-    let mut key = [0u8; 5];
-    for i in 0..5 {
-        key[i] = buf[5 + (4 - i)];
-    }
-    Ok(key)
+    Ok(())
 }
 
 // ── CSSCryptKey ───────────────────────────────────────────────────────────
@@ -556,6 +494,110 @@ fn send_key_cdb(agid: u8, format: u8, param_len: u16) -> [u8; 12] {
 mod tests {
     use super::*;
 
+    /// SECURITY REGRESSION GUARD: no instrumentation in libfreemkv may emit
+    /// raw key material. Scan every source file for a `tracing` field that
+    /// binds a forbidden key name to a value-producing expression (`= expr`
+    /// or `%expr` / `?expr`). The only allowed forms are a string literal
+    /// (e.g. `disc_key = "<redacted>"`) or a `_fp` fingerprint field.
+    ///
+    /// This is a source-scan test (not a runtime capture) so it stays cheap
+    /// and catches re-introductions at compile/CI time.
+    #[test]
+    fn no_key_bytes_in_instrumentation() {
+        use std::path::Path;
+
+        // Forbidden field names whose VALUES must never be logged.
+        const FORBIDDEN: &[&str] = &[
+            "title_key",
+            "disc_key",
+            "unit_key",
+            "vuk",
+            "player_key",
+            "bus_key",
+        ];
+
+        fn scan_dir(dir: &Path, forbidden: &[&str], violations: &mut Vec<String>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_dir(&path, forbidden, violations);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for (lineno, line) in src.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    // Only inspect tracing instrumentation lines.
+                    if !(trimmed.contains("tracing::")
+                        || trimmed.starts_with("debug!")
+                        || trimmed.starts_with("info!")
+                        || trimmed.starts_with("warn!")
+                        || trimmed.starts_with("trace!")
+                        || trimmed.starts_with("error!"))
+                    {
+                        continue;
+                    }
+                    // This guard test itself contains the forbidden names.
+                    if path.file_name().and_then(|n| n.to_str()) == Some("auth.rs")
+                        && line.contains("FORBIDDEN")
+                    {
+                        continue;
+                    }
+                    for &name in forbidden {
+                        // A fingerprint field (`<name>_fp = ...`) is allowed.
+                        // Match `<name>` followed by optional fingerprint
+                        // suffix then `=` and a value that is NOT a string
+                        // literal redaction marker.
+                        if let Some(idx) = line.find(name) {
+                            let after = &line[idx + name.len()..];
+                            let after = after.trim_start();
+                            // `<name>_fp` / `<name>_id` etc. are safe.
+                            if after.starts_with('_') {
+                                continue;
+                            }
+                            // Must be a field binding `name = ...`.
+                            let Some(rest) = after.strip_prefix('=') else {
+                                continue;
+                            };
+                            let rest = rest.trim_start();
+                            // Redaction string literal is the only allowed value.
+                            if rest.starts_with('"') {
+                                continue;
+                            }
+                            // Anything else (`%expr`, `?expr`, bare expr) leaks bytes.
+                            violations.push(format!(
+                                "{}:{}: forbidden key field `{}` logged with a value: {}",
+                                path.display(),
+                                lineno + 1,
+                                name,
+                                line.trim()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Walk up from this file (src/css/auth.rs) to the crate `src` root.
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        scan_dir(&src_root, FORBIDDEN, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "key material logged in instrumentation:\n{}",
+            violations.join("\n")
+        );
+    }
+
     #[test]
     fn crypt_key_is_deterministic() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -584,11 +626,6 @@ mod tests {
         for v in 0..32u8 {
             assert_ne!(crypt_key(0, v, &challenge), [0u8; 5]);
         }
-    }
-
-    #[test]
-    fn player_keys_count() {
-        assert_eq!(PLAYER_KEYS.len(), 31);
     }
 
     // ── CSS constant-table integrity ───────────────────────────────────────
@@ -641,21 +678,6 @@ mod tests {
                 seen.iter().all(|&b| b),
                 "PERM_VARIANT[{row}] misses a value"
             );
-        }
-    }
-
-    /// The 31 built-in player keys are all distinct. Duplicate keys would
-    /// waste disc-key trials and could mask a copy-paste error in the table.
-    ///
-    /// Grounding: PLAYER_KEYS is the set of long-public CSS player keys; each
-    /// is a unique 5-byte key.
-    /// Mutation: set PLAYER_KEYS[1] = PLAYER_KEYS[0] -> duplicate assert fires.
-    #[test]
-    fn player_keys_are_distinct() {
-        for (i, ki) in PLAYER_KEYS.iter().enumerate() {
-            for (j, kj) in PLAYER_KEYS.iter().enumerate().skip(i + 1) {
-                assert_ne!(ki, kj, "player keys {i} and {j} collide");
-            }
         }
     }
 

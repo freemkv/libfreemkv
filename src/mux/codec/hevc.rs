@@ -19,6 +19,13 @@ const _NAL_UNSPEC62_DV_RPU: u8 = 62;
 // IRAP types (keyframes): BLA, IDR, CRA
 const NAL_BLA_W_LP: u8 = 16;
 const NAL_RSV_IRAP_VCL23: u8 = 23;
+// CRA_NUT (Clean Random Access). A CRA at a splice carries RASL leading
+// pictures that reference frames from BEFORE the splice; on linear decode of a
+// concatenated title those references are gone ("Could not find ref with POC
+// N"). The HEVC spec remedy is to rewrite the splice CRA as a BLA (Broken Link
+// Access): a decoder then sets NoRaslOutput and discards the RASL cleanly with
+// no error. See `mark_clip_boundary` / the IRAP arm in `parse`.
+const NAL_CRA_NUT: u8 = 21;
 
 /// HEVC (H.265) Annex B → MKV codec parser: extracts VPS/SPS/PPS for the hvcC
 /// codecPrivate, detects IRAP keyframes, and converts each PES access unit into
@@ -36,6 +43,39 @@ pub struct HevcParser {
     vps: Option<Vec<u8>>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    // The currently-ACTIVE parameter-set body of each type — the most recent
+    // one the bitstream defined, which the decoder must use until the next
+    // redefinition. Distinct from the `vps/sps/pps` codecPrivate copy above
+    // (which is fixed to the FIRST one seen). When a stream redefines a param
+    // set mid-title (e.g. PPS id 0 body changes partway through, then the
+    // source STOPS repeating it at later IRAPs and relies on the decoder
+    // retaining it), a raw decode is fine — but an hvcC/MKV decode is NOT: a
+    // player re-applies the codecPrivate set at EVERY keyframe (ffmpeg's
+    // hvcC→Annex-B insertion), reverting id 0 to the stale FIRST body. We must
+    // therefore re-emit the active set IN-BAND at every keyframe whenever it
+    // differs from the codecPrivate copy and the access unit didn't already
+    // carry it. See `parse`.
+    cur_vps: Option<Vec<u8>>,
+    cur_sps: Option<Vec<u8>>,
+    cur_pps: Option<Vec<u8>>,
+    // Splice-aware CRA→BLA rewrite (non-seamless BD clip boundaries).
+    //
+    // When a BD title concatenates clips at a NON-SEAMLESS join (MPLS
+    // connection_condition 0x01), the next clip opens with a CRA whose RASL
+    // leading pictures reference frames from before the splice — gone after
+    // concatenation. The caller (the code that crosses the join) sets this flag
+    // via `mark_clip_boundary`; the parser then rewrites the FIRST CRA it sees
+    // at/after that point from CRA_NUT (21) to BLA_W_LP (16) so a linear decoder
+    // sets NoRaslOutput and discards the dangling RASL with no error. The flag
+    // is consumed (cleared) by that first CRA so only ONE CRA per boundary is
+    // touched — never a mid-stream CRA, never an IDR, never a non-CRA NAL.
+    //
+    // SAFETY: defaults to `false` and is ONLY ever set through
+    // `mark_clip_boundary`, which the caller invokes ONLY for a non-seamless
+    // (0x01) join. A stream with no boundary marker (single-clip title, any
+    // seamless-joined UHD/BD) never has this set, so the rewrite branch is never
+    // reached and output is byte-identical to a parser without this field.
+    pending_clip_boundary: bool,
 }
 
 impl Default for HevcParser {
@@ -51,40 +91,115 @@ impl HevcParser {
             vps: None,
             sps: None,
             pps: None,
+            cur_vps: None,
+            cur_sps: None,
+            cur_pps: None,
+            pending_clip_boundary: false,
         }
+    }
+
+    /// Mark that the NEXT IRAP this parser sees begins a NON-SEAMLESS BD clip
+    /// (MPLS connection_condition 0x01). The first CRA at/after this point is
+    /// rewritten CRA_NUT (21) → BLA_W_LP (16) so a linear decoder sets
+    /// NoRaslOutput and discards the now-dangling RASL leading pictures with no
+    /// "could not find ref" error.
+    ///
+    /// MUST be called ONLY when MPLS reports the join as non-seamless. It is a
+    /// no-op for the rewrite unless a CRA actually follows: an IDR/IDR_W_RADL
+    /// boundary needs no fix (it carries no cross-splice references), and the
+    /// flag is cleared by the first IRAP-class CRA it reaches.
+    ///
+    /// SAFETY: never call this for a seamless join (0x05/0x06) or within a
+    /// single-clip title — doing so could convert a legitimate mid-content CRA
+    /// to BLA. The default (never called) path leaves output byte-identical.
+    pub fn mark_clip_boundary(&mut self) {
+        self.pending_clip_boundary = true;
     }
 }
 
-/// Handle a VPS/SPS/PPS NAL.
+/// Handle a VPS/SPS/PPS NAL. Decides whether to strip it (the decoder already
+/// has the value) or emit it in-band, and tracks the currently-active body.
 ///
-/// - First of its type → seeds codecPrivate (`first`); stripped from frame data
-///   (the player gets it from hvcC).
-/// - Identical to the codecPrivate copy → stripped (the player already re-applies
-///   it from hvcC at each keyframe; BD streams repeat param sets at every IRAP).
-/// - DIFFERENT body from the codecPrivate copy (a mid-title redefinition of the
-///   same id) → emitted IN-BAND (length-prefixed) at EVERY occurrence, so it
-///   overrides the hvcC copy the player re-applies at each keyframe. Emitting it
-///   only once is not enough — the next keyframe's hvcC re-insertion would revert
-///   it. This matches what a conforming muxer produces and fixes mid-title
-///   PPS-id-0 redefinition.
-fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Vec<u8>) {
-    match first {
-        None => {
-            first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
-        }
-        Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
-        Some(_) => {
-            // Differs from codecPrivate → emit in-band so it wins at this AU.
-            // A NAL longer than u32::MAX can't be length-prefixed in the 4-byte
-            // field; skip it rather than mis-frame the output. Unreachable in
-            // practice (no real access unit is >4 GiB).
-            let Ok(len) = u32::try_from(nal.len()) else {
-                return;
-            };
-            frame_data.extend_from_slice(&len.to_be_bytes());
-            frame_data.extend_from_slice(nal);
-        }
+/// The decision MUST be made against the currently-active set (`cur`), NOT the
+/// codecPrivate copy (`first`). The two player behaviours for hvcC-in-MKV
+/// diverge exactly here:
+///
+/// - A *seek-capable / Annex-B* player (e.g. ffmpeg's `hevc_mp4toannexb`)
+///   re-applies the hvcC sets at every keyframe. `reassert_active` handles it.
+/// - A *streaming* decode (ffmpeg decoding the MKV directly — what most
+///   integrity checkers do) applies hvcC ONCE at init and thereafter updates a
+///   parameter set ONLY from an in-band NAL.
+///
+/// So when a title redefines a set mid-stream (id 0 body A → B) and later
+/// switches BACK to A (== codecPrivate), the change to A must STILL be emitted
+/// in-band: the streaming decoder is sitting on B and will never revert
+/// otherwise, decoding the whole A-segment against B → CABAC/cu_qp_delta
+/// desync. Stripping on `== first` (the old behaviour) dropped exactly that
+/// revert and corrupted every "switch back to the first body" segment.
+///
+/// Rules:
+/// - First of its type → seeds codecPrivate; stripped (the decoder gets it from
+///   hvcC at init).
+/// - Equal to the active set `cur` → redundant; stripped.
+/// - Different from `cur` (a change, in EITHER direction) → emitted in-band and
+///   `cur` updated.
+///
+/// Returns `true` when the NAL was emitted in-band into `frame_data`.
+fn handle_param_set(
+    first: &mut Option<Vec<u8>>,
+    cur: &mut Option<Vec<u8>>,
+    nal: &[u8],
+    frame_data: &mut Vec<u8>,
+) -> bool {
+    let is_first = first.is_none();
+    if is_first {
+        first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
     }
+    let changed = cur.as_deref() != Some(nal);
+    if changed {
+        *cur = Some(nal.to_vec());
+    }
+    // Strip the seeding occurrence (decoder gets it from hvcC) and any NAL that
+    // doesn't change the active set. Emit only a genuine change.
+    if is_first || !changed {
+        return false;
+    }
+    // A NAL longer than u32::MAX can't be length-prefixed in the 4-byte field;
+    // skip it rather than mis-frame the output. Unreachable in practice (no
+    // real access unit is >4 GiB).
+    let Ok(len) = u32::try_from(nal.len()) else {
+        return false;
+    };
+    frame_data.extend_from_slice(&len.to_be_bytes());
+    frame_data.extend_from_slice(nal);
+    true
+}
+
+/// Append the active parameter set `cur` to `prefix` (length-prefixed) so every
+/// keyframe is SELF-CONTAINED: it carries the active VPS/SPS/PPS in-band ahead
+/// of its slices. Skipped only when this access unit ALREADY carried the NAL
+/// in-band (`emitted` — avoids a duplicate) or no active set exists yet.
+///
+/// Why unconditional (not only when the active set differs from codecPrivate):
+/// a streaming decoder applies the hvcC param sets once at init, then relies on
+/// in-band repetition. Some sources stop repeating a param set at later IRAPs
+/// even though its body is unchanged; if the decoder then drops it (a CRA reset
+/// or SPS event), nothing re-sends it and every subsequent slice fails with
+/// "PPS id out of range" until the next genuine change (observed as a ~24 min
+/// corrupt band on one dual-layer UHD title). Re-asserting the active set at
+/// EVERY keyframe — what compliant muxers (mkvmerge) do at every IRAP — makes
+/// streaming decode self-healing. Re-sending an identical param set is benign
+/// (decoders expect it at IRAPs); cost is a few hundred bytes per keyframe.
+/// This strictly supersets the earlier change-only re-assert, so the
+/// param-set-revert fix is unaffected.
+fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
+    if emitted {
+        return;
+    }
+    let Some(active) = cur.as_deref() else {
+        return;
+    };
+    push_length_prefixed(prefix, active);
 }
 
 /// Append `nal` to `out` as a 4-byte big-endian length prefix followed by the
@@ -114,6 +229,12 @@ impl CodecParser for HevcParser {
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         let data = &pes.data;
         let mut keyframe = false;
+        // Track whether THIS access unit already carried each param-set type
+        // in-band (a redefinition vs codecPrivate). Used after the scan to
+        // re-assert the active set at a keyframe the source left bare.
+        let mut emitted_vps = false;
+        let mut emitted_sps = false;
+        let mut emitted_pps = false;
         // Pre-size: output is ~input bytes with a few 4-byte length
         // prefixes added. UHD frames are 150-300 KB; the unsized Vec
         // growth chain otherwise reallocs 5-7× per frame.
@@ -145,13 +266,28 @@ impl CodecParser for HevcParser {
 
                     match nal_type {
                         NAL_VPS => {
-                            handle_param_set(&mut self.vps, &data[nal_start..end], &mut frame_data)
+                            emitted_vps |= handle_param_set(
+                                &mut self.vps,
+                                &mut self.cur_vps,
+                                &data[nal_start..end],
+                                &mut frame_data,
+                            )
                         }
                         NAL_SPS => {
-                            handle_param_set(&mut self.sps, &data[nal_start..end], &mut frame_data)
+                            emitted_sps |= handle_param_set(
+                                &mut self.sps,
+                                &mut self.cur_sps,
+                                &data[nal_start..end],
+                                &mut frame_data,
+                            )
                         }
                         NAL_PPS => {
-                            handle_param_set(&mut self.pps, &data[nal_start..end], &mut frame_data)
+                            emitted_pps |= handle_param_set(
+                                &mut self.pps,
+                                &mut self.cur_pps,
+                                &data[nal_start..end],
+                                &mut frame_data,
+                            )
                         }
                         // Drop Access Unit Delimiters. This is intentional and
                         // spec-correct: Matroska HEVC frame data omits AUDs
@@ -160,7 +296,32 @@ impl CodecParser for HevcParser {
                         NAL_AUD => {}
                         t if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&t) => {
                             keyframe = true;
-                            push_length_prefixed(&mut frame_data, &data[nal_start..end]);
+                            // Splice-aware CRA→BLA rewrite. At the FIRST CRA
+                            // following a non-seamless clip boundary (flag set
+                            // via `mark_clip_boundary`), rewrite CRA_NUT (21) →
+                            // BLA_W_LP (16) so a linear decoder sets NoRaslOutput
+                            // and drops the dangling RASL with no error. The flag
+                            // is consumed here so exactly ONE CRA per boundary is
+                            // touched. A non-CRA IRAP (IDR, BLA) clears the flag
+                            // too (the boundary is handled — IDR carries no
+                            // cross-splice refs) but is NOT modified. Default
+                            // path (flag never set) is unreachable → byte-
+                            // identical output.
+                            if self.pending_clip_boundary && t == NAL_CRA_NUT {
+                                // First CRA after a non-seamless boundary: rewrite
+                                // its header type to BLA_W_LP. NAL type is bits 1-6
+                                // of byte 0: byte = (byte & 0x81) | (type << 1).
+                                self.pending_clip_boundary = false;
+                                let mut rewritten = data[nal_start..end].to_vec();
+                                rewritten[0] = (rewritten[0] & 0x81) | (NAL_BLA_W_LP << 1);
+                                push_length_prefixed(&mut frame_data, &rewritten);
+                            } else {
+                                // Any IRAP clears a pending boundary (it's been
+                                // reached and handled — an IDR needs no rewrite),
+                                // but only a CRA is modified.
+                                self.pending_clip_boundary = false;
+                                push_length_prefixed(&mut frame_data, &data[nal_start..end]);
+                            }
                         }
                         _ => {
                             // All other NAL types (slices, SEI, DV RPU, etc.) pass through
@@ -176,6 +337,27 @@ impl CodecParser for HevcParser {
 
         if frame_data.is_empty() {
             return Vec::new();
+        }
+
+        // A player re-applies the hvcC (codecPrivate) parameter sets at every
+        // keyframe. If the active set was redefined mid-title and the source
+        // stopped repeating that redefinition at later IRAPs (relying on the
+        // decoder to retain it — valid for a raw bitstream), the hvcC
+        // re-insertion would silently revert to the stale FIRST body and every
+        // frame in the segment decodes against the wrong parameter set
+        // (CABAC/cu_qp_delta desync). Re-assert the active set in-band, ahead
+        // of this AU's slices, so it wins. Re-asserted at EVERY keyframe (even
+        // when active == codecPrivate) so each keyframe is self-contained and a
+        // decoder that dropped the set (CRA reset / SPS event) self-heals.
+        if keyframe {
+            let mut prefix = Vec::new();
+            reassert_active(&mut prefix, &self.cur_vps, emitted_vps);
+            reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
+            reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
+            if !prefix.is_empty() {
+                prefix.extend_from_slice(&frame_data);
+                frame_data = prefix;
+            }
         }
 
         vec![Frame {
@@ -208,38 +390,35 @@ impl CodecParser for HevcParser {
         // Minimal HEVCDecoderConfigurationRecord header.
         //
         // The stored SPS NAL is [2-byte HEVC NAL header][SPS RBSP...].
-        // The RBSP begins at sps[2]; profile_tier_level() begins one byte
-        // later, after sps_video_parameter_set_id u(4) +
-        // sps_max_sub_layers_minus1 u(3) + sps_temporal_id_nesting_flag u(1)
-        // (= sps[2], a full byte). So the profile_tier_level fields are:
-        //   sps[3]      general_profile_space u(2)+tier u(1)+profile_idc u(5)
-        //   sps[4..8]   general_profile_compatibility_flags u(32)
-        //   sps[8..14]  general_constraint_indicator_flags 48 bits
-        //   sps[14]     general_level_idc u(8)
-        // (Byte-aligned read; emulation-prevention bytes within the first
-        // 15 SPS bytes are not handled — extremely rare and matches the
-        // pre-existing simplification.)
+        // profile_tier_level fields must be read off the
+        // emulation-prevention-STRIPPED RBSP — a `00 00 03` sequence in the
+        // first ~15 SPS bytes would otherwise shift every raw byte index and
+        // corrupt the PTL (profile/compat/constraint/level). We strip first
+        // (same as parse_sps_chroma) and index into the cleaned RBSP:
+        //   rbsp[0]      sps_vps_id u(4)+max_sub_layers u(3)+temporal_nesting u(1)
+        //   rbsp[1]      general_profile_space u(2)+tier u(1)+profile_idc u(5)
+        //   rbsp[2..6]   general_profile_compatibility_flags u(32)
+        //   rbsp[6..12]  general_constraint_indicator_flags 48 bits
+        //   rbsp[12]     general_level_idc u(8)
+        let ptl: Vec<u8> = if sps.len() > 2 {
+            strip_emulation_prevention(&sps[2..])
+        } else {
+            Vec::new()
+        };
+        let ptl_at = |i: usize| -> u8 { ptl.get(i).copied().unwrap_or(0) };
         record.push(1); // configurationVersion
         // general_profile_space + general_tier_flag + general_profile_idc
-        record.push(if sps.len() > 3 { sps[3] } else { 0 });
-        // general_profile_compatibility_flags (4 bytes) — SPS bytes 4..8
-        if sps.len() > 7 {
-            record.extend_from_slice(&sps[4..8]);
-        } else {
-            let target = record.len() + 4;
-            record.extend_from_slice(&sps[sps.len().min(4)..sps.len().min(8)]);
-            record.resize(target, 0u8); // zero-pad the missing bytes in place
+        record.push(ptl_at(1));
+        // general_profile_compatibility_flags (4 bytes) — RBSP bytes 2..6
+        for i in 2..6 {
+            record.push(ptl_at(i));
         }
-        // general_constraint_indicator_flags (6 bytes) — SPS bytes 8..14
-        if sps.len() > 13 {
-            record.extend_from_slice(&sps[8..14]);
-        } else {
-            let target = record.len() + 6;
-            record.extend_from_slice(&sps[sps.len().min(8)..sps.len().min(14)]);
-            record.resize(target, 0u8); // zero-pad the missing bytes in place
+        // general_constraint_indicator_flags (6 bytes) — RBSP bytes 6..12
+        for i in 6..12 {
+            record.push(ptl_at(i));
         }
-        // general_level_idc — SPS byte 14
-        record.push(if sps.len() > 14 { sps[14] } else { 0 });
+        // general_level_idc — RBSP byte 12
+        record.push(ptl_at(12));
         // min_spatial_segmentation_idc (4 + 12 bits)
         record.extend_from_slice(&[0xF0, 0x00]);
         // parallelismType (6 + 2 bits)
@@ -553,6 +732,171 @@ mod tests {
         );
     }
 
+    /// Regression (Fight Club UHD banded corruption): a stream redefines PPS
+    /// id 0 mid-title, then a later keyframe arrives WITHOUT repeating it (the
+    /// source relies on the decoder retaining the redefinition — valid for a
+    /// raw bitstream). An hvcC player re-applies the FIRST (codecPrivate) PPS
+    /// at every keyframe, so the active redefinition must be re-asserted
+    /// in-band at that bare keyframe or the whole segment decodes against the
+    /// wrong parameter set.
+    #[test]
+    fn reasserts_active_pps_at_bare_keyframe() {
+        fn nal(t: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.extend_from_slice(body);
+            v
+        }
+        // Split length-prefixed frame_data back into NAL bodies.
+        fn nals_in(frame: &[u8]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 4 <= frame.len() {
+                let len = u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]])
+                    as usize;
+                i += 4;
+                if i + len > frame.len() {
+                    break;
+                }
+                out.push(frame[i..i + len].to_vec());
+                i += len;
+            }
+            out
+        }
+        let pps_of = |nals: &[Vec<u8>]| -> Vec<Vec<u8>> {
+            nals.iter()
+                .filter(|n| n.len() >= 2 && (n[0] >> 1) & 0x3F == 34)
+                .map(|n| n[2..].to_vec())
+                .collect()
+        };
+        let sps_body = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+        ];
+        let pps_a = [0xA1u8, 0xA2];
+        let pps_b = [0xB1u8, 0xB2, 0xB3];
+
+        let mut parser = HevcParser::new();
+
+        // AU1: seeds codecPrivate with VPS/SPS/PPS-A (all stripped in-band).
+        let au1 = [
+            nal(32, &[0xAA]),
+            nal(33, &sps_body),
+            nal(34, &pps_a),
+            nal(19, &[0x10]),
+        ]
+        .concat();
+        parser.parse(&make_pes(au1, Some(0)));
+
+        // AU2: keyframe redefines PPS id 0 to body B → emitted in-band.
+        let au2 = [nal(34, &pps_b), nal(19, &[0x11])].concat();
+        let f2 = parser.parse(&make_pes(au2, Some(3600)));
+        assert!(
+            pps_of(&nals_in(&f2[0].data)).iter().any(|b| b == &pps_b),
+            "AU2 must carry the redefined PPS-B in-band"
+        );
+
+        // AU3: BARE keyframe, source omits the PPS. The active set (B) must be
+        // re-asserted, and the stale codecPrivate A must NOT be injected.
+        let au3 = nal(19, &[0x12]);
+        let f3 = parser.parse(&make_pes(au3, Some(7200)));
+        let got = pps_of(&nals_in(&f3[0].data));
+        assert!(
+            got.iter().any(|b| b == &pps_b),
+            "bare keyframe must re-assert the active PPS-B in-band, got {got:?}"
+        );
+        assert!(
+            !got.iter().any(|b| b == &pps_a),
+            "must not re-assert the stale codecPrivate PPS-A"
+        );
+
+        // AU4: switch the active set BACK to A (== codecPrivate) via an in-band
+        // redefinition (a real change from B → emitted).
+        let au4 = [nal(34, &pps_a), nal(19, &[0x13])].concat();
+        parser.parse(&make_pes(au4, Some(10800)));
+        // AU5: BARE keyframe, source omits the PPS, and the active set now
+        // EQUALS codecPrivate. It must STILL be re-asserted in-band — every
+        // keyframe is self-contained: a decoder that dropped PPS id 0 at a CRA
+        // reset can only recover from an in-band copy, and there is no genuine
+        // change here to trigger the emit path.
+        let au5 = nal(19, &[0x14]);
+        let f5 = parser.parse(&make_pes(au5, Some(14400)));
+        assert!(
+            pps_of(&nals_in(&f5[0].data)).iter().any(|b| b == &pps_a),
+            "bare keyframe must re-assert the active PPS even when == codecPrivate"
+        );
+    }
+
+    /// Regression (Fight Club UHD, the real bug): id 0 is body A (→ hvcC), then
+    /// redefined to B, then the title switches BACK to A. A streaming decoder
+    /// (hvcC at init, in-band updates only) is sitting on B; the switch back to
+    /// A must be emitted IN-BAND even though A == codecPrivate, or the whole
+    /// A-segment decodes against B (cu_qp_delta desync). Stripping on `== hvcC`
+    /// dropped this revert.
+    #[test]
+    fn emits_switch_back_to_codecprivate_pps() {
+        fn nal(t: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.extend_from_slice(body);
+            v
+        }
+        fn nals_in(frame: &[u8]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 4 <= frame.len() {
+                let len = u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]])
+                    as usize;
+                i += 4;
+                if i + len > frame.len() {
+                    break;
+                }
+                out.push(frame[i..i + len].to_vec());
+                i += len;
+            }
+            out
+        }
+        let pps_body = |nals: &[Vec<u8>]| -> Vec<Vec<u8>> {
+            nals.iter()
+                .filter(|n| n.len() >= 2 && (n[0] >> 1) & 0x3F == 34)
+                .map(|n| n[2..].to_vec())
+                .collect()
+        };
+        let sps = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+        ];
+        let a = [0xA1u8, 0xA2];
+        let b = [0xB1u8, 0xB2, 0xB3];
+        let mut parser = HevcParser::new();
+
+        // AU1: seeds codecPrivate with PPS-A.
+        parser.parse(&make_pes(
+            [nal(32, &[0xAA]), nal(33, &sps), nal(34, &a), nal(19, &[1])].concat(),
+            Some(0),
+        ));
+        // AU2 keyframe: redefine to B → emitted in-band.
+        parser.parse(&make_pes([nal(34, &b), nal(19, &[2])].concat(), Some(3600)));
+        // AU3 keyframe: source sends A again (== codecPrivate). Must be emitted
+        // in-band because the active set was B.
+        let f3 = parser.parse(&make_pes([nal(34, &a), nal(19, &[3])].concat(), Some(7200)));
+        assert!(
+            pps_body(&nals_in(&f3[0].data)).iter().any(|p| p == &a),
+            "switch back to codecPrivate PPS-A must be emitted in-band"
+        );
+        // AU4 keyframe: A again, now == active AND == codecPrivate. Under the
+        // self-contained-keyframe rule it is STILL re-asserted in-band so a
+        // decoder that dropped PPS id 0 at this IRAP recovers. handle_param_set
+        // strips the source copy (== active), then reassert_active prepends the
+        // active set unconditionally.
+        let f4 = parser.parse(&make_pes(
+            [nal(34, &a), nal(19, &[4])].concat(),
+            Some(10800),
+        ));
+        assert!(
+            pps_body(&nals_in(&f4[0].data)).iter().any(|p| p == &a),
+            "active PPS must be re-asserted at every keyframe (self-contained), even when == codecPrivate"
+        );
+    }
+
     #[test]
     fn hvcc_profile_tier_level_offsets() {
         // The hvcC fixed header must read profile_tier_level from the SPS
@@ -751,6 +1095,204 @@ mod tests {
         assert!(frames[0].keyframe, "type 23 should be keyframe");
     }
 
+    // --- splice-aware CRA→BLA rewrite (non-seamless clip boundary) ---
+
+    /// Split length-prefixed frame_data into NAL bodies (4-byte BE length + NAL).
+    fn nals_of(frame: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= frame.len() {
+            let len =
+                u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]) as usize;
+            i += 4;
+            if i + len > frame.len() {
+                break;
+            }
+            out.push(frame[i..i + len].to_vec());
+            i += len;
+        }
+        out
+    }
+
+    fn nal_type_of(nal: &[u8]) -> u8 {
+        (nal[0] >> 1) & 0x3F
+    }
+
+    /// Build a standalone CRA (type 21) access unit.
+    fn cra_au(payload: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x00, 0x00, 0x01];
+        d.extend_from_slice(&hevc_nal_header(21));
+        d.extend_from_slice(payload);
+        d
+    }
+
+    /// Test 1: a CRA at a MARKED non-seamless boundary is rewritten to BLA_W_LP.
+    #[test]
+    fn cra_at_marked_boundary_rewritten_to_bla() {
+        let mut parser = HevcParser::new();
+        parser.mark_clip_boundary();
+        let frames = parser.parse(&make_pes(cra_au(&[0x10, 0x20, 0x30]), Some(0)));
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe, "rewritten BLA is still a keyframe");
+        let nals = nals_of(&frames[0].data);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(
+            nal_type_of(&nals[0]),
+            NAL_BLA_W_LP,
+            "marked-boundary CRA must be rewritten to BLA_W_LP (16)"
+        );
+        // The forbidden_zero_bit + layer-id-high (bit 0) and the rest of byte 0,
+        // and all payload bytes, are otherwise untouched.
+        assert_eq!(nals[0][0] & 0x81, hevc_nal_header(21)[0] & 0x81);
+        assert_eq!(&nals[0][2..], &[0x10, 0x20, 0x30]);
+        // The flag is one-shot: a SECOND CRA (no new marker) is left as CRA.
+        let f2 = parser.parse(&make_pes(cra_au(&[0x40]), Some(90000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f2[0].data)[0]),
+            NAL_CRA_NUT,
+            "only the first CRA after a boundary is rewritten"
+        );
+    }
+
+    /// Test 2: a CRA with NO boundary marker is left unchanged (CRA stays CRA).
+    #[test]
+    fn cra_without_boundary_unchanged() {
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(cra_au(&[0x10, 0x20]), Some(0)));
+        let nals = nals_of(&frames[0].data);
+        assert_eq!(
+            nal_type_of(&nals[0]),
+            NAL_CRA_NUT,
+            "an unmarked CRA must remain a CRA"
+        );
+    }
+
+    /// Test 3: non-CRA NALs are never rewritten even when a boundary IS marked.
+    /// IDR (19), RASL (8/9), VPS/SPS/PPS, and a trailing slice all pass through
+    /// unmodified; the IDR clears the pending boundary so no later CRA is wrongly
+    /// converted.
+    #[test]
+    fn non_cra_nals_never_rewritten_at_boundary() {
+        // IDR boundary: marker set, but the first IRAP is an IDR → no rewrite,
+        // and the marker is consumed so a later CRA is untouched.
+        let mut parser = HevcParser::new();
+        parser.mark_clip_boundary();
+        let mut idr = vec![0x00, 0x00, 0x01];
+        idr.extend_from_slice(&hevc_nal_header(19)); // IDR_W_RADL
+        idr.extend_from_slice(&[0x10]);
+        let f = parser.parse(&make_pes(idr, Some(0)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f[0].data)[0]),
+            19,
+            "IDR at a marked boundary must stay IDR"
+        );
+        // Marker was consumed by the IDR: a following CRA is NOT rewritten.
+        let f2 = parser.parse(&make_pes(cra_au(&[0x20]), Some(90000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f2[0].data)[0]),
+            NAL_CRA_NUT,
+            "the IDR consumed the boundary marker; later CRA stays CRA"
+        );
+
+        // RASL leading pictures (types 8/9) preceding the splice CRA must not be
+        // touched and must not consume the marker — only the CRA itself does.
+        let mut parser = HevcParser::new();
+        parser.mark_clip_boundary();
+        let mut au = vec![0x00, 0x00, 0x01];
+        au.extend_from_slice(&hevc_nal_header(8)); // RASL_N
+        au.extend_from_slice(&[0xAA]);
+        au.extend_from_slice(&[0x00, 0x00, 0x01]);
+        au.extend_from_slice(&hevc_nal_header(9)); // RASL_R
+        au.extend_from_slice(&[0xBB]);
+        au.extend_from_slice(&cra_au(&[0xCC])); // CRA after the RASLs
+        let f = parser.parse(&make_pes(au, Some(0)));
+        let nals = nals_of(&f[0].data);
+        let types: Vec<u8> = nals.iter().map(|n| nal_type_of(n)).collect();
+        assert_eq!(
+            types,
+            vec![8, 9, NAL_BLA_W_LP],
+            "RASLs pass through untouched; the CRA (after them) becomes BLA"
+        );
+    }
+
+    /// Test 4: a frame stream with NO boundary marker is BYTE-IDENTICAL to a
+    /// parser that has no splice-rewrite field at all (the UHD-safety guarantee).
+    /// We assert byte-equality of every emitted frame across a multi-AU stream
+    /// containing CRAs, IDRs, RASLs, VPS/SPS/PPS, and trailing slices — none of
+    /// which is ever marked.
+    #[test]
+    fn no_boundary_marker_is_byte_identical() {
+        let build = || {
+            let mut d = Vec::new();
+            // AU0: VPS/SPS/PPS + CRA keyframe.
+            d.extend_from_slice(&[0x00, 0x00, 0x01]);
+            d.extend_from_slice(&hevc_nal_header(32));
+            d.extend_from_slice(&[0xAA]);
+            d.extend_from_slice(&[0x00, 0x00, 0x01]);
+            d.extend_from_slice(&hevc_nal_header(33));
+            d.extend_from_slice(&[0xBB, 0xCC, 0xDD]);
+            d.extend_from_slice(&[0x00, 0x00, 0x01]);
+            d.extend_from_slice(&hevc_nal_header(34));
+            d.extend_from_slice(&[0xEE]);
+            d.extend_from_slice(&cra_au(&[0x11, 0x22]));
+            d
+        };
+        // Reference parser: the rewrite field exists but is NEVER marked, so its
+        // output is exactly the pre-feature behaviour. We compare a never-marked
+        // run against a second never-marked run AND against the documented
+        // invariant that the CRA is emitted as-is (type 21, payload intact).
+        let mut a = HevcParser::new();
+        let mut b = HevcParser::new();
+        let fa = a.parse(&make_pes(build(), Some(0)));
+        let fb = b.parse(&make_pes(build(), Some(0)));
+        assert_eq!(fa.len(), 1);
+        assert_eq!(fa[0].data, fb[0].data, "never-marked output must be stable");
+        // And the CRA was NOT converted (type 21 still present, no BLA).
+        let types: Vec<u8> = nals_of(&fa[0].data)
+            .iter()
+            .map(|n| nal_type_of(n))
+            .collect();
+        assert!(
+            types.contains(&NAL_CRA_NUT) && !types.contains(&NAL_BLA_W_LP),
+            "unmarked stream must keep its CRA (no BLA), got {types:?}"
+        );
+
+        // Feed a second AU (a CRA) to the same unmarked parser: still a CRA.
+        // Param sets are re-asserted ahead of the keyframe, so locate the CRA
+        // among the emitted NALs rather than assuming it is first.
+        let f2 = a.parse(&make_pes(cra_au(&[0x33]), Some(90000)));
+        let t2: Vec<u8> = nals_of(&f2[0].data)
+            .iter()
+            .map(|n| nal_type_of(n))
+            .collect();
+        assert!(
+            t2.contains(&NAL_CRA_NUT) && !t2.contains(&NAL_BLA_W_LP),
+            "unmarked mid-stream CRA must never become BLA, got {t2:?}"
+        );
+    }
+
+    /// Test 5: a SEAMLESS boundary (connection_condition 0x05/0x06) is expressed
+    /// by NOT calling `mark_clip_boundary`, so a CRA across a seamless join is
+    /// left unchanged. This encodes the contract: only non-seamless joins call
+    /// `mark_clip_boundary`; seamless ones never do, so no rewrite occurs.
+    #[test]
+    fn seamless_boundary_no_rewrite() {
+        // Simulate two clips joined seamlessly: the caller does NOT mark, so the
+        // second clip's opening CRA stays a CRA.
+        let mut parser = HevcParser::new();
+        // Clip 1 ends with a CRA (no marker — mid-content).
+        let f1 = parser.parse(&make_pes(cra_au(&[0x01]), Some(0)));
+        assert_eq!(nal_type_of(&nals_of(&f1[0].data)[0]), NAL_CRA_NUT);
+        // Seamless join: caller deliberately does NOT call mark_clip_boundary().
+        // Clip 2 opens with a CRA → must remain a CRA.
+        let f2 = parser.parse(&make_pes(cra_au(&[0x02]), Some(90000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&f2[0].data)[0]),
+            NAL_CRA_NUT,
+            "a seamless join (no marker) must never rewrite the CRA"
+        );
+    }
+
     // --- non-IRAP (trailing) → not keyframe ---
 
     #[test]
@@ -792,7 +1334,7 @@ mod tests {
     // --- VPS/SPS/PPS stripped from frame data ---
 
     #[test]
-    fn param_sets_stripped_from_frame() {
+    fn param_sets_seed_codecprivate_and_reassert_at_keyframe() {
         let mut parser = HevcParser::new();
 
         let mut data = Vec::new();
@@ -818,14 +1360,28 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
 
-        // Frame data should only have the IDR NAL (length-prefixed)
+        // The param sets seed codecPrivate (hvcC).
+        assert!(
+            parser.codec_private().is_some(),
+            "VPS/SPS/PPS must seed codecPrivate"
+        );
+
+        // Because this is a keyframe, the active VPS/SPS/PPS are ALSO re-asserted
+        // in-band ahead of the IDR so the keyframe is self-contained. Frame data
+        // = VPS, SPS, PPS, IDR (4 length-prefixed NALs, in that order).
         let fd = &frames[0].data;
-        let length = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]);
-        // IDR NAL = 2 bytes header + 2 bytes payload = 4 bytes
+        let mut types = Vec::new();
+        let mut o = 0;
+        while o + 4 <= fd.len() {
+            let len = u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+            o += 4;
+            types.push((fd[o] >> 1) & 0x3F);
+            o += len;
+        }
         assert_eq!(
-            length as usize + 4,
-            fd.len(),
-            "frame should contain exactly one length-prefixed NAL"
+            types,
+            vec![32, 33, 34, 19],
+            "keyframe must re-assert VPS/SPS/PPS in-band ahead of the IDR slice"
         );
     }
 
@@ -876,27 +1432,32 @@ mod tests {
         let f = parser.parse(&make_pes(d, Some(1)));
         assert_eq!(count_pps(&f[0].data), 1, "redefined PPS must be inline");
 
-        // PES3: PPS-B repeated — still differs from codecPrivate(A), so emitted
-        // AGAIN. Every keyframe of the redefined segment must carry it, because
-        // the player re-applies the hvcC (codecPrivate) copy at each keyframe;
-        // emitting once would be reverted at the next keyframe.
+        // PES3: PPS-B repeated on a NON-keyframe slice — B is already the active
+        // set, so this carries no change and is stripped. (Re-assertion for
+        // players that re-apply hvcC at keyframes is handled by
+        // `reassert_active` at KEYFRAMES, not on every trailing frame; these
+        // slices are TRAIL_R, not IRAP.)
         let mut d = pps(0xBB);
         d.extend(slice());
         let f = parser.parse(&make_pes(d, Some(2)));
         assert_eq!(
             count_pps(&f[0].data),
-            1,
-            "redefined PPS re-emitted every occurrence"
+            0,
+            "PPS equal to the active set carries no change → stripped"
         );
 
-        // PES4: back to PPS-A (== codecPrivate) → stripped (hvcC supplies it).
+        // PES4: back to PPS-A. Even though A == codecPrivate, the ACTIVE set is
+        // B, so switching to A is a real change and MUST be emitted in-band — a
+        // streaming decoder (hvcC at init, in-band updates only) is sitting on B
+        // and would otherwise never revert. (This is the Fight Club bug: the old
+        // `== codecPrivate → strip` rule dropped exactly this revert.)
         let mut d = pps(0xAA);
         d.extend(slice());
         let f = parser.parse(&make_pes(d, Some(3)));
         assert_eq!(
             count_pps(&f[0].data),
-            0,
-            "occurrence equal to codecPrivate stripped"
+            1,
+            "switch back to the codecPrivate body is a change → emitted in-band"
         );
     }
 
@@ -1051,10 +1612,14 @@ mod tests {
             "frame data must contain Dolby Vision RPU NAL (type 62), got: {:?}",
             nal_types
         );
+        // Self-contained keyframe: the active VPS/SPS/PPS are re-asserted in-band
+        // ahead of the IDR, so the frame is VPS, SPS, PPS, IDR, RPU — in that
+        // order. The RPU (type 62) is preserved (never stripped); only the
+        // duplicate-suppression of unchanged param sets was lifted at keyframes.
         assert_eq!(
-            nal_types.len(),
-            2,
-            "frame data should have exactly 2 NALs (IDR + RPU), got: {:?}",
+            nal_types,
+            vec![32, 33, 34, 19, 62],
+            "keyframe carries re-asserted param sets + IDR + preserved RPU, got: {:?}",
             nal_types
         );
 

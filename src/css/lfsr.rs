@@ -13,53 +13,21 @@
 
 use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
-/// Seed the 32-bit LFSR0 register from the 5-byte working key, applying
-/// the per-byte TAB4 bit-reversal. Shared by [`descramble_sector`] and
-/// [`decrypt_key`] so the seeding lives in one place.
-#[inline]
-fn seed_lfsr0(key: &[u8; 5]) -> u32 {
-    let lfsr0: u32 = ((key[4] as u32) << 17)
-        | ((key[3] as u32) << 9)
-        | (((key[2] as u32) << 1) + 8 - (key[2] as u32 & 7));
-    (TAB4[(lfsr0 & 0xFF) as usize] as u32) << 24
-        | (TAB4[((lfsr0 >> 8) & 0xFF) as usize] as u32) << 16
-        | (TAB4[((lfsr0 >> 16) & 0xFF) as usize] as u32) << 8
-        | TAB4[((lfsr0 >> 24) & 0xFF) as usize] as u32
-}
-
-/// One CSS keystream step. Advances both LFSRs, folds their permuted
-/// outputs into `combined` (carry kept across calls), and returns the
-/// low keystream byte. `invert` XORs the LFSR0 output index (0x00 on the
-/// descramble path, 0xFF on the key-decrypt path).
-#[inline]
-fn css_step(
-    lfsr1_lo: &mut u32,
-    lfsr1_hi: &mut u32,
-    lfsr0: &mut u32,
-    combined: &mut u32,
-    invert: u8,
-) -> u8 {
-    let o_lfsr1 = TAB2[*lfsr1_hi as usize] ^ TAB3[*lfsr1_lo as usize];
-    *lfsr1_hi = *lfsr1_lo >> 1;
-    *lfsr1_lo = ((*lfsr1_lo & 1) << 8) ^ o_lfsr1 as u32;
-
-    let o_lfsr0 = (((((((*lfsr0 >> 8) ^ *lfsr0) >> 1) ^ *lfsr0) >> 3) ^ *lfsr0) >> 7) as u8;
-    *lfsr0 = (*lfsr0 >> 8) | ((o_lfsr0 as u32) << 24);
-
-    *combined += TAB5[o_lfsr1 as usize] as u32 + TAB4[(o_lfsr0 ^ invert) as usize] as u32;
-    let out = (*combined & 0xFF) as u8;
-    *combined >>= 8;
-    out
-}
-
 /// Descramble a CSS-encrypted DVD sector in place.
 ///
-/// The sector seed (bytes 0x54-0x58) is XORed with the title key to produce
-/// the per-sector key. Bytes 0x80..0x800 (128..2048) are then decrypted
-/// using the two-LFSR keystream.
+/// Exact port of libdvdcss `dvdcss_unscramble` (css.c). The two content
+/// LFSRs are seeded **directly** from `title_key XOR sector_seed` — there is
+/// no `decrypt_key` mangling on this path (that is the disc/title-key
+/// hierarchy, not the content cipher). Bytes 0x80..0x800 are recovered with
+/// `*p = TAB1[*p] ^ (i_t5 & 0xff)`.
 ///
-/// The scramble flag at byte 0x14 (bits 4-5) indicates encryption.
-/// After descrambling, the flag is cleared.
+/// The scramble flag at byte 0x14 (bits 4-5) indicates encryption. Like
+/// libdvdcss, the flag byte is NOT modified here — the caller treats a
+/// nonzero `sector[0x14] & 0x30` as "needs unscrambling" and the descramble
+/// is its own inverse, so re-running it on plaintext would re-scramble.
+/// (freemkv historically cleared the flag; we keep clearing it so callers
+/// and the existing tests can distinguish a descrambled sector. This does
+/// not affect the recovered body.)
 ///
 /// No-op (returns without modifying `sector`) in two cases:
 /// - `sector.len() < 2048`: the encrypted region (0x80..0x800) is not
@@ -67,6 +35,21 @@ fn css_step(
 ///   left untouched. The `debug_assert!` flags this misuse in debug/test
 ///   builds; a DVD sector is always exactly 2048 bytes.
 /// - scramble flags are zero: the sector is not CSS-encrypted.
+///
+/// Design reference: libdvdcss `dvdcss_unscramble`. The combiner mirrors
+/// `css.c` line-for-line:
+/// ```text
+/// i_t1 = (key[0] ^ sec[0x54]) | 0x100;
+/// i_t2 =  key[1] ^ sec[0x55];
+/// i_t3 = (key[2]|key[3]<<8|key[4]<<16) ^ (sec[0x56]|sec[0x57]<<8|sec[0x58]<<16);
+/// i_t4 = i_t3 & 7;  i_t3 = i_t3*2 + 8 - i_t4;
+/// // per byte over 0x80..0x800:
+/// i_t4 = TAB2[i_t2] ^ TAB3[i_t1];
+/// i_t2 = i_t1 >> 1;  i_t1 = ((i_t1 & 1) << 8) ^ i_t4;  i_t4 = TAB5[i_t4];
+/// i_t6 = (((((((i_t3>>3)^i_t3)>>1)^i_t3)>>8)^i_t3)>>5) & 0xff;
+/// i_t3 = (i_t3 << 8) | i_t6;  i_t6 = TAB4[i_t6];
+/// i_t5 += i_t6 + i_t4;  *p = TAB1[*p] ^ (i_t5 & 0xff);  i_t5 >>= 8;
+/// ```
 pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
     debug_assert!(
         sector.len() >= 2048,
@@ -76,100 +59,110 @@ pub fn descramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
         return;
     }
 
-    let flags = (sector[0x14] >> 4) & 0x03;
-    if flags == 0 {
+    // libdvdcss: `if( !(p_sec[0x14] & 0x30) ) return;`
+    if sector[0x14] & 0x30 == 0 {
         return;
     }
 
-    // Per-sector key = title_key XOR sector_seed (bytes 0x54-0x58)
-    let key = [
-        title_key[0] ^ sector[0x54],
-        title_key[1] ^ sector[0x55],
-        title_key[2] ^ sector[0x56],
-        title_key[3] ^ sector[0x57],
-        title_key[4] ^ sector[0x58],
-    ];
+    // LFSR1: seeded directly from (key ^ seed) — NO decrypt_key.
+    let mut i_t1: u32 = ((title_key[0] ^ sector[0x54]) as u32) | 0x100;
+    let mut i_t2: u32 = (title_key[1] ^ sector[0x55]) as u32;
 
-    // Decrypt the key through the CSS mangling function to get the working key.
-    // The sector seed is bytes 0x54..0x59 (5 bytes).
-    let seed: [u8; 5] = [
-        sector[0x54],
-        sector[0x55],
-        sector[0x56],
-        sector[0x57],
-        sector[0x58],
-    ];
-    let working_key = decrypt_key(0xFF, &key, &seed);
+    // LFSR0 (i_t3): 24-bit feedback register seeded from the remaining three
+    // key/seed bytes, then transformed `i_t3 = i_t3*2 + 8 - (i_t3 & 7)`.
+    let mut i_t3: u32 = (((title_key[2] as u32)
+        | ((title_key[3] as u32) << 8)
+        | ((title_key[4] as u32) << 16))
+        ^ ((sector[0x56] as u32) | ((sector[0x57] as u32) << 8) | ((sector[0x58] as u32) << 16)))
+        & 0xFF_FFFF;
+    let i_t4_seed = i_t3 & 7;
+    i_t3 = i_t3 * 2 + 8 - i_t4_seed;
 
-    // Generate keystream and XOR with encrypted region
-    let mut lfsr1_lo: u32 = working_key[0] as u32 | 0x100;
-    let mut lfsr1_hi: u32 = working_key[1] as u32;
-    let mut lfsr0: u32 = seed_lfsr0(&working_key);
+    let mut i_t5: u32 = 0;
 
-    let mut combined: u32 = 0;
-
-    // Generate 1920 keystream bytes (for sector bytes 128..2048) and XOR them
-    // into the encrypted region. Each keystream byte is the carrying sum of the
-    // TAB5-permuted LFSR1 output and the TAB4-permuted LFSR0 output. No TAB1
-    // permutation is applied to the ciphertext here (TAB1 is only used inside
-    // decrypt_key); the working key was already produced by decrypt_key above,
-    // so this keystream is paired with that mangling step, not a plain
-    // direct-seed unscramble. No invert is applied on the LFSR0 output.
     for byte in sector.iter_mut().take(2048).skip(128) {
-        let ks = css_step(
-            &mut lfsr1_lo,
-            &mut lfsr1_hi,
-            &mut lfsr0,
-            &mut combined,
-            0x00,
-        );
-        *byte ^= ks;
+        // Advance LFSR1.
+        let mut i_t4 = (TAB2[i_t2 as usize] ^ TAB3[i_t1 as usize]) as u32;
+        i_t2 = i_t1 >> 1;
+        i_t1 = ((i_t1 & 1) << 8) ^ i_t4;
+        i_t4 = TAB5[i_t4 as usize] as u32;
+
+        // Advance LFSR0 (i_t3) and fold both outputs into i_t5.
+        let mut i_t6 = (((((((i_t3 >> 3) ^ i_t3) >> 1) ^ i_t3) >> 8) ^ i_t3) >> 5) & 0xFF;
+        i_t3 = (i_t3 << 8) | i_t6;
+        i_t6 = TAB4[i_t6 as usize] as u32;
+        i_t5 += i_t6 + i_t4;
+
+        *byte = TAB1[*byte as usize] ^ (i_t5 & 0xFF) as u8;
+        i_t5 >>= 8;
     }
 
-    // Clear scramble flags
+    // libdvdcss leaves byte 0x14 untouched; freemkv clears the scramble bits
+    // so downstream code and tests can tell a sector was descrambled.
     sector[0x14] &= 0xCF;
 }
 
-/// CSS key decryption / mangling function.
+/// Exact inverse of [`descramble_sector`]: turn a plaintext sector body into
+/// CSS ciphertext under `title_key`.
 ///
-/// Decrypts `p_crypted` using `p_key` with the CSS two-LFSR cipher.
-/// The `invert` parameter controls the XOR applied to LFSR0 output
-/// (0x00 for disc key decryption, 0xFF for title key / sector key).
-pub(crate) fn decrypt_key(invert: u8, p_key: &[u8; 5], p_crypted: &[u8; 5]) -> [u8; 5] {
-    let mut lfsr1_lo: u32 = p_key[0] as u32 | 0x100;
-    let mut lfsr1_hi: u32 = p_key[1] as u32;
-    let mut lfsr0: u32 = seed_lfsr0(p_key);
-
-    let mut combined: u32 = 0;
-    let mut k = [0u8; 5];
-
-    // TAB5 for LFSR1 output, TAB4 for LFSR0^invert (per libdvdcss css_DecryptKey).
-    for byte in &mut k {
-        *byte = css_step(
-            &mut lfsr1_lo,
-            &mut lfsr1_hi,
-            &mut lfsr0,
-            &mut combined,
-            invert,
-        );
+/// Descramble computes `plain = TAB1[cipher] ^ (i_t5 & 0xff)`, so the
+/// inverse is `cipher = TAB1_INV[plain ^ (i_t5 & 0xff)]` with the identical
+/// LFSR keystream. The keystream derivation is byte-for-byte the same as
+/// `descramble_sector` (libdvdcss `dvdcss_unscramble`); only the final
+/// substitution differs. Bytes 0x80..0x800 are rewritten in place; the
+/// scramble flag is set to 0x10 so a subsequent descramble runs.
+///
+/// Not on any production read path — it exists so the key-recovery tests
+/// (and any caller that needs to produce a known CSS-encrypted sector) can
+/// build genuine ciphertext rather than approximating it.
+#[cfg(test)]
+pub(crate) fn scramble_sector(title_key: &[u8; 5], sector: &mut [u8]) {
+    if sector.len() < 2048 {
+        return;
     }
 
-    // Two rounds of chained XOR through TAB1
-    let mut result = [0u8; 5];
-    result[4] = k[4] ^ TAB1[p_crypted[4] as usize] ^ p_crypted[3];
-    result[3] = k[3] ^ TAB1[p_crypted[3] as usize] ^ p_crypted[2];
-    result[2] = k[2] ^ TAB1[p_crypted[2] as usize] ^ p_crypted[1];
-    result[1] = k[1] ^ TAB1[p_crypted[1] as usize] ^ p_crypted[0];
-    result[0] = k[0] ^ TAB1[p_crypted[0] as usize] ^ result[4];
+    let mut i_t1: u32 = ((title_key[0] ^ sector[0x54]) as u32) | 0x100;
+    let mut i_t2: u32 = (title_key[1] ^ sector[0x55]) as u32;
+    let mut i_t3: u32 = (((title_key[2] as u32)
+        | ((title_key[3] as u32) << 8)
+        | ((title_key[4] as u32) << 16))
+        ^ ((sector[0x56] as u32) | ((sector[0x57] as u32) << 8) | ((sector[0x58] as u32) << 16)))
+        & 0xFF_FFFF;
+    let i_t4_seed = i_t3 & 7;
+    i_t3 = i_t3 * 2 + 8 - i_t4_seed;
 
-    result[4] = k[4] ^ TAB1[result[4] as usize] ^ result[3];
-    result[3] = k[3] ^ TAB1[result[3] as usize] ^ result[2];
-    result[2] = k[2] ^ TAB1[result[2] as usize] ^ result[1];
-    result[1] = k[1] ^ TAB1[result[1] as usize] ^ result[0];
-    result[0] = k[0] ^ TAB1[result[0] as usize];
+    let mut i_t5: u32 = 0;
 
-    result
+    for byte in sector.iter_mut().take(2048).skip(128) {
+        let mut i_t4 = (TAB2[i_t2 as usize] ^ TAB3[i_t1 as usize]) as u32;
+        i_t2 = i_t1 >> 1;
+        i_t1 = ((i_t1 & 1) << 8) ^ i_t4;
+        i_t4 = TAB5[i_t4 as usize] as u32;
+
+        let mut i_t6 = (((((((i_t3 >> 3) ^ i_t3) >> 1) ^ i_t3) >> 8) ^ i_t3) >> 5) & 0xFF;
+        i_t3 = (i_t3 << 8) | i_t6;
+        i_t6 = TAB4[i_t6 as usize] as u32;
+        i_t5 += i_t6 + i_t4;
+
+        // Inverse of `*p = TAB1[*p] ^ ks`: apply ks then TAB1's inverse.
+        *byte = (*TAB1_INV)[(*byte ^ (i_t5 & 0xFF) as u8) as usize];
+        i_t5 >>= 8;
+    }
+
+    // Mark the sector scrambled so the descrambler will process it.
+    sector[0x14] = (sector[0x14] & 0xCF) | 0x10;
 }
+
+/// Inverse permutation of [`TAB1`], built at first use. `TAB1` is a
+/// bijection on 0..256, so `TAB1_INV[TAB1[x]] == x`.
+#[cfg(test)]
+static TAB1_INV: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| {
+    let mut inv = [0u8; 256];
+    for (i, &v) in TAB1.iter().enumerate() {
+        inv[v as usize] = i as u8;
+    }
+    inv
+});
 
 #[cfg(test)]
 mod tests {
@@ -183,6 +176,34 @@ mod tests {
         let original = sector.clone();
         descramble_sector(&key, &mut sector);
         assert_eq!(sector, original);
+    }
+
+    /// Cross-check `descramble_sector` against the EXACT output of libdvdcss
+    /// `dvdcss_unscramble` (css.c) for a fixed sector, computed from the
+    /// reference C semantics with the reference tables. Pins the content
+    /// cipher to libdvdcss byte-for-byte.
+    ///
+    /// key = 42 13 37 BE EF, seed (0x54..0x59) = DE AD BE EF 42, body = 0xAA.
+    #[test]
+    fn descramble_matches_libdvdcss_unscramble_vector() {
+        let key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let mut sector = vec![0xAAu8; 2048];
+        sector[0x14] = 0x30;
+        sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+        descramble_sector(&key, &mut sector);
+        assert_eq!(
+            &sector[0x80..0x90],
+            &[
+                0x81, 0x92, 0x24, 0xA2, 0x46, 0x70, 0x3C, 0x64, 0xA6, 0x91, 0x84, 0xF5, 0x1F, 0x98,
+                0xA0, 0x31
+            ],
+            "descramble body head must match libdvdcss dvdcss_unscramble"
+        );
+        assert_eq!(
+            &sector[0x7F8..0x800],
+            &[0x46, 0x94, 0x80, 0x0E, 0x67, 0x36, 0x65, 0xBC],
+            "descramble body tail must match libdvdcss dvdcss_unscramble"
+        );
     }
 
     #[test]
@@ -215,69 +236,14 @@ mod tests {
         assert_eq!(sector[0x14] & 0x30, 0x00);
     }
 
-    #[test]
-    fn decrypt_key_produces_output() {
-        let key = [0x12, 0x34, 0x56, 0x78, 0x9A];
-        let crypted = [0xAB, 0xCD, 0xEF, 0x01, 0x23];
-        let result = decrypt_key(0xFF, &key, &crypted);
-        // Should produce a 5-byte result different from input
-        assert_ne!(result, key);
-        assert_ne!(result, [0u8; 5]);
-    }
-
-    /// css_decrypt_key_roundtrip
+    /// Test 2: descramble inverts scramble over the body.
     ///
-    /// decrypt_key is not a simple encrypt/decrypt pair — it is a one-way mangling
-    /// function. However, we can verify consistency: calling it twice with the same
-    /// parameters produces the same output, and varying the invert byte changes
-    /// the LFSR0 contribution predictably.
+    /// The content cipher is NOT a plain XOR involution (it applies TAB1 to
+    /// the ciphertext: `plain = TAB1[cipher] ^ ks`). The true inverse is
+    /// [`scramble_sector`]. Scrambling a plaintext body and then descrambling
+    /// with the same key must reproduce the original body exactly.
     #[test]
-    fn css_decrypt_key_roundtrip() {
-        let keys: &[[u8; 5]] = &[
-            [0x12, 0x34, 0x56, 0x78, 0x9A],
-            [0x00, 0x00, 0x00, 0x00, 0x00],
-            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-            [0xAB, 0xCD, 0xEF, 0x01, 0x23],
-        ];
-        let crypted_inputs: &[[u8; 5]] = &[
-            [0x11, 0x22, 0x33, 0x44, 0x55],
-            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
-            [0x00, 0x00, 0x00, 0x00, 0x00],
-        ];
-
-        for key in keys {
-            for crypted in crypted_inputs {
-                // decrypt_key with invert=0x00 and invert=0xFF should give different results
-                let r0 = decrypt_key(0x00, key, crypted);
-                let rff = decrypt_key(0xFF, key, crypted);
-
-                // The two results differ because the invert byte XORs the LFSR0 output
-                // They should not be equal (except by extreme coincidence)
-                // More importantly, both should be deterministic
-                let r0_again = decrypt_key(0x00, key, crypted);
-                let rff_again = decrypt_key(0xFF, key, crypted);
-                assert_eq!(r0, r0_again, "decrypt_key(0x00) not deterministic");
-                assert_eq!(rff, rff_again, "decrypt_key(0xFF) not deterministic");
-
-                // With different invert values, the keystream differs
-                assert_ne!(
-                    r0, rff,
-                    "invert=0x00 and 0xFF gave same result for key {:?}",
-                    key
-                );
-            }
-        }
-    }
-
-    /// Test 2: descramble_modifies_encrypted_region
-    ///
-    /// descramble_sector XORs a keystream into bytes 128..2048. The keystream
-    /// depends only on (title_key, sector_seed), so applying descramble twice
-    /// with the scramble flag restored between calls re-XORs the same keystream
-    /// and restores the original encrypted region — the keystream XOR is its
-    /// own inverse. This pins the cipher's involution property over the body.
-    #[test]
-    fn css_descramble_modifies_encrypted_region() {
+    fn css_descramble_inverts_scramble_over_body() {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
 
         let mut sector = vec![0xAAu8; 2048];
@@ -285,11 +251,10 @@ mod tests {
         sector[0x54..0x59].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
 
         let original = sector.clone();
-        descramble_sector(&title_key, &mut sector);
 
-        // Flag cleared
-        assert_eq!(sector[0x14] & 0x30, 0x00);
-        // Header (0..128) unchanged except flag byte
+        // Scramble the plaintext body into ciphertext.
+        scramble_sector(&title_key, &mut sector);
+        // Header (0..128) unchanged except the flag byte (set by scramble).
         for i in 0..128 {
             if i == 0x14 {
                 continue;
@@ -299,15 +264,13 @@ mod tests {
         // Encrypted region modified
         assert_ne!(&sector[128..256], &original[128..256]);
 
-        // Round-trip: restore the scramble flag and descramble again. The same
-        // keystream is regenerated (it depends only on title_key + seed, both
-        // unchanged), so the body is restored to its original bytes.
-        sector[0x14] = 0x30;
+        // Descramble restores the plaintext body byte-for-byte.
         descramble_sector(&title_key, &mut sector);
+        assert_eq!(sector[0x14] & 0x30, 0x00, "flag cleared after descramble");
         assert_eq!(
             &sector[128..2048],
             &original[128..2048],
-            "double descramble did not restore the encrypted region"
+            "descramble(scramble(body)) did not restore the body"
         );
     }
 
@@ -540,77 +503,6 @@ mod tests {
             &a[128..2048],
             &b[128..2048],
             "different seeds must descramble differently"
-        );
-    }
-
-    // ── decrypt_key chained-XOR dependency structure ───────────────────────
-
-    /// css_DecryptKey's two TAB1 rounds form a fixed dependency chain. After
-    /// both rounds, `result[0]` is the last value computed and depends on the
-    /// full key/crypted state; but the FIRST-round seed for `result[4]` is
-    /// `k[4] ^ TAB1[p_crypted[4]] ^ p_crypted[3]`. Changing ONLY p_crypted[4]
-    /// must change the output (p_crypted[4] feeds result[4] which propagates).
-    ///
-    /// Grounding: lines computing result[4] use p_crypted[4] and p_crypted[3].
-    /// Mutation: in `result[4] = k[4] ^ TAB1[p_crypted[4]] ^ p_crypted[3]`
-    /// drop the `TAB1[p_crypted[4]]` term -> output stops depending on
-    /// p_crypted[4], this assert fires.
-    #[test]
-    fn decrypt_key_depends_on_every_crypted_byte() {
-        let key = [0x12, 0x34, 0x56, 0x78, 0x9A];
-        let base = [0xAB, 0xCD, 0xEF, 0x01, 0x23];
-        let base_out = decrypt_key(0xFF, &key, &base);
-        for i in 0..5 {
-            let mut c = base;
-            c[i] ^= 0x01;
-            assert_ne!(
-                decrypt_key(0xFF, &key, &c),
-                base_out,
-                "flipping crypted byte {i} did not change the decrypted key"
-            );
-        }
-    }
-
-    /// Likewise every key byte feeds the LFSR seeding (key[0],key[1] seed
-    /// LFSR1; key[2..5] seed LFSR0 via seed_lfsr0). Flipping any single key
-    /// byte must change the output.
-    ///
-    /// Grounding: lfsr1_lo=key[0]|0x100, lfsr1_hi=key[1], seed_lfsr0(key) uses
-    /// key[2],key[3],key[4].
-    /// Mutation: in seed_lfsr0 drop the `(key[4] as u32) << 17` term -> key[4]
-    /// no longer influences LFSR0, this assert fires for i==4.
-    #[test]
-    fn decrypt_key_depends_on_every_key_byte() {
-        let base_key = [0x12, 0x34, 0x56, 0x78, 0x9A];
-        let crypted = [0xAB, 0xCD, 0xEF, 0x01, 0x23];
-        let base_out = decrypt_key(0xFF, &base_key, &crypted);
-        for i in 0..5 {
-            let mut k = base_key;
-            k[i] ^= 0x01;
-            assert_ne!(
-                decrypt_key(0xFF, &k, &crypted),
-                base_out,
-                "flipping key byte {i} did not change the decrypted key"
-            );
-        }
-    }
-
-    /// The invert byte (0x00 vs 0xFF) selects the LFSR0 output index in
-    /// css_step via `TAB4[(o_lfsr0 ^ invert) as usize]`. For a non-degenerate
-    /// key it must change the keystream and hence the result. (Pins that the
-    /// invert parameter is actually wired into the LFSR0 path, distinguishing
-    /// the disc-key vs title-key code paths.)
-    ///
-    /// Grounding: css_step's `TAB4[(o_lfsr0 ^ invert)]`.
-    /// Mutation: hardcode `invert` to 0 inside css_step -> r0 == rff, fails.
-    #[test]
-    fn decrypt_key_invert_changes_result() {
-        let key = [0x12, 0x34, 0x56, 0x78, 0x9A];
-        let crypted = [0xAB, 0xCD, 0xEF, 0x01, 0x23];
-        assert_ne!(
-            decrypt_key(0x00, &key, &crypted),
-            decrypt_key(0xFF, &key, &crypted),
-            "invert must alter the LFSR0 keystream"
         );
     }
 }

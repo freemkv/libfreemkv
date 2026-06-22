@@ -5,6 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
+extern char **environ;
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -214,16 +219,28 @@ int shim_open_exclusive(const char *bsd_name) {
         return 0;
     }
 
-    // Use a shell wrapper so the device path is not subject to buffer limits.
-    // snprintf into 128 bytes could truncate long BSD names (e.g. disk12s3s1),
-    // producing a broken command. sh -c with $1 passes the arg via argv.
-    const char *shell_fmt = "sh -c 'diskutil unmountDisk force \"$1\" >/dev/null 2>&1' _ %s";
-    char cmd[512];
-    int written = snprintf(cmd, sizeof(cmd), shell_fmt, bsd_name);
-    if (written < 0 || (size_t)written >= sizeof(cmd)) {
-        return -1;
+    // Unmount via diskutil, invoked directly with posix_spawn (no shell) so
+    // the BSD device name can never be interpreted as shell syntax. A shell
+    // wrapper here (system()/sh -c) was a command-injection vector for an
+    // attacker-controlled device argument. Passing bsd_name as a discrete
+    // argv element also sidesteps the old buffer-truncation concern entirely.
+    // stdout/stderr go to /dev/null to keep diskutil chatter out of the
+    // caller's streams.
+    {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        char *const argv[] = {
+            "diskutil", "unmountDisk", "force", (char *)bsd_name, NULL
+        };
+        pid_t pid;
+        if (posix_spawn(&pid, "/usr/sbin/diskutil", &fa, NULL, argv, environ) == 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+        posix_spawn_file_actions_destroy(&fa);
     }
-    system(cmd);
     usleep(500000);
 
     mach_port_t mp;

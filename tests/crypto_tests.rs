@@ -522,6 +522,10 @@ fn css_roundtrip_with_snapshot() {
 /// Multiple key/seed combinations produce different outputs.
 #[test]
 fn css_roundtrip_multiple_keys() {
+    // The content cipher (dvdcss_unscramble) seeds its LFSRs from
+    // `key XOR seed`, so the cases must have DISTINCT `key XOR seed` values to
+    // produce distinct keystreams. (key=0/seed=0 and key=FF/seed=FF both give
+    // key^seed=0 and are correctly identical — excluded here.)
     let cases: &[([u8; 5], [u8; 5])] = &[
         (
             [0x00, 0x00, 0x00, 0x00, 0x00],
@@ -529,7 +533,7 @@ fn css_roundtrip_multiple_keys() {
         ),
         (
             [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            [0x00, 0x00, 0x00, 0x00, 0x00],
         ),
         (
             [0x01, 0x02, 0x03, 0x04, 0x05],
@@ -621,7 +625,7 @@ fn css_stevenson_attack_validates_cracked_key() {
         css::lfsr::descramble_sector(key, &mut sector);
         sector[0x14] = 0x30;
 
-        let cracked = css::crack::crack_title_key(&sector);
+        let cracked = css::stevenson::crack_title_key(&sector);
 
         if let Some(cracked_key) = cracked {
             let mut test = sector.clone();
@@ -678,7 +682,7 @@ fn css_recover_title_key_with_exact_plaintext() {
     sector[0x14] = 0x30;
 
     // Recover with exact known plaintext
-    let recovered = css::crack::recover_title_key(&sector, &pes_header);
+    let recovered = css::stevenson::recover_title_key(&sector, &pes_header);
 
     if let Some(rkey) = recovered {
         let mut test = sector.clone();

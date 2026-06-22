@@ -13,8 +13,22 @@ const SC_ENTRY_POINT: u8 = 0x0E;
 const SC_FRAME: u8 = 0x0D;
 
 pub struct Vc1Parser {
+    // First-seen seq_header + entry_point seed the MKV codecPrivate
+    // (BITMAPINFOHEADER extra data). These are the only out-of-band copies
+    // the player gets. A stream may redefine either header mid-title; any
+    // occurrence whose body DIFFERS from the active value must be emitted
+    // IN-BAND at each point it appears, and at every keyframe (RAP) if the
+    // active value differs from the codecPrivate copy, so seek points carry
+    // valid decoder state (SMPTE 421M requires seq+entry before every RAP).
     seq_header: Option<Vec<u8>>,
     entry_point: Option<Vec<u8>>,
+    // Currently-ACTIVE body of each type — the most recent the bitstream
+    // defined. Distinct from the fixed codecPrivate copies above. The
+    // strip/emit decision is made against `cur_*`, not the first-seen copy:
+    // a switch BACK to the first-seen body (== codecPrivate) is still a
+    // change a streaming decoder must be told about.
+    cur_seq_header: Option<Vec<u8>>,
+    cur_entry_point: Option<Vec<u8>>,
     width: u32,
     height: u32,
 }
@@ -30,10 +44,68 @@ impl Vc1Parser {
         Self {
             seq_header: None,
             entry_point: None,
+            cur_seq_header: None,
+            cur_entry_point: None,
             width: 1920,
             height: 1080,
         }
     }
+}
+
+/// Handle a seq_header or entry_point start-code unit (Annex B raw bytes).
+///
+/// Decision is against the currently-ACTIVE body `cur`, not the codecPrivate
+/// copy `first`:
+/// - First of its type → seeds codecPrivate; stripped (decoder gets it from
+///   the BITMAPINFOHEADER extra data at init).
+/// - Equal to the active set `cur` → redundant; stripped.
+/// - Different from `cur` (a change in EITHER direction, including reverting
+///   to the codecPrivate/first value) → prepended into `prefix` in Annex B
+///   form and `cur` updated.
+///
+/// Returns `true` when the unit was emitted into `prefix`.
+fn handle_header(
+    first: &mut Option<Vec<u8>>,
+    cur: &mut Option<Vec<u8>>,
+    unit: &[u8],
+    prefix: &mut Vec<u8>,
+) -> bool {
+    let is_first = first.is_none();
+    if is_first {
+        first.replace(unit.to_vec()); // seeds codecPrivate; stripped here
+    }
+    let changed = cur.as_deref() != Some(unit);
+    if changed {
+        *cur = Some(unit.to_vec());
+    }
+    // Strip the seeding occurrence and any unit that doesn't change the
+    // active header. Emit only a genuine change.
+    if is_first || !changed {
+        return false;
+    }
+    prefix.extend_from_slice(unit);
+    true
+}
+
+/// Re-assert the active header `cur` into `prefix` (raw Annex B bytes) at every
+/// keyframe (RAP) so the RAP is SELF-CONTAINED. Skipped only when this AU already
+/// emitted the header in-band (`emitted`) or no active header exists yet.
+///
+/// Unconditional (not only when the active differs from codecPrivate): SMPTE 421M
+/// requires seq_header + entry_point before every RAP. A decoder applies the
+/// codecPrivate copy once at init, then relies on in-band repetition; if a source
+/// stops repeating an (unchanged) header at later RAPs and the decoder drops it,
+/// nothing re-sends it and seeks/segments land with wrong decoder state. Re-asserting
+/// at every RAP — what compliant muxers do — makes decode self-healing. Re-sending
+/// an identical header is benign. This strictly supersets the change-only re-assert.
+fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
+    if emitted {
+        return;
+    }
+    let Some(active) = cur.as_deref() else {
+        return;
+    };
+    prefix.extend_from_slice(active);
 }
 
 impl CodecParser for Vc1Parser {
@@ -50,6 +122,13 @@ impl CodecParser for Vc1Parser {
         let mut has_seq_header = false;
         let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
+        // Track whether this AU already emitted each header in-band (a
+        // redefinition vs the active value).
+        let mut emitted_seq = false;
+        let mut emitted_ep = false;
+        // In-band prefix: changed/new seq_header and/or entry_point units that
+        // must appear before the SC_FRAME data in the MKV block.
+        let mut prefix: Vec<u8> = Vec::new();
 
         // Scan for start codes (00 00 01 XX)
         let data = &pes.data;
@@ -61,17 +140,29 @@ impl CodecParser for Vc1Parser {
                     SC_SEQUENCE_HEADER => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
                         let sh = &data[i..end];
-                        self.seq_header = Some(sh.to_vec());
                         // Try to parse resolution from advanced profile sequence header
-                        if let Some((w, h)) = parse_vc1_resolution(sh) {
-                            self.width = w;
-                            self.height = h;
+                        if self.seq_header.is_none() {
+                            if let Some((w, h)) = parse_vc1_resolution(sh) {
+                                self.width = w;
+                                self.height = h;
+                            }
                         }
+                        emitted_seq |= handle_header(
+                            &mut self.seq_header,
+                            &mut self.cur_seq_header,
+                            sh,
+                            &mut prefix,
+                        );
                         has_seq_header = true;
                     }
                     SC_ENTRY_POINT => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
-                        self.entry_point = Some(data[i..end].to_vec());
+                        emitted_ep |= handle_header(
+                            &mut self.entry_point,
+                            &mut self.cur_entry_point,
+                            &data[i..end],
+                            &mut prefix,
+                        );
                         has_entry_point = true;
                     }
                     SC_FRAME => {
@@ -91,11 +182,28 @@ impl CodecParser for Vc1Parser {
         // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
         let keyframe = has_seq_header;
 
-        // Strip sequence header + entry point from frame data — those are in
-        // codecPrivate, not coded-picture data. Only include data from the
-        // frame start code onwards.
+        // At every keyframe (RAP), re-assert the active seq_header + entry_point
+        // in-band (even when unchanged vs codecPrivate) so the RAP is
+        // self-contained. SMPTE 421M requires seq+entry before every RAP; a
+        // decoder that dropped them recovers, and seeks land with correct state.
+        // Skipped per-header only when this AU already emitted it in-band.
+        if keyframe {
+            reassert_active(&mut prefix, &self.cur_seq_header, emitted_seq);
+            reassert_active(&mut prefix, &self.cur_entry_point, emitted_ep);
+        }
+
+        // Assemble frame data: any in-band header changes + picture data from
+        // the first SC_FRAME onwards.
         let frame_data = match frame_start {
-            Some(start) => &data[start..],
+            Some(start) => {
+                if prefix.is_empty() {
+                    data[start..].to_vec()
+                } else {
+                    let mut out = prefix;
+                    out.extend_from_slice(&data[start..]);
+                    out
+                }
+            }
             None => {
                 // No frame start code. If this PES carried only parameter sets
                 // (sequence header / entry point, captured above into
@@ -106,14 +214,14 @@ impl CodecParser for Vc1Parser {
                 if has_seq_header || has_entry_point {
                     return Vec::new();
                 }
-                data // genuine picture payload with no leading 0x0D — pass through
+                data.to_vec() // genuine picture payload with no leading 0x0D — pass through
             }
         };
 
         vec![Frame {
             pts_ns: ts_ns,
             keyframe,
-            data: frame_data.to_vec(),
+            data: frame_data,
             duration_ns: None,
         }]
     }
@@ -385,9 +493,20 @@ mod tests {
         let frames = parser.parse(&pes);
 
         assert_eq!(frames.len(), 1);
-        // Frame data should start with the frame start code (00 00 01 0D)
-        assert!(frames[0].data.len() >= 4);
-        assert_eq!(&frames[0].data[0..4], &[0x00, 0x00, 0x01, SC_FRAME]);
+        // Seq+entry seed codecPrivate on first occurrence, but because this is a
+        // keyframe (RAP) they are re-asserted in-band so the RAP is
+        // self-contained. Frame data therefore STARTS with the seq_header start
+        // code, and the SC_FRAME picture data follows.
+        let fd = &frames[0].data;
+        assert!(fd.len() >= 4);
+        assert_eq!(&fd[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+        let frame_sc = fd
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, SC_FRAME]);
+        assert!(
+            frame_sc.is_some(),
+            "SC_FRAME picture data must follow the re-asserted headers"
+        );
     }
 
     // --- parameter-set-only PES (seq header + entry point, no frame SC) ---
@@ -748,5 +867,116 @@ mod tests {
         );
         // Extra data should start with the sequence header start code
         assert_eq!(&extra[0..4], &[0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+    }
+
+    // --- regression: mid-stream entry_point A→B→A revert emitted in-band ---
+
+    /// Regression: entry_point is redefined from A (== codecPrivate) to B, then
+    /// switched BACK to A. A streaming decoder applied codecPrivate at init and
+    /// is now on B; the revert to A must be emitted IN-BAND even though A ==
+    /// codecPrivate, or the A-segment decodes against the wrong entry point.
+    #[test]
+    fn vc1_emits_entry_point_revert_to_first_value() {
+        let sh = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
+        let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
+        let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
+        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+
+        let mut parser = Vc1Parser::new();
+
+        // AU1: seeds codecPrivate with sh + ep_a. Both are first → stripped from frame.
+        let au1: Vec<u8> = sh
+            .iter()
+            .chain(ep_a.iter())
+            .chain(frame.iter())
+            .cloned()
+            .collect();
+        let f1 = parser.parse(&make_pes(au1, Some(0)));
+        assert_eq!(f1.len(), 1, "AU1 emits a frame");
+        // seq+entry seed codecPrivate, but this is a keyframe (RAP) so the active
+        // headers are re-asserted in-band (self-contained RAP) — ep_a present.
+        assert!(
+            contains_sc(&f1[0].data, SC_ENTRY_POINT),
+            "AU1: keyframe re-asserts the active entry_point in-band"
+        );
+        assert!(
+            f1[0].data.windows(ep_a.len()).any(|w| w == ep_a),
+            "AU1 carries the active ep_a bytes in-band"
+        );
+
+        // AU2: entry_point redefined to B → must be emitted in-band.
+        let au2: Vec<u8> = ep_b.iter().chain(frame.iter()).cloned().collect();
+        let f2 = parser.parse(&make_pes(au2, Some(90000)));
+        assert_eq!(f2.len(), 1, "AU2 emits a frame");
+        assert!(
+            contains_sc(&f2[0].data, SC_ENTRY_POINT),
+            "AU2: redefined entry_point B must be in-band"
+        );
+        assert!(
+            f2[0].data.windows(ep_b.len()).any(|w| w == ep_b),
+            "AU2 must carry the ep_b bytes"
+        );
+
+        // AU3: entry_point reverts to A (== codecPrivate). Active was B; this is
+        // a real change and must still be emitted in-band.
+        let au3: Vec<u8> = ep_a.iter().chain(frame.iter()).cloned().collect();
+        let f3 = parser.parse(&make_pes(au3, Some(180000)));
+        assert_eq!(f3.len(), 1, "AU3 emits a frame");
+        assert!(
+            f3[0].data.windows(ep_a.len()).any(|w| w == ep_a),
+            "AU3: revert to A (== codecPrivate) must be emitted in-band"
+        );
+    }
+
+    /// Regression: a bare keyframe (no seq_header / entry_point in PES) after
+    /// a mid-title redefinition must re-assert the active headers in-band so
+    /// seek points carry valid decoder state (SMPTE 421M).
+    #[test]
+    fn vc1_reasserts_active_headers_at_bare_keyframe() {
+        let sh_a = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
+        let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
+        let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
+        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+
+        let mut parser = Vc1Parser::new();
+
+        // AU1: seed codecPrivate.
+        let au1: Vec<u8> = sh_a
+            .iter()
+            .chain(ep_a.iter())
+            .chain(frame.iter())
+            .cloned()
+            .collect();
+        parser.parse(&make_pes(au1, Some(0)));
+
+        // AU2: redefine entry_point to B at a keyframe.
+        let au2: Vec<u8> = sh_a
+            .iter()
+            .chain(ep_b.iter())
+            .chain(frame.iter())
+            .cloned()
+            .collect();
+        parser.parse(&make_pes(au2, Some(90000)));
+
+        // AU3: bare keyframe — only SC_SEQUENCE_HEADER (keyframe signal) + SC_FRAME,
+        // no entry_point. Active entry_point is B (differs from codecPrivate A);
+        // must be re-asserted in-band so seeks into this frame don't revert to A.
+        let au3: Vec<u8> = sh_a.iter().chain(frame.iter()).cloned().collect();
+        let f3 = parser.parse(&make_pes(au3, Some(180000)));
+        assert_eq!(f3.len(), 1, "AU3 emits a frame");
+        assert!(
+            f3[0].data.windows(ep_b.len()).any(|w| w == ep_b),
+            "bare keyframe must re-assert active entry_point B in-band"
+        );
+        assert!(
+            !f3[0].data.windows(ep_a.len()).any(|w| w == ep_a),
+            "must not re-assert stale codecPrivate entry_point A"
+        );
+    }
+
+    /// Helper: does `data` contain a start-code unit with the given type byte?
+    fn contains_sc(data: &[u8], sc_type: u8) -> bool {
+        data.windows(4)
+            .any(|w| w[0] == 0x00 && w[1] == 0x00 && w[2] == 0x01 && w[3] == sc_type)
     }
 }

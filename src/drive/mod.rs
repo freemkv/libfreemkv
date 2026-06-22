@@ -85,9 +85,20 @@ pub struct Drive {
 
 impl Drive {
     pub fn open(device: &Path) -> Result<Self> {
+        let t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::drive", phase = "open", device = %device.display(), "begin");
         let mut transport = crate::scsi::open(device)?;
         let profiles = profile::load_bundled()?;
         let drive_id = DriveId::from_drive(transport.as_mut())?;
+        tracing::info!(
+            target: "freemkv::drive",
+            phase = "open",
+            device = %device.display(),
+            vendor = %drive_id.vendor_id.trim(),
+            product = %drive_id.product_id.trim(),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "end"
+        );
 
         let m = profile::find_by_drive_id(&profiles, &drive_id);
         let (driver, platform, profile) = match m {
@@ -220,8 +231,14 @@ impl Drive {
 
     pub fn wait_ready(&mut self) -> Result<()> {
         let tur = [SCSI_TEST_UNIT_READY, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::drive", phase = "wait_ready", "begin");
 
-        for _ in 0..60 {
+        // The poll can take up to 30s (60 × 500ms). Heartbeat it so a slow
+        // spin-up is visible as steady beats rather than a silent stall.
+        let mut hb = crate::progress::Heartbeat::new("wait_ready");
+        for attempt in 0..60u64 {
+            hb.tick(attempt, 60);
             let mut buf = [0u8; 0];
             if self
                 .scsi
@@ -229,10 +246,23 @@ impl Drive {
                 .execute(&tur, crate::scsi::DataDirection::None, &mut buf, 5_000)
                 .is_ok()
             {
+                tracing::info!(
+                    target: "freemkv::drive",
+                    phase = "wait_ready",
+                    attempts = attempt + 1,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    "end"
+                );
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
+        tracing::warn!(
+            target: "freemkv::drive",
+            phase = "wait_ready",
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "device never became ready"
+        );
         Err(Error::DeviceNotReady {
             path: self.device_path.clone(),
         })
@@ -311,31 +341,108 @@ impl Drive {
         &self.device_path
     }
 
+    /// Current mounted-disc profile from the GET CONFIGURATION header
+    /// (Current Profile, bytes 6-7). DVD family is `0x0010..=0x001F`, BD
+    /// family `0x0040..=0x0043`. This is a stock MMC command — it works
+    /// before (and without) any firmware unlock. `None` if unreadable.
+    fn current_profile(&mut self) -> Option<u16> {
+        let cdb = [
+            crate::scsi::SCSI_GET_CONFIGURATION,
+            0x00, // RT=0: header carries the Current Profile
+            0x00,
+            0x00, // starting feature 0
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x08, // allocation length = 8 (header only)
+            0x00,
+        ];
+        let mut buf = [0u8; 8];
+        let r = self
+            .scsi
+            .as_mut()
+            .execute(
+                &cdb,
+                crate::scsi::DataDirection::FromDevice,
+                &mut buf,
+                5_000,
+            )
+            .ok()?;
+        if r.bytes_transferred >= 8 {
+            Some(((buf[6] as u16) << 8) | buf[7] as u16)
+        } else {
+            None
+        }
+    }
+
+    /// True when the mounted disc is a DVD (profile family `0x0010..=0x001F`).
+    fn disc_is_dvd(&mut self) -> bool {
+        matches!(self.current_profile(), Some(p) if (0x0010..=0x001F).contains(&p))
+    }
+
     /// Initialize drive — unlock + firmware upload.
     /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
+    ///
+    /// The LibreDrive/OEM firmware unlock is required for BD/UHD (AACS) reads,
+    /// but it puts the drive in an extended-access state where stock CSS
+    /// authentication no longer works — so a CSS-protected DVD can't be read.
+    /// For a DVD we therefore SKIP the unlock and run the drive in its normal
+    /// stock mode; the DVD path then issues standard CSS commands, which a stock
+    /// drive honors. BD/UHD and any non-DVD/unknown media keep today's behavior.
     pub fn init(&mut self) -> Result<()> {
-        match self.driver {
+        let t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::drive", phase = "init", "begin");
+        if self.disc_is_dvd() {
+            tracing::info!(target: "freemkv::drive", phase = "init", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no unlock)");
+            return Ok(());
+        }
+        let r = match self.driver {
             Some(ref mut d) => d.init(self.scsi.as_mut()),
             None => Err(Error::UnsupportedDrive {
                 vendor_id: self.drive_id.vendor_id.trim().to_string(),
                 product_id: self.drive_id.product_id.trim().to_string(),
                 product_revision: self.drive_id.product_revision.trim().to_string(),
             }),
-        }
+        };
+        tracing::info!(
+            target: "freemkv::drive",
+            phase = "init",
+            ok = r.is_ok(),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "end"
+        );
+        r
     }
 
     /// Probe disc surface so the drive firmware learns optimal read speeds
     /// per region. After this the host reads at max speed and the drive
     /// manages zones internally.
     pub fn probe_disc(&mut self) -> Result<()> {
-        match self.driver {
+        let t0 = std::time::Instant::now();
+        tracing::info!(target: "freemkv::drive", phase = "probe_disc", "begin");
+        // A DVD runs in stock mode (see `init`); skip the OEM/firmware-path
+        // disc calibration, which only applies to the unlocked BD/UHD drive.
+        if self.disc_is_dvd() {
+            tracing::info!(target: "freemkv::drive", phase = "probe_disc", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no calibration)");
+            return Ok(());
+        }
+        let r = match self.driver {
             Some(ref mut d) => d.probe_disc(self.scsi.as_mut()),
             None => Err(Error::UnsupportedDrive {
                 vendor_id: self.drive_id.vendor_id.trim().to_string(),
                 product_id: self.drive_id.product_id.trim().to_string(),
                 product_revision: self.drive_id.product_revision.trim().to_string(),
             }),
-        }
+        };
+        tracing::info!(
+            target: "freemkv::drive",
+            phase = "probe_disc",
+            ok = r.is_ok(),
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "end"
+        );
+        r
     }
 
     /// Query a specific GET CONFIGURATION feature by code.
@@ -544,7 +651,22 @@ impl Drive {
             buf,
             timeout_ms,
         ) {
-            Ok(result) => Ok(result.bytes_transferred),
+            Ok(result) if result.bytes_transferred == count as usize * 2048 => {
+                Ok(result.bytes_transferred)
+            }
+            // A READ(10) that completes with GOOD status but a residual
+            // underrun (bytes_transferred < requested) is a SHORT transfer:
+            // the tail of `buf` still holds stale bytes from a prior read.
+            // Committing those as recovered/Good is silent data corruption, so
+            // treat a short transfer as a failed read — the caller marks the
+            // range NonTrimmed and retries (a loud miss, never a silent commit).
+            // The sector/file path enforces the same invariant in
+            // sector/prefetched.rs; this is the live-drive counterpart.
+            Ok(_) => Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            }),
             Err(Error::Halted) => Err(Error::Halted),
             Err(e) => {
                 let (status, sense) = extract_scsi_context(&e);
@@ -1024,6 +1146,39 @@ mod command_tests {
             d.read_capacity(),
             Err(Error::DiscCapacityOverflow)
         ));
+    }
+
+    /// `disc_is_dvd()` must match the DVD profile family (0x0010..=0x001F)
+    /// and ONLY that family. A false positive on a BD/UHD profile (0x0040+)
+    /// would skip the LibreDrive firmware unlock that UHD reads require; a
+    /// false negative on a DVD would re-introduce the CSS read failure. The
+    /// Current Profile is bytes 6-7 of the GET CONFIGURATION header.
+    /// Mutation: widening the range to `..=0x0040` makes the BD-ROM assert
+    /// fire; a failed/short GET CONFIGURATION must default to NOT-DVD so the
+    /// unlock still runs.
+    #[test]
+    fn disc_is_dvd_matches_only_dvd_profile_family() {
+        let probe = |profile: u16| {
+            let mut hdr = vec![0u8; 8];
+            hdr[6] = (profile >> 8) as u8;
+            hdr[7] = profile as u8;
+            drive_with(hdr).disc_is_dvd()
+        };
+        // DVD family → DVD (skip firmware unlock, run stock for CSS).
+        assert!(probe(0x0010), "DVD-ROM");
+        assert!(probe(0x0011), "DVD-R");
+        assert!(probe(0x001B), "DVD+R DL");
+        // BD/UHD family → NOT DVD (must keep today's unlock path).
+        assert!(!probe(0x0040), "BD-ROM (UHD) must NOT be classed as DVD");
+        assert!(!probe(0x0041), "BD-R");
+        assert!(!probe(0x0008), "CD-ROM");
+        assert!(!probe(0x0000), "no/unknown profile");
+        // Short / failed GET CONFIGURATION → no Current Profile → NOT DVD,
+        // so the firmware unlock still runs (safe default).
+        assert!(
+            !drive_with(vec![0u8; 4]).disc_is_dvd(),
+            "short GET CONFIGURATION must default to not-DVD (unlock still runs)"
+        );
     }
 
     #[test]

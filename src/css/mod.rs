@@ -2,29 +2,24 @@
 //!
 //! CSS uses a weak 40-bit LFSR stream cipher (broken since 1999).
 //!
-//! The production entry point is [`resolve`]. Two title-key acquisition
-//! paths exist behind it:
-//! - The SCSI auth path drives bus authentication with the compiled-in CSS
-//!   player keys and reads the title key from the drive (the production DVD
-//!   path on a live drive).
-//! - The crack fallback ([`crack_key`]) needs no keys — it attempts the
-//!   Stevenson known-plaintext attack on MPEG-2 PES headers. (Currently
-//!   non-functional; see the `crack` module docs.)
+//! The title key is recovered keylessly: [`crack_key`] runs the Stevenson
+//! known-plaintext attack (see the [`stevenson`] module) on the scrambled
+//! data, needing no player keys, disc-key crack, or external key file.
+//! Sectors are then decrypted with [`descramble_sector`].
 //!
 //! Usage:
 //! ```rust,ignore
-//! if let Some(state) = css::resolve(&mut ctx) {
+//! if let Some(state) = css::crack_key(reader, extents, batch) {
 //!     css::descramble_sector(&state, &mut sector);
 //! }
 //! ```
 
 pub mod auth;
-pub mod crack;
 pub mod lfsr;
+pub mod stevenson;
 pub(crate) mod tables;
 
 use crate::disc::Extent;
-use crate::drive::Drive;
 use crate::sector::SectorSource;
 
 /// CSS decryption state for a DVD title.
@@ -34,89 +29,97 @@ pub struct CssState {
     pub title_key: [u8; 5],
 }
 
-/// Inputs for CSS key acquisition.
+/// Recover the CSS title key with no keys, by scanning scrambled sectors and
+/// running the Stevenson known-plaintext attack (see the [`stevenson`] module).
 ///
-/// The acquisition path depends on which inputs the caller supplies:
-///
-/// - With `drive` + `auth_lba` set, [`resolve`] runs the full SCSI bus
-///   auth + title-key path (live BU40N / DVD drive).
-/// - With `reader` + `extents` set, [`resolve`] falls back to the
-///   crack path (Stevenson known-plaintext attack on encrypted PES
-///   headers; works on disc images and on drives whose CSS auth path
-///   is unavailable).
-///
-/// The `drive` (auth) path always wins when both modes are populated.
-pub struct CssContext<'a> {
-    /// Live SCSI drive — when present, [`resolve`] tries the auth path.
-    pub drive: Option<&'a mut Drive>,
-    /// LBA of a known-scrambled sector for the auth path's title-key
-    /// query. Required when `drive` is set.
-    pub auth_lba: Option<u32>,
-    /// Sector source for the crack path.
-    pub reader: Option<&'a mut dyn SectorSource>,
-    /// Extents to scan for the crack path. Required when `reader` is
-    /// set.
-    pub extents: Option<&'a [Extent]>,
+/// The crib comes from `AttackPattern`: a scrambled sector's cleartext region
+/// (bytes 0x00..0x80) often ends in a short-period repeating run (stuffing /
+/// constant fill); the attack assumes that run continues across the 0x80
+/// boundary into the encrypted region, giving the known plaintext the 2^16
+/// LFSR recovery needs. We scan up to 50000 scrambled sectors across the
+/// extents and return the first sector that yields a key — no player keys, no
+/// disc-key crack. Works on a live drive (after bus-auth unlocks reads) and on
+/// disc images alike.
+pub fn crack_key(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+) -> Option<CssState> {
+    crack_key_halt(reader, extents, batch_sectors, None)
 }
 
-/// Acquire a CSS title key using whichever inputs the context provides.
+/// [`crack_key`] with an optional cooperative-cancellation token.
 ///
-/// Order of attempts:
-///   1. SCSI auth path (when `drive` and `auth_lba` are set).
-///   2. Crack path (when `reader` and `extents` are set).
-///
-/// Returns `None` if neither path is configured or both fail.
-pub fn resolve(ctx: &mut CssContext<'_>) -> Option<CssState> {
-    if let (Some(drive), Some(lba)) = (ctx.drive.as_deref_mut(), ctx.auth_lba) {
-        if let Ok(title_key) = auth::authenticate_and_read_title_key(drive, lba) {
-            return Some(CssState { title_key });
-        }
-    }
-    if let (Some(reader), Some(extents)) = (ctx.reader.as_deref_mut(), ctx.extents) {
-        return crack_key(reader, extents);
-    }
-    None
-}
-
-/// Crack the CSS title key by scanning scrambled sectors across extents and
-/// applying a known-plaintext attack on MPEG-2 PES headers.
-///
-/// The Stevenson attack needs a sector where a PES header starts at byte
-/// 0x80 (start of the encrypted region). This only happens when a new PES
-/// packet begins at exactly sector offset 128. We scan up to 50000
-/// scrambled sectors sequentially across all extents.
-///
-/// NOTE: the underlying recovery ([`crack::recover_title_key`]) is currently
-/// non-functional against this crate's descrambler (see `crack` module
-/// docs), so this scan returns `None`. The production DVD path uses the SCSI
-/// auth path, not this crack fallback.
-pub fn crack_key(reader: &mut dyn SectorSource, extents: &[Extent]) -> Option<CssState> {
+/// "No silent hangs": the crack scans up to 50_000 sectors, which on a live
+/// drive hitting bad sectors can take a long time. This variant polls `halt`
+/// once per batch (the same cadence sweep/patch use) so an operator Stop or a
+/// scan-level watchdog can interrupt the scan, and emits a
+/// `freemkv::heartbeat` beat ("css_crack") each batch so a stuck scan is
+/// visible in the log.
+pub fn crack_key_halt(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+) -> Option<CssState> {
+    // Batch the reads: a live optical drive at 1 sector/read is glacial, and the
+    // crack only needs to FIND one scrambled sector whose 0x80 plaintext matches
+    // a known PES header. `batch_sectors` MUST be sized to the source — a drive
+    // rejects a READ(10) larger than its per-command max (DVD = 16) and
+    // `Drive::read` does not chunk, so an over-large batch fails every read and
+    // scans nothing. Callers pass `detect_max_batch_sectors(device_path)` for a
+    // live drive, a file-safe value for an image, or 1 to force per-sector.
+    let batch = (batch_sectors.max(1)) as u32;
     let mut tried = 0u32;
-    let max_tries = 50_000;
+    let max_tries = 50_000u32;
+    let mut buf = vec![0u8; batch as usize * 2048];
+    let mut hb = crate::progress::Heartbeat::new("css_crack");
 
-    // Reused across every scanned sector; read_sectors overwrites all 2048
-    // bytes on success, so no re-zeroing is needed between iterations.
-    let mut buf = vec![0u8; 2048];
-
-    for ext in extents {
-        let mut i = 0;
+    'outer: for (extent_idx, ext) in extents.iter().enumerate() {
+        let mut i = 0u32;
         while i < ext.sector_count && tried < max_tries {
-            // Every scanned sector counts toward the cap, so a long run
-            // of unscrambled sectors can't read past the budget.
-            tried += 1;
-            if reader
-                .read_sectors(ext.start_lba + i, 1, &mut buf, true)
-                .is_ok()
-                && is_scrambled(&buf)
-            {
-                if let Some(key) = crack::crack_title_key(&buf) {
-                    return Some(CssState { title_key: key });
+            // Cooperative cancellation — poll once per batch, the same cadence
+            // sweep/patch use, so a Stop / watchdog can interrupt the scan.
+            if let Some(h) = halt {
+                if h.is_cancelled() {
+                    break 'outer;
                 }
             }
-            i += 1;
-        }
-        if tried >= max_tries {
-            break;
+            // Liveness beacon: a long scan over a damaged disc stays visible.
+            // The heartbeat is time-throttled; only when it actually beats do
+            // we emit the crack-specific context (tried/lba/extent_idx).
+            if hb.tick(tried as u64, max_tries as u64) {
+                tracing::debug!(
+                    target: "freemkv::heartbeat",
+                    phase = "css_crack",
+                    tried,
+                    lba = ext.start_lba + i,
+                    extent_idx,
+                    "scanning"
+                );
+            }
+            let n = (ext.sector_count - i).min(batch);
+            let want = n as usize * 2048;
+            match reader.read_sectors(ext.start_lba + i, n as u16, &mut buf[..want], true) {
+                Ok(_) => {
+                    for s in 0..n as usize {
+                        tried += 1;
+                        let sect = &buf[s * 2048..(s + 1) * 2048];
+                        if is_scrambled(sect) {
+                            if let Some(key) = stevenson::crack_title_key(sect) {
+                                return Some(CssState { title_key: key });
+                            }
+                        }
+                        if tried >= max_tries {
+                            break 'outer;
+                        }
+                    }
+                }
+                // A failed batch (bad sectors) still counts toward the budget so a
+                // damaged region can't loop forever; skip ahead by the batch.
+                Err(_) => tried += n,
+            }
+            i += n;
         }
     }
 
@@ -259,7 +262,7 @@ mod tests {
             start_lba: 0,
             sector_count: 200_000,
         }];
-        let res = crack_key(&mut src, &extents);
+        let res = crack_key(&mut src, &extents, 1);
         assert!(res.is_none(), "clear sectors yield no key");
         assert_eq!(
             src.reads.borrow().len(),
@@ -288,7 +291,7 @@ mod tests {
                 sector_count: 40_000,
             },
         ];
-        let res = crack_key(&mut src, &extents);
+        let res = crack_key(&mut src, &extents, 1);
         assert!(res.is_none());
         assert_eq!(
             src.reads.borrow().len(),
@@ -311,7 +314,7 @@ mod tests {
             start_lba: 5_000,
             sector_count: 4,
         }];
-        let _ = crack_key(&mut src, &extents);
+        let _ = crack_key(&mut src, &extents, 1);
         let reads = src.reads.borrow();
         assert_eq!(
             &reads[..],
@@ -338,7 +341,7 @@ mod tests {
             start_lba: 0,
             sector_count: 10,
         }];
-        let res = crack_key(&mut src, &extents);
+        let res = crack_key(&mut src, &extents, 1);
         assert!(res.is_none());
         assert_eq!(
             src.reads.borrow().len(),
@@ -361,7 +364,7 @@ mod tests {
             start_lba: 42,
             sector_count: 0,
         }];
-        let res = crack_key(&mut src, &extents);
+        let res = crack_key(&mut src, &extents, 1);
         assert!(res.is_none());
         assert_eq!(
             src.reads.borrow().len(),
@@ -377,7 +380,7 @@ mod tests {
     #[test]
     fn crack_key_no_extents_is_none() {
         let mut src = MockSource::new(0x30);
-        let res = crack_key(&mut src, &[]);
+        let res = crack_key(&mut src, &[], 1);
         assert!(res.is_none());
         assert_eq!(src.reads.borrow().len(), 0);
     }

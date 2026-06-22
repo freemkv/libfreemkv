@@ -43,9 +43,9 @@
 
 use crate::error::Result;
 use crate::event::{Event, EventKind};
-use crate::halt::Halt;
+use crate::halt::{Halt, POLL_INTERVAL};
 use crate::sector::SectorSource;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use std::thread::JoinHandle;
 
 /// Producer-thread event callback. Fires `BytesRead` after every
@@ -114,7 +114,7 @@ impl PrefetchedSectorSource {
     where
         S: SectorSource + Send + 'static,
     {
-        Self::new_with_events(reader, extents, batch_sectors, halt, None)
+        Self::new_with_events(reader, extents, batch_sectors, SECTOR_ALIGNMENT, halt, None)
     }
 
     /// Same as [`new`] but with a callback fired from the producer
@@ -125,6 +125,7 @@ impl PrefetchedSectorSource {
         mut reader: S,
         extents: Vec<crate::disc::Extent>,
         batch_sectors: u16,
+        unit_align: u16,
         halt: Option<Halt>,
         event_fn: Option<EventFn>,
     ) -> Result<Self>
@@ -197,9 +198,7 @@ impl PrefetchedSectorSource {
                     // way to hand the decrypt step an aligned chunk —
                     // surface a typed error instead of emitting
                     // still-encrypted bytes.
-                    if remaining % SECTOR_ALIGNMENT as u32 != 0
-                        && remaining < SECTOR_ALIGNMENT as u32
-                    {
+                    if remaining % unit_align as u32 != 0 && remaining < unit_align as u32 {
                         let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
                         return;
                     }
@@ -210,15 +209,28 @@ impl PrefetchedSectorSource {
                     // never the trailing-tail case, which the guard
                     // above already rejected. Clamp to one unit so we
                     // always make forward progress.
-                    if sectors >= SECTOR_ALIGNMENT {
-                        sectors -= sectors % SECTOR_ALIGNMENT;
+                    if sectors >= unit_align {
+                        sectors -= sectors % unit_align;
                     } else {
-                        sectors = SECTOR_ALIGNMENT;
+                        sectors = unit_align;
                     }
                     let bytes = sectors as usize * 2048;
-                    let mut buf = match recycle_rx.recv() {
-                        Ok(b) => b,
-                        Err(_) => return, // consumer dropped both channels
+                    // Park on the recycle channel, but re-poll halt every
+                    // POLL_INTERVAL: a pure-AtomicBool Halt does not
+                    // disconnect the channel, so a blocking recv() would
+                    // never re-reach the cancel check at the loop top.
+                    // Mirrors the BytePrefetcher pattern exactly.
+                    let mut buf = loop {
+                        match recycle_rx.recv_timeout(POLL_INTERVAL) {
+                            Ok(b) => break b,
+                            Err(RecvTimeoutError::Timeout) => {
+                                if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
+                                    return;
+                                }
+                            }
+                            // Consumer dropped both channels.
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
                     };
                     if bytes <= buf.capacity() {
                         // Re-expose `bytes` without zero-filling pages that
@@ -387,6 +399,14 @@ impl SectorSource for PrefetchedSectorSource {
                 // `into_channels`), so a too-small buffer here is a
                 // caller bug — surface it instead of corrupting data.
                 if filled.len() > buf.len() {
+                    // Recycle the buffer before returning the error so the
+                    // pool invariant is preserved on every code path. Without
+                    // this, every too-small-buffer error permanently removes
+                    // one buffer from the pool; after PREFETCH_CHANNEL_DEPTH+1
+                    // such errors the pool is exhausted and the producer
+                    // blocks forever on recycle_rx.recv() while the consumer
+                    // blocks on rx.recv() — permanent deadlock.
+                    let _ = self.recycle_tx.send(filled);
                     return Err(crate::error::Error::IoError {
                         source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
                     });
@@ -1067,6 +1087,53 @@ mod tests {
             let io: std::io::Error = err.into();
             assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
             drop(pf);
+        });
+    }
+
+    /// Regression for the fix-1 deadlock: calling read_sectors with a
+    /// too-small buffer more times than the pool depth (PREFETCH_CHANNEL_DEPTH+1
+    /// = 3) must NOT deadlock and the pool must remain usable afterwards.
+    ///
+    /// Before the fix, each too-small-buffer error path returned without
+    /// recycling the received buffer, draining the fixed pool. On the 4th
+    /// call the producer blocked on recycle_rx.recv() while the consumer
+    /// blocked on rx.recv() — permanent deadlock. The watchdog turns a
+    /// regression into a test failure rather than a hung suite.
+    #[test]
+    fn too_small_buffer_repeated_does_not_deadlock_pool() {
+        with_watchdog(Duration::from_secs(10), || {
+            // Extent with enough sectors that the producer never reaches
+            // EOF during the test — we need it to keep producing batches.
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 30,
+            }];
+            let src = PatternSource { capacity: 30 };
+            // batch=3 → producer fills 3 sectors (6144 bytes) per batch.
+            // Pool depth is PREFETCH_CHANNEL_DEPTH+1 = 3.
+            let mut pf = PrefetchedSectorSource::new(src, extents, 3, None).expect("spawn");
+            // Caller buffer holds only 1 sector — far too small for a 3-sector batch.
+            let mut tiny = vec![0u8; 2048];
+
+            // 5 > pool depth of 3: without the fix the pool exhausts by
+            // iteration 4 and both threads deadlock.
+            // 8 >> pool depth (3): WITHOUT the recycle-on-error fix the pool
+            // is drained after the 3rd error and the 4th read deadlocks
+            // (producer blocks on recycle_rx, consumer on rx). WITH the fix the
+            // buffer is returned to the pool on every error path, so the pool
+            // never drains and all reads complete. Reaching this loop's end is
+            // the regression assertion. (read_sectors is a non-production
+            // direct path; the production mux uses the zero-copy into_channels
+            // path. A correctly-sized read afterward is intentionally NOT
+            // asserted — that would couple the test to exact producer EOF/tx
+            // pacing, which is unrelated to the pool-exhaustion invariant.)
+            for i in 0..8 {
+                let r = pf.read_sectors(0, 1, &mut tiny, false);
+                assert!(
+                    r.is_err(),
+                    "iteration {i}: too-small buffer must return Err, got Ok"
+                );
+            }
         });
     }
 

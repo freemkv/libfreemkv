@@ -1,8 +1,10 @@
 # libfreemkv Architecture
 
 Open source optical drive access library for 4K UHD Blu-ray, Blu-ray, and DVD.
-Rust library with no external dependencies at runtime -- profiles are bundled,
-AACS keys are derived internally, and all SCSI communication is handled in-process.
+Rust library with profiles bundled and all SCSI communication handled in-process.
+AACS decryption requires an external `keydb.cfg` (default
+`~/.config/freemkv/keydb.cfg`) — the derivation math is internal, but no AACS key
+material is compiled in; DVD CSS player keys are the only compiled-in keys.
 
 **Repository:** <https://github.com/freemkv/libfreemkv>
 **License:** AGPL-3.0-only
@@ -65,7 +67,7 @@ libfreemkv (lib.rs)
 │
 ├── Streaming
 │   ├── mux/          Stream implementations (Disc, ISO, MKV, M2TS, Network, Stdio, Null)
-│   ├── pes           PES frame types; FrameSource / FrameSink direction-typed traits
+│   ├── pes           PES frame types; the unified pes::Stream (PesStream) read/write trait
 │   └── sector/       SectorSource / SectorSink traits, FileSector{Source,Sink}, DecryptingSectorSource
 │
 ├── I/O Primitives

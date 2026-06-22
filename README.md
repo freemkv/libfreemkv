@@ -6,7 +6,7 @@
 
 Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Bundled drive profiles — no external files needed.
 
-Built-in keys cover DVDs and Blu-rays (AACS 1.0). For UHD (AACS 2.0 / 2.1) discs, an optional `keydb.cfg` supplies disc-specific volume unique keys.
+DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require a `keydb.cfg` (default `~/.config/freemkv/keydb.cfg`) supplying disc-specific volume unique keys; no AACS key material is compiled in.
 
 **12+ MB/s** sustained read speeds on BD. Full init: unlock, firmware upload, speed calibration — all from pure Rust.
 
@@ -20,7 +20,7 @@ Part of the [freemkv](https://github.com/freemkv) project.
 
 ```toml
 [dependencies]
-libfreemkv = "0.25"
+libfreemkv = "1.0.0-rc.1"
 ```
 
 ## Quick Start
@@ -121,11 +121,11 @@ loop {
 | StdioStream | Yes (stdin) | Yes (stdout) | Raw byte pipe |
 | NullStream | -- | Yes | Discard sink (byte counter for benchmarks) |
 
-Streams implement `FrameSource` (read) and/or `FrameSink` (write); direction is type-checked. `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
+Streams implement a single unified `pes::Stream` trait (re-exported as `PesStream`) exposing `read()` and `write()` on one type. `input()` / `output()` resolve URL strings to PES stream instances. All URLs use the `scheme://path` format — bare paths are rejected.
 
 ### Keys
 
-DVDs (CSS) decrypt out of the box — the 1999-era public player keys are compiled into the library.
+DVDs (CSS) decrypt out of the box. The library uses 31 compiled-in 1999-era public player keys (for disc-key cracking) combined with Frank Stevenson's known-plaintext title-key attack — no external key file needed.
 
 Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`). The file holds all DKs, PKs, host certs, and per-disc VUKs. No AACS key material is compiled into the binary.
 
@@ -144,12 +144,11 @@ Disc                   — scan titles, streams, AACS/CSS state
   ├── IFO parser       — DVD title sets, PGC chains, cell addresses
   ├── Labels           — 5 BD-J format parsers (detect + parse)
   ├── AACS             — key resolution + content decryption
-  ├── CSS              — DVD CSS cipher (table-driven, no keys needed)
+  ├── CSS              — DVD CSS (bus auth → player-key disc crack → known-plaintext title-key attack)
   └── KEYDB            — download + verify + save
 
 Streams                — unified PES pipeline
-  ├── FrameSource      — read() PES frames (direction-typed)
-  ├── FrameSink        — write() PES frames (direction-typed)
+  ├── PesStream        — pes::Stream: one trait, read()/write() PES frames
   ├── DiscStream       — sectors → decrypt → TS demux → PES
   ├── IsoStream        — ISO file → decrypt → TS demux → PES
   ├── MkvStream        — MKV mux/demux
@@ -175,6 +174,7 @@ All errors are structured with numeric codes. No user-facing English text — ap
 | E6xxx | Disc format errors |
 | E7xxx | AACS errors |
 | E8xxx | KEYDB update errors |
+| E9xxx | Stream / mux errors (URL, PES, ISO, pipeline, demux) |
 
 ## Platform Support
 

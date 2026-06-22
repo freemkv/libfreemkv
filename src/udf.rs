@@ -20,6 +20,7 @@
 
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
+use std::collections::HashSet;
 
 /// Upper bound on a single UNBOUNDED metadata file read (`read_file`).
 /// BD-ROM metadata files (.mpls/.clpi/.bdmv/.inf) are a few KiB to a few
@@ -482,9 +483,14 @@ impl UdfFs {
         if (icb_flags & 0x07) != 3 {
             return Ok(None);
         }
-        let start = ad_offset.min(icb.len());
-        let end = ad_offset.saturating_add(l_ad).min(icb.len());
-        Ok(Some(icb[start..end].to_vec()))
+        if ad_offset > icb.len() || ad_offset + l_ad > icb.len() {
+            return Err(Error::DiscRead {
+                sector: icb_abs as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        Ok(Some(icb[ad_offset..ad_offset + l_ad].to_vec()))
     }
 
     /// Read ALL allocation extents for a file from its ICB.
@@ -866,8 +872,21 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
     // long_ad = extent_length(4) + extent_location: lba(4) + part_ref(2) + impl_use(6)
     let root_lba = u32::from_le_bytes([fsd[404], fsd[405], fsd[406], fsd[407]]);
 
-    // Step 5: Read root directory and build file tree
-    let root = read_directory(reader, partition_start, metadata_start, root_lba, "", 0)?;
+    // Step 5: Read root directory and build file tree.
+    // Pre-seed visited with the root ICB so that any FID pointing back to
+    // root_lba is detected as a cycle immediately.
+    let root_icb_key = ((metadata_start as u64) << 32) | root_lba as u64;
+    let mut visited: HashSet<u64> = HashSet::from([root_icb_key]);
+    let root = read_directory(
+        reader,
+        partition_start,
+        metadata_start,
+        root_lba,
+        "",
+        0,
+        &mut 0usize,
+        &mut visited,
+    )?;
 
     let metadata_sectors = (metadata_size_bytes as u64).div_ceil(2048) as u32;
 
@@ -885,13 +904,32 @@ pub fn read_filesystem(reader: &mut dyn SectorSource) -> Result<UdfFs> {
 /// are far shallower (BDMV/BACKUP/BDJO is the deepest standard path at 3).
 const MAX_DIR_DEPTH: u32 = 8;
 
+/// Global cap on the total number of directory entries (FIDs) visited across
+/// the entire tree walk. Each named non-parent FID counts as one entry,
+/// regardless of whether it is a file or directory.
+///
+/// Real BD-ROM discs have at most a few thousand entries; the largest real
+/// partition (BDMV/STREAM/) typically holds a few hundred .m2ts FIDs.
+/// 100 000 is well above any legitimate disc and makes the 8-level × 26k-dirs
+/// attack (8^26k astronomical visits) terminate in microseconds.
+const MAX_TOTAL_DIR_ENTRIES: usize = 100_000;
+
 /// Read a UDF directory and its children (up to [`MAX_DIR_DEPTH`] levels).
 ///
 /// Each directory is an ICB (Extended File Entry) pointing to directory data
 /// containing File Identifier Descriptors (FIDs). Each FID names a file/subdir
 /// and points to its ICB. Directories deeper than [`MAX_DIR_DEPTH`] are
 /// recorded as entries but not descended into.
+///
+/// `budget` tracks total FID entries consumed across the whole tree; the walk
+/// aborts with `Error::DiscRead` once it exceeds [`MAX_TOTAL_DIR_ENTRIES`].
+/// `visited` is the set of metadata-relative ICB LBAs already opened as
+/// directories; a repeated LBA is a cycle and is skipped.
+// A recursive UDF directory-tree parser: the arg list (reader, partition/meta
+// offsets, depth, plus the global entry budget and the cycle-detection
+// visited-set) is inherent to the walk, not a refactor smell.
 #[allow(clippy::only_used_in_recursion)]
+#[allow(clippy::too_many_arguments)]
 fn read_directory(
     reader: &mut dyn SectorSource,
     part_start: u32,
@@ -899,6 +937,8 @@ fn read_directory(
     meta_lba: u32,
     name: &str,
     depth: u32,
+    budget: &mut usize,
+    visited: &mut HashSet<u64>,
 ) -> Result<DirEntry> {
     // Read ICB for this directory
     let icb_abs = meta_start.checked_add(meta_lba).ok_or(Error::DiscRead {
@@ -1044,23 +1084,52 @@ fn read_directory(
             let entry_name = parse_udf_name(&dir_data[name_start..name_end]);
 
             if !entry_name.is_empty() {
+                // Global entry budget: abort if a crafted disc tries to
+                // enumerate an astronomically large tree.
+                *budget = budget.saturating_add(1);
+                if *budget > MAX_TOTAL_DIR_ENTRIES {
+                    return Err(Error::DiscRead {
+                        sector: meta_start as u64,
+                        status: None,
+                        sense: None,
+                    });
+                }
+
                 // Read the ICB to get file size
                 let file_size = read_file_size(reader, meta_start, icb_lba).unwrap_or(0);
 
                 if is_dir && depth < MAX_DIR_DEPTH {
-                    // Recurse into subdirectory. The cap guards against
-                    // pathological/looping directory trees on a corrupt disc
-                    // while comfortably covering real BD-ROM nesting
-                    // (e.g. BDMV/BACKUP/BDJO/*.bdjo is 3 levels deep).
-                    let subdir = read_directory(
-                        reader,
-                        part_start,
-                        meta_start,
-                        icb_lba,
-                        &entry_name,
-                        depth + 1,
-                    )?;
-                    entries.push(subdir);
+                    // Cycle guard: skip any ICB LBA we have already opened as
+                    // a directory (self-referential or cross-linked dirs).
+                    let icb_key = ((meta_start as u64) << 32) | icb_lba as u64;
+                    if visited.contains(&icb_key) {
+                        // Emit as a leaf so the name is preserved but don't
+                        // recurse into the cycle.
+                        entries.push(DirEntry {
+                            name: entry_name,
+                            is_dir: true,
+                            meta_lba: icb_lba,
+                            size: file_size,
+                            entries: Vec::new(),
+                        });
+                    } else {
+                        visited.insert(icb_key);
+                        // Recurse into subdirectory. The depth cap guards
+                        // against pathological nesting on a corrupt disc while
+                        // comfortably covering real BD-ROM nesting
+                        // (e.g. BDMV/BACKUP/BDJO/*.bdjo is 3 levels deep).
+                        let subdir = read_directory(
+                            reader,
+                            part_start,
+                            meta_start,
+                            icb_lba,
+                            &entry_name,
+                            depth + 1,
+                            budget,
+                            visited,
+                        )?;
+                        entries.push(subdir);
+                    }
                 } else {
                     entries.push(DirEntry {
                         name: entry_name,
@@ -1238,6 +1307,9 @@ impl BufferedSectorReader<'_> {
     /// Pre-read a contiguous range of sectors into the sliding cache.
     /// Used to bulk-load the UDF metadata partition so subsequent reads are instant.
     pub(crate) fn prefetch(&mut self, start_lba: u32, count: u32) {
+        // Cap to 8192 sectors (16 MiB) so a disc-controlled ad_len cannot
+        // drive a multi-hundred-MiB allocation before any sectors are read.
+        let count = count.min(8192);
         let total = count as usize * 2048;
         self.cache.resize(total, 0);
         let mut offset = 0u32;
@@ -1265,11 +1337,26 @@ impl BufferedSectorReader<'_> {
     /// Pre-read multiple sector ranges into the permanent cache.
     /// Each range is read in batch-sized chunks and stored per-sector in a HashMap.
     /// Used to bulk-load all small files (AACS, MPLS, CLPI, META) before scanning.
+    ///
+    /// Anti-DoS: the permanent cache holds one ~2 KB `Vec` per sector in a
+    /// `HashMap`, so the total sector count bounds RAM. A crafted UDF (a
+    /// bogus metadata-file size in `metadata_sector_ranges`) could otherwise
+    /// drive that count to billions. Cap the cumulative prefetched sectors at
+    /// `MAX_PREFETCH_SECTORS` (~1 GiB of cache); once exceeded, stop seeding
+    /// the cache. The sliding-window read path still serves any LBA on
+    /// demand, so this only forgoes the bulk speed-up — it never loses data.
     pub(crate) fn prefetch_ranges(&mut self, ranges: &[(u32, u32)]) {
+        // 2048 bytes/sector → 512 Ki sectors ≈ 1 GiB of permanent cache.
+        const MAX_PREFETCH_SECTORS: u64 = 512 * 1024;
         let mut tmp = vec![0u8; self.batch as usize * 2048];
+        let total: u64 = ranges.iter().map(|&(_, c)| c as u64).sum();
+        let mut cached: u64 = 0;
+        let mut done: u64 = 0;
+        let mut hb = crate::progress::Heartbeat::new("udf_prefetch");
         for &(start, count) in ranges {
             let mut offset = 0u32;
             while offset < count {
+                hb.tick(done, total);
                 let batch = (count - offset).min(self.batch as u32) as u16;
                 let bytes = batch as usize * 2048;
                 if self
@@ -1280,11 +1367,19 @@ impl BufferedSectorReader<'_> {
                     break;
                 }
                 for i in 0..batch as u32 {
+                    if cached >= MAX_PREFETCH_SECTORS {
+                        // Cache cap hit: stop seeding the permanent HashMap.
+                        // Remaining LBAs are still served by the sliding-window
+                        // read path below, just without the bulk pre-load.
+                        return;
+                    }
                     let s = i as usize * 2048;
                     self.prefetched
                         .insert(start + offset + i, tmp[s..s + 2048].to_vec());
+                    cached += 1;
                 }
                 offset += batch as u32;
+                done += batch as u64;
             }
         }
     }
@@ -1841,7 +1936,8 @@ mod tests {
         let mut reader = MemReader::new();
         reader.put(5, icb); // directory ICB at meta_start(0) + meta_lba(5)
 
-        let err = read_directory(&mut reader, 0, 0, 5, "DIR", 0).unwrap_err();
+        let err = read_directory(&mut reader, 0, 0, 5, "DIR", 0, &mut 0, &mut HashSet::new())
+            .unwrap_err();
         assert!(matches!(err, Error::DiscRead { .. }));
     }
 
@@ -1853,7 +1949,8 @@ mod tests {
         let mut reader = MemReader::new();
         reader.put(5, icb);
         // directory data at meta_start(0) + ad_pos(50) = 50 reads as zeros.
-        let dir = read_directory(&mut reader, 0, 0, 5, "DIR", 0).expect("small dir parses");
+        let dir = read_directory(&mut reader, 0, 0, 5, "DIR", 0, &mut 0, &mut HashSet::new())
+            .expect("small dir parses");
         assert!(dir.entries.is_empty());
         assert!(dir.is_dir);
     }
@@ -2027,7 +2124,8 @@ mod tests {
         reader.put(60, dir);
         reader.put(7, build_efe_icb(123, 2048, 0)); // child size ICB
 
-        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0).expect("dir parses");
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
         assert_eq!(parsed.entries.len(), 1, "exactly one FID entry");
         assert_eq!(
             parsed.entries[0].name, "CLPI",
@@ -2061,7 +2159,8 @@ mod tests {
         reader.put(60, dir);
         reader.put(9, build_efe_icb(0, 2048, 0)); // child size ICB
 
-        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0).expect("dir parses");
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut HashSet::new())
+            .expect("dir parses");
         assert!(
             parsed.entries.is_empty(),
             "the parent (..) FID must not be emitted even with a valid name"
@@ -2092,5 +2191,160 @@ mod tests {
         field[1] = b'A';
         *field.last_mut().unwrap() = 200; // way past the 8-byte field
         assert_eq!(parse_dstring(&field), "");
+    }
+
+    #[test]
+    fn read_inline_data_rejects_oversized_lea() {
+        // AD type=3 (inline data) with an L_EA so large that ad_offset =
+        // 216 + L_EA overflows past the 2048-byte ICB. Before the fix,
+        // the `.min(icb.len())` clamp produced start==end==2048 and the
+        // function returned Ok(Some(vec![])) — silently dropping the file
+        // content. AACS key files (Unit_Key_RO.inf) read as 0 bytes and
+        // decryption failed without a useful diagnostic.
+        let mut icb = [0u8; 2048];
+        // tag = 266 (Extended File Entry)
+        icb[0..2].copy_from_slice(&266u16.to_le_bytes());
+        // ICB Tag flags at offset 34: low 3 bits = 3 → inline data
+        icb[34..36].copy_from_slice(&3u16.to_le_bytes());
+        // L_EA = 2000 → ad_offset = 216 + 2000 = 2216 > 2048
+        let l_ea: u32 = 2000;
+        let l_ad: u32 = 4;
+        icb[208..212].copy_from_slice(&l_ea.to_le_bytes());
+        icb[212..216].copy_from_slice(&l_ad.to_le_bytes());
+
+        let mut reader = MapReader::new();
+        reader.put(0, icb); // meta_start=0 + meta_lba=0 → abs lba 0
+
+        let fs = fs_with(0, 0, file_entry("inline", 0, l_ad as u64));
+        let result = fs.read_inline_data(&mut reader, 0);
+        assert!(
+            result.is_err(),
+            "oversized L_EA must return Err, not Ok(Some(empty vec))"
+        );
+    }
+
+    #[test]
+    fn prefetch_huge_count_is_capped() {
+        // A disc-controlled sector count far exceeding the 8192-sector cap must
+        // not allocate more than 8192 * 2048 bytes in the sliding cache.
+        let mut inner = MapReader::new();
+        let mut br = BufferedSectorReader::new(&mut inner, 32);
+        // Pass a count that would allocate ~512 MiB if uncapped (262144 sectors).
+        br.prefetch(0, 262_144);
+        // The cache must be no larger than the cap: 8192 sectors × 2048 bytes.
+        assert!(
+            br.cache.len() <= 8192 * 2048,
+            "prefetch cache exceeded cap: {} bytes",
+            br.cache.len()
+        );
+    }
+
+    /// Build a 2048-byte directory sector containing `count` minimal file FIDs.
+    ///
+    /// Each FID uses a 2-byte name (compression-id `8` + `b'A'`), so l_fi=2
+    /// and the total FID record is 40 bytes (already 4-byte aligned).
+    /// A 2048-byte sector fits exactly 51 such FIDs.
+    ///
+    /// `icb_base` is the ICB LBA written into the first FID; each subsequent
+    /// FID gets `icb_base + i`.
+    fn build_dir_sector_with_file_fids(count: usize, icb_base: u32) -> [u8; 2048] {
+        let mut sector = [0u8; 2048];
+        let l_fi: u8 = 2;
+        let name: [u8; 2] = [8, b'A'];
+        let fid_stride = 40usize; // 38 + l_fi=2, already 4-byte aligned
+        let mut pos = 0;
+        for i in 0..count {
+            if pos + fid_stride > sector.len() {
+                break;
+            }
+            sector[pos..pos + 2].copy_from_slice(&257u16.to_le_bytes()); // FID tag
+            sector[pos + 18] = 0x00; // file (not dir, not parent)
+            sector[pos + 19] = l_fi;
+            let lba = icb_base.wrapping_add(i as u32);
+            sector[pos + 24..pos + 28].copy_from_slice(&lba.to_le_bytes());
+            // l_iu = 0 at +36
+            sector[pos + 38..pos + 40].copy_from_slice(&name);
+            pos += fid_stride;
+        }
+        sector
+    }
+
+    #[test]
+    fn read_directory_budget_exceeded_returns_err() {
+        // A crafted disc emitting more FIDs than MAX_TOTAL_DIR_ENTRIES must be
+        // rejected rather than visited indefinitely. `budget` is the running
+        // global counter (threshold = MAX_TOTAL_DIR_ENTRIES); pre-load it to
+        // within 10 of the cap and feed 51 file FIDs — the walk must error once
+        // the counter crosses the cap, before consuming all of them.
+        let dir_sector = build_dir_sector_with_file_fids(51, 200);
+        let dir_icb = build_efe_icb(2048, 2048, 50);
+        let mut reader = MemReader::new();
+        reader.put(5, dir_icb);
+        reader.put(50, dir_sector);
+        // MemReader returns zeros for unmapped ICB LBAs → tag=0 → read_file_size=0, fine.
+
+        let mut budget: usize = MAX_TOTAL_DIR_ENTRIES - 10;
+        let err = read_directory(
+            &mut reader,
+            0,
+            0,
+            5,
+            "ROOT",
+            0,
+            &mut budget,
+            &mut HashSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::DiscRead { .. }),
+            "budget exceeded must return DiscRead"
+        );
+    }
+
+    #[test]
+    fn read_directory_icb_cycle_does_not_recurse() {
+        // A directory whose child FID (is_dir=true) points back to the same
+        // ICB LBA as the parent (a self-referential cycle) must NOT recurse.
+        // It must be emitted as a leaf entry instead.
+        //
+        // Layout:
+        //   meta_lba 5  — root directory ICB, dir data at lba 60
+        //   lba 60      — one FID: is_dir, ICB at lba 5 (self-reference)
+        //
+        // We seed visited with lba 5 (the root we are about to descend into),
+        // so when the FID points back to lba 5 the cycle is detected immediately.
+        let mut dir = [0u8; 2048];
+        let mut name_bytes = vec![8u8];
+        name_bytes.extend_from_slice(b"LOOP");
+        let l_fi = name_bytes.len() as u8;
+        dir[0..2].copy_from_slice(&257u16.to_le_bytes()); // FID tag
+        dir[18] = 0x02; // is_dir
+        dir[19] = l_fi;
+        dir[24..28].copy_from_slice(&5u32.to_le_bytes()); // ICB LBA = 5 (self)
+        // l_iu = 0, name at offset 38
+        dir[38..38 + name_bytes.len()].copy_from_slice(&name_bytes);
+
+        let dir_icb = build_efe_icb(2048, 2048, 60);
+        let mut reader = MemReader::new();
+        reader.put(5, dir_icb);
+        reader.put(60, dir);
+
+        // Seed visited with the root ICB key so the child (lba 5) is
+        // immediately recognised as a cycle.
+        let mut visited: HashSet<u64> = HashSet::new();
+        let root_key: u64 = 5u64; // meta_start=0 → key = (0 << 32) | 5
+        visited.insert(root_key);
+
+        let parsed = read_directory(&mut reader, 0, 0, 5, "ROOT", 0, &mut 0, &mut visited)
+            .expect("cycle must not blow up");
+
+        // The cyclic entry is emitted as a leaf (no children), not recursed into.
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].name, "LOOP");
+        assert!(parsed.entries[0].is_dir);
+        assert!(
+            parsed.entries[0].entries.is_empty(),
+            "cycle entry must be a leaf, not recursed"
+        );
     }
 }

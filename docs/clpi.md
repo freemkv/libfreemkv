@@ -189,7 +189,7 @@ The full ripping pipeline chains three parsers:
 2. **CLPI** converts those timestamps to SPN ranges, then to sector extents.
 3. **UDF** provides the file's starting LBA on disc for absolute sector addressing.
 
-The `Disc::scan()` method in `src/disc.rs` orchestrates this: for each play item in each playlist, it loads the corresponding CLPI, calls `get_extents()` with the play item's in/out times, and collects the resulting sector ranges into the title's extent list.
+The `Disc::scan()` method in `src/disc/mod.rs` orchestrates this: for each play item in each playlist, it loads the corresponding CLPI, calls `get_extents()` with the play item's in/out times, and collects the resulting sector ranges into the title's extent list.
 
 ## References
 

@@ -24,9 +24,17 @@ pub struct H264Parser {
     // occurrence whose body DIFFERS from the codecPrivate copy must therefore be
     // emitted IN-BAND at each point it appears so it overrides the re-applied
     // avcC set; otherwise those frames decode against the wrong parameter set.
-    // (Same defect class as the HEVC PPS-redefinition bug.)
+    // (Same defect class as the HEVC PPS-redefinition bug — fixed identically.)
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    // Currently-ACTIVE body of each type (most recent the bitstream defined),
+    // distinct from the fixed `sps`/`pps` codecPrivate copy. See the HEVC
+    // parser for the full rationale: the strip/emit decision must be made
+    // against the active set, and the active set must be re-asserted in-band at
+    // every keyframe that doesn't carry it, or a streaming decoder reverts to
+    // the stale avcC copy after a mid-title redefinition.
+    cur_sps: Option<Vec<u8>>,
+    cur_pps: Option<Vec<u8>>,
 }
 
 impl Default for H264Parser {
@@ -41,37 +49,80 @@ impl H264Parser {
         Self {
             sps: None,
             pps: None,
+            cur_sps: None,
+            cur_pps: None,
         }
     }
 }
 
-/// Handle an SPS/PPS NAL (mirrors the HEVC fix):
-/// - First of its type → seeds codecPrivate (`first`); stripped from frame data
-///   (the player gets it from avcC).
-/// - Identical to the codecPrivate copy → stripped (the player re-applies it
-///   from avcC at each keyframe; BD streams repeat param sets at every IDR).
-/// - DIFFERENT body from the codecPrivate copy (a mid-title redefinition of the
-///   same id) → emitted IN-BAND (length-prefixed) at EVERY occurrence so it
-///   overrides the avcC copy the player re-applies at each keyframe.
-fn handle_param_set(first: &mut Option<Vec<u8>>, nal: &[u8], frame_data: &mut Vec<u8>) {
-    match first {
-        None => {
-            first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
-        }
-        Some(f) if f.as_slice() == nal => {} // == codecPrivate → player has it
-        Some(_) => {
-            // Differs from codecPrivate → emit in-band so it wins at this AU.
-            // A NAL longer than u32::MAX cannot be length-prefixed in the
-            // 4-byte field; skip it rather than emit a truncated length over
-            // the full body (mis-framed NALU). Unreachable in practice — no
-            // real access unit is >4 GiB.
-            let Ok(len) = u32::try_from(nal.len()) else {
-                return;
-            };
-            frame_data.extend_from_slice(&len.to_be_bytes());
-            frame_data.extend_from_slice(nal);
-        }
+/// Append `nal` to `out` as a 4-byte big-endian length prefix + body. A NAL
+/// longer than `u32::MAX` can't be length-prefixed in the 4-byte field, so it
+/// is skipped rather than mis-framed. Unreachable in practice (no AU > 4 GiB).
+fn push_length_prefixed(out: &mut Vec<u8>, nal: &[u8]) {
+    let Ok(len) = u32::try_from(nal.len()) else {
+        return;
+    };
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(nal);
+}
+
+/// Handle an SPS/PPS NAL (mirrors the HEVC fix). The strip/emit decision is
+/// made against the currently-ACTIVE set `cur`, NOT the codecPrivate copy
+/// `first`: a streaming MKV decoder applies avcC once at init and thereafter
+/// updates a parameter set only from an in-band NAL, so a switch BACK to the
+/// first-seen body (== codecPrivate) is still a change the decoder must be told
+/// about. Stripping on `== first` silently dropped that revert.
+///
+/// - First of its type → seeds codecPrivate; stripped (decoder gets it from avcC).
+/// - Equal to the active set `cur` → redundant; stripped.
+/// - Different from `cur` (a change in EITHER direction) → emitted in-band and
+///   `cur` updated.
+///
+/// Returns `true` when the NAL was emitted in-band into `frame_data`.
+fn handle_param_set(
+    first: &mut Option<Vec<u8>>,
+    cur: &mut Option<Vec<u8>>,
+    nal: &[u8],
+    frame_data: &mut Vec<u8>,
+) -> bool {
+    let is_first = first.is_none();
+    if is_first {
+        first.replace(nal.to_vec()); // seeds codecPrivate; stripped here
     }
+    let changed = cur.as_deref() != Some(nal);
+    if changed {
+        *cur = Some(nal.to_vec());
+    }
+    if is_first || !changed {
+        return false;
+    }
+    push_length_prefixed(frame_data, nal);
+    true
+}
+
+/// Append the active parameter set `cur` to `prefix` (length-prefixed) so every
+/// keyframe is SELF-CONTAINED: it carries the active SPS/PPS in-band ahead of
+/// its slices. Skipped only when this access unit ALREADY carried the NAL in-band
+/// (`emitted` — avoids a duplicate) or no active set exists yet.
+///
+/// Unconditional (not only when the active set differs from codecPrivate): a
+/// streaming decoder applies the avcC param sets once at init, then relies on
+/// in-band repetition. Some sources stop repeating a param set at later IDRs even
+/// though its body is unchanged; if the decoder then drops it (a reset event),
+/// nothing re-sends it and every subsequent slice fails (param-set id out of
+/// range) until the next genuine change. Re-asserting at EVERY keyframe — what
+/// compliant muxers do at every IDR — makes streaming decode self-healing.
+/// Re-sending an identical param set is benign; cost is a few bytes per keyframe.
+/// This strictly supersets the change-only re-assert, so the param-set-revert
+/// fix is unaffected.
+fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
+    if emitted {
+        return;
+    }
+    let Some(active) = cur.as_deref() else {
+        return;
+    };
+    push_length_prefixed(prefix, active);
 }
 
 impl CodecParser for H264Parser {
@@ -90,6 +141,9 @@ impl CodecParser for H264Parser {
         // Annex B (start-code prefixed) NALUs to length-prefixed NALUs (MKV with
         // AVCDecoderConfigurationRecord expects a 4-byte length prefix per NAL).
         let mut keyframe = false;
+        // Did this access unit already carry each param-set type in-band?
+        let mut emitted_sps = false;
+        let mut emitted_pps = false;
         // Pre-size: output is ~input bytes plus a few 4-byte NAL length prefixes.
         // The unsized Vec growth chain otherwise reallocs several times per
         // frame in the mux hot path (mirrors the HEVC parser).
@@ -99,10 +153,16 @@ impl CodecParser for H264Parser {
             let nal_type = nal[0] & 0x1F;
 
             match nal_type {
-                // Param sets: seed avcC, strip if identical, emit in-band if a
-                // mid-title redefinition differs from the avcC copy.
-                NAL_SPS => handle_param_set(&mut self.sps, nal, &mut frame_data),
-                NAL_PPS => handle_param_set(&mut self.pps, nal, &mut frame_data),
+                // Param sets: seed avcC, strip if unchanged vs the active set,
+                // emit in-band on any change (incl. reverting to the avcC copy).
+                NAL_SPS => {
+                    emitted_sps |=
+                        handle_param_set(&mut self.sps, &mut self.cur_sps, nal, &mut frame_data)
+                }
+                NAL_PPS => {
+                    emitted_pps |=
+                        handle_param_set(&mut self.pps, &mut self.cur_pps, nal, &mut frame_data)
+                }
                 // Access unit delimiters: drop. Intentional and spec-correct —
                 // Matroska H.264 frame data omits AUDs (the container delimits
                 // access units), so keeping them in-band is redundant. Mirrors
@@ -126,6 +186,20 @@ impl CodecParser for H264Parser {
 
         if frame_data.is_empty() {
             return Vec::new();
+        }
+
+        // Every keyframe is self-contained: re-assert the active SPS/PPS in-band
+        // ahead of the slices (even when unchanged vs codecPrivate) so a decoder
+        // that dropped the set at a reset recovers, and a stale avcC re-apply
+        // can't revert it. Skipped per-type only when this AU already carried it.
+        if keyframe {
+            let mut prefix = Vec::new();
+            reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
+            reassert_active(&mut prefix, &self.cur_pps, emitted_pps);
+            if !prefix.is_empty() {
+                prefix.extend_from_slice(&frame_data);
+                frame_data = prefix;
+            }
         }
 
         vec![Frame {
@@ -165,6 +239,7 @@ impl CodecParser for H264Parser {
         // numOfPictureParameterSets = 1
         // pictureParameterSetLength = pps.len()
         // pictureParameterSetNALUnit = pps
+        // [High Profile extension per ISO 14496-15 §5.3.3.1.2, when applicable]
 
         let mut record = vec![
             1,      // configurationVersion
@@ -182,7 +257,172 @@ impl CodecParser for H264Parser {
         record.push(pps.len() as u8);
         record.extend_from_slice(pps);
 
+        // ISO 14496-15 §5.3.3.1.2: for High-Profile and related profiles
+        // (profile_idc 100, 110, 122, 144) the record has 4 trailing extension
+        // bytes carrying chroma_format_idc and bit depths. Older parsers expect
+        // the record to END after the PPS for Baseline/Main/Extended — do NOT
+        // append for those (strict parsers reject the extra bytes).
+        let profile_idc = sps[1];
+        const HIGH_PROFILES: [u8; 4] = [100, 110, 122, 144];
+        if HIGH_PROFILES.contains(&profile_idc) {
+            if let Some((chroma_fmt, depth_luma, depth_chroma)) = parse_sps_high_profile_ext(sps) {
+                // byte 0: 111111xx — reserved(6) + chroma_format_idc(2)
+                record.push(0xFC | (chroma_fmt & 0x03));
+                // byte 1: 11111xxx — reserved(5) + bit_depth_luma_minus8(3)
+                record.push(0xF8 | (depth_luma & 0x07));
+                // byte 2: 11111xxx — reserved(5) + bit_depth_chroma_minus8(3)
+                record.push(0xF8 | (depth_chroma & 0x07));
+                // byte 3: num_of_sequence_parameter_set_ext (0 = none)
+                record.push(0x00);
+            }
+        }
+
         Some(record)
+    }
+}
+
+/// Parse `(chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)` from
+/// a High-Profile SPS NAL (profile_idc ∈ {100, 110, 122, 144}).
+///
+/// SPS RBSP layout (ITU-T H.264 §7.3.2.1.1) up to the fields we need:
+///   byte 0        NAL header (already known to be type 7)
+///   byte 1        profile_idc
+///   byte 2        constraint_set_flags / reserved
+///   byte 3        level_idc
+///   ue(v)         seq_parameter_set_id
+///   — High-profile branch —
+///   ue(v)         chroma_format_idc
+///   if chroma_format_idc == 3: u(1) separate_colour_plane_flag
+///   ue(v)         bit_depth_luma_minus8
+///   ue(v)         bit_depth_chroma_minus8
+///
+/// RBSP emulation-prevention bytes (0x00 0x00 0x03 → 0x00 0x00) are removed
+/// before bit-parsing so the bit reader sees clean RBSP data.
+///
+/// Returns `None` if the SPS is too short or malformed (Exp-Golomb code
+/// overflows 32 bits, leading-zero count > 31, etc.). The caller silently
+/// omits the extension in that case.
+fn parse_sps_high_profile_ext(sps: &[u8]) -> Option<(u8, u8, u8)> {
+    // Strip emulation-prevention bytes: 00 00 03 xx → 00 00 xx (drop the 03).
+    // We skip byte 0 (NAL header) and start the RBSP from byte 1.
+    let rbsp: Vec<u8> = {
+        let raw = &sps[1..]; // skip NAL header byte
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if i + 2 < raw.len() && raw[i] == 0x00 && raw[i + 1] == 0x00 && raw[i + 2] == 0x03 {
+                out.push(0x00);
+                out.push(0x00);
+                i += 3; // skip the 0x03 emulation-prevention byte
+            } else {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+        out
+    };
+
+    // RBSP layout after stripping the NAL header byte:
+    //   [0] profile_idc (already checked by caller)
+    //   [1] constraint flags
+    //   [2] level_idc
+    //   [3..] seq_parameter_set_id ue(v), then High-Profile fields
+    if rbsp.len() < 4 {
+        return None;
+    }
+
+    // Bit reader over rbsp[3..] (skip profile/flags/level, already known).
+    let mut reader = SpsReader::new(&rbsp[3..]);
+
+    // seq_parameter_set_id — skip
+    reader.read_ue()?;
+
+    // chroma_format_idc
+    let chroma_format_idc = reader.read_ue()?;
+
+    // separate_colour_plane_flag (only when chroma_format_idc == 3)
+    if chroma_format_idc == 3 {
+        reader.read_bits(1)?; // skip separate_colour_plane_flag
+    }
+
+    // bit_depth_luma_minus8
+    let bit_depth_luma_minus8 = reader.read_ue()?;
+    // bit_depth_chroma_minus8
+    let bit_depth_chroma_minus8 = reader.read_ue()?;
+
+    // Clamp to the 2- and 3-bit fields in the avcC extension bytes.
+    // Valid H.264 values are 0..=6; the spec guarantees ≤ 6, so no real
+    // content should be truncated. Out-of-spec values are clamped rather
+    // than rejected so a corrupt-but-decodable SPS still produces a
+    // reasonable avcC.
+    Some((
+        (chroma_format_idc & 0x03) as u8,
+        (bit_depth_luma_minus8 & 0x07) as u8,
+        (bit_depth_chroma_minus8 & 0x07) as u8,
+    ))
+}
+
+/// Minimal Exp-Golomb / fixed-width bit reader over a byte slice, for SPS parsing.
+struct SpsReader<'a> {
+    data: &'a [u8],
+    /// Current byte index.
+    byte: usize,
+    /// Number of bits remaining in data[byte] (0 means fully consumed, advance).
+    bits_left: u8,
+}
+
+impl<'a> SpsReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte: 0,
+            bits_left: if data.is_empty() { 0 } else { 8 },
+        }
+    }
+
+    /// Read one bit. Returns `None` when the slice is exhausted.
+    fn read_bit(&mut self) -> Option<u8> {
+        if self.bits_left == 0 {
+            self.byte += 1;
+            if self.byte >= self.data.len() {
+                return None;
+            }
+            self.bits_left = 8;
+        }
+        self.bits_left -= 1;
+        Some((self.data[self.byte] >> self.bits_left) & 1)
+    }
+
+    /// Read `n` bits (n ≤ 32) as a u32, MSB first. Returns `None` on
+    /// end-of-data.
+    fn read_bits(&mut self, n: u8) -> Option<u32> {
+        let mut val = 0u32;
+        for _ in 0..n {
+            val = (val << 1) | (self.read_bit()? as u32);
+        }
+        Some(val)
+    }
+
+    /// Read one Exp-Golomb coded unsigned integer ue(v). Leading-zero count
+    /// must not exceed 31 (a 63-bit code would overflow u32). Returns `None`
+    /// on end-of-data or overflow.
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u8;
+        loop {
+            let bit = self.read_bit()?;
+            if bit == 1 {
+                break;
+            }
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None; // malformed / non-conforming SPS
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let suffix = self.read_bits(leading_zeros)?;
+        Some((1u32 << leading_zeros) - 1 + suffix)
     }
 }
 
@@ -301,6 +541,112 @@ mod tests {
         assert_eq!(frames.len(), 1);
     }
 
+    // Length-prefixed NAL bodies out of frame_data, and the H.264 PPS (type 8)
+    // payloads among them.
+    fn h264_nals_in(frame: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= frame.len() {
+            let len =
+                u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]) as usize;
+            i += 4;
+            if i + len > frame.len() {
+                break;
+            }
+            out.push(frame[i..i + len].to_vec());
+            i += len;
+        }
+        out
+    }
+    fn h264_pps_bodies(nals: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        nals.iter()
+            .filter(|n| !n.is_empty() && n[0] & 0x1F == 8)
+            .map(|n| n[1..].to_vec())
+            .collect()
+    }
+    fn h264_nal(t: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, t];
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Regression (Fight Club bug, H.264 variant): PPS id 0 = body A (→ avcC),
+    /// redefined to B, then switched BACK to A. A streaming decoder is on B; the
+    /// revert to A == avcC must still be emitted in-band or the A-segment
+    /// decodes against B.
+    #[test]
+    fn h264_emits_switch_back_to_codecprivate_pps() {
+        let a = [0xA1u8, 0xA2];
+        let b = [0xB1u8, 0xB2, 0xB3];
+        let mut p = H264Parser::new();
+        // AU1: SPS (seed avcC) + PPS-A (seed) + IDR.
+        p.parse(&make_pes(
+            [
+                h264_nal(0x67, &[0x42, 0x00, 0x1E, 0xAB]),
+                h264_nal(0x68, &a),
+                h264_nal(0x65, &[1]),
+            ]
+            .concat(),
+            Some(0),
+        ));
+        // AU2 IDR: redefine PPS to B → emitted in-band.
+        let f2 = p.parse(&make_pes(
+            [h264_nal(0x68, &b), h264_nal(0x65, &[2])].concat(),
+            Some(1),
+        ));
+        assert!(
+            h264_pps_bodies(&h264_nals_in(&f2[0].data))
+                .iter()
+                .any(|x| x == &b),
+            "AU2 must carry redefined PPS-B in-band"
+        );
+        // AU3 IDR: back to A (== avcC) — must be emitted in-band (active was B).
+        let f3 = p.parse(&make_pes(
+            [h264_nal(0x68, &a), h264_nal(0x65, &[3])].concat(),
+            Some(2),
+        ));
+        assert!(
+            h264_pps_bodies(&h264_nals_in(&f3[0].data))
+                .iter()
+                .any(|x| x == &a),
+            "switch back to avcC PPS-A must be emitted in-band"
+        );
+    }
+
+    /// Regression: a bare IDR keyframe (source omits the PPS) after a mid-title
+    /// redefinition must re-assert the active PPS in-band.
+    #[test]
+    fn h264_reasserts_active_pps_at_bare_keyframe() {
+        let a = [0xA1u8, 0xA2];
+        let b = [0xB1u8, 0xB2, 0xB3];
+        let mut p = H264Parser::new();
+        p.parse(&make_pes(
+            [
+                h264_nal(0x67, &[0x42, 0x00, 0x1E, 0xAB]),
+                h264_nal(0x68, &a),
+                h264_nal(0x65, &[1]),
+            ]
+            .concat(),
+            Some(0),
+        ));
+        // Redefine to B at a keyframe.
+        p.parse(&make_pes(
+            [h264_nal(0x68, &b), h264_nal(0x65, &[2])].concat(),
+            Some(1),
+        ));
+        // Bare IDR (no PPS): active B must be re-asserted; stale A must not be.
+        let f3 = p.parse(&make_pes(h264_nal(0x65, &[3]), Some(2)));
+        let got = h264_pps_bodies(&h264_nals_in(&f3[0].data));
+        assert!(
+            got.iter().any(|x| x == &b),
+            "bare keyframe must re-assert active PPS-B"
+        );
+        assert!(
+            !got.iter().any(|x| x == &a),
+            "must not re-assert stale avcC PPS-A"
+        );
+    }
+
     #[test]
     fn codec_private_none_before_sps_pps() {
         let parser = H264Parser::new();
@@ -390,14 +736,14 @@ mod tests {
         }
     }
 
-    // --- SPS/PPS/AUD are stripped from frame data ---
+    // --- AUD is stripped; SPS/PPS seed avcC and re-assert at the keyframe ---
 
     #[test]
-    fn sps_pps_aud_stripped_from_frame_data() {
+    fn aud_stripped_param_sets_reasserted_at_keyframe() {
         let mut parser = H264Parser::new();
 
         let mut data = Vec::new();
-        // AUD (type 9)
+        // AUD (type 9) — always dropped
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x09);
         data.push(0xF0);
@@ -409,7 +755,7 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x68);
         data.extend_from_slice(&[0xCE, 0x01]);
-        // IDR (type 5) - only this should appear in frame data
+        // IDR (type 5)
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.push(0x65);
         data.extend_from_slice(&[0x88, 0x00]);
@@ -418,12 +764,25 @@ mod tests {
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
 
-        // Frame data should only contain the IDR NAL (length-prefixed)
+        // SPS/PPS seed avcC...
+        assert!(parser.codec_private().is_some(), "SPS/PPS seed avcC");
+        // ...and because this is a keyframe, the active SPS/PPS are re-asserted
+        // in-band ahead of the IDR so the keyframe is self-contained. AUD (9) is
+        // always dropped. Frame data = SPS(7), PPS(8), IDR(5).
         let fd = &frames[0].data;
-        let length = u32::from_be_bytes([fd[0], fd[1], fd[2], fd[3]]);
-        // IDR NAL is 0x65, 0x88 (trailing 0x00 is stripped as potential start code prefix)
-        assert_eq!(length, 2);
-        assert_eq!(fd[4], 0x65); // IDR NAL type byte
+        let mut types = Vec::new();
+        let mut o = 0;
+        while o + 4 <= fd.len() {
+            let len = u32::from_be_bytes([fd[o], fd[o + 1], fd[o + 2], fd[o + 3]]) as usize;
+            o += 4;
+            types.push(fd[o] & 0x1F);
+            o += len;
+        }
+        assert_eq!(
+            types,
+            vec![7, 8, 5],
+            "keyframe: SPS+PPS re-asserted ahead of IDR, AUD dropped"
+        );
     }
 
     // --- PTS conversion ---
@@ -496,11 +855,12 @@ mod tests {
     }
 
     #[test]
-    fn first_param_sets_stripped_redefinition_emitted_inline() {
+    fn keyframes_self_contained_and_redefinition_emitted() {
         let mut parser = H264Parser::new();
 
-        // AU 1: SPS(id0,bodyA) + PPS(id0,bodyA) + IDR. Both param sets are the
-        // first of their type → seed avcC, stripped from frame data.
+        // AU 1: SPS(id0,bodyA) + PPS(id0,bodyA) + IDR. The param sets seed avcC,
+        // and because this is a keyframe the active SPS/PPS are re-asserted
+        // in-band ahead of the IDR (self-contained keyframe). Frame = SPS,PPS,IDR.
         let mut au1 = Vec::new();
         au1.extend_from_slice(&[0x00, 0x00, 0x01]);
         au1.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAA]); // SPS body A
@@ -510,16 +870,15 @@ mod tests {
         au1.extend_from_slice(&[0x65, 0x10, 0x20]); // IDR
         let f1 = parser.parse(&make_pes(au1, Some(0)));
         assert_eq!(f1.len(), 1);
-        // Frame 1 carries only the IDR — param sets stripped (in avcC).
         assert_eq!(
             frame_nal_types(&f1[0].data),
-            vec![5],
-            "AU1: only IDR in-band"
+            vec![7, 8, 5],
+            "AU1 keyframe: SPS+PPS re-asserted ahead of IDR"
         );
 
-        // AU 2: SPS identical to avcC, PPS REDEFINED (same id, different body) +
-        // IDR. The identical SPS is stripped; the redefined PPS must be emitted
-        // in-band so it overrides the avcC copy at this keyframe.
+        // AU 2: SPS identical to avcC (re-asserted unchanged at the keyframe),
+        // PPS REDEFINED (same id, different body) → emitted in-band as a change.
+        // Frame = SPS(re-asserted), PPS(redefined), IDR.
         let mut au2 = Vec::new();
         au2.extend_from_slice(&[0x00, 0x00, 0x01]);
         au2.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAA]); // SPS == body A
@@ -530,19 +889,32 @@ mod tests {
         let f2 = parser.parse(&make_pes(au2, Some(90000)));
         assert_eq!(f2.len(), 1);
         let types = frame_nal_types(&f2[0].data);
-        assert!(
-            types.contains(&8),
-            "redefined PPS (type 8) must be emitted in-band, got {types:?}"
+        assert_eq!(types, vec![7, 8, 5], "got {types:?}");
+        // Confirm the in-band PPS is the REDEFINED body B (0x22), not avcC's A.
+        let mut o = 0;
+        let mut pps_body = None;
+        while o + 4 <= f2[0].data.len() {
+            let len = u32::from_be_bytes([
+                f2[0].data[o],
+                f2[0].data[o + 1],
+                f2[0].data[o + 2],
+                f2[0].data[o + 3],
+            ]) as usize;
+            o += 4;
+            if f2[0].data[o] & 0x1F == 8 {
+                pps_body = Some(f2[0].data[o + 1]);
+            }
+            o += len;
+        }
+        assert_eq!(
+            pps_body,
+            Some(0x22),
+            "in-band PPS must be the redefined body B"
         );
-        assert!(
-            !types.contains(&7),
-            "identical SPS (type 7) must stay stripped, got {types:?}"
-        );
-        assert!(types.contains(&5), "IDR (type 5) present, got {types:?}");
     }
 
     #[test]
-    fn repeated_identical_param_sets_stay_stripped() {
+    fn repeated_identical_param_sets_reasserted_each_keyframe() {
         let mut parser = H264Parser::new();
         let mut au = Vec::new();
         au.extend_from_slice(&[0x00, 0x00, 0x01]);
@@ -551,13 +923,16 @@ mod tests {
         au.extend_from_slice(&[0x68, 0x11]);
         au.extend_from_slice(&[0x00, 0x00, 0x01]);
         au.extend_from_slice(&[0x65, 0x10]);
-        // Two identical AUs.
+        // Two identical AUs. Each is a keyframe, so each re-asserts the active
+        // SPS/PPS in-band (self-contained keyframe) even though the bodies are
+        // unchanged — a decoder that dropped them at a reset recovers at every
+        // IDR. Frame = SPS, PPS, IDR.
         parser.parse(&make_pes(au.clone(), Some(0)));
         let f = parser.parse(&make_pes(au, Some(90000)));
         assert_eq!(
             frame_nal_types(&f[0].data),
-            vec![5],
-            "repeated identical SPS/PPS stay in avcC, not duplicated in-band"
+            vec![7, 8, 5],
+            "each keyframe re-asserts the active SPS/PPS in-band"
         );
     }
 
@@ -592,12 +967,16 @@ mod tests {
     fn avcc_exact_length_fields_and_payload() {
         // The AVCDecoderConfigurationRecord must encode SPS length and PPS length
         // as 16-bit big-endian fields, followed by the verbatim NAL bodies.
+        // Uses a Main-Profile SPS (profile_idc=0x4D=77) so no High-Profile
+        // extension bytes are appended — the test validates the fixed-header
+        // layout only. High-Profile extension is covered by
+        // avcc_high_profile_appends_extension_bytes.
         // SPS = 0x67,profile,compat,level + 2 payload bytes (6 bytes total).
         // PPS = 0x68 + 2 payload bytes (3 bytes total).
         let mut parser = H264Parser::new();
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
-        data.extend_from_slice(&[0x67, 0x64, 0x00, 0x28, 0xAB, 0xCD]); // SPS, 6 bytes
+        data.extend_from_slice(&[0x67, 0x4D, 0x00, 0x28, 0xAB, 0xCD]); // SPS, 6 bytes, Main Profile (77)
         data.extend_from_slice(&[0x00, 0x00, 0x01]);
         data.extend_from_slice(&[0x68, 0xEE, 0x3C]); // PPS, 3 bytes
         // A slice so a frame is produced (not required for codec_private though).
@@ -607,7 +986,7 @@ mod tests {
         let cp = parser.codec_private().expect("avcC");
         // Fixed header.
         assert_eq!(cp[0], 1, "configurationVersion");
-        assert_eq!(cp[1], 0x64, "AVCProfileIndication = SPS[1]");
+        assert_eq!(cp[1], 0x4D, "AVCProfileIndication = SPS[1]");
         assert_eq!(cp[2], 0x00, "profile_compatibility = SPS[2]");
         assert_eq!(cp[3], 0x28, "AVCLevelIndication = SPS[3]");
         assert_eq!(cp[4], 0xFF, "lengthSizeMinusOne nibble (4-byte prefix)");
@@ -615,14 +994,14 @@ mod tests {
         // sequenceParameterSetLength (16-bit BE) = 6.
         assert_eq!(u16::from_be_bytes([cp[6], cp[7]]), 6, "SPS length field");
         // SPS body follows verbatim.
-        assert_eq!(&cp[8..14], &[0x67, 0x64, 0x00, 0x28, 0xAB, 0xCD]);
+        assert_eq!(&cp[8..14], &[0x67, 0x4D, 0x00, 0x28, 0xAB, 0xCD]);
         // numPPS = 1.
         assert_eq!(cp[14], 1, "numPPS");
         // pictureParameterSetLength (16-bit BE) = 3.
         assert_eq!(u16::from_be_bytes([cp[15], cp[16]]), 3, "PPS length field");
         // PPS body verbatim.
         assert_eq!(&cp[17..20], &[0x68, 0xEE, 0x3C]);
-        // Record length is exactly the sum of its parts — no extra/missing bytes.
+        // Record length is exactly the sum of its parts — no extension bytes for Main Profile.
         assert_eq!(cp.len(), 20);
     }
 
@@ -804,6 +1183,226 @@ mod tests {
         assert!(
             parser.codec_private().is_none(),
             "oversized SPS must not produce a truncated avcC"
+        );
+    }
+
+    // --- High Profile avcC extension (ISO 14496-15 §5.3.3.1.2) ---
+
+    /// Build a minimal High-Profile SPS RBSP with the fields needed for the
+    /// avcC extension. The SPS bytes (NAL-header included) are:
+    ///   [0x67]  NAL header (type=7, ref_idc=3)
+    ///   [profile_idc] [constraint_flags] [level_idc]
+    ///   ue(v) seq_parameter_set_id = 0  → 1 bit: 0b1
+    ///   ue(v) chroma_format_idc         → depends on value
+    ///   if chroma_format_idc==3: u(1) separate_colour_plane_flag
+    ///   ue(v) bit_depth_luma_minus8
+    ///   ue(v) bit_depth_chroma_minus8
+    ///
+    /// All ue(v) values <= 6 fit within 3 leading zeros + 3 suffix bits (7 bits
+    /// total): prefix = leading_zeros + stop-1 bit, suffix = leading_zeros bits.
+    /// For small values (0..=2), the unary prefix + code is short enough to
+    /// pack manually with a simple bit-packing helper.
+    fn build_high_profile_sps(
+        profile_idc: u8,
+        chroma_format_idc: u32,
+        bit_depth_luma_minus8: u32,
+        bit_depth_chroma_minus8: u32,
+    ) -> Vec<u8> {
+        // Bit-pack the ue(v) fields into a byte buffer after the fixed header.
+        // We append bits MSB-first into a growing Vec<u8>.
+        struct BitWriter {
+            buf: Vec<u8>,
+            cur: u8,
+            bits: u8, // bits accumulated in `cur` (0..8)
+        }
+        impl BitWriter {
+            fn new() -> Self {
+                Self {
+                    buf: Vec::new(),
+                    cur: 0,
+                    bits: 0,
+                }
+            }
+            fn push_bit(&mut self, bit: u8) {
+                self.cur = (self.cur << 1) | (bit & 1);
+                self.bits += 1;
+                if self.bits == 8 {
+                    self.buf.push(self.cur);
+                    self.cur = 0;
+                    self.bits = 0;
+                }
+            }
+            fn write_ue(&mut self, val: u32) {
+                // Exp-Golomb encode: find k such that 2^k - 1 <= val, then
+                // k leading zeros + 1 stop + k-bit suffix.
+                if val == 0 {
+                    self.push_bit(1);
+                    return;
+                }
+                let code = val + 1; // code = val + 1, k = floor(log2(code))
+                let k = 31 - code.leading_zeros();
+                for _ in 0..k {
+                    self.push_bit(0);
+                } // k leading zeros
+                self.push_bit(1); // stop bit
+                for i in (0..k).rev() {
+                    self.push_bit(((code >> i) & 1) as u8);
+                }
+            }
+            fn finish(mut self) -> Vec<u8> {
+                // Flush partial byte (padding with zeros on the right — RBSP
+                // trailing bits pattern, sufficient for our test payload).
+                if self.bits > 0 {
+                    self.cur <<= 8 - self.bits;
+                    self.buf.push(self.cur);
+                }
+                self.buf
+            }
+        }
+
+        let mut w = BitWriter::new();
+        w.write_ue(0); // seq_parameter_set_id = 0
+        w.write_ue(chroma_format_idc);
+        if chroma_format_idc == 3 {
+            w.push_bit(0); // separate_colour_plane_flag = 0
+        }
+        w.write_ue(bit_depth_luma_minus8);
+        w.write_ue(bit_depth_chroma_minus8);
+        let payload = w.finish();
+
+        let mut sps = vec![
+            0x67, // NAL header (type=7)
+            profile_idc,
+            0x00, // constraint flags
+            0x28, // level_idc = 4.0
+        ];
+        sps.extend_from_slice(&payload);
+        sps
+    }
+
+    fn feed_sps_pps(parser: &mut H264Parser, sps_bytes: &[u8]) {
+        // Feed a PES containing: custom SPS + a minimal PPS + an IDR slice.
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0x00, 0x00, 0x01]);
+        data.extend_from_slice(sps_bytes);
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x01]); // PPS
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x88]); // IDR
+        parser.parse(&make_pes(data, Some(0)));
+    }
+
+    /// ISO 14496-15 §5.3.3.1.2 regression: a High-Profile SPS (profile_idc=100)
+    /// must produce an avcC with the 4 extension bytes (chroma_format_idc,
+    /// bit_depth_luma_minus8, bit_depth_chroma_minus8, num_sps_ext=0).
+    #[test]
+    fn avcc_high_profile_appends_extension_bytes() {
+        // profile_idc=100 (High), chroma_format_idc=1 (4:2:0), depths both 0.
+        let sps = build_high_profile_sps(100, 1, 0, 0);
+        let mut parser = H264Parser::new();
+        feed_sps_pps(&mut parser, &sps);
+
+        let cp = parser.codec_private().expect("avcC must be present");
+
+        // Walk to the end of the fixed record to locate the extension bytes.
+        // Fixed header: 6 bytes. SPS length field: 2 bytes. SPS body. numPPS: 1.
+        // PPS length: 2. PPS body (0x68, 0xCE, 0x01 = 3 bytes).
+        // Fixed tail offset = 6 + 2 + sps.len() + 1 + 2 + 3 = sps.len() + 14.
+        let ext_off = sps.len() + 14;
+        assert!(
+            cp.len() == ext_off + 4,
+            "High-Profile avcC must have exactly 4 extension bytes (len={}, expected {})",
+            cp.len(),
+            ext_off + 4
+        );
+
+        // Byte 0: 111111xx — upper 6 bits reserved (0b111111), lower 2 = chroma_format_idc=1.
+        assert_eq!(
+            cp[ext_off] & 0xFC,
+            0xFC,
+            "extension byte 0: reserved bits must be 111111xx"
+        );
+        assert_eq!(cp[ext_off] & 0x03, 1, "chroma_format_idc must be 1 (4:2:0)");
+        // Byte 1: 11111xxx — upper 5 bits reserved, lower 3 = bit_depth_luma_minus8=0.
+        assert_eq!(
+            cp[ext_off + 1] & 0xF8,
+            0xF8,
+            "extension byte 1: reserved bits must be 11111xxx"
+        );
+        assert_eq!(cp[ext_off + 1] & 0x07, 0, "bit_depth_luma_minus8 must be 0");
+        // Byte 2: 11111xxx — upper 5 bits reserved, lower 3 = bit_depth_chroma_minus8=0.
+        assert_eq!(
+            cp[ext_off + 2] & 0xF8,
+            0xF8,
+            "extension byte 2: reserved bits must be 11111xxx"
+        );
+        assert_eq!(
+            cp[ext_off + 2] & 0x07,
+            0,
+            "bit_depth_chroma_minus8 must be 0"
+        );
+        // Byte 3: num_of_sequence_parameter_set_ext = 0.
+        assert_eq!(
+            cp[ext_off + 3],
+            0,
+            "num_of_sequence_parameter_set_ext must be 0"
+        );
+    }
+
+    /// ISO 14496-15 §5.3.3.1.2 regression: a High-Profile SPS with non-zero
+    /// chroma_format_idc and bit depths carries those values correctly in the
+    /// extension bytes.
+    #[test]
+    fn avcc_high_profile_extension_carries_correct_values() {
+        // profile_idc=100, chroma_format_idc=3 (4:4:4), depth_luma=2, depth_chroma=2.
+        let sps = build_high_profile_sps(100, 3, 2, 2);
+        let mut parser = H264Parser::new();
+        feed_sps_pps(&mut parser, &sps);
+
+        let cp = parser.codec_private().expect("avcC");
+        let ext_off = sps.len() + 14;
+
+        assert_eq!(cp[ext_off] & 0x03, 3, "chroma_format_idc must be 3 (4:4:4)");
+        assert_eq!(cp[ext_off + 1] & 0x07, 2, "bit_depth_luma_minus8 must be 2");
+        assert_eq!(
+            cp[ext_off + 2] & 0x07,
+            2,
+            "bit_depth_chroma_minus8 must be 2"
+        );
+        assert_eq!(
+            cp[ext_off + 3],
+            0,
+            "num_of_sequence_parameter_set_ext must be 0"
+        );
+    }
+
+    /// ISO 14496-15 §5.3.3.1.2 regression: a Main-Profile SPS (profile_idc=77)
+    /// must NOT have the extension bytes — strict parsers reject trailing bytes
+    /// for Baseline/Main/Extended profiles.
+    #[test]
+    fn avcc_main_profile_no_extension_bytes() {
+        // profile_idc=77 (Main). No High-Profile branch in the SPS RBSP,
+        // so we build a simpler SPS: NAL header + profile/compat/level + a
+        // ue(v) seq_parameter_set_id=0 + remaining RBSP (can be trivial).
+        let sps = vec![
+            0x67, // NAL header (type=7)
+            77,   // profile_idc = Main
+            0x40, // constraint flags
+            0x28, // level_idc
+            // seq_parameter_set_id=0 → ue(v) = 0b1 (1 bit).  Pack into a byte:
+            // bit pattern: 1000_0000 (stop bit in MSB, rest don't-care)
+            0x80,
+        ];
+        let mut parser = H264Parser::new();
+        feed_sps_pps(&mut parser, &sps);
+
+        let cp = parser.codec_private().expect("avcC must be present");
+        // Fixed record: 6 + 2 + sps.len() + 1 + 2 + 3 = sps.len() + 14.
+        let expected_len = sps.len() + 14;
+        assert_eq!(
+            cp.len(),
+            expected_len,
+            "Main-Profile avcC must NOT have extension bytes (len={}, expected {})",
+            cp.len(),
+            expected_len
         );
     }
 }

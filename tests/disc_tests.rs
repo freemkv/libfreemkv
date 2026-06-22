@@ -136,6 +136,7 @@ fn scan_options_default_has_no_credentials() {
 fn scan_options_with_credentials() {
     let opts = ScanOptions {
         credentials: Some(libfreemkv::DriveCredentials::default()),
+        ..Default::default()
     };
     assert!(opts.credentials.is_some());
     assert!(opts.credentials.unwrap().host_certs.is_empty());
