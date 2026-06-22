@@ -391,44 +391,48 @@ impl TimelineContinuity {
 
     /// Map a raw PES PTS (ns) onto the continuous output timeline.
     ///
-    /// `is_video` gates EVERY epoch decision. Only video may advance the frontier
-    /// or open a new epoch; non-video tracks are passive riders.
+    /// `drives_epoch` gates EVERY epoch decision. It is `true` for the PRIMARY
+    /// video track (base layer, track 0) ONLY. Every other track — audio, PGS
+    /// subtitle, and a second video track such as a Dolby Vision enhancement
+    /// layer — passes `false` and is a passive rider. (The DV EL is video but
+    /// runs its own PTS timeline interleaved with the base layer's; letting it
+    /// drive epochs would false-trigger a reset on every GOP.)
     ///
-    /// **Non-video tracks** (`is_video == false`) — audio, PGS subtitle. Always
-    /// remapped under the CURRENT offset. They never advance `high_ns`, never
-    /// trigger a clip-boundary reset, and never bump `offset_ns`. This is what
-    /// kills the single-clip ratchet: a sparse, lagging subtitle/audio PTS can
-    /// no longer push the frontier up and make the next video frame look like a
-    /// boundary. A/V sync is preserved because the offset they ride is the same
-    /// one video established for the epoch.
+    /// **Passive tracks** (`drives_epoch == false`). Always remapped under the
+    /// CURRENT offset. They never advance `high_ns`, never trigger a clip-boundary
+    /// reset, and never bump `offset_ns`. This is what kills the single-clip
+    /// ratchet: a sparse/lagging subtitle/audio PTS, or an interleaved EL frame,
+    /// can no longer push the frontier up and make the next base-video frame look
+    /// like a boundary. A/V sync is preserved because the offset they ride is the
+    /// same one the base video established for the epoch.
     ///
-    /// **Video track** (`is_video == true`):
+    /// **Primary video** (`drives_epoch == true`):
     /// - **Backward jump > `DISCONTINUITY_BACKSTEP_NS`** vs the frontier =
     ///   clip-boundary reset: open a new epoch (bump the offset so this frame
     ///   continues just after the frontier). This is the genuine multi-clip
-    ///   seamless rebasing, now driven only by real video back-jumps.
+    ///   seamless rebasing, now driven only by real base-video back-jumps.
     /// - **Everything else** (normal progression + sub-threshold B-frame reorder
     ///   dips) passes through with the current offset and advances the frontier,
     ///   preserving PTS.
-    fn adjust(&mut self, raw_pts_ns: i64, is_video: bool) -> i64 {
-        // Non-video: ride the current epoch's offset. Never advance the frontier
-        // and never open an epoch — these tracks are too sparse/laggy to make a
-        // reliable boundary signal and would false-trigger the ratchet.
-        if !is_video {
+    fn adjust(&mut self, raw_pts_ns: i64, drives_epoch: bool) -> i64 {
+        // Passive track: ride the current epoch's offset. Never advance the
+        // frontier and never open an epoch — these tracks each run on their own
+        // (sparse/laggy/independent) timeline and would false-trigger the ratchet.
+        if !drives_epoch {
             let mapped = raw_pts_ns.saturating_add(self.offset_ns);
-            // Tail-straggler remap: at a REAL (video-driven) multi-clip boundary
-            // the offset has just jumped forward by ~a whole clip, but a lagging
-            // tail frame from the just-ended clip still carries an OLD-epoch raw
-            // PTS. Adding the NEW offset flings it ~a clip past the frontier and
-            // would force a forward-dated split cluster (breaking cluster
-            // monotonicity). Such a straggler is recognised precisely: its
+            // Tail-straggler remap: at a REAL (base-video-driven) multi-clip
+            // boundary the offset has just jumped forward by ~a whole clip, but a
+            // lagging tail frame from the just-ended clip still carries an
+            // OLD-epoch raw PTS. Adding the NEW offset flings it ~a clip past the
+            // frontier and would force a forward-dated split cluster (breaking
+            // cluster monotonicity). Such a straggler is recognised precisely: its
             // current-offset mapping lands more than a backstep PAST the frontier
             // AND its PREVIOUS-offset mapping lands at/below the frontier (i.e. it
             // belongs to the prior epoch). Remap it with the previous offset so
             // it lands at its true seam position. This is what distinguishes a
             // tail straggler from a frame that legitimately runs ahead of the
-            // (video-only) frontier — a long audio-only tail, or a sparse
-            // subtitle — which is left on the current offset.
+            // (base-video-only) frontier — a long audio-only tail, a sparse
+            // subtitle, or an EL frame — which is left on the current offset.
             if let Some(high) = self.high_ns {
                 if mapped > high + DISCONTINUITY_BACKSTEP_NS {
                     let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
@@ -767,22 +771,29 @@ impl<W: Write + Seek> MkvMuxer<W> {
         data: &[u8],
         duration_ns: Option<u64>,
     ) -> io::Result<()> {
-        // Is this a video track? Needed both for the continuity epoch decision
-        // (only video may open/advance an epoch — non-video tracks are too
-        // sparse/laggy to be a reliable clip-boundary signal and would otherwise
-        // false-trigger the rebase on single-clip titles) and for the monotonic
-        // block-timestamp nudge below.
+        // Is this a video track? Used for the monotonic block-timestamp nudge
+        // below, which must exempt EVERY video track (incl. a Dolby Vision EL).
         let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
 
+        // The clip-boundary epoch decision is driven by the PRIMARY video track
+        // ONLY (track 0). A title can carry a SECOND video track — a Dolby Vision
+        // enhancement layer — whose PTS runs on its OWN timeline, interleaved
+        // with the base layer's. The two video PTS sequences overlap, so the EL's
+        // frames look like multi-second backward jumps against the base layer's
+        // frontier and would false-trigger an epoch reset on every GOP (the exact
+        // ratchet that inflated Top Gun's 1-clip timeline to ~7 h). Only the base
+        // video layer establishes/advances the frontier and opens epochs; the EL
+        // — like audio and subtitles — rides the current offset.
+        let drives_epoch = track_idx == 0;
+
         // Map the raw PES PTS onto the continuous output timeline FIRST, before
-        // any base/cluster math: freemkv concatenates a title's BD clips as one
-        // sector stream, so a non-seamless clip / layer-break boundary arrives
-        // here as a large backward PTS jump. Rebasing it (a global offset across
+        // any base/cluster math: at a non-seamless clip / layer-break boundary
+        // the source PES PTS jumps backward. Rebasing it (a global offset across
         // all tracks, A/V-sync-preserving) keeps the boundary from becoming a
-        // band of non-monotonic block timestamps. Only VIDEO drives the
-        // boundary decision; non-video tracks ride the current offset. No-op for
-        // single-clip titles.
-        let pts_ns = self.continuity.adjust(pts_ns, is_video);
+        // band of non-monotonic block timestamps. Only the PRIMARY video track
+        // drives the boundary decision; every other track (audio, subtitle, DV
+        // EL) rides the current offset. No-op for single-clip titles.
+        let pts_ns = self.continuity.adjust(pts_ns, drives_epoch);
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
         // Cluster boundaries normally coincide with a video keyframe so every
@@ -1447,6 +1458,40 @@ mod tests {
         );
         // And the video frontier is exactly 60s — not billions.
         assert_eq!(tc.high_ns, Some(60 * S), "frontier tracks video only");
+        assert!(max_out <= 60 * S, "no timeline inflation, max={max_out}");
+    }
+
+    /// PRIMARY rc3 regression (Dolby Vision dual-layer): a SECOND video track —
+    /// the DV enhancement layer — runs its OWN PTS timeline interleaved with the
+    /// base layer's, so the two video PTS sequences OVERLAP. The EL must be a
+    /// PASSIVE rider (drives_epoch == false): if it drove epochs, every EL GOP
+    /// would look like a multi-second backward jump against the base-layer
+    /// frontier and false-trigger a clip-boundary reset — the exact ratchet that
+    /// inflated Top Gun's 1-clip 1h49m timeline to ~7 h. Here the base layer
+    /// advances 0..60s while the EL re-emits the SAME 0..60s interleaved; the
+    /// timeline must stay at 60s with offset 0.
+    #[test]
+    fn dv_enhancement_layer_does_not_drive_epochs() {
+        let mut tc = TimelineContinuity::new();
+        let mut max_out = i64::MIN;
+        for sec in 0..=60 {
+            // Base layer (track 0) drives the epoch.
+            let bl = adj_video(&mut tc, sec * S);
+            // EL (track 1) re-emits the same time — a passive rider. Its raw PTS
+            // equals the base layer's, but it arrives just AFTER the base frame
+            // for the NEXT second sometimes; simulate the overlap by feeding the
+            // PREVIOUS second's time, which is a backward swing vs the frontier.
+            let el_raw = if sec > 0 { (sec - 1) * S } else { 0 };
+            let el = adj_other(&mut tc, el_raw);
+            assert_eq!(el, el_raw, "EL rides current offset, true PTS preserved");
+            max_out = max_out.max(bl).max(el);
+        }
+        assert_eq!(
+            tc.offset_ns, 0,
+            "DV EL interleave must not ratchet offset (was {})",
+            tc.offset_ns
+        );
+        assert_eq!(tc.high_ns, Some(60 * S), "frontier tracks base video only");
         assert!(max_out <= 60 * S, "no timeline inflation, max={max_out}");
     }
 
