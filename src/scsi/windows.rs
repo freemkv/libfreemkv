@@ -214,7 +214,13 @@ impl SptiTransport {
     /// Opens the device, sends IOCTL_STORAGE_RESET_DEVICE to reset
     /// the USB/SCSI bus, then closes. Same concept as SG_SCSI_RESET on Linux.
     pub fn reset(device: &Path) -> Result<()> {
-        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D1004;
+        // CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0400, METHOD_BUFFERED=0,
+        // FILE_READ_ACCESS|FILE_WRITE_ACCESS=3)
+        //   = (0x2D<<16) | (3<<14) | (0x0400<<2) | 0 = 0x002DD000.
+        // The earlier literal 0x002D1004 decoded to function 0x401 with the
+        // access bits cleared — not IOCTL_STORAGE_RESET_DEVICE, so
+        // DeviceIoControl would fail ERROR_INVALID_FUNCTION instead of resetting.
+        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_D000;
 
         let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
             path: device.display().to_string(),
