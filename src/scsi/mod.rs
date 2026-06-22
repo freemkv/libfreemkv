@@ -319,6 +319,23 @@ pub trait ScsiTransport: Send {
         data: &mut [u8],
         timeout_ms: u32,
     ) -> Result<ScsiResult>;
+
+    /// Maximum number of bytes the transport can carry in a single SCSI
+    /// data-in transfer. A READ that requests more than this must be split
+    /// into chunks by the caller ([`crate::Drive::read`]) — otherwise the
+    /// transport fails the whole command.
+    ///
+    /// The default is a conservative 1 MiB, safe on every platform. The
+    /// Windows backend overrides this with the adapter's real
+    /// `MaximumTransferLength` (queried via `IOCTL_STORAGE_QUERY_PROPERTY`):
+    /// a 16 MiB READ that exceeds the adapter limit makes
+    /// `DeviceIoControl` fail outright, which freemkv then mis-reads as a
+    /// transport failure and falls back to slow, log-spamming tiny reads.
+    /// Chunking to this limit fixes that. Linux/macOS keep the 1 MiB
+    /// default (well within any real `max_sectors_kb`).
+    fn max_transfer_bytes(&self) -> usize {
+        1 << 20
+    }
 }
 
 // ── Platform-agnostic open / reset ──────────────────────────────────────────

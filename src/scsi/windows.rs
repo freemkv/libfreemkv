@@ -12,6 +12,19 @@ use std::path::Path;
 // ── Windows constants ──────────────────────────────────────────────────────
 
 const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4D014;
+/// IOCTL_STORAGE_QUERY_PROPERTY — CTL_CODE(IOCTL_STORAGE_BASE(0x2D),
+/// 0x500, METHOD_BUFFERED(0), FILE_ANY_ACCESS(0)) = 0x002D1400.
+const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+/// STORAGE_PROPERTY_ID::StorageAdapterProperty.
+const STORAGE_ADAPTER_PROPERTY: u32 = 1;
+/// STORAGE_QUERY_TYPE::PropertyStandardQuery.
+const PROPERTY_STANDARD_QUERY: u32 = 0;
+
+/// Conservative fallback when the adapter MaximumTransferLength query
+/// fails — 64 KiB is universally safe for SPTD on any Windows storage
+/// stack. Also the floor we clamp a reported value up to.
+const WINDOWS_MIN_TRANSFER_BYTES: usize = 64 * 1024;
+
 const SCSI_IOCTL_DATA_OUT: u8 = 0;
 const SCSI_IOCTL_DATA_IN: u8 = 1;
 const SCSI_IOCTL_DATA_UNSPECIFIED: u8 = 2;
@@ -54,6 +67,43 @@ struct SptwbDirect {
     sense: [u8; K_SENSE_SIZE],
 }
 
+// ── STORAGE_QUERY_PROPERTY structures (winioctl.h) ─────────────────────────
+
+/// Input to IOCTL_STORAGE_QUERY_PROPERTY. Mirrors `STORAGE_PROPERTY_QUERY`:
+/// `{ PropertyId: u32, QueryType: u32, AdditionalParameters: [u8; 1] }`.
+#[repr(C)]
+#[allow(non_snake_case)]
+struct StoragePropertyQuery {
+    PropertyId: u32,
+    QueryType: u32,
+    AdditionalParameters: [u8; 1],
+}
+
+/// Subset of `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) up to and including
+/// `MaximumTransferLength`. The real struct has more trailing fields, but
+/// the driver fills the whole thing and we only read this prefix; reading a
+/// truncated descriptor is the documented usage. Field layout (all the
+/// leading fields are present so the offset of `MaximumTransferLength` is
+/// correct):
+///   Version, Size, MaximumTransferLength, MaximumPhysicalPages,
+///   AlignmentMask: u32 …
+#[repr(C)]
+#[allow(non_snake_case)]
+struct StorageAdapterDescriptor {
+    Version: u32,
+    Size: u32,
+    MaximumTransferLength: u32,
+    MaximumPhysicalPages: u32,
+    AlignmentMask: u32,
+    AdapterUsesPio: u8,
+    AdapterScansDown: u8,
+    CommandQueueing: u8,
+    AcceleratedTransfer: u8,
+    BusType: u8,
+    BusMajorVersion: u16,
+    BusMinorVersion: u16,
+}
+
 // ── Windows FFI ────────────────────────────────────────────────────────────
 
 unsafe extern "system" {
@@ -85,6 +135,11 @@ unsafe extern "system" {
 
 pub struct SptiTransport {
     handle: isize,
+    /// Adapter MaximumTransferLength in bytes, queried once at open via
+    /// IOCTL_STORAGE_QUERY_PROPERTY and clamped to at least
+    /// [`WINDOWS_MIN_TRANSFER_BYTES`]. A single READ larger than this fails
+    /// `DeviceIoControl` outright, so [`crate::Drive::read`] chunks to it.
+    max_transfer: usize,
 }
 
 // SptiTransport's only field is an isize HANDLE, so the compiler
@@ -147,7 +202,12 @@ impl SptiTransport {
             });
         }
 
-        Ok(SptiTransport { handle })
+        let max_transfer = query_max_transfer_bytes(handle);
+
+        Ok(SptiTransport {
+            handle,
+            max_transfer,
+        })
     }
 
     /// Reset the drive to a known good state.
@@ -243,7 +303,51 @@ impl Drop for SptiTransport {
     }
 }
 
+/// Query the storage adapter's `MaximumTransferLength` (bytes) via
+/// IOCTL_STORAGE_QUERY_PROPERTY / StorageAdapterProperty. On any failure
+/// (IOCTL failed, short reply, or a nonsensical zero) returns the
+/// conservative [`WINDOWS_MIN_TRANSFER_BYTES`]; otherwise clamps the
+/// reported value up to that floor. Never returns 0.
+fn query_max_transfer_bytes(handle: isize) -> usize {
+    if handle == INVALID_HANDLE_VALUE {
+        return WINDOWS_MIN_TRANSFER_BYTES;
+    }
+    let query = StoragePropertyQuery {
+        PropertyId: STORAGE_ADAPTER_PROPERTY,
+        QueryType: PROPERTY_STANDARD_QUERY,
+        AdditionalParameters: [0u8; 1],
+    };
+    let mut desc: StorageAdapterDescriptor = unsafe { std::mem::zeroed() };
+    let mut bytes_returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *mut std::ffi::c_void,
+            std::mem::size_of::<StoragePropertyQuery>() as u32,
+            &mut desc as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<StorageAdapterDescriptor>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // MaximumTransferLength sits at offset 8; need at least that many bytes
+    // written for the field to be valid.
+    let valid = ok != 0
+        && bytes_returned as usize
+            >= std::mem::offset_of!(StorageAdapterDescriptor, MaximumTransferLength)
+                + std::mem::size_of::<u32>();
+    if !valid || desc.MaximumTransferLength == 0 {
+        return WINDOWS_MIN_TRANSFER_BYTES;
+    }
+    (desc.MaximumTransferLength as usize).max(WINDOWS_MIN_TRANSFER_BYTES)
+}
+
 impl ScsiTransport for SptiTransport {
+    fn max_transfer_bytes(&self) -> usize {
+        self.max_transfer
+    }
+
     fn execute(
         &mut self,
         cdb: &[u8],

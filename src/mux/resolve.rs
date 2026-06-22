@@ -5,6 +5,7 @@
 //! | Scheme | Input | Output | Path |
 //! |--------|-------|--------|------|
 //! | disc:// | Yes | -- | empty (auto-detect) or /dev/sgN |
+//! | disk:// | Yes | -- | alias for `disc://` (identical behavior) |
 //! | iso://  | Yes | -- | file path (required) |
 //! | mkv://  | Yes | Yes | file path (required) |
 //! | m2ts:// | Yes | Yes | file path (required) |
@@ -91,7 +92,13 @@ impl StreamUrl {
 
 /// Parse a URL string into a typed StreamUrl.
 pub fn parse_url(url: &str) -> StreamUrl {
-    if let Some(rest) = url.strip_prefix("disc://") {
+    // `disk://` is an accepted alias for `disc://` (identical behavior):
+    // empty = auto-detect, path = device. Windows users commonly type
+    // `disk://i:` after the drive-letter convention; honor both spellings.
+    if let Some(rest) = url
+        .strip_prefix("disc://")
+        .or_else(|| url.strip_prefix("disk://"))
+    {
         return if rest.is_empty() {
             StreamUrl::Disc { device: None }
         } else {
@@ -637,14 +644,39 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use super::StreamUrl;
     use super::aacs_key_missing;
     use super::css_key_missing;
+    use super::parse_url;
     use super::validate_network_addr;
     use super::{build_demux_state, build_iso_pipeline, input, output};
     use crate::decrypt::DecryptKeys;
     use crate::disc::{ContentFormat, DiscTitle, Extent};
     use crate::pes::Stream as _;
     use crate::sector::SectorSource;
+    use std::path::PathBuf;
+
+    #[test]
+    fn disk_scheme_is_alias_for_disc() {
+        // `disk://` must parse identically to `disc://`: empty = auto-detect
+        // (device None), a trailing path = explicit device. A Windows user
+        // typing `disk://i:` must reach the same live-disc path as `disc://`.
+        match (parse_url("disk://"), parse_url("disc://")) {
+            (StreamUrl::Disc { device: a }, StreamUrl::Disc { device: b }) => {
+                assert_eq!(a, None);
+                assert_eq!(b, None);
+            }
+            other => panic!("disk:// / disc:// must both be Disc, got {other:?}"),
+        }
+        match (parse_url("disk://i:"), parse_url("disc://i:")) {
+            (StreamUrl::Disc { device: a }, StreamUrl::Disc { device: b }) => {
+                assert_eq!(a, Some(PathBuf::from("i:")));
+                assert_eq!(b, Some(PathBuf::from("i:")));
+                assert_eq!(a, b, "disk:// device must match disc:// device");
+            }
+            other => panic!("disk://i: / disc://i: must both be Disc, got {other:?}"),
+        }
+    }
 
     #[test]
     fn validate_network_addr_rejects_portless() {

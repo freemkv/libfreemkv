@@ -630,6 +630,56 @@ impl Drive {
             timeout_ms,
             "Drive::read enter"
         );
+
+        // Cap each CDB to the transport's max data-in transfer. A single
+        // READ larger than the adapter limit fails outright on some
+        // backends (notably Windows SPTI, where a 16 MiB read exceeds the
+        // adapter MaximumTransferLength → DeviceIoControl fails → we'd
+        // mis-read it as a transport failure and spam tiny-read fallbacks).
+        // For the common small read (count <= max_sectors) this is a single
+        // read_one call with no behavior change.
+        let max_sectors = (self.scsi.max_transfer_bytes() / 2048).max(1) as u32;
+        if count as u32 <= max_sectors {
+            return self.read_one(lba, count, buf, timeout_ms, recovery);
+        }
+
+        // Large read: split into chunks of at most `max_sectors` sectors,
+        // each a self-contained READ(10) with the same validation. Any
+        // chunk error reports that chunk's LBA (more precise than the whole
+        // request's base LBA).
+        let mut done: u32 = 0;
+        let mut total: usize = 0;
+        let count = count as u32;
+        while done < count {
+            let chunk = (count - done).min(max_sectors);
+            let cur_lba = lba + done;
+            let byte_off = done as usize * 2048;
+            let byte_len = chunk as usize * 2048;
+            let slice = &mut buf[byte_off..byte_off + byte_len];
+            let n = self.read_one(cur_lba, chunk as u16, slice, timeout_ms, recovery)?;
+            total += n;
+            done += chunk;
+        }
+        Ok(total)
+    }
+
+    /// Issue a single READ(10) for up to `count` sectors at `lba` into
+    /// `buf`, with the recovery-timeout already resolved by the caller.
+    /// This is the byte-identical single-shot read body that `read` calls
+    /// (once for small reads, in a loop for reads larger than the
+    /// transport's max transfer). On failure returns `Err(DiscRead)` with
+    /// `sector = lba` (the failing chunk's LBA) and the preserved SCSI
+    /// status/sense; a short transfer is treated as a failed read.
+    fn read_one(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        timeout_ms: u32,
+        // `recovery` only gates the Linux /dev/sr0 pread fallback below; on
+        // other platforms it is intentionally unused.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] recovery: bool,
+    ) -> Result<usize> {
         let cdb = [
             crate::scsi::SCSI_READ_10,
             0x00,
@@ -900,15 +950,50 @@ impl SectorSource for Drive {
     }
 }
 
-/// Find the first optical drive on this system and open it.
+/// Find an optical drive on this system and open it, **preferring a drive
+/// that currently has media**.
+///
+/// On a multi-drive system (common on Windows, where an empty/not-ready
+/// drive can enumerate first) returning the first drive blindly can pick a
+/// drive with no disc, dooming the operation. So this opens each candidate
+/// in enumeration order, queries [`Drive::drive_status`] (GET EVENT STATUS,
+/// which works regardless of firmware state), and returns the first drive
+/// reporting [`DriveStatus::DiscPresent`].
+///
+/// If no drive reports a disc — or `drive_status()` is unavailable/returns
+/// `Unknown` everywhere (single-drive or quirky bridges) — it falls back to
+/// the first drive that opened, preserving the historical behavior so those
+/// setups don't regress.
 ///
 /// For just listing drives without opening (e.g. UI sidebar), use
 /// `scsi::list_drives()` — that returns `DriveInfo` (path + identity)
 /// without the cost of running every drive's profile + identity probe.
 pub fn find_drive() -> Option<Drive> {
-    discover_drives()
-        .into_iter()
-        .find_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok())
+    select_drive_with_media(
+        discover_drives()
+            .into_iter()
+            .filter_map(|(path, _)| Drive::open(std::path::Path::new(&path)).ok()),
+    )
+}
+
+/// Pick a drive from an iterator of opened drives, preferring one whose
+/// [`Drive::drive_status`] reports [`DriveStatus::DiscPresent`]. Falls back
+/// to the first drive yielded if none report a disc. Split out from
+/// [`find_drive`] so the selection policy is unit-testable against fake
+/// drives without touching real hardware.
+fn select_drive_with_media(drives: impl Iterator<Item = Drive>) -> Option<Drive> {
+    let mut fallback: Option<Drive> = None;
+    for mut drive in drives {
+        if drive.drive_status() == DriveStatus::DiscPresent {
+            return Some(drive);
+        }
+        // Remember the first drive that opened as the no-media fallback so
+        // single-drive / status-unavailable setups still get a drive.
+        if fallback.is_none() {
+            fallback = Some(drive);
+        }
+    }
+    fallback
 }
 
 /// Decode a READ CAPACITY (10) response into a sector count.
@@ -1345,6 +1430,173 @@ mod command_tests {
         let (mut d, _cdb, _to) = recording(TransportOutcome::Ok(65536));
         let mut buf = vec![0u8; 65536];
         assert_eq!(d.read(0, 32, &mut buf, false).unwrap(), 65536);
+    }
+
+    // ── Drive::read chunking against a capped transport ─────────────
+
+    /// Transport with a small `max_transfer_bytes` that records the LBA +
+    /// transfer-length of every READ(10) CDB it sees, reports a full
+    /// transfer for each, and can be told to fail the Nth read with a SCSI
+    /// error. Lets a test assert the chunk decomposition and per-chunk
+    /// error LBA.
+    struct ChunkingTransport {
+        max_bytes: usize,
+        /// Recorded (lba, transfer_length_sectors) per READ(10).
+        reads: Arc<Mutex<Vec<(u32, u16)>>>,
+        /// If Some(i), the i-th READ(10) (0-based) fails with a SCSI error.
+        fail_on: Option<usize>,
+        seen: usize,
+    }
+    impl ScsiTransport for ChunkingTransport {
+        fn max_transfer_bytes(&self) -> usize {
+            self.max_bytes
+        }
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            // Only track READ(10); ignore other CDBs (e.g. the 6-byte
+            // PREVENT ALLOW MEDIUM REMOVAL the Drive sends on Drop).
+            if cdb.first() != Some(&crate::scsi::SCSI_READ_10) || cdb.len() < 10 {
+                return Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                });
+            }
+            let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+            let count = u16::from_be_bytes([cdb[7], cdb[8]]);
+            self.reads.lock().unwrap().push((lba, count));
+            let idx = self.seen;
+            self.seen += 1;
+            if self.fail_on == Some(idx) {
+                return Err(Error::ScsiError {
+                    opcode: cdb[0],
+                    status: 0x02,
+                    sense: Some(crate::scsi::ScsiSense {
+                        sense_key: 3,
+                        asc: 0x11,
+                        ascq: 0x05,
+                    }),
+                });
+            }
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn chunking(max_bytes: usize, fail_on: Option<usize>) -> (Drive, Arc<Mutex<Vec<(u32, u16)>>>) {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let t = ChunkingTransport {
+            max_bytes,
+            reads: reads.clone(),
+            fail_on,
+            seen: 0,
+        };
+        (Drive::from_transport_for_test(Box::new(t)), reads)
+    }
+
+    #[test]
+    fn read_chunks_large_request_to_max_transfer() {
+        // max_transfer = 4 sectors (4 * 2048 = 8192 bytes). A read of 10
+        // sectors at LBA 0 must split into 3 READ(10) CDBs: (0,4), (4,4),
+        // (8,2). The assembled buffer is the full 10*2048 bytes.
+        let (mut d, reads) = chunking(4 * 2048, None);
+        let mut buf = vec![0u8; 10 * 2048];
+        let n = d.read(0, 10, &mut buf, false).unwrap();
+        assert_eq!(n, 10 * 2048, "returns total bytes across all chunks");
+        let r = reads.lock().unwrap();
+        assert_eq!(
+            *r,
+            vec![(0, 4), (4, 4), (8, 2)],
+            "must chunk into 4+4+2 sectors at advancing LBAs"
+        );
+    }
+
+    #[test]
+    fn read_chunk_failure_reports_failing_chunk_lba() {
+        // Same 4-sector cap; fail the 2nd chunk (index 1), which covers
+        // LBA 4. The error must be DiscRead with sector = 4 (the failing
+        // chunk's LBA), NOT the request base LBA 0.
+        let (mut d, reads) = chunking(4 * 2048, Some(1));
+        let mut buf = vec![0u8; 10 * 2048];
+        let err = d.read(0, 10, &mut buf, false).unwrap_err();
+        match err {
+            Error::DiscRead { sector, status, .. } => {
+                assert_eq!(sector, 4, "failing chunk's LBA, not the request base");
+                assert_eq!(status, Some(0x02));
+            }
+            other => panic!("expected DiscRead, got {other:?}"),
+        }
+        // Reads 0 (LBA 0) succeeded and 1 (LBA 4) failed; the loop stops on
+        // the error so LBA 8 is never issued.
+        let r = reads.lock().unwrap();
+        assert_eq!(*r, vec![(0, 4), (4, 4)], "stops at the failing chunk");
+    }
+
+    #[test]
+    fn read_small_request_is_single_unchunked_read() {
+        // count <= max_sectors must take the single-read path unchanged: a
+        // 3-sector read under a 4-sector cap is exactly one READ(10).
+        let (mut d, reads) = chunking(4 * 2048, None);
+        let mut buf = vec![0u8; 3 * 2048];
+        assert_eq!(d.read(0, 3, &mut buf, false).unwrap(), 3 * 2048);
+        assert_eq!(*reads.lock().unwrap(), vec![(0, 3)], "single CDB, no split");
+    }
+
+    // ── find_drive media-preference selection policy ────────────────
+
+    /// Build a fake drive whose GET EVENT STATUS reply reports the given
+    /// media_status byte (byte 5 of an 8-byte reply): 0x02 = DiscPresent,
+    /// 0x00 = NoDisc, etc. Stands in for a real opened drive so the
+    /// selection policy is testable without hardware.
+    fn drive_with_media_byte(media_status: u8) -> Drive {
+        let mut buf = vec![0u8; 8];
+        buf[5] = media_status;
+        drive_with(buf)
+    }
+
+    #[test]
+    fn select_drive_prefers_drive_with_media() {
+        // Drive #1 has no disc (0x00), drive #2 has a disc (0x02). The
+        // selection must skip the empty first drive and pick the one with
+        // media — the Windows multi-drive bug fix.
+        let drives = vec![drive_with_media_byte(0x00), drive_with_media_byte(0x02)];
+        let picked = select_drive_with_media(drives.into_iter()).expect("a drive");
+        let mut picked = picked;
+        assert_eq!(
+            picked.drive_status(),
+            DriveStatus::DiscPresent,
+            "must pick the drive reporting DiscPresent, not the empty first drive"
+        );
+    }
+
+    #[test]
+    fn select_drive_falls_back_to_first_when_none_have_media() {
+        // No drive reports a disc → fall back to the FIRST opened drive so
+        // single-drive / quirky setups still get a drive (historical
+        // behavior preserved). Tag drive #1 distinctly (TrayOpen 0x01) and
+        // confirm it, not #2 (NoDisc 0x00), is returned.
+        let drives = vec![drive_with_media_byte(0x01), drive_with_media_byte(0x00)];
+        let mut picked = select_drive_with_media(drives.into_iter()).expect("a fallback drive");
+        assert_eq!(
+            picked.drive_status(),
+            DriveStatus::TrayOpen,
+            "fallback must be the first drive yielded"
+        );
+    }
+
+    #[test]
+    fn select_drive_none_when_no_drives() {
+        // No candidates at all → None.
+        let empty: Vec<Drive> = Vec::new();
+        assert!(select_drive_with_media(empty.into_iter()).is_none());
     }
 
     // ── drive_status branch coverage (GET EVENT STATUS byte 5) ──────
