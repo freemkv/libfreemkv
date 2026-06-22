@@ -417,6 +417,27 @@ impl DiscStream {
                 break;
             }
 
+            // Transport failure (status=0xFF: USB-bridge crash / disconnect) is
+            // NOT a skippable bad sector. The bridge is wedged and every
+            // subsequent read fails identically, so shrinking + skipping past it
+            // — even under `skip_errors` — just marches the whole disc at one
+            // ~15s bridge-recovery per probe, producing no usable output (the
+            // "runs forever, no MKV" report). Abort immediately, highest
+            // priority, mirroring the multipass sweep's transport-failure rule
+            // in `read_error::handle_read_error`. The CLI/UX surfaces this so the
+            // user power-cycles the drive (or switches to multipass recovery).
+            if let Some(e) = res.as_ref().err() {
+                if e.is_scsi_transport_failure() {
+                    let (status, sense) = extract_scsi_context(e);
+                    return Err(crate::error::Error::DiscRead {
+                        sector: lba as u64,
+                        status: Some(status),
+                        sense,
+                    }
+                    .into());
+                }
+            }
+
             if (sectors as u32) <= align {
                 // Bottomed out at one unit (AACS) / one sector (CSS) / the
                 // extent tail. Skip the WHOLE failed unit or bail. Zero-filling
@@ -930,6 +951,89 @@ mod tests {
         fn capacity_sectors(&self) -> u32 {
             self.capacity
         }
+    }
+
+    /// `SectorSource` that fails every read covering `bad_sector` with a
+    /// SCSI **transport failure** (status=0xFF) — the USB-bridge-crash sentinel
+    /// that `Drive::read` surfaces as `DiscRead { status: Some(0xFF), .. }`.
+    /// Logs each `(lba, count)` so a test can prove the failure was not
+    /// retried/skipped.
+    struct TransportFailReader {
+        capacity: u32,
+        bad_sector: u32,
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16)>>>,
+    }
+
+    impl crate::sector::SectorSource for TransportFailReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.log.lock().unwrap().push((lba, count));
+            let end = lba + count as u32;
+            if self.bad_sector >= lba && self.bad_sector < end {
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// Regression: a USB-bridge transport crash (status=0xFF) during a direct
+    /// single-pass `disc://→mkv://` rip must ABORT immediately, even under
+    /// `skip_errors=true`. The pre-fix behavior treated it as a skippable bad
+    /// sector: zero-fill, advance, repeat — marching the whole disc at one
+    /// ~15s bridge-recovery per probe, producing no MKV ("runs forever"). The
+    /// fix mirrors the multipass sweep: transport failure short-circuits to an
+    /// error before any shrink/skip, so exactly ONE read is issued and no skip
+    /// is counted.
+    #[test]
+    fn transport_failure_aborts_single_pass_even_with_skip_errors() {
+        const COUNT: u32 = 10;
+        let bad = 4u32;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = TransportFailReader {
+            capacity: COUNT,
+            bad_sector: bad,
+            log: log.clone(),
+        };
+        let mut stream = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+        );
+        stream.skip_errors = true;
+
+        let res = stream.fill_extents();
+        assert!(
+            res.is_err(),
+            "transport failure must abort fill_extents, not skip past it"
+        );
+        assert_eq!(
+            stream.errors, 0,
+            "a transport-failure abort must NOT count as a skipped sector"
+        );
+        let reads = log.lock().unwrap();
+        assert_eq!(
+            reads.len(),
+            1,
+            "transport failure must abort after the first failed read with no \
+             shrink/retry/skip-ahead; got reads {reads:?}"
+        );
     }
 
     /// AACS unit-alignment skip (the #1 coverage gap). With `unit_align=3`
