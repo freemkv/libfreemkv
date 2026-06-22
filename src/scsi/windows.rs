@@ -214,13 +214,15 @@ impl SptiTransport {
     /// Opens the device, sends IOCTL_STORAGE_RESET_DEVICE to reset
     /// the USB/SCSI bus, then closes. Same concept as SG_SCSI_RESET on Linux.
     pub fn reset(device: &Path) -> Result<()> {
-        // CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0400, METHOD_BUFFERED=0,
-        // FILE_READ_ACCESS|FILE_WRITE_ACCESS=3)
-        //   = (0x2D<<16) | (3<<14) | (0x0400<<2) | 0 = 0x002DD000.
-        // The earlier literal 0x002D1004 decoded to function 0x401 with the
-        // access bits cleared — not IOCTL_STORAGE_RESET_DEVICE, so
-        // DeviceIoControl would fail ERROR_INVALID_FUNCTION instead of resetting.
-        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_D000;
+        // ntddstor.h: IOCTL_STORAGE_RESET_DEVICE
+        //   = CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0401, METHOD_BUFFERED=0, FILE_READ_ACCESS=1)
+        //   = (0x2D<<16) | (1<<14) | (0x0401<<2) | 0
+        //   = 0x002D0000 | 0x4000 | 0x1004 = 0x002D5004.
+        // Two earlier values were wrong: 0x002D1004 (function 0x401 but access
+        // bits cleared) and 0x002DD000 (function 0x400 + R|W access — that's the
+        // OBSOLETE RESET_BUS code class drivers reject). Both made DeviceIoControl
+        // fail ERROR_INVALID_FUNCTION, silently skipping the reset.
+        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_5004;
 
         let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
             path: device.display().to_string(),
