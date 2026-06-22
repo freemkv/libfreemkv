@@ -179,6 +179,25 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
         }
         .into());
     }
+    // Split host:port on the LAST ':' so a bracketed IPv6 literal
+    // (`[2001:db8::1]:9000`) splits at the port colon, not an address colon.
+    // Require the port substring to be a non-empty u16 — `host:` (empty) and
+    // `host:abc` (non-numeric) are invalid, despite containing ':'.
+    let port = match addr.rsplit_once(':') {
+        Some((_host, port)) => port,
+        None => {
+            return Err(crate::error::Error::StreamUrlMissingPort {
+                addr: addr.to_string(),
+            }
+            .into());
+        }
+    };
+    if port.is_empty() || port.parse::<u16>().is_err() {
+        return Err(crate::error::Error::StreamUrlInvalid {
+            url: addr.to_string(),
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -211,6 +230,16 @@ pub struct InputOptions {
 /// DVDs resolve to `DecryptKeys::Css{..}` (never `None`).
 fn aacs_key_missing(raw: bool, has_aacs: bool, keys: &crate::decrypt::DecryptKeys) -> bool {
     !raw && has_aacs && matches!(keys, crate::decrypt::DecryptKeys::None)
+}
+
+/// CSS analogue of [`aacs_key_missing`]. Returns `true` when decryption is
+/// requested (`!raw`), the disc is CSS-encrypted (`has_css`), and per-title key
+/// resolution yielded no usable key (`keys` is
+/// [`crate::decrypt::DecryptKeys::None`] — e.g. a multi-VTS DVD whose chosen
+/// title's VTS could not be re-cracked). Muxing that would emit scrambled
+/// ciphertext, so the caller fails fast with [`Error::CssKeyMissing`].
+fn css_key_missing(raw: bool, has_css: bool, keys: &crate::decrypt::DecryptKeys) -> bool {
+    !raw && has_css && matches!(keys, crate::decrypt::DecryptKeys::None)
 }
 
 /// Open a PES input stream (produces PES frames).
@@ -276,13 +305,29 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 }
                 .into());
             }
+            // Per-title key resolution. For a multi-VTS CSS DVD the scan's
+            // single cracked key only descrambles its own VTS; re-crack from
+            // the chosen title's extents if it lives elsewhere. A fresh reader
+            // avoids disturbing the mux reader below. 64 sectors is a
+            // file-safe batch for an ISO. AACS / single-VTS paths are
+            // unchanged (decrypt_keys_for_title short-circuits to decrypt_keys).
+            let keys = match crate::io::file_sector_source::FileSectorSource::open(path) {
+                Ok(mut crack_reader) => disc.decrypt_keys_for_title(idx, &mut crack_reader, 64),
+                Err(_) => disc.decrypt_keys(),
+            };
+            // CSS no-key guard (parallel to the AACS gate above): on a CSS
+            // disc, decrypt_keys_for_title may return `None` when the chosen
+            // title's VTS could not be re-cracked. Muxing that would emit
+            // scrambled ciphertext verbatim, so fail loudly here instead.
+            if css_key_missing(opts.raw, disc.css.is_some(), &keys) {
+                return Err(crate::error::Error::CssKeyMissing.into());
+            }
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
             // A fresh reader avoids disturbing the mux reader below. Skipped in
             // --raw mode: the probe would re-open + decrypt for nothing (on an
             // AACS disc with no key the correction is a no-op on ciphertext, and
             // raw output isn't decoded anyway).
-            let keys = disc.decrypt_keys();
             if !opts.raw {
                 match crate::io::file_sector_source::FileSectorSource::open(path) {
                     Ok(probe) => {
@@ -593,6 +638,7 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::aacs_key_missing;
+    use super::css_key_missing;
     use super::validate_network_addr;
     use super::{build_demux_state, build_iso_pipeline, input, output};
     use crate::decrypt::DecryptKeys;
@@ -610,6 +656,26 @@ mod tests {
         // host:port and ip:port forms pass.
         assert!(validate_network_addr("127.0.0.1:9000").is_ok());
         assert!(validate_network_addr("host:9000").is_ok());
+    }
+
+    #[test]
+    fn validate_network_addr_requires_numeric_port() {
+        // An empty port (`host:`) and a non-numeric port (`host:abc`) both
+        // contain ':' but are NOT valid host:port — must be rejected.
+        assert!(validate_network_addr("host:").is_err());
+        assert!(validate_network_addr("127.0.0.1:").is_err());
+        assert!(validate_network_addr("host:abc").is_err());
+        assert!(validate_network_addr("host:99x").is_err());
+        // Out-of-u16-range port is rejected (parse::<u16> fails).
+        assert!(validate_network_addr("host:70000").is_err());
+        // Bracketed IPv6 with a valid port passes; split on the LAST ':' so the
+        // address colons are not mistaken for the port separator.
+        assert!(validate_network_addr("[2001:db8::1]:9000").is_ok());
+        // Bracketed IPv6 WITHOUT a port is rejected (port substring not a u16).
+        assert!(validate_network_addr("[2001:db8::1]").is_err());
+        // Valid numeric port (incl. 0 and max u16) passes.
+        assert!(validate_network_addr("host:0").is_ok());
+        assert!(validate_network_addr("host:65535").is_ok());
     }
 
     fn aacs_keys() -> DecryptKeys {
@@ -642,6 +708,31 @@ mod tests {
         // No AACS state: unencrypted (None keys) and CSS (Css keys) both OK.
         assert!(!aacs_key_missing(false, false, &DecryptKeys::None));
         assert!(!aacs_key_missing(false, false, &css_keys()));
+    }
+
+    #[test]
+    fn css_no_key_aborts() {
+        // CSS disc, decryption requested, per-title resolver yielded None
+        // (e.g. an un-re-crackable VTS) → abort instead of muxing ciphertext.
+        assert!(css_key_missing(false, true, &DecryptKeys::None));
+    }
+
+    #[test]
+    fn css_with_key_proceeds() {
+        // CSS disc with a resolved title key → proceed.
+        assert!(!css_key_missing(false, true, &css_keys()));
+    }
+
+    #[test]
+    fn css_raw_never_aborts() {
+        // --raw skips decryption: never abort even with no CSS key.
+        assert!(!css_key_missing(true, true, &DecryptKeys::None));
+    }
+
+    #[test]
+    fn css_guard_ignores_non_css() {
+        // No CSS state (AACS / unencrypted): the CSS guard never fires.
+        assert!(!css_key_missing(false, false, &DecryptKeys::None));
     }
 
     #[test]

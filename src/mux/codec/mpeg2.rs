@@ -58,6 +58,13 @@ const MAX_AU_BUFFER: usize = 8 * 1024 * 1024;
 /// ever arrives within the cap, buffered frames are released on a 0 base.
 const MAX_PENDING_FRAMES: usize = 600;
 
+/// Byte cap on frames held awaiting the first PES PTS anchor. `MAX_PENDING_FRAMES`
+/// alone bounds the *count*, but 600 full HD/UHD intra pictures can be ~1 GiB.
+/// Mirror the AC-3/DTS/PGS byte caps: once the held data exceeds this, release
+/// on the 0 base instead of accumulating further. 8 MiB ≈ a few large I-frames,
+/// far more than the ~15 frames a well-formed DVD buffers before its first PTS.
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 /// Frame rate table (index from sequence header frame_rate_code).
 const FRAME_RATES: [(u32, u32); 9] = [
     (0, 1),        // 0: forbidden
@@ -117,6 +124,9 @@ pub struct Mpeg2Parser {
     /// sequence whose PTS lands a few frames in; buffering until the anchor lets
     /// those leading frames take the disc's real timeline instead of a 0 base.
     pending: Vec<(u64, Frame)>,
+    /// Accumulated `data.len()` of frames currently in `pending`. Bounds the
+    /// pre-anchor hold by BYTES, not just frame count (see [`MAX_PENDING_BYTES`]).
+    pending_bytes: usize,
 }
 
 impl Default for Mpeg2Parser {
@@ -139,6 +149,7 @@ impl Mpeg2Parser {
             anchor_index: None,
             anchor_pts: 0,
             pending: Vec::new(),
+            pending_bytes: 0,
         }
     }
 
@@ -287,6 +298,7 @@ impl Mpeg2Parser {
                                 p + (di as i64 - display_index as i64) * self.frame_duration_ns;
                             out.push(held);
                         }
+                        self.pending_bytes = 0;
                         frame.pts_ns = p;
                         out.push(frame);
                     }
@@ -296,13 +308,25 @@ impl Mpeg2Parser {
                                 + (display_index as i64 - ai as i64) * self.frame_duration_ns;
                             out.push(frame);
                         }
-                        None if self.pending.len() < MAX_PENDING_FRAMES => {
+                        None if self.pending.len() < MAX_PENDING_FRAMES
+                            && self.pending_bytes < MAX_PENDING_BYTES =>
+                        {
                             // No anchor yet — hold so leading frames get the
                             // disc's real timeline once the first PTS arrives,
                             // not a 0 base.
+                            self.pending_bytes += frame.data.len();
                             self.pending.push((display_index, frame));
                         }
                         None => {
+                            // Hold cap (count OR bytes) reached without a PTS
+                            // anchor ever arriving. Release everything held so
+                            // far on the 0-base timeline rather than growing the
+                            // buffer unbounded, then emit this frame the same way.
+                            for (di, mut held) in self.pending.drain(..) {
+                                held.pts_ns = di as i64 * self.frame_duration_ns;
+                                out.push(held);
+                            }
+                            self.pending_bytes = 0;
                             frame.pts_ns = display_index as i64 * self.frame_duration_ns;
                             out.push(frame);
                         }
@@ -364,6 +388,7 @@ impl CodecParser for Mpeg2Parser {
                 frame.pts_ns = di as i64 * self.frame_duration_ns;
                 out.push(frame);
             }
+            self.pending_bytes = 0;
         }
         out
     }

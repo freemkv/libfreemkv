@@ -214,19 +214,34 @@ impl Mapfile {
                 }
                 continue;
             }
-            // First non-comment line is the "current" state line (pos status [pass] [pass_time]).
-            // We ignore its contents but skip over it.
+            // First non-comment line is the "current" state line
+            // (`pos status [pass] [pass_time]`). We ignore its contents but
+            // skip over it.
             if !saw_current_line {
                 saw_current_line = true;
-                // But if the line looks like an entry (has at least 3 fields starting 0x...),
-                // it's probably actually an entry for a mapfile we wrote without a current line.
-                // Heuristic: current line has status char as 2nd field; entry has size as 2nd field.
+                // Discriminate by ddrescue's actual line shape, not by a
+                // `0x`-prefix heuristic (which dropped a valid first data line
+                // whose size field happened to lack `0x`). A *current* line's
+                // 2nd field is a single status char (`?*/-+`); a *data* line's
+                // 2nd field is the hex size, with the status char in the 3rd.
+                // So: single-char-and-valid-status 2nd field ⇒ current line
+                // (skip); anything else ⇒ fall through to entry parse.
                 let fields: Vec<&str> = t.split_whitespace().collect();
-                if fields.len() >= 3 && fields[1].starts_with("0x") {
-                    // It's an entry, not a current line — fall through to entry parse.
-                } else {
+                let is_current_line = fields
+                    .get(1)
+                    .and_then(|f| {
+                        let mut chars = f.chars();
+                        match (chars.next(), chars.next()) {
+                            // Exactly one char that is a valid status char.
+                            (Some(c), None) => SectorStatus::from_char(c),
+                            _ => None,
+                        }
+                    })
+                    .is_some();
+                if is_current_line {
                     continue;
                 }
+                // Otherwise it's a data line — fall through to entry parse.
             }
             // Entry: `pos size statuschar`
             let fields: Vec<&str> = t.split_whitespace().collect();
@@ -245,6 +260,13 @@ impl Mapfile {
                 let e: io::Error = crate::error::Error::MapfileInvalid { kind: "range" }.into();
                 return Err(e);
             }
+            // A zero-size entry is degenerate: it contributes nothing to the
+            // partition yet trips overlap/coalesce arithmetic (two entries can
+            // share the same pos). Reject it rather than carry it through.
+            if size == 0 {
+                let e: io::Error = crate::error::Error::MapfileInvalid { kind: "zero_size" }.into();
+                return Err(e);
+            }
             let status = fields[2]
                 .chars()
                 .next()
@@ -261,18 +283,45 @@ impl Mapfile {
             entries.push(MapEntry { pos, size, status });
         }
         entries.sort_by_key(|e| e.pos);
-        // Reject overlapping ranges. A well-formed ddrescue mapfile is a
-        // disjoint partition; overlaps (from a corrupt/hand-edited file)
-        // would make compute_stats double-count, so bytes_good /
-        // bytes_unreadable / bytes_pending could exceed bytes_total and
-        // inflate resume / abort-on-loss decisions and >100% progress.
-        for pair in entries.windows(2) {
-            let prev_end = pair[0].pos.saturating_add(pair[0].size);
-            if prev_end > pair[1].pos {
-                let e: io::Error = crate::error::Error::MapfileInvalid { kind: "overlap" }.into();
-                return Err(e);
+        // Reject overlapping ranges, then COALESCE-FILL any internal gaps
+        // with synthetic NonTried entries. A well-formed ddrescue mapfile
+        // is a *gap-free* disjoint partition of [0, total_size).
+        //
+        // Overlaps (from a corrupt/hand-edited file) would make
+        // compute_stats double-count, so bytes_good / bytes_unreadable /
+        // bytes_pending could exceed bytes_total and inflate resume /
+        // abort-on-loss decisions and >100% progress — hard-reject those.
+        //
+        // GAPS are a subtler hazard: total_size is derived from the last
+        // entry's end, so a holed mapfile passes the caller's
+        // `covers_disc = (total_size == disc_size)` check and copy() would
+        // report complete=true even though the hole was never read. Rather
+        // than hard-reject (which would strand existing partial mapfiles),
+        // we fill every gap — leading, internal, and any between entries —
+        // with a NonTried entry so the gap is visible to the resume
+        // sweep's NonTried region list and actually gets read. (A trailing
+        // gap up to the disc size is filled by the caller's full-sweep
+        // path when total_size < disc_size; here we only have the mapfile's
+        // own extent to reason about.)
+        let mut filled: Vec<MapEntry> = Vec::with_capacity(entries.len() + 1);
+        let mut cursor: u64 = 0;
+        for e in entries {
+            if e.pos < cursor {
+                let err: io::Error = crate::error::Error::MapfileInvalid { kind: "overlap" }.into();
+                return Err(err);
             }
+            if e.pos > cursor {
+                // Leading or internal gap — fill it as NonTried.
+                filled.push(MapEntry {
+                    pos: cursor,
+                    size: e.pos - cursor,
+                    status: SectorStatus::NonTried,
+                });
+            }
+            cursor = e.pos.saturating_add(e.size);
+            filled.push(e);
         }
+        let entries = filled;
         let total_size = entries
             .last()
             .map(|e| e.pos.saturating_add(e.size))
@@ -564,6 +613,12 @@ impl Mapfile {
                 )?;
             }
             w.flush()?;
+            // fsync the tmp file before the rename so the bytes are durable on
+            // disk (notably on NFS, where a rename can otherwise reach the
+            // server before the data does and leave a truncated mapfile after
+            // a crash). Recover the File from the BufWriter to call sync_all.
+            let file = w.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -729,6 +784,30 @@ mod tests {
         mf.record(500, 100, SectorStatus::Unreadable).unwrap();
         // record() batches; explicit flush before reading back from disk.
         mf.flush().unwrap();
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.entries(), mf.entries());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_to_disk_fsyncs_and_leaves_no_tmp() {
+        // Regression: write_to_disk must recover the File from the BufWriter
+        // and sync_all() it before rename (NFS durability). The .tmp file
+        // must not survive a successful write, and the renamed mapfile must
+        // load back identically.
+        let p = tmpfile("write_to_disk_fsyncs");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(100, 200, SectorStatus::Finished).unwrap();
+        mf.write_to_disk().unwrap();
+
+        let mut tmp = p.clone().into_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !PathBuf::from(&tmp).exists(),
+            "tmp file should be renamed away after a successful write"
+        );
+
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
         let _ = std::fs::remove_file(&p);
@@ -1028,6 +1107,72 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Regression: a mapfile with an INTERNAL hole (a byte range no entry
+    /// covers) must load with the hole filled as NonTried, so the hole is
+    /// visible to resume (counted as pending, not silently "complete").
+    /// Without the fill, total_size (= last entry's end) would still equal
+    /// the disc size and copy()'s `covers_disc && bad_bytes == 0` check
+    /// would report a holed rip as complete.
+    #[test]
+    fn load_fills_internal_gap_as_nontried() {
+        let p = tmpfile("load_fills_internal_gap");
+        let _ = std::fs::remove_file(&p);
+        // Two Finished entries: [0,0x100) and [0x200,0x300). The hole at
+        // [0x100,0x200) is never covered.
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x00000100    +\n\
+             0x000000200  0x00000100    +\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).expect("holed mapfile must load (gap filled, not rejected)");
+        // The hole [0x100,0x200) must now be a NonTried entry.
+        let hole = mf
+            .entries()
+            .iter()
+            .find(|e| e.pos == 0x100)
+            .expect("internal gap must be filled with a synthetic entry");
+        assert_eq!(hole.size, 0x100, "filled gap covers the whole hole");
+        assert_eq!(
+            hole.status,
+            SectorStatus::NonTried,
+            "filled gap must be NonTried so resume reads it"
+        );
+        // total_size unchanged (last entry end), but the hole is now pending.
+        assert_eq!(mf.total_size(), 0x300);
+        assert!(
+            mf.stats().bytes_pending >= 0x100,
+            "the hole must count as pending so copy() doesn't report complete"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Regression: a LEADING gap (first entry doesn't start at 0) is filled
+    /// as NonTried too, so resume reads the head of the disc.
+    #[test]
+    fn load_fills_leading_gap_as_nontried() {
+        let p = tmpfile("load_fills_leading_gap");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000080  0x00000100    +\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).expect("leading-gap mapfile must load");
+        let head = mf
+            .entries()
+            .first()
+            .expect("must have a leading fill entry");
+        assert_eq!(head.pos, 0, "fill must start at byte 0");
+        assert_eq!(head.size, 0x80);
+        assert_eq!(head.status, SectorStatus::NonTried);
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn num_bad_ranges_counts_unreadable_entries() {
         let p = tmpfile("num_bad_ranges");
@@ -1263,6 +1408,33 @@ mod tests {
         // First line is NOT a status line; both lines are entries.
         assert_eq!(mf.entries().len(), 2);
         assert_eq!(mf.entries()[0].size, 0x200);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Regression (finding 4): a leading DATA line whose size field has NO
+    /// `0x` prefix (ddrescue/`parse_hex` both accept bare hex) must still be
+    /// parsed as an entry, not misclassified as the current-status line and
+    /// dropped. The shape-based discriminator keys off the 2nd field being a
+    /// single status char (current line) vs. a multi-char hex size (data line).
+    #[test]
+    fn load_treats_leading_data_line_without_0x_prefix_as_entry() {
+        let p = tmpfile("load_leading_entry_no_0x");
+        let _ = std::fs::remove_file(&p);
+        // Note: sizes/positions written WITHOUT the `0x` prefix.
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             000000000  200    +\n\
+             000000200  100    ?\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).unwrap();
+        // The old `0x`-prefix heuristic would have skipped the first line as a
+        // "current line" and lost a valid `+` entry. Both lines are entries.
+        assert_eq!(mf.entries().len(), 2);
+        assert_eq!(mf.entries()[0].size, 0x200);
+        assert_eq!(mf.entries()[0].status, SectorStatus::Finished);
+        assert_eq!(mf.entries()[1].status, SectorStatus::NonTried);
         let _ = std::fs::remove_file(&p);
     }
 

@@ -93,6 +93,18 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize> {
+        // Defense-in-depth: AACS aligned units are 3 sectors (6144 bytes) and
+        // `decrypt_sectors` anchors units at buffer offset 0. A read whose START
+        // LBA is not unit-aligned (lba % 3 != 0) would decrypt every unit under
+        // the wrong CBC/unit alignment and silently mis-decrypt. Reject loud
+        // (DecryptFailed) BEFORE reading rather than ever mis-decrypting — callers
+        // (e.g. the multipass sweep) must issue unit-aligned reads.
+        if matches!(self.keys, DecryptKeys::Aacs { .. }) {
+            const UNIT_SECTORS: u32 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u32; // 3
+            if lba % UNIT_SECTORS != 0 {
+                return Err(crate::error::Error::DecryptFailed);
+            }
+        }
         let n = self.inner.read_sectors(lba, count, buf, recovery)?;
         // Apply the crate-wide AACS/CSS/None decrypt entry point in-place
         // over the bytes just read. No-op for DecryptKeys::None.
@@ -555,6 +567,62 @@ mod tests {
             &pristine[128..2048],
             "CSS descramble must alter the encrypted data region"
         );
+    }
+
+    /// Defense-in-depth: an AACS decrypting read whose START LBA is not
+    /// unit-aligned (lba % 3 != 0) must be rejected with DecryptFailed BEFORE
+    /// touching the cipher — a mid-unit start would decrypt every unit under the
+    /// wrong CBC/unit alignment and silently mis-decrypt. A unit-aligned start
+    /// (lba % 3 == 0) must pass the guard and proceed normally.
+    ///
+    /// Grounding: the `lba % UNIT_SECTORS != 0` guard in `read_sectors`.
+    #[test]
+    fn aacs_unaligned_start_lba_rejected() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0u32, [0u8; 16])],
+            read_data_key: None,
+        };
+        // Unaligned starts (1, 2, 4, 5, 32 — note 32 % 3 == 2) must all reject.
+        for lba in [1u32, 2, 4, 5, 32, 64] {
+            let mut wrapped = DecryptingSectorSource::new(ClearUnitSource, keys.clone());
+            let mut buf = vec![0u8; 3 * 2048];
+            let r = wrapped.read_sectors(lba, 3, &mut buf, false);
+            let err = r.expect_err("unaligned AACS start LBA must reject");
+            assert_eq!(
+                err.code(),
+                crate::error::Error::DecryptFailed.code(),
+                "lba {lba} (% 3 = {}) must reject with DecryptFailed",
+                lba % 3
+            );
+        }
+        // Unit-aligned starts (0, 3, 33, 66) must pass the guard. ClearUnitSource
+        // yields TS-clear units, so decrypt is a no-op and the read succeeds.
+        for lba in [0u32, 3, 33, 66] {
+            let mut wrapped = DecryptingSectorSource::new(ClearUnitSource, keys.clone());
+            let mut buf = vec![0u8; 3 * 2048];
+            let n = wrapped
+                .read_sectors(lba, 3, &mut buf, false)
+                .unwrap_or_else(|_| panic!("aligned lba {lba} must pass the guard"));
+            assert_eq!(n, 3 * 2048);
+        }
+    }
+
+    /// The unit-alignment guard is AACS-only. A CSS decrypting read (per-sector,
+    /// stateless — DVDs) must NOT be gated on a 3-sector boundary: a single
+    /// sector at lba 1 must read fine. Grounding: the guard is inside
+    /// `matches!(self.keys, DecryptKeys::Aacs { .. })`.
+    #[test]
+    fn css_start_lba_not_unit_gated() {
+        let mut wrapped = DecryptingSectorSource::new(
+            ClearUnitSource,
+            DecryptKeys::Css {
+                title_key: [0u8; 5],
+            },
+        );
+        let mut buf = vec![0u8; 2048];
+        // lba 1 (not a multiple of 3) must succeed under CSS — no AACS gate.
+        let n = wrapped.read_sectors(1, 1, &mut buf, false).unwrap();
+        assert_eq!(n, 2048, "CSS reads must not be unit-alignment gated");
     }
 
     /// `into_inner` / `inner` / `inner_mut` must hand back the original

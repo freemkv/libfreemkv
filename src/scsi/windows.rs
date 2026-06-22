@@ -268,6 +268,16 @@ impl ScsiTransport for SptiTransport {
             DataDirection::FromDevice => SCSI_IOCTL_DATA_IN,
             DataDirection::ToDevice => SCSI_IOCTL_DATA_OUT,
         };
+        // Match the macOS/Linux guard: a >=4 GiB buffer would wrap when cast to
+        // u32 below, producing a short transfer reported as success with the
+        // wrong byte count.
+        if data.len() > u32::MAX as usize {
+            return Err(Error::ScsiError {
+                opcode: cdb.first().copied().unwrap_or(0),
+                status: super::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            });
+        }
         sptwb.spt.DataTransferLength = data.len() as u32;
         // Round up to the next whole second so a 1500ms request gets at
         // least 2s, not 1s. SPTI's TimeOutValue is u32 seconds with no
@@ -335,7 +345,10 @@ impl ScsiTransport for SptiTransport {
 
         Ok(ScsiResult {
             status: sptwb.spt.ScsiStatus,
-            bytes_transferred: sptwb.spt.DataTransferLength as usize,
+            // Clamp to the caller's buffer length, matching Linux/macOS: a
+            // driver that reports DataTransferLength > data.len() must never
+            // let callers read past the buffer they handed in.
+            bytes_transferred: (sptwb.spt.DataTransferLength as usize).min(data.len()),
             sense,
         })
     }

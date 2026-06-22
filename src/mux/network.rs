@@ -25,12 +25,19 @@ const NET_BUF_SIZE: usize = 256 * 1024;
 pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.is_broadcast()
+                // carrier-grade NAT 100.64.0.0/10
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+                // "this network" 0.0.0.0/8
+                || o[0] == 0
+                // Class E reserved 240.0.0.0/4
+                || o[0] >= 240
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -40,6 +47,10 @@ pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 // link-local fe80::/10
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x);
+                // to_ipv4() returns Some for both forms — re-check as IPv4 so an
+                // IPv4-mapped private/loopback address can't bypass the block above.
+                || v6.to_ipv4().map(|m| is_blocked_ip(IpAddr::V4(m))) == Some(true)
         }
     }
 }
@@ -268,6 +279,25 @@ mod tests {
                 IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
                 "multicast v6",
             ),
+            // CGNAT / 0.0.0.0/8 / Class E (finding 8).
+            (v4(100, 64, 0, 1), "carrier-grade NAT"),
+            (v4(100, 127, 255, 254), "carrier-grade NAT edge"),
+            (v4(0, 1, 2, 3), "0.0.0.0/8"),
+            (v4(240, 0, 0, 1), "Class E"),
+            (v4(255, 0, 0, 1), "Class E high"),
+            // IPv4-mapped / -compatible IPv6 bypass (finding 7).
+            (
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001)),
+                "IPv4-mapped RFC1918 (::ffff:0a00:0001)",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
+                "::ffff:127.0.0.1 mapped",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001)),
+                "::127.0.0.1 compatible",
+            ),
         ];
         for (ip, label) in blocked {
             assert!(is_blocked_ip(*ip), "{label} ({ip}) must be blocked");
@@ -280,6 +310,10 @@ mod tests {
             (
                 IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1)),
                 "public v6",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808)),
+                "::ffff:8.8.8.8 public mapped",
             ),
         ];
         for (ip, label) in allowed {

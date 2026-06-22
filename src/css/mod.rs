@@ -27,6 +27,14 @@ use crate::sector::SectorSource;
 pub struct CssState {
     /// 5-byte CSS title key (from SCSI auth or the crack fallback).
     pub title_key: [u8; 5],
+    /// LBA half-open span `[start, end)` of the extent set this key was
+    /// cracked from. CSS title keys are per-VTS: a key cracked from one
+    /// VTS does NOT descramble a title living in a different VTS. The mux
+    /// path checks whether the title being opened overlaps this span; if
+    /// not, it re-cracks from that title's own extents. `None` for keys
+    /// of unknown provenance (e.g. test fixtures) — treated as "applies
+    /// everywhere" for backward compatibility.
+    pub crack_span: Option<(u32, u32)>,
 }
 
 /// Recover the CSS title key with no keys, by scanning scrambled sectors and
@@ -70,6 +78,14 @@ pub fn crack_key_halt(
     // scans nothing. Callers pass `detect_max_batch_sectors(device_path)` for a
     // live drive, a file-safe value for an image, or 1 to force per-sector.
     let batch = (batch_sectors.max(1)) as u32;
+    // Record the LBA span the key is being cracked from so the per-title mux
+    // path can tell whether a later title lives in the same VTS (overlaps the
+    // span → key applies) or a different one (→ re-crack). Half-open [min,max).
+    let crack_span = extents
+        .iter()
+        .filter(|e| e.sector_count > 0)
+        .map(|e| (e.start_lba, e.start_lba.saturating_add(e.sector_count)))
+        .reduce(|(amin, amax), (bmin, bmax)| (amin.min(bmin), amax.max(bmax)));
     let mut tried = 0u32;
     let max_tries = 50_000u32;
     let mut buf = vec![0u8; batch as usize * 2048];
@@ -107,7 +123,10 @@ pub fn crack_key_halt(
                         let sect = &buf[s * 2048..(s + 1) * 2048];
                         if is_scrambled(sect) {
                             if let Some(key) = stevenson::crack_title_key(sect) {
-                                return Some(CssState { title_key: key });
+                                return Some(CssState {
+                                    title_key: key,
+                                    crack_span,
+                                });
                             }
                         }
                         if tried >= max_tries {

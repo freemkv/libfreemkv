@@ -105,7 +105,7 @@ impl PassthroughParser {
 
 impl CodecParser for PassthroughParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         vec![Frame {
             pts_ns,
             keyframe: self.keyframe,

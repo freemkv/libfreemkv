@@ -44,6 +44,13 @@ struct PesAssembler {
     /// HEVC/H264 that reads as a spurious start code / corrupt slice
     /// payload. Tracks how many header bytes remain across packets.
     header_remaining: usize,
+    /// 4-bit continuity_counter of the last payload-bearing TS packet seen
+    /// on this PID. A non-PUSI continuation whose CC is not `(prev + 1) & 0xf`
+    /// — or whose adaptation field flags a discontinuity — means one or more
+    /// TS packets for this PID were dropped; splicing the new payload onto the
+    /// partial PES would inject corrupt bytes. The partial PES is dropped and
+    /// the assembler resyncs on the next PUSI. `None` until the first packet.
+    last_cc: Option<u8>,
 }
 
 /// Initial capacity for a fresh PES buffer. Sized to cover the
@@ -76,6 +83,7 @@ impl PesAssembler {
             dts: None,
             active: false,
             header_remaining: 0,
+            last_cc: None,
         }
     }
 
@@ -287,6 +295,37 @@ impl TsDemuxer {
         }
 
         let payload = &ts[payload_start..];
+
+        // Continuity check. The 4-bit continuity_counter increments by 1 on
+        // every payload-bearing packet of a PID; a gap means dropped TS
+        // packets. The adaptation field's discontinuity_indicator (first AF
+        // byte, bit 0x80) explicitly flags an intentional break. On a non-PUSI
+        // continuation that is discontinuous, the partial PES has a hole in it
+        // — splicing the new payload would corrupt the elementary stream — so
+        // drop the partial and resync on the next PUSI.
+        let cc = ts[3] & 0x0f;
+        let discontinuity_flag =
+            (adaptation == 0x03 || adaptation == 0x02) && ts[4] > 0 && (ts[5] & 0x80) != 0;
+        // A gap is a CC that is neither the expected `(prev + 1) & 0xf` nor a
+        // duplicate `prev` (ISO 13818-1 permits a packet to repeat its CC; a
+        // duplicate is not a loss). Anything else means one or more packets for
+        // this PID were dropped.
+        let cc_gap = match asm.last_cc {
+            Some(prev) => cc != ((prev + 1) & 0x0f) && cc != prev,
+            None => false,
+        };
+        asm.last_cc = Some(cc);
+        if !pusi && (discontinuity_flag || cc_gap) && asm.active {
+            tracing::trace!(
+                target: "mux",
+                pid = asm.pid,
+                "TS continuity break on non-PUSI continuation; dropping partial PES",
+            );
+            asm.buffer.clear();
+            asm.active = false;
+            asm.header_remaining = 0;
+            return;
+        }
 
         if pusi {
             // `header_len` is the FULL (uncapped) PES-header length:
@@ -518,16 +557,33 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                 section.truncate(total);
                 return Some(section);
             }
-            // Need continuation packets: same PID, no PUSI.
+            // Need continuation packets: same PID, no PUSI, with a
+            // monotonically incrementing continuity counter. The CC lives in
+            // the low nibble of the 4th TS-header byte (offset+7 here: the
+            // BD-TS 4-byte prefix precedes the sync byte). A CC gap means a
+            // dropped/duplicated packet → the assembled section is corrupt, so
+            // abandon it rather than splicing in misordered payload.
+            let mut expected_cc = ((data[offset + 7] & 0x0F) + 1) & 0x0F;
             let mut scan = offset + BD_TS_PACKET_SIZE;
+            let mut desync = false;
             while scan + BD_TS_PACKET_SIZE <= data.len() && section.len() < total {
-                if data[scan + 4] != SYNC_BYTE {
+                // Require a corroborated resync point (this sync byte plus the
+                // follower one packet ahead) before trusting the header. A
+                // stray 0x47 in corrupt payload would otherwise misread the CC
+                // and fire a false desync.
+                if !is_resync_point(data, scan) {
                     scan += 1;
                     continue;
                 }
                 let cpid = (((data[scan + 5] & 0x1F) as u16) << 8) | data[scan + 6] as u16;
                 let cpusi = data[scan + 5] & 0x40 != 0;
                 if cpid == target_pid && !cpusi {
+                    let cc = data[scan + 7] & 0x0F;
+                    if cc != expected_cc {
+                        desync = true;
+                        break;
+                    }
+                    expected_cc = (cc + 1) & 0x0F;
                     // Continuation packets may also carry an adaptation
                     // field; compute their payload base the same way.
                     if let Some(cbase) = psi_payload_base(&data[scan..scan + BD_TS_PACKET_SIZE]) {
@@ -535,6 +591,12 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                     }
                 }
                 scan += BD_TS_PACKET_SIZE;
+            }
+            if desync {
+                // Restart PSI assembly from the next packet after this PUSI;
+                // a later clean copy of the section may still appear.
+                offset += BD_TS_PACKET_SIZE;
+                continue;
             }
             if section.len() >= total {
                 section.truncate(total);
@@ -695,6 +757,99 @@ mod tests {
         // Invalid marker bits → returns None
         let bad = [0x00, 0x00, 0x00, 0x00, 0x00]; // marker bits wrong
         assert_eq!(parse_timestamp(&bad), None);
+    }
+
+    /// Build a 192-byte BD-TS payload packet for `pid` with explicit PUSI and
+    /// continuity_counter, carrying `payload` (truncated/padded to 184 bytes,
+    /// payload-only adaptation).
+    fn ts_payload_packet(pid: u16, pusi: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        pkt[4] = SYNC_BYTE;
+        pkt[5] = ((pid >> 8) as u8) & 0x1F;
+        if pusi {
+            pkt[5] |= 0x40;
+        }
+        pkt[6] = (pid & 0xFF) as u8;
+        pkt[7] = 0x10 | (cc & 0x0f); // payload-only adaptation + CC
+        let n = payload.len().min(184);
+        pkt[8..8 + n].copy_from_slice(&payload[..n]);
+        pkt
+    }
+
+    /// A minimal valid PES start for a video stream id, with no PTS/DTS flags,
+    /// followed by `es` elementary-stream bytes. header_len = 9.
+    fn pes_start(es: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        v.extend_from_slice(es);
+        v
+    }
+
+    /// Regression (finding 3): a non-PUSI continuation whose continuity_counter
+    /// is not (prev+1)&0xf means TS packets were dropped — the partial PES has a
+    /// hole and must be discarded, not spliced. We start a PES (cc=0), then feed
+    /// a continuation with a CC gap (cc=5 instead of 1); the assembler drops the
+    /// partial. A clean follow-on PUSI then produces exactly that next PES,
+    /// proving the corrupt splice didn't happen.
+    #[test]
+    fn continuity_gap_drops_partial_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // Start a PES (cc=0) carrying "AAAA".
+        let mut out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        assert!(
+            out.is_empty(),
+            "first PES still open, nothing completed yet"
+        );
+
+        // Discontinuous continuation (cc jumps 0 -> 5) carrying "BBBB". The gap
+        // must drop the partial PES rather than append "BBBB".
+        out = demux.feed(&ts_payload_packet(pid, false, 5, b"BBBB"));
+        assert!(out.is_empty(), "dropped partial PES is not emitted here");
+
+        // A fresh PUSI (cc=6) starts the next PES "CCCC"; starting it would
+        // normally flush the previous one — but it was dropped, so nothing is
+        // flushed yet.
+        out = demux.feed(&ts_payload_packet(pid, true, 6, &pes_start(b"CCCC")));
+        assert!(
+            out.is_empty(),
+            "the dropped partial must NOT be flushed by the next PUSI"
+        );
+
+        // Flush: only the clean "CCCC" PES comes out — it must NOT begin with
+        // the dropped "AAAA" payload. (Payload-only packets pad to 184 bytes,
+        // so compare the leading ES bytes, not the whole padded buffer.)
+        let final_out = demux.flush();
+        assert_eq!(final_out.len(), 1, "exactly one clean PES");
+        assert_eq!(
+            &final_out[0].data[..4],
+            b"CCCC",
+            "surviving PES is the clean one, not the dropped partial"
+        );
+        // The dropped "BBBB" continuation must not have been spliced anywhere.
+        assert!(
+            !final_out[0].data.windows(4).any(|w| w == b"BBBB"),
+            "dropped continuation must not appear in any emitted PES"
+        );
+    }
+
+    /// In-sequence continuation (cc 0 -> 1) must still splice normally — the
+    /// continuity check must not break the happy path.
+    #[test]
+    fn continuity_in_sequence_splices() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        demux.feed(&ts_payload_packet(pid, false, 1, b"BBBB"));
+        let out = demux.flush();
+        assert_eq!(out.len(), 1);
+        // First payload's ES leads, and the in-sequence continuation's "BBBB"
+        // is present (spliced) — the padding zeros sit between them.
+        assert_eq!(&out[0].data[..4], b"AAAA", "first PES ES leads");
+        assert!(
+            out[0].data.windows(4).any(|w| w == b"BBBB"),
+            "in-sequence continuation must be spliced in"
+        );
     }
 
     #[test]
@@ -984,7 +1139,12 @@ mod tests {
         let tail = &section[head_len..];
         assert!(!tail.is_empty(), "test must actually span two packets");
         p1[..tail.len()].copy_from_slice(tail);
-        let pkt1 = bdts_packet(p1, pmt_pid, false);
+        let mut pkt1 = bdts_packet(p1, pmt_pid, false);
+        // Continuity counter must increment from the PUSI packet (CC=0) to its
+        // continuation (CC=1) — `collect_psi_section` rejects a CC gap as a
+        // desync. The CC lives in the low nibble of TS-header byte 4 (offset 7
+        // here, after the 4-byte BD-TS timecode prefix).
+        pkt1[7] = (pkt1[7] & 0xF0) | 0x01;
 
         let mut out = pkt0;
         out.extend(pkt1);
@@ -1022,6 +1182,35 @@ mod tests {
                 |s| matches!(s, Stream::Audio(a) if a.pid == 0x1100 + 39 && a.codec == Codec::Lpcm)
             ),
             "trailing audio entry from the continuation packet survives"
+        );
+    }
+
+    /// Regression for the PSI continuity-counter guard: a continuation packet
+    /// whose CC does NOT increment from the PUSI packet is a desync (dropped or
+    /// reordered packet). `collect_psi_section` must abandon that assembly
+    /// rather than splice misordered payload. Here the only continuation has a
+    /// bad CC, so the section never completes and no streams are found.
+    #[test]
+    fn scan_streams_rejects_pmt_with_cc_desync() {
+        let pmt_pid = 0x0100;
+        let mut entries: Vec<(u8, u16)> = Vec::new();
+        entries.push((0x1B, 0x1011));
+        for i in 0..40u16 {
+            entries.push((0x80, 0x1100 + i));
+        }
+        let mut pmt = pmt_two_packets(pmt_pid, &entries);
+        // Corrupt the continuation packet's CC. pmt is exactly two BD-TS
+        // packets; the second starts at BD_TS_PACKET_SIZE. Its CC (low nibble
+        // of offset+7) was set to 1 by pmt_two_packets; flip it to a gap (5).
+        let cc_off = BD_TS_PACKET_SIZE + 7;
+        pmt[cc_off] = (pmt[cc_off] & 0xF0) | 0x05;
+
+        let mut data = pat_packet(pmt_pid);
+        data.extend(pmt);
+        // The PMT section can't be reassembled (CC gap) → no program found.
+        assert!(
+            scan_streams(&data).is_none(),
+            "a CC-desynced PMT continuation must not yield streams"
         );
     }
 

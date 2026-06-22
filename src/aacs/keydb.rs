@@ -2,6 +2,16 @@
 
 use std::collections::HashMap;
 
+/// Upper bound on the on-disk keydb.cfg size accepted by [`KeyDb::load`].
+/// The real public UHD keydb is a few MiB; 64 MiB is generous headroom while
+/// still bounding the worst-case allocation from a hostile/corrupt file.
+const MAX_KEYDB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Upper bound on parsed disc entries. The real public keydb carries
+/// ~170k+ entries, so the cap sits well above that while still bounding
+/// memory against a pathological input. Surplus lines are ignored.
+const MAX_DISC_ENTRIES: usize = 500_000;
+
 /// Parsed AACS key database.
 #[derive(Debug)]
 pub struct KeyDb {
@@ -185,6 +195,9 @@ impl KeyDb {
 
             // Disc entry: starts with 0x
             if line.starts_with("0x") && line.contains(" = ") {
+                if db.disc_entries.len() >= MAX_DISC_ENTRIES {
+                    continue;
+                }
                 if let Some(entry) = Self::parse_disc_entry(line) {
                     db.disc_entries.insert(entry.disc_hash.clone(), entry);
                 }
@@ -204,6 +217,15 @@ impl KeyDb {
     /// [`KeyDb`] rather than an error — callers needing a non-empty db must
     /// check the parsed contents.
     pub fn load(path: &std::path::Path) -> crate::error::Result<Self> {
+        // Stat-and-cap before reading so a hostile/corrupt file can't force an
+        // unbounded allocation. A file at or over the cap is rejected outright.
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_KEYDB_BYTES {
+                return Err(crate::error::Error::KeydbLoad {
+                    path: path.display().to_string(),
+                });
+            }
+        }
         let data = std::fs::read_to_string(path).map_err(|_| crate::error::Error::KeydbLoad {
             path: path.display().to_string(),
         })?;

@@ -16,6 +16,7 @@ use libfreemkv::css;
 fn css_descramble_sector_roundtrip_via_public_api() {
     let state = css::CssState {
         title_key: [0x42, 0x13, 0x37, 0xBE, 0xEF],
+        crack_span: None,
     };
 
     let mut sector = vec![0xAAu8; 2048];

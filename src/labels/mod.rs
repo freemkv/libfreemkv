@@ -288,8 +288,15 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
                     a.label = generate_audio_label(&a.codec, &a.channels, a.secondary);
                 }
                 Stream::Video(v) if v.label.is_empty() => {
-                    v.label =
-                        generate_video_label(&v.codec, v.resolution.pixels(), &v.hdr, v.secondary);
+                    // Unknown resolution: pass (0, 0) so the label omits the
+                    // resolution token rather than tagging it a fabricated
+                    // 1080p.
+                    let px = if matches!(v.resolution, crate::disc::Resolution::Unknown) {
+                        (0, 0)
+                    } else {
+                        v.resolution.pixels()
+                    };
+                    v.label = generate_video_label(&v.codec, px, &v.hdr, v.secondary);
                 }
                 Stream::Subtitle(s) if s.forced => {
                     // Ensure forced subs are labeled even if BD-J didn't set a name

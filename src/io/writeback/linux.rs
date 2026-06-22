@@ -191,12 +191,22 @@ impl WritebackPipeline {
         // path (NFS, degraded, normal) — it's nominally non-blocking
         // by spec and gives the kernel an early hint that this range
         // is ready to flush.
-        unsafe {
+        let kickoff_rc = unsafe {
             libc::sync_file_range(
                 self.fd,
                 chunk_off as i64,
                 chunk_len as i64,
                 libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+        if kickoff_rc != 0 {
+            // Non-fatal: the async write-out hint failed, but the data is
+            // still in the page cache and will be flushed by later fsync /
+            // kernel writeback. Surface it for diagnosability.
+            tracing::warn!(
+                target: "freemkv::io",
+                errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                "sync_file_range(WRITE) kickoff failed"
             );
         }
         if let Some((prev_off, prev_len)) = self.pending.take() {
@@ -233,9 +243,16 @@ impl WritebackPipeline {
                         // NOT call DONTNEED — if WAIT_AFTER hasn't
                         // returned, the pages aren't safely flushed.
                         self.degraded.store(true, Ordering::Relaxed);
+                        // Once degraded we skip DONTNEED, so every subsequent
+                        // chunk's pages stay resident until close — the same
+                        // page-cache exposure profile as NFS. Shrink to the
+                        // floor so that exposure window is as small as the NFS
+                        // path keeps it, instead of whatever the adaptive sizing
+                        // had grown chunk_bytes to (up to 256 MiB).
+                        self.chunk_bytes = CHUNK_BYTES_MIN;
                         tracing::error!(
                             target: "mux",
-                            "WritebackPipeline WAIT_AFTER timed out after {}s on chunk off={} len={}, marking writeback degraded (subsequent chunks will skip WAIT_AFTER + DONTNEED)",
+                            "WritebackPipeline WAIT_AFTER timed out after {}s on chunk off={} len={}, marking writeback degraded (subsequent chunks will skip WAIT_AFTER + DONTNEED, chunk_bytes lowered to floor)",
                             WAIT_AFTER_TIMEOUT.as_secs(),
                             prev_off,
                             prev_len

@@ -447,7 +447,10 @@ impl CodecParser for HevcParser {
         //   numTemporalLayers u(3) = sps_max_sub_layers_minus1 + 1
         //   temporalIdNested  u(1) = sps_temporal_id_nesting_flag
         //   lengthSizeMinusOne u(2) = 3 (4-byte length prefix)
-        let num_temporal_layers = (chroma.max_sub_layers_minus1 + 1) & 0x07;
+        // sps_max_sub_layers_minus1 is u(3) (0..7), so +1 is 1..8. The hvcC
+        // numTemporalLayers field is u(3) (0..7); the max legal value (8) is
+        // saturated to 7 rather than wrapping to 0 via the & 0x07 mask.
+        let num_temporal_layers = chroma.max_sub_layers_minus1.saturating_add(1).min(7) & 0x07;
         let temporal_id_nested = chroma.temporal_id_nesting_flag & 0x01;
         record.push((num_temporal_layers << 3) | (temporal_id_nested << 2) | 0x03);
         // numOfArrays

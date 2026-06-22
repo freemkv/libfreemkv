@@ -112,15 +112,23 @@ pub(super) struct SharedPatchState {
 }
 
 impl SharedPatchState {
+    /// Cap on the republished `bad_ranges` Vec. Consumers (progress display,
+    /// scheduler) only sample the head of the list; the full set is bounded by
+    /// the mapfile entry cap so a pathologically fragmented disc can't make
+    /// every per-record republish allocate unboundedly.
+    const MAX_BAD_RANGES: usize = 8192;
+
     fn from_map(map: &Mapfile) -> Self {
+        let mut bad_ranges = map.ranges_with(&[
+            SectorStatus::NonTrimmed,
+            SectorStatus::Unreadable,
+            SectorStatus::NonScraped,
+            SectorStatus::NonTried,
+        ]);
+        bad_ranges.truncate(Self::MAX_BAD_RANGES);
         Self {
             stats: map.stats(),
-            bad_ranges: map.ranges_with(&[
-                SectorStatus::NonTrimmed,
-                SectorStatus::Unreadable,
-                SectorStatus::NonScraped,
-                SectorStatus::NonTried,
-            ]),
+            bad_ranges,
         }
     }
 }
@@ -149,7 +157,14 @@ pub(super) struct PatchSink {
     /// `record()` call. `Mutex` rather than separate atomics because
     /// the producer wants stats + bad_ranges as a coherent pair.
     shared: Arc<Mutex<SharedPatchState>>,
+    /// Last time the shared snapshot was republished. `from_map` allocates
+    /// O(bad_ranges) every call, so the per-record path throttles to a time
+    /// cadence (`REPUBLISH_CADENCE`); the final close always forces a publish.
+    last_republish: Option<std::time::Instant>,
 }
+
+/// Minimum interval between per-record snapshot republishes.
+const REPUBLISH_CADENCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl PatchSink {
     /// Open `path` as a [`crate::io::WritebackFile`] and pair it with
@@ -171,12 +186,29 @@ impl PatchSink {
                 map,
                 is_regular,
                 shared,
+                last_republish: None,
             },
             shared_clone,
         ))
     }
 
-    fn republish(&self) {
+    /// Republish the shared snapshot. When `force` is false the update is
+    /// throttled to `REPUBLISH_CADENCE`; `force` (used at close) always
+    /// publishes the final state.
+    fn republish(&mut self, force: bool) {
+        let now = std::time::Instant::now();
+        if !force {
+            if let Some(prev) = self.last_republish {
+                if now.duration_since(prev) < REPUBLISH_CADENCE {
+                    return;
+                }
+            }
+        }
+        self.last_republish = Some(now);
+        self.publish_now();
+    }
+
+    fn publish_now(&self) {
         // Best-effort lock — only the producer reads, only the consumer
         // writes; contention is single-acquire so the lock is never
         // poisoned in practice. If it ever did get poisoned we'd want
@@ -220,7 +252,7 @@ impl Sink<PatchItem> for PatchSink {
                     .map_err(|e| Error::IoError { source: e })?;
             }
         }
-        self.republish();
+        self.republish(false);
         Ok(Flow::Continue)
     }
 
@@ -254,7 +286,7 @@ impl Sink<PatchItem> for PatchSink {
         // returned `PatchSummary`, but the snapshot is part of the
         // public-ish contract of the consumer: it stays current
         // through close.)
-        self.republish();
+        self.republish(true);
         Ok(PatchSummary {
             stats: self.map.stats(),
         })
@@ -824,6 +856,15 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
                     }
                     Err(_err) => {
                         state.blocks_read_failed += 1;
+                        // Feed the damage window / wedge counter exactly as the
+                        // main loop does, so a string of backtrack failures
+                        // escalates skip distance and trips wedge detection
+                        // rather than being silently under-counted.
+                        state.damage_window.push(false);
+                        if state.damage_window.len() > PASSN_DAMAGE_WINDOW {
+                            state.damage_window.remove(0);
+                        }
+                        state.consecutive_failures += 1;
                         // Leave NonTrimmed (not Unreadable) so a
                         // later pass gets another shot. Per the
                         // project goal — "recover 100% of readable
@@ -1763,6 +1804,12 @@ impl Disc {
                 g.stats.bytes_good
             };
             state.skip_count = 0;
+            // Reset the wedge counter at each range boundary too. Like
+            // consecutive_failures below, wedge_count is a "stuck on THIS
+            // range" signal; carrying it across boundaries lets wedges
+            // accumulated on earlier ranges trip WEDGE_ABORT_THRESHOLD
+            // prematurely on a later, healthy range.
+            state.wedge_count = 0;
             // Reset consecutive_failures at each range boundary. The
             // wedge-exit detector is for "stuck on the same range" — many
             // tiny ranges that each fail their one sampled sector should

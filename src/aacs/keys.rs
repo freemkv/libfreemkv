@@ -163,6 +163,14 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
         pos += stride;
     }
 
+    // The loop above `break`s if the buffer runs out mid-key. A short list
+    // means the .inf is malformed/truncated — reject it rather than silently
+    // accepting fewer keys than the header declared, which would later map
+    // title CPS units to nonexistent keys.
+    if encrypted_keys.len() != num_uk {
+        return None;
+    }
+
     // Title → CPS unit mapping
     let mut title_cps_unit = Vec::new();
     if data.len() >= 26 {
@@ -1370,6 +1378,41 @@ mod tests {
         if path.exists() { Some(path) } else { None }
     }
 
+    /// Finding #5 regression: parse_unit_key_ro must REJECT a Unit_Key_RO.inf
+    /// whose declared `num_unit_keys` exceeds the keys actually present in the
+    /// buffer, instead of silently returning a short list. A truncated list
+    /// would later map title CPS units to nonexistent keys.
+    #[test]
+    fn parse_unit_key_ro_rejects_truncated_key_list() {
+        // V10 layout: stride 48, keys start at uk_pos + 48.
+        // uk_pos = 32; num_uk = 2; keys at 80 and 128.
+        let uk_pos = 32usize;
+        let build = |total_len: usize| -> Vec<u8> {
+            let mut data = vec![0u8; total_len];
+            // uk_pos as BE32 at [0..4].
+            data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+            // num_unit_keys = 2 (BE16) at uk_pos.
+            data[uk_pos] = 0x00;
+            data[uk_pos + 1] = 0x02;
+            data
+        };
+
+        // Full buffer: room for both keys (keys_start 80, key1 at 128..144).
+        let full = build(144);
+        let ok =
+            parse_unit_key_ro(&full, AacsVersion::V10).expect("a full 2-key buffer must parse");
+        assert_eq!(ok.encrypted_keys.len(), 2);
+
+        // Truncated buffer: header still declares 2 keys, but only the first
+        // fits (len 128 — the second key's 16 bytes run off the end). Must be
+        // rejected, not silently accepted with one key.
+        let short = build(128);
+        assert!(
+            parse_unit_key_ro(&short, AacsVersion::V10).is_none(),
+            "a buffer declaring more keys than it contains must be rejected"
+        );
+    }
+
     #[test]
     fn derive_media_key_from_dk_survives_out_of_range_u_mask_shift() {
         // Regression: a crafted/corrupt MKB with a Subset-Difference
@@ -2433,11 +2476,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_unit_key_ro_stops_early_when_keys_run_off_end() {
-        // 3 keys declared but the buffer is sized to hold only 2 strides plus
-        // 8 trailing bytes (not a full 3rd 16-byte key) → the loop's
-        // `pos + 16 > len` guard breaks and returns the keys that fit, never
-        // reading OOB.
+    fn parse_unit_key_ro_rejects_when_keys_run_off_end() {
+        // Finding #5: 3 keys declared but the buffer holds only 2 strides plus
+        // 8 trailing bytes (not a full 3rd 16-byte key). The extraction loop
+        // breaks at the buffer end (never reading OOB), and the post-loop
+        // length check rejects the short list with None — a truncated/malformed
+        // .inf must NOT be silently accepted with fewer keys than declared.
         let uk_pos = 0x60usize;
         let stride = 48usize;
         // Room for keys at uk_pos+48 and uk_pos+48+48, then only 8 spare bytes
@@ -2446,11 +2490,9 @@ mod tests {
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
         data[uk_pos + 1] = 3; // declare 3 keys
-        let parsed = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
-        assert_eq!(
-            parsed.encrypted_keys.len(),
-            2,
-            "must stop at the buffer end, not read past it"
+        assert!(
+            parse_unit_key_ro(&data, AacsVersion::V10).is_none(),
+            "a buffer declaring more keys than it contains must be rejected"
         );
     }
 

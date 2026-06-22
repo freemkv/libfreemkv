@@ -90,12 +90,18 @@ pub fn save(data: &[u8]) -> Result<UpdateResult> {
 
     let path = default_path()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|_| Error::KeydbWrite {
-            path: path.display().to_string(),
+        std::fs::create_dir_all(dir).map_err(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "keydb dir create failed");
+            Error::KeydbWrite {
+                path: path.display().to_string(),
+            }
         })?;
     }
-    std::fs::write(&path, &text).map_err(|_| Error::KeydbWrite {
-        path: path.display().to_string(),
+    std::fs::write(&path, &text).map_err(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "keydb write failed");
+        Error::KeydbWrite {
+            path: path.display().to_string(),
+        }
     })?;
 
     Ok(UpdateResult {
@@ -125,8 +131,10 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             .ok()
             .and_then(|mut it| it.next())
             .ok_or_else(|| Error::KeydbConnect { host: host.clone() })?;
-        let mut stream = TcpStream::connect_timeout(&addr, NET_TIMEOUT)
-            .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
+        let mut stream = TcpStream::connect_timeout(&addr, NET_TIMEOUT).map_err(|e| {
+            tracing::debug!(error = %e, host = %host, "keydb connect failed");
+            Error::KeydbConnect { host: host.clone() }
+        })?;
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
@@ -144,27 +152,45 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             .write_all(request.as_bytes())
             .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
 
-        let mut response = Vec::new();
-        stream
-            .take(100 * 1024 * 1024)
-            .read_to_end(&mut response)
-            .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
-
-        let header_end = find_header_end(&response).ok_or(Error::KeydbParse)?;
+        // Read the header block incrementally up to the \r\n\r\n terminator,
+        // bounded to ~64 KiB, BEFORE pulling any body. This avoids buffering up
+        // to 100 MiB per redirect hop just to inspect the status / Location.
+        const MAX_HEADER_BYTES: usize = 64 * 1024;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut header_buf: Vec<u8> = Vec::with_capacity(1024);
+        let mut byte = [0u8; 1];
+        loop {
+            let n = reader
+                .read(&mut byte)
+                .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
+            if n == 0 {
+                // Connection closed before headers completed.
+                return Err(Error::KeydbParse);
+            }
+            header_buf.push(byte[0]);
+            if header_buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if header_buf.len() > MAX_HEADER_BYTES {
+                return Err(Error::KeydbParse);
+            }
+        }
+        // header_buf includes the trailing \r\n\r\n.
+        let header_end = header_buf.len() - 4;
         // Lossy: a stray non-UTF-8 byte in the header block must not blank
         // out the whole status line / Location header (which would surface
         // as an undiagnosable KeydbHttp{status:0}).
-        let headers = String::from_utf8_lossy(&response[..header_end]);
-        let body = &response[header_end + 4..];
+        let headers = String::from_utf8_lossy(&header_buf[..header_end]).into_owned();
+        let headers = headers.as_str();
 
-        let status = parse_status(&headers);
+        let status = parse_status(headers).ok_or(Error::KeydbParse)?;
 
         // Only treat a Location header as a redirect when the status is
         // actually 3xx; a 200 carrying a stray Location (some proxies) is
         // not a redirect, and a 3xx without Location is a malformed redirect.
         if (300..=399).contains(&status) {
             let location =
-                extract_header(&headers, "Location").ok_or(Error::KeydbHttp { status })?;
+                extract_header(headers, "Location").ok_or(Error::KeydbHttp { status })?;
             let (next_host, next_port, next_path) = resolve_redirect(&location, &host, port)?;
             host = next_host;
             port = next_port;
@@ -176,7 +202,14 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             return Err(Error::KeydbHttp { status });
         }
 
-        return Ok(body.to_vec());
+        // Now read the body, still bounded by the existing 100 MiB cap. The
+        // BufReader carries any bytes already buffered past the header.
+        let mut body = Vec::new();
+        reader
+            .take(100 * 1024 * 1024)
+            .read_to_end(&mut body)
+            .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
+        return Ok(body);
     }
 
     Err(Error::KeydbTooManyRedirects)
@@ -244,15 +277,18 @@ fn parse_url(url: &str) -> Result<(String, u16, String)> {
     Ok((host.to_string(), port, path.to_string()))
 }
 
-fn parse_status(headers: &str) -> u16 {
+fn parse_status(headers: &str) -> Option<u16> {
     headers
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }
 
+/// Locate the end of the HTTP header block (the index of the `\r\n\r\n`).
+/// Retained for the framing unit tests; the live path now reads headers
+/// incrementally in `http_get` so the whole response is never buffered.
+#[cfg_attr(not(test), allow(dead_code))]
 fn find_header_end(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -357,9 +393,9 @@ mod tests {
 
     #[test]
     fn parse_status_extracts_code() {
-        assert_eq!(parse_status("HTTP/1.0 200 OK\r\nFoo: bar"), 200);
-        assert_eq!(parse_status("HTTP/1.1 301 Moved Permanently"), 301);
-        assert_eq!(parse_status("garbage"), 0);
+        assert_eq!(parse_status("HTTP/1.0 200 OK\r\nFoo: bar"), Some(200));
+        assert_eq!(parse_status("HTTP/1.1 301 Moved Permanently"), Some(301));
+        assert_eq!(parse_status("garbage"), None);
     }
 
     // ── New comprehensive tests ────────────────────────────────────────────────
@@ -552,12 +588,12 @@ mod tests {
         assert!(result.is_ok(), "exactly MAX_KEYDB_BYTES must be accepted");
     }
 
-    /// parse_status returns 0 for an empty status line (not a panic).
-    /// Mutation: calling unwrap() instead of unwrap_or(0) panics on empty input.
+    /// parse_status returns None for an empty/malformed status line (not a
+    /// meaningless 0). The call site maps None to Error::KeydbParse.
     #[test]
-    fn parse_status_empty_input_returns_0() {
-        assert_eq!(parse_status(""), 0);
-        assert_eq!(parse_status("\r\n"), 0);
+    fn parse_status_empty_input_returns_none() {
+        assert_eq!(parse_status(""), None);
+        assert_eq!(parse_status("\r\n"), None);
     }
 
     /// Regression: set_read_timeout / set_write_timeout failures must surface as

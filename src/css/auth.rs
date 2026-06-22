@@ -195,8 +195,14 @@ fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
     .map_err(|_| Error::CssAuthFailed)?;
     let agid = (buf[7] >> 6) & 0x03;
 
-    // Host sends challenge
-    let host_challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    // Host sends challenge. The spec wants a fresh per-session random nonce,
+    // not a fixed constant — a predictable challenge weakens the bus-auth
+    // handshake.
+    let mut host_challenge = [0u8; 10];
+    {
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut host_challenge);
+    }
     let mut hc_buf = [0u8; 16];
     hc_buf[0] = 0x00;
     hc_buf[1] = 0x0E;
@@ -587,10 +593,20 @@ mod tests {
             }
         }
 
-        // Walk up from this file (src/css/auth.rs) to the crate `src` root.
-        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Scan this crate's `src` plus the sibling workspace crates so the
+        // key-material logging guard covers every crate that can reach the
+        // CSS/AACS internals, not just libfreemkv. Missing sibling dirs (e.g.
+        // when building the crate standalone) are simply skipped.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest.parent().unwrap_or(manifest);
         let mut violations = Vec::new();
-        scan_dir(&src_root, FORBIDDEN, &mut violations);
+        scan_dir(&manifest.join("src"), FORBIDDEN, &mut violations);
+        for sibling in ["autorip", "freemkv", "freemkv-keysources"] {
+            let dir = workspace.join(sibling).join("src");
+            if dir.is_dir() {
+                scan_dir(&dir, FORBIDDEN, &mut violations);
+            }
+        }
         assert!(
             violations.is_empty(),
             "key material logged in instrumentation:\n{}",

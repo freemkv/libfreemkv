@@ -351,10 +351,10 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     // non-conformant packet that sets the flags but declares a too-short
     // header would otherwise read payload bytes as a bogus timestamp.
     if pts_dts_flags >= 2 && header_data_len >= 5 && data.len() >= 14 {
-        pts = Some(parse_pts(&data[9..14]));
+        pts = parse_pts(&data[9..14]);
     }
     if pts_dts_flags == 3 && header_data_len >= 10 && data.len() >= 19 {
-        dts = Some(parse_pts(&data[14..19]));
+        dts = parse_pts(&data[14..19]);
     }
 
     let payload = &data[header_end..];
@@ -393,15 +393,21 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
 /// byte3: [pts 14..7:8]
 /// byte4: [pts 6..0:7][marker:1]
 /// ```
-fn parse_pts(buf: &[u8]) -> u64 {
+fn parse_pts(buf: &[u8]) -> Option<u64> {
     debug_assert!(buf.len() >= 5);
+    // Validate the three marker bits (bit 0 of bytes 0, 2, 4) per MPEG-2
+    // Systems Table 2-17. A timestamp with a cleared marker is malformed —
+    // matching ts.rs::parse_timestamp, reject it rather than decode garbage.
+    if (buf[0] & 0x01) == 0 || (buf[2] & 0x01) == 0 || (buf[4] & 0x01) == 0 {
+        return None;
+    }
     let b0 = buf[0] as u64;
     let b1 = buf[1] as u64;
     let b2 = buf[2] as u64;
     let b3 = buf[3] as u64;
     let b4 = buf[4] as u64;
 
-    ((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1
+    Some(((b0 >> 1) & 0x07) << 30 | b1 << 22 | (b2 >> 1) << 15 | b3 << 7 | b4 >> 1)
 }
 
 #[cfg(test)]
@@ -748,7 +754,7 @@ mod tests {
     fn pts_zero() {
         // PTS = 0 encoded
         let pts = parse_pts(&encode_pts(0, 0x20));
-        assert_eq!(pts, 0);
+        assert_eq!(pts, Some(0));
     }
 
     #[test]
@@ -757,7 +763,7 @@ mod tests {
         let val: u64 = (1 << 32) - 1; // 0xFFFFFFFF
         let encoded = encode_pts(val, 0x20);
         let decoded = parse_pts(&encoded);
-        assert_eq!(decoded, val);
+        assert_eq!(decoded, Some(val));
     }
 
     // --- DVD PID mapping (track-routing collision regression) ---
@@ -886,7 +892,23 @@ mod tests {
         // The PTS field is exactly 33 bits; 2^33-1 must round-trip — a
         // truncated shift/mask would lose the top bits.
         let max = (1u64 << 33) - 1;
-        assert_eq!(parse_pts(&encode_pts(max, 0x20)), max);
+        assert_eq!(parse_pts(&encode_pts(max, 0x20)), Some(max));
+    }
+
+    #[test]
+    fn parse_pts_rejects_bad_marker_bits() {
+        // A timestamp with any marker bit (bit 0 of bytes 0/2/4) cleared is
+        // malformed and must be rejected, matching ts.rs::parse_timestamp.
+        let mut buf = encode_pts(90000, 0x20);
+        assert!(parse_pts(&buf).is_some());
+        buf[0] &= !0x01;
+        assert_eq!(parse_pts(&buf), None);
+        let mut buf = encode_pts(90000, 0x20);
+        buf[2] &= !0x01;
+        assert_eq!(parse_pts(&buf), None);
+        let mut buf = encode_pts(90000, 0x20);
+        buf[4] &= !0x01;
+        assert_eq!(parse_pts(&buf), None);
     }
 
     // ── pack header (0xBA) framing ────────────────────────────────────────

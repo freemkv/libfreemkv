@@ -606,7 +606,10 @@ impl Resolution {
             6 => Resolution::R1080p,
             7 => Resolution::R576p,
             8 => Resolution::R2160p,
-            _ => Resolution::Unknown,
+            other => {
+                tracing::warn!(video_format = other, "unknown MPLS video_format byte");
+                Resolution::Unknown
+            }
         }
     }
 
@@ -675,7 +678,10 @@ impl FrameRate {
             6 => FrameRate::F50,
             7 => FrameRate::F59_94,
             8 => FrameRate::F60,
-            _ => FrameRate::Unknown,
+            other => {
+                tracing::warn!(video_rate = other, "unknown MPLS video_rate byte");
+                FrameRate::Unknown
+            }
         }
     }
 
@@ -705,7 +711,10 @@ impl AudioChannels {
             3 => AudioChannels::Stereo,
             6 => AudioChannels::Surround51,
             12 => AudioChannels::Surround71,
-            _ => AudioChannels::Unknown,
+            other => {
+                tracing::warn!(audio_format = other, "unknown MPLS audio_format byte");
+                AudioChannels::Unknown
+            }
         }
     }
 
@@ -751,7 +760,10 @@ impl SampleRate {
             5 => SampleRate::S192,
             12 => SampleRate::S48_192,
             14 => SampleRate::S48_96,
-            _ => SampleRate::Unknown,
+            other => {
+                tracing::warn!(audio_rate = other, "unknown MPLS audio_rate byte");
+                SampleRate::Unknown
+            }
         }
     }
 
@@ -881,7 +893,12 @@ macro_rules! enum_str {
                 for (s, v) in $name::ALL {
                     if v == self { return f.write_str(s); }
                 }
-                f.write_str("")
+                // The only variant not in ALL is the Unknown fallback (kept out
+                // of ALL so FromStr("unknown") round-trips to it via $default
+                // without ALL gaining a duplicate key). Display it visibly as
+                // "unknown" rather than an empty string, which produced blank
+                // metadata in labels and logs.
+                f.write_str("unknown")
             }
         }
         impl std::str::FromStr for $name {
@@ -981,7 +998,10 @@ impl std::str::FromStr for HdrFormat {
                 return Ok(*v);
             }
         }
-        Ok(HdrFormat::Sdr)
+        // An unrecognised string is an error, not silently SDR. ("sdr"/"SDR"
+        // already matched above.) Callers that want SDR-on-unknown opt in
+        // explicitly with `.unwrap_or(HdrFormat::Sdr)` (e.g. mux/meta.rs).
+        Err(())
     }
 }
 
@@ -1296,7 +1316,13 @@ impl Disc {
                 // unreliable). The real descramble key is recovered from the
                 // scrambled movie data itself via the known-plaintext attack — no
                 // player keys, no disc-key crack, no REPORT-KEY-derived title key.
-                let _ = crate::css::auth::unlock_css_reads(session, unlock_lba);
+                if let Err(e) = crate::css::auth::unlock_css_reads(session, unlock_lba) {
+                    tracing::warn!(
+                        target: "freemkv::scan",
+                        error_code = e.code(),
+                        "CSS bus-auth unlock failed; scrambled sectors may be unavailable"
+                    );
+                }
                 // Size the crack's batch reads to THIS drive's per-command max
                 // (DVD ≈ 16; the USB bridge may be lower) — an over-large
                 // READ(10) fails outright and would scan nothing.
@@ -1805,17 +1831,71 @@ impl Disc {
                 read_data_key: aacs.read_data_key,
             }
         } else if let Some(ref css) = self.css {
-            // KNOWN LIMITATION (post-1.0): one CSS title key is cracked from the
-            // main feature and used for every title. On a multi-VTS DVD where a
-            // secondary VTS carries a *different* per-VTS key, muxing that title
-            // (`freemkv -t N`) would descramble with the wrong key. The main
-            // feature, single-VTS discs, and autorip (always title 0) are
-            // unaffected; per-VTS key storage is tracked for a follow-up.
             crate::decrypt::DecryptKeys::Css {
                 title_key: css.title_key,
             }
         } else {
             crate::decrypt::DecryptKeys::None
+        }
+    }
+
+    /// Resolve decryption keys for muxing a *specific* title.
+    ///
+    /// CSS title keys are per-VTS. The scan cracks one key (from the main
+    /// feature, title 0 for autorip). Applying it to a title that lives in
+    /// a *different* VTS would silently descramble with the wrong key
+    /// (garbage output). When the requested title's extents don't overlap
+    /// the span the cracked key came from, re-crack the key from this
+    /// title's own extents using `reader`. AACS / unencrypted / single-VTS
+    /// paths are identical to [`Self::decrypt_keys`].
+    ///
+    /// `batch_sectors` sizes the crack's batched reads (file-safe value for
+    /// an ISO; `detect_max_batch_sectors` for a live drive).
+    pub fn decrypt_keys_for_title(
+        &self,
+        idx: usize,
+        reader: &mut dyn SectorSource,
+        batch_sectors: u16,
+    ) -> crate::decrypt::DecryptKeys {
+        let css = match self.css {
+            Some(ref c) => c,
+            None => return self.decrypt_keys(),
+        };
+        let title = match self.titles.get(idx) {
+            Some(t) if !t.extents.is_empty() => t,
+            // No extents to crack from — fall back to the disc-wide key.
+            _ => return self.decrypt_keys(),
+        };
+        // If the title overlaps the span the existing key was cracked from,
+        // it's the same VTS — the cracked key applies. `crack_span: None`
+        // (unknown provenance) is also treated as "applies".
+        let overlaps = match css.crack_span {
+            None => true,
+            Some((cs, ce)) => title.extents.iter().any(|e| {
+                let ts = e.start_lba;
+                let te = e.start_lba.saturating_add(e.sector_count);
+                ts < ce && cs < te
+            }),
+        };
+        if overlaps {
+            return self.decrypt_keys();
+        }
+        // Different VTS: re-crack from this title's extents, largest first
+        // (the movie body is the biggest scrambled chunk — same heuristic
+        // the scan uses). The disc-wide key provably does NOT apply here
+        // (crack_span is Some and this title doesn't overlap it), so a
+        // re-crack miss is a HARD failure: return None rather than fall
+        // back to the known-wrong-VTS key, which would silently descramble
+        // to garbage. The disc-wide fallback is reserved for the unknown-
+        // provenance case (crack_span == None), already handled above via
+        // overlaps == true.
+        let mut extents = title.extents.clone();
+        extents.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
+        match crate::css::crack_key(reader, &extents, batch_sectors) {
+            Some(state) => crate::decrypt::DecryptKeys::Css {
+                title_key: state.title_key,
+            },
+            None => crate::decrypt::DecryptKeys::None,
         }
     }
 
@@ -2084,6 +2164,24 @@ impl Disc {
                     );
                     return self.sweep_internal(reader, path, opts, false);
                 }
+                // NonTried bytes mean a prior sweep was halted mid-way and the
+                // mapfile still has un-attempted ranges (the un-swept tail).
+                // The sweep pass's job is to read those — route to a resume
+                // sweep FIRST, even when retryable bytes also exist. Checking
+                // retryable before this (and routing straight to patch) would
+                // silently abandon the un-swept tail: patch only revisits the
+                // mapfile's bad ranges, never the NonTried ones. The retry
+                // (patch) passes run after, driven separately by the caller's
+                // pass loop, and pick up the retryable bytes the sweep leaves.
+                if stats.bytes_nontried > 0 {
+                    tracing::info!(
+                        "copy dispatch: → sweep resume (covers_disc=true, \
+                         nontried={}, retryable={})",
+                        stats.bytes_nontried,
+                        stats.bytes_retryable,
+                    );
+                    return self.sweep_internal(reader, path, opts, true);
+                }
                 if stats.bytes_retryable > 0 {
                     tracing::info!(
                         "copy dispatch: → patch (retryable={})",
@@ -2091,28 +2189,11 @@ impl Disc {
                     );
                     return self.patch_internal(reader, path, opts);
                 }
-                // Fallthrough: covers_disc=true, bytes_retryable=0.
-                // Two sub-cases:
-                //
-                // (a) bytes_nontried > 0: the mapfile covers the disc but
-                //     some ranges were never attempted (e.g. a prior sweep
-                //     was halted mid-way and the mapfile has NonTried gaps).
-                //     Route to a resume sweep so those unread ranges are
-                //     actually read. Returning terminal here would silently
-                //     abandon readable data.
-                //
-                // (b) bytes_nontried == 0: all sectors were attempted; any
-                //     remaining bad bytes are already Unreadable — a resume
-                //     sweep would visit zero new sectors and be a no-op.
-                //     Return the terminal result immediately.
-                if stats.bytes_nontried > 0 {
-                    tracing::info!(
-                        "copy dispatch: → sweep resume (covers_disc=true, \
-                         retryable=0, nontried={})",
-                        stats.bytes_nontried,
-                    );
-                    return self.sweep_internal(reader, path, opts, true);
-                }
+                // Fallthrough: covers_disc=true, nontried=0, retryable=0.
+                // All sectors were attempted; any remaining bad bytes are
+                // already Unreadable. A resume sweep would visit zero new
+                // sectors and patch has nothing retryable — return the
+                // terminal result immediately.
                 tracing::info!(
                     "copy dispatch: all bad sectors already Unreadable \
                      (retryable=0, nontried=0) — returning terminal result",
@@ -2223,6 +2304,10 @@ impl Disc {
         } else {
             crate::decrypt::DecryptKeys::None
         };
+        // Captured before `keys` moves into the decorator below. A decrypting
+        // AACS-keyed sweep needs unit-aligned (3-sector) batch sizing + region
+        // read-starts (see the batch computation further down).
+        let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
 
         // Wrap the producer-side reader once so every read_sectors call
         // yields plaintext. `DecryptKeys::None` makes the decorator a
@@ -2235,8 +2320,73 @@ impl Disc {
 
         // Mapfile: load if resuming, else wipe + recreate.
         let mapfile_path = self.mapfile_for(path);
-        if !opts.resume {
-            let _ = std::fs::remove_file(&mapfile_path);
+        // covers_disc reconciliation. A resume against a mapfile whose total
+        // size != the real disc size is unsafe — exactly the case copy()'s
+        // dispatch forces to a fresh sweep (see Disc::copy). Under-cover
+        // (map < disc) abandons the disc tail [map.total_size(), disc);
+        // over-cover (map > disc) reads LBAs past capacity. When sweep() is
+        // called directly (not via copy()), apply the same downgrade: drop the
+        // stale mapfile and sweep [0, total_bytes) fresh.
+        let mut resume = opts.resume;
+        if resume && mapfile_path.exists() {
+            match mapfile::Mapfile::load(&mapfile_path) {
+                Ok(existing) => {
+                    if existing.total_size() != total_bytes {
+                        tracing::info!(
+                            "sweep: mapfile total_size {} != disc {}; forcing fresh sweep",
+                            existing.total_size(),
+                            total_bytes,
+                        );
+                        resume = false;
+                    } else {
+                        // Inconsistent-resume guard. The mapfile claims prior
+                        // progress (some range past NonTried) but the ISO is
+                        // missing or zero-length — the ISO was deleted or
+                        // truncated while the mapfile survived (reachable via
+                        // autorip ResumeMode::Require). The producer only builds
+                        // work from NonTried ranges, so any Finished range would
+                        // never be re-read and would stay ZERO in the fresh ISO,
+                        // silently holed. Downgrade to a fresh full sweep (mirror
+                        // the total_size-mismatch case) so the rip self-heals.
+                        let iso_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        let claims_progress =
+                            existing.stats().bytes_pending != existing.total_size();
+                        if iso_len == 0 && claims_progress {
+                            tracing::info!(
+                                "sweep: mapfile claims prior progress (pending {} of {}) but ISO is missing/zero-length; forcing fresh sweep",
+                                existing.stats().bytes_pending,
+                                existing.total_size(),
+                            );
+                            resume = false;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // The mapfile exists but is corrupt / unparseable. Proceeding
+                    // with resume=true would hand a garbage (or empty) mapfile to
+                    // open_or_create and silently skip already-Finished ranges or
+                    // mis-track progress. Downgrade to a fresh sweep — consistent
+                    // with the total_size-mismatch branch above — so the `!resume`
+                    // path below drops the corrupt mapfile and the rip restarts
+                    // clean.
+                    tracing::info!(
+                        "sweep: mapfile at {} is corrupt/unparseable; forcing fresh sweep",
+                        mapfile_path.display(),
+                    );
+                    resume = false;
+                }
+            }
+        }
+        if !resume {
+            // A fresh sweep MUST start from an empty mapfile. If the stale file
+            // can't be removed, open_or_create would load it and the new disc
+            // would inherit the old Finished ranges → silently zero-filled ISO.
+            // ENOENT is fine (nothing to remove); any other error aborts.
+            match std::fs::remove_file(&mapfile_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::IoError { source: e }),
+            }
         }
         let mut map = mapfile::Mapfile::open_or_create(
             &mapfile_path,
@@ -2262,7 +2412,7 @@ impl Disc {
         let is_regular = std::fs::metadata(path)
             .map(|m| m.file_type().is_file())
             .unwrap_or(false);
-        let file = if opts.resume
+        let file = if resume
             && std::fs::metadata(path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
@@ -2285,11 +2435,29 @@ impl Disc {
         // `crate::io`). The `WritebackFile` moves into the consumer
         // thread.
         let file = crate::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
-        let batch: u16 = match opts.batch_sectors {
+        let mut batch: u16 = match opts.batch_sectors {
             Some(b) => b,
             None if opts.skip_on_error => ecc_sectors(self.format),
             None => DEFAULT_BATCH_SECTORS_OPTICAL,
         };
+
+        // AACS unit alignment for a DECRYPTING sweep. AACS aligned units are 3
+        // sectors (6144 bytes); `decrypt_sectors` anchors units at buffer offset
+        // 0, so every read handed to the decrypting reader MUST start on a unit
+        // boundary AND span a whole number of units — otherwise units straddle
+        // batch/region boundaries and decrypt under the wrong CBC/unit alignment
+        // (the verify-gate then leaves content encrypted or aborts DecryptFailed).
+        //
+        // ecc_sectors() is 32 for UHD/BD, which is NOT a multiple of 3, so the
+        // default batch would start every batch-after-the-first mid-unit. Round
+        // the batch UP to the next multiple of 3 (32 → 33) when this sweep both
+        // decrypts and is AACS-keyed. Region read-starts are aligned DOWN to a
+        // unit boundary in the loop below; a fresh sweep starts at LBA 0 (already
+        // aligned), so alignment only bites on resume NonTried regions.
+        const UNIT_SECTORS: u16 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u16; // 3
+        if decrypt_is_aacs && batch % UNIT_SECTORS != 0 {
+            batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
+        }
 
         // Pre-compute the list of NonTried regions before handing the
         // mapfile to the consumer thread. Each region is processed by
@@ -2322,7 +2490,7 @@ impl Disc {
             phase = "sweep",
             total_bytes,
             skip_on_error = opts.skip_on_error,
-            resume = opts.resume,
+            resume,
             "begin"
         );
         let mut iter_count: u64 = 0;
@@ -2360,7 +2528,19 @@ impl Disc {
 
         'outer: for (region_pos, region_size) in regions {
             let region_end = region_pos + region_size;
-            let mut pos = region_pos;
+            // AACS unit alignment: anchor the region's read cursor DOWN to the
+            // nearest 6144-byte unit boundary so the decrypting reader never gets
+            // a buffer that starts mid-unit. Re-reading the few already-covered
+            // head sectors is idempotent (they re-decrypt identically and the
+            // consumer overwrites the same ISO offsets / mapfile ranges). A fresh
+            // sweep's NonTried region starts at 0, already unit-aligned; this only
+            // shifts resume regions that begin mid-unit.
+            let mut pos = if decrypt_is_aacs {
+                let unit_bytes = crate::aacs::ALIGNED_UNIT_LEN as u64;
+                region_pos - (region_pos % unit_bytes)
+            } else {
+                region_pos
+            };
             tracing::trace!(
                 target: "freemkv::disc",
                 phase = "region_enter",
@@ -3081,7 +3261,7 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
             if let Ok(content) = std::fs::read_to_string(&sysfs_path) {
                 if let Ok(kb) = content.trim().parse::<u32>() {
                     // Convert KB to sectors (1 sector = 2 KB = 2048 bytes)
-                    let sectors = (kb / 2) as u16;
+                    let sectors = (kb / 2).min(u16::MAX as u32) as u16;
                     // Align down to 3 (one aligned unit)
                     let aligned = (sectors / 3) * 3;
                     if aligned >= MIN_BATCH_SECTORS {
@@ -3103,6 +3283,52 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AACS unit-alignment of the DECRYPTING multipass sweep. AACS aligned units
+    /// are 3 sectors (6144 bytes); `decrypt_sectors` anchors units at buffer
+    /// offset 0, so the sweep MUST (a) round its per-batch sector count UP to a
+    /// multiple of 3 and (b) align each NonTried region's read cursor DOWN to a
+    /// unit boundary — otherwise batches after the first start mid-unit and every
+    /// unit decrypts under the wrong CBC/unit alignment.
+    ///
+    /// This mirrors the exact arithmetic the sweep loop uses (the full path needs
+    /// a live AACS `Disc`, out of reach in a unit test). The decorator-level
+    /// reject for an unaligned start LBA is covered end-to-end in
+    /// `sector::decrypting::tests::aacs_unaligned_start_lba_rejected`.
+    #[test]
+    fn aacs_sweep_batch_and_region_are_unit_aligned() {
+        const UNIT_SECTORS: u16 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u16; // 3
+        let unit_bytes = crate::aacs::ALIGNED_UNIT_LEN as u64; // 6144
+
+        // (a) Batch rounding: ecc_sectors() for UHD/BD is 32, not a multiple of 3.
+        // The decrypting-AACS path rounds it up to the next multiple of 3 (33).
+        for format in [DiscFormat::Uhd, DiscFormat::BluRay] {
+            let mut batch = ecc_sectors(format);
+            assert_eq!(batch, 32);
+            if batch % UNIT_SECTORS != 0 {
+                batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
+            }
+            assert_eq!(batch, 33, "batch must round 32 -> 33 (a multiple of 3)");
+            assert_eq!(batch % UNIT_SECTORS, 0);
+            // Every full batch read is then a whole number of 6144-byte units.
+            assert_eq!((batch as u64 * 2048) % unit_bytes, 0);
+        }
+
+        // (b) Region-start down-alignment. A resume NonTried region can begin
+        // mid-unit; aligning the read cursor DOWN to the nearest unit boundary
+        // makes block_lba % 3 == 0 for the first (and thus every) batch read.
+        // Re-reading the few head sectors is idempotent.
+        for region_pos in [0u64, 2048, 4096, 6144, 8192, 65536, 67_584] {
+            let pos = region_pos - (region_pos % unit_bytes);
+            assert_eq!(pos % unit_bytes, 0, "aligned cursor must be unit-aligned");
+            assert!(pos <= region_pos, "alignment only moves the cursor down");
+            // block_lba derived as pos/2048 must be a multiple of 3 sectors.
+            assert_eq!((pos / 2048) % UNIT_SECTORS as u64, 0);
+        }
+        // An already-aligned region (fresh sweep starts at 0) is unchanged.
+        assert_eq!(0u64 - (0u64 % unit_bytes), 0);
+        assert_eq!(6144u64 - (6144u64 % unit_bytes), 6144);
+    }
 
     /// Helper: build a DiscTitle with a single video stream at the given resolution.
     fn title_with_video(codec: Codec, resolution: Resolution) -> DiscTitle {
@@ -3671,9 +3897,109 @@ mod tests {
         dvd.encrypted = true;
         dvd.css = Some(crate::css::CssState {
             title_key: [0u8; 5],
+            crack_span: None,
         });
         dvd.inject_unit_keys(vec![(0, [0x33; 16])]);
         assert!(dvd.aacs.is_none(), "CSS disc must not gain an AACS state");
+    }
+
+    /// Records the LBAs read; returns all-zero (unscrambled) sectors so any
+    /// re-crack attempt finds no key and falls back, while we observe WHETHER
+    /// the title's extents were read at all.
+    struct RecordingSource {
+        reads: std::cell::RefCell<Vec<u32>>,
+    }
+    impl SectorSource for RecordingSource {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            self.reads.borrow_mut().push(lba);
+            let n = (count as usize * 2048).min(buf.len());
+            for b in buf[..n].iter_mut() {
+                *b = 0;
+            }
+            Ok(n)
+        }
+    }
+
+    fn css_disc_with_two_vts() -> Disc {
+        // Title 0 (cracked VTS) at LBA 100..200; title 1 (other VTS) at
+        // 5000..5100. The cracked key's span is title 0's extents.
+        let mut t0 = title_with_video(Codec::Mpeg2, Resolution::R480p);
+        t0.extents = vec![Extent {
+            start_lba: 100,
+            sector_count: 100,
+        }];
+        let mut t1 = title_with_video(Codec::Mpeg2, Resolution::R480p);
+        t1.playlist = "00801.mpls".into();
+        t1.extents = vec![Extent {
+            start_lba: 5000,
+            sector_count: 100,
+        }];
+        let mut disc = make_test_disc(6000, "DVD");
+        disc.format = DiscFormat::Dvd;
+        disc.content_format = ContentFormat::MpegPs;
+        disc.encrypted = true;
+        disc.titles = vec![t0, t1];
+        disc.css = Some(crate::css::CssState {
+            title_key: [0xAB; 5],
+            crack_span: Some((100, 200)),
+        });
+        disc
+    }
+
+    /// Regression (multi-VTS CSS): a title that OVERLAPS the cracked span is
+    /// the same VTS — the existing key is reused and the reader is NOT touched.
+    #[test]
+    fn decrypt_keys_for_title_reuses_key_for_same_vts() {
+        let disc = css_disc_with_two_vts();
+        let mut src = RecordingSource {
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        match disc.decrypt_keys_for_title(0, &mut src, 16) {
+            crate::decrypt::DecryptKeys::Css { title_key } => {
+                assert_eq!(title_key, [0xAB; 5], "same-VTS title reuses cracked key");
+            }
+            _ => panic!("expected Css keys for same-VTS title"),
+        }
+        assert!(
+            src.reads.borrow().is_empty(),
+            "an overlapping title must not trigger a re-crack read"
+        );
+    }
+
+    /// Regression (multi-VTS CSS): a title in a DIFFERENT VTS (no overlap with
+    /// the cracked span) must re-crack from its OWN extents — verified by the
+    /// reader being driven over that title's LBA range (5000..). The fixture
+    /// yields unscrambled sectors so the re-crack finds NO key; the fix
+    /// requires this to be a HARD failure (`DecryptKeys::None`), NOT a silent
+    /// fall-back to the known-wrong-VTS disc-wide key (which would descramble
+    /// to garbage). Both the read-attempt and the None result are asserted.
+    #[test]
+    fn decrypt_keys_for_title_recracks_for_other_vts() {
+        let disc = css_disc_with_two_vts();
+        let mut src = RecordingSource {
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let keys = disc.decrypt_keys_for_title(1, &mut src, 16);
+        assert!(
+            matches!(keys, crate::decrypt::DecryptKeys::None),
+            "a re-crack miss in a provably-different VTS must be a hard failure (None), \
+             not the wrong-VTS disc-wide key"
+        );
+        let reads = src.reads.borrow();
+        assert!(
+            !reads.is_empty(),
+            "a non-overlapping title must trigger a re-crack read"
+        );
+        assert!(
+            reads.iter().all(|&lba| lba >= 5000),
+            "re-crack must read title 1's own extents (>=5000), got {reads:?}"
+        );
     }
 
     #[test]
@@ -3729,6 +4055,271 @@ mod tests {
         );
     }
 
+    /// Regression (finding 6): sweep() resume against a mapfile whose
+    /// total_size != the real disc size must DOWNGRADE to a fresh full sweep
+    /// covering [0, capacity), not reuse the stale mapfile (which would
+    /// abandon the disc tail or read past capacity). Mirrors copy()'s
+    /// covers_disc reconciliation for the direct-sweep entry point.
+    #[test]
+    fn sweep_resume_downgrades_on_size_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("mismatch.iso");
+
+        // First sweep: a small disc → mapfile sized to small_sectors.
+        let small_sectors: u32 = 500;
+        let mut small_reader = MockReader {
+            total_sectors: small_sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let small_disc = make_test_disc(small_sectors, "SMALL");
+        let opts0 = SweepOptions {
+            decrypt: false,
+            resume: false,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        small_disc
+            .sweep(&mut small_reader, &iso_path, &opts0)
+            .expect("initial small sweep");
+        let mf = small_disc.mapfile_for(&iso_path);
+        assert_eq!(
+            mapfile::Mapfile::load(&mf).unwrap().total_size(),
+            small_sectors as u64 * 2048,
+            "precondition: mapfile reflects the small disc"
+        );
+
+        // Now a LARGER disc resumes against that stale (under-cover) mapfile.
+        // The reconciliation must force a fresh full sweep of the big disc.
+        let big_sectors: u32 = 2000;
+        let mut big_reader = MockReader {
+            total_sectors: big_sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let big_disc = make_test_disc(big_sectors, "BIG");
+        let opts_resume = SweepOptions {
+            resume: true,
+            ..opts0
+        };
+        let result = big_disc
+            .sweep(&mut big_reader, &iso_path, &opts_resume)
+            .expect("resume sweep on mismatched mapfile");
+
+        assert_eq!(
+            result.bytes_total,
+            big_sectors as u64 * 2048,
+            "fresh sweep must be sized to the real (big) disc"
+        );
+        assert_eq!(
+            result.bytes_good,
+            big_sectors as u64 * 2048,
+            "the whole big disc (incl. the tail beyond the stale mapfile) must be swept"
+        );
+        assert_eq!(
+            mapfile::Mapfile::load(&mf).unwrap().total_size(),
+            big_sectors as u64 * 2048,
+            "mapfile must be re-created at the real disc size, not the stale one"
+        );
+    }
+
+    /// Regression (resume/mapfile consistency, MED): a resume sweep against a
+    /// mapfile that claims prior progress (Finished ranges) while the ISO is
+    /// missing/zero-length must DOWNGRADE to a fresh full sweep — NOT reuse the
+    /// stale mapfile. The producer only builds work from NonTried ranges, so a
+    /// reused mapfile would leave every Finished range unread and ZERO in the
+    /// new ISO (a silent hole). Reachable via autorip ResumeMode::Require when
+    /// the ISO was deleted/truncated but the mapfile survived. The fresh-sweep
+    /// downgrade self-heals: all ranges are re-read and the ISO is fully
+    /// populated.
+    #[test]
+    fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("zeroed.iso");
+
+        let sectors: u32 = 500;
+        let total_bytes = sectors as u64 * 2048;
+        let disc = make_test_disc(sectors, "ZEROED");
+
+        // First sweep: clean disc → ISO fully written, mapfile all-Finished.
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let opts0 = SweepOptions {
+            decrypt: false,
+            resume: false,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        disc.sweep(&mut reader, &iso_path, &opts0)
+            .expect("initial clean sweep");
+        let mf = disc.mapfile_for(&iso_path);
+        let loaded = mapfile::Mapfile::load(&mf).unwrap();
+        assert_eq!(
+            loaded.stats().bytes_pending,
+            0,
+            "precondition: a clean sweep leaves no pending (all Finished) ranges"
+        );
+
+        // Truncate the ISO to zero length while the progress-claiming mapfile
+        // survives — exactly the inconsistent-resume case.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&iso_path)
+            .expect("truncate ISO to zero");
+        assert_eq!(
+            std::fs::metadata(&iso_path).unwrap().len(),
+            0,
+            "precondition: ISO is zero-length"
+        );
+
+        // Resume sweep: must downgrade to a fresh FULL sweep, re-reading every
+        // range (including the formerly-Finished ones).
+        let mut reader2 = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let opts_resume = SweepOptions {
+            resume: true,
+            ..opts0
+        };
+        let result = disc
+            .sweep(&mut reader2, &iso_path, &opts_resume)
+            .expect("resume sweep on zero-length ISO");
+
+        // A holed resume would re-read nothing (no NonTried ranges) → bytes_good
+        // == 0 and a zero ISO. The downgrade re-reads the whole disc.
+        assert_eq!(
+            result.bytes_good, total_bytes,
+            "downgrade must re-read the whole disc, not skip Finished ranges"
+        );
+        assert_eq!(
+            std::fs::metadata(&iso_path).unwrap().len(),
+            total_bytes,
+            "ISO must be re-sized + fully written, not left zero/holed"
+        );
+
+        // The ISO must actually contain the swept data (0xAA) at LBA 0 — proof
+        // the formerly-Finished head range was re-read, not left as a hole.
+        let iso = std::fs::read(&iso_path).unwrap();
+        assert_eq!(
+            &iso[..2048],
+            &[0xAAu8; 2048][..],
+            "head sector must hold re-read data, not a zero hole"
+        );
+    }
+
+    /// Regression (resume reconciliation, MED follow-on): a resume sweep against
+    /// a CORRUPT / unparseable mapfile must DOWNGRADE to a fresh full sweep —
+    /// not proceed with resume=true (which would hand a garbage/empty mapfile to
+    /// open_or_create and silently skip ranges). The `load()` Err arm sets
+    /// resume=false; the `!resume` path then drops the corrupt mapfile and the
+    /// rip restarts clean. Consistent with the total_size-mismatch downgrade.
+    #[test]
+    fn sweep_resume_downgrades_on_corrupt_mapfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("corrupt.iso");
+
+        let sectors: u32 = 500;
+        let total_bytes = sectors as u64 * 2048;
+        let disc = make_test_disc(sectors, "CORRUPT");
+        let mf = disc.mapfile_for(&iso_path);
+
+        // Write a non-empty ISO so the zero-length-ISO guard is NOT what triggers
+        // the downgrade — we want the corrupt-mapfile path specifically.
+        std::fs::write(&iso_path, vec![0u8; total_bytes as usize]).unwrap();
+        // Plant a corrupt mapfile: garbage bytes that Mapfile::load can't parse.
+        std::fs::write(&mf, b"this is not a valid ddrescue mapfile\nxxxx\n").unwrap();
+        assert!(
+            mapfile::Mapfile::load(&mf).is_err(),
+            "precondition: the planted mapfile must be unparseable"
+        );
+
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let opts = SweepOptions {
+            decrypt: false,
+            resume: true,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        let result = disc
+            .sweep(&mut reader, &iso_path, &opts)
+            .expect("resume sweep on corrupt mapfile");
+
+        // The downgrade must re-sweep the whole disc from a fresh mapfile.
+        assert_eq!(
+            result.bytes_good, total_bytes,
+            "corrupt-mapfile resume must downgrade to a fresh full sweep"
+        );
+        let reloaded = mapfile::Mapfile::load(&mf)
+            .expect("a valid mapfile must have been written by the fresh sweep");
+        assert_eq!(
+            reloaded.total_size(),
+            total_bytes,
+            "mapfile must be re-created at the real disc size"
+        );
+        assert_eq!(
+            reloaded.stats().bytes_pending,
+            0,
+            "the fresh sweep must leave all ranges Finished"
+        );
+    }
+
+    /// Regression: a fresh (non-resume) sweep MUST abort if the stale mapfile
+    /// cannot be removed, rather than swallowing the error and letting
+    /// `open_or_create` load the stale file (which would make the new disc
+    /// inherit old Finished ranges → silently zero-filled ISO). We force the
+    /// remove to fail with a non-ENOENT error by placing a NON-EMPTY DIRECTORY
+    /// at the mapfile path (`remove_file` on a dir fails, and a non-empty dir
+    /// can't be ENOENT).
+    #[test]
+    fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("blocked.iso");
+
+        let sectors: u32 = 500;
+        let disc = make_test_disc(sectors, "BLOCKED");
+        let mf = disc.mapfile_for(&iso_path);
+        // Put a non-empty directory where the mapfile would live.
+        std::fs::create_dir_all(&mf).unwrap();
+        std::fs::write(mf.join("occupant"), b"x").unwrap();
+
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let opts = SweepOptions {
+            decrypt: false,
+            resume: false,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        let result = disc.sweep(&mut reader, &iso_path, &opts);
+        assert!(
+            result.is_err(),
+            "fresh sweep must abort when the stale mapfile cannot be removed"
+        );
+    }
+
     struct CleanupGuard(std::path::PathBuf);
     impl Drop for CleanupGuard {
         fn drop(&mut self) {
@@ -3762,6 +4353,98 @@ mod tests {
         let r = result.unwrap();
         assert!(r.complete, "should be complete");
         assert_eq!(r.bytes_good, sectors as u64 * 2048);
+    }
+
+    /// Finding #6 regression: on resume, copy() must NOT abandon the un-swept
+    /// NonTried tail when retryable (NonTrimmed) bytes also remain. The mapfile
+    /// covers the disc and has BOTH a NonTrimmed (retryable) range and a
+    /// NonTried tail; dispatch must route to a resume sweep first so the tail is
+    /// actually read. Before the fix, `bytes_retryable > 0` short-circuited to
+    /// patch and the NonTried tail was silently left unread.
+    #[test]
+    fn resume_sweeps_nontried_tail_even_with_retryable_present() {
+        use crate::disc::mapfile::{Mapfile, SectorStatus};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Reader that records every LBA it is asked to read.
+        struct TrackingReader {
+            total_sectors: u32,
+            reads: Arc<Mutex<HashSet<u32>>>,
+        }
+        impl crate::sector::SectorSource for TrackingReader {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                {
+                    let mut r = self.reads.lock().unwrap();
+                    for i in 0..count as u32 {
+                        r.insert(lba + i);
+                    }
+                }
+                let n = count as usize * 2048;
+                buf[..n].fill(0xAA);
+                Ok(n)
+            }
+            fn capacity_sectors(&self) -> u32 {
+                self.total_sectors
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("test.iso");
+        let sectors: u32 = 200;
+        let disc = make_test_disc(sectors, "T6Tail");
+
+        // Pre-build a mapfile covering the whole disc:
+        //   [0..100)   Finished
+        //   [100..150) NonTrimmed (retryable)
+        //   [150..200) NonTried   (un-swept tail)
+        let mf_path = disc.mapfile_for(&iso_path);
+        {
+            let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+            mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+            mf.record(100 * 2048, 50 * 2048, SectorStatus::NonTrimmed)
+                .unwrap();
+            // [150..200) stays NonTried from create()'s initial region.
+            mf.flush().unwrap();
+
+            // Sanity on the constructed state.
+            let st = mf.stats();
+            assert!(st.bytes_nontried > 0, "must have a NonTried tail");
+            assert!(st.bytes_retryable > 0, "must have retryable bytes too");
+            assert_eq!(mf.total_size(), sectors as u64 * 2048);
+        }
+        // The ISO file must exist for the sweep to write into.
+        std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+
+        let reads = Arc::new(Mutex::new(HashSet::new()));
+        let mut reader = TrackingReader {
+            total_sectors: sectors,
+            reads: reads.clone(),
+        };
+        let opts = CopyOptions {
+            decrypt: false,
+            multipass: true,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        let result = disc.copy(&mut reader, &iso_path, &opts);
+        assert!(result.is_ok(), "resume copy failed: {:?}", result.err());
+
+        // The un-swept tail [150..200) MUST have been read by the resume sweep.
+        let got = reads.lock().unwrap();
+        let tail_read = (150u32..200).any(|lba| got.contains(&lba));
+        assert!(
+            tail_read,
+            "resume must sweep the NonTried tail; tail sectors were never read"
+        );
     }
 
     #[test]

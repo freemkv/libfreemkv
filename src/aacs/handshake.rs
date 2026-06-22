@@ -905,20 +905,23 @@ pub fn aacs_authenticate(
     drive_nonce.copy_from_slice(&response[4..24]);
     drive_cert.copy_from_slice(&response[24..116]);
 
-    // Verify drive certificate
+    // Verify drive certificate. `is_aacs20` tracks the 2.0 cert type so the
+    // step-6 key-signature verify below is skipped too (see there).
+    let is_aacs20 = drive_cert[0] == 0x11;
     if drive_cert[0] == 0x01 {
         // AACS 1.0 certificate
         if !verify_cert(&drive_cert) {
             return Err(Error::AacsCertVerify);
         }
-    } else if drive_cert[0] == 0x11 {
+    } else if is_aacs20 {
         // AACS 2.0 certificate — verification intentionally skipped here.
         // Reason: backward compatibility. AACS 2.0 drives accept AACS 1.0 host
         // certs, so we proceed with the AACS 1.0 flow regardless. The P-256
         // LA public key needed to verify 2.0 certs is not always available, and
         // failing here would break handshakes with drives that work fine otherwise.
-        // The drive's identity is still authenticated through the ECDH key
-        // exchange and signature verification in step 6 below.
+        // The 2.0 cert lays out its public key and signature at different byte
+        // offsets than the 1.0 cert, so the step-6 verify below (which reads
+        // 1.0 offsets) cannot validate a 2.0 cert and is skipped for it.
     }
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
@@ -930,19 +933,25 @@ pub fn aacs_authenticate(
     drive_key_point.copy_from_slice(&response[4..44]);
     drive_key_sig.copy_from_slice(&response[44..84]);
 
-    // Verify drive key signature: sign(drive_nonce=host_nonce || drive_key_point)
-    let (drive_pub_x, drive_pub_y) = cert_pub_key(&drive_cert);
-    let mut verify_data = [0u8; 60];
-    verify_data[..20].copy_from_slice(&host_nonce);
-    verify_data[20..60].copy_from_slice(&drive_key_point);
+    // Verify drive key signature: sign(drive_nonce=host_nonce || drive_key_point).
+    // Skipped for an AACS 2.0 (type 0x11) cert: `cert_pub_key` reads the public
+    // key at AACS-1.0 byte offsets, which don't apply to a 2.0 cert, so the
+    // verify would be meaningless (it would reject every 2.0 drive). Mirrors the
+    // cert-verify skip above; the ECDH key exchange still proceeds.
+    if !is_aacs20 {
+        let (drive_pub_x, drive_pub_y) = cert_pub_key(&drive_cert);
+        let mut verify_data = [0u8; 60];
+        verify_data[..20].copy_from_slice(&host_nonce);
+        verify_data[20..60].copy_from_slice(&drive_key_point);
 
-    let mut sig_r = [0u8; 20];
-    let mut sig_s = [0u8; 20];
-    sig_r.copy_from_slice(&drive_key_sig[..20]);
-    sig_s.copy_from_slice(&drive_key_sig[20..40]);
+        let mut sig_r = [0u8; 20];
+        let mut sig_s = [0u8; 20];
+        sig_r.copy_from_slice(&drive_key_sig[..20]);
+        sig_s.copy_from_slice(&drive_key_sig[20..40]);
 
-    if !ecdsa_verify(&drive_pub_x, &drive_pub_y, &sig_r, &sig_s, &verify_data) {
-        return Err(Error::AacsKeyVerify);
+        if !ecdsa_verify(&drive_pub_x, &drive_pub_y, &sig_r, &sig_s, &verify_data) {
+            return Err(Error::AacsKeyVerify);
+        }
     }
 
     // Step 7: Sign host key point (ECDSA over drive_nonce || host_key_point)

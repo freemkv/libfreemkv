@@ -85,6 +85,7 @@ pub const E_AACS_VUK_NOT_IN_KEYDB: u16 = 7019;
 pub const E_DRIVE_PROFILE_MISSING: u16 = 7020;
 pub const E_VID_CDB_UNAVAILABLE: u16 = 7021;
 pub const E_NO_DISC_KEY: u16 = 7022;
+pub const E_CSS_KEY_MISSING: u16 = 7023;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -304,6 +305,12 @@ pub enum Error {
     NoDiscKey {
         disc_hash: String,
     },
+    /// The disc is CSS-encrypted and decryption was requested, but the
+    /// known-plaintext crack resolved no usable title key for the chosen
+    /// title (e.g. a multi-VTS DVD where the title's VTS could not be
+    /// re-cracked). Muxing would emit scrambled ciphertext, so the caller
+    /// fails fast instead. CSS analogue of [`Error::NoDiscKey`].
+    CssKeyMissing,
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -479,6 +486,7 @@ impl Error {
             Error::DriveProfileMissing => E_DRIVE_PROFILE_MISSING,
             Error::VidCdbUnavailable => E_VID_CDB_UNAVAILABLE,
             Error::NoDiscKey { .. } => E_NO_DISC_KEY,
+            Error::CssKeyMissing => E_CSS_KEY_MISSING,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,

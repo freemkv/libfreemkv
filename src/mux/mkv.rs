@@ -6,7 +6,8 @@
 
 use super::ebml;
 use crate::disc::{
-    AudioStream, Chapter, Codec, ColorSpace, HdrFormat, SubtitleStream, VideoStream,
+    AudioChannels, AudioStream, Chapter, Codec, ColorSpace, HdrFormat, Resolution, SampleRate,
+    SubtitleStream, VideoStream,
 };
 use std::io::{self, Seek, Write};
 
@@ -68,7 +69,14 @@ impl MkvTrack {
             Codec::Mpeg2 => ebml::CODEC_MPEG2,
             _ => ebml::CODEC_MPEG2,
         };
-        let (w, h) = v.resolution.pixels();
+        // An Unknown resolution has no real dimensions — emit (0, 0) so the
+        // serializer omits PixelWidth/PixelHeight (Matroska marks them
+        // optional) rather than writing a fabricated 1920x1080 default.
+        let (w, h) = if matches!(v.resolution, Resolution::Unknown) {
+            (0, 0)
+        } else {
+            v.resolution.pixels()
+        };
         let (num, den) = v.frame_rate.as_fraction();
         let default_duration_ns = if num > 0 {
             (1_000_000_000u64 * den as u64) / num as u64
@@ -139,8 +147,20 @@ impl MkvTrack {
             Codec::Lpcm => ebml::CODEC_PCM_BE,
             _ => ebml::CODEC_AC3,
         };
-        let sr = a.sample_rate.hz();
-        let ch = a.channels.count();
+        // Unknown sample rate / channel layout: emit 0 so the serializer omits
+        // the SamplingFrequency / Channels element (Matroska supplies its own
+        // spec default) rather than writing a fabricated 48000 Hz / 6-channel
+        // value into the file.
+        let sr = if matches!(a.sample_rate, SampleRate::Unknown) {
+            0.0
+        } else {
+            a.sample_rate.hz()
+        };
+        let ch = if matches!(a.channels, AudioChannels::Unknown) {
+            0
+        } else {
+            a.channels.count()
+        };
 
         let name = a.label.clone();
 
@@ -592,7 +612,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if track.track_type == ebml::TRACK_TYPE_AUDIO && track.sample_rate > 0.0 {
                 let aud_pos = ebml::start_master(&mut writer, ebml::AUDIO)?;
                 ebml::write_float(&mut writer, ebml::SAMPLING_FREQUENCY, track.sample_rate)?;
-                ebml::write_uint(&mut writer, ebml::CHANNELS, track.channels as u64)?;
+                // Omit Channels when unknown (0) — Matroska defaults it to 1
+                // rather than us fabricating a 6-channel count.
+                if track.channels > 0 {
+                    ebml::write_uint(&mut writer, ebml::CHANNELS, track.channels as u64)?;
+                }
                 if track.bit_depth > 0 {
                     ebml::write_uint(&mut writer, ebml::BIT_DEPTH, track.bit_depth as u64)?;
                 }

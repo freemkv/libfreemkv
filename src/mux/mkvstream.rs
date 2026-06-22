@@ -214,7 +214,14 @@ impl crate::pes::Stream for MkvStream {
                         if cs == u64::MAX {
                             return Err(crate::error::Error::MkvInvalid.into());
                         }
-                        remaining = remaining.saturating_sub(hlen as u64 + cs);
+                        // A child whose header + body exceeds the bytes left in
+                        // the BlockGroup is malformed — reject it rather than
+                        // saturating `remaining` to 0 and reading past the group.
+                        let consumed = (hlen as u64).saturating_add(cs);
+                        if consumed > remaining {
+                            return Err(crate::error::Error::MkvInvalid.into());
+                        }
+                        remaining -= consumed;
                         match cid {
                             ebml::BLOCK => {
                                 block = Some(ebml::read_binary_val(
