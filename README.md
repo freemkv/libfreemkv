@@ -125,9 +125,9 @@ Streams implement a single unified `pes::Stream` trait (re-exported as `PesStrea
 
 ### Keys
 
-DVDs (CSS) decrypt out of the box. The library uses 31 compiled-in 1999-era public player keys (for disc-key cracking) combined with Frank Stevenson's known-plaintext title-key attack — no external key file needed.
+DVDs (CSS) decrypt out of the box, with no external key file needed.
 
-Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`). The file holds all DKs, PKs, host certs, and per-disc VUKs. No AACS key material is compiled into the binary.
+Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (or passed via `ScanOptions`). No AACS key material is compiled into the binary.
 
 ## Architecture
 
