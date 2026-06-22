@@ -1,8 +1,8 @@
 //! Drive session — open, identify, and read from optical drives.
 //!
 //! A `Drive` is opened from a device path, identifies itself via INQUIRY,
-//! optionally unlocks/initializes via a platform driver, and reads sectors.
-//! `probe_disc()` primes the firmware's per-region speed table.
+//! optionally unlocks/initializes via a registered [`crate::unlock::Unlocker`],
+//! and reads sectors.
 
 pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
@@ -27,9 +27,6 @@ pub(crate) mod windows;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::identity::DriveId;
-use crate::platform::PlatformDriver;
-use crate::platform::mt1959::Mt1959;
-use crate::profile::{self, DriveProfile};
 use crate::scsi::ScsiTransport;
 use crate::sector::SectorSource;
 use std::path::Path;
@@ -62,9 +59,15 @@ const SCSI_REPORT_KEY: u8 = 0xA4;
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct Drive {
     scsi: Box<dyn ScsiTransport>,
-    driver: Option<Box<dyn PlatformDriver>>,
-    pub profile: Option<DriveProfile>,
-    pub platform: Option<profile::Platform>,
+    /// Name of the [`crate::unlock::Unlocker`] that handled this drive at
+    /// `init()`, if any matched. `None` means no unlocker matched and the
+    /// drive runs in stock mode (host-cert AACS handshake carries discs).
+    unlocker_name: Option<String>,
+    /// True once `init()` has run (whether or not an unlocker matched).
+    init_ran: bool,
+    /// Lazily-computed registry-match name for `platform_name()`'s `&str`
+    /// return before `init()` has run.
+    matched_name_cache: std::sync::OnceLock<String>,
     pub drive_id: DriveId,
     device_path: String,
     /// Halt flag — when set, Drive::read() bails at the next check point.
@@ -88,7 +91,6 @@ impl Drive {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "open", device = %device.display(), "begin");
         let mut transport = crate::scsi::open(device)?;
-        let profiles = profile::load_bundled()?;
         let drive_id = DriveId::from_drive(transport.as_mut())?;
         tracing::info!(
             target: "freemkv::drive",
@@ -100,24 +102,14 @@ impl Drive {
             "end"
         );
 
-        let m = profile::find_by_drive_id(&profiles, &drive_id);
-        let (driver, platform, profile) = match m {
-            Some(m) => (
-                create_driver(m.platform, &m.profile).ok(),
-                Some(m.platform),
-                Some(m.profile),
-            ),
-            None => (None, None, None),
-        };
-
         #[cfg(target_os = "linux")]
         let block_dev_fd = open_block_device_for_sg(device);
 
         Ok(Drive {
             scsi: transport,
-            driver,
-            platform,
-            profile,
+            unlocker_name: None,
+            init_ran: false,
+            matched_name_cache: std::sync::OnceLock::new(),
             drive_id,
             device_path: device.to_string_lossy().to_string(),
             halt: Arc::new(AtomicBool::new(false)),
@@ -135,9 +127,9 @@ impl Drive {
     fn from_transport_for_test(scsi: Box<dyn ScsiTransport>) -> Self {
         Drive {
             scsi,
-            driver: None,
-            profile: None,
-            platform: None,
+            unlocker_name: None,
+            init_ran: false,
+            matched_name_cache: std::sync::OnceLock::new(),
             drive_id: DriveId {
                 vendor_id: String::new(),
                 product_id: String::new(),
@@ -212,16 +204,11 @@ impl Drive {
         self.unlock_tray();
     }
 
-    /// Whether this drive has a known profile (unlock parameters available).
+    /// Whether a registered unlocker matches this drive (i.e. it can be
+    /// firmware-unlocked). Queried against the unlock registry by identity;
+    /// does not require `init()` to have run.
     pub fn has_profile(&self) -> bool {
-        self.profile.is_some()
-    }
-
-    /// Borrow the matched drive profile, if any. Used by callers that
-    /// need to issue per-drive OEM CDB templates (e.g. the OEM VID
-    /// retrieval path in `disc::encrypt`).
-    pub fn drive_profile(&self) -> Option<&DriveProfile> {
-        self.profile.as_ref()
+        crate::unlock::matching_name(&self.drive_id).is_some()
     }
 
     /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
@@ -330,11 +317,17 @@ impl Drive {
         }
     }
 
+    /// Name of the unlocker handling this drive. After `init()` this is the
+    /// unlocker that ran; before `init()` it reflects the registry match by
+    /// identity. `"Unknown"` when no unlocker matches.
     pub fn platform_name(&self) -> &str {
-        match self.platform {
-            Some(ref p) => p.name(),
-            None => "Unknown",
+        if let Some(ref n) = self.unlocker_name {
+            return n;
         }
+        // Cache the registry match so we can hand out a `&str` borrow.
+        self.matched_name_cache.get_or_init(|| {
+            crate::unlock::matching_name(&self.drive_id).unwrap_or_else(|| "Unknown".to_string())
+        })
     }
 
     pub fn device_path(&self) -> &str {
@@ -395,20 +388,28 @@ impl Drive {
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
         if self.disc_is_dvd() {
             tracing::info!(target: "freemkv::drive", phase = "init", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no unlock)");
+            self.init_ran = true;
             return Ok(());
         }
-        let r = match self.driver {
-            Some(ref mut d) => d.init(self.scsi.as_mut()),
-            None => Err(Error::UnsupportedDrive {
-                vendor_id: self.drive_id.vendor_id.trim().to_string(),
-                product_id: self.drive_id.product_id.trim().to_string(),
-                product_revision: self.drive_id.product_revision.trim().to_string(),
-            }),
+        // Walk the unlock registry: the first unlocker whose identity
+        // matches runs; none matching leaves the drive in stock mode so the
+        // host-cert AACS handshake (the OEM route) carries the disc.
+        let r = crate::unlock::route_unlock(self.scsi.as_mut(), &self.drive_id);
+        self.init_ran = true;
+        let r = match r {
+            Ok(Some(name)) => {
+                self.unlocker_name = Some(name);
+                Ok(())
+            }
+            // No unlocker matched: not an error — fall through to OEM route.
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
         };
         tracing::info!(
             target: "freemkv::drive",
             phase = "init",
             ok = r.is_ok(),
+            unlocker = self.unlocker_name.as_deref().unwrap_or("none"),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "end"
         );
@@ -427,22 +428,15 @@ impl Drive {
             tracing::info!(target: "freemkv::drive", phase = "probe_disc", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no calibration)");
             return Ok(());
         }
-        let r = match self.driver {
-            Some(ref mut d) => d.probe_disc(self.scsi.as_mut()),
-            None => Err(Error::UnsupportedDrive {
-                vendor_id: self.drive_id.vendor_id.trim().to_string(),
-                product_id: self.drive_id.product_id.trim().to_string(),
-                product_revision: self.drive_id.product_revision.trim().to_string(),
-            }),
-        };
+        // Disc-speed calibration is firmware-specific and now lives inside
+        // the unlocker's `unlock()` (run at `init()`). Nothing to do here.
         tracing::info!(
             target: "freemkv::drive",
             phase = "probe_disc",
-            ok = r.is_ok(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
-            "end"
+            "end (calibration handled by unlocker at init)"
         );
-        r
+        Ok(())
     }
 
     /// Query a specific GET CONFIGURATION feature by code.
@@ -573,31 +567,21 @@ impl Drive {
     }
 
     pub fn is_ready(&self) -> bool {
-        match self.driver {
-            Some(ref d) => d.is_ready(),
-            None => false,
-        }
+        // Ready once init() has run and an unlocker handled the drive.
+        self.init_ran && self.unlocker_name.is_some()
     }
 
-    /// True if the drive is currently in the extended-access state.
+    /// Whether libfreemkv should take the OEM extended-access read path.
     ///
-    /// Detected by the platform driver during `init()` from the unlock
-    /// response's mode markers. When true:
-    ///   - SCSI READ_10 returns plaintext sectors (no AACS bus
-    ///     encryption applied)
-    ///   - VID retrieval works via the per-drive OEM CDB in
-    ///     [`DriveProfile`] without the cert-based AACS handshake
-    ///   - Disc-side Host Revocation List enforcement is effectively
-    ///     bypassed by the alternate data path
-    ///
-    /// AACS layer code branches on this: if true, issue the OEM
-    /// `read_vid_cdb` to retrieve VID directly; if false, fall back
-    /// to the cert-based mutual-auth handshake.
+    /// The pluggable [`crate::unlock::Unlocker`] seam reports only
+    /// success/failure from `unlock()` — it carries no extended-access
+    /// marker back into libfreemkv. With no marker channel, libfreemkv
+    /// always uses the standard host-certificate AACS handshake to acquire
+    /// the Volume ID (the OEM route), so this is always `false`. A firmware
+    /// unlocker still removes riplock / enables BD-UHD reads at `init()`;
+    /// VID acquisition just stays on the cert path.
     pub fn is_unlocked(&self) -> bool {
-        match self.driver {
-            Some(ref d) => d.is_unlocked(),
-            None => false,
-        }
+        false
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no
@@ -996,19 +980,6 @@ pub(crate) fn resolve_device(path: &str) -> Result<(String, DeviceResolution)> {
     #[cfg(windows)]
     {
         windows::resolve_device(path)
-    }
-}
-
-fn create_driver(
-    platform: profile::Platform,
-    profile: &DriveProfile,
-) -> Result<Box<dyn PlatformDriver>> {
-    match platform {
-        profile::Platform::Mt1959A => Ok(Box::new(Mt1959::new(profile.clone(), false))),
-        profile::Platform::Mt1959B => Ok(Box::new(Mt1959::new(profile.clone(), true))),
-        profile::Platform::Renesas => Err(Error::PlatformNotImplemented {
-            platform: "renesas".to_string(),
-        }),
     }
 }
 
@@ -1533,23 +1504,31 @@ mod command_tests {
         assert_eq!(d.read_buffer(0x02, 0xF1, 16), None);
     }
 
-    // ── No-driver paths: init/probe surface UnsupportedDrive ────────
+    // ── No-unlocker paths: init/probe succeed (OEM fallback) ────────
 
     #[test]
-    fn init_without_driver_is_unsupported_drive() {
-        // from_transport_for_test has no platform driver; init() must
-        // return UnsupportedDrive, not panic or silently succeed.
+    fn init_without_unlocker_is_ok_oem_fallback() {
+        // The test transport's identity matches no registered unlocker, so
+        // route_unlock returns None. init() must succeed (leaving the drive
+        // in stock mode for the host-cert handshake), not error — the OEM
+        // route is the no-match fallback, not a failure.
         let mut d = drive_with(vec![]);
-        assert!(matches!(d.init(), Err(Error::UnsupportedDrive { .. })));
+        assert!(
+            d.init().is_ok(),
+            "no-match init must succeed (OEM fallback)"
+        );
+        assert!(
+            !d.is_ready(),
+            "no unlocker ran → not in unlocked-ready state"
+        );
     }
 
     #[test]
-    fn probe_disc_without_driver_is_unsupported_drive() {
+    fn probe_disc_without_unlocker_is_ok_noop() {
+        // Disc-speed calibration moved into the unlocker (run at init).
+        // With no unlocker, probe_disc is a successful no-op.
         let mut d = drive_with(vec![]);
-        assert!(matches!(
-            d.probe_disc(),
-            Err(Error::UnsupportedDrive { .. })
-        ));
+        assert!(d.probe_disc().is_ok());
     }
 
     // ── decode_read_capacity additional boundaries ──────────────────

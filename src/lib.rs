@@ -1,7 +1,9 @@
 //! libfreemkv -- Open source optical drive library for 4K UHD / Blu-ray / DVD.
 //!
 //! Handles drive access, disc structure parsing, AACS decryption, and raw
-//! sector reading. 206 bundled drive profiles. No external files needed.
+//! sector reading. Drive unlocking is pluggable: libfreemkv owns only the
+//! [`Unlocker`] seam and registry — firmware blobs and unlock CDBs live in
+//! an external crate (e.g. `freemkv-unlock-ld`).
 //!
 //! # Quick Start
 //!
@@ -44,10 +46,9 @@
 //! ```text
 //! Drive           -- open, identify, unlock, read sectors
 //!   ├── ScsiTransport    -- SG_IO (Linux), IOKit (macOS)
-//!   ├── DriveProfile     -- per-drive unlock parameters (206 bundled)
 //!   ├── DriveId          -- INQUIRY + GET_CONFIG identification
-//!   └── Platform
-//!       └── Mt1959       -- MediaTek unlock/read (Renesas planned)
+//!   └── Unlocker         -- pluggable, external (e.g. freemkv-unlock-ld);
+//!                           libfreemkv owns only the trait + registry
 //!
 //! Disc                   -- scan titles, streams, AACS state
 //!   ├── UDF reader       -- Blu-ray UDF 2.50 with metadata partitions
@@ -103,12 +104,12 @@ pub(crate) mod mpls;
 pub mod mux;
 pub mod pes;
 pub(crate) mod platform;
-pub mod profile;
 pub mod progress;
 pub mod scsi;
 pub mod sector;
 pub(crate) mod speed;
 pub(crate) mod udf;
+pub mod unlock;
 pub mod verify;
 
 // Re-export verify types at the crate root for ergonomic imports.
@@ -157,8 +158,15 @@ pub use io::pipeline::{
 // ─── Drive events (low-level callbacks) ─────────────────────────────────────
 pub use event::{BatchSizeReason, Event, EventKind};
 pub use identity::DriveId;
-pub use profile::DriveProfile;
-// Platform trait is pub(crate) — callers use Drive, not Platform directly.
+
+// ─── Pluggable unlock seam ──────────────────────────────────────────────────
+//
+// libfreemkv carries no firmware blobs / unlock CDBs / drive profiles. An
+// external unlocker crate (e.g. `freemkv-unlock-ld`) implements `Unlocker`
+// and registers it once at process start via `register_unlocker`. At
+// drive-prep the registry is walked in order; the first matching unlocker
+// runs, else the drive falls through to the host-cert AACS handshake.
+pub use unlock::{Unlocker, register_unlocker};
 
 // ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
 //

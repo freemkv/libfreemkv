@@ -1113,8 +1113,8 @@ impl KeyOrigin {
 
 /// AACS host credentials for the live-drive authenticated handshake.
 ///
-/// Optional and source-agnostic: an unlocked / LibreDrive drive uses the OEM
-/// Volume-ID path and needs none, and an ISO scan has no handshake at all. The
+/// Optional and source-agnostic: an ISO scan has no handshake at all, and a
+/// live drive without supplied credentials simply skips cert auth. The
 /// caller supplies the host cert(s) from wherever it likes — today the keydb's
 /// `host_certs()`, tomorrow a cert file or built-in. Decoupled from the key
 /// source: a locked drive needs the cert to unlock even when the decryption key
@@ -1133,8 +1133,8 @@ pub struct DriveCredentials {
 /// authenticated handshake.
 #[derive(Default)]
 pub struct ScanOptions {
-    /// Host credentials for the live-drive AACS handshake. `None` for an
-    /// unlocked / LibreDrive drive (OEM Volume-ID path) and for ISO scans.
+    /// Host credentials for the live-drive AACS handshake. `None` for ISO
+    /// scans, or a live drive where cert auth should be skipped.
     pub credentials: Option<DriveCredentials>,
     /// Optional cooperative-cancellation token. When set, long scan-time
     /// loops (notably the CSS known-plaintext crack, which can scan up to
@@ -1226,10 +1226,9 @@ impl Disc {
     /// The session must be open and unlocked (`Drive::open` handles this).
     /// All disc reads use standard READ(10) via UDF — no vendor SCSI commands.
     pub fn scan(session: &mut Drive, opts: &ScanOptions) -> Result<Self> {
-        // AACS handshake (Blu-ray/UHD). Routes through Disc::read_vid,
-        // which prefers the per-drive OEM CDB path when the drive is
-        // in the extended-access state and falls back to cert-based
-        // mutual auth otherwise.
+        // AACS handshake (Blu-ray/UHD). Acquires the Volume ID via the
+        // cert-based mutual-auth handshake (the OEM route); drive unlock
+        // itself runs separately behind the pluggable `Unlocker` seam.
         tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
         let (handshake, handshake_error) = Self::do_handshake(session, opts);
         tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");

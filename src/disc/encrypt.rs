@@ -14,115 +14,19 @@ pub(super) struct HandshakeResult {
 }
 
 impl Disc {
-    /// Acquire the Volume ID. Tries the per-drive OEM CDB path first
-    /// when the drive reports `is_unlocked()` (extended-access state),
-    /// and falls back to the cert-based AACS mutual-auth handshake
-    /// otherwise.
-    ///
-    /// The OEM path is a single READ_BUFFER CDB built from the drive
-    /// profile's `read_vid_cdb` template. The response carries a 3-byte
-    /// header (validated against `00 22 00`) followed by the 16-byte
-    /// VID at bytes [4..20]. Crucially, no AGID setup is required —
-    /// the drive's runtime firmware serves the VID directly when in
-    /// extended-access state.
-    ///
-    /// The cert path is the standard AACS spec flow: ECDH key
-    /// agreement, bus-key derivation, then `REPORT_DISC_STRUCTURE`
-    /// format 0x80 to retrieve VID under bus-key MAC.
-    pub(super) fn read_vid(
-        session: &mut crate::drive::Drive,
-        opts: &ScanOptions,
-    ) -> Result<[u8; 16]> {
-        if session.is_unlocked() {
-            let profile = session
-                .drive_profile()
-                .ok_or(Error::DriveProfileMissing)?
-                .clone();
-            return Self::read_vid_oem(session, &profile);
-        }
-        Self::read_vid_cert(session, opts)
-    }
-
-    /// OEM VID retrieval — issues the per-drive READ_BUFFER CDB and
-    /// parses the response.
-    ///
-    /// Response layout (36 bytes):
-    ///   * [0..3]   3-byte response signature; expected `00 22 00`
-    ///   * [3]      reserved
-    ///   * [4..20]  16-byte Volume ID
-    ///   * [20..36] reserved / per-drive padding
-    fn read_vid_oem(
-        session: &mut crate::drive::Drive,
-        profile: &crate::profile::DriveProfile,
-    ) -> Result<[u8; 16]> {
-        const RESPONSE_LEN: usize = 36;
-        const EXPECTED_HEADER: [u8; 3] = [0x00, 0x22, 0x00];
-
-        let cdb = profile.read_vid_cdb.ok_or(Error::VidCdbUnavailable)?;
-        let mut buf = vec![0u8; RESPONSE_LEN];
-        let result = session.scsi_execute(
-            &cdb,
-            crate::scsi::DataDirection::FromDevice,
-            &mut buf,
-            5_000,
-        )?;
-        if result.bytes_transferred < RESPONSE_LEN {
-            tracing::warn!(
-                target: "freemkv::disc",
-                phase = "oem_vid_short_response",
-                bytes_transferred = result.bytes_transferred,
-                "OEM VID CDB returned short response"
-            );
-            return Err(Error::AacsVidRead);
-        }
-        if buf[0..3] != EXPECTED_HEADER {
-            tracing::warn!(
-                target: "freemkv::disc",
-                phase = "oem_vid_bad_header",
-                header_0 = buf[0],
-                header_1 = buf[1],
-                header_2 = buf[2],
-                "OEM VID response header mismatch"
-            );
-            return Err(Error::AacsVidRead);
-        }
-        let mut vid = [0u8; 16];
-        vid.copy_from_slice(&buf[4..20]);
-        tracing::debug!(
-            target: "freemkv::disc",
-            phase = "oem_vid_ok",
-            "OEM VID retrieved"
-        );
-        Ok(vid)
-    }
-
-    /// Cert-based VID retrieval — runs the full AACS mutual-auth
-    /// handshake and extracts VID from the bus-key-MAC'd
-    /// `REPORT_DISC_STRUCTURE` response.
-    fn read_vid_cert(session: &mut crate::drive::Drive, opts: &ScanOptions) -> Result<[u8; 16]> {
-        match Self::do_handshake_cert(session, opts) {
-            (Some(h), _) => Ok(h.volume_id),
-            (None, Some(e)) => Err(e),
-            (None, None) => Err(Error::AacsVidUnavailable),
-        }
-    }
-
     /// SCSI handshake — drives the VID-acquisition flow and returns
     /// a structured `HandshakeResult` for downstream key resolution.
-    /// Prefers the OEM path when `Drive::is_unlocked()` is true and
-    /// falls back to cert-based mutual auth otherwise.
     ///
-    /// The OEM path produces only VID (no bus-key, so no
-    /// `read_data_key`); the cert path can produce both. AACS 2.0
-    /// content that needs read_data_key for bus decryption requires
-    /// the cert path.
+    /// Drive unlock now lives behind the pluggable
+    /// [`crate::unlock::Unlocker`] seam, which reports no extended-access
+    /// marker back to libfreemkv. VID is therefore always acquired via the
+    /// cert-based mutual-auth handshake (the OEM route); the cert path also
+    /// yields `read_data_key`, required for AACS 2.0 bus decryption.
     ///
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
-    ///   * `(None, Some(_))`  — specific failure mode; only
-    ///     `AacsHostCertRejected` and `AacsVidUnavailable` are returned
-    ///     here (the OEM-path `DriveProfileMissing` / `VidCdbUnavailable`
-    ///     errors are caught internally and fall through to cert auth)
+    ///   * `(None, Some(_))`  — specific failure mode
+    ///     (`AacsHostCertRejected` or `AacsVidUnavailable`)
     ///   * `(None, None)`     — handshake not attempted (no keydb;
     ///     resolution will proceed with VID=zero and rely on path 1
     ///     disc-hash → VUK lookup)
@@ -132,7 +36,10 @@ impl Disc {
     ) -> (Option<HandshakeResult>, Option<Error>) {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::scan", phase = "do_handshake", "begin");
-        let (result, err) = Self::do_handshake_inner(session, opts);
+        // Drive unlock moved behind the pluggable `Unlocker` seam, which
+        // reports no extended-access marker — so VID always comes via the
+        // cert-based handshake (the OEM route).
+        let (result, err) = Self::do_handshake_cert(session, opts);
         tracing::info!(
             target: "freemkv::scan",
             phase = "do_handshake",
@@ -144,55 +51,7 @@ impl Disc {
         (result, err)
     }
 
-    fn do_handshake_inner(
-        session: &mut crate::drive::Drive,
-        opts: &ScanOptions,
-    ) -> (Option<HandshakeResult>, Option<Error>) {
-        let unlocked = session.is_unlocked();
-        tracing::debug!(
-            target: "freemkv::disc",
-            phase = "handshake_entry",
-            unlocked,
-            "do_handshake entered"
-        );
-
-        if unlocked {
-            // Try OEM VID retrieval first. If the drive's profile
-            // doesn't carry the CDB template, or the response is
-            // malformed, fall through to cert-based auth.
-            match Self::read_vid(session, opts) {
-                Ok(volume_id) => {
-                    return (
-                        Some(HandshakeResult {
-                            volume_id,
-                            read_data_key: None,
-                        }),
-                        None,
-                    );
-                }
-                Err(Error::DriveProfileMissing) | Err(Error::VidCdbUnavailable) => {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "handshake_oem_unavailable",
-                        "OEM VID path unavailable for this drive; trying cert handshake"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "handshake_oem_failed",
-                        error_code = e.code(),
-                        "OEM VID retrieval failed; trying cert handshake"
-                    );
-                }
-            }
-        }
-
-        Self::do_handshake_cert(session, opts)
-    }
-
-    /// Cert-based AACS handshake. The legacy auth path; still used as
-    /// the fallback when the OEM VID path isn't available or fails.
+    /// Cert-based AACS handshake — the OEM route for VID acquisition.
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
@@ -201,9 +60,8 @@ impl Disc {
 
         // Host certs come from the caller's DriveCredentials (e.g. the keydb's
         // host_certs(), sourced app-side) — the library does not load a keydb.
-        // Absent ⇒ no cert auth: an unlocked / LibreDrive drive already returned
-        // a Volume ID via the OEM path before reaching here, so this is the
-        // locked-drive-without-credentials case.
+        // Absent ⇒ no cert auth: resolution proceeds with VID=zero and relies
+        // on the path-1 disc-hash → VUK lookup.
         let host_certs: &[aacs::HostCert] = match &opts.credentials {
             Some(c) if !c.host_certs.is_empty() => &c.host_certs,
             _ => {
