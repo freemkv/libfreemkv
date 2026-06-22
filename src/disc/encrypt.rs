@@ -76,7 +76,7 @@ impl Disc {
         // DriveId first releases the immutable borrow before we hand the
         // mutable transport to the registry.
         let drive_id = session.drive_id.clone();
-        match crate::unlock::unlocker_read_vid(session.scsi_mut(), &drive_id) {
+        match crate::unlock::unlocker_read_volume_id(session.scsi_mut(), &drive_id) {
             Ok(Some(volume_id)) => {
                 tracing::debug!(
                     target: "freemkv::disc",

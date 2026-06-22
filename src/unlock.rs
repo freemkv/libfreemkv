@@ -4,8 +4,8 @@
 //! supplied by an external crate (e.g. `freemkv-unlock-ld`) and registered
 //! once at process start via [`register_unlocker`]. At drive-prep the
 //! registry is walked in registration order; the first unlocker whose
-//! [`Unlocker::matches`] returns true is asked to [`Unlocker::unlock`] the
-//! drive by issuing its own CDBs through the raw [`ScsiTransport`].
+//! [`Unlocker::matches`] returns true is asked to [`Unlocker::unlock_drive`]
+//! the drive by issuing its own CDBs through the raw [`ScsiTransport`].
 //!
 //! No firmware blobs, no unlock CDBs, no drive profiles live here — only
 //! the trait, the registry, and the routing. If no unlocker matches, the
@@ -17,10 +17,16 @@ use crate::identity::DriveId;
 use crate::scsi::ScsiTransport;
 use std::sync::RwLock;
 
-/// A pluggable drive unlocker.
+/// A pluggable drive-capability provider.
+///
+/// Unlockers are optional drive-capability providers. libfreemkv's AACS
+/// layer is the always-present baseline; it uses an unlocker's capabilities
+/// when one matches, and does the full cert handshake when none do.
+/// Implement only the capabilities your drive supports — the rest default
+/// to no-op.
 ///
 /// Implementors own everything about *how* a particular drive family is
-/// unlocked: firmware upload, vendor CDBs, variant logic. libfreemkv only
+/// driven: firmware upload, vendor CDBs, variant logic. libfreemkv only
 /// hands over the raw SCSI transport and the drive identity.
 pub trait Unlocker: Send + Sync {
     /// Stable, language-neutral identifier for this unlocker (logged).
@@ -29,26 +35,23 @@ pub trait Unlocker: Send + Sync {
     /// True if this unlocker handles the given drive.
     fn matches(&self, id: &DriveId) -> bool;
 
-    /// Unlock the drive. The unlocker issues its own CDBs through `scsi`.
-    /// Returns `Ok(())` once the drive is prepared for reads.
-    fn unlock(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()>;
+    /// Put the drive into extended-access mode (firmware/bootloader/whatever THIS
+    /// unlocker needs). The one required capability.
+    fn unlock_drive(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()>;
 
-    /// Read the AACS Volume ID via this unlocker's OEM mechanism, if it
-    /// has one.
-    ///
-    /// An [`Unlocker`] unlocks *drive functionality*, not just the disc:
-    /// `unlock` is one capability, OEM VID retrieval is another. Once the
-    /// matching unlocker is identified for a drive, libfreemkv uses it for
-    /// BOTH unlock and VID. The OEM path returns the VID *without* the host
-    /// certificate + HRL, decoupling VID from the cert handshake.
-    ///
-    /// Default is a no-op: an unlocker that provides no OEM VID path (or
-    /// any unlocker that doesn't override this) returns `Ok(None)`, and
-    /// libfreemkv falls back to the cert-based VID read. Implementors that
-    /// can serve the VID directly (e.g. a per-drive OEM CDB) return
-    /// `Ok(Some(vid))`.
-    fn read_vid(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<Option<[u8; 16]>> {
+    /// Read the disc Volume ID directly, bypassing the AACS cert handshake.
+    /// None → libfreemkv falls back to the cert-based read. Default: no-op.
+    fn read_volume_id(
+        &self,
+        _scsi: &mut dyn ScsiTransport,
+        _id: &DriveId,
+    ) -> Result<Option<[u8; 16]>> {
         Ok(None)
+    }
+
+    /// Raise the drive to its maximum read speed. Default: no-op.
+    fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -75,7 +78,7 @@ pub fn register_unlocker(u: Box<dyn Unlocker>) {
 ///     drive; `name` is its [`Unlocker::name`].
 ///   * `Ok(None)` — no unlocker matched; the drive was left untouched and
 ///     the caller should fall through to the host-cert handshake.
-///   * `Err(_)` — an unlocker matched but its `unlock` failed.
+///   * `Err(_)` — an unlocker matched but its `unlock_drive` failed.
 pub(crate) fn route_unlock(scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<Option<String>> {
     let reg = match REGISTRY.read() {
         Ok(r) => r,
@@ -86,7 +89,7 @@ pub(crate) fn route_unlock(scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result
     for u in reg.iter() {
         if u.matches(id) {
             let name = u.name().to_string();
-            u.unlock(scsi, id)?;
+            u.unlock_drive(scsi, id)?;
             return Ok(Some(name));
         }
     }
@@ -102,9 +105,9 @@ pub(crate) fn route_unlock(scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result
 ///     path (no cert handshake needed; VID is decoupled from the HRL).
 ///   * `Ok(None)` — no unlocker matched, or the matching unlocker has no
 ///     OEM VID path; the caller falls through to the cert-based VID read.
-///   * `Err(_)` — the matching unlocker's `read_vid` failed (e.g. the OEM
-///     CDB returned a malformed response).
-pub(crate) fn unlocker_read_vid(
+///   * `Err(_)` — the matching unlocker's `read_volume_id` failed (e.g. the
+///     OEM CDB returned a malformed response).
+pub(crate) fn unlocker_read_volume_id(
     scsi: &mut dyn ScsiTransport,
     id: &DriveId,
 ) -> Result<Option<[u8; 16]>> {
@@ -116,10 +119,38 @@ pub(crate) fn unlocker_read_vid(
     };
     for u in reg.iter() {
         if u.matches(id) {
-            return u.read_vid(scsi, id);
+            return u.read_volume_id(scsi, id);
         }
     }
     Ok(None)
+}
+
+/// Walk the registry in order and ask the first matching unlocker to raise
+/// the drive to its maximum read speed.
+///
+/// Mirrors [`route_unlock`]'s resolution so the SAME identified unlocker
+/// that unlocks the drive is the one asked to set speed. Returns:
+///   * `Ok(())` — the matching unlocker set max speed, or no unlocker
+///     matched (no-op), or the matching unlocker has no speed capability
+///     (its default no-op).
+///   * `Err(_)` — the matching unlocker's `set_max_read_speed` failed. The
+///     caller treats this as non-fatal (log and continue): a slow drive
+///     still rips.
+pub(crate) fn unlocker_set_max_read_speed(
+    scsi: &mut dyn ScsiTransport,
+    id: &DriveId,
+) -> Result<()> {
+    let reg = match REGISTRY.read() {
+        Ok(r) => r,
+        // Poisoned lock ⇒ treat as "no unlocker available" (no-op).
+        Err(_) => return Ok(()),
+    };
+    for u in reg.iter() {
+        if u.matches(id) {
+            return u.set_max_read_speed(scsi, id);
+        }
+    }
+    Ok(())
 }
 
 /// Number of registered unlockers — test/introspection helper.
@@ -170,15 +201,18 @@ mod tests {
     }
 
     /// Fake unlocker that records whether it ran, matches on vendor id, and
-    /// optionally serves an OEM VID (mirroring the read_vid capability).
+    /// optionally serves a Volume ID (mirroring the read_volume_id capability)
+    /// or records a set_max_read_speed call.
     struct FakeUnlocker {
         want_vendor: String,
         ran: Arc<AtomicBool>,
-        /// VID this unlocker's OEM path returns: `Some(vid)` (capability
-        /// present), `None` (no OEM path → cert fallback). `vid_ran` records
-        /// whether read_vid was consulted.
+        /// VID this unlocker returns: `Some(vid)` (capability present),
+        /// `None` (no OEM path → cert fallback). `vid_ran` records whether
+        /// read_volume_id was consulted.
         vid: Option<[u8; 16]>,
         vid_ran: Arc<AtomicBool>,
+        /// Records whether set_max_read_speed was invoked.
+        speed_ran: Arc<AtomicBool>,
     }
     impl FakeUnlocker {
         fn new(vendor: &str, ran: Arc<AtomicBool>) -> Self {
@@ -187,11 +221,16 @@ mod tests {
                 ran,
                 vid: None,
                 vid_ran: Arc::new(AtomicBool::new(false)),
+                speed_ran: Arc::new(AtomicBool::new(false)),
             }
         }
         fn with_vid(mut self, vid: Option<[u8; 16]>, vid_ran: Arc<AtomicBool>) -> Self {
             self.vid = vid;
             self.vid_ran = vid_ran;
+            self
+        }
+        fn with_speed(mut self, speed_ran: Arc<AtomicBool>) -> Self {
+            self.speed_ran = speed_ran;
             self
         }
     }
@@ -202,17 +241,21 @@ mod tests {
         fn matches(&self, id: &DriveId) -> bool {
             id.vendor_id.trim() == self.want_vendor
         }
-        fn unlock(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
+        fn unlock_drive(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
             self.ran.store(true, Ordering::SeqCst);
             Ok(())
         }
-        fn read_vid(
+        fn read_volume_id(
             &self,
             _scsi: &mut dyn ScsiTransport,
             _id: &DriveId,
         ) -> Result<Option<[u8; 16]>> {
             self.vid_ran.store(true, Ordering::SeqCst);
             Ok(self.vid)
+        }
+        fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
+            self.speed_ran.store(true, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -231,7 +274,7 @@ mod tests {
         let mut scsi = NoopTransport;
         let matched = route_unlock(&mut scsi, &fake_id("MATCHVND")).unwrap();
         assert_eq!(matched.as_deref(), Some("fake"), "matching unlocker runs");
-        assert!(ran.load(Ordering::SeqCst), "unlock() was invoked");
+        assert!(ran.load(Ordering::SeqCst), "unlock_drive() was invoked");
 
         // Non-matching identity → no unlocker runs, OEM path (None).
         ran.store(false, Ordering::SeqCst);
@@ -239,19 +282,20 @@ mod tests {
         assert!(none.is_none(), "no match → OEM/cert fallback");
         assert!(
             !ran.load(Ordering::SeqCst),
-            "unlock() not invoked on no-match"
+            "unlock_drive() not invoked on no-match"
         );
     }
 
-    /// `unlocker_read_vid` consults the FIRST matching unlocker's `read_vid`.
-    /// A matching unlocker that returns `Some(vid)` yields that VID (the OEM
-    /// path — cert handshake skipped). A matching unlocker that returns
-    /// `None`, or no match at all, yields `Ok(None)` (cert fallback).
+    /// `unlocker_read_volume_id` consults the FIRST matching unlocker's
+    /// `read_volume_id`. A matching unlocker that returns `Some(vid)` yields
+    /// that VID (the OEM path — cert handshake skipped). A matching unlocker
+    /// that returns `None`, or no match at all, yields `Ok(None)` (cert
+    /// fallback).
     ///
     /// Distinct vendor ids keep this independent of the other registry test
     /// despite the process-wide shared registry.
     #[test]
-    fn unlocker_read_vid_routes_match_else_cert() {
+    fn unlocker_read_volume_id_routes_match_else_cert() {
         let mut scsi = NoopTransport;
 
         // Unlocker WITH an OEM VID capability. Vendor ids are exactly 8
@@ -264,29 +308,64 @@ mod tests {
                 .with_vid(Some(vid), vid_ran.clone()),
         ));
 
-        // Matching identity → read_vid consulted, its VID used.
-        let got = unlocker_read_vid(&mut scsi, &fake_id("VIDVNDOR")).unwrap();
+        // Matching identity → read_volume_id consulted, its VID used.
+        let got = unlocker_read_volume_id(&mut scsi, &fake_id("VIDVNDOR")).unwrap();
         assert_eq!(got, Some(vid), "matching unlocker's OEM VID is used");
-        assert!(vid_ran.load(Ordering::SeqCst), "read_vid() was consulted");
+        assert!(
+            vid_ran.load(Ordering::SeqCst),
+            "read_volume_id() was consulted"
+        );
 
-        // Unlocker that MATCHES but has NO OEM VID path (read_vid → None).
+        // Unlocker that MATCHES but has NO OEM VID path (read_volume_id → None).
         let none_ran = Arc::new(AtomicBool::new(false));
         register_unlocker(Box::new(
             FakeUnlocker::new("NOVIDVND", Arc::new(AtomicBool::new(false)))
                 .with_vid(None, none_ran.clone()),
         ));
-        let got = unlocker_read_vid(&mut scsi, &fake_id("NOVIDVND")).unwrap();
+        let got = unlocker_read_volume_id(&mut scsi, &fake_id("NOVIDVND")).unwrap();
         assert!(
             got.is_none(),
             "unlocker without OEM VID falls through to cert"
         );
         assert!(
             none_ran.load(Ordering::SeqCst),
-            "read_vid() consulted even when it returns None"
+            "read_volume_id() consulted even when it returns None"
         );
 
         // No matching unlocker → Ok(None), nothing consulted.
-        let got = unlocker_read_vid(&mut scsi, &fake_id("UNKNWNVD")).unwrap();
+        let got = unlocker_read_volume_id(&mut scsi, &fake_id("UNKNWNVD")).unwrap();
         assert!(got.is_none(), "no match → cert fallback");
+    }
+
+    /// `unlocker_set_max_read_speed` consults the FIRST matching unlocker's
+    /// `set_max_read_speed`. A matching unlocker is invoked; a non-match is a
+    /// safe no-op (nothing invoked, `Ok(())`).
+    ///
+    /// Distinct vendor ids keep this independent of the other registry tests
+    /// despite the process-wide shared registry.
+    #[test]
+    fn unlocker_set_max_read_speed_routes_match_else_noop() {
+        let mut scsi = NoopTransport;
+
+        let speed_ran = Arc::new(AtomicBool::new(false));
+        register_unlocker(Box::new(
+            FakeUnlocker::new("SPEEDVND", Arc::new(AtomicBool::new(false)))
+                .with_speed(speed_ran.clone()),
+        ));
+
+        // Matching identity → set_max_read_speed invoked.
+        unlocker_set_max_read_speed(&mut scsi, &fake_id("SPEEDVND")).unwrap();
+        assert!(
+            speed_ran.load(Ordering::SeqCst),
+            "set_max_read_speed() invoked on match"
+        );
+
+        // No matching unlocker → Ok(()), nothing invoked (safe no-op).
+        speed_ran.store(false, Ordering::SeqCst);
+        unlocker_set_max_read_speed(&mut scsi, &fake_id("NOSPEEDV")).unwrap();
+        assert!(
+            !speed_ran.load(Ordering::SeqCst),
+            "no match → safe no-op, nothing invoked"
+        );
     }
 }

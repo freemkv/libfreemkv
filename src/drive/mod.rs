@@ -399,6 +399,19 @@ impl Drive {
         let r = match r {
             Ok(Some(name)) => {
                 self.unlocker_name = Some(name);
+                // The matched unlocker may also be able to raise the drive to
+                // its maximum read speed. Best-effort: a failure here must NOT
+                // fail the rip — a slow drive still rips. Log and continue.
+                if let Err(e) =
+                    crate::unlock::unlocker_set_max_read_speed(self.scsi.as_mut(), &self.drive_id)
+                {
+                    tracing::warn!(
+                        target: "freemkv::drive",
+                        phase = "init",
+                        error = ?e,
+                        "unlocker set_max_read_speed failed; continuing at current speed"
+                    );
+                }
                 Ok(())
             }
             // No unlocker matched: not an error — fall through to OEM route.
