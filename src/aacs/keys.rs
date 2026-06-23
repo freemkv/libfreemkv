@@ -588,6 +588,101 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     None
 }
 
+// ── MKB Type field (Type-and-Version record 0x10, bytes 4-7) ────────────────
+//
+// Canonical form is `<category>1003` (low 16 bits `0x1003` is a fixed marker).
+// Types 3/4/10 are from the AACS Common Cryptographic Elements spec (0.953,
+// §3.2.5.1.1); the Category-C 2.0/2.1 values match libaacs `mkb.h` constants.
+
+/// `0x00031003` — recordable media MKB (Class I & II compute Km directly).
+pub const MKB_TYPE_3_RECORDABLE: u32 = 0x0003_1003;
+/// `0x00041003` — AACS 1.0 pre-recorded content MKB (KCD-based). Standard BD.
+pub const MKB_TYPE_4_PRERECORDED: u32 = 0x0004_1003;
+/// `0x000A1003` — Class II / Unified MKB (Sequence-Key-Block functionality).
+pub const MKB_TYPE_10_CLASS_II: u32 = 0x000A_1003;
+/// `0x48141003` — AACS 2.0 Category C (UHD content). libaacs `MKB_20_CATEGORY_C`.
+pub const MKB_20_CATEGORY_C: u32 = 0x4814_1003;
+/// `0x48151003` — AACS 2.1 Category C (UHD content). libaacs `MKB_21_CATEGORY_C`.
+pub const MKB_21_CATEGORY_C: u32 = 0x4815_1003;
+
+/// The AACS MKB Type field, decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MkbType {
+    /// Type 3 — recordable media.
+    Recordable,
+    /// Type 4 — AACS 1.0 pre-recorded content (KCD). Standard Blu-ray.
+    Prerecorded,
+    /// Type 10 — Class II / Unified (SKB).
+    ClassII,
+    /// AACS 2.0 Category C — UHD content.
+    CategoryC20,
+    /// AACS 2.1 Category C — UHD content.
+    CategoryC21,
+    /// Unrecognized MKBType value (raw field preserved).
+    Other(u32),
+}
+
+impl MkbType {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            MKB_TYPE_3_RECORDABLE => MkbType::Recordable,
+            MKB_TYPE_4_PRERECORDED => MkbType::Prerecorded,
+            MKB_TYPE_10_CLASS_II => MkbType::ClassII,
+            MKB_20_CATEGORY_C => MkbType::CategoryC20,
+            MKB_21_CATEGORY_C => MkbType::CategoryC21,
+            other => MkbType::Other(other),
+        }
+    }
+
+    /// AACS generation this MKB belongs to (Category C → 2.0/2.1, else 1.0).
+    pub fn generation(self) -> AacsVersion {
+        match self {
+            MkbType::CategoryC21 => AacsVersion::V21,
+            MkbType::CategoryC20 => AacsVersion::V20,
+            _ => AacsVersion::V10,
+        }
+    }
+
+    /// `true` for UHD (AACS 2.x Category C); `false` for Blu-ray (AACS 1.x).
+    pub fn is_uhd(self) -> bool {
+        matches!(self, MkbType::CategoryC20 | MkbType::CategoryC21)
+    }
+}
+
+/// The raw 32-bit MKBType field from the Type-and-Version record (0x10), bytes
+/// 4-7. `None` if no 0x10 record is present.
+pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
+    let mut pos = 0;
+    while pos + 4 <= mkb.len() {
+        let rec_type = mkb[pos];
+        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
+        if rec_len < 4 || pos + rec_len > mkb.len() {
+            break;
+        }
+        if rec_type == 0x10 && rec_len >= 8 {
+            return Some(u32::from_be_bytes([
+                mkb[pos + 4],
+                mkb[pos + 5],
+                mkb[pos + 6],
+                mkb[pos + 7],
+            ]));
+        }
+        pos += rec_len;
+    }
+    None
+}
+
+/// Decode an MKB's Type field. `None` if no Type-and-Version record is present.
+pub fn mkb_type(mkb: &[u8]) -> Option<MkbType> {
+    mkb_type_raw(mkb).map(MkbType::from_raw)
+}
+
+/// `Some(true)` if this MKB is a UHD (AACS 2.x Category C) block, `Some(false)`
+/// for Blu-ray (AACS 1.x), `None` if the Type record is absent.
+pub fn mkb_is_uhd(mkb: &[u8]) -> Option<bool> {
+    mkb_type(mkb).map(MkbType::is_uhd)
+}
+
 // ── AACS-G3 key derivation (subset-difference tree) ─────────────────────────
 
 /// AACS-G3 seed constant.
