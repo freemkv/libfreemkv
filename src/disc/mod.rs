@@ -1821,14 +1821,26 @@ pub enum Key {
     Unit(Vec<(u32, [u8; 16])>),
 }
 
-/// True if `unit_keys` can de-scramble at least one of the supplied content
-/// `samples` — the validation gate for [`Disc::decrypt_with`]. Conservative: a
-/// sample that is not AACS-scrambled proves nothing, and with no scrambled
-/// sample at all there is nothing to disprove against, so it returns `true`
-/// (accept). It only returns `false` when a scrambled sample exists and NO unit
-/// key restores it to clear MPEG-TS — i.e. the key is provably wrong for this
-/// disc. Reuses the ecosystem's single `is_aacs_scrambled` predicate and the
-/// full (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
+/// True if `unit_keys` covers EVERY supplied scrambled content `sample` — the
+/// validation gate for [`Disc::decrypt_with`]. Conservative: a sample that is
+/// not AACS-scrambled proves nothing, and with no scrambled sample at all there
+/// is nothing to disprove against, so it returns `true` (accept).
+///
+/// It returns `false` when ANY scrambled sample cannot be restored to clear
+/// MPEG-TS by ANY unit key in the set. That covers two distinct failure shapes:
+///   1. a wholly wrong key (a keydb VK that does not match this disc) — no
+///      sample decrypts; and
+///   2. a *partially* applicable key set on a multi-CPS-unit disc — the resolved
+///      keys cover CPS unit 0 but not CPS unit 1. Accepting on the first sample
+///      that decrypts (the old behaviour) would commit such a set, after which
+///      CPS-unit-1 sectors pass through as raw encrypted bytes into the ISO/MKV
+///      with no error surfaced anywhere. Requiring every scrambled sample to
+///      decrypt rejects the incomplete set so the caller falls through to the
+///      next candidate (and ultimately surfaces a key error rather than silently
+///      writing ciphertext).
+///
+/// Reuses the ecosystem's single `is_aacs_scrambled` predicate and the full
+/// (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
 fn aligned_unit_keys_validate(
     unit_keys: &[(u32, [u8; 16])],
     read_data_key: Option<&[u8; 16]>,
@@ -1850,18 +1862,26 @@ fn aligned_unit_keys_validate(
     let total = (scrambled.len() as u64) * (unit_keys.len() as u64);
     let mut tried = 0u64;
     let mut hb = crate::progress::Heartbeat::new("scan_key_trial");
+    // Every scrambled sample must be covered by SOME unit key. A single sample
+    // that no key descrambles means the key set is incomplete (wrong key, or a
+    // CPS unit left uncovered) — reject so the wrong/partial set never commits.
     for sample in scrambled {
+        let mut covered = false;
         for (_, k) in unit_keys {
             // Pure-CPU inner loop: only consult the clock every 256 trials.
             hb.tick_cpu(tried, total);
             tried += 1;
             probe.copy_from_slice(&sample[..ALIGNED_UNIT_LEN]);
             if decrypt_unit_full(&mut probe, k, read_data_key) {
-                return true;
+                covered = true;
+                break;
             }
         }
+        if !covered {
+            return false;
+        }
     }
-    false
+    true
 }
 
 impl Disc {
@@ -3893,6 +3913,56 @@ mod tests {
         ));
         // Empty key set against a scrambled sample -> reject.
         assert!(!super::aligned_unit_keys_validate(&[], None, &[enc]));
+    }
+
+    #[test]
+    fn unit_key_validation_rejects_partial_cps_unit_coverage() {
+        // Regression: a multi-CPS-unit disc. CPS unit 0's body is scrambled
+        // under uk0; CPS unit 1's body under uk1. A resolved key set that
+        // covers only CPS unit 0 used to pass validation (the old gate accepted
+        // on the FIRST sample any key decrypted), committing an incomplete set —
+        // CPS-unit-1 sectors then passed through as raw encrypted bytes into the
+        // ISO/MKV with no error surfaced. The gate must now reject a key set
+        // that leaves any scrambled sample uncovered.
+        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, is_aacs_scrambled};
+
+        let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < ALIGNED_UNIT_LEN {
+            clear[off] = 0x47;
+            off += 192;
+        }
+
+        let uk0 = [0x11u8; 16];
+        let uk1 = [0x22u8; 16];
+        let sample0 = encrypt_unit_for_test(&clear, &uk0); // CPS unit 0 body
+        let sample1 = encrypt_unit_for_test(&clear, &uk1); // CPS unit 1 body
+        assert!(is_aacs_scrambled(&sample0));
+        assert!(is_aacs_scrambled(&sample1));
+
+        let samples = vec![sample0.clone(), sample1.clone()];
+
+        // Partial key set (CPS unit 0 only) against samples from BOTH units ->
+        // reject. This is the bug fix: previously this returned true.
+        assert!(!super::aligned_unit_keys_validate(
+            &[(0, uk0)],
+            None,
+            &samples
+        ));
+
+        // Complete key set (both CPS units) -> accept.
+        assert!(super::aligned_unit_keys_validate(
+            &[(0, uk0), (1, uk1)],
+            None,
+            &samples
+        ));
+
+        // Order-independent: covering key present anywhere in the set is fine.
+        assert!(super::aligned_unit_keys_validate(
+            &[(1, uk1), (0, uk0)],
+            None,
+            &samples
+        ));
     }
 
     /// Inverse of `decrypt_unit` for one 6144-byte unit: produce on-disc
