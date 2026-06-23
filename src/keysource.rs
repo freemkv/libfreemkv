@@ -85,6 +85,14 @@ pub trait KeySource {
         false
     }
 
+    /// A short, stable identifier for this source kind (`"keydb"`, `"online"`,
+    /// `"mapfile"`, …). For logging which source produced a key, and for
+    /// composition/ordering logic that needs to tell sources apart. A format
+    /// string, not user-facing English.
+    fn label(&self) -> &'static str {
+        "source"
+    }
+
     /// Whether this source FAILED (I/O, network, parse) rather than simply
     /// having no key. Checked after exhaustion so the caller can tell a genuine
     /// "no key for this disc" apart from "the key service was unreachable". A
