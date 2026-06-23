@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       # libfreemkv is a library — Cargo.lock is gitignored. --locked
       # would always fail on a fresh runner because there's no committed
@@ -25,6 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --tests
 
   check-macos:
@@ -32,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       - run: cargo check
 
   check-windows:
@@ -39,6 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       # Build the tests (not just `cargo check`): catches errors in test
       # code and forces full codegen of the Windows-only SPTI transport
       # (src/scsi/windows.rs), which never compiles on the Linux/macOS dev
