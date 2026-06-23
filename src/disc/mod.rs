@@ -1229,7 +1229,18 @@ impl Disc {
     /// Read UDF filesystem and set up buffered reader with metadata prefetched.
     /// Shared setup for both identify() and scan().
     fn read_udf(session: &mut Drive) -> Result<(u32, udf::BufferedSectorReader<'_>, udf::UdfFs)> {
-        let capacity = Self::read_capacity(session).unwrap_or(0);
+        let capacity = Self::read_capacity(session).unwrap_or_else(|e| {
+            // A READ CAPACITY failure (transient drive spin-up, SCSI error)
+            // must not be silently treated as a 0-sector disc: capacity=0
+            // skews the layer heuristic (always 1 layer) and title ordering.
+            // Recovery is unchanged (we still proceed with 0), but surface it.
+            tracing::warn!(
+                target: "freemkv::scan",
+                error = %e,
+                "READ CAPACITY failed; treating disc capacity as 0 sectors (layer count and title ordering may be wrong)"
+            );
+            0
+        });
         let batch = detect_max_batch_sectors(session.device_path());
         let mut buffered = udf::BufferedSectorReader::new(session, batch);
         let udf_fs = udf::read_filesystem(&mut buffered)?;
