@@ -544,11 +544,17 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         return ReadAction::AbortPass;
     }
 
-    // 2. Bridge degradation: NOT_READY with the well-known signature
-    //    (sense_key=2, ASC=0x04, ASCQ=0x3E). Drive's bridge is in a
-    //    semi-stuck state but typically recovers after a long cooldown.
-    //    If we've exhausted our retry budget, fall through to the
-    //    marginal/skip path below.
+    // 2. Bridge degradation: the SCSI status byte is non-standard —
+    //    neither GOOD (0x00), CHECK CONDITION (0x02), nor TRANSPORT
+    //    FAILURE (0xFF). The USB bridge firmware returns these bogus
+    //    status bytes (e.g. 0x04, 0x05) with empty sense data when it
+    //    enters a semi-stuck state preceding a crash. This is keyed on
+    //    the status byte alone, NOT on sense_key/ASC/ASCQ — a real
+    //    NOT_READY 04/3E bad-sector error arrives as CHECK CONDITION
+    //    (0x02) and is handled by the generic NOT_READY branch below.
+    //    The bridge typically recovers after a long cooldown; if we've
+    //    exhausted our retry budget, fall through to the marginal/skip
+    //    path below.
     if err.is_bridge_degradation() && ctx.bridge_degradation_count < BRIDGE_DEGRADATION_MAX_RETRIES
     {
         ctx.bridge_degradation_count += 1;
@@ -1224,7 +1230,7 @@ mod tests {
             sense: Some(ScsiSense {
                 sense_key: scsi::SENSE_KEY_NOT_READY,
                 asc: 0x04,
-                ascq: 0x00, // not 0x3E, so not the bridge-degradation signature
+                ascq: 0x00,
             }),
         }
     }
@@ -1327,6 +1333,56 @@ mod tests {
             !matches!(a, ReadAction::Retry { .. }),
             "bridge degradation past the retry budget must fall through, got {a:?}"
         );
+    }
+
+    /// The documented BU40N bad-sector signature: NOT_READY
+    /// (sense_key=2, ASC=0x04, ASCQ=0x3E) delivered as a CHECK CONDITION
+    /// (status 0x02). This is the case the old comment on the bridge
+    /// branch wrongly claimed `is_bridge_degradation` matched.
+    fn not_ready_04_3e_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(crate::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_NOT_READY,
+                asc: 0x04,
+                ascq: 0x3E,
+            }),
+        }
+    }
+
+    #[test]
+    fn not_ready_04_3e_does_not_take_bridge_branch() {
+        // Regression guard for the misleading-comment fix: the bridge
+        // branch keys on the *status byte* (non-standard, i.e. not
+        // GOOD/CHECK/TRANSPORT), NOT on the NOT_READY 04/3E sense. A real
+        // 04/3E bad-sector error arrives as CHECK CONDITION (0x02), so
+        // `is_bridge_degradation()` must be false for it, and it must
+        // route to the generic NOT_READY retry (3 s pause) rather than
+        // the bridge cooldown (15 s pause).
+        let err = not_ready_04_3e_err();
+        assert!(
+            !err.is_bridge_degradation(),
+            "04/3E arrives as CHECK CONDITION (0x02); it is not bridge degradation"
+        );
+
+        let mut ctx = ReadCtx::for_patch(1);
+        match handle_read_error(&err, &mut ctx) {
+            ReadAction::Retry { pause_secs } => {
+                assert_eq!(
+                    pause_secs, NOT_READY_PAUSE_SECS,
+                    "04/3E must use the generic NOT_READY pause, not the bridge cooldown"
+                );
+                assert_ne!(
+                    pause_secs, BRIDGE_DEGRADATION_PAUSE_SECS,
+                    "04/3E must not take the bridge-degradation branch"
+                );
+                // Confirm it really went through the NOT_READY path.
+                assert_eq!(ctx.not_ready_retries, 1);
+                assert_eq!(ctx.bridge_degradation_count, 0);
+            }
+            other => panic!("04/3E should Retry via the NOT_READY path, got {other:?}"),
+        }
     }
 
     #[test]
