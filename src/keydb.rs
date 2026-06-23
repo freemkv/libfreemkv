@@ -246,15 +246,19 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
                 .read(&mut byte)
                 .map_err(|_| Error::KeydbConnect { host: host.clone() })?;
             if n == 0 {
-                // Connection closed before headers completed.
-                return Err(Error::KeydbParse);
+                // Server closed the connection before the header block
+                // completed: a connection/protocol-level fault, not malformed
+                // keydb content.
+                return Err(Error::KeydbConnect { host: host.clone() });
             }
             header_buf.push(byte[0]);
             if header_buf.ends_with(b"\r\n\r\n") {
                 break;
             }
             if header_buf.len() > MAX_HEADER_BYTES {
-                return Err(Error::KeydbParse);
+                // Oversized header block from the server: a protocol-level
+                // fault, not a keydb content parse failure.
+                return Err(Error::KeydbConnect { host: host.clone() });
             }
         }
         // header_buf includes the trailing \r\n\r\n.
@@ -799,6 +803,41 @@ mod tests {
         match result.unwrap_err() {
             Error::KeydbConnect { .. } => {}
             e => panic!("expected KeydbConnect for unreachable host, got: {:?}", e),
+        }
+    }
+
+    /// Regression: when the server accepts the connection but closes it before
+    /// sending complete HTTP headers (the `n == 0` byte-read path), that is a
+    /// connection/protocol-level fault. It must surface as KeydbConnect (E8000),
+    /// NOT KeydbParse (E8004) — the keydb content was never received, let alone
+    /// malformed.
+    #[test]
+    fn http_get_server_drops_before_headers_returns_keydb_connect() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // Drain the request so the client's write_all completes, then
+                // drop the socket without writing any response. The client's
+                // header read then returns n == 0.
+                let mut buf = [0u8; 512];
+                let _ = sock.read(&mut buf);
+                drop(sock);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/keydb.zip", addr.port());
+        let result = http_get(&url);
+        server.join().unwrap();
+
+        assert!(result.is_err(), "dropped connection must fail");
+        match result.unwrap_err() {
+            Error::KeydbConnect { .. } => {}
+            e => panic!("expected KeydbConnect for dropped connection, got: {:?}", e),
         }
     }
 }
