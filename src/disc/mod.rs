@@ -1508,8 +1508,12 @@ impl Disc {
     /// out-of-band: obtain the key however you like, then apply it via
     /// [`Disc::decrypt_with`]. libfreemkv never makes a network call.
     pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
-        let mut reader = crate::io::file_sector_source::FileSectorSource::open(iso_path)
-            .map_err(|_| Error::AacsNoKeys)?;
+        // Preserve the underlying open error (`Error::IoError`, E5000, carrying
+        // the OS errno) instead of collapsing ENOENT/EPERM/etc. into
+        // `Error::AacsNoKeys` (E7000). A missing or unreadable ISO is an I/O
+        // fault, not a key-resolution failure; callers that dispatch on
+        // `.code()` must be able to tell the two apart.
+        let mut reader = crate::io::file_sector_source::FileSectorSource::open(iso_path)?;
         let udf_fs = udf::read_filesystem(&mut reader)?;
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
@@ -3392,6 +3396,28 @@ mod tests {
                 "windows path {path:?} batch {batch} exceeds optical cap {MAX_BATCH_SECTORS}"
             );
         }
+    }
+
+    /// `read_aacs_inputs` on a missing/unreadable ISO must surface the real
+    /// I/O fault (`E_IO_ERROR`, 5000) carrying the OS errno — NOT `AacsNoKeys`
+    /// (7000). Collapsing ENOENT into a key error makes callers that dispatch
+    /// on `.code()` tell the user "no keys / check your KEYDB" when the actual
+    /// problem is that the ISO file does not exist.
+    #[test]
+    fn read_aacs_inputs_missing_iso_is_io_error_not_no_keys() {
+        let missing = std::path::Path::new("/nonexistent/freemkv/does-not-exist.iso");
+        let err = Disc::read_aacs_inputs(missing).expect_err("opening a nonexistent ISO must fail");
+        assert_eq!(
+            err.code(),
+            crate::error::E_IO_ERROR,
+            "missing ISO must map to E_IO_ERROR (5000), got {} ({err:?})",
+            err.code()
+        );
+        assert_ne!(
+            err.code(),
+            crate::error::E_AACS_NO_KEYS,
+            "missing ISO must not be reported as AacsNoKeys (7000)"
+        );
     }
 
     /// The sysfs probe only applies on Linux and only to `/`-delimited node
