@@ -622,7 +622,9 @@ impl Drive {
         } else {
             crate::scsi::READ_TIMEOUT_MS
         };
-        tracing::debug!(
+        // TRACE, not DEBUG: this fires on every read (hundreds of thousands per
+        // rip). At DEBUG it floods a bug-report log and buries the real events.
+        tracing::trace!(
             target: "freemkv::drive",
             lba,
             count,
