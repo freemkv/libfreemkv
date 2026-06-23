@@ -15,6 +15,16 @@ const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x4D014;
 /// IOCTL_STORAGE_QUERY_PROPERTY — CTL_CODE(IOCTL_STORAGE_BASE(0x2D),
 /// 0x500, METHOD_BUFFERED(0), FILE_ANY_ACCESS(0)) = 0x002D1400.
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+/// IOCTL_STORAGE_RESET_DEVICE (ntddstor.h) —
+/// CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0401, METHOD_BUFFERED=0,
+/// FILE_READ_ACCESS=1) = (0x2D<<16) | (1<<14) | (0x0401<<2) | 0
+/// = 0x002D0000 | 0x4000 | 0x1004 = 0x002D5004.
+/// Two earlier values were wrong: 0x002D1004 (function 0x401 but access
+/// bits cleared) and 0x002DD000 (function 0x400 + R|W access — the
+/// OBSOLETE RESET_BUS code class drivers reject). Both made
+/// `DeviceIoControl` fail ERROR_INVALID_FUNCTION, silently skipping the
+/// reset. See the value-regression test at the bottom of this module.
+const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_5004;
 /// STORAGE_PROPERTY_ID::StorageAdapterProperty.
 const STORAGE_ADAPTER_PROPERTY: u32 = 1;
 /// STORAGE_QUERY_TYPE::PropertyStandardQuery.
@@ -118,6 +128,8 @@ unsafe extern "system" {
     ) -> isize;
 
     fn CloseHandle(hObject: isize) -> i32;
+
+    fn GetLastError() -> u32;
 
     fn DeviceIoControl(
         hDevice: isize,
@@ -226,16 +238,6 @@ impl SptiTransport {
     /// Opens the device, sends IOCTL_STORAGE_RESET_DEVICE to reset
     /// the USB/SCSI bus, then closes. Same concept as SG_SCSI_RESET on Linux.
     pub fn reset(device: &Path) -> Result<()> {
-        // ntddstor.h: IOCTL_STORAGE_RESET_DEVICE
-        //   = CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0401, METHOD_BUFFERED=0, FILE_READ_ACCESS=1)
-        //   = (0x2D<<16) | (1<<14) | (0x0401<<2) | 0
-        //   = 0x002D0000 | 0x4000 | 0x1004 = 0x002D5004.
-        // Two earlier values were wrong: 0x002D1004 (function 0x401 but access
-        // bits cleared) and 0x002DD000 (function 0x400 + R|W access — that's the
-        // OBSOLETE RESET_BUS code class drivers reject). Both made DeviceIoControl
-        // fail ERROR_INVALID_FUNCTION, silently skipping the reset.
-        const IOCTL_STORAGE_RESET_DEVICE: u32 = 0x002D_5004;
-
         let dev_str = device.to_str().ok_or_else(|| Error::DeviceNotFound {
             path: device.display().to_string(),
         })?;
@@ -258,9 +260,14 @@ impl SptiTransport {
             return Ok(()); // can't open — skip reset, not fatal
         }
 
-        // Send device reset
+        // Send device reset. The result must be checked: a wrong/unsupported
+        // IOCTL code fails with ERROR_INVALID_FUNCTION (0x1) and no-ops
+        // silently — exactly the regression class the doc block above records
+        // for the two earlier (incorrect) code values. Surface failures so a
+        // non-functional reset is observable rather than masked by the
+        // unconditional settle sleep below.
         let mut returned: u32 = 0;
-        unsafe {
+        let ok = unsafe {
             DeviceIoControl(
                 handle,
                 IOCTL_STORAGE_RESET_DEVICE,
@@ -270,7 +277,20 @@ impl SptiTransport {
                 0,
                 &mut returned,
                 std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            // Not fatal — the caller treats reset as best-effort — but a
+            // failing reset (especially ERROR_INVALID_FUNCTION = 1) means the
+            // device was NOT reset despite the settle sleep that follows.
+            tracing::warn!(
+                last_error = err,
+                ioctl = format_args!("{IOCTL_STORAGE_RESET_DEVICE:#010x}"),
+                "IOCTL_STORAGE_RESET_DEVICE failed; drive not reset"
             );
+        } else {
+            tracing::debug!("IOCTL_STORAGE_RESET_DEVICE succeeded");
         }
 
         // Close and wait for drive to settle
@@ -547,5 +567,46 @@ impl ScsiTransport for SptiTransport {
             bytes_transferred: transferred,
             sense,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for `SptiTransport::reset()`. Two earlier IOCTL
+    /// values (0x002D1004 and 0x002DD000) silently failed with
+    /// ERROR_INVALID_FUNCTION while appearing to work — the reset no-oped
+    /// but the unconditional settle sleep made it look successful. This
+    /// recomputes IOCTL_STORAGE_RESET_DEVICE from the CTL_CODE formula
+    /// independently of the hardcoded constant so a wrong value can't slip
+    /// back in unnoticed.
+    #[test]
+    fn ioctl_storage_reset_device_value_is_correct() {
+        // CTL_CODE(DeviceType, Function, Method, Access) =
+        //   (DeviceType << 16) | (Access << 14) | (Function << 2) | Method
+        const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
+            (device_type << 16) | (access << 14) | (function << 2) | method
+        }
+        const IOCTL_STORAGE_BASE: u32 = 0x2D;
+        const METHOD_BUFFERED: u32 = 0;
+        const FILE_READ_ACCESS: u32 = 1;
+        let expected = ctl_code(
+            IOCTL_STORAGE_BASE,
+            0x0401,
+            METHOD_BUFFERED,
+            FILE_READ_ACCESS,
+        );
+
+        assert_eq!(
+            IOCTL_STORAGE_RESET_DEVICE, expected,
+            "IOCTL_STORAGE_RESET_DEVICE must equal CTL_CODE(0x2D, 0x0401, \
+             METHOD_BUFFERED, FILE_READ_ACCESS); a wrong value fails \
+             ERROR_INVALID_FUNCTION and silently no-ops the reset"
+        );
+        assert_eq!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_5004);
+        // The two historically wrong values must never reappear.
+        assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_1004);
+        assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_D000);
     }
 }
