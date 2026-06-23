@@ -109,7 +109,13 @@ struct StorageAdapterDescriptor {
     AdapterScansDown: u8,
     CommandQueueing: u8,
     AcceleratedTransfer: u8,
-    BusType: u8,
+    // STORAGE_BUS_TYPE is an `int`-sized enum (4 bytes), not a byte. With the
+    // four preceding `BOOLEAN`s filling offsets 20..24, `BusType` sits at
+    // offset 24 and the two `USHORT` version fields follow at 28 and 30 —
+    // matching winioctl.h. (Declaring this `u8` total-sized to 32 by luck but
+    // pushed BusMajor/BusMinorVersion to offsets 26/28, so any reader of those
+    // fields got garbage.)
+    BusType: u32,
     BusMajorVersion: u16,
     BusMinorVersion: u16,
 }
@@ -614,5 +620,40 @@ mod tests {
         // The two historically wrong values must never reappear.
         assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_1004);
         assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_D000);
+    }
+
+    /// Regression guard for the `StorageAdapterDescriptor` layout. It must
+    /// match `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) field-for-field so a
+    /// driver-filled buffer is interpreted at the correct offsets. `BusType`
+    /// is `STORAGE_BUS_TYPE`, an `int`-sized (4-byte) enum, NOT a byte; a
+    /// previous `u8` declaration kept the total size at 32 by coincidence but
+    /// shifted `BusMajorVersion`/`BusMinorVersion` to offsets 26/28 (vs the
+    /// SDK's 28/30), so any reader of those fields got wrong values.
+    #[test]
+    fn storage_adapter_descriptor_matches_sdk_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(StorageAdapterDescriptor, Version), 0);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, Size), 4);
+        assert_eq!(
+            offset_of!(StorageAdapterDescriptor, MaximumTransferLength),
+            8
+        );
+        assert_eq!(
+            offset_of!(StorageAdapterDescriptor, MaximumPhysicalPages),
+            12
+        );
+        assert_eq!(offset_of!(StorageAdapterDescriptor, AlignmentMask), 16);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, AdapterUsesPio), 20);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, AdapterScansDown), 21);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, CommandQueueing), 22);
+        assert_eq!(
+            offset_of!(StorageAdapterDescriptor, AcceleratedTransfer),
+            23
+        );
+        // The fields that were misplaced by the old `u8` BusType.
+        assert_eq!(offset_of!(StorageAdapterDescriptor, BusType), 24);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, BusMajorVersion), 28);
+        assert_eq!(offset_of!(StorageAdapterDescriptor, BusMinorVersion), 30);
+        assert_eq!(size_of::<StorageAdapterDescriptor>(), 32);
     }
 }
