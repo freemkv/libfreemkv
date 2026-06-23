@@ -562,7 +562,10 @@ pub fn trim_mkb(mut mkb: Vec<u8>) -> Vec<u8> {
 }
 
 /// Get MKB version from Type and Version Record (type 0x10).
-/// Version is a BE u32 at offset 8 of the record body (offset 12 from `pos`).
+/// Layout: 4-byte record header at `pos` (type + BE24 length), then the
+/// record body starts at `pos + 4`. The body holds the BE u32 Type field at
+/// body offset 0 (`pos + 4`), then the BE u32 version at body offset 4
+/// (`pos + 8`).
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     let mut pos = 0;
     while pos + 4 <= mkb.len() {
@@ -2542,7 +2545,8 @@ mod tests {
 
     #[test]
     fn mkb_version_uses_be24_length_and_reads_offset_8() {
-        // Type 0x10, BE24 length 0x0C (12), version u32 at body offset 8.
+        // Type 0x10, BE24 length 0x0C (12). Body starts at pos+4: Type field
+        // u32 at body offset 0, version u32 at body offset 4 (pos+8).
         // Confirm a length encoded in the high BE24 byte is honored.
         let mkb = [
             0x10, 0x00, 0x00, 0x0C, 0x11, 0x22, 0x33, 0x44, 0x01, 0x02, 0x03, 0x04,
