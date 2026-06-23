@@ -32,6 +32,8 @@
 //! logging throughout the pipeline (channel sends/receives, backpressure,
 //! consumer lag detection). This is critical for diagnosing stalls.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -121,11 +123,16 @@ fn consumer_panicked(payload: Box<dyn std::any::Any + Send>) -> Error {
 /// returned and is about to drop its output file) into a clean join,
 /// releasing the file handle without waiting the full grace period.
 ///
-/// If the consumer is still running when the grace expires, dropping the
-/// `JoinHandle` detaches from the thread — the consumer keeps running
-/// until its kernel call returns or the process exits.
+/// If the consumer is still running when the grace expires, the
+/// `abandoned` flag is set and the `JoinHandle` is dropped, detaching
+/// from the thread. The leaked consumer keeps running until its current
+/// kernel call returns, then — observing `abandoned` — exits WITHOUT
+/// calling `close()`, so it does not finalise an output the caller has
+/// already reported as failed. It does not unblock the in-flight
+/// syscall itself; that still returns on its own (or at process exit).
 fn finish_with_grace<R: Send + 'static>(
     handle: thread::JoinHandle<Result<R, Error>>,
+    abandoned: &Arc<AtomicBool>,
     leak_err: Error,
 ) -> Result<R, Error> {
     let grace = Instant::now() + Duration::from_secs(FINISH_GRACE_SECS);
@@ -138,17 +145,24 @@ fn finish_with_grace<R: Send + 'static>(
         }
         thread::sleep(POLL_INTERVAL);
     }
-    // Grace expired. Log and leak.
+    // Grace expired. Signal abandonment, then log and leak. Setting the
+    // flag BEFORE dropping the handle guarantees the leaked consumer
+    // observes it the moment its wedged syscall returns: it then skips
+    // any further `apply` and skips `close()`, rather than running on to
+    // finalise the abandoned output file.
+    abandoned.store(true, Ordering::Relaxed);
     tracing::warn!(
         target: "freemkv::pipeline",
         phase = "finish_with_halt_grace_expired",
-        "pipeline consumer did not finish within {}s grace period; leaking thread",
+        "pipeline consumer did not finish within {}s grace period; abandoning thread \
+         (output will not be finalised)",
         FINISH_GRACE_SECS
     );
     // Dropping `handle` without joining detaches from the thread — the
     // consumer keeps running until its kernel call returns or the process
     // exits. This is the intentional "leak" documented in
-    // `finish_with_halt`'s contract.
+    // `finish_with_halt`'s contract; the `abandoned` flag bounds what the
+    // leaked thread is allowed to do to the output before it exits.
     drop(handle);
     Err(leak_err)
 }
@@ -218,6 +232,18 @@ pub trait Sink<I>: Send + 'static {
 pub struct Pipeline<I: Send + 'static, R: Send + 'static> {
     tx: Sender<I>,
     handle: JoinHandle<Result<R, Error>>,
+    /// Set by [`finish_with_grace`] when the grace period expires and the
+    /// consumer thread is about to be leaked. The consumer holds a clone
+    /// and polls it in its drain loop and before `close()`: once set, it
+    /// stops applying further items and — crucially — does NOT call
+    /// `close()`. For sinks that finalise an output file in `close()`
+    /// (e.g. the mux MKV writer's Cues/segment-header patch), this
+    /// prevents a leaked consumer from finalising an output the caller
+    /// has already abandoned and reported as failed. It cannot interrupt
+    /// a syscall the consumer is currently wedged in, but it does bound
+    /// the damage to "whatever write is already in flight" once that
+    /// syscall returns, instead of running on to a clean finalise.
+    abandoned: Arc<AtomicBool>,
 }
 
 impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
@@ -251,6 +277,8 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
         sink: S,
     ) -> Result<Self, Error> {
         let (tx, rx) = bounded::<I>(depth);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned_consumer = abandoned.clone();
         let handle = thread::Builder::new()
             .name(name.into())
             .spawn(move || -> Result<R, Error> {
@@ -262,6 +290,17 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     let debug = debug_enabled();
                     if debug {
                         tracing::debug!("Pipeline receive: item={}", std::any::type_name::<I>());
+                    }
+
+                    // If the caller has abandoned us (grace period expired
+                    // after a halt/timeout and the JoinHandle was dropped),
+                    // stop applying items. We keep draining so the producer
+                    // — if it is somehow still alive — never blocks on a
+                    // dead receiver, but we touch the output no further. The
+                    // final post-loop abandonment check returns the error
+                    // and skips `close()`.
+                    if abandoned_consumer.load(Ordering::Relaxed) {
+                        continue;
                     }
 
                     if first_err.is_some() || stopped {
@@ -310,6 +349,20 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     }
                 }
 
+                // Final abandonment check: the common leak case is a
+                // consumer wedged inside `apply` (a blocking write
+                // syscall). When that syscall finally returns, the
+                // producer has long since dropped `tx`, so `recv`
+                // yields `Err` and we fall through to here. If the
+                // caller abandoned us in the meantime, skip `close()`
+                // entirely — finalising the output (e.g. writing the
+                // MKV Cues + patching the segment header) on a file the
+                // caller already reported as failed is exactly the
+                // write race we must not run.
+                if abandoned_consumer.load(Ordering::Relaxed) {
+                    return Err(Error::Halted);
+                }
+
                 match first_err {
                     Some(e) => Err(e),
                     None => sink.close(),
@@ -317,7 +370,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             })
             .map_err(|e| Error::IoError { source: e })?;
 
-        Ok(Pipeline { tx, handle })
+        Ok(Pipeline {
+            tx,
+            handle,
+            abandoned,
+        })
     }
 
     /// Push one item. Blocks if the channel is full — that's the
@@ -459,7 +516,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// logged at the join site (the library carries no English in its
     /// error values), so callers discriminate on the variant.
     pub fn finish(self) -> Result<R, Error> {
-        let Pipeline { tx, handle } = self;
+        let Pipeline {
+            tx,
+            handle,
+            abandoned: _,
+        } = self;
         // Explicit drop, although the destructure already drops `tx`
         // at end-of-scope. Being explicit keeps the intent obvious.
         drop(tx);
@@ -495,7 +556,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
     /// halt-token plumbed through; that path still blocks indefinitely
     /// on `join()`, matching pre-0.20.8 behaviour.
     pub fn finish_with_halt(self, halt: Option<&Halt>) -> Result<R, Error> {
-        let Pipeline { tx, handle } = self;
+        let Pipeline {
+            tx,
+            handle,
+            abandoned,
+        } = self;
         drop(tx);
         let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
         loop {
@@ -507,11 +572,11 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
             }
             if let Some(h) = halt {
                 if h.is_cancelled() {
-                    return finish_with_grace(handle, Error::Halted);
+                    return finish_with_grace(handle, &abandoned, Error::Halted);
                 }
             }
             if Instant::now() >= deadline {
-                return finish_with_grace(handle, Error::PipelineJoinTimeout);
+                return finish_with_grace(handle, &abandoned, Error::PipelineJoinTimeout);
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -1323,6 +1388,147 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "grace join took too long: {elapsed:?}"
+        );
+    }
+
+    /// Regression for the "leaked consumer finalises an abandoned output"
+    /// bug. When the grace period expires and the consumer is leaked, the
+    /// consumer — once its wedged `apply` syscall returns — must observe
+    /// the abandonment flag and exit WITHOUT calling `close()`. For the
+    /// mux writer, `close()` is where the MKV is finalised (Cues +
+    /// segment-header patch); running it on a file the caller already
+    /// reported as failed is the write race this fix prevents.
+    ///
+    /// Setup: a sink whose `apply` blocks until released (simulating a
+    /// wedged write syscall) and records whether `close()` ran. We fire
+    /// the halt, let `finish_with_halt` spin through the full grace period
+    /// and leak the thread, THEN release the wedged `apply`. The consumer
+    /// drains to EOF (tx already dropped) and must skip `close()`.
+    ///
+    /// Without the fix, the leaked consumer would fall through to
+    /// `sink.close()` and `closed` would flip to true.
+    #[test]
+    fn leaked_consumer_skips_close_after_abandonment() {
+        struct WedgeThenRecord {
+            release: Arc<std::sync::atomic::AtomicBool>,
+            started: Arc<std::sync::atomic::AtomicBool>,
+            closed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Sink<u64> for WedgeThenRecord {
+            type Output = ();
+            fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
+                self.started.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), Error> {
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            WedgeThenRecord {
+                release: release.clone(),
+                started: started.clone(),
+                closed: closed.clone(),
+            },
+        )
+        .expect("spawn");
+        pipe.send(0u64)
+            .expect("seed the item the consumer wedges on");
+        wait_for_started(&started, Duration::from_secs(2));
+
+        // Halt is already cancelled when finish_with_halt is called, so
+        // it enters the grace spin immediately; the consumer is wedged in
+        // apply for the whole grace window, so the thread is leaked.
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let res = pipe.finish_with_halt(Some(&halt));
+        assert!(
+            matches!(res, Err(Error::Halted)),
+            "expected Err(Halted) after grace-expiry leak, got {res:?}"
+        );
+
+        // The thread is now leaked but still parked in apply. Release it
+        // and give it time to drain to EOF and reach the close() decision.
+        release.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !closed.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            !closed.load(Ordering::SeqCst),
+            "abandoned consumer called close() — it must skip finalisation \
+             of an output the caller already reported as failed"
+        );
+    }
+
+    /// Companion to the above: the abandonment guard must NOT fire on the
+    /// normal halt path where the consumer finishes inside the grace
+    /// window. There, `close()` runs and the output is finalised as
+    /// usual. (Covered for the value-return case by
+    /// `finish_with_halt_joins_cleanly_when_consumer_finishes_in_grace`;
+    /// this one asserts `close()` specifically ran.)
+    #[test]
+    fn consumer_finishing_in_grace_still_calls_close() {
+        struct ReleasableClose {
+            release: Arc<std::sync::atomic::AtomicBool>,
+            started: Arc<std::sync::atomic::AtomicBool>,
+            closed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Sink<u64> for ReleasableClose {
+            type Output = ();
+            fn apply(&mut self, _item: u64) -> Result<Flow, Error> {
+                self.started.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), Error> {
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipeline::spawn(
+            DEFAULT_PIPELINE_DEPTH,
+            ReleasableClose {
+                release: release.clone(),
+                started: started.clone(),
+                closed: closed.clone(),
+            },
+        )
+        .expect("spawn");
+        pipe.send(0u64).expect("seed");
+        wait_for_started(&started, Duration::from_secs(2));
+
+        // Release the consumer almost immediately — well inside the grace
+        // window — so finish_with_halt joins cleanly and close() runs.
+        let release2 = release.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release2.store(true, Ordering::SeqCst);
+        });
+
+        let halt = crate::halt::Halt::new();
+        halt.cancel();
+        let res = pipe.finish_with_halt(Some(&halt));
+        assert!(res.is_ok(), "expected clean Ok join in grace, got {res:?}");
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "consumer that finished inside grace must have called close()"
         );
     }
 
