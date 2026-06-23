@@ -39,4 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
-      - run: cargo check
+      # Build the tests (not just `cargo check`): catches errors in test
+      # code and forces full codegen of the Windows-only SPTI transport
+      # (src/scsi/windows.rs), which never compiles on the Linux/macOS dev
+      # hosts. We don't `cargo test` here — the suite needs no drive but the
+      # extra build is the value; running tests is covered by the Linux job.
+      - run: cargo build --tests
