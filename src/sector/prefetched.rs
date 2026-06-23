@@ -669,6 +669,80 @@ mod tests {
         });
     }
 
+    /// The producer-thread `event_fn` must fire a `BytesRead` event for
+    /// every batch it reads, with a monotonically increasing cumulative
+    /// byte count that reaches the full extent size at EOF.
+    ///
+    /// This is the contract autorip's mux progress bar + soft-stall
+    /// watchdog depend on: the resume/multipass paths pass an `event_fn`
+    /// so `latest_bytes_read` tracks read-ahead progress and
+    /// `wd_last_frame` is refreshed on each sector read (not only on the
+    /// slower write cadence). Before this guard nothing asserted the
+    /// callback fired at all, so a path that passed `None` (the
+    /// `resume_remux` regression) compiled and ran silently with the bar
+    /// stuck at write-lagged progress.
+    #[test]
+    fn event_fn_fires_bytes_read_per_batch() {
+        with_watchdog(Duration::from_secs(10), || {
+            // 24 sectors = 8 aligned units; batch of 3 gives 8 batches.
+            let extents = vec![Extent {
+                start_lba: 0,
+                sector_count: 24,
+            }];
+            let src = PatternSource { capacity: 24 };
+
+            let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let seen_cb = seen.clone();
+            let event_fn: EventFn = Box::new(move |ev: Event| {
+                if let EventKind::BytesRead { bytes, .. } = ev.kind {
+                    seen_cb.lock().unwrap().push(bytes);
+                }
+            });
+
+            let mut pf = PrefetchedSectorSource::new_with_events(
+                src,
+                extents,
+                3,
+                SECTOR_ALIGNMENT,
+                None,
+                Some(event_fn),
+            )
+            .expect("spawn");
+
+            let mut buf = vec![0u8; 3 * 2048];
+            let mut total = 0usize;
+            for _ in 0..16 {
+                let n = pf.read_sectors(0, 3, &mut buf, false).unwrap();
+                if n == 0 {
+                    break; // EOF
+                }
+                total += n;
+            }
+            assert_eq!(total, 24 * 2048, "all 24 sectors drained");
+
+            let events = seen.lock().unwrap().clone();
+            assert!(
+                !events.is_empty(),
+                "event_fn must fire at least one BytesRead event"
+            );
+            // Cumulative byte count is non-decreasing and reaches the
+            // full extent size by the last event.
+            for w in events.windows(2) {
+                assert!(
+                    w[1] >= w[0],
+                    "cumulative bytes must be non-decreasing: {:?}",
+                    events
+                );
+            }
+            assert_eq!(
+                *events.last().unwrap(),
+                24 * 2048,
+                "final BytesRead must report the full extent: {:?}",
+                events
+            );
+        });
+    }
+
     /// An extent whose sector_count is not a multiple of 3 must not
     /// emit a still-encrypted sub-unit tail. The producer delivers the
     /// readable full units, then surfaces a typed error on the tail
