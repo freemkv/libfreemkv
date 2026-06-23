@@ -22,6 +22,12 @@ jobs:
           fi
           echo "Version match: $CARGO_VER"
 
+  # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
+  # publish/release jobs do NOT `needs:` this job. The tag decision was already
+  # gated by the local precommit (same Rust 1.86, same commit). Binary consumers
+  # (freemkv/autorip/bdemu) git-tag-pin libfreemkv and therefore start building
+  # the instant this tag exists — so this test job and the crates.io publish
+  # below must NOT sit on their critical path.
   test:
     needs: verify
     runs-on: ubuntu-latest
@@ -32,19 +38,30 @@ jobs:
       # would always fail (no lockfile to lock against on a fresh runner).
       - run: cargo test
 
+  # crates.io publish is an INDEPENDENT job: it serves EXTERNAL consumers only.
+  # The freemkv binaries no longer depend on it (they git-tag-pin libfreemkv via
+  # a committed [patch.crates-io]), so this publish runs in parallel with their
+  # release builds rather than gating them. It only `needs: verify` (the version
+  # check) — NOT `test` — so publish isn't serialized behind the test suite.
   publish:
-    needs: test
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      # --no-verify: CI already compiled this exact commit (in the `test` job
+      # and on every push via ci.yml). cargo publish's default re-verify does a
+      # full cold release build of the packaged tarball, which here is pure
+      # redundant work (~a cold lib build). Skip it.
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   release:
-    needs: test
+    # Only needs `verify`; the GitHub Release can be cut as soon as the version
+    # check passes, in parallel with test + publish.
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
