@@ -284,6 +284,15 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
                     .map_err(|e| -> io::Error { e.into() })?;
             }
+            // CSS scrambled-but-uncracked guard (Fix 6): the scan saw scrambled
+            // sectors but recovered no title key, so `disc.css` is None yet the
+            // content IS encrypted. Without this, `css.is_none()` would be read
+            // as "unencrypted" and the scrambled MPEG would mux as plaintext
+            // garbage at exit 0. Surface the recorded hard error instead.
+            // `--raw` skips decryption, so it is exempt.
+            if !opts.raw && disc.css_error.is_some() {
+                return Err(crate::error::Error::CssKeyMissing.into());
+            }
             // No-key guard: if decryption is requested (not --raw) and the disc
             // is AACS-encrypted but key resolution yielded no usable key, FAIL
             // here — muxing an undecryptable stream produces ~100 MB of garbage

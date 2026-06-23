@@ -124,6 +124,11 @@ pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// connect to (every resolved IP was loopback / private / link-local /
 /// multicast / unspecified). Closes the DNS-rebinding SSRF window.
 pub const E_NETWORK_ADDR_BLOCKED: u16 = 9022;
+/// A muxer's `finish()` was called after zero frames were emitted — the
+/// output would be a header-only container with no media. Surfaced so a
+/// zero-frame mux (undecryptable input, fully-unreadable title, every
+/// frame dropped before the first keyframe) cannot report success.
+pub const E_MUX_EMPTY: u16 = 9023;
 pub const E_EXTENT_NOT_UNIT_ALIGNED: u16 = 9030;
 /// READ CAPACITY returned a short or overflowing transfer.
 pub const E_DISC_CAPACITY_MALFORMED: u16 = 9047;
@@ -368,6 +373,13 @@ pub enum Error {
     NetworkAddrBlocked {
         addr: String,
     },
+    /// A muxer's `finish()` was reached after zero frames were written, so
+    /// the output would be a header-only container with no media. Surfaced
+    /// (instead of writing a valid-but-empty file and reporting success) so
+    /// a zero-frame mux — undecryptable input, a fully-unreadable title, or
+    /// every frame dropped before the first keyframe — fails loudly. The
+    /// `m2ts://` analogue of [`Error::MkvInvalid`]'s zero-frame guard.
+    MuxEmpty,
     PesFrameTooLarge {
         size: usize,
     },
@@ -515,6 +527,7 @@ impl Error {
             Error::StreamUrlMissingPath { .. } => E_STREAM_URL_MISSING_PATH,
             Error::StreamUrlMissingPort { .. } => E_STREAM_URL_MISSING_PORT,
             Error::NetworkAddrBlocked { .. } => E_NETWORK_ADDR_BLOCKED,
+            Error::MuxEmpty => E_MUX_EMPTY,
             Error::PesFrameTooLarge { .. } => E_PES_FRAME_TOO_LARGE,
             Error::PesInvalidMagic => E_PES_INVALID_MAGIC,
             Error::PesTrackTooLarge { .. } => E_PES_TRACK_TOO_LARGE,
@@ -739,6 +752,9 @@ impl From<Error> for std::io::Error {
             // 9022 NetworkAddrBlocked: the output host resolved only to
             // blocked (loopback/private/link-local) addresses — refuse.
             E_NETWORK_ADDR_BLOCKED => std::io::ErrorKind::PermissionDenied,
+            // 9023 MuxEmpty: finish() reached with zero frames — the output
+            // would be a header-only container. Treat as invalid output.
+            E_MUX_EMPTY => std::io::ErrorKind::InvalidData,
             // 9030 ExtentNotUnitAligned: a malformed/non-AACS-aligned
             // extent was handed to the prefetch producer.
             9030 => std::io::ErrorKind::InvalidInput,
@@ -1109,6 +1125,7 @@ mod tests {
             E_STREAM_URL_MISSING_PATH,
             E_STREAM_URL_MISSING_PORT,
             E_NETWORK_ADDR_BLOCKED,
+            E_MUX_EMPTY,
             E_PES_FRAME_TOO_LARGE,
             E_PES_INVALID_MAGIC,
             E_PES_TRACK_TOO_LARGE,
@@ -1195,6 +1212,7 @@ mod tests {
             (Error::SweepConsumerGone, E_SWEEP_CONSUMER_GONE),
             (Error::PipelineConsumerGone, E_PIPELINE_CONSUMER_GONE),
             (Error::DiscCapacityOverflow, E_DISC_CAPACITY_OVERFLOW),
+            (Error::MuxEmpty, E_MUX_EMPTY),
             (Error::M2tsPacketMalformed, E_M2TS_PACKET_MALFORMED),
             (Error::ExtentNotUnitAligned, E_EXTENT_NOT_UNIT_ALIGNED),
             (Error::DiscCapacityMalformed, E_DISC_CAPACITY_MALFORMED),

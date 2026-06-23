@@ -102,6 +102,7 @@ fn synthetic_disc(capacity_sectors: u32) -> Disc {
         css: None,
         encrypted: false,
         aacs_error: None,
+        css_error: None,
         content_format: ContentFormat::BdTs,
     }
 }

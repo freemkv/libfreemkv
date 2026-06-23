@@ -43,15 +43,41 @@ fn read_capped_to_string<R: Read>(reader: R) -> Result<String> {
     String::from_utf8(buf).map_err(|_| Error::KeydbParse)
 }
 
-/// Standard keydb storage path.
+/// Standard keydb storage path — the canonical location to write the keydb to.
+///
+/// On Windows this is the idiomatic per-user roaming dir
+/// `%APPDATA%\freemkv\keydb.cfg`, falling back to the legacy
+/// `%USERPROFILE%\.config\freemkv\keydb.cfg` only if `APPDATA` is unset. On
+/// Linux/macOS it stays the long-standing `$HOME/.config/freemkv/keydb.cfg`.
+///
+/// The CLI's read-side search (first existing of several locations) lives in
+/// `freemkv-keysources::keydb_search_paths`; this function is the single
+/// *write* default used by `save`/`update`, kept in lock-step with that crate's
+/// `default_keydb_path` for the same OS.
 pub fn default_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| Error::KeydbParse)?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("freemkv")
-        .join("keydb.cfg"))
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.is_empty() {
+                return Ok(PathBuf::from(appdata).join("freemkv").join("keydb.cfg"));
+            }
+        }
+        let profile = std::env::var("USERPROFILE").map_err(|_| Error::KeydbParse)?;
+        Ok(PathBuf::from(profile)
+            .join(".config")
+            .join("freemkv")
+            .join("keydb.cfg"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| Error::KeydbParse)?;
+        Ok(PathBuf::from(home)
+            .join(".config")
+            .join("freemkv")
+            .join("keydb.cfg"))
+    }
 }
 
 /// Download a KEYDB from a URL, verify, save to the standard path.
