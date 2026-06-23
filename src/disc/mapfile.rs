@@ -630,29 +630,9 @@ impl Mapfile {
         // this window is the wide one. Best-effort: a dir that can't be
         // opened/synced (some filesystems, Windows) is not a write failure.
         if let Some(parent) = self.path.parent() {
-            fsync_dir(parent);
+            crate::io::fsync::dir(parent);
         }
         Ok(())
-    }
-}
-
-/// fsync a directory so a prior `rename(2)` into it is durable. After a
-/// crash a renamed file's dirent can otherwise be lost even though the
-/// rename returned, because it is still page-cache-only. Best-effort:
-/// opening the directory for read and `sync_all()`ing it is the POSIX way
-/// to flush its metadata; failures (unsupported fs, Windows) are logged
-/// and ignored rather than propagated, since the file bytes are already
-/// durable and the caller's write succeeded.
-fn fsync_dir(dir: &Path) {
-    match std::fs::File::open(dir) {
-        Ok(f) => {
-            if let Err(e) = f.sync_all() {
-                tracing::warn!(path = %dir.display(), error = %e, "failed to fsync mapfile directory");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "could not open mapfile directory to fsync");
-        }
     }
 }
 
@@ -863,7 +843,7 @@ mod tests {
 
         // The directly-called dir fsync helper must be a no-op-on-error,
         // never a panic, even for a nonexistent directory.
-        fsync_dir(&dir.join("does-not-exist"));
+        crate::io::fsync::dir(&dir.join("does-not-exist"));
 
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
