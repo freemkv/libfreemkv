@@ -115,26 +115,70 @@ pub fn save(data: &[u8]) -> Result<UpdateResult> {
     }
 
     let path = default_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| {
-            tracing::warn!(error = %e, path = %path.display(), "keydb dir create failed");
-            Error::KeydbWrite {
-                path: path.display().to_string(),
-            }
-        })?;
-    }
-    std::fs::write(&path, &text).map_err(|e| {
-        tracing::warn!(error = %e, path = %path.display(), "keydb write failed");
-        Error::KeydbWrite {
-            path: path.display().to_string(),
-        }
-    })?;
+    write_atomic(&path, &text)?;
 
     Ok(UpdateResult {
         path,
         entries,
         bytes: text.len(),
     })
+}
+
+/// Write `text` to `path` crash-safely (create parent dir, write a sibling
+/// temp file, fsync, then atomic rename).
+///
+/// keydb.cfg is the single source of AACS truth, and `save`/`update` run
+/// unattended (first-boot download + daily-refresh thread, with a container
+/// restart on every release). A bare in-place `fs::write` truncates the file
+/// before writing, so a SIGKILL (docker stop's grace window), OOM-kill, power
+/// loss, or ENOSPC mid-write would leave the keydb half-written — the prior
+/// good copy already gone. A truncated keydb doesn't error at write time; it
+/// silently breaks key resolution on every later AACS rip. Writing to a temp
+/// file then renaming (POSIX rename is atomic within a filesystem) means an
+/// interrupted update leaves the previous keydb fully intact.
+///
+/// The fsync MUST succeed before the rename: a `sync_all` failure (ENOSPC,
+/// ESTALE on the bind-mounted volume) means the kernel never guaranteed the
+/// bytes reached stable storage, so publishing them via rename would defeat
+/// crash-safety. The temp name is unique per call (pid + monotonic counter)
+/// so a concurrent update can't share a fixed temp path and rename a mangled
+/// file over the keydb.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
+    let werr = || Error::KeydbWrite {
+        path: path.display().to_string(),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "keydb dir create failed");
+            werr()
+        })?;
+    }
+    let tmp = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, path = %path.display(), "keydb write/fsync failed; keydb unchanged");
+        return Err(werr());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, path = %path.display(), "keydb rename failed; keydb unchanged");
+        return Err(werr());
+    }
+    Ok(())
 }
 
 /// Result of a KEYDB update -- path written, entry count, and byte size.
@@ -351,6 +395,62 @@ fn extract_zip(data: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Per project convention, tests never touch /tmp (wiped on reboot).
+    // Anchor scratch under the crate's target/ (gitignored), not /tmp.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("keydb-test-{}-{}-{}", std::process::id(), tag, n));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_and_leaves_no_temp() {
+        let dir = scratch("atomic");
+        let path = dir.join("freemkv").join("keydb.cfg");
+
+        // First write creates the parent dir + file.
+        write_atomic(&path, "0xAAAA = old\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xAAAA = old\n");
+
+        // Second write replaces it in place.
+        write_atomic(&path, "0xBBBB = new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+
+        // No leftover *.tmp.* sibling — the temp file was renamed, not orphaned.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_atomic_failure_preserves_prior_keydb() {
+        // Simulate the crash window: a good keydb already on disk, then an
+        // update whose write target can't be created (parent path is a file,
+        // so create_dir_all under it fails — i.e. ENOTDIR). The rename never
+        // happens, so the existing keydb must survive untouched.
+        let dir = scratch("preserve");
+        let good = dir.join("keydb.cfg");
+        write_atomic(&good, "0xGOOD = keep\n").unwrap();
+
+        // `good` is a regular file; treating it as a directory parent fails.
+        let doomed = good.join("freemkv").join("keydb.cfg");
+        let err = write_atomic(&doomed, "0xBAD = partial\n");
+        assert!(matches!(err, Err(Error::KeydbWrite { .. })));
+
+        // Prior good copy is intact.
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "0xGOOD = keep\n");
+    }
 
     #[test]
     fn parse_url_defaults_and_paths() {
