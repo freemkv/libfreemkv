@@ -17,9 +17,10 @@ material is compiled in; DVD CSS player keys are the only compiled-in keys.
    format handling live in the library. CLI binaries are thin wrappers that call
    `Drive::open()` and `Disc::scan()`.
 
-2. **No external files.** Bundled drive profiles are compiled into the binary via
-   `include_str!`. No configuration directory, no runtime file lookups for drive
-   support.
+2. **Firmware-clean core.** libfreemkv ships no firmware, no unlock CDBs, and no
+   drive profiles. Drive-unlock logic is plugged in by an external crate through
+   the `Unlocker` trait + registry (`register_unlocker`); without one the library
+   still rips via the host-certificate AACS handshake.
 
 3. **Transparent AACS.** The `ContentReader` decrypts on the fly when keys are
    available. Callers read cleartext sectors without knowing whether the disc
@@ -43,11 +44,9 @@ material is compiled in; DVD CSS player keys are the only compiled-in keys.
 libfreemkv (lib.rs)
 │
 ├── Drive Access
-│   ├── drive         Drive — open, identify, init, unlock, single-shot read
+│   ├── drive         Drive — open, identify, init, single-shot read
 │   ├── scsi          ScsiTransport trait + platform backends (sg async, IOKit, SPTI)
-│   ├── platform/     Platform trait — per-chipset command handlers
-│   │   └── mt1959    MediaTek MT1959 driver (LG, ASUS, HP)
-│   ├── profile       DriveProfile loading, matching, bundled JSON
+│   ├── unlock        Unlocker trait + registry — the pluggable unlock seam
 │   ├── identity      DriveId from INQUIRY + GET_CONFIG 010C
 │   ├── speed         DriveSpeed enum, SET CD SPEED CDB builder
 │   └── event         Event system for drive status callbacks
@@ -76,8 +75,7 @@ libfreemkv (lib.rs)
 │
 ├── Support
 │   ├── keydb         KEYDB.cfg download, parse, verify, save
-│   ├── error         Error enum with numeric codes E1000-E8000
-│   └── profile       Bundled drive profiles
+│   └── error         Error enum with numeric codes E1000-E8000
 │
 └── lib.rs            Public API re-exports
 ```
@@ -91,13 +89,12 @@ Drive::open(Path::new("/dev/sg4"))
   │
   ├─ scsi::open()           Open /dev/sg4 (async write/poll/read)
   ├─ DriveId::from_drive()  INQUIRY + GET_CONFIG 010C
-  ├─ profile::find_by_drive_id()  Match against bundled profiles
-  ├─ Platform::new()        Instantiate chipset driver (Mt1959)
-  └─ Drive ready for init/unlock/read
+  └─ Drive ready for init/read
 ```
 
 After open:
-- `init()` -- unlock + firmware upload + speed calibration
+- `init()` -- routes to the matching registered unlocker (if any); otherwise
+  a no-op and the cert handshake carries the disc
 - `probe_disc()` -- probe disc surface for optimal speeds
 - `read(lba, count, buf, recovery)` -- single-shot read; `recovery` only selects the per-CDB timeout (1.5 s vs. 30 s)
 - `wait_ready()` -- wait for disc insertion
@@ -197,17 +194,20 @@ implementing `execute()` for that OS and wiring it into `scsi::open()`.
 
 ---
 
-## Chipset Support
+## Drive Unlock
 
-| Chipset | Drives | Status |
-|---------|--------|--------|
-| MediaTek MT1959 | LG, ASUS, HP | Supported (bundled profiles) |
-| Renesas RS8xxx/RS9xxx | Pioneer, some HL-DT-ST | Planned |
+libfreemkv carries no drive-unlock mechanism. The `Unlocker` trait + registry
+(`src/unlock.rs`) is the seam: an external crate implements `Unlocker` and
+registers it once via `register_unlocker(...)`. At drive-prep the registry is
+walked in order and the first unlocker whose `matches()` is true is asked to
+`unlock_drive()` over the raw `ScsiTransport`. If none match, the drive is left
+untouched and the host-certificate AACS handshake carries the disc.
 
-The `Platform` trait abstracts chipset-specific commands. Each chipset implements
-handlers (unlock, config, register, calibrate, keepalive, status, probe,
-read_sectors, timing). All handlers are accessed via SCSI READ BUFFER with
-chipset-specific mode and buffer ID bytes.
+The implementor owns everything firmware-specific — drive profiles, vendor CDBs,
+variant logic. Concrete unlockers live in the separate
+**[freemkv-unlock](https://github.com/freemkv/freemkv-unlock)** repository, never
+in libfreemkv. See [`drive-access.md`](drive-access.md#drive-unlock-seam) for the
+trait definition and routing.
 
 ---
 

@@ -10,14 +10,14 @@ Insert disc
     │
     ▼
 1. Open drive (drive/mod.rs)
-    │  INQUIRY → identify drive
-    │  Match bundled profile → chipset, unlock parameters
+    │  INQUIRY → identify drive (DriveId)
     │
     ▼
-2. Init drive (drive/mod.rs → platform/mt1959)
-    │  Firmware upload (if needed, 10s recovery wait)
-    │  Unlock → vendor-specific command activates raw read mode
-    │  Speed calibration → probe_disc()
+2. Init drive (drive/mod.rs → unlock seam)
+    │  Walk the registered-unlocker registry; first match unlocks the drive
+    │  (firmware/vendor handshakes are the unlocker's own business)
+    │  No match → drive untouched; host-cert AACS handshake carries the disc
+    │  Speed control → probe_disc()
     │
     ▼
 3. AACS handshake (aacs/handshake.rs) — optional

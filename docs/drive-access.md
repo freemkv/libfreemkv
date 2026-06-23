@@ -7,8 +7,9 @@ optical drives.
 
 ## Drive
 
-`Drive` is the primary API. It owns the SCSI transport, the matched
-drive profile, and the chipset-specific platform driver.
+`Drive` is the primary API. It owns the SCSI transport and the drive
+identity (`DriveId`); any drive-specific unlock logic lives behind the
+pluggable [unlock seam](#drive-unlock-seam), not in `Drive` itself.
 
 ### Opening a Drive
 
@@ -16,15 +17,16 @@ drive profile, and the chipset-specific platform driver.
 let mut drive = Drive::open(Path::new("/dev/sg4"))?;
 ```
 
-`open()` performs: open device → send INQUIRY → match profile → instantiate
-platform driver. The drive is ready for `wait_ready()` and `init()`.
+`open()` performs: open device → send INQUIRY → build `DriveId`. The drive
+is ready for `wait_ready()` and `init()` (which routes through the unlock
+seam).
 
 ### Drive Operations
 
 | Method | Description |
 |--------|-------------|
 | `wait_ready()` | Wait for disc insertion (30s timeout, TUR polling) |
-| `init()` | Firmware upload + unlock + speed calibration |
+| `init()` | Route to the matching registered unlocker (if any), then prepare for reads |
 | `probe_disc()` | Probe disc surface for optimal speeds |
 | `read(lba, count, buf, recovery)` | Read sectors. Single-shot — no inline retries or reset. |
 | `reset()` | Eject-cycle escape hatch. Caller-invoked only; not on the read path. |
@@ -32,17 +34,21 @@ platform driver. The drive is ready for `wait_ready()` and `init()`.
 | `unlock_tray()` | Allow tray ejection (also runs on Drop) |
 | `eject()` | Eject disc tray |
 | `drive_status()` | Query physical state (disc present, tray open, etc.) |
-| `has_profile()` | Whether a bundled profile matched |
+| `has_profile()` | Whether a registered unlocker matches this drive |
 | `close()` | Consume Drive, cleanup (also runs via Drop) |
 
 ### init() Sequence
 
-`init()` orchestrates the full drive unlock:
+`init()` routes drive preparation through the unlock seam:
 
-1. Platform driver `run_init()` — sends vendor-specific SCSI commands
-2. If firmware upload needed: upload, wait 10s for drive reset, retry
-3. Speed calibration after unlock
-4. Max 3 attempts before giving up
+1. Walk the registered-unlocker registry; the first whose `matches()` is true
+   is asked to `unlock_drive()` over the raw transport.
+2. Whatever that unlocker needs (firmware upload, vendor handshakes, retries)
+   is the unlocker's own business — libfreemkv only forwards the transport.
+3. If no unlocker matches, the drive is left untouched and the library uses
+   the host-certificate AACS handshake.
+
+See [Drive Unlock Seam](#drive-unlock-seam) for the trait and registry.
 
 ### read() — single-shot
 
@@ -164,100 +170,68 @@ date for drives where Feature 010C is unavailable.
 
 ---
 
-## Drive Profiles
+## Drive Unlock Seam
 
-Profiles are JSON objects compiled into the binary (`profiles.json`).
-Each profile contains:
-
-| Field | Purpose |
-|-------|---------|
-| `vendor_id`, `product_revision`, `vendor_specific`, `firmware_date` | Matching fields |
-| `chipset` | `"mediatek"` or `"renesas"` |
-| `unlock_mode`, `unlock_buf_id` | READ BUFFER CDB parameters |
-| `signature` | Expected 4-byte response signature |
-| `unlock_cdb` | Pre-built unlock CDB (hex-encoded) |
-| `register_offsets` | Offsets for hardware register reads |
-| `capabilities` | Feature flags: `bd_raw_read`, `dvd_all_regions`, etc. |
-
-Loading:
+libfreemkv ships **no firmware, no unlock CDBs, and no drive profiles.** It
+knows only the *seam*, never the *mechanism*. The seam is the `Unlocker`
+trait plus a small process-wide registry (`src/unlock.rs`):
 
 ```rust
-// Bundled (compiled-in) -- no file I/O
-let profiles = profile::load_bundled()?;
+pub trait Unlocker: Send + Sync {
+    /// Stable, language-neutral identifier (logged).
+    fn name(&self) -> &str;
 
-// External file
-let profiles = profile::load_all(Path::new("/path/to/profiles.json"))?;
+    /// True if this unlocker handles the given drive.
+    fn matches(&self, id: &DriveId) -> bool;
+
+    /// Put the drive into extended-access mode. The one required capability.
+    fn unlock_drive(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()>;
+
+    /// Read the disc Volume ID via the drive's OEM path. Default: no-op.
+    fn read_volume_id(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId)
+        -> Result<Option<[u8; 16]>> { Ok(None) }
+
+    /// Raise the drive to its maximum read speed. Default: no-op.
+    fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId)
+        -> Result<()> { Ok(()) }
+}
 ```
 
----
+An unlocker is supplied by an **external crate** and registered once at
+process start:
 
-## Chipsets
+```rust
+libfreemkv::register_unlocker(Box::new(some_unlocker::Plugin::new()));
+```
 
-### MediaTek MT1959
+The implementor owns everything about *how* a particular drive family is
+driven — drive identification against its own profile database, firmware
+upload, vendor CDBs, variant logic. libfreemkv only hands over the raw
+`ScsiTransport` and the `DriveId`.
 
-Covers all LG, ASUS, and HP optical drives. Two sub-variants share identical
-logic with different SCSI parameters:
+### Routing
 
-| Variant | READ BUFFER mode | Buffer ID |
-|---------|------------------|-----------|
-| MT1959-A | 0x01 | 0x44 |
-| MT1959-B | 0x02 | 0x77 |
+At drive-prep the registry is walked in registration order; the first
+unlocker whose `matches()` returns true is asked to `unlock_drive()` (and,
+when needed, `read_volume_id()` / `set_max_read_speed()`). If no unlocker
+matches, the drive is left untouched and the library falls back to the
+standard host-certificate AACS handshake (the "OEM route"). The
+`register_unlocker(...)` line is the entire plug: drop it (and the unlocker
+crate) and libfreemkv still compiles and rips via the cert handshake.
 
-The Platform trait maps to command handlers:
-
-| Handler | Function | Description |
-|---------|----------|-------------|
-| 0 | `unlock()` | Send READ BUFFER, verify signature + verification bytes |
-| 1 | `read_config()` | Read 1888-byte configuration block + 4-byte status |
-| 2-3 | `read_register()` | Read hardware registers at profile-specified offsets |
-| 4 | `calibrate()` | Probe disc surface, build 64-entry speed table |
-| 5 | `keepalive()` | Periodic session maintenance |
-| 6 | `status()` | Query current mode and feature flags |
-| 7 | `probe()` | Generic READ BUFFER with dynamic parameters |
-| 8 | `read_sectors()` | Speed lookup + SET CD SPEED + READ(10) with flag 0x08 |
-| 9 | `timing()` | Timing calibration |
-
-### Renesas (Planned)
-
-RS8xxx/RS9xxx chipsets used in Pioneer and some HL-DT-ST drives.
-Currently returns `Error::UnsupportedDrive` when a Renesas profile is matched.
-
----
-
-## Why Unlock Is Needed
-
-Optical drive firmware restricts what applications can read from disc. Without
-unlock:
-
-- **READ(10) works for unencrypted filesystem data.** UDF structures, MPLS
-  playlists, and CLPI clip info are readable without unlock. Standard READ(10)
-  works on any drive.
-
-- **READ(10) fails for encrypted content sectors.** The drive firmware returns
-  SCSI errors (sense key 0x05, illegal request) when an application attempts to
-  read sectors containing encrypted m2ts content without prior AACS
-  authentication via the bus key.
-
-- **Raw mode bypasses firmware restrictions.** After unlock, the drive accepts
-  READ(10) with the raw read flag (CDB byte 1 = 0x08) for all sectors,
-  regardless of encryption status.
-
-### AACS Before Unlock
-
-AACS bus authentication uses standard MMC REPORT KEY / SEND KEY commands.
-On some drives these must execute before unlock. The `Disc::scan()` handles
-this internally — it manages the handshake/unlock ordering automatically.
+Concrete unlockers — including the firmware-unlock profile databases,
+variant logic, and vendor CDBs that used to live in-tree — are maintained
+in the separate **[freemkv-unlock](https://github.com/freemkv/freemkv-unlock)**
+repository, never here.
 
 ---
 
 ## Speed Control
 
-After `probe_disc()`, the platform driver maintains a speed lookup table
-built by probing the disc surface. On each `read()` call, the driver:
-
-1. Looks up the optimal speed for the target LBA.
-2. Issues SET CD SPEED (0xBB) if the speed differs from current.
-3. Performs the READ(10).
+A matching unlocker may raise the drive to its maximum read speed via
+`set_max_read_speed()` (a no-op when no unlocker matches or the unlocker
+declines). The library issues SET CD SPEED (0xBB) through the generic CDB
+builder; the concrete speed policy lives in the unlocker.
 
 Available speeds:
 
