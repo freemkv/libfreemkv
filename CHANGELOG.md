@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0-rc.4.2]
+
+### Fixed
+
+- **Windows durability.** New platform-aware `io::fsync` module: directory
+  fsync is a no-op on Windows (std cannot open a directory there, which
+  logged a spurious warning on every mapfile write — including from the
+  CLI), and a shared `file_durable` helper opens files read+write before
+  `sync_all` so the flush succeeds on Windows, where `FlushFileBuffers`
+  rejects a read-only handle with `ERROR_ACCESS_DENIED`.
+
 ## [1.0.0-rc.4] — UNRELEASED
 
 An audit-driven round of correctness, durability, and Windows-transport
