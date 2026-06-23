@@ -549,6 +549,12 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     };
     let decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
+    // Grab the decrypt-loss counter before the decorator is moved into the
+    // producer thread. It tracks bytes of scrambled AACS units no key could
+    // decrypt — silent loss the demux drops; the consuming stream surfaces it
+    // through `lost_bytes()` so the mux abort gate sees a partial decrypt
+    // failure rather than a clean rip.
+    let decrypt_loss = decrypting.decrypt_loss();
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,
         extents,
@@ -564,13 +570,10 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     let (demux_thread, demux_rx) =
         super::demux_thread::DemuxThread::spawn_zero_copy(rx, recycle_tx, shell, halt, ts, ps)
             .map_err(|e| -> io::Error { e.into() })?;
-    Ok(PipelinedPesStream::new(
-        demux_thread,
-        demux_rx,
-        title,
-        parsers,
-        pid_to_track,
-    ))
+    Ok(
+        PipelinedPesStream::new(demux_thread, demux_rx, title, parsers, pid_to_track)
+            .with_decrypt_loss(decrypt_loss),
+    )
 }
 
 /// Assemble the M2TS file mux pipeline (read → demux → parse) for a

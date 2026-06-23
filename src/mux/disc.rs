@@ -811,7 +811,17 @@ impl crate::pes::Stream for DiscStream {
     }
 
     fn lost_bytes(&self) -> u64 {
-        self.lost_bytes
+        // Read-error zero-fill loss (counted in fill_extents) PLUS decrypt-time
+        // loss — bytes of scrambled AACS units the decorator could not decrypt
+        // and passed through still encrypted (the TS assembler silently drops
+        // them). Both are real missing content the abort gate must see; without
+        // the decrypt term a partial key failure reports lost_bytes=0 and a rip
+        // missing segments passes even under abort_on_lost_secs=0.
+        self.lost_bytes.saturating_add(
+            self.reader
+                .decrypt_loss()
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 

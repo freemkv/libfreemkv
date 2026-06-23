@@ -172,13 +172,22 @@ impl DecryptKeys {
 ///
 /// Returns `Err` if decryption was expected but keys are missing or invalid.
 /// Never produces silently corrupted output.
+///
+/// On success returns the number of bytes belonging to scrambled AACS units
+/// that **no available key could decrypt** — those units are restored to their
+/// original encrypted bytes (so a clear nav-file is never corrupted), but for
+/// genuine encrypted content this is silent data loss the downstream TS
+/// assembler will drop without a sync. The decrypt-on-read decorator folds this
+/// count into the mux loss accounting so a partial key failure can't be reported
+/// as a perfect rip. `0` for `None` / `Css` and for any AACS buffer where every
+/// scrambled unit decrypted.
 pub fn decrypt_sectors(
     buf: &mut [u8],
     keys: &DecryptKeys,
     unit_key_idx: usize,
-) -> Result<(), crate::error::Error> {
-    match keys {
-        DecryptKeys::None => {}
+) -> Result<usize, crate::error::Error> {
+    let dropped: usize = match keys {
+        DecryptKeys::None => 0,
         DecryptKeys::Aacs {
             unit_keys,
             read_data_key,
@@ -243,6 +252,14 @@ pub fn decrypt_sectors(
             // never a wrong result (TS-sync verify gates correctness).
             let last_key_idx = AtomicUsize::new(unit_key_idx);
 
+            // Count bytes of scrambled units that NO key could decrypt. Shared
+            // across the rayon workers (relaxed is fine — it's a pure tally, not
+            // a synchronisation point). A non-zero total is silent decrypt loss:
+            // the bytes pass downstream still encrypted and the TS assembler
+            // drops them without a sync. The caller folds this into mux loss
+            // accounting so a partial key failure isn't reported as a clean rip.
+            let dropped_bytes = AtomicUsize::new(0);
+
             // Per-unit decrypt closure. For a scrambled full aligned unit:
             //   1. Try the cached key index first (avoids scanning all keys on the
             //      common case where a disc run uses one CPS unit throughout).
@@ -287,8 +304,16 @@ pub fn decrypt_sectors(
                     }
                 }
 
-                // No key validated — restore the original encrypted bytes.
+                // No key validated — restore the original encrypted bytes and
+                // tally the loss. The unit was scrambled (we only reach here past
+                // the `is_aacs_scrambled` gate) but no key applied: a clear
+                // nav-file unit that legitimately fails the cipher, or genuine
+                // encrypted content with a missing/wrong sub-key. We can't tell
+                // them apart here, so we always tally; the mux read path treats
+                // the count as loss (its extents are real content), while
+                // metadata-probe callers that don't install a loss sink ignore it.
                 chunk.copy_from_slice(&original);
+                dropped_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
             };
 
             if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
@@ -323,14 +348,16 @@ pub fn decrypt_sectors(
                     }
                 }
             }
+            dropped_bytes.into_inner()
         }
         DecryptKeys::Css { title_key } => {
             for chunk in buf.chunks_mut(2048) {
                 css::lfsr::descramble_sector(title_key, chunk);
             }
+            0
         }
-    }
-    Ok(())
+    };
+    Ok(dropped)
 }
 
 #[cfg(test)]
@@ -773,6 +800,114 @@ mod tests {
             aacs::ts_packet_total(&buf),
             "all TS sync bytes must be restored for single-key disc"
         );
+    }
+
+    /// Regression for the silent partial-decrypt-loss defect: a scrambled AACS
+    /// unit that NO supplied key can decrypt is restored to its original
+    /// ciphertext (so a clear nav-file is never corrupted) AND `decrypt_sectors`
+    /// returns the unit's byte length as the dropped count. Before the fix this
+    /// returned `()` and the still-encrypted bytes flowed downstream to be
+    /// silently dropped by the TS assembler with zero loss accounting — a rip
+    /// missing real content reported `lost_video_secs=0` and passed the abort
+    /// gate even under `abort_on_lost_secs=0`.
+    ///
+    /// Grounding: the `dropped_bytes.fetch_add(chunk.len(), …)` on the
+    /// no-key-validated restore path; the function returns that tally.
+    /// Mutation: drop the `fetch_add` (or return a constant 0) → dropped == 0,
+    /// this fails.
+    #[test]
+    fn aacs_undecryptable_unit_reports_dropped_bytes() {
+        let real_key = [0x33u8; 16];
+        let wrong_key = [0x44u8; 16]; // not the encrypting key
+
+        // Encrypt a clear unit under real_key, then offer ONLY the wrong key.
+        let mut unit = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit, &real_key);
+        let ciphertext = unit.clone();
+        assert!(
+            aacs::is_aacs_scrambled(&unit),
+            "encrypted unit must look scrambled going in"
+        );
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, wrong_key)],
+            read_data_key: None,
+        };
+        let mut buf = unit;
+        let dropped =
+            decrypt_sectors(&mut buf, &keys, 0).expect("undecryptable unit is not a hard error");
+
+        assert_eq!(
+            dropped,
+            aacs::ALIGNED_UNIT_LEN,
+            "the whole scrambled unit must be reported as dropped when no key validates"
+        );
+        assert_eq!(
+            buf, ciphertext,
+            "an undecryptable unit must be restored to its original ciphertext, not garbled"
+        );
+    }
+
+    /// The dropped-byte tally accumulates across a multi-unit buffer where some
+    /// units decrypt and others don't: a 2-unit buffer with one good and one
+    /// bad unit reports exactly one unit's worth of loss, and the good unit is
+    /// fully decrypted. Confirms the count is per-unit, not all-or-nothing.
+    ///
+    /// Grounding: the per-chunk `decrypt_one` closure tallies only the units
+    /// that fail; the good unit takes the `return` before the tally.
+    #[test]
+    fn aacs_mixed_buffer_tallies_only_failed_units() {
+        let key = [0x55u8; 16];
+        let wrong = [0x66u8; 16];
+
+        // Unit A: encrypted under `key` (decryptable). Unit B: encrypted under
+        // `wrong` (NOT in the key list → undecryptable).
+        let mut unit_a = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit_a, &key);
+        let mut unit_b = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit_b, &wrong);
+        let unit_b_ciphertext = unit_b.clone();
+
+        let mut buf = Vec::with_capacity(2 * aacs::ALIGNED_UNIT_LEN);
+        buf.extend_from_slice(&unit_a);
+        buf.extend_from_slice(&unit_b);
+
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+        };
+        let dropped = decrypt_sectors(&mut buf, &keys, 0).expect("partial decrypt is Ok");
+
+        assert_eq!(
+            dropped,
+            aacs::ALIGNED_UNIT_LEN,
+            "exactly one unit's worth of bytes must be reported dropped"
+        );
+        assert!(
+            !aacs::is_aacs_scrambled(&buf[..aacs::ALIGNED_UNIT_LEN]),
+            "the decryptable unit must come out clear"
+        );
+        assert_eq!(
+            &buf[aacs::ALIGNED_UNIT_LEN..],
+            &unit_b_ciphertext[..],
+            "the undecryptable unit must be restored to ciphertext"
+        );
+    }
+
+    /// A fully-decryptable single-key buffer reports zero dropped bytes — the
+    /// loss tally must not fire on the clean path.
+    #[test]
+    fn aacs_all_units_decrypt_reports_zero_dropped() {
+        let key = [0x77u8; 16];
+        let mut unit = clear_ts_unit();
+        aacs_encrypt_unit_for_test(&mut unit, &key);
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, key)],
+            read_data_key: None,
+        };
+        let mut buf = unit;
+        let dropped = decrypt_sectors(&mut buf, &keys, 0).expect("clean decrypt");
+        assert_eq!(dropped, 0, "a fully-decrypted buffer must report no loss");
     }
 
     // ── decrypt_threads resolution (read-only; no global mutation) ─────────
