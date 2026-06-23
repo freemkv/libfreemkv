@@ -279,23 +279,29 @@ impl SptiTransport {
                 std::ptr::null_mut(),
             )
         };
-        if ok == 0 {
+        let reset_ok = ok != 0;
+        if reset_ok {
+            tracing::debug!("IOCTL_STORAGE_RESET_DEVICE succeeded");
+        } else {
             let err = unsafe { GetLastError() };
             // Not fatal — the caller treats reset as best-effort — but a
             // failing reset (especially ERROR_INVALID_FUNCTION = 1) means the
-            // device was NOT reset despite the settle sleep that follows.
+            // device was NOT reset, so there is nothing to settle and we must
+            // not pay the settle-sleep penalty below.
             tracing::warn!(
                 last_error = err,
                 ioctl = format_args!("{IOCTL_STORAGE_RESET_DEVICE:#010x}"),
                 "IOCTL_STORAGE_RESET_DEVICE failed; drive not reset"
             );
-        } else {
-            tracing::debug!("IOCTL_STORAGE_RESET_DEVICE succeeded");
         }
 
-        // Close and wait for drive to settle
+        // Close the handle, then — only if the reset actually happened — wait
+        // for the drive to settle. A failed IOCTL reset performed no reset, so
+        // sleeping would burn 2 s for nothing.
         unsafe { CloseHandle(handle) };
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        if reset_ok {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         Ok(())
     }
 }
