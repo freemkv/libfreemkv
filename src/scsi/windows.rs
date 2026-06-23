@@ -52,15 +52,7 @@ const K_SENSE_SIZE: usize = 32;
 
 // ── SCSI_PASS_THROUGH_DIRECT structure ─────────────────────────────────────
 
-// `#[repr(C, packed(4))]` mirrors ntddscsi.h's `#pragma pack(push, 4)` around
-// SCSI_PASS_THROUGH_DIRECT. Without it, bare `#[repr(C)]` lets the compiler
-// apply natural 8-byte alignment to the `DataBuffer` pointer on 64-bit hosts,
-// inserting 4 implicit padding bytes after `TimeOutValue`. That shifts
-// `DataBuffer` to offset 24 (SDK: 20), `SenseInfoOffset` to 32 (SDK: 28), and
-// `Cdb` to 36 (SDK: 32), and grows the struct to 56 bytes (SDK: 48). The
-// kernel driver reads the CDB and DataBuffer pointer at the SDK offsets, so a
-// mismatched layout breaks every SPTI ioctl. See the layout regression test.
-#[repr(C, packed(4))]
+#[repr(C)]
 #[allow(non_snake_case)]
 struct ScsiPassThroughDirect {
     Length: u16,
@@ -79,11 +71,7 @@ struct ScsiPassThroughDirect {
     Cdb: [u8; K_MAX_CDB_SIZE],
 }
 
-// Must carry the same `packed(4)` as `ScsiPassThroughDirect`, otherwise the
-// trailing `sense` array would be repositioned and `offset_of!(SptwbDirect,
-// sense)` (used for `SenseInfoOffset`) would point the driver at the wrong
-// place to write sense data.
-#[repr(C, packed(4))]
+#[repr(C)]
 struct SptwbDirect {
     spt: ScsiPassThroughDirect,
     sense: [u8; K_SENSE_SIZE],
@@ -634,31 +622,6 @@ mod tests {
         assert_ne!(IOCTL_STORAGE_RESET_DEVICE, 0x002D_D000);
     }
 
-    /// Regression guard for the `ScsiPassThroughDirect` layout. ntddscsi.h
-    /// wraps SCSI_PASS_THROUGH_DIRECT in `#pragma pack(push, 4)`, forcing the
-    /// PVOID `DataBuffer` to 4-byte alignment even on 64-bit hosts. With bare
-    /// `#[repr(C)]` the compiler instead applies natural 8-byte pointer
-    /// alignment, inserting 4 padding bytes after `TimeOutValue` — shifting
-    /// `DataBuffer` to 24 (vs SDK 20), `SenseInfoOffset` to 32 (vs 28), `Cdb`
-    /// to 36 (vs 32), and growing the struct to 56 bytes (vs 48). The kernel
-    /// driver reads at the SDK offsets, so the wrong layout breaks every SPTI
-    /// ioctl. `#[repr(C, packed(4))]` restores the SDK layout asserted here.
-    #[test]
-    fn scsi_pass_through_direct_matches_sdk_layout() {
-        use std::mem::{offset_of, size_of};
-        assert_eq!(offset_of!(ScsiPassThroughDirect, Length), 0);
-        assert_eq!(offset_of!(ScsiPassThroughDirect, DataTransferLength), 12);
-        assert_eq!(offset_of!(ScsiPassThroughDirect, TimeOutValue), 16);
-        assert_eq!(offset_of!(ScsiPassThroughDirect, DataBuffer), 20);
-        assert_eq!(offset_of!(ScsiPassThroughDirect, SenseInfoOffset), 28);
-        assert_eq!(offset_of!(ScsiPassThroughDirect, Cdb), 32);
-        assert_eq!(size_of::<ScsiPassThroughDirect>(), 48);
-        // `sense` must immediately follow the 48-byte spt with no extra pad.
-        assert_eq!(offset_of!(SptwbDirect, spt), 0);
-        assert_eq!(offset_of!(SptwbDirect, sense), 48);
-        assert_eq!(size_of::<SptwbDirect>(), 48 + K_SENSE_SIZE);
-    }
-
     /// Regression guard for the `StorageAdapterDescriptor` layout. It must
     /// match `STORAGE_ADAPTER_DESCRIPTOR` (winioctl.h) field-for-field so a
     /// driver-filled buffer is interpreted at the correct offsets. `BusType`
@@ -692,5 +655,35 @@ mod tests {
         assert_eq!(offset_of!(StorageAdapterDescriptor, BusMajorVersion), 28);
         assert_eq!(offset_of!(StorageAdapterDescriptor, BusMinorVersion), 30);
         assert_eq!(size_of::<StorageAdapterDescriptor>(), 32);
+    }
+
+    /// Regression guard for the `ScsiPassThroughDirect` layout, cross-checked
+    /// against the authoritative `SCSI_PASS_THROUGH_DIRECT` in the Windows SDK
+    /// `ntddscsi.h`. That struct has **no `#pragma pack`** — it uses natural
+    /// alignment — so on 64-bit Windows (LLP64, 8-byte `PVOID`) the compiler
+    /// pads `DataBuffer` to offset 24 and the struct is 56 bytes. That is the
+    /// layout `DeviceIoControl` expects, and bare `#[repr(C)]` reproduces it.
+    ///
+    /// Do NOT add `packed(4)`: that yields offset 20 / 48 bytes, which is the
+    /// SDK's SEPARATE 32-bit thunk struct `SCSI_PASS_THROUGH_DIRECT32`
+    /// (`VOID* POINTER_32 DataBuffer`). Using that 32-bit layout on a 64-bit
+    /// host malforms every SPTI ioctl, so INQUIRY fails and drive enumeration
+    /// returns zero drives (the rc.4 Windows "no drives detected" regression).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn scsi_pass_through_direct_matches_sdk_layout_win64() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(ScsiPassThroughDirect, Length), 0);
+        assert_eq!(offset_of!(ScsiPassThroughDirect, DataTransferLength), 12);
+        assert_eq!(offset_of!(ScsiPassThroughDirect, TimeOutValue), 16);
+        assert_eq!(offset_of!(ScsiPassThroughDirect, DataBuffer), 24);
+        assert_eq!(offset_of!(ScsiPassThroughDirect, SenseInfoOffset), 32);
+        assert_eq!(offset_of!(ScsiPassThroughDirect, Cdb), 36);
+        assert_eq!(size_of::<ScsiPassThroughDirect>(), 56);
+        // `sense` immediately follows the 56-byte spt; SenseInfoOffset points
+        // here via offset_of! in execute(), so this must stay consistent.
+        assert_eq!(offset_of!(SptwbDirect, spt), 0);
+        assert_eq!(offset_of!(SptwbDirect, sense), 56);
+        assert_eq!(size_of::<SptwbDirect>(), 56 + K_SENSE_SIZE);
     }
 }
