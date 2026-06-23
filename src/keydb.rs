@@ -27,8 +27,8 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_KEYDB_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read a decompressed stream into a String with a hard size ceiling.
-/// Returns `Error::KeydbInvalid` if the input exceeds the cap or is not
-/// valid UTF-8.
+/// Returns `Error::KeydbInvalid` if the input exceeds the cap, or
+/// `Error::KeydbParse` if the bytes are not valid UTF-8.
 fn read_capped_to_string<R: Read>(reader: R) -> Result<String> {
     let mut buf = Vec::new();
     // Read one byte past the cap so an exactly-at-cap stream is accepted
@@ -733,6 +733,21 @@ mod tests {
         assert!(
             matches!(result, Err(Error::KeydbInvalid)),
             "oversized input must yield KeydbInvalid, got: {:?}",
+            result
+        );
+    }
+
+    /// read_capped_to_string returns KeydbParse (not KeydbInvalid) for
+    /// non-UTF-8 input. Guards the doc/behavior contract: KeydbInvalid is
+    /// reserved for the size-cap violation, a decode failure is a parse error.
+    #[test]
+    fn read_capped_to_string_non_utf8_yields_parse() {
+        // 0xFF is never a valid UTF-8 byte.
+        let cursor = std::io::Cursor::new(vec![0xFFu8, 0xFE, 0xFD]);
+        let result = read_capped_to_string(cursor);
+        assert!(
+            matches!(result, Err(Error::KeydbParse)),
+            "non-UTF-8 input must yield KeydbParse, got: {:?}",
             result
         );
     }
