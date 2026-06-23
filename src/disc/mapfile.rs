@@ -621,7 +621,38 @@ impl Mapfile {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        // fsync the parent directory so the rename itself is durable. Syncing
+        // the tmp file's bytes (above) is not enough: after the rename the new
+        // dirent for the final mapfile name lives only in the directory's
+        // page cache, so a crash / power loss in the rename-commit window can
+        // lose it and leave resume reading a stale or absent mapfile even
+        // though the data was synced. On NFS — the case the tmp-fsync guards —
+        // this window is the wide one. Best-effort: a dir that can't be
+        // opened/synced (some filesystems, Windows) is not a write failure.
+        if let Some(parent) = self.path.parent() {
+            fsync_dir(parent);
+        }
         Ok(())
+    }
+}
+
+/// fsync a directory so a prior `rename(2)` into it is durable. After a
+/// crash a renamed file's dirent can otherwise be lost even though the
+/// rename returned, because it is still page-cache-only. Best-effort:
+/// opening the directory for read and `sync_all()`ing it is the POSIX way
+/// to flush its metadata; failures (unsupported fs, Windows) are logged
+/// and ignored rather than propagated, since the file bytes are already
+/// durable and the caller's write succeeded.
+fn fsync_dir(dir: &Path) {
+    match std::fs::File::open(dir) {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                tracing::warn!(path = %dir.display(), error = %e, "failed to fsync mapfile directory");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "could not open mapfile directory to fsync");
+        }
     }
 }
 
@@ -811,6 +842,32 @@ mod tests {
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_to_disk_fsyncs_parent_dir() {
+        // Regression: after rename(2), write_to_disk must fsync the parent
+        // directory so the new dirent is durable (not page-cache-only). We
+        // can't observe a power-loss window in a unit test, but we exercise
+        // the parent-fsync branch against a real subdirectory and confirm the
+        // best-effort dir-sync neither errors the write nor corrupts the
+        // round-trip. A missing/unsyncable dir must not fail the write.
+        let dir = tmpfile("write_to_disk_fsyncs_parent_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("disc.mapfile");
+        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
+        mf.record(0, 400, SectorStatus::Finished).unwrap();
+        mf.record(400, 100, SectorStatus::Unreadable).unwrap();
+        mf.write_to_disk().unwrap();
+
+        // The directly-called dir fsync helper must be a no-op-on-error,
+        // never a panic, even for a nonexistent directory.
+        fsync_dir(&dir.join("does-not-exist"));
+
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.entries(), mf.entries());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
