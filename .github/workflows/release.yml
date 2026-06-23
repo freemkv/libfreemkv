@@ -34,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       # libfreemkv is a library — Cargo.lock isn't tracked, so --locked
       # would always fail (no lockfile to lock against on a fresh runner).
       - run: cargo test
@@ -49,6 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       # --no-verify: CI already compiled this exact commit (in the `test` job
       # and on every push via ci.yml). cargo publish's default re-verify does a
       # full cold release build of the packaged tarball, which here is pure
