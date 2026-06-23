@@ -46,6 +46,12 @@ pub struct TsMuxer<W: Write> {
     /// the audio/video offset is preserved. Frames that arrive before it
     /// is set saturate to 0.
     base_pts_ns: Option<i64>,
+    /// Count of PES frames actually emitted (a frame dropped as non-key
+    /// before the first keyframe does NOT count). `finish()` returns
+    /// [`Error::MuxEmpty`](crate::error::Error::MuxEmpty) when this is zero,
+    /// so a header-only `m2ts://` output can't be reported as success —
+    /// mirroring `MkvMuxer.frame_count`.
+    frame_count: u64,
 }
 
 impl<W: Write> TsMuxer<W> {
@@ -58,6 +64,7 @@ impl<W: Write> TsMuxer<W> {
             codec_privates: vec![None; n],
             params_written: vec![false; n],
             base_pts_ns: None,
+            frame_count: 0,
         }
     }
 
@@ -164,6 +171,10 @@ impl<W: Write> TsMuxer<W> {
                 first_pes = false;
             }
         }
+        // A frame that survived the pre-keyframe drop guard above and reached
+        // the writer counts as emitted. `finish()` checks this so a zero-frame
+        // mux fails loudly instead of producing a header-only "success".
+        self.frame_count += 1;
         Ok(())
     }
 
@@ -284,7 +295,17 @@ impl<W: Write> TsMuxer<W> {
 
     /// Flush the underlying writer. BD-TS needs no stream trailer, so this
     /// only drains buffering; the muxer remains usable afterwards.
+    ///
+    /// Returns [`Error::MuxEmpty`](crate::error::Error::MuxEmpty) when not a
+    /// single frame was emitted: an `m2ts://` sink that wrote only the FMKV
+    /// header (e.g. undecryptable ciphertext yielded no demuxable frames, or
+    /// every frame was dropped before the first keyframe) would otherwise be a
+    /// header-only file reported as a successful rip. Mirrors the zero-frame
+    /// guard in `MkvMuxer::finish`.
     pub fn finish(&mut self) -> io::Result<()> {
+        if self.frame_count == 0 {
+            return Err(crate::error::Error::MuxEmpty.into());
+        }
         self.writer.flush()
     }
 }
@@ -562,7 +583,12 @@ mod tests {
             let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
             let p = fake_hevc_nal(1, 80);
             mux.write_frame(0, 0, false, &p).unwrap();
-            mux.finish().unwrap();
+            // The single non-key frame was dropped (no keyframe to anchor),
+            // so finish() now reports MuxEmpty rather than producing a
+            // header-only "success". The drop behaviour itself is still
+            // verified by the empty packet list below.
+            let err = mux.finish().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         }
         // Nothing should be emitted for that PID.
         let packets = parse_bd_ts(&sink);
@@ -570,6 +596,43 @@ mod tests {
             !packets.iter().any(|p| p.pid == VIDEO_PID),
             "non-key before first keyframe must be dropped"
         );
+    }
+
+    #[test]
+    fn finish_with_zero_frames_errors_mux_empty() {
+        // Fix 4: a TsMuxer that never emitted a frame must NOT report a
+        // clean finish — an m2ts:// sink that wrote only the FMKV header
+        // (undecryptable ciphertext → no demuxable frames) would otherwise
+        // be a header-only file published as a successful rip.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+        let err = mux.finish().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "zero-frame finish must surface MuxEmpty (E9023 → InvalidData)"
+        );
+        // The MuxEmpty variant carries the E9023 code, and its io::Error
+        // mapping is InvalidData (matching the kind above). Asserting both
+        // pins the variant ⇄ code ⇄ kind wiring without a lossy round-trip
+        // (From<Error> for io::Error → from-io goes back to IoError/E5000).
+        assert_eq!(
+            crate::error::Error::MuxEmpty.code(),
+            crate::error::E_MUX_EMPTY
+        );
+        let mapped: std::io::Error = crate::error::Error::MuxEmpty.into();
+        assert_eq!(mapped.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn finish_after_real_frame_succeeds() {
+        // The counterpart: once a genuine keyframe is emitted, finish() is Ok.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = TsMuxer::new(&mut sink, &[VIDEO_PID]);
+        let idr = fake_hevc_nal(19, 50);
+        mux.write_frame(0, 0, true, &idr).unwrap();
+        mux.finish()
+            .expect("a written keyframe makes finish succeed");
     }
 
     const AUDIO_PID: u16 = 0x1100;

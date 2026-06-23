@@ -56,6 +56,58 @@ pub fn crack_key(
     crack_key_halt(reader, extents, batch_sectors, None)
 }
 
+/// Outcome of a CSS crack scan that distinguishes the THREE cases the bare
+/// `Option<CssState>` conflated (and which caused a silent-failure bug:
+/// scrambled-but-uncracked content was treated as "unencrypted" and muxed as
+/// plaintext garbage at exit 0):
+///
+/// - [`CrackOutcome::Cracked`] — a scrambled sector yielded a title key.
+/// - [`CrackOutcome::Unencrypted`] — NO scrambled sector was seen across the
+///   scanned extents (`is_scrambled` never true): the content is genuinely
+///   plaintext, so proceeding without a key is correct.
+/// - [`CrackOutcome::ScrambledUncracked`] — scrambled sectors WERE seen but no
+///   key could be recovered (the Stevenson attack found no crackable crib, or
+///   the scrambled region was unreadable). The content is encrypted; muxing it
+///   as plaintext would emit garbage, so callers MUST surface a hard error
+///   ([`crate::error::Error::CssKeyMissing`]) instead of falling through to
+///   "unencrypted".
+#[derive(Debug, Clone)]
+pub enum CrackOutcome {
+    Cracked(CssState),
+    Unencrypted,
+    ScrambledUncracked,
+}
+
+impl CrackOutcome {
+    /// The cracked `CssState`, if any. `None` for `Unencrypted` /
+    /// `ScrambledUncracked`. Lets the `Option`-returning wrappers stay thin.
+    pub fn into_state(self) -> Option<CssState> {
+        match self {
+            CrackOutcome::Cracked(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// True when scrambled sectors were seen but no key was recovered — the
+    /// case callers must surface as a hard error instead of "unencrypted".
+    pub fn is_scrambled_uncracked(&self) -> bool {
+        matches!(self, CrackOutcome::ScrambledUncracked)
+    }
+}
+
+/// [`crack_key`] returning the full [`CrackOutcome`] (Cracked / Unencrypted /
+/// ScrambledUncracked) so callers can distinguish "genuinely unencrypted" from
+/// "encrypted but uncrackable" — the latter must become a hard error, never a
+/// silent fall-through to plaintext.
+pub fn crack_key_outcome(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+) -> CrackOutcome {
+    crack_key_scan(reader, extents, batch_sectors, halt)
+}
+
 /// [`crack_key`] with an optional cooperative-cancellation token.
 ///
 /// "No silent hangs": the crack scans up to 50_000 sectors, which on a live
@@ -70,6 +122,19 @@ pub fn crack_key_halt(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> Option<CssState> {
+    crack_key_scan(reader, extents, batch_sectors, halt).into_state()
+}
+
+/// The crack scan, returning the full [`CrackOutcome`]. Tracks a
+/// `saw_scrambled` flag so a scrambled-but-uncracked disc is distinguished
+/// from a genuinely-unencrypted one (the [`crack_key`] / [`crack_key_halt`]
+/// `Option` wrappers collapse both to `None`).
+fn crack_key_scan(
+    reader: &mut dyn SectorSource,
+    extents: &[Extent],
+    batch_sectors: u16,
+    halt: Option<&crate::halt::Halt>,
+) -> CrackOutcome {
     // Batch the reads: a live optical drive at 1 sector/read is glacial, and the
     // crack only needs to FIND one scrambled sector whose 0x80 plaintext matches
     // a known PES header. `batch_sectors` MUST be sized to the source — a drive
@@ -90,6 +155,12 @@ pub fn crack_key_halt(
     let max_tries = 50_000u32;
     let mut buf = vec![0u8; batch as usize * 2048];
     let mut hb = crate::progress::Heartbeat::new("css_crack");
+    // Track whether ANY scrambled sector was observed. If we exhaust the scan
+    // budget having seen scrambled data but never recovered a key, the content
+    // is encrypted-but-uncrackable — a HARD failure the caller must surface,
+    // NOT silently treat as unencrypted (which would mux scrambled MPEG as
+    // plaintext → garbage at exit 0). See `CrackOutcome::ScrambledUncracked`.
+    let mut saw_scrambled = false;
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
         let mut i = 0u32;
@@ -122,8 +193,9 @@ pub fn crack_key_halt(
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
                         if is_scrambled(sect) {
+                            saw_scrambled = true;
                             if let Some(key) = stevenson::crack_title_key(sect) {
-                                return Some(CssState {
+                                return CrackOutcome::Cracked(CssState {
                                     title_key: key,
                                     crack_span,
                                 });
@@ -142,7 +214,16 @@ pub fn crack_key_halt(
         }
     }
 
-    None
+    // Budget exhausted / extents walked with no key recovered. Distinguish the
+    // two indistinguishable-in-`Option` cases: if scrambled sectors were seen
+    // (case b: crack failed; case c: scrambled but the crackable region was
+    // unreadable), this is encrypted-but-uncracked — a hard failure. Only a
+    // scan that NEVER saw a scrambled sector is genuinely unencrypted (case a).
+    if saw_scrambled {
+        CrackOutcome::ScrambledUncracked
+    } else {
+        CrackOutcome::Unencrypted
+    }
 }
 
 /// Descramble a single CSS-encrypted sector in place.
@@ -287,6 +368,68 @@ mod tests {
             src.reads.borrow().len(),
             50_000,
             "scan must stop at the 50_000-sector budget"
+        );
+    }
+
+    // ── CrackOutcome: scrambled-but-uncracked vs genuinely unencrypted (Fix 6) ─
+
+    /// A scan over CLEAR sectors (scramble flag never set) returns
+    /// `Unencrypted` — the content is genuinely plaintext, so proceeding
+    /// without a key is correct.
+    #[test]
+    fn crack_outcome_clear_sectors_is_unencrypted() {
+        let mut src = MockSource::new(0x00); // never scrambled
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 100,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
+        assert!(
+            matches!(outcome, CrackOutcome::Unencrypted),
+            "no scrambled sector seen → Unencrypted, got {outcome:?}"
+        );
+        // The Option wrapper collapses Unencrypted → None.
+        assert!(crack_key(&mut MockSource::new(0x00), &extents, 1).is_none());
+    }
+
+    /// THE Fix 6 regression: a scan that SEES scrambled sectors (flag set) but
+    /// recovers no key (the mock's zeroed data has no Stevenson crib) must
+    /// return `ScrambledUncracked` — a HARD failure — NOT `Unencrypted`. The
+    /// old code conflated this with "unencrypted" and muxed scrambled MPEG as
+    /// plaintext (garbage at exit 0).
+    #[test]
+    fn crack_outcome_scrambled_uncracked_is_hard_failure() {
+        let mut src = MockSource::new(0x30); // scrambled flag set, no crackable crib
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 100,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
+        assert!(
+            outcome.is_scrambled_uncracked(),
+            "scrambled sectors seen but no key → ScrambledUncracked, got {outcome:?}"
+        );
+        // The legacy Option wrapper still collapses this to None (the callers
+        // that need the distinction now use crack_key_outcome instead).
+        assert!(crack_key(&mut MockSource::new(0x30), &extents, 1).is_none());
+    }
+
+    /// Even when every read FAILS, a scan that never managed to observe a
+    /// scrambled sector reports `Unencrypted` (we cannot prove encryption from
+    /// unreadable data alone — the AACS/keydb paths and the disc-level
+    /// `css_error` plumbing cover genuinely unreadable encrypted discs).
+    #[test]
+    fn crack_outcome_all_reads_fail_is_unencrypted() {
+        let mut src = MockSource::new(0x30);
+        src.fail_all = true; // no sector is ever inspected
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 10,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
+        assert!(
+            matches!(outcome, CrackOutcome::Unencrypted),
+            "no readable scrambled sector → Unencrypted, got {outcome:?}"
         );
     }
 
