@@ -180,6 +180,17 @@ pub trait Stream: Send {
     fn errors(&self) -> u64 {
         0
     }
+
+    /// Cumulative bytes actually skipped (zero-filled) past read errors.
+    /// Distinct from [`errors`](Self::errors), which counts skip *events*:
+    /// a single AACS skip event covers a whole 6144-byte unit, so
+    /// `errors * 2048` understates real loss. Consumers estimating lost
+    /// video time must scale by this byte count, not the event count.
+    /// Default `0` for streams with no skip-on-error notion; `DiscStream`
+    /// overrides.
+    fn lost_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Wraps any output stream and counts bytes written.
@@ -241,6 +252,10 @@ impl Stream for CountingStream {
 
     fn errors(&self) -> u64 {
         self.inner.errors()
+    }
+
+    fn lost_bytes(&self) -> u64 {
+        self.inner.lost_bytes()
     }
 }
 
