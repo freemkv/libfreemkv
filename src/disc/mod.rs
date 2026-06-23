@@ -3286,8 +3286,29 @@ mod severity_tests {
     }
 }
 
+/// Whether the Linux-sysfs transfer-size probe applies to this device path.
+///
+/// The probe reads `/sys/block/<name>/...` / `/sys/class/scsi_generic/<name>/...`,
+/// which only exist on Linux and only for `/`-delimited node paths. A Windows
+/// `\\.\CdRom0` / `\\.\D:` path has no forward slash and no sysfs node, so the
+/// probe cannot run and the caller must fall back to the optical default.
+fn sysfs_batch_probe_supported(device_path: &str) -> bool {
+    cfg!(target_os = "linux") && device_path.contains('/')
+}
+
 /// Detect the maximum transfer size in sectors for a device.
 pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
+    // The sysfs probe below is Linux-only. Non-sysfs platforms (Windows in
+    // particular) use `\\.\`-form device paths (e.g. `\\.\CdRom0`, `\\.\D:`)
+    // that have no forward slash, so the Linux name-parsing below would treat
+    // the whole path as the device name, find no `/sys` node, and fall through
+    // to the block default (8192 sectors = 16 MiB) — far over the optical cap.
+    // Every device we open on a non-sysfs platform here is an optical drive,
+    // so return the optical default directly.
+    if !sysfs_batch_probe_supported(device_path) {
+        return DEFAULT_BATCH_SECTORS_OPTICAL;
+    }
+
     let dev_name = device_path.rsplit('/').next().unwrap_or("");
     if dev_name.is_empty() {
         return DEFAULT_BATCH_SECTORS_OPTICAL;
@@ -3353,6 +3374,33 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows-form optical device path (`\\.\CdRom0`, `\\.\D:`) must never
+    /// fall through to the block default (8192 sectors = 16 MiB, well over the
+    /// optical 510-sector cap). It has no forward slash, so the Linux-sysfs
+    /// name parse cannot apply; the detector must return the optical default.
+    #[test]
+    fn windows_device_path_uses_optical_default() {
+        for path in ["\\\\.\\CdRom0", "\\\\.\\CdRom15", "\\\\.\\D:", "\\\\.\\E:"] {
+            let batch = detect_max_batch_sectors(path);
+            assert_eq!(
+                batch, DEFAULT_BATCH_SECTORS_OPTICAL,
+                "windows path {path:?} must map to the optical default, got {batch}"
+            );
+            assert!(
+                batch <= MAX_BATCH_SECTORS,
+                "windows path {path:?} batch {batch} exceeds optical cap {MAX_BATCH_SECTORS}"
+            );
+        }
+    }
+
+    /// The sysfs probe only applies on Linux and only to `/`-delimited node
+    /// paths. A backslash-form path is never sysfs-probeable on any platform.
+    #[test]
+    fn windows_path_not_sysfs_probeable() {
+        assert!(!sysfs_batch_probe_supported("\\\\.\\CdRom0"));
+        assert!(!sysfs_batch_probe_supported("\\\\.\\D:"));
+    }
 
     /// AACS unit-alignment of the DECRYPTING multipass sweep. AACS aligned units
     /// are 3 sectors (6144 bytes); `decrypt_sectors` anchors units at buffer
