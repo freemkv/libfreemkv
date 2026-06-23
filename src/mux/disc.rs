@@ -138,6 +138,13 @@ pub struct DiscStream {
     // (detect_max_batch_sectors), shrinks/grows based on read outcomes.
     adaptive: AdaptiveBatch,
     pub errors: u64,
+    /// Cumulative bytes actually skipped (zero-filled) on read error.
+    /// Distinct from `errors`, which counts skip *events*: one event can
+    /// cover a whole AACS unit (`unit_align` sectors = 6144 bytes), so
+    /// `errors * 2048` understates real loss by the alignment factor.
+    /// Consumers estimating lost video time must scale by this, not by
+    /// the event count.
+    pub lost_bytes: u64,
     pub skip_errors: bool,
     /// When set and the token is cancelled, fill_extents returns Err(Halted)
     /// at the next retry boundary. Unlike skip_errors, this propagates the
@@ -261,6 +268,7 @@ impl DiscStream {
             buf_valid: 0,
             adaptive: AdaptiveBatch::new(batch_sectors),
             errors: 0,
+            lost_bytes: 0,
             skip_errors: false,
             halt: None,
             event_fn: None,
@@ -451,6 +459,11 @@ impl DiscStream {
                     self.read_buf[..zb].fill(0);
                     self.buf_valid = zb;
                     self.errors += 1;
+                    // `errors` counts skip events; `lost_bytes` counts the
+                    // bytes actually zero-filled. For AACS (unit_align=3) a
+                    // single event skips a whole 6144-byte unit, so loss
+                    // estimates must use this, not `errors * 2048`.
+                    self.lost_bytes = self.lost_bytes.saturating_add(zb as u64);
                     self.emit(EventKind::SectorSkipped { sector: lba as u64 });
                     self.current_offset += sectors as u32;
                     break;
@@ -796,6 +809,10 @@ impl crate::pes::Stream for DiscStream {
     fn errors(&self) -> u64 {
         self.errors
     }
+
+    fn lost_bytes(&self) -> u64 {
+        self.lost_bytes
+    }
 }
 
 #[cfg(test)]
@@ -1101,6 +1118,21 @@ mod tests {
         // event was emitted; errors counter advanced by exactly the bad units.
         assert!(stream.errors >= 1, "expected the bad unit to be skipped");
 
+        // Regression: `lost_bytes` must account for the WHOLE skipped unit
+        // (3 sectors = 6144 bytes), not a single sector. A loss estimate
+        // built from `errors * 2048` would undercount AACS loss ~3x — the
+        // single-pass abort-gate bug this guards against. Exactly one unit
+        // is bad in this fixture, so lost_bytes == errors * ALIGN * 2048.
+        assert_eq!(
+            stream.lost_bytes,
+            stream.errors * ALIGN as u64 * 2048,
+            "AACS skip must record a whole unit (6144 B) per skip event, not 2048"
+        );
+        assert!(
+            stream.lost_bytes > stream.errors * 2048,
+            "lost_bytes must exceed the errors*2048 undercount for AACS units"
+        );
+
         // Crucial anti-desync assertion: the read that bottomed out and was
         // skipped must have been a single 3-sector unit starting at offset 12
         // (the unit boundary at or below the bad sector 13), NOT a 1-sector
@@ -1160,6 +1192,13 @@ mod tests {
             "align=1 must bottom out at a 1-sector read over the bad sector; got {reads:?}"
         );
         assert!(stream.errors >= 1);
+        // align=1: a skip event covers exactly one sector, so lost_bytes
+        // and errors*2048 agree (the AACS undercount does not apply here).
+        assert_eq!(
+            stream.lost_bytes,
+            stream.errors * 2048,
+            "single-sector (align=1) skip must record exactly 2048 B per event"
+        );
     }
 
     #[test]
