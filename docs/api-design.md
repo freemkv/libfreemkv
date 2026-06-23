@@ -171,7 +171,7 @@ libfreemkv/src/
 │   └── writeback.rs    sync_file_range pipeline
 ├── drive/              Drive (open, init, single-shot read)
 │   ├── mod.rs          Drive struct, init, read (single-shot), reset, eject
-│   ├── capture.rs      Drive profile capture for contribution
+│   ├── capture.rs      Raw drive SCSI capture (INQUIRY/GET_CONFIG) for contribution
 │   ├── linux.rs        Linux drive discovery
 │   ├── macos.rs        macOS drive discovery
 │   └── windows.rs      Windows drive discovery
@@ -182,7 +182,7 @@ libfreemkv/src/
 │   ├── mapfile.rs      ddrescue-format mapfile
 │   └── read_error.rs   ReadCtx / ReadAction state machine
 ├── scsi/               SCSI transport (Linux SG_IO, macOS IOKit, Windows SPTI)
-├── platform/           Drive unlock (MT1959 A/B)
+├── unlock.rs           Unlocker trait + registry (pluggable unlock seam)
 ├── aacs/               AACS decryption (handshake, keys, keydb, decrypt)
 ├── css/                DVD CSS cipher
 ├── decrypt.rs          Unified decrypt dispatcher (AACS/CSS/None)
@@ -198,7 +198,6 @@ libfreemkv/src/
 ├── labels/             BD-J label extraction (5 format parsers)
 ├── keydb.rs            KEYDB download, parse, save
 ├── identity.rs         DriveId from INQUIRY
-├── profile.rs          Bundled drive profiles
 ├── speed.rs            DriveSpeed enum
 ├── mux/
 │   ├── mod.rs          Public mux exports
