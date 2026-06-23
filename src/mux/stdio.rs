@@ -156,6 +156,7 @@ mod tests {
             frame_rate: crate::disc::FrameRate::F23_976,
             hdr: crate::disc::HdrFormat::Hdr10,
             color_space: crate::disc::ColorSpace::Bt2020,
+            display_aspect: None,
             secondary: false,
             label: String::new(),
         }));

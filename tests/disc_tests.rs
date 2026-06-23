@@ -166,6 +166,7 @@ fn title_with_video(
             frame_rate: FrameRate::F23_976,
             hdr: HdrFormat::Sdr,
             color_space: ColorSpace::Bt709,
+            display_aspect: None,
             secondary: false,
             label: String::new(),
         })],

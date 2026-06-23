@@ -11,7 +11,9 @@ use crate::event::{BatchSizeReason, Event, EventKind};
 use crate::halt::Halt;
 use crate::sector::{DecryptingSectorSource, SectorSource};
 use std::io;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
 /// Ramp back up to the preferred batch size after this many sectors
@@ -149,9 +151,8 @@ pub struct DiscStream {
     /// When set and the token is cancelled, fill_extents returns Err(Halted)
     /// at the next retry boundary. Unlike skip_errors, this propagates the
     /// error up so the rip terminates cleanly. Construct with
-    /// [`DiscStream::with_halt`] (preferred) or set post-hoc via the
-    /// deprecated [`DiscStream::set_halt`] bridge — both populate this same
-    /// field and either entry point yields one source of truth.
+    /// [`DiscStream::with_halt`], passing the same `Halt` clone handed to
+    /// sweep / patch / mux so every phase observes one Stop signal.
     halt: Option<Halt>,
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
     eof: bool,
@@ -296,27 +297,11 @@ impl DiscStream {
     /// during dense bad-sector regions (where the outer PES read() loop
     /// can spend minutes inside fill_extents before emitting a frame).
     ///
-    /// Preferred over the post-hoc [`DiscStream::set_halt`] bridge —
-    /// pass the same `Halt` clone you hand to sweep / patch / mux so
-    /// every phase observes a single Stop signal.
+    /// Pass the same `Halt` clone you hand to sweep / patch / mux so every
+    /// phase observes a single Stop signal.
     pub fn with_halt(mut self, halt: Halt) -> Self {
         self.halt = Some(halt);
         self
-    }
-
-    /// Bridge for callers that haven't migrated to the
-    /// [`DiscStream::with_halt`] constructor-time path yet. Wraps the
-    /// supplied `Arc<AtomicBool>` as a [`Halt`] (`Halt::from_arc`) and
-    /// stores it in the same internal slot, so a halt installed via
-    /// either entry point goes through one halt-check inside
-    /// `fill_extents`. Calling `set_halt` after `with_halt` (or vice
-    /// versa) replaces the previous token with the new one.
-    #[deprecated(
-        since = "1.0.0",
-        note = "use `DiscStream::with_halt(Halt)` at construction instead"
-    )]
-    pub fn set_halt(&mut self, flag: Arc<AtomicBool>) {
-        self.halt = Some(Halt::from_arc(flag));
     }
 
     fn is_halted(&self) -> bool {
@@ -918,11 +903,9 @@ mod tests {
         assert_eq!(frames, 0);
     }
 
-    /// `is_halted()` must observe a cancellation signal regardless of
-    /// which entry point installed the token. The deprecated
-    /// `set_halt(Arc<AtomicBool>)` and the new `with_halt(Halt)` are
-    /// two views over one slot — flipping either bit must cause the
-    /// next `fill_extents` retry boundary to bail.
+    /// `is_halted()` must observe a cancellation signal installed via
+    /// `with_halt(Halt)` — flipping the token must cause the next
+    /// `fill_extents` retry boundary to bail.
     #[test]
     fn halt_via_with_halt_observed_by_is_halted() {
         let halt = Halt::new();
@@ -1212,21 +1195,21 @@ mod tests {
     }
 
     #[test]
-    fn halt_via_set_halt_bridge_observed_by_is_halted() {
+    fn halt_via_with_halt_from_arc_observed_by_is_halted() {
         let arc = Arc::new(AtomicBool::new(false));
-        let mut stream = DiscStream::new(
+        let stream = DiscStream::new(
             Box::new(ZeroReader { capacity: 8 }),
             synthetic_title(8),
             crate::decrypt::DecryptKeys::None,
             8,
             crate::disc::ContentFormat::BdTs,
-        );
-        stream.set_halt(arc.clone());
+        )
+        .with_halt(Halt::from_arc(arc.clone()));
         assert!(!stream.is_halted());
         arc.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(
             stream.is_halted(),
-            "set_halt(Arc<AtomicBool>) bridge must observe Arc-side flips"
+            "with_halt(Halt::from_arc) must observe Arc-side flips"
         );
     }
 }

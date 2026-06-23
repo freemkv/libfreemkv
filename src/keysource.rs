@@ -143,7 +143,7 @@ mod tests {
                 None
             }
         }
-        let mut s = MinimalSource;
+        let s = MinimalSource;
         assert!(!s.needs_samples(), "needs_samples must default to false");
     }
 

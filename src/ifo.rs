@@ -60,14 +60,30 @@ pub struct DvdCell {
     pub last_sector: u32,
 }
 
+/// DVD TV system, from VTS_V_ATR `video_format` (byte 0 bits 5-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TvSystem {
+    Ntsc,
+    Pal,
+}
+
+/// DVD display aspect ratio, from VTS_V_ATR `display_aspect_ratio`
+/// (byte 0 bits 3-2). The pixels are anamorphic 720x480/576 either way;
+/// this is the intended *display* shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DvdAspect {
+    R4x3,
+    R16x9,
+}
+
 /// DVD video stream attributes.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct DvdVideoAttr {
     pub codec: Codec,
     pub resolution: Resolution,
-    pub aspect: String,
-    pub standard: String,
+    pub aspect: DvdAspect,
+    pub standard: TvSystem,
 }
 
 /// DVD audio stream attributes.
@@ -350,33 +366,59 @@ fn parse_vts(
 
 // ── Attribute parsers ───────────────────────────────────────────────────────
 
+// ── VTS_V_ATR byte 0 bitfield layout (DVD-Video spec, MSB first) ──────────
+//   bits 7-6 mpeg_version | bits 5-4 video_format | bits 3-2 display_aspect
+//   | bits 1-0 permitted_df
+// Naming the positions is the guard against the original bug: video_format is
+// bits 5-4, NOT bits 1-0 (those are the pan&scan/letterbox permission). Reading
+// the low two bits mis-detected every PAL disc as NTSC → 720x480 not 720x576.
+const V_ATR_VIDEO_FORMAT_SHIFT: u8 = 4;
+const V_ATR_ASPECT_SHIFT: u8 = 2;
+const V_ATR_FIELD_MASK: u8 = 0x03;
+// video_format field values (2/3 are reserved → parsed as NTSC).
+pub(crate) const VIDEO_FORMAT_NTSC: u8 = 0;
+pub(crate) const VIDEO_FORMAT_PAL: u8 = 1;
+// display_aspect_ratio field values (1/2 are reserved → parsed as 4:3).
+pub(crate) const ASPECT_4X3: u8 = 0;
+pub(crate) const ASPECT_16X9: u8 = 3;
+
+/// Compose a VTS_V_ATR byte 0 from its `video_format` / `display_aspect`
+/// fields, mirroring the layout [`parse_video_attr`] reads. Test-only — keeps
+/// fixtures self-documenting (`v_atr_byte(VIDEO_FORMAT_PAL, ASPECT_16X9)`)
+/// instead of opaque packed hex.
+#[cfg(test)]
+pub(crate) fn v_atr_byte(video_format: u8, display_aspect: u8) -> u8 {
+    (video_format << V_ATR_VIDEO_FORMAT_SHIFT) | (display_aspect << V_ATR_ASPECT_SHIFT)
+}
+
 /// Parse video attributes from VTS header offset 0x200.
 fn parse_video_attr(data: &[u8]) -> Result<DvdVideoAttr> {
     let b0 = byte_at(data, 0x200)?;
 
-    let standard = match b0 & 0x03 {
-        0 => "NTSC",
-        1 => "PAL",
-        _ => "NTSC",
+    // video_format (bits 5-4): NTSC / PAL; reserved values (2/3) → NTSC.
+    let standard = match (b0 >> V_ATR_VIDEO_FORMAT_SHIFT) & V_ATR_FIELD_MASK {
+        VIDEO_FORMAT_PAL => TvSystem::Pal,
+        VIDEO_FORMAT_NTSC => TvSystem::Ntsc,
+        _ => TvSystem::Ntsc,
     };
 
-    let aspect = match (b0 >> 2) & 0x03 {
-        0 => "4:3",
-        3 => "16:9",
-        _ => "4:3",
+    // display_aspect_ratio (bits 3-2): 4:3 / 16:9; reserved values (1/2) → 4:3.
+    let aspect = match (b0 >> V_ATR_ASPECT_SHIFT) & V_ATR_FIELD_MASK {
+        ASPECT_16X9 => DvdAspect::R16x9,
+        ASPECT_4X3 => DvdAspect::R4x3,
+        _ => DvdAspect::R4x3,
     };
 
-    let resolution = if standard == "PAL" {
-        Resolution::R576i
-    } else {
-        Resolution::R480i
+    let resolution = match standard {
+        TvSystem::Pal => Resolution::R576i,
+        TvSystem::Ntsc => Resolution::R480i,
     };
 
     Ok(DvdVideoAttr {
         codec: Codec::Mpeg2,
         resolution,
-        aspect: aspect.to_string(),
-        standard: standard.to_string(),
+        aspect,
+        standard,
     })
 }
 
@@ -757,8 +799,8 @@ mod tests {
         let video = DvdVideoAttr {
             codec: Codec::Mpeg2,
             resolution: Resolution::R480i,
-            aspect: "16:9".to_string(),
-            standard: "NTSC".to_string(),
+            aspect: DvdAspect::R16x9,
+            standard: TvSystem::Ntsc,
         };
         assert_eq!(video.codec, Codec::Mpeg2);
 
@@ -844,14 +886,11 @@ mod tests {
 
     #[test]
     fn video_attr_parsing() {
-        // Build minimal data with video attrs at 0x200
         let mut data = vec![0u8; 0x204];
-        // NTSC, 16:9, 720x480: standard=0b00, aspect=0b11, resolution=0b00
-        // b0 = 0b00_00_11_00 = 0x0C
-        data[0x200] = 0x0C;
+        data[0x200] = v_atr_byte(VIDEO_FORMAT_NTSC, ASPECT_16X9);
         let attr = parse_video_attr(&data).unwrap();
-        assert_eq!(attr.standard, "NTSC");
-        assert_eq!(attr.aspect, "16:9");
+        assert_eq!(attr.standard, TvSystem::Ntsc);
+        assert_eq!(attr.aspect, DvdAspect::R16x9);
         assert_eq!(attr.resolution, Resolution::R480i);
         assert_eq!(attr.codec, Codec::Mpeg2);
     }
@@ -859,12 +898,25 @@ mod tests {
     #[test]
     fn video_attr_pal() {
         let mut data = vec![0u8; 0x204];
-        // PAL, 4:3, 720x576: standard=0b01, aspect=0b00, resolution=0b00
-        // b0 = 0b00_00_00_01 = 0x01
-        data[0x200] = 0x01;
+        data[0x200] = v_atr_byte(VIDEO_FORMAT_PAL, ASPECT_4X3);
         let attr = parse_video_attr(&data).unwrap();
-        assert_eq!(attr.standard, "PAL");
-        assert_eq!(attr.aspect, "4:3");
+        assert_eq!(attr.standard, TvSystem::Pal);
+        assert_eq!(attr.aspect, DvdAspect::R4x3);
+        assert_eq!(attr.resolution, Resolution::R576i);
+    }
+
+    /// Real-world regression: a PAL 16:9 anamorphic disc (the Silence of the
+    /// Lambs UK SKU). Must parse as PAL / 16:9 / 576i. The old code read the TV
+    /// system from bits 1-0 (permitted_df, here 0) and reported NTSC/480i — the
+    /// case that shipped broken because only NTSC discs (where the wrong bits
+    /// coincide on 0) were ever tested.
+    #[test]
+    fn video_attr_pal_16x9_anamorphic() {
+        let mut data = vec![0u8; 0x204];
+        data[0x200] = v_atr_byte(VIDEO_FORMAT_PAL, ASPECT_16X9);
+        let attr = parse_video_attr(&data).unwrap();
+        assert_eq!(attr.standard, TvSystem::Pal);
+        assert_eq!(attr.aspect, DvdAspect::R16x9);
         assert_eq!(attr.resolution, Resolution::R576i);
     }
 
@@ -1021,25 +1073,25 @@ mod tests {
         assert!(byte_at(&data, 2).is_err());
     }
 
-    /// Video attr standard bits (b0 & 0x03): 0=NTSC, 1=PAL, else NTSC.
-    /// Value 2 and 3 fall into the NTSC default. Verify the catch-all.
+    /// A reserved video_format value (2/3) falls into the NTSC default.
     #[test]
     fn video_attr_reserved_standard_defaults_ntsc() {
         let mut data = vec![0u8; 0x204];
-        data[0x200] = 0x02; // standard bits = 0b10 → default NTSC
+        // A reserved value is anything past PAL (2 or 3).
+        data[0x200] = v_atr_byte(VIDEO_FORMAT_PAL + 1, ASPECT_4X3);
         let attr = parse_video_attr(&data).unwrap();
-        assert_eq!(attr.standard, "NTSC");
+        assert_eq!(attr.standard, TvSystem::Ntsc);
         assert_eq!(attr.resolution, Resolution::R480i);
     }
 
-    /// Video aspect bits ((b0>>2)&0x03): 0=4:3, 3=16:9, else 4:3.
-    /// Value 1/2 fall into the 4:3 default (catch-all arm).
+    /// A reserved display_aspect value (1/2) falls into the 4:3 default.
     #[test]
     fn video_attr_reserved_aspect_defaults_4_3() {
         let mut data = vec![0u8; 0x204];
-        data[0x200] = 0b00_01_00_00; // aspect bits = 0b01 → default 4:3
+        // A reserved aspect value is between 4:3 (0) and 16:9 (3).
+        data[0x200] = v_atr_byte(VIDEO_FORMAT_NTSC, ASPECT_4X3 + 1);
         let attr = parse_video_attr(&data).unwrap();
-        assert_eq!(attr.aspect, "4:3");
+        assert_eq!(attr.aspect, DvdAspect::R4x3);
     }
 
     /// Audio coding_mode (b0>>5 & 0x07): 0=AC3, 2=MPEG1, 3=MP2, 4=LPCM,
@@ -1079,7 +1131,7 @@ mod tests {
     #[test]
     fn audio_attr_reserved_rate_defaults_48k() {
         let mut data = vec![0u8; 8];
-        data[0] = 0b000_10_000; // rate flag = 0b10
+        data[0] = 0b0001_0000; // sample-rate flag (bits 4-3) = 0b10
         let attr = parse_audio_attr(&data, 0).unwrap();
         assert_eq!(attr.sample_rate, 48000);
     }

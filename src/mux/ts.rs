@@ -690,6 +690,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         frame_rate: FrameRate::Unknown,
                         hdr: HdrFormat::Sdr,
                         color_space: ColorSpace::Bt709,
+                        // TS is a passthrough container — aspect stays in the ES.
+                        display_aspect: None,
                         secondary: false,
                         label: String::new(),
                     }))
