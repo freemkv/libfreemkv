@@ -54,6 +54,18 @@ fn read_capped_to_string<R: Read>(reader: R) -> Result<String> {
 /// `freemkv-keysources::keydb_search_paths`; this function is the single
 /// *write* default used by `save`/`update`, kept in lock-step with that crate's
 /// `default_keydb_path` for the same OS.
+/// Build the error returned when no home directory can be determined
+/// (`HOME`/`USERPROFILE` unset). This is an *environment* failure — the
+/// process has no home dir, which typically signals a stripped container
+/// or CI configuration — not a corrupt or unparseable keydb file. Map it
+/// to a `NotFound` I/O error so display/remediation paths never claim a
+/// keydb parse failure for a file that was never consulted.
+fn no_home_dir() -> Error {
+    Error::IoError {
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    }
+}
+
 pub fn default_path() -> Result<PathBuf> {
     #[cfg(windows)]
     {
@@ -62,7 +74,7 @@ pub fn default_path() -> Result<PathBuf> {
                 return Ok(PathBuf::from(appdata).join("freemkv").join("keydb.cfg"));
             }
         }
-        let profile = std::env::var("USERPROFILE").map_err(|_| Error::KeydbParse)?;
+        let profile = std::env::var("USERPROFILE").map_err(|_| no_home_dir())?;
         Ok(PathBuf::from(profile)
             .join(".config")
             .join("freemkv")
@@ -72,7 +84,7 @@ pub fn default_path() -> Result<PathBuf> {
     {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| Error::KeydbParse)?;
+            .map_err(|_| no_home_dir())?;
         Ok(PathBuf::from(home)
             .join(".config")
             .join("freemkv")
@@ -408,6 +420,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // Regression: a missing home directory (HOME/USERPROFILE unset) is an
+    // *environment* failure, not a corrupt keydb. It must NOT surface as
+    // E8004 (KeydbParse → "failed to parse the keydb file"), which would
+    // blame a file that was never consulted. It maps to a NotFound I/O
+    // error in the 5xxx (I/O) category instead.
+    #[test]
+    fn no_home_dir_is_io_not_found_not_keydb_parse() {
+        let e = no_home_dir();
+        match e {
+            Error::IoError { source } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected IoError(NotFound), got {other:?}"),
+        }
+        // And explicitly: it is not the keydb-parse code.
+        assert_ne!(no_home_dir().code(), Error::KeydbParse.code());
     }
 
     #[test]
