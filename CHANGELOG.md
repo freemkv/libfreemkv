@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.0.0-rc.4] — UNRELEASED
+
+An audit-driven round of correctness, durability, and Windows-transport
+fixes. No API changes; behavior is more conservative on damaged media and
+on partial decryption.
+
+### Fixed
+
+- **Decrypt-time loss is accounted for.** A partial AACS/CSS decryption
+  failure can no longer pass as a perfect rip — skipped/undecryptable
+  bytes are folded into the loss total — and partial CPS-unit (per-title)
+  key coverage is rejected in the AACS validation gate instead of
+  producing partly-garbage output.
+- **Durable writes.** `keydb.cfg` is written atomically (temp file +
+  fsync + rename), and the mapfile fsyncs its parent directory after the
+  rename so a resume checkpoint survives a crash.
+- **Truthful error causes.** A server-dropped keydb download is
+  classified as a connection error, not a parse error; a missing home
+  directory maps to "not found" rather than a keydb-parse failure; the
+  I/O error from opening an AACS-inputs ISO is preserved; and a
+  transport failure is preserved through the AACS auth handshake instead
+  of being relabeled.
+- A failed `READ CAPACITY` now warns instead of silently using a
+  zero-sector disc.
+- A leaked pipeline consumer can no longer finalize an abandoned output.
+- **Windows SCSI.** `ScsiPassThroughDirect` is packed to match the
+  `ntddscsi.h` layout, `StorageAdapterDescriptor.BusType` width is
+  corrected (`u8` → `u32`), oversized read batches on non-sysfs
+  (Windows) drives are bounded, `IOCTL_STORAGE_RESET_DEVICE` failures are
+  surfaced, and a device reset only sleeps on success.
+- Mux now tracks skipped bytes so a partly-read title reports accurate
+  loss.
+
+### Changed
+
+- The per-read `Drive::read` trace event was demoted to TRACE so a debug
+  log isn't flooded by per-sector reads.
+
 ## [1.0.0-rc.2]
 
 Second release candidate for 1.0. libfreemkv is the core library: disc scan,
