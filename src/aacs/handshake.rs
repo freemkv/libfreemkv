@@ -25,6 +25,25 @@ use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use sha1::{Digest, Sha1};
 
+/// Map a SCSI-layer error from a handshake step onto a cert/key-specific
+/// code — but only when the failure is *not* a transport-layer wedge.
+///
+/// A SEND KEY / REPORT KEY step can fail because the drive genuinely
+/// rejected the host certificate or key (a real `Aacs*` condition), or
+/// because the transport died mid-handshake (bridge wedge / USB
+/// disconnect). Collapsing the latter into a cert/key code tells the
+/// operator the drive rejected their credentials, sending them down a
+/// keydb/host-cert rabbit hole for what is actually a replug/power-cycle
+/// situation. Preserve the transport error so the true root cause is
+/// surfaced; otherwise substitute the handshake-specific code.
+fn handshake_err(err: Error, fallback: Error) -> Error {
+    if err.is_scsi_transport_failure() {
+        err
+    } else {
+        fallback
+    }
+}
+
 /// Execute a SCSI command that reads data from the device.
 fn scsi_read(session: &mut Drive, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
@@ -878,7 +897,8 @@ pub fn aacs_authenticate(
 
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
-    let response = scsi_read(session, &cdb, 8).map_err(|_| Error::AacsAgidAlloc)?;
+    let response =
+        scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce and ephemeral key pair
@@ -894,11 +914,12 @@ pub fn aacs_authenticate(
     send_buf[24..116].copy_from_slice(&host_cert[..92]);
 
     let cdb = cdb_send_key(agid, 0x01, 116);
-    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsCertRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|e| handshake_err(e, Error::AacsCertRejected))?;
 
     // Step 5: Read drive certificate + nonce (REPORT KEY format 0x01)
     let cdb = cdb_report_key(agid, 0x01, 116);
-    let response = scsi_read(session, &cdb, 116).map_err(|_| Error::AacsCertRead)?;
+    let response =
+        scsi_read(session, &cdb, 116).map_err(|e| handshake_err(e, Error::AacsCertRead))?;
 
     let mut drive_nonce = [0u8; 20];
     let mut drive_cert = [0u8; 92];
@@ -926,7 +947,8 @@ pub fn aacs_authenticate(
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
     let cdb = cdb_report_key(agid, 0x02, 84);
-    let response = scsi_read(session, &cdb, 84).map_err(|_| Error::AacsKeyRead)?;
+    let response =
+        scsi_read(session, &cdb, 84).map_err(|e| handshake_err(e, Error::AacsKeyRead))?;
 
     let mut drive_key_point = [0u8; 40]; // x(20) + y(20)
     let mut drive_key_sig = [0u8; 40]; // r(20) + s(20)
@@ -971,7 +993,7 @@ pub fn aacs_authenticate(
     send_buf[64..84].copy_from_slice(&host_sig_s);
 
     let cdb = cdb_send_key(agid, 0x02, 84);
-    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsKeyRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|e| handshake_err(e, Error::AacsKeyRejected))?;
 
     // Step 9: Compute bus key via ECDH
     let mut dkp_x = [0u8; 20];
@@ -1038,7 +1060,8 @@ fn aacs2_authenticate_p256(
 
     // Step 2: Allocate AGID
     let cdb = cdb_report_key(0, 0x00, 8);
-    let response = scsi_read(session, &cdb, 8).map_err(|_| Error::AacsAgidAlloc)?;
+    let response =
+        scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
     // Step 3: Generate host nonce + P-256 ephemeral key pair
@@ -1055,12 +1078,13 @@ fn aacs2_authenticate_p256(
     send_buf[24..156].copy_from_slice(&host_cert[..132]);
 
     let cdb = cdb_send_key(agid, 0x01, 156);
-    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsCertRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|e| handshake_err(e, Error::AacsCertRejected))?;
 
     // Step 5: Read drive certificate + nonce
     // AACS 2.0 drive cert is also 132 bytes
     let cdb = cdb_report_key(agid, 0x01, 156);
-    let response = scsi_read(session, &cdb, 156).map_err(|_| Error::AacsCertRead)?;
+    let response =
+        scsi_read(session, &cdb, 156).map_err(|e| handshake_err(e, Error::AacsCertRead))?;
 
     let mut drive_nonce = [0u8; 20];
     drive_nonce.copy_from_slice(&response[4..24]);
@@ -1083,7 +1107,8 @@ fn aacs2_authenticate_p256(
 
     // Step 6: Read drive key point + signature (P-256: 64+64 = 128 bytes)
     let cdb = cdb_report_key(agid, 0x02, 132);
-    let response = scsi_read(session, &cdb, 132).map_err(|_| Error::AacsKeyRead)?;
+    let response =
+        scsi_read(session, &cdb, 132).map_err(|e| handshake_err(e, Error::AacsKeyRead))?;
 
     let drive_key_x = &response[4..36];
     let drive_key_y = &response[36..68];
@@ -1124,7 +1149,7 @@ fn aacs2_authenticate_p256(
     send_buf[100..132].copy_from_slice(&host_sig_s);
 
     let cdb = cdb_send_key(agid, 0x02, 132);
-    scsi_write(session, &cdb, &send_buf).map_err(|_| Error::AacsKeyRejected)?;
+    scsi_write(session, &cdb, &send_buf).map_err(|e| handshake_err(e, Error::AacsKeyRejected))?;
 
     // Step 9: Compute bus key via P-256 ECDH
     let bus_key = compute_bus_key_p256(&host_eph_key, drive_key_x, drive_key_y)
@@ -1147,7 +1172,8 @@ fn aacs2_authenticate_p256(
 pub fn read_volume_id(session: &mut Drive, auth: &mut AacsAuth) -> Result<[u8; 16]> {
     // REPORT DISC STRUCTURE format 0x80
     let cdb = cdb_report_disc_structure(auth.agid, 0x80, 36);
-    let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsVidRead)?;
+    let response =
+        scsi_read(session, &cdb, 36).map_err(|e| handshake_err(e, Error::AacsVidRead))?;
 
     let mut vid = [0u8; 16];
     let mut mac = [0u8; 16];
@@ -1168,7 +1194,8 @@ pub fn read_volume_id(session: &mut Drive, auth: &mut AacsAuth) -> Result<[u8; 1
 pub fn read_data_keys(session: &mut Drive, auth: &mut AacsAuth) -> Result<([u8; 16], [u8; 16])> {
     // REPORT DISC STRUCTURE format 0x84
     let cdb = cdb_report_disc_structure(auth.agid, 0x84, 36);
-    let response = scsi_read(session, &cdb, 36).map_err(|_| Error::AacsDataKey)?;
+    let response =
+        scsi_read(session, &cdb, 36).map_err(|e| handshake_err(e, Error::AacsDataKey))?;
 
     let mut enc_rdk = [0u8; 16];
     let mut enc_wdk = [0u8; 16];
@@ -1188,6 +1215,40 @@ pub fn read_data_keys(session: &mut Drive, auth: &mut AacsAuth) -> Result<([u8; 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_err_preserves_transport_failure() {
+        use crate::scsi::{SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_TRANSPORT_FAILURE};
+
+        // A transport wedge mid-handshake must NOT be reported as a cert/key
+        // rejection — the operator needs to see the real (replug) cause, not
+        // be sent down a keydb/host-cert rabbit hole.
+        let transport = Error::ScsiError {
+            opcode: 0xA3, // SEND KEY
+            status: SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        };
+        let mapped = handshake_err(transport, Error::AacsCertRejected);
+        assert!(
+            mapped.is_scsi_transport_failure(),
+            "transport failure must be preserved, not collapsed to a cert code"
+        );
+
+        // A genuine SCSI rejection (CHECK CONDITION) IS the drive saying no, so
+        // it maps to the handshake-specific code as before.
+        let rejected = Error::ScsiError {
+            opcode: 0xA3,
+            status: SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: 0x05, // ILLEGAL REQUEST
+                asc: 0x24,
+                ascq: 0x00,
+            }),
+        };
+        let mapped = handshake_err(rejected, Error::AacsCertRejected);
+        assert!(matches!(mapped, Error::AacsCertRejected));
+        assert!(!mapped.is_scsi_transport_failure());
+    }
 
     #[test]
     fn test_ec_curve_generator_on_curve() {
