@@ -60,6 +60,16 @@ pub struct Disc {
     /// "disc hash not in KEYDB", etc. None when AACS resolution wasn't
     /// attempted (unencrypted disc) or succeeded.
     pub aacs_error: Option<crate::error::Error>,
+    /// CSS crack failure: `Some(Error::CssKeyMissing)` when the scan SAW
+    /// scrambled sectors but could NOT recover a title key (the
+    /// known-plaintext attack found no crackable crib, or the scrambled
+    /// region was unreadable). `css` is `None` in that case — but the disc is
+    /// genuinely encrypted, so callers MUST surface this hard error rather
+    /// than treat `css.is_none()` as "unencrypted" and mux scrambled MPEG as
+    /// plaintext garbage. `None` when no scrambled sector was seen (genuinely
+    /// unencrypted) or a key was recovered (`css.is_some()`). The CSS analogue
+    /// of [`Self::aacs_error`].
+    pub css_error: Option<crate::error::Error>,
     /// Content format (BD transport stream vs DVD program stream)
     pub content_format: ContentFormat,
 }
@@ -1343,7 +1353,7 @@ impl Disc {
                 let crack_batch = detect_max_batch_sectors(session.device_path());
                 tracing::info!(target: "freemkv::scan", crack_batch, "phase: CSS — known-plaintext crack");
                 let crack_t0 = std::time::Instant::now();
-                let crack_result = crate::css::crack_key_halt(
+                let crack_result = crate::css::crack_key_outcome(
                     session,
                     &main_extents,
                     crack_batch,
@@ -1352,15 +1362,27 @@ impl Disc {
                 tracing::info!(
                     target: "freemkv::scan",
                     elapsed_ms = crack_t0.elapsed().as_millis() as u64,
-                    found = crack_result.is_some(),
+                    outcome = ?crack_result,
                     "phase: CSS — crack done"
                 );
-                if let Some(state) = crack_result {
-                    tracing::debug!(target: "freemkv::disc", "dvd css: title key recovered via known-plaintext crack");
-                    disc.css = Some(state);
-                    disc.encrypted = true;
-                } else {
-                    tracing::warn!(target: "freemkv::disc", "dvd css: no crackable scrambled sector (unencrypted or atypical layout)");
+                match crack_result {
+                    crate::css::CrackOutcome::Cracked(state) => {
+                        tracing::debug!(target: "freemkv::disc", "dvd css: title key recovered via known-plaintext crack");
+                        disc.css = Some(state);
+                        disc.encrypted = true;
+                    }
+                    crate::css::CrackOutcome::ScrambledUncracked => {
+                        // Scrambled sectors WERE seen but no key could be
+                        // recovered — the content is encrypted-but-uncrackable.
+                        // Record a hard error so callers fail loudly instead of
+                        // muxing scrambled MPEG as plaintext garbage at exit 0.
+                        tracing::warn!(target: "freemkv::disc", "dvd css: scrambled sectors seen but no title key cracked");
+                        disc.encrypted = true;
+                        disc.css_error = Some(crate::error::Error::CssKeyMissing);
+                    }
+                    crate::css::CrackOutcome::Unencrypted => {
+                        tracing::debug!(target: "freemkv::disc", "dvd css: no scrambled sector seen (genuinely unencrypted)");
+                    }
                 }
             }
         }
@@ -1405,10 +1427,21 @@ impl Disc {
             };
             if !main_extents.is_empty() {
                 // Image reads aren't drive-batch-limited; use a generous batch.
-                if let Some(state) = crate::css::crack_key(reader, &main_extents, 32) {
-                    tracing::info!(target: "freemkv::scan", "image css: title key recovered via known-plaintext crack");
-                    disc.css = Some(state);
-                    disc.encrypted = true;
+                match crate::css::crack_key_outcome(reader, &main_extents, 32, None) {
+                    crate::css::CrackOutcome::Cracked(state) => {
+                        tracing::info!(target: "freemkv::scan", "image css: title key recovered via known-plaintext crack");
+                        disc.css = Some(state);
+                        disc.encrypted = true;
+                    }
+                    crate::css::CrackOutcome::ScrambledUncracked => {
+                        // Scrambled image data with no recoverable key — a hard
+                        // failure, surfaced so the mux path doesn't pass scrambled
+                        // MPEG through as plaintext (garbage at exit 0).
+                        tracing::warn!(target: "freemkv::scan", "image css: scrambled sectors seen but no title key cracked");
+                        disc.encrypted = true;
+                        disc.css_error = Some(crate::error::Error::CssKeyMissing);
+                    }
+                    crate::css::CrackOutcome::Unencrypted => {}
                 }
             }
         }
@@ -1599,6 +1632,9 @@ impl Disc {
             css,
             encrypted,
             aacs_error,
+            // CSS crack runs AFTER scan_with returns (in `scan` / `scan_image`),
+            // which set this when they observe scrambled-but-uncracked content.
+            css_error: None,
             content_format,
         })
     }
@@ -3513,6 +3549,7 @@ mod tests {
             css: None,
             encrypted: false,
             aacs_error: None,
+            css_error: None,
             content_format: ContentFormat::BdTs,
         };
         let gb = disc.capacity_gb();
@@ -3599,6 +3636,7 @@ mod tests {
             css: None,
             encrypted: false,
             aacs_error: None,
+            css_error: None,
             content_format: ContentFormat::BdTs,
         }
     }

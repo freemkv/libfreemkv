@@ -140,6 +140,17 @@ pub struct SptiTransport {
     /// [`WINDOWS_MIN_TRANSFER_BYTES`]. A single READ larger than this fails
     /// `DeviceIoControl` outright, so [`crate::Drive::read`] chunks to it.
     max_transfer: usize,
+    /// Adapter `AlignmentMask` (STORAGE_ADAPTER_DESCRIPTOR, ntddscsi.h /
+    /// winioctl.h), queried alongside `max_transfer`. It is a *mask*: `0`
+    /// (the common case on USB optical bridges) means the DataBuffer may
+    /// sit at any address; `3` means DWORD-aligned, `7` 8-byte, etc. —
+    /// always one less than the required alignment. SCSI/SAS HBAs report
+    /// nonzero masks, and IOCTL_SCSI_PASS_THROUGH_DIRECT rejects a
+    /// misaligned `DataBuffer` (DeviceIoControl fails → all reads return
+    /// transport failure / status 0xFF). When set and the caller's buffer
+    /// is misaligned, `execute()` bounces through an aligned scratch
+    /// buffer (see there).
+    alignment_mask: u32,
 }
 
 // SptiTransport's only field is an isize HANDLE, so the compiler
@@ -202,11 +213,12 @@ impl SptiTransport {
             });
         }
 
-        let max_transfer = query_max_transfer_bytes(handle);
+        let (max_transfer, alignment_mask) = query_adapter_descriptor(handle);
 
         Ok(SptiTransport {
             handle,
             max_transfer,
+            alignment_mask,
         })
     }
 
@@ -311,14 +323,24 @@ impl Drop for SptiTransport {
     }
 }
 
-/// Query the storage adapter's `MaximumTransferLength` (bytes) via
-/// IOCTL_STORAGE_QUERY_PROPERTY / StorageAdapterProperty. On any failure
-/// (IOCTL failed, short reply, or a nonsensical zero) returns the
-/// conservative [`WINDOWS_MIN_TRANSFER_BYTES`]; otherwise clamps the
-/// reported value up to that floor. Never returns 0.
-fn query_max_transfer_bytes(handle: isize) -> usize {
+/// Query the storage adapter descriptor via IOCTL_STORAGE_QUERY_PROPERTY /
+/// StorageAdapterProperty and return `(max_transfer_bytes, alignment_mask)`.
+///
+/// `max_transfer_bytes`: the adapter's `MaximumTransferLength`. On any
+/// failure (IOCTL failed, short reply, or a nonsensical zero) falls back to
+/// the conservative [`WINDOWS_MIN_TRANSFER_BYTES`]; otherwise clamped up to
+/// that floor. Never 0.
+///
+/// `alignment_mask`: the adapter's `AlignmentMask` (offset 16 in
+/// STORAGE_ADAPTER_DESCRIPTOR). `0` means no alignment requirement (the
+/// common case for USB optical bridges). A nonzero mask (SCSI/SAS HBAs)
+/// forces `execute()` to bounce the DataBuffer through an aligned scratch
+/// buffer. If the reply is too short to include `AlignmentMask`, returns
+/// `0` (no requirement) — the safe default, since any address satisfies a
+/// zero mask and the descriptor's leading fields are read first regardless.
+fn query_adapter_descriptor(handle: isize) -> (usize, u32) {
     if handle == INVALID_HANDLE_VALUE {
-        return WINDOWS_MIN_TRANSFER_BYTES;
+        return (WINDOWS_MIN_TRANSFER_BYTES, 0);
     }
     let query = StoragePropertyQuery {
         PropertyId: STORAGE_ADAPTER_PROPERTY,
@@ -341,14 +363,25 @@ fn query_max_transfer_bytes(handle: isize) -> usize {
     };
     // MaximumTransferLength sits at offset 8; need at least that many bytes
     // written for the field to be valid.
-    let valid = ok != 0
+    let max_valid = ok != 0
         && bytes_returned as usize
             >= std::mem::offset_of!(StorageAdapterDescriptor, MaximumTransferLength)
                 + std::mem::size_of::<u32>();
-    if !valid || desc.MaximumTransferLength == 0 {
-        return WINDOWS_MIN_TRANSFER_BYTES;
-    }
-    (desc.MaximumTransferLength as usize).max(WINDOWS_MIN_TRANSFER_BYTES)
+    let max_transfer = if !max_valid || desc.MaximumTransferLength == 0 {
+        WINDOWS_MIN_TRANSFER_BYTES
+    } else {
+        (desc.MaximumTransferLength as usize).max(WINDOWS_MIN_TRANSFER_BYTES)
+    };
+
+    // AlignmentMask sits at offset 16; only trust it if the reply is long
+    // enough. Otherwise assume 0 (no alignment requirement).
+    let align_valid = ok != 0
+        && bytes_returned as usize
+            >= std::mem::offset_of!(StorageAdapterDescriptor, AlignmentMask)
+                + std::mem::size_of::<u32>();
+    let alignment_mask = if align_valid { desc.AlignmentMask } else { 0 };
+
+    (max_transfer, alignment_mask)
 }
 
 impl ScsiTransport for SptiTransport {
@@ -396,11 +429,49 @@ impl ScsiTransport for SptiTransport {
         // sub-second resolution; biasing toward "more time" is safer than
         // truncating (truncation broke 1500ms fast-reads on Drive::read).
         sptwb.spt.TimeOutValue = ((timeout_ms + 999) / 1000).max(1);
-        sptwb.spt.DataBuffer = if data.is_empty() {
+
+        // AlignmentMask bounce buffer.
+        //
+        // IOCTL_SCSI_PASS_THROUGH_DIRECT requires `DataBuffer` to satisfy
+        // the adapter's `AlignmentMask` (`(ptr & mask) == 0`). On USB
+        // optical bridges the mask is 0, so the caller's buffer is always
+        // acceptable and we point straight at it (zero-copy fast path).
+        // On SCSI/SAS HBAs the mask can be 3/7/… ; if the caller's buffer
+        // happens to be misaligned the IOCTL fails outright (status 0xFF /
+        // all reads fail). In that case we transfer through an aligned
+        // scratch buffer: over-allocate by `mask` extra bytes so an aligned
+        // base is guaranteed to exist inside it, align the base with
+        // [`crate::scsi::align_up`], and use that as `DataBuffer`. For a
+        // FROM-device transfer the result is copied back into `data` after
+        // the IOCTL; for a TO-device transfer `data` is copied in before.
+        //
+        // `bounce` is kept alive for the whole `execute()` body so the
+        // aligned pointer we hand the driver stays valid across the IOCTL.
+        let mask = self.alignment_mask as usize;
+        let needs_bounce =
+            !data.is_empty() && mask != 0 && (data.as_mut_ptr() as usize) & mask != 0;
+        let mut bounce: Vec<u8> = Vec::new();
+        let data_ptr: *mut u8 = if data.is_empty() {
             std::ptr::null_mut()
+        } else if needs_bounce {
+            // Over-allocate by `mask` so an aligned start exists within.
+            bounce = vec![0u8; data.len() + mask];
+            let base = bounce.as_mut_ptr() as usize;
+            let aligned = crate::scsi::align_up(base, mask);
+            let aligned_ptr = aligned as *mut u8;
+            // For writes (ToDevice) prime the aligned region with the
+            // caller's payload before the IOCTL. (FromDevice copies back
+            // after.)
+            if direction == DataDirection::ToDevice {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), aligned_ptr, data.len());
+                }
+            }
+            aligned_ptr
         } else {
             data.as_mut_ptr()
         };
+        sptwb.spt.DataBuffer = data_ptr;
         sptwb.spt.SenseInfoOffset = std::mem::offset_of!(SptwbDirect, sense) as u32;
         sptwb.spt.Cdb[..cdb_len].copy_from_slice(&cdb[..cdb_len]);
 
@@ -452,15 +523,28 @@ impl ScsiTransport for SptiTransport {
             });
         }
 
+        // Clamp to the caller's buffer length, matching Linux/macOS: a
+        // driver that reports DataTransferLength > data.len() must never let
+        // callers read past the buffer they handed in.
+        let transferred = (sptwb.spt.DataTransferLength as usize).min(data.len());
+
+        // If we bounced a FROM-device read, copy the aligned scratch back
+        // into the caller's buffer (only the bytes actually transferred).
+        if needs_bounce && direction == DataDirection::FromDevice {
+            let aligned_ptr = data_ptr; // points inside `bounce`
+            unsafe {
+                std::ptr::copy_nonoverlapping(aligned_ptr, data.as_mut_ptr(), transferred);
+            }
+        }
+        // `bounce` is dropped here, after the last use of `data_ptr`.
+        drop(bounce);
+
         let mut sense = [0u8; 32];
         sense.copy_from_slice(&sptwb.sense);
 
         Ok(ScsiResult {
             status: sptwb.spt.ScsiStatus,
-            // Clamp to the caller's buffer length, matching Linux/macOS: a
-            // driver that reports DataTransferLength > data.len() must never
-            // let callers read past the buffer they handed in.
-            bytes_transferred: (sptwb.spt.DataTransferLength as usize).min(data.len()),
+            bytes_transferred: transferred,
             sense,
         })
     }
