@@ -15,6 +15,8 @@
 
 use crate::decrypt::{DecryptKeys, decrypt_sectors};
 use crate::error::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::SectorSource;
 
@@ -30,6 +32,17 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     inner: S,
     keys: DecryptKeys,
     unit_key_idx: usize,
+    /// Cumulative bytes of scrambled AACS units that no key could decrypt.
+    /// `decrypt_sectors` restores those bytes to their original ciphertext (so a
+    /// clear nav-file is never corrupted), but for genuine encrypted content the
+    /// still-encrypted bytes are silently dropped by the downstream TS assembler
+    /// — real, unaccounted loss. Mux read paths share this counter into their
+    /// loss accounting (via [`decrypt_loss`]) so a partial AACS/CSS decrypt
+    /// failure can't be reported as a perfect rip. Shared `Arc` so the highway's
+    /// producer thread and the consuming `Stream` see the same tally.
+    ///
+    /// [`decrypt_loss`]: Self::decrypt_loss
+    decrypt_dropped: Arc<AtomicU64>,
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -43,7 +56,18 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             inner,
             keys,
             unit_key_idx: 0,
+            decrypt_dropped: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A handle to this decorator's decrypt-loss counter — the cumulative bytes
+    /// of scrambled AACS units that no key could decrypt (see
+    /// [`decrypt_dropped`](Self::decrypt_dropped)). The mux pipelines read this
+    /// to fold decrypt-time loss into their `lost_bytes` accounting; the highway
+    /// shares it across the producer thread and the consuming `Stream`. Returns
+    /// the live counter, so reads after a decrypt observe the updated total.
+    pub fn decrypt_loss(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.decrypt_dropped)
     }
 
     /// Override the AACS unit-key index. Only meaningful for
@@ -107,8 +131,15 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         }
         let n = self.inner.read_sectors(lba, count, buf, recovery)?;
         // Apply the crate-wide AACS/CSS/None decrypt entry point in-place
-        // over the bytes just read. No-op for DecryptKeys::None.
-        decrypt_sectors(&mut buf[..n], &self.keys, self.unit_key_idx)?;
+        // over the bytes just read. No-op for DecryptKeys::None. The returned
+        // count is bytes of scrambled units no key could decrypt — silent
+        // decrypt loss the TS assembler will drop. Tally it so the mux loss
+        // accounting (and the abort gate) can see partial decrypt failure.
+        let dropped = decrypt_sectors(&mut buf[..n], &self.keys, self.unit_key_idx)?;
+        if dropped > 0 {
+            self.decrypt_dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
         Ok(n)
     }
 
@@ -623,6 +654,121 @@ mod tests {
         // lba 1 (not a multiple of 3) must succeed under CSS — no AACS gate.
         let n = wrapped.read_sectors(1, 1, &mut buf, false).unwrap();
         assert_eq!(n, 2048, "CSS reads must not be unit-alignment gated");
+    }
+
+    /// Build a clear 6144-byte AACS unit (TS syncs at the BD-TS stride) then
+    /// encrypt it under `unit_key` so `aacs::decrypt_unit` recovers it. Mirrors
+    /// the encrypt helper in `crate::decrypt`'s tests.
+    fn encrypt_aacs_unit(unit_key: &[u8; 16]) -> Vec<u8> {
+        use aes::Aes128;
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < unit.len() {
+            unit[off] = 0x47;
+            off += 192;
+        }
+        let header: [u8; 16] = unit[..16].try_into().unwrap();
+        let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
+        let mut k = [0u8; 16];
+        for i in 0..16 {
+            k[i] = derived[i] ^ header[i];
+        }
+        let cipher = Aes128::new(GenericArray::from_slice(&k));
+        let mut prev = crate::aacs::decrypt::AACS_IV;
+        let blocks = (crate::aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        for i in 0..blocks {
+            let o = 16 + i * 16;
+            for j in 0..16 {
+                unit[o + j] ^= prev[j];
+            }
+            let mut blk = GenericArray::clone_from_slice(&unit[o..o + 16]);
+            cipher.encrypt_block(&mut blk);
+            unit[o..o + 16].copy_from_slice(&blk);
+            prev.copy_from_slice(&unit[o..o + 16]);
+        }
+        unit
+    }
+
+    /// Regression: when the decrypt step can't decrypt a scrambled AACS unit
+    /// (wrong/missing key), the decorator must accumulate the dropped bytes in
+    /// its `decrypt_loss()` counter while STILL returning `Ok` (per-unit
+    /// tolerance). The mux pipelines read this counter into `lost_bytes()` so a
+    /// partial decrypt failure can't be reported as a perfect rip. A
+    /// decryptable unit must leave the counter at zero.
+    ///
+    /// Grounding: `read_sectors` folds `decrypt_sectors`' dropped count into
+    /// `decrypt_dropped`; `decrypt_loss()` exposes it.
+    #[test]
+    fn decrypt_loss_counter_accumulates_undecryptable_units() {
+        let real_key = [0x33u8; 16];
+        let wrong_key = [0x44u8; 16];
+
+        // A source that always yields one unit encrypted under `real_key`.
+        struct EncUnitSource {
+            unit: Vec<u8>,
+        }
+        impl SectorSource for EncUnitSource {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                assert_eq!(bytes, self.unit.len(), "test reads one whole unit");
+                buf[..bytes].copy_from_slice(&self.unit);
+                Ok(bytes)
+            }
+        }
+
+        let unit = encrypt_aacs_unit(&real_key);
+
+        // Wrong key → undecryptable → loss counted, read still Ok.
+        let mut wrapped = DecryptingSectorSource::new(
+            EncUnitSource { unit: unit.clone() },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, wrong_key)],
+                read_data_key: None,
+            },
+        );
+        let loss = wrapped.decrypt_loss();
+        assert_eq!(loss.load(Ordering::Relaxed), 0, "starts at zero");
+
+        let mut buf = vec![0u8; 3 * 2048];
+        wrapped
+            .read_sectors(0, 3, &mut buf, false)
+            .expect("undecryptable unit must NOT hard-error (per-unit tolerance)");
+        assert_eq!(
+            loss.load(Ordering::Relaxed),
+            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            "one undecryptable unit must add its byte length to the loss counter"
+        );
+
+        // A second read of the same bad unit accumulates further.
+        wrapped.read_sectors(0, 3, &mut buf, false).unwrap();
+        assert_eq!(
+            loss.load(Ordering::Relaxed),
+            2 * crate::aacs::ALIGNED_UNIT_LEN as u64,
+            "loss must accumulate across reads"
+        );
+
+        // Correct key → no loss.
+        let mut good = DecryptingSectorSource::new(
+            EncUnitSource { unit },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, real_key)],
+                read_data_key: None,
+            },
+        );
+        let good_loss = good.decrypt_loss();
+        good.read_sectors(0, 3, &mut buf, false).unwrap();
+        assert_eq!(
+            good_loss.load(Ordering::Relaxed),
+            0,
+            "a decryptable unit must not register any loss"
+        );
     }
 
     /// `into_inner` / `inner` / `inner_mut` must hand back the original
