@@ -137,6 +137,10 @@ impl Disc {
                             2 => ColorSpace::Bt2020,
                             _ => ColorSpace::Unknown,
                         },
+                        // Blu-ray HD/UHD video is square-pixel; display aspect
+                        // equals the pixel grid (16:9). Anamorphic SD-on-BD is
+                        // not special-cased here.
+                        display_aspect: None,
                         secondary: s.secondary,
                         // No user-facing English in the library (numeric-code
                         // rule): the Dolby Vision enhancement layer is signalled

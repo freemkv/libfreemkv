@@ -182,6 +182,13 @@ pub struct VideoStream {
     pub hdr: HdrFormat,
     /// Color space
     pub color_space: ColorSpace,
+    /// Intended display aspect ratio as `(num, den)` when the coded pixels are
+    /// **anamorphic** (display shape ≠ pixel grid) — e.g. DVD 720x576 shown as
+    /// 16:9 → `Some((16, 9))`. `None` means square pixels: the display aspect
+    /// equals the pixel dimensions (HD/UHD, BD). Consumed by the MKV muxer to
+    /// write DisplayWidth/DisplayHeight; passthrough muxers (TS/M2TS) ignore it
+    /// because the aspect already lives in the elementary stream.
+    pub display_aspect: Option<(u32, u32)>,
     /// Whether this is a secondary stream (PiP, Dolby Vision EL)
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
@@ -366,6 +373,13 @@ pub enum HdrFormat {
 pub enum ColorSpace {
     Bt709,
     Bt2020,
+    /// SD PAL/576-line colorimetry (ITU-R BT.470 System B/G — primaries 5,
+    /// transfer 5, matrix 5). DVDs are SD, not HD: stamping BT.709 mis-tags
+    /// their colour.
+    Bt470bg,
+    /// SD NTSC/480-line colorimetry (SMPTE 170M / BT.601-525 — primaries 6,
+    /// transfer 6, matrix 6).
+    Smpte170m,
     Unknown,
 }
 
@@ -843,6 +857,8 @@ impl ColorSpace {
         match self {
             ColorSpace::Bt709 => "BT.709",
             ColorSpace::Bt2020 => "BT.2020",
+            ColorSpace::Bt470bg => "BT.470BG",
+            ColorSpace::Smpte170m => "SMPTE 170M",
             ColorSpace::Unknown => "",
         }
     }
@@ -850,6 +866,8 @@ impl ColorSpace {
     const ALL_CS: &[(&'static str, ColorSpace)] = &[
         ("bt709", ColorSpace::Bt709),
         ("bt2020", ColorSpace::Bt2020),
+        ("bt470bg", ColorSpace::Bt470bg),
+        ("smpte170m", ColorSpace::Smpte170m),
         ("unknown", ColorSpace::Unknown),
     ];
 
@@ -3500,6 +3518,7 @@ mod tests {
                 frame_rate: FrameRate::F23_976,
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
+                display_aspect: None,
                 secondary: false,
                 label: String::new(),
             })],

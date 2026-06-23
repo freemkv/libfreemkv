@@ -83,9 +83,12 @@ impl MkvTrack {
         } else {
             0
         };
+        // (matrix, transfer, primaries, range) — ITU-T H.273 / CICP codes.
         let (matrix, transfer, primaries, range) = match v.color_space {
             ColorSpace::Bt2020 => (9, 16, 9, 1), // bt2020nc, PQ, bt2020, limited
             ColorSpace::Bt709 => (1, 1, 1, 1),   // bt709
+            ColorSpace::Bt470bg => (5, 5, 5, 1), // PAL SD: BT.470BG matrix/transfer/primaries
+            ColorSpace::Smpte170m => (6, 6, 6, 1), // NTSC SD: SMPTE 170M / BT.601-525
             ColorSpace::Unknown => (0, 0, 0, 0),
         };
         // Override transfer for non-PQ HDR
@@ -93,6 +96,17 @@ impl MkvTrack {
             HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => 16, // PQ
             HdrFormat::Hlg => 18,
             _ => transfer,
+        };
+        // Display dimensions. For square-pixel video (HD/UHD/BD) the display
+        // aspect equals the pixel grid, so display == pixel. For anamorphic
+        // content (DVD: 720x480/576 pixels shown as 16:9 or 4:3) the coded
+        // pixels are NOT square — keep the coded height and derive the width so
+        // DisplayWidth:DisplayHeight carries the intended DAR (e.g. 720x576
+        // 16:9 → 1024x576). Without this, players use the square-pixel ratio
+        // and show the disc as 5:4 / 3:2 instead of 16:9.
+        let (display_width, display_height) = match v.display_aspect {
+            Some((an, ad)) if an > 0 && ad > 0 && h > 0 => ((h * an + ad / 2) / ad, h),
+            _ => (w, h),
         };
         Self {
             track_type: ebml::TRACK_TYPE_VIDEO,
@@ -105,8 +119,8 @@ impl MkvTrack {
             pixel_width: w,
             pixel_height: h,
             default_duration_ns,
-            display_width: w,
-            display_height: h,
+            display_width,
+            display_height,
             colour_matrix: matrix,
             colour_transfer: transfer,
             colour_primaries: primaries,
@@ -1074,6 +1088,43 @@ impl<W: Write + Seek> MkvMuxer<W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Anamorphic DVD: a 720x576 (R576i) PAL stream flagged 16:9 must write a
+    /// DisplayWidth/Height carrying the 16:9 DAR (1024x576), NOT the square-pixel
+    /// 720x576 (which players show as ~5:4). Square-pixel video
+    /// (`display_aspect == None`) keeps display == pixel.
+    #[test]
+    fn video_track_anamorphic_display_aspect() {
+        let base = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: Some((16, 9)),
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&base);
+        assert_eq!((t.pixel_width, t.pixel_height), (720, 576));
+        assert_eq!(
+            (t.display_width, t.display_height),
+            (1024, 576),
+            "16:9 anamorphic must emit a 16:9 DAR, not square-pixel 720x576"
+        );
+
+        let square = VideoStream {
+            display_aspect: None,
+            ..base
+        };
+        let t2 = MkvTrack::video(&square);
+        assert_eq!(
+            (t2.display_width, t2.display_height),
+            (720, 576),
+            "square pixels: display == pixel"
+        );
+    }
 
     /// Helper: search for a 4-byte big-endian EBML ID in a byte slice.
     fn find_id(data: &[u8], id: u32) -> Option<usize> {

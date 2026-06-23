@@ -209,6 +209,7 @@ impl M2tsMeta {
                             .unwrap_or(crate::disc::FrameRate::Unknown),
                         hdr: hdr_fmt,
                         color_space: cs,
+                        display_aspect: None,
                         secondary: *secondary,
                         label: label.clone(),
                     })
@@ -403,6 +404,7 @@ mod tests {
             frame_rate: FrameRate::F23_976,
             hdr,
             color_space: cs,
+            display_aspect: None,
             secondary: false,
             label: String::new(),
         }));
@@ -651,6 +653,7 @@ mod tests {
                     frame_rate: FrameRate::F23_976,
                     hdr: HdrFormat::Hdr10,
                     color_space: ColorSpace::Bt2020,
+                    display_aspect: None,
                     secondary: false,
                     label: "x".into(),
                 }));

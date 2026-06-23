@@ -352,6 +352,7 @@ mod tests {
                     frame_rate: FrameRate::F23_976,
                     hdr: HdrFormat::Hdr10,
                     color_space: ColorSpace::Bt2020,
+                    display_aspect: None,
                     secondary: false,
                     label: "Main".into(),
                 }),

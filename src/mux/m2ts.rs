@@ -113,6 +113,7 @@ mod tests {
                 frame_rate: FrameRate::F24,
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
+                display_aspect: None,
                 secondary: false,
                 label: String::new(),
             })],

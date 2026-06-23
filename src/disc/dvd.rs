@@ -24,12 +24,25 @@ impl Disc {
                 pid: 0xE0, // DVD video PID (standard MPEG PS video stream)
                 codec: ts.video.codec,
                 resolution: ts.video.resolution,
-                frame_rate: match ts.video.standard.as_str() {
-                    "PAL" => FrameRate::F25,
-                    _ => FrameRate::F29_97,
+                frame_rate: match ts.video.standard {
+                    crate::ifo::TvSystem::Pal => FrameRate::F25,
+                    crate::ifo::TvSystem::Ntsc => FrameRate::F29_97,
                 },
                 hdr: HdrFormat::Sdr,
-                color_space: ColorSpace::Bt709,
+                // DVD is SD, not HD: PAL is BT.470BG, NTSC is SMPTE-170M.
+                // Stamping BT.709 (HD) mis-tags the colour primaries/transfer.
+                color_space: match ts.video.standard {
+                    crate::ifo::TvSystem::Pal => ColorSpace::Bt470bg,
+                    crate::ifo::TvSystem::Ntsc => ColorSpace::Smpte170m,
+                },
+                // DVD pixels are anamorphic 720x480/576; the real display shape
+                // is the IFO aspect flag, not the pixel grid. Carry it so the
+                // MKV muxer writes a correct 16:9 / 4:3 DisplayWidth/Height
+                // instead of the square-pixel 3:2 / 5:4 it would otherwise emit.
+                display_aspect: Some(match ts.video.aspect {
+                    crate::ifo::DvdAspect::R16x9 => (16, 9),
+                    crate::ifo::DvdAspect::R4x3 => (4, 3),
+                }),
                 secondary: false,
                 label: String::new(),
             });
@@ -527,8 +540,14 @@ mod tests {
     fn scan_dvd_titles_pal_frame_rate_and_video_pid() {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1)]);
-        // video b0 low 2 bits = 1 → PAL.
-        let vts = build_vts(0, 0x01, &[], &[], &[(0, 9)], false);
+        let vts = build_vts(
+            0,
+            crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_4X3),
+            &[],
+            &[],
+            &[(0, 9)],
+            false,
+        );
         let udf = build_video_ts_fs(
             &mut disc,
             &[
@@ -558,6 +577,60 @@ mod tests {
         assert_eq!(v.pid, 0xE0, "DVD video PID is fixed 0xE0");
         assert_eq!(v.frame_rate, FrameRate::F25, "PAL → 25 fps");
         assert_eq!(v.resolution, Resolution::R576i, "PAL → 576i");
+        assert_eq!(
+            v.color_space,
+            ColorSpace::Bt470bg,
+            "PAL DVD is SD BT.470BG, not BT.709"
+        );
+    }
+
+    /// NTSC DVD video is SD SMPTE-170M colorimetry (not BT.709). Mirror of the
+    /// PAL test with `VIDEO_FORMAT_NTSC` → 480i / 29.97 / SMPTE-170M.
+    #[test]
+    fn scan_dvd_titles_ntsc_color_is_smpte170m() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        let vts = build_vts(
+            0,
+            crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_NTSC, crate::ifo::ASPECT_4X3),
+            &[],
+            &[],
+            &[(0, 9)],
+            false,
+        );
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let v = t
+            .streams
+            .iter()
+            .find_map(|s| match s {
+                Stream::Video(v) => Some(v),
+                _ => None,
+            })
+            .expect("video stream");
+        assert_eq!(v.frame_rate, FrameRate::F29_97, "NTSC → 29.97 fps");
+        assert_eq!(v.resolution, Resolution::R480i, "NTSC → 480i");
+        assert_eq!(
+            v.color_space,
+            ColorSpace::Smpte170m,
+            "NTSC DVD is SD SMPTE-170M, not BT.709"
+        );
     }
 
     /// AC-3 audio gets sub_stream_id 0x80 → PID routed via dvd_audio_pid

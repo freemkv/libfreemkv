@@ -582,6 +582,9 @@ fn parse_track(
                 frame_rate: FrameRate::Unknown,
                 hdr: HdrFormat::Sdr,
                 color_space: ColorSpace::Bt709,
+                // Remux input: the source MKV's DisplayWidth/Height is preserved
+                // by the writer separately; nothing anamorphic to reconstruct here.
+                display_aspect: None,
                 secondary: is_secondary,
                 label: name,
             }))
