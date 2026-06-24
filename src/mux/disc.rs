@@ -210,6 +210,7 @@ impl DiscStream {
         batch_sectors: u16,
         content_format: crate::disc::ContentFormat,
     ) -> Self {
+        let mut title = title;
         let extents = title.extents.clone();
         let bytes_total_extents: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
@@ -223,6 +224,16 @@ impl DiscStream {
             "DiscStream constructed with reader type: {}",
             std::any::type_name_of_val(&*reader)
         );
+
+        // CSS/unencrypted content needs a decrypting wrapper to yield plaintext
+        // VOB bytes before the AC-3 sub-stream probe can read real `acmod`s.
+        let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
+
+        // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
+        // declared AC-3 audio onto the physically-correct `0x8x` sub-streams by
+        // probing their real channel counts off the head of the feature. No-op
+        // for non-DVD or when the probe yields nothing.
+        crate::disc::dvd_audio_probe::probe_and_remap(&mut reader, &mut title);
 
         let mut pids = Vec::new();
         let mut parsers = Vec::new();
@@ -262,10 +273,11 @@ impl DiscStream {
             _ => 1,
         };
 
-        // Wrap the input reader in DecryptingSectorSource so the internal
-        // fill_extents path sees plaintext bytes. For DecryptKeys::None
-        // (unencrypted / raw / test fixtures) the decorator is a pass-through.
-        let reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
+        // `reader` is already wrapped in DecryptingSectorSource above (so the
+        // internal fill_extents path sees plaintext bytes; for DecryptKeys::None
+        // the decorator is a pass-through). Reset the unit base the probe read
+        // advanced so the first fill_extents read starts cleanly.
+        reader.set_unit_base(0);
         // Clone the shared loss counter once here so `lost_bytes()` never
         // clones an Arc per frame on the mux hot path.
         let decrypt_loss = reader.decrypt_loss();
