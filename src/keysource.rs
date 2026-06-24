@@ -122,6 +122,100 @@ pub trait KeySource {
     }
 }
 
+/// Drive `sources` until one key decrypts `disc`. Loops [`KeySource::next_key`]
+/// and hands each candidate to [`crate::Disc::decrypt_with`] (which validates it
+/// against `inputs.samples` and only mutates the disc on success), returning
+/// `true` at the first key that decrypts and `false` once every source is
+/// exhausted — the genuine "no key for this disc". THE shared key-resolution
+/// loop: every application uses it instead of re-rolling the candidate/retry
+/// logic, so the "no key" verdict is identical everywhere.
+///
+/// Lives in the library, not a key-source crate: resolution is decryption
+/// *mechanism* — it validates candidates against disc content via
+/// `Disc::decrypt_with` — and the library owns all mechanism. A key source only
+/// hands out candidate keys; what's done with them is not its concern.
+pub fn resolve_and_apply(
+    sources: &mut dyn KeySource,
+    inputs: &DiscInputs,
+    disc: &mut crate::Disc,
+) -> bool {
+    while let Some(key) = sources.next_key(inputs) {
+        if disc.decrypt_with(key, &inputs.samples).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s body, raw (no
+/// decrypt) — the content samples that populate [`DiscInputs::samples`] for a
+/// key server to validate a candidate against, and that [`resolve_and_apply`]
+/// hands to [`crate::Disc::decrypt_with`].
+///
+/// Lives in the library, not a key-source crate: reading the disc and carving
+/// AACS units is decryption *mechanism* (unit geometry anchored at each extent's
+/// `start_lba`), which the library owns. A key source is *handed* these bytes
+/// via `DiscInputs.samples`; it never reads the disc itself.
+///
+/// "Encrypted" is decided by [`crate::aacs::is_aacs_scrambled`] — the SAME
+/// predicate the decrypt gate uses — so all sides agree. A clip opens with clear
+/// navigation units (PAT/PMT, menus); only the feature body is scrambled, and a
+/// clear unit proves nothing, so this collects only scrambled ones, sampling the
+/// largest extent at its midpoint forward.
+pub fn read_encrypted_units(
+    reader: &mut dyn crate::sector::SectorSource,
+    title: &crate::disc::DiscTitle,
+    n: usize,
+) -> Vec<Vec<u8>> {
+    use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, is_aacs_scrambled};
+    const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
+    const MAX_CHUNKS_PER_EXTENT: u32 = 4; // ~60 units scanned at each extent's midpoint
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for ext in &title.extents {
+        let total_units = ext.sector_count / ALIGNED_UNIT_SECTORS;
+        if total_units == 0 {
+            continue;
+        }
+        let mut unit = total_units / 2; // midpoint (past the clear nav at the head)
+        for _ in 0..MAX_CHUNKS_PER_EXTENT {
+            if unit >= total_units {
+                break;
+            }
+            let units_this = CHUNK_UNITS.min(total_units - unit);
+            // Saturate: start_lba comes from attacker-controlled UDF/MPLS
+            // extents; a malformed extent near u32::MAX would otherwise panic
+            // (debug) or wrap to a wrong LBA (release). An over-capacity LBA then
+            // fails cleanly via the read_sectors().is_err() break below.
+            let lba = ext
+                .start_lba
+                .saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
+            let count = (units_this * ALIGNED_UNIT_SECTORS) as u16;
+            let mut buf = vec![0u8; count as usize * 2048];
+            // `false` = no recovery retries; the reader is the raw drive/file
+            // (no decrypt decorator), so these are the on-disc encrypted bytes.
+            if reader.read_sectors(lba, count, &mut buf, false).is_err() {
+                break;
+            }
+            for i in 0..units_this as usize {
+                let o = i * ALIGNED_UNIT_LEN;
+                if o + ALIGNED_UNIT_LEN > buf.len() {
+                    break;
+                }
+                let u = &buf[o..o + ALIGNED_UNIT_LEN];
+                if is_aacs_scrambled(u) {
+                    out.push(u.to_vec());
+                    if out.len() >= n {
+                        return out;
+                    }
+                }
+            }
+            unit += units_this;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
