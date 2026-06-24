@@ -60,8 +60,8 @@ impl Drop for PrefetchShell {
 
 /// Spawned byte prefetcher. Drop joins the producer thread.
 pub struct BytePrefetcher {
-    rx: Receiver<Batch>,
-    recycle_tx: Sender<Vec<u8>>,
+    rx: Option<Receiver<Batch>>,
+    recycle_tx: Option<Sender<Vec<u8>>>,
     producer: Option<JoinHandle<()>>,
 }
 
@@ -168,8 +168,8 @@ impl BytePrefetcher {
             })?;
 
         Ok(Self {
-            rx,
-            recycle_tx,
+            rx: Some(rx),
+            recycle_tx: Some(recycle_tx),
             producer: Some(producer),
         })
     }
@@ -201,14 +201,27 @@ impl BytePrefetcher {
         // bitwise move out; every field is read exactly once and never
         // touched again, so there are no double-frees and no aliasing.
         let producer = unsafe { std::ptr::read(&me.producer) };
-        let rx = unsafe { std::ptr::read(&me.rx) };
-        let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
+        // SAFETY: `rx` and `recycle_tx` are always `Some` here —
+        // `into_channels` is the only way to consume a live
+        // `BytePrefetcher`; `Drop::drop` is suppressed by `ManuallyDrop`.
+        let rx = unsafe { std::ptr::read(&me.rx) }.expect("rx always Some before drop");
+        let recycle =
+            unsafe { std::ptr::read(&me.recycle_tx) }.expect("recycle_tx always Some before drop");
         (rx, recycle, PrefetchShell { producer })
     }
 }
 
 impl Drop for BytePrefetcher {
     fn drop(&mut self) {
+        // Drop channel endpoints BEFORE joining the producer so the
+        // producer observes SendTimeoutError::Disconnected (forward tx)
+        // or RecvTimeoutError::Disconnected (recycle rx) and exits
+        // promptly. Without this, a non-EOF source fills the depth-2
+        // forward channel and then spins in send_timeout(POLL_INTERVAL)
+        // forever because rx is never drained, causing join() to
+        // deadlock.
+        drop(self.rx.take());
+        drop(self.recycle_tx.take());
         if let Some(h) = self.producer.take() {
             let _ = h.join();
         }
@@ -470,6 +483,23 @@ mod tests {
             // Drop without consuming — producer fills the forward
             // channel (capacity 2), reaches EOF on the third read since
             // 100 < 4096 (single chunk + EOF), drops tx, exits.
+            drop(pf);
+        });
+    }
+
+    /// Regression: dropping a BytePrefetcher directly (without
+    /// into_channels) with an ENDLESS source must not deadlock. Before
+    /// the fix, Drop joined the producer while rx/recycle_tx were still
+    /// alive (sibling field drop order), so the producer filled the
+    /// depth-2 forward channel and then spun in send_timeout forever
+    /// (rx never drained, halt=None). The fix drops rx+recycle_tx
+    /// BEFORE the join so the producer sees SendTimeoutError::Disconnected
+    /// and exits.
+    #[test]
+    fn drop_endless_prefetcher_joins_cleanly() {
+        within(10, || {
+            let pf = BytePrefetcher::new(EndlessReader, 4096, None).expect("spawn");
+            // Drop without consuming — the old Drop deadlocked here.
             drop(pf);
         });
     }
