@@ -1291,8 +1291,16 @@ impl Disc {
         // AACS handshake (Blu-ray/UHD). Acquires the Volume ID via the
         // cert-based mutual-auth handshake (the OEM route); drive unlock
         // itself runs separately behind the pluggable `Unlocker` seam.
-        tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
-        let (handshake, handshake_error) = Self::do_handshake(session, opts);
+        // AACS is Blu-ray/UHD only. A DVD uses CSS — skip the AACS handshake
+        // entirely (the drive already classified the disc as DVD at init), so a
+        // DVD never issues AACS OEM-VID / cert SCSI against the drive before the
+        // CSS bus-auth runs.
+        let (handshake, handshake_error) = if session.disc_is_dvd() {
+            (None, None)
+        } else {
+            tracing::info!(target: "freemkv::scan", "phase: AACS handshake");
+            Self::do_handshake(session, opts)
+        };
         tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");
 
         // Request max read speed — removes riplock on DVD
@@ -1660,7 +1668,7 @@ impl Disc {
             elapsed_ms = scan_with_t0.elapsed().as_millis() as u64,
             "end"
         );
-        Ok(Disc {
+        let disc = Disc {
             volume_id: udf_fs.volume_id.clone(),
             meta_title,
             format,
@@ -1677,7 +1685,16 @@ impl Disc {
             // which set this when they observe scrambled-but-uncracked content.
             css_error: None,
             content_format,
-        })
+        };
+
+        // Structured scan diagnostic block (--log-level 3). Emits the
+        // per-title / per-stream / decision / AACS rows under the
+        // `freemkv::diag` target; a no-op unless that target is enabled.
+        // (DVD per-cell category rows are emitted earlier from the IFO scan,
+        // before the per-cell detail is lowered away.)
+        crate::diag::dump_disc(&disc);
+
+        Ok(disc)
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────

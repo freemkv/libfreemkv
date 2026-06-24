@@ -1,12 +1,12 @@
 //! CSS drive bus-authentication — read-unlock primitive.
 //!
 //! A CSS-enforcing DVD drive refuses to return scrambled sectors until a
-//! CSS bus-auth handshake has run for the title. [`unlock_css_reads`]
-//! issues that classic handshake (bus auth → disc-key REPORT KEY → bus
-//! auth → title-key REPORT KEY) purely for its SCSI side effect of
-//! unlocking scrambled-sector reads. The bytes the handshake returns are
-//! NOT used as keys: the descramble title key is recovered keylessly by
-//! the Stevenson known-plaintext attack (see [`super::crack_key`]).
+//! CSS bus-auth handshake has set its Authentication Success Flag (ASF=1).
+//! [`unlock_css_reads`] runs that bus-auth challenge-response (which is what
+//! actually opens scrambled-sector reads), then a best-effort, non-fatal
+//! disc-key REPORT KEY. The bytes are NOT used as keys: the descramble title
+//! key is recovered keylessly by the Stevenson known-plaintext attack (see
+//! [`super::crack_key`]).
 
 use crate::drive::Drive;
 use crate::error::{Error, Result};
@@ -119,11 +119,12 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
 
 /// CSS bus-auth **unlock** primitive.
 ///
-/// Issues the full classic CSS handshake (bus auth → disc-key REPORT KEY →
-/// bus auth → title-key REPORT KEY) purely to unlock the drive's
-/// scrambled-sector read gating. The bytes returned by the handshake are
-/// discarded — the descramble title key is recovered keylessly elsewhere
-/// (the Stevenson known-plaintext attack in [`super::crack_key`]).
+/// Runs the bus-auth challenge-response (which sets the drive's ASF=1 and is
+/// what actually unlocks scrambled-sector reads), then a best-effort,
+/// non-fatal disc-key REPORT KEY. The title-key REPORT KEY is NOT issued: it
+/// is unnecessary (the descramble key is recovered keylessly by the Stevenson
+/// attack in [`super::crack_key`]) and its hard failure on some USB bridges
+/// used to abort the whole unlock (the 7014 bug). The bytes are discarded.
 pub fn unlock_css_reads(drive: &mut Drive, lba: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
     tracing::info!(target: "freemkv::css", phase = "unlock_css_reads", lba, "begin");
@@ -139,27 +140,24 @@ pub fn unlock_css_reads(drive: &mut Drive, lba: u32) -> Result<()> {
     r
 }
 
-fn unlock_css_reads_inner(drive: &mut Drive, lba: u32) -> Result<()> {
-    tracing::debug!(target: "freemkv::css", lba, "css unlock: begin");
-    // Session 1: bus auth → disc-key REPORT KEY (AGID consumed by
-    // READ_DVD_STRUCTURE). The block contents are unused; this is issued
-    // purely for the bus-auth unlock side effect.
+fn unlock_css_reads_inner(drive: &mut Drive, _lba: u32) -> Result<()> {
+    tracing::debug!(target: "freemkv::css", "css unlock: begin");
+    // The bus-auth challenge-response sets the drive's Authentication Success
+    // Flag (ASF=1), which is what opens scrambled-sector reads. This is the
+    // ONLY step required to unlock reads; a failure here is fatal — we
+    // genuinely cannot read scrambled sectors.
     let (agid, _bus_key) = bus_auth(drive).inspect_err(|e| {
-        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth(1) failed");
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth failed");
     })?;
-    tracing::debug!(target: "freemkv::css", agid, "css unlock: bus_auth(1) ok");
-    read_disc_key(drive, agid).inspect_err(|e| {
-        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: read_disc_key failed");
-    })?;
-    tracing::debug!(target: "freemkv::css", "css unlock: disc-key REPORT KEY ok");
-
-    // Session 2: fresh bus auth → title-key REPORT KEY (needs separate AGID).
-    let (agid2, _bus_key2) = bus_auth(drive).inspect_err(|e| {
-        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth(2) failed");
-    })?;
-    read_raw_title_key(drive, agid2, lba).inspect_err(|e| {
-        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: read_raw_title_key failed");
-    })?;
+    tracing::debug!(target: "freemkv::css", agid, "css unlock: bus_auth ok");
+    // Disc-key REPORT KEY: issued BEST-EFFORT for any firmware that ties part
+    // of its read-unlock to it. The bytes are unused (the descramble key is
+    // recovered keylessly) and a failure is NON-FATAL — the gate is already
+    // open from bus-auth. This replaces the title-key REPORT KEY, whose hard
+    // failure used to abort the whole unlock (the 7014 bug on USB bridges).
+    if let Err(e) = read_disc_key(drive, agid) {
+        tracing::debug!(target: "freemkv::css", error_code = e.code(), "css unlock: disc-key REPORT KEY skipped (non-fatal)");
+    }
     tracing::debug!(target: "freemkv::css", "css unlock: ok");
     Ok(())
 }
@@ -307,34 +305,6 @@ fn read_disc_key(drive: &mut Drive, agid: u8) -> Result<()> {
         5_000,
     );
     dvd_result.map_err(|_| Error::CssAuthFailed)?;
-
-    Ok(())
-}
-
-// ── Step 3: Title Key ─────────────────────────────────────────────────────
-
-/// Issue the title-key REPORT KEY (format 0x04) purely for the bus-auth
-/// unlock side effect. The returned key bytes are not used.
-fn read_raw_title_key(drive: &mut Drive, agid: u8, lba: u32) -> Result<()> {
-    let scsi = drive.scsi_mut();
-    let mut cdb = [0u8; 12];
-    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
-    cdb[2] = (lba >> 24) as u8;
-    cdb[3] = (lba >> 16) as u8;
-    cdb[4] = (lba >> 8) as u8;
-    cdb[5] = lba as u8;
-    cdb[8] = 0x00;
-    cdb[9] = 0x0C;
-    cdb[10] = (agid << 6) | 0x04;
-
-    let mut buf = [0u8; 12];
-    let result = scsi.execute(
-        &cdb,
-        crate::scsi::DataDirection::FromDevice,
-        &mut buf,
-        5_000,
-    );
-    result.map_err(|_| Error::CssAuthFailed)?;
 
     Ok(())
 }

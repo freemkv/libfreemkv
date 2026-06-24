@@ -290,6 +290,16 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 let mut first_err: Option<Error> = None;
                 let mut stopped = false;
 
+                // Rolling apply-throughput summary. The per-item "apply: OK"
+                // line was 99% of the mux log; collapse it into a periodic
+                // summary (count, avg ms, items/s) emitted ~every 5 s while
+                // debug tracing is on. The individual slow-apply ("took … s")
+                // STALL events below stay visible — those are signal, not noise.
+                let mut summary_count: u64 = 0;
+                let mut summary_nanos: u128 = 0;
+                let mut summary_since = Instant::now();
+                const SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+
                 while let Ok(item) = rx.recv() {
                     let debug = debug_enabled();
                     if debug {
@@ -338,19 +348,48 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     if let Some(start) = apply_start {
                         let apply_elapsed = start.elapsed();
                         if apply_elapsed > Duration::from_millis(100) {
+                            // STALL event — a single slow apply. Keep it visible:
+                            // its presence is a signal, not per-frame noise.
                             tracing::debug!(
                                 "Pipeline apply: took {:.2}s, item={}",
                                 apply_elapsed.as_secs_f64(),
                                 std::any::type_name::<I>()
                             );
-                        } else {
+                        }
+                        // Benign per-item OK: roll into the periodic summary
+                        // rather than logging one line per frame.
+                        summary_count += 1;
+                        summary_nanos += apply_elapsed.as_nanos();
+                        if summary_since.elapsed() >= SUMMARY_INTERVAL && summary_count > 0 {
+                            let secs = summary_since.elapsed().as_secs_f64();
+                            let avg_ms = (summary_nanos as f64 / summary_count as f64) / 1_000_000.0;
                             tracing::debug!(
-                                "Pipeline apply: OK in {:.3}ms, item={}",
-                                apply_elapsed.as_micros(),
+                                "Pipeline apply summary: {} items in {:.1}s, avg {:.3}ms, {:.0} items/s, type={}",
+                                summary_count,
+                                secs,
+                                avg_ms,
+                                summary_count as f64 / secs.max(1e-9),
                                 std::any::type_name::<I>()
                             );
+                            summary_count = 0;
+                            summary_nanos = 0;
+                            summary_since = Instant::now();
                         }
                     }
+                }
+
+                // Flush the residual apply-summary tail at end-of-stream so the
+                // last partial window's item count isn't silently dropped.
+                if summary_count > 0 && debug_enabled() {
+                    let secs = summary_since.elapsed().as_secs_f64();
+                    let avg_ms = (summary_nanos as f64 / summary_count as f64) / 1_000_000.0;
+                    tracing::debug!(
+                        "Pipeline apply summary (final): {} items in {:.1}s, avg {:.3}ms, type={}",
+                        summary_count,
+                        secs,
+                        avg_ms,
+                        std::any::type_name::<I>()
+                    );
                 }
 
                 // Final abandonment check: the common leak case is a
@@ -401,13 +440,16 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 if let Some(start) = start {
                     let elapsed = start.elapsed();
                     if elapsed > Duration::from_millis(10) {
+                        // BLOCKED event — back-pressure stall. Keep visible.
                         tracing::debug!(
                             "Pipeline send: blocked {:.2}s, item={}",
                             elapsed.as_secs_f64(),
                             std::any::type_name::<I>()
                         );
                     } else {
-                        tracing::debug!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
+                        // Benign per-item OK: trace-level (L4) only; the
+                        // apply-side rolling summary carries throughput.
+                        tracing::trace!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
                     }
                 }
                 Ok(())

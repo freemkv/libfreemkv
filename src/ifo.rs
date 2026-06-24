@@ -58,6 +58,122 @@ pub struct DvdTitle {
 pub struct DvdCell {
     pub first_sector: u32,
     pub last_sector: u32,
+    /// Raw cell-category byte at `cell_playback + 0` (DVD-Video spec).
+    /// Packs cell_type (bits 7-6), block_mode (bits 5-4), block_type
+    /// (bits 3-2), seamless_play (bit 1), interleaved (bit 0). Carried so
+    /// the extent builder can recognise non-feature leading cells
+    /// (scene-index / interleaved angle sub-blocks) and the diagnostic dump
+    /// can show why a cell was kept or dropped.
+    pub category: u8,
+    /// Per-cell playback duration in seconds (BCD time at `cell_playback + 4`).
+    /// Used by the diagnostic dump and the conservative leading-cell filter
+    /// (a short leading scene-index cell vs the multi-minute feature).
+    pub duration_secs: f64,
+}
+
+/// Decoded view of a cell-category byte (`cell_playback + 0`), per the
+/// DVD-Video spec `cell_playback_information` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellCategory {
+    /// bits 7-6: 0=normal, 1=first cell of angle block, 2=middle, 3=last.
+    pub cell_type: u8,
+    /// bits 5-4: 0=not in block, 1=first cell of block, 2=in block, 3=last.
+    pub block_mode: u8,
+    /// bits 3-2: 0=not part of a block, 1=angle block.
+    pub block_type: u8,
+    /// bit 1: seamless playback (STC continuous).
+    pub seamless_play: bool,
+    /// bit 0: interleaved (multi-angle / seamless-branch interleave).
+    pub interleaved: bool,
+}
+
+impl CellCategory {
+    /// Decode the raw `cell_playback + 0` byte.
+    pub fn decode(raw: u8) -> Self {
+        CellCategory {
+            cell_type: (raw >> 6) & 0x03,
+            block_mode: (raw >> 4) & 0x03,
+            block_type: (raw >> 2) & 0x03,
+            seamless_play: (raw & 0x02) != 0,
+            interleaved: (raw & 0x01) != 0,
+        }
+    }
+
+    /// A plain feature cell: not part of any angle/interleave block. Every
+    /// cell of a normal single-angle feature decodes to this (`category`
+    /// byte `0x00`, or `0x00` in every block field with only the
+    /// seamless/interleaved flags possibly set). Such a cell is NEVER
+    /// dropped by the leading-cell filter.
+    pub fn is_plain_feature(&self) -> bool {
+        self.cell_type == 0 && self.block_mode == 0 && self.block_type == 0
+    }
+
+    /// Marks a non-first piece of an angle / interleaved block: a "middle" or
+    /// "last" cell of an angle block (`cell_type ∈ {2,3}`), or an
+    /// in-block / last-of-block cell (`block_mode ∈ {2,3}`). Concatenating
+    /// these back-to-back with the first angle duplicates content at the head
+    /// of the feature. Conservative: the FIRST cell of a block
+    /// (`cell_type==1` / `block_mode==1`) is NOT flagged — it is the angle we
+    /// keep.
+    pub fn is_secondary_block_piece(&self) -> bool {
+        matches!(self.cell_type, 2 | 3) || matches!(self.block_mode, 2 | 3)
+    }
+}
+
+impl DvdTitle {
+    /// Index of the first cell to include in the muxed feature.
+    ///
+    /// Bug-4 (scene-selection / logo at the head of the feature): the main
+    /// feature's PGC can open with leading cells that are NOT part of the
+    /// movie — a scene-index segment or an interleaved-angle sub-block. Those
+    /// are recognisable by their cell-category byte: a leading cell flagged as
+    /// a *secondary* piece of an angle/interleave block
+    /// ([`CellCategory::is_secondary_block_piece`]) is not feature content.
+    ///
+    /// This walks the leading run and returns the index of the first cell that
+    /// is a plain feature cell (category `0x00`-class). Cells before it that
+    /// are secondary block pieces are dropped from the feature extents.
+    ///
+    /// **Conservative by construction — it can NEVER truncate a normal
+    /// feature:**
+    /// - It only ever skips a *prefix*; the scan stops at the first
+    ///   plain-feature cell and keeps everything from there on.
+    /// - A normal single-angle feature has category `0x00` on cell 0, so the
+    ///   scan stops immediately at index 0 and drops nothing.
+    /// - It never drops on duration or any heuristic — only on the spec
+    ///   category bits — and it never drops the FIRST cell of an angle block
+    ///   (the angle we keep).
+    /// - As a final guard it never returns past the last cell, and never drops
+    ///   when that would leave zero cells.
+    ///
+    /// For "The Silence of the Lambs" (every feature cell category `0x00`,
+    /// chapter 1 at 00:00:00) this returns 0 — a no-op — which is the correct
+    /// result: the disc's scene-index lives in a separate menu/title PGC, not
+    /// in leading cells of the feature PGC, so there is nothing to drop here.
+    pub fn feature_start_cell(&self) -> usize {
+        let n = self.cells.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut idx = 0;
+        while idx < n {
+            let cat = CellCategory::decode(self.cells[idx].category);
+            // Stop at the first cell that is genuine feature content.
+            if !cat.is_secondary_block_piece() {
+                break;
+            }
+            idx += 1;
+        }
+        // Never drop everything: if every leading cell looked like a secondary
+        // block piece (pathological/corrupt category bytes), fall back to
+        // keeping all cells rather than producing an empty feature.
+        if idx >= n { 0 } else { idx }
+    }
+
+    /// The feature cells after the leading-cell filter ([`feature_start_cell`]).
+    pub fn feature_cells(&self) -> &[DvdCell] {
+        &self.cells[self.feature_start_cell()..]
+    }
 }
 
 /// DVD TV system, from VTS_V_ATR `video_format` (byte 0 bits 5-4).
@@ -305,11 +421,25 @@ fn parse_vts(
         return Err(Error::IfoParse);
     }
 
-    // VTS_PGCIT sector pointer
-    let pgcit_sector = be_u32(&vts_data, 0xCC)?;
+    // VTSI_MAT (VTS_xx_0.IFO header) field offsets — fixed by the DVD-Video
+    // spec (libdvdread `vtsi_mat_t`). The offsets are constant; the sector
+    // values they point to are per-disc.
+    const VTSTT_VOBS_OFFSET: usize = 0xC4; // VTS title VOBS start sector (feature)
+    const VTS_PGCIT_OFFSET: usize = 0xCC; // VTS_PGCIT sector pointer
 
-    // First VOB sector
-    let vob_start_sector = be_u32(&vts_data, 0xC0)?;
+    // VTS_PGCIT sector pointer
+    let pgcit_sector = be_u32(&vts_data, VTS_PGCIT_OFFSET)?;
+
+    // First sector of the VTS **Title** VOBS (`vtstt_vobs`, VTSTT_VOBS_OFFSET).
+    // The cell `first_sector` / `last_sector` values in the title PGCs are
+    // relative to this. Offset 0xC0 is `vtsm_vobs` — the VTS *menu* VOBS
+    // (VTS_xx_0.VOB), which on discs with a per-title menu (e.g. a Universal
+    // "the parental level has been set, press yes" first-play still) holds that
+    // interactive prompt. Reading the menu base instead prepended the menu VOB
+    // to the feature and shifted every cell extent back by
+    // `vtstt_vobs - vtsm_vobs` sectors, so the rip opened on the parental
+    // prompt instead of the movie. The title content lives at `vtstt_vobs`.
+    let vob_start_sector = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
 
     // Video attributes at offset 0x200 (2 bytes)
     let video = parse_video_attr(&vts_data)?;
@@ -617,11 +747,15 @@ fn parse_pgc(data: &[u8], pgc_offset: usize, chapters: u16) -> Result<DvdTitle> 
             if co + 24 > data.len() {
                 break;
             }
+            let category = byte_at(data, co)?;
+            let duration_secs = bcd_to_secs(&data[co + 4..co + 8]);
             let first_sector = be_u32(data, co + 8)?;
             let last_sector = be_u32(data, co + 20)?;
             cells.push(DvdCell {
                 first_sector,
                 last_sector,
+                category,
+                duration_secs,
             });
         }
     }
@@ -781,6 +915,8 @@ mod tests {
         let cell = DvdCell {
             first_sector: 100,
             last_sector: 200,
+            category: 0,
+            duration_secs: 0.0,
         };
         assert_eq!(cell.first_sector, 100);
         assert_eq!(cell.last_sector, 200);
@@ -1347,6 +1483,159 @@ mod tests {
         // cell_playback_offset (0xE8) left 0.
         let title = parse_pgc(&pgc, 0, 1).unwrap();
         assert!(title.cells.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Cell-category decode + bug-4 leading-cell filter.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn cell(first: u32, last: u32, category: u8) -> DvdCell {
+        DvdCell {
+            first_sector: first,
+            last_sector: last,
+            category,
+            duration_secs: 0.0,
+        }
+    }
+
+    /// CellCategory decodes the spec bitfields: cell_type (7-6), block_mode
+    /// (5-4), block_type (3-2), seamless (1), interleaved (0).
+    #[test]
+    fn cell_category_decode_bits() {
+        // 0x00 → plain feature, nothing set.
+        let c = CellCategory::decode(0x00);
+        assert_eq!(c.cell_type, 0);
+        assert_eq!(c.block_mode, 0);
+        assert_eq!(c.block_type, 0);
+        assert!(!c.seamless_play);
+        assert!(!c.interleaved);
+        assert!(c.is_plain_feature());
+        assert!(!c.is_secondary_block_piece());
+
+        // cell_type=1 (first of angle block), block_mode=1 (first of block):
+        // 0b01_01_00_0_0 = 0x50. This is the angle we KEEP — not secondary.
+        let c = CellCategory::decode(0b01_01_00_00);
+        assert_eq!(c.cell_type, 1);
+        assert_eq!(c.block_mode, 1);
+        assert!(!c.is_plain_feature());
+        assert!(!c.is_secondary_block_piece());
+
+        // cell_type=2 (middle of angle block): 0b10_00_00_00 = 0x80 → secondary.
+        assert!(CellCategory::decode(0b10_00_00_00).is_secondary_block_piece());
+        // cell_type=3 (last of angle block) → secondary.
+        assert!(CellCategory::decode(0b11_00_00_00).is_secondary_block_piece());
+        // block_mode=2 (in block) → secondary; block_mode=3 (last of block) → secondary.
+        assert!(CellCategory::decode(0b00_10_00_00).is_secondary_block_piece());
+        assert!(CellCategory::decode(0b00_11_00_00).is_secondary_block_piece());
+
+        // seamless (bit1) + interleaved (bit0) on an otherwise-plain cell must
+        // NOT make it secondary — they don't mark non-feature content.
+        let c = CellCategory::decode(0b00_00_00_11);
+        assert!(c.seamless_play);
+        assert!(c.interleaved);
+        assert!(c.is_plain_feature());
+        assert!(!c.is_secondary_block_piece());
+    }
+
+    /// A normal single-angle feature (every cell category 0x00) is never
+    /// filtered: feature_start_cell == 0, feature_cells == all cells. This is
+    /// the "Silence of the Lambs" case — the filter must be a no-op.
+    #[test]
+    fn feature_filter_noop_on_plain_feature() {
+        let t = DvdTitle {
+            chapters: 3,
+            duration_secs: 6780.0,
+            cells: vec![
+                cell(0, 99, 0x00),
+                cell(100, 199, 0x00),
+                cell(200, 299, 0x00),
+            ],
+            chapter_times: vec![0.0, 100.0, 200.0],
+            palette: None,
+        };
+        assert_eq!(t.feature_start_cell(), 0);
+        assert_eq!(t.feature_cells().len(), 3);
+    }
+
+    /// A leading interleaved/angle-block sub-cell (category marks a secondary
+    /// block piece) is dropped; the scan stops at the first plain cell and
+    /// keeps the rest.
+    #[test]
+    fn feature_filter_drops_leading_secondary_block_cells() {
+        let t = DvdTitle {
+            chapters: 2,
+            duration_secs: 100.0,
+            cells: vec![
+                cell(0, 9, 0b10_00_00_00),   // middle of angle block → drop
+                cell(10, 19, 0b00_11_00_00), // last of block → drop
+                cell(20, 119, 0x00),         // feature starts here
+                cell(120, 219, 0x00),
+            ],
+            chapter_times: vec![0.0, 50.0],
+            palette: None,
+        };
+        assert_eq!(t.feature_start_cell(), 2);
+        let fc = t.feature_cells();
+        assert_eq!(fc.len(), 2);
+        assert_eq!(fc[0].first_sector, 20);
+    }
+
+    /// Conservative guard: if EVERY cell looks like a secondary block piece
+    /// (corrupt/pathological category bytes), the filter refuses to drop them
+    /// all — it returns 0 and keeps every cell rather than emit an empty
+    /// feature.
+    #[test]
+    fn feature_filter_never_empties_title() {
+        let t = DvdTitle {
+            chapters: 1,
+            duration_secs: 100.0,
+            cells: vec![cell(0, 9, 0b10_00_00_00), cell(10, 19, 0b11_00_00_00)],
+            chapter_times: vec![0.0],
+            palette: None,
+        };
+        assert_eq!(t.feature_start_cell(), 0);
+        assert_eq!(t.feature_cells().len(), 2);
+    }
+
+    /// An empty title (no cells) returns 0 and an empty slice — no panic.
+    #[test]
+    fn feature_filter_empty_cells() {
+        let t = DvdTitle {
+            chapters: 0,
+            duration_secs: 0.0,
+            cells: vec![],
+            chapter_times: vec![],
+            palette: None,
+        };
+        assert_eq!(t.feature_start_cell(), 0);
+        assert!(t.feature_cells().is_empty());
+    }
+
+    /// parse_pgc populates the new `category` + `duration_secs` cell fields
+    /// from `cell_playback + 0` and the BCD time at `cell_playback + 4`.
+    #[test]
+    fn pgc_reads_cell_category_and_duration() {
+        let mut pgc = vec![0u8; 0xEA];
+        pgc[0x02] = 1;
+        pgc[0x03] = 2; // 2 cells
+        pgc[0xE8] = 0x00;
+        pgc[0xE9] = 0xEA;
+        pgc.resize(0xEA + 48, 0);
+        // Cell 0: category byte = 0x80 (middle of angle block), 5s BCD.
+        pgc[0xEA] = 0x80;
+        pgc[0xEA + 6] = 0x05;
+        pgc[0xEA + 8..0xEA + 12].copy_from_slice(&10u32.to_be_bytes());
+        // Cell 1: category 0x00 (plain feature), 7s BCD.
+        pgc[0xEA + 24] = 0x00;
+        pgc[0xEA + 24 + 6] = 0x07;
+        pgc[0xEA + 24 + 8..0xEA + 24 + 12].copy_from_slice(&20u32.to_be_bytes());
+        let title = parse_pgc(&pgc, 0, 2).unwrap();
+        assert_eq!(title.cells[0].category, 0x80);
+        assert!((title.cells[0].duration_secs - 5.0).abs() < 0.01);
+        assert_eq!(title.cells[1].category, 0x00);
+        assert!((title.cells[1].duration_secs - 7.0).abs() < 0.01);
+        // The leading secondary-block cell is filtered out of the feature.
+        assert_eq!(title.feature_start_cell(), 1);
     }
 
     /// Regression: a crafted IFO whose program-map byte names a first_cell
