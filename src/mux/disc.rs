@@ -448,11 +448,47 @@ impl DiscStream {
 
             if (sectors as u32) <= align {
                 // Bottomed out at one unit (AACS) / one sector (CSS) / the
-                // extent tail. Skip the WHOLE failed unit or bail. Zero-filling
-                // and advancing by the full unit keeps current_offset
-                // unit-aligned, so the next read still begins on a real AACS
-                // unit boundary (a 1-sector skip here would desync the rest of
-                // the title — the bug this guards).
+                // extent tail. This is single-pass disc→MKV, which has NO Pass N
+                // to come back and recover later — so before we skip or bail,
+                // give the drive its full ECC recovery budget ONCE
+                // (`recovery=true` → READ_RECOVERY_TIMEOUT_MS, ~60s), exactly as
+                // the multipass patch does on its bad ranges. A single bounded
+                // read, never a loop (hard rule #2: tight retry loops on one LBA
+                // push the BU40N into fast-fail). On success we USE the recovered
+                // data, so the old "transient retry returns a bogus status for
+                // readable data" hole cannot reopen; the earlier 10s-timeout read
+                // gave the drive no chance to recover a marginal sector that a
+                // 60s ECC read can.
+                tracing::debug!(
+                    target: "mux",
+                    "fill_extents last-chance recovery read at LBA {} ({} sectors, 60s ECC)",
+                    lba,
+                    sectors
+                );
+                let rec =
+                    self.reader
+                        .read_sectors(lba, sectors, &mut self.read_buf[..bytes], true);
+                if let Ok(&got) = rec.as_ref() {
+                    debug_assert!(got <= bytes, "recovery read over-reported byte count");
+                    if let Some(ev) = self.adaptive.on_success(sectors) {
+                        self.emit(ev);
+                    }
+                    let got = got.min(bytes);
+                    self.buf_valid = got;
+                    self.current_offset += sectors as u32;
+                    self.bytes_read_total = self.bytes_read_total.saturating_add(got as u64);
+                    self.emit(EventKind::BytesRead {
+                        bytes: self.bytes_read_total,
+                        total: self.bytes_total_extents,
+                    });
+                    break;
+                }
+
+                // Recovery read also failed. Skip the WHOLE failed unit or bail.
+                // Zero-filling and advancing by the full unit keeps
+                // current_offset unit-aligned, so the next read still begins on a
+                // real AACS unit boundary (a 1-sector skip here would desync the
+                // rest of the title — the bug this guards).
                 if self.skip_errors {
                     let zb = sectors as usize * 2048;
                     self.read_buf.resize(zb, 0);
@@ -468,14 +504,9 @@ impl DiscStream {
                     self.current_offset += sectors as u32;
                     break;
                 } else {
-                    // Build the error from the failure we ALREADY hold.
-                    // Re-reading the same known-bad LBA here doubled drive
-                    // abuse (hard rule #2: repeated failed reads on the
-                    // same LBA push the BU40N into fast-fail) and, if the
-                    // retry transiently succeeded, dropped the good data
-                    // and returned a bogus status=0/sense=None error for a
-                    // readable sector.
-                    let err = res.err();
+                    // Build the error from the recovery failure we now hold
+                    // (falling back to the original 10s-read failure).
+                    let err = rec.err().or(res.err());
                     let (status, sense) =
                         err.as_ref().map(extract_scsi_context).unwrap_or((0, None));
                     return Err(crate::error::Error::DiscRead {
