@@ -30,23 +30,38 @@ use crate::mux::ps::PsDemuxer;
 use crate::sector::SectorSource;
 use std::collections::BTreeMap;
 
-/// How many 2048-byte sectors of the first feature extent to probe. The first
-/// GOP of a DVD VOB interleaves every audio sub-stream within the first ~1 MiB,
-/// so 512 sectors (1 MiB) reliably contains at least one frame of every
-/// physical `0x8x` AC-3 sub-stream without an expensive read. Bounded so a live
-/// drive is never hammered (see the project "don't hammer the live drive"
-/// rule).
-const PROBE_SECTORS: u16 = 512;
+/// How many 2048-byte sectors of the first feature extent to probe. The head of
+/// a DVD feature opens with logos/warnings whose audio is frequently a thin 2.0
+/// bed on the FIRST sub-stream only — the other physical `0x8x` sub-streams and
+/// the main 5.1 mix do not appear until a sector or two further in. 512 sectors
+/// (1 MiB) was too short: on Greenland it saw ONLY `0x80`, and only its opening
+/// 2.0 frames. 1024 sectors (2 MiB) reliably contains at least one frame of
+/// every physical AC-3 sub-stream AND enough of `0x80` to reach its 5.1 frames.
+/// Still bounded so a live drive is never hammered (see the project "don't
+/// hammer the live drive" rule).
+const PROBE_SECTORS: u16 = 1024;
 
 /// Decode the real per-sub-stream AC-3 channel count from a buffer of decrypted
 /// MPEG-PS (DVD VOB) bytes.
 ///
 /// Demuxes `private_stream_1` (0xBD), and for each AC-3 sub-stream id
-/// (`0x80..=0x87`) records the channel count of its FIRST decodable frame
-/// (`acmod` + `lfeon` at the `0x0B77` sync). Pure and unit-testable — takes the
-/// already-read bytes, never touches the disc.
+/// (`0x80..=0x87`) records the MAXIMUM channel count seen across EVERY decodable
+/// frame in the probe window (`acmod` + `lfeon` at each `0x0B77` sync). Pure and
+/// unit-testable — takes the already-read bytes, never touches the disc.
 ///
-/// Returns a map `sub_id -> channels`. Sub-streams whose first frame is too
+/// ## Why the maximum, not the first frame
+///
+/// The first frame of a sub-stream at the head of a feature is NOT
+/// representative. A DVD opens with logos/warnings, and the main `0x80`
+/// sub-stream there frequently carries a thin 2.0 bed before transitioning to
+/// its real 5.1 main mix a fraction of a second later (observed on Greenland:
+/// `0x80`'s first frames are acmod=2 → 2 channels, then it becomes acmod=7+lfe →
+/// 6 channels within the same 2 MiB window). Recording only the FIRST frame read
+/// `0x80=2` and missed the 5.1 entirely, defeating the channel-match routing.
+/// The 5.1 capability of a sub-stream is the *maximum* channel count any of its
+/// frames carries, so we scan them all and keep the max.
+///
+/// Returns a map `sub_id -> max channels`. Sub-streams whose frames are all too
 /// short to carry the BSI bits, or that never appear in the buffer, are absent
 /// from the map.
 pub fn probe_ac3_substream_channels(ps_bytes: &[u8]) -> BTreeMap<u8, u8> {
@@ -60,21 +75,50 @@ pub fn probe_ac3_substream_channels(ps_bytes: &[u8]) -> BTreeMap<u8, u8> {
         if !(0x80..=0x87).contains(&sub) {
             continue;
         }
-        if found.contains_key(&sub) {
-            continue; // first frame of this sub-stream already decoded
-        }
-        // The PS demux strips the 4-byte AC-3 sub-header but does not align to
-        // the frame; locate the 0x0B77 sync, then decode acmod/lfeon.
-        let Some(off) = ac3::find_ac3_sync(&p.data) else {
-            continue;
-        };
-        if let Some(ch) = ac3::acmod_channels(&p.data[off..]) {
-            if ch > 0 {
-                found.insert(sub, ch);
-            }
+        // The PS demux strips the 4-byte AC-3 sub-header but does not align to a
+        // frame. Walk EVERY 0x0B77 sync in this sub-stream's payload, decode
+        // each frame's channel count, and keep the largest — the sub-stream's
+        // real (main-mix) channel capability. See the doc comment above for why
+        // the first frame alone is unreliable.
+        if let Some(ch) = max_substream_channels(&p.data) {
+            let slot = found.entry(sub).or_insert(0);
+            *slot = (*slot).max(ch);
         }
     }
     found
+}
+
+/// Largest AC-3 channel count over every decodable frame in a single
+/// sub-stream's payload. Returns `None` when no frame carries enough BSI bits.
+///
+/// Each frame is advanced by its real `ac3_frame_size` so a frame's compressed
+/// body (which can contain stray `0x0B77` byte pairs) cannot be mistaken for a
+/// new frame; only when a size is unmappable do we fall back to a +2 byte
+/// rescan to re-lock the next genuine sync.
+fn max_substream_channels(data: &[u8]) -> Option<u8> {
+    let mut best: Option<u8> = None;
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(rel) = ac3::find_ac3_sync(&data[pos..]) else {
+            break;
+        };
+        let start = pos + rel;
+        let frame = &data[start..];
+        if let Some(ch) = ac3::acmod_channels(frame) {
+            if ch > 0 {
+                best = Some(best.map_or(ch, |b| b.max(ch)));
+            }
+        }
+        // Advance past this frame by its declared size when that is mappable;
+        // otherwise step 2 bytes past the sync and re-scan for the next one.
+        let size = ac3::ac3_frame_size(frame);
+        pos = if (6..=8192).contains(&size) {
+            start + size
+        } else {
+            start + 2
+        };
+    }
+    best
 }
 
 /// Re-route the title's declared AC-3 audio streams onto the physical
@@ -200,16 +244,14 @@ mod tests {
     use super::*;
     use crate::disc::{AudioChannels, AudioStream, Codec, LabelPurpose, SampleRate};
 
-    /// Build a minimal MPEG-PS pack carrying one `private_stream_1` PES with the
-    /// given AC-3 sub-stream id and a single AC-3 frame whose `acmod`/`lfeon`
-    /// encode `channels`. Mirrors the on-disc layout the PS demux expects:
-    /// pack header (0x000001BA) optional, then PES start `0x000001BD`, length,
-    /// PES header (no PTS), sub-header `[sub_id, frame_count, ptr_hi, ptr_lo]`,
-    /// then the AC-3 frame `[0x0B,0x77, crc16(2), byte4, bsid<<3, acmod-byte]`.
-    fn ps_ac3(sub_id: u8, acmod: u8, lfeon: bool) -> Vec<u8> {
-        // AC-3 BSI byte 6 onward: acmod(3) | optional cmixlev/surmixlev/dsurmod
-        // (2 each) | lfeon(1). Assemble the bits with a writer so the test never
-        // hand-miscomputes the lfeon offset, matching `acmod_channels`' reader.
+    /// Build a single, correctly-SIZED AC-3 frame whose `acmod`/`lfeon` encode a
+    /// known channel count. `byte4` is `fscod=0 | frmsizecod=0`, so
+    /// `ac3_frame_size` reports 128 bytes and the frame is zero-padded to exactly
+    /// that — this lets `max_substream_channels` advance frame-by-frame over a
+    /// multi-frame payload exactly as it does on real VOB data. The BSI bits are
+    /// laid down with a writer so the test never hand-miscomputes the lfeon
+    /// offset, matching `acmod_channels`' reader.
+    fn ac3_frame(acmod: u8, lfeon: bool) -> Vec<u8> {
         let mut bits: Vec<u8> = Vec::new();
         let push = |val: u32, n: usize, bits: &mut Vec<u8>| {
             for i in (0..n).rev() {
@@ -242,18 +284,26 @@ mod tests {
             cur <<= 8 - rem;
             tail.push(cur);
         }
-        // AC-3 frame: 0x0B 0x77 crc(2) byte4 bsid<<3 then BSI bits.
+        // AC-3 frame: 0x0B 0x77 crc(2) byte4(fscod=0,frmsizecod=0) bsid<<3 then BSI.
         let mut frame = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 8u8 << 3];
         frame.extend_from_slice(&tail);
-        // Pad to >= 8 bytes so acmod_channels' length guard passes.
-        while frame.len() < 16 {
-            frame.push(0);
-        }
+        // frmsizecod=0 @ 48kHz → 64 words = 128 bytes. Pad to the real size so
+        // the frame-stepping in max_substream_channels lands on the next sync.
+        frame.resize(128, 0);
+        frame
+    }
 
+    /// Build a minimal `private_stream_1` PES carrying `frames` for `sub_id`,
+    /// each preceded only by the 4-byte AC-3 sub-header at the PES head. Mirrors
+    /// the on-disc layout the PS demux expects: PES start `0x000001BD`, length,
+    /// PES header (no PTS), sub-header `[sub_id, frame_count, ptr_hi, ptr_lo]`,
+    /// then the concatenated AC-3 frames.
+    fn ps_ac3_frames(sub_id: u8, frames: &[Vec<u8>]) -> Vec<u8> {
         // PES sub-header for AC-3: sub_id + frame_count + 2-byte access ptr.
-        let mut payload = vec![sub_id, 0x01, 0x00, 0x00];
-        payload.extend_from_slice(&frame);
-
+        let mut payload = vec![sub_id, frames.len() as u8, 0x00, 0x04];
+        for f in frames {
+            payload.extend_from_slice(f);
+        }
         // PES packet: start code 00 00 01 BD, length(2), flags(2), hdr_len(0).
         let pes_payload_len = 3 + payload.len(); // flags(2)+hdrlen(1)+payload
         let mut pkt = vec![0x00, 0x00, 0x01, 0xBD];
@@ -261,6 +311,11 @@ mod tests {
         pkt.extend_from_slice(&[0x80, 0x00, 0x00]); // no PTS, header_data_len=0
         pkt.extend_from_slice(&payload);
         pkt
+    }
+
+    /// Single-frame `private_stream_1` PES — the common case in existing tests.
+    fn ps_ac3(sub_id: u8, acmod: u8, lfeon: bool) -> Vec<u8> {
+        ps_ac3_frames(sub_id, &[ac3_frame(acmod, lfeon)])
     }
 
     fn ac3_stream(pid: u16, channels: AudioChannels) -> Stream {
@@ -286,6 +341,46 @@ mod tests {
         let probed = probe_ac3_substream_channels(&bytes);
         assert_eq!(probed.get(&0x80), Some(&2), "0x80 is the 2.0 down-mix");
         assert_eq!(probed.get(&0x81), Some(&6), "0x81 is the 5.1 main mix");
+    }
+
+    /// GREENLAND regression — the probe must read each sub-stream's TRUE
+    /// (max-mix) channel count, not be poisoned by an unrepresentative head
+    /// frame, and must NOT cross-contaminate between sub-streams.
+    ///
+    /// Mirrors the real on-disc layout that caused the mis-read: the feature
+    /// head carries `0x80` opening with a 2.0 frame and THEN a 5.1 frame (its
+    /// real main mix), interleaved with `0x81` carrying only 2.0. The old
+    /// first-frame probe read `0x80=2` (the logo bed) and missed the 5.1; the
+    /// max-over-frames probe must report `0x80=6` and `0x81=2`.
+    #[test]
+    fn probe_reads_max_channels_no_cross_contamination() {
+        let mut bytes = Vec::new();
+        // 0x80 opens with a 2.0 frame (the logo bed)...
+        bytes.extend(ps_ac3_frames(0x80, &[ac3_frame(2, false)]));
+        // ...0x81 interleaves a pure-2.0 PES (must NOT bleed 6 into 0x80)...
+        bytes.extend(ps_ac3_frames(
+            0x81,
+            &[ac3_frame(2, false), ac3_frame(2, false)],
+        ));
+        // ...then 0x80 reaches its real 5.1 main mix (acmod=7 + lfe → 6 ch),
+        // with a trailing 2.0 frame in the SAME PES to prove we take the max,
+        // not the last frame.
+        bytes.extend(ps_ac3_frames(
+            0x80,
+            &[ac3_frame(7, true), ac3_frame(2, false)],
+        ));
+
+        let probed = probe_ac3_substream_channels(&bytes);
+        assert_eq!(
+            probed.get(&0x80),
+            Some(&6),
+            "0x80's real 5.1 mix must win over its 2.0 head/tail frames"
+        );
+        assert_eq!(
+            probed.get(&0x81),
+            Some(&2),
+            "0x81 is a pure 2.0 stream — must not absorb 0x80's 6-channel frame"
+        );
     }
 
     /// SILENCE-OF-THE-LAMBS regression: the IFO declares ONE 5.1 AC-3 stream and
