@@ -10,6 +10,7 @@
 
 mod bluray;
 mod dvd;
+pub mod dvd_audio_probe;
 mod encrypt;
 pub mod mapfile;
 mod patch;

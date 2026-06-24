@@ -337,7 +337,7 @@ pub(crate) fn acmod_channels(data: &[u8]) -> Option<u8> {
 }
 
 /// Find AC3/E-AC-3 syncword (0x0B77) in data.
-fn find_ac3_sync(data: &[u8]) -> Option<usize> {
+pub(crate) fn find_ac3_sync(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(1)).find(|&i| data[i] == 0x0B && data[i + 1] == 0x77)
 }
 
