@@ -349,6 +349,11 @@ mod tests {
         /// Every read fails with CSS-locked sense `05/6F/03` (drive refusing
         /// scrambled reads because the bus-auth gate isn't open).
         lock_all: bool,
+        /// When set, the sector at `crackable.0` is served as a full
+        /// Stevenson-crackable scrambled sector (`crackable.1`, 2048 bytes)
+        /// instead of the uniform `flag_byte` fill. Lets the scan actually
+        /// reach `CrackOutcome::Cracked` from a synthetic ISO.
+        crackable: Option<(u32, Vec<u8>)>,
     }
 
     impl MockSource {
@@ -358,8 +363,31 @@ mod tests {
                 flag_byte,
                 fail_all: false,
                 lock_all: false,
+                crackable: None,
             }
         }
+    }
+
+    /// Build a Stevenson-crackable scrambled sector for `(title_key, seed)`:
+    /// the cleartext header (0x59..0x80) carries a periodic run that continues
+    /// across the 0x80 boundary into the encrypted region — the crib
+    /// `stevenson::crack_title_key` recovers a key from. Mirrors the
+    /// `synth_periodic_sector` fixture in the stevenson tests but built here
+    /// from the crate-internal `scramble_sector`.
+    fn crackable_sector(title_key: &[u8; 5], seed: &[u8; 5], period: usize) -> Vec<u8> {
+        const RUN_START: usize = 0x59;
+        const SEED_OFFSET: usize = 0x54;
+        let mut plaintext = vec![0u8; 2048];
+        plaintext[0x14] = 0x10; // scramble flag
+        let pat: Vec<u8> = (0..period)
+            .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
+            .collect();
+        for (i, b) in plaintext.iter_mut().enumerate().skip(RUN_START) {
+            *b = pat[i % period];
+        }
+        plaintext[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(seed);
+        lfsr::scramble_sector(title_key, &mut plaintext);
+        plaintext
     }
 
     impl SectorSource for MockSource {
@@ -390,8 +418,22 @@ mod tests {
             for b in buf[..end].iter_mut() {
                 *b = 0;
             }
-            if buf.len() > 0x14 {
-                buf[0x14] = self.flag_byte;
+            // Fill each sector in the batch with the uniform flag byte, EXCEPT a
+            // designated crackable LBA which gets the full synthetic sector.
+            for s in 0..count as u32 {
+                let sect_lba = lba + s;
+                let base = s as usize * 2048;
+                if base + 2048 > end {
+                    break;
+                }
+                match &self.crackable {
+                    Some((clba, sector)) if *clba == sect_lba => {
+                        buf[base..base + 2048].copy_from_slice(sector);
+                    }
+                    _ => {
+                        buf[base + 0x14] = self.flag_byte;
+                    }
+                }
             }
             Ok(n)
         }
@@ -651,5 +693,113 @@ mod tests {
         let res = crack_key(&mut src, &[], 1);
         assert!(res.is_none());
         assert_eq!(src.reads.borrow().len(), 0);
+    }
+
+    // ── Scan-level Cracked branch + per-VTS re-crack success (audit §2 / §5 #8) ─
+
+    /// SCAN-LEVEL CRACKED (audit gap "MockSource never yields a crackable
+    /// sector"): drive the full `crack_key_scan` over a synthetic ISO whose
+    /// scan hits a Stevenson-crackable scrambled sector. The outcome must be
+    /// `CrackOutcome::Cracked` with a key that round-trips the sector, AND the
+    /// `crack_span` must be recorded as the half-open extent span (the per-VTS
+    /// routing key the mux path needs). Previously only the leaf crack and the
+    /// Uncracked/Unencrypted branches were tested — the Cracked branch and
+    /// `crack_span` recording were never exercised end-to-end.
+    #[test]
+    fn crack_outcome_reaches_cracked_with_span() {
+        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let seed = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let crackable = crackable_sector(&title_key, &seed, 8);
+        // The crackable sector sits a few sectors into the extent.
+        let mut src = MockSource::new(0x00); // surrounding sectors: clear
+        src.crackable = Some((1003, crackable.clone()));
+        let extents = [Extent {
+            start_lba: 1000,
+            sector_count: 50,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 4, None);
+        let state = match outcome {
+            CrackOutcome::Cracked(s) => s,
+            other => panic!("expected Cracked, got {other:?}"),
+        };
+        // The recovered key descrambles the crackable sector body.
+        let mut test = crackable.clone();
+        descramble_sector(&state, &mut test);
+        let mut plain = crackable;
+        lfsr::descramble_sector(&title_key, &mut plain);
+        assert_eq!(
+            &test[0x80..],
+            &plain[0x80..],
+            "recovered key must round-trip the scrambled sector body"
+        );
+        // crack_span = half-open [start, start+count) of the scanned extent.
+        assert_eq!(
+            state.crack_span,
+            Some((1000, 1050)),
+            "crack_span must record the extent LBA span for per-VTS routing"
+        );
+    }
+
+    /// CSS_ERROR WIRING (audit §2 / §5 #7): an all-locked synthetic ISO (every
+    /// VOB read returns CSS-locked sense `05/6F/03` across MULTIPLE extents, as a
+    /// real encrypted-but-unauthenticated disc image does) must produce the exact
+    /// outcome the scan converts into `disc.css_error = Some(Error::CssKeyMissing)`
+    /// — i.e. `CrackOutcome::ScrambledUncracked` / `is_scrambled_uncracked()`,
+    /// NOT `Unencrypted`. disc/mod.rs's `crack_key_outcome → ScrambledUncracked`
+    /// arm (where it stamps css_error) is driven by exactly this signal, so this
+    /// pins the css-layer contract that arm depends on without touching the
+    /// scan plumbing.
+    #[test]
+    fn all_locked_synthetic_iso_yields_css_key_missing_signal() {
+        let mut src = MockSource::new(0x30);
+        src.lock_all = true; // every read → 05/6F/03 across the whole "ISO"
+        let extents = [
+            Extent {
+                start_lba: 0,
+                sector_count: 30,
+            },
+            Extent {
+                start_lba: 5_000,
+                sector_count: 30,
+            },
+        ];
+        let outcome = crack_key_outcome(&mut src, &extents, 16, None);
+        assert!(
+            outcome.is_scrambled_uncracked(),
+            "all-locked ISO → ScrambledUncracked (the css_error=CssKeyMissing \
+             signal), got {outcome:?}"
+        );
+        // The legacy Option wrapper still collapses it to None — callers that
+        // surface the hard error must use crack_key_outcome, which this proves.
+        let mut src2 = MockSource::new(0x30);
+        src2.lock_all = true;
+        assert!(crack_key(&mut src2, &extents, 16).is_none());
+    }
+
+    /// PER-VTS RE-CRACK SUCCESS (audit gap "success path missing"): the prior
+    /// re-crack test only covered the locked→None path. Here a re-crack
+    /// (`crack_key`, `fail_on_locked == false`) over a DIFFERENT VTS's extents
+    /// finds that VTS's own crackable sector and returns a `CssState` whose
+    /// `crack_span` matches the new extents — proving a key cracked for one VTS
+    /// is genuinely re-derived (not reused) for another.
+    #[test]
+    fn recrack_succeeds_on_other_vts_extents() {
+        let title_key = [0xFE, 0xDC, 0xBA, 0x98, 0x76];
+        let seed = [0x00, 0xFF, 0x80, 0x7F, 0x01];
+        let crackable = crackable_sector(&title_key, &seed, 5);
+        let mut src = MockSource::new(0x00);
+        // The second VTS lives at a disjoint LBA range; its crackable sector is
+        // the first one in the extent.
+        src.crackable = Some((9000, crackable));
+        let other_vts = [Extent {
+            start_lba: 9000,
+            sector_count: 20,
+        }];
+        let state = crack_key(&mut src, &other_vts, 4).expect("re-crack must recover a key");
+        assert_eq!(
+            state.crack_span,
+            Some((9000, 9020)),
+            "re-crack span must reflect the OTHER VTS extents, not a reused span"
+        );
     }
 }
