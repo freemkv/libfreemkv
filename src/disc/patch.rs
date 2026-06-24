@@ -213,9 +213,8 @@ impl PatchSink {
         // writes; contention is single-acquire so the lock is never
         // poisoned in practice. If it ever did get poisoned we'd want
         // the underlying error surfaced rather than silently swallowed,
-        // so we propagate the poison panic. (Same posture as
-        // `sweep_pipeline.rs` — it never recovers from a poisoned
-        // mutex either.)
+        // so we propagate the poison panic rather than silently
+        // continuing with stale shared state.
         let mut guard = self
             .shared
             .lock()
@@ -370,7 +369,6 @@ pub(super) fn skip_sectors_for_probe(idx: usize) -> u64 {
 
 /// Send a `PatchItem` and translate a `SendError` (consumer thread died
 /// / panicked) into a library error so the caller propagates cleanly.
-/// Mirrors `sweep_pipeline.rs`'s `send_or_abort`.
 pub(super) fn send_or_abort(
     pipe: &Pipeline<PatchItem, PatchSummary>,
     item: PatchItem,
