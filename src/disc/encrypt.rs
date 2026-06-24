@@ -296,17 +296,16 @@ impl Disc {
         // processing-key `decrypt_with` derivation consume, and which a key
         // source ships to an online service — is the full 128 MiB pad, not the
         // ~few-MB record stream.
-        let mut mkb_bytes = udf_fs
+        let mkb_bytes = udf_fs
             .read_file(reader, "/AACS/MKB_RO.inf")
             .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
             .ok()
             .unwrap_or_default();
-        // Trim to the real record length. truncate is a no-op when n >=
-        // len and correctly empties the vec when n == 0 (zeroed/corrupt
-        // MKB), so it never leaves the full ~128 MiB zero-pad on
-        // AacsState.mkb.
-        let n = aacs::mkb_content_len(&mkb_bytes);
-        mkb_bytes.truncate(n);
+        // Trim to the real record length. Use trim_mkb rather than a raw
+        // truncate: trim_mkb only truncates when content_len > 0 and strictly
+        // inside the buffer, so a malformed/unrecognised MKB is preserved
+        // intact instead of being zeroed by truncate(0).
+        let mkb_bytes = aacs::trim_mkb(mkb_bytes);
         let mkb_ver = aacs::mkb_version(&mkb_bytes);
 
         tracing::debug!(
