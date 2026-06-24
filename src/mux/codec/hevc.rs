@@ -78,11 +78,19 @@ pub struct HevcParser {
     // so the rewrite branch is never reached and output is byte-identical to a
     // parser without this field.
     pending_clip_boundary: bool,
-    // Highest PES PTS (90 kHz ticks) seen on this video stream so far. Used to
-    // AUTO-DETECT a non-seamless clip boundary from the bitstream when the
-    // caller never plumbs one in (the common case — see `BACKSTEP_TICKS`).
-    // `None` until the first AU with a PTS.
+    // Highest PES PTS seen on this video stream so far, on a MONOTONIC 64-bit
+    // timeline (raw 33-bit PTS unwrapped across 2^33 wraparounds — see
+    // `pts_wrap_offset`). Used to AUTO-DETECT a non-seamless clip boundary from
+    // the bitstream when the caller never plumbs one in (the common case — see
+    // `BACKSTEP_TICKS`). `None` until the first AU with a PTS.
     high_pts: Option<i64>,
+    // Accumulated 2^33-tick offset applied to raw PES PTS values to unwrap them
+    // onto the monotonic timeline `high_pts` lives on. The 33-bit 90 kHz PTS
+    // wraps every ~26.5 h; a BD clip can start at a high base and cross the wrap
+    // mid-title. Without unwrapping, the 2^33→0 step looks like a backward clip
+    // reset and false-arms the CRA→BLA rewrite (corrupting a legitimate in-clip
+    // CRA and dropping valid RASL pictures). Each detected wrap adds 2^33 here.
+    pts_wrap_offset: i64,
 }
 
 // A backward PES-PTS step larger than this (90 kHz ticks) marks a non-seamless
@@ -96,6 +104,18 @@ pub struct HevcParser {
 // kills the dangling-RASL "Could not find ref with POC N" decode errors a
 // concatenated multi-clip title otherwise produces.
 const BACKSTEP_TICKS: i64 = 270_000;
+
+// The 33-bit 90 kHz PES PTS counter wraps at 2^33 ticks (~26.5 h). When the raw
+// PTS steps backward by approximately a full period — i.e. it landed just past
+// the wrap — it is a counter wraparound, NOT a clip reset: unwrap it (add 2^33)
+// instead of arming the CRA→BLA rewrite. A genuine non-seamless clip join resets
+// the PTS to a fresh small base, a backward step of arbitrary (sub-2^33) size; a
+// wrap is specifically a step of ~2^33. We accept any backward step within one
+// `PTS_WRAP_PERIOD`/2 of a full period as a wrap (the new value is below the old
+// high-water but within a reorder window of the wrap point), which cleanly
+// separates the two cases since a clip reset to a small base is nowhere near 2^33
+// below the high-water unless the title is itself ~26 h long (impossible on BD).
+const PTS_WRAP_PERIOD: i64 = 1 << 33;
 
 impl Default for HevcParser {
     fn default() -> Self {
@@ -115,6 +135,7 @@ impl HevcParser {
             cur_pps: None,
             pending_clip_boundary: false,
             high_pts: None,
+            pts_wrap_offset: 0,
         }
     }
 
@@ -263,17 +284,31 @@ impl CodecParser for HevcParser {
         // clip then consumes. Without this, the splice CRA's RASL leading
         // pictures reference pre-join frames gone after concatenation and a
         // linear decoder floods "Could not find ref with POC N" (the Top Gun
-        // UHD defect). Uses the RAW 90 kHz PES PTS (not the rebased mux
-        // timeline) and tracks the high-water mark so a single in-clip B-frame
-        // dip never arms it. DTS-only AUs (no PTS) leave the watermark untouched.
+        // UHD defect). Uses the 90 kHz PES PTS (not the rebased mux timeline)
+        // UNWRAPPED onto a monotonic 64-bit timeline first — the raw 33-bit PTS
+        // wraps every ~26.5 h, and a single-clip title that crosses 2^33→0 would
+        // otherwise false-arm the rewrite (corrupting a legitimate in-clip CRA).
+        // Tracks the high-water mark so a single in-clip B-frame dip never arms
+        // it. DTS-only AUs (no PTS) leave the watermark untouched.
         if let Some(raw_pts) = pes.pts {
-            match self.high_pts {
-                Some(high) if raw_pts < high - BACKSTEP_TICKS => {
-                    self.pending_clip_boundary = true;
-                    self.high_pts = Some(raw_pts);
+            // Unwrap onto the monotonic timeline. If the offset-adjusted value
+            // dropped to roughly a full period (2^33) below the high-water, the
+            // 33-bit counter wrapped: add another period and re-check, rather
+            // than treat the wrap as a backward clip reset.
+            let mut unwrapped = raw_pts + self.pts_wrap_offset;
+            if let Some(high) = self.high_pts {
+                if high - unwrapped > PTS_WRAP_PERIOD / 2 {
+                    self.pts_wrap_offset += PTS_WRAP_PERIOD;
+                    unwrapped += PTS_WRAP_PERIOD;
                 }
-                Some(high) => self.high_pts = Some(high.max(raw_pts)),
-                None => self.high_pts = Some(raw_pts),
+            }
+            match self.high_pts {
+                Some(high) if unwrapped < high - BACKSTEP_TICKS => {
+                    self.pending_clip_boundary = true;
+                    self.high_pts = Some(unwrapped);
+                }
+                Some(high) => self.high_pts = Some(high.max(unwrapped)),
+                None => self.high_pts = Some(unwrapped),
             }
         }
 
@@ -1258,6 +1293,40 @@ mod tests {
             nal_type_of(&nals_of(&next[0].data)[0]),
             NAL_CRA_NUT,
             "only the first CRA after the boundary is rewritten"
+        );
+    }
+
+    /// Regression for the 33-bit PTS wraparound false-trigger (rc.5.2 audit #1):
+    /// a SINGLE clip whose raw 90 kHz PES PTS crosses the 2^33 counter wrap
+    /// (~26.5 h) must NOT be mistaken for a non-seamless clip join. Before the
+    /// fix the raw 2^33→0 backward step armed `pending_clip_boundary` and the
+    /// next in-clip CRA was wrongly rewritten CRA→BLA_W_LP (dropping valid RASL
+    /// pictures — visible corruption). After unwrapping onto a monotonic
+    /// timeline the wrap is absorbed and the CRA stays CRA.
+    #[test]
+    fn cra_after_33bit_pts_wrap_not_rewritten() {
+        let mut parser = HevcParser::new();
+        let period = 1i64 << 33;
+        // Single clip, PTS climbing toward the 33-bit wrap. Start just below 2^33.
+        let near_wrap = period - 90_000; // ~1 s before the wrap point
+        parser.parse(&make_pes(cra_au(&[0x01]), Some(near_wrap)));
+        parser.parse(&make_pes(cra_au(&[0x02]), Some(near_wrap + 3750)));
+        // The counter wraps: raw PTS resets to a small value, but this is the
+        // SAME continuous clip, one frame later. A naive raw comparison sees a
+        // ~2^33 backward step and false-arms the boundary.
+        let wrapped = parser.parse(&make_pes(cra_au(&[0x03]), Some(7500)));
+        assert_eq!(
+            nal_type_of(&nals_of(&wrapped[0].data)[0]),
+            NAL_CRA_NUT,
+            "a CRA whose PTS merely wrapped 2^33->0 must stay CRA, not become BLA"
+        );
+        // Continue past the wrap: PTS keeps climbing from the new low base; still
+        // one continuous clip, the CRA after must remain CRA.
+        let after = parser.parse(&make_pes(cra_au(&[0x04]), Some(11250)));
+        assert_eq!(
+            nal_type_of(&nals_of(&after[0].data)[0]),
+            NAL_CRA_NUT,
+            "post-wrap in-clip CRA must stay CRA"
         );
     }
 

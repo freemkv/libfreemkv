@@ -442,6 +442,13 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
         return;
     }
     let mut buf = vec![0u8; n as usize * 2048];
+    // Anchor the AACS unit-alignment gate to the title's encrypted-region start
+    // before probing. Without this a `DecryptingSectorSource` falls back to an
+    // absolute `start_lba % 3` gate; a non-3-aligned `ext.start_lba` then trips
+    // DecryptFailed on the very first probe read, so the TrueHD channel count is
+    // never corrected and Atmos / 7.1 is silently understated as 5.1. No-op for
+    // CSS / unencrypted sources (set_unit_base default is a no-op).
+    reader.set_unit_base(ext.start_lba);
     if reader
         .read_sectors(ext.start_lba, n, &mut buf, true)
         .is_err()
