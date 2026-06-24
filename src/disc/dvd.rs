@@ -745,11 +745,15 @@ mod tests {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(1, 1, 1)]);
         // audio b0: coding_mode is (b0 >> 5) & 7. AC-3 = 0 → b0=0x00.
-        // DTS = 6 → b0 = 6<<5 = 0xC0. b1 channels nibble high.
+        // DTS = 6 → b0 = 6<<5 = 0xC0. b1 channels nibble = (channels-1) in bits
+        // 2-0: a REAL 5.1 layout is 5 (0x05), a REAL 2.0 is 1 (0x01). The old
+        // fixture used 0x10/0x50 (both decode to 1 channel) — a placeholder that
+        // would pass even against code mishandling channel counts. Pin real
+        // layouts: AC-3 5.1 eng, DTS 2.0 fra.
         let vts = build_vts(
             0,
             0x00,
-            &[(0x00, 0x10, *b"en"), (0xC0, 0x50, *b"fr")], // AC-3 eng, DTS fra
+            &[(0x00, 0x05, *b"en"), (0xC0, 0x01, *b"fr")], // AC-3 5.1 eng, DTS 2.0 fra
             &[],
             &[(0, 9)],
             false,
@@ -784,11 +788,145 @@ mod tests {
         assert_eq!(audios[0].codec, Codec::Ac3);
         assert_eq!(audios[0].language, "en");
         assert_eq!(audios[1].codec, Codec::Dts);
-        // PIDs must differ (no 0xBD00 collision).
-        assert_ne!(
-            audios[0].pid, audios[1].pid,
-            "mixed-codec audio must route to distinct PIDs"
+        // Real channel layouts survive the scan (not a 1ch placeholder): the
+        // AC-3 is 5.1 (6ch), the DTS is 2.0 (2ch).
+        assert_eq!(
+            audios[0].channels.count(),
+            6,
+            "AC-3 5.1 nibble must decode to 6 channels"
         );
+        assert_eq!(
+            audios[1].channels.count(),
+            2,
+            "DTS 2.0 nibble must decode to 2 channels"
+        );
+        // PIDs route via the per-codec sub-id table: AC-3 #0 → 0x80 → 0xBD80,
+        // DTS #0 → 0x88 → 0xBD88. Distinct (no 0xBD00 collision) AND the exact
+        // canonical PIDs.
+        assert_eq!(audios[0].pid, 0xBD80, "AC-3 #0 → 0xBD80");
+        assert_eq!(audios[1].pid, 0xBD88, "DTS #0 → 0xBD88");
+        assert_ne!(audios[0].pid, audios[1].pid);
+    }
+
+    /// LPCM SCAN ROUTING (audit §2 / §5 #6): the 0xA0..=0xA7 PID range was never
+    /// exercised in the dvd.rs scan. An LPCM stream (coding_mode 4) must get
+    /// sub_stream_id 0xA0 → PID 0xBDA0 via `dvd_audio_pid`, distinct from the
+    /// AC-3 0xBD80 space, with its real channel count preserved.
+    #[test]
+    fn scan_dvd_titles_lpcm_routes_to_a0_pid_range() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        // b0 coding_mode = (b0 >> 5) & 7. LPCM = 4 → b0 = 4<<5 = 0x80.
+        // b1 channels nibble: 2.0 stereo LPCM → (2-1)=1 → 0x01. Plus an AC-3 5.1
+        // so we prove the two land in disjoint PID spaces (0xBD8x vs 0xBDAx).
+        let vts = build_vts(
+            0,
+            0x00,
+            &[(0x00, 0x05, *b"en"), (0x80, 0x01, *b"fr")], // AC-3 5.1 eng, LPCM 2.0 fra
+            &[],
+            &[(0, 9)],
+            false,
+        );
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let audios: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Audio(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(audios.len(), 2);
+        assert_eq!(audios[0].codec, Codec::Ac3);
+        assert_eq!(audios[1].codec, Codec::Lpcm, "coding_mode 4 → LPCM");
+        assert_eq!(audios[0].pid, 0xBD80, "AC-3 #0 → 0xBD80");
+        assert_eq!(
+            audios[1].pid, 0xBDA0,
+            "LPCM #0 → 0xBDA0 (the 0xA0 sub-id range), NOT the AC-3 space"
+        );
+        assert_eq!(
+            audios[1].channels.count(),
+            2,
+            "LPCM 2.0 nibble must decode to 2 channels"
+        );
+    }
+
+    /// MULTI-VOBSUB SCAN (audit §2 / §5 #6): the single-subtitle test covered one
+    /// track; a multi-subtitle VTS must emit one Stream::Subtitle per entry with
+    /// distinct PIDs (0x20 + ordinal) and per-language tags, all sharing the PGC
+    /// palette codec_data.
+    #[test]
+    fn scan_dvd_titles_multiple_vobsub_tracks_distinct_pids() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        let vts = build_vts(
+            0,
+            0x00,
+            &[],
+            &[*b"en", *b"fr", *b"de"], // three VobSub tracks
+            &[(0, 9)],
+            true, // non-zero palette → codec_data on every track
+        );
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        let subs: Vec<_> = t
+            .streams
+            .iter()
+            .filter_map(|s| match s {
+                Stream::Subtitle(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subs.len(), 3, "three VobSub tracks must all surface");
+        // Languages preserved in order.
+        assert_eq!(
+            subs.iter().map(|s| s.language.as_str()).collect::<Vec<_>>(),
+            vec!["en", "fr", "de"]
+        );
+        // PIDs are 0x20 + ordinal, all distinct.
+        let pids: Vec<u16> = subs.iter().map(|s| s.pid).collect();
+        assert_eq!(pids, vec![0x20, 0x21, 0x22], "VobSub PID = 0x20 + ordinal");
+        // Every track carries the palette codec_data.
+        for s in &subs {
+            assert_eq!(s.codec, Codec::DvdSub);
+            assert!(
+                s.codec_data.is_some(),
+                "each VobSub track shares the PGC palette codec_data"
+            );
+        }
     }
 
     /// Subtitle streams map to Codec::DvdSub with palette codec_data when a

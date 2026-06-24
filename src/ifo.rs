@@ -1056,6 +1056,54 @@ mod tests {
         assert_eq!(attr.resolution, Resolution::R576i);
     }
 
+    /// ABSOLUTE-BYTE pin (audit §3 #2): the existing video-attr tests build the
+    /// byte via `v_atr_byte(...)`, which uses the SAME shift constants the parser
+    /// reads with — a co-edit of constant + helper would silently re-introduce
+    /// the PAL-as-NTSC bug and every test would still pass. This test feeds
+    /// `parse_video_attr` HARDCODED bytes captured from real DVD-Video layouts
+    /// (DVD spec / libdvdread `video_attr_t`: mpeg_version[7-6] video_format[5-4]
+    /// display_aspect[3-2] permitted_df[1-0]) — no `v_atr_byte`. If the parser's
+    /// bit positions drift, these fail.
+    #[test]
+    fn video_attr_absolute_bytes_pin_real_layout() {
+        // (byte @0x200, expected standard, expected aspect, expected resolution).
+        // PAL 16:9 anamorphic = mpeg(00) format(01=PAL) aspect(11=16:9) df(00)
+        //   = 0b0001_1100 = 0x1C  (e.g. a PAL 16:9 R2 feature disc).
+        // PAL 4:3          = 0b0001_0000 = 0x10.
+        // NTSC 16:9        = 0b0000_1100 = 0x0C.
+        // NTSC 4:3         = 0b0000_0000 = 0x00.
+        // A real disc also sets mpeg_version=01 (MPEG-2) in bits 7-6, which the
+        // parser must IGNORE; OR it in (|0x40) to prove it doesn't leak into the
+        // video_format read.
+        let cases: &[(u8, TvSystem, DvdAspect, Resolution)] = &[
+            (0x1C, TvSystem::Pal, DvdAspect::R16x9, Resolution::R576i),
+            (0x10, TvSystem::Pal, DvdAspect::R4x3, Resolution::R576i),
+            (0x0C, TvSystem::Ntsc, DvdAspect::R16x9, Resolution::R480i),
+            (0x00, TvSystem::Ntsc, DvdAspect::R4x3, Resolution::R480i),
+            // mpeg_version=2 (MPEG-2) in bits 7-6 must not perturb the read.
+            (0x5C, TvSystem::Pal, DvdAspect::R16x9, Resolution::R576i),
+        ];
+        for &(b0, std, aspect, res) in cases {
+            let mut data = vec![0u8; 0x204];
+            data[0x200] = b0;
+            let attr = parse_video_attr(&data).unwrap();
+            assert_eq!(attr.standard, std, "byte {b0:#04x} → standard");
+            assert_eq!(attr.aspect, aspect, "byte {b0:#04x} → aspect");
+            assert_eq!(attr.resolution, res, "byte {b0:#04x} → resolution");
+        }
+        // Anti-bug anchor: the original bug read the TV system from bits 1-0
+        // (permitted_df). A PAL byte whose low 2 bits are 0 (0x1C) must NOT be
+        // misread as NTSC — and a byte with low bits set but format=NTSC
+        // (0x03 = NTSC, df=11) must stay NTSC, proving the low bits are ignored.
+        let mut df = vec![0u8; 0x204];
+        df[0x200] = 0x03; // format=NTSC(00), df=11
+        assert_eq!(
+            parse_video_attr(&df).unwrap().standard,
+            TvSystem::Ntsc,
+            "permitted_df bits (1-0) must NOT be read as the TV system"
+        );
+    }
+
     #[test]
     fn audio_attr_parsing() {
         let mut data = vec![0u8; 16];
