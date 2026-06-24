@@ -108,6 +108,11 @@ pub struct DiscStream {
     /// inline `decrypt::decrypt_sectors` step. `DecryptKeys::None`
     /// (raw / unencrypted disc) makes the decorator a pass-through.
     reader: DecryptingSectorSource<Box<dyn SectorSource>>,
+    /// Shared decrypt-loss counter, cloned once at construction from
+    /// `reader.decrypt_loss()`. `lost_bytes()` loads it directly so the
+    /// per-frame hot path performs no per-call `Arc::clone` (matching the
+    /// `PipelinedPesStream` pattern).
+    decrypt_loss: std::sync::Arc<std::sync::atomic::AtomicU64>,
     title: DiscTitle,
     /// Mirror of the keys handed in at construction. The decorator
     /// owns the cryptographic state; this field is kept for
@@ -253,12 +258,17 @@ impl DiscStream {
             _ => 1,
         };
 
+        // Wrap the input reader in DecryptingSectorSource so the internal
+        // fill_extents path sees plaintext bytes. For DecryptKeys::None
+        // (unencrypted / raw / test fixtures) the decorator is a pass-through.
+        let reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
+        // Clone the shared loss counter once here so `lost_bytes()` never
+        // clones an Arc per frame on the mux hot path.
+        let decrypt_loss = reader.decrypt_loss();
+
         Self {
-            // Wrap the input reader in DecryptingSectorSource so the
-            // internal fill_extents path sees plaintext bytes. For
-            // DecryptKeys::None (unencrypted / raw / test fixtures)
-            // the decorator is a pass-through.
-            reader: DecryptingSectorSource::new(reader, decrypt_keys.clone()),
+            reader,
+            decrypt_loss,
             title,
             decrypt_keys,
             unit_align,
@@ -802,11 +812,8 @@ impl crate::pes::Stream for DiscStream {
         // them). Both are real missing content the abort gate must see; without
         // the decrypt term a partial key failure reports lost_bytes=0 and a rip
         // missing segments passes even under abort_on_lost_secs=0.
-        self.lost_bytes.saturating_add(
-            self.reader
-                .decrypt_loss()
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        self.lost_bytes
+            .saturating_add(self.decrypt_loss.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

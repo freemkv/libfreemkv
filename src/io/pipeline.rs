@@ -150,7 +150,11 @@ fn finish_with_grace<R: Send + 'static>(
     // observes it the moment its wedged syscall returns: it then skips
     // any further `apply` and skips `close()`, rather than running on to
     // finalise the abandoned output file.
-    abandoned.store(true, Ordering::Relaxed);
+    // `Release` here pairs with the `Acquire` loads in the consumer loop so
+    // the leaked consumer reliably observes the flag the moment its wedged
+    // syscall returns, even on weak memory models (ARM64/POWER) where
+    // `Relaxed` gives no cross-thread visibility guarantee.
+    abandoned.store(true, Ordering::Release);
     tracing::warn!(
         target: "freemkv::pipeline",
         phase = "finish_with_halt_grace_expired",
@@ -299,7 +303,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     // dead receiver, but we touch the output no further. The
                     // final post-loop abandonment check returns the error
                     // and skips `close()`.
-                    if abandoned_consumer.load(Ordering::Relaxed) {
+                    if abandoned_consumer.load(Ordering::Acquire) {
                         continue;
                     }
 
@@ -359,7 +363,7 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                 // MKV Cues + patching the segment header) on a file the
                 // caller already reported as failed is exactly the
                 // write race we must not run.
-                if abandoned_consumer.load(Ordering::Relaxed) {
+                if abandoned_consumer.load(Ordering::Acquire) {
                     return Err(Error::Halted);
                 }
 

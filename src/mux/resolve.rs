@@ -249,6 +249,17 @@ fn css_key_missing(raw: bool, has_css: bool, keys: &crate::decrypt::DecryptKeys)
     !raw && has_css && matches!(keys, crate::decrypt::DecryptKeys::None)
 }
 
+/// Scrambled-but-uncracked CSS guard (Fix 6). Returns `true` when decryption
+/// is requested (`!raw`) and the scan recorded a hard CSS error
+/// (`has_css_error` — `disc.css_error.is_some()`), meaning the content is
+/// scrambled but no title key was recovered (so `disc.css` is `None`). Muxing
+/// that case would pass scrambled MPEG through as plaintext, so the caller
+/// fails fast with [`Error::CssKeyMissing`]. `--raw` is exempt (skips
+/// decryption), so it always returns `false`.
+fn css_error_aborts(raw: bool, has_css_error: bool) -> bool {
+    !raw && has_css_error
+}
+
 /// Open a PES input stream (produces PES frames).
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
@@ -290,7 +301,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // as "unencrypted" and the scrambled MPEG would mux as plaintext
             // garbage at exit 0. Surface the recorded hard error instead.
             // `--raw` skips decryption, so it is exempt.
-            if !opts.raw && disc.css_error.is_some() {
+            if css_error_aborts(opts.raw, disc.css_error.is_some()) {
                 return Err(crate::error::Error::CssKeyMissing.into());
             }
             // No-key guard: if decryption is requested (not --raw) and the disc
@@ -658,6 +669,7 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 mod tests {
     use super::StreamUrl;
     use super::aacs_key_missing;
+    use super::css_error_aborts;
     use super::css_key_missing;
     use super::parse_url;
     use super::validate_network_addr;
@@ -777,6 +789,18 @@ mod tests {
     fn css_guard_ignores_non_css() {
         // No CSS state (AACS / unencrypted): the CSS guard never fires.
         assert!(!css_key_missing(false, false, &DecryptKeys::None));
+    }
+
+    #[test]
+    fn css_error_field_aborts_unless_raw() {
+        // Fix 6: a scrambled-but-uncracked DVD records a hard error in
+        // `disc.css_error` (css is None). With decryption requested the
+        // input() guard must abort with CssKeyMissing.
+        assert!(css_error_aborts(false, true));
+        // --raw skips decryption → never aborts on the css_error field.
+        assert!(!css_error_aborts(true, true));
+        // No recorded css_error → the guard does not fire.
+        assert!(!css_error_aborts(false, false));
     }
 
     #[test]
