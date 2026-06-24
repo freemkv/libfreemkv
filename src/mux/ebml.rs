@@ -424,6 +424,18 @@ pub const DEFAULT_DURATION: u32 = 0x23_E383;
 pub const VIDEO: u32 = 0xE0;
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
+// Scan type (children of Video).
+pub const FLAG_INTERLACED: u32 = 0x9A;
+pub const FIELD_ORDER: u32 = 0x9D;
+// FlagInterlaced values: 1 = interlaced, 2 = progressive (0 = undetermined).
+pub const INTERLACED_INTERLACED: u64 = 1;
+pub const INTERLACED_PROGRESSIVE: u64 = 2;
+// FieldOrder values (Matroska): 0/2 = top-field-first, 1/9 = bottom-field-first.
+// NTSC DVD (480i) and HD (1080i) are top-field-first; PAL DVD (576i) is
+// bottom-field-first. 0xFF is our sentinel for "undetermined / omit".
+pub const FIELD_ORDER_TFF: u8 = 2;
+pub const FIELD_ORDER_BFF: u8 = 9;
+pub const FIELD_ORDER_UNDETERMINED: u8 = 0xFF;
 pub const DISPLAY_WIDTH: u32 = 0x54B0;
 pub const DISPLAY_HEIGHT: u32 = 0x54BA;
 pub const COLOUR: u32 = 0x55B0;

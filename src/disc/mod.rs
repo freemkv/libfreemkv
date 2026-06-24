@@ -655,6 +655,14 @@ impl Resolution {
         matches!(self, Resolution::R2160p | Resolution::R4320p)
     }
 
+    /// True if this is an interlaced resolution (the `R*i` variants).
+    pub fn is_interlaced(&self) -> bool {
+        matches!(
+            self,
+            Resolution::R480i | Resolution::R576i | Resolution::R1080i
+        )
+    }
+
     /// True if this is an HD (720p+) resolution.
     pub fn is_hd(&self) -> bool {
         !matches!(

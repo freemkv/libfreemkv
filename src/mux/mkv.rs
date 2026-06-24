@@ -31,6 +31,11 @@ pub struct MkvTrack {
     pub colour_transfer: u8,  // TransferCharacteristics (16=smpte2084/PQ)
     pub colour_primaries: u8, // Primaries (9=bt2020)
     pub colour_range: u8,     // Range (1=tv/limited)
+    // Scan type. `interlaced` drives FlagInterlaced (0x9A): true → 1
+    // (interlaced), false → 2 (progressive). `field_order` (0x9D) is only
+    // meaningful when interlaced; `FIELD_ORDER_UNDETERMINED` omits it.
+    pub interlaced: bool,
+    pub field_order: u8,
     // Audio-specific
     pub sample_rate: f64,
     pub channels: u8,
@@ -125,6 +130,18 @@ impl MkvTrack {
             colour_transfer: transfer,
             colour_primaries: primaries,
             colour_range: range,
+            interlaced: v.resolution.is_interlaced(),
+            // PAL DVD (576i) is bottom-field-first; NTSC DVD (480i) is
+            // top-field-first. HD interlaced (1080i) is top-field-first.
+            // Progressive content leaves the field order undetermined.
+            field_order: if v.resolution.is_interlaced() {
+                match v.resolution {
+                    Resolution::R576i => ebml::FIELD_ORDER_BFF,
+                    _ => ebml::FIELD_ORDER_TFF,
+                }
+            } else {
+                ebml::FIELD_ORDER_UNDETERMINED
+            },
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -195,6 +212,8 @@ impl MkvTrack {
             colour_transfer: 0,
             colour_primaries: 0,
             colour_range: 0,
+            interlaced: false,
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
             sample_rate: sr,
             channels: ch,
             bit_depth: 0,
@@ -228,6 +247,8 @@ impl MkvTrack {
             colour_transfer: 0,
             colour_primaries: 0,
             colour_range: 0,
+            interlaced: false,
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -666,6 +687,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 let vid_pos = ebml::start_master(&mut writer, ebml::VIDEO)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_WIDTH, track.pixel_width as u64)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
+                // Scan type. FlagInterlaced: 1 = interlaced, 2 = progressive.
+                // FieldOrder is only written for interlaced content with a
+                // determined order (TFF=0/2/6/14, BFF=1/9/13...).
+                ebml::write_uint(
+                    &mut writer,
+                    ebml::FLAG_INTERLACED,
+                    if track.interlaced {
+                        ebml::INTERLACED_INTERLACED
+                    } else {
+                        ebml::INTERLACED_PROGRESSIVE
+                    },
+                )?;
+                if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
+                    ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
+                }
                 if track.display_width > 0 && track.display_height > 0 {
                     ebml::write_uint(&mut writer, ebml::DISPLAY_WIDTH, track.display_width as u64)?;
                     ebml::write_uint(
@@ -1161,6 +1197,8 @@ mod tests {
             colour_transfer: 0,
             colour_primaries: 0,
             colour_range: 0,
+            interlaced: false,
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -1186,6 +1224,8 @@ mod tests {
             colour_transfer: 0,
             colour_primaries: 0,
             colour_range: 0,
+            interlaced: false,
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
             sample_rate: 48000.0,
             channels: 6,
             bit_depth: 0,
@@ -2941,6 +2981,52 @@ mod tests {
         assert!(
             find_id(&data, ebml::COLOUR).is_none(),
             "no Colour element when colour metadata is all zero"
+        );
+    }
+
+    #[test]
+    fn video_emits_flag_interlaced_and_field_order() {
+        // An interlaced (576i PAL) track must emit FlagInterlaced=1 and
+        // FieldOrder=9 (bottom-field-first). A progressive track must emit
+        // FlagInterlaced=2 and NO FieldOrder.
+        let mut interlaced = make_video_track();
+        interlaced.interlaced = true;
+        interlaced.field_order = ebml::FIELD_ORDER_BFF;
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[interlaced], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        let fi = find_id(&data, ebml::FLAG_INTERLACED).expect("FlagInterlaced present");
+        // [id=0x9A][size=0x81][value]
+        assert_eq!(
+            data[fi + 2],
+            ebml::INTERLACED_INTERLACED as u8,
+            "FlagInterlaced must be 1 (interlaced)"
+        );
+        let fo = find_id(&data, ebml::FIELD_ORDER).expect("FieldOrder present");
+        assert_eq!(
+            data[fo + 2],
+            ebml::FIELD_ORDER_BFF,
+            "FieldOrder must be 9 (bottom-field-first) for PAL DVD"
+        );
+
+        // Progressive track: FlagInterlaced=2, no FieldOrder.
+        let muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        let data = muxer.writer.into_inner();
+        let fi = find_id(&data, ebml::FLAG_INTERLACED).expect("FlagInterlaced present");
+        assert_eq!(
+            data[fi + 2],
+            ebml::INTERLACED_PROGRESSIVE as u8,
+            "FlagInterlaced must be 2 (progressive)"
+        );
+        assert!(
+            find_id(&data, ebml::FIELD_ORDER).is_none(),
+            "no FieldOrder for progressive content"
         );
     }
 

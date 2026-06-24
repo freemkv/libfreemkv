@@ -296,7 +296,13 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
                     } else {
                         v.resolution.pixels()
                     };
-                    v.label = generate_video_label(&v.codec, px, &v.hdr, v.secondary);
+                    v.label = generate_video_label(
+                        &v.codec,
+                        px,
+                        v.resolution.is_interlaced(),
+                        &v.hdr,
+                        v.secondary,
+                    );
                 }
                 Stream::Subtitle(s) if s.forced => {
                     // Ensure forced subs are labeled even if BD-J didn't set a name
@@ -311,6 +317,7 @@ pub fn fill_defaults(titles: &mut [crate::disc::DiscTitle]) {
 fn generate_video_label(
     codec: &crate::disc::Codec,
     pixels: (u32, u32),
+    interlaced: bool,
     hdr: &crate::disc::HdrFormat,
     secondary: bool,
 ) -> String {
@@ -331,20 +338,22 @@ fn generate_video_label(
     // Codec
     parts.push(codec.name().to_string());
 
-    // Resolution
+    // Resolution. Scan type (i/p) is honored for heights that can be
+    // interlaced on disc (1080 and SD 576/480); 720/4K/8K are always
+    // progressive.
     let (w, h) = pixels;
     let res = if w >= 7680 {
         "8K"
     } else if w >= 3840 {
         "4K"
     } else if w >= 1920 {
-        "1080p"
+        if interlaced { "1080i" } else { "1080p" }
     } else if w >= 1280 {
         "720p"
     } else if h >= 576 {
-        "576p"
+        if interlaced { "576i" } else { "576p" }
     } else if h >= 480 {
-        "480p"
+        if interlaced { "480i" } else { "480p" }
     } else {
         ""
     };
@@ -1733,6 +1742,51 @@ mod apply_tests {
         if let Stream::Video(v) = &titles[0].streams[0] {
             assert!(v.label.contains("4K"), "expected 4K, got {}", v.label);
             assert!(v.label.contains("HDR10"), "expected HDR10, got {}", v.label);
+        }
+    }
+
+    /// Spec: an interlaced resolution (`R*i`) must surface the "i" scan type
+    /// in the generated label, not a hardcoded "p". PAL DVD is 576i.
+    /// Mutation: hardcode "p" → 576i video mislabeled as 576p.
+    #[test]
+    fn fill_defaults_video_label_honors_interlaced_scan_type() {
+        let interlaced = Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+        });
+        let mut titles = vec![title_with(vec![interlaced])];
+        fill_defaults(&mut titles);
+        if let Stream::Video(v) = &titles[0].streams[0] {
+            assert!(v.label.contains("576i"), "expected 576i, got {}", v.label);
+            assert!(
+                !v.label.contains("576p"),
+                "must not say 576p, got {}",
+                v.label
+            );
+        }
+
+        let progressive = Stream::Video(VideoStream {
+            pid: 0x1011,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576p,
+            frame_rate: FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+        });
+        let mut titles = vec![title_with(vec![progressive])];
+        fill_defaults(&mut titles);
+        if let Stream::Video(v) = &titles[0].streams[0] {
+            assert!(v.label.contains("576p"), "expected 576p, got {}", v.label);
         }
     }
 
