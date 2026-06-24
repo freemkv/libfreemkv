@@ -76,9 +76,10 @@ pub(super) enum PatchItem {
     /// `NonTrimmed` so future passes get another shot at them). Kept
     /// in the enum for the orchestrator-side end-of-recovery promotion
     /// (autorip, after the final retry pass completes, promotes
-    /// still-NonTrimmed bytes to Unreadable). When that ships, this
-    /// becomes the variant the orchestrator emits to the same
-    /// PatchSink.
+    /// still-NonTrimmed bytes to Unreadable). The orchestrator (autorip)
+    /// performs this promotion directly via `Mapfile::record()` after all
+    /// retry passes complete, not by emitting to `PatchSink`. This variant
+    /// remains unused by the library itself.
     #[allow(dead_code)]
     Unreadable { pos: u64, len: u64 },
 
