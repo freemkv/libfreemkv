@@ -319,7 +319,9 @@ const CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD: u64 = 10;
 const ADAPTIVE_UPSCALE_THRESHOLD: u32 = 16;
 // Wedge-family (HARDWARE_ERROR / ILLEGAL_REQUEST) cooldown and abort
 // thresholds — see `handle_read_failure` below for context.
-const WEDGE_FAMILY_COOLDOWN_SECS: u64 = 30;
+// Single source of truth lives in `disc::read_error` so this cannot
+// drift from `ZONE_ENTRY_COOLDOWN_SECS`.
+const WEDGE_FAMILY_COOLDOWN_SECS: u64 = crate::disc::read_error::ZONE_ENTRY_COOLDOWN_SECS;
 const WEDGE_ABORT_THRESHOLD: u32 = 16;
 // Whole-pass stall watchdog: bytes_good must increase within
 // STALL_SECS or the pass bails out as wedged.
@@ -1291,7 +1293,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     // the senses the BU40N's firmware fast-fail mode returns. When
     // the drive is wedged, every subsequent read returns these in
     // <100ms — exactly the rapid-retry cadence that bricks the drive
-    // further. Long cooldown (30s, matching
+    // further. Long cooldown (WEDGE_FAMILY_COOLDOWN_SECS, sourced from
     // read_error::ZONE_ENTRY_COOLDOWN_SECS) gives the firmware
     // breathing room to clear the fast-fail state. After
     // WEDGE_ABORT_THRESHOLD consecutive wedge senses with no recovery,
