@@ -336,7 +336,8 @@ pub enum ReadAction {
 // bridge wedges 524 ms after a 5.4-second internal ECC retry. The
 // post-failure pauses give the drive — and the bridge — time to settle.
 /// Pause between a failed read and the next read attempt — applied
-/// uniformly to Pass 1 sweep and Pass N patch.
+/// by Pass 1 sweep via `handle_read_error`. Pass N patch uses its own
+/// `POST_FAILURE_PAUSE_SECS` (see `disc/patch.rs`).
 ///
 /// 2026-05-11 reframe: a failed read is a failed read, regardless of
 /// which pass is running. The prior split (1s for Pass N, 5s for Pass
