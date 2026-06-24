@@ -191,7 +191,7 @@ fn patch_recovers_good_middle_of_a_bad_range() {
 
     // The good middle (125..175) MUST end up Finished. If size-aware skip
     // is not enabled, patch would skip 32+ sectors after a few failures
-    // and leap clean over LBA 125 → middle stays NonTrimmed/Unreadable.
+    // and leap clean over LBA 125 → middle stays NonTrimmed.
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
     let total_finished_in_middle: u64 = finished_ranges
         .iter()
