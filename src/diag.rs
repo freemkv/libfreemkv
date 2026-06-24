@@ -134,6 +134,19 @@ pub fn sample_rate_hz(s: SampleRate) -> u32 {
 /// filter.
 pub fn dvd_cell_row(idx: usize, cell: &crate::ifo::DvdCell, dropped: bool) -> String {
     let c = CellCategory::decode(cell.category);
+    // Per-cell keep/skip REASON (self-sufficient bug log): a dropped cell is a
+    // leading secondary angle/interleave block piece; a kept cell is either the
+    // first feature cell or genuine feature content. This makes the
+    // leading-cell-filter decision auditable from the log without the disc.
+    let verdict = if dropped {
+        "DROP(leading-secondary-block-piece)"
+    } else if c.is_secondary_block_piece() {
+        // Kept despite being a secondary piece — only happens past the leading
+        // run (the filter stops at the first plain feature cell).
+        "keep(feature-body)"
+    } else {
+        "keep(plain-feature)"
+    };
     format!(
         "tag=dvd.cell idx={idx} cat=0x{:02X} type={} block_mode={} block_type={} \
 seamless={} ilv={} plain={} first={} last={} dur={:.1}s {}",
@@ -147,7 +160,7 @@ seamless={} ilv={} plain={} first={} last={} dur={:.1}s {}",
         cell.first_sector,
         cell.last_sector,
         cell.duration_secs,
-        if dropped { "DROP(non-feature)" } else { "keep" },
+        verdict,
     )
 }
 
@@ -225,6 +238,36 @@ pub fn dump_dvd_attrs(ts: &crate::ifo::DvdTitleSet) {
             "tag=dvd.sattr vts={} idx={i} lang={:?}",
             ts.vts_number,
             s.language,
+        );
+    }
+}
+
+/// Emit the ACTUAL per-physical-sub-stream AC-3 channel counts read off the VOB
+/// during the mux-time sub-stream probe (the Silence-of-the-Lambs wrong-stream
+/// fix). This is the ground truth the IFO nibble is compared against: each row
+/// is `sub_id=0x8x channels=N` for a physical `private_stream_1` AC-3 sub-stream
+/// whose first frame was decoded. An empty probe (scrambled / unreadable / short
+/// VOB) logs a single `probed=0` line so the absence is explicit in a bug log.
+///
+/// Self-sufficiency: with `tag=dvd.aattr` (the IFO's declared sub_id + claimed
+/// channels) and these `tag=dvd.substream` rows (the physical reality), a bug
+/// log alone shows whether the ordinal `0x80` actually carries the declared
+/// channel layout — no disc needed to diagnose a wrong-substream rip.
+pub fn dump_dvd_substream_probe(title_id: u16, probed: &std::collections::BTreeMap<u8, u8>) {
+    if !tracing::enabled!(target: DIAG, tracing::Level::DEBUG) {
+        return;
+    }
+    if probed.is_empty() {
+        tracing::debug!(
+            target: DIAG,
+            "tag=dvd.substream title={title_id} probed=0 (no AC-3 sync in feature head — scrambled/unreadable/none)",
+        );
+        return;
+    }
+    for (sub, ch) in probed {
+        tracing::debug!(
+            target: DIAG,
+            "tag=dvd.substream title={title_id} sub_id=0x{sub:02X} channels={ch} (physical acmod read from VOB)",
         );
     }
 }
@@ -450,7 +493,7 @@ mod tests {
         assert!(row.contains("first=100"), "{row}");
         assert!(row.contains("last=199"), "{row}");
         assert!(row.contains("dur=12.5s"), "{row}");
-        assert!(row.contains("keep"), "{row}");
+        assert!(row.contains("keep(plain-feature)"), "{row}");
         assert!(!row.contains("DROP"), "{row}");
 
         // 0x80 = middle-of-angle-block (cell_type=2), shown dropped.
@@ -463,6 +506,6 @@ mod tests {
         let row = dvd_cell_row(0, &sec, true);
         assert!(row.contains("cat=0x80"), "{row}");
         assert!(row.contains("type=2"), "{row}");
-        assert!(row.contains("DROP(non-feature)"), "{row}");
+        assert!(row.contains("DROP(leading-secondary-block-piece)"), "{row}");
     }
 }

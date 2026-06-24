@@ -558,7 +558,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         crate::decrypt::DecryptKeys::Aacs { .. } => 3,
         _ => 1,
     };
-    let decrypting =
+    let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
     // Grab the decrypt-loss counter before the decorator is moved into the
     // producer thread. It tracks bytes of scrambled AACS units no key could
@@ -566,6 +566,16 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     // through `lost_bytes()` so the mux abort gate sees a partial decrypt
     // failure rather than a clean rip.
     let decrypt_loss = decrypting.decrypt_loss();
+
+    // Wrong-substream fix (Silence-of-the-Lambs): before the prefetcher takes
+    // the reader, probe the feature head through the (plaintext) decrypting
+    // source and re-route the title's declared AC-3 audio onto the physically
+    // correct `0x8x` sub-streams. No-op for non-DVD or an empty probe. Reset the
+    // unit base afterward so the prefetcher's first batch starts clean.
+    let mut title = title;
+    crate::disc::dvd_audio_probe::probe_and_remap(&mut decrypting, &mut title);
+    decrypting.set_unit_base(0);
+
     let prefetched = crate::sector::PrefetchedSectorSource::new_with_events(
         decrypting,
         extents,
