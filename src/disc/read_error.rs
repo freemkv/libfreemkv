@@ -365,7 +365,7 @@ const FAIL_PAUSE_SECS: u64 = 5;
 /// Cost on clean discs: zero (first-error path doesn't trigger).
 /// Cost on damaged discs: ~30s × N damage zones; on a 5-zone disc
 /// that's 2.5 min extra. Trade for never wedging the drive.
-const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
+pub(crate) const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
 /// Cooldown when a long streak of failures suggests the drive is
 /// stuck in a damage zone and needs MORE breathing room than the
 /// standard inter-error pause. Same value as `FAIL_PAUSE_SECS`
