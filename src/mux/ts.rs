@@ -314,7 +314,6 @@ impl TsDemuxer {
             Some(prev) => cc != ((prev + 1) & 0x0f) && cc != prev,
             None => false,
         };
-        let is_dup = asm.last_cc == Some(cc);
         asm.last_cc = Some(cc);
         if !pusi && (discontinuity_flag || cc_gap) && asm.active {
             tracing::trace!(
@@ -359,7 +358,7 @@ impl TsDemuxer {
             if skip < payload.len() {
                 asm.push(&payload[skip..]);
             }
-        } else if !is_dup {
+        } else {
             asm.push(payload);
         }
     }
