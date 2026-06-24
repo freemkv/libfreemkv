@@ -379,12 +379,14 @@ fn patch_recovers_multiple_good_middles() {
 /// 0.18 Pass N pipeline split: exercises the new producer/consumer
 /// path end-to-end on a synthetic patterned reader. Bad range layout
 /// is small (5 bad LBAs surrounded by good middle) so the producer
-/// emits a mix of `Recovered` and `Unreadable` items and the consumer
+/// emits a mix of `Recovered` and `NonTrimmed` items and the consumer
 /// thread must apply both kinds. Verifies:
 ///
 /// - `bytes_good` advances (good sectors flow producer→consumer→file
 ///   →mapfile with the data preserved).
-/// - The recovered LBAs end up Finished; the bad LBAs end up Unreadable.
+/// - The recovered LBAs end up Finished; the bad LBAs end up NonTrimmed
+///   (NOT Unreadable — promotion to Unreadable is the orchestrator's job
+///   after the final pass).
 /// - Bytes written at the recovered offsets match what the producer
 ///   read from the patterned source (proves the channel hand-off
 ///   didn't drop or reorder buffers, and the consumer's seek+write
@@ -440,7 +442,7 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
     );
 
     // Verify the mapfile records: every good LBA is Finished, every
-    // bad LBA is either Unreadable or NonTrimmed (not Finished).
+    // bad LBA is NonTrimmed (not Finished).
     let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
