@@ -2236,6 +2236,45 @@ mod tests {
         out
     }
 
+    /// Walk the direct children of a master element body. Returns
+    /// `Vec<(id, body_start_abs, body_size)>` (absolute offsets into `data`).
+    /// `master_body` is an absolute-offset slice range `[start, start+size)`.
+    /// Unlike `find_id`'s flat byte-scan, this respects EBML nesting: a child
+    /// id buried inside a deeper master is NOT reported at this level.
+    fn master_children(data: &[u8], body_start: usize, body_size: usize) -> Vec<(u32, usize, u64)> {
+        let mut out = Vec::new();
+        let body = &data[body_start..body_start + body_size];
+        let mut cursor = Cursor::new(body);
+        while (cursor.position() as usize) < body.len() {
+            let pos_before = cursor.position();
+            let (id, size, hdr_len) = match ebml::read_element_header(&mut cursor) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let child_abs = body_start + pos_before as usize + hdr_len;
+            out.push((id, child_abs, size));
+            cursor
+                .seek(io::SeekFrom::Current(size as i64))
+                .expect("seek past child body");
+        }
+        out
+    }
+
+    /// Locate the first `TrackEntry` master and return the offset/size of its
+    /// body. Walks Segment → Tracks → TrackEntry, never a flat byte-scan, so the
+    /// returned range is the genuine TrackEntry body.
+    fn first_track_entry(data: &[u8]) -> (usize, usize) {
+        let (tracks_start, tracks_size) = segment_children(data)
+            .into_iter()
+            .find_map(|(id, off, sz)| (id == ebml::TRACKS).then_some((off, sz as usize)))
+            .expect("Tracks element present");
+        let (_, te_start, te_size) = master_children(data, tracks_start, tracks_size)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::TRACK_ENTRY)
+            .expect("TrackEntry present");
+        (te_start, te_size as usize)
+    }
+
     /// Find every Cluster: returns Vec<(cluster_data_start_abs, cluster_data_size, cluster_timestamp_ms)>.
     fn find_clusters(data: &[u8]) -> Vec<(usize, u64, u64)> {
         let mut out = Vec::new();
@@ -3265,6 +3304,262 @@ mod tests {
         assert!(
             find_id(&data, ebml::DEFAULT_DECODED_FIELD_DURATION).is_none(),
             "no field duration for progressive content"
+        );
+    }
+
+    #[test]
+    fn field_duration_is_direct_trackentry_child_not_in_video() {
+        // GUARDS THE REAL BUG (audit §3 #1): DefaultDecodedFieldDuration
+        // (0x234E7A) is, per the Matroska schema, a DIRECT child of TrackEntry —
+        // NOT nested inside the Video master (which only holds FlagInterlaced /
+        // FieldOrder). The pre-fix writer emitted it between start_master(VIDEO)
+        // and end_master(vid_pos), burying it inside Video. The old test used the
+        // flat `find_id` byte-scan, which passes regardless of nesting. This is a
+        // depth-aware check: the element MUST appear among TrackEntry's direct
+        // children and MUST NOT appear among Video's direct children.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+
+        let (te_start, te_size) = first_track_entry(&data);
+        let te_children = master_children(&data, te_start, te_size);
+
+        // Direct child of TrackEntry — present.
+        assert!(
+            te_children
+                .iter()
+                .any(|(id, _, _)| *id == ebml::DEFAULT_DECODED_FIELD_DURATION),
+            "DefaultDecodedFieldDuration must be a DIRECT child of TrackEntry"
+        );
+
+        // Locate the Video master (a direct child of TrackEntry) and confirm the
+        // field-duration element is NOT inside it.
+        let (_, vid_start, vid_size) = te_children
+            .iter()
+            .copied()
+            .find(|(id, _, _)| *id == ebml::VIDEO)
+            .expect("Video master present");
+        let vid_children = master_children(&data, vid_start, vid_size as usize);
+        assert!(
+            !vid_children
+                .iter()
+                .any(|(id, _, _)| *id == ebml::DEFAULT_DECODED_FIELD_DURATION),
+            "DefaultDecodedFieldDuration must NOT be nested inside the Video master"
+        );
+        // And, for completeness, DefaultDuration is also a TrackEntry child (not
+        // in Video) — pins the pair together so a future edit can't move either.
+        assert!(
+            te_children
+                .iter()
+                .any(|(id, _, _)| *id == ebml::DEFAULT_DURATION),
+            "DefaultDuration must be a direct child of TrackEntry"
+        );
+        assert!(
+            !vid_children
+                .iter()
+                .any(|(id, _, _)| *id == ebml::DEFAULT_DURATION),
+            "DefaultDuration must NOT be nested inside the Video master"
+        );
+        // FlagInterlaced / FieldOrder ARE Video children (the spec's split).
+        assert!(
+            vid_children
+                .iter()
+                .any(|(id, _, _)| *id == ebml::FLAG_INTERLACED),
+            "FlagInterlaced is a Video child"
+        );
+    }
+
+    /// Helper: read the 1-byte value of a `[id][size=0x81][value]` uint element
+    /// among the direct children of the Video master of the first TrackEntry.
+    fn video_child_u8(data: &[u8], id: u32) -> Option<u8> {
+        let (te_start, te_size) = first_track_entry(data);
+        let (_, vid_start, vid_size) = master_children(data, te_start, te_size)
+            .into_iter()
+            .find(|(c, _, _)| *c == ebml::VIDEO)?;
+        let (_, child_start, child_size) = master_children(data, vid_start, vid_size as usize)
+            .into_iter()
+            .find(|(c, _, _)| *c == id)?;
+        // 1-byte uint value sits at the child body start.
+        (child_size == 1).then(|| data[child_start])
+    }
+
+    #[test]
+    fn pal_576i_emits_bt470bg_colour_codes() {
+        // GUARDS audit §2 colour-code gap: the dvd.rs tests assert at the stream
+        // layer (ColorSpace::Bt470bg); nothing asserted the actual CICP tuple
+        // emitted in the MKV. PAL SD must emit matrix/transfer/primaries =
+        // (5,5,5) with range=1 (BT.470BG). A swap with NTSC's (6,6,6) goes
+        // uncaught by the stream-layer tests alone.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: Some((16, 9)),
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        assert_eq!(
+            (
+                t.colour_matrix,
+                t.colour_transfer,
+                t.colour_primaries,
+                t.colour_range
+            ),
+            (5, 5, 5, 1),
+            "PAL SD must map to BT.470BG (5,5,5,1)"
+        );
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        // Depth-scoped: Colour master inside Video, with the exact CICP codes.
+        let (te_start, te_size) = first_track_entry(&data);
+        let (_, vid_start, vid_size) = master_children(&data, te_start, te_size)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::VIDEO)
+            .expect("Video master");
+        let (_, col_start, col_size) = master_children(&data, vid_start, vid_size as usize)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::COLOUR)
+            .expect("Colour master present for PAL SD");
+        let col = master_children(&data, col_start, col_size as usize);
+        let val = |id: u32| -> u8 {
+            let (_, off, sz) = col.iter().copied().find(|(c, _, _)| *c == id).unwrap();
+            assert_eq!(sz, 1, "single-byte CICP value");
+            data[off]
+        };
+        assert_eq!(
+            val(ebml::MATRIX_COEFFICIENTS),
+            5,
+            "PAL matrix = BT.470BG (5)"
+        );
+        assert_eq!(
+            val(ebml::TRANSFER_CHARACTERISTICS),
+            5,
+            "PAL transfer = BT.470BG (5)"
+        );
+        assert_eq!(val(ebml::PRIMARIES), 5, "PAL primaries = BT.470BG (5)");
+        assert_eq!(val(ebml::RANGE), 1, "PAL range = limited (1)");
+    }
+
+    #[test]
+    fn ntsc_480i_emits_smpte170m_colour_codes() {
+        // Mirror of the PAL test: NTSC SD must emit (6,6,6,1) — SMPTE-170M /
+        // BT.601-525 — not BT.470BG's (5,5,5). Together the two tests pin the
+        // PAL/NTSC colour split at the emitted-byte layer.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: crate::disc::FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Smpte170m,
+            display_aspect: Some((4, 3)),
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        assert_eq!(
+            (
+                t.colour_matrix,
+                t.colour_transfer,
+                t.colour_primaries,
+                t.colour_range
+            ),
+            (6, 6, 6, 1),
+            "NTSC SD must map to SMPTE-170M (6,6,6,1)"
+        );
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        let (te_start, te_size) = first_track_entry(&data);
+        let (_, vid_start, vid_size) = master_children(&data, te_start, te_size)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::VIDEO)
+            .expect("Video master");
+        let (_, col_start, col_size) = master_children(&data, vid_start, vid_size as usize)
+            .into_iter()
+            .find(|(id, _, _)| *id == ebml::COLOUR)
+            .expect("Colour master present for NTSC SD");
+        let col = master_children(&data, col_start, col_size as usize);
+        let val = |id: u32| -> u8 {
+            let (_, off, sz) = col.iter().copied().find(|(c, _, _)| *c == id).unwrap();
+            assert_eq!(sz, 1, "single-byte CICP value");
+            data[off]
+        };
+        assert_eq!(
+            val(ebml::MATRIX_COEFFICIENTS),
+            6,
+            "NTSC matrix = SMPTE-170M (6)"
+        );
+        assert_eq!(
+            val(ebml::TRANSFER_CHARACTERISTICS),
+            6,
+            "NTSC transfer = SMPTE-170M (6)"
+        );
+        assert_eq!(val(ebml::PRIMARIES), 6, "NTSC primaries = SMPTE-170M (6)");
+        assert_eq!(val(ebml::RANGE), 1, "NTSC range = limited (1)");
+    }
+
+    #[test]
+    fn ntsc_480i_field_order_is_tff_and_encoded() {
+        // 480i FIELD-ORDER HONESTY (audit §2 / §5 #5): NTSC 480i is hardcoded TFF
+        // (mkv.rs field_order). Document & encode that reality so a future edit
+        // can't silently flip it. The old field-order test covered 576i only;
+        // NTSC was never exercised. Assert both the struct value AND the byte
+        // actually written into the Video master.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: crate::disc::FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Smpte170m,
+            display_aspect: Some((4, 3)),
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        assert!(t.interlaced, "480i is interlaced");
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_TFF,
+            "NTSC 480i is hardcoded top-field-first"
+        );
+        // 480i @ 29.97: frame = 1001/30000 s = 33_366_666 ns; field = half.
+        assert_eq!(
+            t.default_duration_ns, 33_366_666,
+            "480i frame duration is ~33.37 ms (29.97 fps, not halved)"
+        );
+        assert_eq!(
+            t.field_duration_ns, 16_683_333,
+            "480i field duration is half the frame (~16.68 ms)"
+        );
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        // FlagInterlaced and FieldOrder are Video children; assert the encoded
+        // bytes (depth-scoped, not a flat scan).
+        assert_eq!(
+            video_child_u8(&data, ebml::FLAG_INTERLACED),
+            Some(ebml::INTERLACED_INTERLACED as u8),
+            "480i must encode FlagInterlaced = 1"
+        );
+        assert_eq!(
+            video_child_u8(&data, ebml::FIELD_ORDER),
+            Some(ebml::FIELD_ORDER_TFF),
+            "480i must encode FieldOrder = TFF (2)"
         );
     }
 
