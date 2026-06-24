@@ -401,11 +401,13 @@ pub(super) fn compute_initial_state(
     let total_bytes = map.total_size();
     let initial_stats = map.stats();
     let initial_entries: Vec<_> = map.entries().to_vec();
-    // Every retry pass acts on every non-Finished range. Including
-    // Unreadable means a sector that failed in pass N gets a fresh
-    // shot in pass N+1 — drive state evolves, the same read can
-    // succeed later. Each pass owns its own jumps/skips; if pass 5
-    // jumps over the same zone as pass 2, fine.
+    // Every retry pass acts on NonTrimmed, NonScraped, and Unreadable
+    // ranges. Including Unreadable means a sector that failed in pass N
+    // gets a fresh shot in pass N+1 — drive state evolves, the same
+    // read can succeed later. Each pass owns its own jumps/skips; if
+    // pass 5 jumps over the same zone as pass 2, fine. NonTried ranges
+    // are intentionally excluded — they are covered by a preceding
+    // sweep pass, not by patch.
     let mut bad_ranges = map.ranges_with(&[
         mapfile::SectorStatus::NonTrimmed,
         mapfile::SectorStatus::NonScraped,
