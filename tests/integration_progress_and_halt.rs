@@ -127,7 +127,7 @@ fn synthetic_title(sector_count: u32) -> DiscTitle {
     }
 }
 
-// ── 1. BytesRead events emitted during disc copy (TDD red) ────────────────
+// ── 1. BytesRead events emitted during disc copy ──────────────────────────
 
 #[test]
 fn test_bytes_read_emitted_during_disc_copy() {
@@ -157,10 +157,9 @@ fn test_bytes_read_emitted_during_disc_copy() {
     }
 
     let n = count.load(Ordering::Relaxed);
-    // EXPECTED TO FAIL until BytesRead emission is wired up. TDD red.
     assert!(
         n > 0,
-        "expected at least one BytesRead event, got {n} (lib does not yet emit BytesRead)"
+        "expected at least one BytesRead event during disc copy, got {n}"
     );
 }
 
