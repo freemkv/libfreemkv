@@ -161,6 +161,10 @@ pub struct DiscStream {
     halt: Option<Halt>,
     event_fn: Option<Box<dyn Fn(Event) + Send>>,
     eof: bool,
+    /// Count of dropped DVD navigation packets (private_stream_2, 0xBF) — these
+    /// are expected on every disc; tallied and summarised once at EOF instead of
+    /// a per-packet WARN.
+    dropped_nav_packets: u64,
 
     // Cumulative bytes successfully read from the source. Drives
     // EventKind::BytesRead emission and autorip's per-device progress.
@@ -284,6 +288,7 @@ impl DiscStream {
             halt: None,
             event_fn: None,
             eof: false,
+            dropped_nav_packets: 0,
             bytes_read_total: 0,
             bytes_total_extents,
             ts_demuxer,
@@ -578,6 +583,13 @@ impl crate::pes::Stream for DiscStream {
             let t0 = self.profiling.then(std::time::Instant::now);
             if !self.fill_extents()? {
                 self.eof = true;
+                if self.dropped_nav_packets > 0 {
+                    tracing::debug!(
+                        target: "mux",
+                        "dropped {} DVD navigation packets (private_stream_2/0xBF) — expected, carry no elementary stream",
+                        self.dropped_nav_packets
+                    );
+                }
                 // Flush demuxer — last PES packet may still be in the assembler
                 if let Some(ref mut demuxer) = self.ts_demuxer {
                     for pes in &demuxer.flush() {
@@ -603,12 +615,20 @@ impl crate::pes::Stream for DiscStream {
                         // pipelined_stream.rs); the old (sub_id & 0x1F)+1
                         // heuristic mis-routed VobSub into the AC-3 parser.
                         let Some(pid) = ps.dvd_pid() else {
-                            tracing::warn!(
-                                target: "mux",
-                                "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                                ps.stream_id,
-                                ps.sub_stream_id,
-                            );
+                            if ps.is_nav() {
+                                // Expected DVD navigation packet (PCI/DSI) —
+                                // tally, no WARN.
+                                self.dropped_nav_packets += 1;
+                            } else {
+                                // Unexpected unmappable stream_id (a
+                                // possibly-dropped real stream). Keep the WARN.
+                                tracing::warn!(
+                                    target: "mux",
+                                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                                    ps.stream_id,
+                                    ps.sub_stream_id,
+                                );
+                            }
                             continue;
                         };
                         let Some((_, track)) =
@@ -714,12 +734,20 @@ impl crate::pes::Stream for DiscStream {
                     // pipelined_stream.rs); the old (sub_id & 0x1F)+1
                     // heuristic mis-routed VobSub into the AC-3 parser.
                     let Some(pid) = ps.dvd_pid() else {
-                        tracing::warn!(
-                            target: "mux",
-                            "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                            ps.stream_id,
-                            ps.sub_stream_id,
-                        );
+                        if ps.is_nav() {
+                            // Expected DVD navigation packet (PCI/DSI) — tally,
+                            // no WARN.
+                            self.dropped_nav_packets += 1;
+                        } else {
+                            // Unexpected unmappable stream_id (a possibly-dropped
+                            // real stream). Keep the individual WARN.
+                            tracing::warn!(
+                                target: "mux",
+                                "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                                ps.stream_id,
+                                ps.sub_stream_id,
+                            );
+                        }
                         continue;
                     };
                     let Some((_, track)) =

@@ -64,6 +64,10 @@ pub struct PipelinedPesStream {
     /// decrypt failure instead of reporting a perfect rip. `None` for pipelines
     /// with no AACS decrypt step (e.g. the M2TS byte-stream path).
     decrypt_loss: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Count of dropped DVD navigation packets (private_stream_2, 0xBF). These
+    /// are expected on every disc; instead of a per-packet WARN they're tallied
+    /// and summarised once at EOF.
+    dropped_nav_packets: u64,
 }
 
 impl PipelinedPesStream {
@@ -93,6 +97,7 @@ impl PipelinedPesStream {
             eof: false,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             decrypt_loss: None,
+            dropped_nav_packets: 0,
         }
     }
 
@@ -174,12 +179,19 @@ impl PipelinedPesStream {
             // subtitle sub-id 0x20+j with audio track j+1, feeding
             // VobSub PES into the AC-3 parser.
             let Some(pid) = ps.dvd_pid() else {
-                tracing::warn!(
-                    target: "mux",
-                    "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
-                    ps.stream_id,
-                    ps.sub_stream_id,
-                );
+                if ps.is_nav() {
+                    // Expected DVD navigation packet (PCI/DSI) — tally, no WARN.
+                    self.dropped_nav_packets += 1;
+                } else {
+                    // Unexpected unmappable stream_id — a possibly-dropped real
+                    // stream. Keep the individual WARN: its repetition is signal.
+                    tracing::warn!(
+                        target: "mux",
+                        "dropping unmappable PS packet (stream_id={:#04x}, sub_stream_id={:?})",
+                        ps.stream_id,
+                        ps.sub_stream_id,
+                    );
+                }
                 continue;
             };
             let Some((_, track)) = self.pid_to_track.iter().find(|(p, _)| *p == pid).copied()
@@ -227,6 +239,13 @@ impl Stream for PipelinedPesStream {
                 }
                 false => {
                     self.eof = true;
+                    if self.dropped_nav_packets > 0 {
+                        tracing::debug!(
+                            target: "mux",
+                            "dropped {} DVD navigation packets (private_stream_2/0xBF) — expected, carry no elementary stream",
+                            self.dropped_nav_packets
+                        );
+                    }
                     // Drain any access unit a parser buffered past the last
                     // PES (e.g. DTS-HD's final core+extension unit).
                     let pid_to_track = &self.pid_to_track;

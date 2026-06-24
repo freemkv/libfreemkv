@@ -261,6 +261,81 @@ fn frame_duration_ns(data: &[u8], bsid: u8) -> u64 {
     (samples * 1_000_000_000 + rate / 2) / rate
 }
 
+/// Base channel count per AC-3 `acmod` (A/52 Table 5.8), BEFORE the LFE.
+/// Index is the 3-bit acmod value; add 1 when `lfeon` is set.
+///
+/// ```text
+///   0 = 1+1 (Ch1, Ch2)  -> 2     4 = 3/0 (L,C,R)        -> 3
+///   1 = 1/0 (C, mono)   -> 1     5 = 2/1 (L,R,S)        -> 3
+///   2 = 2/0 (L, R)      -> 2     6 = 3/1 (L,C,R,S)      -> 4
+///   3 = 3/0 (L,C,R)     -> 3     7 = 3/2 (L,C,R,SL,SR)  -> 5
+/// ```
+const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 3, 4, 5];
+
+/// Decode the channel count of an (E-)AC-3 frame from its bitstream `acmod` and
+/// `lfeon`, starting at the 0x0B77 syncword. Returns `None` when the frame is
+/// too short to carry the BSI bits.
+///
+/// This is the AUTHORITATIVE channel count for the track header: the DVD IFO
+/// `audio_attr_t.channels` nibble is a well-known unreliable/stale field, so
+/// the muxer prefers this over the IFO-claimed count (mirrors MakeMKV /
+/// HandBrake, which never trust the IFO audio nibble). LFE adds one channel
+/// (e.g. acmod=7 + lfeon → 6 = 5.1).
+///
+/// Bit layout from the syncword (A/52 §5.3.2 BSI):
+///
+/// ```text
+///   byte 5: bsid(5) | bsmod(3)
+///   byte 6: acmod(3) | [cmixlev(2) if acmod has a centre and acmod!=1]
+///                    | [surmixlev(2) if acmod has surround]
+///                    | [dsurmod(2) if acmod==2] | lfeon(1) | ...
+/// ```
+///
+/// `acmod` therefore always occupies byte-6 bits 7-5; `lfeon` follows a
+/// variable number of optional 2-bit fields, so we track the bit cursor.
+pub(crate) fn acmod_channels(data: &[u8]) -> Option<u8> {
+    // Need at least bytes 0..=6 to read acmod (byte 6) and its trailing
+    // optional fields + lfeon (which never spills past byte 7 for any acmod).
+    if data.len() < 8 {
+        return None;
+    }
+    let bsid = get_bsid(data);
+    // E-AC-3 (bsid >= 11, Annex E) uses a different BSI layout. DVD audio is
+    // always legacy AC-3 (bsid <= 8); for E-AC-3 we don't decode acmod here
+    // and let the caller fall back to the passed channel count.
+    if bsid >= 11 {
+        return None;
+    }
+    // Bit cursor over `data`, MSB-first, starting at byte 6 bit 7 (= bit 48).
+    let mut bit = 6 * 8;
+    let read = |n: usize, bit: &mut usize| -> u32 {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = data[*bit / 8];
+            let shift = 7 - (*bit % 8);
+            v = (v << 1) | ((byte >> shift) & 1) as u32;
+            *bit += 1;
+        }
+        v
+    };
+    let acmod = read(3, &mut bit) as usize;
+    // cmixlev: present when acmod has a centre channel AND is not the 1/0
+    // (centre-only) mode — i.e. acmod & 0x1 != 0 && acmod != 0x1.
+    if (acmod & 0x1) != 0 && acmod != 0x1 {
+        let _cmixlev = read(2, &mut bit);
+    }
+    // surmixlev: present when acmod has a surround channel (acmod & 0x4).
+    if (acmod & 0x4) != 0 {
+        let _surmixlev = read(2, &mut bit);
+    }
+    // dsurmod: present only for the 2/0 (stereo) mode.
+    if acmod == 0x2 {
+        let _dsurmod = read(2, &mut bit);
+    }
+    let lfeon = read(1, &mut bit);
+    Some(ACMOD_CHANNELS[acmod] + lfeon as u8)
+}
+
 /// Find AC3/E-AC-3 syncword (0x0B77) in data.
 fn find_ac3_sync(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(1)).find(|&i| data[i] == 0x0B && data[i + 1] == 0x77)
@@ -966,6 +1041,112 @@ mod tests {
         let mut parser = Ac3Parser::new();
         parser.buf = vec![0xAA, 0xBB, 0xCC];
         assert!(parser.flush().is_empty());
+    }
+
+    // --- acmod_channels: channel count from the AC-3 BSI bitstream ---
+
+    /// Build a minimal AC-3 BSI header (8 bytes) with a given acmod + lfeon.
+    /// byte5 = bsid<<3 (bsmod=0); byte6 carries acmod in bits 7-5 followed by
+    /// the optional mix-level fields and lfeon. We construct byte6/7 by writing
+    /// bits MSB-first in the exact order acmod_channels reads them.
+    fn make_bsi(acmod: u8, lfeon: bool) -> Vec<u8> {
+        // Collect the bit sequence after byte 6 bit 7: acmod(3), [cmixlev(2)],
+        // [surmixlev(2)], [dsurmod(2)], lfeon(1). Mix-level/dsurmod bits are
+        // arbitrary (0 here) — only their PRESENCE shifts lfeon's position.
+        let mut bits: Vec<u8> = Vec::new();
+        for i in (0..3).rev() {
+            bits.push((acmod >> i) & 1);
+        }
+        if (acmod & 0x1) != 0 && acmod != 0x1 {
+            bits.push(0);
+            bits.push(0); // cmixlev
+        }
+        if (acmod & 0x4) != 0 {
+            bits.push(0);
+            bits.push(0); // surmixlev
+        }
+        if acmod == 0x2 {
+            bits.push(0);
+            bits.push(0); // dsurmod
+        }
+        bits.push(lfeon as u8); // lfeon
+        // Pack bits MSB-first starting at byte 6.
+        let mut frame = vec![0u8; 8];
+        frame[0] = 0x0B;
+        frame[1] = 0x77;
+        frame[5] = 8 << 3; // bsid = 8 (legacy AC-3), bsmod = 0
+        for (idx, &b) in bits.iter().enumerate() {
+            let bitpos = 6 * 8 + idx;
+            if b != 0 {
+                frame[bitpos / 8] |= 1 << (7 - (bitpos % 8));
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn acmod_channels_stereo_2_0_no_lfe() {
+        // acmod=2 (2/0 L,R), no LFE → 2 channels. Verifies the channel count is
+        // read from the AC-3 bitstream's acmod, independent of any IFO claim.
+        // (A disc whose IFO lists 5.1 but where the wrong physical substream is
+        // selected is a separate stream-SELECTION bug, not this label path —
+        // tracked for rc.5.2.)
+        assert_eq!(acmod_channels(&make_bsi(2, false)), Some(2));
+    }
+
+    #[test]
+    fn acmod_channels_5_1() {
+        // acmod=7 (3/2 L,C,R,SL,SR) + LFE → 6 channels (5.1).
+        assert_eq!(acmod_channels(&make_bsi(7, true)), Some(6));
+        // 3/2 without LFE → 5 channels.
+        assert_eq!(acmod_channels(&make_bsi(7, false)), Some(5));
+    }
+
+    #[test]
+    fn acmod_channels_mono_and_dual_mono() {
+        // acmod=1 (1/0 centre/mono) → 1; with LFE → 2.
+        assert_eq!(acmod_channels(&make_bsi(1, false)), Some(1));
+        assert_eq!(acmod_channels(&make_bsi(1, true)), Some(2));
+        // acmod=0 (1+1 dual mono) → 2 base channels.
+        assert_eq!(acmod_channels(&make_bsi(0, false)), Some(2));
+    }
+
+    #[test]
+    fn acmod_channels_3_0_and_2_1() {
+        // acmod=4 (3/0 L,C,R) → 3 (exercises cmixlev present, surmixlev absent).
+        assert_eq!(acmod_channels(&make_bsi(4, false)), Some(3));
+        // acmod=5 (2/1 L,R,S) → 3 (surmixlev present, no centre).
+        assert_eq!(acmod_channels(&make_bsi(5, false)), Some(3));
+        // acmod=6 (3/1) + LFE → 5; lfeon position shifts after both
+        // cmixlev (centre) and surmixlev (surround) 2-bit fields.
+        assert_eq!(acmod_channels(&make_bsi(6, true)), Some(5));
+    }
+
+    #[test]
+    fn acmod_channels_short_frame_is_none() {
+        // Fewer than 8 bytes cannot carry the BSI bits → None (caller falls
+        // back to the IFO-claimed channel count).
+        assert_eq!(acmod_channels(&[0x0B, 0x77, 0, 0, 0, 8 << 3]), None);
+        assert_eq!(acmod_channels(&[]), None);
+    }
+
+    #[test]
+    fn acmod_channels_eac3_is_none() {
+        // E-AC-3 (bsid >= 11) uses a different BSI layout; acmod_channels
+        // declines so the caller keeps the passed count.
+        let mut data = make_bsi(2, false);
+        data[5] = 16 << 3; // bsid = 16 (E-AC-3)
+        assert_eq!(acmod_channels(&data), None);
+    }
+
+    #[test]
+    fn acmod_channels_parses_real_built_frame() {
+        // A frame built by make_ac3_frame (fscod/frmsizecod set, acmod bits 0)
+        // decodes acmod=0 → 2 channels (dual mono), confirming the cursor lands
+        // on the right bytes for a fully-formed frame, not just a stub header.
+        let frame = make_ac3_frame(0, 2);
+        // make_ac3_frame leaves byte 6 = 0 → acmod=0, lfeon=0 → 2 channels.
+        assert_eq!(acmod_channels(&frame), Some(2));
     }
 
     // helper: PES with a generic pts for E-AC-3 tests

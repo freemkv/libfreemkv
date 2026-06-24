@@ -419,6 +419,11 @@ pub const CODEC_ID: u32 = 0x86;
 pub const CODEC_PRIVATE: u32 = 0x63A2;
 pub const TRACK_NAME: u32 = 0x536E;
 pub const DEFAULT_DURATION: u32 = 0x23_E383;
+/// DefaultDecodedFieldDuration — nanoseconds per FIELD (half a frame for
+/// interlaced content). Emitting it on an interlaced track tells a reader the
+/// field rate so it stops halving the frame rate (Windows shell shows 12.5 fps
+/// for a 25 fps 576i stream without it). RFC 9559 / Matroska v4.
+pub const DEFAULT_DECODED_FIELD_DURATION: u32 = 0x23_4E7A;
 
 // Video
 pub const VIDEO: u32 = 0xE0;
@@ -434,6 +439,10 @@ pub const INTERLACED_PROGRESSIVE: u64 = 2;
 // NTSC DVD (480i) and HD (1080i) are top-field-first; PAL DVD (576i) is
 // bottom-field-first. 0xFF is our sentinel for "undetermined / omit".
 pub const FIELD_ORDER_TFF: u8 = 2;
+// Bottom-field-first. Retained for completeness/round-trip tests; the muxer
+// emits TFF for all DVD/HD interlaced content (DV is the only common BFF
+// source and freemkv does not produce it).
+#[allow(dead_code)]
 pub const FIELD_ORDER_BFF: u8 = 9;
 pub const FIELD_ORDER_UNDETERMINED: u8 = 0xFF;
 pub const DISPLAY_WIDTH: u32 = 0x54B0;
@@ -471,6 +480,18 @@ pub const CUE_TIME: u32 = 0xB3;
 pub const CUE_TRACK_POSITIONS: u32 = 0xB7;
 pub const CUE_TRACK: u32 = 0xF7;
 pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
+
+// Tags — per-track statistics tags. mkvmerge convention: a `BPS` SimpleTag
+// per track carries the bits-per-second so readers (Windows Explorer's MKV
+// property handler) that read the container tag rather than computing from
+// stream size show a bitrate for every track, not just CBR audio.
+pub const TAGS: u32 = 0x1254_C367;
+pub const TAG: u32 = 0x7373;
+pub const TARGETS: u32 = 0x63C0;
+pub const TAG_TRACK_UID: u32 = 0x63C5;
+pub const SIMPLE_TAG: u32 = 0x67C8;
+pub const TAG_NAME: u32 = 0x45A3;
+pub const TAG_STRING: u32 = 0x4487;
 
 // Chapters
 pub const CHAPTERS: u32 = 0x1043_A770;

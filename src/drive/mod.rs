@@ -370,7 +370,7 @@ impl Drive {
     }
 
     /// True when the mounted disc is a DVD (profile family `0x0010..=0x001F`).
-    fn disc_is_dvd(&mut self) -> bool {
+    pub(crate) fn disc_is_dvd(&mut self) -> bool {
         matches!(self.current_profile(), Some(p) if (0x0010..=0x001F).contains(&p))
     }
 
