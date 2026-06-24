@@ -1,11 +1,10 @@
 //! Single source of truth for what to do when a sector read fails.
 //!
-//! Both Pass 1 (`Disc::sweep`) and Pass 2-N (`Disc::patch`) call into
-//! `handle_read_error` after every failed `read_sectors`. The handler
-//! classifies the error, updates the in-flight context (counters,
-//! damage window, retry budgets), and returns a `ReadAction` the caller
-//! dispatches on. Every read goes through the same gate — no path can
-//! silently skip pause/skip/jump/abort logic.
+//! Pass 1 (`Disc::sweep`) calls into `handle_read_error` after every failed
+//! `read_sectors`. The handler classifies the error, updates the in-flight
+//! context (counters, damage window, retry budgets), and returns a
+//! `ReadAction` the caller dispatches on. Pass N patch has its own
+//! `handle_read_failure` in `disc/patch.rs` that does not route here.
 //!
 //! Adding a new error class = add one arm in `handle_read_error`.
 //! Adding new logging on errors = one place.
