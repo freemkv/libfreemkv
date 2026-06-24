@@ -219,6 +219,16 @@ impl ScsiSense {
         self.sense_key == SENSE_KEY_ILLEGAL_REQUEST
     }
 
+    /// `true` for sense `05/6F/03` — MMC "READ OF SCRAMBLED SECTOR WITHOUT
+    /// AUTHENTICATION". The drive is enforcing CSS and the bus-auth read gate
+    /// is not (or no longer) open. Unlike a bare ILLEGAL REQUEST, this is
+    /// positive proof the sector is CSS-scrambled — the CSS crack scan keys on
+    /// it to distinguish "encrypted but locked" from "unreadable", and must
+    /// never collapse it to "unencrypted".
+    pub fn is_css_locked(&self) -> bool {
+        self.sense_key == SENSE_KEY_ILLEGAL_REQUEST && self.asc == 0x6F && self.ascq == 0x03
+    }
+
     /// `true` if `sense_key == ABORTED COMMAND (B)` — transient; one
     /// retry is usually safe.
     pub fn is_aborted_command(&self) -> bool {

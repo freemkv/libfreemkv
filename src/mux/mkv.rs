@@ -36,6 +36,9 @@ pub struct MkvTrack {
     // meaningful when interlaced; `FIELD_ORDER_UNDETERMINED` omits it.
     pub interlaced: bool,
     pub field_order: u8,
+    /// DefaultDecodedFieldDuration (ns per field) for interlaced video — half
+    /// the frame `default_duration_ns`. 0 = omit (progressive / unknown).
+    pub field_duration_ns: u64,
     // Audio-specific
     pub sample_rate: f64,
     pub channels: u8,
@@ -131,16 +134,24 @@ impl MkvTrack {
             colour_primaries: primaries,
             colour_range: range,
             interlaced: v.resolution.is_interlaced(),
-            // PAL DVD (576i) is bottom-field-first; NTSC DVD (480i) is
-            // top-field-first. HD interlaced (1080i) is top-field-first.
-            // Progressive content leaves the field order undetermined.
+            // PAL DVD (576i), NTSC DVD (480i), and HD interlaced (1080i) are
+            // all top-field-first ("almost everything but DV is TFF"). MediaInfo
+            // reads "Top Field First" off the MPEG-2 picture coding extension,
+            // so the container element must agree — emitting BFF here for 576i
+            // (the pre-rc.5.1 value) was a wrong container value that disagreed
+            // with the stream. Progressive content leaves the order undetermined.
             field_order: if v.resolution.is_interlaced() {
-                match v.resolution {
-                    Resolution::R576i => ebml::FIELD_ORDER_BFF,
-                    _ => ebml::FIELD_ORDER_TFF,
-                }
+                ebml::FIELD_ORDER_TFF
             } else {
                 ebml::FIELD_ORDER_UNDETERMINED
+            },
+            // One field is half a frame. For 576i 25 fps (40 ms frame) this is
+            // 20 ms; for 480i 29.97 fps (~33.4 ms frame) ~16.68 ms. Only set on
+            // interlaced tracks with a known frame duration.
+            field_duration_ns: if v.resolution.is_interlaced() && default_duration_ns > 0 {
+                default_duration_ns / 2
+            } else {
+                0
             },
             sample_rate: 0.0,
             channels: 0,
@@ -214,6 +225,7 @@ impl MkvTrack {
             colour_range: 0,
             interlaced: false,
             field_order: ebml::FIELD_ORDER_UNDETERMINED,
+            field_duration_ns: 0,
             sample_rate: sr,
             channels: ch,
             bit_depth: 0,
@@ -249,6 +261,7 @@ impl MkvTrack {
             colour_range: 0,
             interlaced: false,
             field_order: ebml::FIELD_ORDER_UNDETERMINED,
+            field_duration_ns: 0,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -305,6 +318,33 @@ pub struct MkvMuxer<W: Write + Seek> {
     info_offset: u64,
     tracks_offset: u64,
     chapters_offset: Option<u64>,
+    /// Total payload bytes muxed PER TRACK (index = track_idx). Used to emit a
+    /// per-track `BPS` statistics tag (bytes*8/duration) at finalize so Windows
+    /// shows a bitrate for every track, not just CBR audio.
+    track_bytes: Vec<u64>,
+    /// Track UIDs in track order (parallels `track_bytes`), for the BPS Targets.
+    track_uids: Vec<u64>,
+    /// Segment duration in seconds (from `Info`), for the BPS denominator.
+    duration_secs: f64,
+    /// Per-AC-3-audio-track channel-correction state. The DVD IFO audio nibble
+    /// is unreliable, so the channel count written in the track header is
+    /// corrected from the AC-3 bitstream `acmod` of the first frame on the
+    /// track. Each entry records the file offset of the 1-byte Channels value
+    /// (to patch in place) and the IFO-claimed count (to warn on disagreement);
+    /// `corrected` flips once patched so we only act on the first frame.
+    ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup>,
+}
+
+/// Deferred AC-3 channel-count correction: the track header's `Channels` byte
+/// is written up-front from the (unreliable) IFO count; on the first AC-3 frame
+/// for the track the value is rewritten from the bitstream `acmod`.
+struct Ac3ChannelFixup {
+    /// Absolute file offset of the 1-byte Channels value in the Tracks element.
+    value_offset: u64,
+    /// Channel count the IFO claimed (already written at `value_offset`).
+    claimed: u8,
+    /// True once the first frame has been parsed and the value finalised.
+    corrected: bool,
 }
 
 /// TimestampScale: nanoseconds per Matroska timestamp tick. 0.1 ms (100_000 ns).
@@ -645,10 +685,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let tracks_start = writer.stream_position()?;
         let tracks_offset = tracks_start - segment_start;
         let tracks_pos = ebml::start_master(&mut writer, ebml::TRACKS)?;
+        let mut track_uids: Vec<u64> = Vec::with_capacity(tracks.len());
+        let mut ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup> =
+            std::collections::HashMap::new();
         for (i, track) in tracks.iter().enumerate() {
+            let track_uid = (i + 1) as u64 | 0x100_0000;
+            track_uids.push(track_uid);
             let entry_pos = ebml::start_master(&mut writer, ebml::TRACK_ENTRY)?;
             ebml::write_uint(&mut writer, ebml::TRACK_NUMBER, (i + 1) as u64)?;
-            ebml::write_uint(&mut writer, ebml::TRACK_UID, (i + 1) as u64 | 0x100_0000)?;
+            ebml::write_uint(&mut writer, ebml::TRACK_UID, track_uid)?;
             ebml::write_uint(&mut writer, ebml::TRACK_TYPE, track.track_type)?;
             ebml::write_uint(&mut writer, ebml::FLAG_LACING, 0)?;
             ebml::write_string(&mut writer, ebml::CODEC_ID, track.codec_id)?;
@@ -679,6 +724,23 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     &mut writer,
                     ebml::DEFAULT_DURATION,
                     track.default_duration_ns,
+                )?;
+            }
+
+            // DefaultDecodedFieldDuration (one FIELD = half a frame) on
+            // interlaced tracks. Per the Matroska schema it is a DIRECT child
+            // of TrackEntry (NOT inside Video). Without it an interlace-aware
+            // reader (Windows shell) assumes "block = one field" and reports
+            // half the frame rate (12.5 instead of 25 for 576i). DefaultDuration
+            // above stays the full-frame period (40 ms); this is 20 ms.
+            if track.track_type == ebml::TRACK_TYPE_VIDEO
+                && track.interlaced
+                && track.field_duration_ns > 0
+            {
+                ebml::write_uint(
+                    &mut writer,
+                    ebml::DEFAULT_DECODED_FIELD_DURATION,
+                    track.field_duration_ns,
                 )?;
             }
 
@@ -748,7 +810,23 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // Omit Channels when unknown (0) — Matroska defaults it to 1
                 // rather than us fabricating a 6-channel count.
                 if track.channels > 0 {
+                    // Record the offset of the 1-byte Channels value so an AC-3
+                    // track can correct it from the bitstream acmod on its first
+                    // frame (the IFO nibble is unreliable). write_uint emits
+                    // ID(0x9F, 1B) + size(0x81, 1B) + value(1B) for 1..=255, so
+                    // the value byte sits 2 bytes after the element start.
+                    let chan_elem_pos = writer.stream_position()?;
                     ebml::write_uint(&mut writer, ebml::CHANNELS, track.channels as u64)?;
+                    if track.codec_id == ebml::CODEC_AC3 {
+                        ac3_channel_fixups.insert(
+                            i,
+                            Ac3ChannelFixup {
+                                value_offset: chan_elem_pos + 2,
+                                claimed: track.channels,
+                                corrected: false,
+                            },
+                        );
+                    }
                 }
                 if track.bit_depth > 0 {
                     ebml::write_uint(&mut writer, ebml::BIT_DEPTH, track.bit_depth as u64)?;
@@ -803,6 +881,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
             info_offset,
             tracks_offset,
             chapters_offset,
+            track_bytes: vec![0u64; tracks.len()],
+            track_uids,
+            duration_secs,
+            ac3_channel_fixups,
         })
     }
 
@@ -969,6 +1051,42 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         self.frame_count += 1;
 
+        // Per-track byte total for the finalize-time BPS statistics tag.
+        if let Some(b) = self.track_bytes.get_mut(track_idx) {
+            *b += data.len() as u64;
+        }
+
+        // Correct the AC-3 track's Channels element from the bitstream acmod on
+        // the FIRST frame of the track. The DVD IFO audio nibble is unreliable
+        // (it claims 5.1 on a 2.0 stream); the bitstream acmod is authoritative.
+        // Only the first frame triggers it; the byte width is unchanged so the
+        // patch is a single-byte in-place rewrite (then restore position).
+        if let Some(fixup) = self.ac3_channel_fixups.get_mut(&track_idx) {
+            if !fixup.corrected {
+                match super::codec::ac3::acmod_channels(data) {
+                    Some(actual) if actual > 0 => {
+                        if actual != fixup.claimed {
+                            tracing::warn!(
+                                target: "mux",
+                                "AC-3 track {track_idx}: IFO claimed {} channels but bitstream acmod says {}; trusting the bitstream (possible wrong-stream selection)",
+                                fixup.claimed,
+                                actual,
+                            );
+                            let here = self.writer.stream_position()?;
+                            self.writer
+                                .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
+                            self.writer.write_all(&[actual])?;
+                            self.writer.seek(std::io::SeekFrom::Start(here))?;
+                        }
+                        fixup.corrected = true;
+                    }
+                    // Frame too short to carry the BSI bits — keep the passed
+                    // (IFO) value and try again on the next frame.
+                    _ => {}
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1015,6 +1133,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::end_master(&mut self.writer, cues_pos)?;
         }
 
+        // Per-track BPS statistics tags (mkvmerge convention). A reader that
+        // reads the container `BPS` tag (Windows Explorer's MKV property
+        // handler) rather than computing bitrate from stream size shows a
+        // bitrate for EVERY track this way, not just CBR audio.
+        self.write_bps_tags()?;
+
         // Back-patch SeekHead SeekPosition values now that all element offsets are known.
         for fixup in &self.seek_fixups {
             let offset = match fixup.target_id {
@@ -1033,6 +1157,48 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.writer.seek(std::io::SeekFrom::End(0))?;
 
         self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Write a `Tags` master with a per-track `BPS` SimpleTag (bytes*8 /
+    /// duration_secs). Mirrors mkvmerge's per-track statistics tag so readers
+    /// that surface the container tag (Windows Explorer) show a bitrate for
+    /// every track. No-op when the duration is unknown (can't compute a rate)
+    /// or no track carried any bytes.
+    fn write_bps_tags(&mut self) -> io::Result<()> {
+        if self.duration_secs <= 0.0 {
+            return Ok(());
+        }
+        if self.track_bytes.iter().all(|&b| b == 0) {
+            return Ok(());
+        }
+        let tags_pos = ebml::start_master(&mut self.writer, ebml::TAGS)?;
+        // Snapshot to avoid borrowing self across the writer borrow.
+        let entries: Vec<(u64, u64)> = self
+            .track_uids
+            .iter()
+            .zip(self.track_bytes.iter())
+            .map(|(&uid, &bytes)| (uid, bytes))
+            .collect();
+        for (uid, bytes) in entries {
+            if bytes == 0 {
+                continue;
+            }
+            // bits per second = bytes * 8 / duration_secs, rounded to nearest.
+            let bps = ((bytes as f64) * 8.0 / self.duration_secs).round() as u64;
+            let tag_pos = ebml::start_master(&mut self.writer, ebml::TAG)?;
+            // Targets → TagTrackUID (this tag applies to one track).
+            let targets_pos = ebml::start_master(&mut self.writer, ebml::TARGETS)?;
+            ebml::write_uint(&mut self.writer, ebml::TAG_TRACK_UID, uid)?;
+            ebml::end_master(&mut self.writer, targets_pos)?;
+            // SimpleTag(TagName="BPS", TagString="<bps>").
+            let st_pos = ebml::start_master(&mut self.writer, ebml::SIMPLE_TAG)?;
+            ebml::write_string(&mut self.writer, ebml::TAG_NAME, "BPS")?;
+            ebml::write_string(&mut self.writer, ebml::TAG_STRING, &bps.to_string())?;
+            ebml::end_master(&mut self.writer, st_pos)?;
+            ebml::end_master(&mut self.writer, tag_pos)?;
+        }
+        ebml::end_master(&mut self.writer, tags_pos)?;
         Ok(())
     }
 
@@ -1199,6 +1365,7 @@ mod tests {
             colour_range: 0,
             interlaced: false,
             field_order: ebml::FIELD_ORDER_UNDETERMINED,
+            field_duration_ns: 0,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -1226,6 +1393,7 @@ mod tests {
             colour_range: 0,
             interlaced: false,
             field_order: ebml::FIELD_ORDER_UNDETERMINED,
+            field_duration_ns: 0,
             sample_rate: 48000.0,
             channels: 6,
             bit_depth: 0,
@@ -2986,12 +3154,12 @@ mod tests {
 
     #[test]
     fn video_emits_flag_interlaced_and_field_order() {
-        // An interlaced (576i PAL) track must emit FlagInterlaced=1 and
-        // FieldOrder=9 (bottom-field-first). A progressive track must emit
-        // FlagInterlaced=2 and NO FieldOrder.
+        // An interlaced track must emit FlagInterlaced=1 and its FieldOrder
+        // value. A progressive track must emit FlagInterlaced=2 and NO
+        // FieldOrder.
         let mut interlaced = make_video_track();
         interlaced.interlaced = true;
-        interlaced.field_order = ebml::FIELD_ORDER_BFF;
+        interlaced.field_order = ebml::FIELD_ORDER_TFF;
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[interlaced], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
         let fi = find_id(&data, ebml::FLAG_INTERLACED).expect("FlagInterlaced present");
@@ -3004,8 +3172,8 @@ mod tests {
         let fo = find_id(&data, ebml::FIELD_ORDER).expect("FieldOrder present");
         assert_eq!(
             data[fo + 2],
-            ebml::FIELD_ORDER_BFF,
-            "FieldOrder must be 9 (bottom-field-first) for PAL DVD"
+            ebml::FIELD_ORDER_TFF,
+            "FieldOrder value must round-trip through the writer"
         );
 
         // Progressive track: FlagInterlaced=2, no FieldOrder.
@@ -3027,6 +3195,161 @@ mod tests {
         assert!(
             find_id(&data, ebml::FIELD_ORDER).is_none(),
             "no FieldOrder for progressive content"
+        );
+    }
+
+    #[test]
+    fn video_576i_defaults_to_top_field_first() {
+        // PAL 576i must default to TFF (2), not BFF — the container element must
+        // agree with the MPEG-2 stream (MediaInfo reads "Top Field First" off
+        // the picture coding extension). The pre-rc.5.1 BFF(9) was a wrong value.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: Some((16, 9)),
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        assert!(t.interlaced, "576i is interlaced");
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_TFF,
+            "576i must default to top-field-first"
+        );
+    }
+
+    #[test]
+    fn interlaced_576i_emits_default_decoded_field_duration() {
+        // 576i @ 25 fps: DefaultDuration = 40 ms (frame), and
+        // DefaultDecodedFieldDuration = 20 ms (field = half a frame). The field
+        // element stops interlace-aware readers (Windows) halving the frame rate.
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i,
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+        };
+        let t = MkvTrack::video(&v);
+        assert_eq!(t.default_duration_ns, 40_000_000, "frame duration is 40 ms");
+        assert_eq!(t.field_duration_ns, 20_000_000, "field duration is 20 ms");
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        // DefaultDuration (frame) present and = 40 ms.
+        let dd = find_id(&data, ebml::DEFAULT_DURATION).expect("DefaultDuration present");
+        // [id 3B][size 0x84][4-byte value] — 40_000_000 needs 4 bytes.
+        let frame_ns = u32::from_be_bytes([data[dd + 4], data[dd + 5], data[dd + 6], data[dd + 7]]);
+        assert_eq!(frame_ns, 40_000_000, "DefaultDuration is the full frame");
+        // DefaultDecodedFieldDuration present and = 20 ms.
+        let fd =
+            find_id(&data, ebml::DEFAULT_DECODED_FIELD_DURATION).expect("field duration present");
+        let field_ns = u32::from_be_bytes([data[fd + 4], data[fd + 5], data[fd + 6], data[fd + 7]]);
+        assert_eq!(field_ns, 20_000_000, "field duration is half the frame");
+    }
+
+    #[test]
+    fn progressive_video_omits_field_duration() {
+        // A progressive track must NOT carry DefaultDecodedFieldDuration.
+        let t = make_video_track(); // progressive
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::DEFAULT_DECODED_FIELD_DURATION).is_none(),
+            "no field duration for progressive content"
+        );
+    }
+
+    #[test]
+    fn finalize_emits_per_track_bps_tags() {
+        // At finalize a Tags master with a per-track BPS SimpleTag is written.
+        // BPS = bytes*8/duration_secs. With a 10 s duration and a video frame of
+        // 1000 bytes, video BPS = 1000*8/10 = 800.
+        let tracks = [make_video_track(), make_audio_track()];
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &tracks, None, 10.0, &[]).unwrap();
+        // Video keyframe 1000 bytes; audio frame 500 bytes.
+        muxer
+            .write_frame(0, 0, true, &vec![0xABu8; 1000], None)
+            .unwrap();
+        muxer
+            .write_frame(1, 0, false, &vec![0xCDu8; 500], None)
+            .unwrap();
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // The Tags master must be present as a top-level Segment child.
+        let children = segment_children(&data);
+        assert!(
+            children.iter().any(|(id, _, _)| *id == ebml::TAGS),
+            "Tags element must be written at finalize"
+        );
+        // The BPS values must appear as TagString text. Video: 800, Audio: 400.
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.contains("BPS"), "BPS TagName must be present");
+        assert!(
+            text.contains("800"),
+            "video BPS (1000*8/10) must be present"
+        );
+        assert!(text.contains("400"), "audio BPS (500*8/10) must be present");
+    }
+
+    #[test]
+    fn no_bps_tags_when_duration_unknown() {
+        // With duration 0 (unknown) the BPS rate can't be computed; no Tags.
+        let tracks = [make_video_track()];
+        let frames = vec![(0usize, 0i64, true, vec![0xABu8; 1000])];
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let children = segment_children(&data);
+        assert!(
+            !children.iter().any(|(id, _, _)| *id == ebml::TAGS),
+            "no Tags element when duration is unknown"
+        );
+    }
+
+    #[test]
+    fn ac3_channels_corrected_from_bitstream_acmod() {
+        // The audio track header claims 6 channels (IFO 5.1), but the AC-3
+        // bitstream's first frame has acmod=2 (2.0 stereo). The Channels element
+        // must be rewritten to 2 from the bitstream, not left at the IFO's 6.
+        let mut audio = make_audio_track(); // codec A_AC3, channels = 6
+        audio.channels = 6;
+        let video = make_video_track();
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &[video, audio], None, 0.0, &[]).unwrap();
+        // A minimal AC-3 BSI with acmod=2 (2/0 stereo), no LFE → 2 channels.
+        // byte5 = bsid 8 (legacy AC-3). byte6: acmod(010) | dsurmod(00) |
+        // lfeon(0) = 0b0100_0000 = 0x40. acmod_channels only needs >= 8 bytes.
+        let ac3 = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 8 << 3, 0x40, 0x00];
+        // Open a cluster with a video keyframe first (cluster invariant).
+        muxer.write_frame(0, 0, true, &[0x01, 0x02], None).unwrap();
+        muxer.write_frame(1, 0, false, &ac3, None).unwrap();
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // Locate the Channels element (0x9F) WITHIN the Tracks body (so a stray
+        // 0x9F in cluster/AC-3 payload can't be mistaken for the element) and
+        // assert the value byte is 2.
+        let (tracks_start, tracks_size) = segment_children(&data)
+            .into_iter()
+            .find_map(|(id, off, sz)| (id == ebml::TRACKS).then_some((off, sz as usize)))
+            .expect("Tracks element present");
+        let tracks_body = &data[tracks_start..tracks_start + tracks_size];
+        let ch = find_id(tracks_body, ebml::CHANNELS).expect("Channels element present");
+        assert_eq!(
+            tracks_body[ch + 2],
+            2,
+            "Channels must be corrected to 2 (bitstream acmod), not 6 (IFO)"
         );
     }
 

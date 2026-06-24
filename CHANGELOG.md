@@ -1,5 +1,81 @@
 # Changelog
 
+## [1.0.0-rc.5.1]
+
+### Fixed
+
+- **CSS reads unlocked on enforcing drives.** CSS-protected DVDs on
+  drives that enforce CSS authentication previously produced an empty MKV
+  at exit 0, or hung indefinitely. The read path now issues the bus-auth
+  handshake (`css::auth::unlock_css_reads`) to unlock scrambled-sector
+  reads before attempting any data transfer, so the drive gates lift
+  correctly.
+- **Keyless title-key recovery always runs.** The Stevenson known-plaintext
+  attack (`css::crack_key` / `src/css/stevenson.rs`) now recovers the
+  title key even when the bus-auth scan detects a CSS drive, removing a
+  code path that fell through to locked reads on certain disc/drive
+  combinations. A wrong key still fails cleanly (confirmed by a sector
+  descramble check) rather than producing silent garbage.
+- **Early bail on undecryptable discs.** When CSS authentication succeeds
+  but no valid title key can be recovered, the mux path now terminates
+  with a clear error code instead of writing an empty (or zero-byte)
+  output file.
+- **DVD audio channel count from AC-3 bitstream.** The audio channel count
+  is now parsed from the AC-3 elementary-stream bitfield rather than from
+  the IFO audio attributes, so the reported channel count always matches the
+  actual muxed audio even when the IFO attribute disagrees. Passthrough only
+  — no downmix is performed. (Selecting the correct audio sub-stream on discs
+  with non-standard ordering is a separate item — see Known issues.)
+- **Interlaced MKV frame rate on Windows.** Interlaced content (576i/480i)
+  now emits a `DefaultDecodedFieldDuration` element in the MKV track
+  header, which Windows Media Foundation and Explorer use to derive the
+  display frame rate. Without it, players reported an incorrect or zero
+  frame rate on interlaced tracks.
+- **Per-track `BPS` bitrate tags populated.** The `BPS` tag is written for
+  each track so players and shell extensions (Windows Explorer, MPC-HC,
+  etc.) can display the per-stream bitrate without reading the full file.
+- **Interlaced field order corrected to TFF.** 576i tracks were written
+  with a bottom-field-first (BFF) container flag that disagreed with the
+  top-field-first order carried in the MPEG-2 stream; the MKV `FieldOrder`
+  element now matches the stream (TFF) so deinterlacers use the correct
+  field parity.
+- **DVD first-play menu no longer prepended to the feature.** The title
+  VOBS base sector was read from the VTS menu-VOBS pointer (`vtsm_vobs`,
+  offset 0xC0) instead of the title-VOBS pointer (`vtstt_vobs`, 0xC4), so on
+  a disc that authors a per-title menu the entire menu VOB — e.g. a studio
+  first-play "the parental level has been set, press yes" prompt — was
+  prepended to the movie and every cell extent shifted back. The rip now
+  opens on the feature's first frame.
+
+### Changed
+
+- **AACS handshake skipped on DVDs.** The AACS authentication sequence is
+  no longer attempted on DVD discs (it never applied to CSS-encrypted
+  media); attempting it on a DVD drive was a no-op at best and surfaced
+  spurious errors at worst.
+
+### Added
+
+- **Structured disc diagnostics at `--log-level 3`.** A new diagnostic
+  pass emits structured log events at INFO level when the log level is 3
+  or higher: DVD PGC/cell layout and IFO video/audio attributes; BD/UHD
+  playlist, clip, and AACS metadata. Provides a single-command snapshot
+  for diagnosing mux or authentication issues without instrumenting the
+  source.
+- **Reduced per-operation log spam.** Mux-read and seek operations are
+  demoted to TRACE (were DEBUG); benign navigation-packet drops are
+  summarized as a single counter at the end of the title rather than
+  logged per-packet.
+
+### Known issues
+
+- **Wrong audio track on discs with non-standard substream ordering.**
+  Audio sub-stream ids are assigned by per-codec ordinal rather than read
+  from the IFO/PGC stream-number table, so a disc whose physical substream
+  order diverges from the convention may select the wrong audio track
+  (e.g. a 2.0 stream in place of 5.1). Diagnose with
+  `freemkv info disc://… --log-level 3`; fix tracked for the next release.
+
 ## [1.0.0-rc.4.2]
 
 ### Fixed

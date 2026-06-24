@@ -101,6 +101,13 @@ pub(crate) struct WritebackFile {
     file: File,
     pipeline: WritebackPipeline,
     pos: u64,
+    /// Count of position-moving seeks (for the finalize summary). The MKV muxer
+    /// seeks back occasionally (cluster size patching, Cues, Segment header
+    /// backpatch); the per-seek DEBUG line is trace-level now, and this rolls
+    /// the total into one finalize summary.
+    seek_count: u64,
+    /// Sum of |delta| over all position-moving seeks, in bytes.
+    seek_bytes: u64,
 }
 
 impl WritebackFile {
@@ -115,6 +122,8 @@ impl WritebackFile {
             file,
             pipeline,
             pos,
+            seek_count: 0,
+            seek_bytes: 0,
         })
     }
 
@@ -176,6 +185,14 @@ impl WritebackFile {
     /// then external commit/DB update) must not treat `Ok(())` as a
     /// durability barrier.
     pub(crate) fn sync_all(&mut self) -> io::Result<()> {
+        if self.seek_count > 0 {
+            tracing::debug!(
+                target: "mux",
+                "WritebackFile finalize: {} seeks, {} bytes seeked total",
+                self.seek_count,
+                self.seek_bytes
+            );
+        }
         self.pipeline.finalize();
         platform::durable_sync(&self.file)
     }
@@ -219,10 +236,14 @@ impl Seek for WritebackFile {
             let from_pos = self.pos;
             let to_pos = p;
             let delta: i64 = (to_pos as i64).wrapping_sub(from_pos as i64);
-            tracing::debug!(
+            // Per-seek detail is trace-level (L4) — benign and high-frequency.
+            // The aggregate (count + total bytes) is logged once at finalize.
+            tracing::trace!(
                 target: "mux",
                 "WritebackFile seek from={from_pos} to={to_pos} delta={delta}"
             );
+            self.seek_count += 1;
+            self.seek_bytes += delta.unsigned_abs();
             self.pipeline.handle_seek(p);
             self.pos = p;
         }

@@ -89,6 +89,7 @@ pub mod aacs;
 pub(crate) mod clpi;
 pub mod css;
 pub mod decrypt;
+pub mod diag;
 pub mod disc;
 pub mod drive;
 pub mod error;

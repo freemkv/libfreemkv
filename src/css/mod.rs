@@ -22,6 +22,13 @@ pub(crate) mod tables;
 use crate::disc::Extent;
 use crate::sector::SectorSource;
 
+/// Consecutive CSS-locked (`05/6F/03`) reads before the crack scan early-bails.
+/// The bus-auth read gate is global (all-or-nothing), so a run this long means
+/// it is shut and nothing here is crackable — bail instead of grinding the full
+/// 50_000-sector budget (which is what made rc5 appear to hang on a wedged USB
+/// bridge). The counter resets to 0 on any readable batch.
+const CSS_LOCKED_BAIL: u32 = 64;
+
 /// CSS decryption state for a DVD title.
 #[derive(Debug, Clone)]
 pub struct CssState {
@@ -105,7 +112,7 @@ pub fn crack_key_outcome(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> CrackOutcome {
-    crack_key_scan(reader, extents, batch_sectors, halt)
+    crack_key_scan(reader, extents, batch_sectors, halt, true)
 }
 
 /// [`crack_key`] with an optional cooperative-cancellation token.
@@ -122,7 +129,7 @@ pub fn crack_key_halt(
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
 ) -> Option<CssState> {
-    crack_key_scan(reader, extents, batch_sectors, halt).into_state()
+    crack_key_scan(reader, extents, batch_sectors, halt, false).into_state()
 }
 
 /// The crack scan, returning the full [`CrackOutcome`]. Tracks a
@@ -134,6 +141,10 @@ fn crack_key_scan(
     extents: &[Extent],
     batch_sectors: u16,
     halt: Option<&crate::halt::Halt>,
+    // True only on the INITIAL scan: a fully CSS-locked (`05/6F/03`) result is a
+    // hard `ScrambledUncracked`. False on the per-VTS re-crack so a lapsed-AGID
+    // locked read returns None instead of killing a genuinely crackable title.
+    fail_on_locked: bool,
 ) -> CrackOutcome {
     // Batch the reads: a live optical drive at 1 sector/read is glacial, and the
     // crack only needs to FIND one scrambled sector whose 0x80 plaintext matches
@@ -161,6 +172,14 @@ fn crack_key_scan(
     // NOT silently treat as unencrypted (which would mux scrambled MPEG as
     // plaintext → garbage at exit 0). See `CrackOutcome::ScrambledUncracked`.
     let mut saw_scrambled = false;
+    // A read rejected with sense `05/6F/03` ("scrambled sector without
+    // authentication") is positive proof of CSS encryption — never collapse it
+    // to "unencrypted". A run of consecutive locked reads means the bus-auth
+    // gate is shut (it is global, so reads are all-or-nothing), so the scan
+    // early-bails. `consecutive_locked` resets on any readable batch, so a
+    // crackable title (gate open) never trips it.
+    let mut saw_locked = false;
+    let mut consecutive_locked = 0u32;
 
     'outer: for (extent_idx, ext) in extents.iter().enumerate() {
         let mut i = 0u32;
@@ -189,6 +208,8 @@ fn crack_key_scan(
             let want = n as usize * 2048;
             match reader.read_sectors(ext.start_lba + i, n as u16, &mut buf[..want], true) {
                 Ok(_) => {
+                    // A readable batch: the gate is open — reset the locked run.
+                    consecutive_locked = 0;
                     for s in 0..n as usize {
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
@@ -206,20 +227,36 @@ fn crack_key_scan(
                         }
                     }
                 }
-                // A failed batch (bad sectors) still counts toward the budget so a
-                // damaged region can't loop forever; skip ahead by the batch.
-                Err(_) => tried += n,
+                // A failed batch still counts toward the budget so a damaged
+                // region can't loop forever. A CSS-locked failure (`05/6F/03`)
+                // proves encryption and, in a long enough run, means the read
+                // gate is shut — track it and early-bail rather than grind.
+                Err(e) => {
+                    tried += n;
+                    if e.scsi_sense().is_some_and(|s| s.is_css_locked()) {
+                        saw_locked = true;
+                        consecutive_locked += 1;
+                        if consecutive_locked >= CSS_LOCKED_BAIL {
+                            break 'outer;
+                        }
+                    } else {
+                        consecutive_locked = 0;
+                    }
+                }
             }
             i += n;
         }
     }
 
-    // Budget exhausted / extents walked with no key recovered. Distinguish the
-    // two indistinguishable-in-`Option` cases: if scrambled sectors were seen
-    // (case b: crack failed; case c: scrambled but the crackable region was
-    // unreadable), this is encrypted-but-uncracked — a hard failure. Only a
-    // scan that NEVER saw a scrambled sector is genuinely unencrypted (case a).
-    if saw_scrambled {
+    // Budget exhausted / extents walked / early-bailed with no key recovered.
+    // The disc is ENCRYPTED-but-uncracked (a hard failure on the initial scan)
+    // when EITHER a scrambled sector was actually seen, OR — on the initial scan
+    // only (`fail_on_locked`) — every read was CSS-locked (`05/6F/03`), itself
+    // proof of scrambling. A re-crack (`fail_on_locked` false) stays soft: a
+    // lapsed-AGID locked read yields None, not a hard fail, so a crackable title
+    // in another VTS isn't killed. Only a scan that saw neither a scrambled
+    // sector nor a CSS-lock is genuinely unencrypted.
+    if saw_scrambled || (saw_locked && fail_on_locked) {
         CrackOutcome::ScrambledUncracked
     } else {
         CrackOutcome::Unencrypted
@@ -309,6 +346,9 @@ mod tests {
         reads: std::cell::RefCell<Vec<u32>>,
         flag_byte: u8,
         fail_all: bool,
+        /// Every read fails with CSS-locked sense `05/6F/03` (drive refusing
+        /// scrambled reads because the bus-auth gate isn't open).
+        lock_all: bool,
     }
 
     impl MockSource {
@@ -317,6 +357,7 @@ mod tests {
                 reads: std::cell::RefCell::new(Vec::new()),
                 flag_byte,
                 fail_all: false,
+                lock_all: false,
             }
         }
     }
@@ -330,6 +371,17 @@ mod tests {
             _recovery: bool,
         ) -> Result<usize> {
             self.reads.borrow_mut().push(lba);
+            if self.lock_all {
+                return Err(Error::DiscRead {
+                    sector: lba as u64,
+                    status: Some(2),
+                    sense: Some(crate::scsi::ScsiSense {
+                        sense_key: 0x05,
+                        asc: 0x6F,
+                        ascq: 0x03,
+                    }),
+                });
+            }
             if self.fail_all {
                 return Err(Error::DecryptFailed);
             }
@@ -430,6 +482,60 @@ mod tests {
         assert!(
             matches!(outcome, CrackOutcome::Unencrypted),
             "no readable scrambled sector → Unencrypted, got {outcome:?}"
+        );
+    }
+
+    /// Fix C (rc.5.1): on the INITIAL scan, a drive that refuses every read with
+    /// CSS-locked sense (`05/6F/03`) is encrypted-but-locked →
+    /// `ScrambledUncracked` (a hard failure), NOT `Unencrypted`. This is the
+    /// rc4.3 bug: every VOB read came back `6F/03`, so the scan saw no scrambled
+    /// sector and wrongly declared the disc unencrypted → 19 KB garbage.
+    #[test]
+    fn crack_outcome_css_locked_initial_is_scrambled_uncracked() {
+        let mut src = MockSource::new(0x30);
+        src.lock_all = true; // every read → 05/6F/03
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 100,
+        }];
+        let outcome = crack_key_outcome(&mut src, &extents, 1, None);
+        assert!(
+            outcome.is_scrambled_uncracked(),
+            "every read 6F/03 on the initial scan → ScrambledUncracked, got {outcome:?}"
+        );
+    }
+
+    /// MISSING #1 guard: the re-crack path (the `Option`-returning `crack_key`,
+    /// `fail_on_locked == false`) must NOT hard-fail on a CSS-locked read — it
+    /// returns `None`. A lapsed-AGID re-crack of another VTS stays soft so a
+    /// genuinely crackable title isn't killed by a transient locked read.
+    #[test]
+    fn crack_key_recrack_locked_is_none_not_hard_fail() {
+        let mut src = MockSource::new(0x30);
+        src.lock_all = true;
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 100,
+        }];
+        assert!(crack_key(&mut src, &extents, 1).is_none());
+    }
+
+    /// Fix F: a fully CSS-locked scan early-bails near `CSS_LOCKED_BAIL`
+    /// consecutive locked reads instead of grinding the whole 50_000-sector
+    /// budget (the rc5 "stuck Scanning…" hang on a wedged bridge).
+    #[test]
+    fn crack_css_locked_scan_early_bails() {
+        let mut src = MockSource::new(0x30);
+        src.lock_all = true;
+        let extents = [Extent {
+            start_lba: 0,
+            sector_count: 10_000,
+        }];
+        let _ = crack_key_outcome(&mut src, &extents, 1, None);
+        let n = src.reads.borrow().len();
+        assert!(
+            n <= (CSS_LOCKED_BAIL as usize) + 1,
+            "locked scan early-bails near {CSS_LOCKED_BAIL}, not 10000; read {n}"
         );
     }
 

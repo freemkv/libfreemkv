@@ -24,6 +24,9 @@ const PROGRAM_END_ID: u8 = 0xB9;
 
 /// Private stream 1 (AC3, DTS, LPCM, subtitles).
 const PRIVATE_STREAM_1: u8 = 0xBD;
+/// Private stream 2 (0xBF) — DVD navigation (PCI/DSI). Carries no muxable
+/// elementary stream; expected to be dropped on every disc.
+const PRIVATE_STREAM_2: u8 = 0xBF;
 
 /// Hard cap on the demuxer's reassembly buffer. A length-0 (unbounded) video
 /// PES is delimited by the next PS-layer boundary; if a corrupt stream declares
@@ -107,6 +110,16 @@ impl PsPacket {
             }
             _ => None,
         }
+    }
+
+    /// Whether this is a DVD navigation packet (private_stream_2, 0xBF —
+    /// PCI/DSI). These carry no muxable elementary stream and are EXPECTED to
+    /// be dropped on every DVD, so a per-packet WARN is noise: the mux loops
+    /// count them and emit one finalize summary instead. A `dvd_pid()` of
+    /// `None` for any OTHER stream_id is unexpected (a possibly-dropped real
+    /// stream) and stays an individual WARN.
+    pub fn is_nav(&self) -> bool {
+        self.stream_id == PRIVATE_STREAM_2
     }
 }
 

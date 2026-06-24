@@ -20,6 +20,10 @@ impl Disc {
         let mut title_number: u16 = 0;
 
         for ts in &dvd_info.title_sets {
+            // Diagnostic dump (--log-level 3): IFO video/audio attrs for this
+            // title set. No-op unless the freemkv::diag target is enabled.
+            crate::diag::dump_dvd_attrs(ts);
+
             let video_stream = Stream::Video(VideoStream {
                 pid: 0xE0, // DVD video PID (standard MPEG PS video stream)
                 codec: ts.video.codec,
@@ -82,9 +86,36 @@ impl Disc {
             for dvd_title in &ts.titles {
                 title_number += 1;
 
+                // Diagnostic dump (--log-level 3): per-cell category table +
+                // chapter map for this title, BEFORE lowering drops the
+                // per-cell IFO detail. No-op unless freemkv::diag is enabled.
+                crate::diag::dump_dvd_cells(ts.vts_number, title_number, dvd_title);
+
+                // Bug-4 leading-cell filter: drop any leading scene-index /
+                // interleaved-angle sub-block cells so the feature starts at the
+                // movie. Conservative — `feature_start_cell` only ever skips a
+                // prefix of secondary-block cells and never truncates a normal
+                // feature (category 0x00 on cell 0 → no-op). See
+                // `ifo::DvdTitle::feature_start_cell`.
+                let feature_start = dvd_title.feature_start_cell();
+                let dropped_secs: f64 = dvd_title.cells[..feature_start]
+                    .iter()
+                    .map(|c| c.duration_secs)
+                    .sum();
+                if feature_start > 0 {
+                    tracing::debug!(
+                        target: "freemkv::scan",
+                        vts = ts.vts_number,
+                        title = title_number,
+                        dropped_cells = feature_start,
+                        dropped_secs,
+                        "dvd: dropped leading non-feature cell(s)"
+                    );
+                }
+
                 // Build extents from cell sector ranges (absolute = vob_start + cell offset)
                 let extents: Vec<Extent> = dvd_title
-                    .cells
+                    .feature_cells()
                     .iter()
                     .map(|cell| {
                         let start = ts.vob_start_sector.saturating_add(cell.first_sector);
@@ -133,12 +164,16 @@ impl Disc {
                 streams.extend(audio_streams.iter().cloned());
                 streams.extend(subtitle_streams);
 
+                // Chapter times are absolute from the PGC start. When leading
+                // cells are dropped the muxed video shifts earlier by exactly
+                // their total duration, so shift the chapter marks too (clamping
+                // any that fell inside the dropped head to 0).
                 let chapters: Vec<Chapter> = dvd_title
                     .chapter_times
                     .iter()
                     .enumerate()
                     .map(|(i, &t)| Chapter {
-                        time_secs: t,
+                        time_secs: (t - dropped_secs).max(0.0),
                         name: chapter_name(i),
                     })
                     .collect();
@@ -342,16 +377,25 @@ mod tests {
         d
     }
 
-    /// Cell playback info entry (24 bytes): BCD time@4..8 (unused here),
+    /// Cell playback info entry (24 bytes): category byte@0, BCD time@4..8,
     /// first_sector(u32 BE)@8, last_sector(u32 BE)@20.
     fn write_cell(buf: &mut [u8], off: usize, first_sector: u32, last_sector: u32) {
         buf[off + 8..off + 12].copy_from_slice(&first_sector.to_be_bytes());
         buf[off + 20..off + 24].copy_from_slice(&last_sector.to_be_bytes());
     }
 
+    /// Like [`write_cell`] but also stamps the cell-category byte (`+0`) so a
+    /// test can build a leading scene-index / interleaved-angle sub-block cell.
+    fn write_cell_cat(buf: &mut [u8], off: usize, first: u32, last: u32, category: u8) {
+        write_cell(buf, off, first, last);
+        buf[off] = category;
+    }
+
     /// Build a VTS_XX_0.IFO. Layout per ifo.rs:
     ///   magic "DVDVIDEO-VTS"@0
-    ///   vob_start_sector(u32 BE)@0xC0
+    ///   vtstt_vobs (Title VOBS start sector, u32 BE)@0xC4 — the production
+    ///     `vob_start_sector` the cell sectors are relative to. (0xC0 is
+    ///     `vtsm_vobs`, the menu VOBS, which the scan must NOT use.)
     ///   VTS_PGCIT sector ptr(u32 BE)@0xCC
     ///   video attr byte@0x200
     ///   num_audio(u16 BE)@0x202, audio blocks (8B) @0x204
@@ -377,7 +421,7 @@ mod tests {
         let pgcit_sector = 2u32;
         let mut d = vec![0u8; 4 * 2048];
         d[0..12].copy_from_slice(b"DVDVIDEO-VTS");
-        d[0xC0..0xC4].copy_from_slice(&vob_start.to_be_bytes());
+        d[0xC4..0xC8].copy_from_slice(&vob_start.to_be_bytes()); // vtstt_vobs (Title VOBS)
         d[0xCC..0xD0].copy_from_slice(&pgcit_sector.to_be_bytes());
         d[0x200] = video_b0;
         d[0x202..0x204].copy_from_slice(&(audio.len() as u16).to_be_bytes());
@@ -491,6 +535,56 @@ mod tests {
         assert_eq!(t.playlist, "VTS_01_1.VOB");
         assert_eq!(t.playlist_id, 1);
         assert_eq!(t.content_format, ContentFormat::MpegPs);
+    }
+
+    /// Regression (first-play menu prepended to the feature): `vob_start` must
+    /// come from the **Title** VOBS pointer `vtstt_vobs` (VTS_IFO 0xC4), NOT the
+    /// **menu** VOBS pointer `vtsm_vobs` (0xC0). On discs with a per-title menu
+    /// — e.g. the Universal "the parental level has been set, press yes"
+    /// first-play still — `vtsm_vobs` points at that menu VOB, which sits just
+    /// before the title VOB. Cell `first_sector` values are relative to
+    /// `vtstt_vobs`; reading 0xC0 prepended the menu and shifted every extent
+    /// back by `vtstt_vobs - vtsm_vobs`, so the rip opened on the parental
+    /// prompt instead of the movie (Greenland NTSC R1: vtsm=44, vtstt=3640).
+    ///
+    /// Here `build_vts` stamps `vtstt_vobs = 3640` (0xC4); we additionally stamp
+    /// a *different* `vtsm_vobs = 44` (0xC0). The extent must resolve from 3640.
+    #[test]
+    fn scan_dvd_titles_uses_title_vobs_not_menu_vobs() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        // vtstt_vobs (title) = 3640; cell 0 first_sector = 0.
+        let mut vts = build_vts(3640, 0x00, &[], &[], &[(0, 99)], false);
+        // Stamp a bogus vtsm_vobs (menu) at 0xC0 — the wrong pointer the bug
+        // used. It must be ignored.
+        vts[0xC0..0xC4].copy_from_slice(&44u32.to_be_bytes());
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let titles = Disc::scan_dvd_titles(&mut disc, &udf);
+        assert_eq!(titles.len(), 1);
+        let t = &titles[0];
+        assert_eq!(t.extents.len(), 1);
+        // Title VOBS (3640) + cell first_sector (0) = 3640 — NOT the menu 44.
+        assert_eq!(
+            t.extents[0].start_lba, 3640,
+            "extent must start at vtstt_vobs (0xC4), not vtsm_vobs (0xC0)"
+        );
+        assert_ne!(t.extents[0].start_lba, 44, "must not use the menu VOBS");
     }
 
     /// Multi-cell title: extents preserve cell order and each maps to its
@@ -824,5 +918,144 @@ mod tests {
         // first program). Name is the ordinal from chapter_name(0).
         assert_eq!(t.chapters.len(), 1);
         assert_eq!(t.chapters[0].name, chapter_name(0));
+    }
+
+    /// Build a VTS with explicit per-cell category bytes and an N-program map.
+    /// Returns the IFO bytes. Cells: `(first, last, category, dur_secs)`.
+    fn build_vts_cells(
+        vob_start: u32,
+        video_b0: u8,
+        cells: &[(u32, u32, u8, u8 /*BCD seconds*/)],
+        program_first_cells: &[u8],
+    ) -> Vec<u8> {
+        let pgcit_sector = 2u32;
+        let mut d = vec![0u8; 4 * 2048];
+        d[0..12].copy_from_slice(b"DVDVIDEO-VTS");
+        d[0xC4..0xC8].copy_from_slice(&vob_start.to_be_bytes()); // vtstt_vobs (Title VOBS)
+        d[0xCC..0xD0].copy_from_slice(&pgcit_sector.to_be_bytes());
+        d[0x200] = video_b0;
+        // no audio / subs
+        let pg = pgcit_sector as usize * 2048;
+        d[pg..pg + 2].copy_from_slice(&1u16.to_be_bytes());
+        let pgc_rel: u32 = 0x100;
+        d[pg + 8 + 4..pg + 8 + 8].copy_from_slice(&pgc_rel.to_be_bytes());
+        let pgc = pg + pgc_rel as usize;
+        d[pgc + 0x02] = program_first_cells.len() as u8; // nr_of_programs
+        d[pgc + 0x03] = cells.len() as u8; // nr_of_cells
+        // Leave PGC-level BCD time zero → duration recomputed from cells.
+        let cell_tbl_rel: u16 = 0xF0;
+        let pgm_map_rel: u16 = 0xEC;
+        d[pgc + 0xE6..pgc + 0xE8].copy_from_slice(&pgm_map_rel.to_be_bytes());
+        d[pgc + 0xE8..pgc + 0xEA].copy_from_slice(&cell_tbl_rel.to_be_bytes());
+        for (i, &fc) in program_first_cells.iter().enumerate() {
+            d[pgc + pgm_map_rel as usize + i] = fc;
+        }
+        let cell_base = pgc + cell_tbl_rel as usize;
+        for (i, (first, last, cat, secs)) in cells.iter().enumerate() {
+            let off = cell_base + i * 24;
+            write_cell_cat(&mut d, off, *first, *last, *cat);
+            d[off + 6] = *secs; // BCD seconds in the cell time field
+        }
+        d
+    }
+
+    /// End-to-end bug-4 fix: a feature PGC that opens with a leading
+    /// interleaved-angle sub-block cell (category 0x80 = middle-of-angle-block)
+    /// must have that cell DROPPED from the muxed extents, so the rip starts at
+    /// the real feature. Chapters shift earlier by the dropped duration.
+    #[test]
+    fn scan_dvd_titles_drops_leading_scene_index_cell() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(2, 1, 1)]);
+        // Cell 0: leading scene-index/angle sub-block (cat 0x80), 5s, sectors 0..9.
+        // Cell 1: feature start (cat 0x00), 59s, sectors 100..199.
+        // Cell 2: feature (cat 0x00), 59s, sectors 300..399.
+        // Programs: prog0 → cell 1 (feature start), prog1 → cell 3.
+        let vts = build_vts_cells(
+            1000,
+            0x00,
+            &[
+                (0, 9, 0x80, 0x05),
+                (100, 199, 0x00, 0x59),
+                (300, 399, 0x00, 0x59),
+            ],
+            &[1, 3],
+        );
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        // The leading 0x80 cell is dropped: 2 feature extents, not 3.
+        assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
+        // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
+        assert_eq!(t.extents[0].start_lba, 1000 + 100);
+        assert_eq!(t.extents[1].start_lba, 1000 + 300);
+        // Chapter times shift earlier by the dropped 5s. Program 0 was at the
+        // dropped head (clamped to 0); program 1 was at cell 3 =
+        // dur(cell0)+dur(cell1) = 5 + 59 = 64s, now 59s after the 5s shift.
+        assert_eq!(t.chapters.len(), 2);
+        assert!(
+            (t.chapters[0].time_secs - 0.0).abs() < 0.01,
+            "ch0 clamped to 0, got {}",
+            t.chapters[0].time_secs
+        );
+        assert!(
+            (t.chapters[1].time_secs - 59.0).abs() < 0.01,
+            "ch1 shifted by dropped 5s → 59s, got {}",
+            t.chapters[1].time_secs
+        );
+    }
+
+    /// Conservative guard end-to-end: a normal feature (every cell category
+    /// 0x00) is muxed in full — the filter drops nothing and chapters are
+    /// unshifted. This is the "Silence of the Lambs" case.
+    #[test]
+    fn scan_dvd_titles_plain_feature_untouched() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(2, 1, 1)]);
+        let vts = build_vts_cells(
+            1000,
+            crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_16X9),
+            &[(0, 99, 0x00, 0x30), (200, 299, 0x00, 0x30)],
+            &[1, 2],
+        );
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        // Nothing dropped: both cells become extents, starting at the very head.
+        assert_eq!(t.extents.len(), 2);
+        assert_eq!(t.extents[0].start_lba, 1000); // 1000 + 0, head intact
+        assert_eq!(t.extents[1].start_lba, 1200);
+        // Chapter 0 stays at 0.0 (no shift).
+        assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }
 }
