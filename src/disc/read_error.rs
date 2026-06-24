@@ -199,9 +199,10 @@ impl ReadCtx {
     /// patch loop's whole job is to chip away at bad ranges — being
     /// more eager to skip clustered bad sectors converges faster on
     /// the recoverable good sectors inside a range. The patch-side
-    /// `compute_damage_skip` reads its threshold from
-    /// `PASSN_DAMAGE_THRESHOLD_PCT`; keep the two in sync until the
-    /// patch loop's damage-skip is unified with `handle_read_error`'s
+    /// `compute_damage_skip` reads its threshold directly from
+    /// `PASSN_DAMAGE_THRESHOLD_PCT`, which is an alias for this crate's
+    /// `PATCH_DAMAGE_THRESHOLD_PCT`, so the two are always in sync.
+    /// The patch loop's damage-skip is not yet unified with `handle_read_error`'s
     /// jump path. (v0.20.8 unification attempt found the unification
     /// itself blocked on the size-aware `range_remaining/4` cap that
     /// lives in `compute_damage_skip` but not in
