@@ -87,27 +87,6 @@ fn handle_header(
     true
 }
 
-/// Re-assert the active header `cur` into `prefix` (raw Annex B bytes) at every
-/// keyframe (RAP) so the RAP is SELF-CONTAINED. Skipped only when this AU already
-/// emitted the header in-band (`emitted`) or no active header exists yet.
-///
-/// Unconditional (not only when the active differs from codecPrivate): SMPTE 421M
-/// requires seq_header + entry_point before every RAP. A decoder applies the
-/// codecPrivate copy once at init, then relies on in-band repetition; if a source
-/// stops repeating an (unchanged) header at later RAPs and the decoder drops it,
-/// nothing re-sends it and seeks/segments land with wrong decoder state. Re-asserting
-/// at every RAP — what compliant muxers do — makes decode self-healing. Re-sending
-/// an identical header is benign. This strictly supersets the change-only re-assert.
-fn reassert_active(prefix: &mut Vec<u8>, cur: &Option<Vec<u8>>, emitted: bool) {
-    if emitted {
-        return;
-    }
-    let Some(active) = cur.as_deref() else {
-        return;
-    };
-    prefix.extend_from_slice(active);
-}
-
 impl CodecParser for Vc1Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         if pes.data.is_empty() {
@@ -122,13 +101,13 @@ impl CodecParser for Vc1Parser {
         let mut has_seq_header = false;
         let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
-        // Track whether this AU already emitted each header in-band (a
-        // redefinition vs the active value).
-        let mut emitted_seq = false;
-        let mut emitted_ep = false;
-        // In-band prefix: changed/new seq_header and/or entry_point units that
-        // must appear before the SC_FRAME data in the MKV block.
-        let mut prefix: Vec<u8> = Vec::new();
+        // Track whether this AU carried a redefined (in-band) copy of each
+        // header type.  These are collected into separate temporaries so the
+        // final keyframe prefix can be assembled in the canonical SMPTE 421M
+        // order (seq_header then entry_point) regardless of bitstream scan
+        // order.
+        let mut redefined_seq: Option<Vec<u8>> = None;
+        let mut redefined_ep: Option<Vec<u8>> = None;
 
         // Scan for start codes (00 00 01 XX)
         let data = &pes.data;
@@ -147,22 +126,32 @@ impl CodecParser for Vc1Parser {
                                 self.height = h;
                             }
                         }
-                        emitted_seq |= handle_header(
+                        // Collect into a scratch Vec so handle_header can
+                        // append; we discard the Vec and only keep the flag.
+                        let mut scratch = Vec::new();
+                        let changed = handle_header(
                             &mut self.seq_header,
                             &mut self.cur_seq_header,
                             sh,
-                            &mut prefix,
+                            &mut scratch,
                         );
+                        if changed {
+                            redefined_seq = Some(scratch);
+                        }
                         has_seq_header = true;
                     }
                     SC_ENTRY_POINT => {
                         let end = find_next_sc(data, i + 4).unwrap_or(data.len());
-                        emitted_ep |= handle_header(
+                        let mut scratch = Vec::new();
+                        let changed = handle_header(
                             &mut self.entry_point,
                             &mut self.cur_entry_point,
                             &data[i..end],
-                            &mut prefix,
+                            &mut scratch,
                         );
+                        if changed {
+                            redefined_ep = Some(scratch);
+                        }
                         has_entry_point = true;
                     }
                     SC_FRAME => {
@@ -182,14 +171,49 @@ impl CodecParser for Vc1Parser {
         // Keyframe = this PES contains a sequence header (I-frame indicator in BD)
         let keyframe = has_seq_header;
 
-        // At every keyframe (RAP), re-assert the active seq_header + entry_point
-        // in-band (even when unchanged vs codecPrivate) so the RAP is
-        // self-contained. SMPTE 421M requires seq+entry before every RAP; a
-        // decoder that dropped them recovers, and seeks land with correct state.
-        // Skipped per-header only when this AU already emitted it in-band.
+        // Build the in-band prefix in the canonical SMPTE 421M order:
+        //   sequence_header (0x0F) THEN entry_point (0x0E).
+        //
+        // For each header type, use the in-band-redefined body when the AU
+        // carried a change; otherwise re-assert the active body (unchanged
+        // repeat) so every RAP is self-contained.  At non-keyframes only
+        // genuine redefinitions are emitted.
+        //
+        // Assembling into separate seq/ep slots and concatenating in fixed
+        // order avoids the ordering hazard that arose when the scan loop
+        // appended headers in bitstream order and reassert() later appended
+        // to whatever was already there: if seq was unchanged (stripped) but
+        // entry_point was redefined (appended), the old code would produce
+        // [entry_point] then reassert seq AFTER it → [entry_point,
+        // seq_header], inverting the required order.
+        let mut prefix: Vec<u8> = Vec::new();
         if keyframe {
-            reassert_active(&mut prefix, &self.cur_seq_header, emitted_seq);
-            reassert_active(&mut prefix, &self.cur_entry_point, emitted_ep);
+            // seq_header slot: prefer the in-band-redefined body, else active.
+            match redefined_seq {
+                Some(body) => prefix.extend_from_slice(&body),
+                None => {
+                    if let Some(active) = self.cur_seq_header.as_deref() {
+                        prefix.extend_from_slice(active);
+                    }
+                }
+            }
+            // entry_point slot: prefer the in-band-redefined body, else active.
+            match redefined_ep {
+                Some(body) => prefix.extend_from_slice(&body),
+                None => {
+                    if let Some(active) = self.cur_entry_point.as_deref() {
+                        prefix.extend_from_slice(active);
+                    }
+                }
+            }
+        } else {
+            // Non-keyframe: only genuine redefinitions go into the prefix.
+            if let Some(body) = redefined_seq {
+                prefix.extend_from_slice(&body);
+            }
+            if let Some(body) = redefined_ep {
+                prefix.extend_from_slice(&body);
+            }
         }
 
         // Assemble frame data: any in-band header changes + picture data from
@@ -971,6 +995,76 @@ mod tests {
         assert!(
             !f3[0].data.windows(ep_a.len()).any(|w| w == ep_a),
             "must not re-assert stale codecPrivate entry_point A"
+        );
+    }
+
+    /// Regression: keyframe where seq_header is UNCHANGED (stripped by scan) but
+    /// entry_point is REDEFINED (changed). Before the fix, the old code appended
+    /// entry_point during the scan, then reassert() appended seq_header AFTER it,
+    /// producing [entry_point, seq_header] — entry_point before seq_header,
+    /// violating SMPTE 421M. After the fix, assembly is always seq-then-entry.
+    #[test]
+    fn vc1_keyframe_prefix_order_seq_unchanged_entry_redefined() {
+        let sh = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB, 0xCC];
+        let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
+        let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
+        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+
+        let mut parser = Vc1Parser::new();
+
+        // AU1: seed codecPrivate (sh + ep_a, both first → stripped, then
+        // re-asserted as active at keyframe in seq-then-entry order).
+        let au1: Vec<u8> = sh
+            .iter()
+            .chain(ep_a.iter())
+            .chain(frame.iter())
+            .cloned()
+            .collect();
+        parser.parse(&make_pes(au1, Some(0)));
+
+        // AU2: keyframe — seq_header UNCHANGED (same bytes as AU1), entry_point
+        // REDEFINED to B. This is the bug trigger: the scan emits ep_b into the
+        // accumulator but strips sh; the keyframe reassert must then prepend sh
+        // BEFORE ep_b, not after.
+        let au2: Vec<u8> = sh
+            .iter()
+            .chain(ep_b.iter())
+            .chain(frame.iter())
+            .cloned()
+            .collect();
+        let f2 = parser.parse(&make_pes(au2, Some(90000)));
+        assert_eq!(f2.len(), 1, "AU2 must emit a frame");
+
+        // Find positions of seq_header and entry_point start codes in the output.
+        let data = &f2[0].data;
+        let seq_pos = data
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER]);
+        let ep_pos = data
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, SC_ENTRY_POINT]);
+        assert!(
+            seq_pos.is_some(),
+            "seq_header must be present in the keyframe prefix"
+        );
+        assert!(
+            ep_pos.is_some(),
+            "entry_point must be present in the keyframe prefix"
+        );
+        assert!(
+            seq_pos.unwrap() < ep_pos.unwrap(),
+            "seq_header (pos {}) must precede entry_point (pos {}) — SMPTE 421M order",
+            seq_pos.unwrap(),
+            ep_pos.unwrap()
+        );
+        // The redefined entry_point body (ep_b) must appear, not the old ep_a.
+        assert!(
+            data.windows(ep_b.len()).any(|w| w == ep_b),
+            "redefined ep_b must be present"
+        );
+        assert!(
+            !data.windows(ep_a.len()).any(|w| w == ep_a),
+            "stale ep_a must not be present"
         );
     }
 
