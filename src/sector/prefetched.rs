@@ -176,6 +176,11 @@ impl PrefetchedSectorSource {
                         return;
                     }
                     let extent = &extents[ext_idx];
+                    // AACS aligned units are anchored at THIS extent's start
+                    // LBA, so tell the decrypt-on-read source to gate relative
+                    // to it (clip-anchored), not absolute disc LBA 0. A no-op
+                    // for non-decrypting / CSS / None sources.
+                    reader.set_unit_base(extent.start_lba);
                     let remaining = extent.sector_count.saturating_sub(offset);
                     if remaining == 0 {
                         ext_idx += 1;

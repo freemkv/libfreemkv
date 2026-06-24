@@ -56,6 +56,17 @@ pub trait SectorSource: Send {
     /// Optional speed control for sources that map to a physical
     /// drive. No-op for everything else.
     fn set_speed(&mut self, _kbs: u16) {}
+
+    /// Set the base LBA an AACS unit-alignment gate measures against — the
+    /// `start_lba` of the extent/clip about to be read. Aligned AACS units
+    /// (6144 B / 3 sectors) are anchored at each clip's encrypted-region start,
+    /// so a decrypt-on-read source gates `lba` relative to this base, not
+    /// absolute disc LBA 0. Mux read paths call this when they advance to a new
+    /// extent. No-op for everything except [`DecryptingSectorSource`], the only
+    /// source that applies the unit-alignment gate.
+    ///
+    /// [`DecryptingSectorSource`]: crate::sector::DecryptingSectorSource
+    fn set_unit_base(&mut self, _lba: u32) {}
 }
 
 // Forwarding impls so `Box<dyn SectorSource>` and `&mut dyn SectorSource`

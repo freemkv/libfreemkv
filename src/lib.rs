@@ -194,7 +194,7 @@ pub use disc::{
     KeyOrigin, LabelPurpose, LabelQualifier, PatchOptions, PatchOutcome, Resolution, SampleRate,
     ScanOptions, Stream, SubtitleStream, SweepOptions, VideoStream, classify_damage,
 };
-pub use keysource::{DiscInputs, KeySource};
+pub use keysource::{DiscInputs, KeySource, read_encrypted_units, resolve_and_apply};
 
 // ─── Streams ────────────────────────────────────────────────────────────────
 //

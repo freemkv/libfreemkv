@@ -13,6 +13,26 @@ pub(crate) const AACS_IV: [u8; 16] = [
 /// Size of an AACS aligned unit (3 × 2048-byte sectors).
 pub const ALIGNED_UNIT_LEN: usize = 6144;
 
+/// An AACS aligned unit spans this many 2048-byte sectors (3).
+pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_LEN) as u32;
+
+/// Whether `lba` sits on an AACS aligned-unit boundary, measured **relative to
+/// the encrypted region's base LBA** (`unit_base` = the clip/extent `start_lba`,
+/// NOT absolute disc LBA 0).
+///
+/// AACS aligned units (6144 B / 3 sectors) are anchored at the start of each
+/// clip's encrypted region, so a read must begin a whole number of units past
+/// that base for `decrypt_sectors` (which anchors units at buffer offset 0) to
+/// align the CBC correctly. This is the SINGLE source of truth for the test —
+/// the decrypt-on-read gate, the inline and highway mux read paths, and the
+/// key-validation sample reader all key off this, never absolute `lba % 3`. A
+/// disc whose clip `start_lba` is not itself 3-aligned would otherwise mis-gate
+/// (reject readable units, then report "Decryption failed") on exactly the
+/// titles whose clips land off a 3-boundary.
+pub fn is_unit_aligned(lba: u32, unit_base: u32) -> bool {
+    lba.wrapping_sub(unit_base) % ALIGNED_UNIT_SECTORS == 0
+}
+
 /// Size of one sector.
 const SECTOR_LEN: usize = 2048;
 
