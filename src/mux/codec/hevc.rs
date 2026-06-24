@@ -61,8 +61,8 @@ pub struct HevcParser {
     // Splice-aware CRA→BLA rewrite (non-seamless BD clip boundaries).
     //
     // When a BD title concatenates clips at a NON-SEAMLESS join (MPLS
-    // connection_condition 0x01), the next clip opens with a CRA whose RASL
-    // leading pictures reference frames from before the splice — gone after
+    // connection_condition 0x05 or 0x06), the next clip opens with a CRA whose
+    // RASL leading pictures reference frames from before the splice — gone after
     // concatenation. The caller (the code that crosses the join) sets this flag
     // via `mark_clip_boundary`; the parser then rewrites the FIRST CRA it sees
     // at/after that point from CRA_NUT (21) to BLA_W_LP (16) so a linear decoder
@@ -72,9 +72,11 @@ pub struct HevcParser {
     //
     // SAFETY: defaults to `false` and is ONLY ever set through
     // `mark_clip_boundary`, which the caller invokes ONLY for a non-seamless
-    // (0x01) join. A stream with no boundary marker (single-clip title, any
-    // seamless-joined UHD/BD) never has this set, so the rewrite branch is never
-    // reached and output is byte-identical to a parser without this field.
+    // (0x05/0x06) join. connection_condition 0x01 is the first-item/seamless
+    // case and must NOT trigger this flag. A stream with no boundary marker
+    // (single-clip title, or seamless-joined 0x01 UHD/BD) never has this set,
+    // so the rewrite branch is never reached and output is byte-identical to a
+    // parser without this field.
     pending_clip_boundary: bool,
 }
 
@@ -99,19 +101,23 @@ impl HevcParser {
     }
 
     /// Mark that the NEXT IRAP this parser sees begins a NON-SEAMLESS BD clip
-    /// (MPLS connection_condition 0x01). The first CRA at/after this point is
-    /// rewritten CRA_NUT (21) → BLA_W_LP (16) so a linear decoder sets
-    /// NoRaslOutput and discards the now-dangling RASL leading pictures with no
-    /// "could not find ref" error.
+    /// join. MPLS connection_condition 0x05 and 0x06 are the non-seamless
+    /// values (per the BD-ROM spec: 0x01 = first item / seamless, 0x05/0x06 =
+    /// non-seamless). The first CRA at/after this point is rewritten CRA_NUT
+    /// (21) → BLA_W_LP (16) so a linear decoder sets NoRaslOutput and discards
+    /// the now-dangling RASL leading pictures with no "could not find ref"
+    /// error.
     ///
-    /// MUST be called ONLY when MPLS reports the join as non-seamless. It is a
-    /// no-op for the rewrite unless a CRA actually follows: an IDR/IDR_W_RADL
-    /// boundary needs no fix (it carries no cross-splice references), and the
-    /// flag is cleared by the first IRAP-class CRA it reaches.
+    /// MUST be called ONLY when MPLS reports connection_condition as 0x05 or
+    /// 0x06 (non-seamless). It is a no-op for the rewrite unless a CRA actually
+    /// follows: an IDR/IDR_W_RADL boundary needs no fix (it carries no
+    /// cross-splice references), and the flag is cleared by the first
+    /// IRAP-class CRA it reaches.
     ///
-    /// SAFETY: never call this for a seamless join (0x05/0x06) or within a
-    /// single-clip title — doing so could convert a legitimate mid-content CRA
-    /// to BLA. The default (never called) path leaves output byte-identical.
+    /// SAFETY: never call this for connection_condition 0x01 (seamless/first
+    /// item) or within a single-clip title — doing so could convert a
+    /// legitimate mid-content CRA to BLA. The default (never called) path
+    /// leaves output byte-identical.
     pub fn mark_clip_boundary(&mut self) {
         self.pending_clip_boundary = true;
     }
