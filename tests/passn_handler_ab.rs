@@ -688,14 +688,15 @@ fn profile_07_medium_then_good() {
         trace,
     );
 
-    // GOLDEN: patch's cache-priming (`prime_cache`) issues 3
-    // throwaway single-sector reads at lba-3..lba before each count==1
-    // recovery read. Those throwaway reads ADVANCE the per-LBA script
-    // step counter even though their results are discarded. So a
-    // 3-step script (fail, fail, ok) gets consumed by 2 prime calls
-    // plus 1 real read → the real read sees `Ok` and the sector is
-    // recovered. Net effect: patch fully recovers the range in one
-    // pass thanks to priming, even though the script said "fails on
+    // GOLDEN: patch's cache-priming (`prime_cache`) issues 3 throwaway
+    // single-sector reads at lba-3, lba-2, lba-1 (NOT lba itself) before
+    // each count==1 recovery read. In the default REVERSE patch pass,
+    // lba 108's prime reads lba 105 (consuming step 0 = fail) and lba 107's
+    // prime reads lba 105 again (consuming step 1 = fail), so when the real
+    // recovery read for lba 105 occurs its script step is 2 (= ok).
+    // prime_cache(105) itself reads 102, 103, 104 — it does NOT advance
+    // lba 105's own counter. Net effect: patch fully recovers the range in
+    // one pass thanks to priming, even though the script said "fails on
     // first two attempts."
     //
     // This is the documented cache-prime behavior (`disc/patch.rs`
