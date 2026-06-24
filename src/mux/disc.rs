@@ -359,6 +359,11 @@ impl DiscStream {
         // Saturate for consistency with the rest of the file's arithmetic.
         let lba = ext_start.saturating_add(self.current_offset);
 
+        // AACS aligned units are anchored at this extent's start LBA — gate the
+        // decrypt-on-read source relative to it (clip-anchored), not absolute
+        // disc LBA 0. No-op for CSS / None.
+        self.reader.set_unit_base(ext_start);
+
         // Adaptive sizer: start at current (preferred until a failure), shrink
         // on failure, advance on success. One 5s read attempt per try — no
         // retry loops, no sleeps. On size-1 failure, skip or error.
@@ -465,9 +470,9 @@ impl DiscStream {
                     lba,
                     sectors
                 );
-                let rec =
-                    self.reader
-                        .read_sectors(lba, sectors, &mut self.read_buf[..bytes], true);
+                let rec = self
+                    .reader
+                    .read_sectors(lba, sectors, &mut self.read_buf[..bytes], true);
                 if let Ok(&got) = rec.as_ref() {
                     debug_assert!(got <= bytes, "recovery read over-reported byte count");
                     if let Some(ev) = self.adaptive.on_success(sectors) {

@@ -24,8 +24,9 @@ pub mod variants;
 // Explicit re-exports — only items needed by external consumers and sibling crate modules.
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
 pub use decrypt::{
-    ALIGNED_UNIT_LEN, UnitKeyResult, decrypt_bus, decrypt_unit, decrypt_unit_full,
-    decrypt_unit_try_keys, is_aacs_scrambled, ts_packet_total, ts_sync_count, unit_key_validates,
+    ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, UnitKeyResult, decrypt_bus, decrypt_unit,
+    decrypt_unit_full, decrypt_unit_try_keys, is_aacs_scrambled, is_unit_aligned, ts_packet_total,
+    ts_sync_count, unit_key_validates,
 };
 pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::probe;

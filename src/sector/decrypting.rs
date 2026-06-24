@@ -32,6 +32,15 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     inner: S,
     keys: DecryptKeys,
     unit_key_idx: usize,
+    /// Base LBA of the encrypted region currently being read — the clip /
+    /// extent `start_lba` that AACS aligned units are anchored at. The unit-
+    /// alignment gate measures `lba` relative to THIS, not absolute disc LBA 0,
+    /// so a clip whose `start_lba` is not 3-aligned still gates correctly. Set
+    /// per-extent by the mux read paths via [`set_unit_base`]; defaults to 0
+    /// (absolute alignment) for callers that read from a 3-aligned base.
+    ///
+    /// [`set_unit_base`]: Self::set_unit_base
+    unit_base: u32,
     /// Cumulative bytes of scrambled AACS units that no key could decrypt.
     /// `decrypt_sectors` restores those bytes to their original ciphertext (so a
     /// clear nav-file is never corrupted), but for genuine encrypted content the
@@ -56,6 +65,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             inner,
             keys,
             unit_key_idx: 0,
+            unit_base: 0,
             decrypt_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -118,16 +128,20 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         recovery: bool,
     ) -> Result<usize> {
         // Defense-in-depth: AACS aligned units are 3 sectors (6144 bytes) and
-        // `decrypt_sectors` anchors units at buffer offset 0. A read whose START
-        // LBA is not unit-aligned (lba % 3 != 0) would decrypt every unit under
-        // the wrong CBC/unit alignment and silently mis-decrypt. Reject loud
-        // (DecryptFailed) BEFORE reading rather than ever mis-decrypting — callers
-        // (e.g. the multipass sweep) must issue unit-aligned reads.
-        if matches!(self.keys, DecryptKeys::Aacs { .. }) {
-            const UNIT_SECTORS: u32 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u32; // 3
-            if lba % UNIT_SECTORS != 0 {
-                return Err(crate::error::Error::DecryptFailed);
-            }
+        // `decrypt_sectors` anchors units at buffer offset 0. A read that does
+        // not begin a whole number of units past the encrypted region's base
+        // (`unit_base`, the clip/extent start_lba) would decrypt every unit
+        // under the wrong CBC/unit alignment and silently mis-decrypt. Reject
+        // loud (DecryptFailed) BEFORE reading rather than ever mis-decrypting.
+        // The gate is measured RELATIVE to `unit_base` (set per-extent by the
+        // mux read paths via `set_unit_base`), never absolute `lba % 3` — a clip
+        // whose start_lba is not itself 3-aligned must still gate on its own
+        // units (else its readable units are wrongly rejected → "Decryption
+        // failed" on exactly those titles).
+        if matches!(self.keys, DecryptKeys::Aacs { .. })
+            && !crate::aacs::is_unit_aligned(lba, self.unit_base)
+        {
+            return Err(crate::error::Error::DecryptFailed);
         }
         let n = self.inner.read_sectors(lba, count, buf, recovery)?;
         // Apply the crate-wide AACS/CSS/None decrypt entry point in-place
@@ -145,6 +159,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
 
     fn set_speed(&mut self, kbs: u16) {
         self.inner.set_speed(kbs)
+    }
+
+    fn set_unit_base(&mut self, lba: u32) {
+        self.unit_base = lba;
     }
 }
 
@@ -635,6 +653,60 @@ mod tests {
                 .read_sectors(lba, 3, &mut buf, false)
                 .unwrap_or_else(|_| panic!("aligned lba {lba} must pass the guard"));
             assert_eq!(n, 3 * 2048);
+        }
+    }
+
+    /// Clip-anchored gate (the Watership Down "Decryption failed" regression):
+    /// AACS aligned units are anchored at the clip's encrypted-region start
+    /// (`unit_base`), NOT absolute disc LBA 0. A clip whose `start_lba` is not
+    /// itself 3-aligned must gate on ITS OWN units, so the clip's base LBA
+    /// (which the old `lba % 3` gate wrongly rejected) now passes, and only
+    /// reads off the clip-relative unit grid reject.
+    #[test]
+    fn aacs_gate_is_clip_anchored_not_absolute() {
+        let keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0u32, [0u8; 16])],
+            read_data_key: None,
+        };
+        // base = 64 (abs % 3 == 1): the non-3-aligned clip start that triggered
+        // the bug. The old absolute gate rejected every read here; the clip-
+        // anchored gate must accept the clip's own unit grid.
+        let base = 64u32;
+
+        // Clip-relative aligned starts (base + {0,3,6,30}) pass.
+        for off in [0u32, 3, 6, 30] {
+            let mut w = DecryptingSectorSource::new(ClearUnitSource, keys.clone());
+            w.set_unit_base(base);
+            let mut buf = vec![0u8; 3 * 2048];
+            let n = w
+                .read_sectors(base + off, 3, &mut buf, false)
+                .unwrap_or_else(|_| panic!("clip-relative aligned lba {} must pass", base + off));
+            assert_eq!(n, 3 * 2048);
+        }
+
+        // The clip's base LBA itself (abs % 3 == 1) — the exact read the old gate
+        // wrongly rejected — must now decrypt.
+        let mut w = DecryptingSectorSource::new(ClearUnitSource, keys.clone());
+        w.set_unit_base(base);
+        let mut buf = vec![0u8; 3 * 2048];
+        assert!(
+            w.read_sectors(base, 3, &mut buf, false).is_ok(),
+            "a clip starting at a non-3-aligned LBA must decrypt from its own base"
+        );
+
+        // Clip-relative MISaligned starts (base + {1,2,4,5}) still reject.
+        for off in [1u32, 2, 4, 5] {
+            let mut w = DecryptingSectorSource::new(ClearUnitSource, keys.clone());
+            w.set_unit_base(base);
+            let mut buf = vec![0u8; 3 * 2048];
+            let err = w
+                .read_sectors(base + off, 3, &mut buf, false)
+                .expect_err("clip-relative unaligned start must reject");
+            assert_eq!(
+                err.code(),
+                crate::error::Error::DecryptFailed.code(),
+                "base+{off} is off the clip-relative unit grid"
+            );
         }
     }
 
