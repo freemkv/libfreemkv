@@ -1636,7 +1636,7 @@ impl Disc {
         // path in `Disc::scan` (which has `&mut Drive`), AFTER this function
         // returns. We deliberately do NOT run the reader-based crack path here:
         // it is non-functional against this crate's descrambler (always returns
-        // None — see `css::crack`), and on a CSS-protected disc it would scan up
+        // None — see `css::crack_key`), and on a CSS-protected disc it would scan up
         // to 50,000 scrambled sectors one-by-one, each rejected by the drive
         // with sense 05/6F/03 ("read of scrambled sector without
         // authentication") — roughly an hour of failing reads before the real
