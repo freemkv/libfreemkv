@@ -444,7 +444,7 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
         _ => 48000,
     };
 
-    let channels = ((b1 >> 4) & 0x0F) + 1; // stored as channels minus 1
+    let channels = (b1 & 0x07) + 1; // (channels - 1) in low 3 bits of byte 1
 
     // Language code: bytes 2-3 as ISO 639
     let lang_bytes = sub_slice(data, offset + 2, 2)?;
@@ -926,8 +926,8 @@ mod tests {
         // AC3 (coding=0), 48kHz (rate=0), 6 channels (stored as 5)
         // b0: bits 7-5=000(AC3), bits 4-3=00(48k) => 0x00
         data[0] = 0x00;
-        // b1: bits 7-4=0101 (channels-1=5) => 0x50
-        data[1] = 0x50;
+        // b1: bits 2-0=101 (channels-1=5) => 0x05
+        data[1] = 0x05;
         // language "en"
         data[2] = b'e';
         data[3] = b'n';
@@ -993,8 +993,8 @@ mod tests {
         // DTS (coding=6), 96kHz (rate=1), 2 channels (stored as 1)
         // b0: bits 7-5=110(DTS), bits 4-3=01(96k) => 0b110_01_000 = 0xC8
         data[0] = 0xC8;
-        // b1: bits 7-4=0001 (channels-1=1) => 0x10
-        data[1] = 0x10;
+        // b1: bits 2-0=001 (channels-1=1) => 0x01
+        data[1] = 0x01;
         data[2] = b'f';
         data[3] = b'r';
 
