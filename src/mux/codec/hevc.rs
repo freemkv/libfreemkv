@@ -78,7 +78,24 @@ pub struct HevcParser {
     // so the rewrite branch is never reached and output is byte-identical to a
     // parser without this field.
     pending_clip_boundary: bool,
+    // Highest PES PTS (90 kHz ticks) seen on this video stream so far. Used to
+    // AUTO-DETECT a non-seamless clip boundary from the bitstream when the
+    // caller never plumbs one in (the common case — see `BACKSTEP_TICKS`).
+    // `None` until the first AU with a PTS.
+    high_pts: Option<i64>,
 }
+
+// A backward PES-PTS step larger than this (90 kHz ticks) marks a non-seamless
+// BD clip boundary: each .m2ts clip carries its own PTS base, so at a 0x05/0x06
+// join the next clip's PTS resets backward by far more than any B-frame reorder
+// window (HEVC reorder depth tops out ~16 frames, <1 s at 24 fps). 3 s = 270000
+// ticks sits well above any legitimate reorder dip and far below any real clip's
+// duration, so it never false-triggers within a clip. This MIRRORS the mux-side
+// `DISCONTINUITY_BACKSTEP_NS` (3 s) in `mux/mkv.rs`, which independently rebases
+// the timeline at the same boundaries; here it drives the CRA→BLA rewrite that
+// kills the dangling-RASL "Could not find ref with POC N" decode errors a
+// concatenated multi-clip title otherwise produces.
+const BACKSTEP_TICKS: i64 = 270_000;
 
 impl Default for HevcParser {
     fn default() -> Self {
@@ -97,6 +114,7 @@ impl HevcParser {
             cur_sps: None,
             cur_pps: None,
             pending_clip_boundary: false,
+            high_pts: None,
         }
     }
 
@@ -233,6 +251,32 @@ impl CodecParser for HevcParser {
         // decode order (visible judder / wrong frames) and breaks PTS-based
         // seeking. Fall back to DTS only if PTS is somehow absent.
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+
+        // Auto-detect a non-seamless clip boundary from the bitstream. freemkv
+        // reads a BD title's clips as ONE concatenated sector stream and the
+        // mpls connection_condition is not plumbed through the (threaded) mux
+        // pipeline, so `mark_clip_boundary` is otherwise never invoked. Each
+        // .m2ts clip carries its own PTS base; at a 0x05/0x06 join the next
+        // clip's PTS resets backward by far more than any reorder window. A
+        // backward step beyond `BACKSTEP_TICKS` is that boundary: arm the same
+        // CRA→BLA rewrite (`pending_clip_boundary`) the first IRAP of the new
+        // clip then consumes. Without this, the splice CRA's RASL leading
+        // pictures reference pre-join frames gone after concatenation and a
+        // linear decoder floods "Could not find ref with POC N" (the Top Gun
+        // UHD defect). Uses the RAW 90 kHz PES PTS (not the rebased mux
+        // timeline) and tracks the high-water mark so a single in-clip B-frame
+        // dip never arms it. DTS-only AUs (no PTS) leave the watermark untouched.
+        if let Some(raw_pts) = pes.pts {
+            match self.high_pts {
+                Some(high) if raw_pts < high - BACKSTEP_TICKS => {
+                    self.pending_clip_boundary = true;
+                    self.high_pts = Some(raw_pts);
+                }
+                Some(high) => self.high_pts = Some(high.max(raw_pts)),
+                None => self.high_pts = Some(raw_pts),
+            }
+        }
+
         let data = &pes.data;
         let mut keyframe = false;
         // Track whether THIS access unit already carried each param-set type
@@ -1173,6 +1217,47 @@ mod tests {
             nal_type_of(&nals[0]),
             NAL_CRA_NUT,
             "an unmarked CRA must remain a CRA"
+        );
+    }
+
+    /// Regression for the "TopGun bug" (Top Gun 1986 UHD, DV P7 dual-layer):
+    /// a multi-clip title is read as one concatenated stream and the mpls
+    /// connection_condition is never plumbed to the parser, so the splice CRA
+    /// opening the next clip kept its dangling RASL leading pictures and a
+    /// linear decoder flooded "Could not find ref with POC N". The parser must
+    /// AUTO-DETECT the boundary from the backward PES-PTS reset between clips
+    /// (each .m2ts has its own PTS base) and rewrite that splice CRA → BLA_W_LP
+    /// with no explicit `mark_clip_boundary` call.
+    #[test]
+    fn cra_at_auto_detected_pts_backstep_rewritten_to_bla() {
+        let mut parser = HevcParser::new();
+        // Clip 1: a CRA then a few trailing frames advancing the PTS watermark.
+        // PTS in 90 kHz ticks: 0, then ~1 h into the clip.
+        let one_hour = 90_000i64 * 3600;
+        parser.parse(&make_pes(cra_au(&[0x01]), Some(0)));
+        parser.parse(&make_pes(cra_au(&[0x02]), Some(one_hour)));
+        // In-clip B-frame dip: PTS steps back a few frames (< BACKSTEP_TICKS).
+        // Must NOT be mistaken for a clip boundary — this CRA stays CRA.
+        let dip = parser.parse(&make_pes(cra_au(&[0x03]), Some(one_hour - 3 * 3750)));
+        assert_eq!(
+            nal_type_of(&nals_of(&dip[0].data)[0]),
+            NAL_CRA_NUT,
+            "a sub-threshold B-frame PTS dip must not trigger the rewrite"
+        );
+        // Clip 2 splice: PES PTS resets to a new clip base far below the
+        // watermark (> BACKSTEP_TICKS backward). The opening CRA is rewritten.
+        let splice = parser.parse(&make_pes(cra_au(&[0x04]), Some(0)));
+        assert_eq!(
+            nal_type_of(&nals_of(&splice[0].data)[0]),
+            NAL_BLA_W_LP,
+            "the splice CRA after a backward PTS reset must become BLA_W_LP"
+        );
+        // One-shot: the NEXT clip-2 CRA (PTS advancing again) stays CRA.
+        let next = parser.parse(&make_pes(cra_au(&[0x05]), Some(90_000)));
+        assert_eq!(
+            nal_type_of(&nals_of(&next[0].data)[0]),
+            NAL_CRA_NUT,
+            "only the first CRA after the boundary is rewritten"
         );
     }
 
