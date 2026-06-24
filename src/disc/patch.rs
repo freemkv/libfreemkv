@@ -350,8 +350,9 @@ const PASSN_ESCALATION_RESET_GOOD: u32 = 4;
 const CACHE_PRIME_SECTORS: u32 = 3;
 
 /// Probe-offset escalation: returns a per-probe skip distance in
-/// sectors that doubles every three indices, capped at
-/// `PASSN_SKIP_SECTORS_CAP`. Used by the wedge-vs-bad-sector probe to
+/// sectors of `PASSN_SKIP_SECTORS_BASE << (3 × idx)` (i.e. multiplies
+/// by 8 per index), capped at `PASSN_SKIP_SECTORS_CAP`. Used by the
+/// wedge-vs-bad-sector probe to
 /// scatter its sample LBAs across the failing region rather than
 /// hammering the same neighborhood.
 pub(super) fn skip_sectors_for_probe(idx: usize) -> u64 {
