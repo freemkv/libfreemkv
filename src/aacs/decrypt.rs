@@ -29,8 +29,15 @@ pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_LEN) as u32;
 /// disc whose clip `start_lba` is not itself 3-aligned would otherwise mis-gate
 /// (reject readable units, then report "Decryption failed") on exactly the
 /// titles whose clips land off a 3-boundary.
+///
+/// `lba` is always `>= unit_base` by contract (a read never begins before the
+/// extent base it is measured against). `saturating_sub` makes the `lba <
+/// unit_base` case well-defined anyway — it clamps the offset to 0, which is a
+/// unit boundary — rather than the latent `wrapping_sub` trap where an
+/// underflow wraps to ~2^32 and, because `2^32 ≡ 1 (mod 3)`, mis-reports the
+/// alignment (e.g. `lba == unit_base - 1` would falsely read as aligned).
 pub fn is_unit_aligned(lba: u32, unit_base: u32) -> bool {
-    lba.wrapping_sub(unit_base) % ALIGNED_UNIT_SECTORS == 0
+    lba.saturating_sub(unit_base) % ALIGNED_UNIT_SECTORS == 0
 }
 
 /// Size of one sector.
@@ -329,6 +336,43 @@ mod tests {
         let enc = aes_ecb_encrypt(&key, &plain);
         let dec = aes_ecb_decrypt(&key, &enc);
         assert_eq!(dec, plain);
+    }
+
+    #[test]
+    fn is_unit_aligned_relative_to_base() {
+        // Aligned at the base and every 3 sectors above it; misaligned between.
+        assert!(is_unit_aligned(100, 100), "base itself is aligned");
+        assert!(is_unit_aligned(103, 100), "one unit past base is aligned");
+        assert!(is_unit_aligned(106, 100));
+        assert!(!is_unit_aligned(101, 100));
+        assert!(!is_unit_aligned(102, 100));
+        // Non-3-aligned base: alignment is RELATIVE to the base, not absolute.
+        assert!(is_unit_aligned(101, 101), "non-3-aligned base is aligned");
+        assert!(is_unit_aligned(104, 101));
+        assert!(!is_unit_aligned(102, 101));
+    }
+
+    #[test]
+    fn is_unit_aligned_lba_below_base_is_well_defined() {
+        // Latent-trap contract (rc.5.2 audit #5): a read never starts before its
+        // extent base, but if `lba < unit_base` the result must be well-defined,
+        // NOT the `wrapping_sub` underflow that — because 2^32 ≡ 1 (mod 3) —
+        // would falsely report alignment. `saturating_sub` clamps to offset 0,
+        // which is a unit boundary, so any `lba <= unit_base` reads as aligned.
+        assert!(
+            is_unit_aligned(99, 100),
+            "lba just below base must not wrap"
+        );
+        assert!(is_unit_aligned(98, 100));
+        assert!(is_unit_aligned(0, 100));
+        // The specific wrapping_sub trap value: unit_base - 1. With wrapping_sub
+        // this is 0xFFFF_FFFF % 3 == 0 → falsely "aligned" by underflow; with
+        // saturating_sub it is genuinely 0 → aligned, for the right reason.
+        assert!(is_unit_aligned(u32::MAX, u32::MAX)); // base == lba, trivially aligned
+        assert!(
+            is_unit_aligned(0, u32::MAX),
+            "max base, lba 0 must saturate to 0"
+        );
     }
 
     #[test]

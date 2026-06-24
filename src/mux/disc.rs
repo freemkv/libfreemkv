@@ -501,6 +501,27 @@ impl DiscStream {
                     break;
                 }
 
+                // Recovery read also failed. A transport failure here (status
+                // 0xFF: USB-bridge crash / disconnect) is NOT a skippable bad
+                // unit — same as the original 10s read above. The line-442
+                // short-circuit only inspected `res`; the 60s recovery read
+                // (`rec`) can wedge the bridge on its own, and falling into the
+                // `skip_errors` branch below would zero-fill + advance, treating
+                // a dead bridge as a skippable unit and marching the whole disc
+                // at one bridge-recovery per probe (hard rule #2, "runs forever,
+                // no MKV"). Re-check `rec` and abort, mirroring line 442.
+                if let Some(e) = rec.as_ref().err() {
+                    if e.is_scsi_transport_failure() {
+                        let (status, sense) = extract_scsi_context(e);
+                        return Err(crate::error::Error::DiscRead {
+                            sector: lba as u64,
+                            status: Some(status),
+                            sense,
+                        }
+                        .into());
+                    }
+                }
+
                 // Recovery read also failed. Skip the WHOLE failed unit or bail.
                 // Zero-filling and advancing by the full unit keeps
                 // current_offset unit-aligned, so the next read still begins on a
@@ -1082,6 +1103,222 @@ mod tests {
         fn capacity_sectors(&self) -> u32 {
             self.capacity
         }
+    }
+
+    /// `SectorSource` that mirrors a marginal sector recoverable only with the
+    /// drive's full ECC budget: every read covering `bad_sector` FAILS while
+    /// `recovery=false` (the fast 10s pass) and SUCCEEDS (zeroed bytes) once
+    /// `recovery=true` (the 60s ECC pass). Drives the single-pass bottom-out
+    /// "last-chance recovery read" success branch in `fill_extents`, which the
+    /// other test sources (ignoring the flag) never exercise.
+    struct RecoverableReader {
+        capacity: u32,
+        bad_sector: u32,
+        /// `(lba, count, recovery)` for every issued read.
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16, bool)>>>,
+    }
+
+    impl crate::sector::SectorSource for RecoverableReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.log.lock().unwrap().push((lba, count, recovery));
+            let end = lba + count as u32;
+            let covers_bad = self.bad_sector >= lba && self.bad_sector < end;
+            // Fail on the fast (non-recovery) pass; the 60s ECC recovery read
+            // succeeds. Distinct non-0x02 sense byte so a transport-failure
+            // re-check (status 0xFF) is provably NOT triggered here.
+            if covers_bad && !recovery {
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(0x02),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// Coverage for the single-pass bottom-out RECOVERY-READ SUCCESS branch
+    /// (rc.5.2 audit #3): a sector that fails the fast 10s read but reads clean
+    /// on the 60s ECC recovery read must have its RECOVERED data muxed — the
+    /// cursor advances over the whole unit, byte counters move, and NO skip is
+    /// counted. Pre-fix the test sources ignored `recovery`, so this branch was
+    /// untested. Uses `unit_align=1` (None) so the bottom-out unit is a single
+    /// sector, exercising the `(sectors as u32) <= align` path precisely.
+    #[test]
+    fn recovery_read_success_muxes_recovered_data_no_skip() {
+        const COUNT: u32 = 10;
+        let bad = 4u32;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecoverableReader {
+            capacity: COUNT,
+            bad_sector: bad,
+            log: log.clone(),
+        };
+        let mut stream = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+        );
+        // skip_errors=false: if the recovery read did NOT succeed, fill_extents
+        // would return Err — so reaching EOF cleanly proves recovery worked.
+        stream.skip_errors = false;
+
+        let mut guard = 0;
+        loop {
+            match stream.fill_extents() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => panic!("recovery read should have succeeded, got: {e}"),
+            }
+            guard += 1;
+            assert!(guard < 1000, "fill_extents did not reach EOF");
+        }
+
+        // No skip counted: the recovered unit was muxed, not zero-filled.
+        assert_eq!(
+            stream.errors, 0,
+            "a successful recovery read must not count as a skipped sector"
+        );
+        assert_eq!(
+            stream.lost_bytes, 0,
+            "a successful recovery read loses no bytes"
+        );
+        // All COUNT sectors' worth of bytes were read through to the cursor end.
+        assert_eq!(
+            stream.bytes_read_total,
+            COUNT as u64 * 2048,
+            "every sector (including the recovered one) must be counted as read"
+        );
+
+        // The bad sector was retried with recovery=true and that read SUCCEEDED.
+        let reads = log.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .any(|&(lba, count, rec)| rec && lba == bad && count == 1),
+            "expected a recovery=true single-sector read at the bad sector; got {reads:?}"
+        );
+        // And the fast pass at the bad sector did happen with recovery=false.
+        assert!(
+            reads.iter().any(|&(lba, _c, rec)| !rec && lba == bad),
+            "expected a non-recovery read to have first failed at the bad sector"
+        );
+    }
+
+    /// `SectorSource` that fails the fast (non-recovery) read covering
+    /// `bad_sector` with an ordinary bad-sector error (status 0x02), then fails
+    /// the 60s ECC recovery read with a TRANSPORT failure (status 0xFF). Models
+    /// a bridge that wedges precisely during the last-chance recovery read.
+    struct RecoveryTransportFailReader {
+        capacity: u32,
+        bad_sector: u32,
+        log: std::sync::Arc<std::sync::Mutex<Vec<(u32, u16, bool)>>>,
+    }
+
+    impl crate::sector::SectorSource for RecoveryTransportFailReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> crate::error::Result<usize> {
+            self.log.lock().unwrap().push((lba, count, recovery));
+            let end = lba + count as u32;
+            if self.bad_sector >= lba && self.bad_sector < end {
+                let status = if recovery {
+                    crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE
+                } else {
+                    0x02
+                };
+                return Err(crate::error::Error::DiscRead {
+                    sector: self.bad_sector as u64,
+                    status: Some(status),
+                    sense: None,
+                });
+            }
+            let bytes = count as usize * 2048;
+            buf[..bytes].fill(0);
+            Ok(bytes)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// Regression (rc.5.2 audit #2): a transport failure on the 60s ECC
+    /// RECOVERY read (not just the initial 10s read) must ABORT, even under
+    /// `skip_errors=true`. The line-442 short-circuit only inspected the
+    /// original `res`; without a re-check the wedged-bridge recovery failure
+    /// fell into the skip branch — zero-fill + advance — marching the disc at
+    /// one bridge-recovery per unit ("runs forever, no MKV", hard rule #2). The
+    /// fix re-checks the recovery error for `is_scsi_transport_failure()` before
+    /// the skip block and returns `Error::DiscRead`.
+    #[test]
+    fn transport_failure_on_recovery_read_aborts_even_with_skip_errors() {
+        const COUNT: u32 = 10;
+        let bad = 4u32;
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = RecoveryTransportFailReader {
+            capacity: COUNT,
+            bad_sector: bad,
+            log: log.clone(),
+        };
+        let mut stream = DiscStream::new(
+            Box::new(reader),
+            synthetic_title(COUNT),
+            crate::decrypt::DecryptKeys::None,
+            8,
+            ContentFormat::BdTs,
+        );
+        stream.skip_errors = true;
+
+        // Drive fill_extents across batches: the good leading sectors mux fine,
+        // and the batch covering the bad sector shrinks to size 1, fails the
+        // fast read (0x02), then the bottom-out recovery read returns the
+        // transport failure (0xFF) — which must abort.
+        let mut res = Ok(true);
+        for _ in 0..1000 {
+            res = stream.fill_extents();
+            if !matches!(res, Ok(true)) {
+                break;
+            }
+        }
+        assert!(
+            res.is_err(),
+            "a transport failure on the recovery read must abort fill_extents, got {res:?}"
+        );
+        assert_eq!(
+            stream.errors, 0,
+            "a recovery-read transport-failure abort must NOT count as a skip"
+        );
+        assert_eq!(
+            stream.lost_bytes, 0,
+            "a transport-failure abort zero-fills nothing"
+        );
+        // Prove the bottom-out recovery read was actually reached and aborted on.
+        let reads = log.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .any(|&(lba, count, rec)| rec && lba == bad && count == 1),
+            "expected a recovery=true read at the bad sector to have been attempted; got {reads:?}"
+        );
     }
 
     /// Regression: a USB-bridge transport crash (status=0xFF) during a direct
