@@ -43,7 +43,7 @@
 //!   budget that the bridge wedge concern was originally about is
 //!   untouched.
 //!
-//! Per-range watchdog (`MAX_RANGE_SECS` / `RANGE_BUDGET_CAP_SECS`)
+//! Per-range watchdog (`range_sectors × SECONDS_PER_SECTOR`, capped at `RANGE_BUDGET_CAP_SECS`)
 //! checks `bytes_good` for forward progress. With work in flight on
 //! the consumer, the producer would otherwise see stale values; the
 //! sink publishes a [`SharedPatchState`] snapshot after every record
