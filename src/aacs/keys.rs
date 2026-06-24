@@ -2651,6 +2651,46 @@ mod tests {
     }
 
     #[test]
+    fn mkb_type_category_c_20_is_uhd() {
+        // Type 0x10 record, BE24 length 0x0C (12). MKBType field (body
+        // offset 0 = pos+4) = MKB_20_CATEGORY_C (0x48141003).
+        let mkb = [
+            0x10, 0x00, 0x00, 0x0C, 0x48, 0x14, 0x10, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(mkb_type_raw(&mkb), Some(MKB_20_CATEGORY_C));
+        assert_eq!(mkb_type(&mkb), Some(MkbType::CategoryC20));
+        assert_eq!(mkb_is_uhd(&mkb), Some(true));
+        assert!(MkbType::CategoryC20.is_uhd());
+        assert_eq!(MkbType::CategoryC20.generation(), AacsVersion::V20);
+        // Sanity on the 2.1 sibling.
+        assert_eq!(MkbType::from_raw(MKB_21_CATEGORY_C), MkbType::CategoryC21);
+        assert_eq!(MkbType::CategoryC21.generation(), AacsVersion::V21);
+    }
+
+    #[test]
+    fn mkb_type_prerecorded_is_bluray_v10() {
+        // Type 0x10 record with MKB_TYPE_4_PRERECORDED (0x00041003) — a
+        // standard Blu-ray (AACS 1.0) block, not UHD.
+        let mkb = [
+            0x10, 0x00, 0x00, 0x0C, 0x00, 0x04, 0x10, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert_eq!(mkb_type(&mkb), Some(MkbType::Prerecorded));
+        assert_eq!(mkb_is_uhd(&mkb), Some(false));
+        assert!(!MkbType::Prerecorded.is_uhd());
+        assert_eq!(MkbType::Prerecorded.generation(), AacsVersion::V10);
+    }
+
+    #[test]
+    fn mkb_type_none_when_no_0x10_record() {
+        // A buffer whose only record is a 0x81 (verify-media-key) record and
+        // no 0x10 Type-and-Version record → mkb_type_raw returns None.
+        let mkb = [0x81, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(mkb_type_raw(&mkb), None);
+        assert_eq!(mkb_type(&mkb), None);
+        assert_eq!(mkb_is_uhd(&mkb), None);
+    }
+
+    #[test]
     fn mkb_find_mk_dv_skips_short_verify_record() {
         // A 0x81 record with rec_len < 20 carries no full mk_dv; the finder
         // must skip it and keep walking (here to a valid 0x86 after it).

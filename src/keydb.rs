@@ -43,17 +43,6 @@ fn read_capped_to_string<R: Read>(reader: R) -> Result<String> {
     String::from_utf8(buf).map_err(|_| Error::KeydbParse)
 }
 
-/// Standard keydb storage path — the canonical location to write the keydb to.
-///
-/// On Windows this is the idiomatic per-user roaming dir
-/// `%APPDATA%\freemkv\keydb.cfg`, falling back to the legacy
-/// `%USERPROFILE%\.config\freemkv\keydb.cfg` only if `APPDATA` is unset. On
-/// Linux/macOS it stays the long-standing `$HOME/.config/freemkv/keydb.cfg`.
-///
-/// The CLI's read-side search (first existing of several locations) lives in
-/// `freemkv-keysources::keydb_search_paths`; this function is the single
-/// *write* default used by `save`/`update`, kept in lock-step with that crate's
-/// `default_keydb_path` for the same OS.
 /// Build the error returned when no home directory can be determined
 /// (`HOME`/`USERPROFILE` unset). This is an *environment* failure — the
 /// process has no home dir, which typically signals a stripped container
@@ -66,6 +55,23 @@ fn no_home_dir() -> Error {
     }
 }
 
+/// Standard keydb storage path — the canonical location to write the keydb to.
+///
+/// On Windows this is the idiomatic per-user roaming dir
+/// `%APPDATA%\freemkv\keydb.cfg`, falling back to the legacy
+/// `%USERPROFILE%\.config\freemkv\keydb.cfg` only if `APPDATA` is unset. On
+/// Linux/macOS it stays the long-standing `$HOME/.config/freemkv/keydb.cfg`.
+///
+/// The CLI's read-side search (first existing of several locations) lives in
+/// `freemkv-keysources::keydb_search_paths`; this function is the single
+/// *write* default used by `save`/`update`. On Windows the two agree. On
+/// Linux they can diverge: this write path always uses
+/// `$HOME/.config/freemkv/keydb.cfg` and ignores `XDG_CONFIG_HOME`, whereas
+/// the read-side search additionally checks `$XDG_CONFIG_HOME/freemkv` first.
+/// A user who sets `XDG_CONFIG_HOME` to a non-`$HOME/.config` location will
+/// therefore have `update-keys` write to the `$HOME` path while the read-side
+/// search may prefer the `XDG_CONFIG_HOME` location — the `$HOME` path is still
+/// in the search list, so the freshly-written keydb is found, just not first.
 pub fn default_path() -> Result<PathBuf> {
     #[cfg(windows)]
     {

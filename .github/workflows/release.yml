@@ -42,10 +42,13 @@ jobs:
   # crates.io publish is an INDEPENDENT job: it serves EXTERNAL consumers only.
   # The freemkv binaries no longer depend on it (they git-tag-pin libfreemkv via
   # a committed [patch.crates-io]), so this publish runs in parallel with their
-  # release builds rather than gating them. It only `needs: verify` (the version
-  # check) — NOT `test` — so publish isn't serialized behind the test suite.
+  # release builds rather than gating them. It `needs: [verify, test]` so a
+  # failing test suite still blocks publication to crates.io — external
+  # consumers who `cargo add libfreemkv` must never receive a release whose
+  # tests were failing. (The two upstream jobs run in parallel, so this gate
+  # does not serialize publish behind test beyond their own completion.)
   publish:
-    needs: verify
+    needs: [verify, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -542,7 +542,7 @@ mod tests {
         let vmg = build_vmg(&[(1, 1, 1)]);
         let vts = build_vts(
             0,
-            crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_4X3),
+            crate::ifo::v_atr_byte(crate::ifo::VIDEO_FORMAT_PAL, crate::ifo::ASPECT_16X9),
             &[],
             &[],
             &[(0, 9)],
@@ -581,6 +581,11 @@ mod tests {
             v.color_space,
             ColorSpace::Bt470bg,
             "PAL DVD is SD BT.470BG, not BT.709"
+        );
+        assert_eq!(
+            v.display_aspect,
+            Some((16, 9)),
+            "ASPECT_16X9 IFO byte must map to a 16:9 display aspect"
         );
     }
 
@@ -630,6 +635,11 @@ mod tests {
             v.color_space,
             ColorSpace::Smpte170m,
             "NTSC DVD is SD SMPTE-170M, not BT.709"
+        );
+        assert_eq!(
+            v.display_aspect,
+            Some((4, 3)),
+            "ASPECT_4X3 IFO byte must map to a 4:3 display aspect"
         );
     }
 
