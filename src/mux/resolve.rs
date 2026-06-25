@@ -223,43 +223,6 @@ pub struct InputOptions {
     pub raw: bool,
 }
 
-/// Decide whether an ISO mux must abort for lack of a usable AACS key.
-///
-/// Returns `true` only when ALL hold: decryption is requested (`!raw`), the
-/// disc carries AACS state (`has_aacs` — AACS-encrypted, not CSS/unencrypted),
-/// and key resolution produced no usable key (`keys` is
-/// [`crate::decrypt::DecryptKeys::None`]). In that case muxing would emit
-/// undecryptable garbage, so the caller fails fast with [`Error::NoDiscKey`].
-///
-/// `--raw` (raw=true) always returns `false` — raw intentionally skips
-/// decryption and needs no key. A non-AACS disc (`has_aacs=false`) always
-/// returns `false`: unencrypted content has `None` keys legitimately, and CSS
-/// DVDs resolve to `DecryptKeys::Css{..}` (never `None`).
-fn aacs_key_missing(raw: bool, has_aacs: bool, keys: &crate::decrypt::DecryptKeys) -> bool {
-    !raw && has_aacs && matches!(keys, crate::decrypt::DecryptKeys::None)
-}
-
-/// CSS analogue of [`aacs_key_missing`]. Returns `true` when decryption is
-/// requested (`!raw`), the disc is CSS-encrypted (`has_css`), and per-title key
-/// resolution yielded no usable key (`keys` is
-/// [`crate::decrypt::DecryptKeys::None`] — e.g. a multi-VTS DVD whose chosen
-/// title's VTS could not be re-cracked). Muxing that would emit scrambled
-/// ciphertext, so the caller fails fast with [`Error::CssKeyMissing`].
-fn css_key_missing(raw: bool, has_css: bool, keys: &crate::decrypt::DecryptKeys) -> bool {
-    !raw && has_css && matches!(keys, crate::decrypt::DecryptKeys::None)
-}
-
-/// Scrambled-but-uncracked CSS guard (Fix 6). Returns `true` when decryption
-/// is requested (`!raw`) and the scan recorded a hard CSS error
-/// (`has_css_error` — `disc.css_error.is_some()`), meaning the content is
-/// scrambled but no title key was recovered (so `disc.css` is `None`). Muxing
-/// that case would pass scrambled MPEG through as plaintext, so the caller
-/// fails fast with [`Error::CssKeyMissing`]. `--raw` is exempt (skips
-/// decryption), so it always returns `false`.
-fn css_error_aborts(raw: bool, has_css_error: bool) -> bool {
-    !raw && has_css_error
-}
-
 /// Open a PES input stream (produces PES frames).
 pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::Stream>> {
     let parsed = parse_url(url);
@@ -295,32 +258,17 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 disc.decrypt_with(crate::disc::Key::Unit(opts.unit_keys.clone()), &[])
                     .map_err(|e| -> io::Error { e.into() })?;
             }
-            // CSS scrambled-but-uncracked guard (Fix 6): the scan saw scrambled
-            // sectors but recovered no title key, so `disc.css` is None yet the
-            // content IS encrypted. Without this, `css.is_none()` would be read
-            // as "unencrypted" and the scrambled MPEG would mux as plaintext
-            // garbage at exit 0. Surface the recorded hard error instead.
-            // `--raw` skips decryption, so it is exempt.
-            if css_error_aborts(opts.raw, disc.css_error.is_some()) {
-                return Err(crate::error::Error::CssKeyMissing.into());
-            }
-            // No-key guard: if decryption is requested (not --raw) and the disc
-            // is AACS-encrypted but key resolution yielded no usable key, FAIL
-            // here — muxing an undecryptable stream produces ~100 MB of garbage
-            // (encrypted m2ts → no TS syncs → demuxer emits nothing). A cheap
-            // result-check on `decrypt_keys()`; no probe decryption needed.
-            // CSS (DVD) decrypts from compiled keys (`decrypt_keys()` returns
-            // `Css{..}`, never `None`), so this gate is AACS-only via `disc.aacs`.
-            if aacs_key_missing(opts.raw, disc.aacs.is_some(), &disc.decrypt_keys()) {
-                // Surface the disc hash (40-hex, no `0x` prefix) so the caller
-                // can name the disc. Empty if scan didn't capture it.
-                let disc_hash = disc
-                    .aacs
-                    .as_ref()
-                    .map(|a| a.disc_hash.trim_start_matches("0x").to_string())
-                    .unwrap_or_default();
-                return Err(crate::error::Error::NoDiscKey { disc_hash }.into());
-            }
+            // Pre-flight decrypt gate (the single, system-wide verdict — see
+            // `Disc::ensure_decryptable`). Fails fast BEFORE any mux work when
+            // decryption is needed and unavailable: a scrambled-but-uncracked
+            // CSS disc (`css_error` set), or an AACS-encrypted disc with no
+            // usable key (would mux ~100 MB of garbage — encrypted m2ts → no TS
+            // syncs → demuxer emits nothing → empty/garbage output at exit 0).
+            // `--raw` and unencrypted/CSS-keyless-success discs pass. This is the
+            // disc-wide check; the per-title (multi-VTS CSS) check is below, once
+            // the chosen title's key is resolved.
+            disc.ensure_decryptable(opts.raw)
+                .map_err(|e| -> io::Error { e.into() })?;
             if disc.titles.is_empty() {
                 return Err(crate::error::Error::NoStreams.into());
             }
@@ -342,13 +290,14 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 Ok(mut crack_reader) => disc.decrypt_keys_for_title(idx, &mut crack_reader, 64),
                 Err(_) => disc.decrypt_keys(),
             };
-            // CSS no-key guard (parallel to the AACS gate above): on a CSS
-            // disc, decrypt_keys_for_title may return `None` when the chosen
-            // title's VTS could not be re-cracked. Muxing that would emit
-            // scrambled ciphertext verbatim, so fail loudly here instead.
-            if css_key_missing(opts.raw, disc.css.is_some(), &keys) {
-                return Err(crate::error::Error::CssKeyMissing.into());
-            }
+            // Per-title decrypt gate (parallel to the disc-wide gate above): on
+            // a multi-VTS CSS disc, `decrypt_keys_for_title` may return `None`
+            // when the chosen title's VTS could not be re-cracked. Muxing that
+            // would emit scrambled ciphertext verbatim, so fail loudly here.
+            // Same verdict source as the disc-wide gate, judged against the
+            // per-title key.
+            disc.ensure_decryptable_keys(opts.raw, &keys)
+                .map_err(|e| -> io::Error { e.into() })?;
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
             // A fresh reader avoids disturbing the mux reader below. Skipped in
@@ -678,9 +627,6 @@ fn build_m2ts_pipeline<R: std::io::Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::StreamUrl;
-    use super::aacs_key_missing;
-    use super::css_error_aborts;
-    use super::css_key_missing;
     use super::parse_url;
     use super::validate_network_addr;
     use super::{build_demux_state, build_iso_pipeline, input, output};
@@ -689,6 +635,50 @@ mod tests {
     use crate::pes::Stream as _;
     use crate::sector::SectorSource;
     use std::path::PathBuf;
+
+    /// `parse_url` must never panic on ANY input — it is the front door for
+    /// caller-supplied URL strings, so a panic here would crash the binary on
+    /// malformed input instead of surfacing a clean error downstream. Feed it a
+    /// battery of adversarial strings (empty, doubled/garbled schemes, embedded
+    /// NUL, unicode, a very long path, lone scheme markers) plus an exhaustive
+    /// sweep of every single byte 0x00..=0xFF as the whole input and as a scheme
+    /// suffix. Any `StreamUrl` variant is an acceptable result; the only failure
+    /// mode under test is a panic.
+    #[test]
+    fn parse_url_never_panics_on_adversarial_input() {
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "://".into(),
+            "//".into(),
+            ":".into(),
+            "disc".into(),
+            "disc:/".into(),
+            "disc:://".into(),
+            "disc://disc://".into(),
+            "iso://iso://x".into(),
+            "mkv://mkv://mkv://".into(),
+            "iso://\0/etc".into(),              // embedded NUL
+            "iso://日本語/フィルム.iso".into(), // unicode path
+            "network://[::1]:9000".into(),
+            "ftp://host/x".into(),
+            format!("iso://{}", "a".repeat(100_000)), // very long path
+            "\u{feff}disc://".into(),                 // BOM prefix
+        ];
+        // Every byte as the entire input, and as an iso:// path suffix.
+        for b in 0u8..=255 {
+            cases.push(String::from_utf8_lossy(&[b]).into_owned());
+            cases.push(format!("iso://{}", String::from_utf8_lossy(&[b])));
+        }
+        for c in &cases {
+            // The contract: returns SOME variant, never panics. We also exercise
+            // scheme()/path_str()/is_disc_source() so their match arms can't
+            // panic on the parsed result either.
+            let u = parse_url(c);
+            let _ = u.scheme();
+            let _ = u.path_str();
+            let _ = u.is_disc_source();
+        }
+    }
 
     #[test]
     fn disk_scheme_is_alias_for_disc() {
@@ -744,83 +734,10 @@ mod tests {
         assert!(validate_network_addr("host:65535").is_ok());
     }
 
-    fn aacs_keys() -> DecryptKeys {
-        DecryptKeys::Aacs {
-            unit_keys: vec![(1, [0x11u8; 16])],
-            read_data_key: None,
-        }
-    }
-
-    fn css_keys() -> DecryptKeys {
-        DecryptKeys::Css {
-            title_key: [0u8; 5],
-        }
-    }
-
-    #[test]
-    fn encrypted_no_key_aborts() {
-        // AACS disc, decryption requested, resolver yielded no key → abort.
-        assert!(aacs_key_missing(false, true, &DecryptKeys::None));
-    }
-
-    #[test]
-    fn encrypted_with_key_proceeds() {
-        // AACS disc with a usable key → proceed.
-        assert!(!aacs_key_missing(false, true, &aacs_keys()));
-    }
-
-    #[test]
-    fn not_encrypted_proceeds() {
-        // No AACS state: unencrypted (None keys) and CSS (Css keys) both OK.
-        assert!(!aacs_key_missing(false, false, &DecryptKeys::None));
-        assert!(!aacs_key_missing(false, false, &css_keys()));
-    }
-
-    #[test]
-    fn css_no_key_aborts() {
-        // CSS disc, decryption requested, per-title resolver yielded None
-        // (e.g. an un-re-crackable VTS) → abort instead of muxing ciphertext.
-        assert!(css_key_missing(false, true, &DecryptKeys::None));
-    }
-
-    #[test]
-    fn css_with_key_proceeds() {
-        // CSS disc with a resolved title key → proceed.
-        assert!(!css_key_missing(false, true, &css_keys()));
-    }
-
-    #[test]
-    fn css_raw_never_aborts() {
-        // --raw skips decryption: never abort even with no CSS key.
-        assert!(!css_key_missing(true, true, &DecryptKeys::None));
-    }
-
-    #[test]
-    fn css_guard_ignores_non_css() {
-        // No CSS state (AACS / unencrypted): the CSS guard never fires.
-        assert!(!css_key_missing(false, false, &DecryptKeys::None));
-    }
-
-    #[test]
-    fn css_error_field_aborts_unless_raw() {
-        // Fix 6: a scrambled-but-uncracked DVD records a hard error in
-        // `disc.css_error` (css is None). With decryption requested the
-        // input() guard must abort with CssKeyMissing.
-        assert!(css_error_aborts(false, true));
-        // --raw skips decryption → never aborts on the css_error field.
-        assert!(!css_error_aborts(true, true));
-        // No recorded css_error → the guard does not fire.
-        assert!(!css_error_aborts(false, false));
-    }
-
-    #[test]
-    fn raw_never_aborts() {
-        // --raw skips decryption — must never hit the no-key abort, even on an
-        // AACS disc with no key resolved.
-        assert!(!aacs_key_missing(true, true, &DecryptKeys::None));
-        assert!(!aacs_key_missing(true, true, &aacs_keys()));
-        assert!(!aacs_key_missing(true, false, &DecryptKeys::None));
-    }
+    // The decrypt-verdict matrix (raw / unencrypted / AACS-no-key /
+    // CSS-no-key / css_error) is owned by `Disc::ensure_decryptable[_keys]` and
+    // tested in `crate::disc` — `input()` now delegates to it, so the matrix is
+    // asserted once at the source of truth rather than re-tested here.
 
     // ── input()/output() routing + validation ─────────────────────────────
 
