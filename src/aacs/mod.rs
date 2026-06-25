@@ -32,12 +32,12 @@ pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::probe;
 pub use keys::{
     AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C, MKB_TYPE_3_RECORDABLE,
-    MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbType, ResolveContext, ResolvedKeys,
-    UnitKeyFile, decrypt_unit_key, derive_media_key_and_pk_from_dk, derive_media_key_from_dk,
-    derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex, mkb_content_len, mkb_is_uhd,
-    mkb_type, mkb_type_raw, mkb_version, parse_content_cert, parse_unit_key_ro,
-    read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2, resolve_keys_v21,
-    trim_mkb,
+    MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbType, ResolveContext, ResolveFailure,
+    ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_and_pk_from_dk,
+    derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex,
+    mkb_content_len, mkb_is_uhd, mkb_type, mkb_type_raw, mkb_version, parse_content_cert,
+    parse_unit_key_ro, read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2,
+    resolve_keys_v21, resolve_keys_with_reason, trim_mkb,
 };
 pub use provider::KeyProvider;
 pub use variants::{
