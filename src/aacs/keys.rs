@@ -1144,7 +1144,7 @@ pub enum ResolveFailure {
 /// Identical key derivation to the [`resolve_keys_v1`] / [`resolve_keys_v2`] /
 /// [`resolve_keys_v21`] chain (it calls straight through to them); the only
 /// addition is that an unresolved disc returns a typed [`ResolveFailure`]
-/// instead of a bare `None`, so callers can report E7021 (material but no VID)
+/// instead of a bare `None`, so callers can report E7017 (material but no VID)
 /// vs E7022 (no material). `version_u8` is the on-disc AACS major (1 → V10,
 /// anything else → the V20/V21 chain), matching `AacsState::version`.
 pub fn resolve_keys_with_reason(
@@ -3172,7 +3172,7 @@ mod tests {
 
     // ── resolve_keys_with_reason / classify_resolve_failure ────────────────
     //
-    // The rc.6 E7021/E7022 split is also exercised end-to-end through the
+    // The rc.6 E7017/E7022 split is also exercised end-to-end through the
     // `ensure_decryptable` gate in `disc/mod.rs`. These tests pin the
     // *classifier* directly at the keys.rs seam and cover the branches the
     // gate test does not: VID-present (must never be VidUnavailable), the
@@ -3203,7 +3203,7 @@ mod tests {
     }
 
     /// Zero VID + PROCESSING keys (not device keys) is still "derivation
-    /// material present, VID missing" → VidUnavailable (E7021). The gate test
+    /// material present, VID missing" → VidUnavailable (E7017). The gate test
     /// only proves the device-keys arm of `has_derivation_material`; this pins
     /// the processing-keys arm of the same `||`.
     #[test]
