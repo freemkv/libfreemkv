@@ -297,17 +297,21 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // avoids disturbing the mux reader below. 64 sectors is a
             // file-safe batch for an ISO. AACS / single-VTS paths are
             // unchanged (decrypt_keys_for_title short-circuits to decrypt_keys).
-            let keys = match crate::io::file_sector_source::FileSectorSource::open(path) {
-                Ok(mut crack_reader) => disc.decrypt_keys_for_title(idx, &mut crack_reader, 64),
-                Err(_) => disc.decrypt_keys(),
-            };
+            let (keys, title_is_clear) =
+                match crate::io::file_sector_source::FileSectorSource::open(path) {
+                    Ok(mut crack_reader) => {
+                        disc.decrypt_keys_for_title_checked(idx, &mut crack_reader, 64)
+                    }
+                    Err(_) => (disc.decrypt_keys(), false),
+                };
             // Per-title decrypt gate (parallel to the disc-wide gate above): on
-            // a multi-VTS CSS disc, `decrypt_keys_for_title` may return `None`
-            // when the chosen title's VTS could not be re-cracked. Muxing that
-            // would emit scrambled ciphertext verbatim, so fail loudly here.
-            // Same verdict source as the disc-wide gate, judged against the
-            // per-title key.
-            disc.ensure_decryptable_keys(opts.raw, &keys)
+            // a multi-VTS CSS disc, the per-title re-crack may return `None` when
+            // the chosen title's VTS could not be re-cracked. Muxing that would
+            // emit scrambled ciphertext verbatim, so fail loudly here — EXCEPT
+            // when the title proved genuinely clear (`title_is_clear`), an
+            // unencrypted stub on an otherwise-CSS disc that needs no key. That
+            // case must NOT raise a false E7023.
+            disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
                 .map_err(|e| -> io::Error { e.into() })?;
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
