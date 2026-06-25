@@ -1975,6 +1975,88 @@ impl Disc {
         }
     }
 
+    /// The 40-hex AACS disc id (SHA1 of `Unit_Key_RO.inf`, no `0x` prefix), or
+    /// empty when this disc has no captured AACS state. Used to name the disc in
+    /// a [`Error::NoDiscKey`] so the application can tell the user which disc to
+    /// add to the keydb.
+    pub fn aacs_disc_hash(&self) -> String {
+        self.aacs
+            .as_ref()
+            .map(|a| a.disc_hash.trim_start_matches("0x").to_string())
+            .unwrap_or_default()
+    }
+
+    /// The system-wide decrypt correctness gate.
+    ///
+    /// Returns `Ok(())` when it is safe to proceed with a copy or mux, and a
+    /// clear typed error when decryption is **needed but unavailable** — the
+    /// case that would otherwise write ciphertext (disc→ISO) or feed the demux
+    /// undecryptable bytes (mux) and exit 0. Every copy/mux entry point calls
+    /// this **after key resolution and before any source-data processing
+    /// begins**, so the verdict is identical everywhere and the failure is a
+    /// pre-flight one (no partial output).
+    ///
+    /// The verdict, in order:
+    /// - `raw == true` → `Ok(())`. `--raw` intentionally skips decryption and
+    ///   needs no key (the caller wants an encrypted image).
+    /// - `self.css_error.is_some()` → `Err(Error::CssKeyMissing)`. The scan saw
+    ///   scrambled CSS sectors but recovered no title key (`self.css` is `None`
+    ///   yet the content IS encrypted). Treating `css.is_none()` as
+    ///   "unencrypted" would mux scrambled MPEG as plaintext garbage.
+    /// - AACS-encrypted (`self.aacs.is_some()`) with no usable key
+    ///   (`decrypt_keys()` is `None`) → `Err(Error::NoDiscKey { .. })`, naming
+    ///   the disc by hash.
+    /// - CSS-encrypted (`self.css.is_some()`) with no usable key →
+    ///   `Err(Error::CssKeyMissing)`. (The disc-wide `decrypt_keys()` yields
+    ///   `Css{..}` whenever `css.is_some()`, so this is defensive; the live
+    ///   multi-VTS case is gated by [`Self::ensure_decryptable_keys`].)
+    /// - otherwise → `Ok(())`. A genuinely unencrypted disc has `None` keys
+    ///   legitimately, and a CSS disc whose keyless crack succeeded has a key.
+    pub fn ensure_decryptable(&self, raw: bool) -> Result<()> {
+        self.ensure_decryptable_keys(raw, &self.decrypt_keys())
+    }
+
+    /// [`Self::ensure_decryptable`] against a caller-resolved key set, for the
+    /// per-title path. A multi-VTS CSS DVD resolves its key with
+    /// [`Self::decrypt_keys_for_title`] (which can return `None` when the chosen
+    /// title's VTS could not be re-cracked even though the disc-wide
+    /// `decrypt_keys()` is `Css{..}`); the gate must judge THAT key, not the
+    /// disc-wide one. The "is the source encrypted?" question is answered by the
+    /// scan-captured disc state (`css_error`/`aacs`/`css`), never by the keys —
+    /// so an unencrypted disc (no AACS/CSS state) never false-errors regardless
+    /// of `keys`.
+    pub fn ensure_decryptable_keys(
+        &self,
+        raw: bool,
+        keys: &crate::decrypt::DecryptKeys,
+    ) -> Result<()> {
+        // --raw skips decryption entirely: never error, even on an encrypted
+        // disc with no key (the user asked for the encrypted image).
+        if raw {
+            return Ok(());
+        }
+        // Scrambled-but-uncracked CSS: the disc is encrypted but `css` is None,
+        // so the key check below can't see it. Surface the recorded hard error.
+        if self.css_error.is_some() {
+            return Err(Error::CssKeyMissing);
+        }
+        // Decryption is needed iff the disc carries cipher state. A no-key
+        // verdict on a non-encrypted disc is impossible here (the disc has no
+        // AACS/CSS state), so a genuinely unencrypted disc never errors.
+        let needs_key = matches!(keys, crate::decrypt::DecryptKeys::None);
+        if needs_key {
+            if self.aacs.is_some() {
+                return Err(Error::NoDiscKey {
+                    disc_hash: self.aacs_disc_hash(),
+                });
+            }
+            if self.css.is_some() {
+                return Err(Error::CssKeyMissing);
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve decryption keys for muxing a *specific* title.
     ///
     /// CSS title keys are per-VTS. The scan cracks one key (from the main
@@ -2246,6 +2328,15 @@ impl Disc {
         path: &std::path::Path,
         opts: &CopyOptions,
     ) -> Result<CopyResult> {
+        // Pre-flight decrypt gate. A decrypting copy (`opts.decrypt == true`,
+        // i.e. NOT `--raw`) of an encrypted disc with no usable key would wrap
+        // the reader in a pass-through `DecryptingSectorSource` and write
+        // ciphertext to the ISO, then return `Ok` (bytes_good > 0) — a silent
+        // garbage success at exit 0. Refuse here, BEFORE any sweep/patch reads a
+        // single sector, so the failure is pre-flight and no partial ISO is
+        // written. `opts.decrypt == false` is `--raw`: the gate is a no-op (the
+        // user wants the encrypted image), and an unencrypted disc passes too.
+        self.ensure_decryptable(!opts.decrypt)?;
         if opts.multipass {
             let mf_path = self.mapfile_for(path);
             if mf_path.exists() {
@@ -2433,6 +2524,13 @@ impl Disc {
         use crate::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
         use crate::sector::{DecryptingSectorSource, SectorSource};
         use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
+
+        // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
+        // direct `sweep` caller can't bypass it). A decrypting sweep of an
+        // encrypted disc with no usable key would write ciphertext to the ISO at
+        // exit 0; refuse before reading any sector. No-op for `--raw`
+        // (`opts.decrypt == false`) and unencrypted discs.
+        self.ensure_decryptable(!opts.decrypt)?;
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
         let keys = if opts.decrypt {
@@ -3857,6 +3955,135 @@ mod tests {
         }
     }
 
+    // ── ensure_decryptable: the system-wide decrypt verdict matrix ──────────
+    //
+    // This is the single gate every copy/mux entry point calls. The cases below
+    // are the full truth table: only "decryption needed AND unavailable AND not
+    // --raw" may error; every legit non-error case (raw / unencrypted / a
+    // resolved key) must proceed.
+
+    fn css_state() -> crate::css::CssState {
+        crate::css::CssState {
+            title_key: [0u8; 5],
+            crack_span: None,
+        }
+    }
+
+    /// AACS-encrypted disc, decryption requested, no unit key resolved → the
+    /// gate must fail with NoDiscKey (this is the headline bug: a pass-through
+    /// `DecryptingSectorSource` would otherwise write ciphertext at exit 0).
+    #[test]
+    fn ensure_decryptable_aacs_no_key_errors() {
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new())); // present but no unit keys → None
+        assert!(matches!(
+            disc.decrypt_keys(),
+            crate::decrypt::DecryptKeys::None
+        ));
+        let err = disc
+            .ensure_decryptable(false)
+            .expect_err("AACS disc, no key, !raw must error");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::NoDiscKey {
+                disc_hash: String::new()
+            }
+            .code()
+        );
+    }
+
+    /// Same AACS-no-key disc under `--raw` (raw=true) must PROCEED — the user
+    /// asked for the encrypted image and needs no key.
+    #[test]
+    fn ensure_decryptable_aacs_no_key_raw_proceeds() {
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new()));
+        assert!(disc.ensure_decryptable(true).is_ok(), "--raw must proceed");
+    }
+
+    /// AACS disc WITH a resolved unit key → proceed (decrypt_keys is Aacs).
+    #[test]
+    fn ensure_decryptable_aacs_with_key_proceeds() {
+        let mut disc = make_test_disc(1000, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(vec![(0, [0x11u8; 16])]));
+        assert!(disc.ensure_decryptable(false).is_ok());
+    }
+
+    /// A genuinely unencrypted disc has `None` keys legitimately — the gate must
+    /// NOT false-error. This is the "is the source encrypted?" guard: the answer
+    /// is the scan-captured disc state, not the keys.
+    #[test]
+    fn ensure_decryptable_unencrypted_proceeds() {
+        let disc = make_test_disc(1000, "BD"); // aacs/css/css_error all None
+        assert!(matches!(
+            disc.decrypt_keys(),
+            crate::decrypt::DecryptKeys::None
+        ));
+        assert!(
+            disc.ensure_decryptable(false).is_ok(),
+            "unencrypted disc with None keys must proceed, not false-error"
+        );
+    }
+
+    /// CSS scrambled-but-uncracked (the keyless crack failed): `css` is None but
+    /// `css_error` is Some — the disc IS encrypted. The gate must fail with
+    /// CssKeyMissing rather than read `css.is_none()` as "unencrypted".
+    #[test]
+    fn ensure_decryptable_css_error_errors() {
+        let mut disc = make_test_disc(1000, "DVD");
+        disc.encrypted = true;
+        disc.css_error = Some(crate::error::Error::CssKeyMissing);
+        let err = disc
+            .ensure_decryptable(false)
+            .expect_err("scrambled-but-uncracked CSS must error");
+        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
+        // --raw is exempt.
+        assert!(disc.ensure_decryptable(true).is_ok());
+    }
+
+    /// CSS-keyless-crack SUCCESS: `css` is Some with a title key → proceed.
+    #[test]
+    fn ensure_decryptable_css_with_key_proceeds() {
+        let mut disc = make_test_disc(1000, "DVD");
+        disc.encrypted = true;
+        disc.css = Some(css_state());
+        assert!(disc.ensure_decryptable(false).is_ok());
+    }
+
+    /// Per-title gate: a multi-VTS CSS disc whose chosen title's VTS could not
+    /// be re-cracked yields `DecryptKeys::None` even though the disc-wide
+    /// `decrypt_keys()` is `Css{..}`. `ensure_decryptable_keys` judges the
+    /// per-title key and must fail with CssKeyMissing.
+    #[test]
+    fn ensure_decryptable_keys_css_per_title_none_errors() {
+        let mut disc = make_test_disc(1000, "DVD");
+        disc.encrypted = true;
+        disc.css = Some(css_state());
+        let err = disc
+            .ensure_decryptable_keys(false, &crate::decrypt::DecryptKeys::None)
+            .expect_err("CSS disc, per-title key None, !raw must error");
+        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
+        // The same None key under --raw proceeds.
+        assert!(
+            disc.ensure_decryptable_keys(true, &crate::decrypt::DecryptKeys::None)
+                .is_ok()
+        );
+    }
+
+    /// `ensure_decryptable_keys` must never false-error an UNENCRYPTED disc no
+    /// matter the key argument (the verdict keys off disc state, not keys).
+    #[test]
+    fn ensure_decryptable_keys_unencrypted_never_errors() {
+        let disc = make_test_disc(1000, "BD");
+        assert!(
+            disc.ensure_decryptable_keys(false, &crate::decrypt::DecryptKeys::None)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn decrypt_keys_none_when_aacs_present_but_unit_keys_empty() {
         // VID-only state (resolved but no Unit Key yet) must read as None, not
@@ -4285,6 +4512,77 @@ mod tests {
             result.is_ok(),
             "sweep to regular file should succeed: {:?}",
             result.err()
+        );
+    }
+
+    /// disc→ISO correctness gate (the headline bug, at the copy entry point):
+    /// a DECRYPTING copy (`decrypt: true`, i.e. not --raw) of an AACS disc with
+    /// no resolved key must ERROR before reading any sector — never write
+    /// ciphertext to the ISO and return Ok. Asserts the error code is NoDiscKey
+    /// AND that no non-empty ISO was produced.
+    #[test]
+    fn copy_decrypting_aacs_no_key_errors_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("garbage.iso");
+        let sectors: u32 = 999; // 3-aligned for AACS units
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let mut disc = make_test_disc(sectors, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new())); // encrypted, no unit key → None
+        let opts = CopyOptions {
+            decrypt: true, // NOT --raw → decryption is required
+            multipass: false,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        let err = disc
+            .copy(&mut reader, &iso_path, &opts)
+            .expect_err("decrypting copy of AACS-no-key disc must error pre-flight");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::NoDiscKey {
+                disc_hash: String::new()
+            }
+            .code(),
+            "must surface NoDiscKey, not silently write ciphertext"
+        );
+        // No partial/garbage ISO: the gate fired before the sweep opened/sized
+        // the file, so either the file doesn't exist or it's empty.
+        let produced = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(produced, 0, "no ciphertext ISO may be written");
+    }
+
+    /// The same disc under `--raw` (`decrypt: false`) must PROCEED: the gate is
+    /// a no-op for raw, the sweep runs as a pass-through and writes the
+    /// encrypted image the user asked for. Proves the gate doesn't over-fire.
+    #[test]
+    fn copy_raw_aacs_no_key_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("raw.iso");
+        let sectors: u32 = 999;
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        let mut disc = make_test_disc(sectors, "UHD");
+        disc.encrypted = true;
+        disc.aacs = Some(aacs_with(Vec::new()));
+        let opts = CopyOptions {
+            decrypt: false, // --raw: no decryption, no key needed
+            multipass: false,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        assert!(
+            disc.copy(&mut reader, &iso_path, &opts).is_ok(),
+            "--raw copy of an encrypted disc must proceed (encrypted image is the goal)"
         );
     }
 
