@@ -1,6 +1,61 @@
 # Changelog
 
-## [1.0.0-rc.5.2] — UNRELEASED
+## [1.0.0-rc.6] — UNRELEASED
+
+### Added
+
+- **Every error is now `Error: E<code> <message>`, with an Error Codes
+  reference.** User-facing errors show their code so you can look it up, and a
+  new **Error Codes** page lists every code with its message, cause, and next
+  steps. A contract test guarantees every error variant has a code, a message in
+  all seven languages, and a Codes-page entry. Messages are source-agnostic
+  ("key source", never a specific database).
+
+### Fixed
+
+- **Multi-extent AACS alignment in `dir://` extraction.** The decrypted
+  file-tree extractor anchored the AACS unit grid to the first extent only, so a
+  file spanning multiple clip extents could mis-align and corrupt. Each extent
+  now anchors on its own encrypted-region start (the same class as the rc.5.2
+  clip-anchor fix). Decryption math is unchanged.
+- **Distinct "no key" reasons.** A disc whose key needs a Volume ID that
+  couldn't be obtained now reports a distinct error from "no key at all".
+- **autorip keydb writes go to the right path.** Auto-download, daily refresh,
+  the "Update KEYDB" button, and the startup existence-check now resolve to the
+  service's config path (matching where reads look); they previously used the
+  CLI's executable-local default.
+- **Crash-safety hardening** in `dir://` extraction and keydb writes (fsync of
+  files and parent directories around rename).
+- **Windows-reserved filenames** (`CON`, `NUL`, `COM1`…) inside a disc's file
+  tree are safely renamed on extraction instead of aborting the walk.
+
+### Tests
+
+- 58 new tests across the toolchain (AACS key resolution, the unlocker seam, the
+  key sources, DVD/CSS, `dir://` routing, and autorip keydb resolution).
+
+## [1.0.0-rc.5.3]
+
+### Added
+
+- **`dir://` output** — write a decrypted `VIDEO_TS` / `BDMV` file tree straight
+  from a disc or ISO instead of a single muxed file.
+
+### Changed
+
+- **Source-agnostic key errors** — decryption messages no longer assume a local
+  key database is *the* key source.
+- **The default `keydb.cfg` location is next to the executable** (portable CLI);
+  the autorip service keeps its container path.
+- **Simpler flags** — dropped `-k` (use `--keydb`) and removed `--device` (the
+  drive is named in the source URL, e.g. `disc:///dev/sgN`).
+
+### Fixed
+
+- **Fail loud on missing keys or bad input** instead of silently writing an
+  undecrypted file.
+
+## [1.0.0-rc.5.2]
 
 ### Fixed
 
