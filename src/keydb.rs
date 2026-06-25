@@ -43,12 +43,13 @@ fn read_capped_to_string<R: Read>(reader: R) -> Result<String> {
     String::from_utf8(buf).map_err(|_| Error::KeydbParse)
 }
 
-/// Build the error returned when no home directory can be determined
-/// (`HOME`/`USERPROFILE` unset). This is an *environment* failure — the
-/// process has no home dir, which typically signals a stripped container
-/// or CI configuration — not a corrupt or unparseable keydb file. Map it
-/// to a `NotFound` I/O error so display/remediation paths never claim a
-/// keydb parse failure for a file that was never consulted.
+/// Build the error returned when the executable's own directory can't be
+/// determined (`std::env::current_exe()` fails or has no parent). This is an
+/// *environment* failure — the process can't locate itself, which typically
+/// signals a stripped container or CI configuration — not a corrupt or
+/// unparseable keydb file. Map it to a `NotFound` I/O error so
+/// display/remediation paths never claim a keydb parse failure for a file
+/// that was never consulted.
 fn no_home_dir() -> Error {
     Error::IoError {
         source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -57,45 +58,24 @@ fn no_home_dir() -> Error {
 
 /// Standard keydb storage path — the canonical location to write the keydb to.
 ///
-/// On Windows this is the idiomatic per-user roaming dir
-/// `%APPDATA%\freemkv\keydb.cfg`, falling back to the legacy
-/// `%USERPROFILE%\.config\freemkv\keydb.cfg` only if `APPDATA` is unset. On
-/// Linux/macOS it stays the long-standing `$HOME/.config/freemkv/keydb.cfg`.
+/// The keydb lives *next to the executable*: `<dir of current exe>/keydb.cfg`,
+/// where the directory is `std::env::current_exe()`'s parent. This makes
+/// freemkv a portable, standalone binary — drop the exe and its `keydb.cfg`
+/// in the same folder and it works, with no OS-specific config dir
+/// (`%APPDATA%`, `~/.config`, XDG) involved at all.
 ///
-/// The CLI's read-side search (first existing of several locations) lives in
-/// `freemkv-keysources::keydb_search_paths`; this function is the single
-/// *write* default used by `save`/`update`. On Windows the two agree. On
-/// Linux they can diverge: this write path always uses
-/// `$HOME/.config/freemkv/keydb.cfg` and ignores `XDG_CONFIG_HOME`, whereas
-/// the read-side search additionally checks `$XDG_CONFIG_HOME/freemkv` first.
-/// A user who sets `XDG_CONFIG_HOME` to a non-`$HOME/.config` location will
-/// therefore have `update-keys` write to the `$HOME` path while the read-side
-/// search may prefer the `XDG_CONFIG_HOME` location — the `$HOME` path is still
-/// in the search list, so the freshly-written keydb is found, just not first.
+/// The CLI's read-side search lives in
+/// `freemkv-keysources::keydb_search_paths`; it resolves the same exe-local
+/// location, so the *write* default used by `save`/`update` and the read-side
+/// search always agree.
+///
+/// Returns a `NotFound` I/O error (via [`no_home_dir`]) if the executable's
+/// own directory can't be determined.
 pub fn default_path() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            if !appdata.is_empty() {
-                return Ok(PathBuf::from(appdata).join("freemkv").join("keydb.cfg"));
-            }
-        }
-        let profile = std::env::var("USERPROFILE").map_err(|_| no_home_dir())?;
-        Ok(PathBuf::from(profile)
-            .join(".config")
-            .join("freemkv")
-            .join("keydb.cfg"))
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| no_home_dir())?;
-        Ok(PathBuf::from(home)
-            .join(".config")
-            .join("freemkv")
-            .join("keydb.cfg"))
-    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("keydb.cfg")))
+        .ok_or_else(no_home_dir)
 }
 
 /// Download a KEYDB from a URL, verify, save to the standard path.
@@ -448,6 +428,23 @@ mod tests {
         }
         // And explicitly: it is not the keydb-parse code.
         assert_ne!(no_home_dir().code(), Error::KeydbParse.code());
+    }
+
+    // The write default is local to the executable: `<exe dir>/keydb.cfg`.
+    // Under `cargo test`, `current_exe()` is the test binary in `target/…`;
+    // assert against the same computation, not a hardcoded path.
+    #[test]
+    fn default_path_is_local_to_executable() {
+        let expected = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("keydb.cfg")));
+        match expected {
+            Some(p) => assert_eq!(default_path().unwrap(), p),
+            None => {
+                // No exe parent available → must surface the env failure.
+                assert!(matches!(default_path(), Err(Error::IoError { .. })));
+            }
+        }
     }
 
     #[test]
