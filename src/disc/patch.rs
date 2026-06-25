@@ -1629,6 +1629,7 @@ impl Disc {
             bytes_good_total: s.bytes_good,
             bytes_unreadable_total: s.bytes_unreadable,
             bytes_pending_total: s.bytes_pending,
+            bytes_retryable_total: s.bytes_retryable,
             bytes_total_disc: total_bytes,
             disc_duration_secs: main_title.map(|t| t.duration_secs),
             bytes_bad_in_main_title: main_title_bad,

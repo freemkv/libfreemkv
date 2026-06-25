@@ -613,6 +613,7 @@ fn report(opts: &ExtractOptions, done: u64, total: u64) -> bool {
                 bytes_good_total: done,
                 bytes_unreadable_total: 0,
                 bytes_pending_total: 0,
+                bytes_retryable_total: 0,
                 bytes_total_disc: total,
                 disc_duration_secs: None,
                 bytes_bad_in_main_title: 0,
