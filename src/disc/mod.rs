@@ -2347,78 +2347,93 @@ impl Disc {
         // written. `opts.decrypt == false` is `--raw`: the gate is a no-op (the
         // user wants the encrypted image), and an unencrypted disc passes too.
         self.ensure_decryptable(!opts.decrypt)?;
-        if opts.multipass {
-            let mf_path = self.mapfile_for(path);
-            if mf_path.exists() {
-                let map =
-                    mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
-                let stats = map.stats();
-                let disc_size = self.capacity_bytes;
-                let covers_disc = map.total_size() == disc_size;
-                let bad_bytes = stats.bytes_pending + stats.bytes_unreadable;
+        // Mapfile-driven resume dispatch. This runs for BOTH plain and
+        // `--multipass` copies: an interrupted plain `disc:// → iso://` writes
+        // a per-block-flushed mapfile (crash-safe), and re-issuing the SAME
+        // command must pick up where it stopped rather than re-sweep from
+        // sector 0 (the help/CLI examples promise "auto-resumes if
+        // interrupted"). The ONLY multipass-specific behaviour is the patch
+        // (Pass N) dispatch on retryable bytes — plain mode has no patch pass,
+        // so it returns a terminal result there instead.
+        let mf_path = self.mapfile_for(path);
+        if mf_path.exists() {
+            let map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
+            let stats = map.stats();
+            let disc_size = self.capacity_bytes;
+            let covers_disc = map.total_size() == disc_size;
+            let bad_bytes = stats.bytes_pending + stats.bytes_unreadable;
+            tracing::info!(
+                "copy dispatch: disc={} map={} covers={} multipass={} good={} nontried={} pending={} unreadable={}",
+                disc_size,
+                map.total_size(),
+                covers_disc,
+                opts.multipass,
+                stats.bytes_good,
+                stats.bytes_nontried,
+                stats.bytes_pending,
+                stats.bytes_unreadable,
+            );
+            if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 {
+                // Every sector is Finished — a prior copy completed. Re-issuing
+                // the command is a no-op (don't re-sweep a finished ISO).
+                return Ok(CopyResult {
+                    bytes_total: disc_size,
+                    bytes_good: stats.bytes_good,
+                    bytes_unreadable: stats.bytes_unreadable,
+                    bytes_pending: 0,
+                    recovered_this_pass: 0,
+                    complete: true,
+                    halted: false,
+                });
+            }
+            if !covers_disc {
+                // Mapfile capacity != disc capacity. Force a full (non-
+                // resume) sweep on ANY mismatch so [0, disc_size) is covered
+                // as one fresh region (the non-resume path also set_len's the
+                // ISO to the full capacity).
+                //
+                // UNDER-cover (map.total_size() < disc_size): a resume sweep
+                // builds its region list only from the mapfile's NonTried
+                // entries and would silently never read the tail
+                // [map.total_size(), disc_size) — abandoning readable data
+                // and the ISO's tail.
+                //
+                // OVER-cover (map.total_size() > disc_size): a resume sweep's
+                // NonTried regions extend past the disc; `reader.read_sectors`
+                // would then read LBAs beyond capacity (the promised
+                // capacity clamp was never actually applied). A fresh sweep
+                // sized to the real disc avoids reading past the end.
                 tracing::info!(
-                    "copy dispatch: disc={} map={} covers={} good={} nontried={} pending={} unreadable={}",
-                    disc_size,
+                    "copy dispatch: → sweep (covers_disc=false, resume=false, map={}, disc={})",
                     map.total_size(),
-                    covers_disc,
-                    stats.bytes_good,
-                    stats.bytes_nontried,
-                    stats.bytes_pending,
-                    stats.bytes_unreadable,
+                    disc_size,
                 );
-                if covers_disc && bad_bytes == 0 {
-                    return Ok(CopyResult {
-                        bytes_total: disc_size,
-                        bytes_good: stats.bytes_good,
-                        bytes_unreadable: stats.bytes_unreadable,
-                        bytes_pending: 0,
-                        recovered_this_pass: 0,
-                        complete: true,
-                        halted: false,
-                    });
-                }
-                if !covers_disc {
-                    // Mapfile capacity != disc capacity. Force a full (non-
-                    // resume) sweep on ANY mismatch so [0, disc_size) is covered
-                    // as one fresh region (the non-resume path also set_len's the
-                    // ISO to the full capacity).
-                    //
-                    // UNDER-cover (map.total_size() < disc_size): a resume sweep
-                    // builds its region list only from the mapfile's NonTried
-                    // entries and would silently never read the tail
-                    // [map.total_size(), disc_size) — abandoning readable data
-                    // and the ISO's tail.
-                    //
-                    // OVER-cover (map.total_size() > disc_size): a resume sweep's
-                    // NonTried regions extend past the disc; `reader.read_sectors`
-                    // would then read LBAs beyond capacity (the promised
-                    // capacity clamp was never actually applied). A fresh sweep
-                    // sized to the real disc avoids reading past the end.
-                    tracing::info!(
-                        "copy dispatch: → sweep (covers_disc=false, resume=false, map={}, disc={})",
-                        map.total_size(),
-                        disc_size,
-                    );
-                    return self.sweep_internal(reader, path, opts, false);
-                }
-                // NonTried bytes mean a prior sweep was halted mid-way and the
-                // mapfile still has un-attempted ranges (the un-swept tail).
-                // The sweep pass's job is to read those — route to a resume
-                // sweep FIRST, even when retryable bytes also exist. Checking
-                // retryable before this (and routing straight to patch) would
-                // silently abandon the un-swept tail: patch only revisits the
-                // mapfile's bad ranges, never the NonTried ones. The retry
-                // (patch) passes run after, driven separately by the caller's
-                // pass loop, and pick up the retryable bytes the sweep leaves.
-                if stats.bytes_nontried > 0 {
-                    tracing::info!(
-                        "copy dispatch: → sweep resume (covers_disc=true, \
-                         nontried={}, retryable={})",
-                        stats.bytes_nontried,
-                        stats.bytes_retryable,
-                    );
-                    return self.sweep_internal(reader, path, opts, true);
-                }
+                return self.sweep_internal(reader, path, opts, false);
+            }
+            // NonTried bytes mean a prior sweep was halted mid-way (Ctrl-C /
+            // crash) and the mapfile still has un-attempted ranges (the un-swept
+            // tail). The sweep pass's job is to read those — route to a resume
+            // sweep FIRST, even when retryable bytes also exist. Checking
+            // retryable before this (and routing straight to patch) would
+            // silently abandon the un-swept tail: patch only revisits the
+            // mapfile's bad ranges, never the NonTried ones. The retry
+            // (patch) passes run after, driven separately by the caller's
+            // pass loop, and pick up the retryable bytes the sweep leaves.
+            // This is the plain-copy resume path too: a clean disc interrupted
+            // by Ctrl-C leaves exactly this state (NonTried tail), so a re-run
+            // resumes the sweep instead of restarting from sector 0.
+            if stats.bytes_nontried > 0 {
+                tracing::info!(
+                    "copy dispatch: → sweep resume (covers_disc=true, \
+                     nontried={}, retryable={})",
+                    stats.bytes_nontried,
+                    stats.bytes_retryable,
+                );
+                return self.sweep_internal(reader, path, opts, true);
+            }
+            // From here covers_disc=true and nontried=0: the whole disc was
+            // attempted. Only the retry/patch decision differs by mode.
+            if opts.multipass {
                 if stats.bytes_retryable > 0 {
                     tracing::info!(
                         "copy dispatch: → patch (retryable={})",
@@ -2445,6 +2460,25 @@ impl Disc {
                     halted: false,
                 });
             }
+            // Plain (non-multipass) copy: there is no patch pass and the sweep
+            // aborts on the first read error, so a fully-attempted mapfile with
+            // bad bytes is terminal. Re-running must NOT restart from sector 0
+            // (that re-reads the whole disc and re-hits the same bad sector);
+            // return the terminal result so the caller surfaces the failure.
+            // (`complete` is true only when no bad bytes remain.)
+            tracing::info!(
+                "copy dispatch: plain copy, disc fully attempted (bad={}) — terminal result",
+                bad_bytes,
+            );
+            return Ok(CopyResult {
+                bytes_total: disc_size,
+                bytes_good: stats.bytes_good,
+                bytes_unreadable: stats.bytes_unreadable,
+                bytes_pending: stats.bytes_pending,
+                recovered_this_pass: 0,
+                complete: bad_bytes == 0,
+                halted: false,
+            });
         }
         self.sweep_internal(reader, path, opts, false)
     }
@@ -5104,6 +5138,121 @@ mod tests {
         assert!(
             tail_read,
             "resume must sweep the NonTried tail; tail sectors were never read"
+        );
+    }
+
+    /// Regression (rc.6 user fix): a PLAIN (non-`--multipass`) `disc:// → iso://`
+    /// copy interrupted by Ctrl-C must RESUME from where it stopped when the
+    /// SAME command is re-issued — not restart from sector 0. The CLI help and
+    /// `rip_iso` examples promise "auto-resumes if interrupted". Before the fix
+    /// the whole mapfile-resume dispatch in `Disc::copy` was gated behind
+    /// `if opts.multipass`, so a plain copy always called
+    /// `sweep_internal(resume=false)`, which wiped the mapfile + ISO and swept
+    /// the disc again from LBA 0.
+    ///
+    /// Simulate an interrupted plain sweep: a mapfile that covers the disc with
+    /// a Finished prefix [0..100) and a NonTried tail [100..200). A plain re-run
+    /// must read ONLY the tail (resume) and leave the prefix untouched.
+    #[test]
+    fn plain_copy_resumes_nontried_tail_after_interrupt() {
+        use crate::disc::mapfile::{Mapfile, SectorStatus};
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        // Reader that records every LBA it is asked to read.
+        struct TrackingReader {
+            total_sectors: u32,
+            reads: Arc<Mutex<HashSet<u32>>>,
+        }
+        impl crate::sector::SectorSource for TrackingReader {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> crate::error::Result<usize> {
+                {
+                    let mut r = self.reads.lock().unwrap();
+                    for i in 0..count as u32 {
+                        r.insert(lba + i);
+                    }
+                }
+                let n = count as usize * 2048;
+                buf[..n].fill(0xAA);
+                Ok(n)
+            }
+            fn capacity_sectors(&self) -> u32 {
+                self.total_sectors
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("test.iso");
+        let sectors: u32 = 200;
+        let disc = make_test_disc(sectors, "PlainResume");
+
+        // Pre-build a mapfile mimicking an interrupted plain sweep:
+        //   [0..100)   Finished  (already written before Ctrl-C)
+        //   [100..200) NonTried  (un-swept tail)
+        let mf_path = disc.mapfile_for(&iso_path);
+        {
+            let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+            mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+            // [100..200) stays NonTried from create()'s initial region.
+            mf.flush().unwrap();
+
+            let st = mf.stats();
+            assert!(st.bytes_nontried > 0, "must have a NonTried tail");
+            assert_eq!(st.bytes_retryable, 0, "plain interrupt leaves no retryable");
+            assert_eq!(mf.total_size(), sectors as u64 * 2048);
+        }
+        // The ISO file must already exist (it was being written before the
+        // interrupt) so the resume opens it rather than recreating it.
+        std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+
+        let reads = Arc::new(Mutex::new(HashSet::new()));
+        let mut reader = TrackingReader {
+            total_sectors: sectors,
+            reads: reads.clone(),
+        };
+        // PLAIN copy — multipass: false. This is the path the bug broke.
+        let opts = CopyOptions {
+            decrypt: false,
+            multipass: false,
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        let result = disc.copy(&mut reader, &iso_path, &opts);
+        assert!(
+            result.is_ok(),
+            "plain resume copy failed: {:?}",
+            result.err()
+        );
+
+        let got = reads.lock().unwrap();
+        // The NonTried tail [100..200) MUST have been read by the resume sweep.
+        let tail_read = (100u32..200).any(|lba| got.contains(&lba));
+        assert!(
+            tail_read,
+            "plain copy must resume-sweep the NonTried tail; tail sectors were never read"
+        );
+        // The Finished prefix [0..100) must NOT be re-read — that would mean a
+        // restart-from-zero (the bug), not a resume.
+        let prefix_reread = (0u32..100).any(|lba| got.contains(&lba));
+        assert!(
+            !prefix_reread,
+            "plain copy must NOT re-read the already-Finished prefix (it restarted from sector 0)"
+        );
+
+        // The mapfile must now be fully Finished (disc fully swept on resume).
+        let reloaded = Mapfile::load(&mf_path).unwrap();
+        assert_eq!(
+            reloaded.stats().bytes_nontried,
+            0,
+            "resume sweep must clear the NonTried tail"
         );
     }
 
