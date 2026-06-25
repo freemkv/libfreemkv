@@ -1116,6 +1116,69 @@ pub struct ResolveContext<'a> {
     pub mkb: Option<&'a [u8]>,
 }
 
+/// Why a key resolution attempt produced no usable key.
+///
+/// Distinguishes the two no-key outcomes that an application must report
+/// differently:
+///   * [`ResolveFailure::VidUnavailable`] — the key source DID provide
+///     derivation material (device or processing keys), but no Volume ID
+///     (VID) was available to derive the Volume Unique Key. The fix is to
+///     recover the VID (a drive / handshake problem), not to add keys.
+///   * [`ResolveFailure::NoMaterial`] — no usable key material was found at
+///     all (no DK/PK material, no disc-keyed hit). The fix is to add keys.
+///
+/// This carries no key bytes and is independent of the decryption math; it
+/// is purely the *reason* a resolution returned no key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveFailure {
+    /// Derivation material was present (DKs or PKs) but no VID was available
+    /// to derive the unit key. Surfaced as [`crate::error::Error::AacsVidUnavailable`].
+    VidUnavailable,
+    /// No usable key material at all. Surfaced as
+    /// [`crate::error::Error::NoDiscKey`].
+    NoMaterial,
+}
+
+/// Version-dispatched resolution that preserves the *reason* on failure.
+///
+/// Identical key derivation to the [`resolve_keys_v1`] / [`resolve_keys_v2`] /
+/// [`resolve_keys_v21`] chain (it calls straight through to them); the only
+/// addition is that an unresolved disc returns a typed [`ResolveFailure`]
+/// instead of a bare `None`, so callers can report E7021 (material but no VID)
+/// vs E7022 (no material). `version_u8` is the on-disc AACS major (1 → V10,
+/// anything else → the V20/V21 chain), matching `AacsState::version`.
+pub fn resolve_keys_with_reason(
+    ctx: &ResolveContext<'_>,
+    version_u8: u8,
+) -> std::result::Result<ResolvedKeys, ResolveFailure> {
+    let resolved = match version_u8 {
+        1 => resolve_keys_v1(ctx),
+        _ => resolve_keys_v2(ctx).or_else(|| resolve_keys_v21(ctx)),
+    };
+    match resolved {
+        Some(r) => Ok(r),
+        None => Err(classify_resolve_failure(ctx)),
+    }
+}
+
+/// Classify why resolution found no key. The key source provided derivation
+/// material (device or processing keys) but the VID sentinel is all-zero →
+/// [`ResolveFailure::VidUnavailable`]; otherwise → [`ResolveFailure::NoMaterial`].
+///
+/// Reads only what the resolver already had (provider material + the VID
+/// sentinel) — no key derivation, no descramble.
+fn classify_resolve_failure(ctx: &ResolveContext<'_>) -> ResolveFailure {
+    let has_vid = *ctx.volume_id != [0u8; 16];
+    let providers = super::provider::Providers(ctx.providers);
+    let has_derivation_material =
+        !providers.device_keys().is_empty() || !providers.processing_keys().is_empty();
+    if !has_vid && has_derivation_material {
+        ResolveFailure::VidUnavailable
+    } else {
+        ResolveFailure::NoMaterial
+    }
+}
+
 /// AACS 1.0 key resolution. Parses `Unit_Key_RO.inf` with 48-byte
 /// stride. Tries paths 1 → 4 in order.
 pub fn resolve_keys_v1(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
