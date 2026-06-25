@@ -1,5 +1,50 @@
 # Changelog
 
+## [1.0.0-rc.5.2] — UNRELEASED
+
+### Fixed
+
+- **Windows Explorer now reports the full 25 fps for interlaced SD-DVD.**
+  rc.5.1 added a `DefaultDecodedFieldDuration` (20 ms field) element to the
+  576i/480i track header on the theory that Windows derives fps from it. The
+  captured Silence-of-the-Lambs evidence proved the opposite: with
+  `FlagInterlaced=1` + `DefaultDuration=40 ms` + `DefaultDecodedFieldDuration=20 ms`,
+  Windows Explorer reported 12.5 fps (half) and MediaInfo flipped the track to
+  "Frame rate mode: Variable". MakeMKV's correct rip of the same disc OMITS
+  `DefaultDecodedFieldDuration`, keeps `FlagInterlaced=1` + `FieldOrder=TFF` +
+  full-frame `DefaultDuration` (40 ms), and Explorer shows the full 25 fps with
+  MediaInfo "Constant". The element is no longer written (`MkvTrack::video` now
+  passes `field_duration_ns == 0`); the only frame-rate signal tools trust,
+  `1/DefaultDuration` = 25 fps, is the full-frame value. Interlace signalling
+  (`FlagInterlaced=1`, `FieldOrder=TFF`) is retained, and MediaInfo still
+  reports "Interlaced / Top Field First" because it reads scan type from the
+  MPEG-2 elementary stream's picture coding extension, not the container flag.
+
+### Added
+
+- **`--log-level 3` is now self-sufficient for MKV/opening-frame diagnosis.**
+  The diagnostic pass now (a) dumps the ACTUAL MKV `TrackEntry` elements written
+  per track (`tag=mkv.track`: FlagInterlaced, FieldOrder, DefaultDuration,
+  DefaultDecodedFieldDuration via field-duration, Display dims, codecPrivate as
+  hex) so the Windows-fps-class metadata is verifiable from a log alone, and
+  (b) captures the first ~100 coded frames per track (raw bytes) to a
+  `<output>.opening.bin` side file with a per-frame summary line
+  (`tag=mkv.opening.frame`: track, key/delta, size, PTS) so opening-GOP / menu
+  issues are diagnosable from a future log without the disc. Both are gated to
+  log-level 3; a normal run opens no side file and records nothing.
+
+### Verified
+
+- **DVD opening-GOP / still-frame open handling is correct (no change needed).**
+  The hypothesis that the opening pictures get the wrong (last-seen) sequence
+  header or have their PTS floored to t=0 was traced and ruled out: the
+  codecPrivate is the FIRST sequence header (read once at headers-ready, before
+  any later AU), DVD VOBU structure guarantees each title opens on a sequence
+  header + I-frame (no mid-GOP open), the parser back-anchors leading
+  still-frames to the disc's real timeline, and the muxer anchors its timestamp
+  base on the opening keyframe's real PTS so the t=0 floor never corrupts it.
+  Regression tests pin all three.
+
 ## [1.0.0-rc.5.1]
 
 ### Fixed

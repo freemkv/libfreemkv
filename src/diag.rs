@@ -272,6 +272,197 @@ pub fn dump_dvd_substream_probe(title_id: u16, probed: &std::collections::BTreeM
     }
 }
 
+// ── MKV TrackEntry dump (the ACTUAL container elements written) ──────────────
+
+/// `true` when the `--log-level 3` diagnostic target is enabled. Hot-path
+/// callers (the opening-frame capture) check this once and skip all work when
+/// off, so a normal run pays nothing.
+pub fn diag_enabled() -> bool {
+    tracing::enabled!(target: DIAG, tracing::Level::DEBUG)
+}
+
+/// Cap on the number of codecPrivate bytes rendered to hex in a `tag=mkv.track`
+/// line. The sequence header / avcC / hvcC prefix that matters for diagnosis
+/// (resolution, frame rate, profile) is at the front; a multi-KB blob past this
+/// is summarised as `..(+NB)` rather than flooding the log.
+const CODEC_PRIVATE_HEX_CAP: usize = 64;
+
+/// Render a track's codecPrivate as an uppercase-hex string for the diagnostic
+/// line, capped at [`CODEC_PRIVATE_HEX_CAP`] bytes (`..(+NB)` suffix beyond).
+/// `None` / empty → `"none"`. Pure (no logging) so it is directly unit-testable.
+fn codec_private_hex(cp: Option<&[u8]>) -> String {
+    match cp {
+        Some(b) if !b.is_empty() => {
+            use std::fmt::Write;
+            let shown = b.len().min(CODEC_PRIVATE_HEX_CAP);
+            let mut s = String::with_capacity(shown * 2 + 8);
+            for byte in &b[..shown] {
+                let _ = write!(s, "{byte:02X}");
+            }
+            if b.len() > CODEC_PRIVATE_HEX_CAP {
+                let _ = write!(s, "..(+{}B)", b.len() - CODEC_PRIVATE_HEX_CAP);
+            }
+            s
+        }
+        _ => "none".to_string(),
+    }
+}
+
+/// Frame the raw bytes of one captured opening frame for the `.opening.bin` side
+/// file: `[track:u8][keyframe:u8][pts_ns:i64 LE][len:u32 LE][raw bytes]`. Pure
+/// (no I/O) so the record layout is directly unit-testable; `record` appends the
+/// returned bytes to the side file.
+fn frame_record(track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(14 + data.len());
+    rec.push(track_idx as u8);
+    rec.push(keyframe as u8);
+    rec.extend_from_slice(&pts_ns.to_le_bytes());
+    rec.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    rec.extend_from_slice(data);
+    rec
+}
+
+/// Emit the MKV `TrackEntry` elements the muxer is about to WRITE for one
+/// track — the Windows-fps-class metadata (FlagInterlaced, FieldOrder,
+/// DefaultDuration, DefaultDecodedFieldDuration, Display dims) plus the
+/// codecPrivate as hex. With this row a bug log alone is enough to verify why
+/// Windows Explorer reports a given frame rate for an interlaced SD track: the
+/// container values that drive its fps derivation are all present, no disc and
+/// no MediaInfo needed.
+///
+/// `track_number` is the 1-based MKV track number; `track` is the built
+/// [`crate::mux::mkv::MkvTrack`] whose fields map one-to-one onto the emitted
+/// elements (see `MkvMuxer::new`). No-op unless the diag target is on.
+pub fn dump_mkv_track(track_number: u64, track: &crate::mux::mkv::MkvTrack) {
+    if !diag_enabled() {
+        return;
+    }
+    // codecPrivate as hex (capped so a multi-KB hvcC doesn't flood the log; the
+    // sequence header / avcC prefix that matters for diagnosis is at the front).
+    let cp = codec_private_hex(track.codec_private.as_deref());
+    let field_order = match track.field_order {
+        crate::mux::ebml::FIELD_ORDER_TFF => "TFF",
+        crate::mux::ebml::FIELD_ORDER_BFF => "BFF",
+        _ => "—",
+    };
+    // FlagInterlaced is only written for video tracks (1=interlaced/2=progressive);
+    // report what the muxer will emit, or "—" for non-video tracks where the
+    // element is omitted entirely.
+    let interlaced = if track.track_type == crate::mux::ebml::TRACK_TYPE_VIDEO {
+        if track.interlaced {
+            "1(interlaced)"
+        } else {
+            "2(progressive)"
+        }
+    } else {
+        "—"
+    };
+    tracing::debug!(
+        target: DIAG,
+        "tag=mkv.track num={track_number} type={} codec={} flag_interlaced={interlaced} \
+    field_order={field_order} default_duration_ns={} field_duration_ns={} \
+    pixel={}x{} display={}x{} cp_len={} cp_hex={cp}",
+        track.track_type,
+        track.codec_id,
+        track.default_duration_ns,
+        track.field_duration_ns,
+        track.pixel_width,
+        track.pixel_height,
+        track.display_width,
+        track.display_height,
+        track.codec_private.as_ref().map_or(0, |b| b.len()),
+    );
+}
+
+// ── Opening-frame capture (first ~N coded frames per track → side file) ──────
+
+/// Number of coded frames captured PER TRACK before the capture goes dormant.
+/// ~100 frames covers a DVD's first few seconds of every track (the
+/// opening-GOP / still-frame / menu window where mid-GOP open or PTS-floor bugs
+/// show up) while bounding the side file to a few MB even for HD I-frames.
+const OPENING_FRAMES_PER_TRACK: usize = 100;
+
+/// Captures the first [`OPENING_FRAMES_PER_TRACK`] coded frames of EACH track to
+/// a side file (`<output>.opening.bin`) and logs a per-frame summary line, so an
+/// opening-GOP / menu / mid-GOP-open issue is diagnosable from a future log +
+/// side file WITHOUT the disc. Gated to `--log-level 3`: constructed only when
+/// the diag target is on, so a normal run never opens the file or records a byte.
+///
+/// Side-file record framing (so a reader can split it back into frames):
+/// `[track:u8][keyframe:u8][pts_ns:i64 LE][len:u32 LE][raw frame bytes]`.
+pub struct OpeningCapture {
+    file: std::fs::File,
+    /// Frames captured so far, per track index. Capture for a track stops once
+    /// its counter reaches [`OPENING_FRAMES_PER_TRACK`].
+    counts: Vec<usize>,
+}
+
+impl OpeningCapture {
+    /// Open `<output>.opening.bin` next to the MKV output. Returns `None` (no
+    /// capture) when the diag target is off OR the side file can't be created —
+    /// a diagnostic must never fail the rip. `track_count` sizes the per-track
+    /// counters.
+    pub fn new(output_path: &std::path::Path, track_count: usize) -> Option<Self> {
+        if !diag_enabled() {
+            return None;
+        }
+        let mut name = output_path.as_os_str().to_os_string();
+        name.push(".opening.bin");
+        match std::fs::File::create(&name) {
+            Ok(file) => {
+                tracing::debug!(
+                    target: DIAG,
+                    "tag=mkv.opening.open path={:?} per_track_cap={OPENING_FRAMES_PER_TRACK}",
+                    std::path::Path::new(&name),
+                );
+                Some(Self {
+                    file,
+                    counts: vec![0; track_count],
+                })
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: DIAG,
+                    "tag=mkv.opening.open path={:?} failed={e} (capture disabled, rip unaffected)",
+                    std::path::Path::new(&name),
+                );
+                None
+            }
+        }
+    }
+
+    /// Record one coded frame for `track_idx` if that track is still under its
+    /// per-track cap. Writes the framed raw bytes to the side file and logs a
+    /// one-line summary. A write error disables further capture for the track
+    /// (counter pinned to the cap) but never propagates — the rip is unaffected.
+    pub fn record(&mut self, track_idx: usize, pts_ns: i64, keyframe: bool, data: &[u8]) {
+        let Some(count) = self.counts.get_mut(track_idx) else {
+            return;
+        };
+        if *count >= OPENING_FRAMES_PER_TRACK {
+            return;
+        }
+        use std::io::Write;
+        let rec = frame_record(track_idx, pts_ns, keyframe, data);
+        if let Err(e) = self.file.write_all(&rec) {
+            // Stop trying on this track; a broken side file must not stall mux.
+            *count = OPENING_FRAMES_PER_TRACK;
+            tracing::debug!(
+                target: DIAG,
+                "tag=mkv.opening.frame track={track_idx} write_failed={e} (capture stopped for track)",
+            );
+            return;
+        }
+        *count += 1;
+        tracing::debug!(
+            target: DIAG,
+            "tag=mkv.opening.frame track={track_idx} n={count} type={} size={} pts_ns={pts_ns}",
+            if keyframe { "key" } else { "delta" },
+            data.len(),
+        );
+    }
+}
+
 // ── Disc-level dump (post-lowering: titles, streams, decisions, AACS) ────────
 
 /// Emit the full scan diagnostic block for a built [`Disc`]. Terse, one line
@@ -474,6 +665,52 @@ mod tests {
     fn sample_rate_hz_values() {
         assert_eq!(sample_rate_hz(SampleRate::S48), 48000);
         assert_eq!(sample_rate_hz(SampleRate::S96), 96000);
+    }
+
+    #[test]
+    fn codec_private_hex_renders_caps_and_handles_empty() {
+        // None / empty → "none" (no hex). The Windows-fps diagnosis only needs
+        // the seq-header prefix, so render it but cap long blobs.
+        assert_eq!(codec_private_hex(None), "none");
+        assert_eq!(codec_private_hex(Some(&[])), "none");
+        // Short blob: full uppercase hex, no suffix. An MPEG-2 seq header starts
+        // 00 00 01 B3 — exactly what a reader greps for in a bug log.
+        assert_eq!(
+            codec_private_hex(Some(&[0x00, 0x00, 0x01, 0xB3])),
+            "000001B3"
+        );
+        // Over the cap: first CODEC_PRIVATE_HEX_CAP bytes + a "..(+NB)" summary.
+        let big = vec![0xABu8; CODEC_PRIVATE_HEX_CAP + 5];
+        let s = codec_private_hex(Some(&big));
+        assert!(s.starts_with(&"AB".repeat(CODEC_PRIVATE_HEX_CAP)), "{s}");
+        assert!(s.ends_with("..(+5B)"), "{s}");
+    }
+
+    #[test]
+    fn frame_record_layout_is_parseable() {
+        // The .opening.bin record framing must round-trip so a future tool can
+        // split the side file back into frames without the disc:
+        // [track:u8][keyframe:u8][pts_ns:i64 LE][len:u32 LE][raw bytes].
+        let data = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let rec = frame_record(2, -40_000_000, true, &data);
+        assert_eq!(rec.len(), 14 + data.len());
+        assert_eq!(rec[0], 2, "track index");
+        assert_eq!(rec[1], 1, "keyframe flag");
+        assert_eq!(
+            i64::from_le_bytes(rec[2..10].try_into().unwrap()),
+            -40_000_000,
+            "pts_ns survives (signed — opening back-anchor can be negative)"
+        );
+        assert_eq!(
+            u32::from_le_bytes(rec[10..14].try_into().unwrap()),
+            4,
+            "len"
+        );
+        assert_eq!(&rec[14..], &data, "raw frame bytes follow");
+        // A non-keyframe records the flag as 0.
+        let delta = frame_record(0, 0, false, &[]);
+        assert_eq!(delta[1], 0);
+        assert_eq!(u32::from_le_bytes(delta[10..14].try_into().unwrap()), 0);
     }
 
     /// The cell row shows the raw category byte (0xNN) beside the decode, and

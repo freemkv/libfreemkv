@@ -95,6 +95,18 @@ impl MkvStream {
     /// Create for writing PES frames → MKV container.
     /// Codec privates come from title.codec_privates (populated by input stream).
     pub fn create(writer: Box<dyn WriteSeek + Send>, title: &DiscTitle) -> io::Result<Self> {
+        Self::create_at(writer, title, None)
+    }
+
+    /// As [`create`](Self::create), but `output_path` (when known) enables the
+    /// `--log-level 3` opening-frame capture to `<output>.opening.bin`. A `None`
+    /// path (e.g. an in-memory / stdio sink) silently skips the side-file
+    /// capture; the per-track TrackEntry dump still fires.
+    pub fn create_at(
+        writer: Box<dyn WriteSeek + Send>,
+        title: &DiscTitle,
+        output_path: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
         let mut tracks = Vec::new();
         let mut has_default_video = false;
         let mut has_default_audio = false;
@@ -118,13 +130,28 @@ impl MkvStream {
             tracks.push(track);
         }
 
-        let muxer = MkvMuxer::new(
+        // --log-level 3: dump the ACTUAL TrackEntry elements about to be written
+        // (FlagInterlaced / FieldOrder / DefaultDuration / DefaultDecodedFieldDuration
+        // / Display dims / codecPrivate hex) so the Windows-fps-class metadata is
+        // verifiable from a log alone. No-op when diag is off.
+        for (i, track) in tracks.iter().enumerate() {
+            crate::diag::dump_mkv_track((i + 1) as u64, track);
+        }
+
+        let mut muxer = MkvMuxer::new(
             writer,
             &tracks,
             Some(&title.playlist),
             title.duration_secs,
             &title.chapters,
         )?;
+
+        // --log-level 3: capture the first ~100 coded frames per track to
+        // `<output>.opening.bin`. Only opens the side file when diag is on AND a
+        // real output path is known; otherwise it's a no-op the muxer never sees.
+        if let Some(path) = output_path {
+            muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, tracks.len()));
+        }
 
         Ok(Self {
             disc_title: title.clone(),
