@@ -232,10 +232,15 @@ impl Disc {
                 }
             }
 
-            let before_loss = decrypt_loss.load(Ordering::Relaxed);
+            // Acquire (rather than Relaxed) on these per-file delta loads:
+            // `extract_tree` drives `dec` single-threaded so there is no race
+            // today, but Acquire costs nothing on x86 and gives a happens-
+            // before edge if file extraction is ever parallelised, so the
+            // delta can never read a torn/stale counter across iterations.
+            let before_loss = decrypt_loss.load(Ordering::Acquire);
             let (mut fr, halted) =
                 extract_one_file(&mut dec, dest, pf, total_bytes, &mut done_bytes, opts)?;
-            let after_loss = decrypt_loss.load(Ordering::Relaxed);
+            let after_loss = decrypt_loss.load(Ordering::Acquire);
             fr.bytes_undecryptable = after_loss.saturating_sub(before_loss);
             fr.bytes_good = fr.bytes_good.saturating_sub(fr.bytes_undecryptable);
 
@@ -444,24 +449,39 @@ fn extract_one_file<S: SectorSource>(
         return Ok((fr, false));
     }
 
-    // Anchor AACS unit alignment at the file's first extent start (clip-
-    // anchored gate, not absolute LBA 0). No-op for CSS / None sources.
-    if let Some(&(first_lba, _)) = pf.extents.first() {
-        dec.set_unit_base(first_lba);
-    }
-
     let mut written: u64 = 0;
     let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_LEN];
     'extents: for &(abs_lba, byte_len) in &pf.extents {
         if written >= pf.size {
             break;
         }
+        // Anchor AACS unit alignment at THIS extent's start (clip-anchored
+        // gate, not absolute LBA 0 and NOT the file's first extent). A file
+        // may span multiple extents (fragmented / Long-AD / continuation ICB
+        // allocation); each extent's start LBA is arbitrary and generally not
+        // a multiple of 3 sectors from the previous extent. The decrypt-on-
+        // read gate (`is_unit_aligned(lba, unit_base)`) measures every read's
+        // LBA relative to `unit_base`, so the base MUST be re-anchored per
+        // extent — otherwise the first read of every later extent fails the
+        // gate and the whole extent is zero-filled as a (false) hole. Matches
+        // the per-extent re-anchoring in the mux read paths
+        // (`mux/disc.rs`, `sector/prefetched.rs`). No-op for CSS / None.
+        dec.set_unit_base(abs_lba);
         let sectors = (byte_len as u64).div_ceil(SECTOR_LEN as u64) as u32;
         let mut sector_off: u32 = 0;
         while sector_off < sectors {
             let mut batch = (sectors - sector_off).min(READ_BATCH_SECTORS);
             // AACS: read whole units. Round the batch DOWN to a multiple of 3
             // unless this is the final (possibly short) tail of the extent.
+            // Every preceding batch is a whole number of units, so the tail
+            // batch always BEGINS on a unit boundary (the gate measures
+            // `lba - unit_base`, which stays unit-aligned). The tail itself may
+            // be 1–2 sectors past a unit boundary; `decrypt_sectors` handles
+            // that trailing partial unit explicitly (see its "Trailing-partial
+            // contract"): a clear partial is left in the clear (the conformant
+            // case — AACS leaves the final short unit unencrypted on disc), a
+            // scrambled partial fails loud as DecryptFailed. So the short tail
+            // is correct without padding the read up to a whole unit.
             if batch >= AACS_UNIT_SECTORS && (sector_off + batch) < sectors {
                 batch -= batch % AACS_UNIT_SECTORS;
             }
@@ -560,10 +580,24 @@ fn finalize_file(
     f.set_len(size).map_err(|e| Error::DirWriteFailed {
         errno: e.raw_os_error(),
     })?;
+    // `set_len` is a separate kernel op on this second handle (opened solely to
+    // truncate); the content fsync above was on the now-dropped writer handle.
+    // Without an fsync here, a crash between `set_len` and the rename can leave
+    // the file at its pre-truncation length — e.g. a sparse/over-read tail keeps
+    // its oversized form. Sync the new metadata (length) before publishing.
+    f.sync_all().map_err(|e| Error::DirWriteFailed {
+        errno: e.raw_os_error(),
+    })?;
     drop(f);
     std::fs::rename(partial, final_path).map_err(|e| Error::DirWriteFailed {
         errno: e.raw_os_error(),
     })?;
+    // Durably commit the new dirent: on POSIX filesystems a crash right after a
+    // rename can lose the directory entry even though the rename returned. Best
+    // effort (swallowed on failure); no-op on Windows. Matches `write_atomic`.
+    if let Some(dir) = final_path.parent() {
+        crate::io::fsync::dir(dir);
+    }
     Ok(())
 }
 
@@ -631,8 +665,12 @@ fn dir_is_non_empty(dir: &Path) -> bool {
 }
 
 /// Sanitize ONE disc-path component for the host filesystem. Rejects `..`,
-/// NUL, host-illegal characters, and Windows reserved device names; strips a
-/// trailing dot/space (Windows). An empty result after stripping is an error.
+/// host-illegal characters, and control bytes; strips a trailing dot/space
+/// (Windows). A name whose base matches a Windows reserved device name (`NUL`,
+/// `CON`, `COM1`..) is **substituted** (prefixed with `_`) rather than rejected
+/// — a Linux-authored disc may legally carry such a file and a single reserved
+/// name must not abort the whole tree walk. An empty result after stripping is
+/// an error.
 fn sanitize_component(name: &str) -> Result<String> {
     if name == ".." || name == "." {
         return Err(Error::DirNameCollision {
@@ -663,18 +701,24 @@ fn sanitize_component(name: &str) -> Result<String> {
         });
     }
     // Windows reserved device names (case-insensitive, base name before any
-    // extension).
+    // extension). `NUL` silently discards all writes on Windows, so a disc file
+    // literally named `NUL.cfg` (legal on UDF/Linux) must NOT pass through
+    // verbatim — but it also must not abort the whole extraction. Substitute by
+    // prefixing `_`, which can never itself collide with another reserved name
+    // and is host-legal everywhere. The substituted name still flows through the
+    // caller's host-path collision check.
     let base = trimmed.split('.').next().unwrap_or(trimmed);
     if is_windows_reserved(base) {
-        return Err(Error::DirNameCollision {
-            host: name.to_string(),
-        });
+        return Ok(format!("_{trimmed}"));
     }
     Ok(trimmed.to_string())
 }
 
+/// Whether `base` (the name component before any extension) matches a Windows
+/// reserved device name. These are reserved by the OS regardless of extension
+/// and silently alias a device (e.g. `NUL` discards writes). Case-insensitive.
 fn is_windows_reserved(base: &str) -> bool {
-    const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL"];
+    const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"];
     if RESERVED.iter().any(|r| base.eq_ignore_ascii_case(r)) {
         return true;
     }
@@ -945,6 +989,106 @@ mod tests {
         }
     }
 
+    /// Build a file ICB with TWO Short ADs (a fragmented / multi-extent file).
+    /// Each AD records `sectors_each` sectors at its own partition-relative
+    /// `data_lba`. Used to exercise the per-extent AACS unit-base re-anchoring:
+    /// the two extents' absolute starts differ by a non-multiple-of-3 so a
+    /// single (first-extent) unit base mis-aligns the second extent.
+    fn build_two_extent_icb(sectors_each: u32, data_lba_a: u32, data_lba_b: u32) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
+        // ad_type 0 = Short AD (icb flags low 3 bits at offset 34).
+        s[34..36].copy_from_slice(&0u16.to_le_bytes());
+        let size = sectors_each * SECTOR_LEN as u32 * 2;
+        s[56..64].copy_from_slice(&(size as u64).to_le_bytes()); // info_length
+        s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
+        s[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad = 2 Short ADs
+        let ext_len = sectors_each * SECTOR_LEN as u32; // bytes, type-0 recorded
+        // AD #0
+        s[216..220].copy_from_slice(&(ext_len & 0x3FFF_FFFF).to_le_bytes());
+        s[220..224].copy_from_slice(&data_lba_a.to_le_bytes());
+        // AD #1
+        s[224..228].copy_from_slice(&(ext_len & 0x3FFF_FFFF).to_le_bytes());
+        s[228..232].copy_from_slice(&data_lba_b.to_le_bytes());
+        s
+    }
+
+    /// Build a clear 6144-byte AACS unit (TS syncs at the 192-byte BD-TS
+    /// stride) then encrypt it under `unit_key` so `aacs::decrypt_unit`
+    /// recovers it cleanly (zero decrypt loss). Mirrors the encrypt helper in
+    /// `sector/decrypting.rs` tests. `tag` distinguishes two units' payloads.
+    fn encrypt_aacs_unit(unit_key: &[u8; 16], tag: u8) -> Vec<u8> {
+        use aes::Aes128;
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < unit.len() {
+            unit[off] = 0x47; // TS sync
+            if off + 1 < unit.len() {
+                unit[off + 1] = tag; // payload marker so the two extents differ
+            }
+            off += 192;
+        }
+        let header: [u8; 16] = unit[..16].try_into().unwrap();
+        let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
+        let mut k = [0u8; 16];
+        for i in 0..16 {
+            k[i] = derived[i] ^ header[i];
+        }
+        let cipher = Aes128::new(GenericArray::from_slice(&k));
+        let mut prev = crate::aacs::decrypt::AACS_IV;
+        let blocks = (crate::aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        for i in 0..blocks {
+            let o = 16 + i * 16;
+            for j in 0..16 {
+                unit[o + j] ^= prev[j];
+            }
+            let mut blk = GenericArray::clone_from_slice(&unit[o..o + 16]);
+            cipher.encrypt_block(&mut blk);
+            unit[o..o + 16].copy_from_slice(&blk);
+            prev.copy_from_slice(&unit[o..o + 16]);
+        }
+        unit
+    }
+
+    /// The plaintext that `encrypt_aacs_unit(_, tag)` decrypts back to.
+    fn clear_aacs_unit(tag: u8) -> Vec<u8> {
+        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < unit.len() {
+            unit[off] = 0x47;
+            if off + 1 < unit.len() {
+                unit[off + 1] = tag;
+            }
+            off += 192;
+        }
+        unit
+    }
+
+    /// A `Disc` carrying an AACS unit key so `decrypt_keys()` returns
+    /// `DecryptKeys::Aacs` (engaging the unit-alignment gate). The content laid
+    /// down by the fixture is genuinely encrypted under the key, so a clean
+    /// per-extent decrypt records zero loss — letting the test isolate the GATE
+    /// (alignment) from a false decrypt-loss tally.
+    fn aacs_disc() -> Disc {
+        let mut d = clear_disc();
+        d.encrypted = true;
+        d.aacs = Some(crate::disc::AacsState {
+            version: 1,
+            bus_encryption: false,
+            mkb_version: None,
+            disc_hash: String::new(),
+            key_source: crate::disc::KeyOrigin::ExternalUk,
+            vuk: None,
+            unit_keys: vec![(0u32, [0u8; 16])],
+            read_data_key: None,
+            volume_id: [0u8; 16],
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
+        });
+        d
+    }
+
     /// A `Disc` with no cipher state (clear content → `DecryptKeys::None`).
     fn clear_disc() -> Disc {
         Disc {
@@ -1202,9 +1346,18 @@ mod tests {
         assert!(sanitize_component("a/b").is_err());
         assert!(sanitize_component("a:b").is_err());
         assert!(sanitize_component("a*b").is_err());
-        assert!(sanitize_component("CON").is_err());
-        assert!(sanitize_component("com1").is_err());
-        assert!(sanitize_component("LPT9").is_err());
+        // Windows reserved device names are substituted (prefixed `_`), not
+        // rejected — a single such file must not abort the whole tree walk.
+        assert_eq!(sanitize_component("CON").unwrap(), "_CON");
+        assert_eq!(sanitize_component("com1").unwrap(), "_com1");
+        assert_eq!(sanitize_component("LPT9").unwrap(), "_LPT9");
+        // Reserved base with an extension is still substituted (the device name
+        // aliases regardless of extension on Windows).
+        assert_eq!(sanitize_component("NUL.cfg").unwrap(), "_NUL.cfg");
+        assert_eq!(sanitize_component("conin$").unwrap(), "_conin$");
+        // A non-reserved lookalike is untouched.
+        assert_eq!(sanitize_component("COM10").unwrap(), "COM10");
+        assert_eq!(sanitize_component("CONSOLE").unwrap(), "CONSOLE");
         // A trailing dot/space is stripped, not rejected outright.
         assert_eq!(sanitize_component("name. ").unwrap(), "name");
         // ...unless stripping empties it.
@@ -1287,6 +1440,117 @@ mod tests {
             "menu VOB is clear, not title"
         );
         assert!(!is_title_vob("VTS_01_1.IFO"));
+    }
+
+    /// Regression (rc.6 audit, finding #449): a MULTI-EXTENT AACS file must
+    /// re-anchor the unit-alignment base PER extent, not once at the first
+    /// extent. The two extents here start at absolute LBAs whose difference is
+    /// NOT a multiple of 3 (PART_START+5000 vs PART_START+5004 → Δ4 sectors).
+    /// With a single first-extent unit base the second extent's first read is
+    /// off the unit grid (offset 4, 4 % 3 == 1) → `is_unit_aligned` fails →
+    /// `DecryptFailed` → the whole extent becomes a zero-filled (false) hole.
+    /// With per-extent anchoring both extents read clean: bytes_unreadable == 0
+    /// and the file content survives. The fixture content is clear (no TS
+    /// syncs) so the decrypt step restores each unit verbatim — this isolates
+    /// the GATE from the cipher math.
+    #[test]
+    fn multi_extent_aacs_anchors_unit_base_per_extent() {
+        const SECTORS_EACH: u32 = 3; // one AACS unit per extent
+        const DATA_A: u32 = 5000; // abs PART_START+5000 (≡ 7000)
+        const DATA_B: u32 = 5004; // abs PART_START+5004 — Δ4 (not mult of 3)
+
+        let key = [0u8; 16];
+        // Each extent is exactly one encrypted AACS unit (distinct payloads).
+        let ext_a = encrypt_aacs_unit(&key, 0xA1);
+        let ext_b = encrypt_aacs_unit(&key, 0xB2);
+        // Expected plaintext after a correct per-extent decrypt.
+        let mut expect = clear_aacs_unit(0xA1);
+        expect.extend_from_slice(&clear_aacs_unit(0xB2));
+
+        // Lay the disc by hand: root dir with one BDMV/STREAM/00001.m2ts whose
+        // ICB carries two Short ADs.
+        let mut disc = MemDisc::new();
+        build_udf_skeleton(&mut disc, 10);
+
+        // root → BDMV → STREAM → 00001.m2ts
+        let mut stream_fids = Vec::new();
+        push_fid(&mut stream_fids, "", 40, true, true);
+        push_fid(&mut stream_fids, "00001.m2ts", 42, false, false);
+        disc.put(
+            PART_START + 42,
+            build_two_extent_icb(SECTORS_EACH, DATA_A, DATA_B),
+        );
+        disc.put_bytes(PART_START + DATA_A, &ext_a);
+        disc.put_bytes(PART_START + DATA_B, &ext_b);
+        disc.put(PART_START + 40, build_dir_icb(41, stream_fids.len() as u32));
+        disc.put_bytes(PART_START + 41, &stream_fids);
+
+        let mut bdmv_fids = Vec::new();
+        push_fid(&mut bdmv_fids, "", 20, true, true);
+        push_fid(&mut bdmv_fids, "STREAM", 40, true, false);
+        disc.put(PART_START + 20, build_dir_icb(21, bdmv_fids.len() as u32));
+        disc.put_bytes(PART_START + 21, &bdmv_fids);
+
+        let mut root_fids = Vec::new();
+        push_fid(&mut root_fids, "", 10, true, true);
+        push_fid(&mut root_fids, "BDMV", 20, true, false);
+        disc.put(PART_START + 10, build_dir_icb(11, root_fids.len() as u32));
+        disc.put_bytes(PART_START + 11, &root_fids);
+
+        let out = TmpDir::new("multiextent_aacs");
+        let res = aacs_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract");
+
+        let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
+        assert_eq!(
+            got, expect,
+            "both extents extract verbatim — the second extent is NOT a hole"
+        );
+        assert_eq!(
+            res.bytes_unreadable, 0,
+            "per-extent unit base must keep the second extent off the hole path"
+        );
+        assert_eq!(
+            res.bytes_undecryptable, 0,
+            "clear units decrypt-restore clean"
+        );
+        assert!(
+            res.complete,
+            "a clean multi-extent AACS file extracts complete"
+        );
+    }
+
+    /// Focused alignment-computation check underpinning the per-extent fix:
+    /// when each extent anchors its OWN start as the unit base, the extent's
+    /// own batch starts are always unit-aligned; anchoring a later extent
+    /// against the FIRST extent's base mis-aligns whenever the extents' starts
+    /// differ by a non-multiple of 3 sectors. This is the exact arithmetic the
+    /// decrypt-on-read gate (`aacs::is_unit_aligned`) performs.
+    #[test]
+    fn per_extent_base_is_aligned_first_extent_base_is_not() {
+        use crate::aacs::is_unit_aligned;
+        let ext_a_start = 7000u32; // first extent abs LBA
+        let ext_b_start = 7004u32; // second extent abs LBA (Δ4 — not mult of 3)
+
+        // Per-extent base: extent B's first read anchors on B's start → aligned.
+        assert!(
+            is_unit_aligned(ext_b_start, ext_b_start),
+            "per-extent base keeps the extent's own first read aligned"
+        );
+        // Stale (first-extent) base: extent B's first read measured against A's
+        // start is OFF the unit grid → the gate would (wrongly) reject it.
+        assert!(
+            !is_unit_aligned(ext_b_start, ext_a_start),
+            "first-extent base mis-aligns a Δ-non-multiple-of-3 later extent"
+        );
+        // Sanity: a later extent whose Δ from the first IS a multiple of 3 would
+        // have masked the bug — that's why the regression fixture uses Δ4.
+        let ext_c_start = ext_a_start + 6; // Δ6 == 2 units
+        assert!(
+            is_unit_aligned(ext_c_start, ext_a_start),
+            "a Δ-multiple-of-3 extent happens to stay aligned even on a stale base"
+        );
     }
 
     /// An inline (ICB-embedded) file extracts from its embedded bytes.
