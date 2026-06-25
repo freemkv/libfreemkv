@@ -1677,6 +1677,13 @@ impl Disc {
         use crate::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
         use crate::sector::{DecryptingSectorSource, SectorSource};
 
+        // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
+        // direct `patch` caller can't bypass it). A decrypting patch pass of an
+        // encrypted disc with no usable key would write ciphertext into the ISO's
+        // recovered ranges; refuse before reading any sector. No-op for `--raw`
+        // (`opts.decrypt == false`) and unencrypted discs.
+        self.ensure_decryptable(!opts.decrypt)?;
+
         let patch_t0 = std::time::Instant::now();
         let mapfile_path = self.mapfile_for(path);
         let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
