@@ -19,6 +19,38 @@
   (`FlagInterlaced=1`, `FieldOrder=TFF`) is retained, and MediaInfo still
   reports "Interlaced / Top Field First" because it reads scan type from the
   MPEG-2 elementary stream's picture coding extension, not the container flag.
+- **Correct AC-3 audio track selected on DVDs with non-standard sub-stream
+  ordering.** freemkv assigned each declared audio stream a physical sub-stream
+  by ordinal (`0x80+n`), assuming the IFO's first stream lives at `0x80`. On
+  discs where the 5.1 main mix sits on a different sub-stream and `0x80` carries
+  a 2.0 down-mix (e.g. Silence of the Lambs), the 2.0 was muxed under a "5.1"
+  label. freemkv now probes each physical sub-stream's actual channel count from
+  the disc — scanning every AC-3 frame and taking the maximum, so a brief 2.0
+  logo bed at the feature head can't mask the real 5.1 — and routes each declared
+  stream onto the sub-stream that genuinely matches.
+- **"Decryption failed" on large AACS Blu-ray titles fixed.** The unit-alignment
+  gate measured `lba % 3` against absolute disc LBA 0, but AACS aligned units are
+  anchored at each clip's encrypted-region start. A clip whose start is not
+  3-aligned had its readable units wrongly rejected — failing the feature/large
+  titles of some discs while short clips passed. The gate is now clip-anchored.
+- **Single-pass disc→MKV recovers marginal/transient sectors before failing.**
+  The direct-to-MKV path now gives the drive its full ECC recovery budget on a
+  bad sector (matching the multipass rip) instead of reporting a read failure a
+  multipass rip would have recovered.
+- **4K decode glitches at non-seamless clip joins fixed (Top Gun class).**
+  Titles assembled from clips joined at non-seamless boundaries no longer drop
+  reference frames at the join ("Could not find ref" stutter); the splice
+  keyframe is rewritten so the decoder discards only the genuinely-dangling
+  leading pictures.
+
+### Changed
+
+- **`freemkv-keysources` is now a pure key lookup.** The encrypted content-sample
+  reader and the candidate-key resolution loop moved into libfreemkv (they read
+  the disc and validate keys — decryption mechanism, not lookup). A key source
+  now only looks a key up and hands it back. Downstream API: use
+  `libfreemkv::read_encrypted_units` / `libfreemkv::resolve_and_apply` (was
+  `freemkv_keysources::read_sample_units` / `…::resolve_and_apply`).
 
 ### Added
 
