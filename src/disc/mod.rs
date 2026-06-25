@@ -2048,7 +2048,7 @@ impl Disc {
         let needs_key = matches!(keys, crate::decrypt::DecryptKeys::None);
         if needs_key {
             if self.aacs.is_some() {
-                // E7021 vs E7022 split: when key resolution had derivation
+                // E7017 vs E7022 split: when key resolution had derivation
                 // material (device / processing keys) but no Volume ID to derive
                 // the unit key, the captured `aacs_error` is `AacsVidUnavailable`
                 // — report THAT (the fix is recovering the VID, not adding keys),
@@ -2278,7 +2278,7 @@ impl Disc {
             // stride; V20/V21 share the 64-byte stride, so try the classical V20
             // paths first and fall back to the 2.1 variant chain. The
             // reason-preserving wrapper threads the no-key cause out so the
-            // decrypt gate can report E7021 (had derivation material but no VID)
+            // decrypt gate can report E7017 (had derivation material but no VID)
             // vs E7022 (no usable material) instead of a flat AacsKeyRejected.
             let resolved = crate::aacs::resolve_keys_with_reason(&ctx, version_u8)
                 .map_err(|_reason| crate::error::Error::AacsKeyRejected)?;
@@ -4003,15 +4003,15 @@ mod tests {
         );
     }
 
-    /// E7021 vs E7022 split (rc.6 WS1). When key resolution HAD derivation
+    /// E7017 vs E7022 split (rc.6 WS1). When key resolution HAD derivation
     /// material (device / processing keys) but no Volume ID was available to
     /// derive the unit key, the captured `aacs_error` is `AacsVidUnavailable`
-    /// — the gate must surface THAT (E7021), not the generic `NoDiscKey`
+    /// — the gate must surface THAT (E7017), not the generic `NoDiscKey`
     /// (E7022). When there was no usable key material at all, the reason is
     /// absent and the gate keeps `NoDiscKey` (E7022). Both branches proven here.
     #[test]
     fn ensure_decryptable_aacs_vid_unavailable_vs_no_key() {
-        // Branch 1 — derivation material present, but no VID: E7021.
+        // Branch 1 — derivation material present, but no VID: E7017.
         // The resolver classifies a device-keys-but-zero-VID context as
         // `VidUnavailable`; that reason rides on `aacs_error`.
         let supplied = crate::aacs::provider::SuppliedKey {
@@ -4045,17 +4045,17 @@ mod tests {
             "device keys + zero VID must classify as VidUnavailable"
         );
 
-        let mut disc_e7021 = make_test_disc(1000, "UHD");
-        disc_e7021.encrypted = true;
-        disc_e7021.aacs = Some(aacs_with(Vec::new())); // present but no unit keys
-        disc_e7021.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
-        let err = disc_e7021
+        let mut disc_e7017 = make_test_disc(1000, "UHD");
+        disc_e7017.encrypted = true;
+        disc_e7017.aacs = Some(aacs_with(Vec::new())); // present but no unit keys
+        disc_e7017.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
+        let err = disc_e7017
             .ensure_decryptable(false)
             .expect_err("AACS disc, material-but-no-VID, !raw must error");
         assert_eq!(
             err.code(),
             crate::error::Error::AacsVidUnavailable.code(),
-            "material-but-no-VID must surface E7021 (AacsVidUnavailable), not E7022"
+            "material-but-no-VID must surface E7017 (AacsVidUnavailable), not E7022"
         );
 
         // Branch 2 — no key material at all: classified NoMaterial, gate E7022.
