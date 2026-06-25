@@ -745,4 +745,113 @@ mod tests {
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         assert!(stream.finish().is_ok());
     }
+
+    // --- DVD highway: keyframe flag must survive the PS → parser → frame path ---
+
+    /// Build a minimal MPEG-2 720x480/29.97 sequence header.
+    fn m2_seq_header() -> Vec<u8> {
+        let (w, h, aspect, fr): (u16, u16, u8, u8) = (720, 480, 2, 4);
+        let mut hdr = vec![0x00, 0x00, 0x01, 0xB3u8];
+        hdr.push((w >> 4) as u8);
+        hdr.push((((w & 0x0F) as u8) << 4) | (((h >> 8) & 0x0F) as u8));
+        hdr.push((h & 0xFF) as u8);
+        hdr.push((aspect << 4) | (fr & 0x0F));
+        hdr.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
+        hdr
+    }
+    fn m2_gop() -> Vec<u8> {
+        vec![0x00, 0x00, 0x01, 0xB8u8, 0x00, 0x00, 0x00, 0x00]
+    }
+    /// Frame-picture AU: picture header (coding_type, temporal_reference) +
+    /// coding extension (frame picture, 2 fields) + slice.
+    fn m2_pic(coding_type: u8, tr: u16) -> Vec<u8> {
+        let b4 = ((tr >> 2) & 0xFF) as u8;
+        let b5 = (((tr & 0x03) as u8) << 6) | ((coding_type & 0x07) << 3);
+        let mut au = vec![0x00, 0x00, 0x01, 0x00u8, b4, b5, 0x00, 0x00];
+        au.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5u8, 0x80, 0x00, 0x03, 0x00, 0x80]);
+        au.extend_from_slice(&[0xAA; 32]);
+        au
+    }
+
+    /// DVD seek-index regression at the HIGHWAY level. The real CLI mux runs
+    /// `PsDemuxer → PipelinedPesStream (codec parse) → frame out`, NOT the
+    /// codec parser straight into the muxer. The keyframe flag and per-frame
+    /// duration the `Mpeg2Parser` sets on each `Frame` must survive that path
+    /// (`from_codec_frame`) so the muxer's cluster/cue logic — which opens a
+    /// cluster + pushes a cue on `keyframe && track 0` — actually fires. If the
+    /// highway dropped the keyframe flag, every video I-frame would arrive as a
+    /// non-keyframe and the DVD MKV would get thousands of clusters with ZERO
+    /// cues (chapter-seek only, no scrub).
+    #[test]
+    fn dvd_highway_preserves_video_keyframe_and_duration() {
+        use crate::mux::codec::mpeg2::Mpeg2Parser;
+
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: crate::mux::ps::DVD_VIDEO_PID,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R480i,
+            frame_rate: FrameRate::F29_97,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: Some((4, 3)),
+            secondary: false,
+            label: String::new(),
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> =
+            vec![(crate::mux::ps::DVD_VIDEO_PID, Box::new(Mpeg2Parser::new()))];
+        let pid_to_track = vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        // 6 GOPs × 12 frames, each GOP one PS batch with one PTS-stamped video
+        // PES (stream_id 0xE0 → DVD_VIDEO_PID). Decode order I + P/B.
+        let field_ns = 1_000_000_000i64 * 1001 / 30000 / 2;
+        let frame_ns = 2 * field_ns;
+        let gop_len = 12u16;
+        for g in 0..6i64 {
+            let mut es = m2_seq_header();
+            es.extend_from_slice(&m2_gop());
+            es.extend_from_slice(&m2_pic(1, 0)); // I-frame, keyframe
+            for tr in 1..gop_len {
+                let ct = if tr % 3 == 0 { 2 } else { 3 };
+                es.extend_from_slice(&m2_pic(ct, tr));
+            }
+            let gop_pts = (g * gop_len as i64 * frame_ns * 90_000 / 1_000_000_000) as u64;
+            tx.send(DemuxBatch::Ps(vec![PsPacket {
+                stream_id: 0xE0,
+                sub_stream_id: None,
+                pts: Some(gop_pts),
+                dts: None,
+                data: es,
+            }]))
+            .unwrap();
+        }
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        // Drain every frame THROUGH the highway's read().
+        let mut frames = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            frames.push(f);
+        }
+
+        assert!(!frames.is_empty(), "highway produced no frames");
+        let keyframes = frames.iter().filter(|f| f.keyframe).count();
+        let dur_some = frames.iter().filter(|f| f.duration_ns.is_some()).count();
+        assert_eq!(
+            keyframes, 6,
+            "the 6 GOP-opening I-frames must arrive as keyframes THROUGH the \
+             highway (one per GOP); got {keyframes} — if 0, the keyframe flag \
+             is being lost in the pipelined path and the DVD seek index dies"
+        );
+        assert_eq!(
+            dur_some,
+            frames.len(),
+            "every DVD VFR frame must carry its duration through the highway \
+             (BlockGroup path)"
+        );
+        assert!(
+            frames.iter().all(|f| f.track == 0),
+            "video routed to track 0 (cluster/cue open requires track 0)"
+        );
+    }
 }
