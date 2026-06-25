@@ -3169,4 +3169,152 @@ mod tests {
         // And the thin wrapper must still return just the MK.
         assert_eq!(derive_media_key_from_dk(&mkb, &dks), Some(mk));
     }
+
+    // ── resolve_keys_with_reason / classify_resolve_failure ────────────────
+    //
+    // The rc.6 E7021/E7022 split is also exercised end-to-end through the
+    // `ensure_decryptable` gate in `disc/mod.rs`. These tests pin the
+    // *classifier* directly at the keys.rs seam and cover the branches the
+    // gate test does not: VID-present (must never be VidUnavailable), the
+    // processing-keys-only material path, and the version dispatch / Ok path.
+
+    /// A `SuppliedKey` provider with the given derivation material and no
+    /// disc-keyed entry. Mirrors the construction the gate test uses, lifted to
+    /// a helper so each branch reads as one line.
+    fn material_provider(
+        device_keys: Vec<DeviceKey>,
+        processing_keys: Vec<[u8; 16]>,
+    ) -> super::super::provider::SuppliedKey {
+        super::super::provider::SuppliedKey {
+            device_keys,
+            processing_keys,
+            media_keys: Vec::new(),
+            disc_entry: None,
+        }
+    }
+
+    fn one_device_key() -> DeviceKey {
+        DeviceKey {
+            key: [0x11; 16],
+            node: 1,
+            uv: 1,
+            u_mask_shift: 0,
+        }
+    }
+
+    /// Zero VID + PROCESSING keys (not device keys) is still "derivation
+    /// material present, VID missing" → VidUnavailable (E7021). The gate test
+    /// only proves the device-keys arm of `has_derivation_material`; this pins
+    /// the processing-keys arm of the same `||`.
+    #[test]
+    fn classify_processing_keys_zero_vid_is_vid_unavailable() {
+        let prov = material_provider(Vec::new(), vec![[0u8; 16]]);
+        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let uk_ro = minimal_unit_key_ro();
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: None,
+        };
+        assert_eq!(
+            resolve_keys_with_reason(&ctx, 2).err(),
+            Some(ResolveFailure::VidUnavailable),
+            "processing keys + zero VID is still material-but-no-VID"
+        );
+    }
+
+    /// A NON-zero VID present, but resolution still fails (the providers carry
+    /// material that doesn't resolve this disc). The VID is available, so the
+    /// failure is NOT "VID unavailable" — it must classify NoMaterial regardless
+    /// of how much derivation material is present, because re-acquiring the VID
+    /// is not the fix. This is the `has_vid == true` short-circuit, which no
+    /// existing test covers (the gate test only uses the zero-VID sentinel).
+    #[test]
+    fn classify_vid_present_with_material_is_no_material_not_vid() {
+        let prov = material_provider(vec![one_device_key()], vec![[0u8; 16]]);
+        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let uk_ro = minimal_unit_key_ro();
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0x42u8; 16], // VID IS available
+            providers,
+            mkb: None,
+        };
+        assert_eq!(
+            resolve_keys_with_reason(&ctx, 2).err(),
+            Some(ResolveFailure::NoMaterial),
+            "VID present must never be reported as VidUnavailable, however much \
+             derivation material is on hand"
+        );
+    }
+
+    /// VID present + NO material → NoMaterial (both conditions for
+    /// VidUnavailable absent). Distinct from the gate's zero-VID/no-material
+    /// branch.
+    #[test]
+    fn classify_vid_present_no_material_is_no_material() {
+        let prov = material_provider(Vec::new(), Vec::new());
+        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let uk_ro = minimal_unit_key_ro();
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0x42u8; 16],
+            providers,
+            mkb: None,
+        };
+        assert_eq!(
+            resolve_keys_with_reason(&ctx, 2).err(),
+            Some(ResolveFailure::NoMaterial)
+        );
+    }
+
+    /// `resolve_keys_with_reason` routes `version_u8 == 1` through the V10
+    /// resolver and any other value through the V20→V21 chain. Prove the
+    /// dispatch by resolving the SAME path-4 (disc-hash→VUK) fixture under both
+    /// versions: V10 stamps V10, the non-1 arm reaches V20/V21. A success must
+    /// come back as `Ok`, never an `Err(ResolveFailure)`.
+    #[test]
+    fn resolve_with_reason_dispatches_on_version_and_returns_ok() {
+        let uk_ro = build_unit_key_ro(1, 64);
+        let hash_hex = disc_hash_hex(&disc_hash(&uk_ro)).to_lowercase();
+        let vuk = [0x77u8; 16];
+        let mut keydb = KeyDb::empty();
+        keydb.disc_entries.insert(
+            hash_hex.clone(),
+            DiscEntry {
+                disc_hash: hash_hex,
+                title: "f".to_string(),
+                media_key: None,
+                disc_id: None,
+                vuk: Some(vuk),
+                unit_keys: Vec::new(),
+            },
+        );
+        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let ctx = ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers,
+            mkb: None,
+        };
+
+        // version 1 → V10 resolver. Path 4 succeeds → Ok, version stamped V10.
+        let v1 = resolve_keys_with_reason(&ctx, 1).expect("v1 dispatch must resolve path 4");
+        assert_eq!(v1.vuk, Some(vuk));
+        assert_eq!(v1.version, AacsVersion::V10);
+
+        // version 2 → V20→V21 chain. Same fixture resolves; not the V10 stamp.
+        let v2 = resolve_keys_with_reason(&ctx, 2).expect("non-1 dispatch must resolve path 4");
+        assert_eq!(v2.vuk, Some(vuk));
+        assert_ne!(
+            v2.version,
+            AacsVersion::V10,
+            "the non-1 arm must run the V20/V21 resolver, not V10"
+        );
+    }
 }
