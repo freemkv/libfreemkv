@@ -2515,6 +2515,154 @@ mod tests {
     }
 
     #[test]
+    fn cue_count_equals_cluster_count_blockgroup_vfr() {
+        // DVD (MPEG-2) seek-index regression. Unlike UHD/HEVC — which emits
+        // SimpleBlocks (`duration_ns = None`) — DVD video is VFR: every coded
+        // picture carries a per-frame `duration_ns = Some(..)`, so it is written
+        // as a BlockGroup, NOT a SimpleBlock. The Cues index must still get one
+        // cue per cluster on this path exactly like the SimpleBlock path; a DVD
+        // MKV with thousands of clusters and ZERO cues lets players chapter-seek
+        // but never scrub. The pre-existing cue tests all feed `None` (SimpleBlock
+        // only), leaving this BlockGroup path unguarded — this test covers it.
+        //
+        // Drives the REAL `Mpeg2Parser` end-to-end (decode-order frames,
+        // non-monotonic B-frame display PTS, telecine field durations) into the
+        // muxer, so it exercises the genuine DVD frame shape, not a hand-built one.
+        use crate::mux::codec::CodecParser;
+        use crate::mux::codec::mpeg2::Mpeg2Parser;
+        use crate::mux::ts::PesPacket;
+
+        // Minimal MPEG-2 ES builders (mirroring the mpeg2 parser's own test
+        // fixtures): a 720x480 / 29.97 sequence header, a GOP delimiter, and a
+        // frame-picture access unit (picture header + coding extension + slice).
+        fn seq_header() -> Vec<u8> {
+            let (w, h, aspect, fr): (u16, u16, u8, u8) = (720, 480, 2, 4);
+            let mut hdr = vec![0x00, 0x00, 0x01, 0xB3u8];
+            hdr.push((w >> 4) as u8);
+            hdr.push((((w & 0x0F) as u8) << 4) | (((h >> 8) & 0x0F) as u8));
+            hdr.push((h & 0xFF) as u8);
+            hdr.push((aspect << 4) | (fr & 0x0F));
+            hdr.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
+            hdr
+        }
+        fn gop() -> Vec<u8> {
+            vec![0x00, 0x00, 0x01, 0xB8u8, 0x00, 0x00, 0x00, 0x00]
+        }
+        fn pic(coding_type: u8, tr: u16) -> Vec<u8> {
+            let b4 = ((tr >> 2) & 0xFF) as u8;
+            let b5 = (((tr & 0x03) as u8) << 6) | ((coding_type & 0x07) << 3);
+            let mut au = vec![0x00, 0x00, 0x01, 0x00u8, b4, b5, 0x00, 0x00];
+            // Picture coding extension: frame picture, no pulldown → 2 fields.
+            au.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5u8, 0x80, 0x00, 0x03, 0x00, 0x80]);
+            au.extend_from_slice(&[0xAA; 32]);
+            au
+        }
+
+        let mut parser = Mpeg2Parser::new();
+        let field_ns = 1_000_000_000i64 * 1001 / 30000 / 2;
+        let frame_ns = 2 * field_ns;
+        let mut frames: Vec<crate::mux::codec::Frame> = Vec::new();
+        // 80 GOPs × 12 frames ≈ 32 s of video — well past the 2 s cluster span,
+        // so many clusters open and every one must carry a cue.
+        let gop_len = 12u16;
+        for g in 0..80i64 {
+            let mut es = seq_header();
+            es.extend_from_slice(&gop());
+            es.extend_from_slice(&pic(1, 0)); // I-frame (tr0, keyframe)
+            for tr in 1..gop_len {
+                // Mix of P (tr%3==0) and B frames at climbing display order.
+                let ct = if tr % 3 == 0 { 2 } else { 3 };
+                es.extend_from_slice(&pic(ct, tr));
+            }
+            // One PES PTS anchor per GOP (90 kHz), as a real VOBU stamps.
+            let gop_pts = g * gop_len as i64 * frame_ns * 90_000 / 1_000_000_000;
+            frames.extend(parser.parse(&PesPacket {
+                pid: 0x1011,
+                pts: Some(gop_pts),
+                dts: None,
+                data: es,
+            }));
+        }
+        frames.extend(parser.flush());
+
+        // Confirm the DVD frame shape: every frame carries a duration (→
+        // BlockGroup, NOT SimpleBlock), and the I-frames are flagged keyframes.
+        assert!(
+            frames.iter().all(|f| f.duration_ns.is_some()),
+            "DVD VFR frames must carry per-frame durations (BlockGroup path)"
+        );
+        assert_eq!(
+            frames.iter().filter(|f| f.keyframe).count(),
+            80,
+            "one I-frame keyframe per GOP"
+        );
+
+        let tracks = [make_video_track()];
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
+        for f in &frames {
+            muxer
+                .write_frame(0, f.pts_ns, f.keyframe, &f.data, f.duration_ns)
+                .unwrap();
+        }
+        muxer.finish().unwrap();
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // The muxer branches on `duration_ns`: Some → BlockGroup, None →
+        // SimpleBlock. Every frame above carries Some, so this output is wholly
+        // the BlockGroup path — confirmed structurally by walking the first
+        // cluster's children (a BlockGroup present, no SimpleBlock).
+        let clusters = find_clusters(&data);
+        {
+            let (c0_start, c0_size, _) = clusters[0];
+            let mut kinds = Vec::new();
+            let mut cur = Cursor::new(&data[c0_start..c0_start + c0_size as usize]);
+            while (cur.position() as usize) < c0_size as usize {
+                let (id, size, _) = ebml::read_element_header(&mut cur).unwrap();
+                kinds.push(id);
+                cur.seek(io::SeekFrom::Current(size as i64)).unwrap();
+            }
+            assert!(
+                kinds.contains(&ebml::BLOCK_GROUP),
+                "DVD VFR cluster must contain a BlockGroup"
+            );
+            assert!(
+                !kinds.contains(&ebml::SIMPLE_BLOCK),
+                "DVD VFR cluster must NOT contain a SimpleBlock"
+            );
+        }
+
+        let cues = parse_cues(&data);
+        assert!(
+            clusters.len() > 1,
+            "expected many clusters for 32 s of video"
+        );
+        assert_eq!(
+            clusters.len(),
+            cues.len(),
+            "BlockGroup/VFR (DVD) seek index: every cluster must have a cue — \
+             cluster count {} != cue count {}",
+            clusters.len(),
+            cues.len()
+        );
+
+        // And each cue must resolve to a real cluster (no dangling positions).
+        let (_, seg_start) = locate_segment(&data);
+        for (_time, _track, pos) in &cues {
+            let abs = seg_start + *pos as usize;
+            let mut cursor = Cursor::new(&data[abs..]);
+            let (id, _size, _hdr_len) = ebml::read_element_header(&mut cursor).unwrap();
+            assert_eq!(
+                id,
+                ebml::CLUSTER,
+                "cue position 0x{:X} did not resolve to a cluster",
+                pos
+            );
+        }
+    }
+
+    #[test]
     fn cue_positions_resolve_to_clusters() {
         let tracks = [make_video_track(), make_audio_track()];
         let frames = frames_for(30.0, 1.0);
