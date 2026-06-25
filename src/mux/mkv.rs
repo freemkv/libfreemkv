@@ -145,14 +145,32 @@ impl MkvTrack {
             } else {
                 ebml::FIELD_ORDER_UNDETERMINED
             },
-            // One field is half a frame. For 576i 25 fps (40 ms frame) this is
-            // 20 ms; for 480i 29.97 fps (~33.4 ms frame) ~16.68 ms. Only set on
-            // interlaced tracks with a known frame duration.
-            field_duration_ns: if v.resolution.is_interlaced() && default_duration_ns > 0 {
-                default_duration_ns / 2
-            } else {
-                0
-            },
+            // DefaultDecodedFieldDuration is DELIBERATELY NOT emitted (0 here
+            // suppresses the element; see the writer in `MkvMuxer::new`).
+            //
+            // rc.5.1 added it (= half the frame period, 20 ms for 576i25) to try
+            // to fix the Windows-fps report, on the theory that Windows derives
+            // fps from it. The captured SOTL evidence proves the opposite: with
+            // FlagInterlaced=1 + DefaultDuration=40 ms + DefaultDecodedFieldDuration=20 ms,
+            // Windows Explorer reports 12.5 fps (half), and MediaInfo flips the
+            // track to "Frame rate mode: Variable" with no clean rate. MakeMKV's
+            // correct rip of the same disc OMITS DefaultDecodedFieldDuration,
+            // keeps FlagInterlaced=1 + FieldOrder=TFF + DefaultDuration=40 ms, and
+            // Explorer reports the full 25 fps with MediaInfo "Constant". ffmpeg's
+            // matroskaenc.c does the same (full-frame DefaultDuration, no field
+            // duration). The lone frame-rate signal every tool actually trusts is
+            // `1 / DefaultDuration`; that full-frame value (40 ms → 25 fps) is kept
+            // below. Dropping the field-duration element removes the per-field
+            // signal that made Explorer halve the rate.
+            //
+            // Trade-off: the container no longer carries an explicit per-field
+            // decoded duration. Nothing is lost in practice — the interlace
+            // signaling that deinterlacers and MediaInfo rely on lives in the
+            // MPEG-2 elementary stream's picture_coding_extension (picture_structure /
+            // top_field_first), which MediaInfo reads directly (so it still reports
+            // "Interlaced / Top Field First"), and the container still flags
+            // FlagInterlaced=1 + FieldOrder=TFF so players keep deinterlacing.
+            field_duration_ns: 0,
             sample_rate: 0.0,
             channels: 0,
             bit_depth: 0,
@@ -333,6 +351,12 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// (to patch in place) and the IFO-claimed count (to warn on disagreement);
     /// `corrected` flips once patched so we only act on the first frame.
     ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup>,
+    /// `--log-level 3` opening-frame capture: the first ~100 coded frames per
+    /// track are written (raw) to a `<output>.opening.bin` side file with a
+    /// per-frame summary logged, so an opening-GOP / menu / mid-GOP-open issue is
+    /// diagnosable from a future log without the disc. `None` on normal runs
+    /// (diag off) — the muxer pays nothing.
+    opening_capture: Option<crate::diag::OpeningCapture>,
 }
 
 /// Deferred AC-3 channel-count correction: the track header's `Channels` byte
@@ -727,12 +751,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 )?;
             }
 
-            // DefaultDecodedFieldDuration (one FIELD = half a frame) on
-            // interlaced tracks. Per the Matroska schema it is a DIRECT child
-            // of TrackEntry (NOT inside Video). Without it an interlace-aware
-            // reader (Windows shell) assumes "block = one field" and reports
-            // half the frame rate (12.5 instead of 25 for 576i). DefaultDuration
-            // above stays the full-frame period (40 ms); this is 20 ms.
+            // DefaultDecodedFieldDuration (one FIELD = half a frame), a DIRECT
+            // child of TrackEntry. The production video path now ALWAYS passes
+            // `field_duration_ns == 0` (see `MkvTrack::video`) so this element is
+            // NOT written: emitting it (20 ms for 576i25) is exactly what made
+            // Windows Explorer report 12.5 fps and MediaInfo flip to VFR on the
+            // captured SOTL rip, while MakeMKV — which omits it — shows the full
+            // 25 fps. The guard below is retained so a non-zero value still emits
+            // a well-formed element for any future caller / round-trip test, but
+            // the muxer's own callers no longer trigger it.
             if track.track_type == ebml::TRACK_TYPE_VIDEO
                 && track.interlaced
                 && track.field_duration_ns > 0
@@ -885,7 +912,16 @@ impl<W: Write + Seek> MkvMuxer<W> {
             track_uids,
             duration_secs,
             ac3_channel_fixups,
+            opening_capture: None,
         })
+    }
+
+    /// Attach an opening-frame capture (`--log-level 3`). The capture writes the
+    /// first ~100 coded frames per track to `<output>.opening.bin` and logs a
+    /// per-frame summary, so opening-GOP / menu issues are diagnosable from a
+    /// log + side file without the disc. `None` is a no-op (normal runs).
+    pub fn set_opening_capture(&mut self, capture: Option<crate::diag::OpeningCapture>) {
+        self.opening_capture = capture;
     }
 
     /// Write a single frame.
@@ -903,6 +939,15 @@ impl<W: Write + Seek> MkvMuxer<W> {
         data: &[u8],
         duration_ns: Option<u64>,
     ) -> io::Result<()> {
+        // --log-level 3: capture the first ~100 coded frames per track to the
+        // side file BEFORE any timeline mangling, with the codec parser's own
+        // frame PTS — so an opening-GOP / mid-GOP-open / menu issue is
+        // reconstructable from the log + side file alone (no disc). No-op (and
+        // no allocation) on normal runs; the capture is `None`.
+        if let Some(cap) = self.opening_capture.as_mut() {
+            cap.record(track_idx, pts_ns, keyframe, data);
+        }
+
         // Is this a video track? Used for the monotonic block-timestamp nudge
         // below, which must exempt EVERY video track (incl. a Dolby Vision EL).
         let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
@@ -2517,6 +2562,50 @@ mod tests {
     }
 
     #[test]
+    fn opening_keyframe_with_nonzero_disc_pts_anchors_base_not_corrupted() {
+        // SOTL SUB-TASK 2 regression (opening-GOP PTS handling). A DVD title
+        // opens on an I-frame the disc stamps at its REAL timeline PTS (here
+        // ~10 s, a large non-zero value — NOT 0). The muxer must anchor `base` on
+        // that first kept keyframe so the first cluster's timestamp is 0 (the
+        // `.max(0)` floor must NOT corrupt it into a huge value or wrap), and the
+        // following frame must land exactly one frame interval (40 ms = 400 ticks
+        // at the 0.1 ms scale) later — proving the opening pictures keep their
+        // relative timeline and aren't garbled.
+        let tracks = [make_video_track()];
+        const OPEN_PTS: i64 = 10_000_000_000; // 10 s opening anchor
+        let frames = vec![
+            (0usize, OPEN_PTS, true, vec![0xAAu8; 8]), // opening I-frame
+            (0usize, OPEN_PTS + 40_000_000, false, vec![0xBBu8; 8]), // +40 ms
+        ];
+        let (data, count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(
+            count, 2,
+            "both opening frames written (none dropped/floored away)"
+        );
+
+        // Read the FIRST cluster's timestamp — must be 0 (base == opening PTS).
+        let (_, seg_start) = locate_segment(&data);
+        let cluster_abs = seg_start
+            + segment_children(&data)
+                .iter()
+                .find(|(id, _, _)| *id == ebml::CLUSTER)
+                .map(|(_, off, _)| *off - seg_start)
+                .expect("a cluster was written");
+        let mut bc = Cursor::new(&data[cluster_abs..]);
+        let (tid, tsize, _) = ebml::read_element_header(&mut bc).unwrap();
+        assert_eq!(tid, ebml::CLUSTER_TIMESTAMP);
+        let cluster_ts = ebml::read_uint_val(&mut bc, tsize as usize).unwrap();
+        assert_eq!(
+            cluster_ts, 0,
+            "opening cluster timestamp must be 0 (base anchored on the opening keyframe's real PTS)"
+        );
+
+        // The first cue (opening keyframe) is at tick 0 — not the absolute disc PTS.
+        let cues = parse_cues(&data);
+        assert_eq!(cues[0].0, 0, "opening cue at t=0, disc PTS rebased to base");
+    }
+
+    #[test]
     fn seekhead_is_first_child_of_segment() {
         let tracks = [make_video_track(), make_audio_track()];
         let (data, _) = mux_to_bytes(&tracks, &[], &frames_for(10.0, 1.0));
@@ -3263,10 +3352,16 @@ mod tests {
     }
 
     #[test]
-    fn interlaced_576i_emits_default_decoded_field_duration() {
-        // 576i @ 25 fps: DefaultDuration = 40 ms (frame), and
-        // DefaultDecodedFieldDuration = 20 ms (field = half a frame). The field
-        // element stops interlace-aware readers (Windows) halving the frame rate.
+    fn interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duration() {
+        // SOTL SUB-TASK 1 regression. The Windows-fps fix: a 576i25 track must
+        // carry the FULL-FRAME DefaultDuration (40 ms → `1/DefaultDuration` = 25
+        // fps, the only rate every tool trusts) and must NOT emit
+        // DefaultDecodedFieldDuration. rc.5.1 emitted the 20 ms field duration to
+        // try to fix Windows; the captured SOTL evidence proved it did the
+        // opposite (Explorer 12.5 fps, MediaInfo VFR). MakeMKV's correct rip omits
+        // it (Explorer 25 fps, MediaInfo CFR). So: frame duration present = 40 ms,
+        // field duration ABSENT, interlace signalling (FlagInterlaced/FieldOrder)
+        // retained.
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -3280,19 +3375,35 @@ mod tests {
         };
         let t = MkvTrack::video(&v);
         assert_eq!(t.default_duration_ns, 40_000_000, "frame duration is 40 ms");
-        assert_eq!(t.field_duration_ns, 20_000_000, "field duration is 20 ms");
+        assert_eq!(
+            t.field_duration_ns, 0,
+            "field duration must be 0 so the element is suppressed"
+        );
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
-        // DefaultDuration (frame) present and = 40 ms.
+        // DefaultDuration (frame) present and = 40 ms → drives the 25 fps report.
         let dd = find_id(&data, ebml::DEFAULT_DURATION).expect("DefaultDuration present");
-        // [id 3B][size 0x84][4-byte value] — 40_000_000 needs 4 bytes.
         let frame_ns = u32::from_be_bytes([data[dd + 4], data[dd + 5], data[dd + 6], data[dd + 7]]);
         assert_eq!(frame_ns, 40_000_000, "DefaultDuration is the full frame");
-        // DefaultDecodedFieldDuration present and = 20 ms.
-        let fd =
-            find_id(&data, ebml::DEFAULT_DECODED_FIELD_DURATION).expect("field duration present");
-        let field_ns = u32::from_be_bytes([data[fd + 4], data[fd + 5], data[fd + 6], data[fd + 7]]);
-        assert_eq!(field_ns, 20_000_000, "field duration is half the frame");
+        // DefaultDecodedFieldDuration must be ABSENT — this is the fix.
+        assert!(
+            find_id(&data, ebml::DEFAULT_DECODED_FIELD_DURATION).is_none(),
+            "DefaultDecodedFieldDuration must NOT be written (Windows halves the rate when it is)"
+        );
+        // Interlace signalling is RETAINED so deinterlacers still engage and
+        // MediaInfo (which also reads scan type from the MPEG-2 ES) agrees.
+        let fi = find_id(&data, ebml::FLAG_INTERLACED).expect("FlagInterlaced present");
+        assert_eq!(
+            data[fi + 2],
+            ebml::INTERLACED_INTERLACED as u8,
+            "FlagInterlaced=1 retained"
+        );
+        let fo = find_id(&data, ebml::FIELD_ORDER).expect("FieldOrder present");
+        assert_eq!(
+            data[fo + 2],
+            ebml::FIELD_ORDER_TFF,
+            "FieldOrder=TFF retained"
+        );
     }
 
     #[test]
@@ -3308,27 +3419,20 @@ mod tests {
     }
 
     #[test]
-    fn field_duration_is_direct_trackentry_child_not_in_video() {
-        // GUARDS THE REAL BUG (audit §3 #1): DefaultDecodedFieldDuration
-        // (0x234E7A) is, per the Matroska schema, a DIRECT child of TrackEntry —
-        // NOT nested inside the Video master (which only holds FlagInterlaced /
-        // FieldOrder). The pre-fix writer emitted it between start_master(VIDEO)
-        // and end_master(vid_pos), burying it inside Video. The old test used the
-        // flat `find_id` byte-scan, which passes regardless of nesting. This is a
-        // depth-aware check: the element MUST appear among TrackEntry's direct
-        // children and MUST NOT appear among Video's direct children.
-        let v = VideoStream {
-            pid: 0xE0,
-            codec: Codec::Mpeg2,
-            resolution: Resolution::R576i,
-            frame_rate: crate::disc::FrameRate::F25,
-            hdr: HdrFormat::Sdr,
-            color_space: ColorSpace::Bt470bg,
-            display_aspect: None,
-            secondary: false,
-            label: String::new(),
-        };
-        let t = MkvTrack::video(&v);
+    fn field_duration_when_set_is_direct_trackentry_child_not_in_video() {
+        // GUARDS the element nesting for the retained (now non-default) writer
+        // path: if a caller DOES set field_duration_ns > 0,
+        // DefaultDecodedFieldDuration (0x234E7A) must be emitted as a DIRECT child
+        // of TrackEntry — NOT nested inside the Video master (which only holds
+        // FlagInterlaced / FieldOrder), per the Matroska schema. The production
+        // video path passes 0 (so the element is suppressed — see
+        // interlaced_576i_omits_default_decoded_field_duration_keeps_full_frame_duration);
+        // this test builds a track with a non-zero field duration to exercise the
+        // writer guard and pin its (correct) nesting depth.
+        let mut t = make_video_track();
+        t.interlaced = true;
+        t.field_order = ebml::FIELD_ORDER_TFF;
+        t.field_duration_ns = 20_000_000;
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
 
@@ -3544,8 +3648,8 @@ mod tests {
             "480i frame duration is ~33.37 ms (29.97 fps, not halved)"
         );
         assert_eq!(
-            t.field_duration_ns, 16_683_333,
-            "480i field duration is half the frame (~16.68 ms)"
+            t.field_duration_ns, 0,
+            "field duration is suppressed (DefaultDecodedFieldDuration omitted — Windows-fps fix)"
         );
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();

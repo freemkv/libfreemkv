@@ -834,6 +834,61 @@ mod tests {
         assert!(f[0].keyframe);
     }
 
+    #[test]
+    fn opening_au_keeps_disc_pts_and_opening_seq_header_no_zero_floor() {
+        // SOTL SUB-TASK 2 regression (opening-GOP / still-frame open). A DVD
+        // title opens on a VOBU that begins with a sequence header + I-frame; the
+        // disc stamps that opening I-frame at its REAL (non-zero) timeline PTS,
+        // not 0. The parser must (a) emit the opening I-frame with that real PTS
+        // — never floored to 0 — and (b) capture THAT opening sequence header as
+        // codec_private (read at headers-ready, before any later AU). Proves the
+        // opening pictures are emitted with the correct seq header + PTS, ruling
+        // out the "wrong/last seq header" and "PTS floored to t=0" hypotheses.
+        let mut p = Mpeg2Parser::new();
+
+        // Opening AU: seq header (the codecPrivate) + GOP + I-frame TR0 carrying
+        // the disc's real opening PTS (2 s here, i.e. NOT zero). 25 fps PAL.
+        let mut a = make_seq_header(720, 576, 3, 3); // 16:9, 25 fps
+        a.extend_from_slice(&gop());
+        a.extend_from_slice(&make_picture_header_tr(PICTURE_TYPE_I, 0));
+        a.extend_from_slice(&[0xAA; 20]);
+        let mut frames = p.parse(&make_pes(a, Some(180_000))); // PTS = 2 s (90 kHz)
+        assert!(frames.is_empty(), "first AU waits for the next boundary");
+
+        // Second picture (no PTS) closes the opening AU: the I-frame emits and
+        // the opening sequence header is captured (headers-ready timing — the
+        // consumer reads codec_private once the first AU drains).
+        let mut b = make_picture_header_tr(3, 1);
+        b.extend_from_slice(&[0xBB; 20]);
+        frames.extend(p.parse(&make_pes(b, None)));
+
+        // codec_private is the OPENING sequence header (read at headers-ready,
+        // before any later AU could replace it).
+        let cp = p
+            .codec_private()
+            .expect("opening seq header captured at headers-ready");
+        assert_eq!(
+            &cp[..4],
+            &[0x00, 0x00, 0x01, SEQ_HEADER_CODE],
+            "codec_private is the opening sequence header"
+        );
+        assert_eq!(p.resolution(), Some((720, 576)), "576i opening header");
+        assert_eq!(p.frame_rate(), Some((25, 1)), "25 fps opening header");
+
+        frames.extend(p.flush());
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].keyframe, "opening picture is the I-frame");
+        assert_eq!(
+            frames[0].pts_ns, 2_000_000_000,
+            "opening I-frame keeps the disc's real PTS (2 s), NOT floored to 0"
+        );
+        assert_eq!(
+            frames[1].pts_ns, 2_040_000_000,
+            "next frame is one 40 ms interval later on the real timeline"
+        );
+    }
+
     // --- Sequence header → codec_private ---
 
     #[test]
