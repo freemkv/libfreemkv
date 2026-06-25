@@ -109,6 +109,9 @@ pub const E_PES_INVALID_MAGIC: u16 = 9006;
 pub const E_ISO_TOO_LARGE: u16 = 9007;
 pub const E_NO_METADATA: u16 = 9008;
 pub const E_DISC_URL_NOT_DIRECT: u16 = 9009;
+/// `--raw` given with a `dir://` destination (raw + decrypted-tree is
+/// a contradiction; raw bytes go to `iso://`).
+pub const E_DIR_RAW_REJECTED: u16 = 9019;
 pub const E_HEVC_PARAM_PARSE: u16 = 9010;
 pub const E_MUX_TRACK_RANGE: u16 = 9011;
 pub const E_FMP4_UNIMPLEMENTED: u16 = 9012;
@@ -119,6 +122,21 @@ pub const E_SWEEP_CONSUMER_GONE: u16 = 9016;
 pub const E_PES_TRACK_TOO_LARGE: u16 = 9017;
 pub const E_PIPELINE_CONSUMER_GONE: u16 = 9018;
 pub const E_DISC_CAPACITY_OVERFLOW: u16 = 9020;
+/// `--multipass` given with a `dir://` destination (`dir://` is 1-shot;
+/// recovery is the `iso://` path's job).
+pub const E_DIR_MULTIPASS_REJECTED: u16 = 9024;
+/// A non-disc (byte-stream) source was routed into `dir://`, which needs a
+/// filesystem (only `disc://` / `iso://` qualify).
+pub const E_DIR_SOURCE_UNSUPPORTED: u16 = 9025;
+/// `dir://` target directory is non-empty and `--force` was not given.
+pub const E_DIR_NOT_EMPTY: u16 = 9026;
+/// `dir://` target filesystem free space is below the sum of file extents.
+pub const E_DIR_INSUFFICIENT_SPACE: u16 = 9027;
+/// Two distinct disc paths sanitize to the same host path (would silently
+/// overwrite — surfaced as a hard error instead).
+pub const E_DIR_NAME_COLLISION: u16 = 9028;
+/// A `dir://` create_dir_all / file write / rename failed.
+pub const E_DIR_WRITE_FAILED: u16 = 9029;
 pub const E_M2TS_PACKET_MALFORMED: u16 = 9021;
 /// A `network://` output target resolved to no address that is safe to
 /// connect to (every resolved IP was loopback / private / link-local /
@@ -457,6 +475,35 @@ pub enum Error {
     /// last-LBA + 1 overflowed `u32`. Either case means the capacity
     /// response is unusable; no English commentary.
     DiscCapacityMalformed,
+    /// `--raw` was given with a `dir://` destination. An encrypted file
+    /// tree is useless; raw bytes belong in `iso://`.
+    DirRawRejected,
+    /// `--multipass` was given with a `dir://` destination. `dir://` is
+    /// 1-shot; recovery is the `iso://` multipass path's job.
+    DirMultipassRejected,
+    /// A non-disc (byte-stream) source was routed into `dir://`, which
+    /// requires a filesystem (only `disc://` / `iso://` qualify).
+    DirSourceUnsupported,
+    /// The `dir://` target directory is non-empty and `--force` was not
+    /// given. Mixing two discs' trees is refused by default.
+    DirNotEmpty,
+    /// The `dir://` target filesystem's free space is below the sum of
+    /// the file extents to extract. Carries required / available bytes.
+    DirInsufficientSpace {
+        required: u64,
+        available: u64,
+    },
+    /// Two distinct disc paths sanitize to the same host path. Surfaced
+    /// as a hard error rather than a silent overwrite. Carries the
+    /// colliding host component.
+    DirNameCollision {
+        host: String,
+    },
+    /// A `dir://` create_dir_all / file write / rename failed. Carries
+    /// the underlying errno when present.
+    DirWriteFailed {
+        errno: Option<i32>,
+    },
 }
 
 impl Error {
@@ -546,6 +593,13 @@ impl Error {
             Error::ExtentNotUnitAligned => E_EXTENT_NOT_UNIT_ALIGNED,
             Error::M2tsPacketMalformed => E_M2TS_PACKET_MALFORMED,
             Error::DiscCapacityMalformed => E_DISC_CAPACITY_MALFORMED,
+            Error::DirRawRejected => E_DIR_RAW_REJECTED,
+            Error::DirMultipassRejected => E_DIR_MULTIPASS_REJECTED,
+            Error::DirSourceUnsupported => E_DIR_SOURCE_UNSUPPORTED,
+            Error::DirNotEmpty => E_DIR_NOT_EMPTY,
+            Error::DirInsufficientSpace { .. } => E_DIR_INSUFFICIENT_SPACE,
+            Error::DirNameCollision { .. } => E_DIR_NAME_COLLISION,
+            Error::DirWriteFailed { .. } => E_DIR_WRITE_FAILED,
         }
     }
 }
@@ -761,6 +815,16 @@ impl From<Error> for std::io::Error {
             // 9047 DiscCapacityMalformed: the drive returned an unusable
             // READ CAPACITY response (short transfer / overflow).
             9047 => std::io::ErrorKind::InvalidData,
+            // dir:// usage / footgun gates (9019, 9024–9026, 9028): the caller
+            // gave an invalid flag/source/name combination — InvalidInput.
+            E_DIR_RAW_REJECTED
+            | E_DIR_MULTIPASS_REJECTED
+            | E_DIR_SOURCE_UNSUPPORTED
+            | E_DIR_NOT_EMPTY
+            | E_DIR_NAME_COLLISION => std::io::ErrorKind::InvalidInput,
+            // 9027 insufficient space / 9029 write failed: a filesystem-level
+            // failure, not bad input.
+            E_DIR_INSUFFICIENT_SPACE | E_DIR_WRITE_FAILED => std::io::ErrorKind::Other,
             _ => std::io::ErrorKind::Other,
         };
         std::io::Error::new(kind, msg)
@@ -879,6 +943,17 @@ mod tests {
             Error::ExtentNotUnitAligned.code(),
             Error::M2tsPacketMalformed.code(),
             Error::DiscCapacityMalformed.code(),
+            Error::DirRawRejected.code(),
+            Error::DirMultipassRejected.code(),
+            Error::DirSourceUnsupported.code(),
+            Error::DirNotEmpty.code(),
+            Error::DirInsufficientSpace {
+                required: 1,
+                available: 0,
+            }
+            .code(),
+            Error::DirNameCollision { host: "x".into() }.code(),
+            Error::DirWriteFailed { errno: Some(28) }.code(),
         ];
         let mut sorted = codes.to_vec();
         sorted.sort();

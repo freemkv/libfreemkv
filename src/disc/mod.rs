@@ -12,6 +12,7 @@ mod bluray;
 mod dvd;
 pub mod dvd_audio_probe;
 mod encrypt;
+mod extract;
 pub mod mapfile;
 mod patch;
 pub mod read_error;
@@ -28,6 +29,7 @@ use encrypt::HandshakeResult;
 // so the public surface keeps the structured metadata together. Callers map
 // these to display text in their own locale.
 pub use crate::labels::{LabelPurpose, LabelQualifier};
+pub use extract::{ExtractOptions, ExtractResult, FileResult};
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
