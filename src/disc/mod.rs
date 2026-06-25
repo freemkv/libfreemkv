@@ -2048,6 +2048,15 @@ impl Disc {
         let needs_key = matches!(keys, crate::decrypt::DecryptKeys::None);
         if needs_key {
             if self.aacs.is_some() {
+                // E7021 vs E7022 split: when key resolution had derivation
+                // material (device / processing keys) but no Volume ID to derive
+                // the unit key, the captured `aacs_error` is `AacsVidUnavailable`
+                // — report THAT (the fix is recovering the VID, not adding keys),
+                // not the generic `NoDiscKey`. Any other (or absent) reason →
+                // `NoDiscKey` naming the disc by hash, unchanged.
+                if matches!(self.aacs_error, Some(Error::AacsVidUnavailable)) {
+                    return Err(Error::AacsVidUnavailable);
+                }
                 return Err(Error::NoDiscKey {
                     disc_hash: self.aacs_disc_hash(),
                 });
@@ -2267,13 +2276,12 @@ impl Disc {
 
             // Version dispatch — V10 uses the classical resolver at 48-byte
             // stride; V20/V21 share the 64-byte stride, so try the classical V20
-            // paths first and fall back to the 2.1 variant chain.
-            let resolved = match version_u8 {
-                1 => crate::aacs::resolve_keys_v1(&ctx),
-                _ => crate::aacs::resolve_keys_v2(&ctx)
-                    .or_else(|| crate::aacs::resolve_keys_v21(&ctx)),
-            }
-            .ok_or(crate::error::Error::AacsKeyRejected)?;
+            // paths first and fall back to the 2.1 variant chain. The
+            // reason-preserving wrapper threads the no-key cause out so the
+            // decrypt gate can report E7021 (had derivation material but no VID)
+            // vs E7022 (no usable material) instead of a flat AacsKeyRejected.
+            let resolved = crate::aacs::resolve_keys_with_reason(&ctx, version_u8)
+                .map_err(|_reason| crate::error::Error::AacsKeyRejected)?;
 
             if resolved.unit_keys.is_empty() {
                 return Err(crate::error::Error::AacsKeyRejected);
@@ -3992,6 +4000,99 @@ mod tests {
                 disc_hash: String::new()
             }
             .code()
+        );
+    }
+
+    /// E7021 vs E7022 split (rc.6 WS1). When key resolution HAD derivation
+    /// material (device / processing keys) but no Volume ID was available to
+    /// derive the unit key, the captured `aacs_error` is `AacsVidUnavailable`
+    /// — the gate must surface THAT (E7021), not the generic `NoDiscKey`
+    /// (E7022). When there was no usable key material at all, the reason is
+    /// absent and the gate keeps `NoDiscKey` (E7022). Both branches proven here.
+    #[test]
+    fn ensure_decryptable_aacs_vid_unavailable_vs_no_key() {
+        // Branch 1 — derivation material present, but no VID: E7021.
+        // The resolver classifies a device-keys-but-zero-VID context as
+        // `VidUnavailable`; that reason rides on `aacs_error`.
+        let supplied = crate::aacs::provider::SuppliedKey {
+            device_keys: vec![crate::aacs::DeviceKey {
+                key: [0x11; 16],
+                node: 1,
+                uv: 1,
+                u_mask_shift: 0,
+            }],
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
+        // A minimal but parseable Unit_Key_RO.inf (uk_pos=32, zero unit keys)
+        // so resolution proceeds to the path-try logic and fails for lack of a
+        // VID — not because the .inf failed to parse.
+        let mut uk_ro = vec![0u8; 40];
+        uk_ro[0..4].copy_from_slice(&32u32.to_be_bytes()); // uk_pos = 32
+        // num_unit_keys = 0 (BE16) at uk_pos -> parses to an empty key file.
+        let ctx = crate::aacs::ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16], // the "no VID" sentinel
+            providers: &provider_refs,
+            mkb: None,
+        };
+        assert_eq!(
+            crate::aacs::resolve_keys_with_reason(&ctx, 2).err(),
+            Some(crate::aacs::ResolveFailure::VidUnavailable),
+            "device keys + zero VID must classify as VidUnavailable"
+        );
+
+        let mut disc_e7021 = make_test_disc(1000, "UHD");
+        disc_e7021.encrypted = true;
+        disc_e7021.aacs = Some(aacs_with(Vec::new())); // present but no unit keys
+        disc_e7021.aacs_error = Some(crate::error::Error::AacsVidUnavailable);
+        let err = disc_e7021
+            .ensure_decryptable(false)
+            .expect_err("AACS disc, material-but-no-VID, !raw must error");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::AacsVidUnavailable.code(),
+            "material-but-no-VID must surface E7021 (AacsVidUnavailable), not E7022"
+        );
+
+        // Branch 2 — no key material at all: classified NoMaterial, gate E7022.
+        let supplied_none = crate::aacs::provider::SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
+        let provider_refs_none: [&dyn crate::aacs::KeyProvider; 1] = [&supplied_none];
+        let ctx_none = crate::aacs::ResolveContext {
+            unit_key_ro: &uk_ro,
+            content_cert: None,
+            volume_id: &[0u8; 16],
+            providers: &provider_refs_none,
+            mkb: None,
+        };
+        assert_eq!(
+            crate::aacs::resolve_keys_with_reason(&ctx_none, 2).err(),
+            Some(crate::aacs::ResolveFailure::NoMaterial),
+            "no key material must classify as NoMaterial"
+        );
+
+        let mut disc_e7022 = make_test_disc(1000, "UHD");
+        disc_e7022.encrypted = true;
+        disc_e7022.aacs = Some(aacs_with(Vec::new()));
+        disc_e7022.aacs_error = None; // no reason captured → generic no-key
+        let err = disc_e7022
+            .ensure_decryptable(false)
+            .expect_err("AACS disc, no material, !raw must error");
+        assert_eq!(
+            err.code(),
+            crate::error::Error::NoDiscKey {
+                disc_hash: String::new()
+            }
+            .code(),
+            "no-material must keep E7022 (NoDiscKey)"
         );
     }
 
