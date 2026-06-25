@@ -56,6 +56,11 @@ pub struct PassProgress {
     pub bytes_good_total: u64,
     pub bytes_unreadable_total: u64,
     pub bytes_pending_total: u64,
+    /// Bytes that FAILED to read and await retry (NonTrimmed/NonScraped) —
+    /// distinct from `bytes_pending_total` which also includes not-yet-attempted
+    /// (NonTried) bytes. Used so "lost" counts only failed reads, never unread
+    /// sectors.
+    pub bytes_retryable_total: u64,
     pub bytes_total_disc: u64,
     pub disc_duration_secs: Option<f64>,
     /// How many bytes of the worst-case damage (unreadable + pending) fall

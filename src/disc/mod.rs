@@ -3180,14 +3180,21 @@ impl Disc {
                     // already sent — Anomaly B in the 0.18.1 prod test was
                     // this regression: a stale early snapshot pinned the
                     // display to 0 GB while bytes_done was already advancing.
-                    let (bytes_good, bytes_unreadable, bytes_pending) = match &cached_snapshot {
-                        Some(snap) => (
-                            snap.stats.bytes_good.max(bytes_done),
-                            snap.stats.bytes_unreadable,
-                            snap.stats.bytes_pending,
-                        ),
-                        None => (bytes_done, 0u64, total_bytes.saturating_sub(bytes_done)),
-                    };
+                    let (bytes_good, bytes_unreadable, bytes_pending, bytes_retryable) =
+                        match &cached_snapshot {
+                            Some(snap) => (
+                                snap.stats.bytes_good.max(bytes_done),
+                                snap.stats.bytes_unreadable,
+                                snap.stats.bytes_pending,
+                                snap.stats.bytes_retryable,
+                            ),
+                            None => (
+                                bytes_done,
+                                0u64,
+                                total_bytes.saturating_sub(bytes_done),
+                                0u64,
+                            ),
+                        };
                     let pp = crate::progress::PassProgress {
                         kind: crate::progress::PassKind::Sweep,
                         work_done: pos,
@@ -3195,6 +3202,7 @@ impl Disc {
                         bytes_good_total: bytes_good,
                         bytes_unreadable_total: bytes_unreadable,
                         bytes_pending_total: bytes_pending,
+                        bytes_retryable_total: bytes_retryable,
                         bytes_total_disc: total_bytes,
                         disc_duration_secs: main_title.map(|t| t.duration_secs),
                         bytes_bad_in_main_title: main_title_bad,
