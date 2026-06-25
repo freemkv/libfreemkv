@@ -368,4 +368,75 @@ mod tests {
             "no match → safe no-op, nothing invoked"
         );
     }
+
+    /// `matching_name` reports the FIRST matching unlocker's name without
+    /// running it (drive-info "is this drive supported?" before any unlock),
+    /// and returns `None` for an unknown drive. `registered_count` counts the
+    /// registered unlockers — pinning the two introspection helpers the routing
+    /// tests never touch.
+    ///
+    /// The registry is process-wide and other unlock tests register into it
+    /// concurrently, so the count is only asserted to be MONOTONIC across this
+    /// test's own registration (never an exact delta) — registering an unlocker
+    /// can only grow the count, never shrink it.
+    #[test]
+    fn matching_name_and_registered_count_introspection() {
+        let before = registered_count();
+
+        register_unlocker(Box::new(FakeUnlocker::new(
+            "NAMEVNDR",
+            Arc::new(AtomicBool::new(false)),
+        )));
+
+        // Registering an unlocker can only grow the count (other tests may also
+        // be registering concurrently, so this is a monotonic check, not a
+        // delta-of-exactly-one).
+        assert!(
+            registered_count() > before,
+            "registered_count grows after register_unlocker"
+        );
+
+        // A matching identity reports the unlocker's name — and `matches`
+        // is consulted WITHOUT running unlock_drive (introspection only).
+        assert_eq!(
+            matching_name(&fake_id("NAMEVNDR")).as_deref(),
+            Some("fake"),
+            "matching_name reports the supporting unlocker"
+        );
+
+        // An identity no registered unlocker matches → None (unsupported).
+        assert!(
+            matching_name(&fake_id("ZZNOMTCH")).is_none(),
+            "matching_name is None for an unsupported drive"
+        );
+    }
+
+    /// Registration order is preserved and the FIRST matching unlocker wins:
+    /// when two unlockers both match the same identity, `route_unlock` runs the
+    /// one registered earlier and never consults the later one. The routing
+    /// docs promise "registration order; stops at the first whose `matches` is
+    /// true" — this is the only test that registers two overlapping matchers to
+    /// prove the ordering rather than a single-match no-op.
+    #[test]
+    fn route_unlock_first_registered_match_wins() {
+        let mut scsi = NoopTransport;
+
+        // Two unlockers that BOTH match vendor "DUPEVNDR"; the first registered
+        // must be the one that runs.
+        let first_ran = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+        register_unlocker(Box::new(FakeUnlocker::new("DUPEVNDR", first_ran.clone())));
+        register_unlocker(Box::new(FakeUnlocker::new("DUPEVNDR", second_ran.clone())));
+
+        let matched = route_unlock(&mut scsi, &fake_id("DUPEVNDR")).unwrap();
+        assert_eq!(matched.as_deref(), Some("fake"), "a match was routed");
+        assert!(
+            first_ran.load(Ordering::SeqCst),
+            "the FIRST-registered matching unlocker ran"
+        );
+        assert!(
+            !second_ran.load(Ordering::SeqCst),
+            "the later-registered unlocker was never consulted (first-match-wins)"
+        );
+    }
 }
