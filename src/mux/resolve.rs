@@ -49,6 +49,10 @@ pub enum StreamUrl {
     Stdio,
     /// ISO disc image file.
     Iso { path: PathBuf },
+    /// Decrypted file-tree output directory (`dir://`). A sink that writes
+    /// per-file decrypted bytes (not muxed PES frames), so it never flows
+    /// through `output()`; the CLI routes a `Dir` dest to `Disc::extract_tree`.
+    Dir { path: PathBuf },
     /// Null sink (write-only, discards data).
     Null,
     /// Unrecognized URL.
@@ -65,6 +69,7 @@ impl StreamUrl {
             StreamUrl::Network { .. } => "network",
             StreamUrl::Stdio => "stdio",
             StreamUrl::Iso { .. } => "iso",
+            StreamUrl::Dir { .. } => "dir",
             StreamUrl::Null => "null",
             StreamUrl::Unknown { .. } => "unknown",
         }
@@ -75,9 +80,10 @@ impl StreamUrl {
         match self {
             StreamUrl::Disc { device: Some(p) } => p.to_str().unwrap_or(""),
             StreamUrl::Disc { device: None } => "",
-            StreamUrl::M2ts { path } | StreamUrl::Mkv { path } | StreamUrl::Iso { path } => {
-                path.to_str().unwrap_or("")
-            }
+            StreamUrl::M2ts { path }
+            | StreamUrl::Mkv { path }
+            | StreamUrl::Iso { path }
+            | StreamUrl::Dir { path } => path.to_str().unwrap_or(""),
             StreamUrl::Network { addr } => addr,
             StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
@@ -137,6 +143,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     }
     if let Some(rest) = url.strip_prefix("iso://") {
         return StreamUrl::Iso {
+            path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("dir://") {
+        return StreamUrl::Dir {
             path: PathBuf::from(rest),
         };
     }
@@ -370,6 +381,9 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             Ok(Box::new(NetworkStream::listen(addr)?))
         }
         StreamUrl::Stdio => Ok(Box::new(StdioStream::input())),
+        // `dir://` is an output-only sink (decrypted file tree); it is never a
+        // PES source. Mirror `null://` → write-only.
+        StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
@@ -423,6 +437,11 @@ pub fn output(
         StreamUrl::Null => Ok(Box::new(NullStream::new(title))),
         StreamUrl::Disc { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         StreamUrl::Iso { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        // `dir://` is NOT a PES sink — it writes raw decrypted files, not muxed
+        // frames. A stray `dir://` routed into the mux/PES path fails loudly,
+        // exactly the category the crate already rejects for `iso://`. The CLI
+        // routes a `dir://` dest to `Disc::extract_tree` before reaching here.
+        StreamUrl::Dir { .. } => Err(crate::error::Error::StreamReadOnly.into()),
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
@@ -811,6 +830,41 @@ mod tests {
         assert_eq!(
             output_err_kind("gopher://x", &t),
             std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// `dir://PATH/` parses to `StreamUrl::Dir` with the raw remainder as the
+    /// path; it is a SINK (not a disc source), so `is_disc_source()` is false.
+    #[test]
+    fn parse_dir_url_is_sink_not_disc_source() {
+        match parse_url("dir://out/movie/") {
+            StreamUrl::Dir { path } => {
+                assert_eq!(path, PathBuf::from("out/movie/"));
+            }
+            other => panic!("dir:// must parse to Dir, got {other:?}"),
+        }
+        assert_eq!(parse_url("dir://x").scheme(), "dir");
+        assert_eq!(parse_url("dir://x/y").path_str(), "x/y");
+        assert!(
+            !parse_url("dir://x").is_disc_source(),
+            "dir:// is a sink, never a disc source"
+        );
+    }
+
+    /// `dir://` is output-only: `input()` rejects it (StreamWriteOnly →
+    /// Unsupported), and `output()` rejects it too (StreamReadOnly →
+    /// Unsupported) because it is NOT a PES sink — the CLI routes it to
+    /// `Disc::extract_tree` before the mux path.
+    #[test]
+    fn dir_url_is_not_a_pes_stream_either_direction() {
+        assert_eq!(
+            input_err_kind("dir://out/"),
+            std::io::ErrorKind::Unsupported
+        );
+        let t = DiscTitle::empty();
+        assert_eq!(
+            output_err_kind("dir://out/", &t),
+            std::io::ErrorKind::Unsupported
         );
     }
 

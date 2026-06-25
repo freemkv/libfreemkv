@@ -652,6 +652,46 @@ impl UdfFs {
         Ok(extents)
     }
 
+    /// If the ICB at `meta_lba` stores its data inline (embedded, AD type 3),
+    /// return the embedded bytes; `Ok(None)` for the normal extent-backed case.
+    /// Public wrapper over [`read_inline_data`](Self::read_inline_data) so the
+    /// per-file tree extractor can honor inline nav files without re-walking a
+    /// path. The caller trims to the entry's declared `size`.
+    pub fn inline_data_at(
+        &self,
+        reader: &mut dyn SectorSource,
+        meta_lba: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.read_inline_data(reader, meta_lba)
+    }
+
+    /// Absolute disc extents `(absolute_lba, byte_length)` for the ICB at
+    /// `meta_lba`. Like [`file_extents`](Self::file_extents) but keyed by ICB
+    /// LBA (so the tree extractor can resolve a `DirEntry` it already holds
+    /// without re-navigating a path) and preserving the per-extent byte length
+    /// (so the last sector can be trimmed to the file's real size). Resolves
+    /// multi-extent / Long-AD / continuation ICBs.
+    pub fn extents_abs_at(
+        &self,
+        reader: &mut dyn SectorSource,
+        meta_lba: u32,
+    ) -> Result<Vec<(u32, u32)>> {
+        let alloc = self.read_icb_extents(reader, meta_lba)?;
+        let mut out = Vec::with_capacity(alloc.len());
+        for (lba, byte_len) in alloc {
+            let abs = self
+                .partition_start
+                .checked_add(lba)
+                .ok_or(Error::DiscRead {
+                    sector: self.partition_start as u64,
+                    status: None,
+                    sense: None,
+                })?;
+            out.push((abs, byte_len));
+        }
+        Ok(out)
+    }
+
     /// Get all absolute disc sector extents for a file.
     /// Returns Vec of (absolute_lba, sector_count) covering the entire file.
     pub fn file_extents(
