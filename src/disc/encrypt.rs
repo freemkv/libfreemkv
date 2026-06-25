@@ -98,7 +98,7 @@ impl Disc {
                 tracing::debug!(
                     target: "freemkv::disc",
                     phase = "oem_vid_ok",
-                    "VID acquired via unlocker OEM path; skipping cert handshake"
+                    "Got the disc's Volume ID from the drive unlocker; skipping the AACS host-certificate handshake."
                 );
                 return (
                     Some(HandshakeResult {
@@ -109,18 +109,27 @@ impl Disc {
                 );
             }
             Ok(None) => {
-                // No unlocker matched, or the matching unlocker has no OEM
-                // VID path — fall through to the cert handshake unchanged.
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "oem_vid_none",
+                    "Drive unlocker has no Volume ID for this disc; trying the AACS host-certificate handshake next."
+                );
             }
             Err(e) => {
                 tracing::warn!(
                     target: "freemkv::disc",
                     phase = "oem_vid_failed",
                     error_code = e.code(),
-                    "unlocker OEM VID retrieval failed; falling back to cert handshake"
+                    "Drive unlocker errored while reading the Volume ID; trying the AACS host-certificate handshake next."
                 );
             }
         }
+
+        // No VID from the unlocker → try the cert handshake (host certs are
+        // served by the key sources). Even on a firmware-unlocked drive we try
+        // it: the drive may still honour a cert. If it doesn't, that is not a
+        // failure here — no VID is fine for a keydb VK/UK, and the wedge guard
+        // bounds the attempts. We log the outcome and continue.
 
         // Host certs are keysource-served, never compiled in. Collect them from
         // BOTH places the caller may carry them:
@@ -139,7 +148,7 @@ impl Disc {
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "handshake_no_host_cert",
-                "no host cert from credentials or any key source; OEM cert route unavailable"
+                "No AACS host certificate available from any key source, so the host-certificate handshake can't run. Continuing without a Volume ID; a key source may still supply this disc's key."
             );
             return (
                 None,
@@ -246,14 +255,13 @@ impl Disc {
                 }
             }
         }
-        tracing::warn!(
+        tracing::info!(
             target: "freemkv::disc",
-            phase = "handshake_all_certs_failed",
+            phase = "vid_cert_rejected",
             host_cert_count,
             tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
             last_error_code = last_err_code,
-            "all host certs in KEYDB rejected by drive (capped at {} attempts to prevent firmware wedge)",
-            MAX_CERT_ATTEMPTS
+            "The drive rejected the AACS host certificate, so no Volume ID was obtained. Continuing; a key source may still supply this disc's key."
         );
         (None, Some(Error::AacsHostCertRejected))
     }
@@ -315,7 +323,7 @@ impl Disc {
             version,
             bus_encryption,
             has_vid = handshake.is_some(),
-            "keydb disabled — carrying VID only, keys resolved out-of-band"
+            "Read this disc's AACS data (media-key block and unit-key file). No decryption key computed here — a key source supplies it."
         );
 
         Ok(AacsState {
