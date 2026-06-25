@@ -2086,14 +2086,42 @@ impl Disc {
         reader: &mut dyn SectorSource,
         batch_sectors: u16,
     ) -> crate::decrypt::DecryptKeys {
+        self.decrypt_keys_for_title_checked(idx, reader, batch_sectors)
+            .0
+    }
+
+    /// [`Self::decrypt_keys_for_title`] plus the per-title encryption verdict the
+    /// gate needs to AVOID A FALSE ERROR on a genuinely-clear extra title.
+    ///
+    /// On a multi-VTS CSS DVD that ALSO carries a clear, unencrypted stub title
+    /// (a 0.5 s menu loop, an FBI-warning nav title) living in its own VTS, the
+    /// re-crack over that stub's extents finds NO scrambled sector and recovers
+    /// no key. The bare `decrypt_keys_for_title` collapses that to
+    /// `DecryptKeys::None`, indistinguishable from "scrambled but uncrackable",
+    /// so [`Self::ensure_decryptable_keys`] (which fails whenever `css.is_some()`
+    /// and the key is `None`) wrongly raised `E7023` for a title that needs no
+    /// key at all. That is the false error the multi-title mux must never emit.
+    ///
+    /// This variant runs the re-crack via [`crate::css::crack_key_outcome`] and
+    /// returns `title_is_clear == true` when the title's own extents showed NO
+    /// scrambling (`CrackOutcome::Unencrypted`) — the gate then treats that title
+    /// as needing no key and passes it cleanly. A title that genuinely IS
+    /// scrambled but uncrackable returns `(None, false)` and still hard-fails.
+    /// The returned bool pairs with [`Self::ensure_title_decryptable`].
+    pub fn decrypt_keys_for_title_checked(
+        &self,
+        idx: usize,
+        reader: &mut dyn SectorSource,
+        batch_sectors: u16,
+    ) -> (crate::decrypt::DecryptKeys, bool) {
         let css = match self.css {
             Some(ref c) => c,
-            None => return self.decrypt_keys(),
+            None => return (self.decrypt_keys(), false),
         };
         let title = match self.titles.get(idx) {
             Some(t) if !t.extents.is_empty() => t,
             // No extents to crack from — fall back to the disc-wide key.
-            _ => return self.decrypt_keys(),
+            _ => return (self.decrypt_keys(), false),
         };
         // If the title overlaps the span the existing key was cracked from,
         // it's the same VTS — the cracked key applies. `crack_span: None`
@@ -2107,25 +2135,69 @@ impl Disc {
             }),
         };
         if overlaps {
-            return self.decrypt_keys();
+            return (self.decrypt_keys(), false);
         }
         // Different VTS: re-crack from this title's extents, largest first
         // (the movie body is the biggest scrambled chunk — same heuristic
         // the scan uses). The disc-wide key provably does NOT apply here
-        // (crack_span is Some and this title doesn't overlap it), so a
-        // re-crack miss is a HARD failure: return None rather than fall
-        // back to the known-wrong-VTS key, which would silently descramble
-        // to garbage. The disc-wide fallback is reserved for the unknown-
-        // provenance case (crack_span == None), already handled above via
-        // overlaps == true.
+        // (crack_span is Some and this title doesn't overlap it). Use
+        // `crack_key_outcome` (not the bare `crack_key`) so we can tell a
+        // genuinely-clear title (`Unencrypted` — no scrambled sector in its
+        // own extents) apart from a scrambled-but-uncrackable one:
+        //   - Cracked            → the title's own key.
+        //   - Unencrypted        → (None, title_is_clear=true): this extra title
+        //                          needs no key; the gate must NOT raise E7023.
+        //   - ScrambledUncracked → (None, false): genuinely encrypted but no key
+        //                          → a real hard failure, still surfaced.
+        // The disc-wide fallback is reserved for the unknown-provenance case
+        // (crack_span == None), already handled above via overlaps == true.
         let mut extents = title.extents.clone();
         extents.sort_by(|a, b| b.sector_count.cmp(&a.sector_count));
-        match crate::css::crack_key(reader, &extents, batch_sectors) {
-            Some(state) => crate::decrypt::DecryptKeys::Css {
-                title_key: state.title_key,
-            },
-            None => crate::decrypt::DecryptKeys::None,
+        match crate::css::crack_key_outcome(reader, &extents, batch_sectors, None) {
+            crate::css::CrackOutcome::Cracked(state) => (
+                crate::decrypt::DecryptKeys::Css {
+                    title_key: state.title_key,
+                },
+                false,
+            ),
+            // No scrambled sector in THIS title's extents: it is genuinely clear.
+            // Signal `title_is_clear` so the per-title gate passes it without a
+            // key — NO FALSE E7023 for an unencrypted extra title.
+            crate::css::CrackOutcome::Unencrypted => (crate::decrypt::DecryptKeys::None, true),
+            // Scrambled sectors seen but no key recovered: a genuine hard failure.
+            crate::css::CrackOutcome::ScrambledUncracked => {
+                (crate::decrypt::DecryptKeys::None, false)
+            }
         }
+    }
+
+    /// Per-title decrypt gate that honours the `title_is_clear` verdict from
+    /// [`Self::decrypt_keys_for_title_checked`].
+    ///
+    /// Identical to [`Self::ensure_decryptable_keys`] EXCEPT it does not raise
+    /// `E7023` when the chosen title proved genuinely clear (`title_is_clear`):
+    /// a multi-VTS CSS disc can carry an unencrypted stub title in its own VTS,
+    /// and that title needs no key. The disc-wide `css.is_some()` is true, so the
+    /// plain gate would false-error; this one passes the clear title through.
+    /// A scrambled-but-uncrackable title (`title_is_clear == false`, key `None`)
+    /// still hard-fails exactly as before.
+    pub fn ensure_title_decryptable(
+        &self,
+        raw: bool,
+        keys: &crate::decrypt::DecryptKeys,
+        title_is_clear: bool,
+    ) -> Result<()> {
+        if raw {
+            return Ok(());
+        }
+        // A title proven clear by its own re-crack (no scrambled sector in its
+        // extents) needs no key even though the disc is CSS — pass it. The
+        // disc-wide `css_error` is deliberately NOT consulted here: it reflects
+        // the MAIN feature's crack, not this clear extra title.
+        if title_is_clear && !keys.is_encrypted() {
+            return Ok(());
+        }
+        self.ensure_decryptable_keys(raw, keys)
     }
 
     /// Inject pre-resolved AACS unit keys into a scanned disc — the deferred-mux
@@ -4225,6 +4297,104 @@ mod tests {
         let disc = make_test_disc(1000, "BD");
         assert!(
             disc.ensure_decryptable_keys(false, &crate::decrypt::DecryptKeys::None)
+                .is_ok()
+        );
+    }
+
+    // ── Fix 2/3: a genuinely-clear extra title on a CSS disc never E7023s ──────
+
+    /// Reader that serves clear (unscrambled) sectors for one extent range and
+    /// CSS-locked errors elsewhere — enough to drive `decrypt_keys_for_title_
+    /// checked`'s per-title re-crack to `Unencrypted` for a clear stub.
+    struct ClearStubReader {
+        clear_range: (u32, u32),
+    }
+    impl crate::sector::SectorSource for ClearStubReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let n = count as usize * 2048;
+            buf[..n].fill(0); // clear sectors: scramble flag never set
+            let _ = self.clear_range;
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.clear_range.1
+        }
+    }
+
+    /// Build a multi-VTS CSS disc: `css` cracked from the main feature's span
+    /// `[main_lba, main_end)`, plus a clear stub title living in a DISJOINT VTS.
+    fn css_disc_with_clear_stub() -> (Disc, usize) {
+        let mut disc = make_test_disc(100_000, "DVD");
+        disc.encrypted = true;
+        disc.css = Some(crate::css::CssState {
+            title_key: [0u8; 5],
+            crack_span: Some((0, 1000)), // main feature VTS span
+        });
+        // Title 0: the main feature, overlaps the cracked span.
+        let mut feature = title_with_video(Codec::Mpeg2, Resolution::R480i);
+        feature.extents = vec![Extent {
+            start_lba: 0,
+            sector_count: 1000,
+        }];
+        // Title 1: a tiny CLEAR stub in its own VTS, disjoint from the span.
+        let mut stub = title_with_video(Codec::Mpeg2, Resolution::R480i);
+        stub.extents = vec![Extent {
+            start_lba: 50_000,
+            sector_count: 7, // a 7-sector menu stub
+        }];
+        disc.titles = vec![feature, stub];
+        (disc, 1) // stub is title index 1
+    }
+
+    /// THE Fix 2/3 regression: on a multi-VTS CSS DVD, a genuinely-clear extra
+    /// title (an unencrypted menu stub in its own VTS) must resolve to
+    /// `title_is_clear = true` with `None` keys, and `ensure_title_decryptable`
+    /// must PASS it — no false E7023. The old `decrypt_keys_for_title` +
+    /// `ensure_decryptable_keys` pair raised CssKeyMissing here because the
+    /// re-crack of the clear stub returned `None`, indistinguishable from a
+    /// scrambled-uncracked title.
+    #[test]
+    fn clear_stub_title_on_css_disc_is_not_a_key_failure() {
+        let (disc, stub_idx) = css_disc_with_clear_stub();
+        let mut reader = ClearStubReader {
+            clear_range: (0, 100_000),
+        };
+        let (keys, title_is_clear) = disc.decrypt_keys_for_title_checked(stub_idx, &mut reader, 8);
+        assert!(
+            !keys.is_encrypted(),
+            "a clear stub needs no key (got encrypted keys)"
+        );
+        assert!(
+            title_is_clear,
+            "the stub's own extents show no scrambling → title_is_clear must be true"
+        );
+        // The gate must PASS the clear stub — NO false E7023.
+        assert!(
+            disc.ensure_title_decryptable(false, &keys, title_is_clear)
+                .is_ok(),
+            "a genuinely clear extra title must never raise E7023"
+        );
+    }
+
+    /// Counterpart guard: a scrambled-but-uncrackable title (`title_is_clear ==
+    /// false`, `None` keys) on a CSS disc must STILL hard-fail with CssKeyMissing.
+    /// Fix 2/3 must not weaken the genuine encrypted-but-uncrackable case.
+    #[test]
+    fn scrambled_uncracked_title_still_hard_fails() {
+        let (disc, _) = css_disc_with_clear_stub();
+        let err = disc
+            .ensure_title_decryptable(false, &crate::decrypt::DecryptKeys::None, false)
+            .expect_err("scrambled-uncracked title (title_is_clear=false) must error");
+        assert_eq!(err.code(), crate::error::Error::CssKeyMissing.code());
+        // --raw is exempt even for a scrambled-uncracked title.
+        assert!(
+            disc.ensure_title_decryptable(true, &crate::decrypt::DecryptKeys::None, false)
                 .is_ok()
         );
     }
