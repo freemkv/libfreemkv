@@ -55,6 +55,11 @@ pub enum StreamUrl {
     Dir { path: PathBuf },
     /// Null sink (write-only, discards data).
     Null,
+    /// Per-track elementary-stream output directory (`demux://`). A write-only
+    /// sink that fans each track of a title out to its own ES file (plus
+    /// chapters + delay metadata). Like `dir://` it targets a directory; the
+    /// CLI constructs the `DemuxSink` with full options before the mux loop.
+    Demux { dir: PathBuf },
     /// Unrecognized URL.
     Unknown { raw: String },
 }
@@ -71,6 +76,7 @@ impl StreamUrl {
             StreamUrl::Iso { .. } => "iso",
             StreamUrl::Dir { .. } => "dir",
             StreamUrl::Null => "null",
+            StreamUrl::Demux { .. } => "demux",
             StreamUrl::Unknown { .. } => "unknown",
         }
     }
@@ -83,7 +89,8 @@ impl StreamUrl {
             StreamUrl::M2ts { path }
             | StreamUrl::Mkv { path }
             | StreamUrl::Iso { path }
-            | StreamUrl::Dir { path } => path.to_str().unwrap_or(""),
+            | StreamUrl::Dir { path }
+            | StreamUrl::Demux { dir: path } => path.to_str().unwrap_or(""),
             StreamUrl::Network { addr } => addr,
             StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
@@ -149,6 +156,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("dir://") {
         return StreamUrl::Dir {
             path: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("demux://") {
+        return StreamUrl::Demux {
+            dir: PathBuf::from(rest),
         };
     }
     StreamUrl::Unknown {
@@ -389,6 +401,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         // PES source. Mirror `null://` → write-only.
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
+        // `demux://` is an output-only sink (per-track ES files); never a source.
+        StreamUrl::Demux { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
@@ -446,6 +460,18 @@ pub fn output(
         // exactly the category the crate already rejects for `iso://`. The CLI
         // routes a `dir://` dest to `Disc::extract_tree` before reaching here.
         StreamUrl::Dir { .. } => Err(crate::error::Error::StreamReadOnly.into()),
+        // `demux://` with default options. The CLI constructs `DemuxSink`
+        // directly (with parsed flags) before reaching here, mirroring how a
+        // `dir://` dest is special-cased; this arm covers the bare
+        // `output()` call with the default option set.
+        StreamUrl::Demux { ref dir } => {
+            validate_file_path(dir, "demux")?;
+            Ok(Box::new(super::demux_sink::DemuxSink::create(
+                dir,
+                title,
+                &super::demux_sink::DemuxOptions::default(),
+            )?))
+        }
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
@@ -849,6 +875,12 @@ mod tests {
         }
         assert_eq!(parse_url("dir://x").scheme(), "dir");
         assert_eq!(parse_url("dir://x/y").path_str(), "x/y");
+        assert_eq!(parse_url("demux://out/movie/").path_str(), "out/movie/");
+        assert_eq!(parse_url("demux://x").scheme(), "demux");
+        assert!(
+            !parse_url("demux://x").is_disc_source(),
+            "demux:// is a sink, never a disc source"
+        );
         assert!(
             !parse_url("dir://x").is_disc_source(),
             "dir:// is a sink, never a disc source"

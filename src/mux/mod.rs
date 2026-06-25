@@ -41,6 +41,7 @@ pub mod resolve;
 // dead-code lint rather than delete still-relevant scaffolding.
 #[allow(dead_code)]
 pub(crate) mod codec;
+pub(crate) mod demux_sink;
 #[allow(dead_code)]
 pub(crate) mod demux_thread;
 
@@ -90,6 +91,7 @@ pub(crate) mod stdio;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
 
+pub use demux_sink::{ChaptersFmt, DelayMode, DemuxOptions, DemuxSink, Naming};
 pub use disc::DiscStream;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
@@ -135,6 +137,7 @@ mod tests {
         assert_eq!(parse_url("stdio://").scheme(), "stdio");
         assert_eq!(parse_url("iso://f").scheme(), "iso");
         assert_eq!(parse_url("null://").scheme(), "null");
+        assert_eq!(parse_url("demux://out/").scheme(), "demux");
         assert_eq!(parse_url("bogus://x").scheme(), "unknown");
     }
 
