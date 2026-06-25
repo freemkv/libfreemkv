@@ -176,6 +176,12 @@ fn write_atomic(path: &std::path::Path, text: &str) -> Result<()> {
         tracing::warn!(error = %e, path = %path.display(), "keydb rename failed; keydb unchanged");
         return Err(werr());
     }
+    // Durably commit the new dirent: on POSIX filesystems (ext2, some NFS) a
+    // crash right after the rename can lose the directory entry even though the
+    // rename returned. Best-effort (swallowed on failure); no-op on Windows.
+    if let Some(dir) = path.parent() {
+        crate::io::fsync::dir(dir);
+    }
     Ok(())
 }
 
@@ -241,9 +247,11 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             if header_buf.ends_with(b"\r\n\r\n") {
                 break;
             }
-            if header_buf.len() > MAX_HEADER_BYTES {
+            if header_buf.len() >= MAX_HEADER_BYTES {
                 // Oversized header block from the server: a protocol-level
-                // fault, not a keydb content parse failure.
+                // fault, not a keydb content parse failure. `>=` caps the
+                // buffer at exactly MAX_HEADER_BYTES (the `>` form admitted one
+                // extra byte before tripping).
                 return Err(Error::KeydbConnect { host: host.clone() });
             }
         }
