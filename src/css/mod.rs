@@ -213,7 +213,11 @@ fn crack_key_scan(
                     for s in 0..n as usize {
                         tried += 1;
                         let sect = &buf[s * 2048..(s + 1) * 2048];
-                        if is_scrambled(sect) {
+                        // Use the HARDENED pack-gated check (Fix 3): a clear stub
+                        // sector with stray bits at 0x14 must NOT count as
+                        // scramble evidence, or a genuinely-unencrypted title
+                        // would falsely report ScrambledUncracked (a false E7023).
+                        if is_scrambled_pack(sect) {
                             saw_scrambled = true;
                             if let Some(key) = stevenson::crack_title_key(sect) {
                                 return CrackOutcome::Cracked(CssState {
@@ -269,8 +273,45 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 }
 
 /// Check if a sector has the CSS scramble flag set.
+///
+/// This is the RAW flag test — bits 4-5 of the sub-header byte 0x14 — used by
+/// the descramble loop (`decrypt::decrypt_sectors`), which has already committed
+/// to descrambling a known title's VOB data and only needs to skip the clear
+/// NAV packs interleaved in it. For the CRACK SCAN's "did this disc actually
+/// contain scrambled content?" decision (which must not false-positive on a
+/// clear stub), use [`is_scrambled_pack`] instead.
 pub fn is_scrambled(sector: &[u8]) -> bool {
     sector.len() >= 2048 && (sector[0x14] >> 4) & 0x03 != 0
+}
+
+/// The 4-byte MPEG-2 Program Stream pack-start code (`00 00 01 BA`) every DVD
+/// video sector opens with. CSS leaves the clear header (`0x00..0x80`)
+/// untouched, so this signature survives scrambling.
+pub(crate) const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
+
+/// Check if a sector is a CSS-scrambled DVD **video pack** — the HARDENED test
+/// the crack scan uses to set its `saw_scrambled` evidence flag (Fix 3).
+///
+/// [`is_scrambled`] keys solely on bits 4-5 of byte 0x14. That single byte is
+/// only meaningful inside a real DVD sector — an MPEG-2 Program Stream pack,
+/// which ALWAYS begins with the 32-bit pack-start code `00 00 01 BA` at offset
+/// 0x00. A tiny clear / nav-only stub (a 0.5 s menu loop, an FBI-warning title)
+/// can carry arbitrary bytes that happen to set bits 4-5 of byte 0x14; trusting
+/// byte 0x14 alone there would flip the scan's `saw_scrambled` gate and make a
+/// genuinely-UNENCRYPTED title report `ScrambledUncracked` — a false E7023.
+///
+/// Requiring the pack-start signature FIRST means only a sector that is
+/// structurally a DVD video pack can be counted as scramble evidence. This does
+/// NOT weaken the genuine "encrypted but uncrackable" hard-fail: a real
+/// scrambled feature is made of valid PS packs, so its scrambled sectors still
+/// pass this check and still drive `ScrambledUncracked` when no key cracks. (The
+/// descramble loop keeps the looser [`is_scrambled`]: by the time it runs we
+/// already know the title is CSS, and it only needs to skip interleaved clear
+/// NAV packs — a wrongly-skipped or wrongly-included sector there is recoverable
+/// per-sector, whereas a false scramble verdict in the scan poisons the whole
+/// title's outcome.)
+pub fn is_scrambled_pack(sector: &[u8]) -> bool {
+    sector.len() >= 2048 && sector[0x00..0x04] == PACK_START && (sector[0x14] >> 4) & 0x03 != 0
 }
 
 #[cfg(test)]
@@ -338,6 +379,41 @@ mod tests {
         assert!(is_scrambled(&s), "exactly 2048 bytes must be eligible");
     }
 
+    /// Fix 3 hardening: `is_scrambled_pack` (the crack-scan evidence gate)
+    /// requires BOTH the MPEG-PS pack-start code at 0x00 AND the 0x14 scramble
+    /// bits. A clear / nav-only stub whose bytes happen to set bits 4-5 of 0x14
+    /// but lacks the pack-start is NOT counted as scramble evidence — without
+    /// this the scan flips `saw_scrambled` and a genuinely unencrypted title
+    /// reports `ScrambledUncracked` (the false E7023). The looser `is_scrambled`
+    /// (descramble gate) still reads the same sector as flagged.
+    ///
+    /// Grounding: `sector[0x00..0x04] == 00 00 01 BA && (sector[0x14] >> 4)...`.
+    /// Mutation: drop the pack-start clause -> the 0x14-only sector counts as a
+    /// scrambled pack; the first assert fails.
+    #[test]
+    fn is_scrambled_pack_requires_pack_start_signature() {
+        let mut s = vec![0u8; 2048];
+        s[0x14] = 0x30; // scramble bits set, but no pack-start at 0x00
+        assert!(
+            !is_scrambled_pack(&s),
+            "0x14 bits without the MPEG-PS pack-start must NOT count as a scrambled pack"
+        );
+        // The looser descramble-gate check still sees the raw flag.
+        assert!(is_scrambled(&s), "is_scrambled keys on the 0x14 flag alone");
+        // A near-miss pack-start (wrong final byte) is still rejected.
+        s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBB]);
+        assert!(
+            !is_scrambled_pack(&s),
+            "a wrong pack-start byte must not qualify"
+        );
+        // The real signature flips it to a scrambled pack.
+        s[0x00..0x04].copy_from_slice(&PACK_START);
+        assert!(
+            is_scrambled_pack(&s),
+            "valid pack-start + 0x14 bits → scrambled pack"
+        );
+    }
+
     // ── crack_key scanning over a mock SectorSource ────────────────────────
 
     /// Records every (lba, count) read; returns a caller-supplied flag byte at
@@ -378,6 +454,7 @@ mod tests {
         const RUN_START: usize = 0x59;
         const SEED_OFFSET: usize = 0x54;
         let mut plaintext = vec![0u8; 2048];
+        plaintext[0x00..0x04].copy_from_slice(&PACK_START); // valid DVD pack header
         plaintext[0x14] = 0x10; // scramble flag
         let pat: Vec<u8> = (0..period)
             .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
@@ -431,6 +508,12 @@ mod tests {
                         buf[base..base + 2048].copy_from_slice(sector);
                     }
                     _ => {
+                        // Real DVD video sectors always open with the MPEG-PS
+                        // pack-start code; `is_scrambled` (Fix 3) requires it
+                        // before trusting the 0x14 scramble bits, so the fixture
+                        // must include it for a `flag_byte` of 0x30 to register
+                        // as scrambled.
+                        buf[base..base + 4].copy_from_slice(&PACK_START);
                         buf[base + 0x14] = self.flag_byte;
                     }
                 }
