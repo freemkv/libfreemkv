@@ -606,6 +606,11 @@ pub(super) struct PatchLoopState {
     pub stall_start: std::time::Instant,
     pub range_start: std::time::Instant,
     pub range_bytes_good: u64,
+    // Clock seam: the watchdog reads wall time through this rather than calling
+    // `Instant::now()` inline, so deterministic tests can advance a fake clock to
+    // prove the stall/range timeouts trip. Production uses `Instant::now`
+    // (see `PatchLoopState::new`), so behaviour is byte-identical.
+    pub now: fn() -> std::time::Instant,
     // Adaptive batch
     pub current_batch: u16,
     pub consecutive_singles_ok: u32,
@@ -627,7 +632,30 @@ impl PatchLoopState {
         recovery: bool,
         work_total: u64,
     ) -> Self {
-        let now = std::time::Instant::now();
+        // Production clock: the real monotonic wall clock.
+        Self::new_with_clock(
+            bytes_good_before,
+            total_bytes,
+            initial_batch,
+            recovery,
+            work_total,
+            std::time::Instant::now,
+        )
+    }
+
+    /// Like `new`, but with an injectable monotonic clock. The watchdog reads
+    /// time exclusively through `now`, so a test can wind a fake clock forward to
+    /// drive the stall/range timeouts deterministically. `new` passes
+    /// `Instant::now`, so the production loop is unchanged.
+    pub(super) fn new_with_clock(
+        bytes_good_before: u64,
+        total_bytes: u64,
+        initial_batch: u16,
+        recovery: bool,
+        work_total: u64,
+        now: fn() -> std::time::Instant,
+    ) -> Self {
+        let t0 = now();
         Self {
             halted: false,
             wedged_exit: false,
@@ -646,9 +674,10 @@ impl PatchLoopState {
             not_ready_retries_per_lba: 0,
             not_ready_lba: None,
             bytes_good_last: bytes_good_before,
-            stall_start: now,
-            range_start: now,
+            stall_start: t0,
+            range_start: t0,
             range_bytes_good: bytes_good_before,
+            now,
             current_batch: initial_batch,
             consecutive_singles_ok: 0,
             bytes_good_before,
@@ -793,14 +822,15 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
         g.stats.bytes_good
     };
     if bytes_good_now > state.bytes_good_last {
-        state.stall_start = std::time::Instant::now();
+        state.stall_start = (state.now)();
         state.bytes_good_last = bytes_good_now;
     }
-    if state.stall_start.elapsed() > std::time::Duration::from_secs(STALL_SECS) {
+    if (state.now)().duration_since(state.stall_start) > std::time::Duration::from_secs(STALL_SECS)
+    {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_stall",
-            elapsed_secs = state.stall_start.elapsed().as_secs(),
+            elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
             bytes_good = bytes_good_now,
             bytes_good_start = state.bytes_good_start,
             "Patch stalled - no recovery for {}s, exiting pass",
@@ -1074,14 +1104,16 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
                 g.stats.bytes_good
             };
             if bytes_good_now > state.bytes_good_last {
-                state.stall_start = std::time::Instant::now();
+                state.stall_start = (state.now)();
                 state.bytes_good_last = bytes_good_now;
             }
-            if state.stall_start.elapsed() > std::time::Duration::from_secs(STALL_SECS) {
+            if (state.now)().duration_since(state.stall_start)
+                > std::time::Duration::from_secs(STALL_SECS)
+            {
                 tracing::warn!(
                     target: "freemkv::disc",
                     phase = "patch_stall",
-                    elapsed_secs = state.stall_start.elapsed().as_secs(),
+                    elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
                     bytes_good = bytes_good_now,
                     bytes_good_start = state.bytes_good_start,
                     "Patch stalled (NOT_READY path) - no recovery for {}s, exiting pass",
@@ -1158,14 +1190,15 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         g.stats.bytes_good
     };
     if bytes_good_now > state.bytes_good_last {
-        state.stall_start = std::time::Instant::now();
+        state.stall_start = (state.now)();
         state.bytes_good_last = bytes_good_now;
     }
-    if state.stall_start.elapsed() > std::time::Duration::from_secs(STALL_SECS) {
+    if (state.now)().duration_since(state.stall_start) > std::time::Duration::from_secs(STALL_SECS)
+    {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_stall",
-            elapsed_secs = state.stall_start.elapsed().as_secs(),
+            elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
             consecutive_failures = state.consecutive_failures,
             bytes_good = bytes_good_now,
             bytes_good_start = state.bytes_good_start,
@@ -1437,15 +1470,15 @@ pub(super) fn check_range_watchdog(
     };
     if bytes_good_now > state.range_bytes_good {
         state.range_bytes_good = bytes_good_now;
-        state.range_start = std::time::Instant::now();
+        state.range_start = (state.now)();
     }
-    if state.range_start.elapsed().as_secs() >= frame.range_budget_secs {
+    if (state.now)().duration_since(state.range_start).as_secs() >= frame.range_budget_secs {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_range_stall",
             range_lba = frame.range_pos / 2048,
             range_sectors = frame.range_sectors,
-            elapsed_secs = state.range_start.elapsed().as_secs(),
+            elapsed_secs = (state.now)().duration_since(state.range_start).as_secs(),
             budget_secs = frame.range_budget_secs,
             bytes_recovered = state.range_bytes_good.saturating_sub(state.bytes_good_before),
             "Range stalled - moving to next range"
@@ -1826,7 +1859,7 @@ impl Disc {
             state.damage_window.clear();
             state.consecutive_skips_without_recovery = 0;
             state.consecutive_good_since_skip = 0;
-            state.range_start = std::time::Instant::now();
+            state.range_start = (state.now)();
             // Fix 4: initialize range_bytes_good to the CURRENT bytes_good
             // (not the pass-start value bytes_good_before). Using the
             // pass-start value means that after any prior range recovers
@@ -2582,6 +2615,164 @@ mod tests {
             drift < std::time::Duration::from_millis(100),
             "range_start must not be reset on the first tick when no new recovery \
              occurred in this range (drift={drift:?})"
+        );
+    }
+
+    // ---- Clock seam: deterministic watchdog timeouts ------------------
+    //
+    // `PatchLoopState::new_with_clock` lets a test inject a monotonic clock so
+    // the per-range / whole-pass watchdogs can be driven WITHOUT real wall time.
+    // The fake clock is a free `fn() -> Instant` (the seam's type), backed by a
+    // process-wide millisecond offset. Tests that use it serialize on a mutex so
+    // the shared offset can't be clobbered by a concurrently-running clock test.
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_CLOCK_OFFSET_MS: AtomicU64 = AtomicU64::new(0);
+    static FAKE_CLOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The injectable clock: a fixed base plus the current offset. `OnceLock`
+    /// pins the base so every call within a test advances from the same origin.
+    fn fake_now() -> std::time::Instant {
+        use std::sync::OnceLock;
+        static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        base + std::time::Duration::from_millis(FAKE_CLOCK_OFFSET_MS.load(Ordering::SeqCst))
+    }
+
+    /// Advance the fake clock by `secs` seconds.
+    fn advance_fake_clock(secs: u64) {
+        FAKE_CLOCK_OFFSET_MS.fetch_add(secs * 1000, Ordering::SeqCst);
+    }
+
+    fn shared_with_bytes_good(bytes_good: u64) -> Arc<Mutex<SharedPatchState>> {
+        Arc::new(Mutex::new(SharedPatchState {
+            stats: MapStats {
+                bytes_total: 0,
+                bytes_good,
+                bytes_pending: 0,
+                bytes_unreadable: 0,
+                bytes_retryable: 0,
+                bytes_nontried: 0,
+                num_bad_ranges: 0,
+                main_lost_ms: 0.0,
+            },
+            bad_ranges: vec![],
+        }))
+    }
+
+    /// The per-range watchdog must NOT trip before the budget elapses and MUST
+    /// trip once the injected clock passes the budget — with zero forward
+    /// progress (bytes_good frozen). Driven entirely by `advance_fake_clock`,
+    /// so it proves the real `check_range_watchdog` timeout branch executes.
+    #[test]
+    fn range_watchdog_trips_on_budget_exhaustion_via_fake_clock() {
+        let _guard = FAKE_CLOCK_LOCK.lock().unwrap();
+        FAKE_CLOCK_OFFSET_MS.store(0, Ordering::SeqCst);
+
+        let shared = shared_with_bytes_good(0);
+        let mut state = PatchLoopState::new_with_clock(0, 1 << 40, 1, false, 1 << 40, fake_now);
+
+        // A 10 s budget. range_start was seeded from fake_now() at offset 0.
+        let frame = RangeFrame {
+            range_idx: 1,
+            range_pos: 0,
+            range_size: 2048,
+            end: 2048,
+            block_end: 2048,
+            range_budget_secs: 10,
+            range_sectors: 1,
+        };
+
+        // Just under budget: no trip.
+        advance_fake_clock(9);
+        assert!(
+            !check_range_watchdog(&mut state, &frame, &shared),
+            "watchdog must not trip before the range budget elapses"
+        );
+
+        // Past budget with no recovery: trip.
+        advance_fake_clock(2); // total 11 s >= 10 s budget
+        assert!(
+            check_range_watchdog(&mut state, &frame, &shared),
+            "watchdog must trip once the injected clock passes the range budget"
+        );
+    }
+
+    /// Forward progress (bytes_good advancing) must reset the per-range clock so
+    /// the watchdog does NOT trip even though more than `budget` seconds of fake
+    /// time have passed in aggregate — proving the reset branch reads the seam,
+    /// not real time.
+    #[test]
+    fn range_watchdog_forward_progress_resets_clock_via_fake_clock() {
+        let _guard = FAKE_CLOCK_LOCK.lock().unwrap();
+        FAKE_CLOCK_OFFSET_MS.store(0, Ordering::SeqCst);
+
+        let shared = shared_with_bytes_good(0);
+        let mut state = PatchLoopState::new_with_clock(0, 1 << 40, 1, false, 1 << 40, fake_now);
+
+        let frame = RangeFrame {
+            range_idx: 1,
+            range_pos: 0,
+            range_size: 2048,
+            end: 2048,
+            block_end: 2048,
+            range_budget_secs: 10,
+            range_sectors: 1,
+        };
+
+        // 8 s, then recovery commits (bytes_good advances) — clock resets.
+        advance_fake_clock(8);
+        shared.lock().unwrap().stats.bytes_good = 4096;
+        assert!(
+            !check_range_watchdog(&mut state, &frame, &shared),
+            "progress tick must not trip"
+        );
+
+        // 8 more seconds (16 s total, but only 8 since the reset): still under
+        // budget because the productive tick reset range_start.
+        advance_fake_clock(8);
+        assert!(
+            !check_range_watchdog(&mut state, &frame, &shared),
+            "watchdog must not trip when forward progress kept resetting the clock"
+        );
+
+        // Now freeze progress and exceed the budget from the last reset.
+        advance_fake_clock(11);
+        assert!(
+            check_range_watchdog(&mut state, &frame, &shared),
+            "watchdog must trip once progress stops and the budget elapses"
+        );
+    }
+
+    /// The whole-pass stall watchdog predicate (`STALL_SECS` on no bytes_good
+    /// movement) must be governed by the injected clock. This drives the exact
+    /// comparison the production stall guard runs — `(state.now)().duration_since
+    /// (state.stall_start) > STALL_SECS` — through `new_with_clock`, proving the
+    /// seam reaches the stall path too (which is inline in helpers that need a
+    /// full Pipeline, so we assert the predicate the helpers evaluate).
+    #[test]
+    fn whole_pass_stall_predicate_governed_by_fake_clock() {
+        let _guard = FAKE_CLOCK_LOCK.lock().unwrap();
+        FAKE_CLOCK_OFFSET_MS.store(0, Ordering::SeqCst);
+
+        let state = PatchLoopState::new_with_clock(0, 1 << 40, 1, false, 1 << 40, fake_now);
+
+        // Before STALL_SECS: predicate false.
+        advance_fake_clock(STALL_SECS - 1);
+        assert!(
+            (state.now)().duration_since(state.stall_start)
+                <= std::time::Duration::from_secs(STALL_SECS),
+            "stall must not fire before STALL_SECS of injected time"
+        );
+
+        // Past STALL_SECS with no progress: predicate true → production sets
+        // wedged_exit and breaks the outer loop.
+        advance_fake_clock(2);
+        assert!(
+            (state.now)().duration_since(state.stall_start)
+                > std::time::Duration::from_secs(STALL_SECS),
+            "stall guard fires once injected time exceeds STALL_SECS"
         );
     }
 
