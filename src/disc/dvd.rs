@@ -106,7 +106,7 @@ impl Disc {
                 })
                 .collect();
 
-            for dvd_title in &ts.titles {
+            for (vts_title_idx, dvd_title) in ts.titles.iter().enumerate() {
                 title_number += 1;
 
                 // Diagnostic dump (--log-level 3): per-cell category table +
@@ -114,13 +114,32 @@ impl Disc {
                 // per-cell IFO detail. No-op unless freemkv::diag is enabled.
                 crate::diag::dump_dvd_cells(ts.vts_number, title_number, dvd_title);
 
-                // Bug-4 leading-cell filter: drop any leading scene-index /
-                // interleaved-angle sub-block cells so the feature starts at the
-                // movie. Conservative — `feature_start_cell` only ever skips a
-                // prefix of secondary-block cells and never truncates a normal
-                // feature (category 0x00 on cell 0 → no-op). See
-                // `ifo::DvdTitle::feature_start_cell`.
-                let feature_start = dvd_title.feature_start_cell();
+                // Feature start cell. Prefer the DVD nav-VM resolver, which
+                // PARKED (#40, menu-at-start playback). The "menu at the start"
+                // symptom (e.g. SOTL) was a sector-mapping fault — the absolute
+                // VOB rebase in `ifo::parse_vts` (`vob_start_sector =
+                // file_start_lba + vtstt_vobs`) — NOT a navigation problem, so
+                // feature-start resolution is unnecessary for correct rips. The
+                // nav resolver + verified VM decoder (`dvdnav`) are kept compiled
+                // but deliberately bypassed; flip `USE_NAV_RESOLVER` to re-enable
+                // once the nav executor is finished. The fallback is the
+                // structural leading-cell filter (`feature_start_cell`), which
+                // drops leading scene-index / interleaved-angle sub-block cells
+                // and is a no-op for a normal feature (category 0x00 on cell 0).
+                // See `dvdnav::resolve_feature_start`.
+                const USE_NAV_RESOLVER: bool = false;
+                let feature_start = if USE_NAV_RESOLVER {
+                    crate::dvdnav::resolve_feature_start(
+                        reader,
+                        udf_fs,
+                        ts.vts_number as u16,
+                        (vts_title_idx + 1) as u16,
+                    )
+                    .unwrap_or_else(|| dvd_title.feature_start_cell())
+                } else {
+                    dvd_title.feature_start_cell()
+                }
+                .min(dvd_title.cells.len());
                 let dropped_secs: f64 = dvd_title.cells[..feature_start]
                     .iter()
                     .map(|c| c.duration_secs)
@@ -136,9 +155,9 @@ impl Disc {
                     );
                 }
 
-                // Build extents from cell sector ranges (absolute = vob_start + cell offset)
-                let extents: Vec<Extent> = dvd_title
-                    .feature_cells()
+                // Build extents from cell sector ranges (absolute = vob_start + cell offset),
+                // starting at the resolved feature-start cell.
+                let extents: Vec<Extent> = dvd_title.cells[feature_start..]
                     .iter()
                     .map(|cell| {
                         let start = ts.vob_start_sector.saturating_add(cell.first_sector);
@@ -553,8 +572,10 @@ mod tests {
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
-        // absolute start = vob_start(1000) + first_sector(10) = 1010.
-        assert_eq!(t.extents[0].start_lba, 1010);
+        // absolute start = ifo_lba + vtstt_vobs(1000) + first_sector(10).
+        // The IFO file sits at PART_START(3000) + data_lba(6000) = 9000, so
+        // 9000 + 1000 + 10 = 10010.
+        assert_eq!(t.extents[0].start_lba, 10010);
         // inclusive: 109 - 10 + 1 = 100 sectors.
         assert_eq!(t.extents[0].sector_count, 100);
         // DVD sector = 2048 bytes.
@@ -607,12 +628,85 @@ mod tests {
         assert_eq!(titles.len(), 1);
         let t = &titles[0];
         assert_eq!(t.extents.len(), 1);
-        // Title VOBS (3640) + cell first_sector (0) = 3640 — NOT the menu 44.
+        // ifo_lba(9000) + vtstt_vobs(3640) + first_sector(0) = 12640 — built
+        // from the Title VOBS (0xC4), NOT the menu VOBS (0xC0). The IFO file is
+        // at PART_START(3000) + data_lba(6000) = 9000.
         assert_eq!(
-            t.extents[0].start_lba, 3640,
-            "extent must start at vtstt_vobs (0xC4), not vtsm_vobs (0xC0)"
+            t.extents[0].start_lba, 12640,
+            "extent must start at ifo_lba + vtstt_vobs (0xC4), not vtsm_vobs (0xC0)"
         );
-        assert_ne!(t.extents[0].start_lba, 44, "must not use the menu VOBS");
+        // Must not resolve from the menu VOBS (would be 9000 + 44 = 9044), nor
+        // use the raw IFO-relative vtstt_vobs (3640) without the absolute base.
+        assert_ne!(t.extents[0].start_lba, 9044, "must not use the menu VOBS");
+        assert_ne!(
+            t.extents[0].start_lba, 3640,
+            "must add the IFO's absolute disc LBA, not use the raw relative value"
+        );
+    }
+
+    /// ABSOLUTE-REBASE regression (THESILENCEOFTHELAMBS / Greenland fix):
+    /// `ifo::parse_vts` now sets `vob_start_sector = file_start_lba(IFO) +
+    /// vtstt_vobs`, so an extent's `start_lba` must equal the sum of THREE
+    /// independent terms — the IFO file's absolute on-disc LBA, the
+    /// IFO-relative `vtstt_vobs` (0xC4), and the cell's `first_sector` — none of
+    /// which may be dropped. The earlier code used the bare relative
+    /// `vtstt_vobs`, placing every extent `ifo_lba` sectors too early (the rip
+    /// opened in the VMGI/menu region before drifting into the movie). The
+    /// other tests fold two of the three terms together (zero cell offset, or
+    /// a single combined expectation); this one keeps all three distinct and
+    /// non-overlapping so a regression to ANY two-term combination is caught.
+    #[test]
+    fn scan_dvd_titles_extent_is_absolute_three_term_sum() {
+        let mut disc = MemDisc::new();
+        let vmg = build_vmg(&[(1, 1, 1)]);
+        // vtstt_vobs (Title VOBS, 0xC4) = 700; one cell first_sector = 33.
+        let vts = build_vts(700, 0x00, &[], &[], &[(33, 132)], false);
+        // IFO data at data_lba 6000 → absolute ifo_lba = PART_START(3000) + 6000.
+        let ifo_lba = PART_START + 6000; // 9000
+        let vtstt_vobs = 700u32;
+        let first_sector = 33u32;
+        let udf = build_video_ts_fs(
+            &mut disc,
+            &[
+                FileSpec {
+                    name: "VIDEO_TS.IFO".into(),
+                    icb_lba: 60,
+                    data_lba: 5000,
+                    contents: vmg,
+                },
+                FileSpec {
+                    name: "VTS_01_0.IFO".into(),
+                    icb_lba: 62,
+                    data_lba: 6000,
+                    contents: vts,
+                },
+            ],
+        );
+        let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
+        assert_eq!(t.extents.len(), 1);
+        let got = t.extents[0].start_lba;
+        // The one correct answer: all three terms summed (9000 + 700 + 33).
+        assert_eq!(
+            got,
+            ifo_lba + vtstt_vobs + first_sector,
+            "extent start must be file_start_lba(IFO) + vtstt_vobs + cell.first_sector"
+        );
+        // Each wrong two-term combination must be rejected:
+        assert_ne!(
+            got,
+            vtstt_vobs + first_sector,
+            "must not use the bare relative vtstt_vobs (missing the IFO's absolute LBA)"
+        );
+        assert_ne!(
+            got,
+            ifo_lba + first_sector,
+            "must not drop vtstt_vobs (the Title VOBS pointer)"
+        );
+        assert_ne!(
+            got,
+            ifo_lba + vtstt_vobs,
+            "must not drop the cell's first_sector offset"
+        );
     }
 
     /// Multi-cell title: extents preserve cell order and each maps to its
@@ -648,9 +742,9 @@ mod tests {
         );
         let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
         assert_eq!(t.extents.len(), 2);
-        assert_eq!(t.extents[0].start_lba, 500); // 500 + 0
+        assert_eq!(t.extents[0].start_lba, 9500); // ifo_lba(9000) + 500 + 0
         assert_eq!(t.extents[0].sector_count, 100);
-        assert_eq!(t.extents[1].start_lba, 700); // 500 + 200
+        assert_eq!(t.extents[1].start_lba, 9700); // ifo_lba(9000) + 500 + 200
         assert_eq!(t.extents[1].sector_count, 100);
         assert_eq!(t.size_bytes, 200 * 2048);
     }
@@ -1051,8 +1145,9 @@ mod tests {
         assert_eq!(titles[0].playlist, "VTS_01_1.VOB");
         assert_eq!(titles[1].playlist, "VTS_02_2.VOB");
         // Distinct vob_start → distinct extents.
-        assert_eq!(titles[0].extents[0].start_lba, 100);
-        assert_eq!(titles[1].extents[0].start_lba, 200);
+        // VTS_01 IFO @ PART_START(3000)+6000=9000; VTS_02 IFO @ 3000+7000=10000.
+        assert_eq!(titles[0].extents[0].start_lba, 9100); // 9000 + 100
+        assert_eq!(titles[1].extents[0].start_lba, 10200); // 10000 + 200
     }
 
     /// chapter_times from the IFO become Chapter entries with ordinal
@@ -1168,8 +1263,8 @@ mod tests {
         // The leading 0x90 cell is dropped: 2 feature extents, not 3.
         assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
         // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
-        assert_eq!(t.extents[0].start_lba, 1000 + 100);
-        assert_eq!(t.extents[1].start_lba, 1000 + 300);
+        assert_eq!(t.extents[0].start_lba, 9000 + 1000 + 100); // ifo_lba + vtstt + first
+        assert_eq!(t.extents[1].start_lba, 9000 + 1000 + 300);
         // Chapter times shift earlier by the dropped 5s. Program 0 was at the
         // dropped head (clamped to 0); program 1 was at cell 3 =
         // dur(cell0)+dur(cell1) = 5 + 59 = 64s, now 59s after the 5s shift.
@@ -1219,8 +1314,8 @@ mod tests {
         let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
         // Nothing dropped: both cells become extents, starting at the very head.
         assert_eq!(t.extents.len(), 2);
-        assert_eq!(t.extents[0].start_lba, 1000); // 1000 + 0, head intact
-        assert_eq!(t.extents[1].start_lba, 1200);
+        assert_eq!(t.extents[0].start_lba, 9000 + 1000); // ifo_lba + vtstt + 0, head intact
+        assert_eq!(t.extents[1].start_lba, 9000 + 1200);
         // Chapter 0 stays at 0.0 (no shift).
         assert!((t.chapters[0].time_secs - 0.0).abs() < 0.01);
     }

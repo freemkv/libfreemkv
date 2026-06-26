@@ -373,9 +373,16 @@ pub fn decrypt_sectors(
                     continue;
                 }
                 let crib = css::stevenson::attack_crib(chunk);
-                let original: Option<Vec<u8>> = crib.as_ref().map(|_| chunk.to_vec());
+                // Snapshot the ciphertext into a stack buffer (chunk is exactly
+                // 2048 here — guaranteed by the `< 2048` continue above) only
+                // when there's a crib to validate against, so the common
+                // cache-hit path costs no per-sector heap allocation.
+                let mut original = [0u8; 2048];
+                if crib.is_some() {
+                    original.copy_from_slice(chunk);
+                }
                 css::lfsr::descramble_sector(title_key, chunk);
-                if let (Some(crib), Some(original)) = (crib, original) {
+                if let Some(crib) = crib {
                     if chunk[0x80..0x80 + 10] != crib[..] {
                         // Cached key is stale for this region — restore the
                         // ciphertext and crack this sector's own key.

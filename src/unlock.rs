@@ -104,11 +104,17 @@ pub fn register_unlocker(u: Box<dyn Unlocker>) {
 ///   * `Ok(Some((name, vid)))` — a registered unlocker matched, put the drive
 ///     into extended mode, and returned the OEM Volume ID. The caller stashes
 ///     the VID for the handshake phase and need not run the cert handshake.
-///   * `Ok(None)` — no unlocker matched, OR the matching unlocker failed
-///     ([`UnlockError`], logged). Either way the drive is usable in stock mode
-///     and the caller falls through to the in-tree cert handshake. Folding an
-///     unlock failure into `Ok(None)` keeps drive `init()` infallible — a drive
-///     that simply isn't firmware-unlockable must not fail init.
+///   * `Ok(None)` — no unlocker matched, OR the matching unlocker reported a
+///     *capability* failure ([`UnlockError::FirmwareNotUnlockable`],
+///     [`UnlockError::VidUnavailable`], or a cert-auth outcome — all logged).
+///     Either way the drive is usable in stock mode and the caller falls
+///     through to the in-tree cert handshake. Folding a capability failure into
+///     `Ok(None)` keeps drive `init()` infallible — a drive that simply isn't
+///     firmware-unlockable must not fail init.
+///   * `Err(_)` — the matching unlocker hit a genuine SCSI/transport fault
+///     ([`UnlockError::Scsi`]). The bus is broken, not merely unsupported, so
+///     this propagates and aborts init rather than silently falling through to
+///     a cert handshake that would also fail.
 pub(crate) fn route_unlock(
     scsi: &mut dyn ScsiTransport,
     id: &DriveId,
@@ -124,10 +130,29 @@ pub(crate) fn route_unlock(
             let name = u.name().to_string();
             match u.unlock(scsi, id) {
                 Ok(vid) => return Ok(Some((name, vid))),
+                // A genuine SCSI/transport fault is not "this drive can't be
+                // unlocked" — the bus is broken. Propagate so init() aborts
+                // instead of falling through to a cert handshake that will
+                // also fail on the same dead transport. The numeric code from
+                // the originating error is logged; the returned error is the
+                // canonical transport-error variant.
+                Err(UnlockError::Scsi(code)) => {
+                    tracing::error!(
+                        target: "freemkv::unlock",
+                        unlocker = %name,
+                        code,
+                        "unlocker hit a transport fault during unlock; aborting init"
+                    );
+                    return Err(crate::error::Error::ScsiError {
+                        opcode: 0,
+                        status: 0,
+                        sense: None,
+                    });
+                }
+                // A firmware unlocker that can't unlock / has no OEM VID:
+                // fall through to the cert handshake. Debug-only structured
+                // log (variant identifiers, no English prose).
                 Err(e) => {
-                    // A firmware unlocker that can't unlock / has no OEM VID:
-                    // fall through to the cert handshake. Debug-only structured
-                    // log (variant identifiers, no English prose).
                     tracing::warn!(
                         target: "freemkv::unlock",
                         unlocker = %name,
@@ -228,6 +253,10 @@ mod tests {
         /// `None` → `unlock` yields `Err(UnlockError::VidUnavailable)` so
         /// `route_unlock` falls through to the cert handshake.
         vid: Option<[u8; 16]>,
+        /// When `Some(code)`, `unlock` yields `Err(UnlockError::Scsi(code))`
+        /// (a transport fault) instead of consulting `vid`, so `route_unlock`
+        /// propagates an error and aborts init.
+        scsi_err: Option<u16>,
         /// Records whether set_max_read_speed was invoked.
         speed_ran: Arc<AtomicBool>,
     }
@@ -238,11 +267,16 @@ mod tests {
                 ran,
                 // Default: a successful unlock returning an all-zero VID.
                 vid: Some([0u8; 16]),
+                scsi_err: None,
                 speed_ran: Arc::new(AtomicBool::new(false)),
             }
         }
         fn with_vid(mut self, vid: Option<[u8; 16]>) -> Self {
             self.vid = vid;
+            self
+        }
+        fn with_scsi_err(mut self, code: u16) -> Self {
+            self.scsi_err = Some(code);
             self
         }
         fn with_speed(mut self, speed_ran: Arc<AtomicBool>) -> Self {
@@ -263,6 +297,9 @@ mod tests {
             _id: &DriveId,
         ) -> std::result::Result<Vid, UnlockError> {
             self.ran.store(true, Ordering::SeqCst);
+            if let Some(code) = self.scsi_err {
+                return Err(UnlockError::Scsi(code));
+            }
             match self.vid {
                 Some(v) => Ok(Vid(v)),
                 None => Err(UnlockError::VidUnavailable),
@@ -357,6 +394,33 @@ mod tests {
         // No matching unlocker → Ok(None), cert fallback.
         let got = route_unlock(&mut scsi, &fake_id("UNKNWNVD")).unwrap();
         assert!(got.is_none(), "no match → cert fallback");
+    }
+
+    /// A matching unlocker that hits a genuine transport fault
+    /// (`UnlockError::Scsi`) makes `route_unlock` PROPAGATE an `Err` rather
+    /// than fold to `Ok(None)`: a dead bus must abort init, not silently fall
+    /// through to a cert handshake that would also fail. Capability failures
+    /// (`VidUnavailable` etc.) still fold to `Ok(None)` — proven by the sibling
+    /// routing tests; this one pins the transport-fault exception.
+    #[test]
+    fn route_unlock_propagates_scsi_transport_fault() {
+        let mut scsi = NoopTransport;
+
+        register_unlocker(Box::new(
+            FakeUnlocker::new("SCSIVNDR", Arc::new(AtomicBool::new(false)))
+                .with_scsi_err(crate::error::E_SCSI_ERROR),
+        ));
+
+        let got = route_unlock(&mut scsi, &fake_id("SCSIVNDR"));
+        assert!(
+            got.is_err(),
+            "a transport fault during unlock aborts init (propagates Err)"
+        );
+        assert_eq!(
+            got.unwrap_err().code(),
+            crate::error::E_SCSI_ERROR,
+            "propagated error is the canonical transport-error code"
+        );
     }
 
     /// `unlocker_set_max_read_speed` consults the FIRST matching unlocker's

@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.0.0-rc.6] — UNRELEASED
+## [1.1.0-beta.1] — UNRELEASED
 
 ### Added
 
@@ -13,6 +13,21 @@
 
 ### Fixed
 
+- **DVD rips now start on the movie, not the disc menu.** A VTS title VOB's
+  start sector was read from the IFO as a VTS-relative pointer but used as an
+  absolute disc address, so a DVD title's read extents began `ifo_lba` sectors
+  too early — the rip opened on the disc's menu / VMGI region and only drifted
+  into the feature minutes later (Silence of the Lambs, for example, showed
+  several minutes of the main menu before the movie). The title VOB is now
+  rebased to its absolute on-disc location, so the rip begins at the first frame
+  of the feature. Aspect ratio and chapter timing were already correct; only the
+  starting sector was wrong. (Covered by a new absolute-placement regression
+  test.)
+- **Container metadata correctness.** Unknown colorimetry now emits the CICP
+  "unspecified" code point (2) consistently across the MKV track and the FVI
+  sidecar (previously 0); PGS subtitle wipes use the NORMAL composition state
+  rather than a full epoch reset; and FVI source-byte offsets are written
+  within-sector per the format spec.
 - **Multi-extent AACS alignment in `dir://` extraction.** The decrypted
   file-tree extractor anchored the AACS unit grid to the first extent only, so a
   file spanning multiple clip extents could mis-align and corrupt. Each extent

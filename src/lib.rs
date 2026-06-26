@@ -93,6 +93,7 @@ pub mod decrypt;
 pub mod diag;
 pub mod disc;
 pub mod drive;
+pub mod dvdnav;
 pub mod error;
 pub mod event;
 pub mod halt;

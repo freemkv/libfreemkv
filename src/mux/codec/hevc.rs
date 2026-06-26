@@ -56,10 +56,7 @@ fn hevc_num_extra_slice_header_bits(pps_nal: &[u8]) -> Option<u32> {
     br.read_ue()?; // pps_pic_parameter_set_id
     br.read_ue()?; // pps_seq_parameter_set_id
     br.skip_bits(2)?; // dependent_slice_segments_enabled_flag, output_flag_present_flag
-    let mut n = 0u32;
-    for _ in 0..3 {
-        n = (n << 1) | br.read_bit()?;
-    }
+    let n = br.read_bits(3)?;
     Some(n)
 }
 

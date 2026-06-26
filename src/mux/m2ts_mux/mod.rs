@@ -254,7 +254,10 @@ impl<W: Write> M2tsMux<W> {
         // step — e.g. a leading audio frame ahead of the first video keyframe),
         // which still floors to 0 per the documented behavior.
         let delta = raw_90k.wrapping_sub(base) & 0x1_FFFF_FFFF;
-        if delta > (1 << 32) { 0 } else { delta }
+        // Signed 33-bit: the sign bit is bit 32 (value 2^32), so the entire
+        // upper half [2^32, 2^33) is negative (frame before base) and floors
+        // to 0. delta == 2^32 is the most-negative value (-2^32), hence `>=`.
+        if delta >= (1 << 32) { 0 } else { delta }
     }
 
     /// Emit one PES payload as a chain of TS packets on `pid`. If `pcr`

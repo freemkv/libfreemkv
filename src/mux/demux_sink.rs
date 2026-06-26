@@ -273,8 +273,8 @@ const SUP_HEADER_LEN: usize = SUP_MAGIC.len() + 4 + 4;
 const SEG_PCS: u8 = 0x16;
 /// PGS segment type: END of display set.
 const SEG_END: u8 = 0x80;
-/// PCS `composition_state` value: Epoch Start (a fresh display).
-const PCS_COMPOSITION_STATE_EPOCH_START: u8 = 0x80;
+/// PCS `composition_state` value: Normal (an update to the current epoch).
+const PCS_COMPOSITION_STATE_NORMAL: u8 = 0x00;
 /// PGS segment header on the wire (inside `frame.data`): type(1) + size(2 BE).
 const PGS_SEG_HEADER_LEN: usize = 3;
 /// Byte offset of `width`/`height` within a PCS segment (after type+size).
@@ -346,7 +346,7 @@ impl PgsSupWriter {
             PCS_FRAME_RATE,
             0x00,
             0x00, // composition_number
-            PCS_COMPOSITION_STATE_EPOCH_START,
+            PCS_COMPOSITION_STATE_NORMAL,
             0x00, // palette_update_flag
             0x00, // palette_id
             PCS_NO_OBJECTS,

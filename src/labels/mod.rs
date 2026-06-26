@@ -1124,9 +1124,10 @@ mod registry_tests {
             // and as a marker for "these parsers exist."
             let _ = (name, detect, parse);
         }
-        // The loop above touches every registry entry; iterating a non-empty
-        // fixed-size array is the assertion (a `.is_empty()` check would be
-        // const-folded). The test fails to compile if the tuple shape changes.
+        // The loop above touches every registry entry. The non-empty
+        // invariant is covered separately by `parsers_registry_order_locked`,
+        // whose assert_eq! on the expected order fails if PARSERS is empty.
+        // This test fails to compile if the tuple shape changes.
     }
 }
 
