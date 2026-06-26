@@ -466,10 +466,17 @@ pub fn output(
         // `output()` call with the default option set.
         StreamUrl::Demux { ref dir } => {
             validate_file_path(dir, "demux")?;
+            // The full `--demux/--naming/--delay/--container/--chapters` flag
+            // surface is parsed in the CLI, which constructs `DemuxSink` directly.
+            // This bare `output()` arm uses defaults but still seeds the filename
+            // `base` from the title's playlist name when present (the default
+            // "title" stem is only a last resort for an unnamed title).
+            let mut opts = super::demux_sink::DemuxOptions::default();
+            if !title.playlist.is_empty() {
+                opts.base = title.playlist.clone();
+            }
             Ok(Box::new(super::demux_sink::DemuxSink::create(
-                dir,
-                title,
-                &super::demux_sink::DemuxOptions::default(),
+                dir, title, &opts,
             )?))
         }
         StreamUrl::Unknown { ref raw } => {

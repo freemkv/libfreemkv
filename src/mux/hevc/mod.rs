@@ -248,9 +248,104 @@ fn starts_with_start_code(data: &[u8]) -> bool {
     data.starts_with(&START_CODE) || data.starts_with(&[0x00, 0x00, 0x01])
 }
 
+/// Convert an `AVCDecoderConfigurationRecord` (avcC) into Annex B NAL
+/// units. Returns `Some(bytes)` if at least one NAL was extracted, else
+/// `None`.
+///
+/// Layout (per ISO/IEC 14496-15 §5.3.3.1.2):
+///   - 5-byte fixed header
+///   - byte 5 = `[reserved:3 | numOfSequenceParameterSets:5]`
+///   - `numOfSPS` × `(sequenceParameterSetLength:u16-BE + SPS bytes)`
+///   - 1 byte = `numOfPictureParameterSets`
+///   - `numOfPPS` × `(pictureParameterSetLength:u16-BE + PPS bytes)`
+///
+/// The H.264 counterpart to [`hvcc_to_annex_b`]: the single source of
+/// truth for avcC → Annex B across all muxers (H.264 ES, BD-TS, standard
+/// MPEG-TS, the `demux://` sink). Do not reimplement it.
+pub(crate) fn avcc_to_annex_b(avcc: &[u8]) -> Option<Vec<u8>> {
+    // avcC fixed header is 5 bytes; byte 5 carries the SPS count (low 5 bits),
+    // then the SPS array begins at byte 6 (ISO/IEC 14496-15 §5.3.3.1.2).
+    const AVCC_HEADER_LEN: usize = 5;
+    const NUM_SPS_MASK: u8 = 0x1F; // numOfSequenceParameterSets: low 5 bits
+    if avcc.len() < AVCC_HEADER_LEN + 1 {
+        return None;
+    }
+    let num_sps = (avcc[AVCC_HEADER_LEN] & NUM_SPS_MASK) as usize;
+    let mut offset = AVCC_HEADER_LEN + 1;
+    let mut out = Vec::new();
+
+    // Extract `count` length-prefixed NALs starting at `*offset` into `out`.
+    // Returns `false` (truncated) if a length field or NAL body runs past the
+    // end — the caller then stops, so it never reads further length fields out
+    // of mid-NAL bytes (mirrors `hvcc_to_annex_b`).
+    fn take(avcc: &[u8], count: usize, offset: &mut usize, out: &mut Vec<u8>) -> bool {
+        for _ in 0..count {
+            if *offset + 2 > avcc.len() {
+                return false;
+            }
+            let nal_len = u16::from_be_bytes([avcc[*offset], avcc[*offset + 1]]) as usize;
+            *offset += 2;
+            if *offset + nal_len > avcc.len() {
+                return false;
+            }
+            // ISO/IEC 14496-15 disallows zero-length NAL entries; emitting a
+            // bare start code with no RBSP yields an invalid Annex B NAL.
+            if nal_len == 0 {
+                continue;
+            }
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(&avcc[*offset..*offset + nal_len]);
+            *offset += nal_len;
+        }
+        true
+    }
+
+    let sps_ok = take(avcc, num_sps, &mut offset, &mut out);
+    if sps_ok && offset < avcc.len() {
+        let num_pps = avcc[offset] as usize;
+        offset += 1;
+        take(avcc, num_pps, &mut offset, &mut out);
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avcc_extracts_sps_and_pps() {
+        // header(5) numSPS=1 spsLen=2 SPS=[0x67,0x42] numPPS=1 ppsLen=1
+        // PPS=[0x68].
+        let avcc = [
+            1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 1, 0x68,
+        ];
+        let out = avcc_to_annex_b(&avcc).expect("SPS+PPS");
+        assert_eq!(out, vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68]);
+    }
+
+    #[test]
+    fn avcc_too_short_is_none() {
+        assert!(avcc_to_annex_b(&[]).is_none());
+        assert!(avcc_to_annex_b(&[1, 0x42, 0, 0x1F, 0xFF]).is_none());
+    }
+
+    #[test]
+    fn avcc_truncated_sps_stops_cleanly() {
+        // numSPS=1, declares spsLen=5 but only 2 bytes follow → drop it, and
+        // do NOT misread the trailing bytes as a PPS count.
+        let avcc = [1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 5, 0xAA, 0xBB];
+        assert!(avcc_to_annex_b(&avcc).is_none());
+    }
+
+    #[test]
+    fn avcc_skips_zero_length_nal() {
+        // numSPS=1 spsLen=0 (skipped) numPPS=1 ppsLen=1 PPS=[0x68].
+        let avcc = [1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 0, 1, 0, 1, 0x68];
+        let out = avcc_to_annex_b(&avcc).expect("just the PPS");
+        assert_eq!(out, vec![0, 0, 0, 1, 0x68]);
+    }
 
     #[test]
     fn length_prefixed_converts_to_annex_b() {
