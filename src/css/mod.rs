@@ -51,7 +51,7 @@ pub struct CssState {
 /// (bytes 0x00..0x80) often ends in a short-period repeating run (stuffing /
 /// constant fill); the attack assumes that run continues across the 0x80
 /// boundary into the encrypted region, giving the known plaintext the 2^16
-/// LFSR recovery needs. We scan up to 50000 scrambled sectors across the
+/// LFSR recovery needs. We scan up to 50000 sectors across the
 /// extents and return the first sector that yields a key — no player keys, no
 /// disc-key crack. Works on a live drive (after bus-auth unlocks reads) and on
 /// disc images alike.

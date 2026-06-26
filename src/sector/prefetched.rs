@@ -168,136 +168,158 @@ impl PrefetchedSectorSource {
         let producer = std::thread::Builder::new()
             .name("freemkv-prefetch".into())
             .spawn(move || {
-                let mut ext_idx = 0usize;
-                let mut offset: u32 = 0;
-                let mut bytes_read_total: u64 = 0;
-                while ext_idx < extents.len() {
-                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                        return;
-                    }
-                    let extent = &extents[ext_idx];
-                    // AACS aligned units are anchored at THIS extent's start
-                    // LBA, so tell the decrypt-on-read source to gate relative
-                    // to it (clip-anchored), not absolute disc LBA 0. A no-op
-                    // for non-decrypting / CSS / None sources.
-                    reader.set_unit_base(extent.start_lba);
-                    let remaining = extent.sector_count.saturating_sub(offset);
-                    if remaining == 0 {
-                        ext_idx += 1;
-                        offset = 0;
-                        continue;
-                    }
-                    // The AACS aligned unit is SECTOR_ALIGNMENT (3)
-                    // sectors / 6144 bytes; the decrypt step only
-                    // processes full units and silently leaves a
-                    // shorter trailing chunk encrypted. So a batch must
-                    // be a whole number of units — except for the final
-                    // batch of an extent whose `sector_count` is itself
-                    // unit-aligned (then the remaining tail is exactly
-                    // 0 mod 3 and forms full units on its own).
-                    //
-                    // If the trailing sectors of this extent cannot fill
-                    // a complete unit (`remaining < SECTOR_ALIGNMENT`
-                    // with nothing more to read, or a 1-2 sector
-                    // leftover after the last full unit), there is no
-                    // way to hand the decrypt step an aligned chunk —
-                    // surface a typed error instead of emitting
-                    // still-encrypted bytes.
-                    if remaining % unit_align as u32 != 0 && remaining < unit_align as u32 {
-                        let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
-                        return;
-                    }
-                    let mut sectors = remaining.min(batch_sectors as u32) as u16;
-                    // Trim to a whole number of units. Once trimmed to 0
-                    // here it means `remaining >= SECTOR_ALIGNMENT` but
-                    // the *batch window* landed on a sub-unit boundary —
-                    // never the trailing-tail case, which the guard
-                    // above already rejected. Clamp to one unit so we
-                    // always make forward progress.
-                    if sectors >= unit_align {
-                        sectors -= sectors % unit_align;
-                    } else {
-                        sectors = unit_align;
-                    }
-                    let bytes = sectors as usize * 2048;
-                    // Park on the recycle channel, but re-poll halt every
-                    // POLL_INTERVAL: a pure-AtomicBool Halt does not
-                    // disconnect the channel, so a blocking recv() would
-                    // never re-reach the cancel check at the loop top.
-                    // Mirrors the BytePrefetcher pattern exactly.
-                    let mut buf = loop {
-                        match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                            Ok(b) => break b,
-                            Err(RecvTimeoutError::Timeout) => {
-                                if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
-                                    return;
-                                }
-                            }
-                            // Consumer dropped both channels.
-                            Err(RecvTimeoutError::Disconnected) => return,
-                        }
-                    };
-                    if bytes <= buf.capacity() {
-                        // Re-expose `bytes` without zero-filling pages that
-                        // `read_sectors` is about to overwrite. The enclosing
-                        // capacity guard makes the `set_len` provably sound even
-                        // if a recycled buffer ever comes back smaller than the
-                        // `vec![0u8; batch_bytes]` it was born with.
-                        debug_assert!(bytes <= buf.capacity(), "set_len exceeds capacity");
-                        unsafe { buf.set_len(bytes) };
-                    } else {
-                        buf.resize(bytes, 0);
-                    }
-                    // `start_lba + offset` derives from untrusted extent
-                    // data — saturate rather than wrap/panic on a
-                    // hostile start_lba near u32::MAX.
-                    let lba = extent.start_lba.saturating_add(offset);
-                    match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
-                        Ok(n) => {
-                            // A short read must not silently desync the
-                            // stream: advance the extent cursor by the
-                            // sectors actually read, not the requested
-                            // count, and reject a byte count that isn't a
-                            // whole number of sectors (it would split a
-                            // sector and leave the decrypt step a partial
-                            // unit). The sole production inner source
-                            // (FileSectorSource) read_exact's the full
-                            // request, so this is belt-and-braces against
-                            // a future short-reading source.
-                            if n % 2048 != 0 {
-                                let _ =
-                                    tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
-                                return;
-                            }
-                            let sectors_read = (n / 2048) as u32;
-                            buf.truncate(n);
-                            bytes_read_total = bytes_read_total.saturating_add(n as u64);
-                            if let Some(ref f) = event_fn {
-                                f(Event {
-                                    kind: EventKind::BytesRead {
-                                        bytes: bytes_read_total,
-                                        total: bytes_total_extents,
-                                    },
-                                });
-                            }
-                            if tx.send(Ok(buf)).is_err() {
-                                return; // consumer dropped
-                            }
-                            // A genuine zero-byte read with no error would
-                            // otherwise spin this loop forever; treat it
-                            // as end-of-source.
-                            if sectors_read == 0 {
-                                return;
-                            }
-                            offset = offset.saturating_add(sectors_read);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e.into()));
+                // Wrap the whole feed loop in catch_unwind so a panic inside a
+                // decrypt-on-read SectorSource, the read path, or a panicking
+                // `event_fn` callback is NOT indistinguishable from a clean
+                // finish at the demux boundary. On a clean exit (input
+                // exhausted, halt cancelled, consumer disconnect) the body
+                // returns and `tx` is dropped → the demux loop reads RecvError
+                // as EOF, which is correct. On a PANIC we send an explicit error
+                // sentinel FIRST so the demux loop's `Ok(Err(_))` arm fires and
+                // propagates a typed error instead of converting the dropped
+                // channel into a clean `DemuxBatch::Eof` (which would finalize a
+                // TRUNCATED mux while reporting success). `tx`/`reader`/locals
+                // are only touched on this thread, so AssertUnwindSafe is sound.
+                let body = std::panic::AssertUnwindSafe(|| {
+                    let mut ext_idx = 0usize;
+                    let mut offset: u32 = 0;
+                    let mut bytes_read_total: u64 = 0;
+                    while ext_idx < extents.len() {
+                        if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
                             return;
                         }
+                        let extent = &extents[ext_idx];
+                        // AACS aligned units are anchored at THIS extent's start
+                        // LBA, so tell the decrypt-on-read source to gate relative
+                        // to it (clip-anchored), not absolute disc LBA 0. A no-op
+                        // for non-decrypting / CSS / None sources.
+                        reader.set_unit_base(extent.start_lba);
+                        let remaining = extent.sector_count.saturating_sub(offset);
+                        if remaining == 0 {
+                            ext_idx += 1;
+                            offset = 0;
+                            continue;
+                        }
+                        // The AACS aligned unit is SECTOR_ALIGNMENT (3)
+                        // sectors / 6144 bytes; the decrypt step only
+                        // processes full units and silently leaves a
+                        // shorter trailing chunk encrypted. So a batch must
+                        // be a whole number of units — except for the final
+                        // batch of an extent whose `sector_count` is itself
+                        // unit-aligned (then the remaining tail is exactly
+                        // 0 mod 3 and forms full units on its own).
+                        //
+                        // If the trailing sectors of this extent cannot fill
+                        // a complete unit (`remaining < SECTOR_ALIGNMENT`
+                        // with nothing more to read, or a 1-2 sector
+                        // leftover after the last full unit), there is no
+                        // way to hand the decrypt step an aligned chunk —
+                        // surface a typed error instead of emitting
+                        // still-encrypted bytes.
+                        if remaining % unit_align as u32 != 0 && remaining < unit_align as u32 {
+                            let _ = tx.send(Err(crate::error::Error::ExtentNotUnitAligned.into()));
+                            return;
+                        }
+                        let mut sectors = remaining.min(batch_sectors as u32) as u16;
+                        // Trim to a whole number of units. Once trimmed to 0
+                        // here it means `remaining >= SECTOR_ALIGNMENT` but
+                        // the *batch window* landed on a sub-unit boundary —
+                        // never the trailing-tail case, which the guard
+                        // above already rejected. Clamp to one unit so we
+                        // always make forward progress.
+                        if sectors >= unit_align {
+                            sectors -= sectors % unit_align;
+                        } else {
+                            sectors = unit_align;
+                        }
+                        let bytes = sectors as usize * 2048;
+                        // Park on the recycle channel, but re-poll halt every
+                        // POLL_INTERVAL: a pure-AtomicBool Halt does not
+                        // disconnect the channel, so a blocking recv() would
+                        // never re-reach the cancel check at the loop top.
+                        // Mirrors the BytePrefetcher pattern exactly.
+                        let mut buf = loop {
+                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
+                                Ok(b) => break b,
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false) {
+                                        return;
+                                    }
+                                }
+                                // Consumer dropped both channels.
+                                Err(RecvTimeoutError::Disconnected) => return,
+                            }
+                        };
+                        if bytes <= buf.capacity() {
+                            // Re-expose `bytes` without zero-filling pages that
+                            // `read_sectors` is about to overwrite. The enclosing
+                            // capacity guard makes the `set_len` provably sound even
+                            // if a recycled buffer ever comes back smaller than the
+                            // `vec![0u8; batch_bytes]` it was born with.
+                            debug_assert!(bytes <= buf.capacity(), "set_len exceeds capacity");
+                            unsafe { buf.set_len(bytes) };
+                        } else {
+                            buf.resize(bytes, 0);
+                        }
+                        // `start_lba + offset` derives from untrusted extent
+                        // data — saturate rather than wrap/panic on a
+                        // hostile start_lba near u32::MAX.
+                        let lba = extent.start_lba.saturating_add(offset);
+                        match reader.read_sectors(lba, sectors, &mut buf[..bytes], false) {
+                            Ok(n) => {
+                                // A short read must not silently desync the
+                                // stream: advance the extent cursor by the
+                                // sectors actually read, not the requested
+                                // count, and reject a byte count that isn't a
+                                // whole number of sectors (it would split a
+                                // sector and leave the decrypt step a partial
+                                // unit). The sole production inner source
+                                // (FileSectorSource) read_exact's the full
+                                // request, so this is belt-and-braces against
+                                // a future short-reading source.
+                                if n % 2048 != 0 {
+                                    let _ = tx.send(Err(
+                                        crate::error::Error::ExtentNotUnitAligned.into()
+                                    ));
+                                    return;
+                                }
+                                let sectors_read = (n / 2048) as u32;
+                                buf.truncate(n);
+                                bytes_read_total = bytes_read_total.saturating_add(n as u64);
+                                if let Some(ref f) = event_fn {
+                                    f(Event {
+                                        kind: EventKind::BytesRead {
+                                            bytes: bytes_read_total,
+                                            total: bytes_total_extents,
+                                        },
+                                    });
+                                }
+                                if tx.send(Ok(buf)).is_err() {
+                                    return; // consumer dropped
+                                }
+                                // A genuine zero-byte read with no error would
+                                // otherwise spin this loop forever; treat it
+                                // as end-of-source.
+                                if sectors_read == 0 {
+                                    return;
+                                }
+                                offset = offset.saturating_add(sectors_read);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e.into()));
+                                return;
+                            }
+                        }
                     }
+                    // Drop tx implicitly — consumer sees RecvError → EOF.
+                });
+                if std::panic::catch_unwind(body).is_err() {
+                    // Producer panicked mid-stream — surface a typed terminal
+                    // error so the demux thread does NOT read the dropped channel
+                    // as a clean EOF and truncate output. Ignore the send result:
+                    // if the consumer is already gone there is nothing to report.
+                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
                 }
-                // Drop tx implicitly — consumer sees RecvError → EOF.
             })
             .map_err(|e| crate::error::Error::IoError { source: e })?;
 

@@ -118,16 +118,21 @@ impl TimelineContinuity {
             // frontier and would force a forward-dated split cluster (breaking
             // cluster monotonicity). Such a straggler is recognised precisely: its
             // current-offset mapping lands more than a backstep PAST the frontier
-            // AND its PREVIOUS-offset mapping lands at/below the frontier (i.e. it
-            // belongs to the prior epoch). Remap it with the previous offset so
-            // it lands at its true seam position. This is what distinguishes a
-            // tail straggler from a frame that legitimately runs ahead of the
-            // (base-video-only) frontier — a long audio-only tail, a sparse
-            // subtitle, or an EL frame — which is left on the current offset.
+            // AND its PREVIOUS-offset mapping lands in the seam TAIL — at/below the
+            // frontier but no more than one backstep below it (i.e. it ended just
+            // before the seam, in the prior epoch). The lower bound is essential:
+            // a NORMAL new-epoch frame that merely leads the sparse (video-only)
+            // frontier by >3s ALSO has `prev_mapped <= high` (its prev-offset
+            // mapping lands ~a whole clip below the frontier), and clamping it
+            // would demote it into the just-ended clip's epoch, mis-timing that
+            // audio/subtitle by a whole clip. Requiring `prev_mapped` to sit
+            // within a backstep below the frontier keeps the remap to genuine
+            // tail stragglers; a long audio-only tail, a sparse subtitle, or an
+            // EL frame that simply runs ahead is left on the current offset.
             if let Some(high) = self.high_ns {
                 if mapped > high + DISCONTINUITY_BACKSTEP_NS {
                     let prev_mapped = raw_pts_ns.saturating_add(self.prev_offset_ns);
-                    if prev_mapped <= high {
+                    if prev_mapped <= high && prev_mapped >= high - DISCONTINUITY_BACKSTEP_NS {
                         return prev_mapped;
                     }
                 }
@@ -417,5 +422,45 @@ mod tests {
         // as a straggler).
         let normal = adj_other(&mut tc, S);
         assert_eq!(normal, S + 600 * S + DISCONTINUITY_GAP_NS);
+    }
+
+    /// Regression for the over-eager straggler clamp: a NORMAL new-epoch
+    /// non-video frame that leads the (sparse, video-only) frontier by MORE than
+    /// one backstep must ride the CURRENT offset — it must NOT be demoted into
+    /// the just-ended clip's epoch. Such a frame satisfies BOTH of the old
+    /// discriminator's conditions (current-map > frontier+backstep AND
+    /// prev-map <= frontier), so the old `prev_mapped <= high` test wrongly
+    /// clamped it back ~a whole clip. The tightened lower bound
+    /// (`prev_mapped >= high - backstep`) fixes it.
+    #[test]
+    fn normal_new_epoch_frame_leading_frontier_is_not_clamped() {
+        let mut tc = TimelineContinuity::new();
+        // Clip1 video rises to 600s, then clip2 resets to 0 → boundary.
+        for i in 0..=600 {
+            adj_video(&mut tc, i * S);
+        }
+        let frontier = tc.high_ns.unwrap();
+        assert_eq!(frontier, 600 * S);
+        let c2 = adj_video(&mut tc, 0);
+        assert_eq!(c2, 600 * S + DISCONTINUITY_GAP_NS);
+
+        // A NORMAL clip-2 audio frame at raw ~5s. Current-offset mapping is
+        // ~605s, which IS more than a backstep (3s) past the 600s frontier — but
+        // its previous-offset mapping (~5s) lands ~595s BELOW the frontier, far
+        // outside the seam tail. It is a legitimate new-epoch frame, NOT a tail
+        // straggler, and must ride the current offset.
+        let raw = 5 * S;
+        let out = adj_other(&mut tc, raw);
+        assert_eq!(
+            out,
+            raw + 600 * S + DISCONTINUITY_GAP_NS,
+            "a normal new-epoch frame leading the frontier by >3s must ride the \
+             current offset, not be clamped back into the previous clip"
+        );
+        // And it must NOT have been demoted near the previous clip's tail (~5s).
+        assert!(
+            out > frontier,
+            "frame must stay in the new epoch (> frontier), got {out}"
+        );
     }
 }

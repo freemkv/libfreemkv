@@ -60,6 +60,63 @@ const COLOUR_RANGE_LIMITED: u8 = 1;
 /// Vision configuration record (RFC 9559 + Dolby Vision-in-Matroska spec).
 const BLOCK_ADD_ID_TYPE_DVCC: u64 = 0x6476_6343;
 
+/// Resolve a video stream's CICP colour code points — `(matrix, transfer,
+/// primaries, range)`, ITU-T H.273 — using a single precedence so EVERY sink
+/// (the MKV muxer here AND the FVI sidecar in `videomap.rs`) agrees and can
+/// never drift:
+///
+/// 1. **Measured CICP** read from the bitstream (HEVC/H.264 VUI
+///    `colour_description` or MPEG-2 `sequence_display_extension`) is
+///    AUTHORITATIVE — copied through verbatim when present.
+/// 2. Otherwise fall back to the coarse `color_space` enum (a playlist nibble /
+///    PAL-NTSC guess), THEN apply the HDR-driven transfer override: BT.2020 only
+///    appears on HDR UHD, where the real transfer is PQ (16) for
+///    HDR10/HDR10+/DV or HLG (18) for HLG — never the SDR transfer 14 the enum
+///    alone would emit.
+pub(crate) fn cicp_for_video(v: &VideoStream) -> (u8, u8, u8, u8) {
+    if let Some(c) = v.measured_cicp {
+        return (c.matrix, c.transfer, c.primaries, c.range);
+    }
+    let (m, t, p, r) = match v.color_space {
+        ColorSpace::Bt2020 => (
+            CICP_MATRIX_BT2020NC,
+            CICP_TRANSFER_PQ,
+            CICP_PRIMARIES_BT2020,
+            COLOUR_RANGE_LIMITED,
+        ),
+        ColorSpace::Bt709 => (
+            CICP_MATRIX_BT709,
+            CICP_TRANSFER_BT709,
+            CICP_PRIMARIES_BT709,
+            COLOUR_RANGE_LIMITED,
+        ),
+        // PAL SD: BT.470 System B/G matrix/transfer/primaries.
+        ColorSpace::Bt470bg => (
+            CICP_MATRIX_BT470BG,
+            CICP_TRANSFER_BT470BG,
+            CICP_PRIMARIES_BT470BG,
+            COLOUR_RANGE_LIMITED,
+        ),
+        // NTSC SD: SMPTE 170M / BT.601-525.
+        ColorSpace::Smpte170m => (
+            CICP_MATRIX_BT601_525,
+            CICP_TRANSFER_BT601_525,
+            CICP_PRIMARIES_BT601_525,
+            COLOUR_RANGE_LIMITED,
+        ),
+        ColorSpace::Unknown => (0, 0, 0, 0),
+    };
+    // Override the transfer for HDR signalled by the HdrFormat (the coarse enum
+    // can't express PQ/HLG). Only applies on the enum fallback; a measured CICP
+    // already carries the real transfer and returned above.
+    let t = match v.hdr {
+        HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => CICP_TRANSFER_PQ,
+        HdrFormat::Hlg => CICP_TRANSFER_HLG,
+        _ => t,
+    };
+    (m, t, p, r)
+}
+
 /// MKV track definition (built from disc stream metadata).
 pub struct MkvTrack {
     pub track_type: u64, // 1=video, 2=audio, 17=subtitle
@@ -225,58 +282,9 @@ impl MkvTrack {
             0
         };
         // CICP (matrix, transfer, primaries, range) — ITU-T H.273 code points.
-        //
-        // Prefer MEASURED CICP read from the bitstream (HEVC/H.264 VUI
-        // colour_description or MPEG-2 sequence_display_extension) when the
-        // stream states it: those are authoritative. Fall back to the coarse
-        // `color_space` enum (a playlist nibble / PAL-NTSC guess) only when no
-        // measured triplet is present, so the container stops ASSUMING a colour
-        // space the bitstream may contradict.
-        let (matrix, transfer, primaries, range) = match v.measured_cicp {
-            Some(c) => (c.matrix, c.transfer, c.primaries, c.range),
-            None => {
-                let (m, t, p, r) = match v.color_space {
-                    ColorSpace::Bt2020 => (
-                        CICP_MATRIX_BT2020NC,
-                        CICP_TRANSFER_PQ,
-                        CICP_PRIMARIES_BT2020,
-                        COLOUR_RANGE_LIMITED,
-                    ),
-                    ColorSpace::Bt709 => (
-                        CICP_MATRIX_BT709,
-                        CICP_TRANSFER_BT709,
-                        CICP_PRIMARIES_BT709,
-                        COLOUR_RANGE_LIMITED,
-                    ),
-                    // PAL SD: BT.470 System B/G matrix/transfer/primaries.
-                    ColorSpace::Bt470bg => (
-                        CICP_MATRIX_BT470BG,
-                        CICP_TRANSFER_BT470BG,
-                        CICP_PRIMARIES_BT470BG,
-                        COLOUR_RANGE_LIMITED,
-                    ),
-                    // NTSC SD: SMPTE 170M / BT.601-525.
-                    ColorSpace::Smpte170m => (
-                        CICP_MATRIX_BT601_525,
-                        CICP_TRANSFER_BT601_525,
-                        CICP_PRIMARIES_BT601_525,
-                        COLOUR_RANGE_LIMITED,
-                    ),
-                    ColorSpace::Unknown => (0, 0, 0, 0),
-                };
-                // Override the transfer for non-PQ HDR signalled by the HdrFormat
-                // (the enum can't express HLG). Only applies on the enum
-                // fallback; a measured CICP already carries the real transfer.
-                let t = match v.hdr {
-                    HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => {
-                        CICP_TRANSFER_PQ
-                    }
-                    HdrFormat::Hlg => CICP_TRANSFER_HLG,
-                    _ => t,
-                };
-                (m, t, p, r)
-            }
-        };
+        // Derived by the single shared resolver so every sink (this muxer, the
+        // FVI sidecar in `videomap.rs`) reports identical code points.
+        let (matrix, transfer, primaries, range) = cicp_for_video(v);
         // Display dimensions. For square-pixel video (HD/UHD/BD) the display
         // aspect equals the pixel grid, so display == pixel. For anamorphic
         // content (DVD: 720x480/576 pixels shown as 16:9 or 4:3) the coded
@@ -498,6 +506,13 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// non-monotonic. Keying the exemption on track type (not index) keeps that
     /// EL's true PTS instead of clobbering it to prev+1ms.
     track_is_video: Vec<bool>,
+    /// Index of the PRIMARY video track — the first track whose type is video.
+    /// This (not the literal index 0) is the clip-boundary epoch driver: the
+    /// M2TS/PMT path orders streams by PMT declaration order and may list an
+    /// audio ES before the video ES, so `streams[0]` is not guaranteed to be
+    /// the primary video. `None` when the title has no video track (no track
+    /// drives epochs).
+    primary_video_track: Option<usize>,
     /// Cross-clip timeline-continuity corrector (clip-boundary PTS rebasing).
     continuity: TimelineContinuity,
     cues: Vec<CuePoint>,
@@ -961,6 +976,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 .iter()
                 .map(|t| t.track_type == ebml::TRACK_TYPE_VIDEO)
                 .collect(),
+            primary_video_track: tracks
+                .iter()
+                .position(|t| t.track_type == ebml::TRACK_TYPE_VIDEO),
             continuity: TimelineContinuity::new(),
             cues: Vec::new(),
             frame_count: 0,
@@ -1026,7 +1044,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let is_video = self.track_is_video.get(track_idx).copied().unwrap_or(false);
 
         // The clip-boundary epoch decision is driven by the PRIMARY video track
-        // ONLY (track 0). A title can carry a SECOND video track — a Dolby Vision
+        // ONLY (the first video track, NOT the literal index 0 — the M2TS/PMT
+        // path can list an audio ES before the video ES, so streams[0] may be
+        // audio). A title can carry a SECOND video track — a Dolby Vision
         // enhancement layer — whose PTS runs on its OWN timeline, interleaved
         // with the base layer's. The two video PTS sequences overlap, so the EL's
         // frames look like multi-second backward jumps against the base layer's
@@ -1034,7 +1054,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // ratchet that inflated Top Gun's 1-clip timeline to ~7 h). Only the base
         // video layer establishes/advances the frontier and opens epochs; the EL
         // — like audio and subtitles — rides the current offset.
-        let drives_epoch = track_idx == 0;
+        let drives_epoch = Some(track_idx) == self.primary_video_track;
 
         // Map the raw PES PTS onto the continuous output timeline FIRST, before
         // any base/cluster math: at a non-seamless clip / layer-break boundary
@@ -1047,8 +1067,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let raw_ticks = pts_ns / TIMESTAMP_SCALE_NS;
 
         // Cluster boundaries normally coincide with a video keyframe so every
-        // Cues entry resolves to a seekable IDR at the cluster start.
-        let is_video_key = keyframe && track_idx == 0;
+        // Cues entry resolves to a seekable IDR at the cluster start. Keyed on
+        // the primary video track (first video index) when the title HAS video;
+        // for an audio-only / subtitle-only title (no video track) fall back to
+        // the first track (index 0) so its keyframes still open clusters —
+        // otherwise no cluster would ever open and every frame would be dropped.
+        let cluster_driver = self.primary_video_track.unwrap_or(0);
+        let is_video_key = keyframe && track_idx == cluster_driver;
 
         // Derive the timestamp base from the first *kept* keyframe (the frame
         // that opens the first cluster), NOT the first frame merely seen. The
@@ -1899,6 +1924,70 @@ mod tests {
             "timeline must span past the boundary, got {max} ticks"
         );
         // And does NOT ratchet far beyond clip1+clip2 (~605s): well under 2× clip1.
+        assert!(
+            max < tick(1_000_000),
+            "no ratchet: max cluster ts {max} ticks must stay near 605s"
+        );
+    }
+
+    /// Regression for the hardcoded-`track 0` epoch driver: on an M2TS/PMT
+    /// title the PMT may list an AUDIO ES before the VIDEO ES, so `streams[0]`
+    /// is audio and the video is at index 1. The epoch driver must follow the
+    /// PRIMARY VIDEO track (first video index), not the literal 0. If audio
+    /// (index 0) drove epochs, its sparse/lagging PTS would ratchet the frontier
+    /// and false-trigger boundary resets, inflating the timeline. This drives
+    /// the muxer with audio=track0 / video=track1 and asserts cluster timestamps
+    /// stay monotonic and the timeline does NOT ratchet past the real span.
+    #[test]
+    fn epoch_driver_follows_primary_video_not_index_zero() {
+        // Audio FIRST (index 0), video SECOND (index 1) — the M2TS/PMT ordering.
+        let tracks = [make_audio_track(), make_video_track()];
+        // The muxer must pick track 1 (first video) as the epoch driver.
+        {
+            let buf = Cursor::new(Vec::new());
+            let mux = MkvMuxer::new(buf, &tracks, None, 0.0, &[]).unwrap();
+            assert_eq!(
+                mux.primary_video_track,
+                Some(1),
+                "primary video must be the first VIDEO track (index 1), not 0"
+            );
+        }
+        let ms = |m: i64| m * 1_000_000;
+        // Track 0 = AUDIO, track 1 = VIDEO. Same clip-boundary + straggler shape
+        // as clip_boundary_with_straggler_yields_monotonic_clusters, but with the
+        // video at index 1.
+        let frames: Vec<(usize, i64, bool, Vec<u8>)> = vec![
+            (1, ms(0), true, vec![0x01; 16]),       // video kf 0s
+            (0, ms(0), true, vec![0xA0; 8]),        // audio 0s
+            (1, ms(600_000), true, vec![0x02; 16]), // video kf 600s
+            (0, ms(600_000), true, vec![0xA1; 8]),  // audio 600s
+            // Clip 2: video keyframe RESETS to 0 (the -600s boundary).
+            (1, ms(0), true, vec![0x03; 16]),
+            // Straggler: clip 1's tail audio arrives interleaved after the reset.
+            (0, ms(599_500), true, vec![0xA2; 8]),
+            (0, ms(0), true, vec![0xA3; 8]),      // clip2 audio at 0
+            (1, ms(5_000), true, vec![0x04; 16]), // clip2 + 5s video kf
+        ];
+        let (data, frame_count) = mux_to_bytes(&tracks, &[], &frames);
+        assert_eq!(frame_count, 8, "all frames written (none dropped)");
+
+        let tick = |ms: i64| ms * 1_000_000 / TIMESTAMP_SCALE_NS;
+        let clusters = find_clusters(&data);
+        let ts: Vec<u64> = clusters.iter().map(|&(_, _, t)| t).collect();
+        assert!(!ts.is_empty(), "expected clusters");
+        assert!(
+            ts.windows(2).all(|w| w[1] >= w[0]),
+            "cluster timestamps must be monotonic, got {ts:?}"
+        );
+        let max = *ts.iter().max().unwrap() as i64;
+        // Timeline reaches past the boundary (clip 2 present): ≥ ~600s.
+        assert!(
+            max >= tick(600_000),
+            "timeline must span past the boundary, got {max} ticks"
+        );
+        // Must NOT ratchet far beyond clip1+clip2 (~605s). With the bug (audio
+        // index 0 driving epochs) the lagging-audio straggler ratchets the
+        // frontier and inflates the timeline well past this bound.
         assert!(
             max < tick(1_000_000),
             "no ratchet: max cluster ts {max} ticks must stay near 605s"

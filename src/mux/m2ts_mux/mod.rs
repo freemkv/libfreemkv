@@ -239,7 +239,19 @@ impl<W: Write> M2tsMux<W> {
             self.base_pts_90k.get_or_insert(raw_90k);
         }
         let base = self.base_pts_90k.unwrap_or(raw_90k);
-        raw_90k.saturating_sub(base)
+        // Modular 33-bit subtraction. The 90 kHz PTS clock is a 33-bit field
+        // that wraps every 2^33 ticks (~26.5 h). A plain `saturating_sub` would
+        // collapse ANY frame whose (33-bit-masked) tick lands below `base` to
+        // PTS 0 — including a frame across a legitimate clock wrap (raw wraps
+        // past 0 and lands far below base), flat-lining timing for that span.
+        // Wrap the difference into the 33-bit range, then interpret it as a
+        // signed 33-bit delta: a small magnitude in the LOWER half is genuine
+        // forward progression (incl. across a wrap) and is kept; a value in the
+        // UPPER half means the frame is truly BEFORE the base (a small backward
+        // step — e.g. a leading audio frame ahead of the first video keyframe),
+        // which still floors to 0 per the documented behavior.
+        let delta = raw_90k.wrapping_sub(base) & 0x1_FFFF_FFFF;
+        if delta > (1 << 32) { 0 } else { delta }
     }
 
     /// Emit one PES payload as a chain of TS packets on `pid`. If `pcr`
@@ -273,11 +285,16 @@ impl<W: Write> M2tsMux<W> {
         while offset < pes.len() {
             self.maybe_emit_psi()?;
 
-            // Force a PCR on the FIRST video PES (PAT+PMT precede it, so
-            // `packets_written` is never 0 here) so a receiver tuning at
-            // stream start has the clock reference the PMT promises.
-            let attach_pcr = first
-                && (pid == PID_VIDEO)
+            // PCR cadence is enforced per VIDEO TS packet, NOT per PES. A single
+            // UHD HEVC I-frame is one PES spanning thousands of TS packets; if
+            // PCR could only ride the PES's first packet, the clock would go
+            // un-restamped for the whole frame — a multi-second gap far beyond
+            // the 40-packet / ~100 ms bound, which strict T-STD validators treat
+            // as a clock discontinuity. So re-stamp whenever the per-packet
+            // counter reaches the interval (or on the very first video packet of
+            // the stream), regardless of whether this is the PES start. Re-using
+            // the PES's own `pcr` for a mid-PES packet keeps the gap bounded.
+            let attach_pcr = (pid == PID_VIDEO)
                 && (pcr.is_some())
                 && (!self.first_video_written
                     || self.video_packets_since_pcr >= PCR_INTERVAL_PACKETS);
@@ -841,20 +858,23 @@ mod tests {
         mux.finish().unwrap();
         drop(mux);
 
-        // The first PUSI video packet carries PCR + RAI (keyframe).
-        // A later video PUSI packet with AF + PCR but NOT keyframe must
-        // have RAI clear.
-        let video_pusi: Vec<&[u8]> = sink
+        // The first video packet carries PCR + RAI (keyframe PES start). RAI
+        // rides only the FIRST packet of a KEYFRAME PES; every OTHER PCR-bearing
+        // video packet — the mid-PES re-stamps and the non-keyframe PES starts —
+        // must have RAI clear. Skip the very first video packet (the keyframe
+        // RAI carrier) and assert the first remaining PCR-bearing packet is RAI
+        // clear.
+        let video_pkts: Vec<&[u8]> = sink
             .chunks(188)
-            .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
+            .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO)
             .collect();
         assert!(
-            video_pusi.len() >= 2,
-            "expected ≥2 video PES starts, got {}",
-            video_pusi.len()
+            video_pkts.len() >= 2,
+            "expected ≥2 video packets, got {}",
+            video_pkts.len()
         );
         // Find a later one with AF that carries PCR (flags & 0x10 set).
-        let later_pcr = video_pusi
+        let later_pcr = video_pkts
             .iter()
             .skip(1)
             .find_map(|p| {
@@ -865,49 +885,115 @@ mod tests {
                     None
                 }
             })
-            .expect("later PCR-bearing PUSI exists");
+            .expect("a later PCR-bearing video packet exists");
         assert_eq!(
             later_pcr[0] & 0x40,
             0,
-            "RAI must be clear on non-keyframe PCR packet"
+            "RAI must be clear on a non-keyframe-start PCR packet"
+        );
+    }
+
+    /// Regression: PCR must be re-stamped MID-PES, not only at PES boundaries.
+    /// A single large video frame (one PES) spans far more than
+    /// PCR_INTERVAL_PACKETS TS packets — a UHD I-frame. PCR-bearing video
+    /// packets must recur at least every PCR_INTERVAL_PACKETS video packets
+    /// across that one PES; before the fix only the PES's first packet carried
+    /// PCR, leaving a multi-second clock gap for the whole frame.
+    #[test]
+    fn pcr_restamped_mid_pes_within_interval() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        // ONE big frame → ONE PES spanning ~330 packets (≫ 40).
+        let big: Vec<u8> = (0..(60 * 1024)).map(|i| (i & 0xff) as u8).collect();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&big);
+        mux.write_video(0, true, &frame).unwrap();
+        mux.finish().unwrap();
+        drop(mux);
+
+        assert_ts_well_formed(&sink);
+
+        // Walk every video TS packet in order; record which ones carry a PCR
+        // (AF present with PCR_flag 0x10). The packet INDEX (among video
+        // packets) of consecutive PCR carriers must never advance by more than
+        // PCR_INTERVAL_PACKETS.
+        let mut video_idx = 0usize;
+        let mut pcr_indices: Vec<usize> = Vec::new();
+        let mut total_video = 0usize;
+        for pkt in sink.chunks(188) {
+            let pid = u16::from_be_bytes([pkt[1] & 0x1F, pkt[2]]);
+            if pid != PID_VIDEO {
+                continue;
+            }
+            total_video += 1;
+            if let Some(af) = af_body(pkt) {
+                if !af.is_empty() && (af[0] & 0x10) != 0 {
+                    pcr_indices.push(video_idx);
+                }
+            }
+            video_idx += 1;
+        }
+        assert!(
+            total_video > PCR_INTERVAL_PACKETS as usize,
+            "test needs a PES spanning more than one PCR interval, got {total_video} video packets"
+        );
+        // More than one PCR across the single PES (the whole point of the fix).
+        assert!(
+            pcr_indices.len() >= 2,
+            "PCR must be re-stamped mid-PES, but only {} PCR-bearing packet(s) \
+             appeared across {} video packets of one PES",
+            pcr_indices.len(),
+            total_video
+        );
+        // First PCR is on the first video packet.
+        assert_eq!(pcr_indices[0], 0, "first video packet must carry PCR");
+        // No gap between consecutive PCRs exceeds the interval. The counter is
+        // post-incremented and PCR attaches on `>= PCR_INTERVAL_PACKETS`, so the
+        // packet index gap is `PCR_INTERVAL_PACKETS + 1` (40 packets carrying no
+        // PCR, then the re-stamp packet) — the spec "every 40 packets" bound.
+        let max_gap = PCR_INTERVAL_PACKETS + 1;
+        for w in pcr_indices.windows(2) {
+            assert!(
+                (w[1] - w[0]) as u64 <= max_gap,
+                "PCR gap {} exceeds the {}-packet bound",
+                w[1] - w[0],
+                max_gap
+            );
+        }
+        let tail = total_video - 1 - *pcr_indices.last().unwrap();
+        assert!(
+            tail as u64 <= max_gap,
+            "trailing run after the last PCR ({tail}) exceeds the {max_gap}-packet bound"
         );
     }
 
     #[test]
     fn keyframe_video_with_pcr_combines_flags() {
-        // The first video PES carries a PCR (and RAI) and resets the PCR
-        // counter. After that, PCR re-attaches only when
-        // video_packets_since_pcr >= PCR_INTERVAL_PACKETS (40). We push:
-        // keyframe (PCR+RAI, counter reset) → many non-key (drives the
-        // counter past the interval) → second keyframe whose PUSI combines
-        // RAI (keyframe) and PCR (counter exceeded).
+        // The FIRST video PES is always a keyframe carrying BOTH a PCR (forced
+        // at stream start so the receiver has the clock the PMT promises) AND a
+        // RAI (keyframe) — exercising the flag-OR path that combines RAI into the
+        // PCR adaptation-field flags byte (0x10 | 0x40 = 0x50). (PCR cadence is
+        // now enforced per video packet, NOT per PES boundary, so a LATER
+        // keyframe PES start no longer deterministically lands on a PCR-due
+        // packet; the combine path is pinned here on the guaranteed first PES.)
         let mut sink: Vec<u8> = Vec::new();
         let mut mux = M2tsMux::new(&mut sink);
         let mut small = Vec::new();
         small.extend_from_slice(&4u32.to_be_bytes());
         small.extend_from_slice(&[0x40, 0x01, 0x0C, 0x01]);
         mux.write_video(0, true, &small).unwrap();
-        // ~50 KB ≈ 270 packets — well over PCR_INTERVAL_PACKETS.
-        let big: Vec<u8> = (0..(50 * 1024)).map(|i| (i & 0xff) as u8).collect();
-        let mut big_frame = Vec::new();
-        big_frame.extend_from_slice(&(big.len() as u32).to_be_bytes());
-        big_frame.extend_from_slice(&big);
-        mux.write_video(40_000_000, false, &big_frame).unwrap();
-        // Now a second keyframe — must combine RAI (keyframe) and PCR
-        // (counter exceeded).
-        mux.write_video(80_000_000, true, &small).unwrap();
         mux.finish().unwrap();
         drop(mux);
 
-        // Collect video PUSI packets and find the third (second keyframe).
         let video_pusi: Vec<&[u8]> = sink
             .chunks(188)
             .filter(|p| u16::from_be_bytes([p[1] & 0x1F, p[2]]) == PID_VIDEO && (p[1] & 0x40) != 0)
             .collect();
-        assert!(video_pusi.len() >= 3, "three video PES starts expected");
-        let af = af_body(video_pusi[2]).expect("AF present");
+        assert!(!video_pusi.is_empty(), "a video PES start exists");
+        let af = af_body(video_pusi[0]).expect("AF present on first keyframe PES");
         assert!(!af.is_empty(), "AF flags byte present");
-        assert_eq!(af[0], 0x50, "flags == RAI | PCR");
+        assert_eq!(af[0], 0x50, "flags == RAI | PCR on the first keyframe PES");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -1150,6 +1236,36 @@ mod tests {
             | ((pes[12] as u64) << 7)
             | ((pes[13] >> 1) as u64);
         assert!(pts < (1u64 << 33), "PTS stays within the 33-bit field");
+    }
+
+    #[test]
+    fn base_relative_pts_wraps_across_33bit_clock_rollover() {
+        // Regression: a real 90 kHz clock wrap must NOT collapse to PTS 0.
+        // Seed base near the top of the 33-bit range; a later frame whose tick
+        // has wrapped past 0 lands far below base. The OLD `saturating_sub`
+        // returned 0 (flat-lining timing); modular subtraction must return the
+        // true small forward delta.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut mux = M2tsMux::new(&mut sink);
+        // Force the base to 2^33 - 100 directly (a value reachable only after
+        // ~26.5 h of stream; set it rather than ripping that long).
+        mux.base_pts_90k = Some((1u64 << 33) - 100);
+        // pts_ns = 1ms → raw_90k = 1_000_000 * 9 / 100_000 = 90 ticks (wrapped
+        // past 0, far below the near-max base).
+        let pts_ns = 1_000_000i64;
+        let rel = mux.base_relative_pts(pts_ns, /* may_seed_base */ false);
+        // 90 - (2^33 - 100) mod 2^33 = 190 ticks forward across the wrap (NOT 0).
+        assert_eq!(
+            rel, 190,
+            "a 33-bit clock wrap must produce the true forward delta, not 0"
+        );
+
+        // And a frame genuinely a little BEFORE the base still floors to 0
+        // (documented pre-base behavior — e.g. leading audio). base = 200 ticks,
+        // frame at 90 ticks (< base) → backward step → floor to 0.
+        mux.base_pts_90k = Some(200);
+        let rel0 = mux.base_relative_pts(1_000_000i64, false); // raw_90k = 90 < 200
+        assert_eq!(rel0, 0, "a frame before the base must still floor to 0");
     }
 
     #[test]
