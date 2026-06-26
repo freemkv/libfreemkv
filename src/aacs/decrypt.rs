@@ -156,7 +156,10 @@ fn verify_ts(unit: &[u8]) -> bool {
 }
 
 /// Decrypt one AACS aligned unit (6144 bytes) in-place.
-/// Returns true if decryption succeeded (verified by TS sync bytes).
+/// Returns true if the unit is now clear MPEG-TS: either it was already
+/// unscrambled (returned untouched, no key used) or it was decrypted and
+/// verified by its TS sync bytes. Returns false only when the unit was
+/// scrambled and this key failed verification.
 ///
 /// Algorithm:
 /// 1. AES-128-ECB encrypt first 16 bytes with unit_key → derived

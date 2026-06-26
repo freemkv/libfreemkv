@@ -340,10 +340,8 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
         return Err(Error::IfoParse);
     }
 
-    // TT_SRPT sector pointer at bytes 0xC4 (offset 196, documented as bytes 62-65
-    // in some references, but the canonical IFO spec uses 0xC4).
-    // NOTE: The user spec says bytes 62-65, which is offset 0x3E.
-    // Let's use the value from the spec provided.
+    // The TT_SRPT pointer is at 0xC4 per the DVD-Video VMGI spec.
+    // (An informal '62-65' / 0x3E note seen elsewhere is wrong — do not use it.)
     let tt_srpt_sector = be_u32(&vmg_data, 0xC4)?;
 
     // Read TT_SRPT — it's at the given sector offset relative to the start of VIDEO_TS.IFO.

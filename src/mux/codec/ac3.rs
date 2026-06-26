@@ -269,12 +269,12 @@ fn frame_duration_ns(data: &[u8], bsid: u8) -> u64 {
 /// Index is the 3-bit acmod value; add 1 when `lfeon` is set.
 ///
 /// ```text
-///   0 = 1+1 (Ch1, Ch2)  -> 2     4 = 3/0 (L,C,R)        -> 3
-///   1 = 1/0 (C, mono)   -> 1     5 = 2/1 (L,R,S)        -> 3
-///   2 = 2/0 (L, R)      -> 2     6 = 3/1 (L,C,R,S)      -> 4
+///   0 = 1+1 (Ch1, Ch2)  -> 2     4 = 2/1 (L,R,S)        -> 3
+///   1 = 1/0 (C, mono)   -> 1     5 = 3/1 (L,C,R,S)      -> 4
+///   2 = 2/0 (L, R)      -> 2     6 = 2/2 (L,R,SL,SR)    -> 4
 ///   3 = 3/0 (L,C,R)     -> 3     7 = 3/2 (L,C,R,SL,SR)  -> 5
 /// ```
-const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 3, 4, 5];
+const ACMOD_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 
 /// Decode the channel count of an (E-)AC-3 frame from its bitstream `acmod` and
 /// `lfeon`, starting at the 0x0B77 syncword. Returns `None` when the frame is
@@ -1129,12 +1129,18 @@ mod tests {
 
     #[test]
     fn acmod_channels_3_0_and_2_1() {
-        // acmod=4 (3/0 L,C,R) → 3 (exercises cmixlev present, surmixlev absent).
+        // Per A/52 Table 5.8: acmod 4 = 2/1, 5 = 3/1, 6 = 2/2.
+        // acmod=4 (2/1 L,R,S) → 3 (surmixlev present, no centre → no cmixlev).
         assert_eq!(acmod_channels(&make_bsi(4, false)), Some(3));
-        // acmod=5 (2/1 L,R,S) → 3 (surmixlev present, no centre).
-        assert_eq!(acmod_channels(&make_bsi(5, false)), Some(3));
-        // acmod=6 (3/1) + LFE → 5; lfeon position shifts after both
-        // cmixlev (centre) and surmixlev (surround) 2-bit fields.
+        // acmod=5 (3/1 L,C,R,S) → 4 (centre → cmixlev present, surround →
+        // surmixlev present). This is the regression case: index 5 was wrongly
+        // 3 in ACMOD_CHANNELS, undercounting a 3/1 stream by one channel.
+        assert_eq!(acmod_channels(&make_bsi(5, false)), Some(4));
+        // acmod=5 (3/1) + LFE → 5; lfeon position shifts after both cmixlev
+        // (centre) and surmixlev (surround) 2-bit fields.
+        assert_eq!(acmod_channels(&make_bsi(5, true)), Some(5));
+        // acmod=6 (2/2 L,R,SL,SR) → 4 (surmixlev present, no centre); +LFE → 5.
+        assert_eq!(acmod_channels(&make_bsi(6, false)), Some(4));
         assert_eq!(acmod_channels(&make_bsi(6, true)), Some(5));
     }
 

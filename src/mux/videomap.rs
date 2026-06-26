@@ -65,8 +65,27 @@ pub struct Colour {
 }
 
 impl Colour {
-    /// Map the title's [`ColorSpace`] to CICP code points. Unknown colorimetry
-    /// maps to code point 2 ("unspecified"), the CICP convention.
+    /// Derive the FVI CICP code points from a full [`VideoStream`], using the
+    /// SAME precedence as the MKV muxer ([`crate::mux::mkv::cicp_for_video`]):
+    /// measured CICP (authoritative) → coarse `color_space` enum + HDR-driven
+    /// transfer override. This is what the sidecar must use so it never reports
+    /// an SDR transfer (14) for an HDR10 BT.2020 title while the MKV container
+    /// reports PQ (16) — the two sinks of one title must agree.
+    pub fn from_video(v: &VideoStream) -> Self {
+        let (matrix, transfer, primaries, range) = crate::mux::mkv::cicp_for_video(v);
+        Self {
+            primaries,
+            transfer,
+            matrix,
+            // Matroska/MeasuredCicp Range: 1 = limited (disc norm), 2 = full.
+            full_range: range == 2,
+        }
+    }
+
+    /// Map the title's [`ColorSpace`] alone to CICP code points (no HDR/measured
+    /// context). Retained for the no-video header fallback and unit coverage;
+    /// the title path uses [`Colour::from_video`]. Unknown colorimetry maps to
+    /// code point 2 ("unspecified"), the CICP convention.
     pub fn from_color_space(cs: ColorSpace) -> Self {
         // (primaries, transfer, matrix) per ITU-T H.273.
         let (p, t, m) = match cs {
@@ -217,7 +236,7 @@ impl MapHeader {
                     } else {
                         Scan::Progressive
                     },
-                    colour: Colour::from_color_space(v.color_space),
+                    colour: Colour::from_video(v),
                 }
             }
             None => StreamInfo {
@@ -473,6 +492,65 @@ mod tests {
             }
         );
         assert_eq!(Colour::from_color_space(ColorSpace::Unknown).primaries, 2);
+    }
+
+    /// Regression: the FVI sidecar must mirror the MKV muxer's colour precedence,
+    /// not blindly map `color_space` → the SDR transfer 14 for BT.2020. An HDR10
+    /// BT.2020 title's real transfer is PQ (16); a measured CICP triplet is
+    /// authoritative and copied through verbatim. Before the fix the FVI Colour
+    /// reported transfer=14 while the MKV container reported 16 — two sinks of
+    /// one title disagreeing on the colour code points.
+    #[test]
+    fn fvi_colour_follows_hdr_and_measured_cicp() {
+        use crate::disc::MeasuredCicp;
+        let mk = |hdr: HdrFormat, cs: ColorSpace, cicp: Option<MeasuredCicp>| VideoStream {
+            pid: 0x1011,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: FrameRate::F23_976,
+            hdr,
+            color_space: cs,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: cicp,
+        };
+
+        // HDR10 BT.2020 with NO measured CICP → PQ transfer (16), NOT SDR 14.
+        let c = Colour::from_video(&mk(HdrFormat::Hdr10, ColorSpace::Bt2020, None));
+        assert_eq!(
+            c,
+            Colour {
+                primaries: 9,
+                transfer: 16, // PQ — not the SDR 14 the enum alone would give
+                matrix: 9,
+                full_range: false,
+            }
+        );
+
+        // HLG BT.2020 → transfer 18.
+        let c = Colour::from_video(&mk(HdrFormat::Hlg, ColorSpace::Bt2020, None));
+        assert_eq!(c.transfer, 18, "HLG transfer must be 18");
+
+        // Measured CICP is authoritative — copied through verbatim, incl. full
+        // range (2 → full_range = true), ignoring the coarse enum/HDR guess.
+        let measured = MeasuredCicp {
+            matrix: 9,
+            transfer: 16,
+            primaries: 9,
+            range: 2,
+        };
+        let c = Colour::from_video(&mk(HdrFormat::Sdr, ColorSpace::Bt709, Some(measured)));
+        assert_eq!(
+            c,
+            Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: true,
+            },
+            "measured CICP must override the coarse color_space enum"
+        );
     }
 
     #[test]

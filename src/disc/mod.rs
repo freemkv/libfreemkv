@@ -603,7 +603,12 @@ impl Codec {
             // lossless pair, parallel to 0x81/0xA1 for AC-3. 0xA2 is
             // lossless MA, not lossy HR.
             0xA2 => Codec::DtsHdMa,
-            0x90 | 0x91 => Codec::Pgs,
+            // 0x90 = Presentation Graphics (PG / subtitles). 0x91 = Interactive
+            // Graphics (IG / menus) and 0x92 = Text subtitles are distinct HDMV
+            // coding types and are NOT PG subtitle streams; only 0x90 maps to
+            // Pgs. IG (0x91) falls through to Unknown so the PMT/STN walker drops
+            // it rather than surfacing a bogus PGS subtitle track for a menu ES.
+            0x90 => Codec::Pgs,
             ct => Codec::Unknown(ct),
         }
     }
@@ -5774,6 +5779,20 @@ mod tests {
     fn coding_type_a2_is_dts_hd_ma() {
         assert_eq!(Codec::from_coding_type(0xA2), Codec::DtsHdMa);
         assert_eq!(Codec::from_coding_type(0x86), Codec::DtsHdMa);
+    }
+
+    /// HDMV coding_type 0x90 = Presentation Graphics (PG / subtitles) → Pgs,
+    /// but 0x91 = Interactive Graphics (IG / menus) is NOT a subtitle stream.
+    /// It must NOT map to Pgs (whose kind() is Subtitle), else a menu ES would
+    /// surface as a bogus PGS subtitle track. 0x91 falls through to Unknown so
+    /// the PMT/STN walker drops it.
+    #[test]
+    fn coding_type_ig_0x91_is_not_pgs_subtitle() {
+        assert_eq!(Codec::from_coding_type(0x90), Codec::Pgs);
+        assert_eq!(Codec::from_coding_type(0x90).kind(), CodecKind::Subtitle);
+        // IG must not be a PGS subtitle.
+        assert_eq!(Codec::from_coding_type(0x91), Codec::Unknown(0x91));
+        assert_ne!(Codec::from_coding_type(0x91).kind(), CodecKind::Subtitle);
     }
 
     /// chapter_name emits a bare 1-based ordinal (no localized prose).
