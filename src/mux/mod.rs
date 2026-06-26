@@ -88,6 +88,9 @@ pub(crate) mod network;
 pub(crate) mod null;
 pub(crate) mod ps;
 pub(crate) mod stdio;
+/// Shared clip-boundary timeline-continuity corrector (used by the MKV muxer
+/// and the `demux://` sink).
+pub(crate) mod timeline;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
 
