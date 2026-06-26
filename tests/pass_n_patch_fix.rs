@@ -31,13 +31,13 @@ fn decrypt_sectors_with_aacs_keys_works() {
     aacs::decrypt_unit(&mut unit, &unit_key); // decrypt_unit is idempotent on already-encrypted data
 
     // Now we have encrypted data - create DecryptKeys with actual keys
-    let keys = DecryptKeys::Aacs {
+    let mut keys = DecryptKeys::Aacs {
         unit_keys: vec![(0u32, unit_key)],
         read_data_key: None,
     };
 
     // decrypt_sectors should handle this without error
-    let result = libfreemkv::decrypt::decrypt_sectors(&mut unit, &keys, 0);
+    let result = libfreemkv::decrypt::decrypt_sectors(&mut unit, &mut keys, 0);
 
     assert!(
         result.is_ok(),
@@ -50,8 +50,8 @@ fn decrypt_sectors_with_aacs_keys_works() {
 fn decrypt_sectors_with_none_keys_is_noop() {
     let mut sector = vec![0x42u8; 2048];
 
-    let keys = DecryptKeys::None;
-    let result = libfreemkv::decrypt::decrypt_sectors(&mut sector, &keys, 0);
+    let mut keys = DecryptKeys::None;
+    let result = libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0);
 
     assert!(result.is_ok());
     assert_eq!(
@@ -70,10 +70,10 @@ fn decrypt_sectors_with_css_keys_works() {
     sector[0x14] |= 0x30;
 
     let title_key: [u8; 5] = [0x42, 0x13, 0x37, 0xBE, 0xEF]; // Not used - defined later
-    let keys = DecryptKeys::Css { title_key };
+    let mut keys = DecryptKeys::Css { title_key };
 
     // Descramble (CSS uses same operation for encrypt/decrypt)
-    libfreemkv::decrypt::decrypt_sectors(&mut sector, &keys, 0).unwrap();
+    libfreemkv::decrypt::decrypt_sectors(&mut sector, &mut keys, 0).unwrap();
 
     // Flag should be cleared
     assert_eq!(sector[0x14] & 0x30, 0x00, "CSS flag should be cleared");
