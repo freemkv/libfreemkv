@@ -14,12 +14,19 @@
 //! The VUK decrypts title keys from AACS/Unit_Key_RO.inf on disc.
 //! Title keys decrypt m2ts stream content (AES-128-CBC).
 
+pub mod boil;
 pub mod decrypt;
 pub mod handshake;
-pub mod keydb;
 pub mod keys;
 pub mod provider;
+pub mod trace;
+pub mod types;
 pub mod variants;
+
+// Boil-down derivation primitives (thin newtypes + wrappers over the crypto).
+pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, uk_from_vuk, vuk_from_mk};
+// Structured, English-free resolution trace.
+pub use trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, UnlockStep};
 
 // Explicit re-exports — only items needed by external consumers and sibling crate modules.
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
@@ -28,7 +35,6 @@ pub use decrypt::{
     decrypt_unit_full, decrypt_unit_try_keys, is_aacs_scrambled, is_unit_aligned, ts_packet_total,
     ts_sync_count, unit_key_validates,
 };
-pub use keydb::{DeviceKey, DiscEntry, HostCert, KeyDb};
 pub use keys::probe;
 pub use keys::{
     AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C, MKB_TYPE_3_RECORDABLE,
@@ -40,6 +46,7 @@ pub use keys::{
     resolve_keys_v21, resolve_keys_with_reason, trim_mkb,
 };
 pub use provider::KeyProvider;
+pub use types::{DeviceKey, DiscEntry, HostCert};
 pub use variants::{
     KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, MkbRecord, ProcessingKeyMatch,
     derive_media_key_variant, is_variant_mkb, variant_nonce, walk_mkb, walk_processing_key,

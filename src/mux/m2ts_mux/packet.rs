@@ -7,11 +7,11 @@
 use crate::error::Error;
 use std::io::{self, Write};
 
-const TS_PACKET_SIZE: usize = 188;
+use crate::consts::TS_PACKET_BYTES;
 /// Header is 4 bytes, leaving 184 bytes for the adaptation field area
 /// plus payload. With a 1-byte `adaptation_field_length` prefix the
 /// field body + stuffing can be at most 183 bytes.
-const MAX_AF_LEN: usize = TS_PACKET_SIZE - 4 - 1;
+const MAX_AF_LEN: usize = TS_PACKET_BYTES - 4 - 1;
 const SYNC_BYTE: u8 = 0x47;
 const STUFF_BYTE: u8 = 0xFF;
 
@@ -20,14 +20,14 @@ const STUFF_BYTE: u8 = 0xFF;
 /// bytes when [`pad_to_188`](Self::pad_to_188) is called; if it's not
 /// called the caller is responsible for filling the packet exactly.
 pub(super) struct Packet {
-    buf: [u8; TS_PACKET_SIZE],
+    buf: [u8; TS_PACKET_BYTES],
     len: usize,
 }
 
 impl Packet {
     pub(super) fn new() -> Self {
         Self {
-            buf: [0u8; TS_PACKET_SIZE],
+            buf: [0u8; TS_PACKET_BYTES],
             len: 0,
         }
     }
@@ -36,14 +36,14 @@ impl Packet {
     /// never reached by the sole caller (mod.rs sizes every field to sum
     /// to 188); the bound prevents a future caller from corrupting memory.
     fn push(&mut self, b: u8) {
-        if self.len < TS_PACKET_SIZE {
+        if self.len < TS_PACKET_BYTES {
             self.buf[self.len] = b;
             self.len += 1;
         }
     }
 
     fn extend(&mut self, bytes: &[u8]) {
-        let n = bytes.len().min(TS_PACKET_SIZE - self.len);
+        let n = bytes.len().min(TS_PACKET_BYTES - self.len);
         self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
         self.len += n;
     }
@@ -111,7 +111,7 @@ impl Packet {
     /// packet past 188 bytes — overflow is a muxer invariant break, not
     /// something to silently emit.
     pub(super) fn append_payload(&mut self, payload: &[u8]) -> io::Result<()> {
-        if self.len + payload.len() > TS_PACKET_SIZE {
+        if self.len + payload.len() > TS_PACKET_BYTES {
             return Err(Error::M2tsPacketMalformed.into());
         }
         self.extend(payload);
@@ -123,7 +123,7 @@ impl Packet {
     /// For PSI packets only — payload-carrying packets reserve room for
     /// stuffing via `append_adaptation`.
     pub(super) fn pad_to_188(&mut self) {
-        while self.len < TS_PACKET_SIZE {
+        while self.len < TS_PACKET_BYTES {
             self.push(STUFF_BYTE);
         }
     }
@@ -155,7 +155,7 @@ impl<W: Write> PacketWriter<W> {
         // Hard check, not a debug_assert: a non-188-byte packet would
         // corrupt the transport stream, so refuse to write it in any
         // build rather than emitting a short/long packet silently.
-        if bytes.len() != TS_PACKET_SIZE {
+        if bytes.len() != TS_PACKET_BYTES {
             return Err(Error::M2tsPacketMalformed.into());
         }
         self.inner.write_all(bytes)

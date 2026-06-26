@@ -268,15 +268,15 @@ mod tests {
     /// absorb). ISO 13818-1 packet layout: sync 0x47 at TS offset 0 (BD off 4).
     fn bdts_pes_packet(pid: u16, payload: &[u8]) -> Vec<u8> {
         const SYNC: u8 = 0x47;
-        const TS_PAYLOAD: usize = 184;
+        use crate::consts::TS_PAYLOAD_BYTES;
         let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         pes.extend_from_slice(payload);
-        assert!(pes.len() <= TS_PAYLOAD);
+        assert!(pes.len() <= TS_PAYLOAD_BYTES);
         let mut pkt = vec![0u8; 192];
         pkt[4] = SYNC;
         pkt[5] = (((pid >> 8) as u8) & 0x1F) | 0x40; // PUSI
         pkt[6] = (pid & 0xFF) as u8;
-        let pad = TS_PAYLOAD - pes.len();
+        let pad = TS_PAYLOAD_BYTES - pes.len();
         if pad == 0 {
             pkt[7] = 0x10; // payload only
             pkt[8..8 + pes.len()].copy_from_slice(&pes);

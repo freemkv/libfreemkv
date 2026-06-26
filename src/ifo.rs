@@ -232,7 +232,7 @@ pub struct DvdSubtitleAttr {
 
 const VMG_MAGIC: &[u8; 12] = b"DVDVIDEO-VMG";
 const VTS_MAGIC: &[u8; 12] = b"DVDVIDEO-VTS";
-const SECTOR_SIZE: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 
 // ── Helper: safe binary reads ───────────────────────────────────────────────
 
@@ -347,7 +347,7 @@ pub fn parse_vmg(reader: &mut dyn SectorSource, udf: &UdfFs) -> Result<DvdInfo> 
     // Read TT_SRPT — it's at the given sector offset relative to the start of VIDEO_TS.IFO.
     // In the IFO file data we already have, sector offsets are relative to the IFO start.
     let tt_srpt_offset = (tt_srpt_sector as usize)
-        .checked_mul(SECTOR_SIZE)
+        .checked_mul(SECTOR_BYTES)
         .ok_or(Error::IfoParse)?;
 
     // TT_SRPT may be beyond what we read; if so, it's embedded in the file data
@@ -481,7 +481,7 @@ fn parse_vts(
 
     // Parse PGC information table
     let pgcit_offset = (pgcit_sector as usize)
-        .checked_mul(SECTOR_SIZE)
+        .checked_mul(SECTOR_BYTES)
         .ok_or(Error::IfoParse)?;
     let titles = parse_pgcit(&vts_data, pgcit_offset, titles_info)?;
 
@@ -1562,8 +1562,8 @@ mod tests {
         assert!(!c.is_secondary_block_piece());
 
         // block_mode=1 (first cell of block), block_type=1 (angle block):
-        // 0b01_01_0000 = 0x50. This is the angle we KEEP — not secondary.
-        let c = CellCategory::decode(0b01_01_0000);
+        // 0b0101_0000 = 0x50. This is the angle we KEEP — not secondary.
+        let c = CellCategory::decode(0b0101_0000);
         assert_eq!(c.block_mode, 1);
         assert_eq!(c.block_type, 1);
         assert!(!c.is_plain_feature());
@@ -1571,10 +1571,10 @@ mod tests {
 
         // block_mode=2 (in block) / 3 (last of block) of an angle block
         // (block_type=1) → secondary.
-        assert!(CellCategory::decode(0b10_01_0000).is_secondary_block_piece());
-        assert!(CellCategory::decode(0b11_01_0000).is_secondary_block_piece());
+        assert!(CellCategory::decode(0b1001_0000).is_secondary_block_piece());
+        assert!(CellCategory::decode(0b1101_0000).is_secondary_block_piece());
         // First cell of the block (block_mode=1) is NEVER secondary.
-        assert!(!CellCategory::decode(0b01_01_0000).is_secondary_block_piece());
+        assert!(!CellCategory::decode(0b0101_0000).is_secondary_block_piece());
 
         // The low flags (seamless_play bit3, interleaved bit2, stc bit1,
         // seamless_angle bit0) on an otherwise-plain cell must NOT make it
@@ -1617,9 +1617,9 @@ mod tests {
             chapters: 2,
             duration_secs: 100.0,
             cells: vec![
-                cell(0, 9, 0b10_01_0000),   // in-block cell of angle block → drop
-                cell(10, 19, 0b11_01_0000), // last cell of angle block → drop
-                cell(20, 119, 0x00),        // feature starts here
+                cell(0, 9, 0b1001_0000),   // in-block cell of angle block → drop
+                cell(10, 19, 0b1101_0000), // last cell of angle block → drop
+                cell(20, 119, 0x00),       // feature starts here
                 cell(120, 219, 0x00),
             ],
             chapter_times: vec![0.0, 50.0],
@@ -1640,7 +1640,7 @@ mod tests {
         let t = DvdTitle {
             chapters: 1,
             duration_secs: 100.0,
-            cells: vec![cell(0, 9, 0b10_01_0000), cell(10, 19, 0b11_01_0000)],
+            cells: vec![cell(0, 9, 0b1001_0000), cell(10, 19, 0b1101_0000)],
             chapter_times: vec![0.0],
             palette: None,
         };

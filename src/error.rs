@@ -87,6 +87,7 @@ pub const E_VID_CDB_UNAVAILABLE: u16 = 7021;
 pub const E_NO_DISC_KEY: u16 = 7022;
 pub const E_CSS_KEY_MISSING: u16 = 7023;
 pub const E_AACS_NO_HOST_CERT: u16 = 7024;
+pub const E_AACS_BUS_KEY_UNAVAILABLE: u16 = 7025;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -347,6 +348,17 @@ pub enum Error {
     AacsNoHostCert {
         path: String,
     },
+    /// A bus-encrypted disc (AACS 2.0 / UHD, Content Certificate bus-encryption
+    /// bit set) was scanned on a live drive, the Volume ID was obtained, but no
+    /// `read_data_key` (bus key) was produced — so the on-disc bytes are still
+    /// bus-encrypted and would decrypt to garbage. The bus key is derivable ONLY
+    /// from the AACS host-certificate cert-auth handshake; a VID-only OEM unlock
+    /// path (which returns no bus key) is insufficient for such a disc. Surfaced
+    /// instead of silently producing a corrupt rip. NOT raised for AACS 1.0 BD
+    /// (no bus encryption, `read_data_key` legitimately absent) nor for
+    /// file-backed (ISO) scans, where bus encryption was already removed at read
+    /// time and no handshake runs.
+    AacsBusKeyUnavailable,
 
     // Keydb (8xxx)
     KeydbConnect {
@@ -560,6 +572,7 @@ impl Error {
             Error::NoDiscKey { .. } => E_NO_DISC_KEY,
             Error::CssKeyMissing => E_CSS_KEY_MISSING,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
+            Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,

@@ -2588,7 +2588,7 @@ mod tests {
             range_sectors: 1,
         };
 
-        let timed_out = check_range_watchdog(&mut state, &frame, &*shared);
+        let timed_out = check_range_watchdog(&mut state, &frame, &shared);
         assert!(!timed_out, "range must not time out immediately");
         // With correct initialization bytes_good_now == range_bytes_good,
         // so the `bytes_good_now > range_bytes_good` branch does NOT fire

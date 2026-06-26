@@ -116,7 +116,9 @@ pub fn sample_rate_hz(s: SampleRate) -> u32 {
     match s {
         SampleRate::S44_1 => 44100,
         SampleRate::S48 => 48000,
+        SampleRate::S88_2 => 88200,
         SampleRate::S96 => 96000,
+        SampleRate::S176_4 => 176400,
         SampleRate::S192 => 192000,
         SampleRate::S48_96 => 96000,
         SampleRate::S48_192 => 192000,

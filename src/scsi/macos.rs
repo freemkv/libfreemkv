@@ -244,6 +244,22 @@ fn cstr_to_str(bytes: &[u8]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
+pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
+    let mut transport = MacScsiTransport::open(path)?;
+    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+    let mut buf = [0u8; 0];
+    match transport.execute(
+        &cdb,
+        crate::scsi::DataDirection::None,
+        &mut buf,
+        crate::scsi::TUR_TIMEOUT_MS,
+    ) {
+        Ok(_) => Ok(true),
+        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::K_MAX_CDB_SIZE;
@@ -256,7 +272,7 @@ mod tests {
     #[test]
     fn oversized_cdb_returns_invalid_cdb_length() {
         // Build a CDB one byte over the limit.
-        let long_cdb = vec![0u8; K_MAX_CDB_SIZE + 1];
+        let long_cdb = [0u8; K_MAX_CDB_SIZE + 1];
         // Replicate the guard logic from MacScsiTransport::execute so
         // this test runs on Linux CI as well (no IOKit present there).
         let result: Result<(), Error> = if long_cdb.len() > K_MAX_CDB_SIZE {
@@ -279,27 +295,11 @@ mod tests {
     /// A CDB exactly at the limit must not trigger the guard.
     #[test]
     fn max_length_cdb_does_not_trigger_guard() {
-        let cdb = vec![0u8; K_MAX_CDB_SIZE];
+        let cdb = [0u8; K_MAX_CDB_SIZE];
         let triggered = cdb.len() > K_MAX_CDB_SIZE;
         assert!(
             !triggered,
             "CDB of exactly K_MAX_CDB_SIZE should not trigger guard"
         );
-    }
-}
-
-pub(super) fn drive_has_disc(path: &Path) -> Result<bool> {
-    let mut transport = MacScsiTransport::open(path)?;
-    let cdb = [crate::scsi::SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-    let mut buf = [0u8; 0];
-    match transport.execute(
-        &cdb,
-        crate::scsi::DataDirection::None,
-        &mut buf,
-        crate::scsi::TUR_TIMEOUT_MS,
-    ) {
-        Ok(_) => Ok(true),
-        Err(ref e) if e.scsi_sense().is_some_and(|s| s.is_not_ready()) => Ok(false),
-        Err(e) => Err(e),
     }
 }

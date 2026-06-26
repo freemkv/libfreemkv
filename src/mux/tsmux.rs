@@ -8,7 +8,7 @@ use super::hevc::{hvcc_to_annex_b, length_prefixed_to_annex_b};
 use std::io::{self, Write};
 
 const SYNC_BYTE: u8 = 0x47;
-const TS_PAYLOAD: usize = 184;
+use crate::consts::TS_PAYLOAD_BYTES;
 
 /// PID range treated as video (HEVC, triggers Annex-B conversion + RAI
 /// on keyframes). Both `write_frame` and `build_pes_header` consult this
@@ -204,21 +204,21 @@ impl<W: Write> TsMuxer<W> {
             let remaining = pes_len - offset;
 
             // Invariant: TP_extra(4) + TS_header(4) + AF(af_bytes) + payload(payload_len) = 192,
-            // i.e. af_bytes + payload_len = TS_PAYLOAD (184).
+            // i.e. af_bytes + payload_len = TS_PAYLOAD_BYTES (184).
             // RAI on first packet of a keyframe video PES requires AF with flags=0x40.
             let want_rai = first && keyframe && is_video;
 
             // Pick payload_len and af_bytes per case.
             let (af_bytes, payload_len): (usize, usize) = if want_rai {
                 // Minimum AF = 2 bytes (length=1, flags=0x40). Payload caps at 182.
-                let max_payload = TS_PAYLOAD - 2;
+                let max_payload = TS_PAYLOAD_BYTES - 2;
                 let p = remaining.min(max_payload);
-                (TS_PAYLOAD - p, p)
-            } else if remaining >= TS_PAYLOAD {
-                (0, TS_PAYLOAD) // no AF, full payload
+                (TS_PAYLOAD_BYTES - p, p)
+            } else if remaining >= TS_PAYLOAD_BYTES {
+                (0, TS_PAYLOAD_BYTES) // no AF, full payload
             } else {
                 // Stuffing-only AF, payload = remaining.
-                (TS_PAYLOAD - remaining, remaining)
+                (TS_PAYLOAD_BYTES - remaining, remaining)
             };
 
             // TP_extra_header (4 bytes — arrival time, set to 0)
@@ -363,7 +363,7 @@ fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const BD_PACKET_SIZE: usize = 192;
+    use crate::consts::BD_SOURCE_PACKET_BYTES;
     const VIDEO_PID: u16 = 0x1011;
 
     /// Parsed BD-TS packet (192 bytes total: 4 TP_extra + 4 TS header + 184 body).
@@ -381,8 +381,8 @@ mod tests {
     /// Walk 192-byte BD-TS packets.
     fn parse_bd_ts(buf: &[u8]) -> Vec<TsPacket> {
         let mut out = Vec::new();
-        for chunk in buf.chunks(BD_PACKET_SIZE) {
-            if chunk.len() != BD_PACKET_SIZE {
+        for chunk in buf.chunks(BD_SOURCE_PACKET_BYTES) {
+            if chunk.len() != BD_SOURCE_PACKET_BYTES {
                 break;
             }
             // Skip TP_extra_header (4 bytes), parse TS header.
@@ -762,9 +762,13 @@ mod tests {
             mux.finish().unwrap();
         }
         assert!(!sink.is_empty());
-        assert_eq!(sink.len() % BD_PACKET_SIZE, 0, "output must be 192-aligned");
-        for chunk in sink.chunks(BD_PACKET_SIZE) {
-            assert_eq!(chunk.len(), BD_PACKET_SIZE);
+        assert_eq!(
+            sink.len() % BD_SOURCE_PACKET_BYTES,
+            0,
+            "output must be 192-aligned"
+        );
+        for chunk in sink.chunks(BD_SOURCE_PACKET_BYTES) {
+            assert_eq!(chunk.len(), BD_SOURCE_PACKET_BYTES);
             assert_eq!(chunk[4], SYNC_BYTE, "TS sync byte at offset 4");
         }
     }

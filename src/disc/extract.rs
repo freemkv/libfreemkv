@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-const SECTOR_LEN: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 /// AACS aligned unit = 3 sectors / 6144 bytes. Content reads are issued in
 /// multiples of this so the decrypt step always sees whole units.
 const AACS_UNIT_SECTORS: u32 = 3;
@@ -282,7 +282,7 @@ impl Disc {
                 for &(abs_lba, byte_len) in &pf.extents {
                     extents.push(crate::disc::Extent {
                         start_lba: abs_lba,
-                        sector_count: (byte_len as u64).div_ceil(SECTOR_LEN as u64) as u32,
+                        sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES as u64) as u32,
                     });
                 }
             }
@@ -450,7 +450,7 @@ fn extract_one_file<S: SectorSource>(
     }
 
     let mut written: u64 = 0;
-    let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_LEN];
+    let mut buf = vec![0u8; READ_BATCH_SECTORS as usize * SECTOR_BYTES];
     'extents: for &(abs_lba, byte_len) in &pf.extents {
         if written >= pf.size {
             break;
@@ -467,7 +467,7 @@ fn extract_one_file<S: SectorSource>(
         // the per-extent re-anchoring in the mux read paths
         // (`mux/disc.rs`, `sector/prefetched.rs`). No-op for CSS / None.
         dec.set_unit_base(abs_lba);
-        let sectors = (byte_len as u64).div_ceil(SECTOR_LEN as u64) as u32;
+        let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES as u64) as u32;
         let mut sector_off: u32 = 0;
         while sector_off < sectors {
             let mut batch = (sectors - sector_off).min(READ_BATCH_SECTORS);
@@ -486,7 +486,7 @@ fn extract_one_file<S: SectorSource>(
                 batch -= batch % AACS_UNIT_SECTORS;
             }
             let lba = abs_lba + sector_off;
-            let want = batch as usize * SECTOR_LEN;
+            let want = batch as usize * SECTOR_BYTES;
             let read_ok = read_batch(dec, lba, batch, &mut buf[..want]);
             let chunk_bytes = want as u64;
             // Clip the chunk to the remaining file size on the final extent.
@@ -1000,11 +1000,11 @@ mod tests {
         s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
         // ad_type 0 = Short AD (icb flags low 3 bits at offset 34).
         s[34..36].copy_from_slice(&0u16.to_le_bytes());
-        let size = sectors_each * SECTOR_LEN as u32 * 2;
+        let size = sectors_each * SECTOR_BYTES as u32 * 2;
         s[56..64].copy_from_slice(&(size as u64).to_le_bytes()); // info_length
         s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
         s[212..216].copy_from_slice(&16u32.to_le_bytes()); // l_ad = 2 Short ADs
-        let ext_len = sectors_each * SECTOR_LEN as u32; // bytes, type-0 recorded
+        let ext_len = sectors_each * SECTOR_BYTES as u32; // bytes, type-0 recorded
         // AD #0
         s[216..220].copy_from_slice(&(ext_len & 0x3FFF_FFFF).to_le_bytes());
         s[220..224].copy_from_slice(&data_lba_a.to_le_bytes());

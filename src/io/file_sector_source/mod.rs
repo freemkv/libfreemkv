@@ -72,7 +72,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 
-const SECTOR_SIZE: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 
 /// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
 /// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
@@ -134,7 +134,7 @@ impl FileSectorSource {
             .metadata()
             .map_err(|e| Error::IoError { source: e })?
             .len();
-        let sectors = len / SECTOR_SIZE as u64;
+        let sectors = len / SECTOR_BYTES as u64;
         if sectors > u32::MAX as u64 {
             return Err(Error::IsoTooLarge {
                 path: path.to_string_lossy().into_owned(),
@@ -170,7 +170,7 @@ impl SectorSource for FileSectorSource {
         _recovery: bool,
     ) -> Result<usize> {
         let count = count as u32;
-        let bytes = count as usize * SECTOR_SIZE;
+        let bytes = count as usize * SECTOR_BYTES;
         debug_assert!(
             out.len() >= bytes,
             "FileSectorSource::read_sectors: out len {} < requested {}",
@@ -180,7 +180,7 @@ impl SectorSource for FileSectorSource {
         if count == 0 {
             return Ok(0);
         }
-        let offset = lba as u64 * SECTOR_SIZE as u64;
+        let offset = lba as u64 * SECTOR_BYTES as u64;
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|e| Error::IoError { source: e })?;
@@ -224,7 +224,7 @@ mod tests {
     /// verify any sector by content alone.
     fn make_iso(path: &std::path::Path, sectors: u32) {
         let mut f = std::fs::File::create(path).unwrap();
-        let mut chunk = vec![0u8; SECTOR_SIZE];
+        let mut chunk = vec![0u8; SECTOR_BYTES];
         for n in 0..sectors {
             let b = (n & 0xff) as u8;
             chunk.iter_mut().for_each(|c| *c = b);
@@ -249,7 +249,7 @@ mod tests {
         let mut src = FileSectorSource::open(&path).unwrap();
         assert_eq!(src.capacity_sectors(), total);
 
-        let mut got = vec![0u8; SECTOR_SIZE];
+        let mut got = vec![0u8; SECTOR_BYTES];
         for lba in 0..total {
             src.read_sectors(lba, 1, &mut got, false).unwrap();
             let expected = (lba & 0xff) as u8;
@@ -270,12 +270,12 @@ mod tests {
         let mut src = FileSectorSource::open(&path).unwrap();
 
         let span_lba = TEST_SPAN_SECTORS - 2;
-        let mut buf4 = vec![0u8; SECTOR_SIZE * 4];
+        let mut buf4 = vec![0u8; SECTOR_BYTES * 4];
         src.read_sectors(span_lba, 4, &mut buf4, false).unwrap();
         for i in 0..4 {
             let lba = span_lba + i as u32;
             let expected = (lba & 0xff) as u8;
-            for b in &buf4[i * SECTOR_SIZE..(i + 1) * SECTOR_SIZE] {
+            for b in &buf4[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES] {
                 assert_eq!(*b, expected, "byte mismatch at sub-sector {i}");
             }
         }
@@ -291,7 +291,7 @@ mod tests {
         make_iso(&path, total);
 
         let mut src = FileSectorSource::open(&path).unwrap();
-        let mut got = vec![0u8; SECTOR_SIZE];
+        let mut got = vec![0u8; SECTOR_BYTES];
 
         src.read_sectors(TEST_SPAN_SECTORS + 1, 1, &mut got, false)
             .unwrap();
@@ -311,7 +311,7 @@ mod tests {
         let mut src = FileSectorSource::open(&path).unwrap();
         assert_eq!(src.capacity_sectors(), total);
 
-        let mut got = vec![0u8; SECTOR_SIZE];
+        let mut got = vec![0u8; SECTOR_BYTES];
         src.read_sectors(0, 1, &mut got, false).unwrap();
         src.read_sectors(total - 1, 1, &mut got, false).unwrap();
         let expected = ((total - 1) & 0xff) as u8;
@@ -330,15 +330,15 @@ mod tests {
 
         let mut src = FileSectorSource::open(&path).unwrap();
         let req = (TEST_SPAN_SECTORS + 1) as u16;
-        let req_bytes = req as usize * SECTOR_SIZE;
+        let req_bytes = req as usize * SECTOR_BYTES;
         let mut big = vec![0u8; req_bytes];
         src.read_sectors(0, req, &mut big, false).unwrap();
-        assert!(big[..SECTOR_SIZE].iter().all(|b| *b == 0));
+        assert!(big[..SECTOR_BYTES].iter().all(|b| *b == 0));
         let last_lba = req as u32 - 1;
         let exp = (last_lba & 0xff) as u8;
-        let last_off = (req as usize - 1) * SECTOR_SIZE;
+        let last_off = (req as usize - 1) * SECTOR_BYTES;
         assert!(
-            big[last_off..last_off + SECTOR_SIZE]
+            big[last_off..last_off + SECTOR_BYTES]
                 .iter()
                 .all(|b| *b == exp)
         );
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(src.capacity_sectors(), 4);
 
         // Request 2 sectors starting at LBA 3 → sector 4 doesn't exist.
-        let mut buf = vec![0u8; 2 * SECTOR_SIZE];
+        let mut buf = vec![0u8; 2 * SECTOR_BYTES];
         let r = src.read_sectors(3, 2, &mut buf, false);
         let err = r.expect_err("reading past EOF must error, not short-read");
         let io: std::io::Error = err.into();
@@ -418,21 +418,21 @@ mod tests {
 
     /// On a successful full read the returned count MUST equal
     /// `count * 2048` exactly — the declared byte count. Grounding:
-    /// `Ok(bytes)` where `bytes = count * SECTOR_SIZE`.
+    /// `Ok(bytes)` where `bytes = count * SECTOR_BYTES`.
     #[test]
     fn full_read_returns_exact_declared_bytes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("exact.iso");
         make_iso(&path, 16);
         let mut src = FileSectorSource::open(&path).unwrap();
-        let mut buf = vec![0u8; 5 * SECTOR_SIZE];
+        let mut buf = vec![0u8; 5 * SECTOR_BYTES];
         let n = src.read_sectors(2, 5, &mut buf, false).unwrap();
-        assert_eq!(n, 5 * SECTOR_SIZE, "must return exactly count*2048 bytes");
+        assert_eq!(n, 5 * SECTOR_BYTES, "must return exactly count*2048 bytes");
     }
 
     /// Capacity is `file_len / 2048` (floor); trailing bytes that don't
     /// complete a sector are NOT counted. A file of 4 sectors + 100
-    /// extra bytes reports capacity 4. Grounding: `len / SECTOR_SIZE`
+    /// extra bytes reports capacity 4. Grounding: `len / SECTOR_BYTES`
     /// integer division in `open`.
     #[test]
     fn capacity_floors_partial_trailing_sector() {
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn dontneed_eviction_does_not_affect_data() {
         // 32 MiB default chunk = 16384 sectors; read a bit past it.
-        let total = (READ_DROP_CHUNK_BYTES_DEFAULT / SECTOR_SIZE as u64) as u32 + 64;
+        let total = (READ_DROP_CHUNK_BYTES_DEFAULT / SECTOR_BYTES as u64) as u32 + 64;
         let dir = tempdir().unwrap();
         let path = dir.path().join("drop.iso");
         make_iso(&path, total);
@@ -502,15 +502,15 @@ mod tests {
         // Read in 16-sector batches to keep the loop fast while still
         // crossing the drop boundary by byte count.
         let batch = 16u16;
-        let mut got = vec![0u8; batch as usize * SECTOR_SIZE];
+        let mut got = vec![0u8; batch as usize * SECTOR_BYTES];
         let mut lba = 0u32;
         while lba + batch as u32 <= total {
             src.read_sectors(lba, batch, &mut got, false).unwrap();
             for i in 0..batch as u32 {
                 let expected = ((lba + i) & 0xff) as u8;
-                let off = i as usize * SECTOR_SIZE;
+                let off = i as usize * SECTOR_BYTES;
                 assert!(
-                    got[off..off + SECTOR_SIZE].iter().all(|x| *x == expected),
+                    got[off..off + SECTOR_BYTES].iter().all(|x| *x == expected),
                     "DONTNEED eviction corrupted sector {}",
                     lba + i
                 );

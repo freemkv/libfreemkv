@@ -150,14 +150,11 @@ mod tests {
         speeds: Arc<Mutex<Vec<u16>>>,
     }
 
+    /// A `Spy` under test plus the handles recording its reads and speed sets.
+    type SpyHarness = (Spy, Arc<Mutex<Vec<(u32, u16, bool)>>>, Arc<Mutex<Vec<u16>>>);
+
     impl Spy {
-        fn new(
-            capacity: u32,
-        ) -> (
-            Self,
-            Arc<Mutex<Vec<(u32, u16, bool)>>>,
-            Arc<Mutex<Vec<u16>>>,
-        ) {
+        fn new(capacity: u32) -> SpyHarness {
             let reads = Arc::new(Mutex::new(Vec::new()));
             let speeds = Arc::new(Mutex::new(Vec::new()));
             (

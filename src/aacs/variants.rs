@@ -56,7 +56,7 @@
 //! variant path.
 
 use super::decrypt::aes_ecb_decrypt;
-use super::keydb::DeviceKey;
+use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
 

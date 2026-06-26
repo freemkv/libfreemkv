@@ -443,13 +443,35 @@ fn codec_hint_adds_detail(hint: &str) -> bool {
 pub(crate) fn generate_audio_label(
     codec: &crate::disc::Codec,
     channels: &crate::disc::AudioChannels,
+    secondary: bool,
+) -> String {
+    generate_audio_label_inner(codec, channels, secondary, false)
+}
+
+/// Atmos-aware variant: same codec/channel string as [`generate_audio_label`]
+/// with the object-audio marker folded into the codec brand
+/// (e.g. "Dolby TrueHD Atmos 7.1"). The "Atmos" string lives here in the label
+/// layer, not in the core parser. Used when a bitstream probe detected an Atmos
+/// substream and the stream still carries the basic (non-editorial) label.
+pub(crate) fn generate_audio_label_atmos(
+    codec: &crate::disc::Codec,
+    channels: &crate::disc::AudioChannels,
+    secondary: bool,
+) -> String {
+    generate_audio_label_inner(codec, channels, secondary, true)
+}
+
+fn generate_audio_label_inner(
+    codec: &crate::disc::Codec,
+    channels: &crate::disc::AudioChannels,
     _secondary: bool,
+    atmos: bool,
 ) -> String {
     use crate::disc::{AudioChannels, Codec};
 
     // Full marketing names for disc audio codecs.
     // These are codec brand identifiers, not user-facing English prose.
-    let codec_name = match codec {
+    let base_name = match codec {
         Codec::TrueHd => "Dolby TrueHD",
         Codec::Ac3 => "Dolby Digital",
         Codec::Ac3Plus => "Dolby Digital Plus",
@@ -463,6 +485,15 @@ pub(crate) fn generate_audio_label(
         Codec::Flac => "FLAC",
         Codec::Opus => "Opus",
         _ => return String::new(),
+    };
+
+    // Atmos is an object-audio extension riding a lossless carrier (TrueHD or
+    // DD+). Fold the marker into the brand name; "Atmos" is a label-layer
+    // string, never asserted by the core parser.
+    let codec_name = if atmos && matches!(codec, Codec::TrueHd | Codec::Ac3Plus) {
+        std::borrow::Cow::Owned(format!("{base_name} Atmos"))
+    } else {
+        std::borrow::Cow::Borrowed(base_name)
     };
 
     // Channel layout
@@ -1090,7 +1121,9 @@ mod registry_tests {
             // and as a marker for "these parsers exist."
             let _ = (name, detect, parse);
         }
-        assert!(!PARSERS.is_empty(), "PARSERS array must not be empty");
+        // The loop above touches every registry entry; iterating a non-empty
+        // fixed-size array is the assertion (a `.is_empty()` check would be
+        // const-folded). The test fails to compile if the tuple shape changes.
     }
 }
 

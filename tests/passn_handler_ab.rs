@@ -84,8 +84,11 @@ struct ScriptedSectorReader {
     trace: Arc<Mutex<Vec<(u32, u16, bool)>>>,
 }
 
+/// A `ScriptedSectorReader` plus the handle recording its `(lba, count, ok)` trace.
+type ScriptedHarness = (ScriptedSectorReader, Arc<Mutex<Vec<(u32, u16, bool)>>>);
+
 impl ScriptedSectorReader {
-    fn new(capacity: u32) -> (Self, Arc<Mutex<Vec<(u32, u16, bool)>>>) {
+    fn new(capacity: u32) -> ScriptedHarness {
         let trace = Arc::new(Mutex::new(Vec::new()));
         (
             Self {

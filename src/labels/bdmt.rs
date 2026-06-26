@@ -385,7 +385,7 @@ mod tests {
             meta.titles.get("fra").map(String::as_str),
             Some("Aurora Drift (Partie Deux)")
         );
-        assert!(meta.descriptions.get("eng").is_none());
+        assert!(!meta.descriptions.contains_key("eng"));
         assert_eq!(
             meta.descriptions.get("fra").map(String::as_str),
             Some("Suite du film fictif.")

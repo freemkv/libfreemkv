@@ -87,6 +87,7 @@
 
 pub mod aacs;
 pub(crate) mod clpi;
+pub mod consts;
 pub mod css;
 pub mod decrypt;
 pub mod diag;
@@ -167,7 +168,7 @@ pub use identity::DriveId;
 // and registers it once at process start via `register_unlocker`. At
 // drive-prep the registry is walked in order; the first matching unlocker
 // runs, else the drive falls through to the host-cert AACS handshake.
-pub use unlock::{Unlocker, register_unlocker};
+pub use unlock::{UnlockError, Unlocker, register_unlocker};
 
 // ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
 //

@@ -729,8 +729,16 @@ fn parse_track(
     };
     let res = Resolution::from_height(ph);
     let chs = AudioChannels::from_count(ch);
-    let srs = if sr >= 96000.0 {
+    let srs = if sr >= 192000.0 {
+        SampleRate::S192
+    } else if sr >= 176400.0 {
+        SampleRate::S176_4
+    } else if sr >= 96000.0 {
         SampleRate::S96
+    } else if sr >= 88200.0 {
+        SampleRate::S88_2
+    } else if (44100.0..48000.0).contains(&sr) {
+        SampleRate::S44_1
     } else {
         SampleRate::S48
     };

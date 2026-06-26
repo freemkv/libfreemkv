@@ -1,7 +1,7 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
 use super::decrypt::aes_ecb_decrypt;
-use super::keydb::DeviceKey;
+use super::types::DeviceKey;
 
 // ── AACS version ────────────────────────────────────────────────────────────
 
@@ -1529,15 +1529,9 @@ fn match_keydb_unit_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::super::decrypt::{ALIGNED_UNIT_LEN, aes_ecb_encrypt};
-    use super::super::keydb::{DiscEntry, KeyDb};
+    use super::super::provider::SuppliedKey;
+    use super::super::types::DiscEntry;
     use super::*;
-
-    /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
-    fn keydb_path() -> Option<std::path::PathBuf> {
-        let path = std::path::PathBuf::from(std::env::var("KEYDB_PATH").ok()?);
-        if path.exists() { Some(path) } else { None }
-    }
 
     /// Finding #5 regression: parse_unit_key_ro must REJECT a Unit_Key_RO.inf
     /// whose declared `num_unit_keys` exceeds the keys actually present in the
@@ -1605,134 +1599,23 @@ mod tests {
     }
 
     #[test]
-    fn test_vuk_derivation() {
-        // Pick any UHD entry with a known MK, VID, and VUK from KEYDB.
-        // VUK = AES-DEC(MK, VID) XOR VID
-        let path = match keydb_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let db = KeyDb::load(&path).unwrap();
-
-        // Find a disc with both MK, disc_id, and VUK so we can verify derivation
-        let entry = db
-            .disc_entries
-            .values()
-            .find(|e| e.media_key.is_some() && e.disc_id.is_some() && e.vuk.is_some())
-            .expect("No disc with MK + VID + VUK");
-
-        let mk = entry.media_key.unwrap();
-        let vid = entry.disc_id.unwrap();
-        let expected_vuk = entry.vuk.unwrap();
-
-        let derived = derive_vuk(&mk, &vid);
-        assert_eq!(
-            derived, expected_vuk,
-            "VUK derivation failed for disc: {} (hash {})",
-            entry.title, entry.disc_hash
-        );
-        eprintln!("VUK derivation verified for: {}", entry.title);
-    }
-
-    #[test]
     fn test_decrypt_unit_key_from_vuk() {
-        // Test the full chain: VUK → decrypt encrypted unit key → unit key
-        // Use a known disc from KEYDB that has both VUK and unit keys
-        let path = match keydb_path() {
-            Some(p) => p,
-            None => return,
-        };
-
-        let db = KeyDb::load(&path).unwrap();
-
-        // Find a disc with VUK and unit keys
-        let entry = db
-            .disc_entries
-            .values()
-            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty())
-            .expect("No disc with VUK + unit keys");
-
-        eprintln!(
-            "Testing unit key decrypt for: {} ({})",
-            entry.title, entry.disc_hash
-        );
-        eprintln!("  VUK: {:02X?}", entry.vuk.unwrap());
-        for (num, key) in &entry.unit_keys {
-            eprintln!("  Unit key {}: {:02X?}", num, key);
-        }
-
-        // The unit keys in KEYDB are already decrypted — we can verify the chain
-        // by encrypting with VUK and then decrypting
-        let vuk = entry.vuk.unwrap();
-        for (num, expected_uk) in &entry.unit_keys {
-            let encrypted = aes_ecb_encrypt(&vuk, expected_uk);
+        // VUK → encrypted unit key → unit key roundtrip. The keydb-sourced
+        // variant of this test (which scanned a real KEYDB for VUK + unit
+        // keys) moved to freemkv-keysources; this rebuilt version exercises
+        // the same AES-G primitive (decrypt_unit_key ∘ aes_ecb_encrypt under a
+        // VUK) with directly-constructed material, so it needs no parser and
+        // keeps the crypto covered in libfreemkv. `aes_ecb_encrypt` is
+        // pub(crate), reachable here but not from keysources — the reason this
+        // half stays.
+        use super::super::decrypt::aes_ecb_encrypt;
+        let vuk = [0x5Au8; 16];
+        // A few representative "decrypted" unit keys.
+        for expected_uk in [[0x11u8; 16], [0x22u8; 16], [0xCDu8; 16]] {
+            let encrypted = aes_ecb_encrypt(&vuk, &expected_uk);
             let decrypted = decrypt_unit_key(&vuk, &encrypted);
-            assert_eq!(
-                &decrypted, expected_uk,
-                "Unit key {} roundtrip failed for {}",
-                num, entry.title
-            );
+            assert_eq!(decrypted, expected_uk, "unit key roundtrip under VUK");
         }
-        eprintln!("  All {} unit key roundtrips passed", entry.unit_keys.len());
-    }
-
-    #[test]
-    fn test_decrypt_real_unit() {
-        // Try decrypting a real encrypted aligned unit from a UHD sample.
-        // This disc is AACS 2.0 (BEE) so unit key alone won't work —
-        // we need bus decryption first. But this verifies the pipeline.
-        // Path comes from ENCRYPTED_UNIT_PATH (same env-driven pattern as the
-        // KEYDB_PATH / MKB_SAMPLE_DIR fixtures); no-ops in CI when unset.
-        let unit_path = match std::env::var("ENCRYPTED_UNIT_PATH").ok() {
-            Some(p) => std::path::PathBuf::from(p),
-            None => return,
-        };
-        if !unit_path.exists() {
-            return;
-        }
-
-        let original = std::fs::read(&unit_path).unwrap();
-        assert_eq!(original.len(), ALIGNED_UNIT_LEN);
-        assert!(
-            super::super::decrypt::is_aacs_scrambled(&original),
-            "Unit should be encrypted"
-        );
-
-        let kp = match keydb_path() {
-            Some(p) => p,
-            None => return,
-        };
-        let db = KeyDb::load(&kp).unwrap();
-
-        // Candidate entries: any UHD entry that carries unit keys.
-        let candidate_entries: Vec<&DiscEntry> = db
-            .disc_entries
-            .values()
-            .filter(|e| !e.unit_keys.is_empty())
-            .collect();
-
-        eprintln!("Found {} entries with unit keys", candidate_entries.len());
-
-        // Try each entry's unit keys
-        for entry in &candidate_entries {
-            let keys: Vec<[u8; 16]> = entry.unit_keys.iter().map(|(_, k)| *k).collect();
-            let mut unit = original.clone();
-
-            if let Some(res) = super::super::decrypt::decrypt_unit_try_keys(&mut unit, &keys) {
-                eprintln!(
-                    "SUCCESS: Decrypted with entry {} ({res:?})",
-                    entry.disc_hash
-                );
-                // Count TS sync bytes
-                let ts = (0..32).filter(|&i| unit[4 + i * 192] == 0x47).count();
-                eprintln!("  TS sync bytes: {}/32", ts);
-                return;
-            }
-        }
-
-        // Expected: none work because this is AACS 2.0 and needs bus decryption first
-        eprintln!("No unit key worked (expected for AACS 2.0 BEE disc — needs read_data_key)");
     }
 
     #[test]
@@ -1834,7 +1717,7 @@ mod tests {
         mkb.extend_from_slice(&[0xAB; 16]);
         mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         let records_len = mkb.len();
-        mkb.extend(std::iter::repeat(0u8).take(128 * 1024)); // padding
+        mkb.extend(std::iter::repeat_n(0u8, 128 * 1024)); // padding
         assert_eq!(mkb_content_len(&mkb), records_len);
         // No padding → returns the full length.
         assert_eq!(mkb_content_len(&mkb[..records_len]), records_len);
@@ -1869,7 +1752,7 @@ mod tests {
         mkb.extend_from_slice(&[0xAB; 16]);
         mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         let records_len = mkb.len();
-        mkb.extend(std::iter::repeat(0u8).take(1024));
+        mkb.extend(std::iter::repeat_n(0u8, 1024));
         assert_eq!(
             trim_mkb(mkb).len(),
             records_len,
@@ -2197,44 +2080,6 @@ mod tests {
         assert_eq!(mkb_find_mk_dv(&mkb), Some(expected));
     }
 
-    #[test]
-    fn test_resolve_keys_vuk_path() {
-        // Test the full resolve chain using VUK path
-        let path = match keydb_path() {
-            Some(p) => p,
-            None => return,
-        };
-        let db = KeyDb::load(&path).unwrap();
-
-        // Find any BD entry that carries a VUK and unit keys, then exercise
-        // the lookup-by-hash + VUK-derivation chain against it.
-        let entry = db
-            .disc_entries
-            .values()
-            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.disc_id.is_some());
-        if entry.is_none() {
-            return;
-        }
-        let entry = entry.unwrap();
-        let vuk = entry.vuk.unwrap();
-        let vid = entry.disc_id.unwrap();
-        let hash_hex = format!("0x{}", entry.disc_hash.trim_start_matches("0x"));
-
-        // We need the actual Unit_Key_RO.inf from the disc to compute disc hash.
-        // Since we don't have it, we can at least test that the KEYDB lookup
-        // works with a known hash.
-        let found = db.find_disc(&hash_hex);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().vuk, Some(vuk));
-
-        // Verify VUK derivation if we have MK + VID
-        if let Some(mk) = entry.media_key {
-            let derived = derive_vuk(&mk, &vid);
-            assert_eq!(derived, vuk, "VUK derivation mismatch");
-            eprintln!("VUK derivation verified");
-        }
-    }
-
     /// Build a minimal Unit_Key_RO.inf with `num_unit_keys = 1`. The
     /// disc hash won't be in any synthetic keydb so path 1 misses,
     /// which lets us isolate the path-2/3/4 short-circuit behavior.
@@ -2262,23 +2107,18 @@ mod tests {
         let uk_ro = minimal_unit_key_ro();
         let zero_vid = [0u8; 16];
 
-        // Populate keydb with a non-matching VID entry (path 2 would
-        // miss anyway) plus dummy processing/device keys (paths 3/4
-        // would also miss, but the short-circuit means they're never
-        // attempted).
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            "0xDEADBEEF".to_string(),
-            DiscEntry {
-                disc_hash: "0xDEADBEEF".to_string(),
-                title: "fixture".to_string(),
-                media_key: Some([0x11u8; 16]),
-                disc_id: Some([0x22u8; 16]),
-                vuk: None,
-                unit_keys: Vec::new(),
-            },
-        );
-        keydb.processing_keys.push([0u8; 16]);
+        // A provider carrying a dummy processing key but NO disc entry that
+        // matches this disc. `disc_entry: None` preserves the negative-miss
+        // the test asserts: with VID=0, paths 1/2/3 are skipped and the
+        // path-4/5 hash lookup must MISS (a SuppliedKey returns its
+        // disc_entry unconditionally, so the planted entry would WRONGLY hit
+        // path 4 — None keeps the miss).
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: vec![[0u8; 16]],
+            media_keys: Vec::new(),
+            disc_entry: None,
+        };
 
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
@@ -2307,19 +2147,20 @@ mod tests {
         // keyed lowercase too, so we have to lowercase here.
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
 
-        let mut keydb = KeyDb::empty();
         let known_vuk = [0xABu8; 16];
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "fixture".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some(known_vuk),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
 
         let vid = [0u8; 16];
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
@@ -2349,18 +2190,19 @@ mod tests {
         // `minimal_unit_key_ro` declares CPS unit 1; supply a matching
         // pre-decrypted unit key in the KEYDB entry.
         let known_uk = [0xCDu8; 16];
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "fixture".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: None,
                 unit_keys: vec![(1, known_uk)],
-            },
-        );
+            }),
+        };
 
         let vid = [0u8; 16];
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
@@ -2377,7 +2219,6 @@ mod tests {
         assert_eq!(resolved.key_source, 5);
         assert_eq!(resolved.unit_keys, vec![(1, known_uk)]);
     }
-
     #[test]
     fn resolve_keys_path5_rejects_partial_unit_key_coverage() {
         // If the disc declares a CPS unit that's not in the KEYDB
@@ -2388,20 +2229,20 @@ mod tests {
         let uk_ro = minimal_unit_key_ro();
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
-
         // KEYDB has a key for CPS unit 99, but the disc declares unit 1.
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "fixture".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: None,
                 unit_keys: vec![(99, [0xEEu8; 16])],
-            },
-        );
+            }),
+        };
 
         let vid = [0u8; 16];
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
@@ -2417,17 +2258,14 @@ mod tests {
             "partial CPS-unit coverage must not produce a half-decrypted result"
         );
     }
-
     #[test]
     fn resolve_keys_path2_5_mk_pool_brute_resolves_unkeyed_disc() {
         // The keyless-disc case: this disc's own hash/VID are NOT in keydb, but its
         // Media Key IS — filed under a sibling disc that shares its MKB. Path
         // 2.5 must km_verifies that MK against the MKB and resolve.
         use super::super::decrypt::aes_ecb_encrypt as enc;
-
         let km = [0x11u8; 16];
         let vid = [0x22u8; 16];
-
         // MKB: 0x10 type/version + 0x86 verify record whose mk_dv decrypts under
         // km to the AACS verify magic, so km_verifies(mkb, km) == true.
         let mut vd = [0u8; 16];
@@ -2439,26 +2277,21 @@ mod tests {
             probe::km_verifies(&mkb, &km),
             "fixture: km must verify the MKB"
         );
-
         // This disc's inf (its hash will NOT be in keydb).
         let uk_ro = minimal_unit_key_ro();
-
-        // keydb: a SIBLING disc carries our km, keyed by the sibling's own
-        // hash + VID (neither matches THIS disc) — so only the MK-pool brute
-        // (km_verifies) can find it.
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            "0xsibling".to_string(),
-            DiscEntry {
-                disc_hash: "0xsibling".to_string(),
-                title: "sibling".to_string(),
-                media_key: Some(km),
-                disc_id: Some([0x99u8; 16]),
-                vuk: None,
-                unit_keys: Vec::new(),
-            },
-        );
-
+        // The sibling's MK is lifted directly into the MK pool: a KeyDb
+        // aggregated per-disc media_keys into media_keys(), but SuppliedKey
+        // does NOT harvest its disc_entry's media_key — it has an explicit
+        // media_keys field. `disc_entry: None` preserves the miss on this
+        // disc's own hash/VID (the sibling matches neither), so ONLY the
+        // MK-pool brute (km_verifies) can resolve it — exactly the path under
+        // test.
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: vec![km],
+            disc_entry: None,
+        };
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
@@ -2479,7 +2312,6 @@ mod tests {
             "VUK must derive from the verified Km + this disc's VID"
         );
     }
-
     #[test]
     fn test_content_cert_parse() {
         // AACS 1.0 cert
@@ -2489,7 +2321,6 @@ mod tests {
         let cc = parse_content_cert(&data).unwrap();
         assert_eq!(cc.version, AacsVersion::V10);
         assert!(!cc.bus_encryption);
-
         // AACS 2.0 with bus encryption
         data[0] = 0x01; // AACS 2.0
         data[1] = 0x01; // bus encryption enabled
@@ -2497,13 +2328,10 @@ mod tests {
         assert_eq!(cc.version, AacsVersion::V20);
         assert!(cc.bus_encryption);
     }
-
     // ════════════════════════════════════════════════════════════════════
     // Hardening additions
     // ════════════════════════════════════════════════════════════════════
-
     // ── VUK derivation: spec relation VUK = AES-D(MK, VID) XOR VID ─────────
-
     #[test]
     fn derive_vuk_matches_spec_relation_explicitly() {
         // Independently compute AES-ECB-D(mk, vid) XOR vid and confirm
@@ -2524,7 +2352,6 @@ mod tests {
         }
         assert_eq!(derive_vuk(&mk, &vid), expected);
     }
-
     #[test]
     fn decrypt_unit_key_is_plain_aes_ecb_decrypt_under_vuk() {
         // The encrypted unit key in Unit_Key_RO.inf is AES-ECB-E(VUK, uk);
@@ -2536,9 +2363,7 @@ mod tests {
         let enc_uk = enc(&vuk, &uk);
         assert_eq!(decrypt_unit_key(&vuk, &enc_uk), uk);
     }
-
     // ── Unit_Key_RO stride: 48 (V10) vs 64 (V20/V21) ──────────────────────
-
     /// Build a Unit_Key_RO.inf carrying `num_uk` keys at a given stride,
     /// where key `i` is filled with byte `0x10 + i`. uk_pos = 0x60.
     fn build_unit_key_ro(num_uk: usize, stride: usize) -> Vec<u8> {
@@ -2561,7 +2386,6 @@ mod tests {
         }
         data
     }
-
     #[test]
     fn stride_v10_is_48_v20_is_64_and_picks_distinct_keys() {
         // AACS 1.0 stride = 48, AACS 2.0/2.1 stride = 64 (keys.rs:30-35).
@@ -2574,7 +2398,6 @@ mod tests {
         assert_eq!(v20.encrypted_keys.len(), 2);
         assert_eq!(v20.encrypted_keys[0].1, [0x10; 16]);
         assert_eq!(v20.encrypted_keys[1].1, [0x11; 16]);
-
         // Same buffer, V10 stride: key 1 still lands at uk_pos+48, but key 2
         // is read at +48 (not +64) so it is NOT the planted 0x11 block.
         let v10 = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
@@ -2584,7 +2407,6 @@ mod tests {
             "48-byte stride must read different bytes than 64-byte stride"
         );
     }
-
     #[test]
     fn v21_uses_same_64_byte_stride_as_v20() {
         // V21 shares V20's 64-byte stride (the enum match groups V20|V21).
@@ -2594,15 +2416,12 @@ mod tests {
         assert_eq!(v20.encrypted_keys, v21.encrypted_keys);
         assert_eq!(v21.version, AacsVersion::V21);
     }
-
     // ── parse_unit_key_ro: early returns / boundaries ──────────────────────
-
     #[test]
     fn parse_unit_key_ro_rejects_too_short_header() {
         // < 20 bytes → None (header fields at 16-18 would index OOB).
         assert!(parse_unit_key_ro(&[0u8; 19], AacsVersion::V10).is_none());
     }
-
     #[test]
     fn parse_unit_key_ro_rejects_uk_pos_past_end() {
         // uk_pos points past the buffer → the `uk_pos + 2 > len` guard
@@ -2611,7 +2430,6 @@ mod tests {
         data[0..4].copy_from_slice(&1000u32.to_be_bytes()); // uk_pos = 1000
         assert!(parse_unit_key_ro(&data, AacsVersion::V10).is_none());
     }
-
     #[test]
     fn parse_unit_key_ro_zero_keys_returns_empty_set() {
         // num_unit_keys == 0 → a valid file with no encrypted keys (early
@@ -2625,7 +2443,6 @@ mod tests {
         assert!(parsed.encrypted_keys.is_empty());
         assert_eq!(parsed.app_type, 1);
     }
-
     #[test]
     fn parse_unit_key_ro_truncated_key_region_returns_none() {
         // keys_start + 16 > len → None (the first key can't fit).
@@ -2635,7 +2452,6 @@ mod tests {
         data[uk_pos + 1] = 1; // 1 key declared
         assert!(parse_unit_key_ro(&data, AacsVersion::V10).is_none());
     }
-
     #[test]
     fn parse_unit_key_ro_rejects_when_keys_run_off_end() {
         // Finding #5: 3 keys declared but the buffer holds only 2 strides plus
@@ -2656,7 +2472,6 @@ mod tests {
             "a buffer declaring more keys than it contains must be rejected"
         );
     }
-
     #[test]
     fn parse_unit_key_ro_app_type_and_skb_flag() {
         // app_type at [16], num_bdmv_dir at [17], use_skb_mkb = bit 7 of [18].
@@ -2673,7 +2488,6 @@ mod tests {
         let p2 = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
         assert!(!p2.use_skb_mkb);
     }
-
     #[test]
     fn parse_unit_key_ro_cps_unit_numbers_are_1_based() {
         // The disc's CPS unit numbers are emitted as (i+1) — keys.rs:162.
@@ -2684,7 +2498,6 @@ mod tests {
             vec![1, 2, 3]
         );
     }
-
     #[test]
     fn parse_unit_key_ro_title_cps_mapping_first_play_top_menu_then_titles() {
         // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then
@@ -2698,9 +2511,7 @@ mod tests {
         let p = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
         assert_eq!(p.title_cps_unit, vec![7, 9, 3, 4]);
     }
-
     // ── MKB record framing: rec_len is BE24 incl. 4-byte header ────────────
-
     #[test]
     fn mkb_version_uses_be24_length_and_reads_offset_8() {
         // Type 0x10, BE24 length 0x0C (12). Body starts at pos+4: Type field
@@ -2712,7 +2523,6 @@ mod tests {
         // version = 0x01020304.
         assert_eq!(mkb_version(&mkb), Some(0x0102_0304));
     }
-
     #[test]
     fn mkb_type_category_c_20_is_uhd() {
         // Type 0x10 record, BE24 length 0x0C (12). MKBType field (body
@@ -2729,7 +2539,6 @@ mod tests {
         assert_eq!(MkbType::from_raw(MKB_21_CATEGORY_C), MkbType::CategoryC21);
         assert_eq!(MkbType::CategoryC21.generation(), AacsVersion::V21);
     }
-
     #[test]
     fn mkb_type_prerecorded_is_bluray_v10() {
         // Type 0x10 record with MKB_TYPE_4_PRERECORDED (0x00041003) — a
@@ -2742,7 +2551,6 @@ mod tests {
         assert!(!MkbType::Prerecorded.is_uhd());
         assert_eq!(MkbType::Prerecorded.generation(), AacsVersion::V10);
     }
-
     #[test]
     fn mkb_type_none_when_no_0x10_record() {
         // A buffer whose only record is a 0x81 (verify-media-key) record and
@@ -2752,7 +2560,6 @@ mod tests {
         assert_eq!(mkb_type(&mkb), None);
         assert_eq!(mkb_is_uhd(&mkb), None);
     }
-
     #[test]
     fn mkb_find_mk_dv_skips_short_verify_record() {
         // A 0x81 record with rec_len < 20 carries no full mk_dv; the finder
@@ -2765,7 +2572,6 @@ mod tests {
         mkb.extend_from_slice(&[0x00; 4]);
         assert_eq!(mkb_find_mk_dv(&mkb), Some(expected));
     }
-
     #[test]
     fn mkb_find_mk_dv_stops_on_overrun_length() {
         // A rec_len that runs past the buffer ends the walk (break), so no
@@ -2773,7 +2579,6 @@ mod tests {
         let mkb = [0x81, 0x00, 0xFF, 0xFF, 0x00, 0x00]; // claims 65535 bytes
         assert_eq!(mkb_find_mk_dv(&mkb), None);
     }
-
     #[test]
     fn mkb_find_mk_dv_stops_on_zero_length_record() {
         // rec_len < 4 (here 0) breaks the walk — guards against an infinite
@@ -2781,9 +2586,7 @@ mod tests {
         let mkb = [0x81, 0x00, 0x00, 0x00, 0x99];
         assert_eq!(mkb_find_mk_dv(&mkb), None);
     }
-
     // ── mkb_content_len / trim_mkb ─────────────────────────────────────────
-
     #[test]
     fn mkb_content_len_stops_at_zero_type_padding_byte() {
         // A type==0 byte marks the start of padding (records done). Two real
@@ -2794,14 +2597,12 @@ mod tests {
         mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]); // padding starts (type 0)
         assert_eq!(mkb_content_len(&mkb), content);
     }
-
     #[test]
     fn mkb_content_len_returns_full_len_when_no_padding() {
         let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
         mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 9, 9, 9, 9]);
         assert_eq!(mkb_content_len(&mkb), mkb.len());
     }
-
     #[test]
     fn trim_mkb_leaves_exactly_sized_buffer_untouched() {
         // n == mkb.len() (no padding) → the `n < mkb.len()` guard is false,
@@ -2809,15 +2610,12 @@ mod tests {
         let mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
         assert_eq!(trim_mkb(mkb.clone()), mkb);
     }
-
     // ── Content Certificate parsing ────────────────────────────────────────
-
     #[test]
     fn parse_content_cert_rejects_short_buffer() {
         // < 8 bytes → None (cc_id slice [2..8] would index OOB).
         assert!(parse_content_cert(&[0x00; 7]).is_none());
     }
-
     #[test]
     fn parse_content_cert_extracts_cc_id_and_nonzero_type_is_v20() {
         // [0]=type, [1]=bus-enc bit0, [2..8]=cc_id. Any non-0x00 type → V20.
@@ -2830,7 +2628,6 @@ mod tests {
         assert_eq!(cc.cc_id, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         assert!(!cc.bus_encryption);
     }
-
     #[test]
     fn parse_content_cert_bus_encryption_only_reads_bit0() {
         // bus_encryption = (data[1] & 0x01) != 0. A high bit set (0x02) with
@@ -2841,9 +2638,7 @@ mod tests {
         data[1] = 0x03; // bit 0 set
         assert!(parse_content_cert(&data).unwrap().bus_encryption);
     }
-
     // ── resolve: version → stride wiring + V21 upgrade on variant MKB ──────
-
     #[test]
     fn resolve_keys_v2_upgrades_to_v21_on_variant_mkb() {
         // resolve_keys_v2 parses with the V20 64-byte stride but upgrades the
@@ -2852,19 +2647,19 @@ mod tests {
         let uk_ro = build_unit_key_ro(1, 64);
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
-
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "fixture".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some([0x5Au8; 16]),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
 
         // MKB with a 0x83 variant record makes is_variant_mkb true.
         let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
@@ -2893,18 +2688,19 @@ mod tests {
         let uk_ro = build_unit_key_ro(1, 64);
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "f".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some([0x5Au8; 16]),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
         let mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
@@ -2923,18 +2719,19 @@ mod tests {
         let uk_ro = build_unit_key_ro(1, 48);
         let hash = disc_hash(&uk_ro);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "f".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some([1u8; 16]),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
         // Content cert: AACS2 + bus encryption enabled.
         let mut cc = vec![0u8; 8];
         cc[0] = 0x01;
@@ -2960,18 +2757,19 @@ mod tests {
         let hash = disc_hash(&data);
         let hash_hex = disc_hash_hex(&hash).to_lowercase();
         let vuk = [0x77u8; 16];
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "f".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some(vuk),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &data,
@@ -2997,18 +2795,19 @@ mod tests {
         let uk_ro = minimal_unit_key_ro();
         let vid = [0x42u8; 16];
         let mk = [0x24u8; 16];
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            "0xnotthishash".to_string(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: "0xnotthishash".to_string(),
                 title: "sibling".to_string(),
                 media_key: Some(mk),
                 disc_id: Some(vid),
                 vuk: None,
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
@@ -3282,18 +3081,19 @@ mod tests {
         let uk_ro = build_unit_key_ro(1, 64);
         let hash_hex = disc_hash_hex(&disc_hash(&uk_ro)).to_lowercase();
         let vuk = [0x77u8; 16];
-        let mut keydb = KeyDb::empty();
-        keydb.disc_entries.insert(
-            hash_hex.clone(),
-            DiscEntry {
+        let keydb = SuppliedKey {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            media_keys: Vec::new(),
+            disc_entry: Some(DiscEntry {
                 disc_hash: hash_hex,
                 title: "f".to_string(),
                 media_key: None,
                 disc_id: None,
                 vuk: Some(vuk),
                 unit_keys: Vec::new(),
-            },
-        );
+            }),
+        };
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
