@@ -694,6 +694,8 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         display_aspect: None,
                         secondary: false,
                         label: String::new(),
+                        top_field_first: None,
+                        measured_cicp: None,
                     }))
                 }
                 CodecKind::Audio => Some(Stream::Audio(AudioStream {

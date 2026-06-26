@@ -394,6 +394,10 @@ pub const SEGMENT: u32 = 0x1853_8067;
 // SeekHead
 pub const SEEK_HEAD: u32 = 0x114D_9B74;
 pub const SEEK: u32 = 0x4DBB;
+/// Void — RFC 9559 (Matroska) §EBML global element 0xEC. Used to neutralise a
+/// reserved-but-unused region (e.g. the CUES SeekHead entry when no Cues element
+/// is written) so it carries no meaning to a parser.
+pub const VOID: u32 = 0xEC;
 pub const SEEK_ID: u32 = 0x53AB;
 pub const SEEK_POSITION: u32 = 0x53AC;
 
@@ -436,16 +440,13 @@ pub const FIELD_ORDER: u32 = 0x9D;
 pub const INTERLACED_INTERLACED: u64 = 1;
 pub const INTERLACED_PROGRESSIVE: u64 = 2;
 // FieldOrder values (Matroska / RFC 9559, element 0x9D): 1 = top-field-first,
-// 6 = bottom-field-first, 2 = undetermined, 0 = progressive. NTSC DVD (480i),
-// PAL DVD (576i) and HD (1080i) are all emitted top-field-first — the muxer
-// hardcodes TFF for every interlaced DVD/HD source (DV is the only common BFF
-// source and freemkv does not produce it). 0xFF is our sentinel for
-// "undetermined / omit".
+// 6 = bottom-field-first, 0 = progressive. The muxer derives TFF vs BFF from the
+// bitstream's measured top_field_first when available, falling back to TFF for
+// interlaced content (NTSC 480i / PAL 576i / HD 1080i are overwhelmingly TFF).
+// 0xFF is our sentinel for "undetermined / omit the element".
 pub const FIELD_ORDER_TFF: u8 = 1;
-// Bottom-field-first. Retained for completeness/round-trip tests; the muxer
-// emits TFF for all DVD/HD interlaced content (DV is the only common BFF
-// source and freemkv does not produce it).
-#[allow(dead_code)]
+/// Bottom-field-first (RFC 9559 element 0x9D = 6). Emitted when the bitstream's
+/// measured top_field_first is false.
 pub const FIELD_ORDER_BFF: u8 = 6;
 pub const FIELD_ORDER_UNDETERMINED: u8 = 0xFF;
 pub const DISPLAY_WIDTH: u32 = 0x54B0;

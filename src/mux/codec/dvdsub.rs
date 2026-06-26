@@ -182,20 +182,37 @@ fn clamp_u8(v: f64) -> u8 {
     }
 }
 
-/// Format a 16-color YCbCr palette as a VobSub .idx palette header.
+/// Format a 16-color YCbCr palette as a VobSub `.idx` header for S_VOBSUB
+/// CodecPrivate.
 ///
-/// Each entry is `[padding, Y, Cb, Cr]`. Output is a UTF-8 text block:
-/// `palette: rrggbb, rrggbb, ...\n`
+/// Each entry is `[padding, Y, Cb, Cr]`. Output is a UTF-8 text block carrying
+/// the two `.idx` header lines mkvmerge / libvobsub expect:
+///
+/// ```text
+/// size: <width>x<height>
+/// palette: rrggbb, rrggbb, ...
+/// ```
+///
+/// The `size:` line is the VobSub original-frame resolution (the video frame the
+/// subpicture coordinates were authored against). Players read it to place and
+/// scale the bitmap; without it, some renderers assume a default frame and
+/// mis-position or mis-scale the subtitles. `width`/`height` are the title's
+/// coded video dimensions. When either is 0 (unknown) the `size:` line is
+/// omitted rather than emitting a `0x0` frame.
 ///
 /// Returns the formatted bytes suitable for MKV codec_private.
-pub fn format_palette(palette: &[[u8; 4]]) -> Vec<u8> {
+pub fn format_palette(palette: &[[u8; 4]], width: u32, height: u32) -> Vec<u8> {
     let mut parts: Vec<String> = Vec::with_capacity(palette.len());
     for color in palette {
         let [r, g, b] = ycbcr_to_rgb(color);
         parts.push(format!("{r:02x}{g:02x}{b:02x}"));
     }
-    let line = format!("palette: {}\n", parts.join(", "));
-    line.into_bytes()
+    let mut out = String::new();
+    if width > 0 && height > 0 {
+        out.push_str(&format!("size: {width}x{height}\n"));
+    }
+    out.push_str(&format!("palette: {}\n", parts.join(", ")));
+    out.into_bytes()
 }
 
 #[cfg(test)]
@@ -436,7 +453,7 @@ mod tests {
             [0x00, 0, 128, 128],   // Y=0 → RGB (0,0,0)
             [0x00, 255, 128, 128], // Y=255 → RGB (255,255,255)
         ];
-        let result = format_palette(&palette);
+        let result = format_palette(&palette, 0, 0);
         let text = String::from_utf8(result).unwrap();
         assert!(
             text.starts_with("palette: "),
@@ -460,7 +477,7 @@ mod tests {
     #[test]
     fn format_palette_16_colors() {
         let palette: Vec<[u8; 4]> = (0..16).map(|i| [0x00, (i * 16) as u8, 128, 128]).collect();
-        let result = format_palette(&palette);
+        let result = format_palette(&palette, 0, 0);
         let text = String::from_utf8(result).unwrap();
         // Should have exactly 15 commas (16 colors separated by ", ")
         let comma_count = text.matches(", ").count();
@@ -475,9 +492,32 @@ mod tests {
     fn format_palette_hex_format() {
         // Y=128, Cb=128, Cr=128 → R=128, G=128, B=128 → "808080"
         let palette = vec![[0x00, 128, 128, 128]];
-        let result = format_palette(&palette);
+        let result = format_palette(&palette, 0, 0);
         let text = String::from_utf8(result).unwrap();
         assert_eq!(text, "palette: 808080\n");
+    }
+
+    #[test]
+    fn format_palette_emits_size_line_before_palette() {
+        // With non-zero dimensions the `.idx` `size:` line is prepended ahead of
+        // the palette so players place/scale the VobSub bitmap (PAL 720x576).
+        let palette = vec![[0x00, 128, 128, 128]];
+        let result = format_palette(&palette, 720, 576);
+        let text = String::from_utf8(result).unwrap();
+        assert_eq!(
+            text, "size: 720x576\npalette: 808080\n",
+            "size: line must precede palette: line"
+        );
+    }
+
+    #[test]
+    fn format_palette_omits_size_line_when_dimensions_unknown() {
+        // 0 width/height (unknown resolution) omits the size line rather than
+        // emitting a 0x0 frame; the palette line is still present.
+        let palette = vec![[0x00, 128, 128, 128]];
+        let result = format_palette(&palette, 0, 576);
+        let text = String::from_utf8(result).unwrap();
+        assert_eq!(text, "palette: 808080\n", "no size line when a dim is 0");
     }
 
     // --- SPU_size boundary: completes exactly at declared size ---
@@ -641,7 +681,7 @@ mod tests {
     #[test]
     fn format_palette_empty_is_just_prefix() {
         // An empty palette yields "palette: \n" (prefix + newline, no entries).
-        let result = format_palette(&[]);
+        let result = format_palette(&[], 0, 0);
         assert_eq!(String::from_utf8(result).unwrap(), "palette: \n");
     }
 
@@ -649,7 +689,7 @@ mod tests {
     fn format_palette_pads_each_channel_to_two_hex_digits() {
         // Each RGB channel is formatted as exactly 2 hex digits (zero-padded).
         // Y=16,neutral → 0x10 → "101010" (each channel two digits).
-        let result = format_palette(&[[0x00, 16, 128, 128]]);
+        let result = format_palette(&[[0x00, 16, 128, 128]], 0, 0);
         assert_eq!(String::from_utf8(result).unwrap(), "palette: 101010\n");
     }
 }

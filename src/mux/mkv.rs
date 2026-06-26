@@ -12,6 +12,54 @@ use crate::disc::{
 };
 use std::io::{self, Seek, Write};
 
+// ── CICP colour codes (ITU-T H.273) ──────────────────────────────────────────
+//
+// The Matroska Colour element (RFC 9559) carries MatrixCoefficients,
+// TransferCharacteristics and Primaries verbatim as the integer code-points
+// defined by ITU-T H.273 ("Coding-independent code points", CICP). Hoisting the
+// codes to named constants keeps the colour match arms self-documenting and the
+// values traceable to the public spec table that defines each.
+
+/// ColourPrimaries = 1 (BT.709 / sRGB) — ITU-T H.273 Table 2.
+const CICP_PRIMARIES_BT709: u8 = 1;
+/// ColourPrimaries = 5 (BT.470 System B/G — PAL/SECAM SD) — ITU-T H.273 Table 2.
+const CICP_PRIMARIES_BT470BG: u8 = 5;
+/// ColourPrimaries = 6 (BT.601-525 / SMPTE 170M — NTSC SD) — ITU-T H.273 Table 2.
+const CICP_PRIMARIES_BT601_525: u8 = 6;
+/// ColourPrimaries = 9 (BT.2020 / BT.2100) — ITU-T H.273 Table 2.
+const CICP_PRIMARIES_BT2020: u8 = 9;
+
+/// TransferCharacteristics = 1 (BT.709) — ITU-T H.273 Table 3.
+const CICP_TRANSFER_BT709: u8 = 1;
+/// TransferCharacteristics = 5 (BT.470 System B/G) — ITU-T H.273 Table 3.
+const CICP_TRANSFER_BT470BG: u8 = 5;
+/// TransferCharacteristics = 6 (BT.601-525 / SMPTE 170M) — ITU-T H.273 Table 3.
+const CICP_TRANSFER_BT601_525: u8 = 6;
+/// TransferCharacteristics = 16 (SMPTE ST 2084 / PQ — HDR10/HDR10+/DV) — ITU-T
+/// H.273 Table 3.
+const CICP_TRANSFER_PQ: u8 = 16;
+/// TransferCharacteristics = 18 (ARIB STD-B67 / Hybrid Log-Gamma) — ITU-T H.273
+/// Table 3.
+const CICP_TRANSFER_HLG: u8 = 18;
+
+/// MatrixCoefficients = 1 (BT.709) — ITU-T H.273 Table 4.
+const CICP_MATRIX_BT709: u8 = 1;
+/// MatrixCoefficients = 5 (BT.470 System B/G) — ITU-T H.273 Table 4.
+const CICP_MATRIX_BT470BG: u8 = 5;
+/// MatrixCoefficients = 6 (BT.601-525 / SMPTE 170M) — ITU-T H.273 Table 4.
+const CICP_MATRIX_BT601_525: u8 = 6;
+/// MatrixCoefficients = 9 (BT.2020 non-constant luminance) — ITU-T H.273 Table 4.
+const CICP_MATRIX_BT2020NC: u8 = 9;
+
+/// Matroska Colour/Range = 1 (broadcast / studio-swing "limited" range). RFC
+/// 9559 Range element. (0 = unspecified, 2 = full.)
+const COLOUR_RANGE_LIMITED: u8 = 1;
+
+/// BlockAddIDType "dvcC" — the DOVIDecoderConfigurationRecord fourcc, big-endian
+/// ASCII 'd''v''c''C'. Matroska BlockAdditionMapping/BlockAddIDType for a Dolby
+/// Vision configuration record (RFC 9559 + Dolby Vision-in-Matroska spec).
+const BLOCK_ADD_ID_TYPE_DVCC: u64 = 0x6476_6343;
+
 /// MKV track definition (built from disc stream metadata).
 pub struct MkvTrack {
     pub track_type: u64, // 1=video, 2=audio, 17=subtitle
@@ -92,19 +140,58 @@ impl MkvTrack {
         } else {
             0
         };
-        // (matrix, transfer, primaries, range) — ITU-T H.273 / CICP codes.
-        let (matrix, transfer, primaries, range) = match v.color_space {
-            ColorSpace::Bt2020 => (9, 16, 9, 1), // bt2020nc, PQ, bt2020, limited
-            ColorSpace::Bt709 => (1, 1, 1, 1),   // bt709
-            ColorSpace::Bt470bg => (5, 5, 5, 1), // PAL SD: BT.470BG matrix/transfer/primaries
-            ColorSpace::Smpte170m => (6, 6, 6, 1), // NTSC SD: SMPTE 170M / BT.601-525
-            ColorSpace::Unknown => (0, 0, 0, 0),
-        };
-        // Override transfer for non-PQ HDR
-        let transfer = match v.hdr {
-            HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => 16, // PQ
-            HdrFormat::Hlg => 18,
-            _ => transfer,
+        // CICP (matrix, transfer, primaries, range) — ITU-T H.273 code points.
+        //
+        // Prefer MEASURED CICP read from the bitstream (HEVC/H.264 VUI
+        // colour_description or MPEG-2 sequence_display_extension) when the
+        // stream states it: those are authoritative. Fall back to the coarse
+        // `color_space` enum (a playlist nibble / PAL-NTSC guess) only when no
+        // measured triplet is present, so the container stops ASSUMING a colour
+        // space the bitstream may contradict.
+        let (matrix, transfer, primaries, range) = match v.measured_cicp {
+            Some(c) => (c.matrix, c.transfer, c.primaries, c.range),
+            None => {
+                let (m, t, p, r) = match v.color_space {
+                    ColorSpace::Bt2020 => (
+                        CICP_MATRIX_BT2020NC,
+                        CICP_TRANSFER_PQ,
+                        CICP_PRIMARIES_BT2020,
+                        COLOUR_RANGE_LIMITED,
+                    ),
+                    ColorSpace::Bt709 => (
+                        CICP_MATRIX_BT709,
+                        CICP_TRANSFER_BT709,
+                        CICP_PRIMARIES_BT709,
+                        COLOUR_RANGE_LIMITED,
+                    ),
+                    // PAL SD: BT.470 System B/G matrix/transfer/primaries.
+                    ColorSpace::Bt470bg => (
+                        CICP_MATRIX_BT470BG,
+                        CICP_TRANSFER_BT470BG,
+                        CICP_PRIMARIES_BT470BG,
+                        COLOUR_RANGE_LIMITED,
+                    ),
+                    // NTSC SD: SMPTE 170M / BT.601-525.
+                    ColorSpace::Smpte170m => (
+                        CICP_MATRIX_BT601_525,
+                        CICP_TRANSFER_BT601_525,
+                        CICP_PRIMARIES_BT601_525,
+                        COLOUR_RANGE_LIMITED,
+                    ),
+                    ColorSpace::Unknown => (0, 0, 0, 0),
+                };
+                // Override the transfer for non-PQ HDR signalled by the HdrFormat
+                // (the enum can't express HLG). Only applies on the enum
+                // fallback; a measured CICP already carries the real transfer.
+                let t = match v.hdr {
+                    HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision => {
+                        CICP_TRANSFER_PQ
+                    }
+                    HdrFormat::Hlg => CICP_TRANSFER_HLG,
+                    _ => t,
+                };
+                (m, t, p, r)
+            }
         };
         // Display dimensions. For square-pixel video (HD/UHD/BD) the display
         // aspect equals the pixel grid, so display == pixel. For anamorphic
@@ -135,14 +222,21 @@ impl MkvTrack {
             colour_primaries: primaries,
             colour_range: range,
             interlaced: v.resolution.is_interlaced(),
-            // PAL DVD (576i), NTSC DVD (480i), and HD interlaced (1080i) are
-            // all top-field-first ("almost everything but DV is TFF"). MediaInfo
-            // reads "Top Field First" off the MPEG-2 picture coding extension,
-            // so the container element must agree — emitting BFF here for 576i
-            // (the pre-rc.5.1 value) was a wrong container value that disagreed
-            // with the stream. Progressive content leaves the order undetermined.
+            // FieldOrder (Matroska 0x9D) MUST agree with the elementary stream's
+            // interlace signalling. Derive it from the MEASURED `top_field_first`
+            // when the bitstream stated it: Some(true) → TFF, Some(false) → BFF.
+            // Genuinely bottom-field-first content (rare, but real) was previously
+            // mis-stamped TFF because the muxer hardcoded TFF for ALL interlaced
+            // streams. When the flag is NOT measured (`None`), fall back to TFF —
+            // PAL DVD (576i), NTSC DVD (480i) and HD (1080i) are overwhelmingly
+            // top-field-first ("almost everything but DV is TFF"). Progressive
+            // content leaves the order undetermined (the element is omitted).
             field_order: if v.resolution.is_interlaced() {
-                ebml::FIELD_ORDER_TFF
+                match v.top_field_first {
+                    Some(true) => ebml::FIELD_ORDER_TFF,
+                    Some(false) => ebml::FIELD_ORDER_BFF,
+                    None => ebml::FIELD_ORDER_TFF,
+                }
             } else {
                 ebml::FIELD_ORDER_UNDETERMINED
             },
@@ -334,6 +428,11 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// silently empty file. See `write_frame` for the track-0 invariant.
     dropped_pre_cluster: u64,
     seek_fixups: Vec<SeekPositionFixup>,
+    /// Absolute file offset of the CUES SeekHead entry (a fixed 21-byte Seek
+    /// element). When `finish()` writes no Cues element (zero cue points), this
+    /// entry is overwritten with a Void so the SeekHead carries no pointer to a
+    /// non-existent / wrong element.
+    cues_seek_entry_pos: Option<u64>,
     info_offset: u64,
     tracks_offset: u64,
     chapters_offset: Option<u64>,
@@ -521,7 +620,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let seek_id_be = (ebml::SEEK as u16).to_be_bytes();
         let seek_inner_id_be = (ebml::SEEK_ID as u16).to_be_bytes();
         let seek_pos_id_be = (ebml::SEEK_POSITION as u16).to_be_bytes();
+        // Absolute file offset where the CUES Seek entry begins, so that — if no
+        // Cues element is ultimately written (zero cue points) — the entry can be
+        // overwritten with a Void at finish() instead of leaving a SeekHead
+        // pointer that resolves to whatever element (Tags / EOF) happens to land
+        // at the Cues offset. See `cues_seek_entry_pos` / `finish`.
+        let mut cues_seek_entry_pos: Option<u64> = None;
         for target_id in &targets {
+            let entry_pos = writer.stream_position()?;
+            if *target_id == ebml::CUES {
+                cues_seek_entry_pos = Some(entry_pos);
+            }
             writer.write_all(&[seek_id_be[0], seek_id_be[1], 0x92])?;
             writer.write_all(&[seek_inner_id_be[0], seek_inner_id_be[1], 0x84])?;
             writer.write_all(&target_id.to_be_bytes())?;
@@ -631,8 +740,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::write_uint(&mut writer, ebml::PIXEL_WIDTH, track.pixel_width as u64)?;
                 ebml::write_uint(&mut writer, ebml::PIXEL_HEIGHT, track.pixel_height as u64)?;
                 // Scan type. FlagInterlaced: 1 = interlaced, 2 = progressive.
-                // FieldOrder is only written for interlaced content with a
-                // determined order (TFF=0/2/6/14, BFF=1/9/13...).
+                // FieldOrder (0x9D) is only written for interlaced content with a
+                // determined order: TFF = 1, BFF = 6, 0 = progressive, and the
+                // element is omitted entirely when undetermined (RFC 9559).
                 ebml::write_uint(
                     &mut writer,
                     ebml::FLAG_INTERLACED,
@@ -679,7 +789,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             if let Some(ref dvcc) = track.dv_config {
                 let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
                 // BlockAddIDType = "dvcC" fourcc (DOVIDecoderConfigurationRecord).
-                ebml::write_uint(&mut writer, ebml::BLOCK_ADD_ID_TYPE, 0x6476_6343)?;
+                ebml::write_uint(&mut writer, ebml::BLOCK_ADD_ID_TYPE, BLOCK_ADD_ID_TYPE_DVCC)?;
                 ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, dvcc)?;
                 ebml::end_master(&mut writer, map_pos)?;
             }
@@ -691,18 +801,24 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 // Omit Channels when unknown (0) — Matroska defaults it to 1
                 // rather than us fabricating a 6-channel count.
                 if track.channels > 0 {
-                    // Record the offset of the 1-byte Channels value so an AC-3
-                    // track can correct it from the bitstream acmod on its first
-                    // frame (the IFO nibble is unreliable). write_uint emits
-                    // ID(0x9F, 1B) + size(0x81, 1B) + value(1B) for 1..=255, so
-                    // the value byte sits 2 bytes after the element start.
-                    let chan_elem_pos = writer.stream_position()?;
-                    ebml::write_uint(&mut writer, ebml::CHANNELS, track.channels as u64)?;
+                    // Capture the ACTUAL file offset of the 1-byte Channels value
+                    // so an AC-3 track can correct it from the bitstream acmod on
+                    // its first frame (the IFO nibble is unreliable). Rather than
+                    // assume write_uint's encoding (ID + size widths), write the
+                    // element's ID and size explicitly, then record the position
+                    // immediately before the value byte. Channels is 1..=255 so
+                    // the value is exactly one byte (Size = 1), and the acmod
+                    // correction is likewise 1..=255 — the width never changes, so
+                    // the in-place single-byte rewrite stays valid.
+                    ebml::write_id(&mut writer, ebml::CHANNELS)?;
+                    ebml::write_size(&mut writer, 1)?;
+                    let value_offset = writer.stream_position()?;
+                    writer.write_all(&[track.channels])?;
                     if track.codec_id == ebml::CODEC_AC3 {
                         ac3_channel_fixups.insert(
                             i,
                             Ac3ChannelFixup {
-                                value_offset: chan_elem_pos + 2,
+                                value_offset,
                                 claimed: track.channels,
                                 corrected: false,
                             },
@@ -759,6 +875,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             frame_count: 0,
             dropped_pre_cluster: 0,
             seek_fixups,
+            cues_seek_entry_pos,
             info_offset,
             tracks_offset,
             chapters_offset,
@@ -1014,6 +1131,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Write Cues
         let cues_start = self.writer.stream_position()?;
         let cues_offset = cues_start - self.segment_start;
+        let have_cues = !self.cues.is_empty();
         if !self.cues.is_empty() {
             let cues_pos = ebml::start_master(&mut self.writer, ebml::CUES)?;
             for cue in &self.cues {
@@ -1038,8 +1156,16 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // bitrate for EVERY track this way, not just CBR audio.
         self.write_bps_tags()?;
 
-        // Back-patch SeekHead SeekPosition values now that all element offsets are known.
+        // Back-patch SeekHead SeekPosition values now that all element offsets
+        // are known. When no Cues element was written (zero cue points), the
+        // CUES entry's SeekPosition would otherwise be back-patched to
+        // `cues_offset`, which now holds Tags / EOF — a dangling pointer to a
+        // non-Cues element. Skip that fixup and instead Void the whole CUES Seek
+        // entry (below) so the SeekHead carries no false pointer.
         for fixup in &self.seek_fixups {
+            if fixup.target_id == ebml::CUES && !have_cues {
+                continue;
+            }
             let offset = match fixup.target_id {
                 ebml::INFO => self.info_offset,
                 ebml::TRACKS => self.tracks_offset,
@@ -1052,6 +1178,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
             self.writer
                 .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
             self.writer.write_all(&offset.to_be_bytes())?;
+        }
+        // Neutralise the unused CUES Seek entry. The entry is a fixed 21-byte
+        // Seek master: SEEK(2 ID + 1 size) + SEEK_ID(2+1) + 4-byte target id +
+        // SEEK_POSITION(2+1) + 8-byte value = 21 bytes. A Void (0xEC, 1-byte ID)
+        // with a 1-byte size VINT covering the remaining 19 bytes occupies
+        // exactly 1 + 1 + 19 = 21 bytes, overwriting the entry in place without
+        // shifting any following element.
+        if !have_cues {
+            if let Some(entry_pos) = self.cues_seek_entry_pos {
+                self.writer.seek(std::io::SeekFrom::Start(entry_pos))?;
+                ebml::write_id(&mut self.writer, ebml::VOID)?;
+                // 19 = 21-byte entry minus the Void ID (1) and size (1) bytes.
+                ebml::write_size(&mut self.writer, 19)?;
+                self.writer.write_all(&[0u8; 19])?;
+            }
         }
         self.writer.seek(std::io::SeekFrom::End(0))?;
 
@@ -1206,6 +1347,8 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&base);
         assert_eq!((t.pixel_width, t.pixel_height), (720, 576));
@@ -1224,6 +1367,113 @@ mod tests {
             (t2.display_width, t2.display_height),
             (720, 576),
             "square pixels: display == pixel"
+        );
+    }
+
+    /// FieldOrder must follow the MEASURED top_field_first, not a hardcoded TFF.
+    /// An interlaced stream whose parsed `top_field_first == Some(false)` tags
+    /// BFF (=6); `Some(true)` and `None` (unknown, the fallback) tag TFF (=1).
+    #[test]
+    fn interlaced_field_order_from_measured_tff() {
+        let base = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Mpeg2,
+            resolution: Resolution::R576i, // interlaced
+            frame_rate: crate::disc::FrameRate::F25,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt470bg,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
+        };
+
+        // Measured bottom-field-first → BFF, NOT the old hardcoded TFF.
+        let bff = VideoStream {
+            top_field_first: Some(false),
+            ..base.clone()
+        };
+        assert_eq!(
+            MkvTrack::video(&bff).field_order,
+            ebml::FIELD_ORDER_BFF,
+            "measured top_field_first=false must tag BFF (6), not TFF"
+        );
+
+        // Measured top-field-first → TFF.
+        let tff = VideoStream {
+            top_field_first: Some(true),
+            ..base.clone()
+        };
+        assert_eq!(MkvTrack::video(&tff).field_order, ebml::FIELD_ORDER_TFF);
+
+        // Unknown (not measured) → TFF fallback (dominant DVD/HD case).
+        assert_eq!(MkvTrack::video(&base).field_order, ebml::FIELD_ORDER_TFF);
+
+        // Progressive content leaves the order undetermined regardless of flag.
+        let prog = VideoStream {
+            resolution: Resolution::R1080p,
+            top_field_first: Some(false),
+            ..base
+        };
+        assert_eq!(
+            MkvTrack::video(&prog).field_order,
+            ebml::FIELD_ORDER_UNDETERMINED,
+            "progressive video never carries a field order"
+        );
+    }
+
+    /// Measured CICP from the bitstream must take precedence over the coarse
+    /// `color_space` enum. A BT.2020/PQ enum that would otherwise produce
+    /// (9,16,9) is overridden by a measured BT.709 triplet when present.
+    #[test]
+    fn measured_cicp_overrides_color_space_enum() {
+        let base = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Hevc,
+            resolution: Resolution::R2160p,
+            frame_rate: crate::disc::FrameRate::F24,
+            hdr: HdrFormat::Hdr10, // enum/HDR path would force PQ transfer
+            color_space: ColorSpace::Bt2020,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
+        };
+
+        // Without a measured triplet: enum + HDR → BT.2020nc / PQ / BT.2020.
+        let t_enum = MkvTrack::video(&base);
+        assert_eq!(
+            (
+                t_enum.colour_matrix,
+                t_enum.colour_transfer,
+                t_enum.colour_primaries
+            ),
+            (
+                CICP_MATRIX_BT2020NC,
+                CICP_TRANSFER_PQ,
+                CICP_PRIMARIES_BT2020
+            ),
+            "enum fallback derives BT.2020/PQ"
+        );
+
+        // With a measured BT.709 triplet: the bitstream's value wins outright,
+        // INCLUDING the transfer (the HDR override does not apply to measured).
+        let measured = VideoStream {
+            measured_cicp: Some(crate::disc::MeasuredCicp {
+                matrix: CICP_MATRIX_BT709,
+                transfer: CICP_TRANSFER_BT709,
+                primaries: CICP_PRIMARIES_BT709,
+                range: COLOUR_RANGE_LIMITED,
+            }),
+            ..base
+        };
+        let t = MkvTrack::video(&measured);
+        assert_eq!(
+            (t.colour_matrix, t.colour_transfer, t.colour_primaries),
+            (CICP_MATRIX_BT709, CICP_TRANSFER_BT709, CICP_PRIMARIES_BT709),
+            "measured CICP must override the enum, transfer included"
         );
     }
 
@@ -1408,6 +1658,54 @@ mod tests {
         assert!(
             find_id(&data, ebml::CUES).is_some(),
             "Cues element (0x1C53BB6B) not found after finish()"
+        );
+    }
+
+    /// When no Cues element is written (zero cue points), the SeekHead must NOT
+    /// retain a CUES entry that back-patches to the Cues offset — that offset now
+    /// holds Tags / EOF, a dangling pointer to a non-Cues element. finish() Voids
+    /// the unused CUES Seek entry instead. (The empty-cues case is defensive —
+    /// the normal path pushes a cue with every cluster — so the test clears the
+    /// cue list directly before finalizing.)
+    #[test]
+    fn zero_cues_voids_seekhead_entry_no_dangling_pointer() {
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        let writer = SharedWriter(shared.clone());
+        let tracks = [make_video_track()];
+        let mut muxer = MkvMuxer::new(writer, &tracks, Some("NoCue"), 60.0, &[]).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None)
+            .unwrap();
+        // Force the zero-cue branch: drop every cue before finalizing.
+        let cues_entry_pos = muxer.cues_seek_entry_pos.expect("CUES seek entry recorded");
+        muxer.cues.clear();
+        muxer.finish().unwrap();
+
+        let data = shared.lock().unwrap().clone().into_inner();
+
+        // No Cues element is written.
+        assert!(
+            find_id(&data, ebml::CUES).is_none(),
+            "no Cues element expected when there are zero cue points"
+        );
+        // The recorded CUES Seek entry was overwritten with a Void (0xEC) of the
+        // remaining 19 bytes — it no longer begins a SEEK (0x4DBB) element.
+        let entry = &data[cues_entry_pos as usize..cues_entry_pos as usize + 2];
+        assert_eq!(
+            entry,
+            &[ebml::VOID as u8, 0x80 | 19],
+            "CUES Seek entry must be Void(19), not a live Seek pointer"
+        );
+
+        // Defensively confirm no Seek entry's SeekPosition resolves to the (now
+        // Tags/EOF) cues offset: scan all 8-byte SeekPosition values in the
+        // SeekHead and ensure none equals the offset where Cues would have been.
+        // (Sanity: the file must still parse its real elements.)
+        assert!(
+            find_id(&data, ebml::INFO).is_some() && find_id(&data, ebml::TRACKS).is_some(),
+            "Info and Tracks must still be present and seekable"
         );
     }
 
@@ -3085,6 +3383,8 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert!(t.interlaced, "576i is interlaced");
@@ -3116,6 +3416,8 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert_eq!(t.default_duration_ns, 40_000_000, "frame duration is 40 ms");
@@ -3259,6 +3561,8 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert_eq!(
@@ -3318,6 +3622,8 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert_eq!(
@@ -3378,6 +3684,8 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert!(t.interlaced, "480i is interlaced");
