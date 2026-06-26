@@ -4,7 +4,8 @@
 //! Detects keyframes (IRAP pictures: IDR, CRA, BLA).
 //! Each PES packet = one access unit = one frame.
 
-use super::startcode::{find_start_code, skip_start_code};
+use super::coding::{CodingType, PictureInfo};
+use super::startcode::{BitReader, find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 // HEVC NAL unit types
@@ -26,6 +27,59 @@ const NAL_RSV_IRAP_VCL23: u8 = 23;
 // Access): a decoder then sets NoRaslOutput and discards the RASL cleanly with
 // no error. See `mark_clip_boundary` / the IRAP arm in `parse`.
 const NAL_CRA_NUT: u8 = 21;
+/// Highest VCL (coded-slice) NAL type. Rec. ITU-T H.265 Table 7-1: types 0..=31
+/// are VCL, 32..=63 non-VCL. A coded slice carries a `slice_type`.
+const NAL_VCL_MAX: u8 = 31;
+
+/// `num_extra_slice_header_bits` from a HEVC PPS NAL (H.265 §7.3.2.3): after the
+/// 2-byte NAL header, skip `pps_pic_parameter_set_id` + `pps_seq_parameter_set_id`
+/// (both `ue(v)`) and `dependent_slice_segments_enabled_flag` +
+/// `output_flag_present_flag` (`u(1)` each), then read `u(3)`. `None` if the PPS
+/// is too short to parse — the caller then declines to guess a slice type.
+fn hevc_num_extra_slice_header_bits(pps_nal: &[u8]) -> Option<u32> {
+    let mut br = BitReader::new(pps_nal.get(2..)?);
+    br.read_ue()?; // pps_pic_parameter_set_id
+    br.read_ue()?; // pps_seq_parameter_set_id
+    br.skip_bits(2)?; // dependent_slice_segments_enabled_flag, output_flag_present_flag
+    let mut n = 0u32;
+    for _ in 0..3 {
+        n = (n << 1) | br.read_bit()?;
+    }
+    Some(n)
+}
+
+/// Map a HEVC `slice_type` (H.265 §7.4.7.1, Table 7-7) to a coding type:
+/// 0 = B, 1 = P, 2 = I. `None` for any other value (malformed header).
+fn hevc_slice_coding_type(slice_type: u32) -> Option<CodingType> {
+    match slice_type {
+        0 => Some(CodingType::B),
+        1 => Some(CodingType::P),
+        2 => Some(CodingType::I),
+        _ => None,
+    }
+}
+
+/// Measure the coding type from the FIRST coded slice of an access unit
+/// (H.265 §7.3.6.1 `slice_segment_header`). Reads only the leading fields of the
+/// first slice segment: `first_slice_segment_in_pic_flag` u(1), the IRAP
+/// `no_output_of_prior_pics_flag` u(1), `slice_pic_parameter_set_id` ue(v), the
+/// `num_extra_slice_header_bits` reserved bits, then `slice_type` ue(v). Returns
+/// `None` for a non-first slice or on truncation — never a guess. `num_extra`
+/// MUST come from the active PPS so the bit offset to `slice_type` is exact.
+fn hevc_first_slice_coding_type(nal: &[u8], nal_type: u8, num_extra: u32) -> Option<CodingType> {
+    let mut br = BitReader::new(nal.get(2..)?); // RBSP after the 2-byte NAL header
+    if br.read_bit()? != 1 {
+        return None; // not the first slice segment of the picture
+    }
+    if (NAL_BLA_W_LP..=NAL_RSV_IRAP_VCL23).contains(&nal_type) {
+        br.skip_bits(1)?; // no_output_of_prior_pics_flag (IRAP only)
+    }
+    br.read_ue()?; // slice_pic_parameter_set_id
+    // First slice → no slice_segment_address and dependent_slice_segment_flag is
+    // 0, so slice_type follows the reserved bits directly.
+    br.skip_bits(num_extra)?; // slice_reserved_flag[i]
+    hevc_slice_coding_type(br.read_ue()?)
+}
 
 /// HEVC (H.265) Annex B → MKV codec parser: extracts VPS/SPS/PPS for the hvcC
 /// codecPrivate, detects IRAP keyframes, and converts each PES access unit into
@@ -314,6 +368,8 @@ impl CodecParser for HevcParser {
 
         let data = &pes.data;
         let mut keyframe = false;
+        // Picture coding type, MEASURED from the first coded slice's header.
+        let mut coding_type: Option<CodingType> = None;
         // Track whether THIS access unit already carried each param-set type
         // in-band (a redefinition vs codecPrivate). Used after the scan to
         // re-assert the active set at a keyframe the source left bare.
@@ -348,6 +404,25 @@ impl CodecParser for HevcParser {
                 if nal_start < data.len() && end > nal_start {
                     // HEVC NAL header: 2 bytes. Type is bits 1-6 of first byte.
                     let nal_type = (data[nal_start] >> 1) & 0x3F;
+
+                    // Measure the coding type from the FIRST coded slice (VCL NAL
+                    // 0..=31). Only attempted once the active PPS is known, so
+                    // `num_extra_slice_header_bits` — and thus the bit offset to
+                    // `slice_type` — is EXACT. With no PPS we decline rather than
+                    // guess, leaving coding `None` (honestly absent).
+                    if coding_type.is_none() && nal_type <= NAL_VCL_MAX {
+                        if let Some(num_extra) = self
+                            .cur_pps
+                            .as_deref()
+                            .and_then(hevc_num_extra_slice_header_bits)
+                        {
+                            coding_type = hevc_first_slice_coding_type(
+                                &data[nal_start..end],
+                                nal_type,
+                                num_extra,
+                            );
+                        }
+                    }
 
                     match nal_type {
                         NAL_VPS => {
@@ -446,8 +521,11 @@ impl CodecParser for HevcParser {
         }
 
         vec![Frame {
-            coding: None,
-            source: None,
+            // Coding-type only: HEVC field order (pic_struct, from a pic_timing
+            // SEI) is not decoded here, so field_order() stays None — honestly
+            // absent, never guessed.
+            coding: coding_type.map(PictureInfo::coding_type_only),
+            source: pes.source,
             pts_ns,
             keyframe,
             data: frame_data,
@@ -582,60 +660,6 @@ struct SpsChroma {
     temporal_id_nesting_flag: u8,
 }
 
-/// Minimal MSB-first bit reader over a byte slice.
-struct BitReader<'a> {
-    data: &'a [u8],
-    bit_pos: usize,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, bit_pos: 0 }
-    }
-
-    fn read_bit(&mut self) -> Option<u32> {
-        let byte = self.bit_pos / 8;
-        if byte >= self.data.len() {
-            return None;
-        }
-        let shift = 7 - (self.bit_pos % 8);
-        self.bit_pos += 1;
-        Some(((self.data[byte] >> shift) & 1) as u32)
-    }
-
-    fn read_bits(&mut self, n: u32) -> Option<u32> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | self.read_bit()?;
-        }
-        Some(v)
-    }
-
-    fn skip_bits(&mut self, n: u32) -> Option<()> {
-        for _ in 0..n {
-            self.read_bit()?;
-        }
-        Some(())
-    }
-
-    /// Exp-Golomb unsigned, ue(v). Bounded leading-zero count to avoid runaway
-    /// on corrupt input.
-    fn read_ue(&mut self) -> Option<u32> {
-        let mut zeros = 0u32;
-        while self.read_bit()? == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        if zeros == 0 {
-            return Some(0);
-        }
-        let rest = self.read_bits(zeros)?;
-        Some((1u32 << zeros) - 1 + rest)
-    }
-}
-
 /// Strip HEVC/H.264 emulation-prevention bytes (00 00 03 → 00 00) from a NAL
 /// RBSP so a bit reader sees the true coded values.
 fn strip_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
@@ -767,6 +791,63 @@ mod tests {
     /// Format: forbidden(1) | type(6) | layer_id_high(1) || layer_id_low(5) | tid(3)
     fn hevc_nal_header(nal_type: u8) -> [u8; 2] {
         [(nal_type & 0x3F) << 1, 0x01] // tid=1
+    }
+
+    #[test]
+    fn hevc_populates_measured_coding_type_and_source() {
+        use super::super::coding::CodingType;
+        // PPS body 0xC0 = pps_id 0, sps_id 0, dependent_slice 0, output_flag 0,
+        // num_extra_slice_header_bits 0 → slice_type follows pps_id directly.
+        // Slice body (TRAIL_R, non-IRAP VCL type 1) = first_slice 1, pps_id 0,
+        // slice_type: 0xD8 → 2 (I); 0xD0 → 1 (P); 0xE0 → 0 (B).
+        let nal = |t: u8, body: u8| {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(t));
+            v.push(body);
+            v
+        };
+        let src = crate::pes::SourcePos::at_byte(16384);
+        let run = |slice_body: u8| {
+            let mut p = HevcParser::new();
+            let mut data = nal(NAL_PPS, 0xC0); // active PPS first (sets num_extra)
+            data.extend_from_slice(&nal(1, slice_body)); // then the coded slice
+            let mut pe = make_pes(data, Some(0));
+            pe.source = Some(src);
+            p.parse(&pe)
+        };
+
+        let fi = run(0xD8);
+        assert_eq!(fi.len(), 1);
+        let ci = fi[0].coding.expect("HEVC frame carries PictureInfo");
+        assert_eq!(ci.coding_type(), CodingType::I, "slice_type 2 → I");
+        assert!(
+            ci.field_order().is_none(),
+            "HEVC field order undecoded → None, never faked"
+        );
+        assert_eq!(
+            fi[0].source.unwrap().byte,
+            16384,
+            "source provenance carried"
+        );
+        assert_eq!(
+            run(0xD0)[0].coding.unwrap().coding_type(),
+            CodingType::P,
+            "slice_type 1 → P"
+        );
+        assert_eq!(
+            run(0xE0)[0].coding.unwrap().coding_type(),
+            CodingType::B,
+            "slice_type 0 → B"
+        );
+
+        // No PPS seen → num_extra is unknown, so slice_type is NOT guessed; the
+        // coding stays None (honestly absent) rather than risk a wrong offset.
+        let mut p = HevcParser::new();
+        let bare = p.parse(&make_pes(nal(1, 0xD8), Some(0)));
+        assert!(
+            bare[0].coding.is_none(),
+            "no active PPS → coding omitted, never a guessed type"
+        );
     }
 
     // --- VPS+SPS+PPS → codec_private ---
