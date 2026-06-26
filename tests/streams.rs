@@ -23,6 +23,8 @@ fn sample_disc_title() -> DiscTitle {
                 display_aspect: None,
                 secondary: false,
                 label: "Main".into(),
+                top_field_first: None,
+                measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1100,
@@ -401,6 +403,8 @@ fn meta_codec_roundtrip() {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         }));
     }
     for (i, &codec) in codecs_audio.iter().enumerate() {
@@ -503,6 +507,8 @@ fn meta_all_stream_types() {
                 display_aspect: None,
                 secondary: false,
                 label: "Primary".into(),
+                top_field_first: None,
+                measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1100,
@@ -688,6 +694,8 @@ fn mkvstream_meta_preserves_all_streams() {
                 display_aspect: None,
                 secondary: false,
                 label: "Main Video".into(),
+                top_field_first: None,
+                measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1100,
@@ -787,6 +795,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
             display_aspect: None,
             secondary: false,
             label: "Main".into(),
+            top_field_first: None,
+            measured_cicp: None,
         })],
         chapters: Vec::new(),
         extents: Vec::new(),

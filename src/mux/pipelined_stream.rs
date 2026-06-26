@@ -640,6 +640,8 @@ mod tests {
             display_aspect: None,
             secondary,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         }));
         t
     }
@@ -797,6 +799,8 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         }));
         let parsers: Vec<(u16, Box<dyn CodecParser>)> =
             vec![(crate::mux::ps::DVD_VIDEO_PID, Box::new(Mpeg2Parser::new()))];

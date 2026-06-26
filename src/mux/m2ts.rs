@@ -116,6 +116,8 @@ mod tests {
                 display_aspect: None,
                 secondary: false,
                 label: String::new(),
+                top_field_first: None,
+                measured_cicp: None,
             })],
             chapters: Vec::new(),
             extents: Vec::new(),
