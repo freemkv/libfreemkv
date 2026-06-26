@@ -617,7 +617,7 @@ mod tests {
         //   0x98 = '1 00110..' → slice_type 5 (P)
         //   0x9C = '1 00111..' → slice_type 6 (B)
         let src = crate::pes::SourcePos::at_byte(8192);
-        let mut parse = |nal_type: u8, body: u8| {
+        let parse = |nal_type: u8, body: u8| {
             let mut p = H264Parser::new();
             let mut pe = make_pes(h264_nal(nal_type, &[body]), Some(0));
             pe.source = Some(src);
