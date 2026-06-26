@@ -1098,14 +1098,14 @@ mod tests {
     }
 
     /// End-to-end bug-4 fix: a feature PGC that opens with a leading
-    /// interleaved-angle sub-block cell (category 0x80 = middle-of-angle-block)
-    /// must have that cell DROPPED from the muxed extents, so the rip starts at
-    /// the real feature. Chapters shift earlier by the dropped duration.
+    /// interleaved-angle sub-block cell (category 0x90 = in-block cell of an
+    /// angle block) must have that cell DROPPED from the muxed extents, so the
+    /// rip starts at the real feature. Chapters shift earlier by the dropped duration.
     #[test]
     fn scan_dvd_titles_drops_leading_scene_index_cell() {
         let mut disc = MemDisc::new();
         let vmg = build_vmg(&[(2, 1, 1)]);
-        // Cell 0: leading scene-index/angle sub-block (cat 0x80), 5s, sectors 0..9.
+        // Cell 0: leading scene-index/angle sub-block (cat 0x90), 5s, sectors 0..9.
         // Cell 1: feature start (cat 0x00), 59s, sectors 100..199.
         // Cell 2: feature (cat 0x00), 59s, sectors 300..399.
         // Programs: prog0 → cell 1 (feature start), prog1 → cell 3.
@@ -1113,7 +1113,7 @@ mod tests {
             1000,
             0x00,
             &[
-                (0, 9, 0x80, 0x05),
+                (0, 9, 0x90, 0x05),
                 (100, 199, 0x00, 0x59),
                 (300, 399, 0x00, 0x59),
             ],
@@ -1137,7 +1137,7 @@ mod tests {
             ],
         );
         let t = &Disc::scan_dvd_titles(&mut disc, &udf)[0];
-        // The leading 0x80 cell is dropped: 2 feature extents, not 3.
+        // The leading 0x90 cell is dropped: 2 feature extents, not 3.
         assert_eq!(t.extents.len(), 2, "leading angle sub-block cell dropped");
         // First extent starts at the feature cell (vob 1000 + 100), not at 1000+0.
         assert_eq!(t.extents[0].start_lba, 1000 + 100);

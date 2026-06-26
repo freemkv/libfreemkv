@@ -149,7 +149,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // count is bytes of scrambled units no key could decrypt — silent
         // decrypt loss the TS assembler will drop. Tally it so the mux loss
         // accounting (and the abort gate) can see partial decrypt failure.
-        let dropped = decrypt_sectors(&mut buf[..n], &self.keys, self.unit_key_idx)?;
+        let dropped = decrypt_sectors(&mut buf[..n], &mut self.keys, self.unit_key_idx)?;
         if dropped > 0 {
             self.decrypt_dropped
                 .fetch_add(dropped as u64, Ordering::Relaxed);

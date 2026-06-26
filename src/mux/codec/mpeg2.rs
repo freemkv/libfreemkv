@@ -101,32 +101,39 @@ pub struct Mpeg2Parser {
     /// `(absolute ES offset of a PES's first byte, PTS in ns)` for every PES
     /// that carried a timestamp, in ascending offset order.
     pts_marks: VecDeque<(u64, i64)>,
-    /// Per-frame presentation interval (ns), derived from the sequence header
-    /// frame rate. DVD stamps a PTS only ~once per VOBU (every ~0.5 s), so
-    /// frames between marks must be timed by `temporal_reference` × this
-    /// interval. 0 until a sequence header with a valid frame rate is seen.
+    /// Full-frame presentation interval (ns) at the sequence-header display rate
+    /// (`1/frame_rate`). The field period is half this. Per-frame durations are
+    /// `nb_fields × field_period`, so 2:3-telecined frames alternate 2- and
+    /// 3-field durations. 0 until a sequence header with a valid frame rate.
     frame_duration_ns: i64,
-    /// Cumulative count of coded pictures emitted in all GOPs before the
-    /// current one. `temporal_reference` is GOP-relative (display order within
-    /// the GOP); adding this base makes a whole-stream display index.
-    gop_base: u64,
-    /// Coded pictures emitted in the current GOP so far (folded into
-    /// `gop_base` at the next GOP boundary).
-    gop_count: u64,
-    /// Display index of the last frame that carried an explicit PES PTS, used
-    /// to anchor interpolated timestamps to the real disc timeline (so video
-    /// stays in sync with the PES-timestamped audio tracks).
-    anchor_index: Option<u64>,
-    /// PTS (ns) of the anchor frame.
-    anchor_pts: i64,
-    /// Frames emitted before the first PES PTS anchor is known, held with their
-    /// display index. A DVD title can open with a still-frame/first-play
-    /// sequence whose PTS lands a few frames in; buffering until the anchor lets
-    /// those leading frames take the disc's real timeline instead of a 0 base.
-    pending: Vec<(u64, Frame)>,
-    /// Accumulated `data.len()` of frames currently in `pending`. Bounds the
-    /// pre-anchor hold by BYTES, not just frame count (see [`MAX_PENDING_BYTES`]).
-    pending_bytes: usize,
+    /// `progressive_sequence` from the sequence extension — selects the
+    /// `nb_fields` rules for `repeat_first_field` pictures.
+    progressive_sequence: bool,
+    /// Pictures of the current GOP, buffered in DECODE order until the GOP
+    /// completes (the next GOP/sequence header). Held so each frame's PTS can be
+    /// the display-order prefix-sum of field durations — exact for 2:3 pulldown
+    /// without ever reordering emitted blocks (B-frames keep decode order; only
+    /// their PTS is lower).
+    gop_buf: Vec<BufferedPicture>,
+    /// Total field-display periods of all frames already emitted, in display
+    /// order — the running base for each new frame's display time.
+    emitted_fields: u64,
+    /// PTS (ns) that display-field 0 of the whole stream maps to. Re-locked from
+    /// each GOP's first PES PTS so video stays in sync with the PES-timestamped
+    /// audio. None until the first PES timestamp is seen.
+    origin_pts_ns: Option<i64>,
+}
+
+/// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
+struct BufferedPicture {
+    /// `temporal_reference` — display order within the GOP.
+    tr: u64,
+    /// Field-display periods this picture occupies (`picture_nb_fields`).
+    nb_fields: u8,
+    /// This picture's own PES PTS (ns), if its access unit carried one.
+    explicit_pts: Option<i64>,
+    /// The emitted frame (PTS + duration filled in at GOP flush).
+    frame: Frame,
 }
 
 impl Default for Mpeg2Parser {
@@ -144,12 +151,10 @@ impl Mpeg2Parser {
             base_offset: 0,
             pts_marks: VecDeque::new(),
             frame_duration_ns: 0,
-            gop_base: 0,
-            gop_count: 0,
-            anchor_index: None,
-            anchor_pts: 0,
-            pending: Vec::new(),
-            pending_bytes: 0,
+            progressive_sequence: false,
+            gop_buf: Vec::new(),
+            emitted_fields: 0,
+            origin_pts_ns: None,
         }
     }
 
@@ -172,22 +177,6 @@ impl Mpeg2Parser {
     pub fn aspect_ratio(&self) -> Option<(u8, u8)> {
         let hdr = self.seq_header.as_ref()?;
         parse_aspect_ratio(hdr)
-    }
-
-    /// The PTS (ns) to assign to an access unit whose first relevant byte is at
-    /// absolute ES offset `target`: the most recent PES timestamp at or before
-    /// that offset (the PES that contains the access unit's start). Falls back
-    /// to 0 when no timestamp has been seen yet.
-    fn pts_for(&self, target: u64) -> i64 {
-        let mut best = 0;
-        for &(off, pts) in &self.pts_marks {
-            if off <= target {
-                best = pts;
-            } else {
-                break;
-            }
-        }
-        best
     }
 
     /// Drain every complete access unit from `buf`, returning one Frame each.
@@ -247,12 +236,12 @@ impl Mpeg2Parser {
             } else {
                 0
             };
-            let pic_abs = self.base_offset + pic as u64;
             let end_abs = self.base_offset + end as u64;
             let data = self.buf[..end].to_vec();
 
             // Phase 2 — mutate self.
             if let Some(h) = hdr {
+                self.progressive_sequence = parse_progressive_sequence(&h);
                 self.seq_header = Some(h);
                 if let Some((num, den)) = self.frame_rate() {
                     if num > 0 {
@@ -260,11 +249,7 @@ impl Mpeg2Parser {
                     }
                 }
             }
-            if gop_boundary && self.gop_count > 0 {
-                self.gop_base += self.gop_count;
-                self.gop_count = 0;
-            }
-            let display_index = self.gop_base + tr;
+            let nb_fields = picture_nb_fields(&data, self.progressive_sequence);
 
             // An explicit PES PTS for this access unit, if any. By the mark-drain
             // invariant the front mark's offset is >= this AU's start, so a front
@@ -275,71 +260,29 @@ impl Mpeg2Parser {
                 .filter(|&&(off, _)| off < end_abs)
                 .map(|&(_, p)| p);
 
-            let duration_ns = (self.frame_duration_ns > 0).then_some(self.frame_duration_ns as u64);
-            let mut frame = Frame {
-                pts_ns: 0,
-                keyframe,
-                data,
-                duration_ns,
-            };
-
-            if self.frame_duration_ns > 0 {
-                // Reconstruct from display order; anchor to the real PES PTS so
-                // video stays in sync with the PES-timestamped audio.
-                match explicit {
-                    Some(p) => {
-                        self.anchor_index = Some(display_index);
-                        self.anchor_pts = p;
-                        // Backfill any leading frames held before the anchor was
-                        // known (still-frame / first-play opening): give each the
-                        // disc's real timeline relative to this anchor.
-                        for (di, mut held) in self.pending.drain(..) {
-                            held.pts_ns =
-                                p + (di as i64 - display_index as i64) * self.frame_duration_ns;
-                            out.push(held);
-                        }
-                        self.pending_bytes = 0;
-                        frame.pts_ns = p;
-                        out.push(frame);
-                    }
-                    None => match self.anchor_index {
-                        Some(ai) => {
-                            frame.pts_ns = self.anchor_pts
-                                + (display_index as i64 - ai as i64) * self.frame_duration_ns;
-                            out.push(frame);
-                        }
-                        None if self.pending.len() < MAX_PENDING_FRAMES
-                            && self.pending_bytes < MAX_PENDING_BYTES =>
-                        {
-                            // No anchor yet — hold so leading frames get the
-                            // disc's real timeline once the first PTS arrives,
-                            // not a 0 base.
-                            self.pending_bytes += frame.data.len();
-                            self.pending.push((display_index, frame));
-                        }
-                        None => {
-                            // Hold cap (count OR bytes) reached without a PTS
-                            // anchor ever arriving. Release everything held so
-                            // far on the 0-base timeline rather than growing the
-                            // buffer unbounded, then emit this frame the same way.
-                            for (di, mut held) in self.pending.drain(..) {
-                                held.pts_ns = di as i64 * self.frame_duration_ns;
-                                out.push(held);
-                            }
-                            self.pending_bytes = 0;
-                            frame.pts_ns = display_index as i64 * self.frame_duration_ns;
-                            out.push(frame);
-                        }
-                    },
-                }
-            } else {
-                // No frame rate yet (no sequence header) — fall back to the
-                // nearest preceding PES timestamp.
-                frame.pts_ns = self.pts_for(pic_abs);
-                out.push(frame);
+            // A GOP boundary means the buffered run is a COMPLETE GOP (all its
+            // pictures display before the next GOP's), so flush it before
+            // starting the new one. `temporal_reference` resets to 0 at the
+            // boundary, keeping each GOP's display order self-contained.
+            if gop_boundary && !self.gop_buf.is_empty() {
+                self.flush_gop(&mut out);
             }
-
-            self.gop_count += 1;
+            self.gop_buf.push(BufferedPicture {
+                tr,
+                nb_fields,
+                explicit_pts: explicit,
+                frame: Frame {
+                    pts_ns: 0,
+                    keyframe,
+                    data,
+                    duration_ns: None,
+                },
+            });
+            // Safety cap: a stream with no GOP/sequence boundaries would buffer
+            // unbounded. Force-flush a pathologically long run as its own GOP.
+            if self.gop_buf.len() >= MAX_PENDING_FRAMES {
+                self.flush_gop(&mut out);
+            }
             self.buf.drain(..end);
             self.base_offset = end_abs;
             // Drop PTS marks fully consumed by the emitted AU; keep the mark at
@@ -352,7 +295,63 @@ impl Mpeg2Parser {
                 }
             }
         }
+        // EOF: emit the final (possibly incomplete) GOP so nothing is dropped.
+        if force {
+            self.flush_gop(&mut out);
+        }
         out
+    }
+
+    /// Emit the buffered GOP. Each frame's PTS is the display-order prefix-sum of
+    /// field durations from the timeline origin; its block duration is its own
+    /// `nb_fields × field_period`. Frames are emitted in DECODE (buffer) order —
+    /// B-frames keep their position with a correctly LOWER PTS, never reordered
+    /// (reordering emitted blocks is what corrupts the picture). The origin is
+    /// (re-)locked to the GOP's PES PTS; because that is a *presentation*
+    /// timestamp, backing out the carrying frame's display-field offset keeps the
+    /// timeline continuous and monotonic across GOP boundaries.
+    fn flush_gop(&mut self, out: &mut Vec<Frame>) {
+        let n = self.gop_buf.len();
+        if n == 0 {
+            return;
+        }
+        let field_period = self.frame_duration_ns / 2;
+        if field_period <= 0 {
+            // No sequence header / frame rate yet (malformed lead-in): emit in
+            // decode order off each AU's own PES PTS, with no field timing.
+            for bp in self.gop_buf.drain(..) {
+                let mut f = bp.frame;
+                f.pts_ns = bp.explicit_pts.unwrap_or(0);
+                out.push(f);
+            }
+            return;
+        }
+        // Fields displayed BEFORE each picture within this GOP: order indices by
+        // temporal_reference (display order) and prefix-sum `nb_fields`.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| self.gop_buf[i].tr);
+        let mut cum_before = vec![0u64; n];
+        let mut running = 0u64;
+        for &i in &order {
+            cum_before[i] = running;
+            running += self.gop_buf[i].nb_fields as u64;
+        }
+        let gop_fields = running;
+        let base = self.emitted_fields;
+        // (Re-)lock the timeline origin to the GOP's PES PTS.
+        for &i in &order {
+            if let Some(p) = self.gop_buf[i].explicit_pts {
+                self.origin_pts_ns = Some(p - field_period * (base + cum_before[i]) as i64);
+                break;
+            }
+        }
+        let origin = self.origin_pts_ns.unwrap_or(0);
+        for (i, mut bp) in self.gop_buf.drain(..).enumerate() {
+            bp.frame.pts_ns = origin + field_period * (base + cum_before[i]) as i64;
+            bp.frame.duration_ns = Some(bp.nb_fields as u64 * field_period as u64);
+            out.push(bp.frame);
+        }
+        self.emitted_fields += gop_fields;
     }
 }
 
@@ -374,23 +373,9 @@ impl CodecParser for Mpeg2Parser {
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        let mut out = self.drain_complete_aus(true);
-        // EOF: if no PES ever supplied a PTS/DTS, `self.pending` still holds the
-        // frames buffered while waiting for an anchor (the opening keyframe +
-        // first ~20s). Without this they'd be silently dropped — a 100%-recovery
-        // violation. Emit each with the same 0-base fallback the no-anchor
-        // overflow arm uses (`display_index * frame_duration_ns`), ordered by
-        // display_index so presentation order is preserved.
-        if !self.pending.is_empty() {
-            let mut held: Vec<(u64, Frame)> = self.pending.drain(..).collect();
-            held.sort_by_key(|(di, _)| *di);
-            for (di, mut frame) in held {
-                frame.pts_ns = di as i64 * self.frame_duration_ns;
-                out.push(frame);
-            }
-            self.pending_bytes = 0;
-        }
-        out
+        // drain_complete_aus(true) force-completes the trailing access unit and
+        // flushes the final GOP, so nothing is left buffered at EOF.
+        self.drain_complete_aus(true)
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -493,10 +478,144 @@ fn parse_aspect_ratio(hdr: &[u8]) -> Option<(u8, u8)> {
     Some(ASPECT_RATIOS[ar_code])
 }
 
+/// Number of field-display periods a coded picture occupies, from its picture
+/// coding extension (`00 00 01 B5`, ext-id `1000`), per ISO/IEC 13818-2 §6.3.10
+/// and ffmpeg `mpeg_field_start` (`nb_fields = repeat_pict + 2`). This is what
+/// times soft-telecined (2:3 pulldown) DVD video correctly: a
+/// `repeat_first_field` frame occupies 3 fields, a normal frame 2, so honoring
+/// it spreads the ~23.976 coded frames across the 29.97 display span with no
+/// gap (the "play, pause, play" judder). `progressive_sequence` comes from the
+/// sequence extension. Returns 2 (a normal frame) when no picture coding
+/// extension is present.
+fn picture_nb_fields(au: &[u8], progressive_sequence: bool) -> u8 {
+    let mut search = 0;
+    while let Some(q) = find_code(au, search, SEQ_EXT_CODE) {
+        search = q + 4;
+        // The picture coding extension is the B5 whose ext-id nibble is 1000.
+        if au.get(q + 4).map(|b| b >> 4) != Some(0b1000) {
+            continue;
+        }
+        // Extension bytes e2..=e4 = au[q+6 ..= q+8].
+        let (Some(&e2), Some(&e3), Some(&e4)) = (au.get(q + 6), au.get(q + 7), au.get(q + 8))
+        else {
+            break;
+        };
+        // picture_structure (e2 bits 1-0): 11 = frame picture. A field picture
+        // (01/10) occupies a single field; two combine into one frame upstream.
+        if e2 & 0x03 != 0b11 {
+            return 1;
+        }
+        let tff = (e3 >> 7) & 1;
+        let rff = (e3 >> 1) & 1;
+        let progressive_frame = (e4 >> 7) & 1;
+        let repeat_pict = if rff == 0 {
+            0
+        } else if progressive_sequence {
+            if tff == 1 { 4 } else { 2 }
+        } else if progressive_frame == 1 {
+            1
+        } else {
+            0
+        };
+        return repeat_pict + 2;
+    }
+    2
+}
+
+/// Read `progressive_sequence` from a captured sequence header's sequence
+/// extension (`00 00 01 B5`, ext-id `0001`). False when absent (MPEG-1 / no
+/// extension) — the interlaced default. Bit layout after the start code:
+/// ext-id(4) profile_and_level(8) **progressive_sequence(1)** … so it is bit 3
+/// of the second extension byte (`hdr[q+5]`).
+fn parse_progressive_sequence(hdr: &[u8]) -> bool {
+    let mut search = 0;
+    while let Some(q) = find_code(hdr, search, SEQ_EXT_CODE) {
+        search = q + 4;
+        if hdr.get(q + 4).map(|b| b >> 4) != Some(0b0001) {
+            continue;
+        }
+        return hdr.get(q + 5).map(|&b| (b >> 3) & 1 == 1).unwrap_or(false);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mux::ts::PesPacket;
+
+    /// Build a picture coding extension (`00 00 01 B5`, ext-id 1000) carrying the
+    /// given pulldown flags, for `picture_nb_fields` tests.
+    fn pic_coding_ext(tff: u8, rff: u8, progressive_frame: u8, frame_picture: bool) -> Vec<u8> {
+        let e0 = 0x80; // ext-id 1000, f_code high nibble 0
+        let e1 = 0x00;
+        let e2 = if frame_picture { 0x03 } else { 0x01 }; // picture_structure bits 1-0
+        let e3 = (tff << 7) | (rff << 1);
+        let e4 = progressive_frame << 7;
+        vec![0x00, 0x00, 0x01, SEQ_EXT_CODE, e0, e1, e2, e3, e4]
+    }
+
+    #[test]
+    fn nb_fields_normal_frame_is_two() {
+        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 0, 0, true), false), 2);
+    }
+
+    #[test]
+    fn nb_fields_telecine_repeat_field_is_three() {
+        // NTSC 2:3 soft telecine: interlaced sequence, progressive frame, rff=1.
+        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 1, 1, true), false), 3);
+    }
+
+    #[test]
+    fn nb_fields_field_picture_is_one() {
+        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 0, 0, false), false), 1);
+    }
+
+    #[test]
+    fn nb_fields_progressive_seq_rff_tff_is_six() {
+        assert_eq!(picture_nb_fields(&pic_coding_ext(1, 1, 0, true), true), 6);
+    }
+
+    #[test]
+    fn nb_fields_progressive_seq_rff_no_tff_is_four() {
+        assert_eq!(picture_nb_fields(&pic_coding_ext(0, 1, 0, true), true), 4);
+    }
+
+    #[test]
+    fn nb_fields_no_picture_ext_defaults_two() {
+        // A picture header with no coding extension → assume a normal 2-field frame.
+        assert_eq!(picture_nb_fields(&[0, 0, 1, 0x00, 0, 0], false), 2);
+    }
+
+    #[test]
+    fn progressive_sequence_parsed_from_seq_ext() {
+        // Sequence extension: 00 00 01 B5, e0 ext-id 0001 (0x1_), e1 bit3 = progressive_sequence.
+        assert!(parse_progressive_sequence(&[
+            0,
+            0,
+            1,
+            SEQ_EXT_CODE,
+            0x10,
+            0x08
+        ]));
+        assert!(!parse_progressive_sequence(&[
+            0,
+            0,
+            1,
+            SEQ_EXT_CODE,
+            0x10,
+            0x00
+        ]));
+        // No sequence extension at all → interlaced default (false).
+        assert!(!parse_progressive_sequence(&[
+            0,
+            0,
+            1,
+            SEQ_HEADER_CODE,
+            0,
+            0
+        ]));
+    }
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
@@ -651,9 +770,11 @@ mod tests {
     }
 
     #[test]
-    fn two_pictures_emit_two_frames_at_the_boundary() {
-        // pic1's frame is emitted as soon as pic2's start code is seen; pic2 on
-        // flush. Each frame contains exactly its own picture.
+    fn two_pictures_in_one_gop_emit_both_on_flush() {
+        // Two pictures with no GOP/sequence boundary between them are ONE GOP.
+        // The VFR timeline needs the whole GOP (a P-frame's PTS depends on its
+        // later B-frames), so they buffer until the GOP closes / EOF, then emit
+        // in DECODE order, each containing exactly its own picture.
         let mut parser = Mpeg2Parser::new();
 
         let mut pic1 = make_picture_header(PICTURE_TYPE_I);
@@ -664,17 +785,13 @@ mod tests {
         let mut stream = pic1.clone();
         stream.extend_from_slice(&pic2);
 
-        let mut frames = parser.parse(&make_pes(stream, Some(0)));
-        assert_eq!(
-            frames.len(),
-            1,
-            "first picture emitted at second's boundary"
-        );
+        let frames = parser.parse(&make_pes(stream, Some(0)));
+        assert!(frames.is_empty(), "same GOP — buffered until flush");
+
+        let frames = parser.flush();
+        assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].data, pic1);
         assert!(frames[0].keyframe);
-
-        frames.extend(parser.flush());
-        assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].data, pic2);
         assert!(!frames[1].keyframe);
     }
@@ -703,23 +820,24 @@ mod tests {
 
     #[test]
     fn each_picture_gets_the_pts_of_the_pes_that_began_it() {
+        // With no sequence header (no frame rate) the parser falls back to each
+        // AU's own PES PTS. Both pictures are one GOP → emitted on flush in
+        // decode order, each carrying the PTS of the PES that began it.
         let mut parser = Mpeg2Parser::new();
 
-        // PES 1: pic1 (PTS 90000) + start of pic2's bytes carried later.
         let mut pic1 = make_picture_header(PICTURE_TYPE_I);
         pic1.extend_from_slice(&vec![0x11; 50]);
         let frames1 = parser.parse(&make_pes(pic1, Some(90000)));
-        assert!(frames1.is_empty(), "pic1 awaits pic2's boundary");
+        assert!(frames1.is_empty(), "buffered until flush");
 
-        // PES 2: pic2 (PTS 180000).
         let mut pic2 = make_picture_header(2);
         pic2.extend_from_slice(&vec![0x22; 50]);
-        let mut frames = parser.parse(&make_pes(pic2, Some(180000)));
-        assert_eq!(frames.len(), 1, "pic1 emitted when pic2 starts");
-        assert_eq!(frames[0].pts_ns, 1_000_000_000, "pic1 → PTS 90000");
+        let frames2 = parser.parse(&make_pes(pic2, Some(180000)));
+        assert!(frames2.is_empty(), "same GOP — still buffered");
 
-        frames.extend(parser.flush());
+        let frames = parser.flush();
         assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].pts_ns, 1_000_000_000, "pic1 → PTS 90000");
         assert_eq!(frames[1].pts_ns, 2_000_000_000, "pic2 → PTS 180000");
     }
 
@@ -759,6 +877,89 @@ mod tests {
         assert_eq!(frames[1].pts_ns, 40_000_000, "TR1 → +1 frame interval");
         assert_eq!(frames[2].pts_ns, 80_000_000, "TR2 → +2 frame intervals");
         assert_eq!(frames[0].duration_ns, Some(40_000_000));
+    }
+
+    /// A frame-picture AU with a picture coding extension carrying pulldown
+    /// flags (progressive_frame=1, so rff=1 → 3 fields), for VFR timing tests.
+    fn make_pulldown_picture(coding_type: u8, tr: u16, rff: u8) -> Vec<u8> {
+        let mut au = make_picture_header_tr(coding_type, tr);
+        // 00 00 01 B5 | e0 ext-id 1000 | e1 | e2 frame-pic | e3 rff<<1 | e4 prog_frame
+        au.extend_from_slice(&[
+            0x00,
+            0x00,
+            0x01,
+            SEQ_EXT_CODE,
+            0x80,
+            0x00,
+            0x03,
+            rff << 1,
+            0x80,
+        ]);
+        au.extend_from_slice(&[0xAA; 16]);
+        au
+    }
+
+    #[test]
+    fn telecine_pts_accumulates_by_field_durations_not_a_fixed_grid() {
+        // NTSC film, frame_rate_code 4 = 29.97 → field_period ≈ 16.683 ms. A 2:3
+        // frame (rff=1) occupies 3 fields, a 2:2 frame 2 fields. PTS must
+        // accumulate by ACTUAL field durations so the next frame starts exactly
+        // when this one ends — closing the fixed-29.97-grid gap that judders.
+        let mut p = Mpeg2Parser::new();
+        let field = 1_000_000_000i64 * 1001 / 30000 / 2;
+
+        let mut a = make_seq_header(720, 480, 2, 4);
+        a.extend_from_slice(&gop());
+        a.extend(make_pulldown_picture(1, 0, 1)); // I tr0, 3 fields, PES anchor 0
+        a.extend(make_pulldown_picture(2, 1, 0)); // P tr1, 2 fields
+        let mut frames = p.parse(&make_pes(a, Some(0)));
+        frames.extend(p.flush());
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].pts_ns, 0, "I anchored to PES PTS 0");
+        assert_eq!(
+            frames[0].duration_ns,
+            Some(3 * field as u64),
+            "I = 3 fields"
+        );
+        assert_eq!(
+            frames[1].pts_ns,
+            3 * field,
+            "P starts exactly at I-end (3 fields), not the 1/29.97 grid"
+        );
+        assert_eq!(
+            frames[1].duration_ns,
+            Some(2 * field as u64),
+            "P = 2 fields"
+        );
+        assert!(frames[1].pts_ns > frames[0].pts_ns, "strictly monotonic");
+    }
+
+    #[test]
+    fn b_frames_emit_in_decode_order_with_lower_display_pts() {
+        // Decode order I(tr0) P(tr2) B(tr1): emitted in DECODE order, but the
+        // B-frame carries a LOWER (earlier) display PTS than the P that precedes
+        // it in the stream — never reordered (reordering corrupts the picture).
+        let mut p = Mpeg2Parser::new();
+        let field = 1_000_000_000i64 * 1001 / 30000 / 2;
+
+        let mut a = make_seq_header(720, 480, 2, 4);
+        a.extend_from_slice(&gop());
+        a.extend(make_pulldown_picture(1, 0, 0)); // I tr0 (displays 1st), PES anchor 0
+        a.extend(make_pulldown_picture(2, 2, 0)); // P tr2 (displays 3rd)
+        a.extend(make_pulldown_picture(3, 1, 0)); // B tr1 (displays 2nd)
+        let mut frames = p.parse(&make_pes(a, Some(0)));
+        frames.extend(p.flush());
+
+        assert_eq!(frames.len(), 3);
+        assert!(frames[0].keyframe, "decode order preserved: I first");
+        assert_eq!(frames[0].pts_ns, 0, "I (tr0) displays 1st");
+        assert_eq!(frames[1].pts_ns, 4 * field, "P (tr2) displays 3rd");
+        assert_eq!(frames[2].pts_ns, 2 * field, "B (tr1) displays 2nd");
+        assert!(
+            frames[2].pts_ns < frames[1].pts_ns,
+            "B emitted AFTER P (decode order) but displays BEFORE it (lower PTS)"
+        );
     }
 
     #[test]
@@ -973,9 +1174,10 @@ mod tests {
         let mut a = make_seq_header(1920, 1080, 3, 4);
         a.extend_from_slice(&make_picture_header(PICTURE_TYPE_I));
         a.extend_from_slice(&[0xAA; 20]);
-        a.extend_from_slice(&gop()); // boundary → AU A emits
-        let fa = parser.parse(&make_pes(a, Some(0)));
-        assert_eq!(fa.len(), 1);
+        a.extend_from_slice(&gop()); // trailing GOP header starts the next GOP
+        let _fa = parser.parse(&make_pes(a, Some(0)));
+        // Header A is captured during parse (codec_private) even though its GOP
+        // only emits once header B's picture closes it / on flush.
         assert_eq!(parser.resolution(), Some((1920, 1080)));
 
         // AU B: a NEW 720x480 seq header + I picture. Its extension/header must
@@ -1062,11 +1264,12 @@ mod tests {
         // > MAX_AU_BUFFER of slice bytes with no following picture/seq/GOP.
         data.extend(std::iter::repeat_n(0xAA, MAX_AU_BUFFER + 1024));
         let frames = parser.parse(&make_pes(data, Some(0)));
-        assert_eq!(
-            frames.len(),
-            1,
-            "over-cap AU force-flushed rather than buffered"
+        assert!(
+            frames.is_empty(),
+            "over-cap AU is force-COMPLETED (bounded) but buffered in its GOP"
         );
+        let frames = parser.flush();
+        assert_eq!(frames.len(), 1, "force-flushed at EOF, not dropped");
         assert!(frames[0].keyframe);
     }
 

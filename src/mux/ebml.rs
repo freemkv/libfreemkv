@@ -435,17 +435,18 @@ pub const FIELD_ORDER: u32 = 0x9D;
 // FlagInterlaced values: 1 = interlaced, 2 = progressive (0 = undetermined).
 pub const INTERLACED_INTERLACED: u64 = 1;
 pub const INTERLACED_PROGRESSIVE: u64 = 2;
-// FieldOrder values (Matroska): 0/2 = top-field-first, 1/9 = bottom-field-first.
-// NTSC DVD (480i), PAL DVD (576i) and HD (1080i) are all emitted top-field-first
-// — the muxer hardcodes TFF for every interlaced DVD/HD source (DV is the only
-// common BFF source and freemkv does not produce it). 0xFF is our sentinel for
+// FieldOrder values (Matroska / RFC 9559, element 0x9D): 1 = top-field-first,
+// 6 = bottom-field-first, 2 = undetermined, 0 = progressive. NTSC DVD (480i),
+// PAL DVD (576i) and HD (1080i) are all emitted top-field-first — the muxer
+// hardcodes TFF for every interlaced DVD/HD source (DV is the only common BFF
+// source and freemkv does not produce it). 0xFF is our sentinel for
 // "undetermined / omit".
-pub const FIELD_ORDER_TFF: u8 = 2;
+pub const FIELD_ORDER_TFF: u8 = 1;
 // Bottom-field-first. Retained for completeness/round-trip tests; the muxer
 // emits TFF for all DVD/HD interlaced content (DV is the only common BFF
 // source and freemkv does not produce it).
 #[allow(dead_code)]
-pub const FIELD_ORDER_BFF: u8 = 9;
+pub const FIELD_ORDER_BFF: u8 = 6;
 pub const FIELD_ORDER_UNDETERMINED: u8 = 0xFF;
 pub const DISPLAY_WIDTH: u32 = 0x54B0;
 pub const DISPLAY_HEIGHT: u32 = 0x54BA;
