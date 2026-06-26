@@ -23,10 +23,10 @@ const SYSTEM_HEADER_ID: u8 = 0xBB;
 const PROGRAM_END_ID: u8 = 0xB9;
 
 /// Private stream 1 (AC3, DTS, LPCM, subtitles).
-const PRIVATE_STREAM_1: u8 = 0xBD;
+const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
 /// Private stream 2 (0xBF) — DVD navigation (PCI/DSI). Carries no muxable
 /// elementary stream; expected to be dropped on every disc.
-const PRIVATE_STREAM_2: u8 = 0xBF;
+const PRIVATE_STREAM_2: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_2;
 
 /// Hard cap on the demuxer's reassembly buffer. A length-0 (unbounded) video
 /// PES is delimited by the next PS-layer boundary; if a corrupt stream declares
@@ -107,8 +107,8 @@ impl PsPacket {
     /// mis-routing the packet.
     pub fn dvd_pid(&self) -> Option<u16> {
         match self.stream_id {
-            0xE0..=0xEF => Some(DVD_VIDEO_PID),
-            0xBD => {
+            crate::consts::pes_stream_id::VIDEO..=0xEF => Some(DVD_VIDEO_PID),
+            PRIVATE_STREAM_1 => {
                 let sub = self.sub_stream_id?;
                 dvd_audio_pid(sub).or_else(|| dvd_subtitle_pid(sub))
             }
@@ -348,8 +348,8 @@ fn find_ps_boundary(data: &[u8], from: usize) -> Option<usize> {
 fn is_pes_stream_id(id: u8) -> bool {
     // Video: 0xE0-0xEF, MPEG audio: 0xC0-0xDF, private stream 1: 0xBD,
     // private stream 2: 0xBF, padding: 0xBE, ECM/EMM etc.
-    // We parse anything in the PES range.
-    matches!(id, 0xBD..=0xEF)
+    // We parse anything in the payload-bearing PES range.
+    crate::consts::pes_stream_id::PAYLOAD_RANGE.contains(&id)
 }
 
 /// Parse a single PES packet from a byte slice that starts at the start code.
@@ -365,12 +365,12 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
     let stream_id = data[3];
 
     // Padding stream — skip entirely.
-    if stream_id == 0xBE {
+    if stream_id == crate::consts::pes_stream_id::PADDING_STREAM {
         return None;
     }
 
     // Streams without standard PES header extension.
-    if stream_id == 0xBF {
+    if stream_id == PRIVATE_STREAM_2 {
         let payload = if data.len() > 6 { &data[6..] } else { &[] };
         return Some(PsPacket {
             stream_id,

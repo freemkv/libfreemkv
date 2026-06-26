@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::consts::SECTOR_BYTES;
+use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 /// AACS aligned unit = 3 sectors / 6144 bytes. Content reads are issued in
 /// multiples of this so the decrypt step always sees whole units.
 const AACS_UNIT_SECTORS: u32 = 3;
@@ -282,7 +282,7 @@ impl Disc {
                 for &(abs_lba, byte_len) in &pf.extents {
                     extents.push(crate::disc::Extent {
                         start_lba: abs_lba,
-                        sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES as u64) as u32,
+                        sector_count: (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32,
                     });
                 }
             }
@@ -467,7 +467,7 @@ fn extract_one_file<S: SectorSource>(
         // the per-extent re-anchoring in the mux read paths
         // (`mux/disc.rs`, `sector/prefetched.rs`). No-op for CSS / None.
         dec.set_unit_base(abs_lba);
-        let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES as u64) as u32;
+        let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
         let mut sector_off: u32 = 0;
         while sector_off < sectors {
             let mut batch = (sectors - sector_off).min(READ_BATCH_SECTORS);

@@ -179,7 +179,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // PG subtitles
             for _ in 0..n_pg {
-                if let Some((entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE) {
+                if let Some((entry, next)) =
+                    parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE)
+                {
                     streams.push(entry);
                     spos = next;
                 } else {
@@ -196,7 +198,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary audio
             for _ in 0..n_sec_audio {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_AUDIO) {
+                if let Some((mut entry, next)) =
+                    parse_stream_entry(item, spos, STREAM_CATEGORY_AUDIO)
+                {
                     entry.stream_type = 5;
                     entry.secondary = true;
                     streams.push(entry);
@@ -213,7 +217,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary video (PiP)
             for _ in 0..n_sec_video {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO) {
+                if let Some((mut entry, next)) =
+                    parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO)
+                {
                     entry.stream_type = 6;
                     entry.secondary = true;
                     streams.push(entry);
@@ -240,7 +246,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary PG (PiP subtitles) — must consume to keep spos aligned
             for _ in 0..n_pip_pg {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE) {
+                if let Some((mut entry, next)) =
+                    parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE)
+                {
                     entry.secondary = true;
                     streams.push(entry);
                     // Skip reference data: num_refs(1) + reserved(1) + refs + padding
@@ -256,7 +264,9 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Dolby Vision enhancement layer
             for _ in 0..n_dv {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO) {
+                if let Some((mut entry, next)) =
+                    parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO)
+                {
                     entry.stream_type = 7;
                     entry.secondary = true;
                     streams.push(entry);
@@ -333,6 +343,7 @@ const STREAM_CATEGORY_PG_SUBTITLE: u8 = 3;
 const STREAM_CATEGORY_IG: u8 = 4;
 
 fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
+    use crate::consts::coding_type as c;
     if pos + 2 > item.len() {
         return None;
     }
@@ -387,22 +398,27 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     let mut color_space_val = 0u8;
     let mut language = String::new();
 
+    // `stream_type` here is the STN category passed by the caller, which is
+    // only ever a primary category (VIDEO/AUDIO/PG_SUBTITLE/IG). Secondary
+    // audio/video and the DV enhancement layer are parsed through their
+    // matching primary category (identical attribute layout) and re-tagged by
+    // the caller after this returns, so there are no secondary arms here.
     match stream_type {
-        1 => {
+        STREAM_CATEGORY_VIDEO => {
             // Video: coding_type(1) + format_rate(1) + [hdr_info(1) if HEVC]
             if sa.len() >= 2 {
                 video_format = (sa[1] >> 4) & 0x0F;
                 video_rate = sa[1] & 0x0F;
             }
-            if coding_type == 0x24 && sa.len() > 2 {
+            if coding_type == c::HEVC && sa.len() > 2 {
                 dynamic_range = (sa[2] >> 4) & 0x0F;
                 color_space_val = sa[2] & 0x0F;
             }
         }
-        2 => {
+        STREAM_CATEGORY_AUDIO => {
             // Audio: coding_type(1) + format_rate(1) + language(3)
-            // Exception: PGS (0x90/0x91) in audio slot uses PG layout: coding_type(1) + language(3)
-            if coding_type == 0x90 || coding_type == 0x91 {
+            // Exception: PG/IG in an audio slot uses PG layout: coding_type(1) + language(3)
+            if coding_type == c::PG || coding_type == c::IG {
                 if sa.len() >= 4 {
                     language = String::from_utf8_lossy(&sa[1..4]).to_string();
                 }
@@ -416,33 +432,12 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
                 }
             }
         }
-        3 => {
+        STREAM_CATEGORY_PG_SUBTITLE => {
             // PG: coding_type(1) + language(3).
-            // IG (type 4) is parsed only to advance spos and is then
-            // discarded by the caller, so it deliberately has no arm here.
+            // IG is parsed only to advance spos and is then discarded by the
+            // caller, so it deliberately has no arm here.
             if sa.len() >= 4 {
                 language = String::from_utf8_lossy(&sa[1..4]).to_string();
-            }
-        }
-        5 => {
-            // Secondary audio: same as primary audio
-            if sa.len() >= 2 {
-                audio_format = (sa[1] >> 4) & 0x0F;
-                audio_rate = sa[1] & 0x0F;
-            }
-            if sa.len() >= 5 {
-                language = String::from_utf8_lossy(&sa[2..5]).to_string();
-            }
-        }
-        6 | 7 => {
-            // Secondary video: same as primary video
-            if sa.len() >= 2 {
-                video_format = (sa[1] >> 4) & 0x0F;
-                video_rate = sa[1] & 0x0F;
-            }
-            if coding_type == 0x24 && sa.len() > 2 {
-                dynamic_range = (sa[2] >> 4) & 0x0F;
-                color_space_val = sa[2] & 0x0F;
             }
         }
         _ => {}

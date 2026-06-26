@@ -72,7 +72,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::sector::SectorSource;
 
-use crate::consts::SECTOR_BYTES;
+use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 
 /// Bytes-read threshold per `posix_fadvise(DONTNEED)` drop on the
 /// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
@@ -134,7 +134,7 @@ impl FileSectorSource {
             .metadata()
             .map_err(|e| Error::IoError { source: e })?
             .len();
-        let sectors = len / SECTOR_BYTES as u64;
+        let sectors = len / SECTOR_BYTES_U64;
         if sectors > u32::MAX as u64 {
             return Err(Error::IsoTooLarge {
                 path: path.to_string_lossy().into_owned(),
@@ -180,7 +180,7 @@ impl SectorSource for FileSectorSource {
         if count == 0 {
             return Ok(0);
         }
-        let offset = lba as u64 * SECTOR_BYTES as u64;
+        let offset = lba as u64 * SECTOR_BYTES_U64;
         self.file
             .seek(SeekFrom::Start(offset))
             .map_err(|e| Error::IoError { source: e })?;
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn dontneed_eviction_does_not_affect_data() {
         // 32 MiB default chunk = 16384 sectors; read a bit past it.
-        let total = (READ_DROP_CHUNK_BYTES_DEFAULT / SECTOR_BYTES as u64) as u32 + 64;
+        let total = (READ_DROP_CHUNK_BYTES_DEFAULT / SECTOR_BYTES_U64) as u32 + 64;
         let dir = tempdir().unwrap();
         let path = dir.path().join("drop.iso");
         make_iso(&path, total);
