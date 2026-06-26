@@ -78,6 +78,39 @@ pub enum CodingDetail {
     CodingTypeOnly,
 }
 
+/// HDR10 static metadata measured from a video bitstream (HEVC SEI). Carried on
+/// [`PictureInfo`] as the per-stream colour-volume signalling: it only ever
+/// reaches the muxer when BOTH SEI messages were actually present in the stream,
+/// so an SDR / no-SEI track leaves it `None` and the muxer omits the elements
+/// (never fabricated).
+///
+/// All values are stored in their RAW SEI integer units (NOT yet scaled to the
+/// Matroska float domain); the muxer applies the H.265 → Matroska unit
+/// conversion at emit time so the scaling lives in exactly one place.
+///
+/// Spec: Rec. ITU-T H.265 D.2.28 (Mastering Display Colour Volume,
+/// payloadType 137) and D.2.35 (Content Light Level Info, payloadType 144).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hdr10Metadata {
+    /// `display_primaries_x[c]` / `display_primaries_y[c]` for c = 0,1,2.
+    /// Per H.265 D.3.28 the SEI order is c=0 → Green, c=1 → Blue, c=2 → Red.
+    /// Stored here in that SAME SEI order; the muxer maps to Matroska's R/G/B
+    /// element layout. Units of 0.00002 (chromaticity).
+    pub display_primaries_x: [u16; 3],
+    pub display_primaries_y: [u16; 3],
+    /// `white_point_x` / `white_point_y` in units of 0.00002 (chromaticity).
+    pub white_point_x: u16,
+    pub white_point_y: u16,
+    /// `max_display_mastering_luminance` in units of 0.0001 cd/m².
+    pub max_display_mastering_luminance: u32,
+    /// `min_display_mastering_luminance` in units of 0.0001 cd/m².
+    pub min_display_mastering_luminance: u32,
+    /// `max_content_light_level` (MaxCLL) in cd/m² — already an integer.
+    pub max_content_light_level: u16,
+    /// `max_pic_average_light_level` (MaxFALL) in cd/m² — already an integer.
+    pub max_pic_average_light_level: u16,
+}
+
 /// Codec-agnostic per-picture coding carrier — the single per-frame record the
 /// muxer reads through the accessors below. Raw codec signals live in
 /// [`CodingDetail`]; consumers MUST use the accessors, never the inner fields.
@@ -89,6 +122,11 @@ pub struct PictureInfo {
     /// Raw per-codec coding detail. Holds the bits the field/pulldown
     /// accessors derive from.
     detail: CodingDetail,
+    /// HDR10 static metadata measured from the bitstream (HEVC SEI), or `None`
+    /// when the stream carried no HDR10 SEI (SDR / not signalled). Per-stream,
+    /// but rides the per-picture carrier so it flows the same deferred-muxer
+    /// path the measured field order does. Never fabricated.
+    hdr10: Option<Hdr10Metadata>,
 }
 
 impl PictureInfo {
@@ -98,6 +136,7 @@ impl PictureInfo {
         Self {
             coding_type,
             detail: CodingDetail::Mpeg2(m),
+            hdr10: None,
         }
     }
 
@@ -107,7 +146,25 @@ impl PictureInfo {
         Self {
             coding_type,
             detail: CodingDetail::CodingTypeOnly,
+            hdr10: None,
         }
+    }
+
+    /// Attach measured HDR10 static metadata (HEVC SEI) to this picture,
+    /// consuming and returning `self` for builder-style use. Only ever called
+    /// with `Some(..)` once both HDR10 SEI messages have been seen, so an SDR
+    /// track never carries fabricated colour-volume data.
+    pub fn with_hdr10(mut self, hdr10: Option<Hdr10Metadata>) -> Self {
+        self.hdr10 = hdr10;
+        self
+    }
+
+    /// Measured HDR10 static metadata for this picture's stream, or `None` when
+    /// the bitstream signalled no HDR10 SEI. Read at mux time to emit the
+    /// Matroska MasteringMetadata / MaxCLL / MaxFALL — omitted entirely when
+    /// `None`.
+    pub fn hdr10(&self) -> Option<Hdr10Metadata> {
+        self.hdr10
     }
 
     /// Agnostic coding type (I/P/B). The single signal for cue/keyframe marking

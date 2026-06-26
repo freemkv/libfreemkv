@@ -456,6 +456,25 @@ pub const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 pub const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 pub const PRIMARIES: u32 = 0x55BB;
 pub const RANGE: u32 = 0x55B9;
+// HDR10 static metadata — children of COLOUR (RFC 9559 / Matroska spec).
+//
+// MaxCLL / MaxFALL are direct children of Colour and are UINTs (cd/m²).
+pub const MAX_CLL: u32 = 0x55BC;
+pub const MAX_FALL: u32 = 0x55BD;
+// MasteringMetadata is a master child of Colour; its chromaticity / luminance
+// children are EBML FLOATs. Chromaticity values are in the 0..1 range; the
+// luminance values are in cd/m².
+pub const MASTERING_METADATA: u32 = 0x55D0;
+pub const PRIMARY_R_CHROMATICITY_X: u32 = 0x55D1;
+pub const PRIMARY_R_CHROMATICITY_Y: u32 = 0x55D2;
+pub const PRIMARY_G_CHROMATICITY_X: u32 = 0x55D3;
+pub const PRIMARY_G_CHROMATICITY_Y: u32 = 0x55D4;
+pub const PRIMARY_B_CHROMATICITY_X: u32 = 0x55D5;
+pub const PRIMARY_B_CHROMATICITY_Y: u32 = 0x55D6;
+pub const WHITE_POINT_CHROMATICITY_X: u32 = 0x55D7;
+pub const WHITE_POINT_CHROMATICITY_Y: u32 = 0x55D8;
+pub const LUMINANCE_MAX: u32 = 0x55D9;
+pub const LUMINANCE_MIN: u32 = 0x55DA;
 
 // Dolby Vision — BlockAdditionMapping carries the DOVIDecoderConfigurationRecord
 // (dvcC) so players / mediainfo recognise the track as Dolby Vision.
