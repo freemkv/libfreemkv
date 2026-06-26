@@ -222,24 +222,14 @@ impl MkvTrack {
             colour_primaries: primaries,
             colour_range: range,
             interlaced: v.resolution.is_interlaced(),
-            // FieldOrder (Matroska 0x9D) MUST agree with the elementary stream's
-            // interlace signalling. Derive it from the MEASURED `top_field_first`
-            // when the bitstream stated it: Some(true) → TFF, Some(false) → BFF.
-            // Genuinely bottom-field-first content (rare, but real) was previously
-            // mis-stamped TFF because the muxer hardcoded TFF for ALL interlaced
-            // streams. When the flag is NOT measured (`None`), fall back to TFF —
-            // PAL DVD (576i), NTSC DVD (480i) and HD (1080i) are overwhelmingly
-            // top-field-first ("almost everything but DV is TFF"). Progressive
-            // content leaves the order undetermined (the element is omitted).
-            field_order: if v.resolution.is_interlaced() {
-                match v.top_field_first {
-                    Some(true) => ebml::FIELD_ORDER_TFF,
-                    Some(false) => ebml::FIELD_ORDER_BFF,
-                    None => ebml::FIELD_ORDER_TFF,
-                }
-            } else {
-                ebml::FIELD_ORDER_UNDETERMINED
-            },
+            // FieldOrder (Matroska 0x9D) is a bitstream property
+            // (`top_field_first`) the IFO/MPLS scan cannot know, so it is NOT set
+            // here — it would only ever be a guess. Default to UNDETERMINED; the
+            // mux stream (`MkvStream`) sets the MEASURED value from the first
+            // coded picture's `PictureInfo` before the muxer writes the header.
+            // If an interlaced track ever reaches the muxer still UNDETERMINED,
+            // that is a parser/source gap and is logged loudly — never faked.
+            field_order: ebml::FIELD_ORDER_UNDETERMINED,
             // DefaultDecodedFieldDuration is DELIBERATELY NOT emitted (0 here
             // suppresses the element; see the writer in `MkvMuxer::new`).
             //
@@ -753,6 +743,10 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     },
                 )?;
                 if track.interlaced && track.field_order != ebml::FIELD_ORDER_UNDETERMINED {
+                    // `track.field_order` was set CORRECTLY before construction
+                    // (the mux stream reads the first coded picture's measured
+                    // field order and sets it on the track), so this writes the
+                    // right value the first time — no later rewrite.
                     ebml::write_uint(&mut writer, ebml::FIELD_ORDER, track.field_order as u64)?;
                 }
                 if track.display_width > 0 && track.display_height > 0 {
@@ -902,6 +896,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// when to remove the on-screen artifact (the practical case is
     /// PGS subtitles — without it, the last bitmap lingers until the
     /// next display set replaces it). Otherwise a plain `SimpleBlock`.
+    /// Rewrite a video track's `FieldOrder` value in place from the MEASURED
+    /// field order carried on the first coded picture, replacing the scan-time
+    /// guess written at construction. This is the fix for the "we parsed
+    /// `top_field_first` then ignored it" red flag: the muxer now stamps the
+    /// field order the bitstream actually states, not an assumption.
+    ///
+    /// Idempotent — only the first call per track patches (later calls and
+    /// non-interlaced / non-video tracks are no-ops). `Progressive` / unknown
+    /// (`None`) leaves the written value untouched: an interlaced track keeps
+    /// its guess rather than being cleared via a multi-element change. The byte
+    /// width is fixed (FieldOrder is 0..=14), so the in-place rewrite is valid.
     pub fn write_frame(
         &mut self,
         track_idx: usize,
@@ -1347,7 +1352,6 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&base);
@@ -1370,59 +1374,6 @@ mod tests {
         );
     }
 
-    /// FieldOrder must follow the MEASURED top_field_first, not a hardcoded TFF.
-    /// An interlaced stream whose parsed `top_field_first == Some(false)` tags
-    /// BFF (=6); `Some(true)` and `None` (unknown, the fallback) tag TFF (=1).
-    #[test]
-    fn interlaced_field_order_from_measured_tff() {
-        let base = VideoStream {
-            pid: 0xE0,
-            codec: Codec::Mpeg2,
-            resolution: Resolution::R576i, // interlaced
-            frame_rate: crate::disc::FrameRate::F25,
-            hdr: HdrFormat::Sdr,
-            color_space: ColorSpace::Bt470bg,
-            display_aspect: None,
-            secondary: false,
-            label: String::new(),
-            top_field_first: None,
-            measured_cicp: None,
-        };
-
-        // Measured bottom-field-first → BFF, NOT the old hardcoded TFF.
-        let bff = VideoStream {
-            top_field_first: Some(false),
-            ..base.clone()
-        };
-        assert_eq!(
-            MkvTrack::video(&bff).field_order,
-            ebml::FIELD_ORDER_BFF,
-            "measured top_field_first=false must tag BFF (6), not TFF"
-        );
-
-        // Measured top-field-first → TFF.
-        let tff = VideoStream {
-            top_field_first: Some(true),
-            ..base.clone()
-        };
-        assert_eq!(MkvTrack::video(&tff).field_order, ebml::FIELD_ORDER_TFF);
-
-        // Unknown (not measured) → TFF fallback (dominant DVD/HD case).
-        assert_eq!(MkvTrack::video(&base).field_order, ebml::FIELD_ORDER_TFF);
-
-        // Progressive content leaves the order undetermined regardless of flag.
-        let prog = VideoStream {
-            resolution: Resolution::R1080p,
-            top_field_first: Some(false),
-            ..base
-        };
-        assert_eq!(
-            MkvTrack::video(&prog).field_order,
-            ebml::FIELD_ORDER_UNDETERMINED,
-            "progressive video never carries a field order"
-        );
-    }
-
     /// Measured CICP from the bitstream must take precedence over the coarse
     /// `color_space` enum. A BT.2020/PQ enum that would otherwise produce
     /// (9,16,9) is overridden by a measured BT.709 triplet when present.
@@ -1438,7 +1389,6 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
 
@@ -2471,6 +2421,7 @@ mod tests {
             // One PES PTS anchor per GOP (90 kHz), as a real VOBU stamps.
             let gop_pts = g * gop_len as i64 * frame_ns * 90_000 / 1_000_000_000;
             frames.extend(parser.parse(&PesPacket {
+                source: None,
                 pid: 0x1011,
                 pts: Some(gop_pts),
                 dts: None,
@@ -3369,10 +3320,11 @@ mod tests {
     }
 
     #[test]
-    fn video_576i_defaults_to_top_field_first() {
-        // PAL 576i must default to TFF (2), not BFF — the container element must
-        // agree with the MPEG-2 stream (MediaInfo reads "Top Field First" off
-        // the picture coding extension). The pre-rc.5.1 BFF(9) was a wrong value.
+    fn video_576i_field_order_undetermined_at_track_build() {
+        // Field order is a bitstream property the IFO/MPLS scan cannot know, so
+        // the track is built with FieldOrder=UNDETERMINED — never a scan-time
+        // guess. The mux stream sets the MEASURED value from the first coded
+        // picture before the header is written (mkvstream::apply_coding_to_track).
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -3383,15 +3335,14 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
-        assert!(t.interlaced, "576i is interlaced");
+        assert!(t.interlaced, "576i is interlaced (FlagInterlaced=1)");
         assert_eq!(
             t.field_order,
-            ebml::FIELD_ORDER_TFF,
-            "576i must default to top-field-first"
+            ebml::FIELD_ORDER_UNDETERMINED,
+            "field order is not known at scan — set later from the measured picture"
         );
     }
 
@@ -3416,7 +3367,6 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
@@ -3444,11 +3394,12 @@ mod tests {
             ebml::INTERLACED_INTERLACED as u8,
             "FlagInterlaced=1 retained"
         );
-        let fo = find_id(&data, ebml::FIELD_ORDER).expect("FieldOrder present");
-        assert_eq!(
-            data[fo + 2],
-            ebml::FIELD_ORDER_TFF,
-            "FieldOrder=TFF retained"
+        // FieldOrder is set at mux time from the first coded picture's measured
+        // field order. A track built directly (no measured picture) carries
+        // UNDETERMINED, so the element is omitted — never a scan-time guess.
+        assert!(
+            find_id(&data, ebml::FIELD_ORDER).is_none(),
+            "FieldOrder omitted until measured — no guess at track build"
         );
     }
 
@@ -3561,7 +3512,6 @@ mod tests {
             display_aspect: Some((16, 9)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
@@ -3622,7 +3572,6 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
@@ -3668,12 +3617,13 @@ mod tests {
     }
 
     #[test]
-    fn ntsc_480i_field_order_is_tff_and_encoded() {
-        // 480i FIELD-ORDER HONESTY (audit §2 / §5 #5): NTSC 480i is hardcoded TFF
-        // (mkv.rs field_order). Document & encode that reality so a future edit
-        // can't silently flip it. The old field-order test covered 576i only;
-        // NTSC was never exercised. Assert both the struct value AND the byte
-        // actually written into the Video master.
+    fn ntsc_480i_duration_metadata_and_field_order_undetermined_at_build() {
+        // NTSC 480i duration metadata (Windows-fps fix) PLUS field-order honesty.
+        // Field order is a bitstream property the IFO/MPLS scan cannot know, so a
+        // track built without a measured picture carries FieldOrder=UNDETERMINED
+        // and the element is OMITTED — never a hardcoded TFF guess. The MEASURED
+        // value is set by the mux stream from the first coded picture (see
+        // mkvstream::apply_coding_to_track and its dedicated test).
         let v = VideoStream {
             pid: 0xE0,
             codec: Codec::Mpeg2,
@@ -3684,15 +3634,14 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         };
         let t = MkvTrack::video(&v);
         assert!(t.interlaced, "480i is interlaced");
         assert_eq!(
             t.field_order,
-            ebml::FIELD_ORDER_TFF,
-            "NTSC 480i is hardcoded top-field-first"
+            ebml::FIELD_ORDER_UNDETERMINED,
+            "field order is not known at scan time — never guessed at track build"
         );
         // 480i @ 29.97: frame = 1001/30000 s = 33_366_666 ns; field = half.
         assert_eq!(
@@ -3705,8 +3654,8 @@ mod tests {
         );
         let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
         let data = muxer.writer.into_inner();
-        // FlagInterlaced and FieldOrder are Video children; assert the encoded
-        // bytes (depth-scoped, not a flat scan).
+        // FlagInterlaced is still encoded (480i IS interlaced); FieldOrder is
+        // omitted until measured — never a hardcoded guess.
         assert_eq!(
             video_child_u8(&data, ebml::FLAG_INTERLACED),
             Some(ebml::INTERLACED_INTERLACED as u8),
@@ -3714,8 +3663,8 @@ mod tests {
         );
         assert_eq!(
             video_child_u8(&data, ebml::FIELD_ORDER),
-            Some(ebml::FIELD_ORDER_TFF),
-            "480i must encode FieldOrder = TFF (2)"
+            None,
+            "FieldOrder omitted until measured — not a hardcoded guess"
         );
     }
 

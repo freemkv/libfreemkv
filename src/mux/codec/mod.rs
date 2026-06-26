@@ -9,6 +9,8 @@
 
 /// AC-3 / E-AC-3 (Dolby Digital / Digital Plus) elementary-stream parser.
 pub mod ac3;
+/// Codec-agnostic per-picture coding carrier (`PictureInfo` + accessors).
+pub mod coding;
 /// DTS / DTS-HD elementary-stream parser.
 pub mod dts;
 /// DVD bitmap subtitle (VobSub) parser.
@@ -30,10 +32,13 @@ pub mod truehd;
 /// VC-1 (SMPTE 421M) elementary-stream parser.
 pub mod vc1;
 
+pub use coding::{FieldOrder, PictureInfo};
+
 use super::ts::PesPacket;
 use crate::disc::Codec;
 
 /// A single frame ready for MKV muxing.
+#[derive(Default)]
 pub struct Frame {
     /// Presentation timestamp in nanoseconds.
     pub pts_ns: i64,
@@ -48,6 +53,18 @@ pub struct Frame {
     /// `SimpleBlock`; without it players guess the display interval
     /// (subtitles linger past their end-time).
     pub duration_ns: Option<u64>,
+    /// Codec-agnostic per-picture coding info, set by the video parsers that
+    /// decode it (MPEG-2 fully; H.264/HEVC/VC-1 coding-type only); `None` for
+    /// audio/subtitle frames. Carried additively through the highway and
+    /// forwarded onto [`crate::pes::PesFrame::coding`] so the muxer can read
+    /// field order / pulldown off the frame instead of assuming it. Default
+    /// `None` keeps non-video frames paying nothing.
+    pub coding: Option<PictureInfo>,
+    /// Source position of this frame's first byte, carried from the demux seam
+    /// (where each PES is stamped) through the parser. `None` for synthetic
+    /// sources / parsers that don't track it. Forwarded onto
+    /// [`crate::pes::PesFrame::source`].
+    pub source: Option<crate::pes::SourcePos>,
 }
 
 /// Convert 90kHz PTS to nanoseconds (round to nearest).
@@ -107,6 +124,8 @@ impl CodecParser for PassthroughParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns,
             keyframe: self.keyframe,
             data: pes.data.clone(),
@@ -174,6 +193,7 @@ mod tests {
 
     fn pes(pts: Option<i64>, data: Vec<u8>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1011,
             pts,
             dts: None,

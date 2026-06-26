@@ -12,6 +12,35 @@
 /// and then hard-erroring mid-stream on read.
 const MAX_FRAME_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
+/// Where a unit's first byte came from in the SOURCE address space.
+///
+/// `byte` is the absolute byte offset of the unit's first byte within the
+/// source stream the producer emits (the decrypted sector stream / ISO);
+/// `sector` is that offset's 2048-byte logical sector (`byte / 2048`). One
+/// value, **stamped once at the demux seam and propagated unchanged** through
+/// every pipeline stage to the emitted frame — no stage recomputes it. This is
+/// the load-bearing column for a frame-accurate source index (random-access
+/// position) and is reusable for loss-to-timestamp mapping and seek indexing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourcePos {
+    /// Source logical sector (2048-byte) of the unit's first byte.
+    pub sector: u64,
+    /// Absolute source byte offset of the unit's first byte.
+    pub byte: u64,
+}
+
+impl SourcePos {
+    /// Build a `SourcePos` from an absolute source byte offset, deriving the
+    /// 2048-byte sector. The single construction helper — callers stamp the
+    /// byte offset they know and the sector follows, so the two never disagree.
+    pub fn at_byte(byte: u64) -> Self {
+        Self {
+            sector: byte / 2048,
+            byte,
+        }
+    }
+}
+
 /// One frame of elementary stream data.
 #[derive(Debug, Clone)]
 pub struct PesFrame {
@@ -28,6 +57,16 @@ pub struct PesFrame {
     /// the PGS parser so the MKV muxer can emit `BlockDuration`; also
     /// preserved across network:// and stdio:// hops.
     pub duration_ns: Option<u64>,
+    /// Byte-exact source provenance of this frame's first byte, stamped at the
+    /// demux seam. `None` for synthetic sources / the `skip_parse` path and for
+    /// the `deserialize` (network/stdio) hop — NOT serialized on the wire.
+    pub source: Option<SourcePos>,
+    /// Codec-agnostic per-picture coding info (field order / type / pulldown),
+    /// set by the video parser; `None` for audio/subtitle frames, codecs that
+    /// do not yet fill it, and the deserialize hop. The muxer reads it through
+    /// the [`crate::mux::codec::PictureInfo`] accessors to stamp `FieldOrder` /
+    /// `DefaultDuration` — never re-deriving from the bitstream.
+    pub coding: Option<crate::mux::codec::PictureInfo>,
 }
 
 /// Sentinel value for `duration_ns` on the wire: `u64::MAX` means `None`.
@@ -115,6 +154,11 @@ impl PesFrame {
             keyframe,
             data,
             duration_ns,
+            // Provenance and coding are not carried on the wire — a frame read
+            // back from a network:// / stdio:// / .pes hop has no source bytes
+            // or parser context to attribute.
+            source: None,
+            coding: None,
         }))
     }
 
@@ -129,6 +173,8 @@ impl PesFrame {
             keyframe: frame.keyframe,
             data: frame.data,
             duration_ns: frame.duration_ns,
+            source: frame.source,
+            coding: frame.coding,
         }
     }
 }
@@ -266,6 +312,8 @@ mod tests {
 
     fn make_frame(track: usize, pts: i64) -> PesFrame {
         PesFrame {
+            coding: None,
+            source: None,
             track,
             pts,
             keyframe: track == 0 && pts == 0,
@@ -444,6 +492,8 @@ mod tests {
     fn serialize_wire_format_matches_spec() {
         // Wire format: [track(1)][pts_le(8)][keyframe(1)][duration_le(8)][len_le(4)][data...]
         let frame = PesFrame {
+            coding: None,
+            source: None,
             track: 2,
             pts: 0x0102030405060708_i64,
             keyframe: true,
@@ -490,6 +540,8 @@ mod tests {
     #[test]
     fn serialize_keyframe_false_encodes_as_zero() {
         let frame = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: false,
@@ -511,6 +563,8 @@ mod tests {
     #[test]
     fn serialize_track_255_is_ok_track_256_is_err() {
         let ok_frame = PesFrame {
+            coding: None,
+            source: None,
             track: 255,
             pts: 0,
             keyframe: false,
@@ -522,6 +576,8 @@ mod tests {
         assert_eq!(buf[0], 255, "track 255 must serialize to 0xFF");
 
         let too_large = PesFrame {
+            coding: None,
+            source: None,
             track: 256,
             pts: 0,
             keyframe: false,
@@ -541,6 +597,8 @@ mod tests {
     fn deserialize_round_trips_pts_boundaries() {
         for pts in [0_i64, i64::MAX, i64::MIN] {
             let frame = PesFrame {
+                coding: None,
+                source: None,
                 track: 0,
                 pts,
                 keyframe: false,
@@ -561,6 +619,8 @@ mod tests {
     #[test]
     fn deserialize_accepts_zero_length_data() {
         let frame = PesFrame {
+            coding: None,
+            source: None,
             track: 3,
             pts: 99,
             keyframe: false,
@@ -586,6 +646,8 @@ mod tests {
     fn deserialize_duration_ns_roundtrips() {
         // None encodes as u64::MAX sentinel and decodes back to None.
         let frame_none = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: false,
@@ -603,6 +665,8 @@ mod tests {
 
         // Some(0) must survive — 0 is a valid zero-length duration, not the sentinel.
         let frame_zero = PesFrame {
+            coding: None,
+            source: None,
             track: 1,
             pts: 1000,
             keyframe: false,
@@ -621,6 +685,8 @@ mod tests {
 
         // Some(N) for a typical PGS duration (~3 seconds).
         let frame_n = PesFrame {
+            coding: None,
+            source: None,
             track: 2,
             pts: 5_000_000_000,
             keyframe: false,
@@ -644,6 +710,8 @@ mod tests {
     #[test]
     fn deserialize_two_sequential_frames() {
         let f1 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 100,
             keyframe: true,
@@ -651,6 +719,8 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            coding: None,
+            source: None,
             track: 1,
             pts: 200,
             keyframe: false,
@@ -679,6 +749,8 @@ mod tests {
     #[test]
     fn counting_stream_accumulates_across_multiple_writes() {
         let f1 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: false,
@@ -686,6 +758,8 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 1,
             keyframe: false,

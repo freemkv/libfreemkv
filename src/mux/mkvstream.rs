@@ -76,13 +76,48 @@ struct ReadState {
     codec_privates: Vec<(u16, Vec<u8>)>,
 }
 
+/// Safety cap on frames buffered before the first video frame triggers muxer
+/// construction. The first video frame normally arrives within the first few
+/// frames, so this is only a backstop for a pathological audio-only-prefix
+/// stream — past it we build with no measured field order (logged) rather than
+/// buffer unbounded.
+const MAX_PENDING_FRAMES: usize = 4096;
+
 enum Mode {
-    Write {
-        // Boxed: MkvMuxer is large relative to the Read variant; boxing keeps
-        // the Mode enum small (avoids clippy::large_enum_variant).
-        muxer: Option<Box<MkvMuxer<Box<dyn WriteSeek + Send>>>>,
-    },
+    Write(WriteMode),
     Read(ReadState),
+}
+
+/// MKV write state with DEFERRED muxer construction. The track header (which
+/// carries `FieldOrder`) is written only once the first coded picture is in
+/// hand, so the primary video track's field order is set to the parser's
+/// MEASURED value the first time — never a guessed default a later pass would
+/// rewrite. The muxer still only ever muxes the track it is *given*; this stream
+/// is the adapter that routes the parser's measured field order onto that track
+/// before construction.
+enum WriteMode {
+    /// Header not written yet: buffering frames until the first video frame.
+    Pending(Box<PendingMux>),
+    /// Header written; muxing live. Boxed (MkvMuxer is large) to keep the enum
+    /// small (clippy::large_enum_variant).
+    Active(Box<MkvMuxer<Box<dyn WriteSeek + Send>>>),
+    /// Transient placeholder held only across the Pending → Active swap; never
+    /// observed by `read` / `write` / `finish`.
+    Building,
+}
+
+/// Everything needed to build the muxer, held until the first coded picture
+/// lets the primary video track's field order be set from the source.
+struct PendingMux {
+    writer: Box<dyn WriteSeek + Send>,
+    tracks: Vec<MkvTrack>,
+    /// Index of the primary (first) video track, if any — the track whose
+    /// `FieldOrder` is set from the first coded picture's measured coding.
+    video_track: Option<usize>,
+    /// `--log-level 3` opening-capture side-file path (if any).
+    opening_capture_path: Option<std::path::PathBuf>,
+    /// Frames received before activation, replayed in order once built.
+    buffered: Vec<crate::pes::PesFrame>,
 }
 
 /// Matroska container stream.
@@ -130,35 +165,61 @@ impl MkvStream {
             tracks.push(track);
         }
 
-        // --log-level 3: dump the ACTUAL TrackEntry elements about to be written
-        // (FlagInterlaced / FieldOrder / DefaultDuration / DefaultDecodedFieldDuration
-        // / Display dims / codecPrivate hex) so the Windows-fps-class metadata is
-        // verifiable from a log alone. No-op when diag is off.
-        for (i, track) in tracks.iter().enumerate() {
-            crate::diag::dump_mkv_track((i + 1) as u64, track);
-        }
-
-        let mut muxer = MkvMuxer::new(
-            writer,
-            &tracks,
-            Some(&title.playlist),
-            title.duration_secs,
-            &title.chapters,
-        )?;
-
-        // --log-level 3: capture the first ~100 coded frames per track to
-        // `<output>.opening.bin`. Only opens the side file when diag is on AND a
-        // real output path is known; otherwise it's a no-op the muxer never sees.
-        if let Some(path) = output_path {
-            muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, tracks.len()));
-        }
+        // Defer muxer construction (and the TrackEntry dump) until the first
+        // coded picture arrives, so the primary video track's FieldOrder is set
+        // from the parser's MEASURED value before the header is written — never
+        // a guess. The dump moves to activation so it reflects the final track.
+        let video_track = tracks.iter().position(|t| t.track_type == 1);
 
         Ok(Self {
             disc_title: title.clone(),
-            mode: Mode::Write {
-                muxer: Some(Box::new(muxer)),
-            },
+            mode: Mode::Write(WriteMode::Pending(Box::new(PendingMux {
+                writer,
+                tracks,
+                video_track,
+                opening_capture_path: output_path.map(|p| p.to_path_buf()),
+                buffered: Vec::new(),
+            }))),
         })
+    }
+
+    /// Build the muxer from the pending state, setting the primary video track's
+    /// `FieldOrder` from the MEASURED `coding` of the first coded picture (when
+    /// available), then write the header and replay buffered frames. A no-op if
+    /// not pending. The muxer only ever muxes the track it is given — this routes
+    /// the parser's measured value onto that track first.
+    fn activate(&mut self, coding: Option<crate::mux::codec::PictureInfo>) -> io::Result<()> {
+        let mut pending = match std::mem::replace(&mut self.mode, Mode::Write(WriteMode::Building))
+        {
+            Mode::Write(WriteMode::Pending(p)) => p,
+            // Not pending (already active / read): restore and bail.
+            other => {
+                self.mode = other;
+                return Ok(());
+            }
+        };
+        if let Some(vt) = pending.video_track {
+            apply_coding_to_track(&mut pending.tracks[vt], coding);
+        }
+        // --log-level 3: dump the FINAL TrackEntry metadata (field order set).
+        for (i, track) in pending.tracks.iter().enumerate() {
+            crate::diag::dump_mkv_track((i + 1) as u64, track);
+        }
+        let mut muxer = MkvMuxer::new(
+            pending.writer,
+            &pending.tracks,
+            Some(&self.disc_title.playlist),
+            self.disc_title.duration_secs,
+            &self.disc_title.chapters,
+        )?;
+        if let Some(path) = &pending.opening_capture_path {
+            muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
+        }
+        for f in pending.buffered.drain(..) {
+            muxer.write_frame(f.track, f.pts, f.keyframe, &f.data, f.duration_ns)?;
+        }
+        self.mode = Mode::Write(WriteMode::Active(Box::new(muxer)));
+        Ok(())
     }
 
     /// Open an MKV file for reading → PES frames.
@@ -176,12 +237,42 @@ impl MkvStream {
     }
 }
 
+/// Set a video track's `FieldOrder` from the MEASURED coding of the first coded
+/// picture — the parser's value, the first time, never a guess.
+///
+/// A progressive track has no field order (left UNDETERMINED — expected). An
+/// INTERLACED track that reaches here with no measured field order is a
+/// parser/source gap (MPEG-2 carries `top_field_first` on every interlaced
+/// picture, so it should never be missing): LOG it loudly so the source can be
+/// debugged, and leave UNDETERMINED — a muxer never fabricates a source fact.
+fn apply_coding_to_track(track: &mut MkvTrack, coding: Option<crate::mux::codec::PictureInfo>) {
+    if !track.interlaced {
+        return;
+    }
+    use crate::mux::codec::FieldOrder;
+    match coding.and_then(|c| c.field_order()) {
+        Some(FieldOrder::Tff) => track.field_order = ebml::FIELD_ORDER_TFF,
+        Some(FieldOrder::Bff) => track.field_order = ebml::FIELD_ORDER_BFF,
+        other => {
+            tracing::warn!(
+                target: "mux",
+                "interlaced video track reached the muxer with NO measured field order \
+                 (field_order={:?}, coding_present={}); writing FieldOrder=UNDETERMINED \
+                 — NOT a guess. Debug why the source/parser did not set top_field_first.",
+                other,
+                coding.is_some(),
+            );
+            track.field_order = ebml::FIELD_ORDER_UNDETERMINED;
+        }
+    }
+}
+
 impl crate::pes::Stream for MkvStream {
     fn read(&mut self) -> io::Result<Option<crate::pes::PesFrame>> {
         let streams_len = self.disc_title.streams.len();
         let rs = match self.mode {
             Mode::Read(ref mut rs) => rs,
-            Mode::Write { .. } => return Err(crate::error::Error::StreamWriteOnly.into()),
+            Mode::Write(_) => return Err(crate::error::Error::StreamWriteOnly.into()),
         };
 
         loop {
@@ -296,24 +387,68 @@ impl crate::pes::Stream for MkvStream {
     }
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
+        // Fast paths.
         match &mut self.mode {
-            Mode::Write { muxer: Some(m) } => m.write_frame(
-                frame.track,
-                frame.pts,
-                frame.keyframe,
-                &frame.data,
-                frame.duration_ns,
-            ),
-            Mode::Write { muxer: None } => Ok(()),
-            Mode::Read(_) => Err(crate::error::Error::StreamReadOnly.into()),
+            Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
+            Mode::Write(WriteMode::Active(m)) => {
+                return m.write_frame(
+                    frame.track,
+                    frame.pts,
+                    frame.keyframe,
+                    &frame.data,
+                    frame.duration_ns,
+                );
+            }
+            Mode::Write(WriteMode::Building) => return Ok(()),
+            Mode::Write(WriteMode::Pending(_)) => {}
+        }
+        // Pending: the first video frame (or the safety cap) triggers muxer
+        // construction; that frame's coding sets the field order. Other frames
+        // buffer until then.
+        let (activate_now, use_coding) = match &self.mode {
+            Mode::Write(WriteMode::Pending(p)) => {
+                let is_video = match p.video_track {
+                    Some(vt) => frame.track == vt,
+                    // No video track: nothing to wait for — build on frame one.
+                    None => true,
+                };
+                (is_video || p.buffered.len() >= MAX_PENDING_FRAMES, is_video)
+            }
+            _ => unreachable!("guarded above"),
+        };
+        if activate_now {
+            // Pass the trigger frame's coding only when it IS the video frame; a
+            // cap-triggered build never saw the video frame, so nothing measured
+            // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
+            self.activate(if use_coding { frame.coding } else { None })?;
+            if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
+                return m.write_frame(
+                    frame.track,
+                    frame.pts,
+                    frame.keyframe,
+                    &frame.data,
+                    frame.duration_ns,
+                );
+            }
+            Ok(())
+        } else {
+            if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
+                p.buffered.push(frame.clone());
+            }
+            Ok(())
         }
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        if let Mode::Write { ref mut muxer } = self.mode {
-            if let Some(m) = muxer.take() {
-                m.finish()?;
-            }
+        // A title that produced no frames (or only buffered ones) is still
+        // finalized into a valid MKV: activate now with no measured coding.
+        if matches!(self.mode, Mode::Write(WriteMode::Pending(_))) {
+            self.activate(None)?;
+        }
+        if let Mode::Write(WriteMode::Active(m)) =
+            std::mem::replace(&mut self.mode, Mode::Write(WriteMode::Building))
+        {
+            m.finish()?;
         }
         Ok(())
     }
@@ -614,7 +749,6 @@ fn parse_track(
                 display_aspect: None,
                 secondary: is_secondary,
                 label: name,
-                top_field_first: None,
                 measured_cicp: None,
             }))
         }
@@ -683,6 +817,8 @@ fn parse_block(
     }
 
     Some(crate::pes::PesFrame {
+        coding: None,
+        source: None,
         track: track_idx,
         // saturating_mul: a hostile CLUSTER_TIMESTAMP could push pts_ticks near
         // i64::MAX, where ticks→ns would overflow and panic in debug builds.
@@ -726,6 +862,97 @@ mod tests {
     use super::*;
     use crate::pes::Stream as _;
     use std::io::Cursor;
+
+    #[test]
+    fn apply_coding_to_track_sets_measured_field_order_never_guesses() {
+        use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+        use crate::mux::codec::coding::{CodingType, Mpeg2Coding, PictureInfo};
+
+        let interlaced_track = || {
+            MkvTrack::video(&VideoStream {
+                pid: 0xE0,
+                codec: Codec::Mpeg2,
+                resolution: Resolution::R576i, // interlaced
+                frame_rate: FrameRate::F25,
+                hdr: HdrFormat::Sdr,
+                color_space: ColorSpace::Bt470bg,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })
+        };
+        let pic = |tff: bool, pf: bool| {
+            PictureInfo::mpeg2(
+                CodingType::I,
+                Mpeg2Coding {
+                    top_field_first: tff,
+                    repeat_first_field: false,
+                    progressive_frame: pf,
+                    progressive_sequence: false,
+                    frame_picture: true,
+                },
+            )
+        };
+
+        // A freshly built interlaced track has no field order — UNDETERMINED,
+        // never a scan-time guess.
+        assert_eq!(
+            interlaced_track().field_order,
+            ebml::FIELD_ORDER_UNDETERMINED
+        );
+
+        // MEASURED bottom-field-first → BFF (6). The red-flag fix.
+        let mut t = interlaced_track();
+        apply_coding_to_track(&mut t, Some(pic(false, false)));
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_BFF,
+            "measured BFF → FieldOrder=6"
+        );
+
+        // MEASURED top-field-first → TFF (1).
+        let mut t = interlaced_track();
+        apply_coding_to_track(&mut t, Some(pic(true, false)));
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_TFF,
+            "measured TFF → FieldOrder=1"
+        );
+
+        // Interlaced track, NO measured coding → UNDETERMINED (logged loudly,
+        // never faked).
+        let mut t = interlaced_track();
+        apply_coding_to_track(&mut t, None);
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_UNDETERMINED,
+            "no measured value → UNDETERMINED, never a guess"
+        );
+
+        // Progressive picture on an interlaced-flagged track → UNDETERMINED (no
+        // field order applies; not faked to TFF/BFF).
+        let mut t = interlaced_track();
+        apply_coding_to_track(&mut t, Some(pic(true, true)));
+        assert_eq!(t.field_order, ebml::FIELD_ORDER_UNDETERMINED);
+
+        // A PROGRESSIVE track is never touched — field order stays UNDETERMINED.
+        let mut prog = MkvTrack::video(&VideoStream {
+            pid: 0xE0,
+            codec: Codec::H264,
+            resolution: Resolution::R1080p, // progressive
+            frame_rate: FrameRate::F24,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        });
+        assert!(!prog.interlaced);
+        apply_coding_to_track(&mut prog, Some(pic(false, false)));
+        assert_eq!(prog.field_order, ebml::FIELD_ORDER_UNDETERMINED);
+    }
 
     // `From<Error> for io::Error` encodes the numeric code into the
     // Display string as "E{code}: ...". Check the prefix.

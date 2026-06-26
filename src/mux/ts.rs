@@ -26,6 +26,10 @@ pub struct PesPacket {
     pub dts: Option<i64>,
     /// Elementary stream data (video frame, audio frame, subtitle segment, etc.).
     pub data: Vec<u8>,
+    /// Source position of this PES's first ES byte, stamped at the demux seam
+    /// from the producer's known stream offset. `None` when the demuxer was fed
+    /// without a base offset (callers that don't need provenance).
+    pub source: Option<crate::pes::SourcePos>,
 }
 
 /// Per-PID PES reassembly state.
@@ -51,6 +55,11 @@ struct PesAssembler {
     /// partial PES would inject corrupt bytes. The partial PES is dropped and
     /// the assembler resyncs on the next PUSI. `None` until the first packet.
     last_cc: Option<u8>,
+    /// Absolute source byte offset of the in-progress PES's first byte (the
+    /// PUSI packet that began it), or `None` when no source base is threaded.
+    /// Stamped at PES start, emitted on the completed packet — provenance is
+    /// carried, never reconstructed downstream.
+    pes_source: Option<crate::pes::SourcePos>,
 }
 
 /// Initial capacity for a fresh PES buffer. Sized to cover the
@@ -84,17 +93,26 @@ impl PesAssembler {
             active: false,
             header_remaining: 0,
             last_cc: None,
+            pes_source: None,
         }
     }
 
     /// Start a new PES packet. Returns the completed previous packet (if any).
-    fn start(&mut self, pts: Option<i64>, dts: Option<i64>) -> Option<PesPacket> {
+    /// `source` is the absolute source position of the new PES's first byte
+    /// (carried onto the completed packet at the next start / flush).
+    fn start(
+        &mut self,
+        pts: Option<i64>,
+        dts: Option<i64>,
+        source: Option<crate::pes::SourcePos>,
+    ) -> Option<PesPacket> {
         let completed = if self.active && !self.buffer.is_empty() {
             Some(PesPacket {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
                 data: std::mem::replace(&mut self.buffer, Vec::with_capacity(PES_BUFFER_INIT_CAP)),
+                source: self.pes_source,
             })
         } else {
             self.buffer.clear();
@@ -103,6 +121,7 @@ impl PesAssembler {
         self.pts = pts;
         self.dts = dts;
         self.active = true;
+        self.pes_source = source;
         completed
     }
 
@@ -139,6 +158,7 @@ impl PesAssembler {
                 pts: self.pts,
                 dts: self.dts,
                 data: std::mem::take(&mut self.buffer),
+                source: self.pes_source,
             })
         } else {
             None
@@ -151,6 +171,14 @@ pub struct TsDemuxer {
     assemblers: Vec<PesAssembler>,
     pid_index: Vec<i16>, // PID → index into assemblers, -1 = not tracked
     remainder: Vec<u8>,  // leftover bytes from previous feed() call
+    /// Absolute source byte offset of the NEXT byte to be fed — the running
+    /// base that turns an in-buffer packet offset into a source position.
+    /// Advanced by each `feed` by the bytes consumed; `feed` (no base) leaves
+    /// it at 0 so non-provenance callers stamp `None`.
+    feed_base: u64,
+    /// True once a caller has threaded a source base via [`feed_at`]. Until
+    /// then no `SourcePos` is stamped (keeps existing callers byte-identical).
+    has_base: bool,
 }
 
 impl TsDemuxer {
@@ -185,6 +213,8 @@ impl TsDemuxer {
             assemblers,
             pid_index,
             remainder: Vec::new(),
+            feed_base: 0,
+            has_base: false,
         }
     }
 
@@ -201,6 +231,27 @@ impl TsDemuxer {
     /// `data` in place. Zero-copy on the bulk path; one 192-byte copy
     /// on the boundary.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
+        self.feed_inner(data)
+    }
+
+    /// Like [`feed`](Self::feed) but records the absolute source byte offset of
+    /// `data[0]` first, so every PES this batch completes is stamped with a
+    /// [`crate::pes::SourcePos`]. The single provenance-stamping entry point;
+    /// the highway calls this with each batch's known source offset.
+    pub fn feed_at(&mut self, base_offset: u64, data: &[u8]) -> Vec<PesPacket> {
+        self.feed_base = base_offset;
+        self.has_base = true;
+        self.feed_inner(data)
+    }
+
+    /// Source position for a packet whose first byte is at `buf_offset` within
+    /// the current feed buffer — `None` until a base has been threaded.
+    fn pkt_source(&self, buf_offset: usize) -> Option<crate::pes::SourcePos> {
+        self.has_base
+            .then(|| crate::pes::SourcePos::at_byte(self.feed_base + buf_offset as u64))
+    }
+
+    fn feed_inner(&mut self, data: &[u8]) -> Vec<PesPacket> {
         let mut completed = Vec::with_capacity(4);
         let mut offset = 0;
 
@@ -218,15 +269,26 @@ impl TsDemuxer {
             boundary[..self.remainder.len()].copy_from_slice(&self.remainder);
             boundary[self.remainder.len()..].copy_from_slice(&data[..need]);
             self.remainder.clear();
-            self.process_packet(&boundary, &mut completed);
+            // The boundary packet began in the PREVIOUS feed buffer; stamp it
+            // with the offset just before this buffer (its first bytes' base).
+            let src = self
+                .has_base
+                .then(|| crate::pes::SourcePos::at_byte(self.feed_base.saturating_sub(1)));
+            self.process_packet(&boundary, src, &mut completed);
             offset = need;
         }
 
         // Aligned-packets fast path — reads directly out of `data`.
         while offset + BD_TS_PACKET_SIZE <= data.len() {
             let packet = &data[offset..offset + BD_TS_PACKET_SIZE];
+            let src = self.pkt_source(offset);
             offset += BD_TS_PACKET_SIZE;
-            self.process_packet(packet, &mut completed);
+            self.process_packet(packet, src, &mut completed);
+        }
+        // Advance the running base past every byte consumed this feed so the
+        // next batch stamps from the correct absolute offset.
+        if self.has_base {
+            self.feed_base += offset as u64;
         }
 
         // Save leftover bytes for next call (cap at one packet to
@@ -248,7 +310,12 @@ impl TsDemuxer {
     /// `PesAssembler`; completed PES packets are pushed onto
     /// `completed` so the caller's allocation amortises across the
     /// batch.
-    fn process_packet(&mut self, packet: &[u8], completed: &mut Vec<PesPacket>) {
+    fn process_packet(
+        &mut self,
+        packet: &[u8],
+        source: Option<crate::pes::SourcePos>,
+        completed: &mut Vec<PesPacket>,
+    ) {
         // Sync byte check skips malformed packets.
         if packet[4] != SYNC_BYTE {
             return;
@@ -331,7 +398,7 @@ impl TsDemuxer {
             // `header_len` is the FULL (uncapped) PES-header length:
             // 0 = malformed (payload is not a PES start), else 6/9+N.
             let (pts, dts, header_len) = parse_pes_header(payload);
-            if let Some(prev) = asm.start(pts, dts) {
+            if let Some(prev) = asm.start(pts, dts, source) {
                 completed.push(prev);
             }
             if header_len == 0 {
@@ -694,7 +761,6 @@ pub fn scan_streams(data: &[u8]) -> Option<Vec<crate::disc::Stream>> {
                         display_aspect: None,
                         secondary: false,
                         label: String::new(),
-                        top_field_first: None,
                         measured_cicp: None,
                     }))
                 }

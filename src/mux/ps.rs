@@ -51,6 +51,10 @@ pub struct PsPacket {
     pub dts: Option<u64>,
     /// Elementary stream payload data.
     pub data: Vec<u8>,
+    /// Source position of this PES's first ES byte, stamped at the demux seam
+    /// from the producer's known stream offset. `None` when the demuxer was fed
+    /// without a base offset.
+    pub source: Option<crate::pes::SourcePos>,
 }
 
 /// Canonical DVD video PID. DVD-Video carries a single MPEG-2 video
@@ -129,6 +133,12 @@ impl PsPacket {
 /// Handles non-aligned input by buffering leftover bytes between calls.
 pub struct PsDemuxer {
     buffer: Vec<u8>,
+    /// Absolute source byte offset of `buffer[0]` — the running base that turns
+    /// an in-buffer unit position into a [`crate::pes::SourcePos`]. Advanced as
+    /// the buffer drains. `has_base` gates stamping so non-provenance callers
+    /// stay byte-identical.
+    buffer_base: u64,
+    has_base: bool,
 }
 
 impl Default for PsDemuxer {
@@ -142,11 +152,31 @@ impl PsDemuxer {
     pub fn new() -> Self {
         Self {
             buffer: Vec::with_capacity(64 * 1024),
+            buffer_base: 0,
+            has_base: false,
         }
     }
 
     /// Feed raw MPEG-2 PS bytes, returning any completely parsed PES packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PsPacket> {
+        self.buffer.extend_from_slice(data);
+        self.extract_packets(false)
+    }
+
+    /// Like [`feed`](Self::feed) but records the absolute source byte offset of
+    /// `data[0]`, so every PES this call completes is stamped with a
+    /// [`crate::pes::SourcePos`]. The provenance-stamping entry point; the
+    /// highway calls this with each batch's known source offset. The base must
+    /// be the offset of the FIRST byte appended (i.e. of `data[0]`), which lines
+    /// up with the current buffer tail.
+    pub fn feed_at(&mut self, base_offset: u64, data: &[u8]) -> Vec<PsPacket> {
+        if !self.has_base {
+            // First base seen: the offset of data[0] is base_offset, and data[0]
+            // lands at buffer[buffer.len()], so buffer[0] is base_offset minus
+            // the bytes already buffered.
+            self.buffer_base = base_offset.saturating_sub(self.buffer.len() as u64);
+            self.has_base = true;
+        }
         self.buffer.extend_from_slice(data);
         self.extract_packets(false)
     }
@@ -255,7 +285,11 @@ impl PsDemuxer {
                         e
                     };
 
-                    if let Some(pkt) = parse_pes_packet(&self.buffer[sc..end]) {
+                    if let Some(mut pkt) = parse_pes_packet(&self.buffer[sc..end]) {
+                        if self.has_base {
+                            pkt.source =
+                                Some(crate::pes::SourcePos::at_byte(self.buffer_base + sc as u64));
+                        }
                         packets.push(pkt);
                     }
                     pos = end;
@@ -269,6 +303,11 @@ impl PsDemuxer {
 
         if pos > 0 {
             self.buffer.drain(..pos);
+            // Advance the absolute base past the drained bytes so subsequent
+            // units stamp from the correct offset.
+            if self.has_base {
+                self.buffer_base += pos as u64;
+            }
         }
 
         packets
@@ -339,6 +378,9 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
             pts: None,
             dts: None,
             data: payload.to_vec(),
+            // Stamped by the demuxer (extract_packets) when a source base is
+            // threaded; the free function has no absolute offset of its own.
+            source: None,
         });
     }
 
@@ -393,6 +435,8 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
         pts,
         dts,
         data: es_data,
+        // Stamped by the demuxer (extract_packets) when a source base is threaded.
+        source: None,
     })
 }
 
@@ -788,6 +832,7 @@ mod tests {
             pts: None,
             dts: None,
             data: vec![0xAA],
+            source: None,
         }
     }
 

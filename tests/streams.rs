@@ -23,7 +23,6 @@ fn sample_disc_title() -> DiscTitle {
                 display_aspect: None,
                 secondary: false,
                 label: "Main".into(),
-                top_field_first: None,
                 measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
@@ -300,6 +299,8 @@ fn m2ts_stream_write_read() {
     // Write some PES frames
     for i in 0..5u8 {
         let frame = libfreemkv::pes::PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: i as i64 * 1_000_000,
             keyframe: i == 0,
@@ -322,6 +323,8 @@ fn m2ts_stream_write_read() {
 fn m2ts_pes_frame_roundtrip() {
     // PesFrame serialize/deserialize roundtrip
     let frame = libfreemkv::pes::PesFrame {
+        coding: None,
+        source: None,
         track: 2,
         pts: 1_234_567_890,
         keyframe: true,
@@ -403,7 +406,6 @@ fn meta_codec_roundtrip() {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         }));
     }
@@ -507,7 +509,6 @@ fn meta_all_stream_types() {
                 display_aspect: None,
                 secondary: false,
                 label: "Primary".into(),
-                top_field_first: None,
                 measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
@@ -596,6 +597,8 @@ fn mkvstream_write_finish() {
     // since there is no real codec data, but it should not panic)
     for i in 0..20u8 {
         let frame = libfreemkv::pes::PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: i as i64 * 1_000_000,
             keyframe: i == 0,
@@ -658,6 +661,8 @@ fn mkvstream_roundtrip_bdts() {
     // Write PES frames targeting the audio track
     for i in 0..10u8 {
         let frame = libfreemkv::pes::PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: i as i64 * 1_000_000,
             keyframe: true,
@@ -694,7 +699,6 @@ fn mkvstream_meta_preserves_all_streams() {
                 display_aspect: None,
                 secondary: false,
                 label: "Main Video".into(),
-                top_field_first: None,
                 measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
@@ -795,7 +799,6 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
             display_aspect: None,
             secondary: false,
             label: "Main".into(),
-            top_field_first: None,
             measured_cicp: None,
         })],
         chapters: Vec::new(),
@@ -857,6 +860,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     // Write the ES data (SPS+PPS+IDR) as a keyframe PES frame.
     let frame1 = libfreemkv::pes::PesFrame {
+        coding: None,
+        source: None,
         track: 0,
         pts: 1_000_000_000, // 1 second in ns
         keyframe: true,
@@ -867,6 +872,8 @@ fn mkvstream_e2e_h264_produces_valid_mkv() {
 
     // Write a second non-IDR frame
     let frame2 = libfreemkv::pes::PesFrame {
+        coding: None,
+        source: None,
         track: 0,
         pts: 1_041_700_000, // ~1 frame later in ns
         keyframe: false,

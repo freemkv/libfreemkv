@@ -196,14 +196,6 @@ pub struct VideoStream {
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
     pub label: String,
-    /// Field-display order MEASURED from the elementary stream's interlace
-    /// signalling (MPEG-2 picture coding extension `top_field_first`, H.264/HEVC
-    /// `pic_struct`), when available: `Some(true)` = top-field-first,
-    /// `Some(false)` = bottom-field-first. `None` = not measured — the muxer
-    /// falls back to TFF for interlaced content (the dominant DVD/HD case). The
-    /// container FieldOrder must agree with the bitstream, so a measured BFF
-    /// stream must NOT be stamped TFF. Ignored for progressive video.
-    pub top_field_first: Option<bool>,
     /// CICP colour signalling (matrix, transfer, primaries, full_range) MEASURED
     /// from the bitstream — HEVC/H.264 VUI `colour_description` or MPEG-2
     /// `sequence_display_extension`. `Some(...)` takes precedence over the
@@ -3805,7 +3797,6 @@ mod tests {
                 display_aspect: None,
                 secondary: false,
                 label: String::new(),
-                top_field_first: None,
                 measured_cicp: None,
             })],
             chapters: Vec::new(),

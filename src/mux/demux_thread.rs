@@ -142,9 +142,13 @@ impl DemuxThread {
                         None
                     };
                     let n = buf.len();
+                    // Source byte offset of this buffer's first byte = bytes fed
+                    // so far. Threaded into the demuxer so every PES it cuts is
+                    // stamped with its SourcePos (carried, not reconstructed).
+                    let buf_base = fed_bytes;
                     fed_bytes += n as u64;
                     if let Some(ref mut d) = ts {
-                        let pkts = d.feed(&buf);
+                        let pkts = d.feed_at(buf_base, &buf);
                         let t2 = if prof {
                             Some(std::time::Instant::now())
                         } else {
@@ -191,7 +195,7 @@ impl DemuxThread {
                             }
                         }
                     } else if let Some(ref mut d) = ps {
-                        let pkts = d.feed(&buf);
+                        let pkts = d.feed_at(buf_base, &buf);
                         let _ = recycle_tx.send(buf);
                         // Always send (even empty) — same early-disconnect
                         // detection rationale as the TS branch above.
