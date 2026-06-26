@@ -95,6 +95,13 @@ pub struct MkvTrack {
     // Dolby Vision: the dvcC (DOVIDecoderConfigurationRecord) for the DV layer,
     // emitted as a BlockAdditionMapping. `None` for non-DV tracks.
     pub dv_config: Option<Vec<u8>>,
+    /// HDR10 static metadata measured from the bitstream (HEVC SEI), or `None`
+    /// when the stream carried no HDR10 SEI. Set from the first coded picture's
+    /// `PictureInfo` at muxer activation (the same deferred path FieldOrder
+    /// uses), NOT at construction — the SEI is only known once the elementary
+    /// stream is parsed. When `Some`, the serializer emits MasteringMetadata +
+    /// MaxCLL/MaxFALL inside Colour; when `None` they are omitted entirely.
+    pub hdr10: Option<crate::mux::codec::Hdr10Metadata>,
 }
 
 /// Build a DOVIDecoderConfigurationRecord (dvcC) — 24 bytes — for the Matroska
@@ -110,6 +117,83 @@ pub fn dolby_vision_config(profile: u8, level: u8, bl_compat_id: u8) -> Vec<u8> 
     v[4] = (bl_compat_id & 0x0F) << 4;
     // v[5..24] reserved = 0
     v
+}
+
+/// SEI chromaticity unit (Rec. ITU-T H.265 D.3.28): `display_primaries_*` and
+/// `white_point_*` are in increments of 0.00002. Matroska chromaticity elements
+/// are floats in the [0, 1] range, so the conversion is `value * 0.00002`.
+const HDR10_CHROMATICITY_UNIT: f64 = 0.00002;
+/// SEI luminance unit (Rec. ITU-T H.265 D.3.28): `max/min_display_mastering_
+/// luminance` are in increments of 0.0001 cd/m². Matroska Luminance elements are
+/// floats in cd/m², so the conversion is `value * 0.0001`.
+const HDR10_LUMINANCE_UNIT: f64 = 0.0001;
+
+/// Emit the HDR10 static-metadata children of the Matroska `Colour` element:
+/// `MasteringMetadata` (chromaticity / luminance floats) plus `MaxCLL` /
+/// `MaxFALL` (uints). Called ONLY when the metadata was measured from the
+/// bitstream SEI, so it is never written for SDR content.
+///
+/// Unit conversions (Rec. ITU-T H.265 D.3.28 → RFC 9559 / Matroska):
+///   - chromaticity: SEI integer × 0.00002 → Matroska float in [0, 1]
+///   - luminance:    SEI integer × 0.0001  → Matroska float in cd/m²
+///   - MaxCLL / MaxFALL: already cd/m² integers → written as uints verbatim
+///
+/// The SEI primary order is c=0 Green, c=1 Blue, c=2 Red (D.3.28); the
+/// `Hdr10Metadata` arrays preserve that SEI order, so index 0 → G, 1 → B, 2 → R
+/// is mapped onto the Matroska R/G/B element layout here.
+fn write_hdr10<W: Write + Seek>(w: &mut W, h: &crate::mux::codec::Hdr10Metadata) -> io::Result<()> {
+    let chroma = |v: u16| -> f64 { v as f64 * HDR10_CHROMATICITY_UNIT };
+    let lum = |v: u32| -> f64 { v as f64 * HDR10_LUMINANCE_UNIT };
+
+    let mm_pos = ebml::start_master(w, ebml::MASTERING_METADATA)?;
+    // SEI index 2 = Red, 0 = Green, 1 = Blue.
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_R_CHROMATICITY_X,
+        chroma(h.display_primaries_x[2]),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_R_CHROMATICITY_Y,
+        chroma(h.display_primaries_y[2]),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_G_CHROMATICITY_X,
+        chroma(h.display_primaries_x[0]),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_G_CHROMATICITY_Y,
+        chroma(h.display_primaries_y[0]),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_B_CHROMATICITY_X,
+        chroma(h.display_primaries_x[1]),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::PRIMARY_B_CHROMATICITY_Y,
+        chroma(h.display_primaries_y[1]),
+    )?;
+    ebml::write_float(w, ebml::WHITE_POINT_CHROMATICITY_X, chroma(h.white_point_x))?;
+    ebml::write_float(w, ebml::WHITE_POINT_CHROMATICITY_Y, chroma(h.white_point_y))?;
+    ebml::write_float(
+        w,
+        ebml::LUMINANCE_MAX,
+        lum(h.max_display_mastering_luminance),
+    )?;
+    ebml::write_float(
+        w,
+        ebml::LUMINANCE_MIN,
+        lum(h.min_display_mastering_luminance),
+    )?;
+    ebml::end_master(w, mm_pos)?;
+
+    ebml::write_uint(w, ebml::MAX_CLL, h.max_content_light_level as u64)?;
+    ebml::write_uint(w, ebml::MAX_FALL, h.max_pic_average_light_level as u64)?;
+    Ok(())
 }
 
 impl MkvTrack {
@@ -266,6 +350,11 @@ impl MkvTrack {
             } else {
                 None
             },
+            // HDR10 static metadata is measured from the HEVC SEI at mux time,
+            // not known at construction. The mux stream sets it from the first
+            // coded picture's PictureInfo before the header is written (the same
+            // deferred path FieldOrder uses). `None` here → omitted unless seen.
+            hdr10: None,
         }
     }
 
@@ -333,6 +422,7 @@ impl MkvTrack {
             channels: ch,
             bit_depth: 0,
             dv_config: None,
+            hdr10: None,
         }
     }
 
@@ -369,6 +459,7 @@ impl MkvTrack {
             channels: 0,
             bit_depth: 0,
             dv_config: None,
+            hdr10: None,
         }
     }
 }
@@ -757,8 +848,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
                         track.display_height as u64,
                     )?;
                 }
-                // Colour metadata (HDR)
-                if track.colour_matrix > 0 || track.colour_transfer > 0 {
+                // Colour metadata (HDR). Open the Colour master when the track
+                // carries CICP signalling OR measured HDR10 static metadata.
+                if track.colour_matrix > 0 || track.colour_transfer > 0 || track.hdr10.is_some() {
                     let col_pos = ebml::start_master(&mut writer, ebml::COLOUR)?;
                     ebml::write_uint(
                         &mut writer,
@@ -772,6 +864,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     )?;
                     ebml::write_uint(&mut writer, ebml::PRIMARIES, track.colour_primaries as u64)?;
                     ebml::write_uint(&mut writer, ebml::RANGE, track.colour_range as u64)?;
+                    // HDR10 static metadata — emitted ONLY when measured from the
+                    // bitstream SEI (never fabricated for SDR).
+                    if let Some(h) = track.hdr10 {
+                        write_hdr10(&mut writer, &h)?;
+                    }
                     ebml::end_master(&mut writer, col_pos)?;
                 }
                 ebml::end_master(&mut writer, vid_pos)?;
@@ -1469,6 +1566,7 @@ mod tests {
             channels: 0,
             bit_depth: 0,
             dv_config: None,
+            hdr10: None,
         }
     }
 
@@ -1497,6 +1595,7 @@ mod tests {
             channels: 6,
             bit_depth: 0,
             dv_config: None,
+            hdr10: None,
         }
     }
 
@@ -3270,6 +3369,120 @@ mod tests {
         assert!(
             find_id(&data, ebml::COLOUR).is_none(),
             "no Colour element when colour metadata is all zero"
+        );
+    }
+
+    /// HDR10 static metadata, when measured, is emitted inside Colour as
+    /// MasteringMetadata (scaled floats) + MaxCLL/MaxFALL (uints) — and OMITTED
+    /// entirely for an SDR track. Asserts the exact H.265 → Matroska unit
+    /// conversions.
+    #[test]
+    fn video_emits_hdr10_mastering_and_cll_with_correct_scaling() {
+        use crate::mux::codec::Hdr10Metadata;
+
+        // Raw SEI integers (SEI primary order G, B, R):
+        //   primaries chromaticity ×0.00002, luminance ×0.0001, CLL/FALL verbatim.
+        let h = Hdr10Metadata {
+            display_primaries_x: [8500, 6550, 35400], // G, B, R
+            display_primaries_y: [39850, 2300, 14600],
+            white_point_x: 15635,
+            white_point_y: 16450,
+            max_display_mastering_luminance: 10_000_000, // 1000 cd/m²
+            min_display_mastering_luminance: 1,          // 0.0001 cd/m²
+            max_content_light_level: 1000,
+            max_pic_average_light_level: 400,
+        };
+        let mut v = make_video_track();
+        v.colour_matrix = 9;
+        v.colour_transfer = 16;
+        v.colour_primaries = 9;
+        v.colour_range = 1;
+        v.hdr10 = Some(h);
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+
+        // Read the 8-byte BE f64 that follows a float element ID (+ 1-byte size).
+        let read_float = |id: u32| -> f64 {
+            let off = find_id(&data, id).unwrap_or_else(|| panic!("element {id:#x} present"));
+            assert_eq!(
+                data[off + 2],
+                0x88,
+                "float element {id:#x} declares 8 bytes"
+            );
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[off + 3..off + 11]);
+            f64::from_be_bytes(b)
+        };
+        let read_uint = |id: u32| -> u64 {
+            let off = find_id(&data, id).unwrap_or_else(|| panic!("element {id:#x} present"));
+            let len = (data[off + 2] & 0x7F) as usize;
+            let mut val = 0u64;
+            for &byte in &data[off + 3..off + 3 + len] {
+                val = (val << 8) | byte as u64;
+            }
+            val
+        };
+
+        assert!(
+            find_id(&data, ebml::MASTERING_METADATA).is_some(),
+            "MasteringMetadata present"
+        );
+        // R is SEI index 2, G index 0, B index 1.
+        assert_eq!(
+            read_float(ebml::PRIMARY_R_CHROMATICITY_X),
+            35400.0 * 0.00002
+        );
+        assert_eq!(
+            read_float(ebml::PRIMARY_R_CHROMATICITY_Y),
+            14600.0 * 0.00002
+        );
+        assert_eq!(read_float(ebml::PRIMARY_G_CHROMATICITY_X), 8500.0 * 0.00002);
+        assert_eq!(
+            read_float(ebml::PRIMARY_G_CHROMATICITY_Y),
+            39850.0 * 0.00002
+        );
+        assert_eq!(read_float(ebml::PRIMARY_B_CHROMATICITY_X), 6550.0 * 0.00002);
+        assert_eq!(read_float(ebml::PRIMARY_B_CHROMATICITY_Y), 2300.0 * 0.00002);
+        assert_eq!(
+            read_float(ebml::WHITE_POINT_CHROMATICITY_X),
+            15635.0 * 0.00002
+        );
+        assert_eq!(
+            read_float(ebml::WHITE_POINT_CHROMATICITY_Y),
+            16450.0 * 0.00002
+        );
+        // Luminance: 10_000_000 × 0.0001 = 1000.0 cd/m²; 1 × 0.0001 = 0.0001.
+        assert_eq!(read_float(ebml::LUMINANCE_MAX), 1000.0);
+        assert_eq!(read_float(ebml::LUMINANCE_MIN), 0.0001);
+        // MaxCLL / MaxFALL are cd/m² uints, verbatim.
+        assert_eq!(read_uint(ebml::MAX_CLL), 1000);
+        assert_eq!(read_uint(ebml::MAX_FALL), 400);
+    }
+
+    /// An SDR track (no measured HDR10) must NOT emit MasteringMetadata, MaxCLL,
+    /// or MaxFALL — the metadata is never fabricated.
+    #[test]
+    fn sdr_video_omits_hdr10_metadata() {
+        // A track with CICP signalling but hdr10 = None: Colour is emitted, but
+        // none of the HDR10 children are.
+        let mut v = make_video_track();
+        v.colour_matrix = 1; // bt709
+        v.colour_transfer = 1;
+        assert!(v.hdr10.is_none());
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::COLOUR).is_some(),
+            "Colour still emitted"
+        );
+        assert!(
+            find_id(&data, ebml::MASTERING_METADATA).is_none(),
+            "no MasteringMetadata for SDR"
+        );
+        assert!(find_id(&data, ebml::MAX_CLL).is_none(), "no MaxCLL for SDR");
+        assert!(
+            find_id(&data, ebml::MAX_FALL).is_none(),
+            "no MaxFALL for SDR"
         );
     }
 
