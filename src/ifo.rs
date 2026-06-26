@@ -58,12 +58,12 @@ pub struct DvdTitle {
 pub struct DvdCell {
     pub first_sector: u32,
     pub last_sector: u32,
-    /// Raw cell-category byte at `cell_playback + 0` (DVD-Video spec).
-    /// Packs cell_type (bits 7-6), block_mode (bits 5-4), block_type
-    /// (bits 3-2), seamless_play (bit 1), interleaved (bit 0). Carried so
-    /// the extent builder can recognise non-feature leading cells
-    /// (scene-index / interleaved angle sub-blocks) and the diagnostic dump
-    /// can show why a cell was kept or dropped.
+    /// Raw cell-category byte at `cell_playback + 0` (libdvdread layout).
+    /// Packs block_mode (bits 7-6), block_type (bits 5-4), seamless_play
+    /// (bit 3), interleaved (bit 2), stc_discontinuity (bit 1),
+    /// seamless_angle (bit 0). Carried so the extent builder can recognise
+    /// non-feature leading cells (interleaved angle sub-blocks) and the
+    /// diagnostic dump can show why a cell was kept or dropped.
     pub category: u8,
     /// Per-cell playback duration in seconds (BCD time at `cell_playback + 4`).
     /// Used by the diagnostic dump and the conservative leading-cell filter
@@ -72,51 +72,54 @@ pub struct DvdCell {
 }
 
 /// Decoded view of a cell-category byte (`cell_playback + 0`), per the
-/// DVD-Video spec `cell_playback_information` layout.
+/// DVD-Video spec / libdvdread `cell_playback_t` layout. Byte-0 bitfields,
+/// MSB-first: `block_mode`(7-6), `block_type`(5-4), `seamless_play`(3),
+/// `interleaved`(2), `stc_discontinuity`(1), `seamless_angle`(0). (The real
+/// `cell_type` is a karaoke-only field in byte 1, not used here.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellCategory {
-    /// bits 7-6: 0=normal, 1=first cell of angle block, 2=middle, 3=last.
-    pub cell_type: u8,
-    /// bits 5-4: 0=not in block, 1=first cell of block, 2=in block, 3=last.
+    /// bits 7-6: 0=not in block, 1=first cell of block, 2=in block, 3=last cell.
     pub block_mode: u8,
-    /// bits 3-2: 0=not part of a block, 1=angle block.
+    /// bits 5-4: 0=not part of a block, 1=angle block.
     pub block_type: u8,
-    /// bit 1: seamless playback (STC continuous).
+    /// bit 3: seamless playback (STC continuous).
     pub seamless_play: bool,
-    /// bit 0: interleaved (multi-angle / seamless-branch interleave).
+    /// bit 2: interleaved (multi-angle / seamless-branch interleave).
     pub interleaved: bool,
+    /// bit 1: STC discontinuity at the start of this cell.
+    pub stc_discontinuity: bool,
+    /// bit 0: seamless angle change.
+    pub seamless_angle: bool,
 }
 
 impl CellCategory {
-    /// Decode the raw `cell_playback + 0` byte.
+    /// Decode the raw `cell_playback + 0` byte (libdvdread `read_cell_playback`).
     pub fn decode(raw: u8) -> Self {
         CellCategory {
-            cell_type: (raw >> 6) & 0x03,
-            block_mode: (raw >> 4) & 0x03,
-            block_type: (raw >> 2) & 0x03,
-            seamless_play: (raw & 0x02) != 0,
-            interleaved: (raw & 0x01) != 0,
+            block_mode: (raw >> 6) & 0x03,
+            block_type: (raw >> 4) & 0x03,
+            seamless_play: (raw & 0x08) != 0,
+            interleaved: (raw & 0x04) != 0,
+            stc_discontinuity: (raw & 0x02) != 0,
+            seamless_angle: (raw & 0x01) != 0,
         }
     }
 
-    /// A plain feature cell: not part of any angle/interleave block. Every
-    /// cell of a normal single-angle feature decodes to this (`category`
-    /// byte `0x00`, or `0x00` in every block field with only the
-    /// seamless/interleaved flags possibly set). Such a cell is NEVER
-    /// dropped by the leading-cell filter.
+    /// A plain feature cell: not part of any angle/interleave block. Every cell
+    /// of a normal single-angle feature decodes to this (`block_mode` and
+    /// `block_type` both 0, only the seamless/interleaved flags possibly set).
+    /// Such a cell is NEVER dropped by the leading-cell filter.
     pub fn is_plain_feature(&self) -> bool {
-        self.cell_type == 0 && self.block_mode == 0 && self.block_type == 0
+        self.block_mode == 0 && self.block_type == 0
     }
 
-    /// Marks a non-first piece of an angle / interleaved block: a "middle" or
-    /// "last" cell of an angle block (`cell_type ∈ {2,3}`), or an
-    /// in-block / last-of-block cell (`block_mode ∈ {2,3}`). Concatenating
-    /// these back-to-back with the first angle duplicates content at the head
-    /// of the feature. Conservative: the FIRST cell of a block
-    /// (`cell_type==1` / `block_mode==1`) is NOT flagged — it is the angle we
-    /// keep.
+    /// Marks a non-first piece of an angle block: an "in-block" or "last of
+    /// block" cell (`block_mode ∈ {2,3}`) of an angle block (`block_type==1`).
+    /// Concatenating these back-to-back with the first angle duplicates content
+    /// at the head of the feature. Conservative: the FIRST cell of a block
+    /// (`block_mode==1`) is NOT flagged — it is the angle we keep.
     pub fn is_secondary_block_piece(&self) -> bool {
-        matches!(self.cell_type, 2 | 3) || matches!(self.block_mode, 2 | 3)
+        self.block_type == 1 && matches!(self.block_mode, 2 | 3)
     }
 }
 
@@ -567,7 +570,7 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
         _ => Codec::Unknown(coding_mode),
     };
 
-    let sample_rate_flag = (b0 >> 3) & 0x03;
+    let sample_rate_flag = (b1 >> 4) & 0x03; // sample_frequency: byte 1 bits 5-4 (libdvdread audio_attr_t)
     let sample_rate = match sample_rate_flag {
         0 => 48000,
         1 => 96000,
@@ -1174,11 +1177,11 @@ mod tests {
     #[test]
     fn audio_attr_dts() {
         let mut data = vec![0u8; 16];
-        // DTS (coding=6), 96kHz (rate=1), 2 channels (stored as 1)
-        // b0: bits 7-5=110(DTS), bits 4-3=01(96k) => 0b110_01_000 = 0xC8
-        data[0] = 0xC8;
-        // b1: bits 2-0=001 (channels-1=1) => 0x01
-        data[1] = 0x01;
+        // DTS (coding=6), 96kHz (rate=1, byte1 bits 5-4), 2 channels (stored as 1)
+        // b0: bits 7-5=110(DTS) => 0b110_00000 = 0xC0
+        data[0] = 0xC0;
+        // b1: bits 5-4=01(96k), bits 2-0=001(channels-1=1) => 0b00_01_0_001 = 0x11
+        data[1] = 0x11;
         data[2] = b'f';
         data[3] = b'r';
 
@@ -1546,13 +1549,13 @@ mod tests {
         }
     }
 
-    /// CellCategory decodes the spec bitfields: cell_type (7-6), block_mode
-    /// (5-4), block_type (3-2), seamless (1), interleaved (0).
+    /// CellCategory decodes the libdvdread byte-0 bitfields: block_mode (7-6),
+    /// block_type (5-4), seamless_play (3), interleaved (2),
+    /// stc_discontinuity (1), seamless_angle (0).
     #[test]
     fn cell_category_decode_bits() {
         // 0x00 → plain feature, nothing set.
         let c = CellCategory::decode(0x00);
-        assert_eq!(c.cell_type, 0);
         assert_eq!(c.block_mode, 0);
         assert_eq!(c.block_type, 0);
         assert!(!c.seamless_play);
@@ -1560,27 +1563,29 @@ mod tests {
         assert!(c.is_plain_feature());
         assert!(!c.is_secondary_block_piece());
 
-        // cell_type=1 (first of angle block), block_mode=1 (first of block):
-        // 0b01_01_00_0_0 = 0x50. This is the angle we KEEP — not secondary.
-        let c = CellCategory::decode(0b01_01_00_00);
-        assert_eq!(c.cell_type, 1);
+        // block_mode=1 (first cell of block), block_type=1 (angle block):
+        // 0b01_01_0000 = 0x50. This is the angle we KEEP — not secondary.
+        let c = CellCategory::decode(0b01_01_0000);
         assert_eq!(c.block_mode, 1);
+        assert_eq!(c.block_type, 1);
         assert!(!c.is_plain_feature());
         assert!(!c.is_secondary_block_piece());
 
-        // cell_type=2 (middle of angle block): 0b10_00_00_00 = 0x80 → secondary.
-        assert!(CellCategory::decode(0b10_00_00_00).is_secondary_block_piece());
-        // cell_type=3 (last of angle block) → secondary.
-        assert!(CellCategory::decode(0b11_00_00_00).is_secondary_block_piece());
-        // block_mode=2 (in block) → secondary; block_mode=3 (last of block) → secondary.
-        assert!(CellCategory::decode(0b00_10_00_00).is_secondary_block_piece());
-        assert!(CellCategory::decode(0b00_11_00_00).is_secondary_block_piece());
+        // block_mode=2 (in block) / 3 (last of block) of an angle block
+        // (block_type=1) → secondary.
+        assert!(CellCategory::decode(0b10_01_0000).is_secondary_block_piece());
+        assert!(CellCategory::decode(0b11_01_0000).is_secondary_block_piece());
+        // First cell of the block (block_mode=1) is NEVER secondary.
+        assert!(!CellCategory::decode(0b01_01_0000).is_secondary_block_piece());
 
-        // seamless (bit1) + interleaved (bit0) on an otherwise-plain cell must
-        // NOT make it secondary — they don't mark non-feature content.
-        let c = CellCategory::decode(0b00_00_00_11);
+        // The low flags (seamless_play bit3, interleaved bit2, stc bit1,
+        // seamless_angle bit0) on an otherwise-plain cell must NOT make it
+        // secondary — they don't mark non-feature content.
+        let c = CellCategory::decode(0b0000_1111);
         assert!(c.seamless_play);
         assert!(c.interleaved);
+        assert!(c.stc_discontinuity);
+        assert!(c.seamless_angle);
         assert!(c.is_plain_feature());
         assert!(!c.is_secondary_block_piece());
     }
@@ -1614,9 +1619,9 @@ mod tests {
             chapters: 2,
             duration_secs: 100.0,
             cells: vec![
-                cell(0, 9, 0b10_00_00_00),   // middle of angle block → drop
-                cell(10, 19, 0b00_11_00_00), // last of block → drop
-                cell(20, 119, 0x00),         // feature starts here
+                cell(0, 9, 0b10_01_0000),   // in-block cell of angle block → drop
+                cell(10, 19, 0b11_01_0000), // last cell of angle block → drop
+                cell(20, 119, 0x00),        // feature starts here
                 cell(120, 219, 0x00),
             ],
             chapter_times: vec![0.0, 50.0],
@@ -1637,7 +1642,7 @@ mod tests {
         let t = DvdTitle {
             chapters: 1,
             duration_secs: 100.0,
-            cells: vec![cell(0, 9, 0b10_00_00_00), cell(10, 19, 0b11_00_00_00)],
+            cells: vec![cell(0, 9, 0b10_01_0000), cell(10, 19, 0b11_01_0000)],
             chapter_times: vec![0.0],
             palette: None,
         };
@@ -1669,8 +1674,8 @@ mod tests {
         pgc[0xE8] = 0x00;
         pgc[0xE9] = 0xEA;
         pgc.resize(0xEA + 48, 0);
-        // Cell 0: category byte = 0x80 (middle of angle block), 5s BCD.
-        pgc[0xEA] = 0x80;
+        // Cell 0: category byte = 0x90 (in-block cell of angle block), 5s BCD.
+        pgc[0xEA] = 0x90;
         pgc[0xEA + 6] = 0x05;
         pgc[0xEA + 8..0xEA + 12].copy_from_slice(&10u32.to_be_bytes());
         // Cell 1: category 0x00 (plain feature), 7s BCD.
@@ -1678,7 +1683,7 @@ mod tests {
         pgc[0xEA + 24 + 6] = 0x07;
         pgc[0xEA + 24 + 8..0xEA + 24 + 12].copy_from_slice(&20u32.to_be_bytes());
         let title = parse_pgc(&pgc, 0, 2).unwrap();
-        assert_eq!(title.cells[0].category, 0x80);
+        assert_eq!(title.cells[0].category, 0x90);
         assert!((title.cells[0].duration_secs - 5.0).abs() < 0.01);
         assert_eq!(title.cells[1].category, 0x00);
         assert!((title.cells[1].duration_secs - 7.0).abs() < 0.01);

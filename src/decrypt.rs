@@ -183,7 +183,7 @@ impl DecryptKeys {
 /// scrambled unit decrypted.
 pub fn decrypt_sectors(
     buf: &mut [u8],
-    keys: &DecryptKeys,
+    keys: &mut DecryptKeys,
     unit_key_idx: usize,
 ) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
@@ -351,8 +351,41 @@ pub fn decrypt_sectors(
             dropped_bytes.into_inner()
         }
         DecryptKeys::Css { title_key } => {
+            // CSS has no supplied key list: the ONLY source of a title key is
+            // cracking the data, and the key changes per VTS/VOB region. So
+            // `title_key` is a CACHE of the last crack, not a fixed disc key —
+            // applying it blindly across a region boundary descrambles with the
+            // wrong key (valid headers, garbage payload). Validate it on every
+            // scrambled sector and re-crack on a miss (libdvdcss's on-demand
+            // per-region rekey; the same validate-then-rekey shape the AACS arm
+            // above uses, but re-cracking instead of picking from a list).
+            //
+            // The clear header (<0x80) is never scrambled, so its periodic crib
+            // predicts the plaintext at 0x80. Descramble with the cached key; if
+            // the crib fails to reappear the key region changed (or the primed
+            // key was wrong) — restore the ciphertext, re-crack from this very
+            // sector, and descramble again. A crib-less sector (no periodic run)
+            // can be neither validated nor cracked, so it rides the cached key —
+            // correct, because it lives in the same region as the nearby crib
+            // sector that set the cache.
             for chunk in buf.chunks_mut(2048) {
+                if chunk.len() < 2048 || !css::is_scrambled(chunk) {
+                    continue;
+                }
+                let crib = css::stevenson::attack_crib(chunk);
+                let original: Option<Vec<u8>> = crib.as_ref().map(|_| chunk.to_vec());
                 css::lfsr::descramble_sector(title_key, chunk);
+                if let (Some(crib), Some(original)) = (crib, original) {
+                    if chunk[0x80..0x80 + 10] != crib[..] {
+                        // Cached key is stale for this region — restore the
+                        // ciphertext and crack this sector's own key.
+                        chunk.copy_from_slice(&original);
+                        if let Some(fresh) = css::stevenson::crack_title_key(chunk) {
+                            *title_key = fresh;
+                        }
+                        css::lfsr::descramble_sector(title_key, chunk);
+                    }
+                }
             }
             0
         }
@@ -381,11 +414,11 @@ mod tests {
         }
         let snapshot = unit.clone();
 
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        decrypt_sectors(&mut unit, &keys, 0).unwrap();
+        decrypt_sectors(&mut unit, &mut keys, 0).unwrap();
         assert_eq!(
             unit, snapshot,
             "non-m2ts unit must be restored after failed decrypt"
@@ -424,7 +457,7 @@ mod tests {
     /// bytes byte-for-byte unchanged — no regression on real discs.
     #[test]
     fn aacs_clear_trailing_partial_is_tolerated_unchanged() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
@@ -434,7 +467,7 @@ mod tests {
         let mut buf = unit;
         buf.extend_from_slice(&tail);
 
-        decrypt_sectors(&mut buf, &keys, 0).expect("clear trailing partial is Ok");
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("clear trailing partial is Ok");
 
         assert_eq!(
             &buf[aacs::ALIGNED_UNIT_LEN..],
@@ -449,7 +482,7 @@ mod tests {
     /// corruption, so we must fail loud with `DecryptFailed`.
     #[test]
     fn aacs_scrambled_trailing_partial_is_rejected() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
@@ -459,7 +492,7 @@ mod tests {
         let mut buf = unit;
         buf.extend_from_slice(&tail);
 
-        let err = decrypt_sectors(&mut buf, &keys, 0)
+        let err = decrypt_sectors(&mut buf, &mut keys, 0)
             .expect_err("scrambled trailing partial must be rejected");
         assert_eq!(
             err.code(),
@@ -471,12 +504,12 @@ mod tests {
     /// An empty buffer is a valid no-op (zero units), not an error.
     #[test]
     fn aacs_empty_buffer_is_ok() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
         let mut buf: Vec<u8> = Vec::new();
-        assert!(decrypt_sectors(&mut buf, &keys, 0).is_ok());
+        assert!(decrypt_sectors(&mut buf, &mut keys, 0).is_ok());
     }
 
     /// An exact multiple of the unit length has no trailing partial: behavior
@@ -484,14 +517,14 @@ mod tests {
     /// attempted. Two clear units must round-trip untouched and return `Ok`.
     #[test]
     fn aacs_exact_multiple_unchanged() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
         let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN * 2);
         let snapshot = buf.clone();
 
-        decrypt_sectors(&mut buf, &keys, 0).expect("exact-multiple buffer is Ok");
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("exact-multiple buffer is Ok");
 
         assert_eq!(
             buf, snapshot,
@@ -512,7 +545,7 @@ mod tests {
     fn none_keys_is_noop() {
         let mut buf: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
         let snapshot = buf.clone();
-        decrypt_sectors(&mut buf, &DecryptKeys::None, 0).expect("None is always Ok");
+        decrypt_sectors(&mut buf, &mut DecryptKeys::None, 0).expect("None is always Ok");
         assert_eq!(buf, snapshot, "None must not touch the buffer");
     }
 
@@ -564,8 +597,8 @@ mod tests {
         let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
         let seed = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
         let (mut sector, plaintext) = make_css_sector(&title_key, &seed, 0xA5);
-        let keys = DecryptKeys::Css { title_key };
-        decrypt_sectors(&mut sector, &keys, 0).expect("CSS decrypt is Ok");
+        let mut keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut sector, &mut keys, 0).expect("CSS decrypt is Ok");
         assert_eq!(
             &sector[0x80..2048],
             &plaintext[0x80..2048],
@@ -594,8 +627,8 @@ mod tests {
         let (s1, p1) = make_css_sector(&title_key, &[0x66, 0x77, 0x88, 0x99, 0xAA], 0xC3);
         let mut buf = s0;
         buf.extend_from_slice(&s1);
-        let keys = DecryptKeys::Css { title_key };
-        decrypt_sectors(&mut buf, &keys, 0).expect("CSS multi-sector decrypt is Ok");
+        let mut keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("CSS multi-sector decrypt is Ok");
         assert_eq!(
             &buf[0x80..2048],
             &p0[0x80..2048],
@@ -606,6 +639,94 @@ mod tests {
             &p1[0x80..2048],
             "sector 1 body must round-trip (loop must reach the 2nd sector)"
         );
+    }
+
+    /// Build a CSS sector whose clear header ends in a periodic run that
+    /// continues into the encrypted region — the crackable shape `attack_crib`/
+    /// `crack_title_key` recover a key from (a constant body fill gives a
+    /// degenerate crib the cracker can't pin a unique key on). Returns
+    /// (scrambled_sector, plaintext_body).
+    fn make_crackable_css_sector(
+        title_key: &[u8; 5],
+        seed: &[u8; 5],
+        period: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut plaintext = vec![0u8; 2048];
+        plaintext[0x14] = 0x10; // scramble flag
+        // Periodic run from 0x59 (just above the seed) through 0x80 and on into
+        // the encrypted region; phase anchored to offset 0 so it is continuous
+        // across the 0x80 boundary.
+        let pat: Vec<u8> = (0..period)
+            .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
+            .collect();
+        for (i, b) in plaintext.iter_mut().enumerate().skip(0x59) {
+            *b = pat[i % period];
+        }
+        plaintext[0x54..0x59].copy_from_slice(seed); // seed sits below the run
+        let body = plaintext.clone();
+        css::lfsr::scramble_sector(title_key, &mut plaintext);
+        (plaintext, body)
+    }
+
+    /// CSS title keys are per-VTS/VOB region: a real disc holds DIFFERENT keys
+    /// for different regions and the only way to get each is to crack it. The
+    /// decrypt path must re-crack when the cached key stops descrambling (its
+    /// crib no longer reappears at 0x80) instead of blindly applying one key
+    /// across a region boundary — the bug that pixelated every freemkv DVD rip.
+    ///
+    /// Two sectors scrambled under DIFFERENT keys, cache primed to ONLY the
+    /// first (exactly what the one-shot scan crack leaves). Sector 0 validates +
+    /// descrambles with the cached key; sector 1's cached-key descramble fails
+    /// the crib, so the path re-cracks sector 1's own key and recovers its
+    /// plaintext. Before the fix (blind single-key apply) sector 1 was garbage.
+    ///
+    /// Grounding: the CSS arm's `attack_crib` → `chunk[0x80..] != crib` →
+    /// `crack_title_key` → `*title_key = fresh` rekey.
+    /// Mutation: drop the rekey branch (apply the cached key always) → sector 1's
+    /// body no longer matches its plaintext; this fails.
+    #[test]
+    fn css_rekeys_when_title_key_region_changes() {
+        let key_a = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let key_b = [0x07, 0x5A, 0xC3, 0x10, 0x88]; // a DIFFERENT region's key
+        let (s0, p0) = make_crackable_css_sector(&key_a, &[0x11, 0x22, 0x33, 0x44, 0x55], 4);
+        let (s1, p1) = make_crackable_css_sector(&key_b, &[0x66, 0x77, 0x88, 0x99, 0xAA], 4);
+        // Precondition: each sector must be crackable on its own (the rekey
+        // depends on it). If this fails the fixture, not the path, is at fault.
+        assert_eq!(
+            crate::css::stevenson::crack_title_key(&s0),
+            Some(key_a),
+            "fixture s0 must crack to key_a standalone"
+        );
+        assert_eq!(
+            crate::css::stevenson::crack_title_key(&s1),
+            Some(key_b),
+            "fixture s1 must crack to key_b standalone"
+        );
+        let mut buf = s0;
+        buf.extend_from_slice(&s1);
+
+        // Cache primed to key_a only — exactly what the one-shot scan crack yields.
+        let mut keys = DecryptKeys::Css { title_key: key_a };
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("CSS multi-region decrypt is Ok");
+
+        assert_eq!(
+            &buf[0x80..2048],
+            &p0[0x80..2048],
+            "region A sector descrambles with the cached (primed) key"
+        );
+        assert_eq!(
+            &buf[2048 + 0x80..4096],
+            &p1[0x80..2048],
+            "region B sector must descramble after the path re-cracks its own key"
+        );
+        // The cache must have advanced to region B's key.
+        match keys {
+            DecryptKeys::Css { title_key } => assert_eq!(
+                title_key, key_b,
+                "cache must hold region B's key after the rekey"
+            ),
+            _ => unreachable!(),
+        }
     }
 
     /// The CSS path leaves UNSCRAMBLED sectors (flag clear) byte-for-byte
@@ -622,8 +743,8 @@ mod tests {
         let mut sector = vec![0x77u8; 2048];
         sector[0x14] = 0x00; // not scrambled
         let snapshot = sector.clone();
-        let keys = DecryptKeys::Css { title_key };
-        decrypt_sectors(&mut sector, &keys, 0).unwrap();
+        let mut keys = DecryptKeys::Css { title_key };
+        decrypt_sectors(&mut sector, &mut keys, 0).unwrap();
         assert_eq!(sector, snapshot, "clear CSS sector must be left untouched");
     }
 
@@ -636,8 +757,8 @@ mod tests {
     #[test]
     fn css_empty_buffer_is_ok() {
         let mut buf: Vec<u8> = Vec::new();
-        let keys = DecryptKeys::Css { title_key: [0; 5] };
-        assert!(decrypt_sectors(&mut buf, &keys, 0).is_ok());
+        let mut keys = DecryptKeys::Css { title_key: [0; 5] };
+        assert!(decrypt_sectors(&mut buf, &mut keys, 0).is_ok());
     }
 
     // ── AACS unit-key index selection ──────────────────────────────────────
@@ -653,12 +774,12 @@ mod tests {
     /// fails.
     #[test]
     fn aacs_out_of_range_unit_key_idx_errors() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
         let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
-        let err = decrypt_sectors(&mut buf, &keys, 5)
+        let err = decrypt_sectors(&mut buf, &mut keys, 5)
             .expect_err("unit_key_idx 5 is out of range for a 1-key list");
         assert_eq!(
             err.code(),
@@ -673,12 +794,12 @@ mod tests {
     /// Mutation: defaulting to [0u8;16] on None would proceed; this fails.
     #[test]
     fn aacs_empty_unit_keys_errors() {
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![],
             read_data_key: None,
         };
         let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
-        let err = decrypt_sectors(&mut buf, &keys, 0).expect_err("empty unit_keys must error");
+        let err = decrypt_sectors(&mut buf, &mut keys, 0).expect_err("empty unit_keys must error");
         assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
     }
 
@@ -751,14 +872,14 @@ mod tests {
             "encrypted unit must look scrambled before decrypt"
         );
 
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key0), (1, key1)], // two CPS units
             read_data_key: None,
         };
 
         // Call with the default hint (idx 0) — the fix must fall back to key1.
         let mut buf = unit;
-        decrypt_sectors(&mut buf, &keys, 0).expect("multi-CPS decrypt must succeed");
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("multi-CPS decrypt must succeed");
 
         assert!(
             !aacs::is_aacs_scrambled(&buf),
@@ -785,12 +906,12 @@ mod tests {
         let mut unit = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut unit, &key);
 
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
         };
         let mut buf = unit;
-        decrypt_sectors(&mut buf, &keys, 0).expect("single-key disc must decrypt");
+        decrypt_sectors(&mut buf, &mut keys, 0).expect("single-key disc must decrypt");
         assert!(
             !aacs::is_aacs_scrambled(&buf),
             "single-key disc: TS syncs must be restored"
@@ -829,13 +950,13 @@ mod tests {
             "encrypted unit must look scrambled going in"
         );
 
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, wrong_key)],
             read_data_key: None,
         };
         let mut buf = unit;
-        let dropped =
-            decrypt_sectors(&mut buf, &keys, 0).expect("undecryptable unit is not a hard error");
+        let dropped = decrypt_sectors(&mut buf, &mut keys, 0)
+            .expect("undecryptable unit is not a hard error");
 
         assert_eq!(
             dropped,
@@ -872,11 +993,11 @@ mod tests {
         buf.extend_from_slice(&unit_a);
         buf.extend_from_slice(&unit_b);
 
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
         };
-        let dropped = decrypt_sectors(&mut buf, &keys, 0).expect("partial decrypt is Ok");
+        let dropped = decrypt_sectors(&mut buf, &mut keys, 0).expect("partial decrypt is Ok");
 
         assert_eq!(
             dropped,
@@ -901,12 +1022,12 @@ mod tests {
         let key = [0x77u8; 16];
         let mut unit = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut unit, &key);
-        let keys = DecryptKeys::Aacs {
+        let mut keys = DecryptKeys::Aacs {
             unit_keys: vec![(0, key)],
             read_data_key: None,
         };
         let mut buf = unit;
-        let dropped = decrypt_sectors(&mut buf, &keys, 0).expect("clean decrypt");
+        let dropped = decrypt_sectors(&mut buf, &mut keys, 0).expect("clean decrypt");
         assert_eq!(dropped, 0, "a fully-decrypted buffer must report no loss");
     }
 

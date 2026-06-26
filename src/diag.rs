@@ -148,14 +148,15 @@ pub fn dvd_cell_row(idx: usize, cell: &crate::ifo::DvdCell, dropped: bool) -> St
         "keep(plain-feature)"
     };
     format!(
-        "tag=dvd.cell idx={idx} cat=0x{:02X} type={} block_mode={} block_type={} \
-seamless={} ilv={} plain={} first={} last={} dur={:.1}s {}",
+        "tag=dvd.cell idx={idx} cat=0x{:02X} block_mode={} block_type={} \
+seamless={} ilv={} stc={} angle={} plain={} first={} last={} dur={:.1}s {}",
         cell.category,
-        c.cell_type,
         c.block_mode,
         c.block_type,
         c.seamless_play as u8,
         c.interleaved as u8,
+        c.stc_discontinuity as u8,
+        c.seamless_angle as u8,
         c.is_plain_feature() as u8,
         cell.first_sector,
         cell.last_sector,
@@ -726,23 +727,25 @@ mod tests {
         };
         let row = dvd_cell_row(0, &plain, false);
         assert!(row.contains("cat=0x00"), "{row}");
-        assert!(row.contains("type=0"), "{row}");
+        assert!(row.contains("block_mode=0"), "{row}");
         assert!(row.contains("first=100"), "{row}");
         assert!(row.contains("last=199"), "{row}");
         assert!(row.contains("dur=12.5s"), "{row}");
         assert!(row.contains("keep(plain-feature)"), "{row}");
         assert!(!row.contains("DROP"), "{row}");
 
-        // 0x80 = middle-of-angle-block (cell_type=2), shown dropped.
+        // 0x90 = in-block cell of an angle block (block_mode=2, block_type=1),
+        // shown dropped as a leading secondary piece.
         let sec = crate::ifo::DvdCell {
             first_sector: 0,
             last_sector: 9,
-            category: 0x80,
+            category: 0x90,
             duration_secs: 1.0,
         };
         let row = dvd_cell_row(0, &sec, true);
-        assert!(row.contains("cat=0x80"), "{row}");
-        assert!(row.contains("type=2"), "{row}");
+        assert!(row.contains("cat=0x90"), "{row}");
+        assert!(row.contains("block_mode=2"), "{row}");
+        assert!(row.contains("block_type=1"), "{row}");
         assert!(row.contains("DROP(leading-secondary-block-piece)"), "{row}");
     }
 }

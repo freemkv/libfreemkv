@@ -262,7 +262,20 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
 /// Inner body of [`crack_title_key`] — the actual AttackPattern search. Split
 /// out so the public entry point can wall-clock the whole attempt for the
 /// runaway guard without threading a timer through every return path.
-fn crack_title_key_inner(sector: &[u8]) -> Option<[u8; 5]> {
+/// AttackPattern crib: the predicted 10-byte plaintext at byte 0x80.
+///
+/// Scans the clear header `sec[0x00..0x80]` (never scrambled) for the longest
+/// run that repeats with a cycle length in 2..0x2F. If the run is long enough
+/// (`plen > 3` and at least two full cycles), the plaintext at 0x80 is taken to
+/// be that periodic run continuing forward. Returns `None` for an unscrambled
+/// sector or one with no usable run — such a sector can be neither cracked nor
+/// key-validated, only descrambled with an externally-cached key.
+///
+/// The header is untouched by `descramble_sector`, so the crib is identical
+/// before and after descramble: the decrypt path uses it as a per-sector
+/// "did the cached key descramble correctly?" oracle (the predicted plaintext
+/// must reappear at 0x80), and the cracker uses it as its known plaintext.
+pub(crate) fn attack_crib(sector: &[u8]) -> Option<[u8; 10]> {
     if sector.len() < SECTOR_SIZE || sector[FLAG_BYTE] & 0x30 == 0 {
         return None;
     }
@@ -285,14 +298,6 @@ fn crack_title_key_inner(sector: &[u8]) -> Option<[u8; 5]> {
 
     // Need at least a few repeated bytes and at least one full cycle.
     if best_plen > 3 && best_p > 0 && best_plen / best_p >= 2 {
-        let seed: [u8; 5] = [
-            sector[SEED_OFFSET],
-            sector[SEED_OFFSET + 1],
-            sector[SEED_OFFSET + 2],
-            sector[SEED_OFFSET + 3],
-            sector[SEED_OFFSET + 4],
-        ];
-
         // The known plaintext is the periodic run continuing past 0x80. The
         // crib starts at `0x80 - (best_plen/best_p)*best_p` and continues
         // through the encrypted region; the bytes at and after 0x80 are the
@@ -300,30 +305,40 @@ fn crack_title_key_inner(sector: &[u8]) -> Option<[u8; 5]> {
         let cycles = best_plen / best_p;
         let plain_start = 0x80 - cycles * best_p;
 
-        // The cipher is the 10 bytes at 0x80; the crib is their predicted
-        // plaintext. The periodic run (period `best_p`) is known to continue
-        // through 0x80, so each predicted byte is the run sample one or more
-        // periods back: `sec[plain_start + (i % best_p)]`. For in-run offsets
+        // Each predicted byte is the run sample one or more periods back:
+        // `sec[plain_start + (i % best_p)]`. For in-run offsets
         // (`plain_start + i < 0x80`) the run is exactly periodic, so this
         // equals `sec[plain_start + i]`; for offsets at/after 0x80 the raw
         // byte is ciphertext, so we MUST wrap within the period rather than
         // read it. (Reading `&sec[plain_start..+10]` directly — as before —
         // pulled ciphertext into the crib whenever the run covered fewer than
         // 10 bytes before 0x80, producing false-negative key recovery.)
-        let crypted = &sector[0x80..0x80 + 10];
         let mut plain = [0u8; 10];
         for (i, p) in plain.iter_mut().enumerate() {
             *p = sector[plain_start + (i % best_p)];
         }
+        Some(plain)
+    } else {
+        None
+    }
+}
 
-        if let Some(key) = recover_title_key_from_plain(crypted, &plain, &seed) {
-            // Verify against the same predicted plaintext.
-            if descramble_matches(sector, &key, &plain) {
-                return Some(key);
-            }
+fn crack_title_key_inner(sector: &[u8]) -> Option<[u8; 5]> {
+    let plain = attack_crib(sector)?;
+    let seed: [u8; 5] = [
+        sector[SEED_OFFSET],
+        sector[SEED_OFFSET + 1],
+        sector[SEED_OFFSET + 2],
+        sector[SEED_OFFSET + 3],
+        sector[SEED_OFFSET + 4],
+    ];
+    let crypted = &sector[0x80..0x80 + 10];
+    if let Some(key) = recover_title_key_from_plain(crypted, &plain, &seed) {
+        // Verify against the same predicted plaintext.
+        if descramble_matches(sector, &key, &plain) {
+            return Some(key);
         }
     }
-
     None
 }
 
