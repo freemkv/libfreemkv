@@ -82,8 +82,16 @@ fn write_fvi_record(w: &mut dyn Write, r: &PictureRecord) -> io::Result<()> {
     // `src` is REQUIRED by the record schema (Appendix A); when provenance is
     // absent the member is still emitted as null — a reader treats null as
     // "position unknown".
+    //
+    // Per `docs/FVI_FORMAT.md` §9, `src.byte` is the offset of the AU's first
+    // byte WITHIN its `sector` (not the absolute source offset). `SourcePos.byte`
+    // is the absolute offset, so reduce it modulo the sector size; `sector`
+    // already carries the whole-sector count.
     let src = match r.source {
-        Some(s) => serde_json::json!({ "sector": s.sector, "byte": s.byte }),
+        Some(s) => serde_json::json!({
+            "sector": s.sector,
+            "byte": s.byte % u64::from(FVI_SECTOR_SIZE),
+        }),
         None => serde_json::Value::Null,
     };
 
@@ -355,8 +363,9 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("movie.fvi");
         let mut sink = FviSink::create(&path, &mpeg2_title(), "iso://m.iso".into(), 1).unwrap();
-        // Video frame on track 0 → indexed.
-        sink.write(&vframe(0, Some(i_pic()), Some(SourcePos::at_byte(2048))))
+        // Video frame on track 0 → indexed. Offset 2148 = sector 1, byte 100
+        // within that sector (exercises the within-sector `src.byte`, §9).
+        sink.write(&vframe(0, Some(i_pic()), Some(SourcePos::at_byte(2148))))
             .unwrap();
         // Audio frame on a non-video track → ignored.
         sink.write(&vframe(7, None, Some(SourcePos::at_byte(9999))))
@@ -387,6 +396,7 @@ mod tests {
         assert_eq!(rec["nb_fields"], 2);
         assert_eq!(rec["pts"], 0);
         assert_eq!(rec["src"]["sector"], 1);
+        assert_eq!(rec["src"]["byte"], 100); // 2148 % 2048 → within-sector (§9)
         assert!(rec.get("dts").is_none(), "no DTS on a frame → omitted");
         assert!(
             rec.get("gop").is_none(),

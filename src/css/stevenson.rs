@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn crack_unscrambled_returns_none() {
-        let sector = vec![0u8; 2048];
+        let sector = vec![0u8; SECTOR_BYTES];
         assert!(crack_title_key(&sector).is_none());
     }
 
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn recover_needs_min_plain() {
-        let sector = vec![0u8; 2048];
+        let sector = vec![0u8; SECTOR_BYTES];
         let short_plain = [0u8; 4];
         assert!(recover_title_key(&sector, &short_plain).is_none());
     }

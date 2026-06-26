@@ -15,11 +15,17 @@
 //!
 //! ```text
 //!   mk_from_dk(device_keys, mkb, vid)  →  MediaKey   (Km)
+//!   mk_from_pk(processing_keys, mkb)   →  MediaKey   (Km)
 //!   vuk_from_mk(MediaKey, Vid)         →  Vuk        (= AES-G(Km, VID))
 //!   uk_from_vuk(Vuk, enc_title_keys)   →  [UnitKey]  (decrypt_unit_key each)
 //! ```
+//!
+//! `mk_from_dk` and `mk_from_pk` are two entry points to the SAME Media Key:
+//! the device-key path walks the MKB's Media-Key-Variant chain, the
+//! processing-key path walks the MKB's Subset-Difference cvalue tables. Neither
+//! needs a VID (the VID enters at `vuk_from_mk`).
 
-use super::keys::{decrypt_unit_key, derive_vuk};
+use super::keys::{decrypt_unit_key, derive_media_key_from_pk, derive_vuk};
 use super::types::DeviceKey;
 use super::variants::{KEY_CORRECTION_DATA_PLACEHOLDER, derive_media_key_variant, walk_mkb};
 
@@ -111,6 +117,31 @@ pub fn mk_from_dk(
     }
 }
 
+/// Derive the Media Key (Km) from one or more Processing Keys and the disc MKB.
+///
+/// Wraps [`derive_media_key_from_pk`] — the Subset-Difference PK→MK walk: each
+/// processing key is validated (and tree-walked) against the MKB's cvalue tables
+/// (records `0x04`/`0x05`) until one yields the Media Key whose verify record
+/// (`0x81`/`0x86`) matches. Unlike [`mk_from_dk`] this path is reachable for
+/// real discs — a leaked/precomputed AACS Processing Key in the keydb resolves
+/// the Media Key directly. No VID is involved at this step; the VID enters at
+/// [`vuk_from_mk`].
+///
+/// Returns [`Error::AacsMkUnavailable`] (E7018) when no processing key resolves
+/// the MKB — the same terminal error as [`mk_from_dk`]; no numeric distinction
+/// is load-bearing at this boundary.
+///
+/// [`Error::AacsMkUnavailable`]: crate::error::Error::AacsMkUnavailable
+pub fn mk_from_pk(
+    processing_keys: &[[u8; 16]],
+    mkb: &[u8],
+) -> Result<MediaKey, crate::error::Error> {
+    match derive_media_key_from_pk(mkb, processing_keys) {
+        Some(km) => Ok(MediaKey(km)),
+        None => Err(crate::error::Error::AacsMkUnavailable),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +227,82 @@ mod tests {
         mkb.extend_from_slice(&[0xAB; 16]);
         let e2 = mk_from_dk(&[dk], &mkb, Vid([0x09; 16]));
         assert!(matches!(e2, Err(crate::error::Error::AacsMkUnavailable)));
+    }
+
+    /// Build a 4-byte MKB record header (type + 3-byte big-endian total length,
+    /// header included) and append `body`. Mirrors the MKB record framing the
+    /// parser expects; no crypto.
+    fn mkb_record(rec_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = 4 + body.len();
+        let mut rec = Vec::with_capacity(total);
+        rec.push(rec_type);
+        rec.push(((total >> 16) & 0xFF) as u8);
+        rec.push(((total >> 8) & 0xFF) as u8);
+        rec.push((total & 0xFF) as u8);
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    /// `mk_from_pk` resolves a planted Processing Key against a synthetic MKB and
+    /// drives the FULL boil chain PK → MK → VUK → UK. The MKB is built with the
+    /// same (pk, cv, mk_dv, uv) construction the production SD walk validates, so
+    /// this proves a PK entry yields real Unit Keys — not just an `Ok`.
+    #[test]
+    fn mk_from_pk_drives_full_chain_to_uks() {
+        let pk: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+
+        // cv = AES-E(pk, mk_raw), where mk_raw is mk with the last-4-bytes-uv XOR
+        // pre-undone, so the validate step XORs uv back in and recovers mk.
+        let mut mk_raw = mk;
+        for a in 0..4 {
+            mk_raw[12 + a] ^= uv[a];
+        }
+        let cv = aes_ecb_encrypt(&pk, &mk_raw);
+
+        // mk_dv = AES-E(mk, magic||pad): AES-D(mk, mk_dv) starts with the AACS
+        // verify sentinel.
+        let mut vd = [0x11u8; 16];
+        vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        // Synthetic MKB: type/version (0x10), verify record (0x86 = mk_dv),
+        // one-entry SD index (0x04 = [u_mask_shift=0][uv]), one-entry cvalue
+        // table (0x05 = cv).
+        let mut sd = vec![0u8];
+        sd.extend_from_slice(&uv);
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&mkb_record(0x86, &mk_dv));
+        mkb.extend_from_slice(&mkb_record(0x04, &sd));
+        mkb.extend_from_slice(&mkb_record(0x05, &cv));
+
+        // PK → MK.
+        let got_mk = mk_from_pk(std::slice::from_ref(&pk), &mkb).expect("planted PK resolves MK");
+        assert_eq!(got_mk, MediaKey(mk), "mk_from_pk recovers the planted MK");
+
+        // MK → VUK → UK over an encrypted title key.
+        let vid = Vid([0x42u8; 16]);
+        let plain_uk = [0x7Eu8; 16];
+        let vuk = vuk_from_mk(got_mk, vid);
+        let enc = aes_ecb_encrypt(&vuk.0, &plain_uk);
+        let uks = uk_from_vuk(vuk, std::slice::from_ref(&enc));
+        assert_eq!(uks.len(), 1);
+        assert_eq!(uks[0].key, plain_uk, "PK chain recovers the title key");
+
+        // A corrupt PK resolves nothing.
+        let mut bad = pk;
+        bad[0] ^= 0xFF;
+        assert!(matches!(
+            mk_from_pk(std::slice::from_ref(&bad), &mkb),
+            Err(crate::error::Error::AacsMkUnavailable)
+        ));
     }
 }

@@ -48,8 +48,9 @@ pub const BD_SOURCE_PACKET_BYTES: usize = TS_PACKET_BYTES + BD_TIMESTAMP_PREFIX_
 /// This is one registry used in two places that share the same value space:
 /// the MPEG-TS PMT `stream_type` (ISO/IEC 13818-1 Table 2-34) and the Blu-ray
 /// STN/CLPI `stream_coding_type` (BD-ROM Part 3). The standardized video codes
-/// (`0x02`, `0x1B`, `0x24`, `0xEA`) are ISO assignments; the `0x80..=0xA2`
-/// audio/graphics codes sit in the ISO user-private range and follow the
+/// (`0x02`, `0x1B`, `0x24`) are ISO assignments (ISO/IEC 13818-1 Table 2-34);
+/// `0xEA` (VC-1) is a BD-ROM convention in the ISO user-private range. The
+/// `0x80..=0xA2` audio/graphics codes also sit in the user-private range and follow the
 /// Blu-ray Disc Association / ATSC A/52 convention. Because every consumer
 /// reads or writes this single byte, the family is unprefixed — the scope is
 /// "any elementary stream freemkv parses or muxes".

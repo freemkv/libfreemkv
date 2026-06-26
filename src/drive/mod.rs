@@ -433,8 +433,12 @@ impl Drive {
                 }
                 Ok(())
             }
-            // No unlocker matched: not an error — fall through to OEM route.
+            // No unlocker matched, or one matched but only hit a capability
+            // failure (not firmware-unlockable / no OEM VID): not an error —
+            // fall through to the OEM host-cert route.
             Ok(None) => Ok(()),
+            // A genuine transport fault during unlock (UnlockError::Scsi)
+            // propagates here and aborts init — the bus is dead.
             Err(e) => Err(e),
         };
         tracing::info!(

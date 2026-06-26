@@ -100,6 +100,12 @@ pub struct DiscInputsCtx<'a> {
 impl<'a> DiscInputsCtx<'a> {
     /// Build a context over `inputs`, parsing the encrypted title keys at the
     /// stride for AACS major `version_u8` (1 = V10, else V20/V21).
+    ///
+    /// A present-but-malformed `unit_key_ro` (truncated / wrong magic / wrong
+    /// stride) parses to an empty key set, so a later [`Self::enc_title_keys`]
+    /// returns `Ok(&[])` indistinguishably from a disc that legitimately has no
+    /// title keys — the parse failure is swallowed here, not surfaced as an
+    /// error.
     pub fn new(inputs: &'a DiscInputs, version_u8: u8) -> Self {
         use crate::aacs::{AacsVersion, parse_unit_key_ro};
         let enc_keys = if inputs.unit_key_ro.is_empty() {

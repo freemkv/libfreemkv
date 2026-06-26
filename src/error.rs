@@ -1199,6 +1199,7 @@ mod tests {
             E_NO_DISC_KEY,
             E_CSS_KEY_MISSING,
             E_AACS_NO_HOST_CERT,
+            E_AACS_BUS_KEY_UNAVAILABLE,
             E_KEYDB_CONNECT,
             E_KEYDB_HTTP,
             E_KEYDB_INVALID,

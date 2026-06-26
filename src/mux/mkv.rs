@@ -28,6 +28,9 @@ const CICP_PRIMARIES_BT470BG: u8 = 5;
 const CICP_PRIMARIES_BT601_525: u8 = 6;
 /// ColourPrimaries = 9 (BT.2020 / BT.2100) — ITU-T H.273 Table 2.
 const CICP_PRIMARIES_BT2020: u8 = 9;
+/// ColourPrimaries = 2 ("unspecified" — colorimetry unknown) — ITU-T H.273
+/// Table 2.
+const CICP_PRIMARIES_UNSPECIFIED: u8 = 2;
 
 /// TransferCharacteristics = 1 (BT.709) — ITU-T H.273 Table 3.
 const CICP_TRANSFER_BT709: u8 = 1;
@@ -41,6 +44,9 @@ const CICP_TRANSFER_PQ: u8 = 16;
 /// TransferCharacteristics = 18 (ARIB STD-B67 / Hybrid Log-Gamma) — ITU-T H.273
 /// Table 3.
 const CICP_TRANSFER_HLG: u8 = 18;
+/// TransferCharacteristics = 2 ("unspecified" — transfer unknown) — ITU-T H.273
+/// Table 3.
+const CICP_TRANSFER_UNSPECIFIED: u8 = 2;
 
 /// MatrixCoefficients = 1 (BT.709) — ITU-T H.273 Table 4.
 const CICP_MATRIX_BT709: u8 = 1;
@@ -50,6 +56,8 @@ const CICP_MATRIX_BT470BG: u8 = 5;
 const CICP_MATRIX_BT601_525: u8 = 6;
 /// MatrixCoefficients = 9 (BT.2020 non-constant luminance) — ITU-T H.273 Table 4.
 const CICP_MATRIX_BT2020NC: u8 = 9;
+/// MatrixCoefficients = 2 ("unspecified" — matrix unknown) — ITU-T H.273 Table 4.
+const CICP_MATRIX_UNSPECIFIED: u8 = 2;
 
 /// Matroska Colour/Range = 1 (broadcast / studio-swing "limited" range). RFC
 /// 9559 Range element. (0 = unspecified, 2 = full.)
@@ -104,7 +112,16 @@ pub(crate) fn cicp_for_video(v: &VideoStream) -> (u8, u8, u8, u8) {
             CICP_PRIMARIES_BT601_525,
             COLOUR_RANGE_LIMITED,
         ),
-        ColorSpace::Unknown => (0, 0, 0, 0),
+        // Unknown colorimetry → CICP "unspecified" (code point 2) for matrix,
+        // transfer, and primaries, with limited range (the disc norm). Both the
+        // MKV sink and the FVI sidecar emit 2 so the two sinks of one title
+        // agree (matches `Colour::from_color_space`'s Unknown mapping).
+        ColorSpace::Unknown => (
+            CICP_MATRIX_UNSPECIFIED,
+            CICP_TRANSFER_UNSPECIFIED,
+            CICP_PRIMARIES_UNSPECIFIED,
+            COLOUR_RANGE_LIMITED,
+        ),
     };
     // Override the transfer for HDR signalled by the HdrFormat (the coarse enum
     // can't express PQ/HLG). Only applies on the enum fallback; a measured CICP
@@ -1546,6 +1563,41 @@ mod tests {
             (t.colour_matrix, t.colour_transfer, t.colour_primaries),
             (CICP_MATRIX_BT709, CICP_TRANSFER_BT709, CICP_PRIMARIES_BT709),
             "measured CICP must override the enum, transfer included"
+        );
+    }
+
+    /// Unknown colorimetry with no measured CICP and no HDR must emit CICP
+    /// "unspecified" (code point 2) for matrix/transfer/primaries — never 0 — so
+    /// the MKV sink agrees with the FVI sidecar (`Colour::from_color_space`).
+    #[test]
+    fn unknown_color_space_emits_unspecified_cicp() {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate: crate::disc::FrameRate::F24,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Unknown,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let t = MkvTrack::video(&v);
+        assert_eq!(
+            (
+                t.colour_matrix,
+                t.colour_transfer,
+                t.colour_primaries,
+                t.colour_range
+            ),
+            (
+                CICP_MATRIX_UNSPECIFIED,
+                CICP_TRANSFER_UNSPECIFIED,
+                CICP_PRIMARIES_UNSPECIFIED,
+                COLOUR_RANGE_LIMITED
+            ),
+            "Unknown colorimetry must emit CICP 'unspecified' (2), not 0"
         );
     }
 
