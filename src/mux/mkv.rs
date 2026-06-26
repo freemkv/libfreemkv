@@ -3777,4 +3777,204 @@ mod tests {
         let data = muxer.writer.into_inner();
         assert!(find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_none());
     }
+
+    // ---- CodecPrivate emission (avcC / hvcC / VC-1 / MPEG-2) -------------
+    //
+    // `MkvTrack::video` always builds with `codec_private: None`; the PES mux
+    // pipeline fills it in up-front from the DiscTitle (avcC for H.264, hvcC for
+    // HEVC, the VFW BITMAPINFOHEADER for VC-1, etc.). Nothing previously asserted
+    // that the muxer EMITS the supplied codecPrivate as a well-formed
+    // CodecPrivate element. These tests build a real `MkvMuxer` per representative
+    // video codec, set the codecPrivate the pipeline would hand over, and read
+    // the EMITTED bytes back: the element must be a DIRECT child of TrackEntry
+    // (never nested in Video), carry the registered CODEC_ID, and reproduce the
+    // exact codecPrivate payload byte-for-byte.
+
+    /// Build a representative video track for `codec` whose codecPrivate is set
+    /// to `cp` (mirroring what the mux pipeline supplies up-front).
+    fn video_track_with_codec_private(codec: Codec, cp: Vec<u8>) -> MkvTrack {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec,
+            resolution: Resolution::R1080p,
+            frame_rate: crate::disc::FrameRate::F23_976,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let mut t = MkvTrack::video(&v);
+        t.codec_private = Some(cp);
+        t
+    }
+
+    /// Read the body bytes of a direct TrackEntry child element by ID.
+    fn track_entry_child_body<'a>(data: &'a [u8], id: u32) -> Option<&'a [u8]> {
+        let (te_start, te_size) = first_track_entry(data);
+        let (_, body_start, body_size) = master_children(data, te_start, te_size)
+            .into_iter()
+            .find(|(c, _, _)| *c == id)?;
+        Some(&data[body_start..body_start + body_size as usize])
+    }
+
+    #[test]
+    fn codec_private_emitted_verbatim_for_each_video_codec() {
+        // A distinctive payload per codec so a mix-up (wrong track / truncation)
+        // is caught. These stand in for avcC / hvcC / VFW-header / MPEG-2 seq
+        // header blobs — the muxer treats codecPrivate as opaque binary, so the
+        // contract under test is "emit exactly what you were given, intact."
+        let cases: [(Codec, &str, Vec<u8>); 4] = [
+            // avcC (H.264): configurationVersion=1, AVCProfileIndication=0x64
+            // (High), profile_compat=0x00, AVCLevelIndication=0x28 (4.0), then
+            // the reserved/length-size byte. A real-shaped, minimal avcC head.
+            (
+                Codec::H264,
+                ebml::CODEC_H264,
+                vec![
+                    0x01, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0x00, 0x04, 0x67, 0x64, 0x00, 0x28,
+                ],
+            ),
+            // hvcC (HEVC): configurationVersion=1, then a real-shaped head.
+            (
+                Codec::Hevc,
+                ebml::CODEC_HEVC,
+                vec![
+                    0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5A,
+                ],
+            ),
+            // VC-1: VFW BITMAPINFOHEADER blob (opaque to the muxer).
+            (
+                Codec::Vc1,
+                ebml::CODEC_VC1,
+                vec![
+                    0x28, 0x00, 0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x38, 0x04, 0x00, 0x00,
+                ],
+            ),
+            // MPEG-2: sequence header start code + payload.
+            (
+                Codec::Mpeg2,
+                ebml::CODEC_MPEG2,
+                vec![0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0xC4, 0x02],
+            ),
+        ];
+
+        for (codec, expected_codec_id, cp) in cases {
+            let t = video_track_with_codec_private(codec, cp.clone());
+            let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+            let data = muxer.writer.into_inner();
+
+            // CodecPrivate must be a DIRECT child of TrackEntry (not in Video) and
+            // reproduce the supplied payload byte-for-byte.
+            let body = track_entry_child_body(&data, ebml::CODEC_PRIVATE).unwrap_or_else(|| {
+                panic!("{codec:?}: CodecPrivate must be a direct TrackEntry child")
+            });
+            assert_eq!(
+                body,
+                &cp[..],
+                "{codec:?}: emitted CodecPrivate must equal the supplied bytes verbatim"
+            );
+
+            // The CodecPrivate must NOT also appear inside the Video master.
+            let (te_start, te_size) = first_track_entry(&data);
+            let (_, vid_start, vid_size) = master_children(&data, te_start, te_size)
+                .into_iter()
+                .find(|(c, _, _)| *c == ebml::VIDEO)
+                .expect("Video master present");
+            assert!(
+                !master_children(&data, vid_start, vid_size as usize)
+                    .iter()
+                    .any(|(c, _, _)| *c == ebml::CODEC_PRIVATE),
+                "{codec:?}: CodecPrivate must not be nested in the Video master"
+            );
+
+            // And the registered CodecID for this codec must be emitted.
+            let cid = track_entry_child_body(&data, ebml::CODEC_ID)
+                .expect("CodecID present")
+                .to_vec();
+            assert_eq!(
+                String::from_utf8_lossy(&cid),
+                *expected_codec_id,
+                "{codec:?}: wrong CodecID emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_private_omitted_when_none() {
+        // The guard at the writer is `if let Some(cp) = ...`: a track with no
+        // codecPrivate (audio commonly, or video before fill) must emit NO
+        // CodecPrivate element at all — not an empty one.
+        let muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_audio_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            track_entry_child_body(&data, ebml::CODEC_PRIVATE).is_none(),
+            "no CodecPrivate element when codec_private is None"
+        );
+    }
+
+    // ---- DefaultDuration ns by frame rate (emitted bytes) ---------------
+    //
+    // Existing tests pin the EMITTED DefaultDuration only for 25 fps (40 ms) and
+    // 29.97 fps (33.366 ms). This fills the gap for the remaining film/PAL/NTSC
+    // and high-frame-rate rates, asserting the value read back out of the muxer —
+    // not just the track field — so a regression in the serializer's uint
+    // encoding (or the element being dropped/nested) is caught too.
+
+    /// Read the DefaultDuration value (ns) emitted for a single-video-track mux.
+    fn emitted_default_duration_ns(frame_rate: crate::disc::FrameRate) -> u64 {
+        let v = VideoStream {
+            pid: 0xE0,
+            codec: Codec::Hevc,
+            resolution: Resolution::R1080p,
+            frame_rate,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        };
+        let t = MkvTrack::video(&v);
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[t], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        let body = track_entry_child_body(&data, ebml::DEFAULT_DURATION)
+            .expect("DefaultDuration present for a known frame rate");
+        // EBML uint: big-endian, variable width.
+        body.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
+    }
+
+    #[test]
+    fn default_duration_ns_matches_frame_rate_for_all_rates() {
+        use crate::disc::FrameRate;
+        // Expected ns/frame = 1e9 * den / num for each (num, den) fraction.
+        // 23.976 = 24000/1001 → 41_708_333; 24 → 41_666_666; 25 → 40_000_000;
+        // 29.97 = 30000/1001 → 33_366_666; 30 → 33_333_333; 50 → 20_000_000;
+        // 59.94 = 60000/1001 → 16_683_333; 60 → 16_666_666.
+        let cases = [
+            (FrameRate::F23_976, 41_708_333u64),
+            (FrameRate::F24, 41_666_666),
+            (FrameRate::F25, 40_000_000),
+            (FrameRate::F29_97, 33_366_666),
+            (FrameRate::F30, 33_333_333),
+            (FrameRate::F50, 20_000_000),
+            (FrameRate::F59_94, 16_683_333),
+            (FrameRate::F60, 16_666_666),
+        ];
+        for (fr, expected) in cases {
+            assert_eq!(
+                emitted_default_duration_ns(fr),
+                expected,
+                "{fr:?}: emitted DefaultDuration ns mismatch"
+            );
+        }
+    }
 }

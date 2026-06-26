@@ -4949,6 +4949,125 @@ mod tests {
         );
     }
 
+    /// End-to-end Pass-1 sweep against a synthetic `MockReader` with an injected
+    /// bad-sector region, asserting the RESULTING MAPFILE — the thing the sweep
+    /// loop and damage-jump exist to produce. Drives the real `Disc::sweep` (no
+    /// live drive, per the project's "synthetic fixtures only" rule) and checks:
+    ///   * the leading good region is marked Finished,
+    ///   * the bad region (and the skip-ahead gap the damage-jump zero-fills) is
+    ///     marked NonTrimmed,
+    ///   * the damage-jump actually engaged — the NonTrimmed span is far larger
+    ///     than the single failed ECC batch, which only happens if Pass-1 jumped
+    ///     ahead (JUMP_BASE_SECTORS×batch) and zero-filled the gap as NonTrimmed,
+    ///   * the mapfile covers the whole disc with no overlap, and good+retryable
+    ///     accounting matches.
+    ///
+    /// Note: this exercises the real cooldown/pause pacing, so it spends a few
+    /// seconds of wall time on the single zone-entry pause (same cost the
+    /// existing `sweep_to_dev_null_real` already pays) — but unlike that test it
+    /// asserts the actual recovery bookkeeping, not just `is_ok()`.
+    #[test]
+    fn sweep_marks_bad_region_nontrimmed_and_engages_damage_jump() {
+        use crate::disc::mapfile::{Mapfile, SectorStatus};
+
+        let sectors: u32 = 1000;
+        // One bad sector at LBA 320 fails the entire ECC batch [320,352).
+        // batch=32 for UHD, so [0,320) = 10 clean batches before the failure.
+        let bad: std::collections::HashSet<u32> = [320u32].into_iter().collect();
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: bad,
+        };
+        let disc = make_test_disc(sectors, "DJ");
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("dj.iso");
+        let opts = SweepOptions {
+            decrypt: false,
+            resume: false,
+            batch_sectors: None, // → ecc batch (32) for UHD
+            skip_on_error: true, // multipass → damage-jump engaged
+            progress: None,
+            halt: None,
+            vid: None,
+            unit_keys: Vec::new(),
+        };
+        disc.sweep(&mut reader, &iso_path, &opts).expect("sweep");
+
+        let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).expect("load mapfile");
+        let good = mf.ranges_with(&[SectorStatus::Finished]);
+        let bad_ranges = mf.ranges_with(&[SectorStatus::NonTrimmed]);
+        let disc_bytes = sectors as u64 * 2048;
+        const SEC: u64 = 2048;
+
+        // The first failing batch starts at LBA 320; everything before it read
+        // cleanly and must be Finished.
+        let good_bytes: u64 = good.iter().map(|(_, sz)| sz).sum();
+        assert!(
+            good_bytes > 0,
+            "leading clean region must be marked Finished"
+        );
+        assert!(
+            good.iter().all(|(pos, sz)| pos + sz <= 320 * SEC),
+            "all Finished bytes must lie before the bad batch at LBA 320; got {good:?}"
+        );
+        // The clean lead is the 10 batches [0,320) = 320 sectors.
+        assert_eq!(
+            good_bytes,
+            320 * SEC,
+            "exactly the 320 clean sectors before the failure are Finished"
+        );
+
+        // The bad region must be NonTrimmed and must START at the failed batch.
+        assert!(
+            !bad_ranges.is_empty(),
+            "the failed batch must produce a NonTrimmed range"
+        );
+        let bad_bytes: u64 = bad_ranges.iter().map(|(_, sz)| sz).sum();
+        let (first_bad_pos, _) = bad_ranges[0];
+        assert_eq!(
+            first_bad_pos,
+            320 * SEC,
+            "NonTrimmed must begin at the failed ECC batch (LBA 320)"
+        );
+
+        // Damage-jump proof: a single ECC batch is 32 sectors. If only the failed
+        // batch were marked, NonTrimmed would be ~32 sectors. The fast-jump
+        // (JUMP_BASE_SECTORS=1024 × batch=32) overshoots this 1000-sector disc, so
+        // the entire tail from the failure to EOF is zero-filled NonTrimmed — far
+        // more than one batch. That can ONLY happen if the jump engaged.
+        assert!(
+            bad_bytes > 32 * SEC,
+            "NonTrimmed span ({} sectors) must exceed a single ECC batch — proves \
+             the damage-jump skipped ahead and zero-filled the gap",
+            bad_bytes / SEC
+        );
+        // Specifically: the jump overshoots EOF, so the whole tail [320,1000) is
+        // NonTrimmed.
+        assert_eq!(
+            bad_bytes,
+            (sectors as u64 - 320) * SEC,
+            "the damage-jump overshoots EOF → the entire tail is NonTrimmed"
+        );
+
+        // Whole-disc coverage with no gaps/overlap: Finished + NonTrimmed = disc.
+        assert_eq!(
+            good_bytes + bad_bytes,
+            disc_bytes,
+            "Finished + NonTrimmed must cover the whole disc exactly"
+        );
+        // Stats agree with the range view.
+        let stats = mf.stats();
+        assert_eq!(stats.bytes_good, good_bytes, "stats.bytes_good vs ranges");
+        assert_eq!(
+            stats.bytes_retryable, bad_bytes,
+            "NonTrimmed counts as retryable in stats"
+        );
+        assert!(
+            stats.bytes_unreadable == 0,
+            "Pass-1 never promotes to Unreadable (that's a later pass's job)"
+        );
+    }
+
     /// Regression (finding 6): sweep() resume against a mapfile whose
     /// total_size != the real disc size must DOWNGRADE to a fresh full sweep
     /// covering [0, capacity), not reuse the stale mapfile (which would
