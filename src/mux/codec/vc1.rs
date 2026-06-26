@@ -6,11 +6,83 @@
 //! I-frames (keyframes) are signalled by the presence of a Sequence Header
 //! (0x0F) in the PES, per the BD VC-1 convention (see `parse`).
 
+use super::coding::{CodingType, PictureInfo};
+use super::startcode::BitReader;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const SC_SEQUENCE_HEADER: u8 = 0x0F;
 const SC_ENTRY_POINT: u8 = 0x0E;
 const SC_FRAME: u8 = 0x0D;
+
+/// Read the advanced-profile sequence header's `INTERLACE` flag (SMPTE 421M
+/// §6.1.1): bit 41 after the start code — after PROFILE(2) LEVEL(3)
+/// COLORDIFF_FORMAT(2) FRMRTQ(3) BITRTQ(5) POSTPROCFLAG(1) MAX_CODED_WIDTH(12)
+/// MAX_CODED_HEIGHT(12) PULLDOWN(1). `None` for simple/main profile or a header
+/// too short / over-escaped to reach the bit. De-escapes emulation-prevention
+/// bytes first (as `parse_vc1_resolution` does) so the bit offset is exact.
+fn parse_vc1_interlace(sh: &[u8]) -> Option<bool> {
+    if sh.len() < 8 || (sh[4] >> 6) & 0x03 != 3 {
+        return None; // need the start code + advanced profile (PROFILE == 3)
+    }
+    // Collect the first 6 de-escaped bytes (48 bits ≥ the 42 we need).
+    let mut deesc = Vec::with_capacity(6);
+    let mut zeros = 0u8;
+    for &b in &sh[4..] {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0; // drop the emulation-prevention byte
+            continue;
+        }
+        deesc.push(b);
+        if deesc.len() == 6 {
+            break;
+        }
+        zeros = if b == 0x00 { zeros + 1 } else { 0 };
+    }
+    if deesc.len() < 6 {
+        return None;
+    }
+    let mut bits: u64 = 0;
+    for &b in &deesc {
+        bits = (bits << 8) | b as u64;
+    }
+    // 48 bits; INTERLACE is bit index 41 from the MSB → (48 - 1 - 41) = 6 from LSB.
+    Some((bits >> 6) & 1 == 1)
+}
+
+/// Decode the advanced-profile **progressive** picture PTYPE VLC (SMPTE 421M
+/// §7.1.1.4, Table): `0`=P, `10`=B, `110`=I, `1110`=BI (intra → I), `1111`=
+/// Skipped (predicted, no residual → P). Only valid when the sequence is
+/// progressive — for interlaced an FCM code (and, for field pictures, a combined
+/// FPTYPE) precedes/replaces PTYPE, so the caller declines those.
+fn vc1_progressive_ptype(br: &mut BitReader) -> Option<CodingType> {
+    if br.read_bit()? == 0 {
+        return Some(CodingType::P); // 0
+    }
+    if br.read_bit()? == 0 {
+        return Some(CodingType::B); // 10
+    }
+    if br.read_bit()? == 0 {
+        return Some(CodingType::I); // 110
+    }
+    // 1110 = BI (intra) → I; 1111 = Skipped (predicted) → P.
+    Some(if br.read_bit()? == 0 {
+        CodingType::I
+    } else {
+        CodingType::P
+    })
+}
+
+/// Measure the coding type of an advanced-profile frame from its picture header.
+/// `frame_rbsp` starts immediately after the frame start code (`00 00 01 0D`).
+/// Decodes PTYPE only for a PROGRESSIVE sequence (where PTYPE is the first
+/// picture-layer field); declines (`None`) for interlaced/simple-main/unknown
+/// rather than guess at the wrong bit offset.
+fn vc1_frame_coding_type(frame_rbsp: &[u8], seq_header: Option<&[u8]>) -> Option<CodingType> {
+    if parse_vc1_interlace(seq_header?)? {
+        return None; // interlaced: FCM/FPTYPE not decoded here
+    }
+    vc1_progressive_ptype(&mut BitReader::new(frame_rbsp))
+}
 
 pub struct Vc1Parser {
     // First-seen seq_header + entry_point seed the MKV codecPrivate
@@ -242,9 +314,18 @@ impl CodecParser for Vc1Parser {
             }
         };
 
+        // Measure the coding type from the picture header (advanced-profile
+        // progressive PTYPE; interlaced/simple-main declined → None). The frame
+        // RBSP begins just past the 4-byte frame start code (00 00 01 0D).
+        let coding_type = frame_start.and_then(|fs| {
+            vc1_frame_coding_type(data.get(fs + 4..)?, self.cur_seq_header.as_deref())
+        });
+
         vec![Frame {
-            coding: None,
-            source: None,
+            // Coding-type only: VC-1 field order is not decoded here, so
+            // field_order() stays None — honestly absent, never guessed.
+            coding: coding_type.map(PictureInfo::coding_type_only),
+            source: pes.source,
             pts_ns: ts_ns,
             keyframe,
             data: frame_data,
@@ -371,6 +452,68 @@ mod tests {
             dts: None,
             data,
         }
+    }
+
+    #[test]
+    fn vc1_populates_measured_coding_type_and_source() {
+        use super::super::coding::CodingType;
+        // Advanced-profile sequence header: 00 00 01 0F, PROFILE=3 (0xC0), then
+        // zeros so INTERLACE (bit 41) = 0 → progressive.
+        let seq_prog = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0];
+        // Frame: 00 00 01 0D then the PTYPE VLC as the first RBSP bits:
+        //   0xC0 = '110' → I; 0x00 = '0' → P; 0x80 = '10' → B.
+        let frame = |ptype: u8| vec![0x00, 0x00, 0x01, SC_FRAME, ptype];
+        let src = crate::pes::SourcePos::at_byte(2048);
+        let mut p = Vc1Parser::new();
+
+        // I-frame carrying the seq header → keyframe, sets the active seq header.
+        let mut pe = make_pes([seq_prog.clone(), frame(0xC0)].concat(), Some(0));
+        pe.source = Some(src);
+        let fi = p.parse(&pe);
+        assert_eq!(fi.len(), 1);
+        assert!(fi[0].keyframe, "seq header present → keyframe");
+        let ci = fi[0].coding.expect("VC-1 frame carries PictureInfo");
+        assert_eq!(ci.coding_type(), CodingType::I, "PTYPE 110 → I");
+        assert!(
+            ci.field_order().is_none(),
+            "VC-1 field order undecoded → None, never faked"
+        );
+        assert_eq!(
+            fi[0].source.unwrap().byte,
+            2048,
+            "source provenance carried"
+        );
+
+        // P / B frames (no seq header; the active progressive seq header
+        // persists) → measured P / B, not keyframes.
+        let fp = p.parse(&make_pes(frame(0x00), Some(0)));
+        assert!(!fp[0].keyframe);
+        assert_eq!(
+            fp[0].coding.unwrap().coding_type(),
+            CodingType::P,
+            "PTYPE 0 → P"
+        );
+        let fb = p.parse(&make_pes(frame(0x80), Some(0)));
+        assert_eq!(
+            fb[0].coding.unwrap().coding_type(),
+            CodingType::B,
+            "PTYPE 10 → B"
+        );
+    }
+
+    #[test]
+    fn vc1_interlaced_declines_coding_type_never_guesses() {
+        // Interlaced sequence (INTERLACE bit 41 = 1): FCM/FPTYPE precede PTYPE
+        // and are NOT decoded here, so the coding type is honestly omitted
+        // rather than read at the wrong bit offset.
+        let seq_int = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xC0, 0, 0, 0, 0, 0x40];
+        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0xC0];
+        let mut p = Vc1Parser::new();
+        let f = p.parse(&make_pes([seq_int, frame].concat(), Some(0)));
+        assert!(
+            f[0].coding.is_none(),
+            "interlaced VC-1 → coding omitted, never a guessed type"
+        );
     }
 
     /// Build a VC-1 PES with sequence header + entry point + frame start code.
