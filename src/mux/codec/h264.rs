@@ -4,14 +4,31 @@
 //! Detects keyframes (IDR slices).
 //! Each PES packet = one access unit = one frame.
 
-use super::startcode::{find_start_code, skip_start_code};
+use super::coding::{CodingType, PictureInfo};
+use super::startcode::{BitReader, find_start_code, skip_start_code};
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 /// H.264 NAL unit types we care about.
+const NAL_SLICE_NON_IDR: u8 = 1;
 const NAL_SLICE_IDR: u8 = 5;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
+
+/// Map an H.264 `slice_type` (Rec. ITU-T H.264 §7.4.3, Table 7-6) to a coding
+/// type. Values 5..=9 repeat 0..=4 (the "all slices of this type" forms), so
+/// `slice_type % 5`: 0 = P, 1 = B, 2 = I, 3 = SP (predicted → P), 4 = SI
+/// (intra → I). Returns `None` for values outside 0..=9 (malformed header).
+fn h264_slice_coding_type(slice_type: u32) -> Option<CodingType> {
+    match slice_type {
+        0..=9 => Some(match slice_type % 5 {
+            0 | 3 => CodingType::P, // P, SP
+            1 => CodingType::B,
+            _ => CodingType::I, // 2 = I, 4 = SI
+        }),
+        _ => None,
+    }
+}
 
 /// H.264 (AVC) Annex B → MKV codec parser: extracts SPS/PPS for the avcC
 /// codecPrivate, detects IDR keyframes, and converts each PES access unit into
@@ -141,6 +158,8 @@ impl CodecParser for H264Parser {
         // Annex B (start-code prefixed) NALUs to length-prefixed NALUs (MKV with
         // AVCDecoderConfigurationRecord expects a 4-byte length prefix per NAL).
         let mut keyframe = false;
+        // Picture coding type, MEASURED from the first coded slice's header.
+        let mut coding_type: Option<CodingType> = None;
         // Did this access unit already carry each param-set type in-band?
         let mut emitted_sps = false;
         let mut emitted_pps = false;
@@ -171,6 +190,21 @@ impl CodecParser for H264Parser {
                 _ => {
                     if nal_type == NAL_SLICE_IDR {
                         keyframe = true;
+                    }
+                    // Measure the coding type from the FIRST coded slice's header
+                    // (H.264 §7.3.3: first_mb_in_slice ue(v), then slice_type
+                    // ue(v)). Populates PictureInfo so a consumer reads a MEASURED
+                    // I/P/B, never a keyframe-only guess. Only the first slice of
+                    // the access unit is read; `nal[1..]` is the RBSP after the
+                    // 1-byte NAL header (slice_type is too early for an
+                    // emulation-prevention byte to intervene).
+                    if (nal_type == NAL_SLICE_NON_IDR || nal_type == NAL_SLICE_IDR)
+                        && coding_type.is_none()
+                    {
+                        let mut br = BitReader::new(&nal[1..]);
+                        if let (Some(_first_mb), Some(slice_type)) = (br.read_ue(), br.read_ue()) {
+                            coding_type = h264_slice_coding_type(slice_type);
+                        }
                     }
                     // A NAL longer than u32::MAX can't be length-prefixed in the
                     // 4-byte field; skip it rather than mis-frame the output.
@@ -203,8 +237,10 @@ impl CodecParser for H264Parser {
         }
 
         vec![Frame {
-            coding: None,
-            source: None,
+            // Coding-type only: H.264 field order is not decoded here, so
+            // `field_order()` stays `None` — honestly absent, never guessed.
+            coding: coding_type.map(PictureInfo::coding_type_only),
+            source: pes.source,
             pts_ns,
             keyframe,
             data: frame_data,
@@ -571,6 +607,54 @@ mod tests {
         let mut v = vec![0x00, 0x00, 0x01, t];
         v.extend_from_slice(body);
         v
+    }
+
+    #[test]
+    fn h264_populates_measured_coding_type_and_source() {
+        use super::super::coding::CodingType;
+        // Slice-header body = first_mb_in_slice=0 ('1') then slice_type ue(v):
+        //   0x88 = '1 0001000' → slice_type 7 (I)
+        //   0x98 = '1 00110..' → slice_type 5 (P)
+        //   0x9C = '1 00111..' → slice_type 6 (B)
+        let src = crate::pes::SourcePos::at_byte(8192);
+        let mut parse = |nal_type: u8, body: u8| {
+            let mut p = H264Parser::new();
+            let mut pe = make_pes(h264_nal(nal_type, &[body]), Some(0));
+            pe.source = Some(src);
+            p.parse(&pe)
+        };
+
+        // IDR carrying an I-slice → keyframe + MEASURED I; source carried; H.264
+        // field order is not decoded, so it is honestly absent (not guessed).
+        let fi = parse(NAL_SLICE_IDR, 0x88);
+        assert_eq!(fi.len(), 1);
+        assert!(fi[0].keyframe, "IDR is a keyframe");
+        let ci = fi[0].coding.expect("H.264 frame carries PictureInfo");
+        assert_eq!(ci.coding_type(), CodingType::I, "slice_type 7 → I");
+        assert!(
+            ci.field_order().is_none(),
+            "H.264 field order undecoded → None, never faked"
+        );
+        assert_eq!(
+            fi[0].source.unwrap().byte,
+            8192,
+            "source provenance carried"
+        );
+
+        // Non-IDR P / B slices → MEASURED P / B, not keyframes.
+        let fp = parse(NAL_SLICE_NON_IDR, 0x98);
+        assert_eq!(
+            fp[0].coding.unwrap().coding_type(),
+            CodingType::P,
+            "slice_type 5 → P"
+        );
+        assert!(!fp[0].keyframe);
+        let fb = parse(NAL_SLICE_NON_IDR, 0x9C);
+        assert_eq!(
+            fb[0].coding.unwrap().coding_type(),
+            CodingType::B,
+            "slice_type 6 → B"
+        );
     }
 
     /// Regression (Fight Club bug, H.264 variant): PPS id 0 = body A (→ avcC),
