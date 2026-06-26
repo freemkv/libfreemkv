@@ -70,8 +70,17 @@ impl<'a> BitReader<'a> {
         Some(b as u32)
     }
 
+    /// Read `n` bits, MSB-first, into the low bits of a `u32`.
+    pub fn read_bits(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit()?;
+        }
+        Some(v)
+    }
+
     /// Skip `n` bits; `None` if that would run past the end.
-    pub fn skip_bits(&mut self, n: usize) -> Option<()> {
+    pub fn skip_bits(&mut self, n: u32) -> Option<()> {
         for _ in 0..n {
             self.read_bit()?;
         }
