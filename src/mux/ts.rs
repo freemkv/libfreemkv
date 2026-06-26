@@ -6,11 +6,9 @@
 //!
 //! This demuxer extracts PES packets from selected PIDs, with PTS/DTS timestamps.
 
-/// BD transport stream packet size (4-byte extra header + 188-byte TS).
-const BD_TS_PACKET_SIZE: usize = 192;
+use crate::consts::BD_SOURCE_PACKET_BYTES;
 
-/// Standard TS packet size.
-const TS_PACKET_SIZE: usize = 188;
+use crate::consts::TS_PACKET_BYTES;
 
 /// TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
@@ -259,13 +257,13 @@ impl TsDemuxer {
         // call, complete it from the head of `data` without touching
         // the rest of `data`.
         if !self.remainder.is_empty() {
-            let need = BD_TS_PACKET_SIZE - self.remainder.len();
+            let need = BD_SOURCE_PACKET_BYTES - self.remainder.len();
             if data.len() < need {
                 // Still not a full packet — accumulate and wait.
                 self.remainder.extend_from_slice(data);
                 return completed;
             }
-            let mut boundary = [0u8; BD_TS_PACKET_SIZE];
+            let mut boundary = [0u8; BD_SOURCE_PACKET_BYTES];
             boundary[..self.remainder.len()].copy_from_slice(&self.remainder);
             boundary[self.remainder.len()..].copy_from_slice(&data[..need]);
             self.remainder.clear();
@@ -279,10 +277,10 @@ impl TsDemuxer {
         }
 
         // Aligned-packets fast path — reads directly out of `data`.
-        while offset + BD_TS_PACKET_SIZE <= data.len() {
-            let packet = &data[offset..offset + BD_TS_PACKET_SIZE];
+        while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
+            let packet = &data[offset..offset + BD_SOURCE_PACKET_BYTES];
             let src = self.pkt_source(offset);
-            offset += BD_TS_PACKET_SIZE;
+            offset += BD_SOURCE_PACKET_BYTES;
             self.process_packet(packet, src, &mut completed);
         }
         // Advance the running base past every byte consumed this feed so the
@@ -295,7 +293,7 @@ impl TsDemuxer {
         // prevent unbounded growth on a desynchronised stream).
         if offset < data.len() {
             let leftover = &data[offset..];
-            if leftover.len() < BD_TS_PACKET_SIZE {
+            if leftover.len() < BD_SOURCE_PACKET_BYTES {
                 self.remainder.extend_from_slice(leftover);
             } else {
                 self.remainder.clear();
@@ -353,7 +351,7 @@ impl TsDemuxer {
             4
         };
 
-        if payload_start >= TS_PACKET_SIZE {
+        if payload_start >= TS_PACKET_BYTES {
             return;
         }
         // adaptation == 0x02 → AF only, no payload.
@@ -532,7 +530,7 @@ fn is_resync_point(data: &[u8], offset: usize) -> bool {
     if data.get(offset + 4) != Some(&SYNC_BYTE) {
         return false;
     }
-    match data.get(offset + BD_TS_PACKET_SIZE + 4) {
+    match data.get(offset + BD_SOURCE_PACKET_BYTES + 4) {
         Some(&b) => b == SYNC_BYTE,
         None => true, // last packet in the buffer — no follower to corroborate
     }
@@ -544,7 +542,7 @@ fn is_resync_point(data: &[u8], offset: usize) -> bool {
 /// Accounts for the adaptation_field_control (bits 5:4 of the 4th TS header
 /// byte). Returns `None` when the packet carries no payload (AFC 0b10 = AF
 /// only, or the reserved 0b00) or when the adaptation field length runs past
-/// the packet. `pkt` must be at least [`BD_TS_PACKET_SIZE`] bytes.
+/// the packet. `pkt` must be at least [`BD_SOURCE_PACKET_BYTES`] bytes.
 fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
     // TS header is pkt[4..]; byte pkt[7] holds AFC in bits 5:4.
     let afc = (pkt[7] >> 4) & 0x03;
@@ -555,7 +553,7 @@ fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
             // payload starts after it.
             let af_len = pkt[8] as usize;
             let base = 9 + af_len; // 4 + 4 + 1(length byte) + af_len
-            if base < BD_TS_PACKET_SIZE {
+            if base < BD_SOURCE_PACKET_BYTES {
                 Some(base)
             } else {
                 None // AF overruns the packet
@@ -587,7 +585,7 @@ fn psi_payload_base(pkt: &[u8]) -> Option<usize> {
 /// matching section is found.
 fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec<u8>> {
     let mut offset = 0;
-    while offset + BD_TS_PACKET_SIZE <= data.len() {
+    while offset + BD_SOURCE_PACKET_BYTES <= data.len() {
         if !is_resync_point(data, offset) {
             offset += 1;
             continue;
@@ -599,12 +597,13 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             // Locate the payload (pointer_field) accounting for any
             // adaptation field. A packet with no payload (AF only) or an
             // AF that overruns the packet is skipped.
-            let Some(payload_off) = psi_payload_base(&data[offset..offset + BD_TS_PACKET_SIZE])
+            let Some(payload_off) =
+                psi_payload_base(&data[offset..offset + BD_SOURCE_PACKET_BYTES])
             else {
-                offset += BD_TS_PACKET_SIZE;
+                offset += BD_SOURCE_PACKET_BYTES;
                 continue;
             };
-            let payload = &data[offset + payload_off..offset + BD_TS_PACKET_SIZE];
+            let payload = &data[offset + payload_off..offset + BD_SOURCE_PACKET_BYTES];
             // pointer_field is the FIRST payload byte; the section starts
             // pointer_field bytes after it. Bound the start to within
             // THIS packet's payload — a pointer that runs into the next
@@ -612,7 +611,7 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             let pointer = payload[0] as usize;
             let sec_start = 1 + pointer;
             if sec_start + 3 > payload.len() || payload[sec_start] != table_id {
-                offset += BD_TS_PACKET_SIZE;
+                offset += BD_SOURCE_PACKET_BYTES;
                 continue;
             }
             let section_len =
@@ -631,9 +630,9 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             // dropped/duplicated packet → the assembled section is corrupt, so
             // abandon it rather than splicing in misordered payload.
             let mut expected_cc = ((data[offset + 7] & 0x0F) + 1) & 0x0F;
-            let mut scan = offset + BD_TS_PACKET_SIZE;
+            let mut scan = offset + BD_SOURCE_PACKET_BYTES;
             let mut desync = false;
-            while scan + BD_TS_PACKET_SIZE <= data.len() && section.len() < total {
+            while scan + BD_SOURCE_PACKET_BYTES <= data.len() && section.len() < total {
                 // Require a corroborated resync point (this sync byte plus the
                 // follower one packet ahead) before trusting the header. A
                 // stray 0x47 in corrupt payload would otherwise misread the CC
@@ -653,16 +652,19 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
                     expected_cc = (cc + 1) & 0x0F;
                     // Continuation packets may also carry an adaptation
                     // field; compute their payload base the same way.
-                    if let Some(cbase) = psi_payload_base(&data[scan..scan + BD_TS_PACKET_SIZE]) {
-                        section.extend_from_slice(&data[scan + cbase..scan + BD_TS_PACKET_SIZE]);
+                    if let Some(cbase) =
+                        psi_payload_base(&data[scan..scan + BD_SOURCE_PACKET_BYTES])
+                    {
+                        section
+                            .extend_from_slice(&data[scan + cbase..scan + BD_SOURCE_PACKET_BYTES]);
                     }
                 }
-                scan += BD_TS_PACKET_SIZE;
+                scan += BD_SOURCE_PACKET_BYTES;
             }
             if desync {
                 // Restart PSI assembly from the next packet after this PUSI;
                 // a later clean copy of the section may still appear.
-                offset += BD_TS_PACKET_SIZE;
+                offset += BD_SOURCE_PACKET_BYTES;
                 continue;
             }
             if section.len() >= total {
@@ -672,7 +674,7 @@ fn collect_psi_section(data: &[u8], target_pid: u16, table_id: u8) -> Option<Vec
             // Incomplete section (truncated input) — stop looking.
             return None;
         }
-        offset += BD_TS_PACKET_SIZE;
+        offset += BD_SOURCE_PACKET_BYTES;
     }
     None
 }
@@ -833,7 +835,7 @@ mod tests {
     /// continuity_counter, carrying `payload` (truncated/padded to 184 bytes,
     /// payload-only adaptation).
     fn ts_payload_packet(pid: u16, pusi: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = ((pid >> 8) as u8) & 0x1F;
         if pusi {
@@ -934,7 +936,7 @@ mod tests {
     /// Wrap a 188-byte TS packet body in a 192-byte BD-TS packet
     /// (4-byte timecode prefix the scanner skips).
     fn bdts_packet(body: [u8; 184], pid: u16, pusi: bool) -> Vec<u8> {
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         // 4-byte timecode prefix is ignored; leave zero.
         pkt[4] = SYNC_BYTE;
         pkt[5] = ((pid >> 8) as u8) & 0x1F;
@@ -1010,7 +1012,7 @@ mod tests {
     /// Build a 192-byte BD-TS data packet on `pid` carrying `payload`
     /// (payload-only adaptation, truncated/padded to fit one packet).
     fn data_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = ((pid >> 8) as u8) & 0x1F;
         if pusi {
@@ -1018,7 +1020,7 @@ mod tests {
         }
         pkt[6] = (pid & 0xFF) as u8;
         pkt[7] = 0x10; // payload only, no adaptation field
-        let room = TS_PACKET_SIZE - 4; // 184 ES bytes after the 4-byte TS header
+        let room = TS_PACKET_BYTES - 4; // 184 ES bytes after the 4-byte TS header
         let n = payload.len().min(room);
         pkt[8..8 + n].copy_from_slice(&payload[..n]);
         pkt
@@ -1029,7 +1031,7 @@ mod tests {
     /// payload base computation in scan_streams.
     fn pmt_packet_with_af(pmt_pid: u16, entries: &[(u8, u16)]) -> Vec<u8> {
         let af_len: u8 = 2; // 1 flags byte + 1 stuffing byte
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = (((pmt_pid >> 8) as u8) & 0x1F) | 0x40; // PUSI set
         pkt[6] = (pmt_pid & 0xFF) as u8;
@@ -1039,7 +1041,7 @@ mod tests {
         pkt[10] = 0xFF; // stuffing
         // Payload (PSI) begins at 4 + 4 + 1 + af_len = 11.
         let payload_off = 4 + 4 + 1 + af_len as usize;
-        let mut body = vec![0xFFu8; BD_TS_PACKET_SIZE - payload_off];
+        let mut body = vec![0xFFu8; BD_SOURCE_PACKET_BYTES - payload_off];
         body[0] = 0x00; // pointer_field
         let s = 1;
         body[s] = 0x02; // table_id = PMT
@@ -1270,9 +1272,9 @@ mod tests {
         }
         let mut pmt = pmt_two_packets(pmt_pid, &entries);
         // Corrupt the continuation packet's CC. pmt is exactly two BD-TS
-        // packets; the second starts at BD_TS_PACKET_SIZE. Its CC (low nibble
+        // packets; the second starts at BD_SOURCE_PACKET_BYTES. Its CC (low nibble
         // of offset+7) was set to 1 by pmt_two_packets; flip it to a gap (5).
-        let cc_off = BD_TS_PACKET_SIZE + 7;
+        let cc_off = BD_SOURCE_PACKET_BYTES + 7;
         pmt[cc_off] = (pmt[cc_off] & 0xF0) | 0x05;
 
         let mut data = pat_packet(pmt_pid);
@@ -1296,16 +1298,16 @@ mod tests {
     /// bytes the demuxer must produce, unlike `data_packet` which leaves
     /// zero padding that a length-0 (unbounded) PES would absorb as ES.
     fn es_packet_exact(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
-        const TS_PAYLOAD: usize = 184;
-        assert!(payload.len() <= TS_PAYLOAD);
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        use crate::consts::TS_PAYLOAD_BYTES;
+        assert!(payload.len() <= TS_PAYLOAD_BYTES);
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = ((pid >> 8) as u8) & 0x1F;
         if pusi {
             pkt[5] |= 0x40;
         }
         pkt[6] = (pid & 0xFF) as u8;
-        let pad = TS_PAYLOAD - payload.len();
+        let pad = TS_PAYLOAD_BYTES - payload.len();
         if pad == 0 {
             pkt[7] = 0x10; // payload only
             pkt[8..8 + payload.len()].copy_from_slice(payload);
@@ -1550,7 +1552,7 @@ mod tests {
         demux.feed(&es_packet_exact(pid, true, &start));
         // …then an AF-only continuation packet whose "payload" bytes must
         // be discarded.
-        let mut afonly = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut afonly = vec![0u8; BD_SOURCE_PACKET_BYTES];
         afonly[4] = SYNC_BYTE;
         afonly[5] = ((pid >> 8) as u8) & 0x1F; // no PUSI
         afonly[6] = (pid & 0xFF) as u8;
@@ -1576,7 +1578,7 @@ mod tests {
         // the TS packet. The AF bytes must NOT appear in the ES.
         let pid = 0x1011;
         let mut demux = TsDemuxer::new(&[pid]);
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = (((pid >> 8) as u8) & 0x1F) | 0x40; // PUSI
         pkt[6] = (pid & 0xFF) as u8;
@@ -1616,7 +1618,7 @@ mod tests {
         // A larger value runs past the packet and must be discarded.
         let pid = 0x1011;
         let mut demux = TsDemuxer::new(&[pid]);
-        let mut pkt = vec![0u8; BD_TS_PACKET_SIZE];
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE;
         pkt[5] = (((pid >> 8) as u8) & 0x1F) | 0x40;
         pkt[6] = (pid & 0xFF) as u8;
@@ -1808,7 +1810,7 @@ mod tests {
     #[test]
     fn scan_streams_no_pat_returns_none() {
         // Without a PAT (table_id 0x00 on PID 0) there is no program to find.
-        let data = vec![0u8; BD_TS_PACKET_SIZE * 2]; // all zero, no sync bytes
+        let data = vec![0u8; BD_SOURCE_PACKET_BYTES * 2]; // all zero, no sync bytes
         assert!(scan_streams(&data).is_none());
     }
 

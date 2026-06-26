@@ -667,7 +667,7 @@ mod tests {
         assert!(err.is_err(), "zero batch_sectors must be rejected");
     }
 
-    /// >3 sequential direct `read_sectors` calls must succeed. The
+    /// More than 3 sequential direct `read_sectors` calls must succeed. The
     /// recycle pool seeds PREFETCH_CHANNEL_DEPTH+1 (3) buffers; before
     /// the fix the direct path dropped each drained buffer, so the 4th
     /// call deadlocked. Watchdog-guarded.

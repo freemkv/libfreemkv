@@ -63,6 +63,12 @@ pub struct Drive {
     /// `init()`, if any matched. `None` means no unlocker matched and the
     /// drive runs in stock mode (host-cert AACS handshake carries discs).
     unlocker_name: Option<String>,
+    /// The OEM Volume ID the matching unlocker returned from `unlock()` at
+    /// `init()`, stashed for the AACS handshake phase (which reads it via
+    /// [`Drive::oem_vid`] instead of a separate VID read). `None` when no
+    /// unlocker matched or the matching unlocker produced no VID — the cert
+    /// handshake then acquires the VID.
+    oem_vid: Option<[u8; 16]>,
     /// True once `init()` has run (whether or not an unlocker matched).
     init_ran: bool,
     /// Lazily-computed registry-match name for `platform_name()`'s `&str`
@@ -108,6 +114,7 @@ impl Drive {
         Ok(Drive {
             scsi: transport,
             unlocker_name: None,
+            oem_vid: None,
             init_ran: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id,
@@ -128,6 +135,7 @@ impl Drive {
         Drive {
             scsi,
             unlocker_name: None,
+            oem_vid: None,
             init_ran: false,
             matched_name_cache: std::sync::OnceLock::new(),
             drive_id: DriveId {
@@ -214,6 +222,14 @@ impl Drive {
     /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
     pub fn scsi_mut(&mut self) -> &mut dyn ScsiTransport {
         self.scsi.as_mut()
+    }
+
+    /// The OEM Volume ID a matching [`crate::unlock::Unlocker`] returned at
+    /// [`Drive::init`], if any. The AACS handshake uses this to skip the cert
+    /// handshake when an unlocker already supplied the VID. `None` when no
+    /// unlocker matched or it produced no VID.
+    pub(crate) fn oem_vid(&self) -> Option<[u8; 16]> {
+        self.oem_vid
     }
 
     pub fn wait_ready(&mut self) -> Result<()> {
@@ -397,8 +413,11 @@ impl Drive {
         let r = crate::unlock::route_unlock(self.scsi.as_mut(), &self.drive_id);
         self.init_ran = true;
         let r = match r {
-            Ok(Some(name)) => {
+            Ok(Some((name, vid))) => {
                 self.unlocker_name = Some(name);
+                // Stash the OEM Volume ID the unlocker returned for the AACS
+                // handshake phase (do_handshake reads it via `oem_vid()`).
+                self.oem_vid = Some(vid.0);
                 // The matched unlocker may also be able to raise the drive to
                 // its maximum read speed. Best-effort: a failure here must NOT
                 // fail the rip — a slow drive still rips. Log and continue.
@@ -1315,7 +1334,15 @@ mod command_tests {
         }
     }
 
-    fn recording(outcome: TransportOutcome) -> (Drive, Arc<Mutex<Vec<u8>>>, Arc<Mutex<u32>>) {
+    /// A drive under test plus the handles that observe it: captured CDB bytes
+    /// and the timeout counter.
+    struct RecordingHarness {
+        drive: Drive,
+        cdb: Arc<Mutex<Vec<u8>>>,
+        timeouts: Arc<Mutex<u32>>,
+    }
+
+    fn recording(outcome: TransportOutcome) -> RecordingHarness {
         let cdb = Arc::new(Mutex::new(Vec::new()));
         let to = Arc::new(Mutex::new(0u32));
         let t = RecordingTransport {
@@ -1323,7 +1350,11 @@ mod command_tests {
             last_timeout: to.clone(),
             outcome,
         };
-        (Drive::from_transport_for_test(Box::new(t)), cdb, to)
+        RecordingHarness {
+            drive: Drive::from_transport_for_test(Box::new(t)),
+            cdb,
+            timeouts: to,
+        }
     }
 
     #[test]
@@ -1331,7 +1362,11 @@ mod command_tests {
         // Drive::read issues READ(10) (0x28). LBA bytes 2..5 big-endian,
         // transfer length bytes 7..8 big-endian (MMC-6). No FUA on this
         // path (byte 1 == 0). Distinct nibbles catch a swapped shift.
-        let (mut d, cdb, _to) = recording(TransportOutcome::Ok(4096));
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(4096));
         let mut buf = vec![0u8; 4096];
         let n = d.read(0x00AB_CDEF, 2, &mut buf, false).unwrap();
         assert_eq!(n, 4096, "returns transport bytes_transferred");
@@ -1346,12 +1381,20 @@ mod command_tests {
     fn read_recovery_flag_selects_60s_timeout() {
         // recovery=true must use READ_RECOVERY_TIMEOUT_MS (60 s); false
         // uses READ_TIMEOUT_MS (10 s). Doc: patch pass vs copy sweep.
-        let (mut d, _cdb, to) = recording(TransportOutcome::Ok(2048));
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: to,
+        } = recording(TransportOutcome::Ok(2048));
         let mut buf = vec![0u8; 2048];
         d.read(0, 1, &mut buf, true).unwrap();
         assert_eq!(*to.lock().unwrap(), crate::scsi::READ_RECOVERY_TIMEOUT_MS);
 
-        let (mut d2, _c2, to2) = recording(TransportOutcome::Ok(2048));
+        let RecordingHarness {
+            drive: mut d2,
+            cdb: _c2,
+            timeouts: to2,
+        } = recording(TransportOutcome::Ok(2048));
         d2.read(0, 1, &mut buf, false).unwrap();
         assert_eq!(*to2.lock().unwrap(), crate::scsi::READ_TIMEOUT_MS);
     }
@@ -1366,7 +1409,11 @@ mod command_tests {
             asc: 0x11,
             ascq: 0x05,
         };
-        let (mut d, _cdb, _to) = recording(TransportOutcome::Scsi(0x02, Some(sense)));
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Scsi(0x02, Some(sense)));
         let mut buf = vec![0u8; 2048];
         let err = d.read(0x1234, 1, &mut buf, false).unwrap_err();
         match err {
@@ -1387,7 +1434,11 @@ mod command_tests {
     fn read_transport_failure_status_preserved_for_marginal_routing() {
         // Status 0xFF (TRANSPORT_FAILURE) with no sense must surface in
         // DiscRead.status so is_scsi_transport_failure() routes it.
-        let (mut d, _cdb, _to) = recording(TransportOutcome::Scsi(
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Scsi(
             crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
             None,
         ));
@@ -1402,7 +1453,11 @@ mod command_tests {
         // When the halt flag is set, checked_exec returns Halted BEFORE
         // execute(); the error must be Halted (not DiscRead), so the
         // recovery loop distinguishes user-stop from a read failure.
-        let (mut d, cdb, _to) = recording(TransportOutcome::Ok(2048));
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(2048));
         d.halt();
         let mut buf = vec![0u8; 2048];
         let err = d.read(0, 1, &mut buf, false).unwrap_err();
@@ -1417,7 +1472,11 @@ mod command_tests {
     fn clear_halt_reenables_reads() {
         // halt() then clear_halt() must allow reads again — the flag is
         // not sticky.
-        let (mut d, _cdb, _to) = recording(TransportOutcome::Ok(2048));
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(2048));
         d.halt();
         d.clear_halt();
         let mut buf = vec![0u8; 2048];
@@ -1429,7 +1488,11 @@ mod command_tests {
         // Single-shot contract: Drive::read returns exactly what the
         // transport reported, never a smaller count silently. Transport
         // says a full 32-sector batch (65536 bytes) succeeded.
-        let (mut d, _cdb, _to) = recording(TransportOutcome::Ok(65536));
+        let RecordingHarness {
+            drive: mut d,
+            cdb: _cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(65536));
         let mut buf = vec![0u8; 65536];
         assert_eq!(d.read(0, 32, &mut buf, false).unwrap(), 65536);
     }
@@ -1493,7 +1556,13 @@ mod command_tests {
         }
     }
 
-    fn chunking(max_bytes: usize, fail_on: Option<usize>) -> (Drive, Arc<Mutex<Vec<(u32, u16)>>>) {
+    /// A drive under test plus the handle recording each `(lba, count)` read.
+    struct ChunkingHarness {
+        drive: Drive,
+        reads: Arc<Mutex<Vec<(u32, u16)>>>,
+    }
+
+    fn chunking(max_bytes: usize, fail_on: Option<usize>) -> ChunkingHarness {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let t = ChunkingTransport {
             max_bytes,
@@ -1501,7 +1570,10 @@ mod command_tests {
             fail_on,
             seen: 0,
         };
-        (Drive::from_transport_for_test(Box::new(t)), reads)
+        ChunkingHarness {
+            drive: Drive::from_transport_for_test(Box::new(t)),
+            reads,
+        }
     }
 
     #[test]
@@ -1509,7 +1581,10 @@ mod command_tests {
         // max_transfer = 4 sectors (4 * 2048 = 8192 bytes). A read of 10
         // sectors at LBA 0 must split into 3 READ(10) CDBs: (0,4), (4,4),
         // (8,2). The assembled buffer is the full 10*2048 bytes.
-        let (mut d, reads) = chunking(4 * 2048, None);
+        let ChunkingHarness {
+            drive: mut d,
+            reads,
+        } = chunking(4 * 2048, None);
         let mut buf = vec![0u8; 10 * 2048];
         let n = d.read(0, 10, &mut buf, false).unwrap();
         assert_eq!(n, 10 * 2048, "returns total bytes across all chunks");
@@ -1526,7 +1601,10 @@ mod command_tests {
         // Same 4-sector cap; fail the 2nd chunk (index 1), which covers
         // LBA 4. The error must be DiscRead with sector = 4 (the failing
         // chunk's LBA), NOT the request base LBA 0.
-        let (mut d, reads) = chunking(4 * 2048, Some(1));
+        let ChunkingHarness {
+            drive: mut d,
+            reads,
+        } = chunking(4 * 2048, Some(1));
         let mut buf = vec![0u8; 10 * 2048];
         let err = d.read(0, 10, &mut buf, false).unwrap_err();
         match err {
@@ -1546,7 +1624,10 @@ mod command_tests {
     fn read_small_request_is_single_unchunked_read() {
         // count <= max_sectors must take the single-read path unchanged: a
         // 3-sector read under a 4-sector cap is exactly one READ(10).
-        let (mut d, reads) = chunking(4 * 2048, None);
+        let ChunkingHarness {
+            drive: mut d,
+            reads,
+        } = chunking(4 * 2048, None);
         let mut buf = vec![0u8; 3 * 2048];
         assert_eq!(d.read(0, 3, &mut buf, false).unwrap(), 3 * 2048);
         assert_eq!(*reads.lock().unwrap(), vec![(0, 3)], "single CDB, no split");

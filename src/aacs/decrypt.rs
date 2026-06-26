@@ -14,7 +14,7 @@ pub(crate) const AACS_IV: [u8; 16] = [
 pub const ALIGNED_UNIT_LEN: usize = 6144;
 
 /// An AACS aligned unit spans this many 2048-byte sectors (3).
-pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_LEN) as u32;
+pub const ALIGNED_UNIT_SECTORS: u32 = (ALIGNED_UNIT_LEN / SECTOR_BYTES) as u32;
 
 /// Whether `lba` sits on an AACS aligned-unit boundary, measured **relative to
 /// the encrypted region's base LBA** (`unit_base` = the clip/extent `start_lba`,
@@ -40,11 +40,9 @@ pub fn is_unit_aligned(lba: u32, unit_base: u32) -> bool {
     lba.saturating_sub(unit_base) % ALIGNED_UNIT_SECTORS == 0
 }
 
-/// Size of one sector.
-const SECTOR_LEN: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 
-/// Transport stream packet spacing in Blu-ray m2ts (192 bytes = 4 TP_extra + 188 TS).
-const TS_PACKET_LEN: usize = 192;
+use crate::consts::BD_SOURCE_PACKET_BYTES;
 
 /// TS sync byte.
 const TS_SYNC: u8 = 0x47;
@@ -133,7 +131,7 @@ pub fn ts_sync_count(unit: &[u8]) -> usize {
         if unit[offset] == TS_SYNC {
             count += 1;
         }
-        offset += TS_PACKET_LEN;
+        offset += BD_SOURCE_PACKET_BYTES;
     }
     count
 }
@@ -141,9 +139,9 @@ pub fn ts_sync_count(unit: &[u8]) -> usize {
 /// Number of BD-TS packets in the unit — the maximum possible sync count.
 pub fn ts_packet_total(unit: &[u8]) -> usize {
     // One sync byte per 192-byte BD-TS packet (at offset 4 of each). The old
-    // `(len - 4) / TS_PACKET_LEN + 1` over-counted by one for lengths of the
+    // `(len - 4) / BD_SOURCE_PACKET_BYTES + 1` over-counted by one for lengths of the
     // form `4 + k·192`.
-    unit.len() / TS_PACKET_LEN
+    unit.len() / BD_SOURCE_PACKET_BYTES
 }
 
 fn ts_syncs_intact(unit: &[u8]) -> bool {
@@ -298,14 +296,14 @@ pub fn decrypt_unit_try_keys(unit: &mut [u8], unit_keys: &[[u8; 16]]) -> Option<
 /// Remove bus encryption from an aligned unit (AACS 2.0 / UHD).
 /// Bus encryption uses read_data_key, decrypting bytes 16..2047 of each 2048-byte sector.
 pub fn decrypt_bus(unit: &mut [u8], read_data_key: &[u8; 16]) {
-    for sector_start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
-        if sector_start + SECTOR_LEN > unit.len() {
+    for sector_start in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
+        if sector_start + SECTOR_BYTES > unit.len() {
             break;
         }
         // First 16 bytes of each sector are plaintext
         aes_cbc_decrypt(
             read_data_key,
-            &mut unit[sector_start + 16..sector_start + SECTOR_LEN],
+            &mut unit[sector_start + 16..sector_start + SECTOR_BYTES],
         );
     }
 }
@@ -385,7 +383,7 @@ mod tests {
         let mut off = 4;
         while off < ALIGNED_UNIT_LEN {
             unit[off] = TS_SYNC;
-            off += TS_PACKET_LEN;
+            off += BD_SOURCE_PACKET_BYTES;
         }
         let key = [0u8; 16];
         assert!(!is_aacs_scrambled(&unit));
@@ -401,7 +399,9 @@ mod tests {
         let unit = vec![0u8; ALIGNED_UNIT_LEN];
         assert_eq!(ts_packet_total(&unit), 32);
         // Confirm the loop visits exactly that many stride positions.
-        let visited = (4..ALIGNED_UNIT_LEN).step_by(TS_PACKET_LEN).count();
+        let visited = (4..ALIGNED_UNIT_LEN)
+            .step_by(BD_SOURCE_PACKET_BYTES)
+            .count();
         assert_eq!(visited, ts_packet_total(&unit));
     }
 
@@ -419,7 +419,7 @@ mod tests {
             let mut placed = 0;
             while off < ALIGNED_UNIT_LEN && placed < n {
                 unit[off] = TS_SYNC;
-                off += TS_PACKET_LEN;
+                off += BD_SOURCE_PACKET_BYTES;
                 placed += 1;
             }
             unit
@@ -443,7 +443,7 @@ mod tests {
         let mut off = 4;
         while off < ALIGNED_UNIT_LEN {
             clear[off] = TS_SYNC;
-            off += TS_PACKET_LEN;
+            off += BD_SOURCE_PACKET_BYTES;
         }
         assert_eq!(ts_sync_count(&clear), 32);
         assert!(
@@ -500,7 +500,7 @@ mod tests {
         let mut offset = 4;
         while offset < ALIGNED_UNIT_LEN {
             plain[offset] = TS_SYNC;
-            offset += TS_PACKET_LEN;
+            offset += BD_SOURCE_PACKET_BYTES;
         }
         // No flag set: CBC-encrypting the body below scrambles packets 1..31's
         // TS syncs, which is exactly what `is_aacs_scrambled` (raw-sync) detects.
@@ -541,7 +541,7 @@ mod tests {
             if unit[off] == TS_SYNC {
                 count += 1;
             }
-            off += TS_PACKET_LEN;
+            off += BD_SOURCE_PACKET_BYTES;
         }
         // Assert against the single canonical packet count, not the old
         // `(len - 4) / 192 + 1` form that `ts_packet_total` corrected away from.
@@ -584,7 +584,7 @@ mod tests {
         let mut off = 4;
         while off < ALIGNED_UNIT_LEN {
             unit[off] = TS_SYNC;
-            off += TS_PACKET_LEN;
+            off += BD_SOURCE_PACKET_BYTES;
         }
         unit
     }
@@ -877,10 +877,10 @@ mod tests {
 
         // Forward: CBC-encrypt unit[s+16 .. s+2048] per sector under AACS IV.
         let cipher = Aes128::new(GenericArray::from_slice(&rdk));
-        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
             let mut prev = AACS_IV;
             let body = s + 16;
-            let end = s + SECTOR_LEN;
+            let end = s + SECTOR_BYTES;
             let nblocks = (end - body) / 16;
             for i in 0..nblocks {
                 let off = body + i * 16;
@@ -901,7 +901,7 @@ mod tests {
             "decrypt_bus must invert per-sector bus encrypt"
         );
         // Each sector's first 16 bytes equal the original (never touched).
-        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
             assert_eq!(&unit[s..s + 16], &plain[s..s + 16]);
         }
     }
@@ -934,9 +934,9 @@ mod tests {
         aacs_encrypt_unit(&mut unit, &unit_key);
         // Layer 2: bus-encrypt on top (per-sector, bytes 16..2048).
         let cipher = Aes128::new(GenericArray::from_slice(&rdk));
-        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_LEN) {
+        for s in (0..ALIGNED_UNIT_LEN).step_by(SECTOR_BYTES) {
             let mut prev = AACS_IV;
-            for i in 0..((SECTOR_LEN - 16) / 16) {
+            for i in 0..((SECTOR_BYTES - 16) / 16) {
                 let off = s + 16 + i * 16;
                 for j in 0..16 {
                     unit[off + j] ^= prev[j];

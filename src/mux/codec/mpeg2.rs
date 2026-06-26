@@ -977,9 +977,9 @@ mod tests {
         let mut parser = Mpeg2Parser::new();
 
         let mut pic1 = make_picture_header(PICTURE_TYPE_I);
-        pic1.extend_from_slice(&vec![0x11; 100]);
+        pic1.extend_from_slice(&[0x11; 100]);
         let mut pic2 = make_picture_header(2); // P
-        pic2.extend_from_slice(&vec![0x22; 100]);
+        pic2.extend_from_slice(&[0x22; 100]);
 
         let mut stream = pic1.clone();
         stream.extend_from_slice(&pic2);
@@ -1005,7 +1005,7 @@ mod tests {
         let mut au = make_picture_header(PICTURE_TYPE_I);
         au.extend_from_slice(&[0x00, 0x00, 0x01, SEQ_EXT_CODE, 0x88, 0x00]); // pic coding ext
         au.extend_from_slice(&[0x00, 0x00, 0x01, 0x01]); // slice
-        au.extend_from_slice(&vec![0x77; 50]);
+        au.extend_from_slice(&[0x77; 50]);
 
         let frames = parse_then_flush(&mut parser, &make_pes(au.clone(), Some(0)));
         assert_eq!(frames.len(), 1);
@@ -1025,12 +1025,12 @@ mod tests {
         let mut parser = Mpeg2Parser::new();
 
         let mut pic1 = make_picture_header(PICTURE_TYPE_I);
-        pic1.extend_from_slice(&vec![0x11; 50]);
+        pic1.extend_from_slice(&[0x11; 50]);
         let frames1 = parser.parse(&make_pes(pic1, Some(90000)));
         assert!(frames1.is_empty(), "buffered until flush");
 
         let mut pic2 = make_picture_header(2);
-        pic2.extend_from_slice(&vec![0x22; 50]);
+        pic2.extend_from_slice(&[0x22; 50]);
         let frames2 = parser.parse(&make_pes(pic2, Some(180000)));
         assert!(frames2.is_empty(), "same GOP — still buffered");
 

@@ -47,8 +47,7 @@
 use super::lfsr::descramble_sector;
 use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 
-/// Sector layout constants.
-const SECTOR_SIZE: usize = 2048;
+use crate::consts::SECTOR_BYTES;
 const ENCRYPTED_START: usize = 0x80; // byte 128
 const SEED_OFFSET: usize = 0x54; // sector seed at bytes 0x54-0x58
 const FLAG_BYTE: usize = 0x14;
@@ -188,7 +187,7 @@ fn recover_title_key_from_plain(
 /// Returns the recovered key only if it actually descrambles the sector back
 /// to `plain` — guarding against the rare spurious LFSR-seed match.
 pub fn recover_title_key(sector: &[u8], plain: &[u8]) -> Option<[u8; 5]> {
-    if sector.len() < SECTOR_SIZE || plain.len() < 10 {
+    if sector.len() < SECTOR_BYTES || plain.len() < 10 {
         return None;
     }
     if sector[FLAG_BYTE] & 0x30 == 0 {
@@ -219,7 +218,7 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
     let mut test = sector.to_vec();
     test[FLAG_BYTE] |= 0x10; // ensure scramble flag set for the descrambler
     descramble_sector(title, &mut test);
-    let n = plain.len().min(SECTOR_SIZE - ENCRYPTED_START);
+    let n = plain.len().min(SECTOR_BYTES - ENCRYPTED_START);
     test[ENCRYPTED_START..ENCRYPTED_START + n] == plain[..n]
 }
 
@@ -232,7 +231,7 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
 /// cycles), the known plaintext at 0x80 is taken to be the periodic run
 /// continuing forward, and [`recover_title_key_from_plain`] is applied.
 pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
-    if sector.len() < SECTOR_SIZE {
+    if sector.len() < SECTOR_BYTES {
         return None;
     }
     if sector[FLAG_BYTE] & 0x30 == 0 {
@@ -276,7 +275,7 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
 /// "did the cached key descramble correctly?" oracle (the predicted plaintext
 /// must reappear at 0x80), and the cracker uses it as its known plaintext.
 pub(crate) fn attack_crib(sector: &[u8]) -> Option<[u8; 10]> {
-    if sector.len() < SECTOR_SIZE || sector[FLAG_BYTE] & 0x30 == 0 {
+    if sector.len() < SECTOR_BYTES || sector[FLAG_BYTE] & 0x30 == 0 {
         return None;
     }
     let mut best_plen: usize = 0;
@@ -352,7 +351,7 @@ mod tests {
     /// EXACTLY the cipher `descramble_sector` inverts. Returns
     /// (scrambled_sector, full_plaintext_body).
     fn synth_sector(title_key: &[u8; 5], seed: &[u8; 5], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut plaintext = vec![0u8; SECTOR_SIZE];
+        let mut plaintext = vec![0u8; SECTOR_BYTES];
         plaintext[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         plaintext[FLAG_BYTE] = 0x10;
         plaintext[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(seed);
@@ -374,7 +373,7 @@ mod tests {
         seed: &[u8; 5],
         period: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let mut plaintext = vec![0u8; SECTOR_SIZE];
+        let mut plaintext = vec![0u8; SECTOR_BYTES];
         plaintext[FLAG_BYTE] = 0x10;
 
         // A clean periodic run occupying the tail of the cleartext header
@@ -460,8 +459,8 @@ mod tests {
                 recover_title_key(&sector, &PES).expect("recover_title_key returned None");
             descramble_sector(&recovered, &mut sector);
             assert_eq!(
-                &sector[ENCRYPTED_START..SECTOR_SIZE],
-                &body[ENCRYPTED_START..SECTOR_SIZE],
+                &sector[ENCRYPTED_START..SECTOR_BYTES],
+                &body[ENCRYPTED_START..SECTOR_BYTES],
                 "recovered key did not descramble the full body for \
                  title={title_key:02x?} seed={seed:02x?}"
             );
@@ -483,8 +482,8 @@ mod tests {
             let mut test = sector.clone();
             descramble_sector(&cracked, &mut test);
             assert_eq!(
-                &test[ENCRYPTED_START..SECTOR_SIZE],
-                &body[ENCRYPTED_START..SECTOR_SIZE],
+                &test[ENCRYPTED_START..SECTOR_BYTES],
+                &body[ENCRYPTED_START..SECTOR_BYTES],
                 "crack_title_key key did not round-trip the body (period {period})"
             );
         }
@@ -515,8 +514,8 @@ mod tests {
                 recover_title_key(&sector, &PES).expect("recover_title_key returned None");
             descramble_sector(&recovered, &mut sector);
             assert_eq!(
-                &sector[ENCRYPTED_START..SECTOR_SIZE],
-                &body[ENCRYPTED_START..SECTOR_SIZE],
+                &sector[ENCRYPTED_START..SECTOR_BYTES],
+                &body[ENCRYPTED_START..SECTOR_BYTES],
                 "descramble with recovered key did not reproduce the body \
                  for title={title_key:02x?} seed={seed:02x?}"
             );
@@ -527,21 +526,21 @@ mod tests {
 
     #[test]
     fn recover_rejects_sector_one_byte_short() {
-        let mut sector = vec![0u8; SECTOR_SIZE - 1];
+        let mut sector = vec![0u8; SECTOR_BYTES - 1];
         sector[FLAG_BYTE] = 0x30;
         assert!(recover_title_key(&sector, &PES).is_none());
     }
 
     #[test]
     fn recover_rejects_unscrambled_sector() {
-        let sector = vec![0x00u8; SECTOR_SIZE];
+        let sector = vec![0x00u8; SECTOR_BYTES];
         assert!(recover_title_key(&sector, &PES).is_none());
     }
 
     #[test]
     fn recover_high_flag_bits_are_not_scramble() {
         for &flag in &[0x40u8, 0x80, 0xC0] {
-            let mut sector = vec![0x11u8; SECTOR_SIZE];
+            let mut sector = vec![0x11u8; SECTOR_BYTES];
             sector[FLAG_BYTE] = flag;
             assert!(
                 recover_title_key(&sector, &PES).is_none(),
@@ -553,7 +552,7 @@ mod tests {
     #[test]
     fn crack_high_flag_bits_are_not_scramble() {
         for &flag in &[0x40u8, 0x80, 0xC0] {
-            let mut sector = vec![0x11u8; SECTOR_SIZE];
+            let mut sector = vec![0x11u8; SECTOR_BYTES];
             sector[FLAG_BYTE] = flag;
             assert!(
                 crack_title_key(&sector).is_none(),
@@ -564,7 +563,7 @@ mod tests {
 
     #[test]
     fn crack_rejects_sector_one_byte_short() {
-        let mut sector = vec![0u8; SECTOR_SIZE - 1];
+        let mut sector = vec![0u8; SECTOR_BYTES - 1];
         if sector.len() > FLAG_BYTE {
             sector[FLAG_BYTE] = 0x30;
         }
@@ -576,7 +575,7 @@ mod tests {
     #[test]
     fn crack_full_path_never_panics() {
         for seed in 0u32..3 {
-            let mut sector = vec![0u8; SECTOR_SIZE];
+            let mut sector = vec![0u8; SECTOR_BYTES];
             sector[FLAG_BYTE] = 0x30;
             let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(7);
             for b in sector.iter_mut().skip(0x80) {

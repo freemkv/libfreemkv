@@ -536,8 +536,8 @@ mod tests {
     fn parse_token_all_regions_recognized() {
         for region in REGIONS {
             let token = format!("eng_MLP_{}_", region);
-            let l =
-                parse_token_inner(&token, None).expect(&format!("region {} should parse", region));
+            let l = parse_token_inner(&token, None)
+                .unwrap_or_else(|| panic!("region {region} should parse"));
             assert_eq!(l.variant, *region, "region {} should be in variant", region);
         }
     }

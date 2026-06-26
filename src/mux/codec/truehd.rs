@@ -14,8 +14,18 @@
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
-/// Duration of one TrueHD access unit in nanoseconds (1/1200 second).
+/// Duration of one TrueHD access unit in nanoseconds for the 48 kHz family
+/// (48 / 96 / 192 kHz). `access_unit_size = 40 << (ratebits & 7)` and
+/// `sample_rate = 48000 << (ratebits & 7)`; the shared shift cancels in
+/// `samples_per_AU / sample_rate = 40/48000 = 1/1200 s`, so this constant is
+/// exact for the whole 48 kHz family — 48, 96 and 192 kHz alike. Used as the
+/// default until a major sync reveals the actual rate family.
 const AU_DURATION_NS: i64 = 833_333;
+
+/// Duration of one TrueHD access unit in nanoseconds for the 44.1 kHz family
+/// (44.1 / 88.2 / 176.4 kHz): `40/44100 = 1/1102.5 s = 907_029.478… ns`. The
+/// 48 kHz constant would run ~8.95 % fast on these (rare) streams.
+const AU_DURATION_NS_441: i64 = 907_029;
 
 /// Hard cap on the reassembly buffer. A valid TrueHD/MAT access unit is
 /// well under 32 KiB; if the buffer grows far past that without yielding a
@@ -26,6 +36,12 @@ const MAX_TRUEHD_BUF: usize = 256 * 1024;
 pub struct TrueHdParser {
     buf: Vec<u8>,
     next_pts_ns: i64,
+    /// Per-AU PTS increment. Defaults to the 48 kHz-family value (833_333) and
+    /// is refined to the 44.1 kHz-family value once the first major sync reveals
+    /// the actual rate. Stays at the default for streams whose major sync is not
+    /// yet seen (head of stream) — preserving byte-identical timing for the
+    /// common 48 kHz case.
+    au_duration_ns: i64,
 }
 
 impl Default for TrueHdParser {
@@ -39,6 +55,7 @@ impl TrueHdParser {
         Self {
             buf: Vec::with_capacity(32768),
             next_pts_ns: 0,
+            au_duration_ns: AU_DURATION_NS,
         }
     }
 
@@ -185,6 +202,17 @@ impl CodecParser for TrueHdParser {
                     & 0xFFFF_FFFE)
                     == 0xF872_6FBA;
 
+            // On a major sync the 32-bit `format_info` word (immediately after
+            // the 4-byte sync, i.e. AU bytes 8..12) carries the rate nibble.
+            // Refine the per-AU PTS increment to the actual rate family. The
+            // 48 kHz family resolves to the unchanged 833_333 default, so the
+            // common case stays byte-identical; only the 44.1 kHz family shifts.
+            if is_major_sync && unit_bytes >= 12 {
+                let format_info =
+                    u32::from_be_bytes([self.buf[8], self.buf[9], self.buf[10], self.buf[11]]);
+                self.au_duration_ns = truehd_au_duration_ns(format_info);
+            }
+
             frames.push(Frame {
                 coding: None,
                 source: None,
@@ -194,7 +222,7 @@ impl CodecParser for TrueHdParser {
                 duration_ns: None,
             });
             self.buf.drain(..unit_bytes);
-            self.next_pts_ns += AU_DURATION_NS;
+            self.next_pts_ns += self.au_duration_ns;
         }
 
         // Bound memory on malformed input: a stream that never yields a
@@ -255,6 +283,93 @@ pub fn truehd_channels_from_stream(data: &[u8]) -> Option<u8> {
         p += 1;
     }
     None
+}
+
+/// Real sample rate (Hz) from a TrueHD major-sync `format_info` word.
+///
+/// The 4-bit `ratebits` nibble sits in `format_info` bits 31..28 (the top
+/// nibble), the same word `truehd_channels` reads for the channel masks. The
+/// MLP rate formula is `(ratebits & 8 ? 44100 : 48000) << (ratebits & 7)`;
+/// rather than evaluate it blindly this is a **strict whitelist** of the only
+/// six rates that occur on real BD/UHD TrueHD. Every other code — the invalid
+/// `0xF`, the formula-only `0x3`/`0xB`, and all reserved values — returns
+/// `None`, so a malformed or unexpected field can never produce a wrong
+/// `SamplingFrequency`; the caller falls back to its container-derived rate.
+pub fn truehd_sample_rate_hz(format_info: u32) -> Option<u32> {
+    match (format_info >> 28) & 0xF {
+        0x0 => Some(48000),
+        0x1 => Some(96000),
+        0x2 => Some(192000),
+        0x8 => Some(44100),
+        0x9 => Some(88200),
+        0xA => Some(176400),
+        _ => None,
+    }
+}
+
+/// Per-AU PTS increment (ns) for the rate family encoded in `format_info`.
+///
+/// Derived from the same whitelisted rate as [`truehd_sample_rate_hz`]: the
+/// 44.1 kHz family (44.1 / 88.2 / 176.4 kHz) is `907_029` ns; everything else —
+/// the entire 48 kHz family AND any unrecognised rate — keeps the exact current
+/// `833_333` default, so the common case and all unknown/garbage inputs are
+/// byte-identical to prior behaviour.
+pub fn truehd_au_duration_ns(format_info: u32) -> i64 {
+    match truehd_sample_rate_hz(format_info) {
+        Some(44100) | Some(88200) | Some(176400) => AU_DURATION_NS_441,
+        _ => AU_DURATION_NS,
+    }
+}
+
+/// First TrueHD major sync found in a demuxed elementary-stream chunk: the
+/// `format_info` word plus the Atmos signal. A single scan that the per-field
+/// helpers below share, so the host probes the bitstream once for channels,
+/// sample rate and Atmos.
+pub struct TrueHdSyncInfo {
+    /// The 32-bit word immediately after the 0xF8726FBA sync (channel masks +
+    /// rate nibble). Feed to `truehd_channels` / `truehd_sample_rate_hz`.
+    pub format_info: u32,
+    /// `num_substreams >= 4` ⟺ a 4th (Atmos object/OAMD) substream is present.
+    /// `num_substreams = msync[16] >> 4`, where `msync[0]` is the sync's 0xF8.
+    /// `None` when the AU is too short to reach that byte — never guess Atmos.
+    pub is_atmos: Option<bool>,
+}
+
+/// Scan a demuxed TrueHD chunk for the first major sync and return its
+/// `format_info` and Atmos signal. The stream may interleave AC-3; the scan
+/// advances one byte at a time and matches the sync word anywhere.
+pub fn truehd_sync_info_from_stream(data: &[u8]) -> Option<TrueHdSyncInfo> {
+    let mut p = 0;
+    while p + 8 <= data.len() {
+        let w = u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+        if (w & 0xFFFF_FFFE) == 0xF872_6FBA {
+            let format_info =
+                u32::from_be_bytes([data[p + 4], data[p + 5], data[p + 6], data[p + 7]]);
+            // num_substreams is the top nibble of the 17th sync byte (p + 16).
+            // .get() yields None — not a panic and not a false Atmos — when the
+            // AU is truncated before that byte.
+            let is_atmos = data.get(p + 16).map(|&b| (b >> 4) >= 4);
+            return Some(TrueHdSyncInfo {
+                format_info,
+                is_atmos,
+            });
+        }
+        p += 1;
+    }
+    None
+}
+
+/// Real sample rate (Hz) from the first major sync in a demuxed chunk, or
+/// `None` if no major sync is found or its rate code is not whitelisted.
+pub fn truehd_sample_rate_from_stream(data: &[u8]) -> Option<u32> {
+    truehd_sync_info_from_stream(data).and_then(|s| truehd_sample_rate_hz(s.format_info))
+}
+
+/// Whether the first major sync in a demuxed chunk carries an Atmos substream.
+/// `None` when no major sync is found or the AU is too short to read the
+/// substream count — callers must treat `None` as "not Atmos" (never label).
+pub fn truehd_is_atmos_from_stream(data: &[u8]) -> Option<bool> {
+    truehd_sync_info_from_stream(data).and_then(|s| s.is_atmos)
 }
 
 #[cfg(test)]
@@ -719,5 +834,195 @@ mod tests {
         // Drive through parse: a short 0x0B77 head must wait, not emit.
         let f = parser.parse(&make_pes(vec![0x0B, 0x77, 0x00], Some(0)));
         assert!(f.is_empty());
+    }
+
+    // --- #2 sample rate from the major-sync rate nibble ---
+
+    /// Build a `format_info` word with the given `ratebits` (top nibble) and a
+    /// 7.1 8-channel mask (ch8 = 0x1F) in the low 13 bits — exactly the layout
+    /// §1.A pins, so the rate nibble and the channel masks are co-located in one
+    /// real word.
+    fn format_info_with(ratebits: u32) -> u32 {
+        ((ratebits & 0xF) << 28) | 0x1F
+    }
+
+    #[test]
+    fn sample_rate_whitelist_real_rates() {
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0x0)), Some(48000));
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0x1)), Some(96000));
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0x2)), Some(192000));
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0x8)), Some(44100));
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0x9)), Some(88200));
+        assert_eq!(truehd_sample_rate_hz(format_info_with(0xA)), Some(176400));
+    }
+
+    #[test]
+    fn sample_rate_unknown_rate_falls_back_to_none() {
+        // 0xF is the explicit invalid code; 0x3/0xB are formula-only and not
+        // whitelisted; 0x7/0xE are reserved. None of them may produce a rate —
+        // the host must fall back to its container value, never write a wrong
+        // SamplingFrequency.
+        for bad in [0x3u32, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF] {
+            assert_eq!(
+                truehd_sample_rate_hz(format_info_with(bad)),
+                None,
+                "ratebits {bad:#x} must not yield a rate"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_rate_nibble_does_not_disturb_channel_decode() {
+        // Internal-consistency guard: with the 96 kHz nibble AND a 7.1 mask in
+        // the same word, the rate reads 96000 and the channels still read 8 —
+        // proving the rate nibble (bits 31..28) and the channel masks
+        // (bits 19..0) do not collide.
+        let fi = format_info_with(0x1);
+        assert_eq!(truehd_sample_rate_hz(fi), Some(96000));
+        assert_eq!(truehd_channels(fi), Some(8));
+    }
+
+    #[test]
+    fn sample_rate_from_stream_scans_major_sync() {
+        // [junk][0xF8726FBA][format_info: ratebits=0x1 (96k), ch8=0x1F]
+        let mut data = vec![0xAA, 0xBB];
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        data.extend_from_slice(&format_info_with(0x1).to_be_bytes());
+        assert_eq!(truehd_sample_rate_from_stream(&data), Some(96000));
+    }
+
+    #[test]
+    fn sample_rate_from_stream_none_without_sync() {
+        let data = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(truehd_sample_rate_from_stream(&data), None);
+    }
+
+    // --- #3 per-AU duration: family-aware, 48 kHz family byte-identical ---
+
+    #[test]
+    fn au_duration_48k_family_unchanged() {
+        // 48 / 96 / 192 kHz (ratebits 0x0/0x1/0x2) all keep the exact current
+        // 833_333 constant — the common case must never shift.
+        for rb in [0x0u32, 0x1, 0x2] {
+            assert_eq!(truehd_au_duration_ns(format_info_with(rb)), 833_333);
+        }
+    }
+
+    #[test]
+    fn au_duration_441k_family_is_907029() {
+        // 44.1 / 88.2 / 176.4 kHz (ratebits 0x8/0x9/0xA) → 907_029 ns.
+        for rb in [0x8u32, 0x9, 0xA] {
+            assert_eq!(truehd_au_duration_ns(format_info_with(rb)), 907_029);
+        }
+    }
+
+    #[test]
+    fn au_duration_unknown_rate_keeps_default() {
+        // An unrecognised/garbage rate nibble must not pick the 44.1 k value
+        // (note 0xF & 8 != 0): it falls back to the 833_333 default.
+        for rb in [0x3u32, 0x7, 0xB, 0xF] {
+            assert_eq!(truehd_au_duration_ns(format_info_with(rb)), 833_333);
+        }
+    }
+
+    #[test]
+    fn parser_44k_major_sync_sets_907029_increment() {
+        // Two AUs: the first carries a major sync with ratebits=0x8 (44.1 k).
+        // After the parser reads it, the per-AU PTS increment must be 907_029.
+        let mut parser = TrueHdParser::new();
+        let mut a1 = make_truehd_unit(200);
+        a1[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes()); // major sync
+        a1[8..12].copy_from_slice(&format_info_with(0x8).to_be_bytes()); // 44.1 k
+        let mut data = a1;
+        data.extend_from_slice(&make_truehd_unit(200));
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[1].pts_ns - frames[0].pts_ns,
+            907_029,
+            "44.1 k-family AU increments by 907_029 once the major sync is read"
+        );
+    }
+
+    #[test]
+    fn parser_48k_major_sync_keeps_833333_increment() {
+        // Regression: a 48 k-family (ratebits=0x0) major sync keeps the exact
+        // current 833_333 increment.
+        let mut parser = TrueHdParser::new();
+        let mut a1 = make_truehd_unit(200);
+        a1[4..8].copy_from_slice(&0xF872_6FBAu32.to_be_bytes());
+        a1[8..12].copy_from_slice(&format_info_with(0x0).to_be_bytes()); // 48 k
+        let mut data = a1;
+        data.extend_from_slice(&make_truehd_unit(200));
+        let frames = parser.parse(&make_pes(data, Some(90000)));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].pts_ns - frames[0].pts_ns, 833_333);
+    }
+
+    // --- #1 Atmos detection from num_substreams (msync[16] >> 4) ---
+
+    /// Build a demuxed chunk with one major sync whose 17th sync byte (offset
+    /// 16 from the 0xF8) has top nibble `num_substreams`. The AU is padded past
+    /// byte 16 so the substream count is reachable.
+    fn major_sync_with_substreams(num_substreams: u8) -> Vec<u8> {
+        let mut data = vec![0x00, 0x00]; // leading junk; scan is byte-aligned
+        let sync_off = data.len();
+        data.extend_from_slice(&0xF872_6FBAu32.to_be_bytes()); // bytes [off..off+4]
+        data.extend_from_slice(&format_info_with(0x0).to_be_bytes()); // format_info
+        // Pad up to and including byte `sync_off + 16`.
+        while data.len() <= sync_off + 16 {
+            data.push(0x00);
+        }
+        data[sync_off + 16] = (num_substreams & 0xF) << 4;
+        data
+    }
+
+    #[test]
+    fn atmos_true_when_four_substreams() {
+        // num_substreams = 4 → byte 16 = 0x40 → Atmos object substream present.
+        let data = major_sync_with_substreams(4);
+        assert_eq!(truehd_is_atmos_from_stream(&data), Some(true));
+    }
+
+    #[test]
+    fn atmos_false_when_three_substreams() {
+        // num_substreams = 3 (plain 7.1 TrueHD) → byte 16 = 0x30 → not Atmos.
+        let data = major_sync_with_substreams(3);
+        assert_eq!(truehd_is_atmos_from_stream(&data), Some(false));
+    }
+
+    #[test]
+    fn atmos_none_when_au_too_short_for_substream_byte() {
+        // Major sync present but the chunk ends before byte sync_off+16 → None,
+        // never a false Atmos. Sync at offset 0; only format_info follows.
+        let mut data = 0xF872_6FBAu32.to_be_bytes().to_vec();
+        data.extend_from_slice(&format_info_with(0x0).to_be_bytes()); // 8 bytes total
+        assert_eq!(truehd_is_atmos_from_stream(&data), None);
+    }
+
+    #[test]
+    fn atmos_none_without_major_sync() {
+        let data = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(truehd_is_atmos_from_stream(&data), None);
+    }
+
+    #[test]
+    fn sync_info_combines_channels_rate_and_atmos() {
+        // One scan yields all three facts: 7.1 channels, 96 kHz, 4 substreams.
+        let data = {
+            let mut d = vec![0x00, 0x00];
+            let off = d.len();
+            d.extend_from_slice(&0xF872_6FBAu32.to_be_bytes());
+            d.extend_from_slice(&format_info_with(0x1).to_be_bytes()); // 96k + 7.1
+            while d.len() <= off + 16 {
+                d.push(0x00);
+            }
+            d[off + 16] = 0x40; // 4 substreams
+            d
+        };
+        let info = truehd_sync_info_from_stream(&data).expect("major sync found");
+        assert_eq!(truehd_channels(info.format_info), Some(8));
+        assert_eq!(truehd_sample_rate_hz(info.format_info), Some(96000));
+        assert_eq!(info.is_atmos, Some(true));
     }
 }

@@ -370,8 +370,12 @@ pub enum SampleRate {
     S44_1,
     /// 48 kHz — standard BD/DVD/UHD audio
     S48,
+    /// 88.2 kHz — 44.1 kHz-family high-res TrueHD (music BD)
+    S88_2,
     /// 96 kHz — high-res BD audio
     S96,
+    /// 176.4 kHz — 44.1 kHz-family high-res TrueHD (music BD)
+    S176_4,
     /// 192 kHz — highest BD audio (LPCM)
     S192,
     /// 48/96 kHz combo (secondary audio resampled)
@@ -432,16 +436,26 @@ pub struct Extent {
     pub sector_count: u32,
 }
 
-/// Correct the channel count of a title's TrueHD audio streams by probing the
-/// first decrypted access units. The MPLS `audio_format` field declares the
-/// BASE layout (often 5.1) even for a 7.1/Atmos TrueHD track; the real count is
-/// in the MLP major sync. `reader` must yield DECRYPTED sectors (the m2ts is
-/// AACS-encrypted, so this can only run at mux time, not scan). Reads a bounded
-/// window of the title's first extent. Also regenerates the stream's codec
-/// label when it was the basic descriptor for the (now corrected) count —
-/// richer editorial labels (e.g. "Dolby Atmos") are left untouched.
+/// Correct a title's TrueHD audio-stream metadata by probing the first
+/// decrypted access units — channel count, real sample rate, and Atmos
+/// detection in a single major-sync read. The MPLS descriptors declare the BASE
+/// layout (often 5.1 / a container-guessed rate) even for a 7.1/Atmos TrueHD
+/// track; the truth is in the MLP major sync. `reader` must yield DECRYPTED
+/// sectors (the m2ts is AACS-encrypted, so this can only run at mux time, not
+/// scan). Reads a bounded window of the title's first extent.
+///
+/// Corrections, each individually guarded so a malformed field never writes a
+/// wrong header:
+/// - **Channels**: from the presentation channel masks (as before).
+/// - **Sample rate**: from the whitelisted rate nibble; left untouched on an
+///   unknown rate or no major sync.
+/// - **Atmos**: when a 4th substream is detected AND the stream still carries
+///   the basic descriptor label, the label is promoted to the Atmos form;
+///   richer editorial labels (e.g. an existing "Dolby Atmos") are left intact.
 pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut DiscTitle) {
-    use crate::mux::codec::truehd::truehd_channels_from_stream;
+    use crate::mux::codec::truehd::{
+        truehd_channels, truehd_sample_rate_hz, truehd_sync_info_from_stream,
+    };
 
     let pids: Vec<u16> = title
         .streams
@@ -496,18 +510,44 @@ pub(crate) fn correct_truehd_channels(reader: &mut dyn SectorSource, title: &mut
         let Some(payload) = payloads.get(&a.pid) else {
             continue;
         };
-        let Some(count) = truehd_channels_from_stream(payload) else {
+        // One major-sync read yields channels, sample rate and the Atmos signal.
+        let Some(info) = truehd_sync_info_from_stream(payload) else {
             continue;
         };
-        let new_ch = AudioChannels::from_count(count);
-        if new_ch == AudioChannels::Unknown || new_ch == a.channels {
-            continue;
-        }
+
+        // Whether the label is still the plain descriptor (no richer editorial
+        // label). Captured against the CURRENT channels before any correction so
+        // a label promotion only happens when nothing editorial is present.
         let was_basic =
             a.label == crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary);
-        a.channels = new_ch;
+
+        // (1) Channels — only when the major sync resolves a different layout.
+        if let Some(count) = truehd_channels(info.format_info) {
+            let new_ch = AudioChannels::from_count(count);
+            if new_ch != AudioChannels::Unknown && new_ch != a.channels {
+                a.channels = new_ch;
+            }
+        }
+
+        // (2) Sample rate — whitelisted rates only; an unknown nibble or a rate
+        // that maps to no enum variant leaves the container value untouched
+        // (never write a wrong SamplingFrequency).
+        if let Some(hz) = truehd_sample_rate_hz(info.format_info) {
+            let new_sr = SampleRate::from_hz(hz);
+            if new_sr != SampleRate::Unknown && new_sr != a.sample_rate {
+                a.sample_rate = new_sr;
+            }
+        }
+
+        // (3) Label — refresh to the corrected channels; promote to the Atmos
+        // form only when the stream carried the basic descriptor (no editorial
+        // Atmos already) AND a 4th substream was positively detected.
         if was_basic {
-            a.label = crate::labels::generate_audio_label(&a.codec, &new_ch, a.secondary);
+            a.label = if info.is_atmos == Some(true) {
+                crate::labels::generate_audio_label_atmos(&a.codec, &a.channels, a.secondary)
+            } else {
+                crate::labels::generate_audio_label(&a.codec, &a.channels, a.secondary)
+            };
         }
     }
 }
@@ -840,7 +880,9 @@ impl SampleRate {
         match self {
             SampleRate::S44_1 => 44100.0,
             SampleRate::S48 | SampleRate::S48_96 | SampleRate::S48_192 => 48000.0,
+            SampleRate::S88_2 => 88200.0,
             SampleRate::S96 => 96000.0,
+            SampleRate::S176_4 => 176400.0,
             SampleRate::S192 => 192000.0,
             SampleRate::Unknown => 48000.0,
         }
@@ -851,7 +893,9 @@ impl SampleRate {
         match hz {
             44100 => SampleRate::S44_1,
             48000 => SampleRate::S48,
+            88200 => SampleRate::S88_2,
             96000 => SampleRate::S96,
+            176400 => SampleRate::S176_4,
             192000 => SampleRate::S192,
             _ => SampleRate::Unknown,
         }
@@ -1037,7 +1081,9 @@ enum_str!(
     [
         ("44.1kHz", SampleRate::S44_1),
         ("48kHz", SampleRate::S48),
+        ("88.2kHz", SampleRate::S88_2),
         ("96kHz", SampleRate::S96),
+        ("176.4kHz", SampleRate::S176_4),
         ("192kHz", SampleRate::S192),
         ("48/96kHz", SampleRate::S48_96),
         ("48/192kHz", SampleRate::S48_192),
@@ -1894,7 +1940,7 @@ pub enum Key {
     /// VUK → unit keys. A source hands in its FULL device-key set, because
     /// choosing which one applies *is* the MKB walk (derivation), and all
     /// derivation lives here — never in a source.
-    Device(Vec<crate::aacs::keydb::DeviceKey>),
+    Device(Vec<crate::aacs::types::DeviceKey>),
     /// Processing key(s) (AACS PK). libfreemkv applies each against the MKB
     /// → media key → VUK → unit keys.
     Processing(Vec<[u8; 16]>),
@@ -5023,7 +5069,7 @@ mod tests {
         let good = mf.ranges_with(&[SectorStatus::Finished]);
         let bad_ranges = mf.ranges_with(&[SectorStatus::NonTrimmed]);
         let disc_bytes = sectors as u64 * 2048;
-        const SEC: u64 = 2048;
+        const SEC: u64 = crate::consts::SECTOR_BYTES as u64;
 
         // The first failing batch starts at LBA 320; everything before it read
         // cleanly and must be Finished.

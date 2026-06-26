@@ -161,7 +161,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
             // Primary video
             for _ in 0..n_video {
-                if let Some((entry, next)) = parse_stream_entry(item, spos, 1) {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO) {
                     streams.push(entry);
                     spos = next;
                 } else {
@@ -170,7 +170,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Primary audio
             for _ in 0..n_audio {
-                if let Some((entry, next)) = parse_stream_entry(item, spos, 2) {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_AUDIO) {
                     streams.push(entry);
                     spos = next;
                 } else {
@@ -179,7 +179,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // PG subtitles
             for _ in 0..n_pg {
-                if let Some((entry, next)) = parse_stream_entry(item, spos, 3) {
+                if let Some((entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE) {
                     streams.push(entry);
                     spos = next;
                 } else {
@@ -188,7 +188,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // IG (skip but advance)
             for _ in 0..n_ig {
-                if let Some((_, next)) = parse_stream_entry(item, spos, 4) {
+                if let Some((_, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_IG) {
                     spos = next;
                 } else {
                     break;
@@ -196,7 +196,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary audio
             for _ in 0..n_sec_audio {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 2) {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_AUDIO) {
                     entry.stream_type = 5;
                     entry.secondary = true;
                     streams.push(entry);
@@ -213,7 +213,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary video (PiP)
             for _ in 0..n_sec_video {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 1) {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO) {
                     entry.stream_type = 6;
                     entry.secondary = true;
                     streams.push(entry);
@@ -240,7 +240,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Secondary PG (PiP subtitles) — must consume to keep spos aligned
             for _ in 0..n_pip_pg {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 3) {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_PG_SUBTITLE) {
                     entry.secondary = true;
                     streams.push(entry);
                     // Skip reference data: num_refs(1) + reserved(1) + refs + padding
@@ -256,7 +256,7 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
             }
             // Dolby Vision enhancement layer
             for _ in 0..n_dv {
-                if let Some((mut entry, next)) = parse_stream_entry(item, spos, 1) {
+                if let Some((mut entry, next)) = parse_stream_entry(item, spos, STREAM_CATEGORY_VIDEO) {
                     entry.stream_type = 7;
                     entry.secondary = true;
                     streams.push(entry);
@@ -317,6 +317,21 @@ pub fn parse(data: &[u8]) -> Result<Playlist> {
 
 /// Parse one stream entry from the STN table.
 /// Returns (StreamEntry, next position) or None.
+/// BD `stream_entry()` type codes (the `stream_entry_type` field). Determine
+/// where the PID sits within the entry — see `parse_stream_entry`.
+const STREAM_ENTRY_PLAYITEM_CLIP: u8 = 0x01; // stream in the PlayItem's Clip
+const STREAM_ENTRY_SUBPATH_SUBCLIP: u8 = 0x02; // stream in a SubPath SubClip
+const STREAM_ENTRY_SUBPATH_CLIP: u8 = 0x03; // stream in a SubPath clip
+const STREAM_ENTRY_SUBPATH_DV_EL: u8 = 0x04; // SubPath Dolby Vision enhancement layer
+
+/// STN-table primary stream categories — the `stream_type` tag carried on each
+/// [`StreamEntry`]. Secondary streams reuse the primary category and set the
+/// `secondary` flag rather than carrying a distinct code.
+const STREAM_CATEGORY_VIDEO: u8 = 1;
+const STREAM_CATEGORY_AUDIO: u8 = 2;
+const STREAM_CATEGORY_PG_SUBTITLE: u8 = 3;
+const STREAM_CATEGORY_IG: u8 = 4;
+
 fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(StreamEntry, usize)> {
     if pos + 2 > item.len() {
         return None;
@@ -337,9 +352,9 @@ fn parse_stream_entry(item: &[u8], pos: usize, stream_type: u8) -> Option<(Strea
     // Previously only type 1 was handled, so the DV EL (type 4) and any
     // sub-path stream fell through to PID 0 and were dropped by the mux.
     let pid_off = match item[pos + 1] {
-        0x01 => 2,
-        0x02 => 4,
-        0x03 | 0x04 => 3,
+        STREAM_ENTRY_PLAYITEM_CLIP => 2,
+        STREAM_ENTRY_SUBPATH_SUBCLIP => 4,
+        STREAM_ENTRY_SUBPATH_CLIP | STREAM_ENTRY_SUBPATH_DV_EL => 3,
         _ => 0,
     };
     // Bound the PID read by the entry's declared end (se_end), not just by
@@ -631,7 +646,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(3);
-        out.push(0x01);
+        out.push(STREAM_ENTRY_PLAYITEM_CLIP);
         out.extend_from_slice(&pid.to_be_bytes());
         // attrs: coding_type(1) + format_rate(1) + language(3)
         let attrs = vec![
@@ -649,7 +664,7 @@ mod tests {
     fn build_stream_entry_pg(pid: u16, coding_type: u8, lang: &[u8; 3]) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(3);
-        out.push(0x01);
+        out.push(STREAM_ENTRY_PLAYITEM_CLIP);
         out.extend_from_slice(&pid.to_be_bytes());
         // attrs: coding_type(1) + language(3)
         let attrs = vec![coding_type, lang[0], lang[1], lang[2]];
@@ -1046,11 +1061,12 @@ mod tests {
     fn stream_entry_type2_pid_at_offset_4() {
         // Build a primary-audio entry with stream_entry type 0x02.
         // se_len = 5: type(1) + subpath_id(1) + subclip_id(1) + pid(2)
-        let mut se = Vec::new();
-        se.push(5); // se_len
-        se.push(0x02); // type: SubPath SubClip
-        se.push(0xAA); // subpath_id (must NOT be read as PID hi)
-        se.push(0xBB); // subclip_id
+        let mut se = vec![
+            5,                            // se_len
+            STREAM_ENTRY_SUBPATH_SUBCLIP, // type: SubPath SubClip
+            0xAA,                         // subpath_id (must NOT be read as PID hi)
+            0xBB,                         // subclip_id
+        ];
         se.extend_from_slice(&0x1100u16.to_be_bytes()); // real PID at +4
         // stream_attributes: audio coding(1)+fmt(1)+lang(3)
         let attrs = vec![0x83u8, (6 << 4) | 1, b'e', b'n', b'g'];
@@ -1074,7 +1090,7 @@ mod tests {
     fn stream_entry_type4_pid_at_offset_3() {
         let mut se = Vec::new();
         se.push(4); // se_len: type(1)+subpath_id(1)+pid(2)
-        se.push(0x04); // type 4 (DV EL)
+        se.push(STREAM_ENTRY_SUBPATH_DV_EL); // type 4 (DV EL)
         se.push(0x07); // subpath_id (not PID)
         se.extend_from_slice(&0x1015u16.to_be_bytes()); // PID at +3
         let attrs = vec![0x24u8, (8 << 4) | 1, 0x12]; // HEVC video attrs
@@ -1158,7 +1174,7 @@ mod tests {
         // Audio-slot entry but coding_type 0x90 (PGS): attrs = 0x90 + lang(3).
         let mut se = Vec::new();
         se.push(3);
-        se.push(0x01);
+        se.push(STREAM_ENTRY_PLAYITEM_CLIP);
         se.extend_from_slice(&0x1100u16.to_be_bytes());
         let attrs = vec![0x90u8, b'j', b'p', b'n']; // PG layout: coding + lang
         se.push(attrs.len() as u8);
@@ -1214,7 +1230,7 @@ mod tests {
     fn truncated_stream_entry_stops_without_panic() {
         let video = build_stream_entry_video(0x1011, 0x1B, 6, 1, None);
         // Second "entry" declares se_len=200 but supplies no body → None.
-        let bad = vec![200u8, 0x01];
+        let bad = vec![200u8, STREAM_ENTRY_PLAYITEM_CLIP];
         let data = build_mpls(
             &[(b"00001", 1, 0, 9000000)],
             (2, 0, 0, 0, 0, 0, 0, 0), // claims 2 video
@@ -1259,7 +1275,7 @@ mod tests {
     fn zero_length_stream_attributes_yields_no_stream() {
         let mut se = Vec::new();
         se.push(3);
-        se.push(0x01);
+        se.push(STREAM_ENTRY_PLAYITEM_CLIP);
         se.extend_from_slice(&0x1011u16.to_be_bytes());
         se.push(0); // sa_len = 0 → parse_stream_entry returns None
         let data = build_mpls(
