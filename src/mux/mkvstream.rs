@@ -614,6 +614,8 @@ fn parse_track(
                 display_aspect: None,
                 secondary: is_secondary,
                 label: name,
+                top_field_first: None,
+                measured_cicp: None,
             }))
         }
         2 => Some(crate::disc::Stream::Audio(AudioStream {

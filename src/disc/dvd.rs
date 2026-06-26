@@ -49,7 +49,31 @@ impl Disc {
                 }),
                 secondary: false,
                 label: String::new(),
+                // TODO(spec): populate from the MPEG-2 picture coding extension
+                // once the codec parser surfaces it. `Mpeg2Parser` already reads
+                // `top_field_first` (mux/codec/mpeg2.rs `picture_nb_fields`) but
+                // tracks are built from the IFO scan BEFORE any frame is parsed;
+                // wiring it requires a CodecParser accessor surfaced through
+                // PipelinedPesStream/DiscStream into the output title (mirroring
+                // the existing `codec_private` handshake). Until then `None`
+                // means the muxer falls back to TFF (correct for ~all DVDs).
+                top_field_first: None,
+                // TODO(spec): DVD MPEG-2 carries no VUI; the colour signalling is
+                // the sequence_display_extension colour_description when present.
+                // Surface it from `Mpeg2Parser` (same handshake as above) and set
+                // this so a disc that states e.g. BT.601-625 colour overrides the
+                // PAL/NTSC guess in `color_space`. `None` uses the enum fallback.
+                measured_cicp: None,
             });
+            // TODO(spec): DefaultDuration is derived from the declared IFO
+            // frame_rate (25 / 29.97). A soft-telecined 23.976-in-29.97 DVD then
+            // reports 29.97 fps instead of the true 23.976 film rate. The pulldown
+            // cadence is detectable from the parser's per-picture `nb_fields`
+            // (repeat_first_field) — when most frames are 3-field-then-2-field
+            // 2:3 pulldown the film rate is frame_rate × 4/5. Emitting the film
+            // DefaultDuration needs the parser to report the measured cadence
+            // through the same parser→title channel as `top_field_first` above;
+            // left as a follow-up to avoid a speculative rate change here.
 
             // Map DvdAudioAttr to Stream::Audio. The PID is derived from the
             // stream's REAL on-wire private_stream_1 sub-stream id (assigned
@@ -132,11 +156,16 @@ impl Disc {
 
                 let size_bytes: u64 = extents.iter().map(|e| e.sector_count as u64 * 2048).sum();
 
-                // Build pre-formatted palette codec_data for VobSub subtitle streams
+                // Build pre-formatted VobSub `.idx` codec_data (size: + palette:
+                // lines) for VobSub subtitle streams. The `size:` line carries
+                // the coded video frame the subpicture was authored against
+                // (720x480 NTSC / 720x576 PAL) so players place and scale the
+                // bitmap correctly.
+                let (vid_w, vid_h) = ts.video.resolution.pixels();
                 let codec_data = dvd_title
                     .palette
                     .as_ref()
-                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal));
+                    .map(|pal| crate::mux::codec::dvdsub::format_palette(pal, vid_w, vid_h));
 
                 // Map DvdSubtitleAttr to Stream::Subtitle
                 let subtitle_streams: Vec<Stream> = ts

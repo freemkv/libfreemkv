@@ -159,6 +159,8 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         }));
         // Index 0 = the video stream's codec init data.
         t.codec_privates = vec![Some(vec![0xDE, 0xAD, 0xBE, 0xEF])];

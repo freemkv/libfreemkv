@@ -148,6 +148,17 @@ impl Disc {
                         // the CLI/UI render the localized descriptor. `label`
                         // stays empty for disc video streams.
                         label: String::new(),
+                        // TODO(spec): for 1080i HEVC/H.264/VC-1 titles, surface
+                        // the measured field order (H.264/HEVC pic_struct, VC-1
+                        // pulldown) from the codec parser instead of the TFF
+                        // fallback; needs the parser→title channel (see dvd.rs).
+                        top_field_first: None,
+                        // TODO(spec): prefer the HEVC/H.264 VUI colour_description
+                        // (measured CICP) over this MPLS playlist-nibble guess
+                        // once the parser surfaces it through the output title.
+                        // `None` keeps the enum fallback. (HDR MaxCLL/Mastering
+                        // metadata is a separate task and intentionally not here.)
+                        measured_cicp: None,
                     })),
                     2 | 5 => {
                         // Guard: if coding_type is a subtitle codec (PGS 0x90/0x91),

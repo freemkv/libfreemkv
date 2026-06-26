@@ -355,6 +355,8 @@ mod tests {
                     display_aspect: None,
                     secondary: false,
                     label: "Main".into(),
+                    top_field_first: None,
+                    measured_cicp: None,
                 }),
                 Stream::Audio(AudioStream {
                     pid: 0x1100,

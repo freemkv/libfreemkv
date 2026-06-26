@@ -196,6 +196,35 @@ pub struct VideoStream {
     pub secondary: bool,
     /// Extra label (e.g. "Dolby Vision EL")
     pub label: String,
+    /// Field-display order MEASURED from the elementary stream's interlace
+    /// signalling (MPEG-2 picture coding extension `top_field_first`, H.264/HEVC
+    /// `pic_struct`), when available: `Some(true)` = top-field-first,
+    /// `Some(false)` = bottom-field-first. `None` = not measured — the muxer
+    /// falls back to TFF for interlaced content (the dominant DVD/HD case). The
+    /// container FieldOrder must agree with the bitstream, so a measured BFF
+    /// stream must NOT be stamped TFF. Ignored for progressive video.
+    pub top_field_first: Option<bool>,
+    /// CICP colour signalling (matrix, transfer, primaries, full_range) MEASURED
+    /// from the bitstream — HEVC/H.264 VUI `colour_description` or MPEG-2
+    /// `sequence_display_extension`. `Some(...)` takes precedence over the
+    /// coarse `color_space` enum (a playlist nibble / PAL-NTSC guess); `None`
+    /// means the bitstream did not state it, so the enum-derived triplet is used.
+    /// Codes are ITU-T H.273 (CICP); `range` is 1 = limited/TV, 2 = full.
+    pub measured_cicp: Option<MeasuredCicp>,
+}
+
+/// Measured CICP colour signalling read directly from a video elementary stream
+/// (ITU-T H.273). Preferred over the coarse [`ColorSpace`] enum when present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredCicp {
+    /// MatrixCoefficients (ITU-T H.273 Table 4).
+    pub matrix: u8,
+    /// TransferCharacteristics (ITU-T H.273 Table 3).
+    pub transfer: u8,
+    /// ColourPrimaries (ITU-T H.273 Table 2).
+    pub primaries: u8,
+    /// Range: 1 = limited (studio/TV), 2 = full. Matroska Colour/Range values.
+    pub range: u8,
 }
 
 /// An audio stream.
@@ -3776,6 +3805,8 @@ mod tests {
                 display_aspect: None,
                 secondary: false,
                 label: String::new(),
+                top_field_first: None,
+                measured_cicp: None,
             })],
             chapters: Vec::new(),
             extents: Vec::new(),

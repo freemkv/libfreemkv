@@ -1308,6 +1308,8 @@ mod apply_tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         })
     }
 
@@ -1760,6 +1762,8 @@ mod apply_tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         });
         let mut titles = vec![title_with(vec![interlaced])];
         fill_defaults(&mut titles);
@@ -1782,6 +1786,8 @@ mod apply_tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
+            top_field_first: None,
+            measured_cicp: None,
         });
         let mut titles = vec![title_with(vec![progressive])];
         fill_defaults(&mut titles);
