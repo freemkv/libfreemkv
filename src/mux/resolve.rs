@@ -12,6 +12,7 @@
 //! | network:// | Yes (listen) | Yes (connect) | host:port (required) |
 //! | stdio:// | Yes (stdin) | Yes (stdout) | empty |
 //! | null:// | -- | Yes | empty |
+//! | fvi://  | -- | Yes | file path (required) — per-picture video index |
 //!
 //! Bare paths without a scheme are rejected.
 //! For disc→ISO (raw sector copy), use `Disc::copy()` instead.
@@ -60,6 +61,10 @@ pub enum StreamUrl {
     /// chapters + delay metadata). Like `dir://` it targets a directory; the
     /// CLI constructs the `DemuxSink` with full options before the mux loop.
     Demux { dir: PathBuf },
+    /// freemkv native per-picture video index (`fvi://`). A write-only PES sink
+    /// that emits one JSON-Lines record per coded picture of the title's primary
+    /// video track to a `.fvi` file (normative spec `docs/FVI_FORMAT.md`).
+    Fvi { path: PathBuf },
     /// Unrecognized URL.
     Unknown { raw: String },
 }
@@ -77,6 +82,7 @@ impl StreamUrl {
             StreamUrl::Dir { .. } => "dir",
             StreamUrl::Null => "null",
             StreamUrl::Demux { .. } => "demux",
+            StreamUrl::Fvi { .. } => "fvi",
             StreamUrl::Unknown { .. } => "unknown",
         }
     }
@@ -90,7 +96,8 @@ impl StreamUrl {
             | StreamUrl::Mkv { path }
             | StreamUrl::Iso { path }
             | StreamUrl::Dir { path }
-            | StreamUrl::Demux { dir: path } => path.to_str().unwrap_or(""),
+            | StreamUrl::Demux { dir: path }
+            | StreamUrl::Fvi { path } => path.to_str().unwrap_or(""),
             StreamUrl::Network { addr } => addr,
             StreamUrl::Stdio | StreamUrl::Null => "",
             StreamUrl::Unknown { raw } => raw,
@@ -161,6 +168,11 @@ pub fn parse_url(url: &str) -> StreamUrl {
     if let Some(rest) = url.strip_prefix("demux://") {
         return StreamUrl::Demux {
             dir: PathBuf::from(rest),
+        };
+    }
+    if let Some(rest) = url.strip_prefix("fvi://") {
+        return StreamUrl::Fvi {
+            path: PathBuf::from(rest),
         };
     }
     StreamUrl::Unknown {
@@ -403,6 +415,8 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
         StreamUrl::Null => Err(crate::error::Error::StreamWriteOnly.into()),
         // `demux://` is an output-only sink (per-track ES files); never a source.
         StreamUrl::Demux { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
+        // `fvi://` is an output-only sink (per-picture video index); never a source.
+        StreamUrl::Fvi { .. } => Err(crate::error::Error::StreamWriteOnly.into()),
         StreamUrl::Unknown { ref raw } => {
             Err(crate::error::Error::StreamUrlInvalid { url: raw.clone() }.into())
         }
@@ -477,6 +491,20 @@ pub fn output(
             }
             Ok(Box::new(super::demux_sink::DemuxSink::create(
                 dir, title, &opts,
+            )?))
+        }
+        // `fvi://` writes the per-picture video index (`docs/FVI_FORMAT.md`).
+        // The bare `output()` arm records the resolver path as the provenance
+        // `source.path` and defaults the title index to 0 (the resolver carries
+        // no title-index context — the CLI follow-up passes the real medium /
+        // title via `FviSink::create_with_source`).
+        StreamUrl::Fvi { ref path } => {
+            validate_file_path(path, "fvi")?;
+            Ok(Box::new(super::fvi_sink::FviSink::create(
+                path,
+                title,
+                path.to_string_lossy().into_owned(),
+                0,
             )?))
         }
         StreamUrl::Unknown { ref raw } => {
