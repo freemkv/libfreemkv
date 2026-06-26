@@ -229,6 +229,12 @@ impl TsDemuxer {
     /// `data` in place. Zero-copy on the bulk path; one 192-byte copy
     /// on the boundary.
     pub fn feed(&mut self, data: &[u8]) -> Vec<PesPacket> {
+        // A plain feed carries no provenance. Reset any base a prior
+        // `feed_at` left behind so mixing the two entry points is safe:
+        // after this call no `SourcePos` is stamped, and the stale running
+        // base can't leak a wrong offset into the boundary packet.
+        self.feed_base = 0;
+        self.has_base = false;
         self.feed_inner(data)
     }
 
@@ -263,15 +269,20 @@ impl TsDemuxer {
                 self.remainder.extend_from_slice(data);
                 return completed;
             }
+            // Capture the remainder length before clearing — it's how many of
+            // the boundary packet's bytes lived in the PREVIOUS feed buffer,
+            // and `feed_base` currently points at the FIRST byte of THIS buffer.
+            let rem_len = self.remainder.len();
             let mut boundary = [0u8; BD_SOURCE_PACKET_BYTES];
-            boundary[..self.remainder.len()].copy_from_slice(&self.remainder);
-            boundary[self.remainder.len()..].copy_from_slice(&data[..need]);
+            boundary[..rem_len].copy_from_slice(&self.remainder);
+            boundary[rem_len..].copy_from_slice(&data[..need]);
             self.remainder.clear();
-            // The boundary packet began in the PREVIOUS feed buffer; stamp it
-            // with the offset just before this buffer (its first bytes' base).
-            let src = self
-                .has_base
-                .then(|| crate::pes::SourcePos::at_byte(self.feed_base.saturating_sub(1)));
+            // The boundary packet's first byte sat `rem_len` bytes before the
+            // current feed_base (in the previous buffer). Stamp it there — not
+            // at `feed_base - 1`, which would be wrong by `rem_len - 1` bytes.
+            let src = self.has_base.then(|| {
+                crate::pes::SourcePos::at_byte(self.feed_base.saturating_sub(rem_len as u64))
+            });
             self.process_packet(&boundary, src, &mut completed);
             offset = need;
         }
@@ -929,6 +940,76 @@ mod tests {
         let mut demux = TsDemuxer::new(&[0x1011]);
         let result = demux.feed(&[]);
         assert!(result.is_empty());
+    }
+
+    /// A boundary packet (one split across two feeds) must be stamped with the
+    /// source offset of its FIRST byte, which sat `remainder.len()` bytes before
+    /// the current feed's base — not at `feed_base - 1`. We feed two 192-byte
+    /// packets via `feed_at`, splitting mid-second-packet so the second packet
+    /// is reassembled at the boundary, and assert its provenance lands exactly
+    /// on its first byte.
+    #[test]
+    fn boundary_packet_source_is_first_byte_not_base_minus_one() {
+        let pid = 0x1011;
+        let base: u64 = 20480; // sector-aligned (10 × 2048)
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        let pkt0 = ts_payload_packet(pid, true, 0, &pes_start(b"AAAA"));
+        let pkt1 = ts_payload_packet(pid, true, 1, &pes_start(b"BBBB"));
+        let mut full = pkt0;
+        full.extend_from_slice(&pkt1);
+
+        // Split mid-pkt1 → pkt1 is reassembled from a 100-byte remainder + the
+        // next feed's head. pkt1's first byte is at absolute offset base + 192.
+        let split = BD_SOURCE_PACKET_BYTES + 100;
+        let out1 = demux.feed_at(base, &full[..split]);
+        assert!(out1.is_empty(), "pkt0's PES is still open");
+
+        // Second feed carries the rest; data[0] is at absolute base + split.
+        let out2 = demux.feed_at(base + split as u64, &full[split..]);
+        // pkt1 (PUSI) flushes pkt0's "AAAA" PES, stamped at pkt0's first byte.
+        assert_eq!(out2.len(), 1, "pkt0's PES completes when pkt1 starts");
+        assert_eq!(
+            out2[0].source.map(|s| s.byte),
+            Some(base),
+            "AAAA PES provenance is pkt0's first byte"
+        );
+
+        // Flush emits pkt1's "BBBB" PES — its source is the boundary stamp.
+        let out3 = demux.flush();
+        assert_eq!(out3.len(), 1, "pkt1's PES flushes out");
+        assert_eq!(
+            out3[0].source.map(|s| s.byte),
+            Some(base + BD_SOURCE_PACKET_BYTES as u64),
+            "boundary packet provenance must be its first byte (base + 192), \
+             not feed_base - 1"
+        );
+    }
+
+    /// Owner decision #7: a plain `feed()` must reset/ignore any base a prior
+    /// `feed_at()` left behind, so mixing the two is safe. After a `feed_at`
+    /// primes a base, the next plain `feed` must stamp `None` on PES packets it
+    /// begins.
+    #[test]
+    fn plain_feed_resets_prior_feed_at_base() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // Prime a base via feed_at; pkt0's PES stays open.
+        let out1 = demux.feed_at(20480, &ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        assert!(out1.is_empty());
+
+        // Plain feed must clear the base. pkt1 (PUSI) flushes "AAAA" (which was
+        // stamped during feed_at) and starts "BBBB" with NO provenance.
+        let out2 = demux.feed(&ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        assert_eq!(out2.len(), 1, "AAAA completes");
+
+        let out3 = demux.flush();
+        assert_eq!(out3.len(), 1, "BBBB flushes");
+        assert_eq!(
+            out3[0].source, None,
+            "PES begun by a plain feed must carry no source after a prior feed_at"
+        );
     }
 
     // ── scan_streams PMT parsing ──────────────────────────────────────────

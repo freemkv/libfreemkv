@@ -12,6 +12,7 @@
 //! | network:// | Yes (listen) | Yes (connect) | host:port (required) |
 //! | stdio:// | Yes (stdin) | Yes (stdout) | empty |
 //! | null:// | -- | Yes | empty |
+//! | demux:// | -- | Yes | directory path (required) — per-track ES demux |
 //! | fvi://  | -- | Yes | file path (required) — per-picture video index |
 //!
 //! Bare paths without a scheme are rejected.
@@ -919,6 +920,30 @@ mod tests {
         assert!(
             !parse_url("dir://x").is_disc_source(),
             "dir:// is a sink, never a disc source"
+        );
+        // fvi:// parses to Fvi with the raw remainder as the path, and is a
+        // sink (never a disc source) — parallel to the demux:// coverage above.
+        match parse_url("fvi://out/movie.fvi") {
+            StreamUrl::Fvi { path } => {
+                assert_eq!(path, PathBuf::from("out/movie.fvi"));
+            }
+            other => panic!("fvi:// must parse to Fvi, got {other:?}"),
+        }
+        assert_eq!(parse_url("fvi://x").scheme(), "fvi");
+        assert_eq!(parse_url("fvi://x/y.fvi").path_str(), "x/y.fvi");
+        assert!(
+            !parse_url("fvi://x").is_disc_source(),
+            "fvi:// is a sink, never a disc source"
+        );
+    }
+
+    /// `fvi://` is output-only: `input()` rejects it with StreamWriteOnly
+    /// (E9001 → Unsupported), mirroring `null://` / `demux://`.
+    #[test]
+    fn input_fvi_url_is_write_only() {
+        assert_eq!(
+            input_err_kind("fvi://out/movie.fvi"),
+            std::io::ErrorKind::Unsupported
         );
     }
 

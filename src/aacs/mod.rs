@@ -24,7 +24,7 @@ pub mod types;
 pub mod variants;
 
 // Boil-down derivation primitives (thin newtypes + wrappers over the crypto).
-pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, uk_from_vuk, vuk_from_mk};
+pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk};
 // Structured, English-free resolution trace.
 pub use trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, UnlockStep};
 
@@ -35,6 +35,10 @@ pub use decrypt::{
     decrypt_unit_full, decrypt_unit_try_keys, is_aacs_scrambled, is_unit_aligned, ts_packet_total,
     ts_sync_count, unit_key_validates,
 };
+// `probe` is a reproduction-harness helper (see keys.rs), not part of the
+// documented 1.0 surface; keep it reachable but off the rendered docs so we
+// don't commit semver stability to test primitives.
+#[doc(hidden)]
 pub use keys::probe;
 pub use keys::{
     AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C, MKB_TYPE_3_RECORDABLE,
@@ -97,5 +101,6 @@ mod tests {
         let _ = mkb_content_len(&[]);
         let _ = is_variant_mkb(&walk_mkb(&[]));
         let _ = disc_hash_hex(&disc_hash(b"x"));
+        let _ = mk_from_pk(&[[0u8; 16]], &[]);
     }
 }

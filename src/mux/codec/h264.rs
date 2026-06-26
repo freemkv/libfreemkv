@@ -325,7 +325,8 @@ impl CodecParser for H264Parser {
 }
 
 /// Parse `(chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)` from
-/// a High-Profile SPS NAL (profile_idc ∈ {100, 110, 122, 144}).
+/// a High-Profile SPS NAL (profile_idc ∈ `HIGH_PROFILES` — the 14 chroma/bit-depth
+/// extended profiles `codec_private` invokes this for).
 ///
 /// SPS RBSP layout (ITU-T H.264 §7.3.2.1.1) up to the fields we need:
 ///   byte 0        NAL header (already known to be type 7)

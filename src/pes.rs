@@ -107,20 +107,17 @@ impl PesFrame {
     /// truncated `.pes` data would be accepted as a graceful end.
     pub fn deserialize(r: &mut dyn std::io::Read) -> std::io::Result<Option<Self>> {
         // Probe one byte first to distinguish clean EOF from a truncated
-        // header.
+        // header. Loop on EINTR so back-to-back signals don't fail a
+        // recoverable read — symmetric with read_exact's internal retry
+        // on the rest of the header and the data below.
         let mut first = [0u8; 1];
-        match r.read(&mut first) {
-            Ok(0) => return Ok(None), // clean EOF, no frame started
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // Retry-once on EINTR before committing to the header read.
-                match r.read(&mut first) {
-                    Ok(0) => return Ok(None),
-                    Ok(_) => {}
-                    Err(e) => return Err(e),
-                }
+        loop {
+            match r.read(&mut first) {
+                Ok(0) => return Ok(None), // clean EOF, no frame started
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
 
         let mut header = [0u8; 22]; // 1 + 8 + 1 + 8 + 4

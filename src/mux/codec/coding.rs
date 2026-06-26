@@ -181,8 +181,13 @@ impl PictureInfo {
         match self.detail {
             CodingDetail::Mpeg2(m) => {
                 if !m.frame_picture {
-                    // A single field picture is inherently interlaced; the
-                    // top_field_first bit names which field this picture is.
+                    // A single field picture is inherently interlaced. Which
+                    // field it actually codes is given by picture_structure
+                    // (top/bottom), not by top_field_first — §6.3.10 constrains
+                    // top_field_first to 0 for field pictures, so it is not the
+                    // spec source here. picture_structure is not retained on
+                    // this carrier, so top_field_first is used only as the lone
+                    // field hint available (best-effort, not spec-derived).
                     Some(if m.top_field_first {
                         FieldOrder::Tff
                     } else {
@@ -203,8 +208,10 @@ impl PictureInfo {
     /// Number of field-display periods this picture occupies — the basis for
     /// soft-telecine (2:3 pulldown) timing. MPEG-2 (ISO/IEC 13818-2 §6.3.10,
     /// ffmpeg `nb_fields = repeat_pict + 2`): a field picture occupies 1 field,
-    /// a normal frame 2, a `repeat_first_field` frame 3 (or 4/6 in a progressive
-    /// sequence). Codecs without pulldown signalling report the normal 2 fields.
+    /// a normal frame 2, a `repeat_first_field` progressive-frame 3 (or 4/6 in a
+    /// progressive sequence); an rff bit on a non-progressive interlaced frame is
+    /// spec-forbidden (§6.3.10) and is treated as 2. Codecs without pulldown
+    /// signalling report the normal 2 fields.
     pub fn nb_fields(&self) -> u8 {
         match self.detail {
             CodingDetail::Mpeg2(m) => {

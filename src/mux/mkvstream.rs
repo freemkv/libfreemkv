@@ -101,8 +101,12 @@ enum WriteMode {
     /// Header written; muxing live. Boxed (MkvMuxer is large) to keep the enum
     /// small (clippy::large_enum_variant).
     Active(Box<MkvMuxer<Box<dyn WriteSeek + Send>>>),
-    /// Transient placeholder held only across the Pending → Active swap; never
-    /// observed by `read` / `write` / `finish`.
+    /// Sentinel held in `self.mode` while the muxer is being built (across the
+    /// Pending → Active swap). It is also the terminal state left behind after
+    /// `finish()` swaps the muxer out, and the degraded state left behind if
+    /// `activate()` fails partway (the first error still surfaces via `?`). In
+    /// that terminal state a subsequent `write()` no-ops (`Ok(())`) and `finish()`
+    /// does not re-finalize.
     Building,
 }
 
@@ -188,7 +192,11 @@ impl MkvStream {
     /// available), then write the header and replay buffered frames. A no-op if
     /// not pending. The muxer only ever muxes the track it is given — this routes
     /// the parser's measured value onto that track first.
-    fn activate(&mut self, coding: Option<crate::mux::codec::PictureInfo>) -> io::Result<()> {
+    fn activate(
+        &mut self,
+        coding: Option<crate::mux::codec::PictureInfo>,
+        video_picture_seen: bool,
+    ) -> io::Result<()> {
         let mut pending = match std::mem::replace(&mut self.mode, Mode::Write(WriteMode::Building))
         {
             Mode::Write(WriteMode::Pending(p)) => p,
@@ -199,7 +207,7 @@ impl MkvStream {
             }
         };
         if let Some(vt) = pending.video_track {
-            apply_coding_to_track(&mut pending.tracks[vt], coding);
+            apply_coding_to_track(&mut pending.tracks[vt], coding, video_picture_seen);
         }
         // --log-level 3: dump the FINAL TrackEntry metadata (field order set).
         for (i, track) in pending.tracks.iter().enumerate() {
@@ -240,12 +248,20 @@ impl MkvStream {
 /// Set a video track's `FieldOrder` from the MEASURED coding of the first coded
 /// picture — the parser's value, the first time, never a guess.
 ///
-/// A progressive track has no field order (left UNDETERMINED — expected). An
-/// INTERLACED track that reaches here with no measured field order is a
+/// A progressive track — or a progressive picture on an interlaced-flagged track
+/// — has no field order (left UNDETERMINED — expected). An INTERLACED track that
+/// reaches here WITH a video picture but no measured field order is a
 /// parser/source gap (MPEG-2 carries `top_field_first` on every interlaced
 /// picture, so it should never be missing): LOG it loudly so the source can be
 /// debugged, and leave UNDETERMINED — a muxer never fabricates a source fact.
-fn apply_coding_to_track(track: &mut MkvTrack, coding: Option<crate::mux::codec::PictureInfo>) {
+/// `video_picture_seen == false` (an empty title finalized with no frames, or a
+/// cap-triggered build that never saw the video frame) is NOT a defect — the
+/// missing coding is expected there, so log it quietly.
+fn apply_coding_to_track(
+    track: &mut MkvTrack,
+    coding: Option<crate::mux::codec::PictureInfo>,
+    video_picture_seen: bool,
+) {
     // HDR10 static metadata measured from the bitstream (HEVC SEI). Applied for
     // ANY track type that carries it (independent of interlace): the first coded
     // picture's PictureInfo holds it once both HDR10 SEI messages were seen.
@@ -260,14 +276,29 @@ fn apply_coding_to_track(track: &mut MkvTrack, coding: Option<crate::mux::codec:
     match coding.and_then(|c| c.field_order()) {
         Some(FieldOrder::Tff) => track.field_order = ebml::FIELD_ORDER_TFF,
         Some(FieldOrder::Bff) => track.field_order = ebml::FIELD_ORDER_BFF,
-        other => {
+        // A progressive picture on an interlaced-flagged track carries no field
+        // order. Leave UNDETERMINED (not a guess) — there is no parser gap here.
+        Some(FieldOrder::Progressive) => {
+            track.field_order = ebml::FIELD_ORDER_UNDETERMINED;
+        }
+        None if video_picture_seen => {
             tracing::warn!(
                 target: "mux",
-                "interlaced video track reached the muxer with NO measured field order \
-                 (field_order={:?}, coding_present={}); writing FieldOrder=UNDETERMINED \
-                 — NOT a guess. Debug why the source/parser did not set top_field_first.",
-                other,
+                "interlaced video track had a video picture but NO usable field order \
+                 (coding_present={}); writing FieldOrder=UNDETERMINED — NOT a guess. \
+                 Debug why the source/parser did not set top_field_first.",
                 coding.is_some(),
+            );
+            track.field_order = ebml::FIELD_ORDER_UNDETERMINED;
+        }
+        None => {
+            // No video picture was ever measured (empty title finalized with no
+            // frames, or a cap-triggered build before the first video frame).
+            // Coding is legitimately absent, not a parser defect — log quietly.
+            tracing::debug!(
+                target: "mux",
+                "interlaced video track activated with no video picture \
+                 (empty/buffered-only title); writing FieldOrder=UNDETERMINED.",
             );
             track.field_order = ebml::FIELD_ORDER_UNDETERMINED;
         }
@@ -427,7 +458,7 @@ impl crate::pes::Stream for MkvStream {
             // Pass the trigger frame's coding only when it IS the video frame; a
             // cap-triggered build never saw the video frame, so nothing measured
             // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
-            self.activate(if use_coding { frame.coding } else { None })?;
+            self.activate(if use_coding { frame.coding } else { None }, use_coding)?;
             if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
                 return m.write_frame(
                     frame.track,
@@ -450,7 +481,10 @@ impl crate::pes::Stream for MkvStream {
         // A title that produced no frames (or only buffered ones) is still
         // finalized into a valid MKV: activate now with no measured coding.
         if matches!(self.mode, Mode::Write(WriteMode::Pending(_))) {
-            self.activate(None)?;
+            // No video picture was ever measured for this title (it produced no
+            // frames, or only buffered non-video ones): coding is legitimately
+            // absent, not a parser defect — `video_picture_seen=false`.
+            self.activate(None, false)?;
         }
         if let Mode::Write(WriteMode::Active(m)) =
             std::mem::replace(&mut self.mode, Mode::Write(WriteMode::Building))
@@ -923,7 +957,7 @@ mod tests {
 
         // MEASURED bottom-field-first → BFF (6). The red-flag fix.
         let mut t = interlaced_track();
-        apply_coding_to_track(&mut t, Some(pic(false, false)));
+        apply_coding_to_track(&mut t, Some(pic(false, false)), true);
         assert_eq!(
             t.field_order,
             ebml::FIELD_ORDER_BFF,
@@ -932,27 +966,37 @@ mod tests {
 
         // MEASURED top-field-first → TFF (1).
         let mut t = interlaced_track();
-        apply_coding_to_track(&mut t, Some(pic(true, false)));
+        apply_coding_to_track(&mut t, Some(pic(true, false)), true);
         assert_eq!(
             t.field_order,
             ebml::FIELD_ORDER_TFF,
             "measured TFF → FieldOrder=1"
         );
 
-        // Interlaced track, NO measured coding → UNDETERMINED (logged loudly,
-        // never faked).
+        // Interlaced track, a video picture but NO usable field order →
+        // UNDETERMINED (logged loudly, never faked).
         let mut t = interlaced_track();
-        apply_coding_to_track(&mut t, None);
+        apply_coding_to_track(&mut t, None, true);
         assert_eq!(
             t.field_order,
             ebml::FIELD_ORDER_UNDETERMINED,
             "no measured value → UNDETERMINED, never a guess"
         );
 
+        // Interlaced track activated with NO video picture (empty/buffered-only
+        // title) → UNDETERMINED, logged quietly (not a parser defect).
+        let mut t = interlaced_track();
+        apply_coding_to_track(&mut t, None, false);
+        assert_eq!(
+            t.field_order,
+            ebml::FIELD_ORDER_UNDETERMINED,
+            "empty title → UNDETERMINED, never a guess"
+        );
+
         // Progressive picture on an interlaced-flagged track → UNDETERMINED (no
         // field order applies; not faked to TFF/BFF).
         let mut t = interlaced_track();
-        apply_coding_to_track(&mut t, Some(pic(true, true)));
+        apply_coding_to_track(&mut t, Some(pic(true, true)), true);
         assert_eq!(t.field_order, ebml::FIELD_ORDER_UNDETERMINED);
 
         // A PROGRESSIVE track is never touched — field order stays UNDETERMINED.
@@ -969,7 +1013,7 @@ mod tests {
             measured_cicp: None,
         });
         assert!(!prog.interlaced);
-        apply_coding_to_track(&mut prog, Some(pic(false, false)));
+        apply_coding_to_track(&mut prog, Some(pic(false, false)), true);
         assert_eq!(prog.field_order, ebml::FIELD_ORDER_UNDETERMINED);
     }
 
@@ -1011,18 +1055,18 @@ mod tests {
         let mut t = make();
         assert!(t.hdr10.is_none(), "fresh track has no HDR10");
         let pic = PictureInfo::coding_type_only(CodingType::I).with_hdr10(Some(h));
-        apply_coding_to_track(&mut t, Some(pic));
+        apply_coding_to_track(&mut t, Some(pic), true);
         assert_eq!(t.hdr10, Some(h), "measured HDR10 must reach the track");
 
         // Picture without HDR10 → track stays None (never fabricated).
         let mut t = make();
         let pic = PictureInfo::coding_type_only(CodingType::I);
-        apply_coding_to_track(&mut t, Some(pic));
+        apply_coding_to_track(&mut t, Some(pic), true);
         assert!(t.hdr10.is_none(), "no measured HDR10 → track stays None");
 
         // No coding at all → None.
         let mut t = make();
-        apply_coding_to_track(&mut t, None);
+        apply_coding_to_track(&mut t, None, true);
         assert!(t.hdr10.is_none());
     }
 

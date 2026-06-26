@@ -160,7 +160,7 @@ fn two_gop_image() -> Vec<u8> {
     data[..a.len()].copy_from_slice(&a);
 
     let mut b = ps_pack_header();
-    b.extend_from_slice(&video_pes(&gop_es(), 3003)); // ~0.1s later
+    b.extend_from_slice(&video_pes(&gop_es(), 3003)); // one frame (~33 ms) later at 29.97 fps (3003/90000 s)
     let off = 3 * 2048;
     data[off..off + b.len()].copy_from_slice(&b);
 
@@ -276,13 +276,21 @@ fn fvi_sink_indexes_real_mpeg2_pipeline_output() {
         vec![0, 3],
         "stamped src sectors must reach the .fvi in arrival order; got {src_sectors:?}"
     );
-    // For each stamped record, sector == byte / 2048 (SourcePos::at_byte). The
-    // byte offset is exact (here 14 into each region, just past the pack
-    // header), so it is NOT sector-aligned — provenance is byte-exact.
+    // Per FVI_FORMAT.md §9, `src.byte` is the offset of the AU's first byte
+    // WITHIN its 2048-byte `src.sector`, so it is always < 2048. The two
+    // stamped sources sit 14 bytes into their sector (just past the pack
+    // header), so the within-sector byte is exact (14) — provenance is
+    // byte-exact, carried unchanged from demux.
     for r in &records {
-        if let (Some(sector), Some(byte)) = (r["src"]["sector"].as_u64(), r["src"]["byte"].as_u64())
-        {
-            assert_eq!(sector, byte / 2048, "src.sector must equal src.byte / 2048");
+        if let Some(byte) = r["src"]["byte"].as_u64() {
+            assert!(
+                byte < 2048,
+                "src.byte is a within-sector offset (§9), must be < 2048; got {byte}"
+            );
+            assert_eq!(
+                byte, 14,
+                "stamped src.byte is 14 (just past the pack header)"
+            );
         }
     }
 
@@ -338,7 +346,7 @@ fn fvi_sink_indexes_non_mpeg2_frames_codec_agnostically() {
     assert_eq!(recs[0]["type"], "I");
     assert_eq!(recs[0]["pts"], 1234);
     assert_eq!(recs[0]["src"]["sector"], 4); // 8192 / 2048
-    assert_eq!(recs[0]["src"]["byte"], 8192);
+    assert_eq!(recs[0]["src"]["byte"], 0); // 8192 is sector-aligned → within-sector offset 0 (§9)
     assert!(
         recs[0].get("field_order").is_none() && recs[0].get("nb_fields").is_none(),
         "coding-absent record omits field_order/nb_fields"

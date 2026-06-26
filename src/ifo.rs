@@ -440,7 +440,19 @@ fn parse_vts(
     // to the feature and shifted every cell extent back by
     // `vtstt_vobs - vtsm_vobs` sectors, so the rip opened on the parental
     // prompt instead of the movie. The title content lives at `vtstt_vobs`.
-    let vob_start_sector = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
+    //
+    // `vtstt_vobs` is a sector address **relative to the start of this VTS_xx_0.IFO
+    // file**, not an absolute disc LBA. The cell `first_sector`/`last_sector`
+    // values are in turn relative to `vtstt_vobs`. To turn them into the absolute
+    // disc LBAs the reader needs, add the IFO file's own on-disc location (from
+    // the UDF FS). Without this rebase every extent started `ifo_lba` sectors too
+    // early — for THESILENCEOFTHELAMBS the feature began at LBA 126 (the VMGI /
+    // VIDEO_TS.VOB main-menu region) instead of 132886 (VTS_03_1.VOB), so the
+    // first ~4.5 min of muxed video was the disc's main menu before the stream
+    // drifted into the movie.
+    let vtstt_vobs = be_u32(&vts_data, VTSTT_VOBS_OFFSET)?;
+    let ifo_lba = udf.file_start_lba(reader, &path)?;
+    let vob_start_sector = ifo_lba.saturating_add(vtstt_vobs);
 
     // Video attributes at offset 0x200 (2 bytes)
     let video = parse_video_attr(&vts_data)?;

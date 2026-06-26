@@ -551,6 +551,21 @@ mod tests {
             },
             "measured CICP must override the coarse color_space enum"
         );
+
+        // Unknown colorimetry, SDR, no measured CICP → all code points map to
+        // "unspecified" (2), matching `from_color_space(Unknown)`. Both sinks of
+        // one title must emit 2, never 0.
+        let c = Colour::from_video(&mk(HdrFormat::Sdr, ColorSpace::Unknown, None));
+        assert_eq!(
+            c,
+            Colour {
+                primaries: 2,
+                transfer: 2,
+                matrix: 2,
+                full_range: false,
+            },
+            "Unknown colorimetry must emit CICP 'unspecified' (2), not 0"
+        );
     }
 
     #[test]

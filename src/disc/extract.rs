@@ -234,9 +234,12 @@ impl Disc {
 
             // Acquire (rather than Relaxed) on these per-file delta loads:
             // `extract_tree` drives `dec` single-threaded so there is no race
-            // today, but Acquire costs nothing on x86 and gives a happens-
-            // before edge if file extraction is ever parallelised, so the
-            // delta can never read a torn/stale counter across iterations.
+            // today, and Acquire costs nothing on x86. Note this is only half
+            // the synchronisation: the paired counter store
+            // (sector/decrypting.rs `fetch_add`) is Relaxed, so an Acquire
+            // load alone does NOT yet establish a happens-before edge. Before
+            // file extraction is parallelised, upgrade that store to Release
+            // (or stronger) so the delta cannot read a stale counter.
             let before_loss = decrypt_loss.load(Ordering::Acquire);
             let (mut fr, halted) =
                 extract_one_file(&mut dec, dest, pf, total_bytes, &mut done_bytes, opts)?;

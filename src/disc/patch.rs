@@ -825,12 +825,12 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
         state.stall_start = (state.now)();
         state.bytes_good_last = bytes_good_now;
     }
-    if (state.now)().duration_since(state.stall_start) > std::time::Duration::from_secs(STALL_SECS)
-    {
+    let stall_elapsed = (state.now)().duration_since(state.stall_start);
+    if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_stall",
-            elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
+            elapsed_secs = stall_elapsed.as_secs(),
             bytes_good = bytes_good_now,
             bytes_good_start = state.bytes_good_start,
             "Patch stalled - no recovery for {}s, exiting pass",
@@ -1107,13 +1107,12 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
                 state.stall_start = (state.now)();
                 state.bytes_good_last = bytes_good_now;
             }
-            if (state.now)().duration_since(state.stall_start)
-                > std::time::Duration::from_secs(STALL_SECS)
-            {
+            let stall_elapsed = (state.now)().duration_since(state.stall_start);
+            if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
                 tracing::warn!(
                     target: "freemkv::disc",
                     phase = "patch_stall",
-                    elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
+                    elapsed_secs = stall_elapsed.as_secs(),
                     bytes_good = bytes_good_now,
                     bytes_good_start = state.bytes_good_start,
                     "Patch stalled (NOT_READY path) - no recovery for {}s, exiting pass",
@@ -1193,12 +1192,12 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         state.stall_start = (state.now)();
         state.bytes_good_last = bytes_good_now;
     }
-    if (state.now)().duration_since(state.stall_start) > std::time::Duration::from_secs(STALL_SECS)
-    {
+    let stall_elapsed = (state.now)().duration_since(state.stall_start);
+    if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_stall",
-            elapsed_secs = (state.now)().duration_since(state.stall_start).as_secs(),
+            elapsed_secs = stall_elapsed.as_secs(),
             consecutive_failures = state.consecutive_failures,
             bytes_good = bytes_good_now,
             bytes_good_start = state.bytes_good_start,
@@ -1472,13 +1471,14 @@ pub(super) fn check_range_watchdog(
         state.range_bytes_good = bytes_good_now;
         state.range_start = (state.now)();
     }
-    if (state.now)().duration_since(state.range_start).as_secs() >= frame.range_budget_secs {
+    let range_elapsed = (state.now)().duration_since(state.range_start);
+    if range_elapsed.as_secs() >= frame.range_budget_secs {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "patch_range_stall",
             range_lba = frame.range_pos / 2048,
             range_sectors = frame.range_sectors,
-            elapsed_secs = (state.now)().duration_since(state.range_start).as_secs(),
+            elapsed_secs = range_elapsed.as_secs(),
             budget_secs = frame.range_budget_secs,
             bytes_recovered = state.range_bytes_good.saturating_sub(state.bytes_good_before),
             "Range stalled - moving to next range"
