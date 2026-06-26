@@ -32,7 +32,7 @@ pub mod truehd;
 /// VC-1 (SMPTE 421M) elementary-stream parser.
 pub mod vc1;
 
-pub use coding::{FieldOrder, PictureInfo};
+pub use coding::{FieldOrder, Hdr10Metadata, PictureInfo};
 
 use super::ts::PesPacket;
 use crate::disc::Codec;

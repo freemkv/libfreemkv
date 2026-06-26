@@ -13,6 +13,21 @@ const NAL_VPS: u8 = 32;
 const NAL_SPS: u8 = 33;
 const NAL_PPS: u8 = 34;
 const NAL_AUD: u8 = 35;
+// Supplemental Enhancement Information (Rec. ITU-T H.265 Table 7-1): a prefix
+// SEI (type 39) precedes the coded picture it applies to, a suffix SEI (40)
+// follows it. HDR10 static metadata (mastering display / content light level)
+// is carried in PREFIX SEI on UHD streams; both are scanned for the two HDR10
+// payload types below. SEI NALs still pass through to the frame data unchanged
+// (the `_ =>` arm); scanning them is observation-only.
+const NAL_SEI_PREFIX: u8 = 39;
+const NAL_SEI_SUFFIX: u8 = 40;
+
+// HEVC SEI payload types (Rec. ITU-T H.265 Annex D.2) carrying HDR10 static
+// metadata.
+//   - Mastering Display Colour Volume (D.2.28): payloadType 137.
+//   - Content Light Level Information (D.2.35): payloadType 144.
+const SEI_MASTERING_DISPLAY_COLOUR_VOLUME: u32 = 137;
+const SEI_CONTENT_LIGHT_LEVEL_INFO: u32 = 144;
 // Dolby Vision RPU (Reference Processing Unit) — NAL type 62 (UNSPEC62).
 // This is NOT filtered: all NAL types except VPS/SPS/PPS/AUD pass through
 // to frame data, so DV enhancement layer RPU NALs are preserved automatically.
@@ -145,6 +160,36 @@ pub struct HevcParser {
     // reset and false-arms the CRA→BLA rewrite (corrupting a legitimate in-clip
     // CRA and dropping valid RASL pictures). Each detected wrap adds 2^33 here.
     pts_wrap_offset: i64,
+    // HDR10 static metadata accumulated from prefix/suffix SEI. The Mastering
+    // Display Colour Volume (payloadType 137) and Content Light Level Info
+    // (payloadType 144) messages arrive in (possibly) separate SEI NALs; each is
+    // captured independently and STICKY (first seen wins — they are per-stream
+    // constants). `hdr10()` combines them into a complete `Hdr10Metadata` only
+    // when BOTH are present. An SDR / no-SEI stream leaves both `None` so no
+    // colour-volume metadata is ever fabricated.
+    sei_mastering: Option<MasteringDisplay>,
+    sei_content_light: Option<ContentLightLevel>,
+}
+
+/// Mastering Display Colour Volume payload (Rec. ITU-T H.265 D.2.28),
+/// payloadType 137. Raw SEI integer values — chromaticity in 0.00002 units,
+/// luminance in 0.0001 cd/m² units. SEI primary order is c=0 G, c=1 B, c=2 R.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MasteringDisplay {
+    display_primaries_x: [u16; 3],
+    display_primaries_y: [u16; 3],
+    white_point_x: u16,
+    white_point_y: u16,
+    max_display_mastering_luminance: u32,
+    min_display_mastering_luminance: u32,
+}
+
+/// Content Light Level Information payload (Rec. ITU-T H.265 D.2.35),
+/// payloadType 144. Both values are cd/m² integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContentLightLevel {
+    max_content_light_level: u16,
+    max_pic_average_light_level: u16,
 }
 
 // A backward PES-PTS step larger than this (90 kHz ticks) marks a non-seamless
@@ -190,6 +235,82 @@ impl HevcParser {
             pending_clip_boundary: false,
             high_pts: None,
             pts_wrap_offset: 0,
+            sei_mastering: None,
+            sei_content_light: None,
+        }
+    }
+
+    /// Combine the accumulated mastering-display and content-light SEI into a
+    /// complete [`Hdr10Metadata`], or `None` until BOTH HDR10 SEI messages have
+    /// been seen. Requiring both means an SDR / partially-signalled stream never
+    /// emits a half-populated (confidently-wrong) HDR10 record.
+    fn hdr10(&self) -> Option<crate::mux::codec::Hdr10Metadata> {
+        let m = self.sei_mastering?;
+        let c = self.sei_content_light?;
+        Some(crate::mux::codec::Hdr10Metadata {
+            display_primaries_x: m.display_primaries_x,
+            display_primaries_y: m.display_primaries_y,
+            white_point_x: m.white_point_x,
+            white_point_y: m.white_point_y,
+            max_display_mastering_luminance: m.max_display_mastering_luminance,
+            min_display_mastering_luminance: m.min_display_mastering_luminance,
+            max_content_light_level: c.max_content_light_level,
+            max_pic_average_light_level: c.max_pic_average_light_level,
+        })
+    }
+
+    /// Scan an SEI NAL (`[2-byte NAL header][RBSP]`) for the two HDR10 payload
+    /// types and capture each the FIRST time it appears (per-stream constants).
+    ///
+    /// RBSP structure (Rec. ITU-T H.265 D.2 `sei_rbsp` / `sei_message`): a
+    /// sequence of messages, each `payloadType` then `payloadSize` encoded as a
+    /// run of 0xFF bytes plus a final <0xFF byte (the "ff-extension" coding),
+    /// followed by `payloadSize` payload bytes. Emulation-prevention (00 00 03)
+    /// is stripped before reading — unlike a slice header, an SEI payload can be
+    /// deep enough that an emulation byte falls inside the fields we read.
+    /// Unknown payload types are skipped by their size so a later HDR10 message
+    /// in the same NAL is still reached.
+    fn scan_sei(&mut self, nal: &[u8]) {
+        let Some(raw) = nal.get(2..) else {
+            return;
+        };
+        let rbsp = strip_emulation_prevention(raw);
+        let mut i = 0usize;
+        loop {
+            // payloadType: sum of 0xFF run + final byte.
+            let Some(payload_type) = read_sei_ff_value(&rbsp, &mut i) else {
+                break;
+            };
+            // payloadSize: same ff-extension coding.
+            let Some(payload_size) = read_sei_ff_value(&rbsp, &mut i) else {
+                break;
+            };
+            let payload_size = payload_size as usize;
+            let Some(payload) = rbsp.get(i..i.saturating_add(payload_size)) else {
+                break; // truncated / malformed payload length — stop scanning
+            };
+            match payload_type {
+                SEI_MASTERING_DISPLAY_COLOUR_VOLUME if self.sei_mastering.is_none() => {
+                    if let Some(m) = parse_mastering_display(payload) {
+                        self.sei_mastering = Some(m);
+                    }
+                }
+                SEI_CONTENT_LIGHT_LEVEL_INFO if self.sei_content_light.is_none() => {
+                    if let Some(c) = parse_content_light_level(payload) {
+                        self.sei_content_light = Some(c);
+                    }
+                }
+                _ => {}
+            }
+            i += payload_size;
+            // An RBSP trailing byte (0x80) or padding zeros after the last
+            // message is not another payloadType; stop when nothing meaningful
+            // remains. `read_sei_ff_value` returning None on the next pass
+            // handles end-of-buffer; a lone 0x80 trailing bits byte is consumed
+            // as a (bogus) payloadType of 128 then fails the size read → break.
+            if i >= rbsp.len() {
+                break;
+            }
         }
     }
 
@@ -483,8 +604,15 @@ impl CodecParser for HevcParser {
                                 push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                             }
                         }
+                        NAL_SEI_PREFIX | NAL_SEI_SUFFIX => {
+                            // Observe HDR10 static metadata (mastering display /
+                            // content light level) but pass the SEI through
+                            // unchanged — scanning is non-destructive.
+                            self.scan_sei(&data[nal_start..end]);
+                            push_length_prefixed(&mut frame_data, &data[nal_start..end]);
+                        }
                         _ => {
-                            // All other NAL types (slices, SEI, DV RPU, etc.) pass through
+                            // All other NAL types (slices, DV RPU, etc.) pass through
                             push_length_prefixed(&mut frame_data, &data[nal_start..end]);
                         }
                     }
@@ -520,11 +648,19 @@ impl CodecParser for HevcParser {
             }
         }
 
+        // HDR10 static metadata is per-stream; once both SEI messages have been
+        // seen it is stamped onto every frame's PictureInfo so it rides the same
+        // deferred-muxer path the measured field order uses (the muxer reads it
+        // from the first coded picture before writing the track header). `None`
+        // until both SEI present → SDR / no-SEI tracks carry nothing.
+        let hdr10 = self.hdr10();
         vec![Frame {
             // Coding-type only: HEVC field order (pic_struct, from a pic_timing
             // SEI) is not decoded here, so field_order() stays None — honestly
-            // absent, never guessed.
-            coding: coding_type.map(PictureInfo::coding_type_only),
+            // absent, never guessed. HDR10 metadata is attached when measured.
+            coding: coding_type
+                .map(PictureInfo::coding_type_only)
+                .map(|p| p.with_hdr10(hdr10)),
             source: pes.source,
             pts_ns,
             keyframe,
@@ -681,6 +817,62 @@ fn strip_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Read an SEI `payloadType` / `payloadSize` value using the H.265 D.2
+/// ff-extension coding: consume a run of `0xFF` bytes (each adding 255) plus one
+/// final byte `< 0xFF`. Advances `*i` past the bytes read. Returns `None` at
+/// end-of-buffer (the value is incomplete / no further message).
+fn read_sei_ff_value(rbsp: &[u8], i: &mut usize) -> Option<u32> {
+    let mut value: u32 = 0;
+    loop {
+        let b = *rbsp.get(*i)?;
+        *i += 1;
+        value = value.checked_add(b as u32)?;
+        if b != 0xFF {
+            return Some(value);
+        }
+    }
+}
+
+/// Parse a Mastering Display Colour Volume SEI payload (Rec. ITU-T H.265
+/// D.2.28 / semantics D.3.28). Layout — 24 bytes total, all big-endian:
+///   display_primaries_x[c] u(16), display_primaries_y[c] u(16) for c=0,1,2
+///     (SEI primary order is c=0 Green, c=1 Blue, c=2 Red)
+///   white_point_x u(16), white_point_y u(16)
+///   max_display_mastering_luminance u(32)
+///   min_display_mastering_luminance u(32)
+/// Returns `None` if the payload is shorter than 24 bytes (malformed → ignored,
+/// never partially populated).
+fn parse_mastering_display(p: &[u8]) -> Option<MasteringDisplay> {
+    if p.len() < 24 {
+        return None;
+    }
+    let u16_at = |off: usize| u16::from_be_bytes([p[off], p[off + 1]]);
+    let u32_at = |off: usize| u32::from_be_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]);
+    Some(MasteringDisplay {
+        display_primaries_x: [u16_at(0), u16_at(4), u16_at(8)],
+        display_primaries_y: [u16_at(2), u16_at(6), u16_at(10)],
+        white_point_x: u16_at(12),
+        white_point_y: u16_at(14),
+        max_display_mastering_luminance: u32_at(16),
+        min_display_mastering_luminance: u32_at(20),
+    })
+}
+
+/// Parse a Content Light Level Information SEI payload (Rec. ITU-T H.265
+/// D.2.35 / semantics D.3.35). Layout — 4 bytes, big-endian:
+///   max_content_light_level u(16)   (MaxCLL, cd/m²)
+///   max_pic_average_light_level u(16) (MaxFALL, cd/m²)
+/// Returns `None` if shorter than 4 bytes.
+fn parse_content_light_level(p: &[u8]) -> Option<ContentLightLevel> {
+    if p.len() < 4 {
+        return None;
+    }
+    Some(ContentLightLevel {
+        max_content_light_level: u16::from_be_bytes([p[0], p[1]]),
+        max_pic_average_light_level: u16::from_be_bytes([p[2], p[3]]),
+    })
+}
+
 /// Parse chroma_format_idc and bit depths from a stored SPS NAL
 /// (`[2-byte NAL header][RBSP...]`). Handles emulation-prevention and
 /// sub-layer profile_tier_level. Returns `None` if the bitstream is too short
@@ -791,6 +983,282 @@ mod tests {
     /// Format: forbidden(1) | type(6) | layer_id_high(1) || layer_id_low(5) | tid(3)
     fn hevc_nal_header(nal_type: u8) -> [u8; 2] {
         [(nal_type & 0x3F) << 1, 0x01] // tid=1
+    }
+
+    /// Encode an SEI message body: payloadType + payloadSize (ff-extension) +
+    /// payload bytes. Values < 255 take a single byte each (the common case).
+    fn sei_message(payload_type: u32, payload: &[u8]) -> Vec<u8> {
+        fn ff_encode(mut v: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            while v >= 255 {
+                out.push(0xFF);
+                v -= 255;
+            }
+            out.push(v as u8);
+            out
+        }
+        let mut m = ff_encode(payload_type);
+        m.extend(ff_encode(payload.len() as u32));
+        m.extend_from_slice(payload);
+        m
+    }
+
+    /// Build a 24-byte Mastering Display Colour Volume payload (D.2.28) from raw
+    /// SEI integers. SEI primary order is G(0), B(1), R(2).
+    fn mastering_payload(
+        prim_x: [u16; 3],
+        prim_y: [u16; 3],
+        wp_x: u16,
+        wp_y: u16,
+        max_lum: u32,
+        min_lum: u32,
+    ) -> Vec<u8> {
+        let mut p = Vec::new();
+        for c in 0..3 {
+            p.extend_from_slice(&prim_x[c].to_be_bytes());
+            p.extend_from_slice(&prim_y[c].to_be_bytes());
+        }
+        p.extend_from_slice(&wp_x.to_be_bytes());
+        p.extend_from_slice(&wp_y.to_be_bytes());
+        p.extend_from_slice(&max_lum.to_be_bytes());
+        p.extend_from_slice(&min_lum.to_be_bytes());
+        p
+    }
+
+    /// Build a 4-byte Content Light Level Info payload (D.2.35).
+    fn cll_payload(maxcll: u16, maxfall: u16) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&maxcll.to_be_bytes());
+        p.extend_from_slice(&maxfall.to_be_bytes());
+        p
+    }
+
+    /// Insert HEVC emulation-prevention bytes: any `00 00` followed by a byte
+    /// ≤ 0x03 gets a `0x03` inserted (Rec. ITU-T H.265 §7.4.2). A real bitstream
+    /// is always EP-coded; the parser strips it back out.
+    fn emulation_prevent(rbsp: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut zeros = 0;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 0x03 {
+                out.push(0x03);
+                zeros = 0;
+            }
+            out.push(b);
+            if b == 0 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+        }
+        out
+    }
+
+    /// Wrap one or more SEI messages in a prefix-SEI NAL (type 39) preceded by an
+    /// Annex-B start code. The assembled message bytes are emulation-prevented
+    /// (as a conforming encoder would) so they never form a false start code; the
+    /// 0x80 RBSP trailing-bits byte is appended.
+    fn sei_nal(messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut rbsp = Vec::new();
+        for m in messages {
+            rbsp.extend_from_slice(m);
+        }
+        let mut v = vec![0x00, 0x00, 0x01];
+        v.extend_from_slice(&hevc_nal_header(NAL_SEI_PREFIX));
+        v.extend_from_slice(&emulation_prevent(&rbsp));
+        v.push(0x80); // rbsp_trailing_bits
+        v
+    }
+
+    /// Both HDR10 SEI messages in one access unit → the parser surfaces a fully
+    /// populated Hdr10Metadata with the EXACT raw SEI integers (scaling is the
+    /// muxer's job, asserted separately in mkv.rs). DCI-P3 D65 reference values.
+    #[test]
+    fn hevc_parses_hdr10_sei_with_exact_raw_values() {
+        // BT.2020 primaries (SEI order G, B, R) and D65 white point, as a typical
+        // UHD master would signal. Luminance: 1000 cd/m² max (×10000 = 10_000_000),
+        // 0.0001 cd/m² min (= 1).
+        let prim_x = [8500u16, 6550, 35400]; // G, B, R
+        let prim_y = [39850u16, 2300, 14600];
+        let (wp_x, wp_y) = (15635u16, 16450);
+        let (max_lum, min_lum) = (10_000_000u32, 1u32);
+        let (maxcll, maxfall) = (1000u16, 400u16);
+
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0); // num_extra_slice_header_bits 0
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19)); // IDR_W_RADL
+            v.push(0xEC); // first_slice, slice_type I
+            v
+        };
+
+        let mut data = pps;
+        data.extend_from_slice(&sei_nal(&[
+            sei_message(
+                SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+                &mastering_payload(prim_x, prim_y, wp_x, wp_y, max_lum, min_lum),
+            ),
+            sei_message(SEI_CONTENT_LIGHT_LEVEL_INFO, &cll_payload(maxcll, maxfall)),
+        ]));
+        data.extend_from_slice(&idr);
+
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        let h = frames[0]
+            .coding
+            .expect("HEVC frame carries PictureInfo")
+            .hdr10()
+            .expect("both HDR10 SEI present → metadata surfaced");
+
+        assert_eq!(h.display_primaries_x, prim_x, "primary X raw (G,B,R)");
+        assert_eq!(h.display_primaries_y, prim_y, "primary Y raw (G,B,R)");
+        assert_eq!(h.white_point_x, wp_x);
+        assert_eq!(h.white_point_y, wp_y);
+        assert_eq!(h.max_display_mastering_luminance, max_lum);
+        assert_eq!(h.min_display_mastering_luminance, min_lum);
+        assert_eq!(h.max_content_light_level, maxcll);
+        assert_eq!(h.max_pic_average_light_level, maxfall);
+    }
+
+    /// Only the mastering-display SEI (no content-light SEI) → metadata is NOT
+    /// surfaced. HDR10 requires BOTH; a half-populated record is never emitted.
+    #[test]
+    fn hevc_requires_both_hdr10_sei_messages() {
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0);
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19));
+            v.push(0xEC); // IDR: first_slice + no_output + pps_id 0 + slice_type I
+            v
+        };
+        let mut data = pps;
+        data.extend_from_slice(&sei_nal(&[sei_message(
+            SEI_MASTERING_DISPLAY_COLOUR_VOLUME,
+            &mastering_payload([1, 2, 3], [4, 5, 6], 7, 8, 9, 10),
+        )]));
+        data.extend_from_slice(&idr);
+
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        assert!(
+            frames[0].coding.unwrap().hdr10().is_none(),
+            "mastering-only stream must NOT surface HDR10 (content-light absent)"
+        );
+    }
+
+    /// An SDR stream with no HDR10 SEI at all leaves hdr10() None — never faked.
+    #[test]
+    fn hevc_sdr_stream_has_no_hdr10() {
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0);
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19));
+            v.push(0xEC); // IDR: first_slice + no_output + pps_id 0 + slice_type I
+            v
+        };
+        let mut data = pps;
+        data.extend_from_slice(&idr);
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        assert!(
+            frames[0].coding.unwrap().hdr10().is_none(),
+            "SDR / no-SEI stream must surface no HDR10 metadata"
+        );
+    }
+
+    /// The HDR10 SEI parse must de-emulate (00 00 03) before reading payload
+    /// fields. A payload byte sequence 00 00 03 in the bitstream is an
+    /// emulation-prevention insertion the parser must strip, or every field
+    /// after it shifts by one byte. Construct a mastering payload whose raw bytes
+    /// contain 00 00 (forcing an emulation byte), insert the 03, and assert the
+    /// decoded values still match the un-emulated payload.
+    #[test]
+    fn hevc_hdr10_sei_de_emulates() {
+        // prim_x[0]=0x0000, prim_y[0]=0x0002 → raw payload starts 00 00 00 02.
+        // A conforming HEVC encoder inserts an emulation-prevention 0x03 after the
+        // 00 00 (since the following byte is ≤ 0x03), giving 00 00 03 00 02. The
+        // parser MUST strip that 03 before reading, or every later field shifts.
+        let prim_x = [0u16, 6550, 35400];
+        let prim_y = [2u16, 2300, 14600];
+        let payload = mastering_payload(prim_x, prim_y, 15635, 16450, 10_000_000, 1);
+
+        // Manually emulate: insert 0x03 after each 00 00 followed by a byte ≤ 0x03,
+        // the way a conforming HEVC encoder would in the RBSP.
+        let mut emulated = Vec::new();
+        let mut zeros = 0;
+        for &b in &payload {
+            if zeros >= 2 && b <= 0x03 {
+                emulated.push(0x03);
+                zeros = 0;
+            }
+            emulated.push(b);
+            if b == 0 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+        }
+        assert!(
+            emulated.len() > payload.len(),
+            "test must actually insert an emulation byte"
+        );
+
+        let mut nal = vec![0x00, 0x00, 0x01];
+        nal.extend_from_slice(&hevc_nal_header(NAL_SEI_PREFIX));
+        nal.push(137); // payloadType
+        nal.push(24); // payloadSize = ORIGINAL (un-emulated) byte count
+        nal.extend_from_slice(&emulated);
+        nal.push(0x80);
+
+        // Pair with a content-light SEI so hdr10() can combine.
+        let mut clnal = vec![0x00, 0x00, 0x01];
+        clnal.extend_from_slice(&hevc_nal_header(NAL_SEI_PREFIX));
+        clnal.push(144);
+        clnal.push(4);
+        clnal.extend_from_slice(&cll_payload(1000, 400));
+        clnal.push(0x80);
+
+        let pps = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(NAL_PPS));
+            v.push(0xC0);
+            v
+        };
+        let idr = {
+            let mut v = vec![0x00, 0x00, 0x01];
+            v.extend_from_slice(&hevc_nal_header(19));
+            v.push(0xEC); // IDR: first_slice + no_output + pps_id 0 + slice_type I
+            v
+        };
+        let mut data = pps;
+        data.extend_from_slice(&nal);
+        data.extend_from_slice(&clnal);
+        data.extend_from_slice(&idr);
+
+        let mut parser = HevcParser::new();
+        let frames = parser.parse(&make_pes(data, Some(0)));
+        let h = frames[0].coding.unwrap().hdr10().unwrap();
+        assert_eq!(
+            h.display_primaries_x, prim_x,
+            "de-emulated payload must decode to original primary X (00 00 03 stripped)"
+        );
+        assert_eq!(h.display_primaries_y, prim_y);
+        assert_eq!(h.max_display_mastering_luminance, 10_000_000);
     }
 
     #[test]

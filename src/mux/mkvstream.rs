@@ -246,6 +246,13 @@ impl MkvStream {
 /// picture, so it should never be missing): LOG it loudly so the source can be
 /// debugged, and leave UNDETERMINED — a muxer never fabricates a source fact.
 fn apply_coding_to_track(track: &mut MkvTrack, coding: Option<crate::mux::codec::PictureInfo>) {
+    // HDR10 static metadata measured from the bitstream (HEVC SEI). Applied for
+    // ANY track type that carries it (independent of interlace): the first coded
+    // picture's PictureInfo holds it once both HDR10 SEI messages were seen.
+    // `None` (SDR / no-SEI) leaves the track's `hdr10` untouched → omitted.
+    if let Some(h) = coding.and_then(|c| c.hdr10()) {
+        track.hdr10 = Some(h);
+    }
     if !track.interlaced {
         return;
     }
@@ -952,6 +959,59 @@ mod tests {
         assert!(!prog.interlaced);
         apply_coding_to_track(&mut prog, Some(pic(false, false)));
         assert_eq!(prog.field_order, ebml::FIELD_ORDER_UNDETERMINED);
+    }
+
+    /// `apply_coding_to_track` routes MEASURED HDR10 static metadata from the
+    /// first coded picture onto the track (independent of interlace), and leaves
+    /// it `None` when the picture carried none — never fabricated.
+    #[test]
+    fn apply_coding_to_track_plumbs_measured_hdr10() {
+        use crate::disc::{Codec, ColorSpace, FrameRate, HdrFormat, Resolution, VideoStream};
+        use crate::mux::codec::Hdr10Metadata;
+        use crate::mux::codec::coding::{CodingType, PictureInfo};
+
+        let make = || {
+            MkvTrack::video(&VideoStream {
+                pid: 0xE0,
+                codec: Codec::Hevc,
+                resolution: Resolution::R2160p, // progressive UHD
+                frame_rate: FrameRate::F24,
+                hdr: HdrFormat::Hdr10,
+                color_space: ColorSpace::Bt2020,
+                display_aspect: None,
+                secondary: false,
+                label: String::new(),
+                measured_cicp: None,
+            })
+        };
+        let h = Hdr10Metadata {
+            display_primaries_x: [8500, 6550, 35400],
+            display_primaries_y: [39850, 2300, 14600],
+            white_point_x: 15635,
+            white_point_y: 16450,
+            max_display_mastering_luminance: 10_000_000,
+            min_display_mastering_luminance: 1,
+            max_content_light_level: 1000,
+            max_pic_average_light_level: 400,
+        };
+
+        // Picture carries HDR10 → plumbed onto the track.
+        let mut t = make();
+        assert!(t.hdr10.is_none(), "fresh track has no HDR10");
+        let pic = PictureInfo::coding_type_only(CodingType::I).with_hdr10(Some(h));
+        apply_coding_to_track(&mut t, Some(pic));
+        assert_eq!(t.hdr10, Some(h), "measured HDR10 must reach the track");
+
+        // Picture without HDR10 → track stays None (never fabricated).
+        let mut t = make();
+        let pic = PictureInfo::coding_type_only(CodingType::I);
+        apply_coding_to_track(&mut t, Some(pic));
+        assert!(t.hdr10.is_none(), "no measured HDR10 → track stays None");
+
+        // No coding at all → None.
+        let mut t = make();
+        apply_coding_to_track(&mut t, None);
+        assert!(t.hdr10.is_none());
     }
 
     // `From<Error> for io::Error` encodes the numeric code into the
