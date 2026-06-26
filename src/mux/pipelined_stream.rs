@@ -208,7 +208,11 @@ impl PipelinedPesStream {
                 continue;
             };
             let pes = PesPacket {
-                source: None,
+                // Carry the PS demuxer's byte-exact source stamp through to the
+                // codec parser, exactly as the TS path does — provenance must
+                // survive the PsPacket → PesPacket seam so the frame's `source`
+                // reaches the mux/index (FVI `src`), never reconstructed.
+                source: ps.source,
                 pid,
                 pts: ps.pts.map(|p| p as i64),
                 dts: ps.dts.map(|d| d as i64),

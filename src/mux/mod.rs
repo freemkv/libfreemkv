@@ -52,6 +52,10 @@ pub(crate) mod demux_thread;
 // network/stdio implementations that no external caller had business
 // reaching for.
 pub(crate) mod ebml;
+/// `fvi://` sink — freemkv's native per-picture video index (see
+/// `docs/FVI_FORMAT.md`). A write-only PES sink that emits one JSON-Lines record
+/// per coded picture; reuses the pure-data [`videomap`] model.
+pub(crate) mod fvi_sink;
 pub(crate) mod m2ts;
 /// FMKV metadata header (used by `M2tsStream` / `NetworkStream` / `StdioStream`
 /// to round-trip codec_privates that don't fit inside the underlying format).
@@ -93,9 +97,18 @@ pub(crate) mod stdio;
 pub(crate) mod timeline;
 pub(crate) mod ts;
 pub(crate) mod tsmux;
+/// Reusable, pure-data per-picture video index (the FVI logical model) consumed
+/// by the [`fvi_sink`]. Serialization-independent. `#[allow(dead_code)]`: the
+/// `VideoMap` accumulator is a standalone primitive staged for the side-channel
+/// (mux-while-indexing) reuse described in its module doc; the `fvi://` sink
+/// today builds `PictureRecord`s directly, so the accumulator is covered only by
+/// its own unit tests until that wiring lands.
+#[allow(dead_code)]
+pub(crate) mod videomap;
 
 pub use demux_sink::{ChaptersFmt, DelayMode, DemuxOptions, DemuxSink, Naming};
 pub use disc::DiscStream;
+pub use fvi_sink::FviSink;
 pub use m2ts::M2tsStream;
 pub use mkvstream::MkvStream;
 pub use network::NetworkStream;
