@@ -3880,6 +3880,27 @@ mod tests {
         assert_eq!(titles[2].playlist, "00100.mpls");
     }
 
+    /// Contract pin (owner-flagged): `freemkv -t 1` ALWAYS selects the main
+    /// feature. The CLI's `-t 1` maps to `titles[0]`, and the title list is
+    /// ordered by `canonical_title_order` (main feature first), so `titles[0]`
+    /// IS the movie. Anything but the main feature at index 0 is a
+    /// title-ordering bug, not a remux problem. DVD-shaped fixture (DVD-9
+    /// capacity; a 1h49m main feature alongside a menu loop and a short extra).
+    #[test]
+    fn title_index_0_is_main_feature_dvd_the_dash_t_1_contract() {
+        const DVD9: u64 = 7_900_000_000; // dual-layer DVD
+        let mut titles = vec![
+            title_with("VTS_01_menu", 120.0, 200_000_000, 1), // 2m menu/setup loop
+            title_with("VTS_02_main", 6540.0, 6_300_000_000, 1), // 1h49m main feature
+            title_with("VTS_03_extra", 900.0, 800_000_000, 1), // 15m extra
+        ];
+        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, DVD9));
+        assert_eq!(
+            titles[0].playlist, "VTS_02_main",
+            "titles[0] (== what `freemkv -t 1` selects) must be the DVD main feature"
+        );
+    }
+
     /// Tiebreak: equal duration + equal capacity-validity → fewer
     /// clips wins. A chapter-stitched 3-clip movie should beat a
     /// 50-clip virtual composite of the same duration.
@@ -4334,7 +4355,7 @@ mod tests {
     impl crate::sector::SectorSource for ClearStubReader {
         fn read_sectors(
             &mut self,
-            lba: u32,
+            _lba: u32,
             count: u16,
             buf: &mut [u8],
             _recovery: bool,
