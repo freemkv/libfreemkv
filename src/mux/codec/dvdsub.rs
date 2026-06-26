@@ -43,6 +43,8 @@ impl DvdSubParser {
         if force || buf.len() >= *size {
             let (pts_ns, _, data) = self.pending.take().unwrap();
             return Some(Frame {
+                coding: None,
+                source: None,
                 pts_ns,
                 keyframe: true,
                 data,
@@ -101,6 +103,8 @@ impl CodecParser for DvdSubParser {
             let d = ((pes.data[0] as usize) << 8) | pes.data[1] as usize;
             if d < 2 {
                 out.push(Frame {
+                    coding: None,
+                    source: None,
                     pts_ns,
                     keyframe: true,
                     data: pes.data.clone(),
@@ -112,6 +116,8 @@ impl CodecParser for DvdSubParser {
         } else {
             // Too short to carry SPU_size — pass through as a lone frame.
             out.push(Frame {
+                coding: None,
+                source: None,
                 pts_ns,
                 keyframe: true,
                 data: pes.data.clone(),
@@ -222,6 +228,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1200,
             pts,
             dts: None,

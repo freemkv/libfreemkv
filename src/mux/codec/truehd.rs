@@ -186,6 +186,8 @@ impl CodecParser for TrueHdParser {
                     == 0xF872_6FBA;
 
             frames.push(Frame {
+                coding: None,
+                source: None,
                 pts_ns: self.next_pts_ns,
                 keyframe: is_major_sync,
                 data: self.buf[..unit_bytes].to_vec(),
@@ -262,6 +264,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1100,
             pts,
             dts: None,

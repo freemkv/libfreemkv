@@ -355,7 +355,6 @@ mod tests {
                     display_aspect: None,
                     secondary: false,
                     label: "Main".into(),
-                    top_field_first: None,
                     measured_cicp: None,
                 }),
                 Stream::Audio(AudioStream {
@@ -406,6 +405,8 @@ mod tests {
             .unwrap()
             .meta(&dt);
         let frame = pes::PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 90000,
             keyframe: true,
@@ -516,6 +517,8 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut ns = NetworkStream::accept_from(listener).unwrap();
             let frame = pes::PesFrame {
+                coding: None,
+                source: None,
                 track: 0,
                 pts: 0,
                 keyframe: true,
@@ -568,6 +571,8 @@ mod tests {
             .meta(&dt);
         for i in 0..5u8 {
             let frame = pes::PesFrame {
+                coding: None,
+                source: None,
                 track: (i % 2) as usize,
                 pts: i as i64 * 90_000,
                 keyframe: i == 0,

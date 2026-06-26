@@ -212,7 +212,6 @@ impl M2tsMeta {
                         display_aspect: None,
                         secondary: *secondary,
                         label: label.clone(),
-                        top_field_first: None,
                         measured_cicp: None,
                     })
                 }
@@ -409,7 +408,6 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         }));
         t
@@ -660,7 +658,6 @@ mod tests {
                     display_aspect: None,
                     secondary: false,
                     label: "x".into(),
-                    top_field_first: None,
                     measured_cicp: None,
                 }));
             }

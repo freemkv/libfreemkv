@@ -152,7 +152,6 @@ impl Disc {
                         // the measured field order (H.264/HEVC pic_struct, VC-1
                         // pulldown) from the codec parser instead of the TFF
                         // fallback; needs the parser→title channel (see dvd.rs).
-                        top_field_first: None,
                         // TODO(spec): prefer the HEVC/H.264 VUI colour_description
                         // (measured CICP) over this MPLS playlist-nibble guess
                         // once the parser surfaces it through the output title.

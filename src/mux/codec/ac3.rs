@@ -115,6 +115,8 @@ impl CodecParser for Ac3Parser {
 
             let duration_ns = frame_duration_ns(remaining, bsid);
             frames.push(Frame {
+                coding: None,
+                source: None,
                 pts_ns: frame_pts_ns,
                 keyframe: true,
                 data: data[start..start + frame_size].to_vec(),
@@ -199,6 +201,8 @@ impl CodecParser for Ac3Parser {
         }
         let duration_ns = frame_duration_ns(frame, bsid);
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns: self.flush_pts_ns,
             keyframe: true,
             data: buf[off..off + frame_size].to_vec(),
@@ -441,6 +445,7 @@ mod tests {
     fn parse_empty_pes() {
         let mut parser = Ac3Parser::new();
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: None,
             dts: None,
@@ -454,6 +459,7 @@ mod tests {
         let mut parser = Ac3Parser::new();
         let frame_data = make_ac3_frame(0, 2); // 48kHz, 80 words = 160 bytes
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -472,6 +478,7 @@ mod tests {
 
         // First PES: first half of frame
         let pes1 = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -482,6 +489,7 @@ mod tests {
 
         // Second PES: second half
         let pes2 = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(93000),
             dts: None,
@@ -499,6 +507,7 @@ mod tests {
         let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF]; // garbage
         data.extend_from_slice(&frame_data);
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: None,
             dts: None,
@@ -521,6 +530,7 @@ mod tests {
         let mut pes1_data = frame_data.clone();
         pes1_data.push(0x0B);
         let pes1 = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -533,6 +543,7 @@ mod tests {
         let mut pes2_data = vec![0x77];
         pes2_data.extend_from_slice(&frame_data[2..]);
         let pes2 = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(93000),
             dts: None,
@@ -558,6 +569,7 @@ mod tests {
                 *data.last_mut().unwrap() = 0x0B;
             }
             let pes = PesPacket {
+                source: None,
                 pid: 0,
                 pts: None,
                 dts: None,
@@ -585,6 +597,7 @@ mod tests {
         let mut parser = Ac3Parser::new();
         let data = vec![0x00, 0x00, 0x0B];
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: None,
             dts: None,
@@ -621,6 +634,7 @@ mod tests {
         let mut data = frame_data.clone();
         data.extend_from_slice(&frame_data[..40]); // partial frame 2 held
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -652,6 +666,7 @@ mod tests {
         let mut data = frame_data.clone();
         data.extend_from_slice(&frame_data);
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -694,6 +709,7 @@ mod tests {
         let good = make_ac3_frame(0, 2);
         data.extend_from_slice(&good);
         let pes = PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,
@@ -1152,6 +1168,7 @@ mod tests {
     // helper: PES with a generic pts for E-AC-3 tests
     fn make_eac3_pes(data: Vec<u8>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0,
             pts: Some(90000),
             dts: None,

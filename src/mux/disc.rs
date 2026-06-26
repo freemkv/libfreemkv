@@ -713,6 +713,7 @@ impl crate::pes::Stream for DiscStream {
                             continue;
                         };
                         let pes = super::ts::PesPacket {
+                            source: None,
                             pid,
                             pts: ps.pts.map(|p| p as i64),
                             dts: ps.dts.map(|d| d as i64),
@@ -775,6 +776,8 @@ impl crate::pes::Stream for DiscStream {
                             // attribute consumer-thread time to
                             // "demux + framing" vs "codec parse".
                             self.pending_frames.push_back(crate::pes::PesFrame {
+                                coding: None,
+                                source: None,
                                 track,
                                 pts: pes.pts.map(super::codec::pts_to_ns).unwrap_or(0),
                                 keyframe: false,
@@ -833,6 +836,7 @@ impl crate::pes::Stream for DiscStream {
                     };
 
                     let pes = super::ts::PesPacket {
+                        source: None,
                         pid,
                         pts: ps.pts.map(|p| p as i64),
                         dts: ps.dts.map(|d| d as i64),

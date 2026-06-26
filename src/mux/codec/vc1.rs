@@ -243,6 +243,8 @@ impl CodecParser for Vc1Parser {
         };
 
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns: ts_ns,
             keyframe,
             data: frame_data,
@@ -363,6 +365,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1011,
             pts,
             dts: None,
@@ -606,6 +609,7 @@ mod tests {
         data.extend_from_slice(&[0x55, 0x66]);
 
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: Some(180000), // presentation
             dts: Some(90000),  // decode
@@ -855,6 +859,7 @@ mod tests {
         // PTS absent → DTS used; both absent → 0.
         let mut parser = Vc1Parser::new();
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: Some(90000),
@@ -865,6 +870,7 @@ mod tests {
 
         let mut parser2 = Vc1Parser::new();
         let pes2 = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: None,

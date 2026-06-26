@@ -28,9 +28,11 @@
 
 use std::collections::VecDeque;
 
+use super::coding::{CodingType, Mpeg2Coding, PictureInfo};
 use super::startcode::find_start_code;
 use super::{CodecParser, Frame, pts_to_ns};
 use crate::mux::ts::PesPacket;
+use crate::pes::SourcePos;
 
 /// Sequence header start code suffix.
 const SEQ_HEADER_CODE: u8 = 0xB3;
@@ -101,6 +103,11 @@ pub struct Mpeg2Parser {
     /// `(absolute ES offset of a PES's first byte, PTS in ns)` for every PES
     /// that carried a timestamp, in ascending offset order.
     pts_marks: VecDeque<(u64, i64)>,
+    /// `(absolute ES offset of a PES's first byte, SourcePos)` for every PES
+    /// that carried byte-exact provenance, parallel to `pts_marks` and drained
+    /// by the SAME mark-drain invariant. Attaches the source position to each
+    /// access unit so the index carries it — never reconstructed.
+    source_marks: VecDeque<(u64, SourcePos)>,
     /// Full-frame presentation interval (ns) at the sequence-header display rate
     /// (`1/frame_rate`). The field period is half this. Per-frame durations are
     /// `nb_fields × field_period`, so 2:3-telecined frames alternate 2- and
@@ -128,8 +135,10 @@ pub struct Mpeg2Parser {
 struct BufferedPicture {
     /// `temporal_reference` — display order within the GOP.
     tr: u64,
-    /// Field-display periods this picture occupies (`picture_nb_fields`).
-    nb_fields: u8,
+    /// Codec-agnostic per-picture coding info. The single source of this
+    /// picture's field count (`nb_fields()`), field order, and coding type;
+    /// also stamped onto the emitted [`Frame::coding`].
+    info: PictureInfo,
     /// This picture's own PES PTS (ns), if its access unit carried one.
     explicit_pts: Option<i64>,
     /// The emitted frame (PTS + duration filled in at GOP flush).
@@ -150,6 +159,7 @@ impl Mpeg2Parser {
             buf: Vec::with_capacity(128 * 1024),
             base_offset: 0,
             pts_marks: VecDeque::new(),
+            source_marks: VecDeque::new(),
             frame_duration_ns: 0,
             progressive_sequence: false,
             gop_buf: Vec::new(),
@@ -206,6 +216,13 @@ impl Mpeg2Parser {
                             break;
                         }
                     }
+                    while let Some(&(off, _)) = self.source_marks.front() {
+                        if off < cutoff {
+                            self.source_marks.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
                 }
                 break;
             };
@@ -228,7 +245,13 @@ impl Mpeg2Parser {
             // GOP, resetting temporal_reference to 0.
             let gop_boundary = find_code(&self.buf[..end], 0, GOP_CODE).is_some()
                 || find_code(&self.buf[..end], 0, SEQ_HEADER_CODE).is_some();
-            let keyframe = pic + 5 < end && ((self.buf[pic + 5] >> 3) & 0x07) == PICTURE_TYPE_I;
+            // picture_coding_type: the full 3-bit value (bits 5-3 of buf[pic+5]).
+            // 0 when the picture header is truncated (no coding type available).
+            let raw_coding_type = if pic + 5 < end {
+                (self.buf[pic + 5] >> 3) & 0x07
+            } else {
+                0
+            };
             // temporal_reference: the 10 bits immediately after the picture
             // start code = display order within the GOP.
             let tr = if pic + 5 < end {
@@ -249,7 +272,24 @@ impl Mpeg2Parser {
                     }
                 }
             }
-            let nb_fields = picture_nb_fields(&data, self.progressive_sequence);
+            // Decode the picture coding extension ONCE here and fold every
+            // per-picture datum (coding type + tff/rff/progressive_frame/
+            // frame_picture, plus the sequence's progressive flag) into one
+            // codec-agnostic `PictureInfo`. `nb_fields()`, `keyframe()`, and
+            // `field_order()` all derive from it; nothing downstream re-parses
+            // the elementary stream.
+            let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+            let info = PictureInfo::mpeg2(
+                coding_type_from_raw(raw_coding_type),
+                Mpeg2Coding {
+                    top_field_first: tff,
+                    repeat_first_field: rff,
+                    progressive_frame,
+                    progressive_sequence: self.progressive_sequence,
+                    frame_picture,
+                },
+            );
+            let keyframe = info.keyframe();
 
             // An explicit PES PTS for this access unit, if any. By the mark-drain
             // invariant the front mark's offset is >= this AU's start, so a front
@@ -260,6 +300,15 @@ impl Mpeg2Parser {
                 .filter(|&&(off, _)| off < end_abs)
                 .map(|&(_, p)| p);
 
+            // Byte-exact source provenance for this AU, by the same mark-drain
+            // invariant as the PTS: the front source mark inside [start, end)
+            // belongs to this access unit.
+            let src = self
+                .source_marks
+                .front()
+                .filter(|&&(off, _)| off < end_abs)
+                .map(|&(_, s)| s);
+
             // A GOP boundary means the buffered run is a COMPLETE GOP (all its
             // pictures display before the next GOP's), so flush it before
             // starting the new one. `temporal_reference` resets to 0 at the
@@ -269,13 +318,15 @@ impl Mpeg2Parser {
             }
             self.gop_buf.push(BufferedPicture {
                 tr,
-                nb_fields,
+                info,
                 explicit_pts: explicit,
                 frame: Frame {
                     pts_ns: 0,
                     keyframe,
                     data,
                     duration_ns: None,
+                    coding: Some(info),
+                    source: src,
                 },
             });
             // Safety cap: a stream with no GOP/sequence boundaries would buffer
@@ -290,6 +341,13 @@ impl Mpeg2Parser {
             while let Some(&(off, _)) = self.pts_marks.front() {
                 if off < end_abs {
                     self.pts_marks.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&(off, _)) = self.source_marks.front() {
+                if off < end_abs {
+                    self.source_marks.pop_front();
                 } else {
                     break;
                 }
@@ -334,7 +392,7 @@ impl Mpeg2Parser {
         let mut running = 0u64;
         for &i in &order {
             cum_before[i] = running;
-            running += self.gop_buf[i].nb_fields as u64;
+            running += self.gop_buf[i].info.nb_fields() as u64;
         }
         let gop_fields = running;
         let base = self.emitted_fields;
@@ -348,7 +406,7 @@ impl Mpeg2Parser {
         let origin = self.origin_pts_ns.unwrap_or(0);
         for (i, mut bp) in self.gop_buf.drain(..).enumerate() {
             bp.frame.pts_ns = origin + field_period * (base + cum_before[i]) as i64;
-            bp.frame.duration_ns = Some(bp.nb_fields as u64 * field_period as u64);
+            bp.frame.duration_ns = Some(bp.info.nb_fields() as u64 * field_period as u64);
             out.push(bp.frame);
         }
         self.emitted_fields += gop_fields;
@@ -367,6 +425,9 @@ impl CodecParser for Mpeg2Parser {
         let off = self.base_offset + self.buf.len() as u64;
         if let Some(ts) = pes.pts.or(pes.dts) {
             self.pts_marks.push_back((off, pts_to_ns(ts)));
+        }
+        if let Some(src) = pes.source {
+            self.source_marks.push_back((off, src));
         }
         self.buf.extend_from_slice(&pes.data);
         self.drain_complete_aus(false)
@@ -476,6 +537,46 @@ fn parse_aspect_ratio(hdr: &[u8]) -> Option<(u8, u8)> {
         return None;
     }
     Some(ASPECT_RATIOS[ar_code])
+}
+
+/// Extract the picture-coding-extension field/pulldown flags
+/// `(top_field_first, repeat_first_field, progressive_frame, frame_picture)`
+/// from a coded access unit (`00 00 01 B5`, ext-id `1000`), per ISO/IEC 13818-2
+/// §6.3.10. The four bits feed the codec-agnostic [`PictureInfo`]. Returns a
+/// progressive whole-frame default `(false, false, true, true)` when no picture
+/// coding extension is present (MPEG-1 / no interlace signalling), so the muxer
+/// omits `FieldOrder` rather than asserting a guess.
+fn picture_coding_flags(au: &[u8]) -> (bool, bool, bool, bool) {
+    let mut search = 0;
+    while let Some(q) = find_code(au, search, SEQ_EXT_CODE) {
+        search = q + 4;
+        // The picture coding extension is the B5 whose ext-id nibble is 1000.
+        if au.get(q + 4).map(|b| b >> 4) != Some(0b1000) {
+            continue;
+        }
+        // Extension bytes e2..=e4 = au[q+6 ..= q+8].
+        let (Some(&e2), Some(&e3), Some(&e4)) = (au.get(q + 6), au.get(q + 7), au.get(q + 8))
+        else {
+            break;
+        };
+        // picture_structure (e2 bits 1-0): 11 = frame picture; 01/10 = field.
+        let frame_picture = e2 & 0x03 == 0b11;
+        let tff = (e3 >> 7) & 1 == 1;
+        let rff = (e3 >> 1) & 1 == 1;
+        let progressive_frame = (e4 >> 7) & 1 == 1;
+        return (tff, rff, progressive_frame, frame_picture);
+    }
+    (false, false, true, true)
+}
+
+/// Map MPEG-2 `picture_coding_type` (ISO/IEC 13818-2 §6.3.8) to the
+/// codec-agnostic [`CodingType`]: 1 → I, 3 → B, else (2 = P, 4 = D) → P.
+fn coding_type_from_raw(raw: u8) -> CodingType {
+    match raw {
+        1 => CodingType::I,
+        3 => CodingType::B,
+        _ => CodingType::P,
+    }
 }
 
 /// Number of field-display periods a coded picture occupies, from its picture
@@ -588,6 +689,103 @@ mod tests {
     }
 
     #[test]
+    fn parser_populates_full_pictureinfo_and_source() {
+        use crate::mux::codec::coding::FieldOrder;
+        // Drive the REAL parser over three pictures that exercise EVERY facet of
+        // PictureInfo the parser measures (not just field order):
+        //   I: tff=1 rff=0 pf=0 → type I, TFF, 2 fields, !progressive, keyframe
+        //   P: tff=0 rff=0 pf=0 → type P, BFF, 2 fields, !progressive, !keyframe
+        //   B: tff=0 rff=1 pf=1 → type B, Progressive, 3 fields (2:3 pulldown),
+        //                         progressive, !keyframe
+        // ...and assert the byte-exact source provenance rides every frame.
+        // Each picture in its OWN PES with its OWN source stamp — the realistic
+        // shape (real DVD video is one picture across many PES, each stamped), so
+        // every picture's frame carries the provenance of its packet.
+        let mk_pes = |data: Vec<u8>, byte: u64| PesPacket {
+            source: Some(crate::pes::SourcePos::at_byte(byte)),
+            pid: 0x1011,
+            pts: None,
+            dts: None,
+            data,
+        };
+        let mut p = Mpeg2Parser::new();
+        let mut frames = Vec::new();
+        // I-picture (with the seq header) @ source byte 0.
+        let mut au = make_seq_header(720, 576, 3, 3); // interlaced 16:9 25fps
+        au.extend_from_slice(&make_picture_header(1));
+        au.extend_from_slice(&pic_coding_ext(1, 0, 0, true));
+        frames.extend(p.parse(&mk_pes(au, 0)));
+        // P-picture @ source byte 2048.
+        let mut au = make_picture_header(2);
+        au.extend_from_slice(&pic_coding_ext(0, 0, 0, true));
+        frames.extend(p.parse(&mk_pes(au, 2048)));
+        // B-picture @ source byte 4096.
+        let mut au = make_picture_header(3);
+        au.extend_from_slice(&pic_coding_ext(0, 1, 1, true));
+        frames.extend(p.parse(&mk_pes(au, 4096)));
+        frames.extend(p.flush());
+        assert_eq!(frames.len(), 3, "three pictures → three frames");
+
+        // Every frame carries PictureInfo and the SourcePos its PES stamped.
+        for f in &frames {
+            assert!(f.coding.is_some(), "every MPEG-2 frame carries PictureInfo");
+            assert!(
+                f.source.is_some(),
+                "every frame carries SourcePos provenance"
+            );
+        }
+        let frame = |t: CodingType| {
+            frames
+                .iter()
+                .find(|f| f.coding.unwrap().coding_type() == t)
+                .unwrap_or_else(|| panic!("no {t:?} frame"))
+        };
+
+        let i = frame(CodingType::I);
+        assert_eq!(
+            i.source.unwrap().byte,
+            0,
+            "I frame keeps its PES source @ 0"
+        );
+        let ic = i.coding.unwrap();
+        assert!(ic.keyframe(), "I picture is a keyframe");
+        assert_eq!(ic.field_order(), Some(FieldOrder::Tff), "tff=1 → TFF");
+        assert_eq!(ic.nb_fields(), 2, "normal interlaced frame = 2 fields");
+        assert_eq!(ic.progressive(), Some(false));
+
+        let pp = frame(CodingType::P);
+        assert_eq!(
+            pp.source.unwrap().byte,
+            2048,
+            "P frame keeps its PES source"
+        );
+        let pc = pp.coding.unwrap();
+        assert!(!pc.keyframe());
+        assert_eq!(
+            pc.field_order(),
+            Some(FieldOrder::Bff),
+            "tff=0 interlaced frame → BFF (the red-flag fix)"
+        );
+        assert_eq!(pc.nb_fields(), 2);
+
+        let b = frame(CodingType::B);
+        assert_eq!(b.source.unwrap().byte, 4096, "B frame keeps its PES source");
+        let bc = b.coding.unwrap();
+        assert!(!bc.keyframe());
+        assert_eq!(
+            bc.field_order(),
+            Some(FieldOrder::Progressive),
+            "progressive_frame → Progressive (no field order)"
+        );
+        assert_eq!(
+            bc.nb_fields(),
+            3,
+            "rff + progressive_frame in interlaced seq → 2:3 pulldown = 3 fields"
+        );
+        assert_eq!(bc.progressive(), Some(true));
+    }
+
+    #[test]
     fn progressive_sequence_parsed_from_seq_ext() {
         // Sequence extension: 00 00 01 B5, e0 ext-id 0001 (0x1_), e1 bit3 = progressive_sequence.
         assert!(parse_progressive_sequence(&[
@@ -619,6 +817,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1011,
             pts,
             dts: None,
@@ -1211,6 +1410,7 @@ mod tests {
         let mut data = make_picture_header(PICTURE_TYPE_I);
         data.extend_from_slice(&[0xFF; 4]);
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: Some(90000),
@@ -1223,6 +1423,7 @@ mod tests {
         let mut data2 = make_picture_header(PICTURE_TYPE_I);
         data2.extend_from_slice(&[0xFF; 4]);
         let pes2 = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: None,

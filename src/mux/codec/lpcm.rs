@@ -72,6 +72,8 @@ impl CodecParser for LpcmParser {
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns,
             keyframe: true,
             data: pes.data[offset..].to_vec(),
@@ -91,6 +93,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1100,
             pts,
             dts: None,

@@ -832,7 +832,6 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         })
     }
@@ -874,6 +873,8 @@ mod tests {
         let mut w = AnnexBWriter::new(Codec::H264, None);
         let mut out = Vec::new();
         let f = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -901,6 +902,8 @@ mod tests {
         let mut w = AnnexBWriter::new(Codec::H264, Some(&rec));
         let mut out = Vec::new();
         let f1 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -920,6 +923,8 @@ mod tests {
         // Second frame: NO param re-prepend.
         let mut out2 = Vec::new();
         let f2 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: false,
@@ -1000,6 +1005,8 @@ mod tests {
         pcs.extend_from_slice(&[0x07, 0x80, 0x04, 0x38]); // 1920x1080
         pcs.extend_from_slice(&[0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01]); // 1 object
         let f = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 1_000_000_000, // 1s
             keyframe: true,
@@ -1043,6 +1050,8 @@ mod tests {
     fn pgs_frame_without_duration_emits_no_clear() {
         // No duration → no synthetic clear (the subtitle's wipe time is unknown).
         let f = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -1080,6 +1089,8 @@ mod tests {
         let mut w = VobSubWriter::new(idx.clone(), Some(b"palette: 000000, ffffff"), "eng");
         let mut sub = Vec::new();
         let f1 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -1087,6 +1098,8 @@ mod tests {
             duration_ns: None,
         };
         let f2 = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 1_000_000_000,
             keyframe: true,
@@ -1176,6 +1189,8 @@ mod tests {
 
         // Video frame (track 0) and audio frame (track 1).
         sink.write(&PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,
@@ -1184,6 +1199,8 @@ mod tests {
         })
         .unwrap();
         sink.write(&PesFrame {
+            coding: None,
+            source: None,
             track: 1,
             pts: 100_000_000, // audio 100ms late
             keyframe: true,
@@ -1216,6 +1233,8 @@ mod tests {
         };
         let mut sink = DemuxSink::create(&dir, &title, &opts).unwrap();
         sink.write(&PesFrame {
+            coding: None,
+            source: None,
             track: 1,
             pts: 0,
             keyframe: true,
