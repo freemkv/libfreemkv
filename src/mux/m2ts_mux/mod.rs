@@ -76,15 +76,18 @@ const PCR_INTERVAL_PACKETS: u64 = 40;
 /// the picture it timestamps. 200 ms in 90 kHz ticks.
 const PCR_LEAD_90KHZ: u64 = 90_000 / 5;
 
+// PMT stream-type codes. These are the same elementary-stream coding-type
+// registry as the parse side; the single source of truth is `consts::coding_type`.
+use crate::consts::coding_type;
 /// HEVC stream-type code, ISO/IEC 13818-1 Table 2-34 (2015 amendment).
-const STREAM_TYPE_HEVC: u8 = 0x24;
+const STREAM_TYPE_HEVC: u8 = coding_type::HEVC;
 /// AC-3 / E-AC-3. Not an ISO assignment — sits in the user-private
 /// 0x80-0xFF range and is the Blu-ray Disc Association / ATSC A/52
 /// convention.
-const STREAM_TYPE_AC3: u8 = 0x81;
+const STREAM_TYPE_AC3: u8 = coding_type::AC3;
 /// Dolby TrueHD. Also a private/BD-conventional value in the
 /// user-private 0x80-0xFF range, not an ISO assignment.
-const STREAM_TYPE_TRUEHD: u8 = 0x83;
+const STREAM_TYPE_TRUEHD: u8 = coding_type::TRUEHD;
 
 /// Audio codec hint for [`M2tsMux::new`] / [`M2tsMux::set_audio`]. The
 /// muxer needs to know the codec to pick the right PMT `stream_type`
@@ -420,7 +423,12 @@ impl<W: Write> M2tsMux<W> {
 
 /// Build a PES packet for a video access unit.
 fn build_video_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
-    build_pes_packet(0xE0, pts_90k, es, /* length_in_header */ false)
+    build_pes_packet(
+        crate::consts::pes_stream_id::VIDEO,
+        pts_90k,
+        es,
+        /* length_in_header */ false,
+    )
 }
 
 /// Build a PES packet for an audio access unit.
@@ -430,7 +438,12 @@ fn build_audio_pes(pts_90k: u64, es: &[u8]) -> Vec<u8> {
     // start code. For an access unit larger than ~64 KiB (rare — e.g. a
     // large TrueHD frame) the length field falls back to the unbounded
     // (0x0000) form, which most demuxers tolerate for private_stream_1.
-    build_pes_packet(0xBD, pts_90k, es, /* length_in_header */ true)
+    build_pes_packet(
+        crate::consts::pes_stream_id::PRIVATE_STREAM_1,
+        pts_90k,
+        es,
+        /* length_in_header */ true,
+    )
 }
 
 fn build_pes_packet(stream_id: u8, pts_90k: u64, es: &[u8], length_in_header: bool) -> Vec<u8> {

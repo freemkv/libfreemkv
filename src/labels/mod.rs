@@ -634,6 +634,7 @@ fn append_clpi_orphans(
     reader: &mut dyn SectorSource,
     udf: &UdfFs,
 ) -> usize {
+    use crate::consts::coding_type as c;
     // Index existing labels by PID — but StreamLabel doesn't carry
     // PID. Index by (type, language, codec_hint) tuple instead; this
     // is fuzzier than PID matching but the only signal available
@@ -679,9 +680,11 @@ fn append_clpi_orphans(
             // Interactive Graphics (BD-J menu overlay), NOT a user-facing
             // subtitle — skip it, matching the MPLS path which drops IG.
             let stype = match s.coding_type {
-                0x80..=0x86 | 0xA1 | 0xA2 => StreamLabelType::Audio,
-                0x90 => StreamLabelType::Subtitle,
-                _ => continue, // 0x91 IG / video / unknown — skip
+                c::LPCM..=c::DTS_HD_MA | c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
+                    StreamLabelType::Audio
+                }
+                c::PG => StreamLabelType::Subtitle,
+                _ => continue, // IG / video / unknown — skip
             };
             // Same dedup logic as MPLS: normalize language, build codec
             // hint, check against existing label set.

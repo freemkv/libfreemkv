@@ -227,21 +227,22 @@ pub(crate) fn language_display_name(iso: &str) -> String {
 /// bytes (the table covers everything the spec defines, but unknown
 /// values are still possible on malformed discs).
 pub(crate) fn codec_name(coding_type: u8) -> &'static str {
+    use crate::consts::coding_type as c;
     match coding_type {
-        0x02 => "MPEG-2",
-        0x1B => "H.264",
-        0x24 => "HEVC",
-        0x80 => "LPCM",
-        0x81 => "AC-3",
-        0x82 => "DTS",
-        0x83 => "TrueHD",
-        0x84 => "AC-3+",
-        0x85 => "DTS-HD HR", // BD-ROM Part 3-1: 0x85 = DTS-HD High Resolution
-        0x86 => "DTS-HD MA",
-        0x90 => "PG",
-        0x91 => "IG",
-        0xA1 => "AC-3+ Secondary",
-        0xA2 => "DTS-HD Secondary",
+        c::MPEG2_VIDEO => "MPEG-2",
+        c::H264 => "H.264",
+        c::HEVC => "HEVC",
+        c::LPCM => "LPCM",
+        c::AC3 => "AC-3",
+        c::DTS => "DTS",
+        c::TRUEHD => "TrueHD",
+        c::AC3_PLUS => "AC-3+",
+        c::DTS_HD_HR => "DTS-HD HR", // BD-ROM Part 3-1: 0x85 = DTS-HD High Resolution
+        c::DTS_HD_MA => "DTS-HD MA",
+        c::PG => "PG",
+        c::IG => "IG",
+        c::AC3_PLUS_SECONDARY => "AC-3+ Secondary",
+        c::DTS_HD_SECONDARY => "DTS-HD Secondary",
         _ => "",
     }
 }

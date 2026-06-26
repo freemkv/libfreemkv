@@ -6,7 +6,7 @@
 //!
 //! Reference: https://github.com/lw/BluRay/wiki/CLPI
 
-use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
+use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES_U64};
 use crate::disc::Extent;
 use crate::error::{Error, Result};
 
@@ -175,8 +175,8 @@ impl ClipInfo {
         // a sub-sector-aligned range still spans every sector it touches.
         let start_byte = start_spn as u64 * BD_SOURCE_PACKET_BYTES as u64;
         let end_byte = end_spn as u64 * BD_SOURCE_PACKET_BYTES as u64;
-        let start_sector = (start_byte / SECTOR_BYTES as u64) as u32;
-        let end_sector = end_byte.div_ceil(SECTOR_BYTES as u64) as u32;
+        let start_sector = (start_byte / SECTOR_BYTES_U64) as u32;
+        let end_sector = end_byte.div_ceil(SECTOR_BYTES_U64) as u32;
 
         vec![Extent {
             start_lba: start_sector, // relative to m2ts file start
@@ -261,6 +261,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 /// errors because the EP map is the primary CLPI output, and a corrupt
 /// program_info shouldn't break sector-range lookups.
 fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
+    use crate::consts::coding_type as c;
     let mut out = Vec::new();
     if data.len() < 6 {
         return out;
@@ -299,16 +300,15 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
             let mut language = String::new();
 
             match coding_type {
-                // Video — MPEG-2 (0x02), H.264 (0x1B), HEVC (0x24)
-                0x02 | 0x1B | 0x24 => {
+                // Video — MPEG-2, H.264, HEVC
+                c::MPEG2_VIDEO | c::H264 | c::HEVC => {
                     if sci.len() >= 2 {
                         video_format = (sci[1] >> 4) & 0x0F;
                         video_rate = sci[1] & 0x0F;
                     }
                 }
-                // Primary audio — LPCM(0x80), AC-3(0x81), DTS(0x82),
-                // TrueHD(0x83), AC-3+(0x84), DTS-HD(0x85), DTS-HD MA(0x86)
-                0x80..=0x86 => {
+                // Primary audio — LPCM, AC-3, DTS, TrueHD, AC-3+, DTS-HD HR, DTS-HD MA
+                c::LPCM..=c::DTS_HD_MA => {
                     if sci.len() >= 2 {
                         audio_format = (sci[1] >> 4) & 0x0F;
                         audio_rate = sci[1] & 0x0F;
@@ -317,8 +317,8 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
                         language = String::from_utf8_lossy(&sci[2..5]).to_string();
                     }
                 }
-                // Secondary audio (0xA1 AC-3+, 0xA2 DTS-HD)
-                0xA1 | 0xA2 => {
+                // Secondary audio (AC-3+ secondary, DTS-HD secondary)
+                c::AC3_PLUS_SECONDARY | c::DTS_HD_SECONDARY => {
                     if sci.len() >= 2 {
                         audio_format = (sci[1] >> 4) & 0x0F;
                         audio_rate = sci[1] & 0x0F;
@@ -327,8 +327,8 @@ fn parse_program_info(data: &[u8]) -> Vec<ClpiStream> {
                         language = String::from_utf8_lossy(&sci[2..5]).to_string();
                     }
                 }
-                // PG (0x90), IG (0x91): coding_type + 3-byte language [+ char_code for PG]
-                0x90 | 0x91 => {
+                // PG, IG: coding_type + 3-byte language [+ char_code for PG]
+                c::PG | c::IG => {
                     if sci.len() >= 4 {
                         language = String::from_utf8_lossy(&sci[1..4]).to_string();
                     }
@@ -1125,8 +1125,8 @@ mod tests {
         let end_spn = big_spn as u64;
         let start_byte = start_spn * BD_SOURCE_PACKET_BYTES as u64;
         let end_byte = end_spn * BD_SOURCE_PACKET_BYTES as u64;
-        let start_sector = (start_byte / SECTOR_BYTES as u64) as u32;
-        let end_sector = end_byte.div_ceil(SECTOR_BYTES as u64) as u32;
+        let start_sector = (start_byte / SECTOR_BYTES_U64) as u32;
+        let end_sector = end_byte.div_ceil(SECTOR_BYTES_U64) as u32;
         assert_eq!(extents[0].start_lba, start_sector);
         assert_eq!(extents[0].sector_count, end_sector - start_sector);
         // Concretely: 0x20000 × 192 / 2048 = 12288 sectors.

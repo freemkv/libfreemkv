@@ -627,28 +627,29 @@ impl Codec {
     ];
 
     pub(crate) fn from_coding_type(ct: u8) -> Self {
+        use crate::consts::coding_type as c;
         match ct {
-            0x24 => Codec::Hevc,
-            0x1B => Codec::H264,
-            0xEA => Codec::Vc1,
-            0x02 => Codec::Mpeg2,
-            0x83 => Codec::TrueHd,
-            0x86 => Codec::DtsHdMa,
-            0x85 => Codec::DtsHdHr,
-            0x82 => Codec::Dts,
-            0x81 => Codec::Ac3,
-            0x84 | 0xA1 => Codec::Ac3Plus,
-            0x80 => Codec::Lpcm,
-            // 0x86 (primary) / 0xA2 (secondary) are the DTS-HD MA
-            // lossless pair, parallel to 0x81/0xA1 for AC-3. 0xA2 is
-            // lossless MA, not lossy HR.
-            0xA2 => Codec::DtsHdMa,
-            // 0x90 = Presentation Graphics (PG / subtitles). 0x91 = Interactive
-            // Graphics (IG / menus) and 0x92 = Text subtitles are distinct HDMV
-            // coding types and are NOT PG subtitle streams; only 0x90 maps to
-            // Pgs. IG (0x91) falls through to Unknown so the PMT/STN walker drops
-            // it rather than surfacing a bogus PGS subtitle track for a menu ES.
-            0x90 => Codec::Pgs,
+            c::HEVC => Codec::Hevc,
+            c::H264 => Codec::H264,
+            c::VC1 => Codec::Vc1,
+            c::MPEG2_VIDEO => Codec::Mpeg2,
+            c::TRUEHD => Codec::TrueHd,
+            c::DTS_HD_MA => Codec::DtsHdMa,
+            c::DTS_HD_HR => Codec::DtsHdHr,
+            c::DTS => Codec::Dts,
+            c::AC3 => Codec::Ac3,
+            c::AC3_PLUS | c::AC3_PLUS_SECONDARY => Codec::Ac3Plus,
+            c::LPCM => Codec::Lpcm,
+            // DTS_HD_MA (primary 0x86) / DTS_HD_SECONDARY (0xA2) are the
+            // DTS-HD MA lossless pair, parallel to AC3/AC3_PLUS_SECONDARY for
+            // AC-3. The secondary code is lossless MA, not lossy HR.
+            c::DTS_HD_SECONDARY => Codec::DtsHdMa,
+            // PG (0x90) = Presentation Graphics (subtitles). IG (0x91, menus)
+            // and TEXT_SUBTITLE (0x92) are distinct HDMV coding types and are
+            // NOT PG subtitle streams; only PG maps to Pgs. IG falls through to
+            // Unknown so the PMT/STN walker drops it rather than surfacing a
+            // bogus PGS subtitle track for a menu ES.
+            c::PG => Codec::Pgs,
             ct => Codec::Unknown(ct),
         }
     }
@@ -5068,8 +5069,8 @@ mod tests {
         let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).expect("load mapfile");
         let good = mf.ranges_with(&[SectorStatus::Finished]);
         let bad_ranges = mf.ranges_with(&[SectorStatus::NonTrimmed]);
-        let disc_bytes = sectors as u64 * 2048;
-        const SEC: u64 = crate::consts::SECTOR_BYTES as u64;
+        const SEC: u64 = crate::consts::SECTOR_BYTES_U64;
+        let disc_bytes = sectors as u64 * SEC;
 
         // The first failing batch starts at LBA 320; everything before it read
         // cleanly and must be Finished.

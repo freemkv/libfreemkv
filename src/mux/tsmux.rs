@@ -312,11 +312,12 @@ impl<W: Write> TsMuxer<W> {
 
 /// Build a PES packet header for a BD stream.
 fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
+    use crate::consts::pes_stream_id;
     // Determine stream_id from PID range
     let stream_id: u8 = if is_video_pid(pid) {
-        0xE0 // video
+        pes_stream_id::VIDEO
     } else {
-        0xBD // audio, PGS subtitle, or default (private stream 1)
+        pes_stream_id::PRIVATE_STREAM_1 // audio, PGS subtitle, or default
     };
 
     let pes_data_len = data_len + 8; // 3 header bytes + 5 PTS bytes + data
@@ -332,7 +333,7 @@ fn build_pes_header(pid: u16, pts_90k: u64, data_len: usize) -> Vec<u8> {
     // video; `write_frame` splits oversized 0xBD access units so a private
     // stream always fits a bounded u16 length here. The `> 65535` arm
     // remains a defensive fallback for video only.
-    if stream_id == 0xE0 || pes_data_len > 65535 {
+    if stream_id == pes_stream_id::VIDEO || pes_data_len > u16::MAX as usize {
         header.push(0x00);
         header.push(0x00);
     } else {
