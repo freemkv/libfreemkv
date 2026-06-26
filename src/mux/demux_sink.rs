@@ -23,6 +23,8 @@
 //! The sink does NOT touch the MKV mux path; it is purely additive.
 
 use crate::disc::{Chapter, Codec, DiscTitle, Stream as DiscStream};
+use crate::mux::hevc::{append_length_prefixed_as_annex_b, avcc_to_annex_b, hvcc_to_annex_b};
+use crate::mux::timeline::TimelineContinuity;
 use crate::pes::{PesFrame, Stream};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -189,8 +191,6 @@ impl EsWriter for PassthroughWriter {
     }
 }
 
-const ANNEXB_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
-
 /// HEVC/H.264 writer: reframes 4-byte-length-prefixed NALs (the hvcC/avcC form
 /// the parsers emit) into Annex-B, prepending the parameter sets once.
 struct AnnexBWriter {
@@ -223,117 +223,29 @@ impl EsWriter for AnnexBWriter {
             }
             self.wrote_params = true;
         }
-        n += length_prefixed_to_annexb(&f.data, w)?;
+        // Reframe via the canonical length-prefixed→Annex-B converter (single
+        // source of truth across all muxers — see `crate::mux::hevc`). It skips
+        // zero-length NALs and drops a truncated trailing NAL without panicking,
+        // rather than `break`ing on the first zero-length NAL.
+        let mut scratch = Vec::with_capacity(f.data.len() + (f.data.len() / 32) + 4);
+        append_length_prefixed_as_annex_b(&mut scratch, &f.data);
+        w.write_all(&scratch)?;
+        n += scratch.len();
         Ok(n)
     }
-}
-
-/// Convert a buffer of 4-byte big-endian length-prefixed NAL units to Annex-B
-/// (each NAL prefixed with `00 00 00 01`). Returns bytes written. A malformed
-/// length (running past the buffer) stops the walk cleanly rather than panic.
-fn length_prefixed_to_annexb(data: &[u8], w: &mut dyn Write) -> io::Result<usize> {
-    let mut pos = 0;
-    let mut written = 0;
-    while pos + 4 <= data.len() {
-        let len =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-        if len == 0 || pos + len > data.len() {
-            // Truncated / malformed length prefix: stop the walk. Emitting a
-            // partial NAL would corrupt the stream worse than dropping the tail.
-            break;
-        }
-        w.write_all(&ANNEXB_START)?;
-        w.write_all(&data[pos..pos + len])?;
-        written += ANNEXB_START.len() + len;
-        pos += len;
-    }
-    Ok(written)
 }
 
 /// Extract the parameter-set NALs from an hvcC (HEVC) or avcC (H.264)
 /// configuration record and return them as a single Annex-B blob
 /// (`00 00 00 01 | NAL …`). Returns an empty Vec if the record can't be parsed.
+/// Delegates to the canonical hvcC/avcC → Annex-B converters in
+/// [`crate::mux::hevc`] — the single source of truth across all muxers.
 fn annexb_param_sets(codec: Codec, record: &[u8]) -> Vec<u8> {
     match codec {
-        Codec::Hevc => hvcc_param_sets(record),
-        Codec::H264 => avcc_param_sets(record),
+        Codec::Hevc => hvcc_to_annex_b(record).unwrap_or_default(),
+        Codec::H264 => avcc_to_annex_b(record).unwrap_or_default(),
         _ => Vec::new(),
     }
-}
-
-/// Parse VPS/SPS/PPS arrays out of an HEVCDecoderConfigurationRecord.
-/// Layout: 22-byte fixed header, then `numOfArrays` (u8); per array:
-/// `array_completeness|NAL_type` (u8), `numNalus` (u16 BE); per NAL:
-/// `nalUnitLength` (u16 BE) + bytes.
-fn hvcc_param_sets(rec: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    if rec.len() < 23 {
-        return out;
-    }
-    let num_arrays = rec[22] as usize;
-    let mut pos = 23;
-    for _ in 0..num_arrays {
-        if pos + 3 > rec.len() {
-            break;
-        }
-        // rec[pos] = array_completeness(1) | reserved(1) | NAL_unit_type(6)
-        pos += 1;
-        let num_nalus = u16::from_be_bytes([rec[pos], rec[pos + 1]]) as usize;
-        pos += 2;
-        for _ in 0..num_nalus {
-            if pos + 2 > rec.len() {
-                return out;
-            }
-            let nlen = u16::from_be_bytes([rec[pos], rec[pos + 1]]) as usize;
-            pos += 2;
-            if pos + nlen > rec.len() {
-                return out;
-            }
-            out.extend_from_slice(&ANNEXB_START);
-            out.extend_from_slice(&rec[pos..pos + nlen]);
-            pos += nlen;
-        }
-    }
-    out
-}
-
-/// Parse SPS/PPS out of an AVCDecoderConfigurationRecord.
-/// Layout: 5-byte fixed header, `numOfSPS`(u8, low 5 bits); per SPS:
-/// length(u16 BE) + bytes; `numOfPPS`(u8); per PPS: length(u16 BE) + bytes.
-fn avcc_param_sets(rec: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    if rec.len() < 6 {
-        return out;
-    }
-    let num_sps = (rec[5] & 0x1F) as usize;
-    let mut pos = 6;
-    let take = |count: usize, pos: &mut usize, out: &mut Vec<u8>| -> bool {
-        for _ in 0..count {
-            if *pos + 2 > rec.len() {
-                return false;
-            }
-            let nlen = u16::from_be_bytes([rec[*pos], rec[*pos + 1]]) as usize;
-            *pos += 2;
-            if *pos + nlen > rec.len() {
-                return false;
-            }
-            out.extend_from_slice(&ANNEXB_START);
-            out.extend_from_slice(&rec[*pos..*pos + nlen]);
-            *pos += nlen;
-        }
-        true
-    };
-    if !take(num_sps, &mut pos, &mut out) {
-        return out;
-    }
-    if pos >= rec.len() {
-        return out;
-    }
-    let num_pps = rec[pos] as usize;
-    pos += 1;
-    take(num_pps, &mut pos, &mut out);
-    out
 }
 
 /// PGS `.sup` writer: rebuilds the HDMV segment framing the parser stripped.
@@ -346,6 +258,27 @@ fn avcc_param_sets(rec: &[u8]) -> Vec<u8> {
 /// When the parser folded a trailing clear (`duration_ns` set), we re-emit it as
 /// an empty composition at `pts + duration` so players time the subtitle out.
 struct PgsSupWriter;
+
+// ── PGS / HDMV segment framing constants ─────────────────────────────────────
+// HDMV Presentation Graphics Stream, as published in the Blu-ray Disc
+// Read-Only Format (BD-ROM) Part 3 graphics-stream specification (and the
+// public US 2009/0185789 A1 application that documents the segment layout).
+
+/// `.sup` per-segment magic: ASCII "PG" (0x50 0x47) starting each segment's
+/// 13-byte header (magic | PTS u32 BE | DTS u32 BE) in a PGStream `.sup` file.
+const SUP_MAGIC: [u8; 2] = [0x50, 0x47];
+/// Size in bytes of the `.sup` per-segment header (magic 2 + PTS 4 + DTS 4).
+const SUP_HEADER_LEN: usize = SUP_MAGIC.len() + 4 + 4;
+/// PGS segment type: Presentation Composition Segment (PCS).
+const SEG_PCS: u8 = 0x16;
+/// PGS segment type: END of display set.
+const SEG_END: u8 = 0x80;
+/// PCS `composition_state` value: Epoch Start (a fresh display).
+const PCS_COMPOSITION_STATE_EPOCH_START: u8 = 0x80;
+/// PGS segment header on the wire (inside `frame.data`): type(1) + size(2 BE).
+const PGS_SEG_HEADER_LEN: usize = 3;
+/// Byte offset of `width`/`height` within a PCS segment (after type+size).
+const PCS_WIDTH_OFFSET: usize = PGS_SEG_HEADER_LEN; // 3
 
 /// 90 kHz ticks from nanoseconds (saturating into u32 for the `.sup` header).
 fn ns_to_90k(pts_ns: i64) -> u32 {
@@ -369,27 +302,94 @@ impl PgsSupWriter {
         let mut pos = 0;
         let mut written = 0;
         // Each PGS segment in the payload is: type(1) + size(2 BE) + size bytes.
-        while pos + 3 <= data.len() {
+        while pos + PGS_SEG_HEADER_LEN <= data.len() {
             let size = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
-            let seg_end = pos + 3 + size;
+            let seg_end = pos + PGS_SEG_HEADER_LEN + size;
             if seg_end > data.len() {
                 break;
             }
-            w.write_all(&[0x50, 0x47])?; // "PG"
+            w.write_all(&SUP_MAGIC)?;
             w.write_all(&pts90k.to_be_bytes())?;
             w.write_all(&dts90k.to_be_bytes())?;
             w.write_all(&data[pos..seg_end])?;
-            written += 13 + size;
+            written += SUP_HEADER_LEN + size;
             pos = seg_end;
         }
         Ok(written)
+    }
+
+    /// Build a synthetic "clear" display set: an empty PCS (0 composition
+    /// objects) followed by an END segment. The parser folds the original
+    /// clear/end PCS pair's wipe time into the display frame's `duration_ns`
+    /// and drops the clear bytes, so a faithful `.sup` re-emits one here at
+    /// `display_pts + duration`. Without it every subtitle lingers to EOF.
+    ///
+    /// `width`/`height` are carried from the display set's PCS so the clear PCS
+    /// advertises the same video geometry; they don't affect the wipe but keep
+    /// the segment well-formed.
+    ///
+    /// Returned bytes are concatenated `type(1)+size(2 BE)+payload` segments,
+    /// the same shape [`emit_segments`] consumes.
+    fn synthetic_clear_display_set(width: u16, height: u16) -> Vec<u8> {
+        // Empty PCS payload (HDMV PGS, BD-ROM Part 3): width(2) height(2)
+        // frame_rate(1) composition_number(2) composition_state(1)
+        // palette_update_flag(1) palette_id(1) number_of_composition_objects(1).
+        const PCS_FRAME_RATE: u8 = 0x10; // reserved high nibble | rate code
+        const PCS_NO_OBJECTS: u8 = 0x00; // number_of_composition_objects = 0
+        let [w_hi, w_lo] = width.to_be_bytes();
+        let [h_hi, h_lo] = height.to_be_bytes();
+        let pcs_payload = [
+            w_hi,
+            w_lo,
+            h_hi,
+            h_lo,
+            PCS_FRAME_RATE,
+            0x00,
+            0x00, // composition_number
+            PCS_COMPOSITION_STATE_EPOCH_START,
+            0x00, // palette_update_flag
+            0x00, // palette_id
+            PCS_NO_OBJECTS,
+        ];
+        let mut out = Vec::with_capacity(PGS_SEG_HEADER_LEN * 2 + pcs_payload.len());
+        out.push(SEG_PCS);
+        out.extend_from_slice(&(pcs_payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&pcs_payload);
+        // END segment: type SEG_END, zero-length payload.
+        out.push(SEG_END);
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    }
+
+    /// Read the (width, height) the display set's first PCS advertises, if the
+    /// frame starts with a PCS carrying them; else `(0, 0)`.
+    fn pcs_dimensions(data: &[u8]) -> (u16, u16) {
+        // segment: type(1) size(2) payload; PCS payload begins width(2) height(2).
+        if data.len() >= PCS_WIDTH_OFFSET + 4 && data[0] == SEG_PCS {
+            let w = u16::from_be_bytes([data[PCS_WIDTH_OFFSET], data[PCS_WIDTH_OFFSET + 1]]);
+            let h = u16::from_be_bytes([data[PCS_WIDTH_OFFSET + 2], data[PCS_WIDTH_OFFSET + 3]]);
+            (w, h)
+        } else {
+            (0, 0)
+        }
     }
 }
 
 impl EsWriter for PgsSupWriter {
     fn write_frame(&mut self, w: &mut dyn Write, f: &PesFrame, pts_ns: i64) -> io::Result<usize> {
         let pts90 = ns_to_90k(pts_ns);
-        Self::emit_segments(&f.data, pts90, pts90, w)
+        let mut written = Self::emit_segments(&f.data, pts90, pts90, w)?;
+        // The parser folds the display/clear PCS pair's wipe time into
+        // `duration_ns` and drops the clear bytes. Re-emit a synthetic clear
+        // display set at `pts + duration` so the subtitle is timed out instead
+        // of lingering to EOF.
+        if let Some(dur) = f.duration_ns {
+            let clear_pts = ns_to_90k(pts_ns.saturating_add(dur as i64));
+            let (w_px, h_px) = Self::pcs_dimensions(&f.data);
+            let clear = Self::synthetic_clear_display_set(w_px, h_px);
+            written += Self::emit_segments(&clear, clear_pts, clear_pts, w)?;
+        }
+        Ok(written)
     }
 }
 
@@ -399,20 +399,27 @@ struct VobSubWriter {
     idx_path: PathBuf,
     /// Pre-formatted `.idx` palette header line bytes, if available.
     palette_line: Option<String>,
+    /// Two-letter language id for the `.idx` `id:` line (empty = omit).
+    lang2: String,
     entries: Vec<(i64, u64)>,
     pos: u64,
 }
 
 impl VobSubWriter {
-    fn new(idx_path: PathBuf, codec_private: Option<&[u8]>) -> Self {
+    fn new(idx_path: PathBuf, codec_private: Option<&[u8]>, lang: &str) -> Self {
         // codec_private for DvdSub is the pre-formatted VobSub `.idx` palette
         // header (UTF-8). Carry it through verbatim if present.
         let palette_line = codec_private
             .and_then(|b| std::str::from_utf8(b).ok())
             .map(|s| s.trim_end().to_string());
+        // VobSub `id:` lines use a 2-letter code; stream languages are ISO
+        // 639-2 (3-letter). Take the leading two chars — the convention
+        // mkvmerge reads to assign a track language.
+        let lang2: String = lang.chars().take(2).collect();
         Self {
             idx_path,
             palette_line,
+            lang2,
             entries: Vec::new(),
             pos: 0,
         }
@@ -435,6 +442,14 @@ impl EsWriter for VobSubWriter {
             idx.push('\n');
         }
         idx.push_str("langidx: 0\n\n");
+        // The conventional `id: <lang2>, index: 0` line mkvmerge reads to
+        // assign the subtitle track's language. Omit the language token when
+        // unknown but still emit the index so the entry list is well-formed.
+        if self.lang2.is_empty() {
+            idx.push_str("id: , index: 0\n");
+        } else {
+            idx.push_str(&format!("id: {}, index: 0\n", self.lang2));
+        }
         for (pts_ns, filepos) in &self.entries {
             idx.push_str(&format!(
                 "timestamp: {}, filepos: {:09x}\n",
@@ -462,6 +477,7 @@ fn es_writer_for(
     codec: Codec,
     codec_private: Option<&[u8]>,
     idx_path: Option<PathBuf>,
+    lang: &str,
 ) -> Box<dyn EsWriter> {
     match codec {
         Codec::Hevc | Codec::H264 => Box::new(AnnexBWriter::new(codec, codec_private)),
@@ -469,55 +485,9 @@ fn es_writer_for(
         Codec::DvdSub => Box::new(VobSubWriter::new(
             idx_path.unwrap_or_else(|| PathBuf::from("subtitle.idx")),
             codec_private,
+            lang,
         )),
         _ => Box::new(PassthroughWriter),
-    }
-}
-
-// ── Timeline rebase (seamless-branch PTS continuity) ─────────────────────────
-
-/// Discontinuity threshold: a backward video-PTS jump larger than this opens a
-/// new epoch. Mirrors the MKV muxer's `DISCONTINUITY_BACKSTEP_NS` (3 s).
-const DISCONTINUITY_BACKSTEP_NS: i64 = 3_000_000_000;
-/// 1 ms seam gap inserted between epochs (mirrors the MKV muxer).
-const SEAM_GAP_NS: i64 = 1_000_000;
-
-/// Port of the MKV muxer's `TimelineContinuity` for the demux sink: track 0
-/// (primary video) drives epochs; a single global `offset_ns` is added to every
-/// track so A/V sync is preserved across clip seams in seamless-branched titles.
-struct TimelineRebase {
-    offset_ns: i64,
-    high_ns: i64,
-    started: bool,
-}
-
-impl TimelineRebase {
-    fn new() -> Self {
-        Self {
-            offset_ns: 0,
-            high_ns: 0,
-            started: false,
-        }
-    }
-
-    /// Map a raw concatenated PTS to a continuous one. Only track 0 opens
-    /// epochs; all tracks get the same global offset.
-    fn rebase(&mut self, track: usize, pts_ns: i64) -> i64 {
-        if track == 0 {
-            if !self.started {
-                self.started = true;
-                self.high_ns = pts_ns;
-            } else if pts_ns < self.high_ns - DISCONTINUITY_BACKSTEP_NS {
-                // Clip seam: shift this and following frames forward so the new
-                // epoch starts just after the previous high-water mark.
-                self.offset_ns += (self.high_ns - pts_ns) + SEAM_GAP_NS;
-            }
-            let out = pts_ns + self.offset_ns;
-            self.high_ns = self.high_ns.max(out);
-            out
-        } else {
-            pts_ns + self.offset_ns
-        }
     }
 }
 
@@ -640,7 +610,7 @@ pub struct DemuxSink {
     /// Index = track id; `None` for unselected tracks.
     tracks: Vec<Option<TrackOut>>,
     ref_video_track: Option<usize>,
-    timeline: TimelineRebase,
+    timeline: TimelineContinuity,
     finished: bool,
 }
 
@@ -685,7 +655,7 @@ impl DemuxSink {
                 None
             };
             let codec_private = title.codec_privates.get(idx).and_then(|o| o.as_deref());
-            let writer = es_writer_for(codec, codec_private, sidecar.clone());
+            let writer = es_writer_for(codec, codec_private, sidecar.clone(), &lang);
 
             let _ = sidecar; // sidecar path is owned by the VobSub writer
             tracks.push(Some(TrackOut {
@@ -703,7 +673,7 @@ impl DemuxSink {
             opts: opts.clone(),
             tracks,
             ref_video_track,
-            timeline: TimelineRebase::new(),
+            timeline: TimelineContinuity::new(),
             finished: false,
         })
     }
@@ -811,7 +781,9 @@ impl Stream for DemuxSink {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        let pts = self.timeline.rebase(frame.track, frame.pts);
+        // Track 0 (primary video) drives epoch decisions; every other track is a
+        // passive rider on the same global offset — see `TimelineContinuity`.
+        let pts = self.timeline.adjust(frame.pts, frame.track == 0);
         if let Some(Some(t)) = self.tracks.get_mut(frame.track) {
             t.first_pts_ns.get_or_insert(pts);
             t.writer.write_frame(&mut t.w, frame, pts)?;
@@ -885,51 +857,38 @@ mod tests {
     }
 
     // ── Annex-B reframing ────────────────────────────────────────────────────
+    //
+    // The length-prefixed → Annex-B conversion and the hvcC/avcC param-set
+    // extraction are exercised canonically in `crate::mux::hevc`; the sink
+    // delegates to those helpers. Here we only assert the sink-level wiring:
+    // param-set prepend and (crucially) that a zero-length NAL mid-frame no
+    // longer truncates the rest of the access unit.
 
     #[test]
-    fn length_prefixed_converts_to_annexb() {
-        // Two NALs: lengths 2 and 3.
-        let data = [0, 0, 0, 2, 0xAA, 0xBB, 0, 0, 0, 3, 0x01, 0x02, 0x03];
+    fn zero_length_nal_midframe_does_not_truncate_access_unit() {
+        // The OLD local reframer `break`d on a zero-length NAL, dropping every
+        // NAL after it. The canonical `append_length_prefixed_as_annex_b` skips
+        // just the empty NAL and keeps going. Frame: NAL(2) | NAL(0) | NAL(3).
+        let mut w = AnnexBWriter::new(Codec::H264, None);
         let mut out = Vec::new();
-        let n = length_prefixed_to_annexb(&data, &mut out).unwrap();
+        let f = PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![
+                0, 0, 0, 2, 0xAA, 0xBB, // NAL #1 (len 2)
+                0, 0, 0, 0, // zero-length NAL — must be skipped, not fatal
+                0, 0, 0, 3, 0x01, 0x02, 0x03, // NAL #3 (len 3) — must survive
+            ],
+            duration_ns: None,
+        };
+        w.write_frame(&mut out, &f, 0).unwrap();
+        // Both real NALs present; the empty NAL emitted nothing.
         assert_eq!(
             out,
-            vec![0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0x01, 0x02, 0x03]
+            vec![0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0x01, 0x02, 0x03],
+            "trailing NAL after a zero-length NAL must NOT be dropped"
         );
-        assert_eq!(n, out.len());
-    }
-
-    #[test]
-    fn length_prefixed_stops_on_truncation() {
-        // Declares length 5 but only 2 bytes follow → drop the bad tail.
-        let data = [0, 0, 0, 5, 0xAA, 0xBB];
-        let mut out = Vec::new();
-        length_prefixed_to_annexb(&data, &mut out).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn avcc_param_sets_extracted_as_annexb() {
-        // Minimal avcC: header(5) numSPS=1 spsLen=2 SPS=[0x67,0x42] numPPS=1
-        // ppsLen=1 PPS=[0x68].
-        let rec = [
-            1, 0x42, 0x00, 0x1F, 0xFF, 0xE1, 0, 2, 0x67, 0x42, 1, 0, 1, 0x68,
-        ];
-        let blob = avcc_param_sets(&rec);
-        assert_eq!(blob, vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68]);
-    }
-
-    #[test]
-    fn hvcc_param_sets_extracted_as_annexb() {
-        // hvcC: 22-byte header (we only need byte 22 = numArrays), then arrays.
-        let mut rec = vec![0u8; 22];
-        rec.push(2); // numArrays
-        // Array 1: type byte, numNalus=1, len=2, NAL=[0x40,0x01]
-        rec.extend_from_slice(&[0x20, 0, 1, 0, 2, 0x40, 0x01]);
-        // Array 2: type byte, numNalus=1, len=1, NAL=[0x42]
-        rec.extend_from_slice(&[0x21, 0, 1, 0, 1, 0x42]);
-        let blob = hvcc_param_sets(&rec);
-        assert_eq!(blob, vec![0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x42]);
     }
 
     #[test]
@@ -1020,14 +979,86 @@ mod tests {
     #[test]
     fn pgs_sup_frames_each_segment_with_pg_header() {
         // One segment: type=0x16, size=2, payload=[0xDE,0xAD].
-        let payload = [0x16, 0x00, 0x02, 0xDE, 0xAD];
+        let payload = [SEG_PCS, 0x00, 0x02, 0xDE, 0xAD];
         let mut out = Vec::new();
         let written = PgsSupWriter::emit_segments(&payload, 0x10, 0x10, &mut out).unwrap();
-        assert_eq!(&out[0..2], b"PG");
+        assert_eq!(&out[0..2], &SUP_MAGIC);
         assert_eq!(&out[2..6], &0x10u32.to_be_bytes()); // PTS
         assert_eq!(&out[6..10], &0x10u32.to_be_bytes()); // DTS
-        assert_eq!(&out[10..], &payload); // segment body verbatim
-        assert_eq!(written, 13 + 2);
+        assert_eq!(&out[SUP_HEADER_LEN..], &payload); // segment body verbatim
+        assert_eq!(written, SUP_HEADER_LEN + 2);
+    }
+
+    #[test]
+    fn pgs_frame_with_duration_emits_clear_segment() {
+        // A display set with a real PCS (type 0x16) carrying 1920x1080, and a
+        // duration → the writer must append a synthetic clear display set
+        // (empty PCS + END) timestamped at pts + duration.
+        let mut pcs = vec![SEG_PCS, 0x00, 0x0B];
+        pcs.extend_from_slice(&[0x07, 0x80, 0x04, 0x38]); // 1920x1080
+        pcs.extend_from_slice(&[0x10, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01]); // 1 object
+        let f = PesFrame {
+            track: 0,
+            pts: 1_000_000_000, // 1s
+            keyframe: true,
+            data: pcs,
+            duration_ns: Some(2_000_000_000), // 2s display → clear at 3s
+        };
+        let mut out = Vec::new();
+        let mut w = PgsSupWriter;
+        w.write_frame(&mut out, &f, f.pts).unwrap();
+
+        // Parse out every PG-framed segment: PG(2) PTS(4) DTS(4) type(1) size(2).
+        let mut segs: Vec<(u8, u32)> = Vec::new();
+        let mut pos = 0;
+        while pos + SUP_HEADER_LEN <= out.len() {
+            assert_eq!(
+                &out[pos..pos + 2],
+                &SUP_MAGIC,
+                "each segment carries PG magic"
+            );
+            let pts = u32::from_be_bytes([out[pos + 2], out[pos + 3], out[pos + 4], out[pos + 5]]);
+            let seg_type = out[pos + SUP_HEADER_LEN];
+            let size =
+                u16::from_be_bytes([out[pos + SUP_HEADER_LEN + 1], out[pos + SUP_HEADER_LEN + 2]])
+                    as usize;
+            segs.push((seg_type, pts));
+            pos += SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + size;
+        }
+        // Display PCS at 1s (90k), then a clear PCS + END at 3s.
+        let clear90 = ns_to_90k(3_000_000_000);
+        assert!(
+            segs.iter().any(|&(t, p)| t == SEG_PCS && p == clear90),
+            "a clear PCS must be emitted at pts+duration, got {segs:?}"
+        );
+        assert!(
+            segs.iter().any(|&(t, p)| t == SEG_END && p == clear90),
+            "an END segment must terminate the clear display set, got {segs:?}"
+        );
+    }
+
+    #[test]
+    fn pgs_frame_without_duration_emits_no_clear() {
+        // No duration → no synthetic clear (the subtitle's wipe time is unknown).
+        let f = PesFrame {
+            track: 0,
+            pts: 0,
+            keyframe: true,
+            data: vec![SEG_PCS, 0x00, 0x02, 0xDE, 0xAD],
+            duration_ns: None,
+        };
+        let mut out = Vec::new();
+        let mut w = PgsSupWriter;
+        w.write_frame(&mut out, &f, 0).unwrap();
+        // Exactly one PG-framed segment (the display), no clear appended.
+        // Output = `.sup` header (10) + the on-wire segment (type+size 3 + 2
+        // payload = 5) → 15 bytes, with no trailing clear.
+        assert_eq!(&out[0..2], &SUP_MAGIC);
+        assert_eq!(
+            out.len(),
+            SUP_HEADER_LEN + PGS_SEG_HEADER_LEN + 2,
+            "only the display segment, no clear"
+        );
     }
 
     #[test]
@@ -1044,7 +1075,7 @@ mod tests {
     fn vobsub_idx_synthesis() {
         let dir = tempdir();
         let idx = dir.join("sub.idx");
-        let mut w = VobSubWriter::new(idx.clone(), Some(b"palette: 000000, ffffff"));
+        let mut w = VobSubWriter::new(idx.clone(), Some(b"palette: 000000, ffffff"), "eng");
         let mut sub = Vec::new();
         let f1 = PesFrame {
             track: 0,
@@ -1065,6 +1096,11 @@ mod tests {
         w.finish(&mut sub).unwrap();
         let idx_text = std::fs::read_to_string(&idx).unwrap();
         assert!(idx_text.contains("palette: 000000, ffffff"));
+        // The conventional `id:` line mkvmerge reads to assign the language.
+        assert!(
+            idx_text.contains("id: en, index: 0"),
+            "missing id: line, got:\n{idx_text}"
+        );
         assert!(idx_text.contains("timestamp: 00:00:00:000, filepos: 000000000"));
         // Second SPU at 1s, filepos = 10.
         assert!(idx_text.contains("timestamp: 00:00:01:000, filepos: 00000000a"));
@@ -1100,20 +1136,24 @@ mod tests {
         assert!(ogm.contains("CHAPTER02NAME=2"));
     }
 
-    // ── Timeline rebase ──────────────────────────────────────────────────────
+    // ── Timeline continuity ──────────────────────────────────────────────────
+    //
+    // The corrector itself is tested verbatim in `crate::mux::timeline`. Here we
+    // only confirm the sink drives it with the right `drives_epoch`: track 0 is
+    // the epoch driver, every other track is a passive rider on the same offset.
 
     #[test]
-    fn timeline_rebase_handles_seam_jump() {
-        let mut tl = TimelineRebase::new();
-        // Clip 1: video 0..10s.
-        assert_eq!(tl.rebase(0, 0), 0);
-        assert_eq!(tl.rebase(1, 0), 0); // audio rides the same offset
-        assert_eq!(tl.rebase(0, 10_000_000_000), 10_000_000_000);
+    fn timeline_track0_drives_epoch_others_ride() {
+        let mut tl = TimelineContinuity::new();
+        // Clip 1: video 0..10s (track 0 drives the epoch).
+        assert_eq!(tl.adjust(0, true), 0);
+        assert_eq!(tl.adjust(0, false), 0); // audio rides the same offset
+        assert_eq!(tl.adjust(10_000_000_000, true), 10_000_000_000);
         // Clip 2 seam: video PTS jumps back to ~0 (> 3s back) → new epoch.
-        let out = tl.rebase(0, 0);
+        let out = tl.adjust(0, true);
         assert!(out >= 10_000_000_000, "epoch must advance past prev high");
-        // Audio in clip 2 gets the SAME offset (A/V sync preserved).
-        let a = tl.rebase(1, 0);
+        // Audio in clip 2 (non-epoch) gets the SAME offset (A/V sync preserved).
+        let a = tl.adjust(0, false);
         assert_eq!(a, out);
     }
 
