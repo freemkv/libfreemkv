@@ -992,7 +992,8 @@ mod scsi_sense_predicate_tests {
         // Each is_* predicate matches exactly its one key and no other.
         // Catches a copy-paste bug where e.g. is_not_ready compared the
         // wrong constant.
-        let cases: &[(u8, fn(&ScsiSense) -> bool)] = &[
+        type SenseCase = (u8, fn(&ScsiSense) -> bool);
+        let cases: &[SenseCase] = &[
             (SENSE_KEY_MEDIUM_ERROR, ScsiSense::is_medium_error),
             (SENSE_KEY_HARDWARE_ERROR, ScsiSense::is_hardware_error),
             (SENSE_KEY_NOT_READY, ScsiSense::is_not_ready),
@@ -1126,6 +1127,7 @@ mod inquiry_tests {
     //!   - vendor identification: bytes 8..16 (8 ASCII chars)
     //!   - product identification: bytes 16..32 (16 ASCII chars)
     //!   - product revision level: bytes 32..36 (4 ASCII chars)
+    //!
     //! Fields are space-padded ASCII; the parser trims surrounding
     //! whitespace.
     use super::*;

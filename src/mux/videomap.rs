@@ -46,7 +46,7 @@ pub const FVI_TIMESCALE: u64 = 1_000_000_000;
 
 /// Bytes per `src.sector` unit (`docs/FVI_FORMAT.md` §6.2, §9). The highway's
 /// [`SourcePos`] counts 2048-byte logical sectors.
-pub const FVI_SECTOR_SIZE: u32 = 2048;
+pub const FVI_SECTOR_SIZE: u32 = crate::consts::SECTOR_BYTES as u32;
 
 // ── Logical model (serialization-independent) ────────────────────────────────
 

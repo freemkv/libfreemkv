@@ -323,6 +323,11 @@ fn parse_language_streams_text(text: &str) -> Vec<StreamLabel> {
     labels
 }
 
+// NOTE: `parse_menu_base` / `parse_menu_base_text` are defined just below this
+// module and structurally belong above it. They are left in place (with the
+// lint allowed) rather than relocated here — a ~120-line block move that is
+// safer to do as its own focused change than inline.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;

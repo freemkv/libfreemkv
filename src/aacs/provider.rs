@@ -37,7 +37,7 @@
 //! [`lookup_disc_by_hash`]: KeyProvider::lookup_disc_by_hash
 //! [`lookup_disc_by_vid`]: KeyProvider::lookup_disc_by_vid
 
-use super::keydb::{DeviceKey, DiscEntry, HostCert};
+use super::types::{DeviceKey, DiscEntry, HostCert};
 
 /// Source of AACS key material.
 ///

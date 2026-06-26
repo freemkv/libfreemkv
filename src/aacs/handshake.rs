@@ -1573,27 +1573,44 @@ mod tests {
 
     #[test]
     fn test_verify_host_cert_from_keydb() {
-        // Verify the host cert from our KEYDB
-        let keydb_path = match std::env::var("KEYDB_PATH").ok() {
+        // Exercise verify_cert against a real AACS 1.0 host certificate.
+        //
+        // libfreemkv no longer parses keydb.cfg (the parser lives in
+        // freemkv-keysources), so the cert bytes are read from a raw 92-byte
+        // certificate file named by HOST_CERT_PATH instead of being pulled
+        // from a parsed KeyDb. This keeps verify_cert (private to this module,
+        // so it cannot move to keysources) covered against genuine LA-signed
+        // bytes without re-introducing a keydb dependency here. Inert in CI
+        // (env unset), matching the prior KEYDB_PATH gating.
+        let cert_path = match std::env::var("HOST_CERT_PATH").ok() {
             Some(p) => std::path::PathBuf::from(p),
-            None => return, // skip if KEYDB_PATH not set
+            None => return,
         };
-        if !keydb_path.exists() {
+        if !cert_path.exists() {
             return;
         }
+        let certificate = match std::fs::read(&cert_path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
 
-        let db = crate::aacs::KeyDb::load(&keydb_path).unwrap();
-        if let Some(hc) = db.host_certs.first() {
-            let valid = verify_cert(&hc.certificate);
-            eprintln!(
-                "Host cert verification: {}",
-                if valid { "PASS" } else { "FAIL" }
-            );
-            // Note: our cert is revoked but should still have valid LA signature
-            // If it doesn't verify, the LA public key might be wrong
-            if !valid {
-                eprintln!("  (cert may use different LA key or format)");
-            }
+        // Direct HostCert construction — no parser. Only `certificate` feeds
+        // verify_cert; the other fields are inert placeholders.
+        let hc = crate::aacs::HostCert {
+            private_key: [0u8; 20],
+            certificate,
+            private_key_v2: None,
+            certificate_v2: None,
+        };
+        let valid = verify_cert(&hc.certificate);
+        eprintln!(
+            "Host cert verification: {}",
+            if valid { "PASS" } else { "FAIL" }
+        );
+        // Note: a revoked cert should still carry a valid LA signature.
+        // If it doesn't verify, the LA public key might be wrong.
+        if !valid {
+            eprintln!("  (cert may use different LA key or format)");
         }
     }
 

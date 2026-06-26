@@ -583,7 +583,7 @@ mod tests {
     }
 
     /// One STN stream entry: stream_entry (len(1)=3, type(1)=0x01, pid(2))
-    /// + stream_attributes (len(1) + coding_type(1) + payload). Matches
+    /// plus stream_attributes (len(1) + coding_type(1) + payload). Matches
     /// the mpls.rs test builders.
     fn se_video(pid: u16, coding_type: u8) -> Vec<u8> {
         let mut out = vec![3u8, 0x01];
@@ -962,7 +962,7 @@ mod tests {
 
     /// A clip whose .clpi is missing contributes NO size and NO extent
     /// (bluray.rs only fetches extents inside the `if let Ok(clpi_data)`
-    /// + `if let Ok(clip_info)` blocks), but the Clip entry is still
+    /// and `if let Ok(clip_info)` blocks), but the Clip entry is still
     /// recorded with packet count 0. Never panics on the missing read.
     #[test]
     fn parse_playlist_missing_clpi_yields_no_extent_no_size() {

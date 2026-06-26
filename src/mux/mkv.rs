@@ -4113,7 +4113,7 @@ mod tests {
     }
 
     /// Read the body bytes of a direct TrackEntry child element by ID.
-    fn track_entry_child_body<'a>(data: &'a [u8], id: u32) -> Option<&'a [u8]> {
+    fn track_entry_child_body(data: &[u8], id: u32) -> Option<&[u8]> {
         let (te_start, te_size) = first_track_entry(data);
         let (_, body_start, body_size) = master_children(data, te_start, te_size)
             .into_iter()

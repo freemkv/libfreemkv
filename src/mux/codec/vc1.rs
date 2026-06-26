@@ -1050,10 +1050,10 @@ mod tests {
     /// codecPrivate, or the A-segment decodes against the wrong entry point.
     #[test]
     fn vc1_emits_entry_point_revert_to_first_value() {
-        let sh = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
+        let sh = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
         let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
         let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
-        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+        let frame = [0x00, 0x00, 0x01, SC_FRAME, 0x77];
 
         let mut parser = Vc1Parser::new();
 
@@ -1106,10 +1106,10 @@ mod tests {
     /// seek points carry valid decoder state (SMPTE 421M).
     #[test]
     fn vc1_reasserts_active_headers_at_bare_keyframe() {
-        let sh_a = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
+        let sh_a = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB];
         let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
         let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
-        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+        let frame = [0x00, 0x00, 0x01, SC_FRAME, 0x77];
 
         let mut parser = Vc1Parser::new();
 
@@ -1154,10 +1154,10 @@ mod tests {
     /// violating SMPTE 421M. After the fix, assembly is always seq-then-entry.
     #[test]
     fn vc1_keyframe_prefix_order_seq_unchanged_entry_redefined() {
-        let sh = vec![0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB, 0xCC];
+        let sh = [0x00, 0x00, 0x01, SC_SEQUENCE_HEADER, 0xAA, 0xBB, 0xCC];
         let ep_a = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x11, 0x22];
         let ep_b = vec![0x00, 0x00, 0x01, SC_ENTRY_POINT, 0x33, 0x44, 0x55];
-        let frame = vec![0x00, 0x00, 0x01, SC_FRAME, 0x77];
+        let frame = [0x00, 0x00, 0x01, SC_FRAME, 0x77];
 
         let mut parser = Vc1Parser::new();
 

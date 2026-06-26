@@ -6,6 +6,7 @@
 //!
 //! Reference: https://github.com/lw/BluRay/wiki/CLPI
 
+use crate::consts::{BD_SOURCE_PACKET_BYTES, SECTOR_BYTES};
 use crate::disc::Extent;
 use crate::error::{Error, Result};
 
@@ -167,13 +168,15 @@ impl ClipInfo {
             return Vec::new();
         }
 
-        // SPN → byte offset: spn × 192
-        // Byte offset → sectors: offset / 2048
-        // Note: the caller needs to add the file's starting LBA from UDF
-        let start_byte = start_spn as u64 * 192;
-        let end_byte = end_spn as u64 * 192;
-        let start_sector = (start_byte / 2048) as u32;
-        let end_sector = end_byte.div_ceil(2048) as u32;
+        // SPN → byte offset → sector range. Note: the caller adds the file's
+        // starting LBA from UDF. The start sector FLOORS (the extent begins in
+        // whichever sector contains its first byte) and the end sector CEILS
+        // (the extent must cover through the sector holding its last byte), so
+        // a sub-sector-aligned range still spans every sector it touches.
+        let start_byte = start_spn as u64 * BD_SOURCE_PACKET_BYTES as u64;
+        let end_byte = end_spn as u64 * BD_SOURCE_PACKET_BYTES as u64;
+        let start_sector = (start_byte / SECTOR_BYTES as u64) as u32;
+        let end_sector = end_byte.div_ceil(SECTOR_BYTES as u64) as u32;
 
         vec![Extent {
             start_lba: start_sector, // relative to m2ts file start
@@ -1112,15 +1115,18 @@ mod tests {
         let data = build_clpi(1000, Some(&cpi));
         let clip = parse(&data).expect("should parse");
 
-        let p0 = (0u64 << 19) + (0u64 << 8); // PTS of first EP
-        let p1 = (100u64 << 19) + (0u64 << 8); // PTS of second EP
+        let p0 = 0u64; // PTS of first EP
+        let p1 = 100u64 << 19; // PTS of second EP
         let extents = clip.get_extents(p0, p1);
         assert_eq!(extents.len(), 1);
-        // start_spn = 0, end_spn = big_spn. SPN→byte ×192, byte→sector /2048.
-        let start_byte = 0u64 * 192;
-        let end_byte = big_spn as u64 * 192;
-        let start_sector = (start_byte / 2048) as u32;
-        let end_sector = end_byte.div_ceil(2048) as u32;
+        // Mirror production: SPN→byte ×packet, byte→sector with start FLOORed
+        // and end CEILed (same constants as get_extents).
+        let start_spn: u64 = 0;
+        let end_spn = big_spn as u64;
+        let start_byte = start_spn * BD_SOURCE_PACKET_BYTES as u64;
+        let end_byte = end_spn * BD_SOURCE_PACKET_BYTES as u64;
+        let start_sector = (start_byte / SECTOR_BYTES as u64) as u32;
+        let end_sector = end_byte.div_ceil(SECTOR_BYTES as u64) as u32;
         assert_eq!(extents[0].start_lba, start_sector);
         assert_eq!(extents[0].sector_count, end_sector - start_sector);
         // Concretely: 0x20000 × 192 / 2048 = 12288 sectors.
@@ -1144,7 +1150,7 @@ mod tests {
         let cpi = build_cpi(0x1011, &[(0, 50, 0x1000)], &[(0, 0)]);
         let data = build_clpi(1000, Some(&cpi));
         let clip = parse(&data).expect("should parse");
-        let p = (50u64 << 19) + (0u64 << 8);
+        let p = 50u64 << 19;
         // in == out → start_spn == end_spn → empty.
         assert!(clip.get_extents(p, p).is_empty());
     }
@@ -1227,11 +1233,11 @@ mod tests {
         let stream_header_bits = &packed_bytes[6..16];
 
         // stream EP data: fine_start points past the 1 coarse entry.
-        let fine_start: u32 = 4 + 1 * 8;
+        let fine_start: u32 = 4 + 8; // 4-byte header + 1 coarse entry x 8 bytes
         let mut stream_ep = Vec::new();
         stream_ep.extend_from_slice(&fine_start.to_be_bytes());
         // exactly ONE coarse entry (8 bytes), though header claims 255.
-        stream_ep.extend_from_slice(&((0u32 << 14) | 10).to_be_bytes());
+        stream_ep.extend_from_slice(&10u32.to_be_bytes());
         stream_ep.extend_from_slice(&0x20000u32.to_be_bytes());
         // one fine entry (4 bytes)
         stream_ep.extend_from_slice(&(((5u32 & 0x7FF) << 17) | 100).to_be_bytes());

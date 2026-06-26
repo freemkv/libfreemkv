@@ -32,8 +32,7 @@ const SUPPORTED_VERSION: u8 = 1;
 /// Index of the version byte within [`MAGIC`].
 const VERSION_BYTE: usize = 5;
 
-/// BD-TS packet size (header must be padded to this boundary).
-const PACKET_SIZE: usize = 192;
+use crate::consts::BD_SOURCE_PACKET_BYTES;
 
 /// Metadata embedded in an m2ts file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,15 +309,15 @@ pub fn write_header(w: &mut impl Write, meta: &M2tsMeta) -> io::Result<()> {
     // real stream metadata, but a v1.0 primitive shouldn't truncate.
     let json_len = u32::try_from(json.len()).map_err(|_| crate::error::Error::NoMetadata)?;
     let raw_len = 8 + 4 + json.len(); // magic + len + json
-    let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
+    let padded_len = raw_len.div_ceil(BD_SOURCE_PACKET_BYTES) * BD_SOURCE_PACKET_BYTES;
     let padding = padded_len - raw_len;
 
     w.write_all(&MAGIC)?;
     w.write_all(&json_len.to_be_bytes())?;
     w.write_all(&json)?;
     if padding > 0 {
-        // Padding is at most PACKET_SIZE-1 bytes — stack buffer, no heap alloc.
-        let pad = [0u8; PACKET_SIZE];
+        // Padding is at most BD_SOURCE_PACKET_BYTES-1 bytes — stack buffer, no heap alloc.
+        let pad = [0u8; BD_SOURCE_PACKET_BYTES];
         w.write_all(&pad[..padding])?;
     }
     Ok(())
@@ -375,13 +374,13 @@ pub fn read_header(r: &mut impl Read) -> io::Result<Option<M2tsMeta>> {
     let meta: M2tsMeta =
         serde_json::from_slice(&json_buf).map_err(|_| crate::error::Error::NoMetadata)?;
 
-    // Skip padding to next 192-byte boundary (at most PACKET_SIZE-1 bytes →
+    // Skip padding to next 192-byte boundary (at most BD_SOURCE_PACKET_BYTES-1 bytes →
     // a stack buffer, no heap allocation).
     let raw_len = 8 + 4 + json_len;
-    let padded_len = raw_len.div_ceil(PACKET_SIZE) * PACKET_SIZE;
+    let padded_len = raw_len.div_ceil(BD_SOURCE_PACKET_BYTES) * BD_SOURCE_PACKET_BYTES;
     let padding = padded_len - raw_len;
     if padding > 0 {
-        let mut skip = [0u8; PACKET_SIZE];
+        let mut skip = [0u8; BD_SOURCE_PACKET_BYTES];
         r.read_exact(&mut skip[..padding])?;
     }
 
@@ -512,7 +511,7 @@ mod tests {
         assert_eq!(back.streams.len(), 1);
         // Header is padded to a 192-byte boundary; the cursor must land
         // exactly there so the following BD-TS data stays aligned.
-        assert_eq!(cursor.position() as usize % PACKET_SIZE, 0);
+        assert_eq!(cursor.position() as usize % BD_SOURCE_PACKET_BYTES, 0);
     }
 
     #[test]
@@ -643,7 +642,7 @@ mod tests {
 
     #[test]
     fn write_header_pads_to_192_byte_boundary() {
-        // The total written length must always be a multiple of PACKET_SIZE
+        // The total written length must always be a multiple of BD_SOURCE_PACKET_BYTES
         // (192). Test a range of JSON sizes by varying stream count.
         for n_streams in 0..6 {
             let mut t = DiscTitle::empty();
@@ -665,7 +664,7 @@ mod tests {
             let mut buf = Vec::new();
             write_header(&mut buf, &meta).unwrap();
             assert_eq!(
-                buf.len() % PACKET_SIZE,
+                buf.len() % BD_SOURCE_PACKET_BYTES,
                 0,
                 "header for {n_streams} streams (len {}) not 192-aligned",
                 buf.len()
@@ -766,7 +765,7 @@ mod tests {
         let mut cur = io::Cursor::new(buf);
         read_header(&mut cur).unwrap().expect("header present");
         assert_eq!(cur.position() as usize, header_len);
-        assert_eq!(header_len % PACKET_SIZE, 0);
+        assert_eq!(header_len % BD_SOURCE_PACKET_BYTES, 0);
         let mut next = [0u8; 1];
         use std::io::Read as _;
         cur.read_exact(&mut next).unwrap();

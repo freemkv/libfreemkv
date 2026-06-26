@@ -288,7 +288,7 @@ mod tests {
         // ignores; the point is that read_to_end stops at the cap rather
         // than following a (potentially huge) declared size.
         let mut payload = MINIMAL_CLASS.to_vec();
-        payload.extend(std::iter::repeat(0u8).take(4096));
+        payload.extend(std::iter::repeat_n(0u8, 4096));
         let mut jar = open(build_stored_zip(
             "Padded.class",
             &payload,
