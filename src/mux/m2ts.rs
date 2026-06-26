@@ -116,7 +116,6 @@ mod tests {
                 display_aspect: None,
                 secondary: false,
                 label: String::new(),
-                top_field_first: None,
                 measured_cicp: None,
             })],
             chapters: Vec::new(),
@@ -168,6 +167,8 @@ mod tests {
         let sink = SharedSink(shared.clone());
         let mut stream = M2tsStream::create(sink, &title).unwrap();
         let frame = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,

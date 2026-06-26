@@ -203,6 +203,8 @@ impl CodecParser for H264Parser {
         }
 
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns,
             keyframe,
             data: frame_data,
@@ -488,6 +490,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1011,
             pts,
             dts: None,
@@ -825,6 +828,7 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x10]);
 
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: Some(180000), // 2 seconds (presentation)
             dts: Some(90000),  // 1 second (decode)
@@ -1133,6 +1137,7 @@ mod tests {
         // PTS absent → DTS is used (or().map). pts.or(dts) per the comment.
         let mut parser = H264Parser::new();
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: Some(90000),
@@ -1147,6 +1152,7 @@ mod tests {
     fn no_pts_no_dts_defaults_zero() {
         let mut parser = H264Parser::new();
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: None,

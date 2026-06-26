@@ -153,6 +153,8 @@ impl PipelinedPesStream {
                 if skip_parse {
                     // Profiling escape hatch — bypass codec parser.
                     self.pending_frames.push_back(PesFrame {
+                        coding: None,
+                        source: None,
                         track,
                         pts: pes.pts.map(super::codec::pts_to_ns).unwrap_or(0),
                         keyframe: false,
@@ -206,6 +208,7 @@ impl PipelinedPesStream {
                 continue;
             };
             let pes = PesPacket {
+                source: None,
                 pid,
                 pts: ps.pts.map(|p| p as i64),
                 dts: ps.dts.map(|d| d as i64),
@@ -371,6 +374,8 @@ mod tests {
         fn parse(&mut self, pes: &PesPacket) -> Vec<super::super::codec::Frame> {
             (0..self.per_pes)
                 .map(|i| super::super::codec::Frame {
+                    coding: None,
+                    source: None,
                     pts_ns: pes.pts.unwrap_or(0) + i as i64,
                     keyframe: i == 0,
                     data: pes.data.clone(),
@@ -381,6 +386,8 @@ mod tests {
         fn flush(&mut self) -> Vec<super::super::codec::Frame> {
             (0..self.flush_n)
                 .map(|_| super::super::codec::Frame {
+                    coding: None,
+                    source: None,
                     pts_ns: 0,
                     keyframe: false,
                     data: vec![0xEE],
@@ -395,6 +402,7 @@ mod tests {
 
     fn ts_pes(pid: u16, data: Vec<u8>) -> PesPacket {
         PesPacket {
+            source: None,
             pid,
             pts: Some(90_000),
             dts: None,
@@ -559,6 +567,7 @@ mod tests {
         let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
 
         let mappable = PsPacket {
+            source: None,
             stream_id: 0xBD,
             sub_stream_id: Some(0x80),
             pts: Some(90_000),
@@ -567,6 +576,7 @@ mod tests {
         };
         // stream_id 0xC0 (MPEG audio) has no DVD PID mapping → dropped.
         let unmappable = PsPacket {
+            source: None,
             stream_id: 0xC0,
             sub_stream_id: None,
             pts: None,
@@ -618,6 +628,8 @@ mod tests {
     fn write_is_read_only_error() {
         let (mut stream, _tx) = make_stream(DiscTitle::empty(), vec![], vec![]);
         let frame = PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: false,
@@ -640,7 +652,6 @@ mod tests {
             display_aspect: None,
             secondary,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         }));
         t
@@ -799,7 +810,6 @@ mod tests {
             display_aspect: Some((4, 3)),
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         }));
         let parsers: Vec<(u16, Box<dyn CodecParser>)> =
@@ -822,6 +832,7 @@ mod tests {
             }
             let gop_pts = (g * gop_len as i64 * frame_ns * 90_000 / 1_000_000_000) as u64;
             tx.send(DemuxBatch::Ps(vec![PsPacket {
+                source: None,
                 stream_id: 0xE0,
                 sub_stream_id: None,
                 pts: Some(gop_pts),

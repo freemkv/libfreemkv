@@ -243,6 +243,8 @@ impl CodecParser for DtsParser {
             // extensions or the next core.
             let au_pts = self.front_pts();
             frames.push(Frame {
+                coding: None,
+                source: None,
                 pts_ns: au_pts,
                 keyframe: true,
                 data: au,
@@ -297,6 +299,8 @@ impl CodecParser for DtsParser {
         let au = std::mem::take(&mut self.buf);
         self.pts_marks.clear();
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns,
             keyframe: true,
             data: au,
@@ -377,6 +381,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1100,
             pts,
             dts: None,

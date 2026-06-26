@@ -57,7 +57,6 @@ impl Disc {
                 // PipelinedPesStream/DiscStream into the output title (mirroring
                 // the existing `codec_private` handshake). Until then `None`
                 // means the muxer falls back to TFF (correct for ~all DVDs).
-                top_field_first: None,
                 // TODO(spec): DVD MPEG-2 carries no VUI; the colour signalling is
                 // the sequence_display_extension colour_description when present.
                 // Surface it from `Mpeg2Parser` (same handshake as above) and set

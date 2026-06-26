@@ -159,7 +159,6 @@ mod tests {
             display_aspect: None,
             secondary: false,
             label: String::new(),
-            top_field_first: None,
             measured_cicp: None,
         }));
         // Index 0 = the video stream's codec init data.
@@ -175,6 +174,8 @@ mod tests {
     fn write_on_input_stream_is_read_only_error() {
         let mut s = StdioStream::input();
         let frame = crate::pes::PesFrame {
+            coding: None,
+            source: None,
             track: 0,
             pts: 0,
             keyframe: true,

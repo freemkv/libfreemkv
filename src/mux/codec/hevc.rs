@@ -446,6 +446,8 @@ impl CodecParser for HevcParser {
         }
 
         vec![Frame {
+            coding: None,
+            source: None,
             pts_ns,
             keyframe,
             data: frame_data,
@@ -753,6 +755,7 @@ mod tests {
 
     fn make_pes(data: Vec<u8>, pts: Option<i64>) -> PesPacket {
         PesPacket {
+            source: None,
             pid: 0x1011,
             pts,
             dts: None,
@@ -1689,6 +1692,7 @@ mod tests {
         data.extend_from_slice(&[0x10, 0x20]);
 
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: Some(180000), // 2 s (presentation)
             dts: Some(90000),  // 1 s (decode)
@@ -2290,6 +2294,7 @@ mod tests {
     fn hevc_dts_fallback_when_pts_absent() {
         let mut parser = HevcParser::new();
         let pes = PesPacket {
+            source: None,
             pid: 0x1011,
             pts: None,
             dts: Some(90000),
