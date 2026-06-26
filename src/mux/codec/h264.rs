@@ -295,13 +295,18 @@ impl CodecParser for H264Parser {
         record.push(pps.len() as u8);
         record.extend_from_slice(pps);
 
-        // ISO 14496-15 §5.3.3.1.2: for High-Profile and related profiles
-        // (profile_idc 100, 110, 122, 144) the record has 4 trailing extension
-        // bytes carrying chroma_format_idc and bit depths. Older parsers expect
-        // the record to END after the PPS for Baseline/Main/Extended — do NOT
-        // append for those (strict parsers reject the extra bytes).
+        // ISO 14496-15 §5.3.3.1.2: for High-Profile and the related
+        // chroma/bit-depth-extended profiles the record has 4 trailing extension
+        // bytes carrying chroma_format_idc and the luma/chroma bit depths. The
+        // full set that mandates the extension is profile_idc ∈ {100, 110, 122,
+        // 144, 244 (High 4:4:4 Predictive), 44, 83, 86, 118, 128, 138, 139, 134,
+        // 135}. Older parsers expect the record to END after the PPS for
+        // Baseline/Main/Extended — do NOT append for those (strict parsers
+        // reject the extra bytes).
         let profile_idc = sps[1];
-        const HIGH_PROFILES: [u8; 4] = [100, 110, 122, 144];
+        const HIGH_PROFILES: [u8; 14] = [
+            100, 110, 122, 144, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+        ];
         if HIGH_PROFILES.contains(&profile_idc) {
             if let Some((chroma_fmt, depth_luma, depth_chroma)) = parse_sps_high_profile_ext(sps) {
                 // byte 0: 111111xx — reserved(6) + chroma_format_idc(2)
@@ -1461,6 +1466,36 @@ mod tests {
             cp[ext_off + 3],
             0,
             "num_of_sequence_parameter_set_ext must be 0"
+        );
+    }
+
+    /// ISO 14496-15 §5.3.3.1.2 regression: profile_idc=244 (High 4:4:4
+    /// Predictive) ALSO mandates the chroma/bit-depth extension. It was missing
+    /// from HIGH_PROFILES, so a 244 stream took the Baseline/Main path and
+    /// emitted an avcC with NO extension bytes — non-conforming, and strict
+    /// parsers then assume 8-bit 4:2:0. The extension must be appended.
+    #[test]
+    fn avcc_profile_244_appends_extension_bytes() {
+        // profile_idc=244, chroma_format_idc=3 (4:4:4), depths both 4 (12-bit).
+        let sps = build_high_profile_sps(244, 3, 4, 4);
+        let mut parser = H264Parser::new();
+        feed_sps_pps(&mut parser, &sps);
+
+        let cp = parser.codec_private().expect("avcC must be present");
+        let ext_off = sps.len() + 14;
+        assert_eq!(
+            cp.len(),
+            ext_off + 4,
+            "profile 244 avcC must have the 4 extension bytes (len={}, expected {})",
+            cp.len(),
+            ext_off + 4
+        );
+        assert_eq!(cp[ext_off] & 0x03, 3, "chroma_format_idc must be 3 (4:4:4)");
+        assert_eq!(cp[ext_off + 1] & 0x07, 4, "bit_depth_luma_minus8 must be 4");
+        assert_eq!(
+            cp[ext_off + 2] & 0x07,
+            4,
+            "bit_depth_chroma_minus8 must be 4"
         );
     }
 

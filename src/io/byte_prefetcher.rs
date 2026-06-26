@@ -94,76 +94,93 @@ impl BytePrefetcher {
         let producer = std::thread::Builder::new()
             .name("freemkv-byte-prefetch".into())
             .spawn(move || {
-                let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
-                // Liveness heartbeat: the producer blocks on the recycle and
-                // forward channels; a stalled consumer or a wedged reader shows
-                // up as the beat going silent. Total is unknown, so `pos` is
-                // cumulative bytes read.
-                let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
-                let mut produced_bytes: u64 = 0;
-                loop {
-                    hb.tick(produced_bytes, 0);
-                    if cancelled() {
-                        return;
-                    }
-                    // Park on the recycle channel, but re-poll halt
-                    // every POLL_INTERVAL: a pure-AtomicBool Halt does
-                    // not disconnect the channel, so a blocking recv()
-                    // would never re-reach the cancel check.
-                    let mut buf = loop {
-                        match recycle_rx.recv_timeout(POLL_INTERVAL) {
-                            Ok(b) => break b,
-                            Err(RecvTimeoutError::Timeout) => {
-                                if cancelled() {
-                                    return;
-                                }
-                            }
-                            // Consumer dropped both channels.
-                            Err(RecvTimeoutError::Disconnected) => return,
-                        }
-                    };
-                    // Re-expose the full extent. After a short read the
-                    // prior iteration truncated to n < chunk_bytes, so
-                    // this regrows the length back to chunk_bytes
-                    // without reallocating (capacity was fixed at
-                    // construction and never shrinks).
-                    if buf.len() < chunk_bytes {
-                        buf.resize(chunk_bytes, 0);
-                    } else {
-                        // SAFETY: capacity is at least chunk_bytes
-                        // after construction.
-                        unsafe { buf.set_len(chunk_bytes) };
-                    }
-                    // Read up to one full chunk. Short reads are
-                    // valid and common — pipe `truncate` so the
-                    // consumer sees only the bytes that arrived.
-                    let n = match reader.read(&mut buf[..]) {
-                        Ok(0) => return, // EOF — drop tx, consumer sees RecvError
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
+                // Wrap the feed loop in catch_unwind so a panic in the inner
+                // `reader.read` (e.g. a decrypt-on-read slice/arith bug) is NOT
+                // indistinguishable from a clean finish at the demux boundary. A
+                // clean exit (EOF, halt, consumer disconnect) returns and drops
+                // `tx` → the demux loop reads RecvError as EOF (correct). A PANIC
+                // sends an explicit error sentinel first so the demux loop's
+                // `Ok(Err(_))` arm fires and propagates a typed error instead of
+                // converting the dropped channel into a clean `DemuxBatch::Eof`
+                // that would finalize a TRUNCATED mux while reporting success.
+                let body = std::panic::AssertUnwindSafe(|| {
+                    let cancelled = || halt.as_ref().map(|h| h.is_cancelled()).unwrap_or(false);
+                    // Liveness heartbeat: the producer blocks on the recycle and
+                    // forward channels; a stalled consumer or a wedged reader shows
+                    // up as the beat going silent. Total is unknown, so `pos` is
+                    // cumulative bytes read.
+                    let mut hb = crate::progress::Heartbeat::new("byte_prefetch");
+                    let mut produced_bytes: u64 = 0;
+                    loop {
+                        hb.tick(produced_bytes, 0);
+                        if cancelled() {
                             return;
                         }
-                    };
-                    produced_bytes += n as u64;
-                    buf.truncate(n);
-                    // Hand off the filled buffer, re-polling halt on
-                    // each timeout slice so a cancel can interrupt a
-                    // producer parked on a saturated forward channel.
-                    let mut pending = Ok(buf);
-                    loop {
-                        match tx.send_timeout(pending, POLL_INTERVAL) {
-                            Ok(()) => break,
-                            Err(SendTimeoutError::Timeout(returned)) => {
-                                if cancelled() {
-                                    return;
+                        // Park on the recycle channel, but re-poll halt
+                        // every POLL_INTERVAL: a pure-AtomicBool Halt does
+                        // not disconnect the channel, so a blocking recv()
+                        // would never re-reach the cancel check.
+                        let mut buf = loop {
+                            match recycle_rx.recv_timeout(POLL_INTERVAL) {
+                                Ok(b) => break b,
+                                Err(RecvTimeoutError::Timeout) => {
+                                    if cancelled() {
+                                        return;
+                                    }
                                 }
-                                pending = returned;
+                                // Consumer dropped both channels.
+                                Err(RecvTimeoutError::Disconnected) => return,
                             }
-                            // Consumer dropped.
-                            Err(SendTimeoutError::Disconnected(_)) => return,
+                        };
+                        // Re-expose the full extent. After a short read the
+                        // prior iteration truncated to n < chunk_bytes, so
+                        // this regrows the length back to chunk_bytes
+                        // without reallocating (capacity was fixed at
+                        // construction and never shrinks).
+                        if buf.len() < chunk_bytes {
+                            buf.resize(chunk_bytes, 0);
+                        } else {
+                            // SAFETY: capacity is at least chunk_bytes
+                            // after construction.
+                            unsafe { buf.set_len(chunk_bytes) };
+                        }
+                        // Read up to one full chunk. Short reads are
+                        // valid and common — pipe `truncate` so the
+                        // consumer sees only the bytes that arrived.
+                        let n = match reader.read(&mut buf[..]) {
+                            Ok(0) => return, // EOF — drop tx, consumer sees RecvError
+                            Ok(n) => n,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
+                            }
+                        };
+                        produced_bytes += n as u64;
+                        buf.truncate(n);
+                        // Hand off the filled buffer, re-polling halt on
+                        // each timeout slice so a cancel can interrupt a
+                        // producer parked on a saturated forward channel.
+                        let mut pending = Ok(buf);
+                        loop {
+                            match tx.send_timeout(pending, POLL_INTERVAL) {
+                                Ok(()) => break,
+                                Err(SendTimeoutError::Timeout(returned)) => {
+                                    if cancelled() {
+                                        return;
+                                    }
+                                    pending = returned;
+                                }
+                                // Consumer dropped.
+                                Err(SendTimeoutError::Disconnected(_)) => return,
+                            }
                         }
                     }
+                });
+                if std::panic::catch_unwind(body).is_err() {
+                    // Producer panicked mid-stream — surface a typed terminal
+                    // error so the demux thread does NOT read the dropped channel
+                    // as a clean EOF and truncate output.
+                    let _ = tx.send(Err(crate::error::Error::DemuxThreadPanicked.into()));
                 }
             })?;
 
@@ -419,6 +436,42 @@ mod tests {
             assert_eq!(got, vec![0x11; 8], "good chunk lost");
             let err = err.expect("read error must surface as an Err batch");
             assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        });
+    }
+
+    /// PANIC propagation: a reader that PANICS mid-stream must NOT be read as a
+    /// clean EOF at the demux boundary. The producer's catch_unwind sends an
+    /// explicit `Err` sentinel before the thread unwinds, so the consumer sees
+    /// the good bytes followed by an error batch — never a silent truncation.
+    /// Without the catch_unwind the panic would just drop `tx`, the consumer
+    /// would see RecvError (== clean EOF) and the partial output would be
+    /// finalized as if complete.
+    #[test]
+    fn read_panic_surfaces_as_err_batch_not_clean_eof() {
+        within(10, || {
+            struct OneThenPanic {
+                served: bool,
+            }
+            impl Read for OneThenPanic {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    if !self.served {
+                        self.served = true;
+                        let n = buf.len().min(8);
+                        buf[..n].fill(0x22);
+                        Ok(n)
+                    } else {
+                        panic!("synthetic mid-stream reader panic");
+                    }
+                }
+            }
+            let pf = BytePrefetcher::new(OneThenPanic { served: false }, 8, None).expect("spawn");
+            let (got, err) = drain_to_vec(pf);
+            assert_eq!(got, vec![0x22; 8], "good chunk lost before the panic");
+            assert!(
+                err.is_some(),
+                "a mid-stream producer PANIC must surface as an Err batch, \
+                 not a clean EOF (which would silently truncate the mux)"
+            );
         });
     }
 

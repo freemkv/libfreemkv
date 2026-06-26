@@ -3,10 +3,13 @@
 //! The CSS cipher uses two table-driven feedback circuits:
 //! - LFSR1: 17-bit state (9-bit lo + 8-bit hi register, seeded from
 //!   key[0..2]), driven by TAB2/TAB3
-//! - LFSR0: 32-bit state, driven by a feedback polynomial through TAB4
+//! - LFSR0: 24-bit feedback register (seeded from key[2..5] XOR seed[2..5],
+//!   masked to 0xFFFFFF), driven by a feedback polynomial through TAB4
 //!
 //! The keystream is the bytewise sum (with carry) of both LFSR outputs.
-//! Content descrambling XORs this keystream with the encrypted sector data.
+//! Content descrambling computes plain = TAB1[cipher] ^ keystream — a TAB1
+//! substitution of each ciphertext byte followed by an XOR with the keystream
+//! (NOT a plain XOR; the cipher is not its own inverse).
 //!
 //! Algorithm: Frank A. Stevenson's divide-and-conquer attack (1999).
 //! Tables: CSS specification constants.
@@ -324,15 +327,15 @@ mod tests {
     // ── scramble-flag detection (byte 0x14, bits 4-5) ──────────────────────
 
     /// Only bits 4-5 of byte 0x14 are the CSS scramble flag: the code reads
-    /// `(sector[0x14] >> 4) & 0x03`. Bit 6 (0x40) and bit 7 (0x80) are NOT
-    /// part of the flag, so a sector with 0x14 == 0x40 or 0x80 must be treated
-    /// as UNSCRAMBLED and left byte-for-byte unchanged. This guards against a
+    /// `sector[0x14] & 0x30 == 0` (bits 6-7, i.e. 0x40/0x80, are masked out by
+    /// 0x30). A sector with 0x14 == 0x40 or 0x80 must therefore be treated as
+    /// UNSCRAMBLED and left byte-for-byte unchanged. This guards against a
     /// too-wide mask silently "descrambling" (and thus corrupting) clear data.
     ///
     /// Grounding: CSS sector header byte 0x14 — copyright/scramble bits live
-    /// in bits 4-5; the 2-bit value 0 means not scrambled.
-    /// Mutation: change `(sector[0x14] >> 4) & 0x03` to `& 0x07` or drop the
-    /// shift -> 0x40 would be seen as scrambled and the body would change.
+    /// in bits 4-5; the masked value 0 means not scrambled.
+    /// Mutation: widen the mask `0x30` to `0x70`/`0xF0` -> 0x40/0x80 would be
+    /// seen as scrambled and the body would change.
     #[test]
     fn descramble_treats_high_bits_of_0x14_as_clear() {
         let key = [0x01, 0x02, 0x03, 0x04, 0x05];

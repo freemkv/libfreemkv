@@ -156,8 +156,12 @@ impl ReadCtx {
     /// outer-batch failure — the user's wedge-prevention principle
     /// (2026-05-11): once the drive returns ANY recoverable error,
     /// retrying the same LBA quickly is what triggers the firmware
-    /// fast-fail transition. Jump immediately, never retry in Pass 1.
-    /// Pass N owns retries — it gets per-sector timeouts that don't
+    /// fast-fail transition. On the damage-jump and marginal paths Pass 1
+    /// jumps immediately rather than grinding the same LBA. Transient errors
+    /// (NOT_READY, bridge degradation) are still retried a small bounded
+    /// number of times (`NOT_READY_MAX_RETRIES` / `BRIDGE_DEGRADATION_MAX_RETRIES`)
+    /// in both passes before falling through to the skip path.
+    /// Pass N owns the heavy retries — it gets per-sector timeouts that don't
     /// hammer the firmware the same way.
     pub fn for_sweep(batch: u16) -> Self {
         Self {

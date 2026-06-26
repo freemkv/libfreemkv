@@ -781,9 +781,15 @@ impl Stream for DemuxSink {
     }
 
     fn write(&mut self, frame: &PesFrame) -> io::Result<()> {
-        // Track 0 (primary video) drives epoch decisions; every other track is a
-        // passive rider on the same global offset — see `TimelineContinuity`.
-        let pts = self.timeline.adjust(frame.pts, frame.track == 0);
+        // The PRIMARY VIDEO track (`ref_video_track`, the first DiscStream::Video)
+        // drives epoch decisions; every other track is a passive rider on the same
+        // global offset — see `TimelineContinuity`. Drive epochs off the same
+        // dynamically-resolved video reference used for the audio-delay
+        // computation, NOT the literal stream index 0 — an M2TS/PMT title can list
+        // an audio ES before the video ES, in which case track 0 is audio and a
+        // non-video epoch driver would ratchet the frontier on sparse/lagging PTS.
+        let drives = Some(frame.track) == self.ref_video_track;
+        let pts = self.timeline.adjust(frame.pts, drives);
         if let Some(Some(t)) = self.tracks.get_mut(frame.track) {
             t.first_pts_ns.get_or_insert(pts);
             t.writer.write_frame(&mut t.w, frame, pts)?;
@@ -1170,6 +1176,56 @@ mod tests {
         // Audio in clip 2 (non-epoch) gets the SAME offset (A/V sync preserved).
         let a = tl.adjust(0, false);
         assert_eq!(a, out);
+    }
+
+    /// Regression for the hardcoded `frame.track == 0` epoch driver: on an
+    /// M2TS/PMT title the PMT can list an AUDIO ES before the VIDEO ES, so the
+    /// video lands at stream index 1. The sink already resolves the video
+    /// reference dynamically (`ref_video_track`); the epoch driver must use that
+    /// SAME reference, not the literal 0. Here track 0 is audio and track 1 is
+    /// video. A video-only clip boundary (track 1) must open a new epoch (bump
+    /// `offset_ns`). With the bug (only `frame.track == 0` drives epochs) the
+    /// video back-jump would be treated as a passive rider and `offset_ns` would
+    /// stay 0 — corrupting every track's rebased timeline.
+    #[test]
+    fn epoch_driver_follows_ref_video_not_track_zero() {
+        let dir = tempdir();
+        // Audio FIRST (index 0), video SECOND (index 1).
+        let title = title_with(
+            vec![audio_stream(Codec::Ac3, "eng"), video_stream(Codec::H264)],
+            vec![None, None],
+        );
+        let mut sink = DemuxSink::create(&dir, &title, &DemuxOptions::default()).unwrap();
+        assert_eq!(
+            sink.ref_video_track,
+            Some(1),
+            "video reference must be the first VIDEO stream (index 1), not 0"
+        );
+
+        let vid = |pts: i64, data: u8| PesFrame {
+            coding: None,
+            source: None,
+            track: 1, // VIDEO is track 1 here
+            pts,
+            keyframe: true,
+            data: vec![0x00, 0x00, 0x00, 0x01, data],
+            duration_ns: None,
+        };
+        // Clip 1 video: 0s then 10s — advances the frontier.
+        sink.write(&vid(0, 0xAA)).unwrap();
+        sink.write(&vid(10_000_000_000, 0xBB)).unwrap();
+        // Clip 2 seam: video PTS jumps back to ~0 (> 3s back) → NEW epoch. The
+        // video track (index 1) must drive this, bumping the offset.
+        sink.write(&vid(0, 0xCC)).unwrap();
+
+        assert!(
+            sink.timeline.offset_ns >= 10_000_000_000,
+            "video (track 1) must drive the epoch: offset_ns should have advanced \
+             past the previous high, got {}",
+            sink.timeline.offset_ns
+        );
+        sink.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── End-to-end sink ──────────────────────────────────────────────────────

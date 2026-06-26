@@ -815,7 +815,11 @@ fn parse_block(
     let rel_ts = i16::from_be_bytes([block[vl], block[vl + 1]]);
     let keyframe = block[vl + 2] & 0x80 != 0;
     let data = block[vl + 3..].to_vec();
-    let pts_ticks = cluster_ts_ticks + rel_ts as i64;
+    // saturating_add: a hostile CLUSTER_TIMESTAMP near i64::MAX plus a positive
+    // rel_ts would overflow this add (panic in debug/test, wrap to a large
+    // negative PTS in release) — one operation BEFORE the saturating_mul below.
+    // rel_ts as i64 is exact, so this fully bounds the sum on adversarial input.
+    let pts_ticks = cluster_ts_ticks.saturating_add(rel_ts as i64);
     let track_idx = (track as usize) - 1; // track >= 1 checked above
 
     // Skip blocks for non-existent tracks.
@@ -1551,6 +1555,23 @@ mod tests {
         let block = [0x81u8, 0x00, 0x00, 0x80, 0xAA];
         let f = parse_block(&block, i64::MAX, 1_000_000, 1, None).unwrap();
         assert_eq!(f.pts, i64::MAX, "ticks→ns must saturate, not wrap/panic");
+    }
+
+    #[test]
+    fn parse_block_cluster_ts_plus_rel_ts_saturates_no_overflow() {
+        // Regression: a hostile CLUSTER_TIMESTAMP near i64::MAX plus a POSITIVE
+        // rel_ts overflows the `cluster_ts + rel_ts` ADD — one step before the
+        // saturating_mul. With a plain `+` this panics in debug/test (overflow
+        // checks on) and silently wraps to a large negative PTS in release.
+        // rel_ts = +0x7FFF = 32767 (max positive signed 16-bit).
+        let block = [0x81u8, 0x7F, 0xFF, 0x80, 0xAA];
+        let f = parse_block(&block, i64::MAX, 1_000_000, 1, None).unwrap();
+        // The add saturates at i64::MAX, then the mul saturates too.
+        assert_eq!(
+            f.pts,
+            i64::MAX,
+            "cluster_ts + rel_ts must saturate, not panic/wrap"
+        );
     }
 
     // ============================================================
