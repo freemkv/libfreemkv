@@ -38,9 +38,105 @@ pub fn skip_start_code(data: &[u8], pos: usize) -> Option<usize> {
     None
 }
 
+/// Minimal MSB-first bit reader over an RBSP, for the leading fields of a coded
+/// slice header (H.264 `first_mb_in_slice` + `slice_type`; HEVC
+/// `slice_segment_header`).
+///
+/// It does NOT remove emulation-prevention bytes (`00 00 03`). Those can only
+/// appear after two consecutive `0x00` bytes, which cannot occur within the
+/// first Exp-Golomb codes of a slice header (a slice header never begins
+/// `00 00`), so the leading fields this reader is used for decode correctly. A
+/// caller reading deep enough into a header that `00 00 03` could appear must
+/// de-emulate the RBSP first.
+pub(crate) struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    /// Reader positioned at the first bit of `data`.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    /// Read a single bit, MSB-first. `None` once the buffer is exhausted.
+    pub fn read_bit(&mut self) -> Option<u32> {
+        let byte = self.bit / 8;
+        if byte >= self.data.len() {
+            return None;
+        }
+        let b = (self.data[byte] >> (7 - (self.bit & 7))) & 1;
+        self.bit += 1;
+        Some(b as u32)
+    }
+
+    /// Skip `n` bits; `None` if that would run past the end.
+    pub fn skip_bits(&mut self, n: usize) -> Option<()> {
+        for _ in 0..n {
+            self.read_bit()?;
+        }
+        Some(())
+    }
+
+    /// Read an unsigned Exp-Golomb code `ue(v)` (H.264 §9.1 / HEVC §9.2):
+    /// count leading zeros, read the `1` stop bit, then that many info bits;
+    /// `code_num = 2^leadingZeros - 1 + info`. `None` on truncation or an
+    /// absurdly long code (>31 leading zeros — malformed input, not a real
+    /// slice header).
+    pub fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u32;
+        while self.read_bit()? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None;
+            }
+        }
+        let mut info = 0u32;
+        for _ in 0..leading_zeros {
+            info = (info << 1) | self.read_bit()?;
+        }
+        Some((1u32 << leading_zeros) - 1 + info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_reader_read_ue_exp_golomb_table() {
+        // ue(v) codes from H.264 Table 9-1: code_num 0='1', 1='010', 2='011',
+        // 3='00100'. Each crafted byte is left-aligned (MSB-first).
+        assert_eq!(BitReader::new(&[0x80]).read_ue(), Some(0)); // 1_______
+        assert_eq!(BitReader::new(&[0x40]).read_ue(), Some(1)); // 010_____
+        assert_eq!(BitReader::new(&[0x60]).read_ue(), Some(2)); // 011_____
+        assert_eq!(BitReader::new(&[0x20]).read_ue(), Some(3)); // 00100___
+        assert_eq!(BitReader::new(&[0x28]).read_ue(), Some(4)); // 00101___
+    }
+
+    #[test]
+    fn bit_reader_read_ue_sequence_and_bits() {
+        // '1' '011' '00101' = ue(0), ue(2), ue(4) across the bitstream.
+        // 1 011 00101 -> 1011 0010 1 -> 0xB2, 0x80.
+        let mut br = BitReader::new(&[0xB2, 0x80]);
+        assert_eq!(br.read_ue(), Some(0));
+        assert_eq!(br.read_ue(), Some(2));
+        assert_eq!(br.read_ue(), Some(4));
+    }
+
+    #[test]
+    fn bit_reader_truncation_and_skip() {
+        // Empty buffer → None, no panic.
+        assert_eq!(BitReader::new(&[]).read_ue(), None);
+        // skip_bits past the end → None.
+        let mut br = BitReader::new(&[0xFF]);
+        assert_eq!(br.skip_bits(9), None);
+        // read_bit MSB-first.
+        let mut b = BitReader::new(&[0b1010_0000]);
+        assert_eq!(b.read_bit(), Some(1));
+        assert_eq!(b.read_bit(), Some(0));
+        assert_eq!(b.read_bit(), Some(1));
+    }
 
     #[test]
     fn find_start_code_3byte() {
