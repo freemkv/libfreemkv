@@ -33,13 +33,24 @@
   sidecar (previously 0); PGS subtitle wipes use the NORMAL composition state
   rather than a full epoch reset; and FVI source-byte offsets are written
   within-sector per the format spec.
-- **Multi-extent AACS alignment in `dir://` extraction.** The decrypted
-  file-tree extractor anchored the AACS unit grid to the first extent only, so a
-  file spanning multiple clip extents could mis-align and corrupt. Each extent
-  now anchors on its own encrypted-region start (the same class as the rc.5.2
-  clip-anchor fix). Decryption math is unchanged.
-- **Distinct "no key" reasons.** A disc whose key needs a Volume ID that
-  couldn't be obtained now reports a distinct error from "no key at all".
+- **Multi-extent AACS alignment in `dir://` extraction.** AACS encrypts in
+  aligned units of 3 sectors (6 KiB), and the decrypt-on-read gate accepts a read
+  only when its LBA is unit-aligned against a base. The `dir://` file-tree
+  extractor set that base once, to the file's first extent. A fragmented file
+  (Long-AD / continuation-ICB allocation) has later extents starting at arbitrary
+  LBAs whose distance from the first extent is generally not a multiple of 3
+  sectors, so the first read of every later extent failed the gate, returned a
+  decrypt error, and the whole extent was written as a zero-filled hole — even
+  though the sectors were readable. The unit base is now re-anchored per extent
+  (matching the mux read paths), so each extent gates on its own unit grid.
+  Decryption math is unchanged. Same class as the rc.5.2 clip-anchor fix.
+- **Distinct "no key" reasons.** When AACS key resolution has usable material
+  (device or processing keys) but cannot obtain the disc's Volume ID — needed to
+  derive the unit key — freemkv now reports a distinct "AACS Volume ID
+  unavailable" error (E7017) instead of collapsing it into the generic "no key"
+  error (E7022), which is now reserved for a genuine absence of any key material.
+  No key derivation or descramble logic changed — only the reason reported on a
+  resolution failure.
 - **autorip keydb writes go to the right path.** Auto-download, daily refresh,
   the "Update KEYDB" button, and the startup existence-check now resolve to the
   service's config path (matching where reads look); they previously used the
@@ -49,9 +60,11 @@
 - **Windows-reserved filenames** (`CON`, `NUL`, `COM1`…) inside a disc's file
   tree are safely renamed on extraction instead of aborting the walk.
 - **`--version` now matches the build stamped into MKVs.** The CLI's `--version`
-  string and the muxing/writing-application field written into every MKV come
-  from one source, so a binary and the files it produces can't report different
-  versions.
+  string and the `MuxingApp` / `WritingApp` fields written into every MKV now
+  derive from a single libfreemkv constant — the package version plus the git
+  short hash (e.g. `freemkv 1.1.0-beta.1 (g835cc99)`). The muxer previously kept
+  its own copy of that string, so the two could drift; a binary and the files it
+  produces can no longer report different versions.
 - **DTS-HD Master Audio: a false core-sync inside the lossless extension no
   longer splits an audio frame.** A byte pattern in the extension substream that
   resembled the `0x7FFE8001` core sync word could truncate the lossless
@@ -112,11 +125,12 @@
   the disc — scanning every AC-3 frame and taking the maximum, so a brief 2.0
   logo bed at the feature head can't mask the real 5.1 — and routes each declared
   stream onto the sub-stream that genuinely matches.
-- **"Decryption failed" on large AACS Blu-ray titles fixed.** The unit-alignment
-  gate measured `lba % 3` against absolute disc LBA 0, but AACS aligned units are
-  anchored at each clip's encrypted-region start. A clip whose start is not
-  3-aligned had its readable units wrongly rejected — failing the feature/large
-  titles of some discs while short clips passed. The gate is now clip-anchored.
+- **"Decryption failed" on large AACS Blu-ray titles fixed.** AACS encrypts in
+  aligned units of 3 sectors (6 KiB); the unit-alignment gate measured `lba % 3`
+  against absolute disc LBA 0, but the unit grid is actually anchored at each
+  clip's encrypted-region start. A clip whose start is not 3-sector-aligned had
+  its readable units wrongly rejected — failing the feature/large titles of some
+  discs while short clips passed. The gate is now clip-anchored.
 - **Single-pass disc→MKV recovers marginal/transient sectors before failing.**
   The direct-to-MKV path now gives the drive its full ECC recovery budget on a
   bad sector (matching the multipass rip) instead of reporting a read failure a
