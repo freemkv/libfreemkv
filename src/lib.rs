@@ -100,7 +100,6 @@ pub mod halt;
 pub(crate) mod identity;
 pub(crate) mod ifo;
 pub mod io;
-pub mod keydb;
 pub mod keysource;
 pub mod labels;
 pub(crate) mod mpls;
