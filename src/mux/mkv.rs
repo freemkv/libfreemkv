@@ -773,10 +773,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
         }
         // Stamp the freemkv version so any muxed file is traceable to the build
         // that produced it (MediaInfo "Writing application"/"library").
-        const FREEMKV_MUX_APP: &str =
-            concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
-        ebml::write_string(&mut writer, ebml::MUXING_APP, FREEMKV_MUX_APP)?;
-        ebml::write_string(&mut writer, ebml::WRITING_APP, FREEMKV_MUX_APP)?;
+        ebml::write_string(&mut writer, ebml::MUXING_APP, crate::MUX_APP)?;
+        ebml::write_string(&mut writer, ebml::WRITING_APP, crate::MUX_APP)?;
         if let Some(t) = title {
             ebml::write_string(&mut writer, ebml::TITLE, t)?;
         }
