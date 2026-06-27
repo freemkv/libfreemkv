@@ -57,6 +57,18 @@ fn main() {
 /// leaving just the package version. Always emitted so `env!("GIT_SUFFIX")`
 /// resolves on every target.
 fn emit_git_suffix() {
+    // Version label for the muxing-app / FVI generator tag. `FREEMKV_BUILD_LABEL`
+    // overrides the Cargo package version when set (non-empty) — used to stamp a
+    // pre-release/test build without bumping Cargo.toml and disturbing the
+    // tag-pinned [patch] version matching. Unset → the package version.
+    let version = std::env::var("FREEMKV_BUILD_LABEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("CARGO_PKG_VERSION").ok())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=FREEMKV_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=FREEMKV_BUILD_LABEL");
+
     let suffix = git_short_hash()
         .map(|h| format!(" (g{h})"))
         .unwrap_or_default();
