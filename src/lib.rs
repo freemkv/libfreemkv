@@ -85,6 +85,20 @@
 //! | E8xxx | Keydb errors (fetch, parse, load) |
 //! | E9xxx | Stream / mux errors (URL, PES, pipeline) |
 
+/// Single source of truth for every freemkv version surface.
+///
+/// `FREEMKV_VERSION` is the package version, overridable at build time via the
+/// `FREEMKV_BUILD_LABEL` env (see `build.rs`); `GIT_SUFFIX` is the git short
+/// hash. The CLI's `--version`, the MKV muxing/writing-application field, and
+/// the FVI generator tag all derive from these two consts, so a binary reports
+/// the exact same label it stamps into the files it produces — no split-brain
+/// where an MKV claims one version and the binary another.
+pub const VERSION_LABEL: &str = concat!(env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
+
+/// The muxing/writing-application string written into MKV output
+/// (`"freemkv <version> (g<hash>)"`).
+pub const MUX_APP: &str = concat!("freemkv ", env!("FREEMKV_VERSION"), env!("GIT_SUFFIX"));
+
 pub mod aacs;
 pub(crate) mod clpi;
 pub mod consts;
