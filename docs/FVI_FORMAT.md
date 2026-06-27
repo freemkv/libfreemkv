@@ -99,15 +99,15 @@ start of a new stream section.
 | `width`,`height` | integer | MUST | Coded luma dimensions in pixels. |
 | `dar` | `[int,int]` | SHOULD | Display aspect ratio as `[num,den]`. |
 | `frame_rate` | `[int,int]` | SHOULD | Nominal rate as exact rational `[num,den]` (e.g. `[24000,1001]`). |
-| `scan` | string | MUST | `"progressive"` \| `"interlaced"` \| `"mbaff"`. |
-| `colour` | object | SHOULD | CICP per ITU-T H.273: `primaries`,`transfer`,`matrix` (integer CICP codes or registered names), `range` (`"limited"`\|`"full"`). HDR: `mastering_display`, `max_cll`, `max_fall` per ITU-T H.273 / SMPTE ST 2086. |
+| `scan` | string | MUST | `"progressive"`<br>`"interlaced"`<br>`"mbaff"` |
+| `colour` | object | SHOULD | CICP per ITU-T H.273: `primaries`, `transfer`, `matrix` (integer CICP codes or registered names)<br>`range`: `"limited"` \| `"full"`<br>HDR: `mastering_display`, `max_cll`, `max_fall` per ITU-T H.273 / SMPTE ST 2086. |
 | `language` | string | MAY | BCP 47 tag, if known. |
 
 ### 6.2 `source` object
 
-| Member | JSON type | Req | Semantics |
+| Member | JSON type | Req | Semantics / reference |
 |---|---|---|---|
-| `medium` | string | MUST | `"disc"` \| `"iso"` \| `"file"` \| `"stream"`. |
+| `medium` | string | MUST | `"disc"`<br>`"iso"`<br>`"file"`<br>`"stream"` |
 | `path` | string | MAY | Source path/label. |
 | `title` | integer | MAY | Title/program number. |
 | `playlist` | string | MAY | Playlist/PGC identifier. |
@@ -122,13 +122,13 @@ One JSON object per coded picture, in coded order.
 |---|---|---|---|
 | `n` | integer | MUST | Coded-order index, 0-based, contiguous. |
 | `src` | object | MUST | Provenance: `{ "file": int?, "sector": uint, "byte": uint }` — the offset of this AU's **first byte** in the source (§9). MUST be carried from demux, never reconstructed. |
-| `type` | string | MUST | Coding type: `"I"` \| `"P"` \| `"B"` (ISO/IEC 13818-2 §6.3.9; H.264/H.265 slice types collapsed to frame type). |
-| `key` | boolean | MUST | `true` iff this picture is an intra (I) picture / parser-flagged decode-restart point (IDR / IRAP / I-picture). MPEG-2 open-GOP clean-RAP precision (`closed_gop`) is not currently distinguished — see note below. |
-| `gop` | boolean | SHOULD | `true` iff this picture begins a GOP / coded video sequence. Omitted when the implementation does not carry a distinct GOP-boundary signal. |
+| `type` | string | MUST | Coding type:<br>`"I"`<br>`"P"`<br>`"B"`<br>_ISO/IEC 13818-2 §6.3.9; H.264/H.265 slice types collapsed to frame type._ |
+| `key` | boolean | MUST | `true` iff this picture is an intra (I) picture / parser-flagged decode-restart point (IDR / IRAP / I-picture).<br>_MPEG-2 open-GOP clean-RAP precision (`closed_gop`) is not currently distinguished — see note below._ |
+| `gop` | boolean | SHOULD | `true` iff this picture begins a GOP / coded video sequence.<br>_Omitted when the implementation does not carry a distinct GOP-boundary signal._ |
 | `pts` | integer\|null | SHOULD | Presentation timestamp in `timescale` ticks; `null` if unknown. |
 | `dts` | integer\|null | MAY | Decode timestamp in `timescale` ticks. |
 | `size` | integer | MAY | AU length in bytes; enables byte-range extraction with `src`. |
-| `recovered` | boolean | MAY | `true` iff any byte of this AU came from a retried/marginal read (§9.1). Default `false`. |
+| `recovered` | boolean | MAY | `true` iff any byte of this AU came from a retried/marginal read (§9.1).<br>_Default `false`._ |
 | codec ext | object | MAY | Codec-specific members under the codec's namespace (§8). |
 
 The `type` and `key` members are **codec-agnostic** and MUST be populated for
@@ -156,11 +156,11 @@ per-picture coding accessors (MPEG-2: ISO/IEC 13818-2 §6.3.10). Emitted as
 top-level members of the record, and ONLY when the codec actually measured the
 signal — an OPTIONAL member that is omitted (not defaulted) when unknown:
 
-| Member | JSON type | Req | Semantics |
+| Member | JSON type | Req | Semantics / reference |
 |---|---|---|---|
-| `field_order` | string | MAY | Display field order: `"tff"` (top field first) \| `"bff"` (bottom field first) \| `"progressive"` (no field order applies). Omitted when the codec did not signal it. |
-| `progressive` | boolean | MAY | `true` iff the picture is progressive. Omitted when the codec did not signal it. |
-| `nb_fields` | integer | MAY | Number of displayed field periods this picture occupies (the soft-telecine / 2:3 pulldown basis): `1` for a single field picture, `2` for a normal frame, `3`/`4`/`6` for `repeat_first_field` pulldown per §6.3.10. |
+| `field_order` | string | MAY | Display field order:<br>`"tff"` — top field first<br>`"bff"` — bottom field first<br>`"progressive"` — no field order applies<br>_Omitted when the codec did not signal it._ |
+| `progressive` | boolean | MAY | `true` iff the picture is progressive.<br>_Omitted when the codec did not signal it._ |
+| `nb_fields` | integer | MAY | Number of displayed field periods this picture occupies (the soft-telecine / 2:3 pulldown basis):<br>`1` for a single field picture<br>`2` for a normal frame<br>`3`/`4`/`6` for `repeat_first_field` pulldown per §6.3.10 |
 
 Codecs that carry only a coding type (e.g. H.264 / HEVC / VC-1 through this
 pipeline) omit `field_order` and `progressive` rather than guessing a default.
