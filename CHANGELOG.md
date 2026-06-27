@@ -48,6 +48,20 @@
   files and parent directories around rename).
 - **Windows-reserved filenames** (`CON`, `NUL`, `COM1`…) inside a disc's file
   tree are safely renamed on extraction instead of aborting the walk.
+- **`--version` now matches the build stamped into MKVs.** The CLI's `--version`
+  string and the muxing/writing-application field written into every MKV come
+  from one source, so a binary and the files it produces can't report different
+  versions.
+- **DTS-HD Master Audio: a false core-sync inside the lossless extension no
+  longer splits an audio frame.** A byte pattern in the extension substream that
+  resembled the `0x7FFE8001` core sync word could truncate the lossless
+  extension and produce decode errors on the affected frames. The extension
+  substream is now sized exactly from its header, so that pattern is skipped as
+  data.
+- **TrueHD: decode timestamps no longer step backward.** In a case where the
+  source PES timing lagged the audio access-unit cadence, the muxed decode
+  timestamp could regress (non-monotonic-DTS warnings to the muxer); the running
+  timestamp is now clamped so it never goes backward.
 
 ### Tests
 
