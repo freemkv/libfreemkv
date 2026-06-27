@@ -1,7 +1,8 @@
 # FVI — Freemkv Video Index Format
 
-**Specification version:** 1.0 (DRAFT)
-**File extension:** `.fvi`  **Media type:** `application/vnd.freemkv.fvi+jsonl`
+**Specification version:** 1.0 (DRAFT)\
+**File extension:** `.fvi`\
+**Media type:** `application/vnd.freemkv.fvi+jsonl`\
 **Status:** Draft for review. This document is the normative reference for the FVI
 format; implementations and downstream tools cite it by section.
 
@@ -24,13 +25,6 @@ An FVI document answers, for every picture in a stream, three questions:
 FVI is **not** a container, a codec, or a copy of the bitstream. It indexes; it
 never stores coded samples. It is the serialized form of an indexer's per-picture
 truth — carried from the demuxer, **never reconstructed** (§9).
-
-### 1.1 Relationship to prior art
-
-Legacy MPEG-only project-index formats from the AviSynth frameserving ecosystem
-solve a narrow version of (1) and (2) for MPEG-1/2 only, in a bespoke,
-single-tool text encoding. FVI generalizes that idea: codec-agnostic, JSON-based,
-provenance-native, and openly specified so any tool may read or write it.
 
 ## 2. Conformance
 
@@ -179,8 +173,21 @@ registered set per codec profile (e.g. MPEG-2 §7.1), or (b) placed under an
 `ext` object keyed by codec id for richer/optional data:
 
 ```json
-{"n":42,"type":"P","key":false,"src":{"sector":17,"byte":924},
- "ext":{"hevc":{"temporal_id":0,"nal_type":1}}}
+{
+  "n": 42,
+  "type": "P",
+  "key": false,
+  "src": {
+    "sector": 17,
+    "byte": 924
+  },
+  "ext": {
+    "hevc": {
+      "temporal_id": 0,
+      "nal_type": 1
+    }
+  }
+}
 ```
 
 New codecs and members are added through Appendix B (codec registry) without a
@@ -238,13 +245,13 @@ Header:
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["format","fvi_version","stream","source","timescale"],
+  "required": ["format", "fvi_version", "stream", "source", "timescale"],
   "properties": {
-    "format": {"const": "freemkv/video-index"},
-    "fvi_version": {"type": "integer", "minimum": 1},
-    "timescale": {"type": "integer", "minimum": 1},
-    "stream": {"type": "object", "required": ["codec","width","height","scan"]},
-    "source": {"type": "object", "required": ["medium"]}
+    "format": { "const": "freemkv/video-index" },
+    "fvi_version": { "type": "integer", "minimum": 1 },
+    "timescale": { "type": "integer", "minimum": 1 },
+    "stream": { "type": "object", "required": ["codec", "width", "height", "scan"] },
+    "source": { "type": "object", "required": ["medium"] }
   }
 }
 ```
@@ -255,15 +262,20 @@ Record:
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["n","src","type","key"],
+  "required": ["n", "src", "type", "key"],
   "properties": {
-    "n": {"type": "integer", "minimum": 0},
-    "type": {"enum": ["I","P","B"]},
-    "key": {"type": "boolean"},
-    "src": {"type":"object","required":["sector","byte"],
-            "properties":{"file":{"type":"integer"},
-                          "sector":{"type":"integer","minimum":0},
-                          "byte":{"type":"integer","minimum":0}}}
+    "n": { "type": "integer", "minimum": 0 },
+    "type": { "enum": ["I", "P", "B"] },
+    "key": { "type": "boolean" },
+    "src": {
+      "type": "object",
+      "required": ["sector", "byte"],
+      "properties": {
+        "file": { "type": "integer" },
+        "sector": { "type": "integer", "minimum": 0 },
+        "byte": { "type": "integer", "minimum": 0 }
+      }
+    }
   }
 }
 ```
