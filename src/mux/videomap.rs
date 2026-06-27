@@ -37,7 +37,7 @@ pub const FVI_VERSION: u32 = 1;
 
 /// Producing tool tag for the header `"generator"` member
 /// (`docs/FVI_FORMAT.md` §6).
-pub const FVI_GENERATOR: &str = concat!("freemkv/", env!("CARGO_PKG_VERSION"));
+pub const FVI_GENERATOR: &str = concat!("freemkv/", env!("CARGO_PKG_VERSION"), env!("GIT_SUFFIX"));
 
 /// Header `"timescale"` for all `pts`/`dts` ticks (`docs/FVI_FORMAT.md` §10).
 /// The highway carries presentation timestamps in nanoseconds, so the timescale
