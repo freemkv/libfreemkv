@@ -11,6 +11,11 @@
   all seven languages, and a Codes-page entry. Messages are source-agnostic
   ("key source", never a specific database).
 
+### Changed
+
+- keydb download/save moved out of the library into freemkv-keysources;
+  libfreemkv no longer has any keydb I/O (it already held no keys).
+
 ### Fixed
 
 - **DVD rips now start on the movie, not the disc menu.** A VTS title VOB's
@@ -74,21 +79,16 @@
 
 ### Fixed
 
-- **Windows Explorer now reports the full 25 fps for interlaced SD-DVD.**
-  rc.5.1 added a `DefaultDecodedFieldDuration` (20 ms field) element to the
-  576i/480i track header on the theory that Windows derives fps from it. The
-  captured Silence-of-the-Lambs evidence proved the opposite: with
-  `FlagInterlaced=1` + `DefaultDuration=40 ms` + `DefaultDecodedFieldDuration=20 ms`,
-  Windows Explorer reported 12.5 fps (half) and MediaInfo flipped the track to
-  "Frame rate mode: Variable". MakeMKV's correct rip of the same disc OMITS
-  `DefaultDecodedFieldDuration`, keeps `FlagInterlaced=1` + `FieldOrder=TFF` +
-  full-frame `DefaultDuration` (40 ms), and Explorer shows the full 25 fps with
-  MediaInfo "Constant". The element is no longer written (`MkvTrack::video` now
-  passes `field_duration_ns == 0`); the only frame-rate signal tools trust,
-  `1/DefaultDuration` = 25 fps, is the full-frame value. Interlace signalling
-  (`FlagInterlaced=1`, `FieldOrder=TFF`) is retained, and MediaInfo still
-  reports "Interlaced / Top Field First" because it reads scan type from the
-  MPEG-2 elementary stream's picture coding extension, not the container flag.
+- **Reverted the rc.5.1 `DefaultDecodedFieldDuration` experiment for interlaced
+  SD-DVD.** rc.5.1 added a 20 ms `DefaultDecodedFieldDuration` field element to
+  the 576i/480i track header on the theory that Windows derives fps from it.
+  Captured evidence showed that element made Windows Explorer report 12.5 fps
+  (half) and MediaInfo flip the track to "Frame rate mode: Variable", while
+  MakeMKV's rip of the same disc omits it. The element is therefore no longer
+  written (`MkvTrack::video` now passes `field_duration_ns == 0`); the track
+  keeps `FlagInterlaced=1` + `FieldOrder=TFF` and the full-frame 40 ms
+  `DefaultDuration` (`1/DefaultDuration` = 25 fps), matching MakeMKV. How a given
+  player or shell handler chooses to display interlaced fps is not guaranteed.
 - **Correct AC-3 audio track selected on DVDs with non-standard sub-stream
   ordering.** freemkv assigned each declared audio stream a physical sub-stream
   by ordinal (`0x80+n`), assuming the IFO's first stream lives at `0x80`. On
