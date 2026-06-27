@@ -5,14 +5,14 @@
 //! Buffers across PES boundaries so frames spanning two PES packets
 //! are emitted complete.
 
+use super::startcode::BitReader;
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
 
 const DTS_CORE_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
-/// DTS-HD extension substream syncword. The parser delimits an access unit by
-/// the next CORE sync (so every extension between two cores is captured), and
-/// never needs to locate or size the extension itself — so this is referenced
-/// only by the tests that synthesize extension substreams.
-#[cfg(test)]
+/// DTS-HD extension substream syncword. An access unit is delimited by the next
+/// CORE sync; the parser locates and exactly sizes each extension substream (via
+/// `exss_frame_size`) so a false core sync inside the EXSS payload can't split
+/// the AU and truncate the lossless extension.
 const DTS_HD_EXT_SYNC: [u8; 4] = [0x64, 0x58, 0x20, 0x25];
 
 /// DTS / DTS-HD elementary-stream parser. Buffers DTS across PES boundaries so
@@ -336,11 +336,108 @@ enum NextCore {
 /// match the core syncword, so each candidate is validated by decoding its
 /// core size: a match whose decoded size is implausible (< MIN_CORE_FRAME_BYTES
 /// or > MAX_AU_BYTES) is a false sync and is skipped, continuing the search.
+/// Both DTS syncwords (core `0x7FFE8001`, EXSS `0x64582025`) are 32-bit words.
+const SYNCWORD_BYTES: usize = DTS_CORE_SYNC.len();
+
+/// DTS-HD extension-substream (EXSS) header field bit widths (ETSI TS 102 114,
+/// ExtSS header). `bHeaderSizeType` selects the short form (`nuExtSSHeaderSize`
+/// 8 bits, `nuExtSSFsize` 16 bits) or, for larger substreams, the long form
+/// (12 / 20 bits).
+const EXSS_USER_DEFINED_BITS: u32 = 8;
+const EXSS_INDEX_BITS: u32 = 2;
+const EXSS_HEADER_SIZE_TYPE_BITS: u32 = 1;
+const EXSS_HDRSIZE_BITS_SHORT: u32 = 8;
+const EXSS_FSIZE_BITS_SHORT: u32 = 16;
+const EXSS_HDRSIZE_BITS_LONG: u32 = 12;
+const EXSS_FSIZE_BITS_LONG: u32 = 20;
+/// `bHeaderSizeType == 1` selects the long-form field widths.
+const EXSS_HEADER_SIZE_TYPE_LONG: u32 = 1;
+/// Bytes that must be buffered to read the EXSS size fields in the worst case
+/// (long form): the 4-byte sync plus the bits up through `nuExtSSFsize`.
+const EXSS_HEADER_MIN_BYTES: usize = SYNCWORD_BYTES
+    + (EXSS_USER_DEFINED_BITS
+        + EXSS_INDEX_BITS
+        + EXSS_HEADER_SIZE_TYPE_BITS
+        + EXSS_HDRSIZE_BITS_LONG
+        + EXSS_FSIZE_BITS_LONG)
+        .div_ceil(u8::BITS) as usize;
+
+/// DTS-HD extension substream (EXSS) total byte size — INCLUDING the
+/// `0x64582025` syncword — read precisely from its header. `buf` must begin with
+/// `DTS_HD_EXT_SYNC`. `None` when the size fields aren't fully buffered.
+///
+/// `nuExtSSFsize` is the total frame size in bytes minus one. Parsing it lets the
+/// AU framer skip the extension by its exact length instead of scanning its
+/// (arbitrary) payload for a core sync.
+fn exss_frame_size(buf: &[u8]) -> Option<usize> {
+    if buf.len() < EXSS_HEADER_MIN_BYTES {
+        return None;
+    }
+    let mut r = BitReader::new(&buf[SYNCWORD_BYTES..]);
+    let _user = r.read_bits(EXSS_USER_DEFINED_BITS)?; // nUserDefinedBits
+    let _idx = r.read_bits(EXSS_INDEX_BITS)?; // nExtSSIndex
+    let large = r.read_bits(EXSS_HEADER_SIZE_TYPE_BITS)? == EXSS_HEADER_SIZE_TYPE_LONG;
+    let (hbits, fbits) = if large {
+        (EXSS_HDRSIZE_BITS_LONG, EXSS_FSIZE_BITS_LONG)
+    } else {
+        (EXSS_HDRSIZE_BITS_SHORT, EXSS_FSIZE_BITS_SHORT)
+    };
+    let _hdr = r.read_bits(hbits)?; // nuExtSSHeaderSize (not needed for framing)
+    let fsize_minus_one = r.read_bits(fbits)?; // nuExtSSFsize = total bytes - 1
+    Some(fsize_minus_one as usize + 1)
+}
+
+/// Offset where the current access unit ends (the start of the next core
+/// frame). The AU is the core frame plus its trailing DTS-HD extension
+/// substreams, which are skipped PRECISELY by their declared size — so a chance
+/// core syncword inside the XLL lossless payload can never be mistaken for the
+/// next AU boundary (the bug that truncated the extension and produced the
+/// "Failed to decode block code(s)" class). Falls back to the heuristic core-sync
+/// scan only when an extension can't be sized (malformed / truncated input).
 fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
-    let mut from = core_size;
+    let mut pos = core_size;
+    loop {
+        if buf.len() < pos + SYNCWORD_BYTES {
+            return NextCore::NeedMore; // need a syncword to identify the next chunk
+        }
+        if buf[pos..].starts_with(&DTS_HD_EXT_SYNC) {
+            match exss_frame_size(&buf[pos..]) {
+                Some(sz) if sz >= SYNCWORD_BYTES => {
+                    if buf.len() < pos + sz {
+                        return NextCore::NeedMore; // extension not fully buffered
+                    }
+                    pos += sz; // skip the whole extension substream precisely
+                }
+                // Couldn't size it (truncated/garbage header) — heuristic fallback.
+                _ => return scan_for_next_core(buf, pos),
+            }
+        } else if buf[pos..].starts_with(&DTS_CORE_SYNC) {
+            // The bytes right after the precisely-skipped extensions are the next
+            // core frame — the AU boundary.
+            if buf.len() - pos < CORE_HEADER_MIN_BYTES {
+                return NextCore::NeedMore;
+            }
+            let sz = dts_core_frame_size(&buf[pos..]);
+            if (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&sz) {
+                return NextCore::Found(pos);
+            }
+            return scan_for_next_core(buf, pos); // implausible core here — fall back
+        } else {
+            // Neither a known extension nor a core sync at the precise boundary
+            // (padding / junk) — fall back to the heuristic scan.
+            return scan_for_next_core(buf, pos);
+        }
+    }
+}
+
+/// Heuristic fallback (the pre-fix behaviour): scan forward for the next core
+/// syncword whose decoded size is plausible. Used only when precise extension
+/// skipping can't proceed; a chance core syncword in extension payload usually
+/// decodes to an implausible size and is skipped.
+fn scan_for_next_core(buf: &[u8], from: usize) -> NextCore {
+    let mut from = from;
     while let Some(rel) = find_sync(&buf[from..], &DTS_CORE_SYNC) {
         let pos = from + rel;
-        // Need the candidate's core header to judge it.
         if buf.len() - pos < CORE_HEADER_MIN_BYTES {
             return NextCore::NeedMore;
         }
@@ -348,8 +445,7 @@ fn next_core_boundary(buf: &[u8], core_size: usize) -> NextCore {
         if (MIN_CORE_FRAME_BYTES..=MAX_AU_BYTES).contains(&sz) {
             return NextCore::Found(pos);
         }
-        // False sync inside extension payload — skip it and keep searching.
-        from = pos + 4;
+        from = pos + SYNCWORD_BYTES;
     }
     NextCore::None
 }
@@ -397,6 +493,55 @@ mod tests {
         data[6] = ((fsize >> 4) & 0xFF) as u8;
         data[7] = (data[7] & 0x0F) | (((fsize & 0x0F) << 4) as u8);
         data
+    }
+
+    /// A real DTS-HD EXSS substream of `total` bytes (short header form), with an
+    /// optional false DTS core syncword embedded in its payload (decoding to a
+    /// plausible core size) — to prove precise sizing, not a payload scan, bounds
+    /// the extension.
+    fn make_exss(total: usize, false_core_at: Option<usize>) -> Vec<u8> {
+        let mut d = vec![0u8; total];
+        d[0..4].copy_from_slice(&DTS_HD_EXT_SYNC);
+        // Short form: all header fields 0 except nuExtSSFsize = total - 1, laid
+        // out at bit 19 after the sync (byte 6 low 5 bits, byte 7, byte 8 top 3).
+        let fsize = (total - 1) as u32;
+        d[6] = ((fsize >> 11) & 0x1F) as u8;
+        d[7] = ((fsize >> 3) & 0xFF) as u8;
+        d[8] = ((fsize & 0x07) << 5) as u8;
+        if let Some(at) = false_core_at {
+            d[at..at + 4].copy_from_slice(&DTS_CORE_SYNC);
+            let fcs = 512u32 - 1; // decode to a plausible core size — fools the heuristic
+            d[at + 5] = (d[at + 5] & 0xFC) | ((fcs >> 12) & 0x03) as u8;
+            d[at + 6] = ((fcs >> 4) & 0xFF) as u8;
+            d[at + 7] = (d[at + 7] & 0x0F) | (((fcs & 0x0F) << 4) as u8);
+        }
+        d
+    }
+
+    #[test]
+    fn plausible_false_core_sync_inside_real_exss_does_not_split_au() {
+        // EXSS size parse round-trips.
+        assert_eq!(exss_frame_size(&make_exss(600, None)), Some(600));
+
+        // AU = core(512) + a REAL EXSS substream whose XLL payload embeds a DTS
+        // core syncword decoding to a plausible size (512). The heuristic-only
+        // framer would split here and truncate the lossless extension (the
+        // Dunkirk `dca` "Failed to decode block code(s)" class). Precise EXSS
+        // sizing spans the whole extension to the REAL next core.
+        let core = make_dts_core(512);
+        let exss = make_exss(600, Some(40));
+        let next = make_dts_core(512);
+        let mut buf = core.clone();
+        buf.extend_from_slice(&exss);
+        buf.extend_from_slice(&next);
+
+        assert!(
+            matches!(
+                next_core_boundary(&buf, core.len()),
+                NextCore::Found(end) if end == core.len() + exss.len()
+            ),
+            "AU must end at the REAL next core (after the full EXSS), not the false sync inside it"
+        );
     }
 
     #[test]
