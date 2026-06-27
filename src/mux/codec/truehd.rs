@@ -138,7 +138,18 @@ impl CodecParser for TrueHdParser {
         // the next PES legitimately begins a new AU and seeds the base.
         if self.buf.is_empty() {
             if let Some(pts) = pes.pts {
-                self.next_pts_ns = pts_to_ns(pts);
+                // Resync to the authoritative PES PTS, but NEVER snap backward.
+                // TrueHD AUs are a fixed sample count (40 @ 48 kHz), so the
+                // per-AU `+AU_DURATION_NS` cadence is sample-accurate — more so
+                // than the disc's per-PES PTS, which carries the source muxer's
+                // own rounding jitter. When the buffer empties exactly on a PES
+                // boundary and that PES's PTS lands a few ticks *below* the
+                // running cadence, an unconditional reset would set the next
+                // AU's timestamp below the AU just emitted, producing the
+                // non-monotonic block timestamps a muxer rejects. Clamp to the
+                // running position so output stays strictly monotonic; a
+                // genuine forward gap/discontinuity is still adopted.
+                self.next_pts_ns = self.next_pts_ns.max(pts_to_ns(pts));
             }
         }
 
@@ -447,6 +458,36 @@ mod tests {
         assert_eq!(frames[0].data.len(), 100);
         assert_eq!(frames[1].data.len(), 120);
         assert_eq!(frames[1].pts_ns - frames[0].pts_ns, AU_DURATION_NS);
+    }
+
+    #[test]
+    fn pes_pts_lagging_the_au_cadence_never_emits_backward() {
+        // Regression: the per-AU cadence is sample-accurate, but a PES boundary
+        // can carry a PTS that lags it slightly (source-muxer rounding jitter).
+        // When the buffer empties exactly on that boundary, an unconditional
+        // reset to the PES PTS snapped the next AU's timestamp BELOW the AU just
+        // emitted — the non-monotonic block timestamps a muxer rejects (the
+        // Top Gun / Dune: Part Two case). The reset must clamp forward-only.
+        let mut parser = TrueHdParser::new();
+        let au = make_truehd_unit(100);
+        // PES1: three complete AUs at pts 90000 — buffer empties, cadence runs
+        // ahead to 90000_ns + 3*AU_DURATION_NS.
+        let mut d1 = au.clone();
+        d1.extend_from_slice(&au);
+        d1.extend_from_slice(&au);
+        let f1 = parser.parse(&make_pes(d1, Some(90000)));
+        assert_eq!(f1.len(), 3);
+        let last1 = f1.last().unwrap().pts_ns;
+        // PES2's PTS (90001) maps to fewer ns than the running cadence — pre-fix
+        // this snapped backward.
+        let f2 = parser.parse(&make_pes(au.clone(), Some(90001)));
+        assert_eq!(f2.len(), 1);
+        assert!(
+            f2[0].pts_ns >= last1,
+            "AU pts must not go backward when PES PTS lags the cadence: got {} after {}",
+            f2[0].pts_ns,
+            last1
+        );
     }
 
     #[test]
