@@ -217,6 +217,33 @@ pub fn unit_is_clean_ts(unit: &[u8]) -> bool {
     true
 }
 
+/// Structural "is this a clean MPEG-2 Program Stream aligned unit?" check — the
+/// PS-container analogue of [`unit_is_clean_ts`], for AACS content carried as
+/// program stream (HD-DVD `.evo`): every 2048-byte pack must begin with the
+/// pack_start_code `00 00 01 BA`. A 6144-byte aligned unit spans three packs.
+///
+/// UNVALIDATED against real HD-DVD media. It assumes (a) HD-DVD uses the
+/// standard AACS 6144-byte unit, (b) `.evo` clips are 2048-pack-aligned so unit
+/// boundaries fall on pack starts, and (c) byte 0 of the unit is the pack start
+/// — i.e. where the AACS seed and CPI indicator sit for PS content is the same
+/// as BD-TS. Each of these must be confirmed against a real HD-DVD disc before
+/// the `.evo` path is turned on (see `disc::verify::ContainerKind`). It exists
+/// now only so the verify gate is structurally ready for that wiring.
+pub fn unit_is_clean_ps(unit: &[u8]) -> bool {
+    if unit.len() < ALIGNED_UNIT_LEN {
+        return false;
+    }
+    const PACK_START: [u8; 4] = [0x00, 0x00, 0x01, 0xBA];
+    let mut o = 0;
+    while o < ALIGNED_UNIT_LEN {
+        if unit[o..o + 4] != PACK_START {
+            return false;
+        }
+        o += SECTOR_BYTES; // one MPEG-2 PS pack per 2048-byte sector
+    }
+    true
+}
+
 /// Decrypt one AACS aligned unit (6144 bytes) in-place.
 /// Returns true if the unit is now clear MPEG-TS: either it was already
 /// unscrambled (returned untouched, no key used) or it was decrypted and
@@ -231,6 +258,21 @@ pub fn unit_is_clean_ts(unit: &[u8]) -> bool {
 /// Decryption restores the TS sync bytes, so the unit reads as clear afterward;
 /// there is no flag to clear.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
+    decrypt_unit_checked(unit, unit_key, unit_is_clean_ts)
+}
+
+/// Decrypt an AACS aligned unit in place, accepting the key only when `accept`
+/// passes on the decrypted bytes. The AACS crypto is container-agnostic; the
+/// post-decrypt acceptance is the only format-specific part — so this is the
+/// extension seam for non-TS containers. [`decrypt_unit`] is this with the BD-TS
+/// check ([`unit_is_clean_ts`]); HD-DVD PS content would pass
+/// [`unit_is_clean_ps`] instead. A CPI-clear unit is plaintext and passes
+/// through untouched (no key consumed), exactly as before.
+pub fn decrypt_unit_checked(
+    unit: &mut [u8],
+    unit_key: &[u8; 16],
+    accept: fn(&[u8]) -> bool,
+) -> bool {
     if unit.len() < ALIGNED_UNIT_LEN {
         return false;
     }
@@ -238,27 +280,26 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
         return true; // CPI flag clear → plaintext, pass through untouched
     }
 
-    // Save original first 16 bytes (they're plaintext TP_extra_header)
+    // Save original first 16 bytes (they're the plaintext seed / header).
     let mut header = [0u8; 16];
     header.copy_from_slice(&unit[..16]);
 
-    // Step 1: Encrypt header with unit key to derive per-unit key
+    // Step 1: Encrypt header with unit key to derive per-unit key.
     let derived = aes_ecb_encrypt(unit_key, &header);
 
-    // Step 2: XOR to get the actual decryption key
+    // Step 2: XOR to get the actual decryption key.
     let mut decrypt_key = [0u8; 16];
     for i in 0..16 {
         decrypt_key[i] = derived[i] ^ header[i];
     }
 
-    // Step 3: Decrypt bytes 16..6143 with AES-CBC
+    // Step 3: Decrypt bytes 16..6143 with AES-CBC.
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
-    // Decryption restored the TS syncs; accept the key only if the unit is now
-    // STRICTLY clean MPEG-TS (all 32 syncs) — the standards-correct gate, shared
-    // with the post-read verify stage. A wrong key that coincidentally restores
-    // a majority of syncs is rejected here, not silently accepted.
-    unit_is_clean_ts(unit)
+    // Accept the key only if the decrypted unit passes the container's strict
+    // structural check. A wrong key that coincidentally restores a majority of
+    // markers is rejected here, not silently accepted.
+    accept(unit)
 }
 
 /// Fast, NON-MUTATING unit-key validation for the brute-force key search.

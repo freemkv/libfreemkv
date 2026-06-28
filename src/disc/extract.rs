@@ -347,6 +347,10 @@ pub(crate) fn clip_layouts(reader: &mut dyn SectorSource) -> Vec<crate::disc::ve
             .map(|pf| crate::disc::verify::ClipLayout {
                 size: pf.size,
                 extents: pf.extents,
+                // Every AACS clip we enumerate today is BD-TS (`.m2ts`/`.ssif`).
+                // HD-DVD `.evo` (program stream) maps to `ContainerKind::Ps` here
+                // once `is_aacs_clip` recognises it — the one-line HD-DVD hook.
+                container: crate::disc::verify::ContainerKind::Ts,
             })
             .collect())
     })();

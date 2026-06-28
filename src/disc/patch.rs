@@ -2119,10 +2119,19 @@ impl Disc {
         // terminalizes it. Reuses the same verifier as the sweep. Fail-safe:
         // disabled gate / unreadable ISO / load failure all leave the pass as-is.
         if let Some(mut v) = verifier.take() {
-            if let Ok(mut iso) = crate::io::file_sector_source::FileSectorSource::open(path) {
-                let bad = v.reverify_iso(&mut iso, &bad_ranges);
-                if !bad.is_empty() {
-                    if let Ok(mut m) = mapfile::Mapfile::load(&mapfile_path) {
+            if let Ok(mut m) = mapfile::Mapfile::load(&mapfile_path) {
+                // Only units whose every backing sector was actually READ
+                // (Finished) may be re-verified — we can't verify what wasn't read
+                // (a non-Finished sector is zero-filled because the read failed),
+                // and must not waste a key lookup on a known-bad block.
+                let finished = m.ranges_with(&[mapfile::SectorStatus::Finished]);
+                let is_finished = |lba: u32| -> bool {
+                    let p = lba as u64 * 2048;
+                    finished.iter().any(|&(s, sz)| p >= s && p < s + sz)
+                };
+                if let Ok(mut iso) = crate::io::file_sector_source::FileSectorSource::open(path) {
+                    let bad = v.reverify_iso(&mut iso, &bad_ranges, &is_finished);
+                    if !bad.is_empty() {
                         let n: usize = bad.len();
                         for (lba, cnt) in bad {
                             let _ = m.record(
