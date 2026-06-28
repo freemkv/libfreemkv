@@ -47,13 +47,29 @@ const MAX_INFLIGHT_UNITS: usize = 4096; // ~24 MiB ceiling
 /// one fetch resolves all orphan units; the cap is a runaway backstop only.
 const MAX_FETCH_CALLS: u32 = 8;
 
-/// A clip's on-disc layout: declared file size plus its absolute disc extents in
-/// FILE order. `extents` is `(disc_lba, byte_len)`; the verifier reuses exactly
-/// the same `(abs_lba, byte_len)` extents the extractor enumerates.
+/// The stream container of an AACS clip — selects the post-decrypt structural
+/// check the verify gate applies. This is the extension seam: the AACS crypto is
+/// container-agnostic, only the "is this clean?" check differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerKind {
+    /// BD/UHD `.m2ts` / `.ssif` — MPEG-2 transport stream (all-32 TS syncs).
+    #[default]
+    Ts,
+    /// HD-DVD `.evo` — MPEG-2 program stream (pack-start `00 00 01 BA`).
+    /// NOT yet enabled by enumeration; present so adding HD-DVD is a one-mapping
+    /// change. See [`crate::aacs::unit_is_clean_ps`] for the (unvalidated) check.
+    Ps,
+}
+
+/// A clip's on-disc layout: declared file size, its absolute disc extents in
+/// FILE order, and its stream container. `extents` is `(disc_lba, byte_len)`;
+/// the verifier reuses exactly the same `(abs_lba, byte_len)` extents the
+/// extractor enumerates.
 #[derive(Debug, Clone)]
 pub struct ClipLayout {
     pub size: u64,
     pub extents: Vec<(u32, u32)>,
+    pub container: ContainerKind,
 }
 
 /// One extent placed in the (disc-LBA -> clip-file-offset) space, for routing an
@@ -96,6 +112,8 @@ pub struct UnitVerifier {
     extents: Vec<ExtentRec>,
     /// Number of FULL (6144) units per clip; the partial tail unit is excluded.
     full_units: Vec<u32>,
+    /// Stream container per clip — selects the post-decrypt structural check.
+    containers: Vec<ContainerKind>,
     /// Content unit keys to try (resolved keys plus any fetched + cached).
     keys: Vec<[u8; 16]>,
     fetch: Option<KeyFetch>,
@@ -128,10 +146,12 @@ impl UnitVerifier {
 
         let mut extents = Vec::new();
         let mut full_units = Vec::new();
+        let mut containers = Vec::new();
         for (clip, layout) in clips.iter().enumerate() {
             // Full units only; the partial tail (size not a multiple of 6144) is
             // never verified (a < 6144 buffer can't satisfy the strict gate).
             full_units.push((layout.size / ALIGNED_UNIT_LEN as u64) as u32);
+            containers.push(layout.container);
             let mut file_off: u64 = 0;
             for &(disc_lba, byte_len) in &layout.extents {
                 let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
@@ -154,6 +174,7 @@ impl UnitVerifier {
         Some(Self {
             extents,
             full_units,
+            containers,
             keys: held,
             fetch,
             fetch_calls: 0,
@@ -161,6 +182,14 @@ impl UnitVerifier {
             partials: HashMap::new(),
             lru: VecDeque::new(),
         })
+    }
+
+    /// The post-decrypt structural check for a clip's container.
+    fn accept_for(&self, clip: u32) -> fn(&[u8]) -> bool {
+        match self.containers[clip as usize] {
+            ContainerKind::Ts => aacs::unit_is_clean_ts,
+            ContainerKind::Ps => aacs::unit_is_clean_ps,
+        }
     }
 
     /// Feed a just-read, just-`Finished` disc byte range (`bytes` starts at disc
@@ -184,7 +213,8 @@ impl UnitVerifier {
             let off = s * sector;
             self.fill(clip, unit, slot, lba, &bytes[off..off + sector]);
             if let Some((raw, lbas)) = self.take_if_complete(clip, unit) {
-                match self.decryptability(&raw) {
+                let accept = self.accept_for(clip);
+                match self.decryptability(&raw, accept) {
                     Decryptability::Undecryptable => push_ranges(&mut bad, &lbas),
                     Decryptability::Decryptable | Decryptability::Unknown => {}
                 }
@@ -270,27 +300,33 @@ impl UnitVerifier {
         }
     }
 
-    /// Can this fully-assembled unit be decrypted + verified? The authoritative
-    /// check is the strict [`aacs::unit_is_clean_ts`]; `decrypt_unit` only
-    /// restores the body. Returns the 3-state [`Decryptability`].
-    fn decryptability(&mut self, raw: &[u8; ALIGNED_UNIT_LEN]) -> Decryptability {
+    /// Can this fully-assembled unit be decrypted + verified? `accept` is the
+    /// container's strict structural check ([`aacs::unit_is_clean_ts`] for TS,
+    /// [`aacs::unit_is_clean_ps`] for PS) — the only format-specific part; the
+    /// AACS crypto is container-agnostic. Returns the 3-state [`Decryptability`].
+    fn decryptability(
+        &mut self,
+        raw: &[u8; ALIGNED_UNIT_LEN],
+        accept: fn(&[u8]) -> bool,
+    ) -> Decryptability {
         // CPI clear -> the unit is plaintext by spec (no key needed). If it is
-        // clean TS, it is decryptable-as-is. If it ISN'T, we DELIBERATELY return
-        // Unknown, not Undecryptable: with no key to crypto-prove anything, a
-        // clear-but-not-clean unit could be a genuine bad read OR a mis-aligned
-        // read OR legitimately-odd clear content (some menu/nav units). We refuse
-        // to assert "bad" without proof — only ENCRYPTED units that no key opens
-        // are ever flagged. (A real bad READ of clear content is still caught by
-        // the normal SCSI read-error path; this gate just won't false-flag it.)
+        // structurally clean, it is decryptable-as-is. If it ISN'T, we
+        // DELIBERATELY return Unknown, not Undecryptable: with no key to
+        // crypto-prove anything, a clear-but-not-clean unit could be a genuine
+        // bad read OR a mis-aligned read OR legitimately-odd clear content (some
+        // menu/nav units). We refuse to assert "bad" without proof — only
+        // ENCRYPTED units that no key opens are ever flagged. (A real bad READ of
+        // clear content is still caught by the normal SCSI read-error path; this
+        // gate just won't false-flag it.)
         if !aacs::aacs_unit_encrypted(raw) {
-            return if aacs::unit_is_clean_ts(raw) {
+            return if accept(raw) {
                 Decryptability::Decryptable
             } else {
                 Decryptability::Unknown
             };
         }
-        // Encrypted: any held key that decrypts to clean TS -> decryptable.
-        if self.try_keys(raw) {
+        // Encrypted: any held key that decrypts to a structurally-clean unit.
+        if self.try_keys(raw, accept) {
             return Decryptability::Decryptable;
         }
         // No held key works. Ask the application's key source ONCE for this
@@ -313,7 +349,7 @@ impl UnitVerifier {
                     self.fetch_spent = true; // service has nothing new; stop asking
                     return Decryptability::Unknown;
                 }
-                if self.try_keys(raw) {
+                if self.try_keys(raw, accept) {
                     return Decryptability::Decryptable;
                 }
                 return Decryptability::Undecryptable; // service's keys don't open it -> bad ciphertext
@@ -322,11 +358,12 @@ impl UnitVerifier {
         Decryptability::Unknown
     }
 
-    /// True if any currently-held key decrypts `raw` to strictly clean TS.
-    fn try_keys(&self, raw: &[u8; ALIGNED_UNIT_LEN]) -> bool {
+    /// True if any currently-held key decrypts `raw` to a structurally-clean unit
+    /// under the container's `accept` check.
+    fn try_keys(&self, raw: &[u8; ALIGNED_UNIT_LEN], accept: fn(&[u8]) -> bool) -> bool {
         for k in &self.keys {
             let mut scratch = *raw;
-            if aacs::decrypt_unit(&mut scratch, k) {
+            if aacs::decrypt_unit_checked(&mut scratch, k, accept) {
                 return true;
             }
         }
@@ -345,10 +382,18 @@ impl UnitVerifier {
     /// ISO). Reading the whole unit back from the just-patched ISO is the only
     /// alignment-correct way to re-check it. FAIL-SAFE: an ISO read error on any
     /// of a unit's sectors skips that unit (no false-bad).
+    ///
+    /// CRITICAL: `is_finished(lba)` must report whether each disc sector was
+    /// actually READ (mapfile `Finished`). A unit with ANY non-Finished sector is
+    /// zero-filled there (the drive read failed) — we CANNOT verify what was
+    /// never read, so such a unit is skipped entirely. This both avoids asserting
+    /// "undecryptable" on unread data and avoids wasting a key lookup on a block
+    /// the read already knows is bad.
     pub fn reverify_iso<S: crate::sector::SectorSource>(
         &mut self,
         iso: &mut S,
         ranges: &[(u64, u64)],
+        is_finished: &dyn Fn(u32) -> bool,
     ) -> Vec<(u32, u32)> {
         let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
         let mut bad: Vec<(u32, u32)> = Vec::new();
@@ -368,6 +413,13 @@ impl UnitVerifier {
                 let Some(lbas) = self.unit_disc_sectors(clip, unit) else {
                     continue;
                 };
+                // We can only verify a unit whose EVERY backing sector was read.
+                // A non-Finished sector is zero-filled (the read failed there);
+                // verifying it would judge data we never read and waste a key
+                // lookup on a known-bad block. Skip the whole unit.
+                if !lbas.iter().all(|&l| is_finished(l)) {
+                    continue;
+                }
                 let mut raw = [0u8; ALIGNED_UNIT_LEN];
                 let mut readable = true;
                 for (slot, &slba) in lbas.iter().enumerate() {
@@ -385,7 +437,10 @@ impl UnitVerifier {
                         break;
                     }
                 }
-                if readable && matches!(self.decryptability(&raw), Decryptability::Undecryptable) {
+                let accept = self.accept_for(clip);
+                if readable
+                    && matches!(self.decryptability(&raw, accept), Decryptability::Undecryptable)
+                {
                     push_ranges(&mut bad, &lbas);
                 }
             }
@@ -446,6 +501,16 @@ mod tests {
         u
     }
 
+    /// A clear MPEG-2 PS aligned unit: pack-start `00 00 01 BA` at each 2048
+    /// boundary, CPI bits clear (byte 0 == 0x00).
+    fn clear_ps_unit() -> Vec<u8> {
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        for o in [0usize, 2048, 4096] {
+            u[o..o + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        }
+        u
+    }
+
     /// Encrypt a clear unit in place under `unit_key` (sets CPI, AES-CBC body) —
     /// the exact inverse of `decrypt_unit`, so the right key restores clean TS.
     fn encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
@@ -485,10 +550,16 @@ mod tests {
 
     /// One contiguous full unit at disc LBA `lba` (size 6144 = 3 sectors).
     fn one_clip(lba: u32) -> Vec<ClipLayout> {
-        vec![ClipLayout {
-            size: ALIGNED_UNIT_LEN as u64,
-            extents: vec![(lba, ALIGNED_UNIT_LEN as u32)],
-        }]
+        vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(lba, ALIGNED_UNIT_LEN as u32)])]
+    }
+
+    /// Build a BD-TS `ClipLayout` (the only container current enumeration emits).
+    fn ts_clip(size: u64, extents: Vec<(u32, u32)>) -> ClipLayout {
+        ClipLayout {
+            size,
+            extents,
+            container: ContainerKind::Ts,
+        }
     }
 
     // ── fail-safe: when the gate must NOT exist ────────────────────────────
@@ -519,10 +590,7 @@ mod tests {
 
     #[test]
     fn new_is_none_with_no_extents() {
-        let clips = vec![ClipLayout {
-            size: 0,
-            extents: vec![],
-        }];
+        let clips = vec![ts_clip(0, vec![])];
         assert!(UnitVerifier::new(&clips, &aacs_keys(&[[1; 16]]), None).is_none());
     }
 
@@ -631,10 +699,7 @@ mod tests {
             c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![real]
         });
-        let clips = vec![ClipLayout {
-            size: 2 * ALIGNED_UNIT_LEN as u64,
-            extents: vec![(200, 2 * ALIGNED_UNIT_LEN as u32)],
-        }];
+        let clips = vec![ts_clip(2 * ALIGNED_UNIT_LEN as u64, vec![(200, 2 * ALIGNED_UNIT_LEN as u32)])];
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[[0x01; 16]]), Some(fetch)).unwrap();
         let mut u0 = clear_unit();
         encrypt_unit(&mut u0, &real);
@@ -659,10 +724,7 @@ mod tests {
         let real = [0x42; 16];
         let mut u = clear_unit();
         encrypt_unit(&mut u, &real);
-        let clips = vec![ClipLayout {
-            size: ALIGNED_UNIT_LEN as u64,
-            extents: vec![(10, 4096), (5000, 2048)],
-        }];
+        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(10, 4096), (5000, 2048)])];
         // Wrong key + a fetch that yields wrong keys => confident bad, fragmented.
         let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[[0x01; 16]]), Some(fetch)).unwrap();
@@ -686,10 +748,7 @@ mod tests {
         let key = [0x5a; 16];
         let mut u0 = clear_unit();
         encrypt_unit(&mut u0, &key);
-        let clips = vec![ClipLayout {
-            size: ALIGNED_UNIT_LEN as u64 + 2048,
-            extents: vec![(100, ALIGNED_UNIT_LEN as u32 + 2048)],
-        }];
+        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64 + 2048, vec![(100, ALIGNED_UNIT_LEN as u32 + 2048)])];
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[key]), None).unwrap();
         // Feed full unit 0 (good) + the tail sector (garbage). Only unit 0 is
         // judged; the tail is never a verdict.
@@ -787,7 +846,7 @@ mod tests {
         let mut iso = MockIso { sectors: Default::default(), err_lba: None };
         place_unit(&mut iso, [100, 101, 102], &u);
         let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[key]), None).unwrap();
-        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)]);
+        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &|_| true);
         assert!(bad.is_empty(), "decryptable unit re-read clean -> not bad");
     }
 
@@ -803,7 +862,7 @@ mod tests {
         let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
         // A range covering only ONE sector of the unit still re-reads the WHOLE
         // unit from the ISO (patch re-reads partial units).
-        let bad = v.reverify_iso(&mut iso, &[(101 * 2048, 2048)]);
+        let bad = v.reverify_iso(&mut iso, &[(101 * 2048, 2048)], &|_| true);
         assert_eq!(bad, vec![(100, 3)], "undecryptable unit -> full 3-sector range");
     }
 
@@ -813,15 +872,12 @@ mod tests {
         let mut u = clear_unit();
         encrypt_unit(&mut u, &key);
         // Unit 0: sectors at 10, 11 (extent A) and 5000 (extent B).
-        let clips = vec![ClipLayout {
-            size: ALIGNED_UNIT_LEN as u64,
-            extents: vec![(10, 4096), (5000, 2048)],
-        }];
+        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(10, 4096), (5000, 2048)])];
         let mut iso = MockIso { sectors: Default::default(), err_lba: None };
         place_unit(&mut iso, [10, 11, 5000], &u);
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[key]), None).unwrap();
         // Range touches only the distant fragment; whole unit still assembled.
-        let bad = v.reverify_iso(&mut iso, &[(5000 * 2048, 2048)]);
+        let bad = v.reverify_iso(&mut iso, &[(5000 * 2048, 2048)], &|_| true);
         assert!(bad.is_empty(), "fragmented decryptable unit re-read clean");
     }
 
@@ -837,8 +893,57 @@ mod tests {
         place_unit(&mut iso, [100, 101, 102], &u);
         let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
         let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
-        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)]);
+        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &|_| true);
         assert!(bad.is_empty(), "ISO read error on a sector -> skip (fail-safe)");
+    }
+
+    #[test]
+    fn reverify_iso_skips_unit_with_unread_sector_and_never_fetches() {
+        // Sector 102 was NOT read (Unreadable -> zero-filled in the ISO). Even
+        // though the partly-zero unit wouldn't decrypt, we CANNOT verify what
+        // wasn't read: the unit is skipped, and crucially NO key lookup is made
+        // on a block the read already knows is bad.
+        let real = [0x11; 16];
+        let mut u = clear_unit();
+        encrypt_unit(&mut u, &real);
+        let mut iso = MockIso { sectors: Default::default(), err_lba: None };
+        place_unit(&mut iso, [100, 101, 102], &u);
+        let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| panic!("must NOT key-fetch an unread unit"));
+        let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
+        // 102 not Finished -> the whole unit is skipped.
+        let is_finished = |lba: u32| lba != 102;
+        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &is_finished);
+        assert!(bad.is_empty(), "unit with an unread sector is skipped, not flagged or fetched");
+    }
+
+    #[test]
+    fn ps_container_routes_through_pack_check() {
+        // A clip declared HD-DVD PS. The verifier must dispatch the structural
+        // check to unit_is_clean_ps (pack starts), not unit_is_clean_ts.
+        let clips = vec![ClipLayout {
+            size: ALIGNED_UNIT_LEN as u64,
+            extents: vec![(100, ALIGNED_UNIT_LEN as u32)],
+            container: ContainerKind::Ps,
+        }];
+        // A clear, valid PS unit passes the PS pack-start check -> not flagged.
+        let mut v = UnitVerifier::new(&clips, &aacs_keys(&[[1; 16]]), None).unwrap();
+        assert!(
+            v.observe(100, &clear_ps_unit()).is_empty(),
+            "valid PS unit passes unit_is_clean_ps"
+        );
+        // An encrypted unit (CPI set) whose decrypt never yields PS pack-starts,
+        // with a fetch returning a non-working key -> confidently Undecryptable
+        // through decrypt_unit_checked(.., unit_is_clean_ps). Exercises the Ps
+        // path end-to-end (and constructs ContainerKind::Ps so it isn't dead).
+        let mut enc = clear_ps_unit();
+        enc[0] |= 0xC0; // CPI set; body is garbage to any key
+        let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
+        let mut v2 = UnitVerifier::new(&clips, &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
+        assert_eq!(
+            v2.observe(100, &enc),
+            vec![(100, 3)],
+            "encrypted PS unit no key opens -> bad via the PS check"
+        );
     }
 
     #[test]
@@ -846,10 +951,7 @@ mod tests {
         // Open more partials than the cap with single-sector feeds; the map must
         // never exceed the cap (oldest evicted, unverified — fail-safe).
         let mut v = UnitVerifier::new(
-            &vec![ClipLayout {
-                size: (MAX_INFLIGHT_UNITS as u64 + 100) * ALIGNED_UNIT_LEN as u64,
-                extents: vec![(0, u32::MAX / 2)],
-            }],
+            &vec![ts_clip((MAX_INFLIGHT_UNITS as u64 + 100) * ALIGNED_UNIT_LEN as u64, vec![(0, u32::MAX / 2)])],
             &aacs_keys(&[[1; 16]]),
             None,
         )
