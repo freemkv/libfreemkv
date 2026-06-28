@@ -171,21 +171,31 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
         return None;
     }
 
-    // Title → CPS unit mapping
+    // Title → CPS unit mapping. libaacs (unit_key.c) validates each on-disc CPS
+    // value is in `1..=num_uk` (else zeroes it) and converts the 1-based on-disc
+    // index to a 0-based key index. We mirror that so the stored value is a safe,
+    // ready-to-use key index rather than a raw 1-based number.
+    let to_key_idx = |cps: u16| -> u16 {
+        if cps >= 1 && cps as usize <= num_uk {
+            cps - 1
+        } else {
+            0
+        }
+    };
     let mut title_cps_unit = Vec::new();
     if data.len() >= 26 {
         let first_play = u16::from_be_bytes([data[20], data[21]]);
         let top_menu = u16::from_be_bytes([data[22], data[23]]);
         let num_titles = u16::from_be_bytes([data[24], data[25]]) as usize;
 
-        title_cps_unit.push(first_play);
-        title_cps_unit.push(top_menu);
+        title_cps_unit.push(to_key_idx(first_play));
+        title_cps_unit.push(to_key_idx(top_menu));
 
         for i in 0..num_titles {
             let off = 26 + i * 4 + 2; // 2 bytes padding + 2 bytes CPS unit
             if off + 2 <= data.len() {
                 let cps = u16::from_be_bytes([data[off], data[off + 1]]);
-                title_cps_unit.push(cps);
+                title_cps_unit.push(to_key_idx(cps));
             }
         }
     }
@@ -1050,22 +1060,25 @@ pub struct ContentCert {
 
 /// Parse a Content Certificate (ContentXXX.cer) file.
 pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
-    if data.len() < 8 {
+    if data.len() < 20 {
         return None;
     }
 
-    // Content Certificate format:
-    //   [0] certificate type (0x00 = AACS1, 0x01 = AACS2)
-    //   [1] bus_encryption_enabled (bit 0)
-    //   [2..8] cc_id (6 bytes)
+    // Content Certificate layout (matches libaacs content_cert.c):
+    //   [0]      certificate type (0x00 = AACS1, 0x10 = AACS2)
+    //   [1] bit7 bus_encryption_enabled_flag  (libaacs: `p[1] >> 7`)
+    //   [14..20] cc_id (6 bytes)             (libaacs: `p + 14`)
     let version = if data[0] == 0x00 {
         AacsVersion::V10
     } else {
         AacsVersion::V20
     };
-    let bus_encryption = (data[1] & 0x01) != 0;
+    // The flag is bit 7 of byte 1, NOT bit 0. Reading bit 0 (the prior bug) made
+    // a bus-encrypted cert (byte1=0x80) read as `false`, defeating the
+    // AacsBusKeyUnavailable fail-loud gate in disc/encrypt.rs.
+    let bus_encryption = (data[1] >> 7) & 1 == 1;
     let mut cc_id = [0u8; 6];
-    cc_id.copy_from_slice(&data[2..8]);
+    cc_id.copy_from_slice(&data[14..20]);
 
     Some(ContentCert {
         bus_encryption,
@@ -2314,19 +2327,26 @@ mod tests {
     }
     #[test]
     fn test_content_cert_parse() {
-        // AACS 1.0 cert
-        let mut data = vec![0u8; 16];
+        // AACS 1.0 cert, bus encryption OFF. Layout matches libaacs: flag in
+        // BIT 7 of byte 1, cc_id at bytes 14..20.
+        let mut data = vec![0u8; 20];
         data[0] = 0x00; // AACS 1.0
-        data[1] = 0x00; // no bus encryption
+        data[1] = 0x00; // bus_encryption flag (bit 7) clear
+        data[14..20].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         let cc = parse_content_cert(&data).unwrap();
         assert_eq!(cc.version, AacsVersion::V10);
         assert!(!cc.bus_encryption);
-        // AACS 2.0 with bus encryption
-        data[0] = 0x01; // AACS 2.0
-        data[1] = 0x01; // bus encryption enabled
+        assert_eq!(cc.cc_id, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        // AACS 2.0 with bus encryption: type 0x10, flag is BIT 7 (0x80) of byte 1
+        // — NOT bit 0. A cert with byte1=0x01 must therefore read as bus-OFF.
+        data[0] = 0x10; // AACS 2.0
+        data[1] = 0x80; // bus_encryption_enabled_flag = bit 7
         let cc = parse_content_cert(&data).unwrap();
         assert_eq!(cc.version, AacsVersion::V20);
         assert!(cc.bus_encryption);
+        // Regression guard: bit 0 set, bit 7 clear -> bus OFF (the old bug read this as ON).
+        data[1] = 0x01;
+        assert!(!parse_content_cert(&data).unwrap().bus_encryption);
     }
     // ════════════════════════════════════════════════════════════════════
     // Hardening additions
@@ -2613,29 +2633,31 @@ mod tests {
     // ── Content Certificate parsing ────────────────────────────────────────
     #[test]
     fn parse_content_cert_rejects_short_buffer() {
-        // < 8 bytes → None (cc_id slice [2..8] would index OOB).
-        assert!(parse_content_cert(&[0x00; 7]).is_none());
+        // < 20 bytes → None (cc_id slice [14..20] would index OOB).
+        assert!(parse_content_cert(&[0x00; 19]).is_none());
+        assert!(parse_content_cert(&[0x00; 20]).is_some());
     }
     #[test]
     fn parse_content_cert_extracts_cc_id_and_nonzero_type_is_v20() {
-        // [0]=type, [1]=bus-enc bit0, [2..8]=cc_id. Any non-0x00 type → V20.
-        let mut data = vec![0u8; 8];
-        data[0] = 0x02; // not 0x00 and not 0x01 → still V20
+        // libaacs layout: [0]=type, [1] bit7=bus-enc, [14..20]=cc_id. Any
+        // non-0x00 type → V20.
+        let mut data = vec![0u8; 20];
+        data[0] = 0x10; // AACS2 type marker → V20
         data[1] = 0x00;
-        data[2..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        data[14..20].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         let cc = parse_content_cert(&data).unwrap();
         assert_eq!(cc.version, AacsVersion::V20);
         assert_eq!(cc.cc_id, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
         assert!(!cc.bus_encryption);
     }
     #[test]
-    fn parse_content_cert_bus_encryption_only_reads_bit0() {
-        // bus_encryption = (data[1] & 0x01) != 0. A high bit set (0x02) with
-        // bit0 clear → false. Pins the mask, not a truthiness of the byte.
-        let mut data = vec![0u8; 8];
-        data[1] = 0x02; // bit 1 set, bit 0 clear
+    fn parse_content_cert_bus_encryption_reads_bit7() {
+        // bus_encryption = (data[1] >> 7) & 1 (libaacs). Low bits set with bit7
+        // clear → false; bit7 set → true. Pins the bit, not a truthiness of the byte.
+        let mut data = vec![0u8; 20];
+        data[1] = 0x7F; // bits 0..6 set, bit 7 clear
         assert!(!parse_content_cert(&data).unwrap().bus_encryption);
-        data[1] = 0x03; // bit 0 set
+        data[1] = 0x80; // bit 7 set
         assert!(parse_content_cert(&data).unwrap().bus_encryption);
     }
     // ── resolve: version → stride wiring + V21 upgrade on variant MKB ──────
@@ -2732,10 +2754,10 @@ mod tests {
                 unit_keys: Vec::new(),
             }),
         };
-        // Content cert: AACS2 + bus encryption enabled.
-        let mut cc = vec![0u8; 8];
-        cc[0] = 0x01;
-        cc[1] = 0x01;
+        // Content cert: AACS2 (type 0x10) + bus encryption enabled (bit 7 of byte 1).
+        let mut cc = vec![0u8; 20];
+        cc[0] = 0x10;
+        cc[1] = 0x80;
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,

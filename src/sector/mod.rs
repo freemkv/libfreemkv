@@ -131,7 +131,7 @@ pub trait SectorSink: Send {
 }
 
 pub use crate::io::file_sector_source::FileSectorSource;
-pub use decrypting::DecryptingSectorSource;
+pub use decrypting::{DECRYPT_VERIFY_READ, DecryptingSectorSource, KeyFetch};
 pub use file::FileSectorSink;
 pub use prefetched::PrefetchedSectorSource;
 

@@ -304,6 +304,60 @@ impl Disc {
             None => base_keys.clone(),
         }
     }
+
+}
+
+/// True for the AACS-encrypted stream files (`.m2ts`, `.ssif`). Every other UDF
+/// file is clear (nav / playlists / filesystem) and needs no decrypt verify.
+fn is_aacs_clip(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".m2ts") || lower.ends_with(".ssif")
+}
+
+/// Enumerate the disc's AACS clip (`.m2ts`/`.ssif`) files as
+/// [`crate::disc::verify::ClipLayout`]s for the post-read verify gate: each
+/// clip's declared size plus its absolute disc extents in FILE order. Reads the
+/// UDF tree through `reader`.
+///
+/// FAIL-SAFE: any enumeration error (bad UDF read, name collision, …) yields an
+/// EMPTY list — the verify gate then covers nothing and the sweep behaves as
+/// today. Enumeration must never break a rip, so the error is logged, not
+/// propagated.
+pub(crate) fn clip_layouts(reader: &mut dyn SectorSource) -> Vec<crate::disc::verify::ClipLayout> {
+    let result = (|| -> Result<Vec<crate::disc::verify::ClipLayout>> {
+        let fs = udf::read_filesystem(reader)?;
+        let mut planned: Vec<PlannedFile> = Vec::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut seen_hosts: std::collections::HashMap<PathBuf, String> =
+            std::collections::HashMap::new();
+        plan_tree(
+            reader,
+            &fs,
+            &fs.root,
+            Path::new(""),
+            "",
+            true,
+            &mut planned,
+            &mut dirs,
+            &mut seen_hosts,
+        )?;
+        Ok(planned
+            .into_iter()
+            .filter(|pf| pf.inline.is_none() && is_aacs_clip(&pf.disc_name))
+            .map(|pf| crate::disc::verify::ClipLayout {
+                size: pf.size,
+                extents: pf.extents,
+            })
+            .collect())
+    })();
+    result.unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "freemkv::verify",
+            error = %e,
+            "clip enumeration failed; post-read verify disabled for this pass"
+        );
+        Vec::new()
+    })
 }
 
 /// A borrowing `SectorSource` wrapper. Lets the decrypting decorator "own" an
@@ -473,21 +527,12 @@ fn extract_one_file<S: SectorSource>(
         let sectors = (byte_len as u64).div_ceil(SECTOR_BYTES_U64) as u32;
         let mut sector_off: u32 = 0;
         while sector_off < sectors {
-            let mut batch = (sectors - sector_off).min(READ_BATCH_SECTORS);
-            // AACS: read whole units. Round the batch DOWN to a multiple of 3
-            // unless this is the final (possibly short) tail of the extent.
-            // Every preceding batch is a whole number of units, so the tail
-            // batch always BEGINS on a unit boundary (the gate measures
-            // `lba - unit_base`, which stays unit-aligned). The tail itself may
-            // be 1–2 sectors past a unit boundary; `decrypt_sectors` handles
-            // that trailing partial unit explicitly (see its "Trailing-partial
-            // contract"): a clear partial is left in the clear (the conformant
-            // case — AACS leaves the final short unit unencrypted on disc), a
-            // scrambled partial fails loud as DecryptFailed. So the short tail
-            // is correct without padding the read up to a whole unit.
-            if batch >= AACS_UNIT_SECTORS && (sector_off + batch) < sectors {
-                batch -= batch % AACS_UNIT_SECTORS;
-            }
+            // AACS: read whole units (see `whole_unit_batch`). The tail batch may
+            // be a 1–2 sector partial unit, which `decrypt_sectors` handles via
+            // its trailing-partial contract: a clear partial stays clear (AACS
+            // leaves the final short unit unencrypted on disc), a scrambled
+            // partial fails loud as DecryptFailed.
+            let batch = whole_unit_batch(sectors - sector_off);
             let lba = abs_lba + sector_off;
             let want = batch as usize * SECTOR_BYTES;
             let read_ok = read_batch(dec, lba, batch, &mut buf[..want]);
@@ -528,6 +573,22 @@ fn extract_one_file<S: SectorSource>(
     finalize_file(writer, &partial_path, pf.size, &final_path)?;
     fr.complete = true;
     Ok((fr, false))
+}
+
+/// Size the next FILE-ANCHORED content read in whole AACS units. `remaining` is
+/// the sectors left in the current extent; the batch is capped at
+/// [`READ_BATCH_SECTORS`] and rounded DOWN to a whole number of 3-sector units
+/// UNLESS it is the extent's final (possibly short) tail — the tail always
+/// begins on a unit boundary, so a 1–2 sector partial there is handled by
+/// `decrypt_sectors`' trailing-partial contract. Shared by `extract_one_file`
+/// (write) and `verify_one_clip` (dead-range) so this rounding rule lives in
+/// exactly one place.
+fn whole_unit_batch(remaining: u32) -> u32 {
+    let mut batch = remaining.min(READ_BATCH_SECTORS);
+    if batch >= AACS_UNIT_SECTORS && batch < remaining {
+        batch -= batch % AACS_UNIT_SECTORS;
+    }
+    batch
 }
 
 /// Read one batch through the decrypting decorator with bounded retries.
@@ -1033,6 +1094,8 @@ mod tests {
             }
             off += 192;
         }
+        // Flag encrypted via CPI bits (byte 0) before key derivation.
+        unit[0] |= 0xC0;
         let header: [u8; 16] = unit[..16].try_into().unwrap();
         let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
         let mut k = [0u8; 16];
@@ -1066,6 +1129,9 @@ mod tests {
             }
             off += 192;
         }
+        // decrypt preserves the plaintext header, so the recovered unit carries
+        // the CPI bits the encrypt fixture set — the expected plaintext must too.
+        unit[0] |= 0xC0;
         unit
     }
 
@@ -1116,6 +1182,7 @@ mod tests {
     fn read_out(dir: &Path, rel: &str) -> Option<Vec<u8>> {
         std::fs::read(dir.join(rel)).ok()
     }
+
 
     // ── Tests ─────────────────────────────────────────────────────────────
 

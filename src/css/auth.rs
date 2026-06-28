@@ -280,9 +280,12 @@ fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
-/// Issue the disc-key REPORT KEY (READ DVD STRUCTURE, format 0x02) purely
-/// for the bus-auth unlock side effect. The returned block contents are
-/// not used — the descramble title key is recovered keylessly elsewhere.
+/// Issue READ DVD STRUCTURE format 0x02 (Copyright Information — opcode 0xAD,
+/// NOT the REPORT KEY 0xA4 disc-key block) purely for the bus-auth unlock side
+/// effect. The returned block contents are not used — the descramble title key
+/// is recovered keylessly elsewhere, so the genuine disc-key REPORT KEY is
+/// intentionally skipped. (If a drive is ever found where bus-auth alone does
+/// not open scrambled reads, a real REPORT KEY format 0x02 belongs here.)
 fn read_disc_key(drive: &mut Drive, agid: u8) -> Result<()> {
     let scsi = drive.scsi_mut();
 

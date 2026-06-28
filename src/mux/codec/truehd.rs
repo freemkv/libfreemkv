@@ -13,6 +13,7 @@
 //! We skip AC-3 frames and only emit TrueHD access units.
 
 use super::{CodecParser, Frame, PesPacket, pts_to_ns};
+use crate::mux::timeline::DISCONTINUITY_BACKSTEP_NS;
 
 /// Duration of one TrueHD access unit in nanoseconds for the 48 kHz family
 /// (48 / 96 / 192 kHz). `access_unit_size = 40 << (ratebits & 7)` and
@@ -138,18 +139,47 @@ impl CodecParser for TrueHdParser {
         // the next PES legitimately begins a new AU and seeds the base.
         if self.buf.is_empty() {
             if let Some(pts) = pes.pts {
-                // Resync to the authoritative PES PTS, but NEVER snap backward.
-                // TrueHD AUs are a fixed sample count (40 @ 48 kHz), so the
-                // per-AU `+AU_DURATION_NS` cadence is sample-accurate — more so
-                // than the disc's per-PES PTS, which carries the source muxer's
-                // own rounding jitter. When the buffer empties exactly on a PES
-                // boundary and that PES's PTS lands a few ticks *below* the
-                // running cadence, an unconditional reset would set the next
-                // AU's timestamp below the AU just emitted, producing the
-                // non-monotonic block timestamps a muxer rejects. Clamp to the
-                // running position so output stays strictly monotonic; a
-                // genuine forward gap/discontinuity is still adopted.
-                self.next_pts_ns = self.next_pts_ns.max(pts_to_ns(pts));
+                // Resync to the authoritative PES PTS. TrueHD AUs are a fixed
+                // sample count (40 @ 48 kHz), so the per-AU `+AU_DURATION_NS`
+                // cadence is sample-accurate — more so than the disc's per-PES
+                // PTS, which carries the source muxer's own rounding jitter.
+                //
+                // Two distinct backward steps must be handled OPPOSITELY:
+                //
+                // 1. Small backward jitter (sub-second PES rounding): when the
+                //    buffer empties exactly on a PES boundary and that PES's PTS
+                //    lands a few ticks *below* the running cadence, an
+                //    unconditional reset would set the next AU's timestamp below
+                //    the AU just emitted, producing non-monotonic block
+                //    timestamps a muxer rejects. CLAMP to the running position so
+                //    output stays strictly monotonic.
+                //
+                // 2. Large backward step (> DISCONTINUITY_BACKSTEP_NS): this is a
+                //    clip-boundary PTS reset — the title's clips are read as one
+                //    concatenated stream and a non-seamless boundary resets the
+                //    source PES PTS near zero. This is NOT jitter and must NOT be
+                //    clamped: clamping strands the audio at the previous clip's
+                //    tail cadence, so when `TimelineContinuity` later bumps the
+                //    global offset for the new epoch (driven by the video
+                //    back-jump) the stranded-high audio PTS is flung ~a whole
+                //    clip past the frontier, producing the non-monotonic
+                //    audio-DTS band on multi-clip titles (Dune: Part Two, Top
+                //    Gun). ADOPT the raw reset so the per-track raw PTS that
+                //    reaches `TimelineContinuity` carries the true boundary, and
+                //    the corrector rebases it exactly as it already does for the
+                //    DTS / AC-3 parsers (which never clamp). Same threshold the
+                //    timeline corrector uses to classify a discontinuity.
+                //
+                // A genuine forward gap/discontinuity is always adopted by the
+                // `.max()`.
+                let new = pts_to_ns(pts);
+                if new < self.next_pts_ns - DISCONTINUITY_BACKSTEP_NS {
+                    // Clip-boundary reset: take the raw PTS, restart the cadence.
+                    self.next_pts_ns = new;
+                } else {
+                    // Within-clip jitter (or forward progression): stay monotonic.
+                    self.next_pts_ns = self.next_pts_ns.max(new);
+                }
             }
         }
 
@@ -487,6 +517,44 @@ mod tests {
             "AU pts must not go backward when PES PTS lags the cadence: got {} after {}",
             f2[0].pts_ns,
             last1
+        );
+    }
+
+    #[test]
+    fn clip_boundary_pts_reset_is_adopted_not_clamped() {
+        // Regression (Dune: Part Two / Top Gun non-monotonic audio-DTS band):
+        // a title's clips are read as one concatenated stream, so at a
+        // non-seamless boundary the source PES PTS resets near zero — a LARGE
+        // backward step (> DISCONTINUITY_BACKSTEP_NS), NOT muxer jitter. The
+        // parser must ADOPT that reset (restart the cadence at the raw PTS), the
+        // same way the DTS / AC-3 parsers pass raw PTS through, so the per-track
+        // raw PTS reaching TimelineContinuity carries the true boundary and the
+        // corrector can rebase it. Clamping it forward (the old `.max()`) stranded
+        // the audio at the previous clip's tail; when the global offset later
+        // bumped for the new epoch the stranded audio was flung ~a clip past the
+        // frontier — the non-monotonic band.
+        let mut parser = TrueHdParser::new();
+        let au = make_truehd_unit(100);
+        // Clip 1: an AU at PES PTS = 10s (90000 ticks/s → 900_000 ticks). Buffer
+        // empties, so the next PES seeds a fresh base.
+        let clip1_pts = 90_000 * 10; // 10 s in 90 kHz ticks
+        let f1 = parser.parse(&make_pes(au.clone(), Some(clip1_pts)));
+        assert_eq!(f1.len(), 1);
+        let last1 = f1[0].pts_ns;
+        assert_eq!(last1, pts_to_ns(clip1_pts));
+        // Clip 2: PES PTS resets to 0 — 10 s backward, far beyond the 3 s
+        // discontinuity threshold. Must be adopted, not clamped to the cadence.
+        let f2 = parser.parse(&make_pes(au.clone(), Some(0)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(
+            f2[0].pts_ns, 0,
+            "clip-boundary PTS reset must be adopted raw (got {}, expected the \
+             reset value 0 — clamping to the previous clip's cadence is the bug)",
+            f2[0].pts_ns
+        );
+        assert!(
+            f2[0].pts_ns < last1,
+            "the reset frame must land below the previous clip's tail, not above it"
         );
     }
 
