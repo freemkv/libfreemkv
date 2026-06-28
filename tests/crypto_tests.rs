@@ -90,8 +90,11 @@ fn aacs_decrypt_unit_roundtrip() {
         plain[offset] = 0x47; // TS sync byte
         offset += 192;
     }
-    // No flag set: CBC-encrypting the body below scrambles packets 1..31's TS
-    // syncs, which is exactly what `is_aacs_scrambled` (raw-sync) detects.
+    // Flag the unit encrypted via the CPI bits (byte 0) — the authoritative gate
+    // `decrypt_unit` consults. Set BEFORE snapshotting `expected`: decrypt
+    // preserves the plaintext header, so the round-tripped unit carries these
+    // bits too.
+    plain[0] |= 0xC0;
 
     // Save original plaintext for comparison
     let expected = plain.clone();
@@ -128,7 +131,7 @@ fn aacs_decrypt_unit_roundtrip() {
     }
 
     // Verify it looks encrypted (body TS syncs scrambled)
-    assert!(aacs::is_aacs_scrambled(&plain));
+    assert!(aacs::ts_sync_destroyed(&plain));
 
     // Now decrypt
     let result = aacs::decrypt_unit(&mut plain, &unit_key);
@@ -137,7 +140,7 @@ fn aacs_decrypt_unit_roundtrip() {
         "decrypt_unit should return true on valid encrypted unit"
     );
     assert!(
-        !aacs::is_aacs_scrambled(&plain),
+        !aacs::ts_sync_destroyed(&plain),
         "decrypted unit should read as clear (TS syncs restored)"
     );
 
@@ -255,9 +258,9 @@ fn aacs_vuk_derivation_roundtrip() {
     assert_eq!(vuk, vuk2, "derive_vuk not deterministic");
 }
 
-/// Test: aacs_is_aacs_scrambled detects scrambled units via the raw TS syncs.
+/// Test: aacs_ts_sync_destroyed detects scrambled units via the raw TS syncs.
 #[test]
-fn aacs_is_aacs_scrambled_detection() {
+fn aacs_ts_sync_destroyed_detection() {
     // A clear unit: TS sync (0x47) intact at every 192-byte packet → not
     // scrambled. (Flag bits play no role.)
     let mut clear = vec![0u8; aacs::ALIGNED_UNIT_LEN];
@@ -267,7 +270,7 @@ fn aacs_is_aacs_scrambled_detection() {
         off += 192;
     }
     assert!(
-        !aacs::is_aacs_scrambled(&clear),
+        !aacs::ts_sync_destroyed(&clear),
         "clear unit (syncs intact) must not be scrambled"
     );
 
@@ -276,21 +279,21 @@ fn aacs_is_aacs_scrambled_detection() {
     flagged[0] = 0xC0; // copy-control bits
     flagged[7] = 0xC0; // TSC bits
     assert!(
-        !aacs::is_aacs_scrambled(&flagged),
+        !aacs::ts_sync_destroyed(&flagged),
         "flag bits must not be read as encryption"
     );
 
     // A scrambled body (syncs destroyed) → scrambled.
     let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
     assert!(
-        aacs::is_aacs_scrambled(&scrambled),
+        aacs::ts_sync_destroyed(&scrambled),
         "unit with no intact TS syncs must read as scrambled"
     );
 
     // Too short
     let short = vec![0xFFu8; 100];
     assert!(
-        !aacs::is_aacs_scrambled(&short),
+        !aacs::ts_sync_destroyed(&short),
         "short buffer should not be detected"
     );
 }
@@ -307,10 +310,12 @@ fn aacs_decrypt_unit_unencrypted_passthrough() {
         unit[off] = 0x47;
         off += 192;
     }
+    // CPI bits (byte 0) CLEAR → the authoritative gate reads this as plaintext.
+    unit[0] &= 0x3F;
     let original = unit.clone();
     let key = [0xAA; 16];
 
-    assert!(!aacs::is_aacs_scrambled(&unit));
+    assert!(!aacs::ts_sync_destroyed(&unit));
     let result = aacs::decrypt_unit(&mut unit, &key);
     assert!(result, "clear unit should return true");
     assert_eq!(unit, original, "clear unit should be unchanged");
@@ -380,7 +385,9 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
             plaintext[i] = (i % 251) as u8;
         }
     }
-    // No flag set: the CBC-encrypted body scrambles the packet syncs.
+    // Flag the unit encrypted via the CPI bits (byte 0) — the gate `decrypt_unit`
+    // consults. Set before snapshotting `expected`; decrypt preserves the header.
+    plaintext[0] |= 0xC0;
 
     let expected = plaintext.clone();
 

@@ -225,7 +225,9 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
 /// AttackPattern: find a repeating pattern just before the encrypted region
 /// and assume the plaintext at 0x80 continues it.
 ///
-/// Exact port of libdvdcss `AttackPattern` (css.c). Scans cleartext
+/// Functionally-equivalent port of libdvdcss `AttackPattern` (css.c) — finds the
+/// same periodic cribs on real DVD data, though its byte-comparison anchor
+/// differs from the C on phase-misaligned runs. Scans cleartext
 /// `sec[0x00..0x80]` for the longest run that repeats with a cycle length in
 /// 2..0x2F. If the run is long enough (`plen > 3` and at least two full
 /// cycles), the known plaintext at 0x80 is taken to be the periodic run

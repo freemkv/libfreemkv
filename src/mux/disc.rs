@@ -1036,7 +1036,7 @@ mod tests {
     /// Recording `SectorSource`: logs every `(lba, count)` request and
     /// returns `Err` whenever the requested range covers `bad_sector`.
     /// Successful reads return zeroed sectors (which are NOT
-    /// `is_aacs_scrambled`, so `DecryptingSectorSource` passes them through
+    /// `ts_sync_destroyed`, so `DecryptingSectorSource` passes them through
     /// even with synthetic AACS keys — no real decrypt is attempted).
     struct RecordingReader {
         capacity: u32,

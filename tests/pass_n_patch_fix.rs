@@ -90,16 +90,16 @@ fn aacs_encryption_flag_detection() {
         off += 192;
     }
     // Encryption is the scrambled body (TS syncs destroyed), NOT a flag bit.
-    assert!(!aacs::is_aacs_scrambled(&unit));
+    assert!(!aacs::ts_sync_destroyed(&unit));
 
     // Flag bits on a synced unit do not make it look encrypted.
     unit[0] = 0xC0;
     unit[7] = 0xC0;
-    assert!(!aacs::is_aacs_scrambled(&unit));
+    assert!(!aacs::ts_sync_destroyed(&unit));
 
     // Scrambled body (syncs gone) → encrypted.
     let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
-    assert!(aacs::is_aacs_scrambled(&scrambled));
+    assert!(aacs::ts_sync_destroyed(&scrambled));
 }
 
 /// Test: DecryptKeys::is_encrypted() correctly identifies encrypted state.

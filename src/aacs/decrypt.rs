@@ -101,22 +101,66 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
-/// True if a 6144-byte aligned unit is AACS-scrambled on disc.
+/// True if a 6144-byte aligned unit's MPEG-TS sync structure is DESTROYED — it
+/// lacks the `0x47` sync bytes a clear BD-TS unit carries at offsets 4, 196,
+/// 388, … (one per 192-byte source packet).
 ///
-/// AACS encrypts the unit body, which destroys the MPEG-TS sync bytes (`0x47`)
-/// a clear unit carries at offsets 4, 196, 388, … (one per 192-byte source
-/// packet). So "scrambled" = "the TS syncs are NOT intact". This is
-/// flag-independent: it does NOT read the TP_extra copy-control bits (byte 0)
-/// or the TS scrambling-control bits (byte 7) — AACS sets neither reliably
-/// across discs/players.
+/// This is a pure BYTE heuristic; on its own it does NOT mean "encrypted". A
+/// destroyed sync structure can be AACS ciphertext, uncorrected-ECC garbage, OR
+/// data that was never MPEG-TS at all (UDF filesystem / nav) — those are
+/// byte-indistinguishable. So this answers only *"does this unit look like valid
+/// clear TS, or not"*, nothing about encryption.
 ///
-/// This is the single shared definition of "encrypted" for the whole ecosystem
-/// — libfreemkv's decrypt gate, autorip's sample selection, and the online key
-/// service's validation gate all call THIS, so they always agree on what is
-/// encrypted. A correctly-decrypted (or natively-clear) unit reports `false`,
-/// so the decrypt path never double-decrypts and there is no flag to clear.
-pub fn is_aacs_scrambled(unit: &[u8]) -> bool {
+/// The "is this unit AACS-encrypted (and must decrypt)?" decision is COMPOSED by
+/// the caller, because it needs context this function lacks:
+/// `inside an m2ts content extent` AND `ts_sync_destroyed` AND `no key decrypts`
+/// (see [`crate::decrypt::decrypt_sectors_in_content`] and
+/// [`crate::Disc::encrypted_content_ranges`]). Inside known content this
+/// primitive separates an encrypted/garbled unit (destroyed) from a clear
+/// segment (intact); OUTSIDE content it is meaningless — feeding it filesystem
+/// bytes is what produced the first-2 GB false-positive this split fixes.
+///
+/// Flag-independent: it does NOT read the TP_extra copy-control bits (byte 0) or
+/// the TS scrambling-control bits (byte 7) — AACS sets neither reliably.
+pub fn ts_sync_destroyed(unit: &[u8]) -> bool {
     unit.len() >= ALIGNED_UNIT_LEN && !ts_syncs_intact(unit)
+}
+
+/// The AUTHORITATIVE AACS "is this aligned unit encrypted?" signal — the Copy
+/// Permission Indicator (CPI) in the top 2 bits of byte 0. Byte 0 is the first
+/// byte of the first source packet's `TP_extra_header`, which AACS always leaves
+/// in the clear (the first 16 bytes of every unit are the unencrypted SEED). So
+/// this is readable WITHOUT a key:
+///   * `(buf[0] & 0xC0) == 0` → CPI clear → the unit is plaintext; pass through.
+///   * non-zero → bytes `16..6144` are AES-CBC encrypted; decrypt.
+///
+/// This is exactly libaacs' test (`if (!(buf[0] & 0xc0)) return; /* clear */`)
+/// and is the spec-correct replacement for the [`ts_sync_destroyed`] byte
+/// heuristic. CRITICAL: it is only meaningful when `unit` is read at the correct
+/// clip-FILE-anchored boundary — byte 0 must be the real unit start. A
+/// disc-absolute / mis-aligned read makes byte 0 arbitrary mid-stream data, so
+/// the CPI bits are meaningless (which is precisely why per-unit verify must run
+/// clip-anchored, not in the whole-disc sweep).
+pub fn aacs_unit_encrypted(unit: &[u8]) -> bool {
+    unit.len() >= ALIGNED_UNIT_LEN && (unit[0] & 0xC0) != 0
+}
+
+/// True when an aligned unit is flagged encrypted (CPI set) AND still looks
+/// scrambled (TS syncs not yet restored) — i.e. genuine encrypted content that
+/// has NOT been decrypted yet.
+///
+/// [`aacs_unit_encrypted`] is the authoritative spec gate, but the CPI bits live
+/// in the plaintext header (bytes `0..16`) which decryption never rewrites, so a
+/// successfully decrypted unit still reports CPI-set. Buffer-iterating sites that
+/// may run twice over the same `buf` (the post-fetch re-decrypt, sample
+/// collection, failure diagnosis) need an IDEMPOTENT "does this still need work?"
+/// test, so they compose CPI with the sync-restored check: once a unit decrypts,
+/// its syncs come back and it drops out. Single-shot callers that always operate
+/// on fresh ciphertext (`decrypt_unit`) gate on [`aacs_unit_encrypted`] alone.
+///
+/// Like CPI itself this is only meaningful at the clip-FILE-anchored boundary.
+pub fn aacs_unit_needs_decrypt(unit: &[u8]) -> bool {
+    aacs_unit_encrypted(unit) && ts_sync_destroyed(unit)
 }
 
 /// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
@@ -148,9 +192,29 @@ fn ts_syncs_intact(unit: &[u8]) -> bool {
     ts_sync_count(unit) > ts_packet_total(unit) / 2
 }
 
-/// Verify a decrypted unit looks like clear MPEG-TS (sync bytes intact).
-fn verify_ts(unit: &[u8]) -> bool {
-    ts_syncs_intact(unit)
+/// STRICT, standards-correct "is this a clean MPEG-TS aligned unit?" check —
+/// byte-for-byte libaacs' `_verify_ts` (`aacs.c`): EVERY one of the 32 BD source
+/// packets (192-byte stride) must carry its TS sync `0x47` at offset 4; the first
+/// miss fails. This is the authoritative gate for the POST-READ verify stage,
+/// independent of (and not coupled to) `decrypt_unit`.
+///
+/// It is deliberately stricter than the majority-vote `ts_syncs_intact`
+/// scramble *heuristic*: a wrong-key decrypt that coincidentally restores >16
+/// syncs passes the majority test and would silently corrupt content, but fails
+/// here. Non-mutating — purely a verdict; it neither decrypts nor clears the CPI
+/// bits (those stay the concern of the unchanged `decrypt_unit`).
+pub fn unit_is_clean_ts(unit: &[u8]) -> bool {
+    if unit.len() < ALIGNED_UNIT_LEN {
+        return false;
+    }
+    let mut i = 0;
+    while i < ALIGNED_UNIT_LEN {
+        if unit[i + 4] != TS_SYNC {
+            return false;
+        }
+        i += BD_SOURCE_PACKET_BYTES;
+    }
+    true
 }
 
 /// Decrypt one AACS aligned unit (6144 bytes) in-place.
@@ -170,8 +234,8 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     if unit.len() < ALIGNED_UNIT_LEN {
         return false;
     }
-    if !is_aacs_scrambled(unit) {
-        return true; // not encrypted
+    if !aacs_unit_encrypted(unit) {
+        return true; // CPI flag clear → plaintext, pass through untouched
     }
 
     // Save original first 16 bytes (they're plaintext TP_extra_header)
@@ -190,8 +254,11 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     // Step 3: Decrypt bytes 16..6143 with AES-CBC
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
-    // Decryption restored the TS syncs; verify the unit now looks like clear TS.
-    verify_ts(unit)
+    // Decryption restored the TS syncs; accept the key only if the unit is now
+    // STRICTLY clean MPEG-TS (all 32 syncs) — the standards-correct gate, shared
+    // with the post-read verify stage. A wrong key that coincidentally restores
+    // a majority of syncs is rejected here, not silently accepted.
+    unit_is_clean_ts(unit)
 }
 
 /// Fast, NON-MUTATING unit-key validation for the brute-force key search.
@@ -206,7 +273,7 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
 /// the full [`decrypt_unit`], so the set of accepted keys is bit-for-bit
 /// identical to the slow path.
 ///
-/// The caller MUST pass an aligned, already-[`is_aacs_scrambled`] unit
+/// The caller MUST pass an aligned, already-[`ts_sync_destroyed`] unit
 /// (`unit.len() >= ALIGNED_UNIT_LEN`). The brute pre-filters its units, so the
 /// per-candidate scramble re-scan is intentionally skipped here.
 ///
@@ -272,7 +339,7 @@ pub enum UnitKeyResult {
 /// consumed), [`UnitKeyResult::DecryptedWith(i)`] if key `i` decrypted it, or
 /// `None` if no key worked (the unit is restored to its original bytes).
 pub fn decrypt_unit_try_keys(unit: &mut [u8], unit_keys: &[[u8; 16]]) -> Option<UnitKeyResult> {
-    if !is_aacs_scrambled(unit) {
+    if !aacs_unit_encrypted(unit) {
         return Some(UnitKeyResult::AlreadyClear);
     }
 
@@ -314,7 +381,7 @@ pub fn decrypt_unit_full(
     unit_key: &[u8; 16],
     read_data_key: Option<&[u8; 16]>,
 ) -> bool {
-    if !is_aacs_scrambled(unit) {
+    if !ts_sync_destroyed(unit) {
         return true;
     }
     if let Some(rdk) = read_data_key {
@@ -386,7 +453,7 @@ mod tests {
             off += BD_SOURCE_PACKET_BYTES;
         }
         let key = [0u8; 16];
-        assert!(!is_aacs_scrambled(&unit));
+        assert!(!ts_sync_destroyed(&unit));
         assert!(decrypt_unit(&mut unit, &key));
     }
 
@@ -429,9 +496,9 @@ mod tests {
         assert_eq!(ts_sync_count(&set_syncs(17)), 17);
 
         // Exactly half intact → classified scrambled (16 > 16 is false).
-        assert!(is_aacs_scrambled(&set_syncs(16)));
+        assert!(ts_sync_destroyed(&set_syncs(16)));
         // One past half → classified clear.
-        assert!(!is_aacs_scrambled(&set_syncs(17)));
+        assert!(!ts_sync_destroyed(&set_syncs(17)));
     }
 
     #[test]
@@ -447,13 +514,13 @@ mod tests {
         }
         assert_eq!(ts_sync_count(&clear), 32);
         assert!(
-            !is_aacs_scrambled(&clear),
+            !ts_sync_destroyed(&clear),
             "fully-clear unit → not scrambled"
         );
 
         let scrambled = vec![0u8; ALIGNED_UNIT_LEN];
         assert_eq!(ts_sync_count(&scrambled), 0);
-        assert!(is_aacs_scrambled(&scrambled), "no syncs → scrambled");
+        assert!(ts_sync_destroyed(&scrambled), "no syncs → scrambled");
     }
 
     #[test]
@@ -502,8 +569,10 @@ mod tests {
             plain[offset] = TS_SYNC;
             offset += BD_SOURCE_PACKET_BYTES;
         }
-        // No flag set: CBC-encrypting the body below scrambles packets 1..31's
-        // TS syncs, which is exactly what `is_aacs_scrambled` (raw-sync) detects.
+        // Flag the unit encrypted via the CPI bits (byte 0) — the authoritative
+        // gate `decrypt_unit` now consults. Set before key derivation so the
+        // recovered plaintext header matches.
+        plain[0] |= 0xC0;
 
         // Now encrypt bytes 16..6143 using the AACS algorithm (reverse of decrypt)
         let header: [u8; 16] = plain[..16].try_into().unwrap();
@@ -530,9 +599,9 @@ mod tests {
 
         // Now plain contains encrypted data. Decrypt it.
         let mut unit = plain;
-        assert!(is_aacs_scrambled(&unit));
+        assert!(ts_sync_destroyed(&unit));
         assert!(decrypt_unit(&mut unit, &unit_key));
-        assert!(!is_aacs_scrambled(&unit)); // decrypted: TS syncs restored
+        assert!(!ts_sync_destroyed(&unit)); // decrypted: TS syncs restored
 
         // Verify TS sync bytes
         let mut count = 0;
@@ -557,6 +626,10 @@ mod tests {
     /// header) XOR header`, then CBC-encrypt bytes 16..6144 under the
     /// fixed AACS IV.
     fn aacs_encrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) {
+        // Set the CPI bits (top 2 of byte 0) so the unit reads as encrypted under
+        // `aacs_unit_encrypted` — done BEFORE key derivation so the plaintext
+        // header the real decrypt recovers matches what we encrypt under.
+        unit[0] |= 0xC0;
         let header: [u8; 16] = unit[..16].try_into().unwrap();
         let derived = aes_ecb_encrypt(unit_key, &header);
         let mut k = [0u8; 16];
@@ -721,14 +794,14 @@ mod tests {
         let mut unit = clear_unit();
         aacs_encrypt_unit(&mut unit, &unit_key);
         assert!(
-            is_aacs_scrambled(&unit),
+            ts_sync_destroyed(&unit),
             "encrypted unit must look scrambled"
         );
 
         assert!(decrypt_unit(&mut unit, &unit_key));
         // All 32 stride positions carry sync after decrypt.
         assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
-        assert!(!is_aacs_scrambled(&unit));
+        assert!(!ts_sync_destroyed(&unit));
     }
 
     #[test]
@@ -756,9 +829,10 @@ mod tests {
         // left untouched by decrypt (only unit[16..] is CBC-processed).
         let unit_key = [0x9Au8; 16];
         let mut clear = clear_unit();
-        // Put a distinctive header so we can confirm it survives.
+        // Put a distinctive header so we can confirm it survives. Byte 0 carries
+        // both CPI bits (0xE0) so it is stable under the fixture's `|= 0xC0`.
         clear[..16].copy_from_slice(&[
-            0xA0, 0xA1, 0xA2, 0xA3, 0x47, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xE0, 0xA1, 0xA2, 0xA3, 0x47, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
             0xAE, 0xAF,
         ]);
         let header_before: [u8; 16] = clear[..16].try_into().unwrap();
@@ -800,7 +874,7 @@ mod tests {
             Some(UnitKeyResult::DecryptedWith(2))
         );
         assert!(
-            !is_aacs_scrambled(&unit),
+            !ts_sync_destroyed(&unit),
             "unit must be clear after the hit"
         );
     }
@@ -817,6 +891,59 @@ mod tests {
         let wrong = [[0xAAu8; 16], [0xBBu8; 16]];
         assert_eq!(decrypt_unit_try_keys(&mut unit, &wrong), None);
         assert_eq!(unit, snapshot, "failed try must restore the original bytes");
+    }
+
+    // ── CPI gate: the authoritative encrypted-vs-clear decision ────────────
+
+    #[test]
+    fn cpi_gate_clear_flag_passes_through_even_when_body_looks_scrambled() {
+        // THE false-fail fix: a unit whose CPI bits are clear (byte 0 & 0xC0 == 0)
+        // is plaintext by spec, even if its body has no TS syncs (non-TS clear
+        // data, or a mis-probed body). `decrypt_unit` must pass it through
+        // untouched and report success — never attempt a decrypt that would fail.
+        let mut unit = vec![0u8; ALIGNED_UNIT_LEN];
+        // Body looks scrambled (no syncs at the stride) but byte 0 stays 0x00.
+        for (i, b) in unit.iter_mut().enumerate().skip(16) {
+            *b = (i as u8).wrapping_mul(31) | 1; // never 0x47 at the sync stride
+        }
+        assert!(ts_sync_destroyed(&unit), "body has no syncs");
+        assert!(!aacs_unit_encrypted(&unit), "CPI clear");
+        assert!(
+            !aacs_unit_needs_decrypt(&unit),
+            "CPI-clear ⇒ no decrypt attempt"
+        );
+        let snapshot = unit.clone();
+        // Any key: passthrough success, bytes untouched (no false DecryptFailed).
+        assert!(decrypt_unit(&mut unit, &[0xABu8; 16]));
+        assert_eq!(unit, snapshot, "CPI-clear unit must be left byte-identical");
+        assert_eq!(
+            decrypt_unit_try_keys(&mut unit, &[[0xABu8; 16]]),
+            Some(UnitKeyResult::AlreadyClear),
+            "CPI-clear unit consumes no key"
+        );
+    }
+
+    #[test]
+    fn cpi_gate_set_flag_decrypts_and_needs_decrypt_is_idempotent() {
+        // A CPI-set encrypted unit decrypts with the right key. CPI lives in the
+        // plaintext header, so it survives decryption — `aacs_unit_encrypted`
+        // still reports true afterward, but `aacs_unit_needs_decrypt` flips to
+        // false (syncs restored), keeping the re-decrypt paths idempotent.
+        let key = [0x5au8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &key); // sets CPI + scrambles body
+        assert!(aacs_unit_encrypted(&unit), "CPI set");
+        assert!(aacs_unit_needs_decrypt(&unit), "flagged + still scrambled");
+
+        assert!(decrypt_unit(&mut unit, &key), "right key decrypts");
+        assert!(
+            aacs_unit_encrypted(&unit),
+            "CPI bits live in the preserved header ⇒ still set post-decrypt"
+        );
+        assert!(
+            !aacs_unit_needs_decrypt(&unit),
+            "syncs restored ⇒ no further decrypt attempt (idempotent re-decrypt)"
+        );
     }
 
     // ── unit_key_validates: matches decrypt_unit's verdict exactly ─────────
@@ -838,6 +965,45 @@ mod tests {
         assert!(!unit_key_validates(&enc, &bad));
         let mut probe2 = enc.clone();
         assert!(!decrypt_unit(&mut probe2, &bad));
+    }
+
+    #[test]
+    fn unit_is_clean_ts_is_strict_all_32_syncs() {
+        // Standards-correct gate (libaacs `_verify_ts`): EVERY one of the 32
+        // packet syncs is required. A fully-synced clear unit passes.
+        let clear = clear_unit();
+        assert!(unit_is_clean_ts(&clear), "all-32-sync unit is clean");
+
+        // Drop a SINGLE sync (packet 17 of 32). 31/32 remain, so the majority
+        // heuristic still passes — that is exactly the silent-corruption hole.
+        // The strict gate must REJECT it.
+        let mut one_missing = clear_unit();
+        one_missing[17 * BD_SOURCE_PACKET_BYTES + 4] = 0x00;
+        assert!(
+            ts_syncs_intact(&one_missing),
+            "majority heuristic still passes one missing sync (the hole)"
+        );
+        assert!(
+            !unit_is_clean_ts(&one_missing),
+            "strict gate rejects even one missing sync"
+        );
+
+        // A correctly decrypted unit is clean; a wrong-key decrypt is not.
+        let key = [0x33u8; 16];
+        let mut enc = clear_unit();
+        aacs_encrypt_unit(&mut enc, &key);
+        let mut good = enc.clone();
+        decrypt_unit(&mut good, &key);
+        assert!(unit_is_clean_ts(&good), "right-key decrypt yields clean TS");
+        let mut wrong = enc.clone();
+        decrypt_unit(&mut wrong, &[0x34u8; 16]);
+        assert!(
+            !unit_is_clean_ts(&wrong),
+            "wrong-key decrypt must fail the strict gate"
+        );
+
+        // Short buffer is never vacuously clean.
+        assert!(!unit_is_clean_ts(&clear[..ALIGNED_UNIT_LEN - 1]));
     }
 
     #[test]
@@ -947,25 +1113,25 @@ mod tests {
                 prev.copy_from_slice(&unit[off..off + 16]);
             }
         }
-        assert!(is_aacs_scrambled(&unit));
+        assert!(ts_sync_destroyed(&unit));
         assert!(decrypt_unit_full(&mut unit, &unit_key, Some(&rdk)));
         assert_eq!(ts_sync_count(&unit), ts_packet_total(&unit));
     }
 
-    // ── is_aacs_scrambled / ts_sync_count edge cases ───────────────────────
+    // ── ts_sync_destroyed / ts_sync_count edge cases ───────────────────────
 
     #[test]
-    fn is_aacs_scrambled_false_for_sub_unit_length() {
+    fn ts_sync_destroyed_false_for_sub_unit_length() {
         // The function guards on `len >= ALIGNED_UNIT_LEN` first; anything
         // shorter is reported NOT scrambled (so the decrypt gate skips it)
         // rather than indexing past the end.
-        assert!(!is_aacs_scrambled(&[]));
-        assert!(!is_aacs_scrambled(&vec![0u8; ALIGNED_UNIT_LEN - 1]));
+        assert!(!ts_sync_destroyed(&[]));
+        assert!(!ts_sync_destroyed(&vec![0u8; ALIGNED_UNIT_LEN - 1]));
         // A scrambled-looking buffer that is one byte short is still "not
         // scrambled" by the length guard.
         let mut almost = vec![0u8; ALIGNED_UNIT_LEN - 1];
         almost[4] = 0x00; // no syncs
-        assert!(!is_aacs_scrambled(&almost));
+        assert!(!ts_sync_destroyed(&almost));
     }
 
     #[test]

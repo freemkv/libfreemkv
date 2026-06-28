@@ -1250,8 +1250,10 @@ fn parse_udf_name(data: &[u8]) -> String {
     }
 }
 
-/// Merge overlapping or adjacent (start, count) ranges.
-fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+/// Merge overlapping or adjacent (start, count) ranges. Caller sorts by start
+/// first. Shared range utility — also used to build the disc's encrypted-content
+/// extent map (see `Disc::encrypted_content_ranges`).
+pub(crate) fn merge_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     if ranges.is_empty() {
         return Vec::new();
     }

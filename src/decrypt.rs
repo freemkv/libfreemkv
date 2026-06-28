@@ -186,6 +186,48 @@ pub fn decrypt_sectors(
     keys: &mut DecryptKeys,
     unit_key_idx: usize,
 ) -> Result<usize, crate::error::Error> {
+    decrypt_sectors_impl(buf, keys, unit_key_idx, None)
+}
+
+/// Like [`decrypt_sectors`], but ONLY decrypts/verifies units whose absolute LBA
+/// falls inside `content_ranges` — the disc's AACS-encrypted content (the m2ts
+/// stream extents). Units OUTSIDE content (UDF filesystem / nav) are left
+/// untouched and never counted as decrypt loss: they are clear by definition, so
+/// [`ts_sync_destroyed`] must not be consulted about them (a filesystem unit has
+/// no TS sync, which would otherwise be mistaken for ciphertext). `base_lba` is
+/// the absolute LBA of `buf`'s first sector; aligned units are 3 sectors.
+///
+/// `content_ranges` is sorted, merged, disjoint `[start_lba, end_lba)`.
+pub fn decrypt_sectors_in_content(
+    buf: &mut [u8],
+    keys: &mut DecryptKeys,
+    unit_key_idx: usize,
+    base_lba: u32,
+    content_ranges: &[(u32, u32)],
+) -> Result<usize, crate::error::Error> {
+    decrypt_sectors_impl(buf, keys, unit_key_idx, Some((base_lba, content_ranges)))
+}
+
+/// True if `lba` falls inside one of the sorted, merged, disjoint
+/// `(start, count)` ranges (same representation as [`crate::udf::merge_ranges`]
+/// and `Extent`). O(log n) binary search — cheap enough to run per unit.
+pub(crate) fn lba_in_ranges(lba: u32, ranges: &[(u32, u32)]) -> bool {
+    match ranges.binary_search_by(|&(start, _)| start.cmp(&lba)) {
+        Ok(_) => true,   // lba is exactly a range start
+        Err(0) => false, // before the first range
+        Err(i) => {
+            let (start, count) = ranges[i - 1];
+            lba < start.saturating_add(count) // inside the range that starts before lba?
+        }
+    }
+}
+
+fn decrypt_sectors_impl(
+    buf: &mut [u8],
+    keys: &mut DecryptKeys,
+    unit_key_idx: usize,
+    content: Option<(u32, &[(u32, u32)])>,
+) -> Result<usize, crate::error::Error> {
     let dropped: usize = match keys {
         DecryptKeys::None => 0,
         DecryptKeys::Aacs {
@@ -223,7 +265,7 @@ pub fn decrypt_sectors(
             //     silent corruption. We fail loud (Error::DecryptFailed), matching
             //     the highway path's Error::ExtentNotUnitAligned policy.
             //
-            // Detection: is_aacs_scrambled() short-circuits to false for any
+            // Detection: ts_sync_destroyed() short-circuits to false for any
             // buffer shorter than a full unit, so it cannot judge a partial. We
             // instead apply the same TS-sync-intactness test it uses internally
             // (ts_sync_count vs ts_packet_total) directly to the available
@@ -235,10 +277,21 @@ pub fn decrypt_sectors(
             // tolerate rather than risk a false positive on conformant tails.
             let partial_len = buf.len() % unit_len;
             if partial_len != 0 {
-                let partial = &buf[buf.len() - partial_len..];
-                let packets = aacs::ts_packet_total(partial);
-                if packets > 0 && aacs::ts_sync_count(partial) <= packets / 2 {
-                    return Err(crate::error::Error::DecryptFailed);
+                // Gate the trailing partial on content too: a scrambled partial
+                // OUTSIDE the encrypted m2ts extents is just clear non-TS bytes
+                // (filesystem tail), not a malformed encrypted unit, so it must
+                // not hard-fail. `nfull * 3` is the partial's absolute LBA.
+                let nfull = (buf.len() / unit_len) as u32;
+                let partial_in_content = match content {
+                    Some((base, ranges)) => lba_in_ranges(base.saturating_add(nfull * 3), ranges),
+                    None => true,
+                };
+                if partial_in_content {
+                    let partial = &buf[buf.len() - partial_len..];
+                    let packets = aacs::ts_packet_total(partial);
+                    if packets > 0 && aacs::ts_sync_count(partial) <= packets / 2 {
+                        return Err(crate::error::Error::DecryptFailed);
+                    }
                 }
             }
             let nthreads = decrypt_threads();
@@ -273,7 +326,7 @@ pub fn decrypt_sectors(
             // must happen first — it's a shared layer on top that is key-independent
             // across all CPS units on the disc.
             let decrypt_one = |chunk: &mut [u8]| {
-                if chunk.len() != unit_len || !aacs::is_aacs_scrambled(chunk) {
+                if chunk.len() != unit_len || !aacs::aacs_unit_needs_decrypt(chunk) {
                     return;
                 }
                 // Save original bytes so we can restore if no key validates.
@@ -305,15 +358,29 @@ pub fn decrypt_sectors(
                 }
 
                 // No key validated — restore the original encrypted bytes and
-                // tally the loss. The unit was scrambled (we only reach here past
-                // the `is_aacs_scrambled` gate) but no key applied: a clear
-                // nav-file unit that legitimately fails the cipher, or genuine
-                // encrypted content with a missing/wrong sub-key. We can't tell
-                // them apart here, so we always tally; the mux read path treats
+                // tally the loss. The unit is flagged encrypted (we only reach
+                // here past the CPI gate) but no key applied: genuine encrypted
+                // content with a missing/wrong sub-key. We always tally; the mux
+                // read path treats
                 // the count as loss (its extents are real content), while
                 // metadata-probe callers that don't install a loss sink ignore it.
                 chunk.copy_from_slice(&original);
                 dropped_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
+            };
+
+            // Content gate wrapper: when a gate is supplied, skip any unit whose
+            // absolute LBA lies OUTSIDE the encrypted-content extents — it is
+            // clear non-TS data (filesystem / nav) and must never be decrypted,
+            // verified, or counted as loss. Each aligned unit is 3 sectors.
+            let unit_sectors = (unit_len / 2048) as u32;
+            let process = |idx: usize, chunk: &mut [u8]| {
+                if let Some((base, ranges)) = content {
+                    let unit_lba = base.saturating_add((idx as u32) * unit_sectors);
+                    if !lba_in_ranges(unit_lba, ranges) {
+                        return;
+                    }
+                }
+                decrypt_one(chunk);
             };
 
             if nthreads <= 1 || nunits < PARALLEL_MIN_UNITS {
@@ -321,8 +388,8 @@ pub fn decrypt_sectors(
                 // buffers; also the only path when caller pinned
                 // single-threaded via FREEMKV_THREADS=1. Iterate the
                 // chunks directly — no Vec of slice pointers needed.
-                for chunk in buf.chunks_mut(unit_len) {
-                    decrypt_one(chunk);
+                for (idx, chunk) in buf.chunks_mut(unit_len).enumerate() {
+                    process(idx, chunk);
                 }
             } else {
                 // Parallel path via rayon's persistent thread pool.
@@ -336,14 +403,14 @@ pub fn decrypt_sectors(
                     Some(pool) => {
                         let chunks: Vec<&mut [u8]> = buf.chunks_mut(unit_len).collect();
                         pool.install(|| {
-                            chunks.into_par_iter().for_each(|chunk| {
-                                decrypt_one(chunk);
+                            chunks.into_par_iter().enumerate().for_each(|(idx, chunk)| {
+                                process(idx, chunk);
                             });
                         });
                     }
                     None => {
-                        for chunk in buf.chunks_mut(unit_len) {
-                            decrypt_one(chunk);
+                        for (idx, chunk) in buf.chunks_mut(unit_len).enumerate() {
+                            process(idx, chunk);
                         }
                     }
                 }
@@ -406,7 +473,7 @@ mod tests {
 
     /// Regression for the 0.18.1 nav-file scramble bug. A non-m2ts unit (here
     /// an MPLS file: starts "MPLS", carries no TS syncs) reads as scrambled
-    /// under `is_aacs_scrambled`, gets AES-decrypted with the unit key, fails
+    /// under `ts_sync_destroyed`, gets AES-decrypted with the unit key, fails
     /// the TS-sync verification, and must be restored to its original bytes —
     /// not left scrambled.
     #[test]
@@ -455,7 +522,247 @@ mod tests {
             v[off] = 0xA5;
             off += 192;
         }
+        // Flag every aligned unit's CPI bits (byte 0) so it reads as encrypted
+        // under the authoritative `aacs_unit_encrypted`/`aacs_unit_needs_decrypt`
+        // gate — real encrypted content always carries these.
+        let mut u = 0;
+        while u < len {
+            v[u] |= 0xC0;
+            u += aacs::ALIGNED_UNIT_LEN;
+        }
         v
+    }
+
+    // ── Content-extent gate (`decrypt_sectors_in_content` / `lba_in_ranges`) ──
+
+    #[test]
+    fn lba_in_ranges_membership() {
+        // (start, count) ⇒ [10,15) and [100,110).
+        let r = &[(10u32, 5u32), (100, 10)];
+        assert!(!lba_in_ranges(0, r), "before first range");
+        assert!(!lba_in_ranges(9, r), "just before first range");
+        assert!(lba_in_ranges(10, r), "at first range start");
+        assert!(lba_in_ranges(14, r), "inside first range");
+        assert!(!lba_in_ranges(15, r), "first range end is exclusive");
+        assert!(!lba_in_ranges(50, r), "in the gap between ranges");
+        assert!(lba_in_ranges(100, r), "at second range start");
+        assert!(lba_in_ranges(109, r), "inside second range");
+        assert!(!lba_in_ranges(110, r), "second range end is exclusive");
+        assert!(!lba_in_ranges(5, &[]), "empty set has no members");
+    }
+
+    /// The content gate at the decrypt primitive: a scrambled-LOOKING unit
+    /// OUTSIDE the content extents (e.g. UDF filesystem) must be SKIPPED — never
+    /// decrypted, never counted as loss. The SAME bytes INSIDE content are
+    /// checked and counted. This is the first-2 GB false-positive fix.
+    #[test]
+    fn content_gate_skips_non_content_units() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+
+        // base_lba 0, content = [(100,10)] ⇒ the unit at LBA 0 is OUTSIDE content.
+        let mut buf = original.clone();
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(100, 10)]).unwrap();
+        assert_eq!(
+            dropped, 0,
+            "a non-content unit must not count as decrypt loss"
+        );
+        assert_eq!(
+            buf, original,
+            "a non-content unit must be left byte-for-byte untouched"
+        );
+
+        // Same bytes INSIDE content (base_lba 100, range covers LBA 100..103).
+        let mut buf2 = original.clone();
+        let dropped2 =
+            decrypt_sectors_in_content(&mut buf2, &mut keys, 0, 100, &[(100, 10)]).unwrap();
+        assert_eq!(
+            dropped2,
+            aacs::ALIGNED_UNIT_LEN,
+            "an undecryptable CONTENT unit IS counted as loss"
+        );
+    }
+
+    /// Per-unit gating across a content boundary: in a 2-unit buffer where only
+    /// the second unit (LBA 3..6) is content, only the second is decrypt-checked.
+    #[test]
+    fn content_gate_is_per_unit_across_a_boundary() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut buf = scrambled_region(2 * aacs::ALIGNED_UNIT_LEN);
+        // unit0 @ LBA 0 (clear/skip), unit1 @ LBA 3 (content). Content = [(3,3)].
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(3, 3)]).unwrap();
+        assert_eq!(
+            dropped,
+            aacs::ALIGNED_UNIT_LEN,
+            "only the in-content unit (unit1) is checked; clear unit0 is skipped"
+        );
+    }
+
+    /// A content range covering the whole buffer must behave EXACTLY like the
+    /// ungated `decrypt_sectors` — the gate adds nothing when everything is content.
+    #[test]
+    fn content_gate_covering_whole_buffer_matches_ungated() {
+        let mut keys_g = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut keys_u = keys_g.clone();
+        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let mut g = original.clone();
+        let mut u = original.clone();
+        let gated = decrypt_sectors_in_content(&mut g, &mut keys_g, 0, 0, &[(0, 3)]).unwrap();
+        let ungated = decrypt_sectors(&mut u, &mut keys_u, 0).unwrap();
+        assert_eq!(
+            gated, ungated,
+            "gated-covering-all == ungated dropped count"
+        );
+        assert_eq!(g, u, "gated-covering-all == ungated bytes");
+    }
+
+    #[test]
+    fn lba_in_ranges_more_edges() {
+        // Single range [5,8).
+        assert!(!lba_in_ranges(4, &[(5, 3)]), "just before single range");
+        assert!(lba_in_ranges(5, &[(5, 3)]), "at single range start");
+        assert!(lba_in_ranges(7, &[(5, 3)]), "inside single range");
+        assert!(
+            !lba_in_ranges(8, &[(5, 3)]),
+            "single range end is exclusive"
+        );
+        // After the last range.
+        assert!(
+            !lba_in_ranges(200, &[(10, 5), (100, 10)]),
+            "past the last range"
+        );
+        // Saturating: a range whose start+count overflows u32 must not panic. The
+        // end saturates to u32::MAX, so the very top LBA is excluded — a harmless
+        // edge (real disc LBAs never reach u32::MAX). The range start is still in.
+        assert!(
+            lba_in_ranges(u32::MAX - 1, &[(u32::MAX - 1, 5)]),
+            "saturating range start is in"
+        );
+        assert!(
+            !lba_in_ranges(u32::MAX, &[(u32::MAX - 1, 5)]),
+            "saturated end excludes the top"
+        );
+    }
+
+    /// An EMPTY content map gates EVERYTHING out — even a scrambled unit is
+    /// skipped (treated as non-content). This is the no-titles fallback at the
+    /// primitive level.
+    #[test]
+    fn content_gate_empty_ranges_skips_everything() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = original.clone();
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[]).unwrap();
+        assert_eq!(
+            dropped, 0,
+            "empty content map ⇒ nothing is content ⇒ no loss"
+        );
+        assert_eq!(buf, original, "empty content map ⇒ buffer untouched");
+    }
+
+    /// A CLEAR (sync-intact) unit INSIDE content is not ciphertext, so even though
+    /// it is in-content it is skipped by the ts-sync check and never counted.
+    #[test]
+    fn content_gate_clear_unit_in_content_not_counted() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let original = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = original.clone();
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
+        assert_eq!(dropped, 0, "a clear in-content unit is not ciphertext");
+        assert_eq!(buf, original, "a clear in-content unit is left untouched");
+    }
+
+    /// `DecryptKeys::None` is a no-op even with a content map + scrambled bytes.
+    #[test]
+    fn content_gate_none_keys_is_noop() {
+        let mut keys = DecryptKeys::None;
+        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = original.clone();
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(buf, original);
+    }
+
+    /// CSS ignores the content gate (it lives in the AACS arm) and always reports
+    /// `0` — confirming the gate is a no-op for CSS and the read stays
+    /// scheme-agnostic (the litmus test: adding CSS verify touches only the CSS
+    /// arm, never the read).
+    #[test]
+    fn content_gate_css_keys_is_noop() {
+        let mut keys = DecryptKeys::Css { title_key: [0; 5] };
+        let mut buf = vec![0u8; 2048];
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
+        assert_eq!(
+            dropped, 0,
+            "CSS arm returns 0; content gate is a no-op for CSS"
+        );
+    }
+
+    /// Mixed 3-unit buffer: only the in-content SCRAMBLED unit is counted; an
+    /// in-content CLEAR unit and an out-of-content SCRAMBLED unit are both skipped.
+    #[test]
+    fn content_gate_mixed_three_units() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let u = aacs::ALIGNED_UNIT_LEN;
+        let mut buf = vec![0u8; 3 * u];
+        buf[..u].copy_from_slice(&scrambled_region(u)); // unit0 @ LBA0 scrambled
+        buf[u..2 * u].copy_from_slice(&clear_ts_region(u)); // unit1 @ LBA3 clear
+        buf[2 * u..].copy_from_slice(&scrambled_region(u)); // unit2 @ LBA6 scrambled
+        // Content = LBA 0..6 (units 0 and 1); unit2 (LBA6) is out of content.
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 6)]).unwrap();
+        assert_eq!(dropped, u, "only unit0 (in-content + scrambled) counts");
+    }
+
+    /// Mirror of the boundary test: content covers the FIRST unit only.
+    #[test]
+    fn content_gate_covers_first_unit_only() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        let mut buf = scrambled_region(2 * aacs::ALIGNED_UNIT_LEN);
+        // unit0 @ LBA0 content, unit1 @ LBA3 out. Content = [(0,3)].
+        let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
+        assert_eq!(dropped, aacs::ALIGNED_UNIT_LEN, "only unit0 counts");
+    }
+
+    /// The trailing-partial reject is ALSO content-gated: a scrambled partial
+    /// OUTSIDE content is clear filesystem tail, not a malformed encrypted unit,
+    /// so it must NOT hard-fail.
+    #[test]
+    fn content_gate_scrambled_partial_outside_content_is_tolerated() {
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(0, [0xAB; 16])],
+            read_data_key: None,
+        };
+        // One full clear unit + a scrambled single-sector partial, all OUTSIDE
+        // content → the partial must be tolerated (Ok), not DecryptFailed.
+        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        buf.extend_from_slice(&scrambled_region(2048));
+        // content far away → both the full unit and the partial are non-content.
+        let res = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(1000, 3)]);
+        assert!(
+            res.is_ok(),
+            "a scrambled partial outside content must not hard-fail"
+        );
     }
 
     /// Whole leading units plus a CLEAR trailing partial (the benign,
@@ -818,6 +1125,9 @@ mod tests {
     fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        // CPI bits on byte 0 so the unit reads as encrypted; set before deriving
+        // the per-unit key so the recovered plaintext header matches.
+        unit[0] |= 0xC0;
         let header: [u8; 16] = unit[..16].try_into().unwrap();
         let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
         let mut k = [0u8; 16];
@@ -840,7 +1150,7 @@ mod tests {
     }
 
     /// Build a clear aligned unit with TS sync bytes placed at the BD-TS stride
-    /// (offset 4 + k*192) so `is_aacs_scrambled` reports false and
+    /// (offset 4 + k*192) so `ts_sync_destroyed` reports false and
     /// `decrypt_unit` verifies it as clear after decryption.
     fn clear_ts_unit() -> Vec<u8> {
         let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
@@ -864,7 +1174,7 @@ mod tests {
     /// Grounding: `for idx in try_order { … if aacs::decrypt_unit(&mut attempt, key) { … } }`
     /// Mutation: revert to the pre-fix `decrypt_unit_full(chunk, &uk, …)` where
     /// `uk = raw_keys[unit_key_idx]` (always key 0) → the unit comes out as
-    /// garbled bytes that still look scrambled, failing the `!is_aacs_scrambled`
+    /// garbled bytes that still look scrambled, failing the `!ts_sync_destroyed`
     /// assert.
     #[test]
     fn aacs_multi_cps_unit_disc_decrypts_under_non_zero_key() {
@@ -875,7 +1185,7 @@ mod tests {
         let mut unit = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut unit, &key1);
         assert!(
-            aacs::is_aacs_scrambled(&unit),
+            aacs::ts_sync_destroyed(&unit),
             "encrypted unit must look scrambled before decrypt"
         );
 
@@ -889,7 +1199,7 @@ mod tests {
         decrypt_sectors(&mut buf, &mut keys, 0).expect("multi-CPS decrypt must succeed");
 
         assert!(
-            !aacs::is_aacs_scrambled(&buf),
+            !aacs::ts_sync_destroyed(&buf),
             "unit encrypted under key1 must be fully decrypted (TS syncs restored)"
         );
         // Every sync position must carry 0x47.
@@ -920,7 +1230,7 @@ mod tests {
         let mut buf = unit;
         decrypt_sectors(&mut buf, &mut keys, 0).expect("single-key disc must decrypt");
         assert!(
-            !aacs::is_aacs_scrambled(&buf),
+            !aacs::ts_sync_destroyed(&buf),
             "single-key disc: TS syncs must be restored"
         );
         assert_eq!(
@@ -953,7 +1263,7 @@ mod tests {
         aacs_encrypt_unit_for_test(&mut unit, &real_key);
         let ciphertext = unit.clone();
         assert!(
-            aacs::is_aacs_scrambled(&unit),
+            aacs::ts_sync_destroyed(&unit),
             "encrypted unit must look scrambled going in"
         );
 
@@ -1012,7 +1322,7 @@ mod tests {
             "exactly one unit's worth of bytes must be reported dropped"
         );
         assert!(
-            !aacs::is_aacs_scrambled(&buf[..aacs::ALIGNED_UNIT_LEN]),
+            !aacs::ts_sync_destroyed(&buf[..aacs::ALIGNED_UNIT_LEN]),
             "the decryptable unit must come out clear"
         );
         assert_eq!(

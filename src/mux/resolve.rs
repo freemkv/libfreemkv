@@ -245,7 +245,7 @@ fn validate_network_addr(addr: &str) -> io::Result<()> {
 }
 
 /// Options for opening an input stream.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct InputOptions {
     /// Caller-resolved per-CPS-unit AACS keys to apply to the scanned disc
     /// (`(cps_unit, 16-byte key)`). Empty for an unencrypted disc or when the
@@ -257,6 +257,26 @@ pub struct InputOptions {
     pub title_index: Option<usize>,
     /// Skip decryption — return raw encrypted bytes.
     pub raw: bool,
+    /// Optional fresh-key-on-failure closure (a shared [`crate::sector::KeyFetch`]).
+    /// `None` (default) keeps the prior behaviour: a unit no held key decrypts is
+    /// counted as decrypt loss. When set, the mux installs it (cloned `Arc`) so a
+    /// still-scrambled unit is re-tried via the application's key source.
+    /// Application seam only; the library makes no network call.
+    pub key_fetch: Option<crate::sector::KeyFetch>,
+}
+
+// `KeyFetchFactory` holds a trait object that is not `Debug`; hand-roll the
+// impl (the prior derive is preserved for every other field) so `InputOptions`
+// stays printable without dumping key material.
+impl std::fmt::Debug for InputOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputOptions")
+            .field("unit_keys", &self.unit_keys.len())
+            .field("title_index", &self.title_index)
+            .field("raw", &self.raw)
+            .field("key_fetch", &self.key_fetch.is_some())
+            .finish()
+    }
 }
 
 /// Open a PES input stream (produces PES frames).
@@ -381,6 +401,14 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             } else {
                 keys
             };
+            // Install the shared fetch closure (if the app supplied one) so a
+            // unit no held key decrypts is re-tried via the app's key source.
+            // Suppressed in --raw (no decrypt step to recover).
+            let fetch = if opts.raw {
+                None
+            } else {
+                opts.key_fetch.clone()
+            };
             let stream = build_iso_pipeline(
                 reader,
                 title,
@@ -389,6 +417,7 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
                 format,
                 None,
                 None,
+                fetch,
             )?;
             Ok(Box::new(stream))
         }
@@ -573,6 +602,13 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
 /// - `halt`: cooperative cancel token (not a timeout); when cancelled the
 ///   pipeline stops at the next boundary. `None` disables cancellation.
 /// - `event_fn`: optional progress/event callback invoked by the prefetcher.
+/// - `fetch`: optional fresh-key-on-failure callback (see
+///   [`crate::sector::KeyFetch`]). When a unit no held key decrypts, the
+///   decrypt decorator hands that ciphertext to `fetch` and adds any key it
+///   returns. `None` keeps the prior behaviour (the unit is counted as loss).
+// Eight reader/title/keys/tuning/callback params is inherent to the mux entry
+// point; grouping them into a struct would only move the same fields around.
+#[allow(clippy::too_many_arguments)]
 pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     reader: S,
     title: DiscTitle,
@@ -581,6 +617,7 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     format: ContentFormat,
     halt: Option<crate::halt::Halt>,
     event_fn: Option<crate::sector::prefetched::EventFn>,
+    fetch: Option<crate::sector::KeyFetch>,
 ) -> io::Result<PipelinedPesStream> {
     let extents = title.extents.clone();
     // Unit alignment is an AACS concept: AACS decrypts whole 6144-byte (3-sector)
@@ -594,6 +631,12 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
     };
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
+    // Install the fresh-key-on-failure callback (if any) so a unit no held key
+    // decrypts is re-tried via the application's key source before being counted
+    // as loss.
+    if let Some(cb) = fetch {
+        decrypting = decrypting.with_key_fetch(cb);
+    }
     // Grab the decrypt-loss counter before the decorator is moved into the
     // producer thread. It tracks bytes of scrambled AACS units no key could
     // decrypt — silent loss the demux drops; the consuming stream surfaces it
@@ -1116,6 +1159,7 @@ mod tests {
             ContentFormat::BdTs,
             None,
             None,
+            None,
         )
         .expect("pipeline builds");
         let first = stream.read().expect("read must not error on clean EOF");
@@ -1154,6 +1198,7 @@ mod tests {
             DecryptKeys::None,
             8192,
             ContentFormat::BdTs,
+            None,
             None,
             None,
         )
@@ -1205,6 +1250,7 @@ mod tests {
             DecryptKeys::None,
             0,
             ContentFormat::BdTs,
+            None,
             None,
             None,
         );
