@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Post-read decrypt-verify gate.** Every AACS unit read off the disc is now
+  buffered, re-aligned to its clip-file 6144-byte unit grid, and verified
+  (CPI flag → decrypt → strict all-32 TS-sync, matching libaacs `_verify_ts`)
+  before it is signed off as good. A unit that neither a held nor a
+  freshly-fetched key decrypts is treated exactly like a bad read — re-read by
+  the patch pass, terminal loss only if truly unrecoverable — closing the
+  "silent bad read" class where a sector reads OK but its ciphertext is subtly
+  wrong. **Fail-safe:** it only ever downgrades a unit it is *confident* is bad;
+  every uncertainty (no keys, a merely-missing key, an unread/zero-filled sector,
+  a non-AACS disc) leaves the read byte-for-byte as before. Gated by a
+  compile-time kill-switch (`POST_READ_VERIFY`), and container-pluggable (BD/UHD
+  transport stream today, with an HD-DVD program-stream seam in place).
 - **Every error is now `Error: E<code> <message>`, with an Error Codes
   reference.** User-facing errors show their code so you can look it up, and a
   new **Error Codes** page lists every code with its message, cause, and next
@@ -13,10 +25,21 @@
 
 ### Changed
 
+- **AACS decrypt acceptance is now standards-strict.** A key is accepted only
+  when the decrypted unit has the TS sync byte on *all* 32 source packets
+  (libaacs `_verify_ts`), replacing a majority-vote heuristic where a wrong key
+  could coincidentally restore enough syncs to pass and silently corrupt a unit.
 - keydb download/save moved out of the library into freemkv-keysources;
   libfreemkv no longer has any keydb I/O (it already held no keys).
 
 ### Fixed
+
+- **AACS content-certificate bus-encryption flag read from the wrong bit.** The
+  flag is bit 7 of byte 1 (libaacs `p[1] >> 7`) but was read as bit 0, so a
+  bus-encrypted disc parsed as *not* bus-encrypted — defeating the fail-loud
+  guard that refuses to decrypt bus-wrapped data to garbage when no bus key was
+  obtained. Also corrected the cc_id offset (byte 14) and the AACS2 type marker
+  (`0x10`). Confirmed against real retail content certificates.
 
 - **DVD rips now start on the movie, not the disc menu.** A VTS title VOB's
   start sector was read from the IFO as a VTS-relative pointer but used as an

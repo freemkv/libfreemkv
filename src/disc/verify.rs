@@ -439,7 +439,10 @@ impl UnitVerifier {
                 }
                 let accept = self.accept_for(clip);
                 if readable
-                    && matches!(self.decryptability(&raw, accept), Decryptability::Undecryptable)
+                    && matches!(
+                        self.decryptability(&raw, accept),
+                        Decryptability::Undecryptable
+                    )
                 {
                     push_ranges(&mut bad, &lbas);
                 }
@@ -550,7 +553,10 @@ mod tests {
 
     /// One contiguous full unit at disc LBA `lba` (size 6144 = 3 sectors).
     fn one_clip(lba: u32) -> Vec<ClipLayout> {
-        vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(lba, ALIGNED_UNIT_LEN as u32)])]
+        vec![ts_clip(
+            ALIGNED_UNIT_LEN as u64,
+            vec![(lba, ALIGNED_UNIT_LEN as u32)],
+        )]
     }
 
     /// Build a BD-TS `ClipLayout` (the only container current enumeration emits).
@@ -615,7 +621,10 @@ mod tests {
         u[4] = 0x00; // break the first packet's sync
         let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[1; 16]]), None).unwrap();
         let bad = v.observe(100, &u);
-        assert!(bad.is_empty(), "clear-but-not-clean unit -> skip, never false-bad");
+        assert!(
+            bad.is_empty(),
+            "clear-but-not-clean unit -> skip, never false-bad"
+        );
     }
 
     // ── encrypted (CPI set) content ────────────────────────────────────────
@@ -699,7 +708,10 @@ mod tests {
             c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![real]
         });
-        let clips = vec![ts_clip(2 * ALIGNED_UNIT_LEN as u64, vec![(200, 2 * ALIGNED_UNIT_LEN as u32)])];
+        let clips = vec![ts_clip(
+            2 * ALIGNED_UNIT_LEN as u64,
+            vec![(200, 2 * ALIGNED_UNIT_LEN as u32)],
+        )];
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[[0x01; 16]]), Some(fetch)).unwrap();
         let mut u0 = clear_unit();
         encrypt_unit(&mut u0, &real);
@@ -724,7 +736,10 @@ mod tests {
         let real = [0x42; 16];
         let mut u = clear_unit();
         encrypt_unit(&mut u, &real);
-        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(10, 4096), (5000, 2048)])];
+        let clips = vec![ts_clip(
+            ALIGNED_UNIT_LEN as u64,
+            vec![(10, 4096), (5000, 2048)],
+        )];
         // Wrong key + a fetch that yields wrong keys => confident bad, fragmented.
         let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[[0x01; 16]]), Some(fetch)).unwrap();
@@ -748,7 +763,10 @@ mod tests {
         let key = [0x5a; 16];
         let mut u0 = clear_unit();
         encrypt_unit(&mut u0, &key);
-        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64 + 2048, vec![(100, ALIGNED_UNIT_LEN as u32 + 2048)])];
+        let clips = vec![ts_clip(
+            ALIGNED_UNIT_LEN as u64 + 2048,
+            vec![(100, ALIGNED_UNIT_LEN as u32 + 2048)],
+        )];
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[key]), None).unwrap();
         // Feed full unit 0 (good) + the tail sector (garbage). Only unit 0 is
         // judged; the tail is never a verdict.
@@ -843,7 +861,10 @@ mod tests {
         let key = [0x5a; 16];
         let mut u = clear_unit();
         encrypt_unit(&mut u, &key);
-        let mut iso = MockIso { sectors: Default::default(), err_lba: None };
+        let mut iso = MockIso {
+            sectors: Default::default(),
+            err_lba: None,
+        };
         place_unit(&mut iso, [100, 101, 102], &u);
         let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[key]), None).unwrap();
         let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &|_| true);
@@ -855,15 +876,23 @@ mod tests {
         let real = [0x11; 16];
         let mut u = clear_unit();
         encrypt_unit(&mut u, &real);
-        let mut iso = MockIso { sectors: Default::default(), err_lba: None };
+        let mut iso = MockIso {
+            sectors: Default::default(),
+            err_lba: None,
+        };
         place_unit(&mut iso, [100, 101, 102], &u);
         // Wrong held key + a fetch that yields a wrong key => confident bad.
         let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
-        let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
+        let mut v =
+            UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
         // A range covering only ONE sector of the unit still re-reads the WHOLE
         // unit from the ISO (patch re-reads partial units).
         let bad = v.reverify_iso(&mut iso, &[(101 * 2048, 2048)], &|_| true);
-        assert_eq!(bad, vec![(100, 3)], "undecryptable unit -> full 3-sector range");
+        assert_eq!(
+            bad,
+            vec![(100, 3)],
+            "undecryptable unit -> full 3-sector range"
+        );
     }
 
     #[test]
@@ -872,8 +901,14 @@ mod tests {
         let mut u = clear_unit();
         encrypt_unit(&mut u, &key);
         // Unit 0: sectors at 10, 11 (extent A) and 5000 (extent B).
-        let clips = vec![ts_clip(ALIGNED_UNIT_LEN as u64, vec![(10, 4096), (5000, 2048)])];
-        let mut iso = MockIso { sectors: Default::default(), err_lba: None };
+        let clips = vec![ts_clip(
+            ALIGNED_UNIT_LEN as u64,
+            vec![(10, 4096), (5000, 2048)],
+        )];
+        let mut iso = MockIso {
+            sectors: Default::default(),
+            err_lba: None,
+        };
         place_unit(&mut iso, [10, 11, 5000], &u);
         let mut v = UnitVerifier::new(&clips, &aacs_keys(&[key]), None).unwrap();
         // Range touches only the distant fragment; whole unit still assembled.
@@ -892,9 +927,13 @@ mod tests {
         };
         place_unit(&mut iso, [100, 101, 102], &u);
         let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| vec![[0xEE; 16]]);
-        let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
+        let mut v =
+            UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
         let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &|_| true);
-        assert!(bad.is_empty(), "ISO read error on a sector -> skip (fail-safe)");
+        assert!(
+            bad.is_empty(),
+            "ISO read error on a sector -> skip (fail-safe)"
+        );
     }
 
     #[test]
@@ -906,14 +945,22 @@ mod tests {
         let real = [0x11; 16];
         let mut u = clear_unit();
         encrypt_unit(&mut u, &real);
-        let mut iso = MockIso { sectors: Default::default(), err_lba: None };
+        let mut iso = MockIso {
+            sectors: Default::default(),
+            err_lba: None,
+        };
         place_unit(&mut iso, [100, 101, 102], &u);
-        let fetch: KeyFetch = Arc::new(|_s: &[Vec<u8>]| panic!("must NOT key-fetch an unread unit"));
-        let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
+        let fetch: KeyFetch =
+            Arc::new(|_s: &[Vec<u8>]| panic!("must NOT key-fetch an unread unit"));
+        let mut v =
+            UnitVerifier::new(&one_clip(100), &aacs_keys(&[[0x22; 16]]), Some(fetch)).unwrap();
         // 102 not Finished -> the whole unit is skipped.
         let is_finished = |lba: u32| lba != 102;
         let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &is_finished);
-        assert!(bad.is_empty(), "unit with an unread sector is skipped, not flagged or fetched");
+        assert!(
+            bad.is_empty(),
+            "unit with an unread sector is skipped, not flagged or fetched"
+        );
     }
 
     #[test]
@@ -951,7 +998,10 @@ mod tests {
         // Open more partials than the cap with single-sector feeds; the map must
         // never exceed the cap (oldest evicted, unverified — fail-safe).
         let mut v = UnitVerifier::new(
-            &vec![ts_clip((MAX_INFLIGHT_UNITS as u64 + 100) * ALIGNED_UNIT_LEN as u64, vec![(0, u32::MAX / 2)])],
+            &vec![ts_clip(
+                (MAX_INFLIGHT_UNITS as u64 + 100) * ALIGNED_UNIT_LEN as u64,
+                vec![(0, u32::MAX / 2)],
+            )],
             &aacs_keys(&[[1; 16]]),
             None,
         )
