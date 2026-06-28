@@ -280,6 +280,56 @@ pub fn resolve_and_apply_traced(
     (false, trace)
 }
 
+/// THE single key-fetch: drive `sources` in order and return the first non-empty
+/// Unit Key set. This is exactly what both paths do — only the samples differ:
+/// * at disc open, `ctx` carries reachable-content samples → resolves the
+///   up-front CPS units (the common one),
+/// * in the read, on a decrypt miss, `ctx` carries the FAILING unit's ciphertext
+///   → resolves the CPS unit that wasn't sampled up front.
+///
+/// Same sources, same call; there is no separate "fetch". Unlike
+/// [`resolve_and_apply`] this does not validate/commit to a disc — the read's
+/// decorator re-decrypts with the returned keys, which is the validation.
+pub fn fetch_unit_keys(sources: &[Box<dyn KeySource>], ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+    for source in sources {
+        if let Ok(uks) = source.get_uk(ctx) {
+            if !uks.is_empty() {
+                return uks;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Build the read-time key-fetch closure from the disc's public AACS inputs and
+/// a way to (re)build the application's key sources. The decorator calls it with
+/// the still-scrambled unit ciphertext when no held key opens that unit; it runs
+/// [`fetch_unit_keys`] with those bytes as `samples` and returns any keys.
+///
+/// One builder, used by every read path (sweep / patch / mux) and by every
+/// consumer (CLI, autorip) — neither application contains the fetch logic, only
+/// its key-source config. Returns a **shared, stateless** [`crate::sector::KeyFetch`]
+/// (`Arc<Fn>`): build it once, clone it into each read path. `make_sources` is
+/// invoked per fetch (the cold path, ~once per CPS unit) so the closure stays
+/// `Send + Sync` without requiring `KeySource: Send`.
+pub fn key_fetch(
+    inputs: DiscInputs,
+    make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync>,
+) -> crate::sector::KeyFetch {
+    std::sync::Arc::new(move |samples: &[Vec<u8>]| -> Vec<[u8; 16]> {
+        let sources = make_sources();
+        let mut di = inputs.clone();
+        di.samples = samples.to_vec();
+        // V20/V21 stride (BD/UHD AACS 2.x); the online /decode UK path forwards
+        // raw inf + samples and doesn't depend on the parsed title-key stride.
+        let ctx = DiscInputsCtx::new(&di, 2);
+        fetch_unit_keys(&sources, &ctx)
+            .into_iter()
+            .map(|u| u.key)
+            .collect()
+    })
+}
+
 /// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s body, raw (no
 /// decrypt) — the content samples that populate [`DiscInputs::samples`] for a
 /// key server to validate a candidate against, and that [`resolve_and_apply`]
@@ -290,7 +340,7 @@ pub fn resolve_and_apply_traced(
 /// `start_lba`), which the library owns. A key source is *handed* these bytes
 /// via `DiscInputs.samples`; it never reads the disc itself.
 ///
-/// "Encrypted" is decided by [`crate::aacs::is_aacs_scrambled`] — the SAME
+/// "Encrypted" is decided by [`crate::aacs::ts_sync_destroyed`] — the SAME
 /// predicate the decrypt gate uses — so all sides agree. A clip opens with clear
 /// navigation units (PAT/PMT, menus); only the feature body is scrambled, and a
 /// clear unit proves nothing, so this collects only scrambled ones, sampling the
@@ -300,7 +350,7 @@ pub fn read_encrypted_units(
     title: &crate::disc::DiscTitle,
     n: usize,
 ) -> Vec<Vec<u8>> {
-    use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, is_aacs_scrambled};
+    use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
     const MAX_CHUNKS_PER_EXTENT: u32 = 4; // ~60 units scanned at each extent's midpoint
 
@@ -336,7 +386,7 @@ pub fn read_encrypted_units(
                     break;
                 }
                 let u = &buf[o..o + ALIGNED_UNIT_LEN];
-                if is_aacs_scrambled(u) {
+                if ts_sync_destroyed(u) {
                     out.push(u.to_vec());
                     if out.len() >= n {
                         return out;
@@ -353,6 +403,7 @@ pub fn read_encrypted_units(
 mod tests {
     use super::*;
     use crate::aacs::UnitKey;
+    use std::sync::{Arc, Mutex};
 
     // ── KeySource default-method behaviour ────────────────────────────────────
 
@@ -459,5 +510,115 @@ mod tests {
         let (_ok, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
         let whos: Vec<&str> = trace.keys.iter().map(|s| s.who.as_str()).collect();
         assert_eq!(whos, vec!["keydb", "my-custom-source"]);
+    }
+
+    // ── fetch_unit_keys / key_fetch (the one shared fetch path) ───────────────
+
+    fn empty_inputs() -> DiscInputs {
+        DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            mkb: Vec::new(),
+            unit_key_ro: Vec::new(),
+            samples: Vec::new(),
+            volume_label: None,
+        }
+    }
+
+    struct EmptySource;
+    impl KeySource for EmptySource {
+        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            Ok(Vec::new())
+        }
+    }
+    struct ErroringSource;
+    impl KeySource for ErroringSource {
+        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            Err(Error::AacsNoKeys)
+        }
+    }
+    struct HasKey([u8; 16]);
+    impl KeySource for HasKey {
+        fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+            Ok(vec![UnitKey {
+                idx: 0,
+                key: self.0,
+            }])
+        }
+    }
+
+    /// `fetch_unit_keys` returns the FIRST source's non-empty keys, skipping a
+    /// source that returns empty or errors; empty when no source answers.
+    #[test]
+    fn fetch_unit_keys_first_nonempty_skips_empty_and_errors() {
+        let inputs = empty_inputs();
+        let ctx = DiscInputsCtx::new(&inputs, 2);
+        let key = [0xABu8; 16];
+
+        let sources: Vec<Box<dyn KeySource>> = vec![
+            Box::new(EmptySource),
+            Box::new(ErroringSource),
+            Box::new(HasKey(key)),
+        ];
+        let got = fetch_unit_keys(&sources, &ctx);
+        assert_eq!(got.len(), 1, "the first source that answers wins");
+        assert_eq!(got[0].key, key);
+
+        let none: Vec<Box<dyn KeySource>> = vec![Box::new(EmptySource), Box::new(ErroringSource)];
+        assert!(
+            fetch_unit_keys(&none, &ctx).is_empty(),
+            "no source answers ⇒ empty"
+        );
+    }
+
+    /// `key_fetch` builds a closure that runs the sources with the GIVEN failing
+    /// samples and returns their keys — the exact bytes are forwarded to the
+    /// source, and `make_sources` is invoked per call.
+    #[test]
+    fn key_fetch_closure_forwards_samples_and_returns_keys() {
+        let key = [0x5au8; 16];
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let builds = Arc::new(Mutex::new(0usize));
+
+        struct Probe {
+            key: [u8; 16],
+            seen: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+        impl KeySource for Probe {
+            fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+                if let Ok(s) = ctx.samples(8) {
+                    self.seen.lock().unwrap().extend(s);
+                }
+                Ok(vec![UnitKey {
+                    idx: 0,
+                    key: self.key,
+                }])
+            }
+        }
+
+        let seen_c = Arc::clone(&seen);
+        let builds_c = Arc::clone(&builds);
+        let make: Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> = Arc::new(move || {
+            *builds_c.lock().unwrap() += 1;
+            vec![Box::new(Probe {
+                key,
+                seen: Arc::clone(&seen_c),
+            }) as Box<dyn KeySource>]
+        });
+
+        let cb = key_fetch(empty_inputs(), make);
+        let samples = vec![vec![0xEEu8; crate::aacs::ALIGNED_UNIT_LEN]];
+        let got = cb(&samples);
+        assert_eq!(
+            got,
+            vec![key],
+            "the source's key flows back through the closure"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the failing ciphertext sample is forwarded to the source"
+        );
+        assert_eq!(*builds.lock().unwrap(), 1, "make_sources invoked per fetch");
     }
 }

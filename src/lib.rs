@@ -253,8 +253,8 @@ pub use mux::{InputOptions, StreamUrl, input, output, parse_url};
 pub use mux::build_iso_pipeline;
 pub use scsi::{DriveInfo, ScsiSense, ScsiTransport, drive_has_disc, list_drives};
 pub use sector::{
-    DecryptingSectorSource, FileSectorSink, FileSectorSource, PrefetchedSectorSource, SectorSink,
-    SectorSource,
+    DecryptingSectorSource, FileSectorSink, FileSectorSource, KeyFetch, PrefetchedSectorSource,
+    SectorSink, SectorSource,
 };
 pub use speed::DriveSpeed;
 pub use udf::{UdfFs, read_filesystem};

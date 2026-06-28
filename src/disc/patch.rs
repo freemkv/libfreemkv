@@ -1731,25 +1731,54 @@ impl Disc {
         );
         let bytes_good_before = initial_stats.bytes_good;
         let bytes_good_start = bytes_good_before;
+
+        // Post-read verify gate for the patch pass (ciphertext multipass only,
+        // `!opts.decrypt`). Built here from the raw reader's UDF enumeration;
+        // reused AFTER the recovery loop (`reverify_iso`) to re-check the units
+        // this pass touched by reading them WHOLE back from the patched ISO —
+        // patch re-reads only the bad sectors of a unit, so per-unit verify
+        // can't run live. Fail-safe `None` when disabled / non-AACS / no keys.
+        let mut verifier = if opts.decrypt {
+            None
+        } else {
+            let verify_keys = self.decrypt_keys();
+            let layouts = crate::disc::extract::clip_layouts(&mut *reader);
+            crate::disc::verify::UnitVerifier::new(&layouts, &verify_keys, opts.key_fetch.clone())
+        };
+        // Decrypt-aware read — symmetric with `Disc::sweep`. A decrypting patch
+        // (`opts.decrypt`) decrypts in place (plaintext ISO). A NON-decrypting
+        // patch (the multipass / `--raw --multipass` path) resolves the keys and
+        // VERIFIES each unit on a scratch copy: a re-read that STILL won't decrypt
+        // fails the read (`DECRYPT_VERIFY_READ`) and stays NonTrimmed, so the
+        // retry loop keeps re-reading it "until it decrypts or retries exhaust"
+        // exactly as for a SCSI read error — and a unit that DOES decrypt on a
+        // fresh read (the drive returned different bytes) is recovered for free.
+        // With no usable AACS keys this degrades to a plain pass-through.
+        // Symmetric with `Disc::sweep`: the patch COPIES ciphertext (multipass /
+        // `--raw`) or decrypts IN PLACE (`opts.decrypt`). It does NOT decrypt-
+        // VERIFY — the disc-absolute read can't anchor to a clip's file-relative
+        // unit grid (see `Disc::sweep` + `Disc::verify_clips`). Re-reads recover
+        // bad sectors; the clip-anchored verify pass re-checks them afterward.
         let keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
             crate::decrypt::DecryptKeys::None
         };
-
-        // Wrap the producer-side reader once so every read_sectors
-        // call (the main recovery read, the backtrack read, and the
-        // non-NOT_READY retry read) yields plaintext. Replaces three
-        // inline decrypt_sectors call sites that all keyed off the
-        // same `keys`. `DecryptKeys::None` keeps the unencrypted /
-        // --raw path a pass-through.
-        // AACS reads must start on a 3-sector unit boundary and span whole
-        // units (DecryptingSectorSource rejects mid-unit reads as DecryptFailed).
-        // The patch cursor derives from arbitrary mapfile byte offsets, so a
-        // single-sector recovery read can land mid-unit — see the aligned read
-        // at the read call site below.
         let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
-        let mut reader = DecryptingSectorSource::new(reader, keys);
+        let content_ranges = self.encrypted_content_ranges();
+        let can_gate = !content_ranges.is_empty();
+        let mut reader = {
+            let mut dec = DecryptingSectorSource::new(reader, keys);
+            if opts.decrypt && can_gate {
+                dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
+            }
+            if decrypt_is_aacs && opts.decrypt {
+                if let Some(cb) = &opts.key_fetch {
+                    dec = dec.with_key_fetch(cb.clone());
+                }
+            }
+            dec
+        };
         let reader = &mut reader;
 
         // Spawn the consumer. The `WritebackFile` (same bounded-cache
@@ -2083,6 +2112,37 @@ impl Disc {
         // behaviour.
         let summary = pipe.finish()?;
 
+        // Scoped post-read re-verify (decrypt-fail == bad read). The consumer
+        // has flushed the ISO + mapfile; re-read each clip unit this pass touched
+        // WHOLE from the patched ISO and downgrade any that still won't decrypt
+        // to NonTrimmed, so the orchestrator's end-of-recovery promotion
+        // terminalizes it. Reuses the same verifier as the sweep. Fail-safe:
+        // disabled gate / unreadable ISO / load failure all leave the pass as-is.
+        if let Some(mut v) = verifier.take() {
+            if let Ok(mut iso) = crate::io::file_sector_source::FileSectorSource::open(path) {
+                let bad = v.reverify_iso(&mut iso, &bad_ranges);
+                if !bad.is_empty() {
+                    if let Ok(mut m) = mapfile::Mapfile::load(&mapfile_path) {
+                        let n: usize = bad.len();
+                        for (lba, cnt) in bad {
+                            let _ = m.record(
+                                lba as u64 * 2048,
+                                cnt as u64 * 2048,
+                                mapfile::SectorStatus::NonTrimmed,
+                            );
+                        }
+                        let _ = m.flush();
+                        tracing::info!(
+                            target: "freemkv::verify",
+                            phase = "patch_reverify",
+                            downgraded_ranges = n,
+                            "post-read re-verify downgraded undecryptable units to NonTrimmed"
+                        );
+                    }
+                }
+            }
+        }
+
         let outcome = build_outcome(
             &state,
             &summary,
@@ -2177,6 +2237,8 @@ mod tests {
             wedged_threshold: 50,
             progress: None,
             halt: None,
+
+            key_fetch: None,
         }
     }
 

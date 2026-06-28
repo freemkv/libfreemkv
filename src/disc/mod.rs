@@ -17,6 +17,7 @@ pub mod mapfile;
 mod patch;
 pub mod read_error;
 mod sweep;
+pub mod verify;
 
 use crate::drive::{Drive, extract_scsi_context};
 use crate::error::{Error, Result};
@@ -434,6 +435,15 @@ pub(crate) fn chapter_name(i: usize) -> String {
 pub struct Extent {
     pub start_lba: u32,
     pub sector_count: u32,
+}
+
+/// Union a set of extents into sorted, merged, disjoint `(start_lba,
+/// sector_count)` ranges — the pure, testable core of
+/// [`Disc::encrypted_content_ranges`]. Reuses [`crate::udf::merge_ranges`].
+fn merged_extents<'a>(extents: impl Iterator<Item = &'a Extent>) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = extents.map(|e| (e.start_lba, e.sector_count)).collect();
+    ranges.sort_by_key(|r| r.0);
+    crate::udf::merge_ranges(&ranges)
 }
 
 /// Correct a title's TrueHD audio-stream metadata by probing the first
@@ -1980,18 +1990,18 @@ pub enum Key {
 ///      next candidate (and ultimately surfaces a key error rather than silently
 ///      writing ciphertext).
 ///
-/// Reuses the ecosystem's single `is_aacs_scrambled` predicate and the full
+/// Reuses the ecosystem's single `ts_sync_destroyed` predicate and the full
 /// (bus + AACS) unit decrypt, so it agrees with the actual mux decrypt.
 fn aligned_unit_keys_validate(
     unit_keys: &[(u32, [u8; 16])],
     read_data_key: Option<&[u8; 16]>,
     samples: &[Vec<u8>],
 ) -> bool {
-    use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, decrypt_unit_full, is_aacs_scrambled};
+    use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit_full};
     let scrambled: Vec<&[u8]> = samples
         .iter()
         .map(|s| s.as_slice())
-        .filter(|s| s.len() >= ALIGNED_UNIT_LEN && is_aacs_scrambled(s))
+        .filter(|s| aacs_unit_needs_decrypt(s))
         .collect();
     if scrambled.is_empty() {
         return true; // nothing to disprove against — accept
@@ -2048,6 +2058,26 @@ impl Disc {
         } else {
             crate::decrypt::DecryptKeys::None
         }
+    }
+
+    /// The disc's AACS-encrypted content as a sorted, merged, disjoint set of
+    /// `(start_lba, sector_count)` ranges — the union of every title's m2ts
+    /// stream extents.
+    ///
+    /// This is the authoritative "which sectors are encrypted" map for a
+    /// whole-disc read. AACS only encrypts the m2ts AV streams, so a sector is
+    /// encrypted content **iff** it falls inside one of these ranges; everything
+    /// else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF) is always clear.
+    ///
+    /// The in-read decrypt-verify gate (`DecryptingSectorSource`) uses this so it
+    /// never consults [`ts_sync_destroyed`](crate::aacs::ts_sync_destroyed) about
+    /// non-content bytes — filesystem data has no TS sync and would otherwise be
+    /// mistaken for ciphertext (the first-2-GB false-positive this fixes).
+    ///
+    /// Empty when the disc has no parsed titles (CSS / unencrypted / unscanned);
+    /// callers treat an empty map as "no content gate" and fall back accordingly.
+    pub fn encrypted_content_ranges(&self) -> Vec<(u32, u32)> {
+        merged_extents(self.titles.iter().flat_map(|t| &t.extents))
     }
 
     /// The 40-hex AACS disc id (SHA1 of `Unit_Key_RO.inf`, no `0x` prefix), or
@@ -2644,6 +2674,7 @@ impl Disc {
             halt: opts.halt.clone(),
             vid: opts.vid,
             unit_keys: opts.unit_keys.clone(),
+            key_fetch: opts.key_fetch.clone(),
         };
         self.sweep(reader, path, &sweep_opts)
     }
@@ -2670,6 +2701,7 @@ impl Disc {
             wedged_threshold: 50,
             progress: opts.progress,
             halt: opts.halt.clone(),
+            key_fetch: opts.key_fetch.clone(),
         };
         let pr = self.patch(reader, path, &patch_opts)?;
         tracing::info!(
@@ -2722,24 +2754,72 @@ impl Disc {
         self.ensure_decryptable(!opts.decrypt)?;
 
         let total_bytes = self.capacity_sectors as u64 * 2048;
+        // Decrypt-aware read.
+        //
+        // A decrypting sweep (`opts.decrypt`, e.g. `disc:// → iso://` without
+        // `--raw`) decrypts each unit IN PLACE → the ISO holds plaintext.
+        //
+        // A NON-decrypting MULTIPASS sweep (`!opts.decrypt && skip_on_error`, the
+        // autorip / `--multipass` path) writes the ISO as CIPHERTEXT, but we
+        // still resolve the keys and VERIFY each unit on a scratch copy: a unit
+        // that won't decrypt fails the read (`DECRYPT_VERIFY_READ`) exactly like
+        // a SCSI error, and flows into the SAME read-error recovery (skip /
+        // NonTrimmed / patch). This is the one spot that makes "a read succeeded"
+        // mean "read AND decrypts" — everything downstream is unchanged. With no
+        // usable AACS keys (no keydb) it degrades to a plain pass-through.
+        //
+        // A plain `--raw` single-pass (no `skip_on_error`) stays a pass-through:
+        // the user asked for the raw image, untouched and unchecked.
+        // The sweep COPIES ciphertext (multipass / `--raw`) or decrypts IN PLACE
+        // (`opts.decrypt`, the rare disc→decrypted-ISO). It deliberately does NOT
+        // decrypt-VERIFY: a whole-disc sweep reads disc-absolute, but AACS aligned
+        // units are anchored to each clip's FILE start and clips can be non-6144-
+        // aligned OR fragmented across UDF extents — so a disc-absolute verify
+        // mis-aligns the unit grid and false-fails good clips (it skipped the
+        // ~990 MB orphan-CPS clip on Dunkirk). Verification moved to the
+        // clip-anchored [`Disc::verify_clips`] pass that runs AFTER the sweep,
+        // reading each clip file-order-anchored from the ISO. The read here stays
+        // a fail-safe copy; alignment is never assumed.
         let keys = if opts.decrypt {
             self.decrypt_keys()
         } else {
             crate::decrypt::DecryptKeys::None
         };
-        // Captured before `keys` moves into the decorator below. A decrypting
-        // AACS-keyed sweep needs unit-aligned (3-sector) batch sizing + region
-        // read-starts (see the batch computation further down).
         let decrypt_is_aacs = matches!(keys, crate::decrypt::DecryptKeys::Aacs { .. });
+        // Content extent map — only the in-place decrypt path (`opts.decrypt`) gates
+        // on it so clear filesystem / nav sectors pass through untouched.
+        let content_ranges = self.encrypted_content_ranges();
+        let can_gate = !content_ranges.is_empty();
 
-        // Wrap the producer-side reader once so every read_sectors call
-        // yields plaintext. `DecryptKeys::None` makes the decorator a
-        // pass-through, so the wrapping is cheap when --raw / unencrypted
-        // discs are being swept and we keep the pipeline shape uniform.
-        // Replaces the inline `decrypt::decrypt_sectors` calls that used
-        // to live in this loop and in the bisect inner loop below.
-        let mut reader = DecryptingSectorSource::new(reader, keys);
+        let mut reader = {
+            let mut dec = DecryptingSectorSource::new(reader, keys);
+            if opts.decrypt && can_gate {
+                dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
+            }
+            if decrypt_is_aacs && opts.decrypt {
+                if let Some(cb) = &opts.key_fetch {
+                    dec = dec.with_key_fetch(cb.clone());
+                }
+            }
+            dec
+        };
         let reader = &mut reader;
+
+        // Post-read verify gate (universal `read -> verify -> sign-off`). Built
+        // ONLY for the ciphertext sweep (`!opts.decrypt`, the multipass rip
+        // path) so `observe` always sees on-disc ciphertext and never
+        // double-decrypts already-plaintext bytes. `UnitVerifier::new` is itself
+        // fail-safe: it returns `None` (verify disabled, behavior unchanged) for
+        // a non-AACS disc, no keys, the kill-switch off, or an empty clip
+        // enumeration. We resolve the REAL AACS keys here even though the sweep
+        // copies ciphertext, and reuse the application's key-fetch seam.
+        let mut verifier = if opts.decrypt {
+            None
+        } else {
+            let verify_keys = self.decrypt_keys();
+            let layouts = extract::clip_layouts(&mut *reader);
+            crate::disc::verify::UnitVerifier::new(&layouts, &verify_keys, opts.key_fetch.clone())
+        };
 
         // Mapfile: load if resuming, else wipe + recreate.
         let mapfile_path = self.mapfile_for(path);
@@ -3019,12 +3099,44 @@ impl Disc {
                         // The consumer thread sees decrypted bytes; the
                         // pre-0.18 inline decrypt_sectors call lived here.
 
+                        // Post-read verify: observe the just-read ciphertext
+                        // BEFORE it is moved into the channel, collecting the
+                        // clip units this batch completes that are confidently
+                        // undecryptable. Sent as `MarkBad` AFTER the `Good`
+                        // below so the FIFO pipe records `Finished` first and the
+                        // downgrade to `NonTrimmed` last. No-op when the gate is
+                        // disabled (`verifier` is `None`).
+                        let verify_bad = verifier
+                            .as_mut()
+                            .map(|v| v.observe(block_lba, &buf[..block_bytes as usize]))
+                            .unwrap_or_default();
+
                         // Move the batch into the channel via fresh
                         // owned Vec. The producer's `buf` is reused
                         // for the next read.
                         let send_buf = buf[..block_bytes as usize].to_vec();
                         if pipe.send(WorkItem::Good { pos, buf: send_buf }).is_err() {
                             producer_err = Some(consumer_gone());
+                            break 'outer;
+                        }
+                        // Downgrade any unit that failed verify (decrypt-fail ==
+                        // bad read). decrypt-fail is NOT physical damage, so it
+                        // deliberately does not touch the damage-jump window.
+                        let mut send_failed = false;
+                        for (bad_lba, bad_cnt) in verify_bad {
+                            if pipe
+                                .send(WorkItem::MarkBad {
+                                    pos: bad_lba as u64 * 2048,
+                                    len: bad_cnt as u64 * 2048,
+                                })
+                                .is_err()
+                            {
+                                producer_err = Some(consumer_gone());
+                                send_failed = true;
+                                break;
+                            }
+                        }
+                        if send_failed {
                             break 'outer;
                         }
                         bytes_done = bytes_done.saturating_add(block_bytes);
@@ -3446,6 +3558,12 @@ pub struct CopyOptions<'a> {
     /// deferred-mux/resume decrypts directly) and the VID is NOT — keys XOR VID.
     /// Caller wires this from `Disc::aacs.unit_keys`.
     pub unit_keys: Vec<(u32, [u8; 16])>,
+    /// On-decrypt-miss key fetch (see [`crate::keysource::key_fetch_factory`]).
+    /// When set, a read that hits AACS ciphertext no held key opens asks the
+    /// application's key sources for the CPS unit's key, caches it, and retries —
+    /// recovering an orphan CPS unit never sampled at resolve time. `None`
+    /// disables it (the prior behaviour). Threaded into sweep + patch.
+    pub key_fetch: Option<crate::sector::KeyFetch>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3474,6 +3592,8 @@ pub struct SweepOptions<'a> {
     /// Resolved AACS unit keys persisted into the mapfile when the sweep
     /// creates / opens it. When non-empty these win over `vid`.
     pub unit_keys: Vec<(u32, [u8; 16])>,
+    /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]).
+    pub key_fetch: Option<crate::sector::KeyFetch>,
 }
 
 /// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
@@ -3485,6 +3605,9 @@ pub struct PatchOptions<'a> {
     pub wedged_threshold: u64,
     pub progress: Option<&'a dyn crate::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]). Lets Pass N
+    /// recover an orphan CPS unit's key when re-reading its bad range.
+    pub key_fetch: Option<crate::sector::KeyFetch>,
 }
 
 /// Result returned by [`Disc::patch`].
@@ -3735,6 +3858,53 @@ pub fn detect_max_batch_sectors(device_path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── encrypted-content map (`merged_extents` core) ────────────────────────
+
+    fn ext(start_lba: u32, sector_count: u32) -> Extent {
+        Extent {
+            start_lba,
+            sector_count,
+        }
+    }
+
+    #[test]
+    fn merged_extents_empty_is_empty() {
+        assert_eq!(merged_extents([].iter()), Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn merged_extents_single() {
+        assert_eq!(merged_extents([ext(100, 50)].iter()), vec![(100, 50)]);
+    }
+
+    /// Out-of-order extents from several titles, with an OVERLAP, an ADJACENT
+    /// pair, and a DISJOINT one, must come back sorted + merged + disjoint.
+    #[test]
+    fn merged_extents_unions_sorts_and_merges() {
+        // [300,310) ; [100,150) ; [150,200) adjacent→merges with prev ;
+        // [120,160) overlaps [100,150)&[150,200) ; [500,505) disjoint.
+        let v = vec![
+            ext(300, 10),
+            ext(100, 50),
+            ext(150, 50),
+            ext(120, 40),
+            ext(500, 5),
+        ];
+        assert_eq!(
+            merged_extents(v.iter()),
+            vec![(100, 100), (300, 10), (500, 5)],
+            "[100,200) merged, [300,310), [500,505)"
+        );
+    }
+
+    /// The same clip referenced by two titles (identical extents) de-duplicates
+    /// to a single range — no double-counting of shared content.
+    #[test]
+    fn merged_extents_dedups_shared_clip() {
+        let v = vec![ext(100, 50), ext(100, 50)];
+        assert_eq!(merged_extents(v.iter()), vec![(100, 50)]);
+    }
 
     /// A Windows-form optical device path (`\\.\CdRom0`, `\\.\D:`) must never
     /// fall through to the block default (8192 sectors = 16 MiB, well over the
@@ -4640,7 +4810,7 @@ mod tests {
 
     #[test]
     fn unit_key_validation_gates_on_real_ciphertext() {
-        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, is_aacs_scrambled};
+        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
 
         // No samples -> nothing to disprove against -> accept (sample-less paths
         // like resume / mapfile must be unaffected).
@@ -4658,7 +4828,7 @@ mod tests {
             clear[off] = 0x47;
             off += 192;
         }
-        assert!(!is_aacs_scrambled(&clear));
+        assert!(!ts_sync_destroyed(&clear));
         assert!(super::aligned_unit_keys_validate(
             &[(0, [0x11u8; 16])],
             None,
@@ -4669,7 +4839,7 @@ mod tests {
         let uk = [0x5au8; 16];
         let enc = encrypt_unit_for_test(&clear, &uk);
         assert!(
-            is_aacs_scrambled(&enc),
+            ts_sync_destroyed(&enc),
             "encrypted unit must read scrambled"
         );
 
@@ -4698,7 +4868,7 @@ mod tests {
         // CPS-unit-1 sectors then passed through as raw encrypted bytes into the
         // ISO/MKV with no error surfaced. The gate must now reject a key set
         // that leaves any scrambled sample uncovered.
-        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, is_aacs_scrambled};
+        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
 
         let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
         let mut off = 4;
@@ -4711,8 +4881,8 @@ mod tests {
         let uk1 = [0x22u8; 16];
         let sample0 = encrypt_unit_for_test(&clear, &uk0); // CPS unit 0 body
         let sample1 = encrypt_unit_for_test(&clear, &uk1); // CPS unit 1 body
-        assert!(is_aacs_scrambled(&sample0));
-        assert!(is_aacs_scrambled(&sample1));
+        assert!(ts_sync_destroyed(&sample0));
+        assert!(ts_sync_destroyed(&sample1));
 
         let samples = vec![sample0.clone(), sample1.clone()];
 
@@ -4748,6 +4918,10 @@ mod tests {
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
         let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();
+        // Flag the unit encrypted (CPI bits on byte 0) before key derivation so
+        // the recovered plaintext header matches and `decrypt_unit`'s CPI gate
+        // attempts the decrypt.
+        unit[0] |= 0xC0;
         let mut header = [0u8; 16];
         header.copy_from_slice(&unit[..16]);
         let cipher = Aes128::new(GenericArray::from_slice(uk));
@@ -4916,6 +5090,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         assert!(
@@ -4949,6 +5125,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let err = disc
             .copy(&mut reader, &iso_path, &opts)
@@ -4989,6 +5167,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         assert!(
             disc.copy(&mut reader, &iso_path, &opts).is_ok(),
@@ -5013,6 +5193,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -5063,6 +5245,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         disc.sweep(&mut reader, &iso_path, &opts).expect("sweep");
 
@@ -5167,6 +5351,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         small_disc
             .sweep(&mut small_reader, &iso_path, &opts0)
@@ -5243,6 +5429,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         disc.sweep(&mut reader, &iso_path, &opts0)
             .expect("initial clean sweep");
@@ -5342,6 +5530,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc
             .sweep(&mut reader, &iso_path, &opts)
@@ -5398,6 +5588,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.sweep(&mut reader, &iso_path, &opts);
         assert!(
@@ -5429,6 +5621,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, std::path::Path::new("/dev/null"), &opts);
         assert!(
@@ -5520,6 +5714,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         assert!(result.is_ok(), "resume copy failed: {:?}", result.err());
@@ -5616,6 +5812,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         assert!(
@@ -5667,6 +5865,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts);
         assert!(
@@ -5686,6 +5886,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let patch_result = disc.copy(&mut reader2, &iso_path, &patch_opts);
         assert!(
@@ -5720,6 +5922,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let _sweep_result = disc.copy(&mut reader, &iso_path, &sweep_opts).unwrap();
 
@@ -5734,6 +5938,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let patch_result = disc.copy(&mut reader2, std::path::Path::new("/dev/null"), &patch_opts);
         assert!(
@@ -5768,6 +5974,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
         let result = disc.copy(&mut reader, &iso_path, &opts);
         let r = result.expect("100-batch clean sweep should succeed");
@@ -6024,6 +6232,8 @@ mod tests {
             halt: None,
             vid: None,
             unit_keys: Vec::new(),
+
+            key_fetch: None,
         };
 
         let result = disc.copy(&mut reader, &iso_path, &opts);
