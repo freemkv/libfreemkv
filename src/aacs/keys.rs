@@ -2521,15 +2521,19 @@ mod tests {
     #[test]
     fn parse_unit_key_ro_title_cps_mapping_first_play_top_menu_then_titles() {
         // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then
-        // per-title 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2.
-        let mut data = build_unit_key_ro(2, 64);
-        data[20..22].copy_from_slice(&7u16.to_be_bytes()); // first_play
-        data[22..24].copy_from_slice(&9u16.to_be_bytes()); // top_menu
-        data[24..26].copy_from_slice(&2u16.to_be_bytes()); // num_titles
-        data[28..30].copy_from_slice(&3u16.to_be_bytes()); // title 0 CPS
-        data[32..34].copy_from_slice(&4u16.to_be_bytes()); // title 1 CPS
+        // per-title 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2. Each on-disc
+        // 1-based CPS number in `1..=num_uk` is validated and converted to a
+        // 0-based key index (libaacs unit_key.c); an out-of-range number → 0.
+        let mut data = build_unit_key_ro(4, 64); // num_uk = 4 → CPS 1..=4 valid
+        data[20..22].copy_from_slice(&1u16.to_be_bytes()); // first_play CPS 1
+        data[22..24].copy_from_slice(&2u16.to_be_bytes()); // top_menu  CPS 2
+        data[24..26].copy_from_slice(&3u16.to_be_bytes()); // num_titles = 3
+        data[28..30].copy_from_slice(&3u16.to_be_bytes()); // title 0 CPS 3
+        data[32..34].copy_from_slice(&4u16.to_be_bytes()); // title 1 CPS 4
+        data[36..38].copy_from_slice(&9u16.to_be_bytes()); // title 2 CPS 9 (> num_uk)
         let p = parse_unit_key_ro(&data, AacsVersion::V20).unwrap();
-        assert_eq!(p.title_cps_unit, vec![7, 9, 3, 4]);
+        // 1-based CPS {1,2,3,4} → 0-based {0,1,2,3}; out-of-range 9 → 0.
+        assert_eq!(p.title_cps_unit, vec![0, 1, 2, 3, 0]);
     }
     // ── MKB record framing: rec_len is BE24 incl. 4-byte header ────────────
     #[test]

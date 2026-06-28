@@ -547,11 +547,12 @@ mod tests {
     }
 
     /// A content certificate: type byte@0 (0x00 = V10, else V20),
-    /// bus_encryption bit0@1, cc_id@2..8 (aacs/keys.rs parse_content_cert).
+    /// bus_encryption bit7@1, cc_id@14..20 (aacs/keys.rs parse_content_cert,
+    /// which requires ≥20 bytes and reads the bus flag from `data[1] >> 7`).
     fn build_content_cert(cert_type: u8, bus_encryption: bool) -> Vec<u8> {
-        let mut v = vec![0u8; 8];
+        let mut v = vec![0u8; 20];
         v[0] = cert_type;
-        v[1] = if bus_encryption { 0x01 } else { 0x00 };
+        v[1] = if bus_encryption { 0x80 } else { 0x00 };
         v
     }
 
