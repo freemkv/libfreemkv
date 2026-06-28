@@ -304,7 +304,6 @@ impl Disc {
             None => base_keys.clone(),
         }
     }
-
 }
 
 /// True for the AACS-encrypted stream files (`.m2ts`, `.ssif`). Every other UDF
@@ -1186,7 +1185,6 @@ mod tests {
     fn read_out(dir: &Path, rel: &str) -> Option<Vec<u8>> {
         std::fs::read(dir.join(rel)).ok()
     }
-
 
     // ── Tests ─────────────────────────────────────────────────────────────
 
