@@ -143,6 +143,14 @@ pub struct Unlocked {
     pub vid: Option<Vid>,
     /// AACS 2.x bus key (`read_data_key`) from the cert handshake, if any.
     pub read_data_key: Option<[u8; 16]>,
+    /// True when a firmware unlocker put the drive into clear-content mode: AACS
+    /// bus encryption is then removed AT THE DRIVE (no bus key needed). The
+    /// downstream bus-key gate credits this exactly like a cert `read_data_key`.
+    pub drive_unlocked: bool,
+    /// Numeric [`crate::error::Error`] code when the AACS bus-key read was
+    /// ATTEMPTED and FAILED (cert path) — diagnostic only, so the gate can log
+    /// WHY the bus key is missing. `None` when never attempted or it succeeded.
+    pub read_data_key_err: Option<u16>,
 }
 
 /// Process-wide ordered registry of unlockers.
@@ -195,7 +203,7 @@ fn ensure_builtins() {
 pub(crate) fn route_unlock(
     scsi: &mut dyn ScsiTransport,
     ctx: &UnlockCtx,
-) -> Result<Option<(String, Vid)>> {
+) -> Result<Option<(String, Unlocked)>> {
     ensure_builtins();
     let reg = match REGISTRY.read() {
         Ok(r) => r,
@@ -209,14 +217,12 @@ pub(crate) fn route_unlock(
         if u.matches(ctx) {
             let name = u.name().to_string();
             match u.unlock(scsi, ctx) {
-                // The firmware route reports a VID; `read_data_key` is None here
-                // (this is the firmware seam — the cert handshake supplies the
-                // bus key on its own path). A drive that unlocked but produced no
-                // VID falls through to the cert handshake.
-                Ok(unlocked) => match unlocked.vid {
-                    Some(vid) => return Ok(Some((name, vid))),
-                    None => return Ok(None),
-                },
+                // A successful unlock removed the barrier — return what it
+                // learned (VID and/or bus key, plus drive_unlocked) verbatim;
+                // libfreemkv files those onto the disc/drive. A firmware route
+                // carries a VID with drive_unlocked=true; the cert route a VID +
+                // read_data_key; CSS an empty Unlocked (side-effect only).
+                Ok(unlocked) => return Ok(Some((name, unlocked))),
                 // A genuine SCSI/transport fault is not "this drive can't be
                 // unlocked" — the bus is broken. Propagate so init() aborts
                 // instead of falling through to a cert handshake that will
@@ -396,6 +402,8 @@ mod tests {
                 Some(v) => Ok(Unlocked {
                     vid: Some(Vid(v)),
                     read_data_key: None,
+                    drive_unlocked: true,
+                    read_data_key_err: None,
                 }),
                 None => Err(UnlockError::VidUnavailable),
             }
@@ -487,7 +495,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            got.map(|(_, v)| v),
+            got.and_then(|(_, u)| u.vid),
             Some(Vid(vid)),
             "matching unlocker's OEM VID is used"
         );
