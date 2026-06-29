@@ -163,6 +163,44 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8]) -> bool {
     aacs_unit_encrypted(unit) && ts_sync_destroyed(unit)
 }
 
+/// Overwrite an aligned unit (6144 bytes) IN PLACE with valid NULL MPEG-TS
+/// source packets — the [A2] mux loss-concealment fill for a content unit that
+/// genuinely would not decrypt.
+///
+/// Zero-filling such a unit is wrong at the TS layer: a run of `0x00` bytes
+/// carries no `0x47` sync, so the demuxer loses packet framing and can mis-parse
+/// the *next* unit if a stray `0x47` appears mid-zero. Instead we lay down 32
+/// well-formed BD source packets, each a TS null packet (PID `0x1FFF`):
+///
+/// ```text
+///   [4-byte TP_extra_header = 0][47 1F FF 10][184 bytes 0xFF stuffing]
+/// ```
+///
+/// The demuxer stays byte-synced on the 192-byte stride, and because PID
+/// `0x1FFF` matches no elementary stream every null packet is silently dropped —
+/// so the *video/audio* PID simply loses these packets. That shows up downstream
+/// as a continuity-counter gap on the real PID, which the TS assembler already
+/// turns into a dropped partial PES (see `mux::ts`), the foundation B1 builds on.
+/// This NEVER emits ciphertext and is lossless framing, not fabricated content.
+pub fn fill_null_ts_unit(unit: &mut [u8]) {
+    const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
+    let mut off = 0;
+    while off + PKT <= unit.len() {
+        // TP_extra_header (arrival timestamp / copy-control) — zero is fine; the
+        // demuxer never reads it for a PID it does not track.
+        unit[off..off + 4].fill(0);
+        // 188-byte TS null packet: sync, PID 0x1FFF (no PUSI/TEI), payload-only
+        // with continuity counter 0.
+        unit[off + 4] = TS_SYNC; // 0x47
+        unit[off + 5] = 0x1F; // PID high (top 5 bits of 0x1FFF, flags clear)
+        unit[off + 6] = 0xFF; // PID low
+        unit[off + 7] = 0x10; // adaptation=01 (payload only), CC=0
+        // Stuffing: 0xFF is the conventional null-packet payload fill.
+        unit[off + 8..off + PKT].fill(0xFF);
+        off += PKT;
+    }
+}
+
 /// Count the MPEG-TS sync bytes (`0x47`) present at the BD-TS packet stride
 /// (offset 4 and every 192 bytes after — 4-byte TP_extra_header + 188-byte
 /// TS packet). A clear or correctly-decrypted m2ts unit shows ~one per

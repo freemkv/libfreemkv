@@ -660,10 +660,12 @@ mod tests {
         assert!(st.bus_encryption, "cert bus_encryption bit must propagate");
     }
 
-    /// No content cert at all but bus_encryption can't be read → version
-    /// defaults to 1 (encrypt.rs: `None => 1`). bus_encryption false.
+    /// No content cert at all → version defaults to UHD (major 2), matching
+    /// `read_aacs_version` so the scanned `AacsState.version` and the out-of-band
+    /// fetch agree on the Unit_Key_RO stride (audit #4: a wrong BD-vs-UHD guess
+    /// mis-parses unit keys). bus_encryption false (unreadable → off).
     #[test]
-    fn resolve_vid_only_no_cert_defaults_version_1() {
+    fn resolve_vid_only_no_cert_defaults_version_uhd() {
         let mut disc = MemDisc::new();
         let udf = build_aacs_fs(
             &mut disc,
@@ -675,7 +677,11 @@ mod tests {
             }],
         );
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("state");
-        assert_eq!(st.version, 1, "no cert → default version 1");
+        assert_eq!(
+            st.version,
+            aacs::AACS_MAJOR_UHD,
+            "no cert → default UHD (major 2)"
+        );
         assert!(!st.bus_encryption);
     }
 
