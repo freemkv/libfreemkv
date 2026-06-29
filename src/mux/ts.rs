@@ -28,6 +28,15 @@ pub struct PesPacket {
     /// from the producer's known stream offset. `None` when the demuxer was fed
     /// without a base offset (callers that don't need provenance).
     pub source: Option<crate::pes::SourcePos>,
+    /// True when a TS continuity gap (a CC discontinuity, or an adaptation-field
+    /// discontinuity_indicator) was seen on this PID since the previous PES
+    /// completed — i.e. one or more packets for this stream were lost (e.g. the
+    /// mux replaced an undecryptable unit with NULL TS packets, P3/A2). This is
+    /// the FIRST surviving PES after the gap, so for inter-coded video it (and
+    /// every later frame up to the next IRAP/IDR) may reference data that is now
+    /// gone. The codec-parse consumer uses it to drop forward to the next
+    /// keyframe (B1) instead of emitting frames with dangling references.
+    pub discontinuity: bool,
 }
 
 /// Per-PID PES reassembly state.
@@ -58,6 +67,11 @@ struct PesAssembler {
     /// Stamped at PES start, emitted on the completed packet — provenance is
     /// carried, never reconstructed downstream.
     pes_source: Option<crate::pes::SourcePos>,
+    /// Sticky "a continuity gap occurred on this PID" flag. Set whenever a CC
+    /// gap or an explicit discontinuity_indicator is seen; carried onto the NEXT
+    /// completed PES (which is the first surviving frame after the loss) and then
+    /// cleared. Drives B1 drop-to-keyframe in the codec consumer.
+    pending_discontinuity: bool,
 }
 
 /// Initial capacity for a fresh PES buffer. Sized to cover the
@@ -92,6 +106,7 @@ impl PesAssembler {
             header_remaining: 0,
             last_cc: None,
             pes_source: None,
+            pending_discontinuity: false,
         }
     }
 
@@ -105,12 +120,15 @@ impl PesAssembler {
         source: Option<crate::pes::SourcePos>,
     ) -> Option<PesPacket> {
         let completed = if self.active && !self.buffer.is_empty() {
+            let discontinuity = self.pending_discontinuity;
+            self.pending_discontinuity = false;
             Some(PesPacket {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
                 data: std::mem::replace(&mut self.buffer, Vec::with_capacity(PES_BUFFER_INIT_CAP)),
                 source: self.pes_source,
+                discontinuity,
             })
         } else {
             self.buffer.clear();
@@ -151,12 +169,15 @@ impl PesAssembler {
     fn flush(&mut self) -> Option<PesPacket> {
         if self.active && !self.buffer.is_empty() {
             self.active = false;
+            let discontinuity = self.pending_discontinuity;
+            self.pending_discontinuity = false;
             Some(PesPacket {
                 pid: self.pid,
                 pts: self.pts,
                 dts: self.dts,
                 data: std::mem::take(&mut self.buffer),
                 source: self.pes_source,
+                discontinuity,
             })
         } else {
             None
@@ -391,6 +412,16 @@ impl TsDemuxer {
             None => false,
         };
         asm.last_cc = Some(cc);
+        // Any continuity gap — at a PUSI boundary or mid-PES — means packets for
+        // this stream were lost (an upstream NULL-TS conceal, a damaged source).
+        // Mark it sticky so the NEXT completed PES carries `discontinuity` and the
+        // codec consumer can drop forward to the next keyframe (B1). The partial
+        // PES is still dropped below only for a NON-PUSI continuation (a hole in
+        // the middle of the current frame); a gap landing exactly on a PUSI starts
+        // a clean new frame, but it is still the first frame after the loss.
+        if discontinuity_flag || cc_gap {
+            asm.pending_discontinuity = true;
+        }
         if !pusi && (discontinuity_flag || cc_gap) && asm.active {
             tracing::trace!(
                 target: "mux",
@@ -913,6 +944,50 @@ mod tests {
         assert!(
             !final_out[0].data.windows(4).any(|w| w == b"BBBB"),
             "dropped continuation must not appear in any emitted PES"
+        );
+    }
+
+    /// B1 plumbing: a continuity gap must STAMP `discontinuity = true` on the
+    /// next completed PES so the codec consumer can drop forward to the next
+    /// keyframe. A clean in-sequence PES carries `discontinuity = false`. We
+    /// open A (cc=0), flush it cleanly via B's PUSI (cc=1), then jump the CC
+    /// (cc 1 -> 5) on C's PUSI: the gap is sticky and lands on the PES flushed
+    /// at that boundary (B — the frame whose tail packets were the lost ones).
+    #[test]
+    fn continuity_gap_stamps_discontinuity_on_next_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+
+        // Open A (cc=0): nothing completed yet.
+        let out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        assert!(out.is_empty());
+
+        // B's PUSI (cc=1, in sequence) flushes A. A saw no gap → clean.
+        let out = demux.feed(&ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        assert_eq!(out.len(), 1, "A completes");
+        assert_eq!(&out[0].data[..4], b"AAAA");
+        assert!(
+            !out[0].discontinuity,
+            "in-sequence PES is not a discontinuity"
+        );
+
+        // C's PUSI jumps cc 1 -> 5: packets were lost. The gap is sticky and is
+        // attributed to the PES flushed here (B), which lost its tail packets.
+        let out = demux.feed(&ts_payload_packet(pid, true, 5, &pes_start(b"CCCC")));
+        assert_eq!(out.len(), 1, "B completes");
+        assert_eq!(&out[0].data[..4], b"BBBB");
+        assert!(
+            out[0].discontinuity,
+            "the PES at the continuity gap must be flagged so B1 can resync"
+        );
+
+        // C itself was opened clean (after the gap) and carries no new gap.
+        let out = demux.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0].data[..4], b"CCCC");
+        assert!(
+            !out[0].discontinuity,
+            "post-gap PES with no further gap is clean"
         );
     }
 

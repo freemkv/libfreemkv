@@ -723,6 +723,8 @@ impl crate::pes::Stream for DiscStream {
                             pts: ps.pts.map(|p| p as i64),
                             dts: ps.dts.map(|d| d as i64),
                             data: ps.data.clone(),
+                            // PS (DVD/CSS) path: no AACS conceal, no gap flag.
+                            discontinuity: false,
                         };
                         if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid)
                         {
@@ -846,6 +848,8 @@ impl crate::pes::Stream for DiscStream {
                         pts: ps.pts.map(|p| p as i64),
                         dts: ps.dts.map(|d| d as i64),
                         data: ps.data.clone(),
+                        // PS (DVD/CSS) path: no AACS conceal, no gap flag.
+                        discontinuity: false,
                     };
 
                     if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {

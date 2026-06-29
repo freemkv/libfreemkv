@@ -68,6 +68,13 @@ pub struct PipelinedPesStream {
     /// are expected on every disc; instead of a per-packet WARN they're tallied
     /// and summarised once at EOF.
     dropped_nav_packets: u64,
+    /// Per-track (by stream index) B1 drop-to-keyframe gate. After a TS gap on a
+    /// video track, drop inter-coded frames until the next IRAP so the muxed
+    /// stream stays decode-clean across an upstream concealed loss (P3/B1).
+    resync: Vec<super::resync::ResyncGate>,
+    /// Per-track "is inter-coded video" flag (only video has cross-frame
+    /// references the gate must protect). Indexed by stream index.
+    is_video: Vec<bool>,
 }
 
 impl PipelinedPesStream {
@@ -87,6 +94,14 @@ impl PipelinedPesStream {
         parsers: Vec<(u16, Box<dyn CodecParser>)>,
         pid_to_track: Vec<(u16, usize)>,
     ) -> Self {
+        let is_video: Vec<bool> = title
+            .streams
+            .iter()
+            .map(|s| matches!(s, crate::disc::Stream::Video(_)))
+            .collect();
+        let resync = (0..title.streams.len())
+            .map(|_| super::resync::ResyncGate::new())
+            .collect();
         Self {
             title,
             parsers,
@@ -98,6 +113,8 @@ impl PipelinedPesStream {
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             decrypt_loss: None,
             dropped_nav_packets: 0,
+            resync,
+            is_video,
         }
     }
 
@@ -164,9 +181,35 @@ impl PipelinedPesStream {
                 } else if let Some((_, parser)) =
                     self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
                 {
+                    let is_video = self.is_video.get(track).copied().unwrap_or(false);
+                    let discontinuity = pes.discontinuity;
                     for frame in parser.parse(&pes) {
-                        self.pending_frames
-                            .push_back(PesFrame::from_codec_frame(track, frame));
+                        // B1: after a TS gap on a video track, drop forward to the
+                        // next keyframe so no frame with a dangling reference is
+                        // emitted. Audio/subtitle always admit (independent frames).
+                        // A track with no gate (out-of-range index) emits as-is.
+                        let emit = match self.resync.get_mut(track) {
+                            Some(gate) => {
+                                let was_armed = gate.is_armed();
+                                let dropped = gate.dropped_in_run();
+                                let admit = gate.admit(is_video, discontinuity, frame.keyframe);
+                                if admit && was_armed {
+                                    tracing::warn!(
+                                        target: "mux",
+                                        track,
+                                        pid = pes.pid,
+                                        dropped,
+                                        "B1: resynced at keyframe after concealed gap"
+                                    );
+                                }
+                                admit
+                            }
+                            None => true,
+                        };
+                        if emit {
+                            self.pending_frames
+                                .push_back(PesFrame::from_codec_frame(track, frame));
+                        }
                     }
                 }
             }
@@ -217,6 +260,8 @@ impl PipelinedPesStream {
                 pts: ps.pts.map(|p| p as i64),
                 dts: ps.dts.map(|d| d as i64),
                 data: ps.data,
+                // PS (DVD/CSS) path: no AACS conceal → no continuity-gap flag.
+                discontinuity: false,
             };
             if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
                 for frame in parser.parse(&pes) {
@@ -411,6 +456,7 @@ mod tests {
             pts: Some(90_000),
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 
@@ -495,6 +541,125 @@ mod tests {
         assert!(
             stream.read().unwrap().is_none(),
             "untracked PES dropped, EOF"
+        );
+    }
+
+    /// A parser that emits exactly one frame per PES, marking it a keyframe iff
+    /// the PES payload's first byte is `b'K'`. Lets a test script a precise
+    /// keyframe/inter-frame sequence to exercise the B1 resync gate.
+    struct KeyframeParser;
+    impl CodecParser for KeyframeParser {
+        fn parse(&mut self, pes: &PesPacket) -> Vec<super::super::codec::Frame> {
+            vec![super::super::codec::Frame {
+                coding: None,
+                source: None,
+                pts_ns: pes.pts.unwrap_or(0),
+                keyframe: pes.data.first() == Some(&b'K'),
+                data: pes.data.clone(),
+                duration_ns: None,
+            }]
+        }
+        fn flush(&mut self) -> Vec<super::super::codec::Frame> {
+            vec![]
+        }
+        fn codec_private(&self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn ts_pes_disc(pid: u16, data: Vec<u8>, discontinuity: bool) -> PesPacket {
+        PesPacket {
+            source: None,
+            pid,
+            pts: Some(90_000),
+            dts: None,
+            data,
+            discontinuity,
+        }
+    }
+
+    /// B1 end-to-end: after a TS discontinuity on a VIDEO track the consumer
+    /// must DROP every inter-coded frame until the next keyframe, so no frame
+    /// with a dangling reference reaches the muxer (an ffmpeg deep-scan would
+    /// otherwise report a missing reference). The frame carrying the
+    /// discontinuity and the inter frames behind it are dropped; the stream
+    /// resumes cleanly at the next keyframe.
+    #[test]
+    fn b1_video_drops_to_keyframe_after_discontinuity() {
+        let title = video_title(false); // one HEVC video stream, PID 0x1011
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1011, Box::new(KeyframeParser))];
+        let pid_to_track = vec![(0x1011u16, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        // K0,P1 clean → emit. P2 carries the gap (inter frame referencing the
+        // lost data) → arms the gate; P2,P3 drop. K4 is the next keyframe →
+        // resync + emit. P5 then admits cleanly.
+        tx.send(DemuxBatch::Ts(vec![
+            ts_pes_disc(0x1011, b"K0".to_vec(), false),
+            ts_pes_disc(0x1011, b"P1".to_vec(), false),
+            ts_pes_disc(0x1011, b"P2".to_vec(), true),
+            ts_pes_disc(0x1011, b"P3".to_vec(), false),
+            ts_pes_disc(0x1011, b"K4".to_vec(), false),
+            ts_pes_disc(0x1011, b"P5".to_vec(), false),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        let mut emitted = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            emitted.push(f.data);
+        }
+        // P2 (gap) and P3 (still no keyframe) are dropped; the rest survive in
+        // order. Crucially the FIRST frame after the gap that we emit is the
+        // keyframe K4 — never a dangling-reference inter frame.
+        assert_eq!(
+            emitted,
+            vec![
+                b"K0".to_vec(),
+                b"P1".to_vec(),
+                b"K4".to_vec(),
+                b"P5".to_vec()
+            ],
+            "post-gap inter frames dropped, stream resumes at the keyframe"
+        );
+    }
+
+    /// Counterpart to B1: a discontinuity on a NON-video track must NOT drop
+    /// frames — audio/subtitle access units are independent, so the gate admits
+    /// every frame the parser still produces.
+    #[test]
+    fn b1_audio_does_not_drop_on_discontinuity() {
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Audio(AudioStream {
+            pid: 0x1100,
+            codec: Codec::Ac3,
+            channels: AudioChannels::Surround51,
+            language: "eng".into(),
+            sample_rate: SampleRate::S48,
+            secondary: false,
+            purpose: LabelPurpose::Normal,
+            label: String::new(),
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(0x1100, Box::new(KeyframeParser))];
+        let pid_to_track = vec![(0x1100u16, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        tx.send(DemuxBatch::Ts(vec![
+            ts_pes_disc(0x1100, b"a0".to_vec(), false),
+            ts_pes_disc(0x1100, b"a1".to_vec(), true), // gap — but audio is independent
+            ts_pes_disc(0x1100, b"a2".to_vec(), false),
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        let mut emitted = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            emitted.push(f.data);
+        }
+        assert_eq!(
+            emitted,
+            vec![b"a0".to_vec(), b"a1".to_vec(), b"a2".to_vec()],
+            "audio frames are never dropped on a discontinuity"
         );
     }
 

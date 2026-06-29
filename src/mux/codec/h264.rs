@@ -537,6 +537,7 @@ mod tests {
             pts,
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 
@@ -923,6 +924,7 @@ mod tests {
             pts: Some(180000), // 2 seconds (presentation)
             dts: Some(90000),  // 1 second (decode)
             data,
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
@@ -1232,6 +1234,7 @@ mod tests {
             pts: None,
             dts: Some(90000),
             data: vec![0x00, 0x00, 0x01, 0x41, 0x10],
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f.len(), 1);
@@ -1247,6 +1250,7 @@ mod tests {
             pts: None,
             dts: None,
             data: vec![0x00, 0x00, 0x01, 0x41, 0x10],
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f.len(), 1);
