@@ -126,18 +126,21 @@ enum Ac3Size {
 
 impl CodecParser for TrueHdParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
-
         // B1: a concealed/lost gap means the buffered TrueHD AU is TRUNCATED.
         // Splicing post-gap bytes onto it corrupts the AU framing (→ "Invalid
         // data found") and strands the PTS cadence (the non-monotonic audio-DTS
         // band at gaps). Drop the partial; with `buf` now empty the PTS-base block
         // below re-seeds the cadence from the post-gap PES, monotonic across the
         // gap. (Audio has no inter-frame refs — this is the whole audio fix.)
+        //
+        // Handle the discontinuity BEFORE the empty-data guard so the signal can
+        // never be stranded by an empty post-gap PES (defensive; the demuxer only
+        // emits non-empty PES today).
         if pes.discontinuity {
             self.buf.clear();
+        }
+        if pes.data.is_empty() {
+            return Vec::new();
         }
 
         // Capture the PTS base ONLY at an access-unit boundary, i.e. when no AU
