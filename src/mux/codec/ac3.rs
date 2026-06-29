@@ -64,6 +64,17 @@ impl CodecParser for Ac3Parser {
             return Vec::new();
         }
 
+        // B1: a concealed/lost gap means the bytes held in `buf` are a TRUNCATED
+        // frame. Appending the post-gap bytes would splice them into one corrupt
+        // frame (wrong frame_size, bad CRC → "exponent out of range" / garbage).
+        // Drop the partial and resync on the next syncword — a clean single-frame
+        // gap instead of a frankenstein frame. (The video parsers carry this via
+        // the ResyncGate; audio has no inter-frame refs, so dropping the spliced
+        // partial is the whole fix.)
+        if pes.discontinuity {
+            self.buf.clear();
+        }
+
         // Base PTS for the FIRST frame emitted from this call. Each subsequent
         // frame in the same call advances by the previous frame's duration, so a
         // PES that carries several AC-3 frames stamps a monotonically increasing
@@ -504,6 +515,48 @@ mod tests {
         let frames2 = parser.parse(&pes2);
         assert_eq!(frames2.len(), 1);
         assert_eq!(frames2[0].data.len(), 160);
+    }
+
+    #[test]
+    fn discontinuity_drops_truncated_partial() {
+        // B1: a partial AC-3 frame is buffered, then a concealed gap arrives
+        // (PES marked discontinuity) carrying a fresh complete frame. The
+        // truncated partial must be DROPPED, not spliced — otherwise the parser
+        // emits one corrupt frame built from [stale partial | head of fresh] and
+        // strands the tail (FFmpeg: "incomplete frame" / wrong sync).
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2); // 160 bytes, starts with 0x0B77
+
+        // First PES: only the first half of a frame (no boundary marker).
+        let pes1 = PesPacket {
+            source: None,
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data: frame_data[..80].to_vec(),
+            discontinuity: false,
+        };
+        assert!(
+            parser.parse(&pes1).is_empty(),
+            "partial frame should not emit"
+        );
+
+        // Concealed gap: a fresh whole frame, marked discontinuity.
+        let fresh = make_ac3_frame(0, 2);
+        let pes2 = PesPacket {
+            source: None,
+            pid: 0,
+            pts: Some(99000),
+            dts: None,
+            data: fresh.clone(),
+            discontinuity: true,
+        };
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1, "exactly one clean frame across the gap");
+        assert_eq!(
+            frames[0].data, fresh,
+            "emitted frame is the fresh post-gap frame, not a spliced partial"
+        );
     }
 
     #[test]
