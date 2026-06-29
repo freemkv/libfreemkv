@@ -310,6 +310,10 @@ use crate::sector::SectorSource;
 // per-LBA NOT_READY retries so a persistently-not-ready disc cannot burn
 // up to RANGE_BUDGET_CAP_SECS per range on a single LBA.
 const NOT_READY_MAX_RETRIES_PER_LBA: u32 = 3;
+/// Cooldown between patch ranges that actually grinded (dropped to the slow
+/// recovery speed). Lets the drive settle before the next range re-enters at max
+/// speed. Gated on "grinded" so a many-small-range pass doesn't stall on it.
+const INTER_RANGE_COOLDOWN_SECS: u64 = 10;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 10;
 const POST_FAILURE_PAUSE_SECS: u64 = 1;
 const CONSECUTIVE_FAIL_LONG_PAUSE: u64 = 5;
@@ -1838,7 +1842,15 @@ impl Disc {
         );
         let mut buf = vec![0u8; initial_batch as usize * 2048];
 
-        reader.set_speed(0x0000);
+        // Adaptive patch speed (replaces the old pass-wide slow pin): each range
+        // now ENTERS at max speed + the initial batch and only drops to the slow
+        // recovery speed on its FIRST read failure (set per-range below). Pass 1's
+        // damage-jump overshoots, so most of a jumped range is clean data the
+        // reverse-walk reads first — reading it at max speed instead of grinding
+        // the whole range slow is the win. `cooldown_pending` arms the inter-range
+        // pause, but ONLY after a range that actually grinded (dropped to slow) —
+        // an unconditional pause would stall 20+ min on a many-small-range pass.
+        let mut cooldown_pending = false;
 
         log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
 
@@ -1864,6 +1876,18 @@ impl Disc {
         );
 
         'outer: for (range_idx, (range_pos, range_size)) in bad_ranges.iter().enumerate() {
+            // Inter-range cooldown — only after a range that grinded (dropped to
+            // slow). Halt-responsive so a stop request interrupts the wait.
+            if cooldown_pending {
+                tracing::info!(
+                    target: "freemkv::disc",
+                    phase = "patch_inter_range_cooldown",
+                    secs = INTER_RANGE_COOLDOWN_SECS,
+                    "Cooldown before next range (previous range grinded at slow speed)"
+                );
+                super::sleep_secs_or_halt(INTER_RANGE_COOLDOWN_SECS, opts.halt.as_ref());
+                cooldown_pending = false;
+            }
             tracing::info!(
                 target: "freemkv::disc",
                 phase = "patch_range_start",
@@ -1926,6 +1950,15 @@ impl Disc {
                 range_budget_secs,
                 "Per-range time budget computed"
             );
+            // Enter the range at MAX speed + the full initial batch: read the
+            // clean overshoot fast. `current_batch` carries across ranges, so
+            // reset it here or a prior range's single-sector grind would start
+            // this range slow. `range_slowed` flips on the first read failure
+            // (below), dropping to the slow recovery speed for the rest of the
+            // range and arming the inter-range cooldown.
+            reader.set_speed(0xFFFF);
+            state.current_batch = initial_batch;
+            let mut range_slowed = false;
             loop {
                 if let Some(ref h) = opts.halt {
                     if h.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2043,6 +2076,15 @@ impl Disc {
                         }
                     }
                     Err(err) => {
+                        // First failure in this range: the fast-batched pass over
+                        // the clean overshoot is done; drop to the slow recovery
+                        // speed for the rest of the range and arm the cooldown.
+                        // Idempotent — only the first failure issues SET CD SPEED.
+                        if !range_slowed {
+                            reader.set_speed(0x0000);
+                            range_slowed = true;
+                            cooldown_pending = true;
+                        }
                         match handle_read_failure(
                             &mut state,
                             &frame,
