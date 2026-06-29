@@ -2,6 +2,28 @@
 
 ## [1.2.0] — 2026-06-28
 
+### Breaking
+
+The disc's AACS version is now carried through the key-resolution path as the
+single source of truth for the `Unit_Key_RO` stride (AACS-1.0 = 48-byte,
+AACS-2.x = 64-byte), so keys are always read at the disc's own layout. That
+threaded one new value through three public signatures. In-tree consumers
+(`freemkv`, `autorip`, `freemkv-keysources`) are updated; external callers must
+adjust:
+
+- **`DiscInputs` gains a `version: u8` field** (between `volume_id` and `mkb`).
+  Code constructing it with a struct literal must add the field. It is normally
+  obtained from `Disc::inputs()`, not constructed by hand.
+- **`keysource::DiscInputsCtx::new` takes one argument, not two** — the version
+  is now read from `inputs.version` (`new(inputs)` instead of
+  `new(inputs, version)`).
+- **`disc::read_aacs_inputs` / `read_aacs_inputs_from_drive` return a 3-tuple**
+  `(inf, mkb, version)` instead of `(inf, mkb)`.
+
+These are source-breaking for external crates.io consumers. Shipped under a
+minor bump (1.2.0): libfreemkv's surface is not yet frozen and the only known
+consumers are the in-tree toolchain crates.
+
 ### Added
 
 - **Mux loss concealment — a logged gap still produces a decode-clean file.**
