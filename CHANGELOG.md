@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.0-beta.1] — UNRELEASED
+## [1.1.0]
 
 ### Added
 
@@ -85,7 +85,7 @@
 - **`--version` now matches the build stamped into MKVs.** The CLI's `--version`
   string and the `MuxingApp` / `WritingApp` fields written into every MKV now
   derive from a single libfreemkv constant — the package version plus the git
-  short hash (e.g. `freemkv 1.1.0-beta.1 (g835cc99)`). The muxer previously kept
+  short hash (e.g. `freemkv 1.1.0 (g835cc99)`). The muxer previously kept
   its own copy of that string, so the two could drift; a binary and the files it
   produces can no longer report different versions.
 - **DTS-HD Master Audio: a false core-sync inside the lossless extension no
