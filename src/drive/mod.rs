@@ -410,7 +410,12 @@ impl Drive {
         // Walk the unlock registry: the first unlocker whose identity
         // matches runs; none matching leaves the drive in stock mode so the
         // host-cert AACS handshake (the OEM route) carries the disc.
-        let r = crate::unlock::route_unlock(self.scsi.as_mut(), &self.drive_id);
+        // Drive-prep dispatch: disc structure has not been probed yet, so the
+        // kind is Unknown — only a drive-keyed (firmware) unlocker can match.
+        let r = crate::unlock::route_unlock(
+            self.scsi.as_mut(),
+            &crate::unlock::UnlockCtx::new(&self.drive_id, crate::unlock::DiscKind::Unknown),
+        );
         self.init_ran = true;
         let r = match r {
             Ok(Some((name, vid))) => {
@@ -421,9 +426,13 @@ impl Drive {
                 // The matched unlocker may also be able to raise the drive to
                 // its maximum read speed. Best-effort: a failure here must NOT
                 // fail the rip — a slow drive still rips. Log and continue.
-                if let Err(e) =
-                    crate::unlock::unlocker_set_max_read_speed(self.scsi.as_mut(), &self.drive_id)
-                {
+                if let Err(e) = crate::unlock::unlocker_set_max_read_speed(
+                    self.scsi.as_mut(),
+                    &crate::unlock::UnlockCtx::new(
+                        &self.drive_id,
+                        crate::unlock::DiscKind::Unknown,
+                    ),
+                ) {
                     tracing::warn!(
                         target: "freemkv::drive",
                         phase = "init",
