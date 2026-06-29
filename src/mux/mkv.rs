@@ -2665,6 +2665,7 @@ mod tests {
                 pts: Some(gop_pts),
                 dts: None,
                 data: es,
+                discontinuity: false,
             }));
         }
         frames.extend(parser.flush());

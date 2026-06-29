@@ -223,6 +223,7 @@ mod tests {
             pts,
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 

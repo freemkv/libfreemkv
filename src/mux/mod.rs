@@ -91,6 +91,7 @@ pub(crate) mod mkvstream;
 pub(crate) mod network;
 pub(crate) mod null;
 pub(crate) mod ps;
+pub(crate) mod resync;
 pub(crate) mod stdio;
 /// Shared clip-boundary timeline-continuity corrector (used by the MKV muxer
 /// and the `demux://` sink).

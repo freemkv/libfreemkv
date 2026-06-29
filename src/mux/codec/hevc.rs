@@ -973,6 +973,7 @@ mod tests {
             pts,
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 
@@ -2243,6 +2244,7 @@ mod tests {
             pts: Some(180000), // 2 s (presentation)
             dts: Some(90000),  // 1 s (decode)
             data,
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
@@ -2850,6 +2852,7 @@ mod tests {
                 d.extend_from_slice(&[0x10, 0x20]);
                 d
             },
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f.len(), 1);

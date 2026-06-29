@@ -450,6 +450,7 @@ mod tests {
             pts: None,
             dts: None,
             data: vec![],
+            discontinuity: false,
         };
         assert!(parser.parse(&pes).is_empty());
     }
@@ -464,6 +465,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data: frame_data.clone(),
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
@@ -483,6 +485,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data: frame_data[..mid].to_vec(),
+            discontinuity: false,
         };
         let frames1 = parser.parse(&pes1);
         assert!(frames1.is_empty(), "partial frame should not emit");
@@ -494,6 +497,7 @@ mod tests {
             pts: Some(93000),
             dts: None,
             data: frame_data[mid..].to_vec(),
+            discontinuity: false,
         };
         let frames2 = parser.parse(&pes2);
         assert_eq!(frames2.len(), 1);
@@ -512,6 +516,7 @@ mod tests {
             pts: None,
             dts: None,
             data,
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
@@ -535,6 +540,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data: pes1_data,
+            discontinuity: false,
         };
         let frames1 = parser.parse(&pes1);
         assert_eq!(frames1.len(), 1, "first complete frame emitted");
@@ -548,6 +554,7 @@ mod tests {
             pts: Some(93000),
             dts: None,
             data: pes2_data,
+            discontinuity: false,
         };
         let frames2 = parser.parse(&pes2);
         assert_eq!(frames2.len(), 1, "split-sync frame must be recovered");
@@ -574,6 +581,7 @@ mod tests {
                 pts: None,
                 dts: None,
                 data,
+                discontinuity: false,
             };
             let frames = parser.parse(&pes);
             assert!(frames.is_empty());
@@ -602,6 +610,7 @@ mod tests {
             pts: None,
             dts: None,
             data,
+            discontinuity: false,
         };
         assert!(parser.parse(&pes).is_empty());
         assert_eq!(parser.buf, vec![0x0B], "lone trailing 0x0B retained");
@@ -639,6 +648,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data,
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f.len(), 1, "frame 1 emitted in parse");
@@ -671,6 +681,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data,
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f.len(), 2);
@@ -714,6 +725,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data,
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1, "only the real AC-3 frame is emitted");
@@ -1179,6 +1191,7 @@ mod tests {
             pts: Some(90000),
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 }
