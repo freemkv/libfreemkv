@@ -99,10 +99,11 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     unit_base: u32,
     /// Cumulative bytes of scrambled AACS units that no key could decrypt.
     /// `decrypt_sectors` restores those bytes to their original ciphertext (so a
-    /// clear nav-file is never corrupted), but for genuine encrypted content the
-    /// still-encrypted bytes are silently dropped by the downstream TS assembler
-    /// — real, unaccounted loss. Mux read paths share this counter into their
-    /// loss accounting (via [`decrypt_loss`]) so a partial AACS/CSS decrypt
+    /// clear nav-file is never corrupted). On the mux read path
+    /// (`tolerate_decrypt_loss`) such content is concealed as NULL-TS and tallied
+    /// here (not silently dropped); on the rip path the read fails loud for
+    /// re-read. Either way this counter is the loss signal: mux read paths fold it
+    /// into their accounting (via [`decrypt_loss`]) so a partial AACS/CSS decrypt
     /// failure can't be reported as a perfect rip. Shared `Arc` so the highway's
     /// producer thread and the consuming `Stream` see the same tally.
     ///
@@ -579,7 +580,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                     // the PADDING-AWARE test that matches `decrypt_unit`'s success
                     // criterion — NOT the majority-vote `aacs_unit_needs_decrypt`.
                     // A successfully padding-aware-decrypted content-fragment TAIL
-                    // (the v1.1.1 fix: a few real packets + source-zero padding) has
+                    // (the 1.2.0 fix: a few real packets + source-zero padding) has
                     // <16 TS syncs, so the majority vote would mis-flag it as
                     // "needs decrypt" and overwrite GOOD video with NULL-TS. The
                     // padding-aware predicate excludes zero-payload (padding) packets
@@ -602,6 +603,29 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                         units = concealed,
                         bytes = dropped,
                         "mux: undecryptable content concealed as NULL TS (loss tallied)"
+                    );
+                } else {
+                    // dropped > 0 (decrypt reported undecryptable bytes) yet the
+                    // padding-aware predicate matched NOTHING to conceal — a
+                    // contradiction: the only way a genuinely-ciphertext unit passes
+                    // `aacs_unit_still_ciphertext` is if every one of its non-zero
+                    // packets coincidentally carried a 0x47 (~256^-31). Belt-and-
+                    // suspenders so ciphertext can NEVER reach the mux: fall back to
+                    // the strict majority-vote predicate and conceal whatever it
+                    // flags, loudly. Cryptographically unreachable in practice.
+                    let mut forced = 0usize;
+                    for chunk in buf[..n].chunks_mut(unit_len) {
+                        if chunk.len() == unit_len && crate::aacs::aacs_unit_needs_decrypt(chunk) {
+                            crate::aacs::fill_null_ts_unit(chunk);
+                            forced += 1;
+                        }
+                    }
+                    tracing::warn!(
+                        target: "freemkv::decrypt",
+                        lba,
+                        bytes = dropped,
+                        forced,
+                        "mux: decrypt reported loss but padding-aware conceal matched nothing; forced strict conceal (unexpected)"
                     );
                 }
                 return Ok(n);
@@ -1427,7 +1451,7 @@ mod tests {
 
     /// REGRESSION (silent-data-loss): the conceal loop must NOT overwrite a
     /// SUCCESSFULLY-decrypted content-fragment TAIL unit. Such a tail (a few real
-    /// content packets + source-zero padding — the v1.1.1 shape) carries <16 TS
+    /// content packets + source-zero padding — the 1.2.0 shape) carries <16 TS
     /// syncs after decrypt, so the old majority-vote `aacs_unit_needs_decrypt`
     /// predicate mis-flagged it as "still needs decrypt" and, when it shared a read
     /// buffer with a genuinely-undecryptable unit (`dropped > 0`), NULL-TS-filled
