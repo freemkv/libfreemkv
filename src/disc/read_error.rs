@@ -531,13 +531,20 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     );
 
     if is_wedge_transition {
+        // NOTE: this is the FIRST escalation into the hardware/illegal-request
+        // sense family — NOT a confirmed wedge. Drives frequently recover and keep
+        // reading after one such error (a single bad spot), so calling it a "wedge"
+        // here over-claims (it sent past investigations chasing a drive ghost). A
+        // genuine wedge is PERSISTENT — see the `wedge_skip` / WEDGE_ABORT_THRESHOLD
+        // path below, which only fires after repeated fast-fails with no recovery.
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "wedge_transition",
+            phase = "fastfail_escalation",
             errors_in_zone = ctx.total_errors,
             ms_since_last_success,
             new_family = ?current_family,
-            "drive entered wedge / fast-fail family (was returning recoverable medium errors before this)"
+            "drive escalated into the fast-fail sense family (was returning recoverable medium \
+             errors before this) — often transient; only a PERSISTENT run is a real wedge"
         );
     }
 

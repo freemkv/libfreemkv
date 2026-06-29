@@ -93,6 +93,19 @@ consumers are the in-tree toolchain crates.
   with a per-unit "already-asked-dry" set (still bounded by the fetch budget).
 - **`verify::push_ranges` uses saturating arithmetic** so a corrupt-disc LBA near
   `u32::MAX` can't panic (matches `udf::merge_ranges`).
+- **Audio no longer corrupts at a stream discontinuity.** At a transport-stream
+  discontinuity — a continuity-counter break, an adaptation-field
+  discontinuity_indicator, or a concealed-loss gap — the AC-3 / DTS / TrueHD
+  parsers held a *truncated* partial access unit and spliced the post-gap bytes
+  onto it, manufacturing a corrupt frame (ffmpeg "exponent out of range" /
+  "Failed to decode block code(s)" / "Invalid data found") and, for TrueHD, a
+  non-monotonic timestamp band on multi-segment titles. The video path already
+  resynced via the keyframe gate; the audio parsers now do too — on a
+  discontinuity they drop the un-completable partial and resync on the next
+  syncword, rebasing the timestamp from the post-gap PES. A discontinuity becomes
+  a clean single-frame gap instead of a corrupt splice. Audio has no inter-frame
+  references, so dropping the truncated partial is the complete fix; the approach
+  matches FFmpeg's parser layer and GStreamer's `tsdemux`.
 
 ## [1.1.0]
 
