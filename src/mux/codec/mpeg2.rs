@@ -707,6 +707,7 @@ mod tests {
             pts: None,
             dts: None,
             data,
+            discontinuity: false,
         };
         let mut p = Mpeg2Parser::new();
         let mut frames = Vec::new();
@@ -822,6 +823,7 @@ mod tests {
             pts,
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 
@@ -1415,6 +1417,7 @@ mod tests {
             pts: None,
             dts: Some(90000),
             data,
+            discontinuity: false,
         };
         let f = parse_then_flush(&mut parser, &pes);
         assert_eq!(f[0].pts_ns, 1_000_000_000, "DTS fallback");
@@ -1428,6 +1431,7 @@ mod tests {
             pts: None,
             dts: None,
             data: data2,
+            discontinuity: false,
         };
         let f2 = parse_then_flush(&mut parser2, &pes2);
         assert_eq!(f2[0].pts_ns, 0, "no PTS/DTS → 0");

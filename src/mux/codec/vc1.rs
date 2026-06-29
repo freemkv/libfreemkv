@@ -451,6 +451,7 @@ mod tests {
             pts,
             dts: None,
             data,
+            discontinuity: false,
         }
     }
 
@@ -757,6 +758,7 @@ mod tests {
             pts: Some(180000), // presentation
             dts: Some(90000),  // decode
             data,
+            discontinuity: false,
         };
         let frames = parser.parse(&pes);
         assert_eq!(frames.len(), 1);
@@ -1007,6 +1009,7 @@ mod tests {
             pts: None,
             dts: Some(90000),
             data: vec![0x00, 0x00, 0x01, SC_FRAME, 0x55],
+            discontinuity: false,
         };
         let f = parser.parse(&pes);
         assert_eq!(f[0].pts_ns, 1_000_000_000, "DTS fallback");
@@ -1018,6 +1021,7 @@ mod tests {
             pts: None,
             dts: None,
             data: vec![0x00, 0x00, 0x01, SC_FRAME, 0x55],
+            discontinuity: false,
         };
         let f2 = parser2.parse(&pes2);
         assert_eq!(f2[0].pts_ns, 0, "no PTS/DTS → 0");
