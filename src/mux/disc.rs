@@ -227,7 +227,12 @@ impl DiscStream {
 
         // CSS/unencrypted content needs a decrypting wrapper to yield plaintext
         // VOB bytes before the AC-3 sub-stream probe can read real `acmod`s.
-        let mut reader = DecryptingSectorSource::new(reader, decrypt_keys.clone());
+        // MUX path: tolerate decrypt loss — conceal an undecryptable unit (NULL TS
+        // fill) + tally + log rather than abort the stream (P3). DiscStream is a
+        // decode/mux stream (live-drive single-pass / direct), never the
+        // ciphertext-preserving sweep, so concealment is always correct here.
+        let mut reader =
+            DecryptingSectorSource::new(reader, decrypt_keys.clone()).tolerate_decrypt_loss();
 
         // Wrong-substream fix (Silence-of-the-Lambs): re-route the title's
         // declared AC-3 audio onto the physically-correct `0x8x` sub-streams by

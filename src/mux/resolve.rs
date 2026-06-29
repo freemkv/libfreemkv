@@ -629,8 +629,13 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         crate::decrypt::DecryptKeys::Aacs { .. } => 3,
         _ => 1,
     };
+    // MUX path: tolerate decrypt loss. An undecryptable content unit is concealed
+    // (NULL TS fill) + tallied + logged, never an abort — decrypt-verify is a RIP
+    // gate, not a mux gate (P3). The rip's own read paths keep their fail-loud
+    // decorator; only this mux pipeline opts in.
     let mut decrypting =
-        crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys);
+        crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys)
+            .tolerate_decrypt_loss();
     // Install the fresh-key-on-failure callback (if any) so a unit no held key
     // decrypts is re-tried via the application's key source before being counted
     // as loss.
