@@ -140,6 +140,78 @@ pub fn unlock_css_reads(scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
     r
 }
 
+/// The CSS unlocker — the DVD peer of the firmware and AACS-cert unlockers in
+/// the uniform [`crate::unlock::Unlocker`] registry. It removes the CSS
+/// scrambled-read barrier (drive ASF=1) and learns no VID or bus key — the
+/// descramble key is recovered keylessly downstream (the Stevenson attack).
+pub struct CssUnlocker;
+
+impl crate::unlock::Unlocker for CssUnlocker {
+    fn name(&self) -> &str {
+        "css"
+    }
+
+    fn matches(&self, ctx: &crate::unlock::UnlockCtx) -> bool {
+        ctx.kind == crate::unlock::DiscKind::Css
+    }
+
+    fn unlock(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        _ctx: &crate::unlock::UnlockCtx,
+    ) -> std::result::Result<crate::unlock::Unlocked, crate::unlock::UnlockError> {
+        // Self-guard against the hardware — do NOT trust the caller-declared
+        // DiscKind alone. If the drive does not report a DVD profile, refuse
+        // (NotApplicable) WITHOUT issuing any CSS CDB, so a mis-routed
+        // Blu-ray/UHD is never sent CSS bus-auth.
+        if !mounted_disc_is_dvd(scsi) {
+            tracing::debug!(
+                target: "freemkv::css",
+                phase = "css_unlocker_not_dvd",
+                "CssUnlocker invoked on a non-DVD profile; refusing (NotApplicable)"
+            );
+            return Err(crate::unlock::UnlockError::NotApplicable);
+        }
+        // The bus-auth handshake is what unlocks scrambled-sector reads; the lba
+        // is not consumed by the unlock primitive (the disc-key REPORT KEY is
+        // best-effort). CSS yields neither a Volume ID nor an AACS bus key.
+        unlock_css_reads(scsi, 0)?;
+        Ok(crate::unlock::Unlocked::default())
+    }
+}
+
+/// Transport-level "is the mounted disc a DVD?" probe (GET CONFIGURATION
+/// current-profile, DVD family `0x0010..=0x001F`). Lets the CssUnlocker
+/// self-verify against the drive instead of trusting the caller's DiscKind.
+fn mounted_disc_is_dvd(scsi: &mut dyn ScsiTransport) -> bool {
+    // RT=0: the 8-byte feature header carries the Current Profile in bytes 6-7.
+    let cdb = [
+        crate::scsi::SCSI_GET_CONFIGURATION,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x08,
+        0x00,
+    ];
+    let mut buf = [0u8; 8];
+    match scsi.execute(
+        &cdb,
+        crate::scsi::DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    ) {
+        Ok(r) if r.bytes_transferred >= 8 => {
+            let profile = ((buf[6] as u16) << 8) | buf[7] as u16;
+            (0x0010..=0x001F).contains(&profile)
+        }
+        _ => false,
+    }
+}
+
 fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()> {
     tracing::debug!(target: "freemkv::css", "css unlock: begin");
     // The bus-auth challenge-response sets the drive's Authentication Success
@@ -836,5 +908,88 @@ mod tests {
         let cdb = report_key_cdb(0, 0x00, 0x0804);
         assert_eq!(cdb[8], 0x08, "high byte of 2052-byte transfer");
         assert_eq!(cdb[9], 0x04, "low byte of 2052-byte transfer");
+    }
+
+    /// The CssUnlocker is the DVD member of the uniform registry: it matches
+    /// ONLY `DiscKind::Css` (so it never fires during drive-prep or on a
+    /// Blu-ray), and carries the stable language-neutral name "css".
+    #[test]
+    fn css_unlocker_matches_only_css_kind() {
+        use crate::unlock::{DiscKind, UnlockCtx, Unlocker};
+        let mut inquiry = vec![0u8; 96];
+        inquiry[8..16].copy_from_slice(b"FAKEVNDR");
+        let id = crate::identity::DriveId::from_inquiry(&inquiry, "");
+
+        let u = CssUnlocker;
+        assert_eq!(u.name(), "css");
+        assert!(
+            u.matches(&UnlockCtx::new(&id, DiscKind::Css)),
+            "matches a CSS DVD"
+        );
+        for k in [DiscKind::Unknown, DiscKind::Unencrypted, DiscKind::Aacs] {
+            assert!(
+                !u.matches(&UnlockCtx::new(&id, k)),
+                "CssUnlocker must not match {k:?}"
+            );
+        }
+    }
+
+    /// Defense in depth: even when the caller declares `DiscKind::Css`, the
+    /// CssUnlocker self-verifies against the drive's GET CONFIGURATION profile.
+    /// A drive reporting a Blu-ray profile → `NotApplicable`, and NOT a single
+    /// CSS CDB is issued (no bus-auth fired at a BD).
+    #[test]
+    fn css_unlocker_self_guards_against_non_dvd() {
+        use crate::scsi::{DataDirection, ScsiResult};
+        use crate::unlock::{DiscKind, UnlockCtx, UnlockError, Unlocker};
+
+        /// Reports a BD-ROM profile (0x0040) to GET CONFIGURATION and counts any
+        /// other CDB (i.e. CSS bus-auth activity).
+        struct BdTransport {
+            non_config_cdbs: usize,
+        }
+        impl ScsiTransport for BdTransport {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                if cdb[0] == crate::scsi::SCSI_GET_CONFIGURATION {
+                    if data.len() >= 8 {
+                        data[6] = 0x00;
+                        data[7] = 0x40; // BD-ROM current profile
+                    }
+                    return Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: 8,
+                        sense: [0u8; 32],
+                    });
+                }
+                self.non_config_cdbs += 1;
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+
+        let mut inquiry = vec![0u8; 96];
+        inquiry[8..16].copy_from_slice(b"FAKEVNDR");
+        let id = crate::identity::DriveId::from_inquiry(&inquiry, "");
+
+        let mut t = BdTransport { non_config_cdbs: 0 };
+        let r = CssUnlocker.unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
+        assert_eq!(
+            r.unwrap_err(),
+            UnlockError::NotApplicable,
+            "a BD-profile drive must be refused"
+        );
+        assert_eq!(
+            t.non_config_cdbs, 0,
+            "no CSS CDB may be issued at a non-DVD drive"
+        );
     }
 }

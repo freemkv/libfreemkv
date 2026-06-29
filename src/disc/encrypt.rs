@@ -221,6 +221,7 @@ fn unlock_error_to_error(e: crate::unlock::UnlockError) -> Error {
         UnlockError::HandshakeRejected
         | UnlockError::CertRevoked { .. }
         | UnlockError::FirmwareNotUnlockable
+        | UnlockError::NotApplicable
         | UnlockError::Scsi(_) => Error::AacsHostCertRejected,
     }
 }
@@ -235,7 +236,9 @@ fn cert_unlock_outcome(e: &crate::unlock::UnlockError) -> crate::aacs::UnlockOut
         UnlockError::NoUsableHostCert { mkb } => UnlockOutcome::NoUsableHostCert { mkb: *mkb },
         UnlockError::CertRevoked { mkb } => UnlockOutcome::CertRevoked { mkb: *mkb },
         UnlockError::VidUnavailable => UnlockOutcome::VidUnavailable,
-        UnlockError::HandshakeRejected | UnlockError::Scsi(_) => UnlockOutcome::HandshakeRejected,
+        UnlockError::HandshakeRejected | UnlockError::NotApplicable | UnlockError::Scsi(_) => {
+            UnlockOutcome::HandshakeRejected
+        }
     }
 }
 
