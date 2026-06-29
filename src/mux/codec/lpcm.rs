@@ -72,6 +72,7 @@ impl CodecParser for LpcmParser {
         }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
         vec![Frame {
+            discontinuity: false,
             coding: None,
             source: None,
             pts_ns,

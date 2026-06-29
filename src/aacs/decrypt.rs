@@ -217,18 +217,23 @@ pub fn aacs_unit_still_ciphertext(unit: &[u8]) -> bool {
 /// Zero-filling such a unit is wrong at the TS layer: a run of `0x00` bytes
 /// carries no `0x47` sync, so the demuxer loses packet framing and can mis-parse
 /// the *next* unit if a stray `0x47` appears mid-zero. Instead we lay down 32
-/// well-formed BD source packets, each a TS null packet (PID `0x1FFF`):
+/// well-formed BD source packets, each a TS null packet (PID `0x1FFF`) carrying
+/// an adaptation-field **discontinuity_indicator**:
 ///
 /// ```text
-///   [4-byte TP_extra_header = 0][47 1F FF 10][184 bytes 0xFF stuffing]
+///   [4-byte TP_extra_header = 0][47 1F FF 20  B7 80  + 182 bytes 0xFF stuffing]
+///                                ^sync ^PID  ^AF-only ^af_len=183 ^disc_indicator
 /// ```
 ///
 /// The demuxer stays byte-synced on the 192-byte stride, and because PID
-/// `0x1FFF` matches no elementary stream every null packet is silently dropped —
-/// so the *video/audio* PID simply loses these packets. That shows up downstream
-/// as a continuity-counter gap on the real PID, which the TS assembler already
-/// turns into a dropped partial PES (see `mux::ts`), the foundation B1 builds on.
-/// This NEVER emits ciphertext and is lossless framing, not fabricated content.
+/// `0x1FFF` matches no elementary stream every null packet is silently dropped.
+/// The discontinuity_indicator is the B1 loss SIGNAL: `mux::ts` recognises a
+/// `0x1FFF` packet with that bit set as a concealed gap and forces a discontinuity
+/// on every tracked PID's next PES (the codec consumer then drops forward to the
+/// next keyframe). This is CC-INDEPENDENT — unlike the real PID's continuity
+/// counter it survives a loss that is an exact multiple of 16 packets, or a loss
+/// at a PID's very start. NEVER emits ciphertext; lossless framing, not fabricated
+/// content.
 pub fn fill_null_ts_unit(unit: &mut [u8]) {
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     let mut off = 0;
@@ -236,14 +241,19 @@ pub fn fill_null_ts_unit(unit: &mut [u8]) {
         // TP_extra_header (arrival timestamp / copy-control) — zero is fine; the
         // demuxer never reads it for a PID it does not track.
         unit[off..off + 4].fill(0);
-        // 188-byte TS null packet: sync, PID 0x1FFF (no PUSI/TEI), payload-only
-        // with continuity counter 0.
+        // 188-byte TS null packet: sync, PID 0x1FFF (no PUSI/TEI).
         unit[off + 4] = TS_SYNC; // 0x47
         unit[off + 5] = 0x1F; // PID high (top 5 bits of 0x1FFF, flags clear)
         unit[off + 6] = 0xFF; // PID low
-        unit[off + 7] = 0x10; // adaptation=01 (payload only), CC=0
-        // Stuffing: 0xFF is the conventional null-packet payload fill.
-        unit[off + 8..off + PKT].fill(0xFF);
+        // adaptation_field_control = 0b10 (AF only, no payload), CC = 0.
+        unit[off + 7] = 0x20;
+        // adaptation_field_length = 183: the AF (its flags byte + 182 stuffing)
+        // fills the rest of the 188-byte packet.
+        unit[off + 8] = 0xB7;
+        // AF flags: discontinuity_indicator (0x80) — the concealed-gap signal.
+        unit[off + 9] = 0x80;
+        // Stuffing: 0xFF is the conventional adaptation-field fill.
+        unit[off + 10..off + PKT].fill(0xFF);
         off += PKT;
     }
 }

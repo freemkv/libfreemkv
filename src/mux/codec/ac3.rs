@@ -115,6 +115,7 @@ impl CodecParser for Ac3Parser {
 
             let duration_ns = frame_duration_ns(remaining, bsid);
             frames.push(Frame {
+                discontinuity: false,
                 coding: None,
                 source: None,
                 pts_ns: frame_pts_ns,
@@ -201,6 +202,7 @@ impl CodecParser for Ac3Parser {
         }
         let duration_ns = frame_duration_ns(frame, bsid);
         vec![Frame {
+            discontinuity: false,
             coding: None,
             source: None,
             pts_ns: self.flush_pts_ns,

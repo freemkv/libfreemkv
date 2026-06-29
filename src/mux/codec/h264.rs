@@ -243,6 +243,9 @@ impl CodecParser for H264Parser {
             source: pes.source,
             pts_ns,
             keyframe,
+            // One access unit per PES (BD-TS aligns AUs to PES), so the gap
+            // signal maps straight onto this frame.
+            discontinuity: pes.discontinuity,
             data: frame_data,
             duration_ns: None,
         }]
