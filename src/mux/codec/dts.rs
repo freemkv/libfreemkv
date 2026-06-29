@@ -126,6 +126,17 @@ impl CodecParser for DtsParser {
         if pes.data.is_empty() {
             return Vec::new();
         }
+        // B1: a concealed/lost gap means the buffered DTS access unit is
+        // TRUNCATED. Splicing post-gap bytes onto it corrupts the core/extension
+        // framing (→ "Failed to decode block code(s)" / "Invalid data found").
+        // Drop the partial AU and its PTS marks; the next PES re-bases a fresh
+        // unit. (Audio has no inter-frame refs — dropping the spliced partial is
+        // the whole fix; the video ResyncGate handles video.)
+        if pes.discontinuity {
+            self.buf.clear();
+            self.pts_marks.clear();
+            self.pending_pts = PTS_UNSET;
+        }
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
 
         // On Blu-ray, a DTS-HD MA/HRA access unit is a DTS core frame
@@ -582,6 +593,49 @@ mod tests {
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 512);
+    }
+
+    #[test]
+    fn discontinuity_drops_truncated_partial() {
+        // B1: a partial DTS core is buffered, then a concealed gap (PES marked
+        // discontinuity) carries a fresh core. The truncated partial must be
+        // DROPPED — splicing it makes the framer emit a corrupt sub-core-length
+        // AU (the Dunkirk `dca` "Failed to decode block code(s)" class) and
+        // strands the rest. With the fix the post-gap core is the only AU, and it
+        // carries the post-gap PTS (not the stale pre-gap one).
+        let mut parser = DtsParser::new();
+
+        // PES 1: first half of a 512-byte core (no boundary marker).
+        let core = make_dts_core(512);
+        let pes1 = make_pes(core[..256].to_vec(), Some(90000));
+        assert!(parser.parse(&pes1).is_empty(), "partial core held");
+
+        // Concealed gap: a fresh whole core, marked discontinuity.
+        let fresh = make_dts_core(512);
+        let pes2 = PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: Some(99000),
+            dts: None,
+            data: fresh.clone(),
+            discontinuity: true,
+        };
+        assert!(
+            parser.parse(&pes2).is_empty(),
+            "post-gap core held awaiting next core — NO corrupt partial emitted"
+        );
+
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1, "exactly one clean AU across the gap");
+        assert_eq!(
+            tail[0].data, fresh,
+            "AU is the fresh post-gap core, not a splice"
+        );
+        assert_eq!(
+            tail[0].pts_ns,
+            pts_to_ns(99000),
+            "post-gap AU re-bases to the post-gap PTS, not the stranded pre-gap one"
+        );
     }
 
     #[test]

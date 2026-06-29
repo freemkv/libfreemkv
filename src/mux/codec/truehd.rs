@@ -130,6 +130,16 @@ impl CodecParser for TrueHdParser {
             return Vec::new();
         }
 
+        // B1: a concealed/lost gap means the buffered TrueHD AU is TRUNCATED.
+        // Splicing post-gap bytes onto it corrupts the AU framing (→ "Invalid
+        // data found") and strands the PTS cadence (the non-monotonic audio-DTS
+        // band at gaps). Drop the partial; with `buf` now empty the PTS-base block
+        // below re-seeds the cadence from the post-gap PES, monotonic across the
+        // gap. (Audio has no inter-frame refs — this is the whole audio fix.)
+        if pes.discontinuity {
+            self.buf.clear();
+        }
+
         // Capture the PTS base ONLY at an access-unit boundary, i.e. when no AU
         // is mid-assembly in `buf`. TrueHD access units span PES packets; a PES
         // that merely continues an AU already in progress carries its own (later)
@@ -477,6 +487,50 @@ mod tests {
         let frames = parser.parse(&pes2);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data.len(), 200);
+    }
+
+    #[test]
+    fn discontinuity_drops_truncated_partial() {
+        // B1: a partial TrueHD unit is buffered, then a concealed gap (PES marked
+        // discontinuity) carries a fresh unit. The truncated partial must be
+        // DROPPED — splicing it makes the length-prefixed framer emit a
+        // wrong-size unit (corrupt AU framing) and re-seeds the PTS cadence from
+        // the post-gap PES rather than stranding it (the non-monotonic audio-DTS
+        // band at gaps).
+        let mut parser = TrueHdParser::new();
+
+        // PES 1: first 150 bytes of a 300-byte unit (length prefix says 300, only
+        // 150 present) → held, nothing emitted.
+        let partial = make_truehd_unit(300);
+        let pes1 = make_pes(partial[..150].to_vec(), Some(90000));
+        assert!(parser.parse(&pes1).is_empty(), "partial unit held");
+
+        // Concealed gap: a fresh 200-byte unit at a forward PTS jump.
+        let fresh = make_truehd_unit(200);
+        let pes2 = PesPacket {
+            source: None,
+            pid: 0x1100,
+            pts: Some(180000),
+            dts: None,
+            data: fresh.clone(),
+            discontinuity: true,
+        };
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1, "exactly one clean unit across the gap");
+        assert_eq!(
+            frames[0].data.len(),
+            200,
+            "emitted unit is the fresh 200-byte one, not a 300-byte splice"
+        );
+        assert_eq!(
+            frames[0].data, fresh,
+            "unit bytes are the fresh post-gap unit"
+        );
+        assert_eq!(
+            frames[0].pts_ns,
+            pts_to_ns(180000),
+            "cadence re-bases to the post-gap PTS across the cleared buffer"
+        );
     }
 
     #[test]
