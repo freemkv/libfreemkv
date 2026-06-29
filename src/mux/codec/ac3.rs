@@ -60,10 +60,6 @@ impl Ac3Parser {
 
 impl CodecParser for Ac3Parser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
-
         // B1: a concealed/lost gap means the bytes held in `buf` are a TRUNCATED
         // frame. Appending the post-gap bytes would splice them into one corrupt
         // frame (wrong frame_size, bad CRC → "exponent out of range" / garbage).
@@ -71,8 +67,15 @@ impl CodecParser for Ac3Parser {
         // gap instead of a frankenstein frame. (The video parsers carry this via
         // the ResyncGate; audio has no inter-frame refs, so dropping the spliced
         // partial is the whole fix.)
+        //
+        // Handle the discontinuity BEFORE the empty-data guard so the signal can
+        // never be stranded by an empty post-gap PES (the demuxer only emits
+        // non-empty PES today; this is defensive for any future caller).
         if pes.discontinuity {
             self.buf.clear();
+        }
+        if pes.data.is_empty() {
+            return Vec::new();
         }
 
         // Base PTS for the FIRST frame emitted from this call. Each subsequent
@@ -80,7 +83,13 @@ impl CodecParser for Ac3Parser {
         // PES that carries several AC-3 frames stamps a monotonically increasing
         // PTS per frame instead of the same PES timestamp on all of them (which
         // collapses their timecodes and drifts A/V).
-        let base_pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        //
+        // A PES with no PTS (rare for audio, but legal — and the case OSS demuxers
+        // guard at a post-gap continuation) must NOT reset the timeline to 0;
+        // carry the running cadence (`flush_pts_ns` tracks the retained partial /
+        // last frame's PTS). The discontinuity-carrying PES is a PUSI with a PTS
+        // in practice, so this is defense-in-depth.
+        let base_pts_ns = pes.pts.map(pts_to_ns).unwrap_or(self.flush_pts_ns);
 
         // Prepend leftover from previous PES
         self.buf.extend_from_slice(&pes.data);
@@ -556,6 +565,55 @@ mod tests {
         assert_eq!(
             frames[0].data, fresh,
             "emitted frame is the fresh post-gap frame, not a spliced partial"
+        );
+    }
+
+    #[test]
+    fn empty_discontinuity_pes_still_drops_partial() {
+        // Defensive ordering: the discontinuity clear runs BEFORE the empty-data
+        // guard, so even an empty-payload discontinuity PES drops the stranded
+        // partial instead of leaking the signal and splicing on the next PES.
+        let mut parser = Ac3Parser::new();
+        let frame_data = make_ac3_frame(0, 2); // 160 bytes
+
+        // Partial first half buffered.
+        let pes1 = PesPacket {
+            source: None,
+            pid: 0,
+            pts: Some(90000),
+            dts: None,
+            data: frame_data[..80].to_vec(),
+            discontinuity: false,
+        };
+        assert!(parser.parse(&pes1).is_empty());
+
+        // Empty-payload discontinuity PES: must still clear the partial.
+        let gap = PesPacket {
+            source: None,
+            pid: 0,
+            pts: None,
+            dts: None,
+            data: vec![],
+            discontinuity: true,
+        };
+        assert!(parser.parse(&gap).is_empty(), "empty PES emits nothing");
+
+        // A fresh whole frame (no discontinuity now): if the partial had leaked,
+        // this would splice into a frankenstein; instead it emits cleanly.
+        let fresh = make_ac3_frame(0, 2);
+        let pes2 = PesPacket {
+            source: None,
+            pid: 0,
+            pts: Some(99000),
+            dts: None,
+            data: fresh.clone(),
+            discontinuity: false,
+        };
+        let frames = parser.parse(&pes2);
+        assert_eq!(frames.len(), 1, "one clean frame, partial was dropped");
+        assert_eq!(
+            frames[0].data, fresh,
+            "no splice — partial did not leak past the empty gap PES"
         );
     }
 

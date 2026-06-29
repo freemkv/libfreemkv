@@ -123,21 +123,39 @@ const PTS_UNSET: i64 = -1;
 
 impl CodecParser for DtsParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
-        if pes.data.is_empty() {
-            return Vec::new();
-        }
         // B1: a concealed/lost gap means the buffered DTS access unit is
         // TRUNCATED. Splicing post-gap bytes onto it corrupts the core/extension
         // framing (→ "Failed to decode block code(s)" / "Invalid data found").
         // Drop the partial AU and its PTS marks; the next PES re-bases a fresh
         // unit. (Audio has no inter-frame refs — dropping the spliced partial is
         // the whole fix; the video ResyncGate handles video.)
+        //
+        // Handle the discontinuity BEFORE the empty-data guard so the signal can
+        // never be stranded by an empty post-gap PES (defensive; the demuxer only
+        // emits non-empty PES today).
         if pes.discontinuity {
             self.buf.clear();
             self.pts_marks.clear();
             self.pending_pts = PTS_UNSET;
         }
-        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or(0);
+        if pes.data.is_empty() {
+            return Vec::new();
+        }
+        // A PES with no PTS (rare for audio, but legal — the case OSS demuxers
+        // guard at a post-gap continuation) must NOT reset the timeline to 0;
+        // continue from the most recent known base. Defense-in-depth: the
+        // discontinuity-carrying PES is a PUSI with a PTS in practice.
+        let pts_ns = pes.pts.map(pts_to_ns).unwrap_or_else(|| {
+            self.pts_marks
+                .last()
+                .map(|&(_, p)| p)
+                .filter(|&p| p >= 0)
+                .unwrap_or(if self.pending_pts >= 0 {
+                    self.pending_pts
+                } else {
+                    0
+                })
+        });
 
         // On Blu-ray, a DTS-HD MA/HRA access unit is a DTS core frame
         // (sync 0x7FFE8001) followed by one or more DTS extension substreams
