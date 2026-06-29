@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] — 2026-06-28
+## [1.2.0] — 2026-06-29
 
 ### Breaking
 
@@ -101,8 +101,8 @@ consumers are the in-tree toolchain crates.
 - **Post-read decrypt-verify gate.** Every AACS unit read off the disc is now
   buffered, re-aligned to its clip-file 6144-byte unit grid, and verified
   (CPI flag → decrypt → strict all-32 TS-sync, matching libaacs `_verify_ts`)
-  before it is signed off as good. A unit that neither a held nor a
-  freshly-fetched key decrypts is treated exactly like a bad read — re-read by
+  before it is signed off as good. A unit that no held or freshly-fetched key
+  decrypts is treated exactly like a bad read — re-read by
   the patch pass, terminal loss only if truly unrecoverable — closing the
   "silent bad read" class where a sector reads OK but its ciphertext is subtly
   wrong. **Fail-safe:** it only ever downgrades a unit it is *confident* is bad;
