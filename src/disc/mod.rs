@@ -1471,14 +1471,18 @@ impl Disc {
             tracing::info!(target: "freemkv::scan", extents = main_extents.len(), "phase: CSS — main feature located");
             if let Some(unlock_lba) = main_extents.first().map(|e| e.start_lba) {
                 tracing::info!(target: "freemkv::scan", unlock_lba, "phase: CSS — bus-auth unlock");
-                // Unlock the drive's CSS read gating. A CSS-enforcing drive (the
-                // BU40N) refuses to return scrambled sectors until a CSS bus-auth
-                // handshake has run for the title; we run it here purely for that
-                // unlock and IGNORE the key it derives (the disc-key crack is
-                // unreliable). The real descramble key is recovered from the
-                // scrambled movie data itself via the known-plaintext attack — no
-                // player keys, no disc-key crack, no REPORT-KEY-derived title key.
-                if let Err(e) = crate::css::auth::unlock_css_reads(session.scsi_mut(), unlock_lba) {
+                // Unlock the drive's CSS read gating through the uniform
+                // unlocker registry: the in-tree CssUnlocker matches
+                // DiscKind::Css and runs the bus-auth handshake. A CSS-enforcing
+                // drive (the BU40N) refuses to return scrambled sectors until
+                // that handshake has run; we run it purely for that unlock and
+                // IGNORE any key (the descramble key is recovered keylessly from
+                // the scrambled movie data via the known-plaintext attack — no
+                // player keys, no disc-key crack, no REPORT-KEY title key).
+                let drive_id = session.drive_id.clone();
+                let css_ctx =
+                    crate::unlock::UnlockCtx::new(&drive_id, crate::unlock::DiscKind::Css);
+                if let Err(e) = crate::unlock::route_unlock(session.scsi_mut(), &css_ctx) {
                     tracing::warn!(
                         target: "freemkv::scan",
                         error_code = e.code(),
