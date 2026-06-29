@@ -64,21 +64,39 @@ pub trait Unlocker: Send + Sync {
     fn matches(&self, id: &DriveId) -> bool;
 
     /// Put the drive into extended-access mode (firmware/bootloader/whatever
-    /// THIS unlocker needs) AND return the disc's Volume ID — folding the old
-    /// `unlock_drive()` + `read_volume_id()` into one step. A firmware unlocker
-    /// that cannot unlock returns [`UnlockError::FirmwareNotUnlockable`]; one
-    /// that unlocks but has no OEM VID path returns [`UnlockError::VidUnavailable`].
-    /// Either error makes libfreemkv fall through to the in-tree cert handshake.
+    /// THIS unlocker needs) and report what it LEARNED — see [`Unlocked`]. The
+    /// hardware side-effect (extended mode / auth flag) happens here; the
+    /// returned value is only the learned data (VID, bus key), which libfreemkv
+    /// files onto the disc/drive in one place. A firmware unlocker that cannot
+    /// unlock returns [`UnlockError::FirmwareNotUnlockable`]; one that unlocks
+    /// but has no OEM VID returns an [`Unlocked`] with `vid: None`. Either makes
+    /// libfreemkv fall through to the next unlocker / the cert handshake.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         id: &DriveId,
-    ) -> std::result::Result<Vid, UnlockError>;
+    ) -> std::result::Result<Unlocked, UnlockError>;
 
     /// Raise the drive to its maximum read speed. Default: no-op.
     fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
         Ok(())
     }
+}
+
+/// What an [`Unlocker::unlock`] LEARNED. The hardware side-effect (the drive
+/// entering extended mode, or CSS auth setting the ASF flag) already happened
+/// inside `unlock`; this carries only the learned data, which libfreemkv files
+/// onto the disc/drive in a single place (the plugin never touches `Disc`).
+///
+/// - a firmware unlocker: `{ vid: Some, read_data_key: None }` (serves clear)
+/// - the cert handshake:  `{ vid: Some, read_data_key: Some }` (AACS bus key)
+/// - CSS auth:            `{ vid: None, read_data_key: None }` (reads enabled)
+#[derive(Debug, Default, Clone)]
+pub struct Unlocked {
+    /// Disc Volume ID, if this route obtained one.
+    pub vid: Option<Vid>,
+    /// AACS 2.x bus key (`read_data_key`) from the cert handshake, if any.
+    pub read_data_key: Option<[u8; 16]>,
 }
 
 /// Process-wide ordered registry of unlockers.
@@ -125,11 +143,20 @@ pub(crate) fn route_unlock(
         // "no unlocker available" so the cert fallback still runs.
         Err(_) => return Ok(None),
     };
+    // Walk in registration order — the registry is the single ordered place
+    // that decides which unlocker runs first (register ld, then aacs, then css).
     for u in reg.iter() {
         if u.matches(id) {
             let name = u.name().to_string();
             match u.unlock(scsi, id) {
-                Ok(vid) => return Ok(Some((name, vid))),
+                // The firmware route reports a VID; `read_data_key` is None here
+                // (this is the firmware seam — the cert handshake supplies the
+                // bus key on its own path). A drive that unlocked but produced no
+                // VID falls through to the cert handshake.
+                Ok(unlocked) => match unlocked.vid {
+                    Some(vid) => return Ok(Some((name, vid))),
+                    None => return Ok(None),
+                },
                 // A genuine SCSI/transport fault is not "this drive can't be
                 // unlocked" — the bus is broken. Propagate so init() aborts
                 // instead of falling through to a cert handshake that will
@@ -295,13 +322,16 @@ mod tests {
             &self,
             _scsi: &mut dyn ScsiTransport,
             _id: &DriveId,
-        ) -> std::result::Result<Vid, UnlockError> {
+        ) -> std::result::Result<Unlocked, UnlockError> {
             self.ran.store(true, Ordering::SeqCst);
             if let Some(code) = self.scsi_err {
                 return Err(UnlockError::Scsi(code));
             }
             match self.vid {
-                Some(v) => Ok(Vid(v)),
+                Some(v) => Ok(Unlocked {
+                    vid: Some(Vid(v)),
+                    read_data_key: None,
+                }),
                 None => Err(UnlockError::VidUnavailable),
             }
         }
