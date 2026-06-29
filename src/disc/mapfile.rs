@@ -651,35 +651,9 @@ impl Drop for Mapfile {
 /// caller treats a bad VID comment as simply absent rather than an
 /// error, so a corrupt header never fails a mapfile load.
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    // Parse on bytes, not on the &str: slicing a &str by byte index
-    // (`&s[i*2..i*2+2]`) panics when the cut lands inside a multi-byte
-    // UTF-8 char. A hand-edited/corrupt `# freemkv-vid:` comment of
-    // exactly 32 bytes containing a multi-byte char would otherwise
-    // kill the whole load. ASCII hex is one byte per char, so anything
-    // non-ASCII is simply rejected here as malformed.
-    let bytes = s.as_bytes();
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, b) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(bytes[i * 2])?;
-        let lo = hex_nibble(bytes[i * 2 + 1])?;
-        *b = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-/// Map a single ASCII hex digit byte to its 0-15 value. Returns `None`
-/// for any non-hex byte (including any non-ASCII / multi-byte lead byte).
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
+    // byte-based so a multi-byte `# freemkv-vid:` comment rejects, never panics).
+    crate::hex::parse_hex_fixed::<16>(s)
 }
 
 /// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`. Returns

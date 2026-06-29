@@ -344,8 +344,9 @@ pub fn key_fetch(
 /// "Encrypted" is decided by [`crate::aacs::ts_sync_destroyed`] — the SAME
 /// predicate the decrypt gate uses — so all sides agree. A clip opens with clear
 /// navigation units (PAT/PMT, menus); only the feature body is scrambled, and a
-/// clear unit proves nothing, so this collects only scrambled ones, sampling the
-/// largest extent at its midpoint forward.
+/// clear unit proves nothing, so this collects only scrambled ones — probing
+/// several points spread across EACH extent so a title whose encrypted body
+/// starts late (or whose midpoint lands in clear nav) still yields samples.
 pub fn read_encrypted_units(
     reader: &mut dyn crate::sector::SectorSource,
     title: &crate::disc::DiscTitle,
@@ -353,7 +354,12 @@ pub fn read_encrypted_units(
 ) -> Vec<Vec<u8>> {
     use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
-    const MAX_CHUNKS_PER_EXTENT: u32 = 4; // ~60 units scanned at each extent's midpoint
+    // Probe several evenly-spaced points across EACH extent rather than only the
+    // midpoint-and-forward: a title whose encrypted feature starts late, or whose
+    // midpoint lands in a clear nav stretch, must STILL yield scrambled samples.
+    // Empty samples make `Disc::decrypt_with` skip wrong-key validation, so a
+    // real encrypted title returning nothing here is a silent wrong-key hazard.
+    const PROBES_PER_EXTENT: u32 = 8;
 
     let mut out: Vec<Vec<u8>> = Vec::new();
     for ext in &title.extents {
@@ -361,25 +367,30 @@ pub fn read_encrypted_units(
         if total_units == 0 {
             continue;
         }
-        let mut unit = total_units / 2; // midpoint (past the clear nav at the head)
-        for _ in 0..MAX_CHUNKS_PER_EXTENT {
+        for p in 1..=PROBES_PER_EXTENT {
+            // Probe at p/(P+1) of the extent — spreads P points across it while
+            // skipping the clear nav at the very head.
+            let unit = ((total_units as u64 * p as u64) / (PROBES_PER_EXTENT as u64 + 1)) as u32;
             if unit >= total_units {
-                break;
+                continue;
             }
             let units_this = CHUNK_UNITS.min(total_units - unit);
             // Saturate: start_lba comes from attacker-controlled UDF/MPLS
             // extents; a malformed extent near u32::MAX would otherwise panic
             // (debug) or wrap to a wrong LBA (release). An over-capacity LBA then
-            // fails cleanly via the read_sectors().is_err() break below.
+            // fails cleanly via the read_sectors().is_err() skip below.
             let lba = ext
                 .start_lba
                 .saturating_add(unit.saturating_mul(ALIGNED_UNIT_SECTORS));
             let count = (units_this * ALIGNED_UNIT_SECTORS) as u16;
             let mut buf = vec![0u8; count as usize * 2048];
             // `false` = no recovery retries; the reader is the raw drive/file
-            // (no decrypt decorator), so these are the on-disc encrypted bytes.
+            // (no decrypt decorator), so these are the on-disc encrypted bytes. A
+            // read error at one probe skips THAT probe only — it must not abandon
+            // the rest of the extent (the old `break` blinded the sampler on a
+            // single transient miss).
             if reader.read_sectors(lba, count, &mut buf, false).is_err() {
-                break;
+                continue;
             }
             for i in 0..units_this as usize {
                 let o = i * ALIGNED_UNIT_LEN;
@@ -394,7 +405,6 @@ pub fn read_encrypted_units(
                     }
                 }
             }
-            unit += units_this;
         }
     }
     out
@@ -624,5 +634,86 @@ mod tests {
             "the failing ciphertext sample is forwarded to the source"
         );
         assert_eq!(*builds.lock().unwrap(), 1, "make_sources invoked per fetch");
+    }
+
+    /// #4 regression: encrypted content NOT at the extent midpoint (a late-
+    /// starting feature, or a midpoint landing in clear nav) must still be
+    /// sampled — empty samples make `decrypt_with` skip wrong-key validation.
+    /// The old midpoint-and-forward sampler returned empty; the probe-spread
+    /// finds the early scrambled band.
+    #[test]
+    fn read_encrypted_units_finds_scrambled_content_off_the_midpoint() {
+        use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
+        use crate::error::Result;
+        use crate::sector::SectorSource;
+
+        // Units in the FIRST SIXTH of the extent are scrambled (0xFF → no TS
+        // sync); everything else (incl. the midpoint) is clear (0x47 syncs).
+        struct BandSource {
+            ext_start: u32,
+            total_units: u32,
+        }
+        impl SectorSource for BandSource {
+            fn capacity_sectors(&self) -> u32 {
+                self.ext_start + self.total_units * ALIGNED_UNIT_SECTORS + 64
+            }
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _r: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                for (i, chunk) in buf[..bytes].chunks_mut(ALIGNED_UNIT_LEN).enumerate() {
+                    if chunk.len() < ALIGNED_UNIT_LEN {
+                        break;
+                    }
+                    let abs_unit = (lba - self.ext_start) / ALIGNED_UNIT_SECTORS + i as u32;
+                    if abs_unit < self.total_units / 6 {
+                        chunk.fill(0xFF); // scrambled: no TS sync
+                    } else {
+                        chunk.fill(0);
+                        let mut o = 4;
+                        while o < ALIGNED_UNIT_LEN {
+                            chunk[o] = 0x47; // clear TS syncs
+                            o += 192;
+                        }
+                    }
+                }
+                Ok(bytes)
+            }
+        }
+
+        let total_units = 600u32;
+        let ext_start = 1000u32;
+        let mut src = BandSource {
+            ext_start,
+            total_units,
+        };
+        let title = crate::disc::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![crate::disc::Extent {
+                start_lba: ext_start,
+                sector_count: total_units * ALIGNED_UNIT_SECTORS,
+            }],
+            content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        };
+
+        let samples = read_encrypted_units(&mut src, &title, 4);
+        assert!(
+            !samples.is_empty(),
+            "the probe-spread must sample the early scrambled band the midpoint misses"
+        );
+        for s in &samples {
+            assert!(ts_sync_destroyed(s), "every sample is a scrambled unit");
+        }
     }
 }
