@@ -32,6 +32,10 @@ pub struct DiscInputs {
     /// Volume ID (16 bytes). `[0u8; 16]` when no authenticated handshake ran
     /// (e.g. an ISO/mapfile flow), which disables VID-keyed lookups.
     pub volume_id: [u8; 16],
+    /// AACS major version (1 = V10 / BD AACS 1.0, 2 = V20+ / UHD). Drives the
+    /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21) when a
+    /// source returns a VUK to derive unit keys from. Defaults to 2.
+    pub version: u8,
     /// Raw MKB bytes. Empty when not captured.
     pub mkb: Vec<u8>,
     /// Raw `Unit_Key_RO.inf` bytes. Empty when not captured.
@@ -99,24 +103,21 @@ pub struct DiscInputsCtx<'a> {
 
 impl<'a> DiscInputsCtx<'a> {
     /// Build a context over `inputs`, parsing the encrypted title keys at the
-    /// stride for AACS major `version_u8` (1 = V10, else V20/V21).
+    /// stride for the disc's own AACS major (`inputs.version`: 1 → 48-byte V10
+    /// stride, else 64-byte V20/V21) — the single source of truth, no separate
+    /// version argument to drift from it.
     ///
     /// A present-but-malformed `unit_key_ro` (truncated / wrong magic / wrong
     /// stride) parses to an empty key set, so a later [`Self::enc_title_keys`]
     /// returns `Ok(&[])` indistinguishably from a disc that legitimately has no
     /// title keys — the parse failure is swallowed here, not surfaced as an
     /// error.
-    pub fn new(inputs: &'a DiscInputs, version_u8: u8) -> Self {
+    pub fn new(inputs: &'a DiscInputs) -> Self {
         use crate::aacs::{AacsVersion, parse_unit_key_ro};
         let enc_keys = if inputs.unit_key_ro.is_empty() {
             Vec::new()
         } else {
-            let version = if version_u8 == 1 {
-                AacsVersion::V10
-            } else {
-                AacsVersion::V20
-            };
-            parse_unit_key_ro(&inputs.unit_key_ro, version)
+            parse_unit_key_ro(&inputs.unit_key_ro, AacsVersion::from_major(inputs.version))
                 .map(|f| f.encrypted_keys.into_iter().map(|(_, k)| k).collect())
                 .unwrap_or_default()
         };
@@ -232,11 +233,9 @@ pub fn resolve_and_apply_traced(
 
     let mut trace = crate::aacs::ResolutionTrace::new();
 
-    // AACS major drives the Unit_Key_RO.inf stride the ctx parses at. Default to
-    // the V20/V21 stride when there is no AACS state (it is the common live case;
-    // a non-AACS disc has nothing to resolve and the loop simply finds nothing).
-    let version_u8 = disc.aacs.as_ref().map(|a| a.version).unwrap_or(2);
-    let ctx = DiscInputsCtx::new(inputs, version_u8);
+    // The ctx parses Unit_Key_RO.inf at the stride for `inputs.version` (the
+    // disc's own AACS major), so the stride is the disc's single source of truth.
+    let ctx = DiscInputsCtx::new(inputs);
 
     for source in sources {
         // `who` is the source's own stable identifier — no enum to map back to.
@@ -320,9 +319,11 @@ pub fn key_fetch(
         let sources = make_sources();
         let mut di = inputs.clone();
         di.samples = samples.to_vec();
-        // V20/V21 stride (BD/UHD AACS 2.x); the online /decode UK path forwards
-        // raw inf + samples and doesn't depend on the parsed title-key stride.
-        let ctx = DiscInputsCtx::new(&di, 2);
+        // Parse Unit_Key_RO.inf at the disc's OWN stride (carried on `inputs`):
+        // an online /decode reply that returns a VUK (not a terminal UK) then
+        // derives unit keys from `enc_title_keys`, which a V10 disc parses at the
+        // 48-byte stride — hardcoding the V20 stride here corrupted them.
+        let ctx = DiscInputsCtx::new(&di);
         fetch_unit_keys(&sources, &ctx)
             .into_iter()
             .map(|u| u.key)
@@ -443,6 +444,7 @@ mod tests {
         let inputs = DiscInputs {
             disc_hash: "0xABC".into(),
             volume_id: [0u8; 16],
+            version: crate::aacs::AACS_MAJOR_BD,
             mkb: vec![1, 2, 3],
             unit_key_ro: uk_ro,
             samples: vec![vec![9u8; 4], vec![8u8; 4], vec![7u8; 4]],
@@ -450,7 +452,7 @@ mod tests {
         };
 
         // Zero VID → None.
-        let ctx = DiscInputsCtx::new(&inputs, 1);
+        let ctx = DiscInputsCtx::new(&inputs);
         assert_eq!(ctx.disc_hash(), "0xABC");
         assert_eq!(ctx.title(), Some("TITLE_X"));
         assert!(ctx.vid().is_none(), "all-zero VID is the no-VID sentinel");
@@ -461,7 +463,7 @@ mod tests {
         // Non-zero VID → Some(vid).
         let mut inputs2 = inputs.clone();
         inputs2.volume_id = [0x42u8; 16];
-        let ctx2 = DiscInputsCtx::new(&inputs2, 1);
+        let ctx2 = DiscInputsCtx::new(&inputs2);
         assert_eq!(ctx2.vid(), Some(Vid([0x42u8; 16])));
     }
 
@@ -498,6 +500,7 @@ mod tests {
         let inputs = DiscInputs {
             disc_hash: "0x00".into(),
             volume_id: [0u8; 16],
+            version: crate::aacs::AACS_MAJOR_UHD,
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
             samples: Vec::new(),
@@ -518,6 +521,7 @@ mod tests {
         DiscInputs {
             disc_hash: String::new(),
             volume_id: [0u8; 16],
+            version: crate::aacs::AACS_MAJOR_UHD,
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
             samples: Vec::new(),
@@ -552,7 +556,7 @@ mod tests {
     #[test]
     fn fetch_unit_keys_first_nonempty_skips_empty_and_errors() {
         let inputs = empty_inputs();
-        let ctx = DiscInputsCtx::new(&inputs, 2);
+        let ctx = DiscInputsCtx::new(&inputs);
         let key = [0xABu8; 16];
 
         let sources: Vec<Box<dyn KeySource>> = vec![

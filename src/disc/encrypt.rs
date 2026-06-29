@@ -315,24 +315,22 @@ impl Disc {
         use crate::aacs;
 
         let uk_ro_data = udf_fs
-            .read_file(reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .read_file(reader, crate::aacs::PATH_UNIT_KEY_RO)
+            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_UNIT_KEY_RO_DUPLICATE))
             .map_err(|_| Error::AacsNoKeys)?;
         let dh = aacs::disc_hash(&uk_ro_data);
 
         let cc = udf_fs
-            .read_file(reader, "/AACS/Content000.cer")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/Content001.cer"))
+            .read_file(reader, crate::aacs::PATH_CONTENT_CERT)
+            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
             .ok()
             .as_deref()
             .and_then(aacs::parse_content_cert);
         let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
-        let version = match cc.as_ref().map(|c| c.version) {
-            Some(aacs::AacsVersion::V10) => 1,
-            Some(_) => 2,
-            None if bus_encryption => 2,
-            None => 1,
-        };
+        let version = cc
+            .as_ref()
+            .map(|c| c.version.major())
+            .unwrap_or(aacs::AACS_MAJOR_BD);
 
         // OEM bus-key gate (wrong-keys guard). A bus-encrypted disc (Content
         // Certificate bus-encryption bit set) still carries bus encryption on
