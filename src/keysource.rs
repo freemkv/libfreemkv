@@ -716,4 +716,52 @@ mod tests {
             assert!(ts_sync_destroyed(s), "every sample is a scrambled unit");
         }
     }
+
+    /// Audit #5 — a DISCRIMINATING test for the version→stride fix. A 2-key
+    /// `Unit_Key_RO.inf` whose SECOND key sits at the V20 (64-byte) offset; a V10
+    /// (48-byte) parse reads a DIFFERENT region. Confirms `DiscInputsCtx` parses
+    /// at the stride for `inputs.version` — a swapped `from_major` branch or a
+    /// hardcoded stride (the exact bug 1.2.0 fixes) would fail this, where the
+    /// prior single-key fixtures passed regardless of stride.
+    #[test]
+    fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
+        use crate::aacs::{AACS_MAJOR_BD, AACS_MAJOR_UHD};
+        const UK_POS: usize = 64;
+        let mut inf = vec![0u8; 200];
+        inf[0..4].copy_from_slice(&(UK_POS as u32).to_be_bytes()); // uk_pos
+        inf[UK_POS..UK_POS + 2].copy_from_slice(&2u16.to_be_bytes()); // num_uk = 2
+        let key0_at = UK_POS + 48; // first key — same for both strides
+        let key1_v10_at = key0_at + 48; // second key if parsed at V10 stride
+        let key1_v20_at = key0_at + 64; // second key if parsed at V20 stride
+        inf[key0_at..key0_at + 16].fill(0xA0);
+        inf[key1_v10_at..key1_v10_at + 16].fill(0x10);
+        inf[key1_v20_at..key1_v20_at + 16].fill(0x20);
+
+        let base = DiscInputs {
+            disc_hash: String::new(),
+            volume_id: [0u8; 16],
+            version: AACS_MAJOR_UHD,
+            mkb: Vec::new(),
+            unit_key_ro: inf,
+            samples: Vec::new(),
+            volume_label: None,
+        };
+        let k20 = DiscInputsCtx::new(&base).enc_title_keys().unwrap().to_vec();
+        let v10_inputs = DiscInputs {
+            version: AACS_MAJOR_BD,
+            ..base.clone()
+        };
+        let k10 = DiscInputsCtx::new(&v10_inputs)
+            .enc_title_keys()
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(k20.len(), 2);
+        assert_eq!(k10.len(), 2);
+        assert_eq!(k20[0], [0xA0; 16], "first key is at +48 for both strides");
+        assert_eq!(k10[0], [0xA0; 16]);
+        assert_eq!(k20[1], [0x20; 16], "V20 reads the 2nd key at +64");
+        assert_eq!(k10[1], [0x10; 16], "V10 reads the 2nd key at +48");
+        assert_ne!(k20[1], k10[1], "the parse stride follows inputs.version");
+    }
 }

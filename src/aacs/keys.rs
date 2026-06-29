@@ -460,61 +460,38 @@ pub mod probe {
 
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
 fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
-    let mut pos = 0;
-    let mut verify_rec_seen: Vec<(u8, usize, usize)> = Vec::new();
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-
-        if rec_type == 0x81 || rec_type == 0x86 {
-            verify_rec_seen.push((rec_type, pos, rec_len));
-        }
-
-        if (rec_type == 0x81 || rec_type == 0x86) && rec_len >= 20 {
-            // mk_dv is at offset 4 of the record (after the 4-byte header)
+    // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
+    // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
+    let found = crate::aacs::variants::mkb_records(mkb)
+        .find(|&(_, rt, len)| (rt == 0x81 || rt == 0x86) && len >= 20);
+    match found {
+        Some((o, rec_type, rec_len)) => {
             let mut dv = [0u8; 16];
-            dv.copy_from_slice(&mkb[pos + 4..pos + 20]);
+            dv.copy_from_slice(&mkb[o + 4..o + 20]);
             tracing::debug!(
                 target: "freemkv::disc",
                 phase = "mkb_mk_dv_found",
                 rec_type,
-                pos,
+                pos = o,
                 rec_len,
                 "mk_dv extracted from MKB"
             );
-            return Some(dv);
+            Some(dv)
         }
-        pos += rec_len;
+        None => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "mkb_mk_dv_not_found",
+                "no 0x81/0x86 record with rec_len>=20 found"
+            );
+            None
+        }
     }
-    tracing::warn!(
-        target: "freemkv::disc",
-        phase = "mkb_mk_dv_not_found",
-        verify_rec_seen = ?verify_rec_seen,
-        scanned_bytes = pos,
-        "no 0x81/0x86 record with rec_len>=20 found"
-    );
-    None
 }
 
 /// Find Subset-Difference records (type 0x04) in MKB.
 fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-
-        if rec_type == 0x04 && rec_len > 4 {
-            return Some(mkb[pos + 4..pos + rec_len].to_vec());
-        }
-        pos += rec_len;
-    }
-    None
+    find_record_body(mkb, 0x04)
 }
 
 /// Find the Media Key Data Record (cvalues table) in an MKB.
@@ -545,19 +522,9 @@ fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
 /// record matching `rec_type`. Returns `None` if no such record exists or
 /// the record is empty.
 fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-        if rec_type == rec_type_wanted && rec_len > 4 {
-            return Some(mkb[pos + 4..pos + rec_len].to_vec());
-        }
-        pos += rec_len;
-    }
-    None
+    crate::aacs::variants::mkb_records(mkb)
+        .find(|&(_, rt, len)| rt == rec_type_wanted && len > 4)
+        .map(|(o, _, len)| mkb[o + 4..o + len].to_vec())
 }
 
 /// Real content length of an MKB: the byte offset where the record stream
@@ -568,17 +535,13 @@ fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
 /// actual size so callers can trim off megabytes of zeros before sending or
 /// archiving. Returns `mkb.len()` only if the whole buffer parsed as records.
 pub fn mkb_content_len(mkb: &[u8]) -> usize {
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        // A zero type, a zero/short length, or an overrun = records done, padding begun.
-        if rec_type == 0x00 || rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-        pos += rec_len;
-    }
-    pos
+    // End of the last framed record = where the fixed-region zero padding begins.
+    // (The `00 000000` terminator / overrun stops the walk; real MKBs pad with
+    // zeros, so this matches the prior "stop at the first padding byte".)
+    crate::aacs::variants::mkb_records(mkb)
+        .last()
+        .map(|(o, _, len)| o + len)
+        .unwrap_or(0)
 }
 
 /// Trim an MKB's trailing fixed-region padding to its real content length —
@@ -602,25 +565,11 @@ pub fn trim_mkb(mut mkb: Vec<u8>) -> Vec<u8> {
 /// body offset 0 (`pos + 4`), then the BE u32 version at body offset 4
 /// (`pos + 8`).
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-
-        if rec_type == 0x10 && rec_len >= 12 {
-            return Some(u32::from_be_bytes([
-                mkb[pos + 8],
-                mkb[pos + 9],
-                mkb[pos + 10],
-                mkb[pos + 11],
-            ]));
-        }
-        pos += rec_len;
-    }
-    None
+    // Type-and-Version record (0x10): version is the BE u32 at body offset 4
+    // (record offset 8). Needs rec_len >= 12 (4 header + 4 type + 4 version).
+    crate::aacs::variants::mkb_records(mkb)
+        .find(|&(_, rt, len)| rt == 0x10 && len >= 12)
+        .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 8], mkb[o + 9], mkb[o + 10], mkb[o + 11]]))
 }
 
 // ── MKB Type field (Type-and-Version record 0x10, bytes 4-7) ────────────────
@@ -687,24 +636,11 @@ impl MkbType {
 /// The raw 32-bit MKBType field from the Type-and-Version record (0x10), bytes
 /// 4-7. `None` if no 0x10 record is present.
 pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
-        let rec_type = mkb[pos];
-        let rec_len = u32::from_be_bytes([0, mkb[pos + 1], mkb[pos + 2], mkb[pos + 3]]) as usize;
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
-        }
-        if rec_type == 0x10 && rec_len >= 8 {
-            return Some(u32::from_be_bytes([
-                mkb[pos + 4],
-                mkb[pos + 5],
-                mkb[pos + 6],
-                mkb[pos + 7],
-            ]));
-        }
-        pos += rec_len;
-    }
-    None
+    // Type-and-Version record (0x10): the 32-bit MKBType is bytes 4-7 (body
+    // offset 0). Needs rec_len >= 8 (4 header + 4 type).
+    crate::aacs::variants::mkb_records(mkb)
+        .find(|&(_, rt, len)| rt == 0x10 && len >= 8)
+        .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 4], mkb[o + 5], mkb[o + 6], mkb[o + 7]]))
 }
 
 /// Decode an MKB's Type field. `None` if no Type-and-Version record is present.
@@ -1570,6 +1506,23 @@ mod tests {
     use super::super::provider::SuppliedKey;
     use super::super::types::DiscEntry;
     use super::*;
+
+    /// Audit #5: the `major` / `from_major` mapping is load-bearing for the
+    /// Unit_Key_RO stride, so pin it as a table. V10 ↔ BD; V20/V21 → UHD; any
+    /// non-BD major selects the V20/V21 64-byte stride (V10 is the only 48-byte).
+    #[test]
+    fn aacs_major_round_trips_and_strides_differ() {
+        assert_eq!(AacsVersion::V10.major(), AACS_MAJOR_BD);
+        assert_eq!(AacsVersion::V20.major(), AACS_MAJOR_UHD);
+        assert_eq!(AacsVersion::V21.major(), AACS_MAJOR_UHD);
+        assert_eq!(AacsVersion::from_major(AACS_MAJOR_BD), AacsVersion::V10);
+        assert_eq!(AacsVersion::from_major(AACS_MAJOR_UHD), AacsVersion::V20);
+        assert_eq!(AacsVersion::from_major(99), AacsVersion::V20); // any non-BD → V20
+        assert_ne!(
+            AacsVersion::from_major(AACS_MAJOR_BD).unit_key_stride(),
+            AacsVersion::from_major(AACS_MAJOR_UHD).unit_key_stride()
+        );
+    }
 
     /// Finding #5 regression: parse_unit_key_ro must REJECT a Unit_Key_RO.inf
     /// whose declared `num_unit_keys` exceeds the keys actually present in the
