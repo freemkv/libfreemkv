@@ -174,7 +174,7 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8]) -> bool {
 /// syncs after decrypt, so the majority vote calls it "destroyed" and
 /// `aacs_unit_needs_decrypt` returns true — even though the unit decrypted
 /// PERFECTLY. Concealing on that predicate overwrites the good decrypted tail with
-/// NULL-TS, silently discarding correct video (the bug this fixes; the v1.1.1
+/// NULL-TS, silently discarding correct video (the bug this fixes; the 1.2.0
 /// fragment-tail fix in [`decrypt_unit`] must not be undone by the conceal loop).
 ///
 /// The correct, padding-aware notion of "still ciphertext", checkable on the
@@ -1441,5 +1441,61 @@ mod tests {
         assert_eq!(ts_packet_total(&[0u8; 191]), 0);
         // 6144 = 32 packets.
         assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
+    }
+
+    /// Direct coverage for the padding-aware conceal predicate. It must conceal
+    /// ONLY genuinely-undecryptable ciphertext — never a decrypted unit (full or
+    /// short padding-tail), a clear/non-encrypted unit, or an all-zero unit.
+    #[test]
+    fn aacs_unit_still_ciphertext_is_padding_aware() {
+        let pkt = BD_SOURCE_PACKET_BYTES;
+        // Build a 32-packet aligned unit. `cpi` sets the AACS CPI bits (byte 0).
+        // Per packet: b'S' = decrypted TS (0x47 sync + non-zero payload),
+        // b'C' = ciphertext (non-zero payload, no sync), b'P' = zero padding.
+        let build = |cpi: bool, kinds: &[u8]| {
+            let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+            if cpi {
+                u[0] = 0xC0; // CPI bits in the packet-0 header (not the payload)
+            }
+            for (i, &k) in kinds.iter().enumerate() {
+                let off = i * pkt;
+                match k {
+                    b'S' => {
+                        u[off + 4] = TS_SYNC;
+                        for b in &mut u[off + 5..off + pkt] {
+                            *b = 0x10;
+                        }
+                    }
+                    b'C' => {
+                        // Scrambled: non-zero payload, no 0x47 at the sync position.
+                        for b in &mut u[off + 4..off + pkt] {
+                            *b = 0x5A;
+                        }
+                    }
+                    _ => {} // b'P' → leave zero
+                }
+            }
+            u
+        };
+
+        // Not encrypted (CPI clear) → never concealed, even if it looks scrambled.
+        assert!(!aacs_unit_still_ciphertext(&build(false, &[b'C'; 32])));
+        // All-zero unit (CPI clear) → not encrypted → false.
+        assert!(!aacs_unit_still_ciphertext(&build(false, &[b'P'; 32])));
+        // Fully decrypted (all packets carry their sync) → false.
+        assert!(!aacs_unit_still_ciphertext(&build(true, &[b'S'; 32])));
+        // Fully ciphertext (no packet carries its sync) → true.
+        assert!(aacs_unit_still_ciphertext(&build(true, &[b'C'; 32])));
+        // Decrypted SHORT padding-tail: 11 content packets + 21 zero padding. The
+        // majority vote would mis-flag it (<16 syncs); the padding-aware predicate
+        // skips the zero padding and sees every non-zero packet has its sync.
+        let mut tail = [b'P'; 32];
+        for k in tail.iter_mut().take(11) {
+            *k = b'S';
+        }
+        assert!(
+            !aacs_unit_still_ciphertext(&build(true, &tail)),
+            "a decrypted short padding-tail must NOT be flagged as ciphertext"
+        );
     }
 }
