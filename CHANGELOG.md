@@ -1,6 +1,40 @@
 # Changelog
 
-## [1.1.1]
+## [1.2.0] — 2026-06-28
+
+### Added
+
+- **Mux loss concealment — a logged gap still produces a decode-clean file.**
+  When a unit genuinely cannot be decrypted on the mux read path (a key the disc
+  never yielded, after the rip's own decrypt-verify already failed loud and
+  re-read), the mux no longer passes ciphertext downstream or emits a broken
+  frame. The undecryptable aligned unit is concealed as NULL transport-stream
+  packets (PID 0x1FFF, invisible to every real stream), and the codec layer
+  **drops forward to the next keyframe** so no frame with a dangling reference
+  reaches the muxer. An ffmpeg deep scan of the result is clean — no missing
+  references, no partial frames. The loss is tallied and logged, never silently
+  dropped, and the mux always completes. Audio and subtitle tracks have no
+  cross-frame references, so only the directly-affected frames are dropped there.
+  Decrypt-verify remains a **rip** gate (fail loud → re-read), never a mux gate.
+
+### Changed
+
+- **One hex parser.** All hex parsing (keys, IDs, key-source inputs) routes
+  through a single `libfreemkv::hex` parser instead of several ad-hoc decoders,
+  so length/odd-nibble/invalid-digit handling is identical everywhere.
+- **Robust encrypted-unit sampling + a single MKB framing walker.** Up-front
+  AACS sampling tolerates content layouts that previously yielded too few
+  encrypted units to resolve a key, and the Media Key Block is now walked by one
+  framing routine shared across the in-band and out-of-band readers (no
+  divergent record-stride logic). AACS resolution hardened around these paths.
+- **One reader, one `DiscInputs`.** `Disc::inputs()` is now the single, complete
+  source of a disc's AACS inputs (inf, MKB, VID, disc_hash, version), and
+  `read_aacs_inputs*` returns the version alongside inf+MKB. Both the CLI and
+  autorip resolve through `Disc::inputs()`; the duplicate out-of-band readers
+  (autorip's `key_files()`/`volume_id()`) and the stale mapfile-VID read are
+  removed. AACS file paths and the AACS major versions are now named constants
+  (`aacs::PATH_*`, `aacs::AACS_MAJOR_*`, `AacsVersion::major`/`from_major`) so a
+  fallback or stride change lives in exactly one place.
 
 ### Fixed
 
@@ -37,17 +71,6 @@
   with a per-unit "already-asked-dry" set (still bounded by the fetch budget).
 - **`verify::push_ranges` uses saturating arithmetic** so a corrupt-disc LBA near
   `u32::MAX` can't panic (matches `udf::merge_ranges`).
-
-### Changed
-
-- **One reader, one `DiscInputs`.** `Disc::inputs()` is now the single, complete
-  source of a disc's AACS inputs (inf, MKB, VID, disc_hash, version), and
-  `read_aacs_inputs*` returns the version alongside inf+MKB. Both the CLI and
-  autorip resolve through `Disc::inputs()`; the duplicate out-of-band readers
-  (autorip's `key_files()`/`volume_id()`) and the stale mapfile-VID read are
-  removed. AACS file paths and the AACS major versions are now named constants
-  (`aacs::PATH_*`, `aacs::AACS_MAJOR_*`, `AacsVersion::major`/`from_major`) so a
-  fallback or stride change lives in exactly one place.
 
 ## [1.1.0]
 
