@@ -356,22 +356,34 @@ impl Disc {
             );
             return Err(Error::AacsBusKeyUnavailable);
         }
-        // MKB_RO/RW are allocated to a fixed ~128 MiB and zero-padded; trim to
-        // the real record length (same as `read_aacs_inputs`). Without this the
-        // MKB stashed on `AacsState` — which `Disc::inputs()` and the device/
-        // processing-key `decrypt_with` derivation consume, and which a key
-        // source ships to an online service — is the full 128 MiB pad, not the
-        // ~few-MB record stream.
-        let mkb_bytes = udf_fs
-            .read_file(reader, "/AACS/MKB_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/MKB_RW.inf"))
-            .ok()
-            .unwrap_or_default();
-        // Trim to the real record length. Use trim_mkb rather than a raw
-        // truncate: trim_mkb only truncates when content_len > 0 and strictly
-        // inside the buffer, so a malformed/unrecognised MKB is preserved
-        // intact instead of being zeroed by truncate(0).
-        let mkb_bytes = aacs::trim_mkb(mkb_bytes);
+        // Read the MKB record stream via the SAME bounded reader the
+        // out-of-band `read_aacs_inputs` uses (`read_mkb_content`: a prefix-grow
+        // read + trim), NOT a full `read_file`. MKB_RO/RW is allocated to a
+        // fixed ~128 MiB of zero padding, and a full `read_file` of it FAILS on
+        // file-backed / large readers — which left `a.mkb` empty here, silently
+        // breaking online key resolution: `Disc::inputs()` shipped `mkb=0` to
+        // the decode service and it 404'd, while autorip's separate
+        // `read_aacs_inputs` path (this same helper) worked. One reader now, so
+        // `Disc::inputs()` is the single complete source of AACS inputs.
+        // A read ERROR is surfaced (logged), not silently emptied: an empty MKB
+        // here is invisible until an online key service rejects the request, so
+        // a transient I/O hiccup must not masquerade as "no MKB". We still
+        // continue with an empty MKB (disc-hash-keyed keydb lookups don't need
+        // it), but the cause is now on the log.
+        let mkb_bytes = match Self::read_mkb_content(reader, udf_fs) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "scan_aacs_mkb",
+                    error = %e,
+                    "MKB read failed at scan; AACS inputs will carry an empty MKB \
+                     (online key resolution cannot proceed without it). Continuing \
+                     — disc-hash-keyed lookups are unaffected."
+                );
+                Vec::new()
+            }
+        };
         let mkb_ver = aacs::mkb_version(&mkb_bytes);
 
         tracing::debug!(

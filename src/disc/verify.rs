@@ -477,7 +477,9 @@ fn push_ranges(out: &mut Vec<(u32, u32)>, lbas: &[u32; 3]) {
     present.sort_unstable();
     for lba in present {
         if let Some(last) = out.last_mut() {
-            if last.0 + last.1 == lba {
+            // Saturating: LBAs come from disc-controlled ICB extents, so a
+            // corrupt disc must not panic here (matches `udf::merge_ranges`).
+            if last.0.saturating_add(last.1) == lba {
                 last.1 += 1;
                 continue;
             }
