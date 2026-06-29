@@ -8,8 +8,8 @@
 //! key is recovered keylessly by the Stevenson known-plaintext attack (see
 //! [`super::crack_key`]).
 
-use crate::drive::Drive;
 use crate::error::{Error, Result};
+use crate::scsi::ScsiTransport;
 
 // ── CryptKey tables ───────────────────────────────────────────────────────
 
@@ -125,10 +125,10 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
 /// is unnecessary (the descramble key is recovered keylessly by the Stevenson
 /// attack in [`super::crack_key`]) and its hard failure on some USB bridges
 /// used to abort the whole unlock (the 7014 bug). The bytes are discarded.
-pub fn unlock_css_reads(drive: &mut Drive, lba: u32) -> Result<()> {
+pub fn unlock_css_reads(scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
     tracing::info!(target: "freemkv::css", phase = "unlock_css_reads", lba, "begin");
-    let r = unlock_css_reads_inner(drive, lba);
+    let r = unlock_css_reads_inner(scsi, lba);
     tracing::info!(
         target: "freemkv::css",
         phase = "unlock_css_reads",
@@ -140,22 +140,22 @@ pub fn unlock_css_reads(drive: &mut Drive, lba: u32) -> Result<()> {
     r
 }
 
-fn unlock_css_reads_inner(drive: &mut Drive, _lba: u32) -> Result<()> {
+fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()> {
     tracing::debug!(target: "freemkv::css", "css unlock: begin");
     // The bus-auth challenge-response sets the drive's Authentication Success
     // Flag (ASF=1), which is what opens scrambled-sector reads. This is the
     // ONLY step required to unlock reads; a failure here is fatal — we
     // genuinely cannot read scrambled sectors.
-    let (agid, _bus_key) = bus_auth(drive).inspect_err(|e| {
-        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus_auth failed");
+    let agid = establish_authenticated_session(scsi).inspect_err(|e| {
+        tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus authentication failed");
     })?;
-    tracing::debug!(target: "freemkv::css", agid, "css unlock: bus_auth ok");
+    tracing::debug!(target: "freemkv::css", agid, "css unlock: bus authentication ok");
     // Disc-key REPORT KEY: issued BEST-EFFORT for any firmware that ties part
     // of its read-unlock to it. The bytes are unused (the descramble key is
     // recovered keylessly) and a failure is NON-FATAL — the gate is already
     // open from bus-auth. This replaces the title-key REPORT KEY, whose hard
     // failure used to abort the whole unlock (the 7014 bug on USB bridges).
-    if let Err(e) = read_disc_key(drive, agid) {
+    if let Err(e) = read_disc_key(scsi, agid) {
         tracing::debug!(target: "freemkv::css", error_code = e.code(), "css unlock: disc-key REPORT KEY skipped (non-fatal)");
     }
     tracing::debug!(target: "freemkv::css", "css unlock: ok");
@@ -164,9 +164,15 @@ fn unlock_css_reads_inner(drive: &mut Drive, _lba: u32) -> Result<()> {
 
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
 
-fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
-    let scsi = drive.scsi_mut();
-
+/// Run the CSS bus-authentication challenge-response (invalidate AGIDs →
+/// allocate AGID → host challenge → brute-force the variant → drive challenge →
+/// send host key). Completing the handshake sets the drive's Authentication
+/// Success Flag (ASF=1) — which is the ENTIRE purpose: it unlocks
+/// scrambled-sector reads. Returns the negotiated AGID (the caller needs it for
+/// the best-effort disc-key REPORT KEY). The CSS bus key is intentionally NOT
+/// derived: descrambling is keyless (the Stevenson known-plaintext attack), so
+/// the bus key has no consumer.
+fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F
     for agid in 0..4u8 {
         let mut cdb = [0u8; 12];
@@ -269,13 +275,11 @@ fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
     )
     .map_err(|_| Error::CssAuthFailed)?;
 
-    // Bus key = CryptKey(2, variant, key1 || key2)
-    let mut combined = [0u8; 10];
-    combined[..5].copy_from_slice(&key1);
-    combined[5..].copy_from_slice(&key2);
-    let bus_key = crypt_key(2, variant, &combined);
-
-    Ok((agid, bus_key))
+    // The authenticated session (ASF=1) is now established — scrambled-sector
+    // reads are unlocked, which is the only thing we needed. The CSS bus key
+    // would be CryptKey(2, variant, key1 || key2), but it has no consumer
+    // (descrambling is keyless via the Stevenson attack), so it is not derived.
+    Ok(agid)
 }
 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
@@ -286,9 +290,7 @@ fn bus_auth(drive: &mut Drive) -> Result<(u8, [u8; 5])> {
 /// is recovered keylessly elsewhere, so the genuine disc-key REPORT KEY is
 /// intentionally skipped. (If a drive is ever found where bus-auth alone does
 /// not open scrambled reads, a real REPORT KEY format 0x02 belongs here.)
-fn read_disc_key(drive: &mut Drive, agid: u8) -> Result<()> {
-    let scsi = drive.scsi_mut();
-
+fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
     let alloc_len: u16 = 2048 + 4;
     let mut cdb = [0u8; 12];

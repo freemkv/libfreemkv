@@ -1478,7 +1478,7 @@ impl Disc {
                 // unreliable). The real descramble key is recovered from the
                 // scrambled movie data itself via the known-plaintext attack — no
                 // player keys, no disc-key crack, no REPORT-KEY-derived title key.
-                if let Err(e) = crate::css::auth::unlock_css_reads(session, unlock_lba) {
+                if let Err(e) = crate::css::auth::unlock_css_reads(session.scsi_mut(), unlock_lba) {
                     tracing::warn!(
                         target: "freemkv::scan",
                         error_code = e.code(),
