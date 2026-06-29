@@ -36,6 +36,12 @@ pub enum UnlockError {
     HandshakeRejected,
     /// Auth succeeded (or was skipped) but the Volume ID could not be read.
     VidUnavailable,
+    /// This unlocker self-verified against the hardware and does NOT apply to
+    /// the mounted disc/drive — e.g. the CSS unlocker found the drive reports a
+    /// non-DVD profile, or the cert unlocker found a non-AACS disc. The unlocker
+    /// issued no unlock CDBs; the caller falls through to the next unlocker.
+    /// Defense in depth: an unlocker never trusts the caller-declared kind alone.
+    NotApplicable,
     /// A SCSI/transport error; carries the numeric [`crate::error::Error`] code.
     Scsi(u16),
 }
@@ -155,6 +161,19 @@ pub fn register_unlocker(u: Box<dyn Unlocker>) {
     }
 }
 
+/// Append the in-tree built-in unlockers (CSS bus-auth today; the AACS cert
+/// handshake follows) exactly once, the first time any dispatch runs. They land
+/// AFTER any client-registered firmware unlocker (e.g. `freemkv-unlock-ld`,
+/// registered at process start, before the first rip), so the registry order is
+/// firmware → cert → css. libfreemkv owns this order; clients never register the
+/// built-ins — they only register the external plugins they link.
+fn ensure_builtins() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        register_unlocker(Box::new(crate::css::auth::CssUnlocker));
+    });
+}
+
 /// Walk the registry in order and run the first matching unlocker, returning
 /// its name AND the Volume ID it produced.
 ///
@@ -177,6 +196,7 @@ pub(crate) fn route_unlock(
     scsi: &mut dyn ScsiTransport,
     ctx: &UnlockCtx,
 ) -> Result<Option<(String, Vid)>> {
+    ensure_builtins();
     let reg = match REGISTRY.read() {
         Ok(r) => r,
         // A poisoned lock means a prior unlocker panicked; treat as
@@ -208,7 +228,7 @@ pub(crate) fn route_unlock(
                         target: "freemkv::unlock",
                         unlocker = %name,
                         code,
-                        "unlocker hit a transport fault during unlock; aborting init"
+                        "unlocker hit a transport fault during unlock; aborting"
                     );
                     return Err(crate::error::Error::ScsiError {
                         opcode: 0,
@@ -249,6 +269,7 @@ pub(crate) fn unlocker_set_max_read_speed(
     scsi: &mut dyn ScsiTransport,
     ctx: &UnlockCtx,
 ) -> Result<()> {
+    ensure_builtins();
     let reg = match REGISTRY.read() {
         Ok(r) => r,
         // Poisoned lock ⇒ treat as "no unlocker available" (no-op).
@@ -275,6 +296,7 @@ pub(crate) fn matching_name(id: &DriveId) -> Option<String> {
     // Drive-info introspection runs before any disc probe, so the kind is
     // Unknown — only a drive-keyed (firmware) unlocker can match here.
     let ctx = UnlockCtx::new(id, DiscKind::Unknown);
+    ensure_builtins();
     let reg = REGISTRY.read().ok()?;
     reg.iter()
         .find(|u| u.matches(&ctx))
