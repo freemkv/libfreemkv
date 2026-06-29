@@ -11,6 +11,12 @@ use crate::udf;
 pub(super) struct HandshakeResult {
     pub volume_id: [u8; 16],
     pub read_data_key: Option<[u8; 16]>,
+    /// When `read_data_key` is `None` because the bus-key read FAILED (as opposed
+    /// to a path that never attempts it), the error code from `read_data_keys`.
+    /// Carried so the downstream bus-key gate can log WHY the bus key is missing
+    /// instead of a bare "unavailable" — the difference between a diagnosable log
+    /// and archaeology.
+    pub read_data_key_err: Option<u16>,
 }
 
 /// In-tree AACS host-certificate cert-auth "unlocker" — the Drive-level peer of
@@ -97,18 +103,33 @@ impl AacsCertUnlocker<'_> {
                             return Err(UnlockError::VidUnavailable);
                         }
                     };
-                    let read_data_key = aacs::handshake::read_data_keys(session, &mut auth)
-                        .ok()
-                        .map(|(rdk, _)| rdk);
+                    let (read_data_key, read_data_key_err) =
+                        match aacs::handshake::read_data_keys(session, &mut auth) {
+                            Ok((rdk, _)) => (Some(rdk), None),
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "freemkv::disc",
+                                    phase = "handshake_read_data_key_failed",
+                                    cert_index = idx,
+                                    error_code = e.code(),
+                                    "auth + VID read OK, but the drive served no read_data_key (bus key); \
+                                     a bus-encrypted disc stays undecryptable until it does"
+                                );
+                                (None, Some(e.code()))
+                            }
+                        };
                     tracing::debug!(
                         target: "freemkv::disc",
                         phase = "handshake_ok",
                         cert_index = idx,
+                        has_volume_id = volume_id != [0u8; 16],
                         has_read_data_key = read_data_key.is_some(),
+                        "AACS bus-auth handshake complete"
                     );
                     return Ok(HandshakeResult {
                         volume_id,
                         read_data_key,
+                        read_data_key_err,
                     });
                 }
                 Err(e) => {
@@ -270,6 +291,9 @@ impl Disc {
                 Some(HandshakeResult {
                     volume_id,
                     read_data_key: None,
+                    // OEM/VID-only path never attempts the bus-key read — None here
+                    // is "not attempted", not "failed".
+                    read_data_key_err: None,
                 }),
                 None,
             );
@@ -351,10 +375,16 @@ impl Disc {
         // BD is not bus-encrypted, so `bus_encryption` is false and the gate is
         // skipped (its `read_data_key` is legitimately absent).
         if bus_encryption && handshake.is_some_and(|h| h.read_data_key.is_none()) {
+            let h = handshake.expect("is_some_and matched");
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "bus_key_unavailable",
-                "Disc declares bus encryption but the handshake produced no read_data_key; a VID-only/OEM unlock cannot remove bus encryption. Refusing to proceed with a key that would decrypt to garbage."
+                read_data_key_err = ?h.read_data_key_err,
+                has_volume_id = h.volume_id != [0u8; 16],
+                "Disc declares bus encryption but the drive served no read_data_key (bus key). \
+                 read_data_key_err=None ⇒ the unlock path never attempted it (VID-only/OEM); \
+                 a code ⇒ the bus-key read FAILED. Either way bus encryption can't be removed — \
+                 refusing to emit a key that would decrypt to garbage."
             );
             return Err(Error::AacsBusKeyUnavailable);
         }
@@ -785,6 +815,7 @@ mod tests {
         let hs = HandshakeResult {
             volume_id: vid,
             read_data_key: Some(rdk),
+            read_data_key_err: None,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("state");
         assert_eq!(st.volume_id, vid);
@@ -829,6 +860,7 @@ mod tests {
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
+            read_data_key_err: None,
         };
         let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
             .expect_err("bus-encrypted disc with no bus key must hard-error");
@@ -843,6 +875,7 @@ mod tests {
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: Some([0x22u8; 16]),
+            read_data_key_err: None,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("bus key present → ok");
         assert!(st.bus_encryption);
@@ -869,6 +902,7 @@ mod tests {
         let hs = HandshakeResult {
             volume_id: [0x11u8; 16],
             read_data_key: None,
+            read_data_key_err: None,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("AACS 1.0 → ok");
         assert!(!st.bus_encryption);
