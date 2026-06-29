@@ -60,8 +60,11 @@ pub trait Unlocker: Send + Sync {
     /// Stable, language-neutral identifier for this unlocker (logged).
     fn name(&self) -> &str;
 
-    /// True if this unlocker handles the given drive.
-    fn matches(&self, id: &DriveId) -> bool;
+    /// True if this unlocker applies in the given [`UnlockCtx`]. A firmware
+    /// unlocker keys off `ctx.drive_id` (disc kind irrelevant); the cert
+    /// unlocker matches `ctx.kind == DiscKind::Aacs`; the CSS unlocker matches
+    /// `DiscKind::Css`.
+    fn matches(&self, ctx: &UnlockCtx) -> bool;
 
     /// Put the drive into extended-access mode (firmware/bootloader/whatever
     /// THIS unlocker needs) and report what it LEARNED — see [`Unlocked`]. The
@@ -74,12 +77,49 @@ pub trait Unlocker: Send + Sync {
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
-        id: &DriveId,
+        ctx: &UnlockCtx,
     ) -> std::result::Result<Unlocked, UnlockError>;
 
     /// Raise the drive to its maximum read speed. Default: no-op.
-    fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
+    fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _ctx: &UnlockCtx) -> Result<()> {
         Ok(())
+    }
+}
+
+/// The bus-encryption class of the loaded disc, as cheaply probed before the
+/// full structure scan. An [`Unlocker::matches`] keys off this (plus the drive
+/// identity in [`UnlockCtx`]): a firmware unlocker ignores it; the cert unlocker
+/// matches [`DiscKind::Aacs`]; the CSS unlocker matches [`DiscKind::Css`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscKind {
+    /// Not yet probed — drive-prep phase, before any disc structure is read.
+    Unknown,
+    /// Disc carries no bus encryption; nothing to remove.
+    Unencrypted,
+    /// AACS (Blu-ray / UHD).
+    Aacs,
+    /// CSS (DVD-Video).
+    Css,
+}
+
+/// Context handed to every [`Unlocker`] at the single dispatch point: the drive
+/// identity and the disc's bus-encryption [`DiscKind`]. An unlocker reads only
+/// what it needs — firmware keys off [`Self::drive_id`]; cert/CSS off
+/// [`Self::kind`]. `#[non_exhaustive]` so more context (e.g. a host-cert source)
+/// can be added later without breaking external unlockers.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct UnlockCtx<'a> {
+    /// Identity of the drive being unlocked.
+    pub drive_id: &'a DriveId,
+    /// Bus-encryption class of the loaded disc (`Unknown` during drive-prep).
+    pub kind: DiscKind,
+}
+
+impl<'a> UnlockCtx<'a> {
+    /// Construct a context for the given drive and disc kind.
+    pub fn new(drive_id: &'a DriveId, kind: DiscKind) -> Self {
+        Self { drive_id, kind }
     }
 }
 
@@ -135,7 +175,7 @@ pub fn register_unlocker(u: Box<dyn Unlocker>) {
 ///     a cert handshake that would also fail.
 pub(crate) fn route_unlock(
     scsi: &mut dyn ScsiTransport,
-    id: &DriveId,
+    ctx: &UnlockCtx,
 ) -> Result<Option<(String, Vid)>> {
     let reg = match REGISTRY.read() {
         Ok(r) => r,
@@ -146,9 +186,9 @@ pub(crate) fn route_unlock(
     // Walk in registration order — the registry is the single ordered place
     // that decides which unlocker runs first (register ld, then aacs, then css).
     for u in reg.iter() {
-        if u.matches(id) {
+        if u.matches(ctx) {
             let name = u.name().to_string();
-            match u.unlock(scsi, id) {
+            match u.unlock(scsi, ctx) {
                 // The firmware route reports a VID; `read_data_key` is None here
                 // (this is the firmware seam — the cert handshake supplies the
                 // bus key on its own path). A drive that unlocked but produced no
@@ -207,7 +247,7 @@ pub(crate) fn route_unlock(
 ///     still rips.
 pub(crate) fn unlocker_set_max_read_speed(
     scsi: &mut dyn ScsiTransport,
-    id: &DriveId,
+    ctx: &UnlockCtx,
 ) -> Result<()> {
     let reg = match REGISTRY.read() {
         Ok(r) => r,
@@ -215,8 +255,8 @@ pub(crate) fn unlocker_set_max_read_speed(
         Err(_) => return Ok(()),
     };
     for u in reg.iter() {
-        if u.matches(id) {
-            return u.set_max_read_speed(scsi, id);
+        if u.matches(ctx) {
+            return u.set_max_read_speed(scsi, ctx);
         }
     }
     Ok(())
@@ -232,9 +272,12 @@ pub fn registered_count() -> usize {
 /// running it. Used for drive-info display ("is this drive supported?")
 /// before any unlock has been attempted.
 pub(crate) fn matching_name(id: &DriveId) -> Option<String> {
+    // Drive-info introspection runs before any disc probe, so the kind is
+    // Unknown — only a drive-keyed (firmware) unlocker can match here.
+    let ctx = UnlockCtx::new(id, DiscKind::Unknown);
     let reg = REGISTRY.read().ok()?;
     reg.iter()
-        .find(|u| u.matches(id))
+        .find(|u| u.matches(&ctx))
         .map(|u| u.name().to_string())
 }
 
@@ -315,13 +358,13 @@ mod tests {
         fn name(&self) -> &str {
             "fake"
         }
-        fn matches(&self, id: &DriveId) -> bool {
-            id.vendor_id.trim() == self.want_vendor
+        fn matches(&self, ctx: &UnlockCtx) -> bool {
+            ctx.drive_id.vendor_id.trim() == self.want_vendor
         }
         fn unlock(
             &self,
             _scsi: &mut dyn ScsiTransport,
-            _id: &DriveId,
+            _ctx: &UnlockCtx,
         ) -> std::result::Result<Unlocked, UnlockError> {
             self.ran.store(true, Ordering::SeqCst);
             if let Some(code) = self.scsi_err {
@@ -335,7 +378,11 @@ mod tests {
                 None => Err(UnlockError::VidUnavailable),
             }
         }
-        fn set_max_read_speed(&self, _scsi: &mut dyn ScsiTransport, _id: &DriveId) -> Result<()> {
+        fn set_max_read_speed(
+            &self,
+            _scsi: &mut dyn ScsiTransport,
+            _ctx: &UnlockCtx,
+        ) -> Result<()> {
             self.speed_ran.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -367,7 +414,11 @@ mod tests {
 
         // Matching identity → unlocker runs, returns its name + VID.
         let mut scsi = NoopTransport;
-        let matched = route_unlock(&mut scsi, &fake_id("MATCHVND")).unwrap();
+        let matched = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("MATCHVND"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert_eq!(
             matched.as_ref().map(|(n, _)| n.as_str()),
             Some("fake"),
@@ -377,7 +428,11 @@ mod tests {
 
         // Non-matching identity → no unlocker runs, cert path (None).
         ran.store(false, Ordering::SeqCst);
-        let none = route_unlock(&mut scsi, &fake_id("OTHERVND")).unwrap();
+        let none = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("OTHERVND"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert!(none.is_none(), "no match → cert fallback");
         assert!(
             !ran.load(Ordering::SeqCst),
@@ -404,7 +459,11 @@ mod tests {
         ));
 
         // Matching identity → its VID is returned.
-        let got = route_unlock(&mut scsi, &fake_id("VIDVNDOR")).unwrap();
+        let got = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("VIDVNDOR"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert_eq!(
             got.map(|(_, v)| v),
             Some(Vid(vid)),
@@ -415,14 +474,22 @@ mod tests {
         register_unlocker(Box::new(
             FakeUnlocker::new("NOVIDVND", Arc::new(AtomicBool::new(false))).with_vid(None),
         ));
-        let got = route_unlock(&mut scsi, &fake_id("NOVIDVND")).unwrap();
+        let got = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("NOVIDVND"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert!(
             got.is_none(),
             "unlocker without OEM VID falls through to cert"
         );
 
         // No matching unlocker → Ok(None), cert fallback.
-        let got = route_unlock(&mut scsi, &fake_id("UNKNWNVD")).unwrap();
+        let got = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("UNKNWNVD"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert!(got.is_none(), "no match → cert fallback");
     }
 
@@ -441,7 +508,10 @@ mod tests {
                 .with_scsi_err(crate::error::E_SCSI_ERROR),
         ));
 
-        let got = route_unlock(&mut scsi, &fake_id("SCSIVNDR"));
+        let got = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("SCSIVNDR"), DiscKind::Unknown),
+        );
         assert!(
             got.is_err(),
             "a transport fault during unlock aborts init (propagates Err)"
@@ -470,7 +540,11 @@ mod tests {
         ));
 
         // Matching identity → set_max_read_speed invoked.
-        unlocker_set_max_read_speed(&mut scsi, &fake_id("SPEEDVND")).unwrap();
+        unlocker_set_max_read_speed(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("SPEEDVND"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert!(
             speed_ran.load(Ordering::SeqCst),
             "set_max_read_speed() invoked on match"
@@ -478,7 +552,11 @@ mod tests {
 
         // No matching unlocker → Ok(()), nothing invoked (safe no-op).
         speed_ran.store(false, Ordering::SeqCst);
-        unlocker_set_max_read_speed(&mut scsi, &fake_id("NOSPEEDV")).unwrap();
+        unlocker_set_max_read_speed(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("NOSPEEDV"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert!(
             !speed_ran.load(Ordering::SeqCst),
             "no match → safe no-op, nothing invoked"
@@ -544,7 +622,11 @@ mod tests {
         register_unlocker(Box::new(FakeUnlocker::new("DUPEVNDR", first_ran.clone())));
         register_unlocker(Box::new(FakeUnlocker::new("DUPEVNDR", second_ran.clone())));
 
-        let matched = route_unlock(&mut scsi, &fake_id("DUPEVNDR")).unwrap();
+        let matched = route_unlock(
+            &mut scsi,
+            &UnlockCtx::new(&fake_id("DUPEVNDR"), DiscKind::Unknown),
+        )
+        .unwrap();
         assert_eq!(
             matched.as_ref().map(|(n, _)| n.as_str()),
             Some("fake"),
