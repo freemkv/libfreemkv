@@ -1771,8 +1771,9 @@ mod tests {
         reader.put(50, [0xCC; 2048]);
 
         let fs = fs_with(0, 0, root);
-        let (inf, _mkb) = crate::disc::Disc::read_aacs_inputs_from_reader(&mut reader, &fs)
-            .expect("read_aacs_inputs must succeed for a Long-AD disc");
+        let (inf, _mkb, _version) =
+            crate::disc::Disc::read_aacs_inputs_from_reader(&mut reader, &fs)
+                .expect("read_aacs_inputs must succeed for a Long-AD disc");
         assert_eq!(
             inf.len(),
             4096,
