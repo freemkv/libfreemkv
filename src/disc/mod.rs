@@ -1600,13 +1600,31 @@ impl Disc {
     pub(crate) fn read_aacs_inputs_from_reader(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         let inf = udf_fs
-            .read_file(reader, "/AACS/Unit_Key_RO.inf")
-            .or_else(|_| udf_fs.read_file(reader, "/AACS/DUPLICATE/Unit_Key_RO.inf"))
+            .read_file(reader, crate::aacs::PATH_UNIT_KEY_RO)
+            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_UNIT_KEY_RO_DUPLICATE))
             .map_err(|_| Error::AacsNoKeys)?;
         let mkb = Self::read_mkb_content(reader, udf_fs)?;
-        Ok((inf, mkb))
+        let version = Self::read_aacs_version(reader, udf_fs);
+        Ok((inf, mkb, version))
+    }
+
+    /// AACS major version ([`crate::aacs::AACS_MAJOR_BD`] /
+    /// [`crate::aacs::AACS_MAJOR_UHD`]) from the content certificate. Drives the
+    /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21), so the
+    /// out-of-band key-fetch path parses `enc_title_keys` at the right stride (a
+    /// server VUK then derives the correct unit keys). Defaults to BD (V10) when
+    /// no content certificate is present.
+    fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
+        udf_fs
+            .read_file(reader, crate::aacs::PATH_CONTENT_CERT)
+            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
+            .ok()
+            .as_deref()
+            .and_then(crate::aacs::parse_content_cert)
+            .map(|c| c.version.major())
+            .unwrap_or(crate::aacs::AACS_MAJOR_BD)
     }
 
     /// Read the AACS MKB's real record stream — NOT its zero padding.
@@ -1626,8 +1644,8 @@ impl Disc {
         let mut want = START_BYTES;
         loop {
             let buf = udf_fs
-                .read_file_prefix(reader, "/AACS/MKB_RO.inf", want)
-                .or_else(|_| udf_fs.read_file_prefix(reader, "/AACS/MKB_RW.inf", want))
+                .read_file_prefix(reader, crate::aacs::PATH_MKB_RO, want)
+                .or_else(|_| udf_fs.read_file_prefix(reader, crate::aacs::PATH_MKB_RW, want))
                 .map_err(|_| Error::AacsNoKeys)?;
             let n = crate::aacs::mkb_content_len(&buf);
             // `n` strictly inside `buf` => the record walk reached the padding
@@ -1642,10 +1660,10 @@ impl Disc {
     }
 
     /// Read a disc's AACS key-input files from an ISO image: returns
-    /// `(Unit_Key_RO.inf, MKB)` raw bytes. For callers that resolve a Unit Key
-    /// out-of-band: obtain the key however you like, then apply it via
+    /// `(Unit_Key_RO.inf, MKB, aacs_major_version)`. For callers that resolve a
+    /// Unit Key out-of-band: obtain the key however you like, then apply it via
     /// [`Disc::decrypt_with`]. libfreemkv never makes a network call.
-    pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn read_aacs_inputs(iso_path: &std::path::Path) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         // Preserve the underlying open error (`Error::IoError`, E5000, carrying
         // the OS errno) instead of collapsing ENOENT/EPERM/etc. into
         // `Error::AacsNoKeys` (E7000). A missing or unreadable ISO is an I/O
@@ -1661,7 +1679,7 @@ impl Disc {
     /// resolves a key from them however it likes, then applies it via
     /// [`Disc::decrypt_with`]. These files are plaintext UDF metadata — no
     /// AACS handshake or keys are required to read them.
-    pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn read_aacs_inputs_from_drive(drive: &mut Drive) -> Result<(Vec<u8>, Vec<u8>, u8)> {
         let (_, mut reader, udf_fs) = Self::read_udf(drive)?;
         Self::read_aacs_inputs_from_reader(&mut reader, &udf_fs)
     }
@@ -2326,7 +2344,11 @@ impl Disc {
             aacs.key_source = KeyOrigin::ExternalUk;
         } else if self.encrypted && self.css.is_none() {
             self.aacs = Some(AacsState {
-                version: if self.format == DiscFormat::Uhd { 2 } else { 1 },
+                version: if self.format == DiscFormat::Uhd {
+                    crate::aacs::AACS_MAJOR_UHD
+                } else {
+                    crate::aacs::AACS_MAJOR_BD
+                },
                 bus_encryption: self.format == DiscFormat::Uhd,
                 mkb_version: None,
                 disc_hash: String::new(),
@@ -2353,6 +2375,7 @@ impl Disc {
         self.aacs.as_ref().map(|a| crate::keysource::DiscInputs {
             disc_hash: a.disc_hash.clone(),
             volume_id: a.volume_id,
+            version: a.version,
             mkb: a.mkb.clone(),
             unit_key_ro: a.uk_ro.clone(),
             // Content samples need the disc reader, which scan does not retain;

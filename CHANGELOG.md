@@ -24,6 +24,30 @@
   MKB through the same bounded prefix-grow + trim reader as the out-of-band
   path, so `Disc::inputs()` is the single complete source of AACS inputs — one
   reader for every caller.
+- **Read-time key-fetch parses `Unit_Key_RO.inf` at the disc's own AACS stride.**
+  The on-demand fetch (for a CPS unit not sampled up front) hardcoded the V20
+  64-byte stride, so an AACS-1.0 (V10) disc whose key arrived as a VUK derived
+  the wrong unit keys. `DiscInputs` now carries the disc's `version`, and the
+  context parses at the matching stride — the disc is the single source of truth
+  for its own stride (no separate version argument to drift).
+- **A dry key-fetch for one unit no longer blocks fetching a different unit.**
+  A global "fetch spent" latch meant that once the key service returned nothing
+  for one CPS unit's ciphertext, no further unit was ever asked — so a multi-CPS
+  disc could strand a unit whose key the service *would* have served. Replaced
+  with a per-unit "already-asked-dry" set (still bounded by the fetch budget).
+- **`verify::push_ranges` uses saturating arithmetic** so a corrupt-disc LBA near
+  `u32::MAX` can't panic (matches `udf::merge_ranges`).
+
+### Changed
+
+- **One reader, one `DiscInputs`.** `Disc::inputs()` is now the single, complete
+  source of a disc's AACS inputs (inf, MKB, VID, disc_hash, version), and
+  `read_aacs_inputs*` returns the version alongside inf+MKB. Both the CLI and
+  autorip resolve through `Disc::inputs()`; the duplicate out-of-band readers
+  (autorip's `key_files()`/`volume_id()`) and the stale mapfile-VID read are
+  removed. AACS file paths and the AACS major versions are now named constants
+  (`aacs::PATH_*`, `aacs::AACS_MAJOR_*`, `AacsVersion::major`/`from_major`) so a
+  fallback or stride change lives in exactly one place.
 
 ## [1.1.0]
 

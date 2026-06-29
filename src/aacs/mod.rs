@@ -23,6 +23,18 @@ pub mod trace;
 pub mod types;
 pub mod variants;
 
+/// On-disc UDF paths to the AACS key-input files (with their fallbacks).
+/// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
+/// `read_mkb_content`, `read_aacs_version`) walks the exact same files — adding
+/// or changing a fallback in one place can then never silently diverge the
+/// disc_hash / MKB / VID that another reader feeds a key service.
+pub const PATH_UNIT_KEY_RO: &str = "/AACS/Unit_Key_RO.inf";
+pub const PATH_UNIT_KEY_RO_DUPLICATE: &str = "/AACS/DUPLICATE/Unit_Key_RO.inf";
+pub const PATH_MKB_RO: &str = "/AACS/MKB_RO.inf";
+pub const PATH_MKB_RW: &str = "/AACS/MKB_RW.inf";
+pub const PATH_CONTENT_CERT: &str = "/AACS/Content000.cer";
+pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
+
 // Boil-down derivation primitives (thin newtypes + wrappers over the crypto).
 pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk};
 // Structured, English-free resolution trace.
@@ -42,9 +54,9 @@ pub use decrypt::{
 #[doc(hidden)]
 pub use keys::probe;
 pub use keys::{
-    AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C, MKB_TYPE_3_RECORDABLE,
-    MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbType, ResolveContext, ResolveFailure,
-    ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_and_pk_from_dk,
+    AACS_MAJOR_BD, AACS_MAJOR_UHD, AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C,
+    MKB_TYPE_3_RECORDABLE, MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbType, ResolveContext,
+    ResolveFailure, ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_and_pk_from_dk,
     derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex,
     mkb_content_len, mkb_is_uhd, mkb_type, mkb_type_raw, mkb_version, parse_content_cert,
     parse_unit_key_ro, read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2,

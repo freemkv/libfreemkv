@@ -24,6 +24,13 @@ pub enum AacsVersion {
     V21,
 }
 
+/// AACS major version as the small integer threaded through the scan / key
+/// paths (`AacsState.version`, `DiscInputs.version`, `DiscInputsCtx::new`):
+/// 1 = AACS 1.0 (BD), 2 = AACS 2.x (UHD). Centralised so the bare `1`/`2` — and
+/// the V10-vs-else stride choice it drives — lives in exactly one place.
+pub const AACS_MAJOR_BD: u8 = 1;
+pub const AACS_MAJOR_UHD: u8 = 2;
+
 impl AacsVersion {
     /// Stride (in bytes) between successive encrypted unit keys in
     /// `Unit_Key_RO.inf`.
@@ -31,6 +38,24 @@ impl AacsVersion {
         match self {
             AacsVersion::V10 => 48,
             AacsVersion::V20 | AacsVersion::V21 => 64,
+        }
+    }
+
+    /// This version as the major integer ([`AACS_MAJOR_BD`] / [`AACS_MAJOR_UHD`]).
+    pub fn major(self) -> u8 {
+        match self {
+            AacsVersion::V10 => AACS_MAJOR_BD,
+            AacsVersion::V20 | AacsVersion::V21 => AACS_MAJOR_UHD,
+        }
+    }
+
+    /// The version a bare major integer selects for stride purposes: only the
+    /// BD major is V10; every other value takes the V20/V21 64-byte stride.
+    pub fn from_major(major: u8) -> Self {
+        if major == AACS_MAJOR_BD {
+            AacsVersion::V10
+        } else {
+            AacsVersion::V20
         }
     }
 }
