@@ -418,11 +418,14 @@ impl Drive {
         );
         self.init_ran = true;
         let r = match r {
-            Ok(Some((name, vid))) => {
+            Ok(Some((name, unlocked))) => {
                 self.unlocker_name = Some(name);
-                // Stash the OEM Volume ID the unlocker returned for the AACS
-                // handshake phase (do_handshake reads it via `oem_vid()`).
-                self.oem_vid = Some(vid.0);
+                // Stash the OEM Volume ID the firmware unlocker returned for the
+                // AACS handshake phase (do_handshake reads it via `oem_vid()`).
+                // A drive-prep unlocker always carries a VID; guard anyway.
+                if let Some(vid) = unlocked.vid {
+                    self.oem_vid = Some(vid.0);
+                }
                 // The matched unlocker may also be able to raise the drive to
                 // its maximum read speed. Best-effort: a failure here must NOT
                 // fail the rip — a slow drive still rips. Log and continue.
