@@ -393,7 +393,7 @@ impl Drive {
     /// Initialize drive — unlock + firmware upload.
     /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
     ///
-    /// The LibreDrive/OEM firmware unlock is required for BD/UHD (AACS) reads,
+    /// The firmware/OEM unlock is required for BD/UHD (AACS) reads,
     /// but it puts the drive in an extended-access state where stock CSS
     /// authentication no longer works — so a CSS-protected DVD can't be read.
     /// For a DVD we therefore SKIP the unlock and run the drive in its normal
@@ -1245,7 +1245,7 @@ mod command_tests {
 
     /// `disc_is_dvd()` must match the DVD profile family (0x0010..=0x001F)
     /// and ONLY that family. A false positive on a BD/UHD profile (0x0040+)
-    /// would skip the LibreDrive firmware unlock that UHD reads require; a
+    /// would skip the firmware unlock that UHD reads require; a
     /// false negative on a DVD would re-introduce the CSS read failure. The
     /// Current Profile is bytes 6-7 of the GET CONFIGURATION header.
     /// Mutation: widening the range to `..=0x0040` makes the BD-ROM assert

@@ -31,7 +31,7 @@ impl ResolutionTrace {
 // ── Unlock phase ────────────────────────────────────────────────────────────
 
 /// One unlocker's contribution to the unlock phase. `who` is the unlocker's
-/// `name()` (a stable identifier, e.g. `"LibreDrive"`), carried verbatim.
+/// `name()` (a stable, product-neutral identifier), carried verbatim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnlockStep {
     pub who: String,

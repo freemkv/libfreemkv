@@ -17,6 +17,36 @@ pub(super) struct HandshakeResult {
     /// instead of a bare "unavailable" — the difference between a diagnosable log
     /// and archaeology.
     pub read_data_key_err: Option<u16>,
+    /// True when the VID came from a firmware unlocker (`freemkv-unlock-ld`
+    /// et al.) that unlocked the drive. Such a drive serves CLEAR
+    /// content, so AACS bus encryption is already removed AT THE DRIVE — the same
+    /// end state a successful cert handshake's `read_data_key` provides, just via
+    /// firmware instead of the AKE. The bus-key gate MUST credit this as a valid
+    /// bus-removal: bus encryption is unremovable only when NEITHER the firmware
+    /// unlocked the drive NOR the cert handshake yielded a bus key. Without this,
+    /// a SUCCESSFUL unlock (VID present, `read_data_key: None`) paradoxically trips
+    /// the gate and blocks ALL key resolution (incl. the online source).
+    pub drive_unlocked: bool,
+}
+
+/// Single source of truth for "is AACS bus encryption gone for this scan?". The
+/// gate asks ONLY this — `if !removed { error }` — never enumerating cases. Bus
+/// encryption is gone when ANY of these holds:
+///   - the disc never had it (`!bus_encryption`): nothing to remove;
+///   - file/ISO reads (`handshake == None`): content is already clear at read time;
+///   - a firmware unlocker unlocked the drive (`drive_unlocked`): it serves clear
+///     content;
+///   - the cert handshake produced the bus key (`read_data_key`).
+///
+/// Add a NEW removal mechanism HERE, never in the gate.
+fn bus_encryption_removed(bus_encryption: bool, handshake: Option<&HandshakeResult>) -> bool {
+    if !bus_encryption {
+        return true; // never had it → nothing to remove
+    }
+    match handshake {
+        None => true, // file/ISO: clear at read time
+        Some(h) => h.drive_unlocked || h.read_data_key.is_some(),
+    }
 }
 
 /// In-tree AACS host-certificate cert-auth "unlocker" — the Drive-level peer of
@@ -103,21 +133,22 @@ impl AacsCertUnlocker<'_> {
                             return Err(UnlockError::VidUnavailable);
                         }
                     };
-                    let (read_data_key, read_data_key_err) =
-                        match aacs::handshake::read_data_keys(session, &mut auth) {
-                            Ok((rdk, _)) => (Some(rdk), None),
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "freemkv::disc",
-                                    phase = "handshake_read_data_key_failed",
-                                    cert_index = idx,
-                                    error_code = e.code(),
-                                    "auth + VID read OK, but the drive served no read_data_key (bus key); \
-                                     a bus-encrypted disc stays undecryptable until it does"
-                                );
-                                (None, Some(e.code()))
-                            }
-                        };
+                    let (read_data_key, read_data_key_err) = match aacs::handshake::read_data_keys(
+                        session, &mut auth,
+                    ) {
+                        Ok((rdk, _)) => (Some(rdk), None),
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "freemkv::disc",
+                                phase = "handshake_read_data_key_failed",
+                                cert_index = idx,
+                                error_code = e.code(),
+                                "auth + VID read OK, but the drive served no read_data_key (bus key); \
+                                 a bus-encrypted disc stays undecryptable until it does"
+                            );
+                            (None, Some(e.code()))
+                        }
+                    };
                     tracing::debug!(
                         target: "freemkv::disc",
                         phase = "handshake_ok",
@@ -130,6 +161,9 @@ impl AacsCertUnlocker<'_> {
                         volume_id,
                         read_data_key,
                         read_data_key_err,
+                        // Host-cert AKE path: bus removal depends on read_data_key,
+                        // NOT a firmware unlock.
+                        drive_unlocked: false,
                     });
                 }
                 Err(e) => {
@@ -294,6 +328,10 @@ impl Disc {
                     // OEM/VID-only path never attempts the bus-key read — None here
                     // is "not attempted", not "failed".
                     read_data_key_err: None,
+                    // The firmware unlocker stashed this VID at init, which means it
+                    // matched and unlocked the drive — it now serves clear content,
+                    // so bus encryption is removed at the drive. Credit it.
+                    drive_unlocked: true,
                 }),
                 None,
             );
@@ -360,31 +398,39 @@ impl Disc {
             .map(|c| c.version.major())
             .unwrap_or(aacs::AACS_MAJOR_UHD);
 
-        // OEM bus-key gate (wrong-keys guard). A bus-encrypted disc (Content
-        // Certificate bus-encryption bit set) still carries bus encryption on
-        // its sectors; descrambling needs the `read_data_key` (bus key), which
-        // ONLY the AACS host-certificate cert-auth handshake produces. A
-        // VID-only OEM unlock path returns `read_data_key: None`, and a VID
-        // alone does NOT remove bus encryption — so if a handshake ran (live
-        // drive) and yielded a VID but no bus key on a bus-encrypted disc, the
-        // bytes would decrypt to garbage. Fail loudly here instead.
+        // Bus-encryption gate (wrong-keys guard). A bus-encrypted disc (Content
+        // Certificate bus-encryption bit set) carries bus encryption on its
+        // sectors, which MUST be removed before any AACS key can decrypt them.
+        // There are TWO ways it gets removed, and bus encryption is unremovable
+        // only when NEITHER succeeded:
+        //   1. A firmware unlocker unlocked the drive → it serves
+        //      CLEAR content (`drive_unlocked`). This is the common live-drive
+        //      case and yields no `read_data_key` — it doesn't need one.
+        //   2. The AACS host-certificate cert-auth handshake produced the bus key
+        //      (`read_data_key`).
+        // The old gate credited ONLY (2), so a SUCCESSFUL firmware unlock (VID
+        // present, `read_data_key: None`, `drive_unlocked: true`) tripped it and
+        // blocked ALL key resolution — including the online source — even though
+        // the drive was serving clear content. That was the bug.
         //
-        // Gated on `handshake.is_some()` so the two preserved cases never
-        // regress: (1) file-backed/ISO scans reach here with `handshake = None`
-        // and have already had bus encryption removed at read time; (2) AACS 1.0
-        // BD is not bus-encrypted, so `bus_encryption` is false and the gate is
-        // skipped (its `read_data_key` is legitimately absent).
-        if bus_encryption && handshake.is_some_and(|h| h.read_data_key.is_none()) {
-            let h = handshake.expect("is_some_and matched");
+        // Also skipped when `handshake = None` (file-backed/ISO scans — bus
+        // encryption already removed at read time) and when `bus_encryption` is
+        // false (AACS 1.0 BD is not bus-encrypted).
+        // ONE question — "is AACS bus encryption gone?" — asked of the single
+        // `bus_encryption_removed` predicate, which OWNS every case (never had it,
+        // file/ISO, firmware unlock, cert bus key). The gate enumerates nothing.
+        if !bus_encryption_removed(bus_encryption, handshake) {
+            let (rdk_err, has_vid) = handshake
+                .map(|h| (h.read_data_key_err, h.volume_id != [0u8; 16]))
+                .unwrap_or((None, false));
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "bus_key_unavailable",
-                read_data_key_err = ?h.read_data_key_err,
-                has_volume_id = h.volume_id != [0u8; 16],
-                "Disc declares bus encryption but the drive served no read_data_key (bus key). \
-                 read_data_key_err=None ⇒ the unlock path never attempted it (VID-only/OEM); \
-                 a code ⇒ the bus-key read FAILED. Either way bus encryption can't be removed — \
-                 refusing to emit a key that would decrypt to garbage."
+                read_data_key_err = ?rdk_err,
+                has_volume_id = has_vid,
+                "Disc declares bus encryption but it could not be removed: no firmware unlocker \
+                 unlocked the drive AND the cert handshake produced no read_data_key. Refusing to \
+                 emit a key that would decrypt to garbage."
             );
             return Err(Error::AacsBusKeyUnavailable);
         }
@@ -816,6 +862,7 @@ mod tests {
             volume_id: vid,
             read_data_key: Some(rdk),
             read_data_key_err: None,
+            drive_unlocked: false,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("state");
         assert_eq!(st.volume_id, vid);
@@ -861,6 +908,7 @@ mod tests {
             volume_id: [0x11u8; 16],
             read_data_key: None,
             read_data_key_err: None,
+            drive_unlocked: false,
         };
         let err = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs))
             .expect_err("bus-encrypted disc with no bus key must hard-error");
@@ -876,6 +924,7 @@ mod tests {
             volume_id: [0x11u8; 16],
             read_data_key: Some([0x22u8; 16]),
             read_data_key_err: None,
+            drive_unlocked: false,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("bus key present → ok");
         assert!(st.bus_encryption);
@@ -903,6 +952,7 @@ mod tests {
             volume_id: [0x11u8; 16],
             read_data_key: None,
             read_data_key_err: None,
+            drive_unlocked: false,
         };
         let st = Disc::resolve_vid_only(&udf, &mut disc, Some(&hs)).expect("AACS 1.0 → ok");
         assert!(!st.bus_encryption);
