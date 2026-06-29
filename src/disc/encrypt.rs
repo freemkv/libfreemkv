@@ -118,23 +118,29 @@ impl AacsCertUnlocker<'_> {
             if idx > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
             }
-            match aacs::handshake::aacs_authenticate(session, &hc.private_key, &hc.certificate) {
+            match aacs::handshake::aacs_authenticate(
+                session.scsi_mut(),
+                &hc.private_key,
+                &hc.certificate,
+            ) {
                 Ok(mut auth) => {
-                    let volume_id = match aacs::handshake::read_volume_id(session, &mut auth) {
-                        Ok(vid) => vid,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "handshake_vid_read_failed",
-                                cert_index = idx,
-                                error_code = e.code(),
-                                "auth ok but volume ID read failed"
-                            );
-                            return Err(UnlockError::VidUnavailable);
-                        }
-                    };
+                    let volume_id =
+                        match aacs::handshake::read_volume_id(session.scsi_mut(), &mut auth) {
+                            Ok(vid) => vid,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "freemkv::disc",
+                                    phase = "handshake_vid_read_failed",
+                                    cert_index = idx,
+                                    error_code = e.code(),
+                                    "auth ok but volume ID read failed"
+                                );
+                                return Err(UnlockError::VidUnavailable);
+                            }
+                        };
                     let (read_data_key, read_data_key_err) = match aacs::handshake::read_data_keys(
-                        session, &mut auth,
+                        session.scsi_mut(),
+                        &mut auth,
                     ) {
                         Ok((rdk, _)) => (Some(rdk), None),
                         Err(e) => {
