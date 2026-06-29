@@ -163,6 +163,53 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8]) -> bool {
     aacs_unit_encrypted(unit) && ts_sync_destroyed(unit)
 }
 
+/// PADDING-AWARE "is this aligned unit STILL genuine ciphertext?" — the conceal-
+/// path twin of [`decrypt_unit`]'s acceptance criterion, run on the POST-decrypt
+/// bytes.
+///
+/// [`aacs_unit_needs_decrypt`] cannot answer this: it composes CPI with the
+/// MAJORITY-VOTE [`ts_sync_destroyed`] (`ts_sync_count <= total/2`). A
+/// successfully padding-aware-decrypted content-fragment TAIL unit (e.g. 11 of 32
+/// packets are real content, the other 21 source-zero padding) carries only 11 TS
+/// syncs after decrypt, so the majority vote calls it "destroyed" and
+/// `aacs_unit_needs_decrypt` returns true — even though the unit decrypted
+/// PERFECTLY. Concealing on that predicate overwrites the good decrypted tail with
+/// NULL-TS, silently discarding correct video (the bug this fixes; the v1.1.1
+/// fragment-tail fix in [`decrypt_unit`] must not be undone by the conceal loop).
+///
+/// The correct, padding-aware notion of "still ciphertext", checkable on the
+/// post-decrypt bytes, uses the SAME discriminator [`decrypt_unit`] uses:
+///   * A genuinely-FAILED unit was restored to on-disc ciphertext by
+///     `decrypt_unit_try_keys`/`decrypt_buf` → its packets are scrambled: a
+///     non-padding (non-zero payload) packet LACKS the `0x47` sync at offset 4.
+///   * A SUCCESSFULLY-decrypted unit (full OR padding-tail) → every non-zero
+///     (content) packet carries `0x47`; padding packets are all-zero.
+///
+/// So this is true iff `aacs_unit_encrypted` AND at least one 192-byte packet
+/// whose 188-byte payload (`[off+4..off+192]`) is NOT all-zero is missing its
+/// `0x47` sync at `off+4`. A full content unit (no zero-payload packets) reduces
+/// to the strict all-32 check, so the common cases are unchanged: a fully-clear /
+/// fully-decrypted unit is never flagged; a fully-ciphertext unit always is.
+pub fn aacs_unit_still_ciphertext(unit: &[u8]) -> bool {
+    if !aacs_unit_encrypted(unit) {
+        return false;
+    }
+    const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
+    let limit = ALIGNED_UNIT_LEN.min(unit.len());
+    let mut off = 0;
+    while off + PKT <= limit {
+        // A packet whose 188-byte payload is all-zero is padding (source zeros) —
+        // excluded from the verdict, exactly as `decrypt_unit` excludes it. Any
+        // other (content) packet that lacks its TS sync is un-restored ciphertext.
+        let payload = &unit[off + 4..off + PKT];
+        if !payload.iter().all(|&b| b == 0) && unit[off + 4] != TS_SYNC {
+            return true;
+        }
+        off += PKT;
+    }
+    false
+}
+
 /// Overwrite an aligned unit (6144 bytes) IN PLACE with valid NULL MPEG-TS
 /// source packets — the [A2] mux loss-concealment fill for a content unit that
 /// genuinely would not decrypt.
