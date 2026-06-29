@@ -328,6 +328,9 @@ impl CodecParser for Vc1Parser {
             source: pes.source,
             pts_ns: ts_ns,
             keyframe,
+            // One frame per PES (BD-TS aligns frames to PES), so the gap signal
+            // maps straight onto this frame.
+            discontinuity: pes.discontinuity,
             data: frame_data,
             duration_ns: None,
         }]

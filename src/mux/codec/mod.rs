@@ -44,6 +44,16 @@ pub struct Frame {
     pub pts_ns: i64,
     /// Whether this is a keyframe (used for cue points).
     pub keyframe: bool,
+    /// This frame is the FIRST coded picture after a concealed/lost gap (P3/B1):
+    /// its data begins after packets the demuxer never received (an undecryptable
+    /// unit concealed as NULL-TS upstream, or a continuity break in a damaged
+    /// source). Inter-coded video frames carrying this flag reference data that is
+    /// gone, so the consumer's `ResyncGate` arms here and drops forward to the next
+    /// keyframe. Carried per-FRAME (not per-PES) because buffering parsers — MPEG-2
+    /// emits whole GOPs, H.264/HEVC lag one access unit — decouple the frame from
+    /// the PES that carried the gap signal. Default `false`; only ever set on the
+    /// degraded/conceal path, so a clean rip leaves every frame `false`.
+    pub discontinuity: bool,
     /// Frame data (elementary stream bytes).
     pub data: Vec<u8>,
     /// Optional duration in nanoseconds — only set by parsers that
@@ -123,11 +133,15 @@ impl PassthroughParser {
 impl CodecParser for PassthroughParser {
     fn parse(&mut self, pes: &PesPacket) -> Vec<Frame> {
         let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        // Passthrough emits exactly one frame per PES with no cross-PES buffering,
+        // so the PES's discontinuity maps directly onto this frame. (Buffering
+        // parsers must instead defer the flag to the next emitted frame.)
         vec![Frame {
             coding: None,
             source: None,
             pts_ns,
             keyframe: self.keyframe,
+            discontinuity: pes.discontinuity,
             data: pes.data.clone(),
             duration_ns: None,
         }]

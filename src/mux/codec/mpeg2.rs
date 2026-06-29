@@ -129,6 +129,15 @@ pub struct Mpeg2Parser {
     /// each GOP's first PES PTS so video stays in sync with the PES-timestamped
     /// audio. None until the first PES timestamp is seen.
     origin_pts_ns: Option<i64>,
+    /// B1: absolute ES offsets at which a concealed/lost-gap PES began, parallel
+    /// to `pts_marks`/`source_marks` and drained by the SAME mark-drain invariant.
+    /// MPEG-2 emits whole GOPs asynchronously, so a per-PES flag can't ride
+    /// through to the right frame (the PES that carries the gap completes the
+    /// PREVIOUS picture); associating by OFFSET instead stamps `discontinuity` on
+    /// the access unit whose own bytes begin after the gap — the first post-gap
+    /// picture — surviving GOP buffering + temporal reorder. The consumer's
+    /// ResyncGate then arms at that exact picture, mid-GOP if need be.
+    disc_marks: VecDeque<u64>,
 }
 
 /// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
@@ -165,6 +174,7 @@ impl Mpeg2Parser {
             gop_buf: Vec::new(),
             emitted_fields: 0,
             origin_pts_ns: None,
+            disc_marks: VecDeque::new(),
         }
     }
 
@@ -219,6 +229,13 @@ impl Mpeg2Parser {
                     while let Some(&(off, _)) = self.source_marks.front() {
                         if off < cutoff {
                             self.source_marks.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    while let Some(&off) = self.disc_marks.front() {
+                        if off < cutoff {
+                            self.disc_marks.pop_front();
                         } else {
                             break;
                         }
@@ -316,6 +333,11 @@ impl Mpeg2Parser {
             if gop_boundary && !self.gop_buf.is_empty() {
                 self.flush_gop(&mut out);
             }
+            // A concealed-gap mark inside this AU's range [start, end_abs) means
+            // this picture's own bytes begin after the gap — the first post-gap
+            // AU. Same front-mark invariant as PTS/source. Carries through GOP
+            // buffering/reorder to the ResyncGate (which arms at this picture).
+            let discontinuity = self.disc_marks.front().is_some_and(|&off| off < end_abs);
             self.gop_buf.push(BufferedPicture {
                 tr,
                 info,
@@ -323,6 +345,7 @@ impl Mpeg2Parser {
                 frame: Frame {
                     pts_ns: 0,
                     keyframe,
+                    discontinuity,
                     data,
                     duration_ns: None,
                     coding: Some(info),
@@ -348,6 +371,13 @@ impl Mpeg2Parser {
             while let Some(&(off, _)) = self.source_marks.front() {
                 if off < end_abs {
                     self.source_marks.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some(&off) = self.disc_marks.front() {
+                if off < end_abs {
+                    self.disc_marks.pop_front();
                 } else {
                     break;
                 }
@@ -428,6 +458,12 @@ impl CodecParser for Mpeg2Parser {
         }
         if let Some(src) = pes.source {
             self.source_marks.push_back((off, src));
+        }
+        // A concealed/lost gap on this PES marks the access unit its bytes begin —
+        // associated by offset (like PTS/source) so it lands on the first post-gap
+        // picture, not the previous one that completes when this PES arrives.
+        if pes.discontinuity {
+            self.disc_marks.push_back(off);
         }
         self.buf.extend_from_slice(&pes.data);
         self.drain_complete_aus(false)
@@ -995,6 +1031,48 @@ mod tests {
         assert!(frames[0].keyframe);
         assert_eq!(frames[1].data, pic2);
         assert!(!frames[1].keyframe);
+    }
+
+    /// B1 hole-2 regression: MPEG-2 buffers a GOP and emits asynchronously, so a
+    /// concealed gap must be associated by OFFSET (like PTS), landing on the
+    /// picture whose own bytes begin after the gap — NOT the previous picture
+    /// that completes when the discontinuity PES arrives. pic1 (I) is pre-gap;
+    /// pic2 (P), carried by a `discontinuity` PES, is the first post-gap AU.
+    #[test]
+    fn discontinuity_offset_mark_stamps_post_gap_picture_not_previous() {
+        let mut parser = Mpeg2Parser::new();
+        let mut pic1 = make_picture_header(PICTURE_TYPE_I);
+        pic1.extend_from_slice(&[0x11; 100]);
+        let mut pic2 = make_picture_header(2); // P
+        pic2.extend_from_slice(&[0x22; 100]);
+
+        // pic1 on a clean PES; nothing emits (same GOP, buffered).
+        assert!(parser.parse(&make_pes(pic1.clone(), Some(0))).is_empty());
+        // pic2 on a PES flagged discontinuity (a concealed gap preceded it).
+        // parse() of this PES completes pic1's AU (the PREVIOUS picture) — which
+        // must stay clean — while pic2 keeps buffering.
+        let pes2 = PesPacket {
+            source: None,
+            pid: 0x1011,
+            pts: Some(90000),
+            dts: None,
+            data: pic2.clone(),
+            discontinuity: true,
+        };
+        assert!(parser.parse(&pes2).is_empty(), "same GOP — still buffered");
+
+        let frames = parser.flush();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, pic1);
+        assert!(
+            !frames[0].discontinuity,
+            "the previous (pre-gap) I picture must NOT be flagged"
+        );
+        assert_eq!(frames[1].data, pic2);
+        assert!(
+            frames[1].discontinuity,
+            "the post-gap P picture (the discontinuity PES's own AU) IS flagged"
+        );
     }
 
     #[test]

@@ -243,6 +243,7 @@ impl CodecParser for DtsParser {
             // extensions or the next core.
             let au_pts = self.front_pts();
             frames.push(Frame {
+                discontinuity: false,
                 coding: None,
                 source: None,
                 pts_ns: au_pts,
@@ -299,6 +300,7 @@ impl CodecParser for DtsParser {
         let au = std::mem::take(&mut self.buf);
         self.pts_marks.clear();
         vec![Frame {
+            discontinuity: false,
             coding: None,
             source: None,
             pts_ns,
