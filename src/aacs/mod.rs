@@ -45,8 +45,8 @@ pub use trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, Un
 pub use decrypt::{
     ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, UnitKeyResult, aacs_unit_encrypted,
     aacs_unit_needs_decrypt, decrypt_bus, decrypt_unit, decrypt_unit_checked, decrypt_unit_full,
-    decrypt_unit_try_keys, is_unit_aligned, ts_packet_total, ts_sync_count, ts_sync_destroyed,
-    unit_is_clean_ps, unit_is_clean_ts, unit_key_validates,
+    decrypt_unit_try_keys, fill_null_ts_unit, is_unit_aligned, ts_packet_total, ts_sync_count,
+    ts_sync_destroyed, unit_is_clean_ps, unit_is_clean_ts, unit_key_validates,
 };
 // `probe` is a reproduction-harness helper (see keys.rs), not part of the
 // documented 1.0 surface; keep it reachable but off the rendered docs so we

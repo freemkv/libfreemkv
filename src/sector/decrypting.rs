@@ -143,6 +143,20 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// Reused scratch buffer for verify-only decrypt checks — avoids a per-read
     /// allocation on the sweep's hot path. Grown on demand, never shrunk.
     scratch: Vec<u8>,
+    /// MUX loss-concealment switch (P3 / Edit-2). When `true`, a content unit
+    /// that genuinely won't decrypt is NOT a read failure: it is overwritten with
+    /// valid NULL TS packets ([`crate::aacs::fill_null_ts_unit`]), tallied into
+    /// [`decrypt_dropped`](Self::decrypt_dropped), logged loud with its LBA, and
+    /// the read returns `Ok` so the mux KEEPS GOING (it can never abort over an
+    /// undecryptable unit). This is the spec's "decrypt-verify is a RIP gate, not
+    /// a MUX gate": the rip path leaves this `false` (default) and fails loud via
+    /// [`DECRYPT_VERIFY_READ`] so its read-error recovery re-reads the disc; only
+    /// the mux read path opts in. Ciphertext is NEVER passed downstream either
+    /// way — fail-loud re-reads it, conceal replaces it with null packets.
+    ///
+    /// Mutually meaningful only with `!verify_only` (the in-place decrypt path
+    /// the mux uses); a verify-only sweep keeps the rip's fail-loud contract.
+    tolerate_decrypt_loss: bool,
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -164,7 +178,18 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             verify_only: false,
             content_ranges: None,
             scratch: Vec::new(),
+            tolerate_decrypt_loss: false,
         }
+    }
+
+    /// Opt into MUX loss-concealment: an undecryptable content unit is concealed
+    /// (filled with NULL TS packets), tallied, logged loud, and the read still
+    /// succeeds — the mux never aborts over it. See
+    /// [`tolerate_decrypt_loss`](Self::tolerate_decrypt_loss). The rip path must
+    /// NOT set this (it relies on fail-loud read-error recovery).
+    pub fn tolerate_decrypt_loss(mut self) -> Self {
+        self.tolerate_decrypt_loss = true;
+        self
     }
 
     /// Restrict decrypt/verify to the disc's encrypted-content extents
@@ -533,6 +558,46 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         if dropped > 0 {
             self.decrypt_dropped
                 .fetch_add(dropped as u64, Ordering::Relaxed);
+            // MUX CONCEALMENT (P3 / Edit-2): on the mux read path an undecryptable
+            // content unit is NOT a read failure — never abort the mux over it.
+            // Overwrite each still-scrambled in-content unit with valid NULL TS
+            // packets (A2: keeps the demuxer byte-synced; the lost video/audio PID
+            // packets surface as a CC gap the TS assembler already drops a partial
+            // PES on), tally it (done above), log it LOUD with the LBA, and return
+            // Ok so the stream keeps flowing. Verify-only (sweep) is excluded — the
+            // rip stays fail-loud. Ciphertext is never passed downstream: it is
+            // replaced by null packets, not emitted.
+            if self.tolerate_decrypt_loss && !self.verify_only {
+                let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
+                let mut concealed = 0usize;
+                let mut first_lba = lba;
+                for (i, chunk) in buf[..n].chunks_mut(unit_len).enumerate() {
+                    if chunk.len() < unit_len {
+                        continue; // trailing partial can't be a whole scrambled unit
+                    }
+                    // A unit still flagged-encrypted + scrambled after the decrypt
+                    // pass is the genuinely-undecryptable content. In-content gating
+                    // already happened in `decrypt_buf`, which restored only those
+                    // units to ciphertext; clear nav passed through clean.
+                    if crate::aacs::aacs_unit_needs_decrypt(chunk) {
+                        if concealed == 0 {
+                            first_lba = lba + (i as u32) * crate::aacs::ALIGNED_UNIT_SECTORS;
+                        }
+                        crate::aacs::fill_null_ts_unit(chunk);
+                        concealed += 1;
+                    }
+                }
+                if concealed > 0 {
+                    tracing::warn!(
+                        target: "freemkv::decrypt",
+                        lba = first_lba,
+                        units = concealed,
+                        bytes = dropped,
+                        "mux: undecryptable content concealed as NULL TS (loss tallied)"
+                    );
+                }
+                return Ok(n);
+            }
             // DECRYPT_VERIFY_READ: a unit that SHOULD have decrypted but didn't
             // means this read did NOT truly succeed — it returned ciphertext the
             // TS assembler would silently drop. Fail the read loud so the caller's
@@ -1264,6 +1329,113 @@ mod tests {
             0,
             "a decryptable unit must not register any loss"
         );
+    }
+
+    /// MUX CONCEALMENT (P3): with `tolerate_decrypt_loss()` an undecryptable AACS
+    /// content unit must NOT fail the read. Instead the decorator (a) tallies the
+    /// loss, (b) overwrites the unit with valid NULL TS packets (PID 0x1FFF, sync
+    /// 0x47 at the BD-TS stride), and (c) returns `Ok` so the mux keeps going.
+    /// This is the inverse of the fail-loud rip path proven directly above.
+    #[test]
+    fn tolerate_decrypt_loss_conceals_undecryptable_unit_as_null_ts() {
+        let real_key = [0x33u8; 16];
+        let wrong_key = [0x44u8; 16];
+
+        // One unit encrypted under real_key, plus one trailing CLEAR (TS-sync)
+        // unit so we can confirm conceal touches ONLY the undecryptable unit.
+        let enc = encrypt_aacs_unit(&real_key);
+        let mut clear = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut o = 4;
+        while o < clear.len() {
+            clear[o] = 0x47;
+            o += 192;
+        }
+        let mut two_units = enc;
+        two_units.extend_from_slice(&clear);
+
+        struct TwoUnitSource {
+            data: Vec<u8>,
+        }
+        impl SectorSource for TwoUnitSource {
+            fn capacity_sectors(&self) -> u32 {
+                (self.data.len() / 2048) as u32
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                buf[..bytes].copy_from_slice(&self.data[..bytes]);
+                Ok(bytes)
+            }
+        }
+
+        let mut wrapped = DecryptingSectorSource::new(
+            TwoUnitSource { data: two_units },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, wrong_key)], // can't open the encrypted unit
+                read_data_key: None,
+            },
+        )
+        .tolerate_decrypt_loss();
+        let loss = wrapped.decrypt_loss();
+
+        let mut buf = vec![0u8; 6 * 2048];
+        // Must SUCCEED (no DecryptFailed) — the mux never aborts on bad decrypt.
+        let n = wrapped
+            .read_sectors(0, 6, &mut buf, false)
+            .expect("tolerate_decrypt_loss must conceal, not error");
+        assert_eq!(n, 6 * 2048);
+
+        // The undecryptable unit is tallied as loss.
+        assert_eq!(
+            loss.load(Ordering::Relaxed),
+            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            "the concealed unit is still counted as loss"
+        );
+
+        // Unit 0 is now valid NULL TS packets — sync 0x47 at every 192-byte
+        // stride (offset 4), PID 0x1FFF — and carries no ciphertext.
+        let unit0 = &buf[..crate::aacs::ALIGNED_UNIT_LEN];
+        let mut off = 0;
+        while off + 192 <= unit0.len() {
+            assert_eq!(unit0[off + 4], 0x47, "null packet sync at {off}");
+            assert_eq!(unit0[off + 5] & 0x1F, 0x1F, "PID high bits 0x1FFF");
+            assert_eq!(unit0[off + 6], 0xFF, "PID low byte 0xFF");
+            off += 192;
+        }
+        assert!(
+            !crate::aacs::ts_sync_destroyed(unit0),
+            "concealed unit reads as well-formed TS, not scrambled"
+        );
+
+        // Unit 1 (clear) passed through untouched.
+        let unit1 = &buf[crate::aacs::ALIGNED_UNIT_LEN..2 * crate::aacs::ALIGNED_UNIT_LEN];
+        assert_eq!(unit1, &clear[..], "the clear unit is left exactly as read");
+    }
+
+    /// `fill_null_ts_unit` round-trip: every BD source packet in the unit becomes
+    /// a well-formed TS null packet, and a TS demuxer tracking a real PID sees
+    /// none of them (PID 0x1FFF matches nothing) — the basis for A2 concealment.
+    #[test]
+    fn null_ts_fill_is_well_formed_and_invisible_to_real_pids() {
+        let mut unit = vec![0xAAu8; crate::aacs::ALIGNED_UNIT_LEN];
+        crate::aacs::fill_null_ts_unit(&mut unit);
+        // 32 packets, each sync 0x47, PID 0x1FFF, payload-only CC 0.
+        let mut off = 0;
+        let mut pkts = 0;
+        while off + 192 <= unit.len() {
+            assert_eq!(unit[off + 4], 0x47);
+            let pid = ((unit[off + 5] as u16 & 0x1F) << 8) | unit[off + 6] as u16;
+            assert_eq!(pid, 0x1FFF, "null PID");
+            assert_eq!(unit[off + 7] & 0x30, 0x10, "payload-only");
+            off += 192;
+            pkts += 1;
+        }
+        assert_eq!(pkts, 32, "32 source packets per aligned unit");
     }
 
     /// Fresh-key-on-failure: a unit encrypted under a key NOT in the initial set
