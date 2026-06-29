@@ -283,7 +283,7 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     // non-zero (real ciphertext that won't decrypt) → still rejected.
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     let npkt = ALIGNED_UNIT_LEN / PKT;
-    let mut pad = [false; ALIGNED_UNIT_LEN / 192];
+    let mut pad = [false; ALIGNED_UNIT_LEN / PKT];
     for (p, slot) in pad.iter_mut().enumerate().take(npkt) {
         let off = p * PKT;
         *slot = unit[off..off + PKT].iter().all(|&b| b == 0);

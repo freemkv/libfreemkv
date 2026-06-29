@@ -88,29 +88,44 @@ pub struct MkbRecord {
 /// INCLUDING the 4-byte header, followed by payload. The walker stops
 /// at the first `(type=0, len=0)` end marker or at end of buffer.
 pub fn walk_mkb(mkb: &[u8]) -> Vec<MkbRecord> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos + 4 <= mkb.len() {
+    mkb_records(mkb)
+        .map(|(offset, rec_type, rec_len)| MkbRecord {
+            offset,
+            rec_type,
+            rec_len,
+            body: mkb[offset + 4..offset + rec_len].to_vec(),
+        })
+        .collect()
+}
+
+/// THE single MKB record-framing walker: yields `(offset, rec_type, rec_len)`
+/// for each record — a 4-byte header (type byte + big-endian 24-bit length)
+/// then the body — stopping at the `00 000000` end marker or a
+/// malformed/out-of-bounds length. Lazy (no body clone), so a find-one-record
+/// caller never materialises the multi-MB cvalue table. [`walk_mkb`] and every
+/// MKB record walk in `aacs::keys` are built on this, so the framing rules — and
+/// any future fix to them — live in exactly one place (they had drifted across
+/// six hand-rolled copies).
+pub(crate) fn mkb_records(mkb: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if pos + 4 > mkb.len() {
+            return None;
+        }
         let rec_type = mkb[pos];
         let rec_len = ((mkb[pos + 1] as usize) << 16)
             | ((mkb[pos + 2] as usize) << 8)
             | (mkb[pos + 3] as usize);
         if rec_type == 0 && rec_len == 0 {
-            break;
+            return None;
         }
         if rec_len < 4 || pos + rec_len > mkb.len() {
-            break;
+            return None;
         }
-        let body = mkb[pos + 4..pos + rec_len].to_vec();
-        out.push(MkbRecord {
-            offset: pos,
-            rec_type,
-            rec_len,
-            body,
-        });
+        let here = pos;
         pos += rec_len;
-    }
-    out
+        Some((here, rec_type, rec_len))
+    })
 }
 
 /// True iff `records` contains at least one Media Key Variant record
@@ -771,6 +786,23 @@ mod tests {
         assert_eq!(recs[1].offset, 6);
         assert_eq!(recs[1].rec_len, 8);
         assert_eq!(recs[1].body, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn mkb_records_matches_walk_mkb_framing() {
+        // The lazy `mkb_records` iterator and the owning `walk_mkb` must agree on
+        // (offset, type, len) for every record — they share the one framing
+        // walker, and every keys.rs MKB walk now relies on this equivalence.
+        let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB];
+        mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 1, 2, 3, 4]);
+        mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0xFF]); // terminator + trailing
+        let owned: Vec<(usize, u8, usize)> = walk_mkb(&mkb)
+            .iter()
+            .map(|r| (r.offset, r.rec_type, r.rec_len))
+            .collect();
+        let lazy: Vec<(usize, u8, usize)> = mkb_records(&mkb).collect();
+        assert_eq!(lazy, owned);
+        assert_eq!(lazy, vec![(0, 0x10, 6), (6, 0x05, 8)]);
     }
 
     #[test]

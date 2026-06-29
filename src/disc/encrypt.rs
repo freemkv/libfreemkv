@@ -327,10 +327,14 @@ impl Disc {
             .as_deref()
             .and_then(aacs::parse_content_cert);
         let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
+        // No-cert default = UHD (V20 stride), matching `read_aacs_version` so the
+        // scanned `AacsState.version` and the out-of-band fetch agree. A wrong
+        // stride on the main resolve path fails loudly (sample validation) rather
+        // than silently, so the conservative V20 default is safe here too.
         let version = cc
             .as_ref()
             .map(|c| c.version.major())
-            .unwrap_or(aacs::AACS_MAJOR_BD);
+            .unwrap_or(aacs::AACS_MAJOR_UHD);
 
         // OEM bus-key gate (wrong-keys guard). A bus-encrypted disc (Content
         // Certificate bus-encryption bit set) still carries bus encryption on

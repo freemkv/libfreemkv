@@ -1614,17 +1614,32 @@ impl Disc {
     /// [`crate::aacs::AACS_MAJOR_UHD`]) from the content certificate. Drives the
     /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21), so the
     /// out-of-band key-fetch path parses `enc_title_keys` at the right stride (a
-    /// server VUK then derives the correct unit keys). Defaults to BD (V10) when
-    /// no content certificate is present.
+    /// server VUK then derives the correct unit keys).
+    ///
+    /// When no content certificate is readable/parseable, defaults to **UHD
+    /// (V20, 64-byte stride)** — the conservative choice the pre-1.2.0 fetch path
+    /// hardcoded — and logs it: a wrong stride here folds a server VUK against
+    /// mis-strided title keys (silent wrong unit keys), so a missing cert must
+    /// not quietly pick the V10 stride for a UHD disc.
     fn read_aacs_version(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> u8 {
-        udf_fs
+        match udf_fs
             .read_file(reader, crate::aacs::PATH_CONTENT_CERT)
             .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
             .ok()
             .as_deref()
             .and_then(crate::aacs::parse_content_cert)
-            .map(|c| c.version.major())
-            .unwrap_or(crate::aacs::AACS_MAJOR_BD)
+        {
+            Some(c) => c.version.major(),
+            None => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "scan_aacs_version",
+                    "no readable AACS content certificate; defaulting to the V20/UHD \
+                     Unit_Key_RO stride (a VUK-from-server path would otherwise mis-stride)"
+                );
+                crate::aacs::AACS_MAJOR_UHD
+            }
+        }
     }
 
     /// Read the AACS MKB's real record stream — NOT its zero padding.
