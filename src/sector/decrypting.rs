@@ -575,11 +575,19 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                     if chunk.len() < unit_len {
                         continue; // trailing partial can't be a whole scrambled unit
                     }
-                    // A unit still flagged-encrypted + scrambled after the decrypt
-                    // pass is the genuinely-undecryptable content. In-content gating
-                    // already happened in `decrypt_buf`, which restored only those
-                    // units to ciphertext; clear nav passed through clean.
-                    if crate::aacs::aacs_unit_needs_decrypt(chunk) {
+                    // Conceal ONLY a unit that is GENUINELY still ciphertext, using
+                    // the PADDING-AWARE test that matches `decrypt_unit`'s success
+                    // criterion — NOT the majority-vote `aacs_unit_needs_decrypt`.
+                    // A successfully padding-aware-decrypted content-fragment TAIL
+                    // (the v1.1.1 fix: a few real packets + source-zero padding) has
+                    // <16 TS syncs, so the majority vote would mis-flag it as
+                    // "needs decrypt" and overwrite GOOD video with NULL-TS. The
+                    // padding-aware predicate excludes zero-payload (padding) packets
+                    // and flags the unit only when a real content packet is still
+                    // un-restored ciphertext. In-content gating already happened in
+                    // `decrypt_buf`, which restored only failed units to ciphertext;
+                    // clear nav and decrypted tails pass through clean.
+                    if crate::aacs::aacs_unit_still_ciphertext(chunk) {
                         if concealed == 0 {
                             first_lba = lba + (i as u32) * crate::aacs::ALIGNED_UNIT_SECTORS;
                         }
@@ -1415,6 +1423,122 @@ mod tests {
         // Unit 1 (clear) passed through untouched.
         let unit1 = &buf[crate::aacs::ALIGNED_UNIT_LEN..2 * crate::aacs::ALIGNED_UNIT_LEN];
         assert_eq!(unit1, &clear[..], "the clear unit is left exactly as read");
+    }
+
+    /// REGRESSION (silent-data-loss): the conceal loop must NOT overwrite a
+    /// SUCCESSFULLY-decrypted content-fragment TAIL unit. Such a tail (a few real
+    /// content packets + source-zero padding — the v1.1.1 shape) carries <16 TS
+    /// syncs after decrypt, so the old majority-vote `aacs_unit_needs_decrypt`
+    /// predicate mis-flagged it as "still needs decrypt" and, when it shared a read
+    /// buffer with a genuinely-undecryptable unit (`dropped > 0`), NULL-TS-filled
+    /// the GOOD decrypted video. The padding-aware `aacs_unit_still_ciphertext`
+    /// predicate must conceal ONLY the genuinely-undecryptable unit and leave the
+    /// good tail byte-for-byte intact.
+    #[test]
+    fn conceal_leaves_decrypted_padding_tail_unit_intact() {
+        let bad_key = [0x77u8; 16]; // encrypts the undecryptable unit (NOT provided)
+        let good_key = [0x33u8; 16]; // encrypts the padding-tail unit (provided)
+
+        // Unit A: a full content unit encrypted under `bad_key` — with only
+        // `good_key` in the pool it cannot be decrypted → restored to ciphertext.
+        let bad_unit = encrypt_aacs_unit(&bad_key);
+
+        // Unit B: a SHORT-PADDING-TAIL unit — encrypt a full clear unit under
+        // `good_key`, then zero the trailing source packets (from packet 11 on) so
+        // they decrypt back to clean zero padding. Only 11 of 32 packets are real
+        // content → 11 TS syncs after decrypt (well under the majority-vote 16).
+        const KEEP: usize = 11;
+        let mut good_tail = encrypt_aacs_unit(&good_key);
+        for b in good_tail[KEEP * 192..].iter_mut() {
+            *b = 0;
+        }
+
+        // The byte-exact expected post-decrypt form of unit B (independent decrypt).
+        let mut expected_tail = good_tail.clone();
+        assert!(
+            crate::aacs::decrypt_unit(&mut expected_tail, &good_key),
+            "padding-tail must decrypt under good_key"
+        );
+
+        let mut two_units = bad_unit;
+        two_units.extend_from_slice(&good_tail);
+
+        struct TwoUnitSource {
+            data: Vec<u8>,
+        }
+        impl SectorSource for TwoUnitSource {
+            fn capacity_sectors(&self) -> u32 {
+                (self.data.len() / 2048) as u32
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                buf[..bytes].copy_from_slice(&self.data[..bytes]);
+                Ok(bytes)
+            }
+        }
+
+        let mut wrapped = DecryptingSectorSource::new(
+            TwoUnitSource { data: two_units },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, good_key)], // opens unit B, NOT unit A
+                read_data_key: None,
+            },
+        )
+        .tolerate_decrypt_loss();
+        let loss = wrapped.decrypt_loss();
+
+        let mut buf = vec![0u8; 6 * 2048];
+        let n = wrapped
+            .read_sectors(0, 6, &mut buf, false)
+            .expect("tolerate_decrypt_loss must conceal, not error");
+        assert_eq!(n, 6 * 2048);
+
+        // ONLY the genuinely-undecryptable unit A is tallied / concealed.
+        assert_eq!(
+            loss.load(Ordering::Relaxed),
+            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            "exactly one unit (the undecryptable one) is counted as loss"
+        );
+
+        // Unit A → NULL TS (concealed).
+        let unit0 = &buf[..crate::aacs::ALIGNED_UNIT_LEN];
+        let mut off = 0;
+        while off + 192 <= unit0.len() {
+            assert_eq!(unit0[off + 4], 0x47, "unit A null packet sync at {off}");
+            assert_eq!(
+                unit0[off + 6],
+                0xFF,
+                "unit A null packet PID low 0xFF at {off}"
+            );
+            off += 192;
+        }
+
+        // Unit B → the GOOD decrypted padding tail, byte-for-byte intact (NOT
+        // overwritten with NULL TS). This is the silent-data-loss the old
+        // majority-vote predicate caused.
+        let unit1 = &buf[crate::aacs::ALIGNED_UNIT_LEN..2 * crate::aacs::ALIGNED_UNIT_LEN];
+        assert_eq!(
+            unit1,
+            &expected_tail[..],
+            "the decrypted padding-tail unit must be left byte-for-byte intact"
+        );
+        // Sanity: its real content packets carry their TS sync; its padding is zero.
+        for p in 0..KEEP {
+            assert_eq!(unit1[p * 192 + 4], 0x47, "content pkt {p} sync preserved");
+        }
+        for p in KEEP..32 {
+            let o = p * 192;
+            assert!(
+                unit1[o..o + 192].iter().all(|&b| b == 0),
+                "padding pkt {p} stayed zero (not NULL-TS-filled)"
+            );
+        }
     }
 
     /// `fill_null_ts_unit` round-trip: every BD source packet in the unit becomes
