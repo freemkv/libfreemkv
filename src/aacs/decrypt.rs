@@ -258,7 +258,62 @@ pub fn unit_is_clean_ps(unit: &[u8]) -> bool {
 /// Decryption restores the TS sync bytes, so the unit reads as clear afterward;
 /// there is no flag to clear.
 pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
-    decrypt_unit_checked(unit, unit_key, unit_is_clean_ts)
+    if unit.len() < ALIGNED_UNIT_LEN {
+        return false;
+    }
+    if !aacs_unit_encrypted(unit) {
+        return true; // CPI flag clear → plaintext, pass through untouched
+    }
+
+    // PADDING-AWARE acceptance. The question this answers is "did we read good,
+    // decryptable data?" — NOT "are all 32 packets present". A content fragment
+    // can END mid-unit, with the disc zero-padding the rest of the aligned unit
+    // to the next fragment. Such a tail unit is `[real encrypted packets][source
+    // zeros]`: the real packets decrypt perfectly, but the strict all-32
+    // `unit_is_clean_ts` would reject the whole unit over the padding tail and
+    // discard real video. AES ciphertext is high-entropy, so a SOURCE-zero packet
+    // (all 192 bytes zero before decrypt) can only be padding, never content.
+    //
+    // So: a packet whose SOURCE bytes are all zero is padding — excluded from the
+    // verify and emitted as clean zeros. Every other (content) packet must
+    // restore its TS sync. A full content unit has no zero-source packets, so this
+    // is byte-identical to the old all-32 check (no regression, no wrong-key
+    // hole). The discriminator between a legitimate short tail and a genuine
+    // misread is exactly this: a misread leaves the failing packets' SOURCE
+    // non-zero (real ciphertext that won't decrypt) → still rejected.
+    const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
+    let npkt = ALIGNED_UNIT_LEN / PKT;
+    let mut pad = [false; ALIGNED_UNIT_LEN / 192];
+    for (p, slot) in pad.iter_mut().enumerate().take(npkt) {
+        let off = p * PKT;
+        *slot = unit[off..off + PKT].iter().all(|&b| b == 0);
+    }
+
+    // Save original first 16 bytes (the plaintext seed / header) and derive the
+    // per-unit decrypt key (identical to `decrypt_unit_checked`).
+    let mut header = [0u8; 16];
+    header.copy_from_slice(&unit[..16]);
+    let derived = aes_ecb_encrypt(unit_key, &header);
+    let mut decrypt_key = [0u8; 16];
+    for i in 0..16 {
+        decrypt_key[i] = derived[i] ^ header[i];
+    }
+    aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
+
+    // Verify content packets; zero out padding packets (their decrypted bytes are
+    // garbage from AES-decrypting zeros, but the source was zero so a clean zero
+    // fill is lossless and gives the demux a tidy gap instead of garbage).
+    for (p, &is_pad) in pad.iter().enumerate().take(npkt) {
+        let off = p * PKT;
+        if is_pad {
+            for b in unit[off..off + PKT].iter_mut() {
+                *b = 0;
+            }
+        } else if unit[off + 4] != TS_SYNC {
+            return false; // a real content packet failed → genuinely undecryptable
+        }
+    }
+    true
 }
 
 /// Decrypt an AACS aligned unit in place, accepting the key only when `accept`
@@ -701,6 +756,101 @@ mod tests {
             off += BD_SOURCE_PACKET_BYTES;
         }
         unit
+    }
+
+    // ── Padding-aware IsDecryptable (fragment-tail recovery) ───────────────
+    //
+    // A content fragment can end mid-unit, with the disc zero-padding the rest
+    // of the aligned unit to the next fragment (proven on Dunkirk: ~11 real
+    // video packets + source-zero pad). `decrypt_unit` must accept such a unit
+    // — its real packets decrypt; the source-zero tail is padding, not content
+    // — while still REJECTING a unit whose undecryptable tail is non-zero (a
+    // genuine misread / wrong key). The discriminator is the SOURCE bytes of the
+    // failing packets: zero ⇒ padding (still decryptable), non-zero ⇒ bad data.
+
+    /// Encrypt a full clear unit under `unit_key`, then overwrite the tail (from
+    /// packet `keep` onward) with `fill`. `0x00` models disc fragment padding; a
+    /// non-zero `fill` models a corrupt/misread tail.
+    fn tail_filled_unit(unit_key: &[u8; 16], keep_pkts: usize, fill: u8) -> Vec<u8> {
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, unit_key);
+        for b in unit[keep_pkts * BD_SOURCE_PACKET_BYTES..].iter_mut() {
+            *b = fill;
+        }
+        unit
+    }
+
+    #[test]
+    fn decryptable_full_content_unit_under_correct_key() {
+        let key = [0x5Au8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &key);
+        assert!(
+            decrypt_unit(&mut unit, &key),
+            "full clean unit is decryptable"
+        );
+        assert_eq!(ts_sync_count(&unit), 32, "all 32 syncs restored");
+    }
+
+    #[test]
+    fn fragment_tail_with_source_zero_pad_is_decryptable() {
+        // 11 real content packets, then source-zero padding (the Dunkirk shape).
+        let key = [0x5Au8; 16];
+        let mut unit = tail_filled_unit(&key, 11, 0x00);
+        assert!(
+            decrypt_unit(&mut unit, &key),
+            "real prefix + source-zero pad IS decryptable"
+        );
+        for p in 0..11 {
+            assert_eq!(
+                unit[p * BD_SOURCE_PACKET_BYTES + 4],
+                TS_SYNC,
+                "content pkt {p} restored its sync"
+            );
+        }
+        // Padding emitted as clean zeros, not decrypted garbage.
+        for p in 11..32 {
+            let off = p * BD_SOURCE_PACKET_BYTES;
+            assert!(
+                unit[off..off + BD_SOURCE_PACKET_BYTES]
+                    .iter()
+                    .all(|&b| b == 0),
+                "padding pkt {p} zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_tail_with_nonzero_garbage_is_not_decryptable() {
+        // Same shape, but the tail is NON-zero — a genuine misread, not padding.
+        let key = [0x5Au8; 16];
+        let mut unit = tail_filled_unit(&key, 11, 0xC3);
+        assert!(
+            !decrypt_unit(&mut unit, &key),
+            "real prefix + non-zero garbage tail is NOT decryptable (misread)"
+        );
+    }
+
+    #[test]
+    fn wrong_key_full_unit_is_not_decryptable() {
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &[0x11u8; 16]);
+        assert!(
+            !decrypt_unit(&mut unit, &[0x22u8; 16]),
+            "wrong key on a full content unit is rejected"
+        );
+    }
+
+    #[test]
+    fn cpi_clear_unit_passes_through_decryptable() {
+        // CPI-clear (plaintext) unit: decryptable by definition, untouched.
+        let mut unit = clear_unit(); // byte 0 high bits clear
+        let before = unit.clone();
+        assert!(
+            decrypt_unit(&mut unit, &[0u8; 16]),
+            "clear unit passes through as decryptable"
+        );
+        assert_eq!(unit, before, "clear unit left untouched");
     }
 
     // ── AES-ECB KAT (FIPS-197 Appendix C.1) ────────────────────────────────

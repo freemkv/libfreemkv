@@ -113,10 +113,13 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// [`with_key_fetch`](Self::with_key_fetch) by an application that wants
     /// to ask its key source for a key when a unit fails to decrypt.
     fetch: Option<KeyFetch>,
-    /// Latched once a fetch call returns no NEW key — further failures on this
-    /// decorator then skip the callback (the source has nothing more to offer, so
-    /// re-asking would only burn key-server requests).
-    fetch_spent: bool,
+    /// Fingerprints (hash over the unit ciphertext) of failing units a fetch
+    /// already returned NO new key for. A later failure re-asks the source only
+    /// for units NOT in this set — so on a multi-CPS disc the source is still
+    /// asked for the *second* CPS unit's key even after the first came back dry
+    /// (the old global latch blocked that), while the *same* failing unit is
+    /// never re-fetched (and the total is still bounded by `MAX_FETCH_CALLS`).
+    fetch_dry: std::collections::HashSet<u64>,
     /// How many times the fetch closure has been invoked, capped at
     /// [`MAX_FETCH_CALLS`].
     fetch_calls: usize,
@@ -156,7 +159,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             unit_base: 0,
             decrypt_dropped: Arc::new(AtomicU64::new(0)),
             fetch: None,
-            fetch_spent: false,
+            fetch_dry: std::collections::HashSet::new(),
             fetch_calls: 0,
             verify_only: false,
             content_ranges: None,
@@ -289,6 +292,15 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         if samples.is_empty() {
             return prev_dropped;
         }
+        // Skip the call when EVERY failing unit here is one a prior fetch already
+        // came back empty for — re-asking the identical ciphertext only burns a
+        // key-server request. A unit we have NOT asked about yet (e.g. a second
+        // CPS unit on a multi-CPS disc) still gets its one chance, where the old
+        // global `fetch_spent` latch wrongly blocked it.
+        let fps: Vec<u64> = samples.iter().map(|s| Self::sample_fp(s)).collect();
+        if fps.iter().all(|fp| self.fetch_dry.contains(fp)) {
+            return prev_dropped;
+        }
         // Ask the application's key source for keys that open this ciphertext.
         self.fetch_calls += 1;
         let fresh = match self.fetch.as_ref() {
@@ -307,14 +319,25 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             }
         }
         if added == 0 {
-            // Nothing new — stop asking for the rest of this decorator's life.
-            self.fetch_spent = true;
+            // Nothing new for THESE units — remember them so we don't re-ask the
+            // same ciphertext, but leave the door open for other units.
+            self.fetch_dry.extend(fps);
             return prev_dropped;
         }
         // Retry now that the pool has grown; a unit that still won't decrypt is
         // genuine loss. A retry error must not mask the original count.
         Self::decrypt_buf(buf, &mut self.keys, self.unit_key_idx, lba, content)
             .unwrap_or(prev_dropped)
+    }
+
+    /// Stable per-run fingerprint of a failing unit's ciphertext, for the
+    /// `fetch_dry` set. `DefaultHasher` is fixed-seed, so equal samples map to
+    /// equal fingerprints within a process — all the dedup needs.
+    fn sample_fp(sample: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sample.hash(&mut h);
+        h.finish()
     }
 
     /// Emit a bounded, structured diagnostic for each undecryptable unit in a
@@ -457,8 +480,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
         let content_ref = content.as_deref();
         // Whether a fresh-key fetch is still worth attempting on this decorator.
-        let fetch_viable =
-            !self.fetch_spent && self.fetch.is_some() && self.fetch_calls < MAX_FETCH_CALLS;
+        let fetch_viable = self.fetch.is_some() && self.fetch_calls < MAX_FETCH_CALLS;
         // First decrypt, then the FRESH-KEY-ON-FAILURE retry (read → decrypt → on
         // fail fetch a new key → retry → CACHE or fail). This runs in BOTH modes:
         //   * VERIFY-ONLY (multipass sweep): decrypt a reused SCRATCH copy so `buf`
@@ -1335,6 +1357,87 @@ mod tests {
             nocb_loss.load(Ordering::Relaxed),
             crate::aacs::ALIGNED_UNIT_LEN as u64,
             "without a fetch callback the undecryptable unit is loss"
+        );
+    }
+
+    /// A fetch that comes back EMPTY for one unit must NOT block a later fetch
+    /// for a DIFFERENT unit (the multi-CPS case). The old global `fetch_spent`
+    /// latch wrongly blocked it; the per-sample `fetch_dry` set must let unit B
+    /// be asked for after unit A came back dry.
+    #[test]
+    fn fetch_dry_does_not_block_a_distinct_later_unit() {
+        let key_a = [0x5au8; 16];
+        let key_b = [0x77u8; 16];
+        let unit_a = encrypt_aacs_unit(&key_a);
+        let unit_b = encrypt_aacs_unit(&key_b);
+        assert_ne!(unit_a, unit_b, "distinct ciphertext under distinct keys");
+
+        struct AltSource {
+            units: Vec<Vec<u8>>,
+            idx: usize,
+        }
+        impl SectorSource for AltSource {
+            fn capacity_sectors(&self) -> u32 {
+                6
+            }
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _r: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                let u = &self.units[self.idx.min(self.units.len() - 1)];
+                buf[..bytes].copy_from_slice(u);
+                self.idx += 1;
+                Ok(bytes)
+            }
+        }
+
+        // Callback serves key_b only when asked about unit B; nothing for A.
+        let unit_b_cb = unit_b.clone();
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_cb = Arc::clone(&calls);
+        let fetch: super::KeyFetch = std::sync::Arc::new(move |samples: &[Vec<u8>]| {
+            *calls_cb.lock().unwrap() += 1;
+            if samples.iter().any(|s| *s == unit_b_cb) {
+                vec![key_b]
+            } else {
+                vec![]
+            }
+        });
+
+        let mut wrapped = DecryptingSectorSource::new(
+            AltSource {
+                units: vec![unit_a, unit_b],
+                idx: 0,
+            },
+            DecryptKeys::Aacs {
+                unit_keys: vec![(0, [0x11u8; 16])], // neither real key held up front
+                read_data_key: None,
+            },
+        )
+        .with_key_fetch(fetch);
+
+        // Read A: fetch fires, returns nothing → A undecryptable (read errors).
+        let mut buf = vec![0u8; 3 * 2048];
+        let _ = wrapped.read_sectors(0, 3, &mut buf, false);
+        // Read B: fetch must STILL fire (B's sample isn't in the dry set) and
+        // recover key_b → B decrypts cleanly.
+        let mut buf2 = vec![0u8; 3 * 2048];
+        wrapped
+            .read_sectors(3, 3, &mut buf2, false)
+            .expect("unit B recovers via its own fetch");
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "fetch fired for BOTH units — the dry result for A did not latch off B"
+        );
+        assert!(
+            !crate::aacs::ts_sync_destroyed(&buf2),
+            "unit B is decrypted after its on-demand fetch"
         );
     }
 

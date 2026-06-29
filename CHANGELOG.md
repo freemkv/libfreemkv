@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.1.1]
+
+### Fixed
+
+- **ISO mux no longer drops real video at content-fragment tails.** A title's
+  encrypted content can end mid-AACS-unit, with the disc zero-padding the rest
+  of the 6144-byte aligned unit to the next fragment. The decrypt-verify
+  demanded the TS sync byte on *all 32* source packets, so it rejected such a
+  tail unit over its legitimate padding — discarding the real video packets it
+  contained. On a flawless rip this surfaced as a small phantom "loss" at mux
+  (and, once retries were exhausted, a truncated MKV). Unit acceptance is now
+  **padding-aware**: only packets whose *source* (pre-decrypt) bytes are
+  non-zero must restore their TS sync; the zero padding is excluded from the
+  check and emitted as clean zeros. A full content unit still requires all 32
+  (unchanged — no wrong-key relaxation), and a unit whose *non-zero* tail fails
+  to decrypt is still rejected as a genuine bad read.
+- **ISO online key resolution now sends the Media Key Block.** Capturing a
+  disc's AACS inputs at scan read the MKB with a full `read_file` of the
+  ~128 MiB `MKB_RO`/`MKB_RW` allocation, which fails on file-backed readers —
+  leaving the MKB empty, so `Disc::inputs()` shipped `mkb=0` to an online key
+  service and the request was rejected (no key → no decrypt). Scan now reads the
+  MKB through the same bounded prefix-grow + trim reader as the out-of-band
+  path, so `Disc::inputs()` is the single complete source of AACS inputs — one
+  reader for every caller.
+
 ## [1.1.0]
 
 ### Added
