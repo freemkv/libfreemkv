@@ -12,6 +12,10 @@ use crate::consts::TS_PACKET_BYTES;
 
 /// TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
+/// MPEG-TS null-packet PID (0x1FFF). Carries no elementary stream; the P3
+/// concealment fill emits null packets on this PID, tagged with an
+/// adaptation-field discontinuity_indicator to signal a concealed gap.
+const NULL_PID: u16 = 0x1FFF;
 
 /// A reassembled PES packet with timestamp info.
 #[derive(Debug)]
@@ -28,14 +32,17 @@ pub struct PesPacket {
     /// from the producer's known stream offset. `None` when the demuxer was fed
     /// without a base offset (callers that don't need provenance).
     pub source: Option<crate::pes::SourcePos>,
-    /// True when a TS continuity gap (a CC discontinuity, or an adaptation-field
-    /// discontinuity_indicator) was seen on this PID since the previous PES
-    /// completed — i.e. one or more packets for this stream were lost (e.g. the
-    /// mux replaced an undecryptable unit with NULL TS packets, P3/A2). This is
-    /// the FIRST surviving PES after the gap, so for inter-coded video it (and
-    /// every later frame up to the next IRAP/IDR) may reference data that is now
-    /// gone. The codec-parse consumer uses it to drop forward to the next
-    /// keyframe (B1) instead of emitting frames with dangling references.
+    /// True when one or more packets for this stream were lost before this PES —
+    /// a continuity break (CC gap or adaptation-field discontinuity_indicator) on
+    /// a tracked PID, or the CC-independent concealment marker the mux emits when
+    /// it replaces an undecryptable unit with NULL-TS packets (P3/A2). This PES is
+    /// the FIRST whose data is entirely after the gap: a mid-frame loss drops the
+    /// truncated partial and flags the next complete PES; a loss landing on a PES
+    /// boundary flags the PES STARTING after it (never the one just flushed). So
+    /// for inter-coded video this PES — and every later frame up to the next
+    /// IRAP/IDR — may reference data that is now gone. The codec-parse consumer
+    /// (via the per-frame `Frame::discontinuity` its parser propagates) drops
+    /// forward to the next keyframe (B1) instead of emitting dangling references.
     pub discontinuity: bool,
 }
 
@@ -67,10 +74,11 @@ struct PesAssembler {
     /// Stamped at PES start, emitted on the completed packet — provenance is
     /// carried, never reconstructed downstream.
     pes_source: Option<crate::pes::SourcePos>,
-    /// Sticky "a continuity gap occurred on this PID" flag. Set whenever a CC
-    /// gap or an explicit discontinuity_indicator is seen; carried onto the NEXT
-    /// completed PES (which is the first surviving frame after the loss) and then
-    /// cleared. Drives B1 drop-to-keyframe in the codec consumer.
+    /// Sticky "a gap occurred on this PID" flag. Set by a CC gap, an explicit
+    /// discontinuity_indicator, or the concealment marker; consumed by the NEXT
+    /// PES this assembler completes — the first whose data is entirely post-gap —
+    /// then cleared. A gap detected on a PUSI sets it AFTER `start()` so it rides
+    /// the new PES, not the one just flushed. Drives B1 drop-to-keyframe.
     pending_discontinuity: bool,
 }
 
@@ -356,6 +364,39 @@ impl TsDemuxer {
         let pusi = ts[1] & 0x40 != 0; // Payload Unit Start Indicator
         let adaptation = (ts[3] >> 4) & 0x03;
 
+        // P3/B1 CONCEALMENT MARKER. The decrypt layer fills an undecryptable
+        // aligned unit with NULL-TS packets (PID 0x1FFF) that carry an
+        // adaptation-field discontinuity_indicator (see `aacs::fill_null_ts_unit`).
+        // This is the authoritative loss signal — unlike a tracked PID's 4-bit
+        // continuity_counter it is CC-INDEPENDENT, so it survives a loss that is
+        // an exact multiple of 16 packets and a loss at the very start of a PID
+        // (no prior CC to diff against). The decrypt layer cannot know which
+        // elementary PID(s) the lost unit carried (the data was undecryptable),
+        // so force a pending discontinuity on EVERY tracked assembler: the next
+        // completed PES of each resyncs. Harmless for audio/subtitle (the codec
+        // gate is a no-op there) and at most one extra GOP on a video track that
+        // did not actually lose packets — bounded, and only on a degraded disc.
+        if pid == NULL_PID
+            && (adaptation == 0x02 || adaptation == 0x03)
+            && (ts[4] as usize) > 0
+            && (ts[5] & 0x80) != 0
+        {
+            for a in &mut self.assemblers {
+                // A concealed unit may have dropped packets belonging to a PES
+                // currently open on any PID — so that partial is potentially
+                // TRUNCATED (a hole in the middle of its access unit). Drop it
+                // like a mid-PES continuity break, and flag pending so the NEXT
+                // completed PES (the first frame whose data is entirely post-gap)
+                // resyncs. Mirrors the non-PUSI cc_gap path, applied to every PID
+                // because the lost unit's PID(s) are unknowable (undecryptable).
+                a.buffer.clear();
+                a.active = false;
+                a.header_remaining = 0;
+                a.pending_discontinuity = true;
+            }
+            return;
+        }
+
         let idx = if (pid as usize) < self.pid_index.len() {
             self.pid_index[pid as usize]
         } else {
@@ -401,8 +442,9 @@ impl TsDemuxer {
         // — splicing the new payload would corrupt the elementary stream — so
         // drop the partial and resync on the next PUSI.
         let cc = ts[3] & 0x0f;
-        let discontinuity_flag =
-            (adaptation == 0x03 || adaptation == 0x02) && ts[4] > 0 && (ts[5] & 0x80) != 0;
+        // adaptation == 0x02 (AF only) already returned above, so only 0x03
+        // (AF + payload) can carry an adaptation field here.
+        let discontinuity_flag = adaptation == 0x03 && ts[4] > 0 && (ts[5] & 0x80) != 0;
         // A gap is a CC that is neither the expected `(prev + 1) & 0xf` nor a
         // duplicate `prev` (ISO 13818-1 permits a packet to repeat its CC; a
         // duplicate is not a loss). Anything else means one or more packets for
@@ -412,34 +454,29 @@ impl TsDemuxer {
             None => false,
         };
         asm.last_cc = Some(cc);
-        // Any continuity gap — at a PUSI boundary or mid-PES — means packets for
-        // this stream were lost (an upstream NULL-TS conceal, a damaged source).
-        // Mark it sticky so the NEXT completed PES carries `discontinuity` and the
-        // codec consumer can drop forward to the next keyframe (B1). The partial
-        // PES is still dropped below only for a NON-PUSI continuation (a hole in
-        // the middle of the current frame); a gap landing exactly on a PUSI starts
-        // a clean new frame, but it is still the first frame after the loss.
-        if discontinuity_flag || cc_gap {
-            asm.pending_discontinuity = true;
-        }
-        if !pusi && (discontinuity_flag || cc_gap) && asm.active {
-            tracing::trace!(
-                target: "mux",
-                pid = asm.pid,
-                "TS continuity break on non-PUSI continuation; dropping partial PES",
-            );
-            asm.buffer.clear();
-            asm.active = false;
-            asm.header_remaining = 0;
-            return;
-        }
+        // A continuity gap means packets for THIS PID were lost (a damaged source,
+        // or — for the conceal path — a loss that the CC-independent NULL-TS marker
+        // above did not already flag). The flag is sticky and rides to the FIRST
+        // post-gap PES so the codec consumer drops forward to the next keyframe
+        // (B1). Attribution differs by where the gap lands (see below).
+        let gap = discontinuity_flag || cc_gap;
 
         if pusi {
             // `header_len` is the FULL (uncapped) PES-header length:
             // 0 = malformed (payload is not a PES start), else 6/9+N.
             let (pts, dts, header_len) = parse_pes_header(payload);
+            // Flush the previous PES FIRST — a gap detected on this PUSI packet
+            // belongs to the PES STARTING now (its data begins after the lost
+            // packets), NOT the one just completing. So set `pending_discontinuity`
+            // AFTER start(): it rides the new PES to its own completion. (Setting
+            // it before would stamp the pre-gap frame; if that frame were a
+            // keyframe the gate would arm-then-disarm on it and admit the real
+            // post-gap inter frame with a dangling reference.)
             if let Some(prev) = asm.start(pts, dts, source) {
                 completed.push(prev);
+            }
+            if gap {
+                asm.pending_discontinuity = true;
             }
             if header_len == 0 {
                 // PUSI packet whose payload is not a valid PES start. Do
@@ -457,16 +494,37 @@ impl TsDemuxer {
                 // the following continuation packet(s).
                 asm.header_remaining = header_len - payload.len();
             }
-        } else if asm.header_remaining > 0 {
-            // Continuation packet still inside a PES header that spanned
-            // the boundary — consume header bytes before any ES data.
-            let skip = asm.header_remaining.min(payload.len());
-            asm.header_remaining -= skip;
-            if skip < payload.len() {
-                asm.push(&payload[skip..]);
-            }
         } else {
-            asm.push(payload);
+            // Non-PUSI continuation.
+            if gap {
+                // Mid-PES hole: the open partial has a gap, so splicing this
+                // payload would corrupt the ES. Flag pending (consumed at the
+                // NEXT completed PES — the first post-gap frame) and drop the
+                // open partial; resync on the next PUSI.
+                asm.pending_discontinuity = true;
+                if asm.active {
+                    tracing::trace!(
+                        target: "mux",
+                        pid = asm.pid,
+                        "TS continuity break on non-PUSI continuation; dropping partial PES",
+                    );
+                    asm.buffer.clear();
+                    asm.active = false;
+                    asm.header_remaining = 0;
+                    return;
+                }
+            }
+            if asm.header_remaining > 0 {
+                // Continuation packet still inside a PES header that spanned
+                // the boundary — consume header bytes before any ES data.
+                let skip = asm.header_remaining.min(payload.len());
+                asm.header_remaining -= skip;
+                if skip < payload.len() {
+                    asm.push(&payload[skip..]);
+                }
+            } else {
+                asm.push(payload);
+            }
         }
     }
 
@@ -947,12 +1005,13 @@ mod tests {
         );
     }
 
-    /// B1 plumbing: a continuity gap must STAMP `discontinuity = true` on the
-    /// next completed PES so the codec consumer can drop forward to the next
-    /// keyframe. A clean in-sequence PES carries `discontinuity = false`. We
-    /// open A (cc=0), flush it cleanly via B's PUSI (cc=1), then jump the CC
-    /// (cc 1 -> 5) on C's PUSI: the gap is sticky and lands on the PES flushed
-    /// at that boundary (B — the frame whose tail packets were the lost ones).
+    /// B1 plumbing: a continuity gap detected on a PUSI must stamp
+    /// `discontinuity = true` on the PES STARTING after the gap, NOT the one
+    /// flushed at the boundary — the post-gap PES is the one whose data begins
+    /// after the lost packets and references them. (Attribution fix: stamping the
+    /// pre-gap PES would, if it were a keyframe, arm-then-disarm the gate and let
+    /// the real post-gap inter frame through with a dangling reference.) A clean
+    /// in-sequence PES carries `discontinuity = false`.
     #[test]
     fn continuity_gap_stamps_discontinuity_on_next_pes() {
         let pid = 0x1011;
@@ -971,23 +1030,100 @@ mod tests {
             "in-sequence PES is not a discontinuity"
         );
 
-        // C's PUSI jumps cc 1 -> 5: packets were lost. The gap is sticky and is
-        // attributed to the PES flushed here (B), which lost its tail packets.
+        // C's PUSI jumps cc 1 -> 5: packets were lost between B and C. B (flushed
+        // here) is PRE-gap and stays clean — the gap belongs to C, which starts
+        // after the lost packets.
         let out = demux.feed(&ts_payload_packet(pid, true, 5, &pes_start(b"CCCC")));
         assert_eq!(out.len(), 1, "B completes");
         assert_eq!(&out[0].data[..4], b"BBBB");
         assert!(
-            out[0].discontinuity,
-            "the PES at the continuity gap must be flagged so B1 can resync"
+            !out[0].discontinuity,
+            "the pre-gap PES flushed at the boundary must NOT be flagged"
         );
 
-        // C itself was opened clean (after the gap) and carries no new gap.
+        // C carries the discontinuity — it is the first post-gap PES.
         let out = demux.flush();
         assert_eq!(out.len(), 1);
         assert_eq!(&out[0].data[..4], b"CCCC");
         assert!(
-            !out[0].discontinuity,
-            "post-gap PES with no further gap is clean"
+            out[0].discontinuity,
+            "the post-gap PES must be flagged so B1 resyncs at/after it"
+        );
+    }
+
+    /// One 192-byte BD source packet that is a B1 concealment marker: a PID-0x1FFF
+    /// null packet carrying the adaptation-field discontinuity_indicator (the byte
+    /// shape `fill_null_ts_unit` writes for every packet of a concealed unit).
+    fn null_marker_packet() -> Vec<u8> {
+        let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
+        pkt[4] = SYNC_BYTE; // 0x47
+        pkt[5] = 0x1F; // PID 0x1FFF
+        pkt[6] = 0xFF;
+        pkt[7] = 0x20; // adaptation-field only
+        pkt[8] = 0xB7; // af_len 183
+        pkt[9] = 0x80; // discontinuity_indicator
+        for b in &mut pkt[10..] {
+            *b = 0xFF;
+        }
+        pkt
+    }
+
+    /// HOLE 3 (16-multiple CC blind spot) + the truncated-partial drop. A concealed
+    /// unit can drop an exact multiple of 16 packets on a PID, leaving its 4-bit
+    /// continuity_counter looking IN-SEQUENCE — so CC-based detection is blind. The
+    /// CC-INDEPENDENT marker flags the loss anyway, drops the (potentially
+    /// truncated) open PES, and stamps the first post-gap PES.
+    #[test]
+    fn conceal_marker_forces_discontinuity_with_in_sequence_cc() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        // A (cc=0) opens; B's PUSI (cc=1) flushes A clean.
+        demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        let out = demux.feed(&ts_payload_packet(pid, true, 1, &pes_start(b"BBBB")));
+        assert_eq!(&out[0].data[..4], b"AAAA");
+        assert!(!out[0].discontinuity);
+
+        // Concealment marker: a unit was dropped. B is open → potentially truncated
+        // → dropped. CC is NOT consulted.
+        assert!(
+            demux.feed(&null_marker_packet()).is_empty(),
+            "marker emits nothing itself"
+        );
+
+        // C (cc=2) is EXACTLY in-sequence after B's cc=1 — as if a multiple of 16
+        // packets were lost, so `cc_gap` is false. The marker is the only signal.
+        let out = demux.feed(&ts_payload_packet(pid, true, 2, &pes_start(b"CCCC")));
+        assert!(
+            out.is_empty(),
+            "the truncated open PES (B) is dropped, not emitted"
+        );
+        let out = demux.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0].data[..4], b"CCCC");
+        assert!(
+            out[0].discontinuity,
+            "marker flags the post-gap PES despite in-sequence CC (16-aligned blind spot)"
+        );
+    }
+
+    /// HOLE 4 (leading loss). If the disc's very first unit is undecryptable the
+    /// first surviving packet has no predecessor CC (`last_cc == None`), so CC
+    /// detection is blind. The marker still flags the first PES.
+    #[test]
+    fn conceal_marker_at_stream_start_flags_first_pes() {
+        let pid = 0x1011;
+        let mut demux = TsDemuxer::new(&[pid]);
+        // Marker FIRST — no prior CC exists for this PID.
+        assert!(demux.feed(&null_marker_packet()).is_empty());
+        // The first real PES of the PID.
+        let out = demux.feed(&ts_payload_packet(pid, true, 0, &pes_start(b"AAAA")));
+        assert!(out.is_empty());
+        let out = demux.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0].data[..4], b"AAAA");
+        assert!(
+            out[0].discontinuity,
+            "leading concealed loss flags the first PES (last_cc == None case)"
         );
     }
 

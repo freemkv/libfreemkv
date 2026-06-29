@@ -255,6 +255,7 @@ impl CodecParser for TrueHdParser {
             }
 
             frames.push(Frame {
+                discontinuity: false,
                 coding: None,
                 source: None,
                 pts_ns: self.next_pts_ns,

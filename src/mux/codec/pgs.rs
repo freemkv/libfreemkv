@@ -57,6 +57,7 @@ impl PgsParser {
         let (start_pts, data) = self.pending.take()?;
         let duration = end_pts_ns.saturating_sub(start_pts).max(0) as u64;
         Some(Frame {
+            discontinuity: false,
             coding: None,
             source: None,
             pts_ns: start_pts,
@@ -92,6 +93,7 @@ impl CodecParser for PgsParser {
                 .take()
                 .map(|(start_pts, data)| {
                     vec![Frame {
+                        discontinuity: false,
                         coding: None,
                         source: None,
                         pts_ns: start_pts,
@@ -119,6 +121,7 @@ impl CodecParser for PgsParser {
                 let frame = match pts {
                     Some(end) => self.emit_pending(end),
                     None => self.pending.take().map(|(start_pts, data)| Frame {
+                        discontinuity: false,
                         coding: None,
                         source: None,
                         pts_ns: start_pts,
@@ -142,6 +145,7 @@ impl CodecParser for PgsParser {
                 // Flush any prior pending undurated and skip storing this one.
                 None => {
                     out.extend(self.pending.take().map(|(start_pts, data)| Frame {
+                        discontinuity: false,
                         coding: None,
                         source: None,
                         pts_ns: start_pts,
@@ -167,6 +171,7 @@ impl CodecParser for PgsParser {
                     // (A missing PTS falls through to the drop path below: a
                     // bitmap with no timing reference would land at 00:00:00.)
                     out.push(Frame {
+                        discontinuity: false,
                         coding: None,
                         source: None,
                         pts_ns: pts.unwrap_or(0),
@@ -195,6 +200,7 @@ impl CodecParser for PgsParser {
         // the final on-screen subtitle (see the module doc).
         match self.pending.take() {
             Some((start_pts, data)) => vec![Frame {
+                discontinuity: false,
                 coding: None,
                 source: None,
                 pts_ns: start_pts,

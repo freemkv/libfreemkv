@@ -182,17 +182,21 @@ impl PipelinedPesStream {
                     self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
                 {
                     let is_video = self.is_video.get(track).copied().unwrap_or(false);
-                    let discontinuity = pes.discontinuity;
                     for frame in parser.parse(&pes) {
-                        // B1: after a TS gap on a video track, drop forward to the
-                        // next keyframe so no frame with a dangling reference is
-                        // emitted. Audio/subtitle always admit (independent frames).
-                        // A track with no gate (out-of-range index) emits as-is.
+                        // B1: after a concealed/lost gap, drop forward to the next
+                        // keyframe on a video track so no frame with a dangling
+                        // reference is emitted. The signal is read PER-FRAME
+                        // (`frame.discontinuity`), not per-PES: buffering parsers
+                        // (MPEG-2 GOPs, H.264/HEVC AU lag) stamp the exact post-gap
+                        // picture, so only it arms the gate — not a whole PES of
+                        // frames. Audio/subtitle always admit (independent frames);
+                        // a track with no gate (out-of-range index) emits as-is.
                         let emit = match self.resync.get_mut(track) {
                             Some(gate) => {
                                 let was_armed = gate.is_armed();
                                 let dropped = gate.dropped_in_run();
-                                let admit = gate.admit(is_video, discontinuity, frame.keyframe);
+                                let admit =
+                                    gate.admit(is_video, frame.discontinuity, frame.keyframe);
                                 if admit && was_armed {
                                     tracing::warn!(
                                         target: "mux",
@@ -299,15 +303,47 @@ impl Stream for PipelinedPesStream {
                         );
                     }
                     // Drain any access unit a parser buffered past the last
-                    // PES (e.g. DTS-HD's final core+extension unit).
+                    // PES (e.g. DTS-HD's final core+extension unit, or MPEG-2's
+                    // final GOP). These flush frames carry their own per-frame
+                    // `discontinuity` (a post-gap picture buffered at EOF was
+                    // stamped by the parser), so route them through the SAME B1
+                    // gate the in-stream path uses — otherwise a trailing
+                    // dangling-reference frame (MPEG-2 final-GOP corner) would
+                    // bypass the resync. Disjoint field borrows so the gate +
+                    // is_video reads coexist with the mutable parser drain.
                     let pid_to_track = &self.pid_to_track;
                     let pending = &mut self.pending_frames;
+                    let resync = &mut self.resync;
+                    let is_video = &self.is_video;
                     for (pid, parser) in self.parsers.iter_mut() {
                         let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                             continue;
                         };
                         for frame in parser.flush() {
-                            pending.push_back(PesFrame::from_codec_frame(track, frame));
+                            let emit = match resync.get_mut(track) {
+                                Some(gate) => gate.admit(
+                                    is_video.get(track).copied().unwrap_or(false),
+                                    frame.discontinuity,
+                                    frame.keyframe,
+                                ),
+                                None => true,
+                            };
+                            if emit {
+                                pending.push_back(PesFrame::from_codec_frame(track, frame));
+                            }
+                        }
+                    }
+                    // A gate still armed at EOF dropped post-gap frames that never
+                    // reached a keyframe (e.g. a concealed gap in the final GOP).
+                    // Surface it once so the loss is visible, not silent.
+                    for (track, gate) in self.resync.iter().enumerate() {
+                        if gate.is_armed() {
+                            tracing::warn!(
+                                target: "mux",
+                                track,
+                                dropped = gate.dropped_in_run(),
+                                "B1: stream ended while dropping to a keyframe after a concealed gap (no trailing keyframe)"
+                            );
                         }
                     }
                     return Ok(self.pending_frames.pop_front());
@@ -427,6 +463,7 @@ mod tests {
                     source: None,
                     pts_ns: pes.pts.unwrap_or(0) + i as i64,
                     keyframe: i == 0,
+                    discontinuity: false,
                     data: pes.data.clone(),
                     duration_ns: None,
                 })
@@ -439,6 +476,7 @@ mod tests {
                     source: None,
                     pts_ns: 0,
                     keyframe: false,
+                    discontinuity: false,
                     data: vec![0xEE],
                     duration_ns: None,
                 })
@@ -555,6 +593,8 @@ mod tests {
                 source: None,
                 pts_ns: pes.pts.unwrap_or(0),
                 keyframe: pes.data.first() == Some(&b'K'),
+                // Propagate so the B1 gate can be driven end-to-end in tests.
+                discontinuity: pes.discontinuity,
                 data: pes.data.clone(),
                 duration_ns: None,
             }]

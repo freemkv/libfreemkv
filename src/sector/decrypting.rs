@@ -1542,20 +1542,32 @@ mod tests {
     }
 
     /// `fill_null_ts_unit` round-trip: every BD source packet in the unit becomes
-    /// a well-formed TS null packet, and a TS demuxer tracking a real PID sees
-    /// none of them (PID 0x1FFF matches nothing) — the basis for A2 concealment.
+    /// a well-formed TS null packet (PID 0x1FFF, invisible to any real PID) that
+    /// carries the B1 adaptation-field discontinuity_indicator — the marker
+    /// `mux::ts` reads as a concealed gap.
     #[test]
     fn null_ts_fill_is_well_formed_and_invisible_to_real_pids() {
         let mut unit = vec![0xAAu8; crate::aacs::ALIGNED_UNIT_LEN];
         crate::aacs::fill_null_ts_unit(&mut unit);
-        // 32 packets, each sync 0x47, PID 0x1FFF, payload-only CC 0.
+        // 32 packets, each: sync 0x47, PID 0x1FFF, adaptation-only (0b10) with a
+        // discontinuity_indicator in the adaptation field.
         let mut off = 0;
         let mut pkts = 0;
         while off + 192 <= unit.len() {
-            assert_eq!(unit[off + 4], 0x47);
+            assert_eq!(unit[off + 4], 0x47, "sync");
             let pid = ((unit[off + 5] as u16 & 0x1F) << 8) | unit[off + 6] as u16;
             assert_eq!(pid, 0x1FFF, "null PID");
-            assert_eq!(unit[off + 7] & 0x30, 0x10, "payload-only");
+            assert_eq!(
+                (unit[off + 7] >> 4) & 0x03,
+                0x02,
+                "adaptation_field_control = AF only (no payload)"
+            );
+            assert!(unit[off + 8] > 0, "adaptation_field_length > 0");
+            assert_eq!(
+                unit[off + 9] & 0x80,
+                0x80,
+                "adaptation-field discontinuity_indicator set (the B1 marker)"
+            );
             off += 192;
             pkts += 1;
         }
