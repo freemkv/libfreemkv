@@ -686,6 +686,7 @@ fn report(opts: &ExtractOptions, done: u64, total: u64) -> bool {
                 bytes_bad_in_main_title: 0,
                 main_title_duration_secs: None,
                 main_title_size_bytes: None,
+                located: Default::default(),
             };
             p.report(&pp)
         }

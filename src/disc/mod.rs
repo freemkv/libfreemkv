@@ -588,6 +588,103 @@ pub fn bytes_bad_in_title(title: &DiscTitle, bad_ranges: &[(u64, u64)]) -> u64 {
     total
 }
 
+/// Byte offset of `lba` within `title`'s extents (concatenated in order), or
+/// `None` if the LBA falls outside every extent. The title is a virtual
+/// contiguous stream; this maps a disc LBA into that stream so a chapter/time
+/// lookup can place it. (Moved from autorip — clients must not re-derive it.)
+fn byte_offset_in_title(lba: u32, title: &DiscTitle) -> Option<u64> {
+    use crate::consts::SECTOR_BYTES_U64;
+    let mut cumulative = 0u64;
+    for ext in &title.extents {
+        if lba >= ext.start_lba && lba < ext.start_lba + ext.sector_count {
+            return Some(cumulative + (lba - ext.start_lba) as u64 * SECTOR_BYTES_U64);
+        }
+        cumulative += ext.sector_count as u64 * SECTOR_BYTES_U64;
+    }
+    None
+}
+
+/// The 1-based chapter + movie-time offset an LBA falls in, or `(None, None)`
+/// if it isn't inside the title.
+fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
+    if let Some(byte_offset) = byte_offset_in_title(lba, title) {
+        if let Some((ch, t)) = crate::verify::VerifyResult::chapter_at_offset(
+            &title.chapters,
+            byte_offset,
+            title.duration_secs,
+            title.size_bytes,
+        ) {
+            return (Some(ch as u32), Some(t));
+        }
+    }
+    (None, None)
+}
+
+/// Annotate raw bad byte-ranges with chapter + movie time, producing the
+/// rendered drilldown ([`crate::progress::LocatedProgress`]) a client draws.
+/// `raw` is the mapfile's `(byte_pos, byte_len)` set for whichever statuses the
+/// caller cares about (the live "Maybe" set during a patch, or terminal
+/// `Unreadable` for the verdict). The list is sorted largest-movie-time first
+/// and capped at 50; `truncated` reports the overflow. `bps` (title bytes/sec)
+/// is derived from the title so callers don't thread it.
+///
+/// This is the single place range→chapter/time annotation happens; autorip used
+/// to own it and read the mapfile to do so. Now the library computes it from
+/// its in-memory mapfile + title, and the client renders the result verbatim.
+pub fn locate_ranges(raw: &[(u64, u64)], title: &DiscTitle) -> crate::progress::LocatedProgress {
+    use crate::consts::{MILLIS_PER_SEC, SECTOR_BYTES_U64};
+    use crate::progress::{LocatedProgress, LocatedRange};
+    const MAX_LOCATED: usize = 50;
+    let bps = if title.duration_secs > 0.0 {
+        title.size_bytes as f64 / title.duration_secs
+    } else {
+        0.0
+    };
+    let num_ranges = raw.len() as u32;
+    let mut ranges: Vec<LocatedRange> = raw
+        .iter()
+        .map(|(pos, size)| {
+            let lba = pos / SECTOR_BYTES_U64;
+            let count = (size / SECTOR_BYTES_U64) as u32;
+            let duration_ms = if bps > 0.0 {
+                (*size as f64) / bps * MILLIS_PER_SEC
+            } else {
+                0.0
+            };
+            let (chapter, time_offset_secs) = range_chapter(lba as u32, title);
+            LocatedRange {
+                lba,
+                count,
+                duration_ms,
+                chapter,
+                time_offset_secs,
+            }
+        })
+        .collect();
+    ranges.sort_by(|a, b| {
+        b.duration_ms
+            .partial_cmp(&a.duration_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let largest_gap_ms = ranges.first().map(|r| r.duration_ms).unwrap_or(0.0);
+    let truncated = ranges.len().saturating_sub(MAX_LOCATED) as u32;
+    ranges.truncate(MAX_LOCATED);
+    // At-risk movie time = duration of the ranges that intersect the title
+    // extents (the others are menus/extras → no movie impact).
+    let main_at_risk_ms = if bps > 0.0 {
+        bytes_bad_in_title(title, raw) as f64 * MILLIS_PER_SEC / bps
+    } else {
+        0.0
+    };
+    LocatedProgress {
+        ranges,
+        num_ranges,
+        truncated,
+        main_at_risk_ms,
+        largest_gap_ms,
+    }
+}
+
 // ─── Display helpers ────────────────────────────────────────────────────────
 
 impl Codec {
@@ -3512,6 +3609,15 @@ impl Disc {
                         bytes_bad_in_main_title: main_title_bad,
                         main_title_duration_secs: main_title.map(|t| t.duration_secs),
                         main_title_size_bytes: main_title.map(|t| t.size_bytes),
+                        // Rendered drilldown from the consumer's in-memory
+                        // snapshot (bad ranges) + title; empty until the first
+                        // snapshot arrives.
+                        located: match &cached_snapshot {
+                            Some(snap) => main_title
+                                .map(|t| locate_ranges(&snap.bad_ranges, t))
+                                .unwrap_or_default(),
+                            None => crate::progress::LocatedProgress::default(),
+                        },
                     };
                     if !reporter.report(&pp) {
                         halt_requested = true;
