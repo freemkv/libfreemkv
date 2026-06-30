@@ -1,10 +1,8 @@
-[![Crates.io](https://img.shields.io/crates/v/libfreemkv)](https://crates.io/crates/libfreemkv)
-[![docs.rs](https://img.shields.io/docsrs/libfreemkv)](https://docs.rs/libfreemkv)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
 # libfreemkv
 
-Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Firmware-clean core: drive-unlock support is plugged in via the `Unlocker` trait, with concrete unlockers shipped as separate crates.
+Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scanning, stream labels, AACS decryption, CSS decryption, KEYDB updates, and content reading in one crate. Drive-level unlocking is handled internally; consumers work with disc access and decryption only.
 
 DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require a `keydb.cfg` (default `~/.config/freemkv/keydb.cfg`) supplying disc-specific volume unique keys; no AACS key material is compiled in.
 
