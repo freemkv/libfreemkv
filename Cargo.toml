@@ -22,6 +22,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
 cbc = "0.1"
+freemkv-unlock = { path = "../freemkv-unlock" }
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
