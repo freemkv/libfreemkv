@@ -685,6 +685,44 @@ pub fn locate_ranges(raw: &[(u64, u64)], title: &DiscTitle) -> crate::progress::
     }
 }
 
+/// One-shot progress snapshot built from a mapfile on disk plus the title. The
+/// library reads + parses the mapfile HERE so a client (autorip) gets a
+/// fully-rendered [`crate::progress::PassProgress`] without ever touching
+/// mapfile internals — used for the pass-boundary paint (before the live
+/// callback stream begins) and the terminal done-card verdict. Returns `None`
+/// if the mapfile can't be read. `work_done`/`work_total` are `0`: this is a
+/// point-in-time snapshot, not a per-pass progress tick.
+pub fn progress_snapshot_from_mapfile(
+    mapfile_path: &std::path::Path,
+    title: Option<&DiscTitle>,
+    kind: crate::progress::PassKind,
+    bytes_total_disc: u64,
+) -> Option<crate::progress::PassProgress> {
+    use mapfile::SectorStatus::{NonScraped, NonTrimmed, Unreadable};
+    let map = mapfile::Mapfile::load(mapfile_path).ok()?;
+    let stats = map.stats();
+    // MAYBE set = not-yet-good (NonTrimmed/NonScraped/Unreadable), excluding
+    // NonTried (the unread remainder) — same set the live patch emitter uses.
+    let maybe = map.ranges_with(&[NonTrimmed, NonScraped, Unreadable]);
+    let located = title.map(|t| locate_ranges(&maybe, t)).unwrap_or_default();
+    let main_bad = title.map(|t| bytes_bad_in_title(t, &maybe)).unwrap_or(0);
+    Some(crate::progress::PassProgress {
+        kind,
+        work_done: 0,
+        work_total: 0,
+        bytes_good_total: stats.bytes_good,
+        bytes_unreadable_total: stats.bytes_unreadable,
+        bytes_pending_total: stats.bytes_pending,
+        bytes_retryable_total: stats.bytes_retryable,
+        bytes_total_disc,
+        disc_duration_secs: title.map(|t| t.duration_secs),
+        bytes_bad_in_main_title: main_bad,
+        main_title_duration_secs: title.map(|t| t.duration_secs),
+        main_title_size_bytes: title.map(|t| t.size_bytes),
+        located,
+    })
+}
+
 // ─── Display helpers ────────────────────────────────────────────────────────
 
 impl Codec {
@@ -4179,6 +4217,40 @@ mod tests {
             content_format: ContentFormat::BdTs,
             codec_privates: Vec::new(),
         }
+    }
+
+    #[test]
+    fn locate_ranges_at_risk_in_vs_out_of_feature() {
+        // The honest-"Maybe" behaviour the rendered drilldown must preserve:
+        // in-feature damage counts as movie time at risk; out-of-feature damage
+        // is still located but reads 0:00. (Ported from autorip's old
+        // RipProgress::from_map tests when that logic moved into the library.)
+        // bps = size_bytes / duration_secs = 4096 B/s → 4096 B == 1000 ms.
+        let mut title = title_with_video(Codec::Hevc, Resolution::R2160p);
+        title.duration_secs = 100.0;
+        title.size_bytes = 409_600;
+        // Feature extent = sectors [10,110) → bytes [20480, 225280).
+        title.extents = vec![Extent {
+            start_lba: 10,
+            sector_count: 100,
+        }];
+
+        // In-feature pending range: 4096 B == 1000 ms of movie at risk.
+        let in_feat = locate_ranges(&[(40_960, 4096)], &title);
+        assert_eq!(in_feat.num_ranges, 1);
+        assert!(
+            (in_feat.main_at_risk_ms - 1000.0).abs() < 1.0,
+            "in-feature damage must count as at-risk movie time, got {}",
+            in_feat.main_at_risk_ms
+        );
+
+        // Out-of-feature range: located, but zero movie time at risk.
+        let out_feat = locate_ranges(&[(2_000_000, 100_000)], &title);
+        assert_eq!(out_feat.num_ranges, 1, "still a located range");
+        assert_eq!(
+            out_feat.main_at_risk_ms, 0.0,
+            "out-of-feature damage must not read as movie loss"
+        );
     }
 
     /// Build a DiscTitle with full control over the fields the title
