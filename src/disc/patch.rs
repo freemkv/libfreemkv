@@ -351,9 +351,6 @@ const PASSN_DAMAGE_THRESHOLD_PCT: usize = crate::disc::read_error::PATCH_DAMAGE_
 const PASSN_SKIP_SECTORS_BASE: u64 = 32;
 const PASSN_SKIP_SECTORS_CAP: u64 = 4096;
 const PASSN_ESCALATION_RESET_GOOD: u32 = 4;
-// Cache-prime: number of single-sector throwaway reads issued at LBAs
-// immediately preceding the target before a count==1 recovery read.
-const CACHE_PRIME_SECTORS: u32 = 3;
 
 /// Probe-offset escalation: returns a per-probe skip distance in
 /// sectors of `PASSN_SKIP_SECTORS_BASE << (3 × idx)` (i.e. multiplies
@@ -434,30 +431,6 @@ pub(super) fn compute_initial_state(
         work_total,
         is_regular,
     ))
-}
-
-/// Cache priming: before the recovery read, issue `CACHE_PRIME_SECTORS`
-/// throwaway single-sector reads at the LBAs immediately preceding
-/// `lba`. The drive's read-ahead cache prefetches forward on
-/// sequential reads — by the time the caller asks for `lba` it may
-/// already be cached, even if a cold read of the same LBA would fail.
-/// Proven 2026-05-07 with dd-as-oracle: 8/8 sectors recoverable when
-/// primed vs 6/8 cold. Failures are best-effort: we already have these
-/// bytes Finished from a prior pass, so prime failures don't update
-/// mapfile state. Only runs on count==1 reads (the genuine recovery
-/// path) and when `lba >= CACHE_PRIME_SECTORS` so the subtraction
-/// doesn't underflow.
-pub(super) fn prime_cache<R: SectorSource + ?Sized>(reader: &mut R, lba: u32, count: u16) {
-    if !(lba >= CACHE_PRIME_SECTORS && count == 1) {
-        return;
-    }
-    let mut prime_buf = [0u8; 2048];
-    for i in 0..CACHE_PRIME_SECTORS {
-        let prime_lba = lba - CACHE_PRIME_SECTORS + i;
-        // Best-effort; ignore errors. Recovery=false is intentional:
-        // a fast 1.5s timeout is fine because we don't need the data.
-        let _ = reader.read_sectors(prime_lba, 1, &mut prime_buf[..], false);
-    }
 }
 
 /// One recovery read of `[lba, lba+count)` into `buf[..count*2048]`.
@@ -1179,23 +1152,30 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     // Adaptive batching split decision: a batch-read failure
     // (count > 1) is NOT a recorded failure. We don't yet know which
     // sector in the batch was actually bad — could be one, could be
-    // many. Drop to count=1 and retry the SAME starting position so
-    // every sector gets individually probed. Cursor stays put; loop
-    // continues. Invariants: no good sector ever gets lumped into a
-    // NonTrimmed mark, no spurious consecutive_failures (which drives
-    // wedge detection), no damage_window pollution from batch-level
-    // signals.
+    // many. BISECT: halve the batch and retry the SAME starting position.
+    // If the bad sector is in the upper half, the lower half now SUCCEEDS
+    // and recovers in BULK (one read, not N single reads); if it's in the
+    // lower half, we halve again. Either way the bad sector is isolated in
+    // O(log n) reads instead of single-stepping all n. Collapsing straight
+    // to count=1 (the pre-bisect behavior) single-walked the entire failed
+    // batch — on a mostly-good NonTrimmed range that is the dominant cost.
+    // Cursor stays put; loop continues. Invariants preserved: only a
+    // count==1 failure ever marks NonTrimmed, so no good sector is lumped
+    // into a bad mark; a batch failure still doesn't touch
+    // consecutive_failures / the damage window.
     if count > 1 {
+        let halved = (count / 2).max(1);
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch.batch.split",
             lba,
             count,
             from_batch = state.current_batch,
+            to_batch = halved,
             err_code = err.code(),
-            "adaptive batching: batch read failed, dropping to count=1 to probe individually"
+            "adaptive batching: batch read failed, bisecting (halving) to isolate the bad sector"
         );
-        state.current_batch = 1;
+        state.current_batch = halved;
         state.consecutive_singles_ok = 0;
         return Ok(FailureAction::ContinueInner);
     }
@@ -2039,8 +2019,6 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
                 pos_byte = pos,
                 "starting sector read"
             );
-
-            prime_cache(self.reader, lba, count);
 
             // Single-shot read (no inline retry — see the historical note
             // in handle_read_failure). `recovery_read` widens a mid-unit
