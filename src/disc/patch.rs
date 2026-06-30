@@ -2085,20 +2085,32 @@ impl Disc {
                     }
                     Err(err) => {
                         // First failure in this range: the fast-batched pass over
-                        // the clean overshoot is done; drop to the slow recovery
-                        // speed for the rest of the range and arm the cooldown.
-                        // Idempotent — only the first failure issues SET CD SPEED.
-                        if !range_slowed {
+                        // the clean overshoot is done. A genuine transport fault
+                        // (bridge crash) is NOT a recoverable bad sector — let
+                        // handle_read_failure abort the pass immediately rather
+                        // than burn a slow re-read on a wedged bus.
+                        if !range_slowed && !err.is_scsi_transport_failure() {
+                            // Drop to the slow recovery speed, arm the cooldown,
+                            // and RE-ATTEMPT the same position at slow speed before
+                            // marking it. The drive's deep recovery (long re-reads
+                            // / ECC) only engages at the slow speed; the failure so
+                            // far is a fast-read miss. Hold the cursor (don't
+                            // advance, don't count damage) and retry — only a
+                            // slow-speed result reaches handle_read_failure below.
+                            // Without this, a single-sector range's first failing
+                            // sector was marked from a MAX-speed read it never got
+                            // to recover. range_slowed gates this to once per range.
                             reader.set_speed(0x0000);
                             tracing::info!(
                                 target: "freemkv::disc",
                                 phase = "patch_speed",
                                 lba,
                                 speed = "0x0000",
-                                "patch: range dropped to slow recovery speed on first read failure"
+                                "patch: range dropped to slow recovery speed; retrying the failing read at slow speed before marking"
                             );
                             range_slowed = true;
                             cooldown_pending = true;
+                            continue;
                         }
 
                         match handle_read_failure(

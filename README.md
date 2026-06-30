@@ -6,19 +6,21 @@ Rust library for 4K UHD / Blu-ray / DVD optical drives. Drive access, disc scann
 
 DVDs (CSS) decrypt out of the box. Blu-ray and UHD (AACS) require a `keydb.cfg` (default `~/.config/freemkv/keydb.cfg`) supplying disc-specific volume unique keys; no AACS key material is compiled in.
 
-**12+ MB/s** sustained read speeds on BD. Drive prep routes through the pluggable unlock seam — register an unlocker and `init()` drives it; with none registered the library rips via the host-certificate AACS handshake.
+**12+ MB/s** sustained read speeds on BD. Drive prep (`init()`) handles unlocking internally via the `freemkv-unlock` crate — clients never see it; when no drive unlock applies, the library rips via the host-certificate AACS handshake.
 
 Multi-lingual by design — the library outputs structured data and numeric error codes, never English text. Build any UI or localization on top.
 
-**[API Documentation](https://docs.rs/libfreemkv)** · **[Technical Docs](docs/)**
+**[Source & API](https://github.com/freemkv/libfreemkv)** · **[Technical Docs](docs/)**
 
 Part of the [freemkv](https://github.com/freemkv) project.
 
 ## Install
 
+Consumed by git tag (not published to crates.io):
+
 ```toml
 [dependencies]
-libfreemkv = "1.0.0-rc.1"
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "vX.Y.Z" }
 ```
 
 ## Quick Start
@@ -30,7 +32,7 @@ use std::path::Path;
 // Open drive — identified via INQUIRY
 let mut drive = Drive::open(Path::new("/dev/sg4"))?;
 drive.wait_ready()?;              // wait for disc
-drive.init()?;                     // route through the unlock seam (if an unlocker is registered)
+drive.init()?;                     // unlock + prep (handled internally)
 drive.probe_disc()?;               // probe disc surface for optimal speeds
 
 // Scan disc — UDF, playlists, streams, AACS (all automatic)
@@ -98,7 +100,7 @@ loop {
 
 ## What It Does
 
-- **Drive access** — open, identify, pluggable unlock seam, speed control, eject
+- **Drive access** — open, identify, internal unlock + prep, speed control, eject
 - **12+ MB/s reads** — auto-detects kernel transfer limits, sustained full speed
 - **Disc scanning** — UDF 2.50 filesystem, MPLS playlists, CLPI clip info
 - **Stream labels** — 5 BD-J format parsers (Paramount, Criterion, Pixelogic, CTRM, Deluxe)
@@ -132,8 +134,8 @@ Blu-rays and UHD (AACS) require a `keydb.cfg` at `~/.config/freemkv/keydb.cfg` (
 ```text
 Drive                  — open, identify, init, single-shot read
   ├── ScsiTransport    — SG_IO (Linux), IOKit (macOS), SPTI (Windows)
-  └── Unlocker seam    — pluggable trait + registry; concrete unlockers
-                         live in the separate freemkv-unlock repo
+  └── unlock_bridge    — private seam to the freemkv-unlock crate
+                         (firmware / AACS cert / CSS bus-auth unlockers)
 
 Disc                   — scan titles, streams, AACS/CSS state
   ├── UDF reader       — Blu-ray UDF 2.50 with metadata partitions

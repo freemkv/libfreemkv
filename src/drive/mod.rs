@@ -413,33 +413,45 @@ impl Drive {
         // the kind is Unknown — only an identity-keyed unlocker can match here.
         // The first matching unlocker runs; none matching leaves the drive in
         // stock mode so the host-cert AACS handshake (the OEM route) carries the
-        // disc. An `Err` return means "nothing applied" — not a hard error; fall
-        // through. (A transport fault during unlock is swallowed by the bridge
-        // today, mirroring the old no-match fall-through.)
+        // disc. A genuine transport fault means the bus is dead — abort init
+        // (the v1.1.0 invariant; `if let Ok` was silently swallowing it). Every
+        // other error (NotApplicable / no match) is "nothing applied" — fall
+        // through to stock mode.
         self.init_ran = true;
-        if let Ok(unlocked) = crate::unlock_bridge::run_unlockers(
+        let r: Result<()> = match crate::unlock_bridge::run_unlockers(
             self.scsi.as_mut(),
             &self.drive_id,
             freemkv_unlock::DiscKind::Unknown,
             &[],
         ) {
-            self.unlocker_name =
-                crate::unlock_bridge::unlocker_name(&self.drive_id).map(str::to_string);
-            // Stash the OEM Volume ID the unlocker returned for the AACS handshake
-            // phase (do_handshake reads it via `oem_vid()`). A drive-prep unlocker
-            // always carries a VID; guard anyway.
-            if let Some(vid) = unlocked.vid {
-                self.oem_vid = Some(vid);
+            Ok(unlocked) => {
+                self.unlocker_name =
+                    crate::unlock_bridge::unlocker_name(&self.drive_id).map(str::to_string);
+                // Stash the OEM Volume ID the unlocker returned for the AACS
+                // handshake phase (do_handshake reads it via `oem_vid()`). A
+                // drive-prep unlocker always carries a VID; guard anyway.
+                if let Some(vid) = unlocked.vid {
+                    self.oem_vid = Some(vid);
+                }
+                Ok(())
             }
-        }
+            Err(freemkv_unlock::UnlockError::Transport) => Err(Error::ScsiError {
+                opcode: 0,
+                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                sense: None,
+            }),
+            Err(_) => Ok(()),
+        };
         // Raise the drive to its maximum read speed with a generic SET CD SPEED —
-        // UNCONDITIONALLY, whether or not an unlocker matched. A stock-mode BD/UHD
-        // drive (no firmware unlocker) still wants max speed; gating this on an
-        // unlocker match left such drives riplocked. (DVD returns earlier in
-        // stock mode; its sweep sets DVD speed separately.) Best-effort: a
-        // failure here must NOT fail the rip — a slow drive still rips.
-        self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
-        let r: Result<()> = Ok(());
+        // UNCONDITIONALLY whenever the bus is alive (init didn't transport-fault),
+        // whether or not an unlocker matched. A stock-mode BD/UHD drive (no
+        // firmware unlocker) still wants max speed; gating this on an unlocker
+        // match left such drives riplocked. (DVD returns earlier in stock mode;
+        // its sweep sets DVD speed separately.) Best-effort: a failure here must
+        // NOT fail the rip — a slow drive still rips.
+        if r.is_ok() {
+            self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
+        }
         tracing::info!(
             target: "freemkv::drive",
             phase = "init",
