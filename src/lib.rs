@@ -58,7 +58,7 @@
 //!   ├── JAR parser       -- BD-J audio track labels
 //!   └── AACS             -- encryption: key resolution + content decrypt
 //!       ├── aacs         -- KEYDB, VUK, MKB, unit decrypt
-//!       └── handshake    -- SCSI auth, ECDH, bus key
+//!       └── host_certs   -- collect host certs (cert handshake lives in freemkv-unlock)
 //! ```
 //!
 //! # AACS Encryption
