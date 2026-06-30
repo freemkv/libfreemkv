@@ -264,7 +264,7 @@ impl Sink<PatchItem> for PatchSink {
             if self.is_regular {
                 tracing::warn!(
                     target: "freemkv::disc",
-                    phase = "patch_sync_failed",
+                    phase = "patch.sync.failed",
                     error = %e,
                     os_error = e.raw_os_error(),
                     error_kind = ?e.kind(),
@@ -274,7 +274,7 @@ impl Sink<PatchItem> for PatchSink {
             }
             tracing::debug!(
                 target: "freemkv::disc",
-                phase = "patch_sync_skipped",
+                phase = "patch.sync.skipped",
                 error = %e,
                 "patch: sync_all failed for non-regular file; ignoring"
             );
@@ -460,6 +460,42 @@ pub(super) fn prime_cache<R: SectorSource + ?Sized>(reader: &mut R, lba: u32, co
     }
 }
 
+/// One recovery read of `[lba, lba+count)` into `buf[..count*2048]`.
+///
+/// On an AACS disc a mid-unit window (start or length not unit-aligned)
+/// is widened to the enclosing aligned 3-sector unit, decrypted, and the
+/// originally-requested window copied back out: the decrypting reader
+/// rejects an unaligned read (`DecryptFailed`) and the sector would be
+/// abandoned without the drive ever being asked. Units anchor at offset
+/// 0, so the widened start is always unit-aligned. All recovery
+/// accounting upstream (pos, block_bytes, dispatched lba/count) is
+/// unchanged — only the physical read widens, so the cursor cannot
+/// desync. `recovery` selects the SCSI timeout (true = 60 s deep
+/// recovery, false = the fast path).
+pub(super) fn recovery_read<R: SectorSource + ?Sized>(
+    reader: &mut R,
+    decrypt_is_aacs: bool,
+    lba: u32,
+    count: u16,
+    buf: &mut [u8],
+    recovery: bool,
+) -> Result<usize> {
+    let bytes = count as usize * 2048;
+    if decrypt_is_aacs && (lba % 3 != 0 || count % 3 != 0) {
+        const U: u32 = 3;
+        let aligned_lba = lba - (lba % U);
+        let head = (lba - aligned_lba) as usize; // lead-in sectors
+        let span = head + count as usize;
+        let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
+        let mut scratch = vec![0u8; aligned_count * 2048];
+        reader.read_sectors(aligned_lba, aligned_count as u16, &mut scratch, recovery)?;
+        buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
+        Ok(bytes)
+    } else {
+        reader.read_sectors(lba, count, &mut buf[..bytes], recovery)
+    }
+}
+
 /// Pre-loop diagnostic dump: emits `patch_mapfile_snapshot` plus the
 /// first/last 10 entries (info + per-entry debug). Pure logging — no
 /// state mutation. Pulled out of `Disc::patch` so the coordination
@@ -474,7 +510,7 @@ pub(super) fn log_patch_start_snapshot(
 ) {
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_mapfile_snapshot",
+        phase = "patch.mapfile.snapshot",
         total_entries = initial_entries.len(),
         bytes_good_before,
         bytes_retryable = initial_stats.bytes_retryable,
@@ -486,14 +522,14 @@ pub(super) fn log_patch_start_snapshot(
     if !initial_entries.is_empty() {
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_mapfile_entries_start",
+            phase = "patch.mapfile.entries.start",
             num_to_log = (initial_entries.len().min(10)) as u32,
             "First 10 entries"
         );
         for entry in initial_entries.iter().take(10) {
             tracing::debug!(
                 target: "freemkv::disc",
-                phase = "patch_mapfile_entry_start",
+                phase = "patch.mapfile.entry.start",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
                 status_char = entry.status.to_char() as u8 as i32,
@@ -504,14 +540,14 @@ pub(super) fn log_patch_start_snapshot(
     if initial_entries.len() > 10 {
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_mapfile_entries_end",
+            phase = "patch.mapfile.entries.end",
             num_to_log = (initial_entries.len().min(10)) as u32,
             "Last 10 entries"
         );
         for entry in initial_entries.iter().skip(initial_entries.len() - 10) {
             tracing::debug!(
                 target: "freemkv::disc",
-                phase = "patch_mapfile_entry_end",
+                phase = "patch.mapfile.entry.end",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
                 status_char = format!("{}", entry.status.to_char()),
@@ -539,7 +575,7 @@ pub(super) fn build_outcome(
     if let Ok(metadata) = std::fs::metadata(path) {
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_iso_size_end",
+            phase = "patch.iso_size.end",
             iso_bytes = metadata.len(),
             bytes_recovered = stats.bytes_good.saturating_sub(state.bytes_good_before),
             "ISO file size at patch end"
@@ -548,7 +584,7 @@ pub(super) fn build_outcome(
 
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_done",
+        phase = "patch.done",
         blocks_attempted = state.blocks_attempted,
         blocks_read_ok = state.blocks_read_ok,
         blocks_read_failed = state.blocks_read_failed,
@@ -746,7 +782,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
         if state.consecutive_singles_ok >= ADAPTIVE_UPSCALE_THRESHOLD {
             tracing::info!(
                 target: "freemkv::disc",
-                phase = "patch_adaptive_upscale",
+                phase = "patch.batch.upscale",
                 from = state.current_batch,
                 to = state.initial_batch,
                 consecutive_singles_ok = state.consecutive_singles_ok,
@@ -764,7 +800,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
 
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_read_ok",
+        phase = "patch.read.ok",
         lba,
         count,
         bytes,
@@ -781,7 +817,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     let write_start = std::time::Instant::now();
     tracing::debug!(
         target: "freemkv::disc",
-        phase = "patch_write_start",
+        phase = "patch.write.start",
         pos,
         bytes,
         "Starting ISO write"
@@ -800,7 +836,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     let write_duration_ms = write_start.elapsed().as_millis();
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_write_ok",
+        phase = "patch.write.ok",
         pos,
         bytes,
         write_duration_ms,
@@ -808,7 +844,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     );
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_mapfile_record_ok",
+        phase = "patch.record.ok",
         pos,
         block_bytes,
         "Mapfile record dispatched"
@@ -833,7 +869,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_stall",
+            phase = "patch.stall",
             elapsed_secs = stall_elapsed.as_secs(),
             bytes_good = bytes_good_now,
             bytes_good_start = state.bytes_good_start,
@@ -850,7 +886,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
         if opts.reverse && backtrack_start < backtrack_end {
             tracing::info!(
                 target: "freemkv::disc",
-                phase = "patch_backtrack_start",
+                phase = "patch.backtrack.start",
                 from_lba = pos,
                 to_lba = backtrack_end / 2048,
                 "recovered after skip; backtracking into gap"
@@ -921,7 +957,7 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
                         )?;
                         tracing::info!(
                             target: "freemkv::disc",
-                            phase = "patch_backtrack_stop",
+                            phase = "patch.backtrack.stop",
                             lba = bt_lba,
                             "backtrack hit damage; stopping"
                         );
@@ -975,7 +1011,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     if err.is_scsi_transport_failure() {
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_transport_failure",
+            phase = "patch.transport_fault",
             lba,
             count,
             "transport failure (bridge crash) during patch — aborting pass"
@@ -996,7 +1032,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     if count > 1 {
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_adaptive_split",
+            phase = "patch.batch.split",
             lba,
             count,
             from_batch = state.current_batch,
@@ -1050,7 +1086,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
 
     tracing::warn!(
         target: "freemkv::disc",
-        phase = "patch_read_err",
+        phase = "patch.read.fail",
         lba,
         count,
         bytes,
@@ -1074,7 +1110,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             state.not_ready_retries_per_lba += 1;
             tracing::info!(
                 target: "freemkv::disc",
-                phase = "patch_not_ready_retry",
+                phase = "patch.read.not_ready.retry",
                 lba,
                 not_ready_retries_per_lba = state.not_ready_retries_per_lba,
                 not_ready_max = NOT_READY_MAX_RETRIES_PER_LBA,
@@ -1089,7 +1125,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             let pause_secs = 15u64;
             tracing::debug!(
                 target: "freemkv::disc",
-                phase = "patch_not_ready_pause",
+                phase = "patch.read.not_ready.pause",
                 lba,
                 consecutive_failures = state.consecutive_failures,
                 pause_secs,
@@ -1115,7 +1151,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
                 tracing::warn!(
                     target: "freemkv::disc",
-                    phase = "patch_stall",
+                    phase = "patch.stall",
                     elapsed_secs = stall_elapsed.as_secs(),
                     bytes_good = bytes_good_now,
                     bytes_good_start = state.bytes_good_start,
@@ -1139,7 +1175,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         // back for this LBA in this pass; a later pass can retry.
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_not_ready_cap_exceeded",
+            phase = "patch.read.not_ready.cap_exceeded",
             lba,
             not_ready_retries_per_lba = state.not_ready_retries_per_lba,
             not_ready_max = NOT_READY_MAX_RETRIES_PER_LBA,
@@ -1200,7 +1236,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     if stall_elapsed > std::time::Duration::from_secs(STALL_SECS) {
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_stall",
+            phase = "patch.stall",
             elapsed_secs = stall_elapsed.as_secs(),
             consecutive_failures = state.consecutive_failures,
             bytes_good = bytes_good_now,
@@ -1216,7 +1252,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     if state.consecutive_failures % 10 == 0 || state.consecutive_failures >= opts.wedged_threshold {
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_failure_count",
+            phase = "patch.read.fail.count",
             lba,
             consecutive_failures = state.consecutive_failures,
             wedged_threshold = opts.wedged_threshold,
@@ -1268,7 +1304,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
                     probes_ok += 1;
                     tracing::debug!(
                         target: "freemkv::disc",
-                        phase = "patch_probe_ok",
+                        phase = "patch.probe.ok",
                         lba = probe_lba,
                         offset_from_current = offset,
                         probe_idx,
@@ -1278,7 +1314,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
                 Err(_) => {
                     tracing::debug!(
                         target: "freemkv::disc",
-                        phase = "patch_probe_err",
+                        phase = "patch.probe.miss",
                         lba = probe_lba,
                         offset_from_current = offset,
                         probe_idx,
@@ -1291,7 +1327,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         if probes_ok > 0 {
             tracing::info!(
                 target: "freemkv::disc",
-                phase = "patch_drive_responsive",
+                phase = "patch.probe.responsive",
                 consecutive_failures = state.consecutive_failures,
                 probes_ok,
                 total_probes = 3,
@@ -1309,7 +1345,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             // is what actually decides + acts.
             tracing::warn!(
                 target: "freemkv::disc",
-                phase = "patch_zone_fully_bad",
+                phase = "patch.probe.zone_bad",
                 consecutive_failures = state.consecutive_failures,
                 lba,
                 range_idx = frame.range_idx,
@@ -1346,7 +1382,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         state.wedge_count += 1;
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_wedge_family",
+            phase = "patch.wedge.family",
             lba,
             wedge_count = state.wedge_count,
             wedge_abort_threshold = WEDGE_ABORT_THRESHOLD,
@@ -1356,7 +1392,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
         if state.wedge_count >= WEDGE_ABORT_THRESHOLD {
             tracing::warn!(
                 target: "freemkv::disc",
-                phase = "patch_wedge_abort",
+                phase = "patch.wedge.abort",
                 wedge_count = state.wedge_count,
                 WEDGE_ABORT_THRESHOLD,
                 "Drive appears wedged ({} consecutive wedge-family senses); aborting pass for autorip eject+reload",
@@ -1369,7 +1405,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
     } else if err.is_bridge_degradation() {
         tracing::debug!(
             target: "freemkv::disc",
-            phase = "patch_bridge_degradation",
+            phase = "patch.wedge.bridge_degradation",
             lba,
             consecutive_failures = state.consecutive_failures,
             error = %err,
@@ -1389,7 +1425,7 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
 
     tracing::debug!(
         target: "freemkv::disc",
-        phase = "patch_post_failure_pause",
+        phase = "patch.read.post_failure_pause",
         lba,
         consecutive_failures = state.consecutive_failures,
         pause_secs,
@@ -1431,6 +1467,33 @@ pub(super) enum FailureAction {
     /// Break out of the outer `'outer` loop. `state.wedged_exit` has
     /// already been set.
     BreakOuter,
+}
+
+/// Why [`PatchCtx::patch_region`] returned. The orchestrator
+/// ([`PatchCtx::run`]) advances to the next bad range on `Completed` /
+/// `SkipLimit` / `BudgetExceeded`, and ends the whole pass on `Wedged` /
+/// `Halted` / `TransportFault` — for which the matching `state.halted` /
+/// `state.wedged_exit` flag was already set, so `build_outcome` reports
+/// it. (A pass also ends, by `?`-propagation, if a read inside the
+/// region returns `Err(Halted)` from the backtrack inner loop.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RegionOutcome {
+    /// Walked (or converged on) the entire range.
+    Completed,
+    /// Hit `MAX_SKIPS_PER_RANGE`; remaining bytes left NonTrimmed.
+    SkipLimit,
+    /// Per-range watchdog fired (`range_budget_secs` elapsed with no
+    /// forward progress).
+    BudgetExceeded,
+    /// Drive wedged — whole-pass stall guard, wedge-family abort, or the
+    /// consecutive-failure wedge threshold. `state.wedged_exit` is set.
+    Wedged,
+    /// Halt requested — the halt token or the progress reporter.
+    /// `state.halted` is set.
+    Halted,
+    /// USB-bridge transport fault (status 0xFF): a dead bus, not a bad
+    /// sector. `state.wedged_exit` is set.
+    TransportFault,
 }
 
 /// Per-range constants captured once when the outer loop enters a
@@ -1479,7 +1542,7 @@ pub(super) fn check_range_watchdog(
     if range_elapsed.as_secs() >= frame.range_budget_secs {
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "patch_range_stall",
+            phase = "patch.region.watchdog",
             range_lba = frame.range_pos / 2048,
             range_sectors = frame.range_sectors,
             elapsed_secs = range_elapsed.as_secs(),
@@ -1504,7 +1567,7 @@ pub(super) fn handle_skip_limit(
 ) -> Result<()> {
     tracing::warn!(
         target: "freemkv::disc",
-        phase = "patch_skip_limit",
+        phase = "patch.skip.limit",
         range_lba = frame.range_pos / 2048,
         skip_count = state.skip_count,
         "Skip limit reached - leaving remaining bytes NonTrimmed for next pass",
@@ -1602,7 +1665,7 @@ pub(super) fn compute_damage_skip(
     }
     tracing::info!(
         target: "freemkv::disc",
-        phase = "patch_damage_skip",
+        phase = "patch.skip",
         from_lba = lba,
         skip_sectors,
         escalation = state.consecutive_skips_without_recovery,
@@ -1620,6 +1683,349 @@ pub(super) fn compute_damage_skip(
     state.consecutive_skips_without_recovery += 1;
     state.skip_count += 1;
     true
+}
+
+/// Per-pass coordination state for one `Disc::patch` run: the decrypting
+/// reader, the consumer pipe + its shared mapfile snapshot, the options,
+/// and the accumulating [`PatchLoopState`]. Bundling these lets the
+/// orchestrator ([`PatchCtx::run`]) and the focused per-range recovery
+/// loop ([`PatchCtx::patch_region`]) be methods rather than free
+/// functions threading a dozen arguments. `state` carries ACROSS ranges
+/// (counters, stall timers, NOT_READY/last-skip cursors); the per-range
+/// scratch inside it is reset at the top of each `patch_region`.
+struct PatchCtx<'a, 'o, R: SectorSource + ?Sized> {
+    disc: &'a Disc,
+    reader: &'a mut R,
+    pipe: &'a Pipeline<PatchItem, PatchSummary>,
+    shared: &'a Mutex<SharedPatchState>,
+    opts: &'a PatchOptions<'o>,
+    total_bytes: u64,
+    decrypt_is_aacs: bool,
+    /// Armed when a range grinded (dropped to slow speed); consumed as an
+    /// inter-range cooldown before the NEXT range enters at max speed.
+    /// Gated on "grinded" so a many-small-range pass doesn't stall on it.
+    cooldown_pending: bool,
+    state: PatchLoopState,
+    /// Recovery read buffer, sized to `initial_batch` sectors and reused
+    /// across reads so the per-iteration read doesn't reallocate.
+    buf: Vec<u8>,
+}
+
+impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
+    /// Orchestrator (one pass): walk the ordered bad ranges. Apply the
+    /// inter-range cooldown only after a range that grinded, then recover
+    /// the range; stop the whole pass the moment a range reports
+    /// halt / wedge / transport-fault.
+    fn run(&mut self, bad_ranges: &[(u64, u64)]) -> Result<()> {
+        let num_ranges = bad_ranges.len();
+        for (range_idx, &(range_pos, range_size)) in bad_ranges.iter().enumerate() {
+            if self.cooldown_pending {
+                tracing::info!(
+                    target: "freemkv::disc",
+                    phase = "patch.region.cooldown",
+                    secs = INTER_RANGE_COOLDOWN_SECS,
+                    "inter-range cooldown (previous range grinded at slow speed)"
+                );
+                super::sleep_secs_or_halt(INTER_RANGE_COOLDOWN_SECS, self.opts.halt.as_ref());
+                self.cooldown_pending = false;
+            }
+            let outcome = self.patch_region(range_idx, num_ranges, range_pos, range_size)?;
+            tracing::info!(
+                target: "freemkv::disc",
+                phase = "patch.region.exit",
+                range_index = range_idx,
+                range_lba = range_pos / 2048,
+                outcome = ?outcome,
+                blocks_read_ok = self.state.blocks_read_ok,
+                blocks_read_failed = self.state.blocks_read_failed,
+                bytes_recovered =
+                    self.state.bytes_good_last.saturating_sub(self.state.bytes_good_before),
+                "region finished"
+            );
+            match outcome {
+                RegionOutcome::Completed
+                | RegionOutcome::SkipLimit
+                | RegionOutcome::BudgetExceeded => {}
+                RegionOutcome::Wedged | RegionOutcome::Halted | RegionOutcome::TransportFault => {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover ONE bad range, end to start (reverse) or start to end.
+    /// Owns the per-iteration read → success/failure → damage-skip →
+    /// watchdog cycle and nothing else; cross-range concerns live in
+    /// [`PatchCtx::run`]. Returns why it stopped (see [`RegionOutcome`]).
+    fn patch_region(
+        &mut self,
+        range_idx: usize,
+        num_ranges: usize,
+        range_pos: u64,
+        range_size: u64,
+    ) -> Result<RegionOutcome> {
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "patch.region.enter",
+            range_index = range_idx,
+            num_total_ranges = num_ranges,
+            range_lba = range_pos / 2048,
+            range_size_mb = range_size as f64 / 1_048_576.0,
+            "entering patch range"
+        );
+        let end = range_pos + range_size;
+        let range_sectors = range_size / 2048;
+        let range_budget_secs = (range_sectors * SECONDS_PER_SECTOR).min(RANGE_BUDGET_CAP_SECS);
+        let mut frame = RangeFrame {
+            range_idx,
+            range_pos,
+            range_size,
+            end,
+            block_end: if self.opts.reverse { end } else { range_pos },
+            range_budget_secs,
+            range_sectors,
+        };
+
+        // Per-range reset (was the inline range-boundary block): a fresh
+        // range starts with an empty damage window, zeroed escalation /
+        // good / skip / wedge / failure counters, and the full initial
+        // batch. `current_batch` carries across ranges, so resetting it
+        // here stops a prior range's single-sector grind from starting
+        // this range slow. The range timer's forward-progress baseline is
+        // the CURRENT bytes_good (Fix 4 — NOT the pass-start value, else a
+        // prior range's recovery would refill this range's budget for
+        // free on its first watchdog tick).
+        self.state.damage_window.clear();
+        self.state.consecutive_skips_without_recovery = 0;
+        self.state.consecutive_good_since_skip = 0;
+        self.state.range_start = (self.state.now)();
+        self.state.range_bytes_good = {
+            let g = self
+                .shared
+                .lock()
+                .expect("PatchSink shared state mutex poisoned");
+            g.stats.bytes_good
+        };
+        self.state.skip_count = 0;
+        self.state.wedge_count = 0;
+        self.state.consecutive_failures = 0;
+        tracing::debug!(
+            target: "freemkv::disc",
+            phase = "patch.region.budget",
+            range_lba = range_pos / 2048,
+            range_sectors,
+            range_budget_secs,
+            "per-range time budget computed"
+        );
+
+        // Enter at MAX speed + the full initial batch: read the clean
+        // overshoot fast. `range_slowed` flips on the first read failure
+        // (below), dropping to the slow recovery speed for the rest of
+        // the range and arming the inter-range cooldown.
+        self.reader.set_speed(0xFFFF);
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "patch.speed",
+            range_lba = range_pos / 2048,
+            range_sectors,
+            speed = "0xFFFF",
+            "range entering at MAX read speed (drops to slow recovery on first failure)"
+        );
+        self.state.current_batch = self.state.initial_batch;
+        let mut range_slowed = false;
+
+        loop {
+            if let Some(ref h) = self.opts.halt {
+                if h.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.state.halted = true;
+                    return Ok(RegionOutcome::Halted);
+                }
+            }
+
+            if check_range_watchdog(&mut self.state, &frame, self.shared) {
+                return Ok(RegionOutcome::BudgetExceeded);
+            }
+
+            if self.state.skip_count >= MAX_SKIPS_PER_RANGE {
+                handle_skip_limit(&self.state, &frame, self.opts, self.pipe)?;
+                return Ok(RegionOutcome::SkipLimit);
+            }
+
+            let (pos, block_bytes) = if self.opts.reverse {
+                if frame.block_end <= frame.range_pos {
+                    return Ok(RegionOutcome::Completed);
+                }
+                let span =
+                    (frame.block_end - frame.range_pos).min(self.state.current_batch as u64 * 2048);
+                (frame.block_end - span, span)
+            } else {
+                if frame.block_end >= frame.end {
+                    return Ok(RegionOutcome::Completed);
+                }
+                let span =
+                    (frame.end - frame.block_end).min(self.state.current_batch as u64 * 2048);
+                (frame.block_end, span)
+            };
+            let lba = (pos / 2048) as u32;
+            let count = (block_bytes / 2048) as u16;
+            let bytes = count as usize * 2048;
+            self.state.blocks_attempted += 1;
+
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "patch.read.start",
+                lba,
+                count,
+                bytes,
+                attempt_num = self.state.blocks_attempted,
+                range_index = range_idx,
+                pos_byte = pos,
+                "starting sector read"
+            );
+
+            prime_cache(self.reader, lba, count);
+
+            // Single-shot read (no inline retry — see the historical note
+            // in handle_read_failure). `recovery_read` widens a mid-unit
+            // AACS window to the aligned unit; otherwise it's a plain read.
+            let read_start = std::time::Instant::now();
+            let read_result = recovery_read(
+                self.reader,
+                self.decrypt_is_aacs,
+                lba,
+                count,
+                &mut self.buf,
+                self.state.recovery,
+            );
+            let read_duration_ms = read_start.elapsed().as_millis();
+
+            match read_result {
+                Ok(_) => {
+                    match handle_read_success(
+                        &mut self.state,
+                        &frame,
+                        self.opts,
+                        lba,
+                        count,
+                        pos,
+                        block_bytes,
+                        bytes,
+                        &mut self.buf,
+                        read_duration_ms,
+                        self.pipe,
+                        self.shared,
+                        self.reader,
+                    )? {
+                        // Break == the whole-pass stall guard fired
+                        // (wedged_exit already set).
+                        OuterAction::Break => return Ok(RegionOutcome::Wedged),
+                        OuterAction::Continue => {}
+                    }
+                }
+                Err(err) => {
+                    // First failure in this range: the fast-batched pass
+                    // over the clean overshoot is done. A genuine transport
+                    // fault (bridge crash) is NOT a recoverable bad sector —
+                    // skip the slow re-read and let handle_read_failure abort
+                    // immediately. Drop to the slow recovery speed, arm the
+                    // cooldown, and RE-ATTEMPT the same position once at slow
+                    // speed before marking it: the drive's deep ECC recovery
+                    // only engages slow, and the failure so far is a fast-read
+                    // miss. Hold the cursor (don't advance, don't count
+                    // damage); only a slow-speed result reaches
+                    // handle_read_failure. `range_slowed` gates this to once.
+                    if !range_slowed && !err.is_scsi_transport_failure() {
+                        self.reader.set_speed(0x0000);
+                        tracing::info!(
+                            target: "freemkv::disc",
+                            phase = "patch.speed",
+                            lba,
+                            speed = "0x0000",
+                            "range dropped to slow recovery speed; retrying the failing read at slow speed before marking"
+                        );
+                        range_slowed = true;
+                        self.cooldown_pending = true;
+                        continue;
+                    }
+
+                    match handle_read_failure(
+                        &mut self.state,
+                        &frame,
+                        self.opts,
+                        &err,
+                        lba,
+                        count,
+                        pos,
+                        block_bytes,
+                        bytes,
+                        read_duration_ms,
+                        self.pipe,
+                        self.shared,
+                        self.reader,
+                    )? {
+                        FailureAction::Continue => {}
+                        FailureAction::ContinueInner => continue,
+                        // BreakOuter fires for both a transport fault and a
+                        // wedge-family abort; distinguish for the exit reason.
+                        FailureAction::BreakOuter => {
+                            return Ok(if err.is_scsi_transport_failure() {
+                                RegionOutcome::TransportFault
+                            } else {
+                                RegionOutcome::Wedged
+                            });
+                        }
+                    }
+                }
+            }
+
+            let did_skip =
+                compute_damage_skip(&mut self.state, &mut frame, self.opts, lba, block_bytes);
+
+            if !did_skip {
+                if self.opts.reverse {
+                    frame.block_end = frame.block_end.saturating_sub(block_bytes);
+                } else {
+                    frame.block_end += block_bytes;
+                }
+            }
+
+            if self.opts.wedged_threshold > 0
+                && self.state.consecutive_failures >= self.opts.wedged_threshold
+            {
+                // Only exit wedged after attempting multiple ranges with
+                // zero recovery. A single-range terminal failure should not
+                // abort the whole pass.
+                let multi_range_attempted = frame.range_idx > 0;
+                if multi_range_attempted {
+                    tracing::info!(
+                        target: "freemkv::disc",
+                        phase = "patch.wedge.exit",
+                        consecutive_failures = self.state.consecutive_failures,
+                        blocks_read_failed = self.state.blocks_read_failed,
+                        blocks_read_ok = self.state.blocks_read_ok,
+                        range_index = frame.range_idx,
+                        total_ranges = num_ranges,
+                        "giving up — drive appears wedged after multiple ranges"
+                    );
+                    self.state.wedged_exit = true;
+                    return Ok(RegionOutcome::Wedged);
+                }
+            }
+
+            self.state.work_done = self.state.work_done.saturating_add(block_bytes);
+
+            if self.disc.report_patch_progress(
+                &self.state,
+                self.opts,
+                self.total_bytes,
+                self.shared,
+            ) {
+                self.state.halted = true;
+                return Ok(RegionOutcome::Halted);
+            }
+        }
+    }
 }
 
 impl Disc {
@@ -1713,7 +2119,7 @@ impl Disc {
         opts: &PatchOptions,
     ) -> Result<PatchOutcome> {
         use crate::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
-        use crate::sector::{DecryptingSectorSource, SectorSource};
+        use crate::sector::DecryptingSectorSource;
 
         // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
         // direct `patch` caller can't bypass it). A decrypting patch pass of an
@@ -1807,7 +2213,7 @@ impl Disc {
         if let Ok(metadata) = std::fs::metadata(path) {
             tracing::info!(
                 target: "freemkv::disc",
-                phase = "patch_iso_size_start",
+                phase = "patch.iso_size.start",
                 iso_bytes = metadata.len(),
                 "ISO file size at patch start"
             );
@@ -1833,30 +2239,11 @@ impl Disc {
         // until its watchdog fired.
         let initial_batch = opts.block_sectors.unwrap_or(1).max(1);
         let recovery = opts.full_recovery;
-        let mut state = PatchLoopState::new(
-            bytes_good_before,
-            total_bytes,
-            initial_batch,
-            recovery,
-            work_total,
-        );
-        let mut buf = vec![0u8; initial_batch as usize * 2048];
-
-        // Adaptive patch speed (replaces the old pass-wide slow pin): each range
-        // now ENTERS at max speed + the initial batch and only drops to the slow
-        // recovery speed on its FIRST read failure (set per-range below). Pass 1's
-        // damage-jump overshoots, so most of a jumped range is clean data the
-        // reverse-walk reads first — reading it at max speed instead of grinding
-        // the whole range slow is the win. `cooldown_pending` arms the inter-range
-        // pause, but ONLY after a range that actually grinded (dropped to slow) —
-        // an unconditional pause would stall 20+ min on a many-small-range pass.
-        let mut cooldown_pending = false;
-
         log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
 
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_bad_ranges",
+            phase = "patch.ranges",
             num_ranges = bad_ranges.len(),
             work_total,
             reverse_mode = opts.reverse,
@@ -1864,7 +2251,7 @@ impl Disc {
         );
         tracing::info!(
             target: "freemkv::disc",
-            phase = "patch_start",
+            phase = "patch.start",
             block_sectors = initial_batch,
             recovery,
             reverse = opts.reverse,
@@ -1875,305 +2262,29 @@ impl Disc {
             "Disc::patch entered"
         );
 
-        'outer: for (range_idx, (range_pos, range_size)) in bad_ranges.iter().enumerate() {
-            // Inter-range cooldown — only after a range that grinded (dropped to
-            // slow). Halt-responsive so a stop request interrupts the wait.
-            if cooldown_pending {
-                tracing::info!(
-                    target: "freemkv::disc",
-                    phase = "patch_inter_range_cooldown",
-                    secs = INTER_RANGE_COOLDOWN_SECS,
-                    "Cooldown before next range (previous range grinded at slow speed)"
-                );
-                super::sleep_secs_or_halt(INTER_RANGE_COOLDOWN_SECS, opts.halt.as_ref());
-                cooldown_pending = false;
-            }
-            tracing::info!(
-                target: "freemkv::disc",
-                phase = "patch_range_start",
-                range_index = range_idx,
-                num_total_ranges = bad_ranges.len(),
-                range_lba = *range_pos / 2048,
-                range_size_mb = *range_size as f64 / 1_048_576.0,
-                "Starting patch range"
-            );
-            let end = *range_pos + *range_size;
-            let range_sectors = *range_size / 2048;
-            let range_budget_secs = (range_sectors * SECONDS_PER_SECTOR).min(RANGE_BUDGET_CAP_SECS);
-            let mut frame = RangeFrame {
-                range_idx,
-                range_pos: *range_pos,
-                range_size: *range_size,
-                end,
-                block_end: if opts.reverse { end } else { *range_pos },
-                range_budget_secs,
-                range_sectors,
-            };
-            state.damage_window.clear();
-            state.consecutive_skips_without_recovery = 0;
-            state.consecutive_good_since_skip = 0;
-            state.range_start = (state.now)();
-            // Fix 4: initialize range_bytes_good to the CURRENT bytes_good
-            // (not the pass-start value bytes_good_before). Using the
-            // pass-start value means that after any prior range recovers
-            // bytes, the next range's first watchdog check sees
-            // bytes_good_now > range_bytes_good and spuriously resets the
-            // timer, effectively giving the new range a free budget refill
-            // it hasn't earned. Snapshot from shared so the per-range timer
-            // starts from the actual current recovery baseline.
-            state.range_bytes_good = {
-                let g = shared
-                    .lock()
-                    .expect("PatchSink shared state mutex poisoned");
-                g.stats.bytes_good
-            };
-            state.skip_count = 0;
-            // Reset the wedge counter at each range boundary too. Like
-            // consecutive_failures below, wedge_count is a "stuck on THIS
-            // range" signal; carrying it across boundaries lets wedges
-            // accumulated on earlier ranges trip WEDGE_ABORT_THRESHOLD
-            // prematurely on a later, healthy range.
-            state.wedge_count = 0;
-            // Reset consecutive_failures at each range boundary. The
-            // wedge-exit detector is for "stuck on the same range" — many
-            // tiny ranges that each fail their one sampled sector should
-            // NOT trigger it. Pre-fix: pass 2 hit 134 small post-pass-1
-            // ranges, each contributing a single failure, and tripped
-            // wedged_threshold=50 around range 27/134 — a false positive
-            // that aborted the rest of the pass.
-            state.consecutive_failures = 0;
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "patch_range_budget",
-                range_lba = *range_pos / 2048,
-                range_sectors,
-                range_budget_secs,
-                "Per-range time budget computed"
-            );
-            // Enter the range at MAX speed + the full initial batch: read the
-            // clean overshoot fast. `current_batch` carries across ranges, so
-            // reset it here or a prior range's single-sector grind would start
-            // this range slow. `range_slowed` flips on the first read failure
-            // (below), dropping to the slow recovery speed for the rest of the
-            // range and arming the inter-range cooldown.
-            reader.set_speed(0xFFFF);
-            tracing::info!(
-                target: "freemkv::disc",
-                phase = "patch_speed",
-                range_lba = *range_pos / 2048,
-                range_sectors,
-                speed = "0xFFFF",
-                "patch: range entering at MAX read speed (drops to slow recovery on first failure)"
-            );
-            state.current_batch = initial_batch;
-            let mut range_slowed = false;
-            loop {
-                if let Some(ref h) = opts.halt {
-                    if h.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.halted = true;
-                        break 'outer;
-                    }
-                }
-
-                if check_range_watchdog(&mut state, &frame, &shared) {
-                    break;
-                }
-
-                // Test 3: Skip count - max 10 skips per range
-                if state.skip_count >= MAX_SKIPS_PER_RANGE {
-                    handle_skip_limit(&state, &frame, opts, &pipe)?;
-                    break;
-                }
-                let (pos, block_bytes) = if opts.reverse {
-                    if frame.block_end <= frame.range_pos {
-                        break;
-                    }
-                    let span =
-                        (frame.block_end - frame.range_pos).min(state.current_batch as u64 * 2048);
-                    (frame.block_end - span, span)
-                } else {
-                    if frame.block_end >= frame.end {
-                        break;
-                    }
-                    let span = (frame.end - frame.block_end).min(state.current_batch as u64 * 2048);
-                    (frame.block_end, span)
-                };
-                let lba = (pos / 2048) as u32;
-                let count = (block_bytes / 2048) as u16;
-                let bytes = count as usize * 2048;
-                state.blocks_attempted += 1;
-
-                tracing::debug!(
-                    target: "freemkv::disc",
-                    phase = "patch_read_start",
-                    lba,
-                    count,
-                    bytes,
-                    attempt_num = state.blocks_attempted,
-                    range_index = range_idx,
-                    pos_byte = pos,
-                    "Starting sector read"
-                );
-
-                prime_cache(reader, lba, count);
-
-                // Single-shot read. Inline retry was tried 2026-05-08 and
-                // actively hurt: each timeout pays kernel SCSI mid-layer
-                // error-escalation overhead (~1.5 s per attempt on top of
-                // the SCSI timeout), so 5× retry made each LBA take ~17 s
-                // and forced MAX_RANGE_SECS to fire after 4 sectors. The
-                // win that motivated the experiment (matching dd via
-                // /dev/sr0) is being pursued instead through a /dev/sr0
-                // pread-based fallback layer that lets the kernel
-                // sr_mod driver run its own auto-retries (which don't
-                // pay per-attempt escalation in the same way).
-                let read_start = std::time::Instant::now();
-                let read_result = if decrypt_is_aacs && (lba % 3 != 0 || count % 3 != 0) {
-                    // Mid-unit recovery read on an AACS disc: the decrypting
-                    // reader would reject it (DecryptFailed) and the sector would
-                    // be abandoned without the drive ever being asked. Read the
-                    // enclosing whole-unit window instead (units anchor at offset
-                    // 0, so the start MUST be unit-aligned), decrypt that, then
-                    // copy out the originally-requested [lba, count) window. All
-                    // recovery accounting (pos, block_bytes, the dispatched
-                    // lba/count) stays exactly as computed — only the physical
-                    // read is widened, so the cursor cannot desync.
-                    const U: u32 = 3;
-                    let aligned_lba = lba - (lba % U);
-                    let head = (lba - aligned_lba) as usize; // lead-in sectors
-                    let span = head + count as usize;
-                    let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
-                    let mut scratch = vec![0u8; aligned_count * 2048];
-                    match reader.read_sectors(
-                        aligned_lba,
-                        aligned_count as u16,
-                        &mut scratch,
-                        state.recovery,
-                    ) {
-                        Ok(_) => {
-                            buf[..bytes]
-                                .copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
-                            Ok(bytes)
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    reader.read_sectors(lba, count, &mut buf[..bytes], state.recovery)
-                };
-                let read_duration_ms = read_start.elapsed().as_millis();
-
-                match read_result {
-                    Ok(_) => {
-                        match handle_read_success(
-                            &mut state,
-                            &frame,
-                            opts,
-                            lba,
-                            count,
-                            pos,
-                            block_bytes,
-                            bytes,
-                            &mut buf,
-                            read_duration_ms,
-                            &pipe,
-                            &shared,
-                            reader,
-                        )? {
-                            OuterAction::Break => break 'outer,
-                            OuterAction::Continue => {}
-                        }
-                    }
-                    Err(err) => {
-                        // First failure in this range: the fast-batched pass over
-                        // the clean overshoot is done. A genuine transport fault
-                        // (bridge crash) is NOT a recoverable bad sector — let
-                        // handle_read_failure abort the pass immediately rather
-                        // than burn a slow re-read on a wedged bus.
-                        if !range_slowed && !err.is_scsi_transport_failure() {
-                            // Drop to the slow recovery speed, arm the cooldown,
-                            // and RE-ATTEMPT the same position at slow speed before
-                            // marking it. The drive's deep recovery (long re-reads
-                            // / ECC) only engages at the slow speed; the failure so
-                            // far is a fast-read miss. Hold the cursor (don't
-                            // advance, don't count damage) and retry — only a
-                            // slow-speed result reaches handle_read_failure below.
-                            // Without this, a single-sector range's first failing
-                            // sector was marked from a MAX-speed read it never got
-                            // to recover. range_slowed gates this to once per range.
-                            reader.set_speed(0x0000);
-                            tracing::info!(
-                                target: "freemkv::disc",
-                                phase = "patch_speed",
-                                lba,
-                                speed = "0x0000",
-                                "patch: range dropped to slow recovery speed; retrying the failing read at slow speed before marking"
-                            );
-                            range_slowed = true;
-                            cooldown_pending = true;
-                            continue;
-                        }
-
-                        match handle_read_failure(
-                            &mut state,
-                            &frame,
-                            opts,
-                            &err,
-                            lba,
-                            count,
-                            pos,
-                            block_bytes,
-                            bytes,
-                            read_duration_ms,
-                            &pipe,
-                            &shared,
-                            reader,
-                        )? {
-                            FailureAction::Continue => {}
-                            FailureAction::ContinueInner => continue,
-                            FailureAction::BreakOuter => break 'outer,
-                        }
-                    }
-                }
-
-                let did_skip = compute_damage_skip(&mut state, &mut frame, opts, lba, block_bytes);
-
-                if !did_skip {
-                    if opts.reverse {
-                        frame.block_end = frame.block_end.saturating_sub(block_bytes);
-                    } else {
-                        frame.block_end += block_bytes;
-                    }
-                }
-
-                if opts.wedged_threshold > 0 && state.consecutive_failures >= opts.wedged_threshold
-                {
-                    // Only exit wedged after attempting multiple ranges with zero recovery.
-                    // Single-range terminal failures should not abort the entire pass.
-                    let multi_range_attempted = frame.range_idx > 0;
-                    if multi_range_attempted {
-                        tracing::info!(
-                            target: "freemkv::disc",
-                            phase = "patch_wedged_exit",
-                            consecutive_failures = state.consecutive_failures,
-                            blocks_read_failed = state.blocks_read_failed,
-                            blocks_read_ok = state.blocks_read_ok,
-                            range_index = frame.range_idx,
-                            total_ranges = bad_ranges.len(),
-                            "Disc::patch giving up — drive appears wedged after multiple ranges"
-                        );
-                        state.wedged_exit = true;
-                        break 'outer;
-                    }
-                }
-
-                state.work_done = state.work_done.saturating_add(block_bytes);
-
-                if self.report_patch_progress(&state, opts, total_bytes, &shared) {
-                    state.halted = true;
-                    break 'outer;
-                }
-            }
-        }
+        // Drive the recovery: build the per-pass context, then walk the
+        // ordered bad ranges. `run` owns inter-range cooldown + the
+        // pass-ending conditions; `patch_region` owns one range's loop.
+        let mut ctx = PatchCtx {
+            disc: self,
+            reader,
+            pipe: &pipe,
+            shared: &shared,
+            opts,
+            total_bytes,
+            decrypt_is_aacs,
+            cooldown_pending: false,
+            state: PatchLoopState::new(
+                bytes_good_before,
+                total_bytes,
+                initial_batch,
+                recovery,
+                work_total,
+            ),
+            buf: vec![0u8; initial_batch as usize * 2048],
+        };
+        ctx.run(&bad_ranges)?;
+        let PatchCtx { state, .. } = ctx;
 
         // Drain the consumer thread: drop tx, wait for `close` to run
         // sync_all + mapfile.flush, then take the final stats from the
@@ -2213,7 +2324,7 @@ impl Disc {
                         let _ = m.flush();
                         tracing::info!(
                             target: "freemkv::verify",
-                            phase = "patch_reverify",
+                            phase = "patch.reverify",
                             downgraded_ranges = n,
                             "post-read re-verify downgraded undecryptable units to NonTrimmed"
                         );
