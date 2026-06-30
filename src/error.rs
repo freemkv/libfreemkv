@@ -879,6 +879,15 @@ impl Error {
                 status: Some(crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
                 ..
             }
+        ) || matches!(
+            // A failed `ioctl(SG_IO)` (Error::IoError, e.g. ENODEV/EIO on an
+            // unplugged USB bridge) and a vanished device (Error::DeviceNotFound,
+            // fd gone) are dead-bus / transport-layer faults too — NOT recoverable
+            // bad sectors. Treat them as transport failures so sweep / patch /
+            // fill_extents abort the pass and re-enumerate the bridge instead of
+            // zero-filling every read against a wedged device.
+            self,
+            Error::IoError { .. } | Error::DeviceNotFound { .. }
         )
     }
 
@@ -1375,11 +1384,13 @@ mod tests {
         }
     }
 
-    /// is_scsi_transport_failure returns true only for SCSI_STATUS_TRANSPORT_FAILURE (0xFF).
-    /// Spec: comment on SCSI_STATUS_TRANSPORT_FAILURE says "synthesised sentinel: the
-    ///       transport never delivered a SCSI status byte".
+    /// is_scsi_transport_failure is true for the 0xFF SCSI sentinel AND for the
+    /// non-SCSI dead-bus faults (Error::IoError from a failed ioctl(SG_IO),
+    /// Error::DeviceNotFound from a vanished fd) — but NEVER for a real SCSI
+    /// reply (CHECK CONDITION) or unrelated errors.
     /// Mutation: testing against 0x02 (CHECK CONDITION) would wrongly mark CHECK
-    ///           CONDITION replies as transport failures.
+    ///           CONDITION replies as transport failures; dropping the IoError/
+    ///           DeviceNotFound arm would let a dead bus zero-fill the disc.
     #[test]
     fn is_scsi_transport_failure_only_for_0xff() {
         use crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE;
@@ -1403,7 +1414,22 @@ mod tests {
         };
         assert!(!cc.is_scsi_transport_failure());
 
-        // False for non-SCSI errors.
+        // True: non-SCSI dead-bus faults — a failed ioctl(SG_IO) and a vanished
+        // device are transport-layer failures, not recoverable bad sectors.
+        assert!(
+            Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::NotConnected)
+            }
+            .is_scsi_transport_failure()
+        );
+        assert!(
+            Error::DeviceNotFound {
+                path: "/dev/sg9".into()
+            }
+            .is_scsi_transport_failure()
+        );
+
+        // False for unrelated errors.
         assert!(!Error::Halted.is_scsi_transport_failure());
     }
 
