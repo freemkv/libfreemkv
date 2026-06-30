@@ -17,8 +17,8 @@ pub(super) struct HandshakeResult {
     /// instead of a bare "unavailable" — the difference between a diagnosable log
     /// and archaeology.
     pub read_data_key_err: Option<u16>,
-    /// True when the VID came from a firmware unlocker (`freemkv-unlock-ld`
-    /// et al.) that unlocked the drive. Such a drive serves CLEAR
+    /// True when the VID came from an unlocker (in `freemkv-unlock`) that
+    /// unlocked the drive. Such a drive serves CLEAR
     /// content, so AACS bus encryption is already removed AT THE DRIVE — the same
     /// end state a successful cert handshake's `read_data_key` provides, just via
     /// firmware instead of the AKE. The bus-key gate MUST credit this as a valid
@@ -34,7 +34,7 @@ pub(super) struct HandshakeResult {
 /// encryption is gone when ANY of these holds:
 ///   - the disc never had it (`!bus_encryption`): nothing to remove;
 ///   - file/ISO reads (`handshake == None`): content is already clear at read time;
-///   - a firmware unlocker unlocked the drive (`drive_unlocked`): it serves clear
+///   - an unlocker unlocked the drive (`drive_unlocked`): it serves clear
 ///     content;
 ///   - the cert handshake produced the bus key (`read_data_key`).
 ///
@@ -49,33 +49,39 @@ fn bus_encryption_removed(bus_encryption: bool, handshake: Option<&HandshakeResu
     }
 }
 
-/// In-tree AACS host-certificate cert-auth "unlocker" — the Drive-level peer of
-/// the external firmware [`crate::unlock::Unlocker`]s.
-///
-/// It is NOT a registry `dyn Unlocker`: the cert handshake helpers
-/// ([`crate::aacs::handshake::aacs_authenticate`] et al.) operate on a concrete
-/// `&mut Drive`, whereas the registry trait hands out a `&mut dyn ScsiTransport`
-/// for external firmware unlockers (and keeps their unit tests trivially
-/// fakeable). So the firmware path stays transport-level and registry-routed,
-/// while this cert path is an in-tree Drive-level peer invoked directly by
-/// [`Disc::do_handshake`]. Both produce a Volume ID under the shared
-/// [`crate::unlock::UnlockError`] taxonomy.
+/// libfreemkv-side driver for the AACS cert route. It owns the host-cert
+/// collection (a keysource concern that stays in libfreemkv) and then dispatches
+/// the actual mutual-auth to the `freemkv-unlock` AACS unlocker via the
+/// [`crate::unlock_bridge`]. The firmware (drive-prep) and CSS routes dispatch
+/// the same way at their own call sites; this one carries the host certs.
 struct AacsCertUnlocker<'a> {
     opts: &'a ScanOptions,
 }
 
+/// Why the AACS cert path produced no Volume ID. Distinguishes the libfreemkv-
+/// side "no host cert at all" case (which carries the disc MKB generation for
+/// the outcome trace) from the unlocker-reported [`freemkv_unlock::UnlockError`].
+enum CertUnlockFailure {
+    /// No host cert was available from any source — detected in libfreemkv
+    /// before the unlocker runs, so the MKB generation is still known.
+    NoHostCert { mkb: Option<u32> },
+    /// The AACS unlocker ran and reported a specific failure.
+    Unlock(freemkv_unlock::UnlockError),
+}
+
 impl AacsCertUnlocker<'_> {
     /// Run the host-certificate mutual-auth handshake: collect non-compiled-in
-    /// host certs from the key sources + credentials, try each (wedge-guarded),
-    /// and on success read the Volume ID + `read_data_key` (the AACS 2.0 bus
-    /// key). Returns a structured [`crate::unlock::UnlockError`] on every
-    /// no-VID outcome.
+    /// host certs from the key sources + credentials, then hand them to the AACS
+    /// unlocker (via the `freemkv-unlock` dispatch), which tries each cert
+    /// (wedge-guarded) and on success yields the Volume ID + `read_data_key`
+    /// (the AACS 2.0 bus key). Returns a [`CertUnlockFailure`] on every no-VID
+    /// outcome.
     fn authenticate(
         &self,
         session: &mut crate::drive::Drive,
-    ) -> std::result::Result<HandshakeResult, crate::unlock::UnlockError> {
+    ) -> std::result::Result<HandshakeResult, CertUnlockFailure> {
         use crate::aacs;
-        use crate::unlock::UnlockError;
+        use freemkv_unlock::UnlockError;
 
         // MKB generation (best-effort) — forwarded to each source's
         // `host_certs(mkb)` so a source MAY select a generation-appropriate cert
@@ -86,8 +92,9 @@ impl AacsCertUnlocker<'_> {
 
         // Host certs are keysource-served, never compiled in — unioned from the
         // explicit `DriveCredentials` and the key-source layer. With ZERO certs
-        // the cert route cannot run: NoUsableHostCert (folded to AacsNoHostCert
-        // by the caller, preserving the graceful path-1 disc-hash → VUK fallback).
+        // the cert route cannot run: NoHostCert (folded to AacsNoHostCert by the
+        // caller, preserving the graceful path-1 disc-hash → VUK fallback). This
+        // is detected here, where the MKB generation is still in hand.
         let host_certs = Disc::collect_host_certs(self.opts, mkb_gen);
         if host_certs.is_empty() {
             tracing::warn!(
@@ -95,54 +102,70 @@ impl AacsCertUnlocker<'_> {
                 phase = "handshake_no_host_cert",
                 "No AACS host certificate available from any key source, so the host-certificate handshake can't run."
             );
-            return Err(UnlockError::NoUsableHostCert { mkb: mkb_gen });
+            return Err(CertUnlockFailure::NoHostCert { mkb: mkb_gen });
         }
 
-        // Delegate the wedge-guarded cert loop to the shared primitive (also the
-        // body of the external freemkv-unlock-aacs plugin). The host-cert AKE
-        // path's bus removal depends on the read_data_key, NOT a firmware unlock.
-        let h = aacs::handshake::run_cert_handshake(session.scsi_mut(), &host_certs)?;
+        // Hand the collected certs to the AACS unlocker. The cert-route bus
+        // removal depends on the read_data_key, NOT a drive unlock. The
+        // borrow checker can't split `session` across `scsi_mut()` + `&drive_id`
+        // through method calls, so clone the (cheap) identity first.
+        let drive_id = session.drive_id.clone();
+        let fu_certs = crate::unlock_bridge::map_host_certs(&host_certs);
+        let unlocked = crate::unlock_bridge::run_unlockers(
+            session.scsi_mut(),
+            &drive_id,
+            freemkv_unlock::DiscKind::Aacs,
+            &fu_certs,
+        )
+        .map_err(CertUnlockFailure::Unlock)?;
+        // The cert handshake yields a VID on success; its absence is VidUnavailable.
+        let Some(volume_id) = unlocked.vid else {
+            return Err(CertUnlockFailure::Unlock(UnlockError::VidUnavailable));
+        };
         Ok(HandshakeResult {
-            volume_id: h.volume_id,
-            read_data_key: h.read_data_key,
-            read_data_key_err: h.read_data_key_err,
-            drive_unlocked: false,
+            volume_id,
+            read_data_key: unlocked.bus_key,
+            // The generic `Unlocked` contract carries no bus-key error code; the
+            // AACS-specific "why the read_data_key read failed" diagnostic does
+            // not cross the seam. The bus-key gate keys off presence, not cause.
+            read_data_key_err: None,
+            drive_unlocked: unlocked.drive_unlocked,
         })
     }
 }
 
-/// Map an [`crate::unlock::UnlockError`] from the cert path back to the
-/// `Error` variant `do_handshake_cert` has always surfaced, so `scan_with`'s
-/// rendering and the path-1 disc-hash → VUK fallback are byte-for-byte
-/// unchanged. (`NoUsableHostCert` keeps the `<no host cert>` sentinel.)
-fn unlock_error_to_error(e: crate::unlock::UnlockError) -> Error {
-    use crate::unlock::UnlockError;
+/// Map a [`CertUnlockFailure`] back to the `Error` variant `do_handshake_cert`
+/// has always surfaced, so `scan_with`'s rendering and the path-1 disc-hash →
+/// VUK fallback are byte-for-byte unchanged. (`NoHostCert` keeps the
+/// `<no host cert>` sentinel.)
+fn unlock_error_to_error(e: &CertUnlockFailure) -> Error {
+    use freemkv_unlock::UnlockError;
     match e {
-        UnlockError::NoUsableHostCert { .. } => Error::AacsNoHostCert {
+        CertUnlockFailure::NoHostCert { .. }
+        | CertUnlockFailure::Unlock(UnlockError::NoUsableHostCert) => Error::AacsNoHostCert {
             path: "<no host cert>".into(),
         },
-        UnlockError::VidUnavailable => Error::AacsVidUnavailable,
-        UnlockError::HandshakeRejected
-        | UnlockError::CertRevoked { .. }
-        | UnlockError::FirmwareNotUnlockable
-        | UnlockError::NotApplicable
-        | UnlockError::Scsi(_) => Error::AacsHostCertRejected,
+        CertUnlockFailure::Unlock(UnlockError::VidUnavailable) => Error::AacsVidUnavailable,
+        CertUnlockFailure::Unlock(
+            UnlockError::HandshakeRejected | UnlockError::NotApplicable | UnlockError::Transport,
+        ) => Error::AacsHostCertRejected,
     }
 }
 
-/// Map a cert-path [`crate::unlock::UnlockError`] to a structured
-/// [`crate::aacs::UnlockOutcome`] for the resolution trace (English-free).
-fn cert_unlock_outcome(e: &crate::unlock::UnlockError) -> crate::aacs::UnlockOutcome {
+/// Map a [`CertUnlockFailure`] to a structured [`crate::aacs::UnlockOutcome`]
+/// for the resolution trace (English-free).
+fn cert_unlock_outcome(e: &CertUnlockFailure) -> crate::aacs::UnlockOutcome {
     use crate::aacs::UnlockOutcome;
-    use crate::unlock::UnlockError;
+    use freemkv_unlock::UnlockError;
     match e {
-        UnlockError::FirmwareNotUnlockable => UnlockOutcome::FirmwareNotUnlockable,
-        UnlockError::NoUsableHostCert { mkb } => UnlockOutcome::NoUsableHostCert { mkb: *mkb },
-        UnlockError::CertRevoked { mkb } => UnlockOutcome::CertRevoked { mkb: *mkb },
-        UnlockError::VidUnavailable => UnlockOutcome::VidUnavailable,
-        UnlockError::HandshakeRejected | UnlockError::NotApplicable | UnlockError::Scsi(_) => {
-            UnlockOutcome::HandshakeRejected
+        CertUnlockFailure::NoHostCert { mkb } => UnlockOutcome::NoUsableHostCert { mkb: *mkb },
+        CertUnlockFailure::Unlock(UnlockError::NoUsableHostCert) => {
+            UnlockOutcome::NoUsableHostCert { mkb: None }
         }
+        CertUnlockFailure::Unlock(UnlockError::VidUnavailable) => UnlockOutcome::VidUnavailable,
+        CertUnlockFailure::Unlock(
+            UnlockError::HandshakeRejected | UnlockError::NotApplicable | UnlockError::Transport,
+        ) => UnlockOutcome::HandshakeRejected,
     }
 }
 
@@ -151,11 +174,11 @@ impl Disc {
     /// a structured `HandshakeResult` for downstream key resolution.
     ///
     /// VID acquisition runs through [`Self::do_handshake_cert`], which first
-    /// asks the pluggable [`crate::unlock::Unlocker`] seam for the OEM VID
+    /// uses the OEM VID a firmware unlocker may have stashed at drive `init()`
     /// (a drive-functionality capability decoupled from the host cert + HRL)
-    /// and falls back to the cert-based mutual-auth handshake when no
-    /// unlocker serves one. The cert path also yields `read_data_key`,
-    /// required for AACS 2.0 bus decryption.
+    /// and falls back to the cert-based mutual-auth handshake (dispatched to the
+    /// `freemkv-unlock` AACS unlocker) when none is present. The cert path also
+    /// yields `read_data_key`, required for AACS 2.0 bus decryption.
     ///
     /// Returns `(handshake, error)`:
     ///   * `(Some(_), None)`  — VID acquired
@@ -187,11 +210,11 @@ impl Disc {
 
     /// Cert-based AACS handshake — the cert route for VID acquisition.
     ///
-    /// Before running the cert mutual-auth, this asks the pluggable
-    /// [`crate::unlock::Unlocker`] seam for the OEM Volume ID. An unlocker
-    /// unlocks *drive functionality*, not just the disc: VID retrieval via
-    /// the drive's OEM CDB is a capability separate from `unlock`. When the
-    /// matching unlocker serves a VID, we use it and SKIP the cert handshake
+    /// Before running the cert mutual-auth, this checks for an OEM Volume ID a
+    /// firmware unlocker stashed at drive `init()`. Such an unlocker unlocks
+    /// *drive functionality*, not just the disc: VID retrieval via the drive's
+    /// OEM CDB is a capability separate from `unlock`. When one served a VID,
+    /// we use it and SKIP the cert handshake
     /// entirely — the OEM path gets the VID *without* the host certificate +
     /// HRL, decoupling VID from the cert chain. The OEM path yields no
     /// `read_data_key` (no bus-key is derived); AACS 2.0 content needing
@@ -211,16 +234,16 @@ impl Disc {
         // Delegates to the shared cert primitive (the external freemkv-unlock-aacs
         // plugin uses the same one). Kept as a thin Disc method so the existing
         // collect_host_certs_* unit tests and call sites are unchanged.
-        crate::aacs::handshake::collect_host_certs(opts, mkb)
+        crate::aacs::host_certs::collect_host_certs(opts, mkb)
     }
 
     fn do_handshake_cert(
         session: &mut crate::drive::Drive,
         opts: &ScanOptions,
     ) -> (Option<HandshakeResult>, Option<Error>) {
-        // OEM VID shortcut: a matching firmware unlocker stashed the disc's
-        // Volume ID at drive `init()` (the new `unlock()` folds in the old
-        // `read_volume_id`). Use it and SKIP the cert handshake — the OEM path
+        // OEM VID shortcut: a matching unlocker stashed the disc's Volume ID at
+        // drive `init()` (the new `unlock()` folds in the old `read_volume_id`).
+        // Use it and SKIP the cert handshake — the OEM path
         // decouples the VID from the host cert + HRL. It yields no
         // `read_data_key`; a bus-encrypted disc that needs the bus key is caught
         // by the bus-key gate in `resolve_vid_only`.
@@ -237,7 +260,7 @@ impl Disc {
                     // OEM/VID-only path never attempts the bus-key read — None here
                     // is "not attempted", not "failed".
                     read_data_key_err: None,
-                    // The firmware unlocker stashed this VID at init, which means it
+                    // The unlocker stashed this VID at init, which means it
                     // matched and unlocked the drive — it now serves clear content,
                     // so bus encryption is removed at the drive. Credit it.
                     drive_unlocked: true,
@@ -267,7 +290,7 @@ impl Disc {
                     outcome = ?cert_unlock_outcome(&e),
                     "AACS cert handshake produced no VID; a key source may still supply this disc's key."
                 );
-                (None, Some(unlock_error_to_error(e)))
+                (None, Some(unlock_error_to_error(&e)))
             }
         }
     }
@@ -312,12 +335,12 @@ impl Disc {
         // sectors, which MUST be removed before any AACS key can decrypt them.
         // There are TWO ways it gets removed, and bus encryption is unremovable
         // only when NEITHER succeeded:
-        //   1. A firmware unlocker unlocked the drive → it serves
-        //      CLEAR content (`drive_unlocked`). This is the common live-drive
-        //      case and yields no `read_data_key` — it doesn't need one.
+        //   1. An unlocker unlocked the drive → it serves CLEAR content
+        //      (`drive_unlocked`). This is the common live-drive case and yields
+        //      no `read_data_key` — it doesn't need one.
         //   2. The AACS host-certificate cert-auth handshake produced the bus key
         //      (`read_data_key`).
-        // The old gate credited ONLY (2), so a SUCCESSFUL firmware unlock (VID
+        // The old gate credited ONLY (2), so a SUCCESSFUL drive unlock (VID
         // present, `read_data_key: None`, `drive_unlocked: true`) tripped it and
         // blocked ALL key resolution — including the online source — even though
         // the drive was serving clear content. That was the bug.
@@ -327,7 +350,7 @@ impl Disc {
         // false (AACS 1.0 BD is not bus-encrypted).
         // ONE question — "is AACS bus encryption gone?" — asked of the single
         // `bus_encryption_removed` predicate, which OWNS every case (never had it,
-        // file/ISO, firmware unlock, cert bus key). The gate enumerates nothing.
+        // file/ISO, drive unlock, cert bus key). The gate enumerates nothing.
         if !bus_encryption_removed(bus_encryption, handshake) {
             let (rdk_err, has_vid) = handshake
                 .map(|h| (h.read_data_key_err, h.volume_id != [0u8; 16]))
@@ -337,7 +360,7 @@ impl Disc {
                 phase = "bus_key_unavailable",
                 read_data_key_err = ?rdk_err,
                 has_volume_id = has_vid,
-                "Disc declares bus encryption but it could not be removed: no firmware unlocker \
+                "Disc declares bus encryption but it could not be removed: no unlocker \
                  unlocked the drive AND the cert handshake produced no read_data_key. Refusing to \
                  emit a key that would decrypt to garbage."
             );
@@ -1026,22 +1049,28 @@ mod tests {
 
     #[test]
     fn unlock_error_maps_to_legacy_error_variants() {
-        use crate::unlock::UnlockError;
-        // No host cert keeps the AacsNoHostCert sentinel path.
-        match unlock_error_to_error(UnlockError::NoUsableHostCert { mkb: Some(68) }) {
+        use freemkv_unlock::UnlockError;
+        // No host cert (libfreemkv-side, carries mkb) keeps the AacsNoHostCert
+        // sentinel path — as does the unlocker's own NoUsableHostCert.
+        match unlock_error_to_error(&CertUnlockFailure::NoHostCert { mkb: Some(68) }) {
+            Error::AacsNoHostCert { path } => assert_eq!(path, "<no host cert>"),
+            other => panic!("expected AacsNoHostCert, got {other:?}"),
+        }
+        match unlock_error_to_error(&CertUnlockFailure::Unlock(UnlockError::NoUsableHostCert)) {
             Error::AacsNoHostCert { path } => assert_eq!(path, "<no host cert>"),
             other => panic!("expected AacsNoHostCert, got {other:?}"),
         }
         assert!(matches!(
-            unlock_error_to_error(UnlockError::VidUnavailable),
+            unlock_error_to_error(&CertUnlockFailure::Unlock(UnlockError::VidUnavailable)),
             Error::AacsVidUnavailable
         ));
         assert!(matches!(
-            unlock_error_to_error(UnlockError::HandshakeRejected),
+            unlock_error_to_error(&CertUnlockFailure::Unlock(UnlockError::HandshakeRejected)),
             Error::AacsHostCertRejected
         ));
+        // A transport fault folds to the rejected surface too.
         assert!(matches!(
-            unlock_error_to_error(UnlockError::CertRevoked { mkb: None }),
+            unlock_error_to_error(&CertUnlockFailure::Unlock(UnlockError::Transport)),
             Error::AacsHostCertRejected
         ));
     }
@@ -1049,22 +1078,23 @@ mod tests {
     #[test]
     fn cert_unlock_outcome_maps_to_structured_trace_step() {
         use crate::aacs::UnlockOutcome;
-        use crate::unlock::UnlockError;
+        use freemkv_unlock::UnlockError;
+        // The libfreemkv-side no-cert case carries the MKB generation.
         assert_eq!(
-            cert_unlock_outcome(&UnlockError::NoUsableHostCert { mkb: Some(77) }),
+            cert_unlock_outcome(&CertUnlockFailure::NoHostCert { mkb: Some(77) }),
             UnlockOutcome::NoUsableHostCert { mkb: Some(77) }
         );
         assert_eq!(
-            cert_unlock_outcome(&UnlockError::VidUnavailable),
+            cert_unlock_outcome(&CertUnlockFailure::Unlock(UnlockError::VidUnavailable)),
             UnlockOutcome::VidUnavailable
         );
         assert_eq!(
-            cert_unlock_outcome(&UnlockError::HandshakeRejected),
+            cert_unlock_outcome(&CertUnlockFailure::Unlock(UnlockError::HandshakeRejected)),
             UnlockOutcome::HandshakeRejected
         );
-        // A SCSI/transport error folds to HandshakeRejected at the trace layer.
+        // A transport fault folds to HandshakeRejected at the trace layer.
         assert_eq!(
-            cert_unlock_outcome(&UnlockError::Scsi(4000)),
+            cert_unlock_outcome(&CertUnlockFailure::Unlock(UnlockError::Transport)),
             UnlockOutcome::HandshakeRejected
         );
     }

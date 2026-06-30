@@ -14,7 +14,6 @@
 //! }
 //! ```
 
-pub mod auth;
 pub mod lfsr;
 pub mod stevenson;
 pub(crate) mod tables;

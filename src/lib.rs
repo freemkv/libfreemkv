@@ -1,9 +1,10 @@
 //! libfreemkv -- Open source optical drive library for 4K UHD / Blu-ray / DVD.
 //!
 //! Handles drive access, disc structure parsing, AACS decryption, and raw
-//! sector reading. Drive unlocking is pluggable: libfreemkv owns only the
-//! [`Unlocker`] seam and registry — firmware blobs and unlock CDBs live in
-//! an external crate (e.g. `freemkv-unlock-ld`).
+//! sector reading. Unlocking — removing bus encryption (firmware unlock, AACS
+//! cert handshake, CSS bus-auth) — lives entirely in the `freemkv-unlock`
+//! crate; libfreemkv consumes it privately and exposes none of it, so clients
+//! are oblivious to unlockers (just as they are to the SCSI layer).
 //!
 //! # Quick Start
 //!
@@ -47,8 +48,8 @@
 //! Drive           -- open, identify, unlock, read sectors
 //!   ├── ScsiTransport    -- SG_IO (Linux), IOKit (macOS)
 //!   ├── DriveId          -- INQUIRY + GET_CONFIG identification
-//!   └── Unlocker         -- pluggable, external (e.g. freemkv-unlock-ld);
-//!                           libfreemkv owns only the trait + registry
+//!   └── unlock_bridge    -- private seam to the `freemkv-unlock` crate
+//!                           (firmware / AACS cert / CSS bus-auth unlockers)
 //!
 //! Disc                   -- scan titles, streams, AACS state
 //!   ├── UDF reader       -- Blu-ray UDF 2.50 with metadata partitions
@@ -126,7 +127,7 @@ pub mod scsi;
 pub mod sector;
 pub(crate) mod speed;
 pub(crate) mod udf;
-pub mod unlock;
+pub(crate) mod unlock_bridge;
 pub mod verify;
 
 // Re-export verify types at the crate root for ergonomic imports.
@@ -176,14 +177,13 @@ pub use io::pipeline::{
 pub use event::{BatchSizeReason, Event, EventKind};
 pub use identity::DriveId;
 
-// ─── Pluggable unlock seam ──────────────────────────────────────────────────
+// ─── Unlock seam ────────────────────────────────────────────────────────────
 //
-// libfreemkv carries no firmware blobs / unlock CDBs / drive profiles. An
-// external unlocker crate (e.g. `freemkv-unlock-ld`) implements `Unlocker`
-// and registers it once at process start via `register_unlocker`. At
-// drive-prep the registry is walked in order; the first matching unlocker
-// runs, else the drive falls through to the host-cert AACS handshake.
-pub use unlock::{DiscKind, UnlockCtx, UnlockError, Unlocked, Unlocker, register_unlocker};
+// Drive/disc unlocking (removing bus encryption — firmware, AACS cert, CSS
+// bus-auth) lives entirely in the `freemkv-unlock` crate. libfreemkv consumes
+// it through the private `unlock_bridge` and exposes nothing of it: clients are
+// oblivious to unlockers, exactly as they are to the SCSI layer. There is no
+// public unlock surface to import.
 
 // ─── Decryption (AACS / CSS) ────────────────────────────────────────────────
 //
