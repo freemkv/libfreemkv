@@ -80,7 +80,7 @@ impl AacsCertUnlocker<'_> {
         // MKB generation (best-effort) — forwarded to each source's
         // `host_certs(mkb)` so a source MAY select a generation-appropriate cert
         // (the default impl ignores it). A read failure leaves it `None`.
-        let mkb_gen = aacs::read_mkb_from_drive(session)
+        let mkb_gen = aacs::read_mkb_from_drive(session.scsi_mut())
             .ok()
             .and_then(|m| aacs::mkb_version(&m));
 

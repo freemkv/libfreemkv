@@ -418,7 +418,7 @@ impl Drive {
         );
         self.init_ran = true;
         let r = match r {
-            Ok(Some((name, unlocked))) => {
+            Ok(crate::unlock::UnlockRoute::Unlocked(name, unlocked)) => {
                 self.unlocker_name = Some(name);
                 // Stash the OEM Volume ID the firmware unlocker returned for the
                 // AACS handshake phase (do_handshake reads it via `oem_vid()`).
@@ -448,7 +448,9 @@ impl Drive {
             // No unlocker matched, or one matched but only hit a capability
             // failure (not firmware-unlockable / no OEM VID): not an error —
             // fall through to the OEM host-cert route.
-            Ok(None) => Ok(()),
+            Ok(crate::unlock::UnlockRoute::Failed(..) | crate::unlock::UnlockRoute::NoMatch) => {
+                Ok(())
+            }
             // A genuine transport fault during unlock (UnlockError::Scsi)
             // propagates here and aborts init — the bus is dead.
             Err(e) => Err(e),

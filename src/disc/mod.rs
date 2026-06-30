@@ -1482,12 +1482,28 @@ impl Disc {
                 let drive_id = session.drive_id.clone();
                 let css_ctx =
                     crate::unlock::UnlockCtx::new(&drive_id, crate::unlock::DiscKind::Css);
-                if let Err(e) = crate::unlock::route_unlock(session.scsi_mut(), &css_ctx) {
-                    tracing::warn!(
-                        target: "freemkv::scan",
-                        error_code = e.code(),
-                        "CSS bus-auth unlock failed; scrambled sectors may be unavailable"
-                    );
+                match crate::unlock::route_unlock(session.scsi_mut(), &css_ctx) {
+                    Ok(crate::unlock::UnlockRoute::Unlocked(..)) => {}
+                    Ok(crate::unlock::UnlockRoute::Failed(e)) => {
+                        tracing::warn!(
+                            target: "freemkv::scan",
+                            outcome = ?e,
+                            "CSS bus-auth unlock failed; scrambled sectors may be unavailable"
+                        );
+                    }
+                    Ok(crate::unlock::UnlockRoute::NoMatch) => {
+                        tracing::warn!(
+                            target: "freemkv::scan",
+                            "no CSS unlocker registered; scrambled sectors may be unavailable"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "freemkv::scan",
+                            error_code = e.code(),
+                            "CSS bus-auth unlock hit a transport fault; scrambled sectors may be unavailable"
+                        );
+                    }
                 }
                 // Size the crack's batch reads to THIS drive's per-command max
                 // (DVD ≈ 16; the USB bridge may be lower) — an over-large
