@@ -195,6 +195,16 @@ pub struct DiscStream {
     /// timestamp cost or `prof_active()` env-var lookup (which takes a
     /// process-wide lock).
     profiling: bool,
+    /// B1 drop-to-keyframe resync gate, one per stream — mirrors
+    /// `PipelinedPesStream`. After an AACS-concealed (undecryptable) gap stamps
+    /// a frame `discontinuity`, the gate drops forward inter-coded video frames
+    /// until the next keyframe so no dangling-reference frame reaches the muxer.
+    /// Without this the live-drive single-pass path emitted decode-broken output
+    /// on an undecryptable unit (the file-backed highway path is already gated).
+    resync: Vec<super::resync::ResyncGate>,
+    /// Whether each stream (by track index) is video — audio/subtitle frames are
+    /// independent and always admit.
+    is_video: Vec<bool>,
 }
 
 impl DiscStream {
@@ -287,6 +297,18 @@ impl DiscStream {
         // clones an Arc per frame on the mux hot path.
         let decrypt_loss = reader.decrypt_loss();
 
+        // B1 resync gates: one per stream, video flagged so the gate only
+        // drop-to-keyframes video (audio/subtitle always admit). Computed before
+        // `title` is moved into the struct below.
+        let is_video: Vec<bool> = title
+            .streams
+            .iter()
+            .map(|s| matches!(s, crate::disc::Stream::Video(_)))
+            .collect();
+        let resync = (0..title.streams.len())
+            .map(|_| super::resync::ResyncGate::new())
+            .collect();
+
         Self {
             reader,
             decrypt_loss,
@@ -315,6 +337,8 @@ impl DiscStream {
             pid_to_track,
             skip_parse: std::env::var_os("FREEMKV_SKIP_PARSE").is_some(),
             profiling: std::env::var_os("FREEMKV_PROFILE").is_some(),
+            resync,
+            is_video,
         }
     }
 
@@ -673,10 +697,25 @@ impl crate::pes::Stream for DiscStream {
                             if let Some((_, parser)) =
                                 self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
                             {
+                                let resync = &mut self.resync;
+                                let is_video = &self.is_video;
+                                let pending = &mut self.pending_frames;
                                 for frame in parser.parse(pes) {
-                                    self.pending_frames.push_back(
-                                        crate::pes::PesFrame::from_codec_frame(*track, frame),
-                                    );
+                                    // Same B1 gate — a concealed gap can leave a
+                                    // post-gap frame in the demuxer's final flush.
+                                    let emit = match resync.get_mut(*track) {
+                                        Some(gate) => gate.admit(
+                                            is_video.get(*track).copied().unwrap_or(false),
+                                            frame.discontinuity,
+                                            frame.keyframe,
+                                        ),
+                                        None => true,
+                                    };
+                                    if emit {
+                                        pending.push_back(crate::pes::PesFrame::from_codec_frame(
+                                            *track, frame,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -741,12 +780,42 @@ impl crate::pes::Stream for DiscStream {
                 // PES boundaries).
                 let pid_to_track = &self.pid_to_track;
                 let pending = &mut self.pending_frames;
+                let resync = &mut self.resync;
+                let is_video = &self.is_video;
                 for (pid, parser) in self.parsers.iter_mut() {
                     let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                         continue;
                     };
+                    // Flush frames carry their own per-frame `discontinuity` (a
+                    // post-gap picture buffered at EOF was stamped by the parser),
+                    // so route them through the SAME B1 gate the in-stream path
+                    // uses — otherwise a trailing dangling-reference frame would
+                    // bypass the resync.
                     for frame in parser.flush() {
-                        pending.push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
+                        let emit = match resync.get_mut(track) {
+                            Some(gate) => gate.admit(
+                                is_video.get(track).copied().unwrap_or(false),
+                                frame.discontinuity,
+                                frame.keyframe,
+                            ),
+                            None => true,
+                        };
+                        if emit {
+                            pending.push_back(crate::pes::PesFrame::from_codec_frame(track, frame));
+                        }
+                    }
+                }
+                // A gate still armed at EOF dropped post-gap frames that never
+                // reached a keyframe (a concealed gap in the final GOP). Surface
+                // it once so the loss is visible, not silent.
+                for (track, gate) in self.resync.iter().enumerate() {
+                    if gate.is_armed() {
+                        tracing::warn!(
+                            target: "mux",
+                            track,
+                            dropped = gate.dropped_in_run(),
+                            "B1: stream ended while dropping to a keyframe after a concealed gap (no trailing keyframe)"
+                        );
                     }
                 }
                 return Ok(self.pending_frames.pop_front());
@@ -794,10 +863,28 @@ impl crate::pes::Stream for DiscStream {
                         } else if let Some((_, parser)) =
                             self.parsers.iter_mut().find(|(pid, _)| *pid == pes.pid)
                         {
+                            // Disjoint field borrows: the resync gate + is_video
+                            // reads coexist with the mutable `self.parsers` drain.
+                            let resync = &mut self.resync;
+                            let is_video = &self.is_video;
+                            let pending = &mut self.pending_frames;
                             for frame in parser.parse(&pes) {
-                                self.pending_frames.push_back(
-                                    crate::pes::PesFrame::from_codec_frame(track, frame),
-                                );
+                                // B1: after a concealed/lost gap, drop forward to
+                                // the next keyframe on a video track so no frame
+                                // with a dangling reference is emitted.
+                                let emit = match resync.get_mut(track) {
+                                    Some(gate) => gate.admit(
+                                        is_video.get(track).copied().unwrap_or(false),
+                                        frame.discontinuity,
+                                        frame.keyframe,
+                                    ),
+                                    None => true,
+                                };
+                                if emit {
+                                    pending.push_back(crate::pes::PesFrame::from_codec_frame(
+                                        track, frame,
+                                    ));
+                                }
                             }
                         }
                     }
