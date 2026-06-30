@@ -44,11 +44,31 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
                 bytes_transferred: r.bytes_transferred,
                 sense: r.sense,
             }),
-            // libfreemkv's transport returns Err only on a transport-layer fault.
-            Err(_) => Err(fu::scsi::ScsiError {
-                status: 0xFF,
-                sense: None,
-            }),
+            // libfreemkv's transport returns Err for ANY non-zero SCSI status —
+            // i.e. a normal drive CHECK CONDITION (ILLEGAL_REQUEST, etc.), NOT
+            // only a transport-layer fault. Preserve the real status AND the
+            // parsed sense across the seam: the AACS handshake's wedge guard
+            // bails on an ILLEGAL_REQUEST sense (so it stops hammering the drive),
+            // and its diagnosis distinguishes a cert rejection from a dead bus by
+            // the same status/sense. Collapsing everything to 0xFF/None defeated
+            // both. Reconstruct the 32-byte sense buffer at the offsets the
+            // unlock crate reads (sense_key@2 low-nibble, asc@12, ascq@13); a
+            // genuine transport fault (status 0xFF, no sense) maps through
+            // unchanged.
+            Err(e) => {
+                let (status, sense) = crate::drive::extract_scsi_context(&e);
+                let sense_buf = sense.map(|s| {
+                    let mut b = [0u8; 32];
+                    b[2] = s.sense_key & 0x0F;
+                    b[12] = s.asc;
+                    b[13] = s.ascq;
+                    b
+                });
+                Err(fu::scsi::ScsiError {
+                    status,
+                    sense: sense_buf,
+                })
+            }
         }
     }
 }
