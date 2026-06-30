@@ -320,7 +320,6 @@ const CONSECUTIVE_FAIL_LONG_PAUSE: u64 = 5;
 const CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD: u64 = 10;
 // Adaptive batching: climb back to `initial_batch` after this many
 // consecutive clean single-sector successes.
-const ADAPTIVE_UPSCALE_THRESHOLD: u32 = 16;
 // Wedge-family (HARDWARE_ERROR / ILLEGAL_REQUEST) cooldown and abort
 // thresholds — see `handle_read_failure` below for context.
 // Single source of truth lives in `disc::read_error` so this cannot
@@ -782,7 +781,6 @@ pub(super) struct PatchLoopState {
     pub now: fn() -> std::time::Instant,
     // Adaptive batch
     pub current_batch: u16,
-    pub consecutive_singles_ok: u32,
     // Snapshot at construction — these stay constant for the whole pass
     pub bytes_good_before: u64,
     pub bytes_good_start: u64,
@@ -848,7 +846,6 @@ impl PatchLoopState {
             range_bytes_good: bytes_good_before,
             now,
             current_batch: initial_batch,
-            consecutive_singles_ok: 0,
             bytes_good_before,
             bytes_good_start: bytes_good_before,
             total_bytes,
@@ -900,26 +897,28 @@ pub(super) fn handle_read_success<R: SectorSource + ?Sized>(
     if state.consecutive_good_since_skip >= PASSN_ESCALATION_RESET_GOOD {
         state.consecutive_skips_without_recovery = 0;
     }
-    // Adaptive batching: track clean single-sector reads to decide
-    // when to climb back to `state.initial_batch`. A batch read
-    // succeeding (count > 1) tells us the drive is healthy but doesn't
-    // accumulate toward upscale — we got back to batch=1 because of a
-    // failure here, we need consistent health at the slow tempo
-    // before scaling up again.
-    if count == 1 && state.current_batch < state.initial_batch {
-        state.consecutive_singles_ok += 1;
-        if state.consecutive_singles_ok >= ADAPTIVE_UPSCALE_THRESHOLD {
-            tracing::info!(
+    // Adaptive batch re-grow: the partner to handle_read_failure's
+    // halve-on-failure (bisect). On ANY successful read below
+    // initial_batch, double the batch — so it converges on the right
+    // granularity (tiny across damage, climbing back through clean runs)
+    // and a mid-size batch left by a bisect (8/4/2) still climbs back,
+    // not just count==1. Mirrors the sweep's read_error adaptive batch:
+    // halve down, double up.
+    if state.current_batch < state.initial_batch {
+        let grown = state
+            .current_batch
+            .saturating_mul(2)
+            .min(state.initial_batch);
+        if grown != state.current_batch {
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "patch.batch.upscale",
                 from = state.current_batch,
-                to = state.initial_batch,
-                consecutive_singles_ok = state.consecutive_singles_ok,
+                to = grown,
                 lba,
-                "adaptive batching: drive stable, climbing back to initial_batch"
+                "adaptive batching: clean read, doubling batch toward initial_batch"
             );
-            state.current_batch = state.initial_batch;
-            state.consecutive_singles_ok = 0;
+            state.current_batch = grown;
         }
     }
     state.damage_window.push(true);
@@ -1173,16 +1172,14 @@ pub(super) fn handle_read_failure<R: SectorSource + ?Sized>(
             from_batch = state.current_batch,
             to_batch = halved,
             err_code = err.code(),
-            "adaptive batching: batch read failed, bisecting (halving) to isolate the bad sector"
+            "batch read failed, bisecting (halving) to isolate the bad sector"
         );
         state.current_batch = halved;
-        state.consecutive_singles_ok = 0;
         return Ok(FailureAction::ContinueInner);
     }
 
     state.blocks_read_failed += 1;
     state.consecutive_good_since_skip = 0;
-    state.consecutive_singles_ok = 0;
     state.unreadable_count += 1;
 
     // Reset the per-LBA NOT_READY counter whenever the LBA changes.
@@ -1956,7 +1953,7 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
         );
 
         // Enter at MAX speed + the full initial batch: read the clean
-        // overshoot fast. `range_slowed` flips on the first read failure
+        // overshoot fast. `retried_once` flips on the first read failure
         // (below), dropping to the slow recovery speed for the rest of
         // the range and arming the inter-range cooldown.
         self.reader.set_speed(0xFFFF);
@@ -1969,7 +1966,7 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
             "range entering at MAX read speed (drops to slow recovery on first failure)"
         );
         self.state.current_batch = self.state.initial_batch;
-        let mut range_slowed = false;
+        let mut retried_once = false;
 
         loop {
             if let Some(ref h) = self.opts.halt {
@@ -2058,28 +2055,20 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
                     }
                 }
                 Err(err) => {
-                    // First failure in this range: the fast-batched pass
-                    // over the clean overshoot is done. A genuine transport
-                    // fault (bridge crash) is NOT a recoverable bad sector —
-                    // skip the slow re-read and let handle_read_failure abort
-                    // immediately. Drop to the slow recovery speed, arm the
-                    // cooldown, and RE-ATTEMPT the same position once at slow
-                    // speed before marking it: the drive's deep ECC recovery
-                    // only engages slow, and the failure so far is a fast-read
-                    // miss. Hold the cursor (don't advance, don't count
-                    // damage); only a slow-speed result reaches
-                    // handle_read_failure. `range_slowed` gates this to once.
-                    if !range_slowed && !err.is_scsi_transport_failure() {
-                        self.reader.set_speed(0x0000);
-                        tracing::info!(
-                            target: "freemkv::disc",
-                            phase = "patch.speed",
-                            lba,
-                            speed = "0x0000",
-                            "range dropped to slow recovery speed; retrying the failing read at slow speed before marking"
-                        );
-                        range_slowed = true;
-                        self.cooldown_pending = true;
+                    // First failure in this range: the fast-batched pass over
+                    // the clean overshoot is done. A genuine transport fault
+                    // (bridge crash) is NOT a recoverable bad sector — let
+                    // handle_read_failure abort immediately. Otherwise re-attempt
+                    // the read ONCE (stochastic media: a marginal sector often
+                    // reads on a retry) and fall through. Stay at MAX speed:
+                    // direct probing on the live BU40N/UHD proved MAX reads a
+                    // marginal sector ~12x faster than slow AND slow never
+                    // recovered one MAX didn't — so the old drop-to-0x0000 only
+                    // wasted time on the GOOD sectors of a bad range (~3x slower
+                    // overall). `retried_once` gates the retry to once per range.
+                    if !retried_once && !err.is_scsi_transport_failure() {
+                        self.reader.set_speed(0xFFFF);
+                        retried_once = true;
                         continue;
                     }
 
@@ -2392,10 +2381,10 @@ impl Disc {
             );
         }
 
-        // Adaptive batching: read at `state.current_batch`, drop to 1
-        // on batch-read failure, climb back to `state.initial_batch`
-        // after ADAPTIVE_UPSCALE_THRESHOLD consecutive single-sector
-        // successes. Rationale: dense damage scattered through a
+        // Adaptive batching: read at `state.current_batch`, HALVE on a
+        // batch-read failure (bisect to isolate the bad sector), and
+        // DOUBLE back toward `state.initial_batch` on each clean read.
+        // Rationale: dense damage scattered through a
         // NonTrimmed range is rare — most "bad ranges" in pass N have
         // lots of good sectors that swept-by-default landed inside.
         // Batch reads walk those at ~32x the speed of singles,
