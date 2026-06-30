@@ -275,6 +275,7 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
         progress: None,
         halt: Some(halt.clone()),
         key_fetch: None,
+        fast_capture: false,
     };
 
     let outcome = disc.patch(&mut reader, &iso_path, &opts);

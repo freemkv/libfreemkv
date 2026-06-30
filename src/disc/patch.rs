@@ -1972,6 +1972,30 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
                     }
                 }
                 Err(err) => {
+                    // Fast-capture pass: don't grind this block. Mark it
+                    // NonTrimmed for a later granular pass and move on, so the
+                    // readable blocks of EVERY range are captured before any
+                    // single range's slow per-sector recovery. A transport fault
+                    // (bridge crash) still falls through below — it isn't a
+                    // recoverable bad sector. No data is dropped: the block stays
+                    // NonTrimmed until a granular pass recovers or gives up on it.
+                    if self.opts.fast_capture && !err.is_scsi_transport_failure() {
+                        send_or_abort(
+                            self.pipe,
+                            PatchItem::NonTrimmed {
+                                pos,
+                                len: block_bytes,
+                            },
+                        )?;
+                        self.state.blocks_read_failed += 1;
+                        if self.opts.reverse {
+                            frame.block_end = frame.block_end.saturating_sub(block_bytes);
+                        } else {
+                            frame.block_end += block_bytes;
+                        }
+                        continue;
+                    }
+
                     // First failure in this range: the fast-batched pass over
                     // the clean overshoot is done. A genuine transport fault
                     // (bridge crash) is NOT a recoverable bad sector — let
@@ -2481,6 +2505,7 @@ mod tests {
             halt: None,
 
             key_fetch: None,
+            fast_capture: false,
         }
     }
 
