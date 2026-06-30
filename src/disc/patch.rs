@@ -496,6 +496,162 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scatter-recovery: "reset, read good data, come back for one sector."
+// ---------------------------------------------------------------------------
+//
+// A genuinely-damaged sector makes the drive grind its internal C1/C2/L-EC
+// re-read loop for the whole recovery timeout (~60 s) and still fail. Worse,
+// re-reading consecutive bad LBAs at identical conditions both (a) re-fails
+// identically and (b) is exactly the rapid-failure cadence that drops the
+// BU40N into a firmware fast-fail wedge (see CLAUDE.md hard-rule #2).
+//
+// The fix mirrors ddrescue/MakeMKV practice: between attempts on a stuck
+// sector, SEEK AWAY and read a run of known-good sectors. That forces a full
+// re-seek + servo/focus relock (re-seating the head so it arrives at the bad
+// sector on a fresh, tracking-locked approach — which recovers marginal
+// sectors a stationary grind can't) AND breaks the consecutive-failure cadence
+// that wedges the drive. Each fresh re-read uses the FAST timeout
+// (`recovery = false`), not the 60 s deep grind: a recalibrated marginal
+// sector reads quickly, and a truly-dead one fails fast instead of burning
+// 60 s per fresh attempt. Many fast fresh attempts beat one long grind.
+
+/// Fresh re-read attempts on a stuck sector before giving up (each preceded
+/// by a recalibration read).
+const SCATTER_MAX_ATTEMPTS: u32 = 3;
+/// Known-good sectors read at the anchor to recalibrate between attempts
+/// (~196 KB; a multiple of 3 so AACS units stay aligned, no widening).
+const SCATTER_GOOD_SECTORS: u16 = 96;
+/// Base anchor LBA. The leading region of a mounted disc is good, and seeking
+/// there from a high bad-region LBA is a long stroke that fully re-seats the
+/// head.
+const SCATTER_ANCHOR_BASE_LBA: u32 = 64;
+/// Vary the anchor per attempt so the drive can't satisfy the recalibration
+/// read from cache (a cache hit performs no seek = no recalibration).
+const SCATTER_ANCHOR_STRIDE: u32 = 8192;
+
+/// Recalibration primitive: read `count` known-good sectors at `anchor`,
+/// discarding the data. The point is the physical SEEK + sustained tracking
+/// read that re-seats the head/servo — not the bytes. Routed through
+/// [`recovery_read`] (fast path) so an unaligned AACS anchor still issues a
+/// real drive read instead of being rejected pre-read by the decrypting
+/// source. Best-effort: a failed anchor read (e.g. it landed in another bad
+/// range) still performed the seek, so the error is ignored.
+pub(super) fn read_good_sectors<R: SectorSource + ?Sized>(
+    reader: &mut R,
+    decrypt_is_aacs: bool,
+    anchor: u32,
+    count: u16,
+) {
+    let mut buf = vec![0u8; count as usize * 2048];
+    let _ = recovery_read(reader, decrypt_is_aacs, anchor, count, &mut buf, false);
+}
+
+/// Try to recover a stuck single sector by recalibrating between fresh, fast
+/// re-reads (see the module-section comment above). On success `buf[..bytes]`
+/// holds the recovered sector and the caller treats it exactly like a normal
+/// read success; on failure it returns `false` to fall through to the usual
+/// NonTrimmed give-up.
+///
+/// Engages ONLY for a genuine single-sector MEDIUM ERROR (sense_key 0x03):
+/// transport faults abort the pass, NOT_READY has its own retry path, and
+/// wedge-family senses (HARDWARE / ILLEGAL_REQUEST) want a cooldown/eject —
+/// scattering on those would just hammer an already-wedged drive.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scatter_recover<R: SectorSource + ?Sized>(
+    reader: &mut R,
+    err: &Error,
+    lba: u32,
+    count: u16,
+    bytes: usize,
+    buf: &mut [u8],
+    decrypt_is_aacs: bool,
+    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> bool {
+    let is_medium = err
+        .scsi_sense()
+        .map(|s| s.sense_key == crate::scsi::SENSE_KEY_MEDIUM_ERROR)
+        .unwrap_or(false);
+    if count != 1 || !is_medium {
+        return false;
+    }
+
+    let halted = |h: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>| {
+        h.map(|h| h.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
+    for attempt in 1..=SCATTER_MAX_ATTEMPTS {
+        if halted(halt) {
+            return false;
+        }
+        // Anchor toward disc start, varied per attempt, clamped below the
+        // target so we never read the bad region itself as the "good" anchor.
+        let anchor = SCATTER_ANCHOR_BASE_LBA
+            .saturating_add(attempt.saturating_mul(SCATTER_ANCHOR_STRIDE))
+            .min(lba.saturating_sub(SCATTER_GOOD_SECTORS as u32 + 1));
+        // Recalibration read (a real seek + sustained good-sector read) IS the
+        // settle and the cadence-breaker — no extra idle sleep. Time it so the
+        // live test can see what the recalibration costs.
+        let anchor_t = std::time::Instant::now();
+        read_good_sectors(reader, decrypt_is_aacs, anchor, SCATTER_GOOD_SECTORS);
+        let anchor_ms = anchor_t.elapsed().as_millis();
+        if halted(halt) {
+            return false;
+        }
+
+        // Fresh, FAST re-read of the target (recovery=false). Time it: a quick
+        // success means a marginal sector caught on the recalibrated approach;
+        // a slow failure means the fast timeout is being spent — both inform
+        // tuning SCATTER_* without guessing.
+        let reread_t = std::time::Instant::now();
+        let reread = recovery_read(
+            reader,
+            decrypt_is_aacs,
+            lba,
+            count,
+            &mut buf[..bytes],
+            false,
+        );
+        let reread_ms = reread_t.elapsed().as_millis();
+        match reread {
+            Ok(_) => {
+                tracing::info!(
+                    target: "freemkv::disc",
+                    phase = "patch.scatter.recovered",
+                    lba,
+                    attempt,
+                    anchor,
+                    anchor_ms,
+                    reread_ms,
+                    "scatter-recovery: recalibrated fresh approach recovered the sector"
+                );
+                return true;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "patch.scatter.miss",
+                    lba,
+                    attempt,
+                    anchor,
+                    anchor_ms,
+                    reread_ms,
+                    "scatter-recovery: fresh attempt still failed"
+                );
+            }
+        }
+    }
+    tracing::debug!(
+        target: "freemkv::disc",
+        phase = "patch.scatter.exhausted",
+        lba,
+        attempts = SCATTER_MAX_ATTEMPTS,
+        "scatter-recovery: all fresh attempts failed; leaving sector NonTrimmed"
+    );
+    false
+}
+
 /// Pre-loop diagnostic dump: emits `patch_mapfile_snapshot` plus the
 /// first/last 10 entries (info + per-entry debug). Pure logging — no
 /// state mutation. Pulled out of `Disc::patch` so the coordination
@@ -1949,31 +2105,70 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
                         continue;
                     }
 
-                    match handle_read_failure(
-                        &mut self.state,
-                        &frame,
-                        self.opts,
-                        &err,
-                        lba,
-                        count,
-                        pos,
-                        block_bytes,
-                        bytes,
-                        read_duration_ms,
-                        self.pipe,
-                        self.shared,
-                        self.reader,
-                    )? {
-                        FailureAction::Continue => {}
-                        FailureAction::ContinueInner => continue,
-                        // BreakOuter fires for both a transport fault and a
-                        // wedge-family abort; distinguish for the exit reason.
-                        FailureAction::BreakOuter => {
-                            return Ok(if err.is_scsi_transport_failure() {
-                                RegionOutcome::TransportFault
-                            } else {
-                                RegionOutcome::Wedged
-                            });
+                    // The slow deep-recovery read also failed. Before giving
+                    // up on this single sector, try scatter-recovery: read
+                    // good data far away to recalibrate the head, then re-read
+                    // this one sector fresh and fast (see `scatter_recover`).
+                    // A recovery here is a normal read success — record it and
+                    // advance the cursor exactly like the Ok arm does.
+                    if count == 1
+                        && scatter_recover(
+                            self.reader,
+                            &err,
+                            lba,
+                            count,
+                            bytes,
+                            &mut self.buf,
+                            self.decrypt_is_aacs,
+                            self.opts.halt.as_ref(),
+                        )
+                    {
+                        match handle_read_success(
+                            &mut self.state,
+                            &frame,
+                            self.opts,
+                            lba,
+                            count,
+                            pos,
+                            block_bytes,
+                            bytes,
+                            &mut self.buf,
+                            read_duration_ms,
+                            self.pipe,
+                            self.shared,
+                            self.reader,
+                        )? {
+                            // Break == the whole-pass stall guard fired.
+                            OuterAction::Break => return Ok(RegionOutcome::Wedged),
+                            OuterAction::Continue => {}
+                        }
+                    } else {
+                        match handle_read_failure(
+                            &mut self.state,
+                            &frame,
+                            self.opts,
+                            &err,
+                            lba,
+                            count,
+                            pos,
+                            block_bytes,
+                            bytes,
+                            read_duration_ms,
+                            self.pipe,
+                            self.shared,
+                            self.reader,
+                        )? {
+                            FailureAction::Continue => {}
+                            FailureAction::ContinueInner => continue,
+                            // BreakOuter fires for both a transport fault and a
+                            // wedge-family abort; distinguish for the exit reason.
+                            FailureAction::BreakOuter => {
+                                return Ok(if err.is_scsi_transport_failure() {
+                                    RegionOutcome::TransportFault
+                                } else {
+                                    RegionOutcome::Wedged
+                                });
+                            }
                         }
                     }
                 }
@@ -3318,6 +3513,239 @@ mod tests {
             !bad_sector.is_scsi_transport_failure(),
             "an ordinary bad-sector CHECK CONDITION must not be misclassified as \
              a transport failure"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Scatter-recovery ("reset, read good data, come back for one
+    // sector") — recalibrate-between-fresh-attempts + the medium-error
+    // gate. Validated against a synthetic SectorSource, never the live
+    // drive (CLAUDE.md hard-rule #2: hammering real bad LBAs wedges it).
+    // ----------------------------------------------------------------
+
+    /// A medium-error (sense_key 0x03 = UNRECOVERED READ) CHECK CONDITION —
+    /// the genuine bad-sector case scatter-recovery targets.
+    fn medium_err() -> Error {
+        Error::ScsiError {
+            opcode: 0x28,
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_MEDIUM_ERROR,
+                asc: 0x11,
+                ascq: 0x05,
+            }),
+        }
+    }
+
+    /// A NOT_READY error — has its OWN retry path; scatter must skip it.
+    fn not_ready_err() -> Error {
+        Error::ScsiError {
+            opcode: 0x28,
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense: Some(crate::scsi::ScsiSense {
+                sense_key: crate::scsi::SENSE_KEY_NOT_READY,
+                asc: 0x04,
+                ascq: 0x00,
+            }),
+        }
+    }
+
+    /// Reads at `target` fail until `target_reads > fail_until` (a marginal
+    /// sector that comes back on a later fresh approach), unless
+    /// `always_fail`. Any other LBA (the recalibration anchor) reads OK.
+    /// Counts target vs anchor reads so tests can assert the scatter cadence.
+    struct ScatterFixture {
+        target: u32,
+        fail_until: u32,
+        always_fail: bool,
+        target_reads: u32,
+        anchor_reads: u32,
+    }
+
+    impl SectorSource for ScatterFixture {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> Result<usize> {
+            let bytes = count as usize * 2048;
+            if lba == self.target {
+                self.target_reads += 1;
+                if !self.always_fail && self.target_reads > self.fail_until {
+                    buf[..bytes].fill(0xAB);
+                    return Ok(bytes);
+                }
+                return Err(medium_err());
+            }
+            self.anchor_reads += 1;
+            let n = bytes.min(buf.len());
+            buf[..n].fill(0);
+            Ok(bytes)
+        }
+    }
+
+    #[test]
+    fn scatter_recovers_marginal_sector_after_recalibration() {
+        let target = 1_000_000u32;
+        let mut fx = ScatterFixture {
+            target,
+            fail_until: 1,
+            always_fail: false,
+            target_reads: 0,
+            anchor_reads: 0,
+        };
+        let mut buf = vec![0u8; 2048];
+        let ok = scatter_recover(
+            &mut fx,
+            &medium_err(),
+            target,
+            1,
+            2048,
+            &mut buf,
+            false,
+            None,
+        );
+        assert!(ok, "a marginal sector should recover on a fresh re-read");
+        assert_eq!(buf[0], 0xAB, "recovered bytes are written into buf");
+        assert_eq!(
+            fx.target_reads, 2,
+            "1st fresh re-read fails, the 2nd (after recalibration) succeeds"
+        );
+        assert_eq!(
+            fx.anchor_reads, 2,
+            "one recalibration read precedes each fresh attempt"
+        );
+    }
+
+    #[test]
+    fn scatter_gives_up_on_dead_sector_after_max_attempts() {
+        let target = 1_000_000u32;
+        let mut fx = ScatterFixture {
+            target,
+            fail_until: 0,
+            always_fail: true,
+            target_reads: 0,
+            anchor_reads: 0,
+        };
+        let mut buf = vec![0u8; 2048];
+        let ok = scatter_recover(
+            &mut fx,
+            &medium_err(),
+            target,
+            1,
+            2048,
+            &mut buf,
+            false,
+            None,
+        );
+        assert!(!ok, "a truly-dead sector exhausts attempts and gives up");
+        assert_eq!(
+            fx.target_reads, SCATTER_MAX_ATTEMPTS,
+            "exactly SCATTER_MAX_ATTEMPTS fresh re-reads, no more"
+        );
+        assert_eq!(
+            fx.anchor_reads, SCATTER_MAX_ATTEMPTS,
+            "recalibrates before each fresh attempt"
+        );
+    }
+
+    #[test]
+    fn scatter_skips_non_medium_error() {
+        let target = 1_000_000u32;
+        let mut fx = ScatterFixture {
+            target,
+            fail_until: 0,
+            always_fail: true,
+            target_reads: 0,
+            anchor_reads: 0,
+        };
+        let mut buf = vec![0u8; 2048];
+        let ok = scatter_recover(
+            &mut fx,
+            &not_ready_err(),
+            target,
+            1,
+            2048,
+            &mut buf,
+            false,
+            None,
+        );
+        assert!(
+            !ok,
+            "NOT_READY is handled by its own retry path, not scatter"
+        );
+        assert_eq!(fx.target_reads, 0, "no reads issued for a non-medium error");
+        assert_eq!(fx.anchor_reads, 0);
+    }
+
+    #[test]
+    fn scatter_skips_batch_reads() {
+        // count > 1 means "don't know which sector is bad yet" — the loop
+        // drops to count=1 elsewhere; scatter only ever runs on singles.
+        let target = 1_000_000u32;
+        let mut fx = ScatterFixture {
+            target,
+            fail_until: 0,
+            always_fail: true,
+            target_reads: 0,
+            anchor_reads: 0,
+        };
+        let mut buf = vec![0u8; 2 * 2048];
+        let ok = scatter_recover(
+            &mut fx,
+            &medium_err(),
+            target,
+            2,
+            2 * 2048,
+            &mut buf,
+            false,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(fx.target_reads, 0, "batch reads are not scattered");
+    }
+
+    #[test]
+    fn recovery_read_widens_unaligned_aacs_window() {
+        // A mid-unit AACS read must widen to the enclosing 3-sector unit
+        // (so the decrypting source accepts it) and copy back exactly the
+        // requested sector. Each sector is filled with its own LBA's low
+        // byte so we can prove which window came back.
+        struct RecordReader {
+            saw_lba: u32,
+            saw_count: u16,
+        }
+        impl SectorSource for RecordReader {
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                self.saw_lba = lba;
+                self.saw_count = count;
+                for s in 0..count as usize {
+                    buf[s * 2048..(s + 1) * 2048].fill((lba as usize + s) as u8);
+                }
+                Ok(count as usize * 2048)
+            }
+        }
+        let mut rr = RecordReader {
+            saw_lba: 0,
+            saw_count: 0,
+        };
+        let mut buf = vec![0u8; 2048];
+        // Request lba=4 (4 % 3 == 1, mid-unit), count=1.
+        let n = recovery_read(&mut rr, true, 4, 1, &mut buf, true).unwrap();
+        assert_eq!(n, 2048);
+        assert_eq!(rr.saw_lba, 3, "widened down to the unit-aligned start");
+        assert_eq!(rr.saw_count, 3, "widened to a whole 3-sector unit");
+        assert_eq!(
+            buf[0], 4u8,
+            "copied back the requested sector (lba 4), not the unit head (lba 3)"
         );
     }
 }
