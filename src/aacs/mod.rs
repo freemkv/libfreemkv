@@ -16,7 +16,7 @@
 
 pub mod boil;
 pub mod decrypt;
-pub mod handshake;
+pub mod host_certs;
 pub mod keys;
 pub mod provider;
 pub mod trace;

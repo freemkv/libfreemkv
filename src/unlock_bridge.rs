@@ -3,9 +3,24 @@
 //! news up `all_unlockers()` and runs the first matching one. libfreemkv names
 //! no individual unlocker — it only calls this bridge.
 
-#![allow(dead_code)] // wired into drive.open() in the next stage-4 step
-
 use freemkv_unlock as fu;
+
+/// Map libfreemkv's drive identity to the unlock contract's `DriveId`.
+fn to_fu_drive_id(drive_id: &crate::identity::DriveId) -> fu::DriveId {
+    fu::DriveId {
+        vendor_id: drive_id.vendor_id.clone(),
+        product_revision: drive_id.product_revision.clone(),
+        vendor_specific: drive_id.vendor_specific.clone(),
+        firmware_date: drive_id.firmware_date.clone(),
+    }
+}
+
+/// Name of the unlocker that claims this drive by identity (drive-info "is this
+/// drive supported?" display), or `None`. A pure lookup — does NOT touch the
+/// drive or unlock anything.
+pub(crate) fn unlocker_name(drive_id: &crate::identity::DriveId) -> Option<&'static str> {
+    fu::unlocker_name(&to_fu_drive_id(drive_id))
+}
 
 /// Adapt libfreemkv's `ScsiTransport` to the unlock crate's transport contract.
 struct ScsiAdapter<'a>(&'a mut dyn crate::scsi::ScsiTransport);
@@ -51,29 +66,25 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::HostCert]) -> Vec<fu::HostCer
         .collect()
 }
 
-/// News up the unlockers, build the context, and run the FIRST matching one.
-/// Returns what it learned (vid / bus_key / drive_unlocked), or `None` when
-/// nothing matched or the matching unlocker did not apply (the caller falls back
-/// to its keysource / no-unlock path). `host_certs` are collected by the caller
-/// — lazily, only for AACS.
+/// News up the unlockers, build the context for `kind`, and run the FIRST
+/// matching one — returning its `Result` so the caller can both consume what it
+/// learned (vid / bus_key / drive_unlocked) AND render the specific failure
+/// (the AACS cert path maps the `UnlockError` to its outcome trace). `Err(
+/// NotApplicable)` when nothing matched. `host_certs` are collected by the
+/// caller — lazily, only for AACS; pass `&[]` for the drive-prep / CSS kinds.
 pub(crate) fn run_unlockers(
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
-) -> Option<fu::Unlocked> {
-    let id = fu::DriveId {
-        vendor_id: drive_id.vendor_id.clone(),
-        product_revision: drive_id.product_revision.clone(),
-        vendor_specific: drive_id.vendor_specific.clone(),
-        firmware_date: drive_id.firmware_date.clone(),
-    };
+) -> std::result::Result<fu::Unlocked, fu::UnlockError> {
+    let id = to_fu_drive_id(drive_id);
     let ctx = fu::UnlockCtx::new(&id, kind, host_certs);
     let mut adapter = ScsiAdapter(scsi);
     for u in fu::all_unlockers() {
         if u.matches(&ctx) {
-            return u.unlock(&mut adapter, &ctx).ok();
+            return u.unlock(&mut adapter, &ctx);
         }
     }
-    None
+    Err(fu::UnlockError::NotApplicable)
 }

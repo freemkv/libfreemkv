@@ -1397,7 +1397,7 @@ impl Disc {
         tracing::info!(target: "freemkv::scan", handshake = handshake.is_some(), "phase: handshake done");
 
         // Request max read speed — removes riplock on DVD
-        // (BD/UHD speed is set by firmware init, but DVD needs explicit SET CD SPEED)
+        // (BD/UHD speed is set by drive unlock/init, but DVD needs explicit SET CD SPEED)
         session.set_speed(0xFFFF);
 
         // Read UDF filesystem with buffered sector reader
@@ -1472,38 +1472,27 @@ impl Disc {
             if let Some(unlock_lba) = main_extents.first().map(|e| e.start_lba) {
                 tracing::info!(target: "freemkv::scan", unlock_lba, "phase: CSS — bus-auth unlock");
                 // Unlock the drive's CSS read gating through the uniform
-                // unlocker registry: the in-tree CssUnlocker matches
-                // DiscKind::Css and runs the bus-auth handshake. A CSS-enforcing
-                // drive (the BU40N) refuses to return scrambled sectors until
-                // that handshake has run; we run it purely for that unlock and
-                // IGNORE any key (the descramble key is recovered keylessly from
-                // the scrambled movie data via the known-plaintext attack — no
-                // player keys, no disc-key crack, no REPORT-KEY title key).
+                // unlocker dispatch: the CSS unlocker matches DiscKind::Css and
+                // runs the bus-auth handshake (self-guarding to DVD media). A
+                // CSS-enforcing drive (the BU40N) refuses to return scrambled
+                // sectors until that handshake has run; we run it purely for that
+                // unlock and IGNORE any key (the descramble key is recovered
+                // keylessly from the scrambled movie data via the known-plaintext
+                // attack — no player keys, no disc-key crack, no REPORT-KEY title
+                // key). Any failure is non-fatal: continue to the crack, which
+                // simply finds nothing if the drive kept the sectors gated.
                 let drive_id = session.drive_id.clone();
-                let css_ctx =
-                    crate::unlock::UnlockCtx::new(&drive_id, crate::unlock::DiscKind::Css);
-                match crate::unlock::route_unlock(session.scsi_mut(), &css_ctx) {
-                    Ok(crate::unlock::UnlockRoute::Unlocked(..)) => {}
-                    Ok(crate::unlock::UnlockRoute::Failed(e)) => {
-                        tracing::warn!(
-                            target: "freemkv::scan",
-                            outcome = ?e,
-                            "CSS bus-auth unlock failed; scrambled sectors may be unavailable"
-                        );
-                    }
-                    Ok(crate::unlock::UnlockRoute::NoMatch) => {
-                        tracing::warn!(
-                            target: "freemkv::scan",
-                            "no CSS unlocker registered; scrambled sectors may be unavailable"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "freemkv::scan",
-                            error_code = e.code(),
-                            "CSS bus-auth unlock hit a transport fault; scrambled sectors may be unavailable"
-                        );
-                    }
+                if let Err(e) = crate::unlock_bridge::run_unlockers(
+                    session.scsi_mut(),
+                    &drive_id,
+                    freemkv_unlock::DiscKind::Css,
+                    &[],
+                ) {
+                    tracing::warn!(
+                        target: "freemkv::scan",
+                        outcome = ?e,
+                        "CSS bus-auth unlock did not apply; scrambled sectors may be unavailable"
+                    );
                 }
                 // Size the crack's batch reads to THIS drive's per-command max
                 // (DVD ≈ 16; the USB bridge may be lower) — an over-large
@@ -3079,7 +3068,7 @@ impl Disc {
         );
 
         // Request the drive's max read speed for the whole sweep — removes
-        // riplock. BD/UHD get their speed from the firmware unlock/init, but a
+        // riplock. BD/UHD get their speed from the drive unlock/init, but a
         // DVD skips that path (the stock-mode gate, `Drive::disc_is_dvd`), so
         // without this explicit SET CD SPEED a DVD rip sweeps at the drive's
         // default (riplocked) speed. The damage-recovery branch below also
