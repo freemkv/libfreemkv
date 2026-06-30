@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] — 2026-06-29
+## [1.2.0] — 2026-06-30
 
 ### Breaking
 
@@ -19,12 +19,29 @@ adjust:
   `new(inputs, version)`).
 - **`disc::read_aacs_inputs` / `read_aacs_inputs_from_drive` return a 3-tuple**
   `(inf, mkb, version)` instead of `(inf, mkb)`.
+- **`PassProgress` is no longer `Copy` and gains a `located: LocatedProgress`
+  field.** It now carries a `Vec` (the rendered bad-range drilldown), so it's
+  `Clone` only — still built once per throttled emission and passed by reference
+  to `Progress::report`. Struct-literal constructors must add the field (empty:
+  `located: Default::default()`). New public types `LocatedRange` /
+  `LocatedProgress`.
 
 These are source-breaking for external crates.io consumers. Shipped under a
 minor bump (1.2.0): libfreemkv's surface is not yet frozen and the only known
 consumers are the in-tree toolchain crates.
 
 ### Added
+
+- **`PassProgress` is the complete, mapfile-free progress contract.** Every
+  emission now carries the fully-rendered "where is the damage" drilldown
+  (`located`): the bad ranges annotated with chapter + movie-time offset, the
+  main-feature at-risk time, the section count and the largest gap — computed by
+  the library from its in-memory mapfile + title. A client (autorip, a future
+  GUI/CLI) renders the disc map + at-risk time straight from it and never parses
+  the mapfile, so a mapfile→mapdb change is invisible to clients. Adds
+  `disc::locate_ranges`, the one-shot `disc::progress_snapshot_from_mapfile`
+  (builds a snapshot from a mapfile on disk so a boundary/verdict paint stays
+  mapfile-free client-side), and `consts::MILLIS_PER_SEC`.
 
 - **Mux loss concealment — a logged gap still produces a decode-clean file.**
   When a unit genuinely cannot be decrypted on the mux read path (a key the disc
