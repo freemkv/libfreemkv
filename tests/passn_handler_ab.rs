@@ -699,31 +699,32 @@ fn profile_07_medium_then_good() {
         trace,
     );
 
-    // GOLDEN: patch's cache-priming (`prime_cache`) issues 3 throwaway
-    // single-sector reads at lba-3, lba-2, lba-1 (NOT lba itself) before
-    // each count==1 recovery read. In the default REVERSE patch pass,
-    // lba 108's prime reads lba 105 (consuming step 0 = fail) and lba 107's
-    // prime reads lba 105 again (consuming step 1 = fail), so when the real
-    // recovery read for lba 105 occurs its script step is 2 (= ok).
-    // prime_cache(105) itself reads 102, 103, 104 — it does NOT advance
-    // lba 105's own counter. Net effect: patch fully recovers the range in
-    // one pass thanks to priming, even though the script said "fails on
-    // first two attempts."
-    //
-    // This is the documented cache-prime behavior (`disc/patch.rs`
-    // ~line 398, "Proven 2026-05-07 with dd-as-oracle: 8/8 sectors
-    // recoverable when primed vs 6/8 cold"). The golden pins it.
+    // GOLDEN: cache-priming and scatter-recovery are BOTH gone (ruled out
+    // by live drive probing — neither improves recovery; the drive's
+    // per-sector ECC is media-bound, not approach-bound). With the script
+    // "fail, fail, ok" per bad sector, recovery in ONE pass now hinges on
+    // bisect re-reading a sector enough times to consume its two failing
+    // steps: a sector caught in a failed batch is re-read as the batch
+    // halves (32→16→8→4→2→1), which for most of the cluster reaches the
+    // Ok step. The 2 sectors bisect reads fewest times stay NonTrimmed and
+    // recover on the NEXT pass — exactly the multi-pass design this test's
+    // header describes ("bad sectors stay NonTrimmed in this pass"). So
+    // 254 of 256 sectors recover here; 2 (4096 B) defer.
     assert_eq!(
         stats.bytes_good,
-        capacity_sectors as u64 * 2048,
-        "07_medium_then_good bytes_good — cache-prime should consume \
-         the failing script steps so the real read sees Ok"
+        254 * 2048,
+        "07_medium_then_good bytes_good (bisect re-reads consume the \
+         fail,fail,ok script for most of the cluster; 2 defer to next pass)"
     );
     assert_eq!(
         stats.bytes_unreadable, 0,
-        "07_medium_then_good bytes_unreadable"
+        "07_medium_then_good bytes_unreadable (NonTrimmed, never terminal in one pass)"
     );
-    assert_eq!(stats.bytes_pending, 0, "07_medium_then_good bytes_pending");
+    assert_eq!(
+        stats.bytes_pending,
+        2 * 2048,
+        "07_medium_then_good bytes_pending (2 sectors deferred to the next pass)"
+    );
     assert!(!pr.halted, "07_medium_then_good halted");
     assert!(
         trace_len <= 100,
