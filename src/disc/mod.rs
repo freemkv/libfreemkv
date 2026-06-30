@@ -2884,6 +2884,10 @@ impl Disc {
             progress: opts.progress,
             halt: opts.halt.clone(),
             key_fetch: opts.key_fetch.clone(),
+            // Disc::copy's internal patch grinds each range fully (it's a
+            // single-call recovery); the breadth-first fast-capture ordering is
+            // an autorip multi-pass concern.
+            fast_capture: false,
         };
         let pr = self.patch(reader, path, &patch_opts)?;
         tracing::info!(
@@ -3799,6 +3803,18 @@ pub struct PatchOptions<'a> {
     /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]). Lets Pass N
     /// recover an orphan CPS unit's key when re-reading its bad range.
     pub key_fetch: Option<crate::sector::KeyFetch>,
+    /// Fast-capture pass: read each bad range ONCE at the full batch and leave
+    /// every failed block `NonTrimmed` for a later pass — WITHOUT bisecting,
+    /// re-reading, or grinding it here. This lets a first retry pass grab the
+    /// readable blocks (the sweep's good skip-ahead overshoot) of EVERY range
+    /// quickly, before any single range's slow per-sector recovery — so
+    /// recovered data surfaces across the whole disc first instead of grinding
+    /// section 1 to exhaustion before even touching section 2. A later pass
+    /// (`fast_capture = false`) does the granular bisect/retry on what's left.
+    /// No data is dropped: a failed block stays `NonTrimmed` until a granular
+    /// pass recovers it or finally gives up. A transport fault (bridge crash)
+    /// still aborts — it isn't a recoverable bad sector.
+    pub fast_capture: bool,
 }
 
 /// Result returned by [`Disc::patch`].

@@ -819,3 +819,105 @@ fn profile_08_batch_fail_singles_ok() {
 // If the unification ever proceeds, the next step is to add a clock
 // injection point in `handle_read_failure` and extend this fixture
 // with the wedge/NOT_READY profiles too.
+
+// ─────────────── Fast-capture (breadth-first) recovery — #50 ───────────────
+//
+// `fast_capture = true` reads each bad range ONCE at the batch size and leaves
+// every FAILED block NonTrimmed for a later pass — no bisection, no per-sector
+// grind. This is the breadth-first "fast-capture every section first, then
+// escalate" ordering: a first retry pass grabs every range's readable blocks
+// quickly instead of grinding section 1 to exhaustion before touching section 2.
+//
+// The load-bearing invariant: NO data is dropped. A failed block becomes
+// NonTrimmed (pending, retried by a later granular pass), NEVER Unreadable.
+
+#[test]
+fn fast_capture_keeps_readable_blocks_and_leaves_bad_nontrimmed_unbisected() {
+    let capacity_sectors: u32 = 256;
+    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    // One bad sector at LBA 130 — inside the LOW 32-sector block of the range.
+    reader.always(
+        130,
+        ScriptStep::Err {
+            sense_key: 3,
+            asc: 0x11,
+            ascq: 0x05,
+        },
+    );
+
+    let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let disc = synthetic_disc(capacity_sectors);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+    // 64-sector NonTrimmed range [128,192); everything else already Finished.
+    let nontrimmed = [(128 * 2048, 64 * 2048)];
+    let finished = [
+        (0, 128 * 2048),
+        (192 * 2048, (capacity_sectors as u64 - 192) * 2048),
+    ];
+    prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
+
+    let opts = libfreemkv::disc::PatchOptions {
+        decrypt: false,
+        block_sectors: Some(32),
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: None,
+        halt: None,
+        key_fetch: None,
+        fast_capture: true,
+    };
+    disc.patch(&mut reader, &iso_path, &opts)
+        .expect("fast-capture patch must not error");
+
+    let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
+    let stats = Mapfile::load(&map_path).unwrap().stats();
+
+    // The clean 32-block [160,192) recovered (+32 sectors over the 192 already
+    // Finished); the bad 32-block [128,160) is left NonTrimmed — NOT Unreadable.
+    // fast_capture never gives up; the next (granular) pass retries it.
+    // Conservation: the 64-sector range split into 32 good + 32 still-pending,
+    // nothing lost.
+    assert_eq!(
+        stats.bytes_unreadable, 0,
+        "fast capture must never mark Unreadable"
+    );
+    assert_eq!(
+        stats.bytes_pending,
+        32 * 2048,
+        "the bad block stays NonTrimmed for the next pass"
+    );
+    assert_eq!(
+        stats.bytes_good,
+        224 * 2048,
+        "192 pre-Finished + 32 newly recovered"
+    );
+
+    // No bisection: the range [128,192) is read in exactly TWO 32-sector batch
+    // reads (clean half + bad half). Full mode would halve [128,160) into
+    // count=16,8,…,1 reads to isolate sector 130; fast capture marks the whole
+    // 32-block NonTrimmed in one read. (Reads outside the range — e.g. a lone
+    // count=1 probe at the capacity edge — are unrelated and ignored.)
+    let t = trace.lock().unwrap();
+    let range_reads: Vec<_> = t
+        .iter()
+        .filter(|&&(lba, _, _)| (128..192).contains(&lba))
+        .collect();
+    assert_eq!(
+        range_reads.len(),
+        2,
+        "range read in 2 batches (clean + bad), no bisection; trace={:?}",
+        *t
+    );
+    assert!(
+        range_reads.iter().all(|&&(_, count, _)| count == 32),
+        "fast capture must not bisect — both range reads are the full batch; trace={:?}",
+        *t
+    );
+    drop(t);
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(&map_path);
+}
