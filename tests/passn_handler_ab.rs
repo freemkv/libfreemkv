@@ -397,10 +397,14 @@ fn profile_02_all_medium_error() {
     );
     assert!(!pr.halted, "02_all_medium halted");
     // Upper bound: every sector probed individually + a few batch-drop
-    // and skip-escalation attempts. 16 sectors × ~3 visits ≈ 50.
+    // and skip-escalation attempts, PLUS scatter-recovery on each hard
+    // single sector (up to SCATTER_MAX_ATTEMPTS fresh tries, each a
+    // recalibration read + a re-read = +6 reads/sector). Still strictly
+    // bounded — the guard exists to catch an UNBOUNDED retry loop, which
+    // would be in the hundreds.
     assert!(
-        trace_len <= 80,
-        "02_all_medium trace_len={trace_len} exceeds 80"
+        trace_len <= 200,
+        "02_all_medium trace_len={trace_len} exceeds 200"
     );
 }
 
@@ -636,9 +640,13 @@ fn profile_06_deep_pit() {
         "06_deep_pit bytes_pending expected > 0"
     );
     assert!(!pr.halted, "06_deep_pit halted");
+    // Bounded as in profile 02: the deep pit's hard single sectors each get
+    // scatter-recovery (up to SCATTER_MAX_ATTEMPTS recalibrate + re-read
+    // tries) on top of the baseline probe/skip walk. Still bounded — a
+    // runaway loop would be in the hundreds.
     assert!(
-        trace_len <= 120,
-        "06_deep_pit trace_len={trace_len} exceeds 120"
+        trace_len <= 180,
+        "06_deep_pit trace_len={trace_len} exceeds 180"
     );
 }
 
