@@ -431,11 +431,14 @@ impl Drive {
             if let Some(vid) = unlocked.vid {
                 self.oem_vid = Some(vid);
             }
-            // Now that the drive is unlocked, raise it to its maximum read speed
-            // with a generic SET CD SPEED. Best-effort: a failure here must NOT
-            // fail the rip — a slow drive still rips.
-            self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
         }
+        // Raise the drive to its maximum read speed with a generic SET CD SPEED —
+        // UNCONDITIONALLY, whether or not an unlocker matched. A stock-mode BD/UHD
+        // drive (no firmware unlocker) still wants max speed; gating this on an
+        // unlocker match left such drives riplocked. (DVD returns earlier in
+        // stock mode; its sweep sets DVD speed separately.) Best-effort: a
+        // failure here must NOT fail the rip — a slow drive still rips.
+        self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
         let r: Result<()> = Ok(());
         tracing::info!(
             target: "freemkv::drive",
