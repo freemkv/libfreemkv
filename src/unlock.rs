@@ -113,19 +113,52 @@ pub enum DiscKind {
 /// what it needs — firmware keys off [`Self::drive_id`]; cert/CSS off
 /// [`Self::kind`]. `#[non_exhaustive]` so more context (e.g. a host-cert source)
 /// can be added later without breaking external unlockers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct UnlockCtx<'a> {
     /// Identity of the drive being unlocked.
     pub drive_id: &'a DriveId,
     /// Bus-encryption class of the loaded disc (`Unknown` during drive-prep).
     pub kind: DiscKind,
+    /// Scan options carrying the host-cert source for the AACS cert route.
+    /// `None` for the drive-prep / CSS dispatches (they need no host certs).
+    pub opts: Option<&'a crate::disc::ScanOptions>,
+}
+
+// Manual Debug: ScanOptions carries non-Debug key-source trait objects, so the
+// derived impl can't see through `opts` — report only whether it's present.
+impl std::fmt::Debug for UnlockCtx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlockCtx")
+            .field("drive_id", &self.drive_id)
+            .field("kind", &self.kind)
+            .field("has_opts", &self.opts.is_some())
+            .finish()
+    }
 }
 
 impl<'a> UnlockCtx<'a> {
-    /// Construct a context for the given drive and disc kind.
+    /// Construct a context for the given drive and disc kind (no host certs).
     pub fn new(drive_id: &'a DriveId, kind: DiscKind) -> Self {
-        Self { drive_id, kind }
+        Self {
+            drive_id,
+            kind,
+            opts: None,
+        }
+    }
+
+    /// Construct a context carrying scan options (the AACS cert route's
+    /// host-cert source).
+    pub fn with_opts(
+        drive_id: &'a DriveId,
+        kind: DiscKind,
+        opts: &'a crate::disc::ScanOptions,
+    ) -> Self {
+        Self {
+            drive_id,
+            kind,
+            opts: Some(opts),
+        }
     }
 }
 
@@ -182,53 +215,51 @@ fn ensure_builtins() {
     });
 }
 
-/// Walk the registry in order and run the first matching unlocker, returning
-/// its name AND the Volume ID it produced.
-///
-/// Returns:
-///   * `Ok(Some((name, vid)))` — a registered unlocker matched, put the drive
-///     into extended mode, and returned the OEM Volume ID. The caller stashes
-///     the VID for the handshake phase and need not run the cert handshake.
-///   * `Ok(None)` — no unlocker matched, OR the matching unlocker reported a
-///     *capability* failure ([`UnlockError::FirmwareNotUnlockable`],
-///     [`UnlockError::VidUnavailable`], or a cert-auth outcome — all logged).
-///     Either way the drive is usable in stock mode and the caller falls
-///     through to the in-tree cert handshake. Folding a capability failure into
-///     `Ok(None)` keeps drive `init()` infallible — a drive that simply isn't
-///     firmware-unlockable must not fail init.
-///   * `Err(_)` — the matching unlocker hit a genuine SCSI/transport fault
-///     ([`UnlockError::Scsi`]). The bus is broken, not merely unsupported, so
-///     this propagates and aborts init rather than silently falling through to
-///     a cert handshake that would also fail.
-pub(crate) fn route_unlock(
-    scsi: &mut dyn ScsiTransport,
-    ctx: &UnlockCtx,
-) -> Result<Option<(String, Unlocked)>> {
+/// Outcome of one registry dispatch at a single [`UnlockCtx`]. Carries enough
+/// for every caller: the firmware/cert path wants the learned [`Unlocked`], the
+/// cert path also wants the *reason* on failure (to render "missing keys" vs
+/// "host cert rejected"), and drive-prep just wants "did anything unlock".
+#[derive(Debug)]
+pub(crate) enum UnlockRoute {
+    /// A matching unlocker removed the barrier; carries its name + learned data.
+    Unlocked(String, Unlocked),
+    /// A matching unlocker reported a capability failure — it does not apply,
+    /// the disc is not its kind, or auth was rejected. NOT a transport fault.
+    /// The caller renders the reason or falls through to the next phase. (The
+    /// unlocker's name is already logged by `route_unlock`.)
+    Failed(UnlockError),
+    /// No registered unlocker matched this context.
+    NoMatch,
+}
+
+/// Walk the registry in registration order and run the FIRST unlocker whose
+/// [`Unlocker::matches`] is true for `ctx`, returning a structured
+/// [`UnlockRoute`]. Only a genuine SCSI/transport fault
+/// ([`UnlockError::Scsi`]) returns `Err` — the bus is broken, so the caller
+/// must abort rather than silently fall through; everything else (capability
+/// failure, no match) is an `Ok(UnlockRoute::…)` the caller folds.
+pub(crate) fn route_unlock(scsi: &mut dyn ScsiTransport, ctx: &UnlockCtx) -> Result<UnlockRoute> {
     ensure_builtins();
     let reg = match REGISTRY.read() {
         Ok(r) => r,
         // A poisoned lock means a prior unlocker panicked; treat as
         // "no unlocker available" so the cert fallback still runs.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(UnlockRoute::NoMatch),
     };
     // Walk in registration order — the registry is the single ordered place
     // that decides which unlocker runs first (register ld, then aacs, then css).
     for u in reg.iter() {
         if u.matches(ctx) {
             let name = u.name().to_string();
-            match u.unlock(scsi, ctx) {
+            return match u.unlock(scsi, ctx) {
                 // A successful unlock removed the barrier — return what it
                 // learned (VID and/or bus key, plus drive_unlocked) verbatim;
-                // libfreemkv files those onto the disc/drive. A firmware route
-                // carries a VID with drive_unlocked=true; the cert route a VID +
-                // read_data_key; CSS an empty Unlocked (side-effect only).
-                Ok(unlocked) => return Ok(Some((name, unlocked))),
-                // A genuine SCSI/transport fault is not "this drive can't be
-                // unlocked" — the bus is broken. Propagate so init() aborts
-                // instead of falling through to a cert handshake that will
-                // also fail on the same dead transport. The numeric code from
-                // the originating error is logged; the returned error is the
-                // canonical transport-error variant.
+                // libfreemkv files those onto the disc/drive.
+                Ok(unlocked) => Ok(UnlockRoute::Unlocked(name, unlocked)),
+                // A genuine SCSI/transport fault is not "this disc can't be
+                // unlocked" — the bus is broken. Propagate so the caller aborts
+                // instead of falling through to another route that will also
+                // fail on the same dead transport.
                 Err(UnlockError::Scsi(code)) => {
                     tracing::error!(
                         target: "freemkv::unlock",
@@ -236,28 +267,28 @@ pub(crate) fn route_unlock(
                         code,
                         "unlocker hit a transport fault during unlock; aborting"
                     );
-                    return Err(crate::error::Error::ScsiError {
+                    Err(crate::error::Error::ScsiError {
                         opcode: 0,
                         status: 0,
                         sense: None,
-                    });
+                    })
                 }
-                // A firmware unlocker that can't unlock / has no OEM VID:
-                // fall through to the cert handshake. Debug-only structured
-                // log (variant identifiers, no English prose).
+                // A capability failure (not firmware-unlockable, NotApplicable,
+                // cert rejected, …). Carry the reason so the caller can render
+                // it; drive-prep simply falls through.
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "freemkv::unlock",
                         unlocker = %name,
                         outcome = ?e,
-                        "unlocker matched but produced no VID; falling through to cert handshake"
+                        "unlocker matched but did not unlock; caller folds the reason"
                     );
-                    return Ok(None);
+                    Ok(UnlockRoute::Failed(e))
                 }
-            }
+            };
         }
     }
-    Ok(None)
+    Ok(UnlockRoute::NoMatch)
 }
 
 /// Walk the registry in order and ask the first matching unlocker to raise
@@ -449,21 +480,23 @@ mod tests {
             &UnlockCtx::new(&fake_id("MATCHVND"), DiscKind::Unknown),
         )
         .unwrap();
-        assert_eq!(
-            matched.as_ref().map(|(n, _)| n.as_str()),
-            Some("fake"),
+        assert!(
+            matches!(&matched, UnlockRoute::Unlocked(n, _) if n.as_str() == "fake"),
             "matching unlocker runs"
         );
         assert!(ran.load(Ordering::SeqCst), "unlock() was invoked");
 
-        // Non-matching identity → no unlocker runs, cert path (None).
+        // Non-matching identity → no unlocker runs, cert path (NoMatch).
         ran.store(false, Ordering::SeqCst);
         let none = route_unlock(
             &mut scsi,
             &UnlockCtx::new(&fake_id("OTHERVND"), DiscKind::Unknown),
         )
         .unwrap();
-        assert!(none.is_none(), "no match → cert fallback");
+        assert!(
+            matches!(none, UnlockRoute::NoMatch),
+            "no match → cert fallback"
+        );
         assert!(
             !ran.load(Ordering::SeqCst),
             "unlock() not invoked on no-match"
@@ -494,13 +527,13 @@ mod tests {
             &UnlockCtx::new(&fake_id("VIDVNDOR"), DiscKind::Unknown),
         )
         .unwrap();
-        assert_eq!(
-            got.and_then(|(_, u)| u.vid),
-            Some(Vid(vid)),
+        assert!(
+            matches!(&got, UnlockRoute::Unlocked(_, u) if u.vid == Some(Vid(vid))),
             "matching unlocker's OEM VID is used"
         );
 
-        // Unlocker that MATCHES but has NO OEM VID path (unlock → Err) → cert.
+        // Unlocker that MATCHES but has NO OEM VID path (unlock → Err) → a
+        // capability failure carrying the reason, NOT a transport fault.
         register_unlocker(Box::new(
             FakeUnlocker::new("NOVIDVND", Arc::new(AtomicBool::new(false))).with_vid(None),
         ));
@@ -510,17 +543,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            got.is_none(),
-            "unlocker without OEM VID falls through to cert"
+            matches!(got, UnlockRoute::Failed(UnlockError::VidUnavailable)),
+            "unlocker without OEM VID is a capability failure → cert fallback"
         );
 
-        // No matching unlocker → Ok(None), cert fallback.
+        // No matching unlocker → NoMatch, cert fallback.
         let got = route_unlock(
             &mut scsi,
             &UnlockCtx::new(&fake_id("UNKNWNVD"), DiscKind::Unknown),
         )
         .unwrap();
-        assert!(got.is_none(), "no match → cert fallback");
+        assert!(
+            matches!(got, UnlockRoute::NoMatch),
+            "no match → cert fallback"
+        );
     }
 
     /// A matching unlocker that hits a genuine transport fault
@@ -657,9 +693,8 @@ mod tests {
             &UnlockCtx::new(&fake_id("DUPEVNDR"), DiscKind::Unknown),
         )
         .unwrap();
-        assert_eq!(
-            matched.as_ref().map(|(n, _)| n.as_str()),
-            Some("fake"),
+        assert!(
+            matches!(&matched, UnlockRoute::Unlocked(n, _) if n.as_str() == "fake"),
             "a match was routed"
         );
         assert!(

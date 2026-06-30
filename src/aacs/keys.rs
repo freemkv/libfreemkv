@@ -933,7 +933,9 @@ const MKB_PACK_SIZE: usize = 32772;
 
 /// Read MKB from drive via SCSI (REPORT DISC STRUCTURE format 0x83).
 /// Returns the concatenated MKB data from all packs.
-pub fn read_mkb_from_drive(session: &mut crate::drive::Drive) -> crate::error::Result<Vec<u8>> {
+pub fn read_mkb_from_drive(
+    session: &mut dyn crate::scsi::ScsiTransport,
+) -> crate::error::Result<Vec<u8>> {
     use crate::scsi::{DataDirection, SCSI_READ_DISC_STRUCTURE};
 
     let cdb = [
@@ -951,7 +953,7 @@ pub fn read_mkb_from_drive(session: &mut crate::drive::Drive) -> crate::error::R
         0x00,
     ];
     let mut buf = vec![0u8; 32772];
-    session.scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
+    session.execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)?;
 
     let data_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
     if data_len < 2 {
@@ -989,7 +991,7 @@ pub fn read_mkb_from_drive(session: &mut crate::drive::Drive) -> crate::error::R
 
         let mut buf = vec![0u8; 32772];
         if session
-            .scsi_execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)
+            .execute(&cdb, DataDirection::FromDevice, &mut buf, 10_000)
             .is_ok()
         {
             let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
