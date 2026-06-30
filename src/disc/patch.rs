@@ -2124,6 +2124,12 @@ impl Disc {
             bytes_bad_in_main_title: main_title_bad,
             main_title_duration_secs: main_title.map(|t| t.duration_secs),
             main_title_size_bytes: main_title.map(|t| t.size_bytes),
+            // The rendered drilldown — located ranges + at-risk movie time —
+            // computed here from the in-memory bad-range set + title so the
+            // client renders it verbatim and never reads the mapfile.
+            located: main_title
+                .map(|t| crate::disc::locate_ranges(&bad_ranges_now, t))
+                .unwrap_or_default(),
         };
         !reporter.report(&pp)
     }

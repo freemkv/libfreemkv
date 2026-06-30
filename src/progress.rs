@@ -35,6 +35,51 @@ pub enum PassKind {
     Verify,
 }
 
+/// One located bad/not-yet-good range, annotated with the chapter and movie
+/// time it falls in. This is the *rendered* drilldown a client draws: the LBA
+/// and sector count place it on the disc map, while `chapter` and
+/// `time_offset_secs` tell the user *what* is affected. Computed by the library
+/// (which owns the mapfile and title) so no client ever re-derives it. If the
+/// mapfile becomes a mapdb, this type and its producer change; clients don't.
+#[derive(Debug, Clone)]
+pub struct LocatedRange {
+    /// First sector (LBA) of the range.
+    pub lba: u64,
+    /// Length of the range in sectors.
+    pub count: u32,
+    /// Movie time this range spans, in milliseconds (range bytes ÷ title
+    /// bytes/sec). Used to sort the drilldown and size the "largest gap".
+    pub duration_ms: f64,
+    /// 1-based chapter the range falls in, if it lands inside the title.
+    pub chapter: Option<u32>,
+    /// Movie time offset (seconds) where the range begins, if in-title.
+    pub time_offset_secs: Option<f64>,
+}
+
+/// The fully-rendered "where is the damage" view for one progress sample: the
+/// located drilldown plus the derived movie-time figures. A client maps this
+/// straight to its UI — it never touches the mapfile. `Default` is the empty
+/// (no-damage / not-applicable) view, used by phases that don't locate ranges
+/// (verify, extract, mux-label).
+#[derive(Debug, Clone, Default)]
+pub struct LocatedProgress {
+    /// Located not-yet-good ranges, largest-movie-time first, capped (see
+    /// `truncated`).
+    pub ranges: Vec<LocatedRange>,
+    /// Total number of located ranges before the cap (so a client can say
+    /// "N sections").
+    pub num_ranges: u32,
+    /// How many ranges were dropped by the display cap (`ranges.len()` is the
+    /// kept count; this is the "+X more").
+    pub truncated: u32,
+    /// Main-feature movie time still at risk: duration of the not-yet-good
+    /// ranges that intersect the title extents, in milliseconds. `0` when all
+    /// damage is out-of-feature (menus/extras).
+    pub main_at_risk_ms: f64,
+    /// Movie time of the single largest range, in milliseconds.
+    pub largest_gap_ms: f64,
+}
+
 /// One progress sample from a pipeline phase.
 ///
 /// `work_done / work_total` is the per-pass percentage — always 0..=100%
@@ -48,7 +93,12 @@ pub enum PassKind {
 /// - `bytes_good_total` = good + slow + recovered sectors × 2048
 /// - `bytes_unreadable_total` = bad sectors × 2048
 /// - `bytes_pending_total` = 0 (verify processes sequentially, nothing pending)
-#[derive(Debug, Clone, Copy)]
+///
+/// NOT `Copy`: `located` carries a `Vec`. Constructed once per (throttled)
+/// emission and passed by reference to `Progress::report`, so this costs one
+/// small heap alloc per UI tick — cheap, and it makes `PassProgress` the single
+/// complete contract a client renders from.
+#[derive(Debug, Clone)]
 pub struct PassProgress {
     pub kind: PassKind,
     pub work_done: u64,
@@ -72,6 +122,11 @@ pub struct PassProgress {
     pub main_title_duration_secs: Option<f64>,
     /// Main title size in bytes (sum of extent sizes).
     pub main_title_size_bytes: Option<u64>,
+    /// The fully-rendered "where is the damage" drilldown for this sample:
+    /// located ranges + at-risk movie time. Empty (`Default`) for phases that
+    /// don't locate ranges. A client renders the disc map + section list from
+    /// this and NEVER reads the mapfile itself.
+    pub located: LocatedProgress,
 }
 
 impl PassProgress {

@@ -221,6 +221,7 @@ pub fn verify_title(
                         bytes_bad_in_main_title: 0,
                         main_title_duration_secs: Some(title.duration_secs),
                         main_title_size_bytes: Some(total_sectors * 2048),
+                        located: Default::default(),
                     };
                     if !cb.report(&pp) {
                         break 'outer;
@@ -271,6 +272,7 @@ pub fn verify_title(
                                     bytes_bad_in_main_title: 0,
                                     main_title_duration_secs: Some(title.duration_secs),
                                     main_title_size_bytes: Some(total_sectors * 2048),
+                                    located: Default::default(),
                                 })
                             })
                         });
@@ -335,6 +337,7 @@ pub fn verify_title(
                             bytes_bad_in_main_title: 0,
                             main_title_duration_secs: Some(title.duration_secs),
                             main_title_size_bytes: Some(total_sectors * 2048),
+                            located: Default::default(),
                         };
                         if !cb.report(&pp) {
                             break 'outer;

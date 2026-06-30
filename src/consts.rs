@@ -20,6 +20,10 @@ pub const SECTOR_BYTES: usize = 2048;
 /// the workspace reads as `sectors * SECTOR_BYTES_U64` with no per-site cast.
 pub const SECTOR_BYTES_U64: u64 = SECTOR_BYTES as u64;
 
+/// Milliseconds per second. For turning a byte count ÷ bytes-per-second into a
+/// movie-time figure (`bytes / bps * MILLIS_PER_SEC`) without a bare `1000.0`.
+pub const MILLIS_PER_SEC: f64 = 1_000.0;
+
 /// Bytes per MPEG-2 transport-stream packet. Common to all MPEG-TS, not just
 /// Blu-ray — prefixed by the format, not a disc type.
 pub const TS_PACKET_BYTES: usize = 188;
