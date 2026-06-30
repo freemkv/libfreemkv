@@ -1212,6 +1212,148 @@ pub fn read_data_keys(
     Ok((read_data_key, write_data_key))
 }
 
+// ── Cert-handshake orchestration (shared by the in-tree path + the external
+//    freemkv-unlock-aacs plugin) ─────────────────────────────────────────────
+
+/// What a completed AACS host-certificate handshake learned: the Volume ID, the
+/// AACS 2.x bus key (`read_data_key`) when the drive served one, and — when the
+/// bus-key read was attempted and FAILED — its numeric error code (so the
+/// downstream bus-key gate can log WHY the bus key is missing).
+pub struct CertHandshake {
+    pub volume_id: [u8; 16],
+    pub read_data_key: Option<[u8; 16]>,
+    pub read_data_key_err: Option<u16>,
+}
+
+/// Union the host certificates a scan can offer the drive: the explicit
+/// `DriveCredentials`, then each key source's `host_certs(mkb)`. Host certs are
+/// keysource-served, never compiled in. `mkb` lets a source pick a
+/// generation-appropriate cert (the default impl ignores it).
+pub fn collect_host_certs(
+    opts: &crate::disc::ScanOptions,
+    mkb: Option<u32>,
+) -> Vec<crate::aacs::HostCert> {
+    let mut host_certs: Vec<crate::aacs::HostCert> = Vec::new();
+    if let Some(c) = &opts.credentials {
+        host_certs.extend(c.host_certs.iter().cloned());
+    }
+    for src in &opts.key_sources {
+        host_certs.extend(src.host_certs(mkb));
+    }
+    host_certs
+}
+
+/// Run the host-certificate mutual-auth handshake over `scsi` against the given
+/// host certs (already collected — see [`collect_host_certs`]) and, on success,
+/// read the Volume ID + `read_data_key`. This is the cert "remove bus
+/// encryption" primitive, shared by the in-tree path and the external
+/// `freemkv-unlock-aacs` plugin. Wedge-guarded: caps attempts, sleeps between,
+/// and bails on the drive's ILLEGAL_REQUEST sense. Every no-VID outcome is a
+/// structured [`crate::unlock::UnlockError`].
+pub fn run_cert_handshake(
+    scsi: &mut dyn ScsiTransport,
+    host_certs: &[crate::aacs::HostCert],
+) -> std::result::Result<CertHandshake, crate::unlock::UnlockError> {
+    use crate::unlock::UnlockError;
+
+    let host_cert_count = host_certs.len();
+    tracing::debug!(
+        target: "freemkv::disc",
+        phase = "handshake_start",
+        host_cert_count,
+        "handshake starting"
+    );
+
+    // Cert-attempt wedge guard. An earlier version fired up to 16 AACS
+    // authenticate attempts back-to-back with no pause — 80-160 SCSI
+    // REPORT_KEY/SEND_KEY commands in a few hundred ms, which can drive
+    // consumer optical drives into a fast-fail firmware wedge (every CDB
+    // returns ILLEGAL_REQUEST until power-cycled). Defense-in-depth: cap
+    // attempts, sleep between, bail early on the drive's wedge sense.
+    const MAX_CERT_ATTEMPTS: usize = 3;
+    const PER_CERT_BACKOFF_MS: u64 = 1000;
+    let mut last_err_code: Option<u16> = None;
+    for (idx, hc) in host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
+        if idx > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
+        }
+        match aacs_authenticate(scsi, &hc.private_key, &hc.certificate) {
+            Ok(mut auth) => {
+                let volume_id = match read_volume_id(scsi, &mut auth) {
+                    Ok(vid) => vid,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "handshake_vid_read_failed",
+                            cert_index = idx,
+                            error_code = e.code(),
+                            "auth ok but volume ID read failed"
+                        );
+                        return Err(UnlockError::VidUnavailable);
+                    }
+                };
+                let (read_data_key, read_data_key_err) = match read_data_keys(scsi, &mut auth) {
+                    Ok((rdk, _)) => (Some(rdk), None),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "handshake_read_data_key_failed",
+                            cert_index = idx,
+                            error_code = e.code(),
+                            "auth + VID read OK, but the drive served no read_data_key (bus key); \
+                             a bus-encrypted disc stays undecryptable until it does"
+                        );
+                        (None, Some(e.code()))
+                    }
+                };
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "handshake_ok",
+                    cert_index = idx,
+                    has_volume_id = volume_id != [0u8; 16],
+                    has_read_data_key = read_data_key.is_some(),
+                    "AACS bus-auth handshake complete"
+                );
+                return Ok(CertHandshake {
+                    volume_id,
+                    read_data_key,
+                    read_data_key_err,
+                });
+            }
+            Err(e) => {
+                last_err_code = Some(e.code());
+                // Read the wedge sense off the structured ScsiSense, NOT
+                // `e.code()` (a flat constant for every ScsiError). On
+                // ILLEGAL_REQUEST the drive is signalling it won't talk to us
+                // — trying more certs worsens the wedge, so bail immediately.
+                let sense = e.scsi_sense();
+                if sense.map(|s| s.is_illegal_request()).unwrap_or(false) {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "handshake_wedge_detected",
+                        cert_index = idx,
+                        sense_key = sense.map(|s| s.sense_key),
+                        asc = sense.map(|s| s.asc),
+                        ascq = sense.map(|s| s.ascq),
+                        "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
+                    );
+                    return Err(UnlockError::HandshakeRejected);
+                }
+                continue;
+            }
+        }
+    }
+    tracing::info!(
+        target: "freemkv::disc",
+        phase = "vid_cert_rejected",
+        host_cert_count,
+        tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
+        last_error_code = last_err_code,
+        "The drive rejected the AACS host certificate, so no Volume ID was obtained."
+    );
+    Err(UnlockError::HandshakeRejected)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

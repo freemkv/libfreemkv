@@ -97,113 +97,17 @@ impl AacsCertUnlocker<'_> {
             );
             return Err(UnlockError::NoUsableHostCert { mkb: mkb_gen });
         }
-        let host_cert_count = host_certs.len();
-        tracing::debug!(
-            target: "freemkv::disc",
-            phase = "handshake_start",
-            host_cert_count,
-            "handshake starting"
-        );
 
-        // Cert-attempt wedge guard. An earlier version fired up to 16 AACS
-        // authenticate attempts back-to-back with no pause — 80-160 SCSI
-        // REPORT_KEY/SEND_KEY commands in a few hundred ms, which can drive
-        // consumer optical drives into a fast-fail firmware wedge (every CDB
-        // returns ILLEGAL_REQUEST until power-cycled). Defense-in-depth: cap
-        // attempts, sleep between, bail early on the drive's wedge sense.
-        const MAX_CERT_ATTEMPTS: usize = 3;
-        const PER_CERT_BACKOFF_MS: u64 = 1000;
-        let mut last_err_code: Option<u16> = None;
-        for (idx, hc) in host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
-            if idx > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
-            }
-            match aacs::handshake::aacs_authenticate(
-                session.scsi_mut(),
-                &hc.private_key,
-                &hc.certificate,
-            ) {
-                Ok(mut auth) => {
-                    let volume_id =
-                        match aacs::handshake::read_volume_id(session.scsi_mut(), &mut auth) {
-                            Ok(vid) => vid,
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "freemkv::disc",
-                                    phase = "handshake_vid_read_failed",
-                                    cert_index = idx,
-                                    error_code = e.code(),
-                                    "auth ok but volume ID read failed"
-                                );
-                                return Err(UnlockError::VidUnavailable);
-                            }
-                        };
-                    let (read_data_key, read_data_key_err) = match aacs::handshake::read_data_keys(
-                        session.scsi_mut(),
-                        &mut auth,
-                    ) {
-                        Ok((rdk, _)) => (Some(rdk), None),
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "freemkv::disc",
-                                phase = "handshake_read_data_key_failed",
-                                cert_index = idx,
-                                error_code = e.code(),
-                                "auth + VID read OK, but the drive served no read_data_key (bus key); \
-                                 a bus-encrypted disc stays undecryptable until it does"
-                            );
-                            (None, Some(e.code()))
-                        }
-                    };
-                    tracing::debug!(
-                        target: "freemkv::disc",
-                        phase = "handshake_ok",
-                        cert_index = idx,
-                        has_volume_id = volume_id != [0u8; 16],
-                        has_read_data_key = read_data_key.is_some(),
-                        "AACS bus-auth handshake complete"
-                    );
-                    return Ok(HandshakeResult {
-                        volume_id,
-                        read_data_key,
-                        read_data_key_err,
-                        // Host-cert AKE path: bus removal depends on read_data_key,
-                        // NOT a firmware unlock.
-                        drive_unlocked: false,
-                    });
-                }
-                Err(e) => {
-                    last_err_code = Some(e.code());
-                    // Read the wedge sense off the structured ScsiSense, NOT
-                    // `e.code()` (a flat constant for every ScsiError). On
-                    // ILLEGAL_REQUEST the drive is signalling it won't talk to us
-                    // — trying more certs worsens the wedge, so bail immediately.
-                    let sense = e.scsi_sense();
-                    if sense.map(|s| s.is_illegal_request()).unwrap_or(false) {
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "handshake_wedge_detected",
-                            cert_index = idx,
-                            sense_key = sense.map(|s| s.sense_key),
-                            asc = sense.map(|s| s.asc),
-                            ascq = sense.map(|s| s.ascq),
-                            "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
-                        );
-                        return Err(UnlockError::HandshakeRejected);
-                    }
-                    continue;
-                }
-            }
-        }
-        tracing::info!(
-            target: "freemkv::disc",
-            phase = "vid_cert_rejected",
-            host_cert_count,
-            tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
-            last_error_code = last_err_code,
-            "The drive rejected the AACS host certificate, so no Volume ID was obtained."
-        );
-        Err(UnlockError::HandshakeRejected)
+        // Delegate the wedge-guarded cert loop to the shared primitive (also the
+        // body of the external freemkv-unlock-aacs plugin). The host-cert AKE
+        // path's bus removal depends on the read_data_key, NOT a firmware unlock.
+        let h = aacs::handshake::run_cert_handshake(session.scsi_mut(), &host_certs)?;
+        Ok(HandshakeResult {
+            volume_id: h.volume_id,
+            read_data_key: h.read_data_key,
+            read_data_key_err: h.read_data_key_err,
+            drive_unlocked: false,
+        })
     }
 }
 
@@ -304,14 +208,10 @@ impl Disc {
     /// [`crate::KeySource::host_certs`] so a source MAY return only
     /// generation-appropriate certs (the default ignores it).
     fn collect_host_certs(opts: &ScanOptions, mkb: Option<u32>) -> Vec<crate::aacs::HostCert> {
-        let mut host_certs: Vec<crate::aacs::HostCert> = Vec::new();
-        if let Some(c) = &opts.credentials {
-            host_certs.extend(c.host_certs.iter().cloned());
-        }
-        for src in &opts.key_sources {
-            host_certs.extend(src.host_certs(mkb));
-        }
-        host_certs
+        // Delegates to the shared cert primitive (the external freemkv-unlock-aacs
+        // plugin uses the same one). Kept as a thin Disc method so the existing
+        // collect_host_certs_* unit tests and call sites are unchanged.
+        crate::aacs::handshake::collect_host_certs(opts, mkb)
     }
 
     fn do_handshake_cert(
