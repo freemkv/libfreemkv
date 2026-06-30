@@ -1,8 +1,8 @@
 //! Drive session — open, identify, and read from optical drives.
 //!
 //! A `Drive` is opened from a device path, identifies itself via INQUIRY,
-//! optionally unlocks/initializes via a registered [`crate::unlock::Unlocker`],
-//! and reads sectors.
+//! optionally unlocks/initializes via the `freemkv-unlock` dispatch
+//! (through [`crate::unlock_bridge`]), and reads sectors.
 
 pub(crate) fn extract_scsi_context(e: &Error) -> (u8, Option<crate::scsi::ScsiSense>) {
     match e {
@@ -59,9 +59,9 @@ const SCSI_REPORT_KEY: u8 = 0xA4;
 /// Optical disc drive session -- open, identify, unlock, and read.
 pub struct Drive {
     scsi: Box<dyn ScsiTransport>,
-    /// Name of the [`crate::unlock::Unlocker`] that handled this drive at
-    /// `init()`, if any matched. `None` means no unlocker matched and the
-    /// drive runs in stock mode (host-cert AACS handshake carries discs).
+    /// Name of the unlocker that handled this drive at `init()`, if any matched.
+    /// `None` means no unlocker matched and the drive runs in stock mode
+    /// (host-cert AACS handshake carries discs).
     unlocker_name: Option<String>,
     /// The OEM Volume ID the matching unlocker returned from `unlock()` at
     /// `init()`, stashed for the AACS handshake phase (which reads it via
@@ -212,11 +212,11 @@ impl Drive {
         self.unlock_tray();
     }
 
-    /// Whether a registered unlocker matches this drive (i.e. it can be
-    /// firmware-unlocked). Queried against the unlock registry by identity;
-    /// does not require `init()` to have run.
+    /// Whether an unlocker claims this drive by identity (i.e. it can be
+    /// unlocked at drive-prep). Queried via `freemkv-unlock`; does not require
+    /// `init()` to have run.
     pub fn has_profile(&self) -> bool {
-        crate::unlock::matching_name(&self.drive_id).is_some()
+        crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
     }
 
     /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
@@ -224,10 +224,10 @@ impl Drive {
         self.scsi.as_mut()
     }
 
-    /// The OEM Volume ID a matching [`crate::unlock::Unlocker`] returned at
-    /// [`Drive::init`], if any. The AACS handshake uses this to skip the cert
-    /// handshake when an unlocker already supplied the VID. `None` when no
-    /// unlocker matched or it produced no VID.
+    /// The OEM Volume ID a matching unlocker returned at [`Drive::init`], if any.
+    /// The AACS handshake uses this to skip the cert handshake when an unlocker
+    /// already supplied the VID. `None` when no unlocker matched or it produced
+    /// no VID.
     pub(crate) fn oem_vid(&self) -> Option<[u8; 16]> {
         self.oem_vid
     }
@@ -334,15 +334,17 @@ impl Drive {
     }
 
     /// Name of the unlocker handling this drive. After `init()` this is the
-    /// unlocker that ran; before `init()` it reflects the registry match by
+    /// unlocker that ran; before `init()` it reflects the unlocker match by
     /// identity. `"Unknown"` when no unlocker matches.
     pub fn platform_name(&self) -> &str {
         if let Some(ref n) = self.unlocker_name {
             return n;
         }
-        // Cache the registry match so we can hand out a `&str` borrow.
+        // Cache the unlocker match so we can hand out a `&str` borrow.
         self.matched_name_cache.get_or_init(|| {
-            crate::unlock::matching_name(&self.drive_id).unwrap_or_else(|| "Unknown".to_string())
+            crate::unlock_bridge::unlocker_name(&self.drive_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| "Unknown".to_string())
         })
     }
 
@@ -353,7 +355,7 @@ impl Drive {
     /// Current mounted-disc profile from the GET CONFIGURATION header
     /// (Current Profile, bytes 6-7). DVD family is `0x0010..=0x001F`, BD
     /// family `0x0040..=0x0043`. This is a stock MMC command — it works
-    /// before (and without) any firmware unlock. `None` if unreadable.
+    /// before (and without) any drive unlock. `None` if unreadable.
     fn current_profile(&mut self) -> Option<u16> {
         let cdb = [
             crate::scsi::SCSI_GET_CONFIGURATION,
@@ -390,10 +392,10 @@ impl Drive {
         matches!(self.current_profile(), Some(p) if (0x0010..=0x001F).contains(&p))
     }
 
-    /// Initialize drive — unlock + firmware upload.
+    /// Initialize drive — drive-prep unlock + init.
     /// Optional. Adds features: removes riplock, enables UHD reads, speed control.
     ///
-    /// The firmware/OEM unlock is required for BD/UHD (AACS) reads,
+    /// The drive-prep (OEM) unlock is required for BD/UHD (AACS) reads,
     /// but it puts the drive in an extended-access state where stock CSS
     /// authentication no longer works — so a CSS-protected DVD can't be read.
     /// For a DVD we therefore SKIP the unlock and run the drive in its normal
@@ -407,54 +409,34 @@ impl Drive {
             self.init_ran = true;
             return Ok(());
         }
-        // Walk the unlock registry: the first unlocker whose identity
-        // matches runs; none matching leaves the drive in stock mode so the
-        // host-cert AACS handshake (the OEM route) carries the disc.
-        // Drive-prep dispatch: disc structure has not been probed yet, so the
-        // kind is Unknown — only a drive-keyed (firmware) unlocker can match.
-        let r = crate::unlock::route_unlock(
-            self.scsi.as_mut(),
-            &crate::unlock::UnlockCtx::new(&self.drive_id, crate::unlock::DiscKind::Unknown),
-        );
+        // Drive-prep dispatch: the disc structure has not been probed yet, so
+        // the kind is Unknown — only an identity-keyed unlocker can match here.
+        // The first matching unlocker runs; none matching leaves the drive in
+        // stock mode so the host-cert AACS handshake (the OEM route) carries the
+        // disc. An `Err` return means "nothing applied" — not a hard error; fall
+        // through. (A transport fault during unlock is swallowed by the bridge
+        // today, mirroring the old no-match fall-through.)
         self.init_ran = true;
-        let r = match r {
-            Ok(crate::unlock::UnlockRoute::Unlocked(name, unlocked)) => {
-                self.unlocker_name = Some(name);
-                // Stash the OEM Volume ID the firmware unlocker returned for the
-                // AACS handshake phase (do_handshake reads it via `oem_vid()`).
-                // A drive-prep unlocker always carries a VID; guard anyway.
-                if let Some(vid) = unlocked.vid {
-                    self.oem_vid = Some(vid.0);
-                }
-                // The matched unlocker may also be able to raise the drive to
-                // its maximum read speed. Best-effort: a failure here must NOT
-                // fail the rip — a slow drive still rips. Log and continue.
-                if let Err(e) = crate::unlock::unlocker_set_max_read_speed(
-                    self.scsi.as_mut(),
-                    &crate::unlock::UnlockCtx::new(
-                        &self.drive_id,
-                        crate::unlock::DiscKind::Unknown,
-                    ),
-                ) {
-                    tracing::warn!(
-                        target: "freemkv::drive",
-                        phase = "init",
-                        error = ?e,
-                        "unlocker set_max_read_speed failed; continuing at current speed"
-                    );
-                }
-                Ok(())
+        if let Ok(unlocked) = crate::unlock_bridge::run_unlockers(
+            self.scsi.as_mut(),
+            &self.drive_id,
+            freemkv_unlock::DiscKind::Unknown,
+            &[],
+        ) {
+            self.unlocker_name =
+                crate::unlock_bridge::unlocker_name(&self.drive_id).map(str::to_string);
+            // Stash the OEM Volume ID the unlocker returned for the AACS handshake
+            // phase (do_handshake reads it via `oem_vid()`). A drive-prep unlocker
+            // always carries a VID; guard anyway.
+            if let Some(vid) = unlocked.vid {
+                self.oem_vid = Some(vid);
             }
-            // No unlocker matched, or one matched but only hit a capability
-            // failure (not firmware-unlockable / no OEM VID): not an error —
-            // fall through to the OEM host-cert route.
-            Ok(crate::unlock::UnlockRoute::Failed(..) | crate::unlock::UnlockRoute::NoMatch) => {
-                Ok(())
-            }
-            // A genuine transport fault during unlock (UnlockError::Scsi)
-            // propagates here and aborts init — the bus is dead.
-            Err(e) => Err(e),
-        };
+            // Now that the drive is unlocked, raise it to its maximum read speed
+            // with a generic SET CD SPEED. Best-effort: a failure here must NOT
+            // fail the rip — a slow drive still rips.
+            self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
+        }
+        let r: Result<()> = Ok(());
         tracing::info!(
             target: "freemkv::drive",
             phase = "init",
@@ -472,13 +454,13 @@ impl Drive {
     pub fn probe_disc(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "probe_disc", "begin");
-        // A DVD runs in stock mode (see `init`); skip the OEM/firmware-path
+        // A DVD runs in stock mode (see `init`); skip the OEM/drive-prep
         // disc calibration, which only applies to the unlocked BD/UHD drive.
         if self.disc_is_dvd() {
             tracing::info!(target: "freemkv::drive", phase = "probe_disc", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no calibration)");
             return Ok(());
         }
-        // Disc-speed calibration is firmware-specific and now lives inside
+        // Disc-speed calibration is unlocker-specific and now lives inside
         // the unlocker's `unlock()` (run at `init()`). Nothing to do here.
         tracing::info!(
             target: "freemkv::drive",
@@ -623,16 +605,14 @@ impl Drive {
 
     /// Whether libfreemkv should take the OEM extended-access read path.
     ///
-    /// Whether a registered [`crate::unlock::Unlocker`] matches this drive.
-    ///
-    /// An unlocker unlocks *drive functionality* — firmware unlock, OEM VID
-    /// retrieval, and other vendor capabilities. When one matches, libfreemkv
-    /// routes both `unlock` and OEM VID through it (VID via the OEM path is
-    /// decoupled from the host cert + HRL). This mirrors [`Self::has_profile`]
-    /// — the honest signal is "a registered unlocker claims this drive" —
-    /// rather than the old const `false`.
+    /// True when an unlocker claims this drive by identity. Such an unlocker
+    /// unlocks *drive functionality* — drive unlock, OEM VID retrieval, and other
+    /// vendor capabilities. When one matches, libfreemkv routes both `unlock` and
+    /// OEM VID through it (VID via the OEM path is decoupled from the host cert +
+    /// HRL). This mirrors [`Self::has_profile`] — the honest signal is "an
+    /// unlocker claims this drive" — rather than the old const `false`.
     pub fn is_unlocked(&self) -> bool {
-        crate::unlock::matching_name(&self.drive_id).is_some()
+        crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
     }
 
     /// Read sectors from the disc. Single-shot — no inline retries, no
@@ -1259,7 +1239,7 @@ mod command_tests {
 
     /// `disc_is_dvd()` must match the DVD profile family (0x0010..=0x001F)
     /// and ONLY that family. A false positive on a BD/UHD profile (0x0040+)
-    /// would skip the firmware unlock that UHD reads require; a
+    /// would skip the drive unlock that UHD reads require; a
     /// false negative on a DVD would re-introduce the CSS read failure. The
     /// Current Profile is bytes 6-7 of the GET CONFIGURATION header.
     /// Mutation: widening the range to `..=0x0040` makes the BD-ROM assert
@@ -1273,7 +1253,7 @@ mod command_tests {
             hdr[7] = profile as u8;
             drive_with(hdr).disc_is_dvd()
         };
-        // DVD family → DVD (skip firmware unlock, run stock for CSS).
+        // DVD family → DVD (skip drive unlock, run stock for CSS).
         assert!(probe(0x0010), "DVD-ROM");
         assert!(probe(0x0011), "DVD-R");
         assert!(probe(0x001B), "DVD+R DL");
@@ -1283,7 +1263,7 @@ mod command_tests {
         assert!(!probe(0x0008), "CD-ROM");
         assert!(!probe(0x0000), "no/unknown profile");
         // Short / failed GET CONFIGURATION → no Current Profile → NOT DVD,
-        // so the firmware unlock still runs (safe default).
+        // so the drive unlock still runs (safe default).
         assert!(
             !drive_with(vec![0u8; 4]).disc_is_dvd(),
             "short GET CONFIGURATION must default to not-DVD (unlock still runs)"
