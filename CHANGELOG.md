@@ -43,6 +43,15 @@ consumers are the in-tree toolchain crates.
   (builds a snapshot from a mapfile on disk so a boundary/verdict paint stays
   mapfile-free client-side), and `consts::MILLIS_PER_SEC`.
 
+- **`PatchOptions::fast_capture` — breadth-first patch recovery.** A fast-capture
+  pass reads each bad range once at the full batch and leaves every failed block
+  `NonTrimmed` for a later pass — no bisect, no re-read, no per-sector grind — so
+  a first retry pass grabs the readable blocks (a sweep's good skip-ahead
+  overshoot) of EVERY range before any single range's slow per-sector recovery.
+  No data is dropped: a failed block stays `NonTrimmed` (retried by a granular
+  pass), never `Unreadable`. A transport fault still aborts. `Disc::copy`'s
+  internal patch leaves it `false` (single-call full recovery).
+
 - **Mux loss concealment — a logged gap still produces a decode-clean file.**
   When a unit genuinely cannot be decrypted on the mux read path (a key the disc
   never yielded, after the rip's own decrypt-verify already failed loud and
