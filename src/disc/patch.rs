@@ -1957,6 +1957,14 @@ impl Disc {
             // (below), dropping to the slow recovery speed for the rest of the
             // range and arming the inter-range cooldown.
             reader.set_speed(0xFFFF);
+            tracing::info!(
+                target: "freemkv::disc",
+                phase = "patch_speed",
+                range_lba = *range_pos / 2048,
+                range_sectors,
+                speed = "0xFFFF",
+                "patch: range entering at MAX read speed (drops to slow recovery on first failure)"
+            );
             state.current_batch = initial_batch;
             let mut range_slowed = false;
             loop {
@@ -2082,9 +2090,17 @@ impl Disc {
                         // Idempotent — only the first failure issues SET CD SPEED.
                         if !range_slowed {
                             reader.set_speed(0x0000);
+                            tracing::info!(
+                                target: "freemkv::disc",
+                                phase = "patch_speed",
+                                lba,
+                                speed = "0x0000",
+                                "patch: range dropped to slow recovery speed on first read failure"
+                            );
                             range_slowed = true;
                             cooldown_pending = true;
                         }
+
                         match handle_read_failure(
                             &mut state,
                             &frame,
