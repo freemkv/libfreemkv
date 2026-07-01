@@ -2269,6 +2269,22 @@ impl Disc {
             .unwrap_or_default()
     }
 
+    /// The unlocker matrix for this scanned disc on `drive`: each REGISTERED
+    /// unlocker's name + whether it applies to this drive + disc. Registry-driven
+    /// (no hardcoded names) so the CLI and autorip render an identical, always-
+    /// current report. The disc's crypto kind is derived here (in the library) so
+    /// both apps agree.
+    pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
+        let kind = if self.aacs.is_some() || self.aacs_error.is_some() {
+            freemkv_unlock::DiscKind::Aacs
+        } else if self.css.is_some() || self.css_error.is_some() {
+            freemkv_unlock::DiscKind::Css
+        } else {
+            freemkv_unlock::DiscKind::Unencrypted
+        };
+        crate::unlock_bridge::unlocker_matrix(&drive.drive_id, kind)
+    }
+
     /// The system-wide decrypt correctness gate.
     ///
     /// Returns `Ok(())` when it is safe to proceed with a copy or mux, and a

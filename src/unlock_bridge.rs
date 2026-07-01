@@ -124,6 +124,23 @@ pub(crate) fn run_unlockers(
     Err(fu::UnlockError::NotApplicable)
 }
 
+/// Registry-driven unlocker matrix: each REGISTERED unlocker's name + whether it
+/// applies to this drive + disc, in dispatch order. Dynamic — sourced from
+/// `all_unlockers()`, so adding/removing an unlocker updates every report with no
+/// other change (no hardcoded names). Apps render the yes/no English from this
+/// typed list. Report-only: uses `applies_to`, not the phase-gated `matches`.
+pub(crate) fn unlocker_matrix(
+    drive_id: &crate::identity::DriveId,
+    kind: fu::DiscKind,
+) -> Vec<(&'static str, bool)> {
+    let id = to_fu_drive_id(drive_id);
+    let ctx = fu::UnlockCtx::new(&id, kind, &[]);
+    fu::all_unlockers()
+        .iter()
+        .map(|u| (u.name(), u.applies_to(&ctx)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
