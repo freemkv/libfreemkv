@@ -128,10 +128,6 @@ pub mod sector;
 pub(crate) mod speed;
 pub(crate) mod udf;
 pub(crate) mod unlock_bridge;
-pub mod verify;
-
-// Re-export verify types at the crate root for ergonomic imports.
-pub use verify::{SectorRange, SectorStatus, VerifyResult, verify_title};
 
 // ─── Drive lifecycle ────────────────────────────────────────────────────────
 //
