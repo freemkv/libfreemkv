@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] — 2026-06-30
+## [1.2.0] — 2026-07-01
 
 ### Breaking
 
@@ -64,6 +64,12 @@ consumers are the in-tree toolchain crates.
   dropped, and the mux always completes. Audio and subtitle tracks have no
   cross-frame references, so only the directly-affected frames are dropped there.
   Decrypt-verify remains a **rip** gate (fail loud → re-read), never a mux gate.
+- **`Disc::unlocker_matrix()` — registry-driven unlocker did-work report.** Returns
+  each registered unlocker's name alongside a `did_work` flag recording whether it
+  performed authentication steps during the current rip. Callers (autorip, the CLI)
+  surface this so an operator can confirm at a glance which unlock paths —
+  LibreDrive firmware, AACS, CSS — actually ran, with no hardcoded names on the
+  caller side.
 
 ### Changed
 
@@ -83,6 +89,29 @@ consumers are the in-tree toolchain crates.
   removed. AACS file paths and the AACS major versions are now named constants
   (`aacs::PATH_*`, `aacs::AACS_MAJOR_*`, `AacsVersion::major`/`from_major`) so a
   fallback or stride change lives in exactly one place.
+- **Pass-N recovery rebuilt as a bounded, never-hang handler chain.** The 1.1.0
+  patch loop retried each bad range sector-by-sector until a per-range budget was
+  exhausted, with no escape from a wedged drive short of the watchdog firing after
+  tens of minutes. 1.2.0 replaces that with a two-tier handler chain dispatched
+  breadth-first, largest bad range first:
+  - **Jump** (lead tier): reads each range in large forward-skipping batches to
+    quickly locate readable islands — clearing a multi-gigabyte dead spot in
+    seconds rather than sector-by-sector.
+  - **Bisect** (trailing tier): binary-searches the boundaries of each remaining
+    bad block, converging to within a single sector of the last-readable LBA.
+    Boundary-probe reads are exempt from the early-yield stall so the boundary
+    walk always completes.
+  - **Handler scorecard**: handlers that make progress stay at the front of the
+    rotation per rip; an idle handler is ranked last so proven performers lead.
+  - **Wedge detection**: a pass-level streak counter tracks consecutive
+    wedge-family senses (HARDWARE ERROR / ILLEGAL REQUEST) across section
+    boundaries. At the threshold the pass aborts and a soft un-wedge
+    (`Drive::spin_cycle()` — START STOP UNIT, no eject) runs before the next retry
+    pass, instead of grinding at near-zero throughput until the pass watchdog
+    fires.
+
+  No data is dropped: a block that neither handler recovers in a pass stays
+  `NonTrimmed` for the next pass.
 
 ### Fixed
 
@@ -132,6 +161,14 @@ consumers are the in-tree toolchain crates.
   a clean single-frame gap instead of a corrupt splice. Audio has no inter-frame
   references, so dropping the truncated partial is the complete fix; the approach
   matches FFmpeg's parser layer and GStreamer's `tsdemux`.
+- **Drive-prep firmware unlock skipped for DVD discs.** An
+  `if disc_is_dvd() { return }` guard in `Drive::init()` (present since
+  1.0.0-rc.1) bypassed the entire drive-prep unlock step for DVDs. That unlock is
+  what removes riplock and raises the drive to maximum read speed — a drive-level,
+  disc-independent feature — so every DVD rip ran at riplock speed (~0.4× rated,
+  multi-hour ETA). The guard is removed; all disc types now go through the full
+  drive-prep sequence. UHD and Blu-ray were unaffected (they already ran through
+  the unlock path).
 
 ## [1.1.0]
 
