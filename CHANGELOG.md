@@ -32,6 +32,22 @@ consumers are the in-tree toolchain crates.
 
 ### Added
 
+- **Pass-N marginal-sector recovery specialists.** The patch pass gained a
+  roster of parameterized recovery techniques — read speed (max/min), cache
+  bypass (FUA), and traversal (linear fwd/rev, bisect, cache-prime, oscillate,
+  per-sector speed-sweep) — each targeting a distinct physical failure mode of
+  marginal media. A per-rip **decayed (EWMA) scorecard** grades every technique
+  by its recent recovery rate and re-orders them best-first, so the engine
+  hardcodes no conclusion: a technique that fits *this* disc floats to the front
+  and one that doesn't self-deprioritises (but is never dropped). Every read is
+  wedge-safe and deadline-bounded; the existing fast/deep recovery behavior is
+  unchanged (the specialists are additive, tried only on the hardened residue).
+- **Opt-in flat-pool recovery scheduler (`FREEMKV_PATCH_FLAT`).** Collapses the
+  breadth-first recovery tiers into one flat pool so every technique gets a shot
+  at each bad range immediately, scorecard-ordered — a data-driven bandit for a
+  hardened residual (e.g. a late resume) where the tiered ladder would spend a
+  long time on cheap techniques before reaching the specialists. Unset keeps the
+  proven tier ladder as the default.
 - **`PassProgress` is the complete, mapfile-free progress contract.** Every
   emission now carries the fully-rendered "where is the damage" drilldown
   (`located`): the bad ranges annotated with chapter + movie-time offset, the
@@ -115,6 +131,14 @@ consumers are the in-tree toolchain crates.
 
 ### Fixed
 
+- **DVD DTS/LPCM audio tracks no longer mux silent.** On DVD-Video the
+  `private_stream_1` sub-stream id's low nibble is the audio-stream *number*
+  (shared across codecs), not a per-codec ordinal. A DTS or LPCM track that
+  wasn't the disc's first audio stream got a sub-id one too low, so the demux
+  routing key (`0xBD00 | sub_id`) never matched and every packet was dropped —
+  the track appeared in the container but played silent (AC-3 at position 0
+  worked by coincidence). Audio sub-stream ids are now assigned by positional
+  stream number, so a DTS 5.0 track after an AC-3 5.1 track routes correctly.
 - **ISO mux no longer drops real video at content-fragment tails.** A title's
   encrypted content can end mid-AACS-unit, with the disc zero-padding the rest
   of the 6144-byte aligned unit to the next fragment. The decrypt-verify
