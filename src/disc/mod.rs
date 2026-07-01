@@ -2930,9 +2930,6 @@ impl Disc {
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch_done",
-            blocks_attempted = pr.blocks_attempted,
-            blocks_read_ok = pr.blocks_read_ok,
-            blocks_read_failed = pr.blocks_read_failed,
             bytes_recovered = pr.bytes_recovered_this_pass,
             halted = pr.halted,
             wedged_exit = pr.wedged_exit,
@@ -3870,9 +3867,6 @@ pub struct PatchOutcome {
     pub bytes_pending: u64,
     pub bytes_recovered_this_pass: u64,
     pub halted: bool,
-    pub blocks_attempted: u64,
-    pub blocks_read_ok: u64,
-    pub blocks_read_failed: u64,
     pub wedged_exit: bool,
     pub wedged_threshold: u64,
 }

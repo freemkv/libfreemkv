@@ -190,11 +190,17 @@ impl Sink<WorkItem> for SweepSink {
             }
             WorkItem::StatsRequest => {
                 let stats = self.map.stats();
+                // DAMAGE only — NOT NonTried. NonTried is the unread remainder
+                // ahead of the sweep head, not damage; including it made the live
+                // located drilldown (at-risk movie time + range count) treat the
+                // whole unread disc as confirmed damage, so at sweep start it
+                // showed ~full-movie at-risk and melted to 0 as the sweep
+                // progressed. Matches the one-shot progress path, which already
+                // excludes NonTried.
                 let bad_ranges = self.map.ranges_with(&[
                     SectorStatus::NonTrimmed,
                     SectorStatus::Unreadable,
                     SectorStatus::NonScraped,
-                    SectorStatus::NonTried,
                 ]);
                 // Best-effort: drop on backpressure; producer's cache
                 // stays current enough.
