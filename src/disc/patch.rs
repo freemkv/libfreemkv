@@ -1937,6 +1937,13 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
             // Single-shot read (no inline retry — see the historical note
             // in handle_read_failure). `recovery_read` widens a mid-unit
             // AACS window to the aligned unit; otherwise it's a plain read.
+            // Fast-capture reads FAIL-FAST (no deep-recovery timeout): a block
+            // it can't read quickly is deferred to a granular pass anyway, so
+            // there's no point spending the drive's 60s recovery grind on it
+            // here — that just freezes the breadth-first sweep on a bad cluster
+            // (~25s/block). The granular passes (fast_capture = false) do the
+            // deep recovery on what's left.
+            let recovery = self.state.recovery && !self.opts.fast_capture;
             let read_start = std::time::Instant::now();
             let read_result = recovery_read(
                 self.reader,
@@ -1944,7 +1951,7 @@ impl<R: SectorSource + ?Sized> PatchCtx<'_, '_, R> {
                 lba,
                 count,
                 &mut self.buf,
-                self.state.recovery,
+                recovery,
             );
             let read_duration_ms = read_start.elapsed().as_millis();
 
