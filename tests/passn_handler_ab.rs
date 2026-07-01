@@ -467,9 +467,13 @@ fn profile_03_alternating_good_bad() {
         "03_alternating expected NonTrimmed remainder, got bytes_pending=0"
     );
     assert!(!pr.halted, "03_alternating halted");
+    // Efficiency guard (catches runaway, not the tier-2 roster). The 8
+    // permanently-bad sectors are now additionally probed by the tier-2
+    // marginal specialists (SlowSpin/FuaRetry/SlowFua/CachePrime/Oscillate/
+    // SpeedSweep) before being left NonTrimmed — bounded, finite extra reads.
     assert!(
-        trace_len <= 120,
-        "03_alternating trace_len={trace_len} exceeds 120"
+        trace_len <= 220,
+        "03_alternating trace_len={trace_len} exceeds 220"
     );
 }
 
