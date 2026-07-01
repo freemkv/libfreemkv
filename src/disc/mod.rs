@@ -605,11 +605,37 @@ fn byte_offset_in_title(lba: u32, title: &DiscTitle) -> Option<u64> {
     None
 }
 
+/// The 1-based chapter index + movie-time offset a byte position within a title
+/// falls in, or `None` if the title has no size/chapters. Pure helper for the
+/// range→chapter/time annotation the progress drilldown ([`locate_ranges`])
+/// renders — also used by autorip's done-card range annotation. (Formerly lived
+/// in the removed standalone sector-verify module.)
+pub fn chapter_at_offset(
+    chapters: &[Chapter],
+    byte_offset: u64,
+    duration_secs: f64,
+    total_bytes: u64,
+) -> Option<(usize, f64)> {
+    if total_bytes == 0 || chapters.is_empty() {
+        return None;
+    }
+    let time_secs = byte_offset as f64 / total_bytes as f64 * duration_secs;
+    let mut chapter_idx = 0;
+    for (i, ch) in chapters.iter().enumerate() {
+        if ch.time_secs <= time_secs {
+            chapter_idx = i;
+        } else {
+            break;
+        }
+    }
+    Some((chapter_idx + 1, time_secs))
+}
+
 /// The 1-based chapter + movie-time offset an LBA falls in, or `(None, None)`
 /// if it isn't inside the title.
 fn range_chapter(lba: u32, title: &DiscTitle) -> (Option<u32>, Option<f64>) {
     if let Some(byte_offset) = byte_offset_in_title(lba, title) {
-        if let Some((ch, t)) = crate::verify::VerifyResult::chapter_at_offset(
+        if let Some((ch, t)) = chapter_at_offset(
             &title.chapters,
             byte_offset,
             title.duration_secs,
