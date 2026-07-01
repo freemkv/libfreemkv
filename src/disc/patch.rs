@@ -59,7 +59,7 @@ use crate::io::pipeline::{Flow, Sink};
 
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
-    Bisect, HandlerCtx, HandlerOutcome, Linear, RecoverySink, SectionHandler, run_handlers,
+    Bisect, HandlerCtx, HandlerOutcome, Jump, Linear, RecoverySink, SectionHandler, run_handlers,
 };
 
 /// Wall-clock budget one recovery handler gets on a section before the chain
@@ -834,6 +834,13 @@ impl PatchCtx<'_, '_> {
         // 0 left. Adding a recovery idea is one more entry in the right tier (#55).
         let mut handlers: Vec<Box<dyn SectionHandler>> = if tier == 0 {
             vec![
+                // Jump LEADS the fast tier: it recovers readable data and skips
+                // ahead past dead runs, so a mostly-dead range is confirmed and
+                // left in seconds instead of the linear sweeps grinding every
+                // dead batch (10 s each) first. On a readable range it just
+                // streams it back like a linear read. The linear sweeps then
+                // mop up the spans Jump stepped over.
+                Box::new(Jump),
                 Box::new(Linear {
                     reverse: true,
                     fast: true,
@@ -974,9 +981,16 @@ impl Disc {
             .map(|t| bytes_bad_in_title(t, &bad_ranges_now))
             .unwrap_or(0);
         let main_title = self.titles.first();
+        // Progress = bytes RECOVERED so far (initial bad − still-pending), not a
+        // per-range counter. With breadth-first tiers the readable bulk comes
+        // back during tier 0 before any range is "finished", so a range-counter
+        // sits at 0% while hundreds of MB are actually recovered. Deriving it
+        // from the live pending count makes the bar (and the speed the client
+        // computes from its delta) reflect real recovery the instant it happens.
+        let recovered = state.work_total.saturating_sub(s.bytes_pending);
         let pp = crate::progress::PassProgress {
             kind,
-            work_done: state.work_done,
+            work_done: recovered,
             work_total: state.work_total,
             bytes_good_total: s.bytes_good,
             bytes_unreadable_total: s.bytes_unreadable,

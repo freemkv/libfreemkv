@@ -42,6 +42,14 @@ const SECTOR: u64 = 2048;
 /// spans against granularity on dead ones.
 const BATCH_SECTORS: u64 = 32;
 
+/// `Jump` handler: after this many consecutive failed batches, skip ahead to
+/// find where readable data resumes rather than reading every dead sector.
+const JUMP_AFTER_FAILS: u32 = 2;
+/// `Jump` initial skip distance; doubles after each jump, capped at
+/// [`JUMP_CAP_BYTES`]. Mirrors the escalating Pass-1 damage-jump.
+const JUMP_BASE_BYTES: u64 = 1 << 20; // 1 MiB
+const JUMP_CAP_BYTES: u64 = 256 << 20; // 256 MiB
+
 /// Where a handler left the section after its bounded attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HandlerOutcome {
@@ -308,6 +316,79 @@ impl SectionHandler for Bisect {
             }
         }
 
+        if bad.is_empty() {
+            HandlerOutcome::Complete
+        } else {
+            HandlerOutcome::Remaining
+        }
+    }
+}
+
+/// Blow through a LARGE dead run fast. Reads forward in batches; after
+/// [`JUMP_AFTER_FAILS`] consecutive failed batches it SKIPS AHEAD an escalating
+/// distance (1 MiB → 2 → 4 … capped at [`JUMP_CAP_BYTES`]), leaving the skipped
+/// span bad, to find where readable data RESUMES — mirroring the Pass-1
+/// damage-jump. A later handler / `Bisect` pins the exact good/bad boundary the
+/// jump stepped over. Uses fast reads (this is a scout, not a deep-recovery
+/// pass). Without it a linear walk pays one up-to-10 s read per dead batch
+/// across the whole run, so a deadline-bounded pass never reaches readable data
+/// buried behind a big dead front (exactly the 192 MB range on Dune).
+pub(super) struct Jump;
+
+impl SectionHandler for Jump {
+    fn name(&self) -> &'static str {
+        "jump"
+    }
+
+    fn recover(
+        &mut self,
+        ctx: &mut HandlerCtx,
+        bad: &mut SubRanges,
+        deadline: Instant,
+    ) -> HandlerOutcome {
+        let batch = BATCH_SECTORS * SECTOR;
+        let mut buf = vec![0u8; batch as usize];
+        let snapshot: Vec<(u64, u64)> = bad.ranges().to_vec();
+        for (rp, rl) in snapshot {
+            let mut off = 0u64;
+            let mut consec_fail = 0u32;
+            let mut jump = JUMP_BASE_BYTES;
+            while off < rl {
+                if ctx.halted() {
+                    return HandlerOutcome::Halted;
+                }
+                if ctx.past(deadline) {
+                    return HandlerOutcome::Remaining;
+                }
+                let span = batch.min(rl - off);
+                let pos = rp + off;
+                let count = (span / SECTOR) as u16;
+                match read_span(ctx, &mut buf[..span as usize], pos, count, false) {
+                    ReadHit::Good => {
+                        bad.remove(pos, span);
+                        consec_fail = 0;
+                        jump = JUMP_BASE_BYTES;
+                        off += span;
+                    }
+                    ReadHit::Bad => {
+                        consec_fail += 1;
+                        if consec_fail >= JUMP_AFTER_FAILS {
+                            // Sustained dead run — skip ahead (sector-aligned so
+                            // the walk stays batch-aligned) and escalate the next
+                            // jump. The skipped span stays bad for Bisect / a
+                            // later handler to pin the boundary.
+                            let step = (jump / SECTOR).max(1) * SECTOR;
+                            off = (off + step).min(rl);
+                            jump = jump.saturating_mul(2).min(JUMP_CAP_BYTES);
+                            consec_fail = 0;
+                        } else {
+                            off += span;
+                        }
+                    }
+                    ReadHit::Transport => return HandlerOutcome::TransportFault,
+                }
+            }
+        }
         if bad.is_empty() {
             HandlerOutcome::Complete
         } else {
