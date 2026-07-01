@@ -88,6 +88,12 @@ pub(super) struct HandlerCtx<'a> {
     pub halt: Option<&'a AtomicBool>,
     /// Widen mid-unit reads to the aligned AACS unit (see [`recovery_read`]).
     pub decrypt_is_aacs: bool,
+    /// Progress heartbeat. Handlers call [`HandlerCtx::progress`] frequently (it
+    /// is internally throttled); this pushes a fresh progress snapshot to the
+    /// caller's reporter DURING a handler, not just at range boundaries — so the
+    /// bar and speed move as recovery happens instead of jumping once per
+    /// section. `None` in tests (no reporter).
+    pub tick: Option<&'a mut dyn FnMut()>,
 }
 
 impl HandlerCtx<'_> {
@@ -97,6 +103,13 @@ impl HandlerCtx<'_> {
 
     fn past(&self, deadline: Instant) -> bool {
         (self.now)() >= deadline
+    }
+
+    /// Emit a progress heartbeat (throttling lives in the tick closure).
+    fn progress(&mut self) {
+        if let Some(t) = self.tick.as_mut() {
+            t();
+        }
     }
 }
 
@@ -124,14 +137,18 @@ fn read_span(
 ) -> ReadHit {
     let lba = (pos / SECTOR) as u32;
     let bytes = count as usize * SECTOR as usize;
-    match recovery_read(ctx.reader, ctx.decrypt_is_aacs, lba, count, buf, recovery) {
+    let hit = match recovery_read(ctx.reader, ctx.decrypt_is_aacs, lba, count, buf, recovery) {
         Ok(_) => {
             ctx.sink.recovered(pos, &buf[..bytes]);
             ReadHit::Good
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
         Err(_) => ReadHit::Bad,
-    }
+    };
+    // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
+    // UI's bar/speed move DURING a handler, not just when the section finishes.
+    ctx.progress();
+    hit
 }
 
 /// One recovery idea, given a bounded shot at the section's still-bad set.
@@ -262,11 +279,14 @@ impl SectionHandler for Linear {
     }
 }
 
-/// Probe the MIDDLE sector of each bad sub-range; if it reads, remove it and
-/// recurse on the two halves to converge on good centers. If the middle is dead,
-/// leave that chunk for another handler / pass. Finds islands of readable data
-/// inside a mostly-dead range that a linear sweep would tar with one failing
-/// batch.
+/// Bisect + expand. Probe the middle sector of a bad sub-range; when it reads,
+/// EXPAND outward from it — forward and backward in full batches — until a read
+/// fails, recovering the whole readable island around the good centre in large
+/// reads. The two failing ends become smaller bad sub-ranges, pushed back to be
+/// bisected again. A dead middle just splits into halves. This shreds one huge
+/// bad range into precisely-located small dead clusters (a handful of sectors)
+/// instead of leaving the whole thing bad. Uses fast reads: it LOCATES readable
+/// data; deep-recovering the dead sectors is the slow linear handlers' job.
 pub(super) struct Bisect;
 
 impl SectionHandler for Bisect {
@@ -280,10 +300,13 @@ impl SectionHandler for Bisect {
         bad: &mut SubRanges,
         deadline: Instant,
     ) -> HandlerOutcome {
-        let mut buf = [0u8; SECTOR as usize];
-        // Explicit work stack of (pos, len) chunks still to probe. Each good
-        // probe removes one sector and pushes its two halves; each read consumes
-        // a sector, so the stack drains in bounded steps.
+        let batch = BATCH_SECTORS * SECTOR;
+        let mut buf = vec![0u8; batch as usize];
+        let mut probe = [0u8; SECTOR as usize];
+        // Work stack of still-bad chunks. A good probe recovers the readable
+        // island around it and pushes the two (smaller) failing ends; a dead
+        // probe pushes the two halves. Either way the stack shrinks toward small
+        // bad clusters, so it drains in bounded steps.
         let mut stack: Vec<(u64, u64)> = bad.ranges().to_vec();
         while let Some((rp, rl)) = stack.pop() {
             if rl == 0 {
@@ -295,23 +318,65 @@ impl SectionHandler for Bisect {
             if ctx.past(deadline) {
                 return HandlerOutcome::Remaining;
             }
-            // Middle sector, floored to a sector boundary.
-            let sectors = rl / SECTOR;
-            let mid = rp + (sectors / 2) * SECTOR;
-            match read_span(ctx, &mut buf, mid, 1, true) {
+            let end = rp + rl;
+            let mid = rp + (rl / SECTOR / 2) * SECTOR;
+            match read_span(ctx, &mut probe, mid, 1, false) {
                 ReadHit::Good => {
                     bad.remove(mid, SECTOR);
-                    // Left half [rp, mid), right half [mid+SECTOR, rp+rl).
+                    // Expand FORWARD from mid+1 in batches until a read fails.
+                    let mut fwd = mid + SECTOR;
+                    while fwd < end {
+                        if ctx.past(deadline) {
+                            return HandlerOutcome::Remaining;
+                        }
+                        let span = batch.min(end - fwd);
+                        let count = (span / SECTOR) as u16;
+                        match read_span(ctx, &mut buf[..span as usize], fwd, count, false) {
+                            ReadHit::Good => {
+                                bad.remove(fwd, span);
+                                fwd += span;
+                            }
+                            ReadHit::Bad => break,
+                            ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        }
+                    }
+                    // Expand BACKWARD from mid toward rp until a read fails.
+                    let mut bwd = mid;
+                    while bwd > rp {
+                        if ctx.past(deadline) {
+                            return HandlerOutcome::Remaining;
+                        }
+                        let span = batch.min(bwd - rp);
+                        let pos = bwd - span;
+                        let count = (span / SECTOR) as u16;
+                        match read_span(ctx, &mut buf[..span as usize], pos, count, false) {
+                            ReadHit::Good => {
+                                bad.remove(pos, span);
+                                bwd = pos;
+                            }
+                            ReadHit::Bad => break,
+                            ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        }
+                    }
+                    // The two failing ends stay bad — bisect them again to pin
+                    // the exact dead sectors.
+                    if bwd > rp {
+                        stack.push((rp, bwd - rp));
+                    }
+                    if fwd < end {
+                        stack.push((fwd, end - fwd));
+                    }
+                }
+                ReadHit::Bad => {
+                    // Dead middle: split and keep hunting for a good centre.
                     if mid > rp {
                         stack.push((rp, mid - rp));
                     }
                     let right = mid + SECTOR;
-                    if right < rp + rl {
-                        stack.push((right, rp + rl - right));
+                    if right < end {
+                        stack.push((right, end - right));
                     }
                 }
-                // Dead middle: leave the chunk bad and move on.
-                ReadHit::Bad => {}
                 ReadHit::Transport => return HandlerOutcome::TransportFault,
             }
         }
@@ -570,6 +635,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 10 * SECTOR);
         // Generous deadline: 10 s from start.
@@ -610,6 +676,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 40 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -645,6 +712,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(3);
@@ -678,6 +746,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 9 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -712,6 +781,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 16 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
@@ -750,6 +820,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 64 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![Box::new(Linear {
@@ -778,6 +849,7 @@ mod tests {
             now: &now,
             halt: None,
             decrypt_is_aacs: false,
+            tick: None,
         };
         // Single-sector batches so the transport LBA is hit directly.
         let mut bad = SubRanges::from_section(0, 8 * SECTOR);
@@ -805,6 +877,7 @@ mod tests {
             now: &now,
             halt: Some(&halt),
             decrypt_is_aacs: false,
+            tick: None,
         };
         let mut bad = SubRanges::from_section(0, 100 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
