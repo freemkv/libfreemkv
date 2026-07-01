@@ -226,6 +226,15 @@ impl Drive {
         crate::unlock_bridge::unlocker_name(&self.drive_id).is_some()
     }
 
+    /// The name of the drive unlocker that ACTUALLY unlocked this drive at
+    /// `init()`, or `None` if none applied (unsupported drive, or the unlock
+    /// failed). Distinct from [`has_profile`](Self::has_profile), which reports
+    /// only an identity match: this is the runtime outcome. Apps render it in the
+    /// user-facing unlocker report.
+    pub fn unlocker_name(&self) -> Option<&str> {
+        self.unlocker_name.as_deref()
+    }
+
     /// Access the SCSI transport for direct commands (used by CSS/AACS auth).
     pub fn scsi_mut(&mut self) -> &mut dyn ScsiTransport {
         self.scsi.as_mut()
