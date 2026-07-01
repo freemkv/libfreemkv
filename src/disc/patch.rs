@@ -342,10 +342,9 @@ use super::{Disc, DiscTitle, PatchOptions, PatchOutcome, bytes_bad_in_title};
 use crate::io::pipeline::Pipeline;
 use crate::sector::SectorSource;
 
-/// Cooldown between patch ranges that actually grinded (dropped to the slow
-/// recovery speed). Lets the drive settle before the next range re-enters at max
-/// speed. Gated on "grinded" so a many-small-range pass doesn't stall on it.
-const INTER_RANGE_COOLDOWN_SECS: u64 = 10;
+/// Breadth-first recovery tiers. Tier 0 fast-sweeps every bad range; tier 1
+/// deep-recovers the residual. See `PatchCtx::run`.
+const PATCH_TIERS: usize = 2;
 
 /// Send a `PatchItem` and translate a `SendError` (consumer thread died
 /// / panicked) into a library error so the caller propagates cleanly.
@@ -651,8 +650,6 @@ pub(super) struct PatchLoopState {
     pub blocks_read_failed: u64,
     pub unreadable_count: u64,
     pub work_done: u64,
-    // Progress baseline for the region-exit "bytes recovered" log.
-    pub bytes_good_last: u64,
     // Clock seam: the handler chain reads wall time through this rather than
     // calling `Instant::now()` inline, so the per-handler deadline is driven by
     // an injectable clock and deterministic tests can wind it forward.
@@ -700,7 +697,6 @@ impl PatchLoopState {
             blocks_read_failed: 0,
             unreadable_count: 0,
             work_done: 0,
-            bytes_good_last: bytes_good_before,
             now,
             bytes_good_before,
             total_bytes,
@@ -744,10 +740,6 @@ struct PatchCtx<'a, 'o> {
     opts: &'a PatchOptions<'o>,
     total_bytes: u64,
     decrypt_is_aacs: bool,
-    /// Armed when a range grinded (dropped to slow speed); consumed as an
-    /// inter-range cooldown before the NEXT range enters at max speed.
-    /// Gated on "grinded" so a many-small-range pass doesn't stall on it.
-    cooldown_pending: bool,
     state: PatchLoopState,
 }
 
@@ -758,58 +750,78 @@ impl PatchCtx<'_, '_> {
     /// halt / wedge / transport-fault.
     fn run(&mut self, bad_ranges: &[(u64, u64)]) -> Result<()> {
         let num_ranges = bad_ranges.len();
-        for (range_idx, &(range_pos, range_size)) in bad_ranges.iter().enumerate() {
-            if self.cooldown_pending {
-                tracing::info!(
-                    target: "freemkv::disc",
-                    phase = "patch.region.cooldown",
-                    secs = INTER_RANGE_COOLDOWN_SECS,
-                    "inter-range cooldown (previous range grinded at slow speed)"
-                );
-                super::sleep_secs_or_halt(INTER_RANGE_COOLDOWN_SECS, self.opts.halt.as_ref());
-                self.cooldown_pending = false;
-            }
-            let outcome = self.patch_region(range_idx, num_ranges, range_pos, range_size)?;
-            tracing::info!(
-                target: "freemkv::disc",
-                phase = "patch.region.exit",
-                range_index = range_idx,
-                range_lba = range_pos / 2048,
-                outcome = ?outcome,
-                blocks_read_ok = self.state.blocks_read_ok,
-                blocks_read_failed = self.state.blocks_read_failed,
-                bytes_recovered =
-                    self.state.bytes_good_last.saturating_sub(self.state.bytes_good_before),
-                "region finished"
-            );
-            match outcome {
-                RegionOutcome::Completed => {}
-                RegionOutcome::Halted | RegionOutcome::TransportFault => {
-                    break;
+        // Attack the LARGEST ranges first. The big NonTrimmed regions are usually
+        // sweep-jump over-marks that read straight back, so ordering them ahead of
+        // the many tiny dead fragments lets tier 0 recover the bulk of the disc in
+        // its first minutes instead of grinding fragments first (ties: low LBA
+        // first for a predictable, mostly-sequential walk).
+        let mut ordered: Vec<(u64, u64)> = bad_ranges.to_vec();
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Per-range still-bad sets, persisted ACROSS the breadth-first tiers so
+        // tier N+1 works on exactly what tier N left behind.
+        let mut sections: Vec<SubRanges> = ordered
+            .iter()
+            .map(|&(p, l)| SubRanges::from_section(p, l))
+            .collect();
+
+        // BREADTH-FIRST recovery. Tier 0 fast-sweeps EVERY range first — grabbing
+        // the easily-readable bulk across the whole disc (sweep-jump over-marks a
+        // big region NonTrimmed without testing each sector, so most of it reads
+        // back in seconds) — BEFORE any range's slow per-sector grind. Tier 1
+        // then deep-recovers only the residual. This fixes the depth-first
+        // starvation bug: the full chain used to run per range, so a small dead
+        // cluster at the front burned ~5 min/range and the big
+        // mostly-recoverable ranges were never reached.
+        for tier in 0..PATCH_TIERS {
+            let final_tier = tier + 1 == PATCH_TIERS;
+            for (range_idx, &(range_pos, range_size)) in ordered.iter().enumerate() {
+                if sections[range_idx].is_empty() {
+                    continue; // already fully recovered by an earlier tier
+                }
+                let outcome = self.recover_section(
+                    tier,
+                    range_idx,
+                    num_ranges,
+                    range_pos,
+                    range_size,
+                    &mut sections[range_idx],
+                    final_tier,
+                )?;
+                match outcome {
+                    RegionOutcome::Completed => {}
+                    RegionOutcome::Halted | RegionOutcome::TransportFault => return Ok(()),
                 }
             }
         }
         Ok(())
     }
 
-    /// Recover ONE bad range, end to start (reverse) or start to end.
-    /// Owns the per-iteration read → success/failure → damage-skip →
-    /// watchdog cycle and nothing else; cross-range concerns live in
-    /// [`PatchCtx::run`]. Returns why it stopped (see [`RegionOutcome`]).
-    fn patch_region(
+    /// Run ONE breadth-first tier of the handler chain over one range's still-bad
+    /// set `bad`. Tier 0 = the fast breadth handlers (grab the readable bulk,
+    /// fast-fail the rest); tier 1 = deep recovery (slow reads) + bisect on the
+    /// residual. `final_tier` records the surviving residue as NonTrimmed and
+    /// accounts the range toward progress exactly once. Cross-range scheduling
+    /// lives in [`PatchCtx::run`]; this owns one (tier, range) unit of work.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_section(
         &mut self,
+        tier: usize,
         range_idx: usize,
         num_ranges: usize,
         range_pos: u64,
         range_size: u64,
+        bad: &mut SubRanges,
+        final_tier: bool,
     ) -> Result<RegionOutcome> {
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch.region.enter",
+            tier,
             range_index = range_idx,
             num_total_ranges = num_ranges,
             range_lba = range_pos / 2048,
             range_size_mb = range_size as f64 / 1_048_576.0,
+            bad_bytes = bad.total_len(),
             "entering patch range"
         );
 
@@ -817,35 +829,33 @@ impl PatchCtx<'_, '_> {
         // itself via its `fast` flag.
         self.reader.set_speed(0xFFFF);
 
-        // The section's still-bad set. Handlers shrink it via `SubRanges::remove`
-        // as they recover spans; whatever survives the chain is this pass's
-        // residue.
-        let mut bad = SubRanges::from_section(range_pos, range_size);
-
-        // The recovery-idea chain, cheapest first: fast reverse, fast forward,
-        // slow reverse, slow forward, then bisect for readable islands inside a
-        // mostly-dead range. Each is deadline-bounded; when one can't shrink the
-        // set the next tries a different idea. Adding an idea is one more entry
-        // here (#55).
-        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
-            Box::new(Linear {
-                reverse: true,
-                fast: true,
-            }),
-            Box::new(Linear {
-                reverse: false,
-                fast: true,
-            }),
-            Box::new(Linear {
-                reverse: true,
-                fast: false,
-            }),
-            Box::new(Linear {
-                reverse: false,
-                fast: false,
-            }),
-            Box::new(Bisect),
-        ];
+        // Tier 0: the fast handlers only — sweep the readable bulk of EVERY range
+        // before any slow grind. Tier 1: slow deep-recovery + bisect on what tier
+        // 0 left. Adding a recovery idea is one more entry in the right tier (#55).
+        let mut handlers: Vec<Box<dyn SectionHandler>> = if tier == 0 {
+            vec![
+                Box::new(Linear {
+                    reverse: true,
+                    fast: true,
+                }),
+                Box::new(Linear {
+                    reverse: false,
+                    fast: true,
+                }),
+            ]
+        } else {
+            vec![
+                Box::new(Linear {
+                    reverse: true,
+                    fast: false,
+                }),
+                Box::new(Linear {
+                    reverse: false,
+                    fast: false,
+                }),
+                Box::new(Bisect),
+            ]
+        };
 
         // Clock seam: handlers read wall time through this so tests can wind a
         // fake clock (the same seam the pass uses for its own timing).
@@ -857,6 +867,7 @@ impl PatchCtx<'_, '_> {
             err: None,
         };
 
+        let bad_before = bad.total_len();
         let outcome = {
             let mut ctx = HandlerCtx {
                 reader: &mut *self.reader,
@@ -865,10 +876,23 @@ impl PatchCtx<'_, '_> {
                 halt: self.opts.halt.as_deref(),
                 decrypt_is_aacs: self.decrypt_is_aacs,
             };
-            run_handlers(&mut ctx, &mut handlers, &mut bad, |_bad| {
+            run_handlers(&mut ctx, &mut handlers, bad, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
             })
         };
+
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "patch.region.exit",
+            tier,
+            range_index = range_idx,
+            range_lba = range_pos / 2048,
+            outcome = ?outcome,
+            bad_bytes_before = bad_before,
+            bad_bytes_after = bad.total_len(),
+            recovered = bad_before.saturating_sub(bad.total_len()),
+            "region tier finished"
+        );
 
         // A pipe-closed / halt error captured while emitting recovered spans is
         // fatal to the pass.
@@ -876,17 +900,17 @@ impl PatchCtx<'_, '_> {
             return Err(e);
         }
 
-        // Everything still bad is this pass's residue: record NonTrimmed and MOVE
-        // ON to the next range. A later pass — or a future handler — gets another
-        // shot; the orchestrator promotes still-NonTrimmed to Unreadable only
-        // after the final pass completes.
-        for &(pos, len) in bad.ranges() {
-            send_or_abort(self.pipe, PatchItem::NonTrimmed { pos, len })?;
+        // On the FINAL tier, whatever is still bad is this pass's residue: record
+        // NonTrimmed and account the range toward progress (once). A later pass —
+        // or a future handler — gets another shot; the orchestrator promotes
+        // still-NonTrimmed to Unreadable only after the final pass completes.
+        if final_tier {
+            for &(pos, len) in bad.ranges() {
+                send_or_abort(self.pipe, PatchItem::NonTrimmed { pos, len })?;
+            }
+            self.state.work_done = self.state.work_done.saturating_add(range_size);
         }
 
-        // The whole section is now processed (recovered or left as residue);
-        // account it for progress/ETA and report once.
-        self.state.work_done = self.state.work_done.saturating_add(range_size);
         if self
             .disc
             .report_patch_progress(&self.state, self.opts, self.total_bytes, self.shared)
@@ -1164,7 +1188,6 @@ impl Disc {
             opts,
             total_bytes,
             decrypt_is_aacs,
-            cooldown_pending: false,
             state: PatchLoopState::new(bytes_good_before, total_bytes, initial_batch, work_total),
         };
         ctx.run(&bad_ranges)?;
