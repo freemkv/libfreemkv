@@ -1783,4 +1783,109 @@ mod tests {
         // It tried the fast (max) read first, then the min read — 2 reads.
         assert_eq!(h.read_count(), 2, "swept max then min");
     }
+
+    fn max_fua_deep() -> ReadParams {
+        ReadParams {
+            speed: SpeedPref::Max,
+            fua: true,
+            timeout: TimeoutPref::Deep,
+        }
+    }
+
+    #[test]
+    fn fua_retry_recovers_a_stochastic_sector_a_cached_read_keeps_missing() {
+        // Sector 9 lands only on its 2nd PHYSICAL (FUA) read; a cached (non-FUA)
+        // re-read never gets it (the cache masks the good re-read). FuaRetry =
+        // the Linear fwd + rev + Bisect group at FUA params: across its reads the
+        // sector gets enough physical attempts to land, where cached reads can't.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.fua_need = [(9u32, 2u32)].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(9 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // Cached (non-FUA) reads keep missing — twice, and the sector stays bad
+        // (a cached miss never even counts as a physical attempt).
+        for _ in 0..2 {
+            let out = Linear {
+                direction: Direction::Forward,
+                params: ReadParams::deep(),
+            }
+            .recover(&mut ctx, &mut bad, deadline);
+            assert_eq!(out, HandlerOutcome::Remaining);
+            assert_eq!(bad.total_len(), SECTOR, "cached read must keep missing");
+        }
+
+        // FuaRetry group: Linear fwd (FUA attempt 1) leaves it, Linear rev (FUA
+        // attempt 2) lands it.
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: max_fua_deep(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Reverse,
+                params: max_fua_deep(),
+            }),
+            Box::new(Bisect {
+                params: max_fua_deep(),
+            }),
+        ];
+        let mut sb = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "FuaRetry must land the stochastic sector");
+        assert_eq!(sink.got.get(&(9 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    #[test]
+    fn slow_fua_recovers_the_hardest_sector_needing_both_min_and_fua() {
+        // Sector 11 is the hardest case: it reads ONLY at min speed AND ONLY on a
+        // physical (FUA) read. Neither lever alone works — SlowFua (Linear at
+        // {min, fua, deep}) is the combination that recovers it.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.slow_only = [11u32].into_iter().collect();
+        disc.fua_need = [(11u32, 1u32)].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(11 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // FUA but max speed → wrong speed, fails.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: max_fua_deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(bad.total_len(), SECTOR, "max+fua must miss the min-only sector");
+
+        // Min speed but cached (no FUA) → no physical attempt, fails.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: min_deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(bad.total_len(), SECTOR, "min+cached must miss the FUA-only sector");
+
+        // Both levers: min speed AND FUA → recovers.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: ReadParams {
+                speed: SpeedPref::Min,
+                fua: true,
+                timeout: TimeoutPref::Deep,
+            },
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "SlowFua (min+fua) must recover the hardest sector");
+        assert_eq!(sink.got.get(&(11 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
 }
