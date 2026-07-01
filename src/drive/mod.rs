@@ -51,6 +51,13 @@ pub enum DriveStatus {
 // SCSI opcodes used in drive control
 const SCSI_TEST_UNIT_READY: u8 = 0x00;
 const SCSI_START_STOP_UNIT: u8 = 0x1B;
+/// Idle time the disc sits spun-down during [`Drive::spin_cycle`] before it's
+/// spun back up — long enough for the mechanism's fast-fail wedge state to
+/// clear. Validated at 5–6 s live.
+const SPIN_DOWN_IDLE_SECS: u64 = 5;
+/// Settle time after spin-up in [`Drive::spin_cycle`] before the caller reads
+/// again, so the first post-cycle read doesn't hit a transient NOT_READY.
+const SPIN_UP_SETTLE_SECS: u64 = 10;
 const SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
 const SCSI_GET_EVENT_STATUS: u8 = 0x4A;
 const SCSI_MODE_SENSE: u8 = 0x5A;
@@ -892,6 +899,29 @@ impl Drive {
             &mut buf,
             30_000,
         )?;
+        Ok(())
+    }
+
+    /// Soft power-cycle the drive mechanism WITHOUT ejecting: spin the disc
+    /// down (`START STOP UNIT`, START=0, **LOEJ=0**) then back up (START=1).
+    /// This clears the BU40N/Initio fast-fail *wedge* state that a run of
+    /// `HARDWARE_ERROR` reads leaves the drive in — the non-eject equivalent of
+    /// the power-cycle our notes say the wedge needs. The disc stays loaded (the
+    /// BU40N is slot-loading; we NEVER eject to recover — a hands-on eject is a
+    /// failure for an unattended service). Validated live 2026-07-01: took the
+    /// drive from failing-every-read back to reading at MB/s.
+    pub fn spin_cycle(&mut self) -> Result<()> {
+        let stop = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x00, 0]; // START=0, LOEJ=0 → spin down
+        let start = [SCSI_START_STOP_UNIT, 0, 0, 0, 0x01, 0]; // START=1, LOEJ=0 → spin up
+        let mut buf = [0u8; 0];
+        self.scsi
+            .as_mut()
+            .execute(&stop, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        std::thread::sleep(std::time::Duration::from_secs(SPIN_DOWN_IDLE_SECS));
+        self.scsi
+            .as_mut()
+            .execute(&start, crate::scsi::DataDirection::None, &mut buf, 30_000)?;
+        std::thread::sleep(std::time::Duration::from_secs(SPIN_UP_SETTLE_SECS));
         Ok(())
     }
 
