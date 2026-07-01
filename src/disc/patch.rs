@@ -870,6 +870,43 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
     }
 }
 
+/// The FLAT handler pool — every technique×parameterization from all tiers in
+/// ONE chain, no tier gate. `run_handlers` sorts it best-first by the rip
+/// scorecard on every range, so this is a data-driven bandit: the first ranges
+/// try them all (explore), then the decayed-yield ranking floats whatever is
+/// actually landing sectors to the front (exploit), re-measured per range. A
+/// handler that doesn't fit stays last but is never dropped (floor → it can
+/// still revive if the residual's character shifts). No fixed ordering, no
+/// "start tier" — the data picks the order. Enabled by `FREEMKV_PATCH_FLAT`;
+/// unset keeps the proven tier ladder.
+fn build_flat_pool() -> Vec<Box<dyn SectionHandler>> {
+    let mut pool = Vec::new();
+    for tier in 0..PATCH_TIERS {
+        pool.extend(build_tier_handlers(tier));
+    }
+    pool
+}
+
+/// True when the flat-pool bandit scheduler is requested (`FREEMKV_PATCH_FLAT`
+/// set to anything but empty / `0`). Default (unset) keeps the tier ladder.
+fn patch_flat_mode() -> bool {
+    std::env::var("FREEMKV_PATCH_FLAT")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Short per-handler EXPLORE budget for the flat bandit (seconds). Keeps any one
+/// handler from hogging a range so all 16 get a fast turn and the scorecard
+/// learns quickly. `FREEMKV_PATCH_FLAT_BUDGET` overrides; default 12 s, floored
+/// at 1.
+fn flat_handler_budget_secs() -> u64 {
+    std::env::var("FREEMKV_PATCH_FLAT_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(12)
+        .max(1)
+}
+
 impl PatchCtx<'_, '_> {
     /// Orchestrator (one pass): walk the ordered bad ranges. Apply the
     /// inter-range cooldown only after a range that grinded, then recover
@@ -891,14 +928,47 @@ impl PatchCtx<'_, '_> {
             .map(|&(p, l)| SubRanges::from_section(p, l))
             .collect();
 
-        // BREADTH-FIRST recovery. Tier 0 fast-sweeps EVERY range first — grabbing
+        // Two schedulers select the handler chain per range:
+        //
+        // FLAT bandit (`FREEMKV_PATCH_FLAT`): ONE range walk, the full flat pool
+        // per range. `run_handlers` orders it best-first by the live scorecard,
+        // so the data — not a fixed tier order — decides what runs first. Right
+        // for a hardened residual (late resume): the specialists get a shot on
+        // every range immediately instead of waiting out a full bucket→mug sweep.
+        //
+        // TIER ladder (default): tier 0 fast-sweeps EVERY range first — grabbing
         // the easily-readable bulk across the whole disc (sweep-jump over-marks a
-        // big region NonTrimmed without testing each sector, so most of it reads
-        // back in seconds) — BEFORE any range's slow per-sector grind. Tier 1
-        // then deep-recovers only the residual. This fixes the depth-first
-        // starvation bug: the full chain used to run per range, so a small dead
-        // cluster at the front burned ~5 min/range and the big
-        // mostly-recoverable ranges were never reached.
+        // big region NonTrimmed without testing each sector, so most reads back in
+        // seconds) — BEFORE any slow per-sector grind; tiers 1-2 escalate onto the
+        // residue. Right for a FRESH rip (flood still present). This is also the
+        // fix for the OLD depth-first starvation bug (full chain per range burned
+        // ~5 min on a front cluster and starved the big recoverable ranges) — but
+        // the new handlers self-limit (yield after 4 dead reads), so the flat
+        // scheduler no longer hits that.
+        if patch_flat_mode() {
+            for (range_idx, &(range_pos, range_size)) in ordered.iter().enumerate() {
+                if sections[range_idx].is_empty() {
+                    continue;
+                }
+                // Single flat pass: this IS the final (only) tier for the range,
+                // so surviving residue is recorded NonTrimmed for the next pass.
+                let outcome = self.recover_section(
+                    0,
+                    range_idx,
+                    num_ranges,
+                    range_pos,
+                    range_size,
+                    &mut sections[range_idx],
+                    /* final_tier */ true,
+                    /* flat */ true,
+                )?;
+                match outcome {
+                    RegionOutcome::Completed => {}
+                    RegionOutcome::Halted | RegionOutcome::TransportFault => return Ok(()),
+                }
+            }
+            return Ok(());
+        }
         for tier in 0..PATCH_TIERS {
             let final_tier = tier + 1 == PATCH_TIERS;
             for (range_idx, &(range_pos, range_size)) in ordered.iter().enumerate() {
@@ -913,6 +983,7 @@ impl PatchCtx<'_, '_> {
                     range_size,
                     &mut sections[range_idx],
                     final_tier,
+                    /* flat */ false,
                 )?;
                 match outcome {
                     RegionOutcome::Completed => {}
@@ -939,11 +1010,13 @@ impl PatchCtx<'_, '_> {
         range_size: u64,
         bad: &mut SubRanges,
         final_tier: bool,
+        flat: bool,
     ) -> Result<RegionOutcome> {
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch.region.enter",
             tier,
+            flat,
             range_index = range_idx,
             num_total_ranges = num_ranges,
             range_lba = range_pos / 2048,
@@ -957,10 +1030,17 @@ impl PatchCtx<'_, '_> {
         // every tier starts from the streaming default.
         self.reader.set_speed(0xFFFF);
 
-        // The tier roster (see `build_tier_handlers`): tier 0 fast scouts, tier 1
-        // slow-deep, tier 2 marginal specialists. `run_handlers` orders WITHIN a
-        // tier best-first by the rip scorecard, which re-learns per disc.
-        let mut handlers: Vec<Box<dyn SectionHandler>> = build_tier_handlers(tier);
+        // Handler roster. FLAT mode: the whole pool (all techniques) in one
+        // chain — `run_handlers` orders it best-first by the rip scorecard, so
+        // the data picks what runs first. TIER mode: just this tier's roster
+        // (tier 0 fast scouts, 1 slow-deep, 2 marginal specialists), likewise
+        // scorecard-ordered within the tier. Either way the scorecard re-learns
+        // per disc.
+        let mut handlers: Vec<Box<dyn SectionHandler>> = if flat {
+            build_flat_pool()
+        } else {
+            build_tier_handlers(tier)
+        };
 
         // Clock seam: handlers read wall time through this so tests can wind a
         // fake clock (the same seam the pass uses for its own timing).
@@ -1009,8 +1089,19 @@ impl PatchCtx<'_, '_> {
                 // Drive was just reset to max above; read_span tracks changes.
                 cur_speed: 0xFFFF,
             };
+            // Per-handler time budget. FLAT mode is EXPLORE-first: give each
+            // handler only a short slice so all 16 get a turn on the range
+            // quickly ("test all quick"), and the scorecard learns which land
+            // bytes — a winner then earns more cumulative time across ranges and
+            // passes. TIER mode keeps the full 60 s deep-recovery window. Both
+            // env-tunable via `FREEMKV_PATCH_FLAT_BUDGET`.
+            let budget_secs = if flat {
+                flat_handler_budget_secs()
+            } else {
+                PER_HANDLER_BUDGET_SECS
+            };
             let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
-                now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
+                now_ptr() + std::time::Duration::from_secs(budget_secs)
             });
             (o, ctx.wedge_streak)
         };
@@ -1420,6 +1511,41 @@ impl Disc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flat bandit pool must contain every handler from every tier, with a
+    /// UNIQUE name per config — the scoreboard keys on the name, so any two
+    /// handlers sharing a name would blur each other's decayed-yield ranking.
+    #[test]
+    fn flat_pool_is_all_tiers_with_unique_names() {
+        let flat = build_flat_pool();
+        let tiered: usize = (0..PATCH_TIERS).map(|t| build_tier_handlers(t).len()).sum();
+        assert_eq!(
+            flat.len(),
+            tiered,
+            "flat pool must equal the sum of all tier rosters"
+        );
+        let mut names: Vec<String> = flat.iter().map(|h| h.name()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "every flat-pool handler must have a unique scoreboard name"
+        );
+    }
+
+    /// The flat-mode toggle: unset / empty / "0" → tier ladder; anything else →
+    /// flat bandit. (Env is process-global; this asserts the parse logic via the
+    /// same rules `patch_flat_mode` applies.)
+    #[test]
+    fn flat_mode_toggle_parsing() {
+        let on = |v: &str| !v.is_empty() && v != "0";
+        assert!(!on(""));
+        assert!(!on("0"));
+        assert!(on("1"));
+        assert!(on("true"));
+    }
 
     /// Transport failure (status=0xFF, USB-bridge crash) must be recognised by
     /// the gate `handle_read_failure` now checks FIRST, so it aborts the pass
