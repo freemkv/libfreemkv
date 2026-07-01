@@ -621,37 +621,34 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
 }
 
 /// Assign the on-wire `private_stream_1` sub-stream id to each audio
-/// stream by per-codec ordinal, matching DVD authoring convention and the
-/// muxer's `dvd_pid()` routing:
-///   - AC-3  → `0x80 + n` (n = 0-based index among AC-3 streams)
-///   - DTS   → `0x88 + n`
-///   - LPCM  → `0xA0 + n`
+/// stream. On DVD-Video the sub-id's **low nibble is the audio-stream
+/// *number* (0-7), shared across all codecs** — the single stream index the
+/// PGC `audio_control` table / navigation registers select — and the high
+/// nibble is the codec base. So the sub-id is `codec_base | position`, where
+/// `position` is the stream's index in the IFO audio-attribute table (NOT a
+/// per-codec running count):
+///   - AC-3  → `0x80 | i`
+///   - DTS   → `0x88 | i`
+///   - LPCM  → `0xA0 | i`
 ///   - MP1/MP2 and anything else → `None` (regular MPEG-audio PES, not a
 ///     private-stream-1 sub-id).
 ///
-/// Indices saturate at the codec range ceiling (8 AC-3/DTS, 8 LPCM) so a
-/// malformed over-count never produces an out-of-range sub-id.
+/// A per-codec ordinal was wrong: it only coincides with the wire id when a
+/// codec's first stream is also the disc's audio stream #0. Any codec that is
+/// not the first audio stream (e.g. a DTS track after an AC-3 track) then got
+/// a sub-id one-too-low, so the demux routing key (`0xBD00 | sub_id`) never
+/// matched and the track muxed silent. The positional index is the real wire
+/// number, so distinct positions still give distinct sub-ids (no collision).
+///
+/// Position saturates at 7 so a malformed over-count never produces an
+/// out-of-range sub-id.
 fn assign_audio_sub_stream_ids(streams: &mut [DvdAudioAttr]) {
-    let mut n_ac3 = 0u8;
-    let mut n_dts = 0u8;
-    let mut n_lpcm = 0u8;
-    for s in streams.iter_mut() {
+    for (i, s) in streams.iter_mut().enumerate() {
+        let n = (i as u8).min(7);
         s.sub_stream_id = match s.codec {
-            Codec::Ac3 => {
-                let id = 0x80 + n_ac3.min(7);
-                n_ac3 = n_ac3.saturating_add(1);
-                Some(id)
-            }
-            Codec::Dts => {
-                let id = 0x88 + n_dts.min(7);
-                n_dts = n_dts.saturating_add(1);
-                Some(id)
-            }
-            Codec::Lpcm => {
-                let id = 0xA0 + n_lpcm.min(7);
-                n_lpcm = n_lpcm.saturating_add(1);
-                Some(id)
-            }
+            Codec::Ac3 => Some(0x80 | n),
+            Codec::Dts => Some(0x88 | n),
+            Codec::Lpcm => Some(0xA0 | n),
             _ => None,
         };
     }
@@ -1138,9 +1135,10 @@ mod tests {
 
     #[test]
     fn mixed_codec_sub_stream_ids_are_distinct() {
-        // A title mixing AC-3, DTS and LPCM must get per-codec ordinal
-        // sub-ids (0x80, 0x88, 0xA0...), all distinct — this is the
-        // routing key that keeps mixed-codec audio from colliding.
+        // A title mixing AC-3, DTS and LPCM: the sub-id low nibble is the
+        // POSITIONAL audio-stream number (shared across codecs), OR'd with the
+        // codec base. So idx 1 (DTS) → 0x89, idx 3 (AC-3) → 0x83 — the real
+        // wire ids the demux routes on. All distinct (positions are unique).
         let mut streams = vec![
             DvdAudioAttr {
                 codec: Codec::Ac3,
@@ -1172,16 +1170,52 @@ mod tests {
             },
         ];
         assign_audio_sub_stream_ids(&mut streams);
-        assert_eq!(streams[0].sub_stream_id, Some(0x80)); // AC-3 #0
-        assert_eq!(streams[1].sub_stream_id, Some(0x88)); // DTS  #0
-        assert_eq!(streams[2].sub_stream_id, Some(0xA0)); // LPCM #0
-        assert_eq!(streams[3].sub_stream_id, Some(0x81)); // AC-3 #1
+        assert_eq!(streams[0].sub_stream_id, Some(0x80)); // AC-3 @ pos 0
+        assert_eq!(streams[1].sub_stream_id, Some(0x89)); // DTS  @ pos 1
+        assert_eq!(streams[2].sub_stream_id, Some(0xA2)); // LPCM @ pos 2
+        assert_eq!(streams[3].sub_stream_id, Some(0x83)); // AC-3 @ pos 3
         // All sub-ids unique.
         let ids: Vec<u8> = streams.iter().filter_map(|s| s.sub_stream_id).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids.len(), sorted.len(), "sub-stream ids must be unique");
+    }
+
+    /// Regression (The Punisher 2004): audio[0]=AC-3 5.1, audio[1]=DTS 5.0.
+    /// The DTS track sits at audio position 1, so its wire sub-id is 0x89
+    /// (0x88 | 1), NOT the per-codec 0x88. With the old per-codec ordinal it
+    /// got 0x88 → demux routing key 0xBD88 had no match → every DTS packet
+    /// (which carries 0x89) was dropped → the track muxed present-but-silent
+    /// while the AC-3 (at position 0, where ordinal and position coincide)
+    /// played fine. Positional numbering fixes it end-to-end.
+    #[test]
+    fn dts_after_ac3_uses_positional_substream_id() {
+        let mut streams = vec![
+            DvdAudioAttr {
+                codec: Codec::Ac3,
+                channels: 6,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+            DvdAudioAttr {
+                codec: Codec::Dts,
+                channels: 5,
+                sample_rate: 48000,
+                language: "en".into(),
+                sub_stream_id: None,
+            },
+        ];
+        assign_audio_sub_stream_ids(&mut streams);
+        assert_eq!(streams[0].sub_stream_id, Some(0x80));
+        assert_eq!(
+            streams[1].sub_stream_id,
+            Some(0x89),
+            "DTS at audio position 1 routes to 0x89 on the wire, not 0x88"
+        );
+        // The routing key the muxer actually uses must resolve for 0x89.
+        assert_eq!(crate::mux::ps::dvd_audio_pid(0x89), Some(0xBD89));
     }
 
     #[test]
@@ -1371,10 +1405,10 @@ mod tests {
         ];
         assign_audio_sub_stream_ids(&mut streams);
         assert_eq!(streams[0].sub_stream_id, None); // MP2 → no sub-id
-        assert_eq!(streams[1].sub_stream_id, Some(0x80)); // AC3 #0
+        assert_eq!(streams[1].sub_stream_id, Some(0x81)); // AC3 @ pos 1
     }
 
-    /// assign_audio_sub_stream_ids saturates the per-codec ordinal at the
+    /// assign_audio_sub_stream_ids saturates the positional index at the
     /// range ceiling (min(7)) so a malformed over-count never produces an
     /// out-of-range sub-id. 9 AC-3 streams: the 9th still ≤ 0x87.
     #[test]
