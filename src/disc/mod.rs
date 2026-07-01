@@ -2270,19 +2270,39 @@ impl Disc {
     }
 
     /// The unlocker matrix for this scanned disc on `drive`: each REGISTERED
-    /// unlocker's name + whether it applies to this drive + disc. Registry-driven
-    /// (no hardcoded names) so the CLI and autorip render an identical, always-
-    /// current report. The disc's crypto kind is derived here (in the library) so
-    /// both apps agree.
+    /// unlocker's name + whether it actually **did work this rip** — i.e. ran and
+    /// accomplished its job, NOT merely "matched the disc kind". Registry-driven
+    /// names (no hardcoding) so the CLI and autorip render an identical, always-
+    /// current report; the per-unlocker runtime signal is computed here because
+    /// the library owns unlock semantics AND the disc/drive state.
+    ///
+    /// The distinction matters: on a LibreDrive drive, LibreDrive's firmware route
+    /// removes the AACS bus and reads the VID, so the AACS host-cert unlocker
+    /// never runs — it "matched" (AACS disc) but did nothing. `did-work` reports
+    /// that honestly (`AACS: no`), and on a *stock* drive that fell back to the
+    /// cert route it reports `LibreDrive: no, AACS: yes` — the real diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
-        let kind = if self.aacs.is_some() || self.aacs_error.is_some() {
-            freemkv_unlock::DiscKind::Aacs
-        } else if self.css.is_some() || self.css_error.is_some() {
-            freemkv_unlock::DiscKind::Css
-        } else {
-            freemkv_unlock::DiscKind::Unencrypted
-        };
-        crate::unlock_bridge::unlocker_matrix(&drive.drive_id, kind)
+        // LibreDrive firmware-unlocked the drive iff a drive unlocker actually
+        // succeeded at init (name recorded only on success).
+        let ld_worked = drive.unlocker_name().is_some();
+        crate::unlock_bridge::unlocker_names()
+            .into_iter()
+            .map(|name| {
+                let did_work = match name {
+                    // The drive firmware unlock ran and succeeded.
+                    "LibreDrive" => ld_worked,
+                    // The AACS host-cert route removed the bus ONLY when LibreDrive
+                    // didn't (stock drive) AND AACS state was actually obtained.
+                    "AACS" => self.aacs.is_some() && !ld_worked,
+                    // The CSS handshake/crack succeeded → title keys recovered.
+                    "CSS" => self.css.is_some(),
+                    // A newly-registered unlocker with no runtime signal wired
+                    // here yet: report `no` rather than guess.
+                    _ => false,
+                };
+                (name, did_work)
+            })
+            .collect()
     }
 
     /// The system-wide decrypt correctness gate.
