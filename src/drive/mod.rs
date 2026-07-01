@@ -411,27 +411,18 @@ impl Drive {
     pub fn init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
-        // Drive-level features (max read speed / riplock lift) — matched on the
-        // DRIVE, applied for ANY disc. STOCK MMC commands only (no firmware
-        // unlock), so this is safe for a CSS DVD that must stay in stock mode.
-        // Runs BEFORE the DVD early-return below so a DVD is no longer riplocked:
-        // previously only the BD/UHD path (which returns clear content via the
-        // firmware unlock + its speed calibration) got up to speed, and DVD fell
-        // through with just the legacy SET CD SPEED the drive ignores.
-        crate::unlock_bridge::apply_drive_features(self.scsi.as_mut(), &self.drive_id);
-        if self.disc_is_dvd() {
-            tracing::info!(target: "freemkv::drive", phase = "init", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, drive features applied, no bus unlock)");
-            self.init_ran = true;
-            return Ok(());
-        }
-        // Drive-prep dispatch: the disc structure has not been probed yet, so
-        // the kind is Unknown — only an identity-keyed unlocker can match here.
-        // The first matching unlocker runs; none matching leaves the drive in
-        // stock mode so the host-cert AACS handshake (the OEM route) carries the
-        // disc. A genuine transport fault means the bus is dead — abort init
-        // (the v1.1.0 invariant; `if let Ok` was silently swallowing it). Every
-        // other error (NotApplicable / no match) is "nothing applied" — fall
-        // through to stock mode.
+        // Drive-prep runs for EVERY disc, DVD INCLUDED. The drive-level firmware
+        // unlock lifts riplock and readies max read speed regardless of disc type
+        // — drive features are disc-independent. At init the disc kind is not yet
+        // probed (Unknown), so only the identity-keyed DRIVE unlocker matches
+        // here; the AACS host-cert handshake and the CSS bus-auth handshake run
+        // LATER, each gated on the actual disc kind, on TOP of the already-
+        // unlocked drive. A genuine transport fault means the bus is dead — abort
+        // init (the v1.1.0 invariant; `if let Ok` was silently swallowing it).
+        // Every other error (NotApplicable / no match) is "nothing applied" —
+        // fall through to stock mode. NOTE: the `if disc_is_dvd() { return }` skip
+        // that used to sit here was the v1.0.0-rc.1 regression — it skipped the
+        // drive-prep for DVD, leaving DVDs riplocked at stock speed.
         self.init_ran = true;
         let r: Result<()> = match crate::unlock_bridge::run_unlockers(
             self.scsi.as_mut(),
@@ -457,13 +448,12 @@ impl Drive {
             }),
             Err(_) => Ok(()),
         };
-        // Raise the drive to its maximum read speed with a generic SET CD SPEED —
-        // UNCONDITIONALLY whenever the bus is alive (init didn't transport-fault),
-        // whether or not an unlocker matched. A stock-mode BD/UHD drive (no
-        // firmware unlocker) still wants max speed; gating this on an unlocker
-        // match left such drives riplocked. (DVD returns earlier in stock mode;
-        // its sweep sets DVD speed separately.) Best-effort: a failure here must
-        // NOT fail the rip — a slow drive still rips.
+        // Raise the drive to its maximum read speed — UNCONDITIONALLY whenever
+        // the bus is alive (init didn't transport-fault), whether or not an
+        // unlocker matched, and for ANY disc type (DVD now flows through here too,
+        // so it gets max speed on the freshly firmware-unlocked drive instead of
+        // the stock riplock). A stock-mode drive with no firmware unlocker still
+        // wants max speed. Best-effort: a failure here must NOT fail the rip.
         if r.is_ok() {
             self.set_speed(crate::speed::DriveSpeed::Max.to_kbps());
         }
@@ -484,14 +474,9 @@ impl Drive {
     pub fn probe_disc(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "probe_disc", "begin");
-        // A DVD runs in stock mode (see `init`); skip the OEM/drive-prep
-        // disc calibration, which only applies to the unlocked BD/UHD drive.
-        if self.disc_is_dvd() {
-            tracing::info!(target: "freemkv::drive", phase = "probe_disc", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no calibration)");
-            return Ok(());
-        }
         // Disc-speed calibration is unlocker-specific and now lives inside
-        // the unlocker's `unlock()` (run at `init()`). Nothing to do here.
+        // the unlocker's `unlock()` (run at `init()`, for every disc including
+        // DVD). Nothing to do here — no disc-type branch.
         tracing::info!(
             target: "freemkv::drive",
             phase = "probe_disc",
