@@ -16,6 +16,7 @@ mod extract;
 pub mod mapfile;
 mod patch;
 pub mod read_error;
+mod section_recover;
 mod sweep;
 pub mod verify;
 
