@@ -821,7 +821,8 @@ impl SectionHandler for CachePrime {
             // the servo/PLL, so the boundary sector is read warm, not cold-seeked.
             if rp >= SECTOR {
                 // A bad/absent preceding sector just means no prime — read cold.
-                if let ReadHit::Transport = read_span(ctx, &mut prime, rp - SECTOR, 1, self.params) {
+                if let ReadHit::Transport = read_span(ctx, &mut prime, rp - SECTOR, 1, self.params)
+                {
                     return HandlerOutcome::TransportFault;
                 }
             }
@@ -1018,7 +1019,7 @@ impl HandlerScoreboard {
     pub(super) fn log(&self) {
         let mut rows: Vec<_> = self.stats.iter().collect();
         // Rank by the decayed rate (the live signal), highest first.
-        rows.sort_by(|a, b| self.rank(b.0).cmp(&self.rank(a.0)));
+        rows.sort_by_key(|(name, _)| std::cmp::Reverse(self.rank(name)));
         for (name, s) in rows {
             let mbps = s.recovered as f64 / (s.nanos as f64 / 1e9).max(1e-9) / 1_048_576.0;
             tracing::info!(
@@ -1895,7 +1896,11 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Remaining);
-        assert_eq!(bad.total_len(), SECTOR, "max-speed linear must leave it bad");
+        assert_eq!(
+            bad.total_len(),
+            SECTOR,
+            "max-speed linear must leave it bad"
+        );
 
         // SlowSpin = Linear at min speed — recovers it.
         let out = Linear {
@@ -2012,7 +2017,11 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Remaining);
-        assert_eq!(bad.total_len(), SECTOR, "max+fua must miss the min-only sector");
+        assert_eq!(
+            bad.total_len(),
+            SECTOR,
+            "max+fua must miss the min-only sector"
+        );
 
         // Min speed but cached (no FUA) → no physical attempt, fails.
         let out = Linear {
@@ -2021,7 +2030,11 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Remaining);
-        assert_eq!(bad.total_len(), SECTOR, "min+cached must miss the FUA-only sector");
+        assert_eq!(
+            bad.total_len(),
+            SECTOR,
+            "min+cached must miss the FUA-only sector"
+        );
 
         // Both levers: min speed AND FUA → recovers.
         let out = Linear {
@@ -2034,7 +2047,10 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Complete);
-        assert!(bad.is_empty(), "SlowFua (min+fua) must recover the hardest sector");
+        assert!(
+            bad.is_empty(),
+            "SlowFua (min+fua) must recover the hardest sector"
+        );
         assert_eq!(sink.got.get(&(11 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 
@@ -2068,7 +2084,10 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Complete);
-        assert!(bad.is_empty(), "Oscillate must recover the direction-dependent sector");
+        assert!(
+            bad.is_empty(),
+            "Oscillate must recover the direction-dependent sector"
+        );
         assert_eq!(sink.got.get(&(13 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 
@@ -2094,7 +2113,11 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Remaining);
-        assert_eq!(bad.total_len(), SECTOR, "cold linear must miss the boundary sector");
+        assert_eq!(
+            bad.total_len(),
+            SECTOR,
+            "cold linear must miss the boundary sector"
+        );
 
         // CachePrime reads the preceding run first → warm channel → lands it.
         let out = CachePrime {
@@ -2102,7 +2125,10 @@ mod tests {
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Complete);
-        assert!(bad.is_empty(), "CachePrime must recover the primed boundary sector");
+        assert!(
+            bad.is_empty(),
+            "CachePrime must recover the primed boundary sector"
+        );
         assert_eq!(sink.got.get(&(15 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 }

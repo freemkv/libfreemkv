@@ -59,8 +59,9 @@ use crate::io::pipeline::{Flow, Sink};
 
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
-    Bisect, Direction, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear, ReadParams,
-    RecoverySink, SectionHandler, run_handlers,
+    Bisect, CachePrime, Direction, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear,
+    Oscillate, ReadParams, RecoverySink, SectionHandler, SpeedPref, SpeedSweep, TimeoutPref,
+    run_handlers,
 };
 
 /// Wall-clock budget one recovery handler gets on a section before the chain
@@ -349,8 +350,10 @@ use crate::io::pipeline::Pipeline;
 use crate::sector::SectorSource;
 
 /// Breadth-first recovery tiers. Tier 0 fast-sweeps every bad range; tier 1
-/// deep-recovers the residual. See `PatchCtx::run`.
-const PATCH_TIERS: usize = 2;
+/// deep-recovers the residual; tier 2 runs the marginal specialists on whatever
+/// tiers 0-1 leave (the true hardened residual). See `PatchCtx::run` and
+/// `build_tier_handlers`.
+const PATCH_TIERS: usize = 3;
 
 /// Send a `PatchItem` and translate a `SendError` (consumer thread died
 /// / panicked) into a library error so the caller propagates cleanly.
@@ -448,7 +451,13 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
         let span = head + count as usize;
         let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
         let mut scratch = vec![0u8; aligned_count * 2048];
-        reader.read_sectors_fua(aligned_lba, aligned_count as u16, &mut scratch, recovery, fua)?;
+        reader.read_sectors_fua(
+            aligned_lba,
+            aligned_count as u16,
+            &mut scratch,
+            recovery,
+            fua,
+        )?;
         buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
         Ok(bytes)
     } else {
@@ -790,8 +799,74 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                 params: ReadParams::deep(),
             }),
         ],
-        // Tier 2 — marginal specialists (wired in when PATCH_TIERS reaches 3).
-        _ => Vec::new(),
+        // Tier 2 — marginal specialists, run ONLY on the hardened residual that
+        // tiers 0-1 leave. Each targets ONE physical failure mode. They are all
+        // NEW configs, so the scorecard calibrates each once then ranks by its
+        // decayed rate — a specialist that doesn't fit THIS disc self-
+        // deprioritises (scores low, yields after 4 unproductive reads) and one
+        // that starts landing sectors climbs. Every read is a wedge-safe
+        // `read_span`, so they inherit the wedge-abort / unproductive-yield /
+        // deadline bounds for free. Additive: tiers 0-1 are untouched.
+        _ => {
+            // Slower spindle (more servo dwell + ECC integration per sector).
+            let min_deep = ReadParams {
+                speed: SpeedPref::Min,
+                fua: false,
+                timeout: TimeoutPref::Deep,
+            };
+            // Cache-bypass physical re-read (stochastic marginal sectors).
+            let fua_deep = ReadParams {
+                speed: SpeedPref::Max,
+                fua: true,
+                timeout: TimeoutPref::Deep,
+            };
+            // Both levers for the hardest sectors (min spindle AND cache-bypass).
+            let slow_fua = ReadParams {
+                speed: SpeedPref::Min,
+                fua: true,
+                timeout: TimeoutPref::Deep,
+            };
+            vec![
+                // SlowSpin: Linear fwd + rev at min speed.
+                Box::new(Linear {
+                    direction: Direction::Reverse,
+                    params: min_deep,
+                }),
+                Box::new(Linear {
+                    direction: Direction::Forward,
+                    params: min_deep,
+                }),
+                // FuaRetry: Linear fwd + rev + Bisect under FUA (multiple physical
+                // attempts per marginal sector).
+                Box::new(Linear {
+                    direction: Direction::Forward,
+                    params: fua_deep,
+                }),
+                Box::new(Linear {
+                    direction: Direction::Reverse,
+                    params: fua_deep,
+                }),
+                Box::new(Bisect { params: fua_deep }),
+                // SlowFua: the hardest sector — min speed AND FUA.
+                Box::new(Linear {
+                    direction: Direction::Forward,
+                    params: slow_fua,
+                }),
+                // CachePrime: warm the channel on the preceding good run first.
+                Box::new(CachePrime {
+                    params: ReadParams::deep(),
+                }),
+                // Oscillate: alternate approach direction, at max and at min.
+                Box::new(Oscillate {
+                    params: ReadParams::deep(),
+                }),
+                Box::new(Oscillate { params: min_deep }),
+                // SpeedSweep: per-sector Max→Min speed search.
+                Box::new(SpeedSweep {
+                    params: ReadParams::deep(),
+                }),
+            ]
+        }
     }
 }
 
