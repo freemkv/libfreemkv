@@ -148,10 +148,11 @@ pub(super) enum PatchItem {
 
 /// Mapfile snapshot the sink republishes after every record so the
 /// producer can drive its stall / progress logic without holding the
-/// mapfile lock for long. `bad_ranges` mirrors what
-/// `Mapfile::ranges_with(&[NonTrimmed, Unreadable, NonScraped, NonTried])`
-/// would return — same set the pre-split patch loop computed inline
-/// for the progress callback.
+/// mapfile lock for long. `bad_ranges` is the DAMAGE set
+/// (`NonTrimmed + Unreadable + NonScraped`) — NOT NonTried, which is the unread
+/// remainder, not damage. Including NonTried inflated the live located drilldown
+/// (at-risk movie time + range count) with unread sectors; excluding it matches
+/// the one-shot progress path.
 pub(super) struct SharedPatchState {
     pub stats: MapStats,
     pub bad_ranges: Vec<(u64, u64)>,
@@ -169,7 +170,6 @@ impl SharedPatchState {
             SectorStatus::NonTrimmed,
             SectorStatus::Unreadable,
             SectorStatus::NonScraped,
-            SectorStatus::NonTried,
         ]);
         bad_ranges.truncate(Self::MAX_BAD_RANGES);
         Self {
@@ -614,10 +614,6 @@ pub(super) fn build_outcome(
     tracing::info!(
         target: "freemkv::disc",
         phase = "patch.done",
-        blocks_attempted = state.blocks_attempted,
-        blocks_read_ok = state.blocks_read_ok,
-        blocks_read_failed = state.blocks_read_failed,
-        unreadable_count = state.unreadable_count,
         wedged_exit = state.wedged_exit,
         halted = state.halted,
         bytes_recovered = stats.bytes_good.saturating_sub(state.bytes_good_before),
@@ -635,9 +631,6 @@ pub(super) fn build_outcome(
         bytes_pending: stats.bytes_pending,
         bytes_recovered_this_pass: stats.bytes_good.saturating_sub(state.bytes_good_before),
         halted: state.halted,
-        blocks_attempted: state.blocks_attempted,
-        blocks_read_ok: state.blocks_read_ok,
-        blocks_read_failed: state.blocks_read_failed,
         wedged_exit: state.wedged_exit,
         wedged_threshold,
     }
@@ -651,10 +644,6 @@ pub(super) struct PatchLoopState {
     // Counters
     pub halted: bool,
     pub wedged_exit: bool,
-    pub blocks_attempted: u64,
-    pub blocks_read_ok: u64,
-    pub blocks_read_failed: u64,
-    pub unreadable_count: u64,
     // Clock seam: the handler chain reads wall time through this rather than
     // calling `Instant::now()` inline, so the per-handler deadline is driven by
     // an injectable clock and deterministic tests can wind it forward.
@@ -697,10 +686,6 @@ impl PatchLoopState {
         Self {
             halted: false,
             wedged_exit: false,
-            blocks_attempted: 0,
-            blocks_read_ok: 0,
-            blocks_read_failed: 0,
-            unreadable_count: 0,
             now,
             bytes_good_before,
             total_bytes,
