@@ -59,8 +59,8 @@ use crate::io::pipeline::{Flow, Sink};
 
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
-    Bisect, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear, RecoverySink,
-    SectionHandler, run_handlers,
+    Bisect, Direction, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear, ReadParams,
+    RecoverySink, SectionHandler, run_handlers,
 };
 
 /// Wall-clock budget one recovery handler gets on a section before the chain
@@ -426,8 +426,11 @@ pub(super) fn compute_initial_state(
 /// 0, so the widened start is always unit-aligned. All recovery
 /// accounting upstream (pos, block_bytes, dispatched lba/count) is
 /// unchanged — only the physical read widens, so the cursor cannot
-/// desync. `recovery` selects the SCSI timeout (true = 60 s deep
-/// recovery, false = the fast path).
+/// desync. `recovery` selects the SCSI timeout (true = 60 s deep recovery,
+/// false = the fast path); `fua` forces the drive to bypass its readahead cache
+/// and re-fetch
+/// the medium (a Pass-N marginal-sector lever — see
+/// [`crate::sector::SectorSource::read_sectors_fua`]).
 pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     reader: &mut R,
     decrypt_is_aacs: bool,
@@ -435,6 +438,7 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     count: u16,
     buf: &mut [u8],
     recovery: bool,
+    fua: bool,
 ) -> Result<usize> {
     let bytes = count as usize * 2048;
     if decrypt_is_aacs && (lba % 3 != 0 || count % 3 != 0) {
@@ -444,11 +448,11 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
         let span = head + count as usize;
         let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
         let mut scratch = vec![0u8; aligned_count * 2048];
-        reader.read_sectors(aligned_lba, aligned_count as u16, &mut scratch, recovery)?;
+        reader.read_sectors_fua(aligned_lba, aligned_count as u16, &mut scratch, recovery, fua)?;
         buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
         Ok(bytes)
     } else {
-        reader.read_sectors(lba, count, &mut buf[..bytes], recovery)
+        reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua)
     }
 }
 
@@ -740,6 +744,57 @@ struct PatchCtx<'a, 'o> {
     wedge_streak: u32,
 }
 
+/// Build the handler chain for one breadth-first tier. Each config is named by
+/// its FULL parameterisation (`build_tier_handlers` picks the roster; the
+/// scorecard re-orders WITHIN a tier per rip). The engine hardcodes no
+/// conclusion: every technique is always present at its tier, and a technique
+/// that doesn't fit this disc self-deprioritises (scores low, yields after 4
+/// unproductive reads) rather than being removed.
+///
+/// - **Tier 0 — fast scouts** (`fast`: max speed, 10 s, cache on): grab the
+///   readable bulk across every range.
+/// - **Tier 1 — slow-deep** (`deep`: max speed, 60 s ECC budget): deep-recover
+///   the easy residual.
+/// - **Tier 2 — marginal specialists**: the physical-failure-mode matrix
+///   (SlowSpin / FuaRetry / SlowFua / CachePrime / Oscillate / SpeedSweep), run
+///   ONLY on what tiers 0-1 leave.
+fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
+    match tier {
+        // Tier 0 — fast scouts. Bisect leads by default (probing a range's
+        // MIDDLE finds a readable island in one read); Jump blows through large
+        // dead runs; the fast linear sweeps mop up. The scorecard re-orders.
+        0 => vec![
+            Box::new(Bisect {
+                params: ReadParams::fast(),
+            }),
+            Box::new(Jump {
+                params: ReadParams::fast(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Reverse,
+                params: ReadParams::fast(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: ReadParams::fast(),
+            }),
+        ],
+        // Tier 1 — slow deep recovery on the small residue tier 0 leaves.
+        1 => vec![
+            Box::new(Linear {
+                direction: Direction::Reverse,
+                params: ReadParams::deep(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: ReadParams::deep(),
+            }),
+        ],
+        // Tier 2 — marginal specialists (wired in when PATCH_TIERS reaches 3).
+        _ => Vec::new(),
+    }
+}
+
 impl PatchCtx<'_, '_> {
     /// Orchestrator (one pass): walk the ordered bad ranges. Apply the
     /// inter-range cooldown only after a range that grinded, then recover
@@ -822,42 +877,15 @@ impl PatchCtx<'_, '_> {
             "entering patch range"
         );
 
-        // Enter at max read speed; a handler drops to the deep-recovery read
-        // itself via its `fast` flag.
+        // Enter at max read speed. A handler picks its own speed / FUA / timeout
+        // via its `ReadParams`; `read_span` restores max after each handler, so
+        // every tier starts from the streaming default.
         self.reader.set_speed(0xFFFF);
 
-        // Tier 0 = FAST scouts, ordered best-first by the rip scorecard (see
-        // run_handlers). Bisect leads by default because probing the MIDDLE of a
-        // range finds a readable island in one read, where Jump has to grind the
-        // dead front to reach it; Jump then blows through large dead runs, and
-        // the fast linear sweeps mop up. The scorecard re-orders these as it
-        // learns which one is actually winning on THIS disc. Tier 1 = slow deep
-        // recovery on the small residue tier 0 leaves.
-        let mut handlers: Vec<Box<dyn SectionHandler>> = if tier == 0 {
-            vec![
-                Box::new(Bisect),
-                Box::new(Jump),
-                Box::new(Linear {
-                    reverse: true,
-                    fast: true,
-                }),
-                Box::new(Linear {
-                    reverse: false,
-                    fast: true,
-                }),
-            ]
-        } else {
-            vec![
-                Box::new(Linear {
-                    reverse: true,
-                    fast: false,
-                }),
-                Box::new(Linear {
-                    reverse: false,
-                    fast: false,
-                }),
-            ]
-        };
+        // The tier roster (see `build_tier_handlers`): tier 0 fast scouts, tier 1
+        // slow-deep, tier 2 marginal specialists. `run_handlers` orders WITHIN a
+        // tier best-first by the rip scorecard, which re-learns per disc.
+        let mut handlers: Vec<Box<dyn SectionHandler>> = build_tier_handlers(tier);
 
         // Clock seam: handlers read wall time through this so tests can wind a
         // fake clock (the same seam the pass uses for its own timing).
@@ -903,6 +931,8 @@ impl PatchCtx<'_, '_> {
                 // Carry the pass-level wedge streak in so a fast-fail wedge is
                 // caught across many small sections, not reset each one.
                 wedge_streak: self.wedge_streak,
+                // Drive was just reset to max above; read_span tracks changes.
+                cur_speed: 0xFFFF,
             };
             let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
@@ -1399,7 +1429,7 @@ mod tests {
         };
         let mut buf = vec![0u8; 2048];
         // Request lba=4 (4 % 3 == 1, mid-unit), count=1.
-        let n = recovery_read(&mut rr, true, 4, 1, &mut buf, true).unwrap();
+        let n = recovery_read(&mut rr, true, 4, 1, &mut buf, true, false).unwrap();
         assert_eq!(n, 2048);
         assert_eq!(rr.saw_lba, 3, "widened down to the unit-aligned start");
         assert_eq!(rr.saw_count, 3, "widened to a whole 3-sector unit");

@@ -658,6 +658,25 @@ impl Drive {
     /// recovery layers (Disc::patch multi-pass, DiscStream batch halving)
     /// do not touch the wedge-prone reset path.
     pub fn read(&mut self, lba: u32, count: u16, buf: &mut [u8], recovery: bool) -> Result<usize> {
+        // Bulk path: FUA off (the drive cache IS the streaming throughput).
+        self.read_fua(lba, count, buf, recovery, false)
+    }
+
+    /// [`read`], but with an explicit Force Unit Access request: `fua = true`
+    /// sets the READ(10) FUA bit so the drive re-fetches the medium instead of
+    /// returning a cached copy — the Pass-N marginal-sector lever (see
+    /// [`crate::sector::SectorSource::read_sectors_fua`]). The bulk sweep always
+    /// passes `false`; only a per-sector recovery handler asks for FUA.
+    ///
+    /// [`read`]: Drive::read
+    pub fn read_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
         let timeout_ms = if recovery {
             crate::scsi::READ_RECOVERY_TIMEOUT_MS
         } else {
@@ -683,7 +702,7 @@ impl Drive {
         // read_one call with no behavior change.
         let max_sectors = (self.scsi.max_transfer_bytes() / 2048).max(1) as u32;
         if count as u32 <= max_sectors {
-            return self.read_one(lba, count, buf, timeout_ms, recovery);
+            return self.read_one(lba, count, buf, timeout_ms, recovery, fua);
         }
 
         // Large read: split into chunks of at most `max_sectors` sectors,
@@ -699,7 +718,7 @@ impl Drive {
             let byte_off = done as usize * 2048;
             let byte_len = chunk as usize * 2048;
             let slice = &mut buf[byte_off..byte_off + byte_len];
-            let n = self.read_one(cur_lba, chunk as u16, slice, timeout_ms, recovery)?;
+            let n = self.read_one(cur_lba, chunk as u16, slice, timeout_ms, recovery, fua)?;
             total += n;
             done += chunk;
         }
@@ -722,20 +741,20 @@ impl Drive {
         // `recovery` gates only the Linux /dev/sr0 pread fallback below; on
         // other platforms it is intentionally unused.
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] recovery: bool,
+        // FUA (Force Unit Access): when set, byte-1 bit 0x08 forces the drive to
+        // re-fetch the medium past its cache.
+        fua: bool,
     ) -> Result<usize> {
-        // FUA (Force Unit Access) is DISABLED for now — byte-1 bit 0x08 cleared.
-        // Unconditionally forcing every READ(10) past the drive cache disabled
-        // the drive's readahead/streaming cache on the bulk sequential sweep and
-        // collapsed throughput ~10x (UHD 15-25 → ~2 MB/s, DVD → ~0.5 MB/s),
-        // disc-type-agnostic — the cache IS the streaming throughput.
-        //
-        // TODO(#55): reintroduce FUA as a dedicated Pass-N recovery HANDLER that
-        // sets/clears it per marginal-sector re-read (where cache-masking of a
-        // stochastic sector actually matters), never blanket-applied to the bulk
-        // read path.
+        // FUA is OFF on the bulk path — unconditionally forcing every READ(10)
+        // past the cache disabled the drive's readahead/streaming cache on the
+        // sequential sweep and collapsed throughput ~10x (UHD 15-25 → ~2 MB/s,
+        // DVD → ~0.5 MB/s), disc-type-agnostic — the cache IS the streaming
+        // throughput. It is set ONLY when a Pass-N recovery handler (FuaRetry)
+        // asks for it per marginal-sector re-read, where cache-masking of a
+        // stochastic sector actually matters (#55).
         let cdb = [
             crate::scsi::SCSI_READ_10,
-            0x00,
+            if fua { 0x08 } else { 0x00 },
             (lba >> 24) as u8,
             (lba >> 16) as u8,
             (lba >> 8) as u8,
@@ -1019,6 +1038,17 @@ impl SectorSource for Drive {
         recovery: bool,
     ) -> Result<usize> {
         self.read(lba, count, buf, recovery)
+    }
+
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        self.read_fua(lba, count, buf, recovery, fua)
     }
 
     fn set_speed(&mut self, kbs: u16) {
@@ -1435,6 +1465,25 @@ mod command_tests {
         );
         assert_eq!(&c[2..6], &[0x00, 0xAB, 0xCD, 0xEF], "LBA big-endian");
         assert_eq!(&c[7..9], &[0x00, 0x02], "transfer length big-endian");
+    }
+
+    #[test]
+    fn read_fua_sets_the_force_unit_access_bit() {
+        // The Pass-N FuaRetry lever: read_fua(.., fua=true) sets READ(10) byte-1
+        // bit 0x08 so the drive re-fetches the medium past its cache; fua=false
+        // leaves it clear (the bulk path).
+        let RecordingHarness {
+            drive: mut d,
+            cdb,
+            timeouts: _to,
+        } = recording(TransportOutcome::Ok(2048));
+        let mut buf = vec![0u8; 2048];
+        d.read_fua(0, 1, &mut buf, false, true).unwrap();
+        assert_eq!(
+            cdb.lock().unwrap()[1],
+            0x08,
+            "FUA requested — byte-1 bit 0x08 set so the drive bypasses its cache"
+        );
     }
 
     #[test]
