@@ -699,31 +699,27 @@ fn profile_07_medium_then_good() {
         trace,
     );
 
-    // GOLDEN: cache-priming and scatter-recovery are BOTH gone (ruled out
-    // by live drive probing — neither improves recovery; the drive's
-    // per-sector ECC is media-bound, not approach-bound). With the script
-    // "fail, fail, ok" per bad sector, recovery in ONE pass now hinges on
-    // bisect re-reading a sector enough times to consume its two failing
-    // steps: a sector caught in a failed batch is re-read as the batch
-    // halves (32→16→8→4→2→1), which for most of the cluster reaches the
-    // Ok step. The 2 sectors bisect reads fewest times stay NonTrimmed and
-    // recover on the NEXT pass — exactly the multi-pass design this test's
-    // header describes ("bad sectors stay NonTrimmed in this pass"). So
-    // 254 of 256 sectors recover here; 2 (4096 B) defer.
+    // GOLDEN (handler-chain engine): with the script "fail, fail, ok" per bad
+    // sector, each bad sector needs three reads to recover. The chain re-reads a
+    // sector across successive handlers — linear reverse/forward (each narrows a
+    // failed batch to per-sector reads) then bisect — so every sector in the
+    // cluster is read enough times to consume its two failing steps and reach
+    // the Ok step WITHIN one pass. So all 256 sectors recover here; none defer.
+    // (The old batch-halving loop reached only 254; the chain is strictly
+    // better because more handlers re-touch each sector.)
     assert_eq!(
         stats.bytes_good,
-        254 * 2048,
-        "07_medium_then_good bytes_good (bisect re-reads consume the \
-         fail,fail,ok script for most of the cluster; 2 defer to next pass)"
+        256 * 2048,
+        "07_medium_then_good bytes_good (handler chain re-reads each sector \
+         across handlers, consuming the fail,fail,ok script for the whole cluster)"
     );
     assert_eq!(
         stats.bytes_unreadable, 0,
         "07_medium_then_good bytes_unreadable (NonTrimmed, never terminal in one pass)"
     );
     assert_eq!(
-        stats.bytes_pending,
-        2 * 2048,
-        "07_medium_then_good bytes_pending (2 sectors deferred to the next pass)"
+        stats.bytes_pending, 0,
+        "07_medium_then_good bytes_pending (whole cluster recovered in one pass)"
     );
     assert!(!pr.halted, "07_medium_then_good halted");
     assert!(
@@ -820,19 +816,21 @@ fn profile_08_batch_fail_singles_ok() {
 // injection point in `handle_read_failure` and extend this fixture
 // with the wedge/NOT_READY profiles too.
 
-// ─────────────── Fast-capture (breadth-first) recovery — #50 ───────────────
+// ──────── Handler chain recovers re-readable sectors inside a bad block ────────
 //
-// `fast_capture = true` reads each bad range ONCE at the batch size and leaves
-// every FAILED block NonTrimmed for a later pass — no bisection, no per-sector
-// grind. This is the breadth-first "fast-capture every section first, then
-// escalate" ordering: a first retry pass grabs every range's readable blocks
-// quickly instead of grinding section 1 to exhaustion before touching section 2.
+// A bad range holds one genuinely-dead sector surrounded by readable ones. The
+// handler chain's linear pass narrows a failed batch to per-sector reads, so it
+// recovers EVERY re-readable sector and leaves ONLY the dead sector NonTrimmed —
+// strictly better than the old fast-capture path, which left the whole failed
+// 32-block untouched. (`fast_capture` is now inert: the chain supersedes it. The
+// breadth-first "fast on all ranges, then escalate" ORDERING it once provided is
+// a scheduling concern for the handler scheduler, tracked separately.)
 //
-// The load-bearing invariant: NO data is dropped. A failed block becomes
-// NonTrimmed (pending, retried by a later granular pass), NEVER Unreadable.
+// The load-bearing invariant is unchanged: NO data is dropped. A still-bad
+// sector becomes NonTrimmed (pending, retried by a later pass), NEVER Unreadable.
 
 #[test]
-fn fast_capture_keeps_readable_blocks_and_leaves_bad_nontrimmed_unbisected() {
+fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
     let capacity_sectors: u32 = 256;
     let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
     // One bad sector at LBA 130 — inside the LOW 32-sector block of the range.
@@ -875,48 +873,25 @@ fn fast_capture_keeps_readable_blocks_and_leaves_bad_nontrimmed_unbisected() {
     let map_path = libfreemkv::disc::mapfile_path_for(&iso_path);
     let stats = Mapfile::load(&map_path).unwrap().stats();
 
-    // The clean 32-block [160,192) recovered (+32 sectors over the 192 already
-    // Finished); the bad 32-block [128,160) is left NonTrimmed — NOT Unreadable.
-    // fast_capture never gives up; the next (granular) pass retries it.
-    // Conservation: the 64-sector range split into 32 good + 32 still-pending,
-    // nothing lost.
+    // The clean sectors of [128,192) all recover; only the one always-dead
+    // sector (LBA 130) stays NonTrimmed — NOT Unreadable. The chain narrows the
+    // failed batch to per-sector reads, so 63 of the 64 range sectors come back.
+    // Conservation: 255 good + 1 still-pending = the full 256, nothing lost.
     assert_eq!(
         stats.bytes_unreadable, 0,
-        "fast capture must never mark Unreadable"
+        "recovery must never mark Unreadable in a pass"
     );
     assert_eq!(
-        stats.bytes_pending,
-        32 * 2048,
-        "the bad block stays NonTrimmed for the next pass"
+        stats.bytes_pending, 2048,
+        "only the single always-dead sector (LBA 130) stays NonTrimmed"
     );
     assert_eq!(
         stats.bytes_good,
-        224 * 2048,
-        "192 pre-Finished + 32 newly recovered"
+        255 * 2048,
+        "every sector except the one dead LBA is recovered"
     );
 
-    // No bisection: the range [128,192) is read in exactly TWO 32-sector batch
-    // reads (clean half + bad half). Full mode would halve [128,160) into
-    // count=16,8,…,1 reads to isolate sector 130; fast capture marks the whole
-    // 32-block NonTrimmed in one read. (Reads outside the range — e.g. a lone
-    // count=1 probe at the capacity edge — are unrelated and ignored.)
-    let t = trace.lock().unwrap();
-    let range_reads: Vec<_> = t
-        .iter()
-        .filter(|&&(lba, _, _)| (128..192).contains(&lba))
-        .collect();
-    assert_eq!(
-        range_reads.len(),
-        2,
-        "range read in 2 batches (clean + bad), no bisection; trace={:?}",
-        *t
-    );
-    assert!(
-        range_reads.iter().all(|&&(_, count, _)| count == 32),
-        "fast capture must not bisect — both range reads are the full batch; trace={:?}",
-        *t
-    );
-    drop(t);
+    let _ = trace; // read trace retained by the fixture; no ordering assertion here
 
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(&map_path);
