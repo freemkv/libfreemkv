@@ -922,18 +922,19 @@ mod tests {
             2,
             "DTS 2.0 nibble must decode to 2 channels"
         );
-        // PIDs route via the per-codec sub-id table: AC-3 #0 → 0x80 → 0xBD80,
-        // DTS #0 → 0x88 → 0xBD88. Distinct (no 0xBD00 collision) AND the exact
-        // canonical PIDs.
-        assert_eq!(audios[0].pid, 0xBD80, "AC-3 #0 → 0xBD80");
-        assert_eq!(audios[1].pid, 0xBD88, "DTS #0 → 0xBD88");
+        // PIDs route via the positional sub-id table: AC-3 @ pos 0 → 0x80 →
+        // 0xBD80, DTS @ pos 1 → 0x89 → 0xBD89 (the shared audio-stream number
+        // in the low nibble, NOT a per-codec ordinal). Distinct AND the exact
+        // canonical wire PIDs the demux routes on.
+        assert_eq!(audios[0].pid, 0xBD80, "AC-3 @ pos 0 → 0xBD80");
+        assert_eq!(audios[1].pid, 0xBD89, "DTS @ pos 1 → 0xBD89");
         assert_ne!(audios[0].pid, audios[1].pid);
     }
 
     /// LPCM SCAN ROUTING (audit §2 / §5 #6): the 0xA0..=0xA7 PID range was never
-    /// exercised in the dvd.rs scan. An LPCM stream (coding_mode 4) must get
-    /// sub_stream_id 0xA0 → PID 0xBDA0 via `dvd_audio_pid`, distinct from the
-    /// AC-3 0xBD80 space, with its real channel count preserved.
+    /// exercised in the dvd.rs scan. An LPCM stream (coding_mode 4) at audio
+    /// position 1 must get sub_stream_id 0xA1 → PID 0xBDA1 via `dvd_audio_pid`,
+    /// distinct from the AC-3 0xBD80 space, with its real channel count preserved.
     #[test]
     fn scan_dvd_titles_lpcm_routes_to_a0_pid_range() {
         let mut disc = MemDisc::new();
@@ -978,10 +979,10 @@ mod tests {
         assert_eq!(audios.len(), 2);
         assert_eq!(audios[0].codec, Codec::Ac3);
         assert_eq!(audios[1].codec, Codec::Lpcm, "coding_mode 4 → LPCM");
-        assert_eq!(audios[0].pid, 0xBD80, "AC-3 #0 → 0xBD80");
+        assert_eq!(audios[0].pid, 0xBD80, "AC-3 @ pos 0 → 0xBD80");
         assert_eq!(
-            audios[1].pid, 0xBDA0,
-            "LPCM #0 → 0xBDA0 (the 0xA0 sub-id range), NOT the AC-3 space"
+            audios[1].pid, 0xBDA1,
+            "LPCM @ pos 1 → 0xBDA1 (the 0xA0 sub-id range | position), NOT the AC-3 space"
         );
         assert_eq!(
             audios[1].channels.count(),
