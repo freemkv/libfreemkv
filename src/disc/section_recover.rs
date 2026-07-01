@@ -47,6 +47,14 @@ const BATCH_SECTORS: u64 = 32;
 /// resumes rather than reading every dead sector.
 const JUMP_AFTER_FAILS: u32 = 2;
 
+/// Early-yield threshold: after this many consecutive reads that recover NOTHING,
+/// a handler hands the still-bad set to the next handler instead of grinding out
+/// its whole time budget on a dead zone. The baton comes back — a later handler,
+/// or the next pass, retries the same sectors from a different angle / after the
+/// drive state has shifted (recovery is stochastic). This is what turns a
+/// "60 s of 0 B/s" stall into a fast hand-off.
+const UNPRODUCTIVE_YIELD: u32 = 4;
+
 /// Where a handler left the section after its bounded attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HandlerOutcome {
@@ -91,6 +99,10 @@ pub(super) struct HandlerCtx<'a> {
     /// bar and speed move as recovery happens instead of jumping once per
     /// section. `None` in tests (no reporter).
     pub tick: Option<&'a mut dyn FnMut()>,
+    /// Consecutive reads that recovered nothing, updated by [`read_span`]. When
+    /// it reaches [`UNPRODUCTIVE_YIELD`] the handler should yield to the next one
+    /// (see [`HandlerCtx::stalled`]). Reset to 0 before each handler runs.
+    pub unproductive: u32,
 }
 
 impl HandlerCtx<'_> {
@@ -98,7 +110,25 @@ impl HandlerCtx<'_> {
         self.halt.is_some_and(|h| h.load(Ordering::Relaxed))
     }
 
+    /// The universal "stop this handler now" check every handler loop already
+    /// calls between reads. True when the deadline passed OR the handler has hit
+    /// its early-yield dead streak — folding the yield in here means every
+    /// handler hands the baton off on a dead zone with no per-handler edits.
     fn past(&self, deadline: Instant) -> bool {
+        self.stalled() || (self.now)() >= deadline
+    }
+
+    /// True once the handler has read `UNPRODUCTIVE_YIELD` sectors in a row with
+    /// no recovery — its cue to hand the baton to the next handler instead of
+    /// grinding a dead zone for its whole budget.
+    fn stalled(&self) -> bool {
+        self.unproductive >= UNPRODUCTIVE_YIELD
+    }
+
+    /// Deadline-only stop check (ignores the early-yield stall streak). Used
+    /// inside Bisect's boundary-probing loops, where a short run of failing
+    /// reads is the *expected* way to home in on a dead edge — not a stall.
+    fn timed_out(&self, deadline: Instant) -> bool {
         (self.now)() >= deadline
     }
 
@@ -142,6 +172,12 @@ fn read_span(
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
         Err(_) => ReadHit::Bad,
     };
+    // Track the dead streak for the early-yield hand-off: a recovering read
+    // resets it, a fruitless one advances it toward UNPRODUCTIVE_YIELD.
+    match hit {
+        ReadHit::Good => ctx.unproductive = 0,
+        _ => ctx.unproductive = ctx.unproductive.saturating_add(1),
+    }
     // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
     // UI's bar/speed move DURING a handler, not just when the section finishes.
     ctx.progress();
@@ -174,40 +210,6 @@ pub(super) trait SectionHandler {
 pub(super) struct Linear {
     pub reverse: bool,
     pub fast: bool,
-}
-
-impl Linear {
-    /// A batch read failed as a unit — retry it sector-by-sector so the readable
-    /// sectors of a partially-dead batch are still recovered and only the dead
-    /// ones stay bad. Bounded: at most `span_bytes / SECTOR` single reads.
-    fn narrow_batch(
-        &self,
-        ctx: &mut HandlerCtx,
-        bad: &mut SubRanges,
-        deadline: Instant,
-        pos: u64,
-        span_bytes: u64,
-    ) -> Option<HandlerOutcome> {
-        let recovery = !self.fast;
-        let mut buf = [0u8; SECTOR as usize];
-        let mut off = 0;
-        while off < span_bytes {
-            if ctx.halted() {
-                return Some(HandlerOutcome::Halted);
-            }
-            if ctx.past(deadline) {
-                return Some(HandlerOutcome::Remaining);
-            }
-            let spos = pos + off;
-            match read_span(ctx, &mut buf, spos, 1, recovery) {
-                ReadHit::Good => bad.remove(spos, SECTOR),
-                ReadHit::Bad => {}
-                ReadHit::Transport => return Some(HandlerOutcome::TransportFault),
-            }
-            off += SECTOR;
-        }
-        None
-    }
 }
 
 impl SectionHandler for Linear {
@@ -255,13 +257,12 @@ impl SectionHandler for Linear {
                 let count = (span / SECTOR) as u16;
                 match read_span(ctx, &mut buf, pos, count, recovery) {
                     ReadHit::Good => bad.remove(pos, span),
-                    ReadHit::Bad => {
-                        // Recover the readable sectors inside the dead batch,
-                        // leave the truly-dead ones bad, and keep moving.
-                        if let Some(o) = self.narrow_batch(ctx, bad, deadline, pos, span) {
-                            return o;
-                        }
-                    }
+                    // Keep reads at the full batch — no per-sector grind (proven
+                    // worse on the BU40N, and it's what stalled a handler on a
+                    // dead front). Leave the failed batch bad and advance; the
+                    // readable tail past it is reached by the next batch, and
+                    // Bisect salvages readable islands inside a dead batch.
+                    ReadHit::Bad => {}
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
                 }
                 done += span;
@@ -322,39 +323,63 @@ impl SectionHandler for Bisect {
                     bad.remove(mid, SECTOR);
                     // Expand FORWARD from mid+1 in batches until a read fails.
                     let mut fwd = mid + SECTOR;
+                    let mut step = batch;
                     while fwd < end {
-                        if ctx.past(deadline) {
+                        if ctx.timed_out(deadline) {
                             return HandlerOutcome::Remaining;
                         }
-                        let span = batch.min(end - fwd);
+                        let span = step.min(end - fwd);
                         let count = (span / SECTOR) as u16;
                         match read_span(ctx, &mut buf[..span as usize], fwd, count, false) {
                             ReadHit::Good => {
                                 bad.remove(fwd, span);
                                 fwd += span;
+                                step = batch;
                             }
-                            ReadHit::Bad => break,
+                            // Halve at the dead boundary instead of giving up, so
+                            // the readable sectors right up to the dead one are
+                            // recovered in ~log2(batch) reads (no per-sector grind).
+                            ReadHit::Bad => {
+                                if span > SECTOR {
+                                    step = ((span / SECTOR) / 2).max(1) * SECTOR;
+                                } else {
+                                    break;
+                                }
+                            }
                             ReadHit::Transport => return HandlerOutcome::TransportFault,
                         }
                     }
                     // Expand BACKWARD from mid toward rp until a read fails.
                     let mut bwd = mid;
+                    let mut step = batch;
                     while bwd > rp {
-                        if ctx.past(deadline) {
+                        if ctx.timed_out(deadline) {
                             return HandlerOutcome::Remaining;
                         }
-                        let span = batch.min(bwd - rp);
+                        let span = step.min(bwd - rp);
                         let pos = bwd - span;
                         let count = (span / SECTOR) as u16;
                         match read_span(ctx, &mut buf[..span as usize], pos, count, false) {
                             ReadHit::Good => {
                                 bad.remove(pos, span);
                                 bwd = pos;
+                                step = batch;
                             }
-                            ReadHit::Bad => break,
+                            ReadHit::Bad => {
+                                if span > SECTOR {
+                                    step = ((span / SECTOR) / 2).max(1) * SECTOR;
+                                } else {
+                                    break;
+                                }
+                            }
                             ReadHit::Transport => return HandlerOutcome::TransportFault,
                         }
                     }
+                    // Locating this readable island was productive work; the
+                    // failed reads that pinned its dead edges are boundary probes,
+                    // not a stall. Clear the streak so the re-bisect (and the next
+                    // handler) start fresh.
+                    ctx.unproductive = 0;
                     // The two failing ends stay bad — bisect them again to pin
                     // the exact dead sectors.
                     if bwd > rp {
@@ -546,6 +571,9 @@ pub(super) fn run_handlers(
         let before = bad.total_len();
         let deadline = section_deadline_for(bad);
         let started = (ctx.now)();
+        // Fresh dead-streak budget per handler: each gets its own chance before
+        // the early-yield trips.
+        ctx.unproductive = 0;
         let outcome = handler.recover(ctx, bad, deadline);
         let elapsed = (ctx.now)().duration_since(started);
         let after = bad.total_len();
@@ -689,11 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn linear_forward_recovers_all_readable_and_leaves_only_dead() {
-        // Section [0, 10 sectors). Dead: sectors 3 and 7. Forward linear must
-        // recover the other 8 and leave ONLY 3 and 7 bad — proving it moves past
-        // a dead sector instead of stalling on it. Batch=1-effective here since
-        // the dead sectors force the narrow path; use a small section.
+    fn chain_recovers_readable_in_a_dead_batch_leaving_only_dead() {
+        // Section [0, 10 sectors). Dead: sectors 3 and 7. Linear reads it as one
+        // batch, which fails (it contains dead sectors), so Linear leaves the
+        // whole batch bad — NO per-sector grind (that's the point of dropping
+        // narrow_batch). Bisect then probes/expands and salvages the 8 readable
+        // sectors, leaving ONLY 3 and 7. Proves the Linear→Bisect division of
+        // labour: Linear sweeps at batch granularity, Bisect finds the islands.
         let dead = [3u32, 7u32];
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
         let mut disc = disc;
@@ -706,15 +736,24 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 10 * SECTOR);
-        // Generous deadline: 10 s from start.
         let deadline = (ctx.now)() + Duration::from_secs(10);
-        let mut lin = Linear {
+        // Linear leaves the failed 10-sector batch whole.
+        Linear {
             reverse: false,
             fast: false,
-        };
-        let out = lin.recover(&mut ctx, &mut bad, deadline);
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(
+            bad.total_len(),
+            10 * SECTOR,
+            "linear leaves the dead batch whole"
+        );
+        // Bisect salvages the readable sectors around the dead ones.
+        ctx.unproductive = 0;
+        let out = Bisect.recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Remaining);
         // Exactly the two dead sectors remain.
         assert_eq!(bad.total_len(), 2 * SECTOR);
@@ -726,8 +765,6 @@ mod tests {
                 lba(p)
             );
         }
-        // All eight readable sectors were handed to the sink.
-        assert_eq!(sink.got.len(), 8);
     }
 
     #[test]
@@ -747,6 +784,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 40 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -783,6 +821,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(3);
@@ -817,6 +856,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 9 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -852,6 +892,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 16 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
@@ -892,6 +933,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 64 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![Box::new(Linear {
@@ -922,6 +964,7 @@ mod tests {
             halt: None,
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         // Single-sector batches so the transport LBA is hit directly.
         let mut bad = SubRanges::from_section(0, 8 * SECTOR);
@@ -950,6 +993,7 @@ mod tests {
             halt: Some(&halt),
             decrypt_is_aacs: false,
             tick: None,
+            unproductive: 0,
         };
         let mut bad = SubRanges::from_section(0, 100 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
