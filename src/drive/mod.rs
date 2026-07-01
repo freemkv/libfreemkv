@@ -411,8 +411,16 @@ impl Drive {
     pub fn init(&mut self) -> Result<()> {
         let t0 = std::time::Instant::now();
         tracing::info!(target: "freemkv::drive", phase = "init", "begin");
+        // Drive-level features (max read speed / riplock lift) — matched on the
+        // DRIVE, applied for ANY disc. STOCK MMC commands only (no firmware
+        // unlock), so this is safe for a CSS DVD that must stay in stock mode.
+        // Runs BEFORE the DVD early-return below so a DVD is no longer riplocked:
+        // previously only the BD/UHD path (which returns clear content via the
+        // firmware unlock + its speed calibration) got up to speed, and DVD fell
+        // through with just the legacy SET CD SPEED the drive ignores.
+        crate::unlock_bridge::apply_drive_features(self.scsi.as_mut(), &self.drive_id);
         if self.disc_is_dvd() {
-            tracing::info!(target: "freemkv::drive", phase = "init", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, no unlock)");
+            tracing::info!(target: "freemkv::drive", phase = "init", dvd = true, elapsed_ms = t0.elapsed().as_millis() as u64, "end (stock-mode DVD, drive features applied, no bus unlock)");
             self.init_ran = true;
             return Ok(());
         }
