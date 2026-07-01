@@ -420,7 +420,6 @@ impl SectionHandler for Jump {
         for (rp, rl) in snapshot {
             let mut off = 0u64;
             let mut consec_fail = 0u32;
-            let mut jump = JUMP_BASE_BYTES;
             while off < rl {
                 if ctx.halted() {
                     return HandlerOutcome::Halted;
@@ -435,19 +434,22 @@ impl SectionHandler for Jump {
                     ReadHit::Good => {
                         bad.remove(pos, span);
                         consec_fail = 0;
-                        jump = JUMP_BASE_BYTES;
                         off += span;
                     }
                     ReadHit::Bad => {
                         consec_fail += 1;
                         if consec_fail >= JUMP_AFTER_FAILS {
-                            // Sustained dead run — skip ahead (sector-aligned so
-                            // the walk stays batch-aligned) and escalate the next
-                            // jump. The skipped span stays bad for Bisect / a
-                            // later handler to pin the boundary.
-                            let step = (jump / SECTOR).max(1) * SECTOR;
-                            off = (off + step).min(rl);
-                            jump = jump.saturating_mul(2).min(JUMP_CAP_BYTES);
+                            // Sustained dead run — jump to the MIDDLE of the
+                            // remaining span (never overshoot the range). Halving
+                            // adapts to any size: a big dead run is crossed in
+                            // ~log2 jumps, and a small range lands mid-range
+                            // instead of being skipped past entirely (the 8 MiB
+                            // fixed jump used to leap clean over a <8 MiB range and
+                            // miss readable data in its middle). The skipped span
+                            // stays bad for Bisect to reclaim.
+                            let remaining = rl - off;
+                            let step = ((remaining / 2) / SECTOR).max(1) * SECTOR;
+                            off += step;
                             consec_fail = 0;
                         } else {
                             off += span;
@@ -465,31 +467,102 @@ impl SectionHandler for Jump {
     }
 }
 
-/// Run the handler chain over one section's still-bad set. This is the
-/// never-hang guarantee: each handler is bounded by the deadline
-/// `section_deadline_for(bad)` returns, and the loop always drains to
-/// `Complete`/`Remaining` (whatever is still bad is the caller's residue to
-/// record as loss). `Halted` / `TransportFault` short-circuit so the caller can
-/// abort or un-wedge.
+/// Per-rip handler scorecard. Grades each handler by the recovery RATE it has
+/// achieved so far (bytes recovered per second of wall time) so the coordinator
+/// runs the best-performing handler FIRST on later sections and lets a proven
+/// dud fall to the back. Ephemeral — reset each rip, no persistence. A handler
+/// not yet tried ranks top (`u64::MAX`) so every handler is calibrated once
+/// before the ranking narrows to the winners ("try each quick, then prioritise").
+#[derive(Default)]
+pub(super) struct HandlerScoreboard {
+    stats: std::collections::HashMap<&'static str, ScoreStat>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ScoreStat {
+    recovered: u64,
+    nanos: u128,
+    attempts: u64,
+}
+
+impl HandlerScoreboard {
+    fn rate(s: &ScoreStat) -> u64 {
+        if s.nanos == 0 {
+            0
+        } else {
+            ((s.recovered as u128 * 1_000_000_000) / s.nanos).min(u64::MAX as u128) as u64
+        }
+    }
+
+    /// Record one attempt: bytes recovered over `elapsed`.
+    fn record(&mut self, name: &'static str, recovered: u64, elapsed: std::time::Duration) {
+        let e = self.stats.entry(name).or_default();
+        e.recovered = e.recovered.saturating_add(recovered);
+        e.nanos = e.nanos.saturating_add(elapsed.as_nanos());
+        e.attempts += 1;
+    }
+
+    /// Ranking key (higher runs earlier). Untried → top, so it gets calibrated.
+    fn rank(&self, name: &str) -> u64 {
+        match self.stats.get(name) {
+            None => u64::MAX,
+            Some(s) if s.nanos == 0 => u64::MAX,
+            Some(s) => Self::rate(s),
+        }
+    }
+
+    /// Emit the scorecard to the log so the operator can see, per rip, which
+    /// handler is pulling the weight and which is a dud on this drive/disc.
+    pub(super) fn log(&self) {
+        let mut rows: Vec<_> = self.stats.iter().collect();
+        rows.sort_by_key(|(_, s)| std::cmp::Reverse(Self::rate(s)));
+        for (name, s) in rows {
+            let mbps = s.recovered as f64 / (s.nanos as f64 / 1e9).max(1e-9) / 1_048_576.0;
+            tracing::info!(
+                target: "freemkv::disc",
+                phase = "scorecard",
+                handler = *name,
+                recovered_mb = s.recovered as f64 / 1_048_576.0,
+                attempts = s.attempts,
+                mb_per_s = mbps,
+                "handler scorecard (this rip)"
+            );
+        }
+    }
+}
+
+/// Run the handler chain over one section's still-bad set, ordered best-first by
+/// the rip scorecard. Never-hang guarantee: each handler is deadline-bounded and
+/// the loop always drains to `Complete`/`Remaining`. `Halted` / `TransportFault`
+/// short-circuit so the caller can abort or un-wedge. Each attempt is scored so
+/// later sections run the winners first.
 pub(super) fn run_handlers(
     ctx: &mut HandlerCtx,
     handlers: &mut [Box<dyn SectionHandler>],
     bad: &mut SubRanges,
+    scoreboard: &mut HandlerScoreboard,
     section_deadline_for: impl Fn(&SubRanges) -> Instant,
 ) -> HandlerOutcome {
+    // Best-first by recovery rate so far; untried handlers rank top (calibrate).
+    handlers.sort_by_key(|h| std::cmp::Reverse(scoreboard.rank(h.name())));
     for handler in handlers.iter_mut() {
         if bad.is_empty() {
             return HandlerOutcome::Complete;
         }
         let before = bad.total_len();
         let deadline = section_deadline_for(bad);
+        let started = (ctx.now)();
         let outcome = handler.recover(ctx, bad, deadline);
+        let elapsed = (ctx.now)().duration_since(started);
+        let after = bad.total_len();
+        scoreboard.record(handler.name(), before.saturating_sub(after), elapsed);
         tracing::info!(
             target: "freemkv::disc",
             phase = "section_recover.handler",
             handler = handler.name(),
             bad_bytes_before = before,
-            bad_bytes_after = bad.total_len(),
+            bad_bytes_after = after,
+            recovered = before.saturating_sub(after),
             outcome = ?outcome,
             "handler finished; remaining bad bytes carry to the next handler"
         );
@@ -799,7 +872,8 @@ mod tests {
             Box::new(Bisect),
         ];
         let deadline_base = (ctx.now)();
-        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, |_| {
+        let mut scoreboard = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut scoreboard, |_| {
             deadline_base + Duration::from_secs(30)
         });
         assert_eq!(out, HandlerOutcome::Remaining);
@@ -831,7 +905,8 @@ mod tests {
             fast: true,
         })];
         let base = (ctx.now)();
-        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, |_| {
+        let mut scoreboard = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut scoreboard, |_| {
             base + Duration::from_secs(30)
         });
         assert_eq!(out, HandlerOutcome::Complete);
