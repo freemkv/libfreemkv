@@ -53,6 +53,33 @@ pub trait SectorSource: Send {
         recovery: bool,
     ) -> Result<usize>;
 
+    /// Like [`read_sectors`], but with an explicit Force Unit Access request.
+    ///
+    /// `fua = true` asks the drive to bypass its readahead cache and physically
+    /// re-fetch the medium — a Pass-N marginal-sector lever: a cached hit can
+    /// mask a *stochastic* sector that would land differently off the platter on
+    /// each physical read, so FuaRetry re-reads it FUA. It is never blanket-
+    /// applied to the bulk path (forcing every sequential read past the cache
+    /// collapses streaming throughput ~10×).
+    ///
+    /// The default ignores `fua` and delegates to [`read_sectors`]: only a live
+    /// [`Drive`] sets the CDB bit; file- / memory-backed sources have no drive
+    /// cache to bypass, so FUA is meaningless to them.
+    ///
+    /// [`read_sectors`]: SectorSource::read_sectors
+    /// [`Drive`]: crate::drive::Drive
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        let _ = fua;
+        self.read_sectors(lba, count, buf, recovery)
+    }
+
     /// Optional speed control for sources that map to a physical
     /// drive. No-op for everything else.
     fn set_speed(&mut self, _kbs: u16) {}
@@ -87,6 +114,17 @@ impl SectorSource for Box<dyn SectorSource> {
         (**self).read_sectors(lba, count, buf, recovery)
     }
 
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        (**self).read_sectors_fua(lba, count, buf, recovery, fua)
+    }
+
     fn set_speed(&mut self, kbs: u16) {
         (**self).set_speed(kbs)
     }
@@ -105,6 +143,17 @@ impl SectorSource for &mut (dyn SectorSource + '_) {
         recovery: bool,
     ) -> Result<usize> {
         (**self).read_sectors(lba, count, buf, recovery)
+    }
+
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
+        (**self).read_sectors_fua(lba, count, buf, recovery, fua)
     }
 
     fn set_speed(&mut self, kbs: u16) {

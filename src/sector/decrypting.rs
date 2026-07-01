@@ -471,6 +471,20 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         buf: &mut [u8],
         recovery: bool,
     ) -> Result<usize> {
+        // Bulk path: no Force Unit Access (the cache IS the streaming
+        // throughput). FUA is a Pass-N recovery lever threaded through
+        // `read_sectors_fua`.
+        self.read_sectors_fua(lba, count, buf, recovery, false)
+    }
+
+    fn read_sectors_fua(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+        fua: bool,
+    ) -> Result<usize> {
         // Defense-in-depth: AACS aligned units are 3 sectors (6144 bytes) and
         // `decrypt_sectors` anchors units at buffer offset 0. A read that does
         // not begin a whole number of units past the encrypted region's base
@@ -488,7 +502,9 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             return Err(crate::error::Error::DecryptFailed);
         }
         let read_t0 = std::time::Instant::now();
-        let n = self.inner.read_sectors(lba, count, buf, recovery)?;
+        let n = self
+            .inner
+            .read_sectors_fua(lba, count, buf, recovery, fua)?;
         let read_ms = read_t0.elapsed().as_millis() as u64;
         // Decrypt the bytes just read. Scheme-agnostic: `decrypt_sectors*`
         // dispatches on the keys (None / CSS / AACS) and returns the count of
