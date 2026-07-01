@@ -77,6 +77,15 @@ const UNPRODUCTIVE_YIELD: u32 = 4;
 /// by `wedge_streak_persists_across_sections_for_tier1`.
 const WEDGE_ABORT_STREAK: u32 = 16;
 
+/// A wedge-family failure only counts toward [`WEDGE_ABORT_STREAK`] if it came
+/// back faster than this — the fast-fail wedge rejects a CDB in <100ms with no
+/// recovery attempt, whereas a genuine uncorrectable sector on Hardware-error
+/// media spends real time on ECC recovery before failing. Gating on latency stops
+/// slow, real damage that happens to report a Hardware sense from false-tripping
+/// the wedge abort. Generous (500ms) so a slow bus adds margin without admitting
+/// a true fast-fail.
+const WEDGE_FASTFAIL_MS: u64 = 500;
+
 /// Where a handler left the section after its bounded attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HandlerOutcome {
@@ -199,6 +208,7 @@ fn read_span(
         count >= 1 && pos % SECTOR == 0,
         "read_span requires a sector-aligned, >=1-sector span (pos={pos}, count={count})"
     );
+    let read_started = (ctx.now)();
     let hit = match recovery_read(ctx.reader, ctx.decrypt_is_aacs, lba, count, buf, recovery) {
         Ok(_) => {
             ctx.sink.recovered(pos, &buf[..bytes]);
@@ -206,17 +216,24 @@ fn read_span(
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
         Err(e) => {
-            // Wedge watch: a Hardware / IllegalRequest sense is the drive's
-            // fast-fail signature. Count consecutive ones; a sustained run means
-            // the firmware wedged (rejecting every CDB), so escalate to Transport
-            // and let the pass abort + spin-cycle rather than grind on. A medium
-            // error or any success below resets the streak — real bad sectors
-            // never trip it.
-            let wedge = e
+            // Wedge watch: the drive's fast-fail wedge REJECTS every CDB in <100ms
+            // without attempting recovery, with a Hardware / IllegalRequest sense.
+            // Both signals are required to count toward the streak:
+            //   (1) wedge-family sense (Hardware / IllegalRequest), AND
+            //   (2) the failure came back FAST (< WEDGE_FASTFAIL_MS).
+            // The latency gate is what keeps a genuine uncorrectable sector on
+            // Hardware-error media from false-tripping the wedge abort: a real
+            // ECC-recovery attempt takes far longer than a fast-fail rejection, so
+            // a SLOW Hardware-error is real damage (resets the streak, retried
+            // next pass), while only the fast rejections — the actual wedge —
+            // accumulate. A medium error or any success below also resets it.
+            let sense_is_wedge = e
                 .scsi_sense()
                 .map(|s| SenseFamily::from_sense_key(s.sense_key).is_wedge_family())
                 .unwrap_or(false);
-            if wedge {
+            let elapsed = (ctx.now)().duration_since(read_started);
+            let fast_fail = elapsed.as_millis() < WEDGE_FASTFAIL_MS as u128;
+            if sense_is_wedge && fast_fail {
                 ctx.wedge_streak = ctx.wedge_streak.saturating_add(1);
                 if ctx.wedge_streak >= WEDGE_ABORT_STREAK {
                     ReadHit::Transport
@@ -1138,6 +1155,60 @@ mod tests {
             h.read_count() < 100,
             "wedge must abort fast; did {} reads on a 1000-sector wedged section",
             h.read_count()
+        );
+    }
+
+    #[test]
+    fn slow_hardware_error_media_does_not_false_trip_wedge_abort() {
+        // A genuine uncorrectable sector on Hardware-error media reports a
+        // wedge-FAMILY sense (IllegalRequest here) but comes back SLOW — the drive
+        // spent real time on ECC recovery before failing. That must NOT count
+        // toward the wedge abort (which targets the drive's <100ms fast-fail
+        // rejection). Each read here costs 600ms (> WEDGE_FASTFAIL_MS), so even a
+        // wholly-"wedge-sense" section never escalates to TransportFault — it just
+        // leaves the residue bad for the next pass, exactly like ordinary damage.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(600));
+        let mut disc = disc;
+        disc.wedge = (0..1000u32).collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut disc,
+            sink: &mut sink,
+            now: &now,
+            halt: None,
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+        };
+        let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Bisect),
+            Box::new(Jump),
+            Box::new(Linear {
+                reverse: true,
+                fast: true,
+            }),
+            Box::new(Linear {
+                reverse: false,
+                fast: true,
+            }),
+        ];
+        let mut scoreboard = HandlerScoreboard::default();
+        // Long per-handler deadline so the deadline (not the wedge) is never the
+        // reason a handler stops — we're isolating the wedge-escalation decision.
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut scoreboard, |_| {
+            (h.now_fn())() + Duration::from_secs(3600)
+        });
+        assert_ne!(
+            out,
+            HandlerOutcome::TransportFault,
+            "slow (ECC-recovery) Hardware-error reads must NOT trip the fast-fail wedge abort"
+        );
+        assert_eq!(
+            ctx.wedge_streak, 0,
+            "slow wedge-family reads must not accumulate the streak"
         );
     }
 
