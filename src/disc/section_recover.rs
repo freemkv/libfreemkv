@@ -785,6 +785,155 @@ impl SectionHandler for SpeedSweep {
     }
 }
 
+/// CachePrime — before reading a residual island, read the good run immediately
+/// PRECEDING it to lock the drive's PLL/servo, then read the marginal sectors
+/// while the channel is warm. *Failure mode:* a boundary sector the drive can't
+/// lock onto from a cold seek (ddrescue's "back up, run forward"). The priming
+/// read is a normal wedge-safe [`read_span`]; if the preceding sector is itself
+/// bad the prime just fails and the island is read cold (no worse than Linear).
+pub(super) struct CachePrime {
+    pub params: ReadParams,
+}
+
+impl SectionHandler for CachePrime {
+    fn name(&self) -> String {
+        format!("cacheprime:{}", self.params.tag())
+    }
+
+    fn recover(
+        &mut self,
+        ctx: &mut HandlerCtx,
+        bad: &mut SubRanges,
+        deadline: Instant,
+    ) -> HandlerOutcome {
+        let batch_bytes = BATCH_SECTORS * SECTOR;
+        let mut buf = vec![0u8; batch_bytes as usize];
+        let mut prime = [0u8; SECTOR as usize];
+        let snapshot: Vec<(u64, u64)> = bad.ranges().to_vec();
+        for (rp, rl) in snapshot {
+            if ctx.halted() {
+                return HandlerOutcome::Halted;
+            }
+            if ctx.past(deadline) {
+                return HandlerOutcome::Remaining;
+            }
+            // Prime: read the good sector immediately before the island to lock
+            // the servo/PLL, so the boundary sector is read warm, not cold-seeked.
+            if rp >= SECTOR {
+                // A bad/absent preceding sector just means no prime — read cold.
+                if let ReadHit::Transport = read_span(ctx, &mut prime, rp - SECTOR, 1, self.params) {
+                    return HandlerOutcome::TransportFault;
+                }
+            }
+            // Now walk the island forward while warm; contiguous reads keep the
+            // channel primed across it (each sector's predecessor was just read).
+            let mut done = 0u64;
+            while done < rl {
+                if ctx.halted() {
+                    return HandlerOutcome::Halted;
+                }
+                if ctx.past(deadline) {
+                    return HandlerOutcome::Remaining;
+                }
+                let span = batch_bytes.min(rl - done);
+                let pos = rp + done;
+                let count = (span / SECTOR) as u16;
+                match read_span(ctx, &mut buf[..span as usize], pos, count, self.params) {
+                    ReadHit::Good => bad.remove(pos, span),
+                    ReadHit::Bad => {}
+                    ReadHit::Transport => return HandlerOutcome::TransportFault,
+                }
+                done += span;
+            }
+        }
+        if bad.is_empty() {
+            HandlerOutcome::Complete
+        } else {
+            HandlerOutcome::Remaining
+        }
+    }
+}
+
+/// Oscillate — read each residual sector by ALTERNATING approach: forward-into
+/// (prime from the sector below, then read) and reverse-into (prime from the
+/// sector above, then read). *Failure mode:* direction-dependent tracking — a
+/// sector's servo lock differs by approach direction, so it may read one way but
+/// not the other. Combines the two Linear directions into a per-sector
+/// alternation on the true residual. `params` carries the speed / FUA / timeout
+/// axes; the alternation is the direction axis.
+pub(super) struct Oscillate {
+    pub params: ReadParams,
+}
+
+impl SectionHandler for Oscillate {
+    fn name(&self) -> String {
+        format!("oscillate:{}", self.params.tag())
+    }
+
+    fn recover(
+        &mut self,
+        ctx: &mut HandlerCtx,
+        bad: &mut SubRanges,
+        deadline: Instant,
+    ) -> HandlerOutcome {
+        let mut probe = [0u8; SECTOR as usize];
+        let snapshot: Vec<(u64, u64)> = bad.ranges().to_vec();
+        for (rp, rl) in snapshot {
+            let mut off = 0u64;
+            while off < rl {
+                if ctx.halted() {
+                    return HandlerOutcome::Halted;
+                }
+                if ctx.past(deadline) {
+                    return HandlerOutcome::Remaining;
+                }
+                let pos = rp + off;
+                // Forward-into: prime from the sector below, then read the target
+                // (the head approaches from a lower LBA).
+                if pos >= SECTOR {
+                    if let ReadHit::Transport =
+                        read_span(ctx, &mut probe, pos - SECTOR, 1, self.params)
+                    {
+                        return HandlerOutcome::TransportFault;
+                    }
+                }
+                let mut recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
+                    ReadHit::Good => {
+                        bad.remove(pos, SECTOR);
+                        true
+                    }
+                    ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Bad => false,
+                };
+                // Reverse-into: prime from the sector above, then read the target
+                // (the head approaches from a higher LBA).
+                if !recovered {
+                    if let ReadHit::Transport =
+                        read_span(ctx, &mut probe, pos + SECTOR, 1, self.params)
+                    {
+                        return HandlerOutcome::TransportFault;
+                    }
+                    recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
+                        ReadHit::Good => {
+                            bad.remove(pos, SECTOR);
+                            true
+                        }
+                        ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Bad => false,
+                    };
+                }
+                let _ = recovered;
+                off += SECTOR;
+            }
+        }
+        if bad.is_empty() {
+            HandlerOutcome::Complete
+        } else {
+            HandlerOutcome::Remaining
+        }
+    }
+}
+
 /// EWMA smoothing factor for the decayed recovery rate. Each new attempt is
 /// weighted `α`, the running average `1-α`, so a handler's score tracks its
 /// RECENT performance and forgets its distant past at a rate set by `α`. Higher
@@ -1887,5 +2036,73 @@ mod tests {
         assert_eq!(out, HandlerOutcome::Complete);
         assert!(bad.is_empty(), "SlowFua (min+fua) must recover the hardest sector");
         assert_eq!(sink.got.get(&(11 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    #[test]
+    fn oscillate_recovers_a_direction_dependent_sector_forward_linear_misses() {
+        // Sector 13 reads ONLY when approached from ABOVE (reverse-into). A plain
+        // forward Linear (approaches from below) misses it; Oscillate's
+        // reverse-into pass recovers it.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.dir_reverse_only = [13u32].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(13 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // Forward Linear approaches from below → misses the reverse-only sector.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(bad.total_len(), SECTOR, "forward linear must miss it");
+
+        // Oscillate tries forward-into then reverse-into → the reverse-into pass
+        // approaches from above and lands it.
+        let out = Oscillate {
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "Oscillate must recover the direction-dependent sector");
+        assert_eq!(sink.got.get(&(13 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    #[test]
+    fn cache_prime_recovers_a_boundary_sector_that_needs_a_warm_channel() {
+        // Sector 15 reads ONLY when the immediately-preceding sector was just
+        // read (servo primed) — a boundary the drive can't lock onto from a cold
+        // seek. A cold Linear read of the island misses it; CachePrime reads the
+        // preceding good sector first, then lands it warm.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.prime_only = [15u32].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(15 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // Cold Linear read (never touches the preceding sector) → misses it.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(bad.total_len(), SECTOR, "cold linear must miss the boundary sector");
+
+        // CachePrime reads the preceding run first → warm channel → lands it.
+        let out = CachePrime {
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "CachePrime must recover the primed boundary sector");
+        assert_eq!(sink.got.get(&(15 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 }
