@@ -70,6 +70,11 @@ use super::section_recover::{
 /// Replaces the old 1800 s/range + 3600 s/pass grind budgets on the live path.
 const PER_HANDLER_BUDGET_SECS: u64 = 60;
 
+/// Minimum interval between progress heartbeats pushed from inside a handler, so
+/// the UI's bar/speed move continuously during a long section without flooding
+/// the reporter (see the tick closure in `recover_section`).
+const PROGRESS_TICK_MS: u64 = 250;
+
 /// Bridges the decoupled [`RecoverySink`] a handler writes to onto the live
 /// patch consumer pipe: each recovered span becomes a [`PatchItem::Recovered`]
 /// the consumer thread seeks + writes + records `Finished`. `recovered` can't
@@ -833,14 +838,18 @@ impl PatchCtx<'_, '_> {
         // before any slow grind. Tier 1: slow deep-recovery + bisect on what tier
         // 0 left. Adding a recovery idea is one more entry in the right tier (#55).
         let mut handlers: Vec<Box<dyn SectionHandler>> = if tier == 0 {
+            // Tier 0 = a SINGLE fast scout (Jump only). It streams the big
+            // readable wins back and skips dead runs in seconds — so the pass
+            // sweeps every range fast, recovers the recoverable bulk largest
+            // first, and converges to the small genuine-dead residue instead of
+            // spending 3 handlers × 60 s grinding every dead fragment. Order of
+            // recovery is exactly big-wins → smaller → smallest, then grind.
+            vec![Box::new(Jump)]
+        } else {
+            // Tier 1 = deep recovery on the (now small) residue: fast full-batch
+            // mop-up of anything Jump stepped over, then slow deep-recovery reads,
+            // then Bisect for readable islands inside a mostly-dead chunk.
             vec![
-                // Jump LEADS the fast tier: it recovers readable data and skips
-                // ahead past dead runs, so a mostly-dead range is confirmed and
-                // left in seconds instead of the linear sweeps grinding every
-                // dead batch (10 s each) first. On a readable range it just
-                // streams it back like a linear read. The linear sweeps then
-                // mop up the spans Jump stepped over.
-                Box::new(Jump),
                 Box::new(Linear {
                     reverse: true,
                     fast: true,
@@ -849,9 +858,6 @@ impl PatchCtx<'_, '_> {
                     reverse: false,
                     fast: true,
                 }),
-            ]
-        } else {
-            vec![
                 Box::new(Linear {
                     reverse: true,
                     fast: false,
@@ -876,12 +882,34 @@ impl PatchCtx<'_, '_> {
 
         let bad_before = bad.total_len();
         let outcome = {
+            // Progress heartbeat: a throttled closure that pushes a fresh
+            // snapshot to the reporter as recovery happens (called from every
+            // read via `HandlerCtx::progress`), so the bar and speed move DURING
+            // a handler instead of only when a section finishes. Scoped to this
+            // block so its borrow of `self.state` ends before the post-tier
+            // accounting below.
+            let disc = self.disc;
+            let opts = self.opts;
+            let shared = self.shared;
+            let total_bytes = self.total_bytes;
+            let state = &self.state;
+            let last_tick = std::cell::Cell::new(now_ptr());
+            let mut tick = move || {
+                let t = now_ptr();
+                if t.duration_since(last_tick.get())
+                    >= std::time::Duration::from_millis(PROGRESS_TICK_MS)
+                {
+                    last_tick.set(t);
+                    let _ = disc.report_patch_progress(state, opts, total_bytes, shared);
+                }
+            };
             let mut ctx = HandlerCtx {
                 reader: &mut *self.reader,
                 sink: &mut sink,
                 now: &now_fn,
                 halt: self.opts.halt.as_deref(),
                 decrypt_is_aacs: self.decrypt_is_aacs,
+                tick: Some(&mut tick),
             };
             run_handlers(&mut ctx, &mut handlers, bad, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
