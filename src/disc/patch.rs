@@ -912,6 +912,7 @@ impl PatchCtx<'_, '_> {
                 halt: self.opts.halt.as_deref(),
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
+                unproductive: 0,
             };
             run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
