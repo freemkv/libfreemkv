@@ -59,7 +59,8 @@ use crate::io::pipeline::{Flow, Sink};
 
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
-    Bisect, HandlerCtx, HandlerOutcome, Jump, Linear, RecoverySink, SectionHandler, run_handlers,
+    Bisect, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear, RecoverySink,
+    SectionHandler, run_handlers,
 };
 
 /// Wall-clock budget one recovery handler gets on a section before the chain
@@ -746,6 +747,10 @@ struct PatchCtx<'a, 'o> {
     total_bytes: u64,
     decrypt_is_aacs: bool,
     state: PatchLoopState,
+    /// Per-rip handler scorecard: grades handlers by recovery rate so the
+    /// coordinator runs the winners first and lets duds fall back. Reset per
+    /// pass (ephemeral, no persistence).
+    scoreboard: HandlerScoreboard,
 }
 
 impl PatchCtx<'_, '_> {
@@ -834,39 +839,36 @@ impl PatchCtx<'_, '_> {
         // itself via its `fast` flag.
         self.reader.set_speed(0xFFFF);
 
-        // Tier 0: the fast handlers only — sweep the readable bulk of EVERY range
-        // before any slow grind. Tier 1: slow deep-recovery + bisect on what tier
-        // 0 left. Adding a recovery idea is one more entry in the right tier (#55).
+        // Tier 0 = FAST scouts, ordered best-first by the rip scorecard (see
+        // run_handlers). Bisect leads by default because probing the MIDDLE of a
+        // range finds a readable island in one read, where Jump has to grind the
+        // dead front to reach it; Jump then blows through large dead runs, and
+        // the fast linear sweeps mop up. The scorecard re-orders these as it
+        // learns which one is actually winning on THIS disc. Tier 1 = slow deep
+        // recovery on the small residue tier 0 leaves.
         let mut handlers: Vec<Box<dyn SectionHandler>> = if tier == 0 {
-            // Tier 0 = a SINGLE fast scout (Jump only). It streams the big
-            // readable wins back and skips dead runs in seconds — so the pass
-            // sweeps every range fast, recovers the recoverable bulk largest
-            // first, and converges to the small genuine-dead residue instead of
-            // spending 3 handlers × 60 s grinding every dead fragment. Order of
-            // recovery is exactly big-wins → smaller → smallest, then grind.
-            vec![Box::new(Jump)]
+            vec![
+                Box::new(Bisect),
+                Box::new(Jump),
+                Box::new(Linear {
+                    reverse: true,
+                    fast: true,
+                }),
+                Box::new(Linear {
+                    reverse: false,
+                    fast: true,
+                }),
+            ]
         } else {
-            // Tier 1 = deep recovery on the (now small) residue: fast full-batch
-            // mop-up of anything Jump stepped over, then slow deep-recovery reads,
-            // then Bisect for readable islands inside a mostly-dead chunk.
             vec![
                 Box::new(Linear {
                     reverse: true,
-                    fast: true,
-                }),
-                Box::new(Linear {
-                    reverse: false,
-                    fast: true,
-                }),
-                Box::new(Linear {
-                    reverse: true,
                     fast: false,
                 }),
                 Box::new(Linear {
                     reverse: false,
                     fast: false,
                 }),
-                Box::new(Bisect),
             ]
         };
 
@@ -911,7 +913,7 @@ impl PatchCtx<'_, '_> {
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
             };
-            run_handlers(&mut ctx, &mut handlers, bad, |_bad| {
+            run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
             })
         };
@@ -1231,8 +1233,10 @@ impl Disc {
             total_bytes,
             decrypt_is_aacs,
             state: PatchLoopState::new(bytes_good_before, total_bytes, initial_batch, work_total),
+            scoreboard: HandlerScoreboard::default(),
         };
         ctx.run(&bad_ranges)?;
+        ctx.scoreboard.log();
         let PatchCtx { state, .. } = ctx;
 
         // Drain the consumer thread: drop tx, wait for `close` to run
