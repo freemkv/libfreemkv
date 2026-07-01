@@ -46,8 +46,11 @@ const BATCH_SECTORS: u64 = 32;
 /// find where readable data resumes rather than reading every dead sector.
 const JUMP_AFTER_FAILS: u32 = 2;
 /// `Jump` initial skip distance; doubles after each jump, capped at
-/// [`JUMP_CAP_BYTES`]. Mirrors the escalating Pass-1 damage-jump.
-const JUMP_BASE_BYTES: u64 = 1 << 20; // 1 MiB
+/// [`JUMP_CAP_BYTES`]. Starts large so a big dead region is cleared in a handful
+/// of ~10 s probe reads instead of a dozen (each dead read costs the drive's
+/// full timeout). A skipped span is left bad for Bisect to reclaim any readable
+/// islands, so an over-jump loses nothing — it just defers precision.
+const JUMP_BASE_BYTES: u64 = 8 << 20; // 8 MiB
 const JUMP_CAP_BYTES: u64 = 256 << 20; // 256 MiB
 
 /// Where a handler left the section after its bounded attempt.
