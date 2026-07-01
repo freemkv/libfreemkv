@@ -722,6 +722,69 @@ impl SectionHandler for Jump {
     }
 }
 
+/// SpeedSweep — per residual sector, try Max→Min spindle speeds until one reads.
+/// *Failure mode:* speed resonance — the best speed is NOT always the slowest;
+/// some marginal sectors hit a read-channel sweet spot at a higher speed, so a
+/// per-sector search beats committing to min. Distinct from SlowSpin (a `Linear`
+/// pinned to min): this searches. `params` carries the FUA / timeout axes; the
+/// speed axis is what it sweeps. Single-sector, so it runs on the true residual.
+pub(super) struct SpeedSweep {
+    pub params: ReadParams,
+}
+
+impl SectionHandler for SpeedSweep {
+    fn name(&self) -> String {
+        format!("speedsweep:{}", self.params.tag())
+    }
+
+    fn recover(
+        &mut self,
+        ctx: &mut HandlerCtx,
+        bad: &mut SubRanges,
+        deadline: Instant,
+    ) -> HandlerOutcome {
+        // Fastest first — resonance means the sweet spot isn't always the
+        // slowest, and the fast read costs least when it happens to work.
+        const SWEEP: [SpeedPref; 2] = [SpeedPref::Max, SpeedPref::Min];
+        let mut probe = [0u8; SECTOR as usize];
+        let snapshot: Vec<(u64, u64)> = bad.ranges().to_vec();
+        for (rp, rl) in snapshot {
+            let mut off = 0u64;
+            while off < rl {
+                if ctx.halted() {
+                    return HandlerOutcome::Halted;
+                }
+                if ctx.past(deadline) {
+                    return HandlerOutcome::Remaining;
+                }
+                let pos = rp + off;
+                for speed in SWEEP {
+                    let params = ReadParams {
+                        speed,
+                        fua: self.params.fua,
+                        timeout: self.params.timeout,
+                    };
+                    match read_span(ctx, &mut probe, pos, 1, params) {
+                        ReadHit::Good => {
+                            bad.remove(pos, SECTOR);
+                            break;
+                        }
+                        // This speed didn't read it; try the next one.
+                        ReadHit::Bad => continue,
+                        ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    }
+                }
+                off += SECTOR;
+            }
+        }
+        if bad.is_empty() {
+            HandlerOutcome::Complete
+        } else {
+            HandlerOutcome::Remaining
+        }
+    }
+}
+
 /// EWMA smoothing factor for the decayed recovery rate. Each new attempt is
 /// weighted `α`, the running average `1-α`, so a handler's score tracks its
 /// RECENT performance and forgets its distant past at a rate set by `α`. Higher
@@ -1635,5 +1698,89 @@ mod tests {
         assert_eq!(sb.rank("never_tried"), u64::MAX, "untried → top");
         sb.record("idle", 0, Duration::ZERO);
         assert_eq!(sb.rank("idle"), 0, "attempted-but-zero-time → bottom");
+    }
+
+    /// Build a ctx over `disc` with the fake clock — the common per-test setup.
+    macro_rules! ctx {
+        ($h:expr, $disc:expr, $sink:expr, $now:expr) => {
+            HandlerCtx {
+                reader: &mut $disc,
+                sink: &mut $sink,
+                now: &$now,
+                halt: None,
+                decrypt_is_aacs: false,
+                tick: None,
+                unproductive: 0,
+                wedge_streak: 0,
+                cur_speed: SPEED_MAX_KBS,
+            }
+        };
+    }
+
+    fn min_deep() -> ReadParams {
+        ReadParams {
+            speed: SpeedPref::Min,
+            fua: false,
+            timeout: TimeoutPref::Deep,
+        }
+    }
+
+    #[test]
+    fn slow_spin_recovers_a_min_speed_only_sector_that_max_linear_misses() {
+        // Sector 5 reads ONLY at min spindle speed (weak signal / servo drift):
+        // a max-speed deep Linear leaves it bad; SlowSpin (Linear pinned to min)
+        // recovers it. Single-sector residual so Linear reads it directly.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.slow_only = [5u32].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(5 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // Max-speed deep Linear cannot read a min-only sector.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(bad.total_len(), SECTOR, "max-speed linear must leave it bad");
+
+        // SlowSpin = Linear at min speed — recovers it.
+        let out = Linear {
+            direction: Direction::Forward,
+            params: min_deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "SlowSpin must recover the min-only sector");
+        assert_eq!(sink.got.get(&(5 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    #[test]
+    fn speed_sweep_recovers_a_min_speed_only_sector() {
+        // SpeedSweep sweeps Max→Min per sector, so it reaches the min-only
+        // sector 7 that a max-only read never gets — proving the sweep actually
+        // drops the spindle when the fast read fails.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.slow_only = [7u32].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        let mut bad = SubRanges::from_section(7 * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        let out = SpeedSweep {
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Complete);
+        assert!(bad.is_empty(), "SpeedSweep must reach min and recover it");
+        assert_eq!(sink.got.get(&(7 * SECTOR)).copied(), Some(SECTOR as usize));
+        // It tried the fast (max) read first, then the min read — 2 reads.
+        assert_eq!(h.read_count(), 2, "swept max then min");
     }
 }
