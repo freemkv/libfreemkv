@@ -723,7 +723,16 @@ impl Drive {
     ) -> Result<usize> {
         let cdb = [
             crate::scsi::SCSI_READ_10,
-            0x00,
+            // FUA (Force Unit Access, bit 3 = 0x08): every read comes from the
+            // physical MEDIA, never the drive's cache. A recovery tool must not
+            // trust the cache — the BU40N caches aggressively (a re-read of a
+            // good sector returns in ~4 ms vs ~250 ms from media), so without
+            // FUA a retry of a marginal sector could return a cached result
+            // instead of giving the surface a fresh physical attempt. A
+            // stochastic sector that would read on a real media hit is otherwise
+            // masked by a cached miss. Cache-bypass is validated on the
+            // BU40N/Initio bridge (FUA reads execute, media 40 ms vs cache 4 ms).
+            0x08,
             (lba >> 24) as u8,
             (lba >> 16) as u8,
             (lba >> 8) as u8,
@@ -1403,8 +1412,9 @@ mod command_tests {
     #[test]
     fn read_builds_read10_cdb_with_be_lba_and_count() {
         // Drive::read issues READ(10) (0x28). LBA bytes 2..5 big-endian,
-        // transfer length bytes 7..8 big-endian (MMC-6). No FUA on this
-        // path (byte 1 == 0). Distinct nibbles catch a swapped shift.
+        // transfer length bytes 7..8 big-endian (MMC-6). FUA is set (byte 1 ==
+        // 0x08) so every read bypasses the drive cache and hits physical media.
+        // Distinct nibbles catch a swapped shift.
         let RecordingHarness {
             drive: mut d,
             cdb,
@@ -1415,7 +1425,10 @@ mod command_tests {
         assert_eq!(n, 4096, "returns transport bytes_transferred");
         let c = cdb.lock().unwrap();
         assert_eq!(c[0], crate::scsi::SCSI_READ_10);
-        assert_eq!(c[1], 0x00, "Drive::read path sets no FUA");
+        assert_eq!(
+            c[1], 0x08,
+            "Drive::read sets FUA (force media, bypass cache)"
+        );
         assert_eq!(&c[2..6], &[0x00, 0xAB, 0xCD, 0xEF], "LBA big-endian");
         assert_eq!(&c[7..9], &[0x00, 0x02], "transfer length big-endian");
     }
