@@ -722,12 +722,25 @@ impl SectionHandler for Jump {
     }
 }
 
-/// Per-rip handler scorecard. Grades each handler by the recovery RATE it has
-/// achieved so far (bytes recovered per second of wall time) so the coordinator
-/// runs the best-performing handler FIRST on later sections and lets a proven
-/// dud fall to the back. Ephemeral — reset each rip, no persistence. A handler
-/// not yet tried ranks top (`u64::MAX`) so every handler is calibrated once
-/// before the ranking narrows to the winners ("try each quick, then prioritise").
+/// EWMA smoothing factor for the decayed recovery rate. Each new attempt is
+/// weighted `α`, the running average `1-α`, so a handler's score tracks its
+/// RECENT performance and forgets its distant past at a rate set by `α`. Higher
+/// = more reactive (leadership flips sooner); lower = steadier. 0.5 halves the
+/// weight of the previous score on every attempt — reactive enough that a proven
+/// early winner whose territory is exhausted decays out of the lead within a few
+/// barren attempts, while a late-starting specialist climbs as it earns.
+const SCORE_EWMA_ALPHA: f64 = 0.5;
+
+/// Per-rip handler scorecard. Grades each handler by a DECAYED recovery rate (an
+/// EWMA of bytes-recovered-per-second, [`SCORE_EWMA_ALPHA`]) so the coordinator
+/// runs whoever is winning *now* FIRST on later sections. The residual shrinks
+/// and hardens mid-pass, so the best technique CHANGES: the fast scouts clean
+/// the range-fronts, then the leftovers are exactly the marginal sectors where
+/// the specialists win — and the ranking must FLIP. A cumulative rate froze the
+/// early winner in the lead forever; the EWMA re-prices continuously — a handler
+/// that stops earning decays down, one that starts earning climbs. Ephemeral —
+/// reset each rip, no persistence. A handler not yet tried ranks top
+/// (`u64::MAX`) so every handler is calibrated once before the ranking narrows.
 #[derive(Default)]
 pub(super) struct HandlerScoreboard {
     stats: std::collections::HashMap<String, ScoreStat>,
@@ -735,26 +748,41 @@ pub(super) struct HandlerScoreboard {
 
 #[derive(Default, Clone, Copy)]
 struct ScoreStat {
+    /// Decayed recovery rate (bytes/second), the ranking signal. `None` until
+    /// the first attempt that spent measurable time (a zero-elapsed call proves
+    /// no rate). Seeded to the first timed sample, then EWMA'd.
+    ewma_rate: Option<f64>,
+    // Cumulative totals — for the operator log line only, NOT for ranking.
     recovered: u64,
     nanos: u128,
     attempts: u64,
 }
 
 impl HandlerScoreboard {
-    fn rate(s: &ScoreStat) -> u64 {
-        if s.nanos == 0 {
-            0
-        } else {
-            ((s.recovered as u128 * 1_000_000_000) / s.nanos).min(u64::MAX as u128) as u64
+    /// Fold one timed sample (bytes/second) into the decayed rate.
+    fn decay(prev: Option<f64>, sample: f64) -> f64 {
+        match prev {
+            None => sample,
+            Some(p) => SCORE_EWMA_ALPHA * sample + (1.0 - SCORE_EWMA_ALPHA) * p,
         }
     }
 
-    /// Record one attempt: bytes recovered over `elapsed`.
+    /// Record one attempt: `recovered` bytes over `elapsed`. A timed attempt
+    /// (elapsed > 0) decays a fresh bytes/second sample into `ewma_rate` — a
+    /// barren attempt (recovered = 0) contributes a 0 sample that decays the
+    /// score DOWN, which is exactly what lets an exhausted early winner lose its
+    /// lead. A zero-elapsed call (handler yielded before any timed read)
+    /// contributes no rate sample.
     fn record(&mut self, name: &str, recovered: u64, elapsed: std::time::Duration) {
         let e = self.stats.entry(name.to_string()).or_default();
         e.recovered = e.recovered.saturating_add(recovered);
         e.nanos = e.nanos.saturating_add(elapsed.as_nanos());
         e.attempts += 1;
+        let secs = elapsed.as_secs_f64();
+        if secs > 0.0 {
+            let sample = recovered as f64 / secs;
+            e.ewma_rate = Some(Self::decay(e.ewma_rate, sample));
+        }
     }
 
     /// Ranking key (higher runs earlier). Untried → top, so it gets calibrated.
@@ -762,13 +790,14 @@ impl HandlerScoreboard {
         match self.stats.get(name) {
             // Never attempted → top, so every handler is calibrated once.
             None => u64::MAX,
-            // Attempted but recorded no measurable time — e.g. it returned
-            // `Halted` on its first check or did zero reads. It proved nothing,
-            // so rank it at the BOTTOM (0), not the top: otherwise a called-but-
-            // idle handler perpetually crowds out proven performers. (An entry
-            // exists only after `record`, so `Some` always means attempts ≥ 1.)
-            Some(s) if s.nanos == 0 => 0,
-            Some(s) => Self::rate(s),
+            // Attempted but no timed sample yet — e.g. it returned `Halted` on
+            // its first check or did zero reads. It proved nothing, so rank it at
+            // the BOTTOM (0), not the top: otherwise a called-but-idle handler
+            // perpetually crowds out proven performers.
+            Some(s) => match s.ewma_rate {
+                None => 0,
+                Some(r) => r.max(0.0).min(u64::MAX as f64) as u64,
+            },
         }
     }
 
@@ -776,7 +805,8 @@ impl HandlerScoreboard {
     /// handler is pulling the weight and which is a dud on this drive/disc.
     pub(super) fn log(&self) {
         let mut rows: Vec<_> = self.stats.iter().collect();
-        rows.sort_by_key(|(_, s)| std::cmp::Reverse(Self::rate(s)));
+        // Rank by the decayed rate (the live signal), highest first.
+        rows.sort_by(|a, b| self.rank(b.0).cmp(&self.rank(a.0)));
         for (name, s) in rows {
             let mbps = s.recovered as f64 / (s.nanos as f64 / 1e9).max(1e-9) / 1_048_576.0;
             tracing::info!(
@@ -785,6 +815,7 @@ impl HandlerScoreboard {
                 handler = name.as_str(),
                 recovered_mb = s.recovered as f64 / 1_048_576.0,
                 attempts = s.attempts,
+                decayed_bytes_per_s = s.ewma_rate.unwrap_or(0.0),
                 mb_per_s = mbps,
                 "handler scorecard (this rip)"
             );
@@ -1566,5 +1597,43 @@ mod tests {
         let out = lin.recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Halted);
         assert_eq!(h.read_count(), 0, "halt must precede any read");
+    }
+
+    #[test]
+    fn scorecard_decays_so_a_late_starter_overtakes_an_early_winner() {
+        // The whole point of the DECAYED rate: the residual hardens mid-pass, so
+        // leadership must hand off. A cumulative rate would freeze "early" in the
+        // lead forever; the EWMA re-prices continuously.
+        let mut sb = HandlerScoreboard::default();
+        let dt = Duration::from_secs(1);
+
+        // Round 1 — "early" cleans the easy bulk; "late" finds nothing yet.
+        sb.record("early", 1_000_000, dt);
+        sb.record("late", 0, dt);
+        assert!(
+            sb.rank("early") > sb.rank("late"),
+            "early must lead once it's the only one recovering"
+        );
+
+        // The bulk is gone. Now "early"'s technique no longer fits the hardened
+        // residual (barren attempts) while "late"'s specialist starts winning.
+        for _ in 0..4 {
+            sb.record("early", 0, dt);
+            sb.record("late", 1_000_000, dt);
+        }
+        assert!(
+            sb.rank("late") > sb.rank("early"),
+            "a handler that stops earning must LOSE its lead to a late starter \
+             (late={}, early={})",
+            sb.rank("late"),
+            sb.rank("early")
+        );
+
+        // Calibration invariants preserved: an untried handler still ranks top
+        // (one-shot calibration), and a handler attempted with no timed read
+        // (zero elapsed) ranks bottom rather than crowding out proven performers.
+        assert_eq!(sb.rank("never_tried"), u64::MAX, "untried → top");
+        sb.record("idle", 0, Duration::ZERO);
+        assert_eq!(sb.rank("idle"), 0, "attempted-but-zero-time → bottom");
     }
 }
