@@ -68,6 +68,13 @@ const UNPRODUCTIVE_YIELD: u32 = 4;
 /// even when every bad sub-range is smaller than the streak. Learned the hard way
 /// (2026-07-01): the handler chain ground a wedged drive for 28 min at 0 B/s
 /// because a fast-fail sense was classified as an ordinary bad sector.
+///
+/// Detection latency scales with how much streak one section can build. Tier 0's
+/// 4 handlers × [`UNPRODUCTIVE_YIELD`] = 16 reads, so a single large wedged
+/// section trips it within one `run_handlers` call. Tier 1 has only 2 handlers
+/// (max 8 per section), so a wedge seen only in tier 1 relies on the pass-level
+/// streak PERSISTING across sections to reach the threshold — regression-tested
+/// by `wedge_streak_persists_across_sections_for_tier1`.
 const WEDGE_ABORT_STREAK: u32 = 16;
 
 /// Where a handler left the section after its bounded attempt.
@@ -184,6 +191,14 @@ fn read_span(
 ) -> ReadHit {
     let lba = (pos / SECTOR) as u32;
     let bytes = count as usize * SECTOR as usize;
+    // Every SubRange enters via `from_section` / `remove`, which keep byte
+    // offsets sector-aligned, so a handler never asks for a sub-sector span. Pin
+    // that invariant: a zero `count` (span < SECTOR) would be a 0-sector read
+    // that silently "recovers" nothing — surface the caller bug in tests.
+    debug_assert!(
+        count >= 1 && pos % SECTOR == 0,
+        "read_span requires a sector-aligned, >=1-sector span (pos={pos}, count={count})"
+    );
     let hit = match recovery_read(ctx.reader, ctx.decrypt_is_aacs, lba, count, buf, recovery) {
         Ok(_) => {
             ctx.sink.recovered(pos, &buf[..bytes]);
@@ -221,7 +236,13 @@ fn read_span(
             ctx.unproductive = 0;
             ctx.wedge_streak = 0;
         }
-        _ => ctx.unproductive = ctx.unproductive.saturating_add(1),
+        // A Bad read is unproductive grinding — advance the yield streak.
+        ReadHit::Bad => ctx.unproductive = ctx.unproductive.saturating_add(1),
+        // A Transport hit aborts the handler immediately (bus fault / wedge
+        // escalation), so it is NOT unproductive grinding — leave the streak
+        // untouched (the counter is never read again after TransportFault, but
+        // keep the semantics honest in case an arm is ever reordered).
+        ReadHit::Transport => {}
     }
     // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
     // UI's bar/speed move DURING a handler, not just when the section finishes.
@@ -370,6 +391,9 @@ impl SectionHandler for Bisect {
                     let mut fwd = mid + SECTOR;
                     let mut step = batch;
                     while fwd < end {
+                        if ctx.halted() {
+                            return HandlerOutcome::Halted;
+                        }
                         if ctx.timed_out(deadline) {
                             return HandlerOutcome::Remaining;
                         }
@@ -398,6 +422,9 @@ impl SectionHandler for Bisect {
                     let mut bwd = mid;
                     let mut step = batch;
                     while bwd > rp {
+                        if ctx.halted() {
+                            return HandlerOutcome::Halted;
+                        }
                         if ctx.timed_out(deadline) {
                             return HandlerOutcome::Remaining;
                         }
@@ -569,8 +596,14 @@ impl HandlerScoreboard {
     /// Ranking key (higher runs earlier). Untried → top, so it gets calibrated.
     fn rank(&self, name: &str) -> u64 {
         match self.stats.get(name) {
+            // Never attempted → top, so every handler is calibrated once.
             None => u64::MAX,
-            Some(s) if s.nanos == 0 => u64::MAX,
+            // Attempted but recorded no measurable time — e.g. it returned
+            // `Halted` on its first check or did zero reads. It proved nothing,
+            // so rank it at the BOTTOM (0), not the top: otherwise a called-but-
+            // idle handler perpetually crowds out proven performers. (An entry
+            // exists only after `record`, so `Some` always means attempts ≥ 1.)
+            Some(s) if s.nanos == 0 => 0,
             Some(s) => Self::rate(s),
         }
     }
@@ -1105,6 +1138,64 @@ mod tests {
             h.read_count() < 100,
             "wedge must abort fast; did {} reads on a 1000-sector wedged section",
             h.read_count()
+        );
+    }
+
+    #[test]
+    fn wedge_streak_persists_across_sections_for_tier1() {
+        // Tier 1 is only TWO handlers, so one wedged section builds at most
+        // 2 × UNPRODUCTIVE_YIELD = 8 streak — below WEDGE_ABORT_STREAK (16). The
+        // wedge is caught only because the pass-level wedge_streak PERSISTS across
+        // sections. Simulate what PatchCtx does: carry wedge_streak in/out of each
+        // per-section run_handlers call, and assert the abort lands on a LATER
+        // section, not the first.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.wedge = (0..4000u32).collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut carried = 0u32; // the pass-level wedge_streak
+        let mut caught_on: Option<usize> = None;
+        for section in 0..6usize {
+            let mut ctx = HandlerCtx {
+                reader: &mut disc,
+                sink: &mut sink,
+                now: &now,
+                halt: None,
+                decrypt_is_aacs: false,
+                tick: None,
+                unproductive: 0,
+                wedge_streak: carried,
+            };
+            // Distinct 100-sector section per iteration, all within the wedge set.
+            let pos = (section as u64) * 100 * SECTOR;
+            let mut bad = SubRanges::from_section(pos, 100 * SECTOR);
+            // Tier-1 shape: two slow Linear handlers, nothing that reaches 16 alone.
+            let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+                Box::new(Linear {
+                    reverse: true,
+                    fast: false,
+                }),
+                Box::new(Linear {
+                    reverse: false,
+                    fast: false,
+                }),
+            ];
+            let mut sb = HandlerScoreboard::default();
+            let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| {
+                (h.now_fn())() + Duration::from_secs(60)
+            });
+            carried = ctx.wedge_streak;
+            if out == HandlerOutcome::TransportFault {
+                caught_on = Some(section);
+                break;
+            }
+        }
+        let caught = caught_on.expect("a two-handler tier must still catch the wedge");
+        assert!(
+            caught >= 1,
+            "one 2-handler section can't reach the streak alone; the wedge must be \
+             caught via cross-section accumulation, not on section 0 (caught on {caught})"
         );
     }
 

@@ -655,7 +655,6 @@ pub(super) struct PatchLoopState {
     pub blocks_read_ok: u64,
     pub blocks_read_failed: u64,
     pub unreadable_count: u64,
-    pub work_done: u64,
     // Clock seam: the handler chain reads wall time through this rather than
     // calling `Instant::now()` inline, so the per-handler deadline is driven by
     // an injectable clock and deterministic tests can wind it forward.
@@ -702,7 +701,6 @@ impl PatchLoopState {
             blocks_read_ok: 0,
             blocks_read_failed: 0,
             unreadable_count: 0,
-            work_done: 0,
             now,
             bytes_good_before,
             total_bytes,
@@ -955,7 +953,6 @@ impl PatchCtx<'_, '_> {
             for &(pos, len) in bad.ranges() {
                 send_or_abort(self.pipe, PatchItem::NonTrimmed { pos, len })?;
             }
-            self.state.work_done = self.state.work_done.saturating_add(range_size);
         }
 
         if self
@@ -1021,13 +1018,25 @@ impl Disc {
             .map(|t| bytes_bad_in_title(t, &bad_ranges_now))
             .unwrap_or(0);
         let main_title = self.titles.first();
-        // Progress = bytes RECOVERED so far (initial bad − still-pending), not a
+        // Progress = bytes RECOVERED so far (initial bad − still-bad), not a
         // per-range counter. With breadth-first tiers the readable bulk comes
         // back during tier 0 before any range is "finished", so a range-counter
         // sits at 0% while hundreds of MB are actually recovered. Deriving it
-        // from the live pending count makes the bar (and the speed the client
+        // from the live still-bad count makes the bar (and the speed the client
         // computes from its delta) reflect real recovery the instant it happens.
-        let recovered = state.work_total.saturating_sub(s.bytes_pending);
+        //
+        // Compose the still-bad set to MATCH `work_total` (= the initial
+        // NonTrimmed + NonScraped + Unreadable, no NonTried). `bytes_pending`
+        // alone is the wrong denominator: it INCLUDES NonTried (so on a partially
+        // swept disc it exceeds `work_total` and saturating_sub pins the bar at 0)
+        // and EXCLUDES Unreadable (so the final-tier Unreadable→NonTrimmed relabel
+        // would drive `recovered` backward). Subtract NonTried and add Unreadable
+        // back so the two sets line up and progress stays monotonic.
+        let still_bad_work = s
+            .bytes_pending
+            .saturating_sub(s.bytes_nontried)
+            .saturating_add(s.bytes_unreadable);
+        let recovered = state.work_total.saturating_sub(still_bad_work);
         let pp = crate::progress::PassProgress {
             kind,
             work_done: recovered,
@@ -1188,24 +1197,16 @@ impl Disc {
             );
         }
 
-        // Adaptive batching: read at `state.current_batch`, HALVE on a
-        // batch-read failure (bisect to isolate the bad sector), and
-        // DOUBLE back toward `state.initial_batch` on each clean read.
-        // Rationale: dense damage scattered through a
-        // NonTrimmed range is rare — most "bad ranges" in pass N have
-        // lots of good sectors that swept-by-default landed inside.
-        // Batch reads walk those at ~32x the speed of singles,
-        // dropping to 1 only when the drive actually returns an error.
-        // Guarantees:
-        //   - no good sector is ever marked NonTrimmed because it
-        //     was bundled in a failed batch — failed batches are
-        //     "split decisions", not recorded failures
-        //   - drop-to-1 retries the SAME starting position, so every
-        //     sector in the failed batch is individually probed
-        // Clamp to at least 1 sector. block_sectors is public
-        // (Option<u16>); Some(0) would compute a zero-length read per
-        // iteration, never advance block_end, and busy-spin the range
-        // until its watchdog fired.
+        // Read sizing and fast-vs-deep recovery are owned by the handler chain
+        // (`section_recover.rs`): it reads at a fixed `BATCH_SECTORS`, bisects to
+        // isolate readable islands, and selects fast vs 60 s deep reads per
+        // handler/tier. The old adaptive `current_batch` / halve-on-failure /
+        // double-back loop that this comment used to describe no longer exists.
+        // `block_sectors` and `full_recovery` therefore no longer drive behavior
+        // — they survive only as the PassKind label and the diagnostics logged
+        // below (informational-only; a caller can't change read sizing or the
+        // recovery timeout through them). Clamp to ≥1 so the label math never
+        // underflows on a `Some(0)`.
         let initial_batch = opts.block_sectors.unwrap_or(1).max(1);
         let recovery = opts.full_recovery;
         log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
@@ -1255,7 +1256,7 @@ impl Disc {
         // sink's summary. `close` failing on a regular-file sync_all is
         // surfaced here as `Error::IoError`, matching pre-split
         // behaviour.
-        let summary = pipe.finish()?;
+        let mut summary = pipe.finish()?;
 
         // Scoped post-read re-verify (decrypt-fail == bad read). The consumer
         // has flushed the ISO + mapfile; re-read each clip unit this pass touched
@@ -1286,6 +1287,14 @@ impl Disc {
                             );
                         }
                         let _ = m.flush();
+                        // The re-verify ran AFTER `pipe.finish()` snapshotted
+                        // `summary.stats`, so those stats still count the just-
+                        // downgraded units as good. Refresh from the mapfile so
+                        // `build_outcome` reports the true post-downgrade picture
+                        // (bytes_good ↓, bytes_pending ↑) — otherwise the caller
+                        // over-reports recovery and can call an imperfect rip
+                        // "complete".
+                        summary.stats = m.stats();
                         tracing::info!(
                             target: "freemkv::verify",
                             phase = "patch.reverify",

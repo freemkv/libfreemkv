@@ -3505,7 +3505,15 @@ impl Disc {
                                     );
                                 }
 
-                                let jump_pos = (pos + block_bytes + sectors * 2048).min(region_end);
+                                // Saturating throughout — the read_error side
+                                // computes the sector count with saturating_mul as
+                                // "defence in depth"; honor the same guarantee at
+                                // the consuming multiply/add so a pathological jump
+                                // distance can't wrap.
+                                let jump_pos = pos
+                                    .saturating_add(block_bytes)
+                                    .saturating_add(sectors.saturating_mul(2048))
+                                    .min(region_end);
                                 let gap_start = pos + block_bytes;
                                 let gap_bytes = jump_pos.saturating_sub(gap_start);
                                 if gap_bytes > 0 {
