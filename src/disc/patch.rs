@@ -751,6 +751,10 @@ struct PatchCtx<'a, 'o> {
     /// coordinator runs the winners first and lets duds fall back. Reset per
     /// pass (ephemeral, no persistence).
     scoreboard: HandlerScoreboard,
+    /// Consecutive wedge-family senses across the WHOLE pass. Seeded into each
+    /// per-section `HandlerCtx` and read back after, so a drive fast-fail wedge is
+    /// detected even when every bad sub-range is smaller than the abort streak.
+    wedge_streak: u32,
 }
 
 impl PatchCtx<'_, '_> {
@@ -883,7 +887,7 @@ impl PatchCtx<'_, '_> {
         };
 
         let bad_before = bad.total_len();
-        let outcome = {
+        let (outcome, wedge_after) = {
             // Progress heartbeat: a throttled closure that pushes a fresh
             // snapshot to the reporter as recovery happens (called from every
             // read via `HandlerCtx::progress`), so the bar and speed move DURING
@@ -913,11 +917,16 @@ impl PatchCtx<'_, '_> {
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
                 unproductive: 0,
+                // Carry the pass-level wedge streak in so a fast-fail wedge is
+                // caught across many small sections, not reset each one.
+                wedge_streak: self.wedge_streak,
             };
-            run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
+            let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 now_ptr() + std::time::Duration::from_secs(PER_HANDLER_BUDGET_SECS)
-            })
+            });
+            (o, ctx.wedge_streak)
         };
+        self.wedge_streak = wedge_after;
 
         tracing::info!(
             target: "freemkv::disc",
@@ -1235,6 +1244,7 @@ impl Disc {
             decrypt_is_aacs,
             state: PatchLoopState::new(bytes_good_before, total_bytes, initial_batch, work_total),
             scoreboard: HandlerScoreboard::default(),
+            wedge_streak: 0,
         };
         ctx.run(&bad_ranges)?;
         ctx.scoreboard.log();

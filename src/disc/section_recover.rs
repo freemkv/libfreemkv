@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::patch::{SubRanges, recovery_read};
+use super::read_error::SenseFamily;
 use crate::sector::SectorSource;
 
 /// One 2048-byte sector.
@@ -54,6 +55,20 @@ const JUMP_AFTER_FAILS: u32 = 2;
 /// drive state has shifted (recovery is stochastic). This is what turns a
 /// "60 s of 0 B/s" stall into a fast hand-off.
 const UNPRODUCTIVE_YIELD: u32 = 4;
+
+/// Wedge abort: after this many CONSECUTIVE wedge-family senses (Hardware /
+/// IllegalRequest — the BU40N firmware's fast-fail state, where it rejects every
+/// CDB in <100 ms without attempting recovery) the drive is wedged. `read_span`
+/// escalates the read to `Transport`, which every handler propagates as
+/// `TransportFault` → the whole pass aborts and the caller spin-cycles the drive
+/// instead of hammering all remaining sections (which only deepens the wedge).
+/// Any Good read or non-wedge (medium-error) read resets the streak, so only a
+/// sustained fast-fail run — never scattered bad sectors on real media — trips
+/// it. Counted at the PASS level (persisted across sections) so a wedge is caught
+/// even when every bad sub-range is smaller than the streak. Learned the hard way
+/// (2026-07-01): the handler chain ground a wedged drive for 28 min at 0 B/s
+/// because a fast-fail sense was classified as an ordinary bad sector.
+const WEDGE_ABORT_STREAK: u32 = 16;
 
 /// Where a handler left the section after its bounded attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +118,11 @@ pub(super) struct HandlerCtx<'a> {
     /// it reaches [`UNPRODUCTIVE_YIELD`] the handler should yield to the next one
     /// (see [`HandlerCtx::stalled`]). Reset to 0 before each handler runs.
     pub unproductive: u32,
+    /// Consecutive wedge-family senses (Hardware / IllegalRequest), updated by
+    /// [`read_span`]. At [`WEDGE_ABORT_STREAK`] the drive is wedged and the read
+    /// escalates to `Transport`. Seeded from and read back into the pass-level
+    /// counter so the streak spans sections; a Good or non-wedge read resets it.
+    pub wedge_streak: u32,
 }
 
 impl HandlerCtx<'_> {
@@ -170,12 +190,37 @@ fn read_span(
             ReadHit::Good
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
-        Err(_) => ReadHit::Bad,
+        Err(e) => {
+            // Wedge watch: a Hardware / IllegalRequest sense is the drive's
+            // fast-fail signature. Count consecutive ones; a sustained run means
+            // the firmware wedged (rejecting every CDB), so escalate to Transport
+            // and let the pass abort + spin-cycle rather than grind on. A medium
+            // error or any success below resets the streak — real bad sectors
+            // never trip it.
+            let wedge = e
+                .scsi_sense()
+                .map(|s| SenseFamily::from_sense_key(s.sense_key).is_wedge_family())
+                .unwrap_or(false);
+            if wedge {
+                ctx.wedge_streak = ctx.wedge_streak.saturating_add(1);
+                if ctx.wedge_streak >= WEDGE_ABORT_STREAK {
+                    ReadHit::Transport
+                } else {
+                    ReadHit::Bad
+                }
+            } else {
+                ctx.wedge_streak = 0;
+                ReadHit::Bad
+            }
+        }
     };
     // Track the dead streak for the early-yield hand-off: a recovering read
     // resets it, a fruitless one advances it toward UNPRODUCTIVE_YIELD.
     match hit {
-        ReadHit::Good => ctx.unproductive = 0,
+        ReadHit::Good => {
+            ctx.unproductive = 0;
+            ctx.wedge_streak = 0;
+        }
         _ => ctx.unproductive = ctx.unproductive.saturating_add(1),
     }
     // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
@@ -618,6 +663,10 @@ mod tests {
     /// staying `Send`.
     struct FakeDisc {
         dead: HashSet<u32>,
+        /// LBAs that return a wedge-family sense (IllegalRequest) — the drive
+        /// fast-fail state, distinct from an ordinary dead sector (which carries
+        /// no sense). Used to exercise wedge detection.
+        wedge: HashSet<u32>,
         transport_at: Option<u32>,
         clock_nanos: Arc<AtomicU64>,
         per_read: Duration,
@@ -645,6 +694,21 @@ mod tests {
                 }
             }
             for l in lba..lba + count as u32 {
+                if self.wedge.contains(&l) {
+                    // Fast-fail wedge sense: ILLEGAL REQUEST / INVALID FIELD IN
+                    // CDB (0x05/0x24), the real BU40N wedge signature. Non-
+                    // transport status so it isn't caught as a bus fault, but
+                    // carries sense so the wedge classifier sees it.
+                    return Err(Error::ScsiError {
+                        opcode: crate::scsi::SCSI_READ_10,
+                        status: 0x02,
+                        sense: Some(crate::scsi::ScsiSense {
+                            sense_key: crate::scsi::SENSE_KEY_ILLEGAL_REQUEST,
+                            asc: 0x24,
+                            ascq: 0x00,
+                        }),
+                    });
+                }
                 if self.dead.contains(&l) {
                     // Non-transport bad-sector error (CHECK CONDITION, 0x02).
                     return Err(Error::DiscRead {
@@ -686,6 +750,7 @@ mod tests {
             let reads = Arc::new(AtomicU64::new(0));
             let disc = FakeDisc {
                 dead: dead.iter().copied().collect(),
+                wedge: HashSet::new(),
                 transport_at,
                 clock_nanos: clock_nanos.clone(),
                 per_read,
@@ -737,6 +802,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 10 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -785,6 +851,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 40 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -822,6 +889,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(3);
@@ -857,6 +925,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 9 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
@@ -893,6 +962,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 16 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
@@ -934,6 +1004,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 64 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![Box::new(Linear {
@@ -965,6 +1036,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         // Single-sector batches so the transport LBA is hit directly.
         let mut bad = SubRanges::from_section(0, 8 * SECTOR);
@@ -975,6 +1047,65 @@ mod tests {
         };
         let out = lin.recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::TransportFault);
+    }
+
+    #[test]
+    fn wedged_drive_aborts_fast_instead_of_grinding() {
+        // Regression for the 2026-07-01 incident: a fast-fail wedge (drive
+        // returns ILLEGAL REQUEST on every CDB) was classified as an ordinary
+        // bad sector, so the chain ground a dead drive for 28 min at 0 B/s.
+        // Now a sustained run of wedge-family senses escalates to TransportFault
+        // so the pass aborts and the caller spin-cycles. A big section (1000
+        // sectors) that is ENTIRELY wedged must bail after ~WEDGE_ABORT_STREAK
+        // reads, not after reading the whole thing.
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.wedge = (0..1000u32).collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut disc,
+            sink: &mut sink,
+            now: &now,
+            halt: None,
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+        };
+        let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
+        // The full tier-0 chain: the wedge streak persists across handlers (only
+        // `unproductive` resets per handler), so it reaches the abort threshold
+        // even though each handler yields early on the dead streak.
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Bisect),
+            Box::new(Jump),
+            Box::new(Linear {
+                reverse: true,
+                fast: true,
+            }),
+            Box::new(Linear {
+                reverse: false,
+                fast: true,
+            }),
+        ];
+        let mut scoreboard = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut scoreboard, |_| {
+            (h.now_fn())() + Duration::from_secs(60)
+        });
+        assert_eq!(
+            out,
+            HandlerOutcome::TransportFault,
+            "a wholly-wedged section must escalate to TransportFault"
+        );
+        // The whole point: it bailed after a short streak, not after grinding all
+        // 1000 sectors. Generous bound (handlers read in batches) but far below
+        // the section size.
+        assert!(
+            h.read_count() < 100,
+            "wedge must abort fast; did {} reads on a 1000-sector wedged section",
+            h.read_count()
+        );
     }
 
     #[test]
@@ -994,6 +1125,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            wedge_streak: 0,
         };
         let mut bad = SubRanges::from_section(0, 100 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
