@@ -124,6 +124,26 @@ pub(crate) fn run_unlockers(
     Err(fu::UnlockError::NotApplicable)
 }
 
+/// Apply drive-level feature tuning (max read speed / riplock lift) for the
+/// installed drive, for ANY disc. This is the drive-features capability, kept
+/// separate from bus removal: it issues only STOCK MMC commands (no firmware
+/// unlock), so it is safe on a CSS DVD that must stay in stock mode. Each
+/// unlocker's `apply_drive_features` is self-gating (a no-op unless it recognises
+/// the drive), so we call every one; disc kind is irrelevant here, so we pass
+/// `Unknown`. Best-effort — never returns an error to the caller (a slow drive
+/// still rips).
+pub(crate) fn apply_drive_features(
+    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive_id: &crate::identity::DriveId,
+) {
+    let id = to_fu_drive_id(drive_id);
+    let ctx = fu::UnlockCtx::new(&id, fu::DiscKind::Unknown, &[]);
+    let mut adapter = ScsiAdapter(scsi);
+    for u in fu::all_unlockers() {
+        let _ = u.apply_drive_features(&mut adapter, &ctx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
