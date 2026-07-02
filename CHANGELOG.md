@@ -7,16 +7,18 @@
 - **DVD DTS audio no longer muxes with non-monotonic timestamps.** A DVD
   Program Stream packs several DTS core frames into one PES packet; the parser
   stamped every access unit with that single PES timestamp and no per-frame
-  duration, so consecutive frames collided on one PTS. A strict decode/remux
-  (ffmpeg) rejected the result — `non monotonically increasing dts to muxer` —
-  and reported the track as corrupt, sometimes with spurious `[dca] Failed to
-  decode block` errors. The DTS parser now derives each core frame's duration
-  from its header (`(NBLKS+1)*32` samples ÷ the `SFREQ` sample rate) and stamps
-  a monotonically-advancing PTS, so frames sharing a PES advance frame-by-frame.
-  The UHD DTS-HD MA path (one access unit per PES with its own timestamp) is
-  unchanged — a later PES whose timestamp is already ahead still wins, so the
-  1.2.0 per-PES attribution is preserved. This completes the DVD DTS fix begun
-  in 1.2.0 (which corrected the silent-track routing, exposing this timing bug).
+  duration, so consecutive frames collided on one PTS and a strict decode/remux
+  (ffmpeg) rejected the track — `non monotonically increasing dts to muxer`.
+  The DTS parser now derives each core frame's duration from its header
+  (`(NBLKS+1)*32` samples ÷ the `SFREQ` sample rate) and re-bases to each PES's
+  own container timestamp, advancing by a frame duration only *within* a single
+  PES — so the track stays monotonic and does not drift past its real length on
+  a feature-long title. The UHD DTS-HD MA path (one access unit per PES) is
+  unaffected: each unit keeps its own PES timestamp, preserving the 1.2.0 per-PES
+  attribution. Completes the DVD DTS fix begun in 1.2.0 (which corrected the
+  silent-track routing, exposing this timing bug). Note: genuinely corrupt
+  source DTS frames — valid framing, bad audio blocks — are passed through
+  faithfully; freemkv never fabricates or drops audio it can't prove is bad.
 
 ## [1.2.0] — 2026-07-01
 
