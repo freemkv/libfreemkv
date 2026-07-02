@@ -38,6 +38,16 @@ pub struct DtsParser {
     /// current `buf` start and rebased whenever bytes are drained from the
     /// front.
     pts_marks: Vec<(usize, i64)>,
+    /// Running monotonic timestamp: the PTS the NEXT emitted access unit must
+    /// not fall below. Each AU is stamped `max(next_pts_ns, its own core PES
+    /// PTS)` and then `next_pts_ns` advances by the AU's decoded duration. This
+    /// is what makes the DVD case — several DTS core frames packed in ONE PES,
+    /// all reporting that single PES PTS — advance frame-by-frame instead of
+    /// colliding on one timestamp (the "non monotonically increasing dts" mux
+    /// error). The UHD/DTS-HD MA case (one AU per PES with its own later PTS) is
+    /// unaffected: that PTS is `>= next_pts_ns`, so the AU keeps its own PES's
+    /// timestamp exactly as before. `PTS_UNSET` = no base captured yet.
+    next_pts_ns: i64,
 }
 
 impl Default for DtsParser {
@@ -52,7 +62,26 @@ impl DtsParser {
             buf: Vec::with_capacity(32768),
             pending_pts: 0,
             pts_marks: Vec::new(),
+            next_pts_ns: PTS_UNSET,
         }
+    }
+
+    /// Stamp an access unit with a monotonic PTS and advance the running clock.
+    /// `front` is the AU's own core-PES PTS (from [`front_pts`]); `dur_ns` its
+    /// decoded duration. Honors a forward jump to a new PES PTS (UHD multi-PES
+    /// AUs) but never emits below the running clock (DVD multi-AU-per-PES).
+    fn stamp_pts(&mut self, front: i64, dur_ns: i64) -> i64 {
+        let base = if front != PTS_UNSET && front > self.next_pts_ns {
+            front
+        } else if self.next_pts_ns != PTS_UNSET {
+            self.next_pts_ns
+        } else if front != PTS_UNSET {
+            front
+        } else {
+            0
+        };
+        self.next_pts_ns = base + dur_ns;
+        base
     }
 
     /// Drop `n` bytes from the front of `buf` and rebase the PTS markers so
@@ -137,6 +166,9 @@ impl CodecParser for DtsParser {
             self.buf.clear();
             self.pts_marks.clear();
             self.pending_pts = PTS_UNSET;
+            // A concealed gap is a timeline discontinuity: let the post-gap AU
+            // re-base to its own (later) PES PTS rather than the pre-gap clock.
+            self.next_pts_ns = PTS_UNSET;
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -267,10 +299,13 @@ impl CodecParser for DtsParser {
             };
 
             let au: Vec<u8> = self.buf[..au_end].to_vec();
-            // The AU takes the PTS of the PES covering its first byte — its own
-            // core's PES, even if that PES preceded the one(s) carrying its
-            // extensions or the next core.
-            let au_pts = self.front_pts();
+            // The AU's own core PES PTS (the PES covering its first byte, even if
+            // that PES preceded the one(s) carrying its extensions or the next
+            // core), stamped monotonically: honored when it advances past the
+            // running clock (UHD one-AU-per-PES), but never allowed to collide
+            // with the previous AU when several cores share ONE PES (DVD).
+            let dur_ns = dts_core_duration_ns(&au) as i64;
+            let au_pts = self.stamp_pts(self.front_pts(), dur_ns);
             frames.push(Frame {
                 discontinuity: false,
                 coding: None,
@@ -278,7 +313,7 @@ impl CodecParser for DtsParser {
                 pts_ns: au_pts,
                 keyframe: true,
                 data: au,
-                duration_ns: None,
+                duration_ns: Some(dur_ns as u64),
             });
             self.drain_front(au_end);
             // After draining, the marker covering the new front (if any) carries
@@ -324,9 +359,9 @@ impl CodecParser for DtsParser {
         }
         // The final AU's PTS is the PES covering the buffer front (its core's
         // PES). Fall back to pending_pts, clamping the sentinel to 0.
-        let front = self.front_pts();
-        let pts_ns = if front == PTS_UNSET { 0 } else { front };
         let au = std::mem::take(&mut self.buf);
+        let dur_ns = dts_core_duration_ns(&au) as i64;
+        let pts_ns = self.stamp_pts(self.front_pts(), dur_ns);
         self.pts_marks.clear();
         vec![Frame {
             discontinuity: false,
@@ -335,7 +370,7 @@ impl CodecParser for DtsParser {
             pts_ns,
             keyframe: true,
             data: au,
-            duration_ns: None,
+            duration_ns: Some(dur_ns as u64),
         }]
     }
 
@@ -501,6 +536,49 @@ fn dts_core_frame_size(data: &[u8]) -> usize {
     fsize + 1
 }
 
+/// DTS core `SFREQ` → sample rate (Hz). 4-bit index; reserved/invalid entries
+/// fall back to 48 kHz (the DVD/UHD norm) so a bogus value never yields a zero
+/// rate (division) or a wildly wrong frame duration.
+const DTS_CORE_SAMPLE_RATES: [u32; 16] = [
+    48_000, // 0: invalid → fallback
+    8_000, 16_000, 32_000, 48_000, // 4: invalid → fallback
+    48_000, // 5: invalid → fallback
+    11_025, 22_050, 44_100, 48_000, // 9: invalid → fallback
+    48_000, // 10: invalid → fallback
+    12_000, 24_000, 48_000, 96_000, 192_000,
+];
+
+/// Samples in one DTS core frame: `(NBLKS + 1) * 32`. `NBLKS` (7 bits) is the
+/// core-header PCM-sample-block count — the same field ffmpeg's `dca` decoder
+/// uses to timestamp frames. Bit layout after the 32-bit sync: FTYPE(1) SHORT(5)
+/// CPF(1) **NBLKS(7)** FSIZE(14) …, so NBLKS = byte4 bit0 + byte5 bits7-2.
+fn dts_core_samples(data: &[u8]) -> u32 {
+    if data.len() < CORE_HEADER_MIN_BYTES {
+        return 512; // typical; only reached on a truncated header
+    }
+    let nblks = ((data[4] as u32 & 0x01) << 6) | (data[5] as u32 >> 2);
+    (nblks + 1) * 32
+}
+
+/// DTS core sample rate (Hz) from `SFREQ` (4 bits: byte8 bits5-2), with a 48 kHz
+/// fallback for reserved indices.
+fn dts_core_sample_rate(data: &[u8]) -> u32 {
+    if data.len() < CORE_HEADER_MIN_BYTES {
+        return 48_000;
+    }
+    let sfreq = (data[8] as usize >> 2) & 0x0F;
+    DTS_CORE_SAMPLE_RATES[sfreq]
+}
+
+/// Duration of one DTS core access unit in nanoseconds: `samples / rate`,
+/// rounded to nearest. This is what lets consecutive core frames packed in a
+/// single DVD PES advance monotonically instead of colliding on one PES PTS.
+fn dts_core_duration_ns(data: &[u8]) -> u64 {
+    let samples = dts_core_samples(data) as u64;
+    let rate = dts_core_sample_rate(data) as u64;
+    (samples * 1_000_000_000 + rate / 2) / rate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,11 +599,21 @@ mod tests {
         let fsize = size - 1;
         let mut data = vec![0u8; size];
         data[0..4].copy_from_slice(&DTS_CORE_SYNC);
-        data[5] = (data[5] & 0xFC) | ((fsize >> 12) & 0x03) as u8;
+        // NBLKS = 15 → (15+1)*32 = 512 samples/frame (the DVD/UHD DTS-core norm).
+        // NBLKS is byte4 bit0 + byte5 bits7-2; here byte4 bit0 = 0, byte5 = 15<<2.
+        data[5] = (15u8 << 2) | ((fsize >> 12) & 0x03) as u8;
         data[6] = ((fsize >> 4) & 0xFF) as u8;
         data[7] = (data[7] & 0x0F) | (((fsize & 0x0F) << 4) as u8);
+        // SFREQ = 13 → 48 kHz (byte8 bits5-2). Only when the header byte exists.
+        if size > 8 {
+            data[8] = 13u8 << 2;
+        }
         data
     }
+
+    // 512 samples @ 48 kHz, rounded to nearest ns — the duration make_dts_core
+    // frames advance by. (512 * 1e9 + 24000) / 48000 = 10_666_667 ns.
+    const DTS_CORE_DUR_NS: i64 = (512 * 1_000_000_000 + 48_000 / 2) / 48_000;
 
     /// A real DTS-HD EXSS substream of `total` bytes (short header form), with an
     /// optional false DTS core syncword embedded in its payload (decoding to a
@@ -657,10 +745,11 @@ mod tests {
     }
 
     #[test]
-    fn two_cores_back_to_back_emit_first_on_boundary() {
-        // The first complete unit is emitted as soon as the next core sync is
-        // seen; the second is held until flush. Both cores arrived in ONE PES,
-        // so both legitimately carry that PES's PTS.
+    fn two_cores_back_to_back_advance_within_one_pes() {
+        // Both cores arrive in ONE PES — the DVD layout. AU1 keeps the PES PTS;
+        // AU2 must ADVANCE by one frame duration to stay monotonic. Reusing the
+        // single PES PTS for both was the "non monotonically increasing dts to
+        // muxer" bug (fixed for 1.2.1).
         let mut parser = DtsParser::new();
         let mut stream = make_dts_core(512);
         stream.extend_from_slice(&make_dts_core(640));
@@ -668,13 +757,18 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].data.len(), 512);
         assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU1 keeps its PES PTS");
+        assert_eq!(
+            f[0].duration_ns,
+            Some(DTS_CORE_DUR_NS as u64),
+            "AU1 carries a real frame duration (was None)"
+        );
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].data.len(), 640);
         assert_eq!(
             tail[0].pts_ns,
-            pts_to_ns(90000),
-            "AU2 came in the same PES → same PTS"
+            pts_to_ns(90000) + DTS_CORE_DUR_NS,
+            "AU2 in the same PES advances one frame duration (monotonic)"
         );
     }
 
@@ -689,31 +783,33 @@ mod tests {
         let mut parser = DtsParser::new();
 
         // PES A: just core1 (held — no following core yet).
-        let f0 = parser.parse(&make_pes(make_dts_core(512), Some(100)));
+        let f0 = parser.parse(&make_pes(make_dts_core(512), Some(90000)));
         assert!(f0.is_empty(), "core1 held awaiting next core");
 
-        // PES B: core2 + core3. Closes AU1 (core1) and AU2 (core2).
+        // PES B (realistically LATER — far past one frame): core2 + core3.
+        // Closes AU1 (core1) and AU2 (core2).
         let mut pes_b = make_dts_core(600);
         pes_b.extend_from_slice(&make_dts_core(640));
-        let f = parser.parse(&make_pes(pes_b, Some(200)));
+        let f = parser.parse(&make_pes(pes_b, Some(190000)));
         assert_eq!(f.len(), 2, "AU1 and AU2 both close in this call");
         assert_eq!(f[0].data.len(), 512, "AU1 = core1");
         assert_eq!(
             f[0].pts_ns,
-            pts_to_ns(100),
+            pts_to_ns(90000),
             "AU1 keeps PES A's PTS, not the later PES B PTS"
         );
         assert_eq!(f[1].data.len(), 600, "AU2 = core2");
         assert_eq!(
             f[1].pts_ns,
-            pts_to_ns(200),
-            "AU2's core arrived in PES B → PES B PTS"
+            pts_to_ns(190000),
+            "AU2's core is in PES B → attributes to PES B PTS (ahead of the clock, so it wins)"
         );
 
-        // AU3 (core3) drains on flush, also PES B PTS.
+        // AU3 (core3) drains on flush — 2nd core in PES B, so it advances one
+        // frame duration from AU2 to stay monotonic.
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].pts_ns, pts_to_ns(200));
+        assert_eq!(tail[0].pts_ns, pts_to_ns(190000) + DTS_CORE_DUR_NS);
     }
 
     #[test]
@@ -728,23 +824,80 @@ mod tests {
         // AU2 (core2) held awaiting a third core.
         let mut pes_a = make_dts_core(512);
         pes_a.extend_from_slice(&make_dts_core(600));
-        let f = parser.parse(&make_pes(pes_a, Some(100)));
+        let f = parser.parse(&make_pes(pes_a, Some(90000)));
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].pts_ns, pts_to_ns(100), "AU1 PES A PTS");
+        assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU1 PES A PTS");
 
-        // PES B: core3 — closes AU2 (core2). AU2's core was in PES A.
-        let f2 = parser.parse(&make_pes(make_dts_core(640), Some(200)));
+        // PES B (realistically later): core3 — closes AU2 (core2). AU2's core
+        // was in PES A, so it is PES A's 2nd frame: it advances one frame
+        // duration from AU1 (still on PES A's timeline, and monotonic) — it does
+        // NOT inherit the closing PES B PTS.
+        let f2 = parser.parse(&make_pes(make_dts_core(640), Some(190000)));
         assert_eq!(f2.len(), 1);
         assert_eq!(f2[0].data.len(), 600, "AU2 = core2");
         assert_eq!(
             f2[0].pts_ns,
-            pts_to_ns(100),
-            "AU2's core arrived in PES A → must keep PES A's PTS, not PES B's"
+            pts_to_ns(90000) + DTS_CORE_DUR_NS,
+            "AU2 = 2nd frame of PES A → PES A base + one frame, not the closing PES B PTS"
         );
 
+        // AU3 = core3, whose own core is in PES B → jumps to PES B's PTS.
         let tail = parser.flush();
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].pts_ns, pts_to_ns(200), "AU3 = core3, PES B PTS");
+        assert_eq!(
+            tail[0].pts_ns,
+            pts_to_ns(190000),
+            "AU3 = core3 in PES B → PES B PTS"
+        );
+    }
+
+    #[test]
+    fn dvd_many_cores_one_pes_are_strictly_monotonic() {
+        // Punisher-DVD reproduction: a single PES carrying SEVERAL DTS core
+        // frames (the DVD packing) must emit STRICTLY-increasing PTSs. The old
+        // code stamped every AU with the one PES PTS, which ffmpeg rejected as
+        // "non monotonically increasing dts to muxer: X >= X".
+        let mut parser = DtsParser::new();
+        let mut stream = Vec::new();
+        for _ in 0..6 {
+            stream.extend_from_slice(&make_dts_core(512));
+        }
+        let mut frames = parser.parse(&make_pes(stream, Some(90000)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 6, "all six cores emitted");
+        for w in frames.windows(2) {
+            assert!(
+                w[1].pts_ns > w[0].pts_ns,
+                "consecutive DTS AUs must STRICTLY increase: {} !> {}",
+                w[1].pts_ns,
+                w[0].pts_ns
+            );
+        }
+        // Each advances by exactly one frame duration, and carries that duration.
+        assert_eq!(frames[0].pts_ns, pts_to_ns(90000));
+        assert_eq!(frames[1].pts_ns, pts_to_ns(90000) + DTS_CORE_DUR_NS);
+        assert_eq!(frames[5].pts_ns, pts_to_ns(90000) + 5 * DTS_CORE_DUR_NS);
+        for f in &frames {
+            assert_eq!(f.duration_ns, Some(DTS_CORE_DUR_NS as u64));
+        }
+    }
+
+    #[test]
+    fn dts_core_duration_512_samples_48khz() {
+        // NBLKS=15 → (15+1)*32 = 512 samples; SFREQ=13 → 48 kHz.
+        let core = make_dts_core(512);
+        assert_eq!(dts_core_samples(&core), 512);
+        assert_eq!(dts_core_sample_rate(&core), 48_000);
+        assert_eq!(dts_core_duration_ns(&core), DTS_CORE_DUR_NS as u64);
+    }
+
+    #[test]
+    fn dts_core_sfreq_reserved_falls_back_to_48k() {
+        // A bogus SFREQ index must never yield a zero rate (division) — fall
+        // back to 48 kHz.
+        let mut core = make_dts_core(512);
+        core[8] = 0; // SFREQ = 0 (reserved)
+        assert_eq!(dts_core_sample_rate(&core), 48_000);
     }
 
     /// Build a minimal DTS-HD extension substream of `size` bytes (just the
