@@ -36,7 +36,10 @@ pub const PATH_CONTENT_CERT: &str = "/AACS/Content000.cer";
 pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
 
 // Boil-down derivation primitives (thin newtypes + wrappers over the crypto).
-pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk};
+pub use boil::{
+    KeyCandidate, MediaKey, ProcessingKey, ResolvedChain, UnitKey, Vid, Vuk, mk_from_dk,
+    mk_from_pk, resolve_candidate, uk_from_vuk, vuk_from_mk,
+};
 // Structured, English-free resolution trace.
 pub use trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, UnlockStep};
 
