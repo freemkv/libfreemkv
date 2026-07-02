@@ -20,14 +20,16 @@
 //!   uk_from_vuk(Vuk, enc_title_keys)   →  [UnitKey]  (decrypt_unit_key each)
 //! ```
 //!
-//! `mk_from_dk` and `mk_from_pk` are two entry points to the SAME Media Key:
-//! the device-key path walks the MKB's Media-Key-Variant chain, the
-//! processing-key path walks the MKB's Subset-Difference cvalue tables. Neither
-//! needs a VID (the VID enters at `vuk_from_mk`).
+//! `mk_from_dk` and `mk_from_pk` are two entry points to the SAME Media Key,
+//! both via the MKB's Subset-Difference cvalue tables: the device-key path
+//! recovers its Processing Key at the matching SD node and walks on to the MK;
+//! the processing-key path starts from a precomputed PK. Neither needs a VID
+//! (the VID enters at `vuk_from_mk`).
 
-use super::keys::{decrypt_unit_key, derive_media_key_from_pk, derive_vuk};
+use super::keys::{
+    decrypt_unit_key, derive_media_key_and_pk_from_dk, derive_media_key_from_pk, derive_vuk,
+};
 use super::types::DeviceKey;
-use super::variants::{KEY_CORRECTION_DATA_PLACEHOLDER, derive_media_key_variant, walk_mkb};
 
 /// Volume ID (16 bytes) — read from the disc via the SCSI handshake / OEM path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,12 @@ pub struct MediaKey(pub [u8; 16]);
 /// decrypts the per-disc encrypted title keys in `Unit_Key_RO.inf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vuk(pub [u8; 16]);
+
+/// Processing Key (Kp, 16 bytes) — an MKB Subset-Difference key that yields the
+/// Media Key. A leaked/precomputed PK in the keydb, or the intermediate PK a
+/// device-key walk derives at its matching SD node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessingKey(pub [u8; 16]);
 
 /// One decrypted per-CPS-unit AACS title key.
 ///
@@ -84,36 +92,30 @@ pub fn uk_from_vuk(vuk: Vuk, enc_title_keys: &[[u8; 16]]) -> Vec<UnitKey> {
         .collect()
 }
 
-/// Derive the Media Key (Km) from device keys via the Media Key Variant chain.
+/// Derive the Media Key (Km) from positioned device keys via the MKB's
+/// Subset-Difference tables.
 ///
-/// Wraps [`walk_mkb`] + [`derive_media_key_variant`] with exactly the arguments
-/// `resolve_keys_v21` path 1 passes: the placeholder Key Correction Data and the
-/// disc Volume ID. Returns the FIRST tuple element `Km` (the Media Key) — the
-/// resolver treats `Km` as the media key and derives the VUK from it as
-/// `Kvu = AES-G(Km, VID)`, which equals [`vuk_from_mk`]`(MediaKey(km), vid)`. The
-/// variant fn's second element is that already-derived `Kvu`; returning `Km`
-/// keeps this primitive at the "media key" level so the chain composes.
+/// Wraps [`derive_media_key_and_pk_from_dk`] — the real SD walk the resolver
+/// runs: each positioned device key is placed against the MKB's subset-diff /
+/// cvalue records, recovering its Processing Key at the matching node and
+/// continuing to the Media Key. Reachable for real discs whenever a device key
+/// applies to the MKB. No VID is involved here — it enters at [`vuk_from_mk`].
 ///
-/// Because the integrator KCD is unavailable in-tree (the placeholder is
-/// rejected by the variant chain), this returns `Err` for every real disc today
-/// — byte-for-byte identical to `resolve_keys_v21` path 1, which the resolver
-/// also leaves unreachable in production. All variant-chain failures collapse to
-/// [`Error::AacsMkUnavailable`] (E7018): no numeric distinction is load-bearing
-/// at this boundary, and the variant error carries no English to preserve.
-pub fn mk_from_dk(
-    device_keys: &[DeviceKey],
-    mkb: &[u8],
-    vid: Vid,
-) -> Result<MediaKey, crate::error::Error> {
-    let records = walk_mkb(mkb);
-    match derive_media_key_variant(
-        &records,
-        device_keys,
-        &KEY_CORRECTION_DATA_PLACEHOLDER,
-        &vid.0,
-    ) {
-        Ok((km, _kvu)) => Ok(MediaKey(km)),
-        Err(_) => Err(crate::error::Error::AacsMkUnavailable),
+/// Returns [`Error::AacsMkUnavailable`] (E7018) when no supplied device key
+/// resolves the MKB — the same terminal error as [`mk_from_pk`]; no numeric
+/// distinction is load-bearing at this boundary.
+///
+/// [`Error::AacsMkUnavailable`]: crate::error::Error::AacsMkUnavailable
+pub fn mk_from_dk(device_keys: &[DeviceKey], mkb: &[u8]) -> Result<MediaKey, crate::error::Error> {
+    // Positioned device keys drive the real Subset-Difference MKB walk
+    // ([`derive_media_key_and_pk_from_dk`], the same walk the resolver runs). The
+    // old Media-Key-Variant path needed integrator Key Correction Data absent
+    // in-tree, so it Err'd for EVERY real disc (dead for both consumers —
+    // freemkv-keysources' DK fallback and the kdb harvester). No VID is needed
+    // for the Media Key; it enters only at [`vuk_from_mk`].
+    match derive_media_key_and_pk_from_dk(mkb, device_keys) {
+        Some((km, _pk)) => Ok(MediaKey(km)),
+        None => Err(crate::error::Error::AacsMkUnavailable),
     }
 }
 
@@ -139,6 +141,134 @@ pub fn mk_from_pk(
     match derive_media_key_from_pk(mkb, processing_keys) {
         Some(km) => Ok(MediaKey(km)),
         None => Err(crate::error::Error::AacsMkUnavailable),
+    }
+}
+
+/// A candidate key at any rung of the AACS ladder, handed to [`resolve_candidate`].
+///
+/// Each variant carries the module's existing newtype for that rung (a `Dk` is a
+/// POSITIONED [`DeviceKey`] — recover an unpositioned one with
+/// [`super::keys::recover_dk_position`] first).
+#[derive(Debug, Clone)]
+pub enum KeyCandidate {
+    Uk(UnitKey),
+    Vuk(Vuk),
+    Mk(MediaKey),
+    Pk(ProcessingKey),
+    Dk(DeviceKey),
+}
+
+/// The AACS key chain derived from a candidate, from [`resolve_candidate`].
+///
+/// PURE DERIVATION — no unit sampling, no validation. `unit_keys` holds every
+/// CPS-unit key the disc's `Unit_Key_RO.inf` yields from the VUK (positional
+/// order); the caller runs [`super::decrypt::unit_key_validates`] to find which
+/// one actually opens the disc. Rungs above the candidate are `None` (a `Vuk`
+/// candidate has no `mk`/`pk`/`dk`; a `Uk` candidate has only `unit_keys`).
+#[derive(Debug, Clone)]
+pub struct ResolvedChain {
+    /// Every unit key derived from the VUK, as `(cps_unit_number, key)` — the
+    /// CPS-unit numbers come from `Unit_Key_RO.inf` (via `parse_unit_key_ro`), so
+    /// a consumer maps `UK → CPS unit` directly. Same shape as
+    /// [`super::keys::ResolvedKeys::unit_keys`]. A `Uk` candidate yields exactly
+    /// itself, keyed by its own `idx`.
+    pub unit_keys: Vec<(u32, [u8; 16])>,
+    pub vuk: Option<Vuk>,
+    pub mk: Option<MediaKey>,
+    pub pk: Option<ProcessingKey>,
+    /// The positioned device key (for a `Dk` candidate).
+    pub dk: Option<DeviceKey>,
+}
+
+/// Derive the full AACS key chain from a candidate key of ANY ladder rung.
+///
+/// Runs the deterministic derivation DOWNWARD to the disc's terminal unit keys:
+/// `DK → MK → VUK → UKs`, `PK → MK → VUK → UKs`, `MK → VUK → UKs`,
+/// `VUK → UKs`, or `UK → itself`. Composes the module's own boil steps
+/// ([`mk_from_pk`], [`vuk_from_mk`], [`uk_from_vuk`]) and parses
+/// `Unit_Key_RO.inf` at the version the disc's MKB declares (48-byte stride for
+/// AACS-1.0, 64 for AACS-2.x), so a multi-CPS disc yields all its unit keys from
+/// the one candidate.
+///
+/// PURE DERIVATION: no sampling, no validation, no position recovery. Every step
+/// is deterministic AES, so the returned keys are only as sound as the input
+/// candidate — validate `unit_keys` against a real encrypted unit with
+/// [`super::decrypt::unit_key_validates`] to prove the candidate opens the disc.
+///
+/// Returns `None` only when derivation itself cannot proceed: a PK its MKB
+/// rejects, a `Dk` the MKB can't process, a missing VID on a path that needs
+/// one, or an unparseable/empty `Unit_Key_RO.inf`.
+pub fn resolve_candidate(
+    candidate: &KeyCandidate,
+    mkb: &[u8],
+    unit_key_ro: &[u8],
+    vid: Option<Vid>,
+) -> Option<ResolvedChain> {
+    use super::keys::{AacsVersion, derive_media_key_and_pk_from_dk, mkb_type, parse_unit_key_ro};
+
+    // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
+    // `.inf` parsing lives here: derive the stride version from the disc's own
+    // MKB, then defer the VUK→unit-keys step to the shared `derive_unit_keys`
+    // (the one place both resolvers and this path decrypt the title keys).
+    let boil = |vuk: Vuk| -> Option<Vec<(u32, [u8; 16])>> {
+        let version = mkb_type(mkb)
+            .map(|t| t.generation())
+            .unwrap_or(AacsVersion::V10);
+        let ukf = parse_unit_key_ro(unit_key_ro, version)?;
+        if ukf.encrypted_keys.is_empty() {
+            return None;
+        }
+        Some(super::keys::derive_unit_keys(&ukf, &vuk.0))
+    };
+
+    match candidate {
+        KeyCandidate::Uk(uk) => Some(ResolvedChain {
+            unit_keys: vec![(uk.idx, uk.key)],
+            vuk: None,
+            mk: None,
+            pk: None,
+            dk: None,
+        }),
+        KeyCandidate::Vuk(v) => Some(ResolvedChain {
+            unit_keys: boil(*v)?,
+            vuk: Some(*v),
+            mk: None,
+            pk: None,
+            dk: None,
+        }),
+        KeyCandidate::Mk(mk) => {
+            let vuk = vuk_from_mk(*mk, vid?);
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(*mk),
+                pk: None,
+                dk: None,
+            })
+        }
+        KeyCandidate::Pk(pk) => {
+            let mk = mk_from_pk(std::slice::from_ref(&pk.0), mkb).ok()?;
+            let vuk = vuk_from_mk(mk, vid?);
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(mk),
+                pk: Some(*pk),
+                dk: None,
+            })
+        }
+        KeyCandidate::Dk(dk) => {
+            let (km, pk) = derive_media_key_and_pk_from_dk(mkb, std::slice::from_ref(dk))?;
+            let mk = MediaKey(km);
+            let vuk = vuk_from_mk(mk, vid?);
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(mk),
+                pk: Some(ProcessingKey(pk)),
+                dk: Some(dk.clone()),
+            })
+        }
     }
 }
 
@@ -205,27 +335,28 @@ mod tests {
         assert!(uk_from_vuk(Vuk([0u8; 16]), &[]).is_empty());
     }
 
-    /// `mk_from_dk` returns `Err(AacsMkUnavailable)` for the placeholder-KCD
-    /// path that production also leaves unreachable — never a wrong key, never a
-    /// panic — on both an empty MKB and a non-variant MKB.
+    /// `mk_from_dk` returns `Err(AacsMkUnavailable)` when the MKB has no
+    /// processable Subset-Difference tables (empty MKB, or one with no
+    /// mk_dv/cvalues/subdiff records) — never a wrong key, never a panic.
     #[test]
-    fn mk_from_dk_errors_without_integrator_kcd() {
+    fn mk_from_dk_errors_on_unprocessable_mkb() {
         let dk = DeviceKey {
             key: [0x11; 16],
             node: 1,
             uv: 1,
             u_mask_shift: 0,
         };
-        // Empty MKB → not a variant MKB → Err.
-        let e = mk_from_dk(std::slice::from_ref(&dk), &[], Vid([0x09; 16]));
+        // Empty MKB → no SD records to walk → Err.
+        let e = mk_from_dk(std::slice::from_ref(&dk), &[]);
         assert!(matches!(e, Err(crate::error::Error::AacsMkUnavailable)));
 
-        // A variant-looking MKB (0x82 record) still cannot complete without the
-        // integrator KCD, so it also errors — never silently yields a key.
+        // An MKB with no complete Subset-Difference tables (mk_dv / cvalues /
+        // subdiff) cannot yield a Media Key, so the real walk also errors —
+        // never silently yields a key.
         let mut mkb: Vec<u8> = Vec::new();
-        mkb.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]); // variant data record
+        mkb.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]); // stray data record only
         mkb.extend_from_slice(&[0xAB; 16]);
-        let e2 = mk_from_dk(&[dk], &mkb, Vid([0x09; 16]));
+        let e2 = mk_from_dk(&[dk], &mkb);
         assert!(matches!(e2, Err(crate::error::Error::AacsMkUnavailable)));
     }
 
@@ -304,5 +435,66 @@ mod tests {
             mk_from_pk(std::slice::from_ref(&bad), &mkb),
             Err(crate::error::Error::AacsMkUnavailable)
         ));
+    }
+
+    /// Minimal AACS-1.0 (48-byte stride) `Unit_Key_RO.inf` with `n` encrypted
+    /// unit keys — `parse_unit_key_ro` numbers CPS units 1..=n.
+    fn synth_inf(encs: &[[u8; 16]]) -> Vec<u8> {
+        let uk_pos = 32usize;
+        let stride = 48usize;
+        let n = encs.len();
+        let total = uk_pos + 48 + n.saturating_sub(1) * stride + 16;
+        let mut inf = vec![0u8; total.max(20)];
+        inf[..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        inf[uk_pos..uk_pos + 2].copy_from_slice(&(n as u16).to_be_bytes());
+        for (i, k) in encs.iter().enumerate() {
+            let o = uk_pos + 48 + i * stride;
+            inf[o..o + 16].copy_from_slice(k);
+        }
+        inf
+    }
+
+    /// A VUK candidate boils to ALL the disc's unit keys, each paired with its
+    /// declared CPS-unit number, and each key equals the VUK-decrypt of its slot.
+    #[test]
+    fn resolve_candidate_vuk_returns_all_cps_units() {
+        let vuk = Vuk([0x33u8; 16]);
+        let encs = [[0x11u8; 16], [0x22u8; 16], [0x44u8; 16]];
+        let inf = synth_inf(&encs);
+        let r = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None).expect("vuk derives");
+        let cps: Vec<u32> = r.unit_keys.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            cps,
+            vec![1, 2, 3],
+            "every CPS unit surfaced, numbered from the inf"
+        );
+        for ((_, key), enc) in r.unit_keys.iter().zip(encs.iter()) {
+            assert_eq!(
+                *key,
+                decrypt_unit_key(&vuk.0, enc),
+                "key = VUK-decrypt of its slot"
+            );
+        }
+        assert_eq!(r.vuk, Some(vuk));
+        assert!(r.mk.is_none() && r.pk.is_none() && r.dk.is_none());
+    }
+
+    /// A bare UK candidate is terminal — it returns itself keyed by its own idx.
+    #[test]
+    fn resolve_candidate_uk_is_itself() {
+        let uk = UnitKey {
+            idx: 2,
+            key: [0x9u8; 16],
+        };
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
+        assert_eq!(r.unit_keys, vec![(2, uk.key)]);
+        assert!(r.vuk.is_none() && r.mk.is_none());
+    }
+
+    /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.
+    #[test]
+    fn resolve_candidate_mk_requires_vid() {
+        let r = resolve_candidate(&KeyCandidate::Mk(MediaKey([1u8; 16])), &[], &[], None);
+        assert!(r.is_none(), "MK path returns None without a VID");
     }
 }
