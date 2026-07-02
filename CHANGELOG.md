@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.1] — 2026-07-02
+
+### Fixed
+
+- **DVD DTS audio no longer muxes with non-monotonic timestamps.** A DVD
+  Program Stream packs several DTS core frames into one PES packet; the parser
+  stamped every access unit with that single PES timestamp and no per-frame
+  duration, so consecutive frames collided on one PTS. A strict decode/remux
+  (ffmpeg) rejected the result — `non monotonically increasing dts to muxer` —
+  and reported the track as corrupt, sometimes with spurious `[dca] Failed to
+  decode block` errors. The DTS parser now derives each core frame's duration
+  from its header (`(NBLKS+1)*32` samples ÷ the `SFREQ` sample rate) and stamps
+  a monotonically-advancing PTS, so frames sharing a PES advance frame-by-frame.
+  The UHD DTS-HD MA path (one access unit per PES with its own timestamp) is
+  unchanged — a later PES whose timestamp is already ahead still wins, so the
+  1.2.0 per-PES attribution is preserved. This completes the DVD DTS fix begun
+  in 1.2.0 (which corrected the silent-track routing, exposing this timing bug).
+
 ## [1.2.0] — 2026-07-01
 
 ### Breaking
