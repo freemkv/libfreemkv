@@ -77,6 +77,18 @@ pub fn decrypt_unit_key(vuk: &[u8; 16], encrypted_uk: &[u8; 16]) -> [u8; 16] {
     aes_ecb_decrypt(vuk, encrypted_uk)
 }
 
+/// Decrypt every encrypted unit key in a parsed `Unit_Key_RO.inf` with a VUK,
+/// paired with its declared CPS-unit number. THE single VUK→unit-keys step:
+/// both classical/v21 resolvers and `boil::resolve_candidate` call this, so the
+/// map cannot drift between the player and harvest paths.
+pub(crate) fn derive_unit_keys(uk_file: &UnitKeyFile, vuk: &[u8; 16]) -> Vec<(u32, [u8; 16])> {
+    uk_file
+        .encrypted_keys
+        .iter()
+        .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
+        .collect()
+}
+
 // ── Unit_Key_RO.inf parsing ─────────────────────────────────────────────────
 
 /// Parsed Unit_Key_RO.inf file.
@@ -1203,13 +1215,7 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         .unwrap_or(false);
     let has_vid = *ctx.volume_id != [0u8; 16];
 
-    let derive_uks = |vuk: &[u8; 16]| -> Vec<(u32, [u8; 16])> {
-        uk_file
-            .encrypted_keys
-            .iter()
-            .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
-            .collect()
-    };
+    let derive_uks = |vuk: &[u8; 16]| derive_unit_keys(&uk_file, vuk);
 
     let build =
         |vuk: Option<[u8; 16]>, unit_keys: Vec<(u32, [u8; 16])>, key_source: u8| -> ResolvedKeys {
@@ -1331,13 +1337,7 @@ fn resolve_keys_classical(ctx: &ResolveContext<'_>, version: AacsVersion) -> Opt
     let has_vid = *ctx.volume_id != [0u8; 16];
 
     // Decrypt the disc's encrypted unit keys with a freshly-derived VUK.
-    let derive_uks = |vuk: &[u8; 16]| -> Vec<(u32, [u8; 16])> {
-        uk_file
-            .encrypted_keys
-            .iter()
-            .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
-            .collect()
-    };
+    let derive_uks = |vuk: &[u8; 16]| derive_unit_keys(&uk_file, vuk);
 
     // Common result constructor — paths 1-4 supply Some(VUK) + derived
     // unit keys; path 5 supplies None + pre-decrypted unit keys from
