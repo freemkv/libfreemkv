@@ -38,15 +38,16 @@ pub struct DtsParser {
     /// current `buf` start and rebased whenever bytes are drained from the
     /// front.
     pts_marks: Vec<(usize, i64)>,
-    /// Running monotonic timestamp: the PTS the NEXT emitted access unit must
-    /// not fall below. Each AU is stamped `max(next_pts_ns, its own core PES
-    /// PTS)` and then `next_pts_ns` advances by the AU's decoded duration. This
-    /// is what makes the DVD case — several DTS core frames packed in ONE PES,
-    /// all reporting that single PES PTS — advance frame-by-frame instead of
-    /// colliding on one timestamp (the "non monotonically increasing dts" mux
-    /// error). The UHD/DTS-HD MA case (one AU per PES with its own later PTS) is
-    /// unaffected: that PTS is `>= next_pts_ns`, so the AU keeps its own PES's
-    /// timestamp exactly as before. `PTS_UNSET` = no base captured yet.
+    /// The `front_pts` of the PREVIOUS emitted access unit. When the current
+    /// AU's `front_pts` differs, it began a new PES → re-base to it. When it is
+    /// unchanged, this AU shares the previous AU's PES → advance one frame
+    /// duration. This per-PES re-base (rather than a global running clock) is
+    /// what keeps a feature-long DVD DTS track from drifting past its real
+    /// length. `PTS_UNSET` = no AU emitted yet.
+    last_front_pts: i64,
+    /// The PTS for the NEXT AU *if it shares the current PES* (the within-PES
+    /// running cursor: previous emit + its duration). Only consulted when
+    /// `front_pts` is unchanged from `last_front_pts`. `PTS_UNSET` = no base yet.
     next_pts_ns: i64,
 }
 
@@ -62,24 +63,37 @@ impl DtsParser {
             buf: Vec::with_capacity(32768),
             pending_pts: 0,
             pts_marks: Vec::new(),
+            last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
         }
     }
 
-    /// Stamp an access unit with a monotonic PTS and advance the running clock.
-    /// `front` is the AU's own core-PES PTS (from [`front_pts`]); `dur_ns` its
-    /// decoded duration. Honors a forward jump to a new PES PTS (UHD multi-PES
-    /// AUs) but never emits below the running clock (DVD multi-AU-per-PES).
+    /// Stamp an access unit's PTS. `front` is the AU's own core-PES PTS (from
+    /// [`front_pts`]); `dur_ns` its decoded duration.
+    ///
+    /// The model matches the (correct) AC-3 path: **re-base to each PES's own
+    /// container timestamp, and advance by one frame duration ONLY within a run
+    /// of AUs that share the same PES.** A new PES (its `front` differs from the
+    /// previous AU's) trusts its own timestamp — so the emitted timeline tracks
+    /// the container and never drifts. Advancing within a PES is what fixes the
+    /// DVD case (several DTS core frames packed in one PES, which otherwise all
+    /// collided on that single PES timestamp → "non monotonically increasing
+    /// dts"). A global running clock was WRONG here: once accumulated frame
+    /// durations exceeded the PES spacing it never re-based, drifting the track
+    /// minutes past the real length over a feature-long title.
     fn stamp_pts(&mut self, front: i64, dur_ns: i64) -> i64 {
-        let base = if front != PTS_UNSET && front > self.next_pts_ns {
+        let base = if front != PTS_UNSET && front != self.last_front_pts {
+            // New PES (or the first AU): trust its own timestamp — no drift.
             front
         } else if self.next_pts_ns != PTS_UNSET {
+            // Same PES as the previous AU (front unchanged) → advance one frame.
             self.next_pts_ns
         } else if front != PTS_UNSET {
             front
         } else {
             0
         };
+        self.last_front_pts = front;
         self.next_pts_ns = base + dur_ns;
         base
     }
@@ -167,8 +181,9 @@ impl CodecParser for DtsParser {
             self.pts_marks.clear();
             self.pending_pts = PTS_UNSET;
             // A concealed gap is a timeline discontinuity: let the post-gap AU
-            // re-base to its own (later) PES PTS rather than the pre-gap clock.
+            // re-base to its own PES PTS rather than the pre-gap cursor.
             self.next_pts_ns = PTS_UNSET;
+            self.last_front_pts = PTS_UNSET;
         }
         if pes.data.is_empty() {
             return Vec::new();
@@ -898,6 +913,44 @@ mod tests {
         let mut core = make_dts_core(512);
         core[8] = 0; // SFREQ = 0 (reserved)
         assert_eq!(dts_core_sample_rate(&core), 48_000);
+    }
+
+    #[test]
+    fn new_pes_rebases_to_its_own_pts_no_drift() {
+        // Regression for the drift bug: a global running clock overshot a
+        // feature-long DTS track by minutes (2h44 for a 2h03 film). When a NEW
+        // PES arrives whose PTS is BEHIND where accumulated frame durations
+        // would put a running clock, the AU must re-base to that PES's OWN
+        // timestamp — tracking the container, not drifting ahead of it.
+        let mut parser = DtsParser::new();
+        // PES A: core1 + core2 (2 frames), pts 90000.
+        let mut pes_a = make_dts_core(512);
+        pes_a.extend_from_slice(&make_dts_core(600));
+        let f = parser.parse(&make_pes(pes_a, Some(90000)));
+        assert_eq!(f.len(), 1, "AU1 (core1) emits on the core2 boundary");
+        assert_eq!(f[0].pts_ns, pts_to_ns(90000), "AU1 = PES A base");
+        // PES B: core3, pts only 500 ticks after PES A — LESS than one frame
+        // (960 ticks @ 48 kHz). AU2 (core2, still PES A) advances within PES A;
+        // AU3 (core3, PES B) must RE-BASE to PES B's own PTS.
+        let f2 = parser.parse(&make_pes(make_dts_core(640), Some(90500)));
+        assert_eq!(f2.len(), 1, "AU2 (core2) closes on core3");
+        assert_eq!(
+            f2[0].pts_ns,
+            pts_to_ns(90000) + DTS_CORE_DUR_NS,
+            "AU2 = 2nd frame of PES A → advances one frame within PES A"
+        );
+        let tail = parser.flush();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(
+            tail[0].pts_ns,
+            pts_to_ns(90500),
+            "AU3 = core3 in PES B → re-bases to PES B's PTS"
+        );
+        assert_ne!(
+            tail[0].pts_ns,
+            pts_to_ns(90000) + 2 * DTS_CORE_DUR_NS,
+            "must NOT carry the accumulated running clock across a PES (drift)"
+        );
     }
 
     /// Build a minimal DTS-HD extension substream of `size` bytes (just the
