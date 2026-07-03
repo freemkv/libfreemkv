@@ -252,8 +252,17 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
 
 /// Derive Media Key from MKB data using processing keys.
 ///
-/// Processing keys are pre-computed keys that work for specific MKB versions.
-/// This is the fast path — no subset-difference tree traversal needed.
+/// A Processing Key is **terminal**: it is the key at its Subset-Difference
+/// node, one `AES-G` from the Media Key. So this is the fast path — each PK is
+/// tried *directly* against the MKB cvalue tables (no tree descent), matching
+/// libaacs `_calc_mk_pks` (iterate PKs × cvalues). On a large AACS 2.x UHD MKB
+/// (~181k cvalues) this is ~15x faster than treating a PK as a device-node
+/// label and walking the tree.
+///
+/// If you hold a **device-node label** at unknown tree depth (not a terminal
+/// PK), derive its Media Key through the device-key path
+/// ([`derive_media_key_from_dk`]) — that path owns the Subset-Difference tree
+/// walk; the PK path never descends.
 ///
 /// MKB format:
 ///   Record type 0x10 = Type and Version Record (has MKB version)
@@ -263,67 +272,28 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
 ///   Record type 0x05 = Media Key Data Record (cvalues, 1:1 with 0x04)
 ///   Record type 0x07 = Explicit Subset-Difference Record (NOT cvalues)
 pub fn derive_media_key_from_pk(mkb: &[u8], processing_keys: &[[u8; 16]]) -> Option<[u8; 16]> {
-    derive_media_key_from_pk_walked(mkb, processing_keys, PK_WALK_MAX_DEPTH)
-}
-
-/// SD-tree walk depth applied to every entry in `processing_keys`.
-///
-/// Each entry is treated as a node-key (label) at unknown depth. The
-/// resolver applies `AES-G3(K, 1)` to derive the PK at this node, then
-/// descends via `AES-G3(K, 0)` (left child) and `AES-G3(K, 2)` (right
-/// child) up to this many additional levels — try-everything since we
-/// have no path bits per entry.
-///
-/// Each level doubles the candidate count. Cost per entry per MKB
-/// cvalue ≈ `2 × (2^(D+1) - 1)` AES decrypts. For a ~100-cvalue MKB
-/// (typical UHD) at depth 2: ~14 × 100 = 1400 ops per entry; for 1.5k
-/// entries that's ~2 M validate calls, sub-second with AES-NI.
-///
-/// Set to 0 to disable walking (entries tried only as terminal PKs).
-const PK_WALK_MAX_DEPTH: u8 = 3;
-
-/// Hard ceiling on the requested walk depth. The BFS frontier holds `2^depth`
-/// 16-byte node keys, so an uncapped `max_depth` (e.g. 26+) would exhaust
-/// memory; the walk silently clamps to this. 5 (32-wide frontier) covers every
-/// realistic leaked-label case with margin.
-const PK_WALK_MAX_DEPTH_CAP: u8 = 5;
-
-/// Same as [`derive_media_key_from_pk`] but with explicit walk depth.
-/// Each entry is tried as a terminal PK at depth 0, then as a node-key
-/// whose PK and children are derived via `AES-G3(K, 0|1|2)` for up to
-/// `max_depth` additional levels.
-///
-/// The BFS frontier grows as `2^max_depth`; `max_depth` is clamped to
-/// [`PK_WALK_MAX_DEPTH_CAP`] so a large value cannot exhaust memory.
-pub(crate) fn derive_media_key_from_pk_walked(
-    mkb: &[u8],
-    processing_keys: &[[u8; 16]],
-    max_depth: u8,
-) -> Option<[u8; 16]> {
     let mk_dv = mkb_find_mk_dv(mkb)?;
     let uvs = mkb_find_subdiff_records(mkb)?;
     let cvalues = mkb_find_cvalues(mkb)?;
-    walk_pk_against_tables_impl(processing_keys, &uvs, &cvalues, &mk_dv, max_depth)
+    try_pk_against_tables(processing_keys, &uvs, &cvalues, &mk_dv)
 }
 
-/// Core Subset-Difference PK walk over explicit record bodies. The single PK→MK
-/// walk engine, reached in production via [`derive_media_key_from_pk`].
-fn walk_pk_against_tables_impl(
+/// Core terminal-PK table scan over explicit record bodies. Each processing
+/// key is tried **directly** against every `(uv, cvalue)` pair — no tree
+/// descent. Reached in production via [`derive_media_key_from_pk`]; factored
+/// out so reproduction harnesses can drive it with explicit tables.
+fn try_pk_against_tables(
     processing_keys: &[[u8; 16]],
     uvs: &[u8],
     cvalues: &[u8],
     mk_dv: &[u8; 16],
-    max_depth: u8,
 ) -> Option<[u8; 16]> {
-    // Clamp the frontier depth (2^depth node keys) so a caller-supplied value
-    // cannot OOM the process.
-    let max_depth = max_depth.min(PK_WALK_MAX_DEPTH_CAP);
     let num_uvs = uvs
         .chunks(5)
         .take_while(|c| c.len() == 5 && (c[0] & 0xC0) == 0)
         .count();
 
-    let try_against_mkb = |pk: &[u8; 16]| -> Option<[u8; 16]> {
+    for pk in processing_keys {
         for i in 0..num_uvs {
             if (i + 1) * 16 > cvalues.len() {
                 continue;
@@ -337,48 +307,6 @@ fn walk_pk_against_tables_impl(
             if let Some(mk) = validate_processing_key(pk, cv, uv, mk_dv) {
                 return Some(mk);
             }
-        }
-        None
-    };
-
-    // Two interpretations per entry:
-    //   (a) entry IS already a terminal PK → validate directly
-    //   (b) entry is a node key (label) → derive PK via aesg3(K, 1) and validate
-    // Then descend to children's node keys via aesg3(K, 0) / aesg3(K, 2) and
-    // repeat up to max_depth levels deep.
-    for entry in processing_keys {
-        // Depth-0 attempts on the raw entry
-        if let Some(mk) = try_against_mkb(entry) {
-            return Some(mk);
-        }
-        let pk_at_node = aesg3(entry, 1);
-        if let Some(mk) = try_against_mkb(&pk_at_node) {
-            return Some(mk);
-        }
-        if max_depth == 0 {
-            continue;
-        }
-        // Walk: BFS through child node keys
-        let mut frontier: Vec<[u8; 16]> = vec![aesg3(entry, 0), aesg3(entry, 2)];
-        for depth in 1..=max_depth {
-            let mut next = Vec::with_capacity(frontier.len() * 2);
-            for nk in &frontier {
-                // Try this node's PK (label → PK at this level)
-                let pk_here = aesg3(nk, 1);
-                if let Some(mk) = try_against_mkb(&pk_here) {
-                    return Some(mk);
-                }
-                // Some leaked materials are themselves PKs at this depth, so
-                // also try the node-key bytes directly.
-                if let Some(mk) = try_against_mkb(nk) {
-                    return Some(mk);
-                }
-                if depth < max_depth {
-                    next.push(aesg3(nk, 0));
-                    next.push(aesg3(nk, 2));
-                }
-            }
-            frontier = next;
         }
     }
     None
@@ -1785,11 +1713,11 @@ mod tests {
     }
 
     #[test]
-    fn probe_walk_pk_against_tables_accepts_planted_pk_rejects_corrupt() {
-        // Lock in the shared SD walk (`walk_pk_against_tables_impl`) used by the
+    fn probe_try_pk_against_tables_accepts_planted_pk_rejects_corrupt() {
+        // Lock in the terminal PK scan (`try_pk_against_tables`) used by the
         // production PK path (`derive_media_key_from_pk`). Plant a terminal PK
         // whose derived Media Key satisfies a synthetic verify record; confirm
-        // the walk ACCEPTS it against caller-supplied SD/cvalue tables and
+        // the scan ACCEPTS it against caller-supplied SD/cvalue tables and
         // REJECTS a 1-byte corruption.
         use super::super::decrypt::aes_ecb_encrypt as enc;
 
@@ -1817,14 +1745,14 @@ mod tests {
         subdiff.extend_from_slice(&uv);
 
         assert_eq!(
-            walk_pk_against_tables_impl(std::slice::from_ref(&pk), &subdiff, &cv, &mk_dv, 1),
+            try_pk_against_tables(std::slice::from_ref(&pk), &subdiff, &cv, &mk_dv),
             Some(mk),
             "planted terminal PK must verify"
         );
         let mut bad = pk;
         bad[0] ^= 0xFF;
         assert_eq!(
-            walk_pk_against_tables_impl(std::slice::from_ref(&bad), &subdiff, &cv, &mk_dv, 1),
+            try_pk_against_tables(std::slice::from_ref(&bad), &subdiff, &cv, &mk_dv),
             None,
             "corrupted PK must be rejected"
         );
