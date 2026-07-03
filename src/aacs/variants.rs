@@ -9,23 +9,26 @@
 //!
 //! This module is wiring only — `resolve_keys` is not aware of it. The
 //! entry point is [`derive_media_key_variant`]. The Variant scheme is
-//! detected via the new MKB record types `0x82` (Encrypted Media Key
-//! Variant Data + Variant Key Data) and `0x83` (Variant Number). When
-//! a disc carries neither, callers should fall back to the classical
-//! single-stage derivation in [`super::keys`].
+//! detected via the real AACS 2.1 MKB records `0x2d` (Encrypted Media
+//! Key Variant Data / C), `0x2f` (Variant Key Data table, 65,535×16),
+//! and `0x0c` (variant cvalues, one per `0x04` subset-difference slot).
+//! When a disc carries none, callers fall back to the classical
+//! single-stage derivation in [`super::keys`]. (The earlier `0x82`/`0x83`
+//! record types were a speculative guess that never appeared in any real
+//! MKB; they were replaced with the real records once a live variant MKB
+//! was obtained.)
 //!
-//! **Status: the chain cannot yet produce a key on a real disc.** Two
-//! sub-fields are unfinished:
-//!   - [`variants_for_uv`] (the `VARIANTS[uv]` lookup in the `0x83`
-//!     record) is a stub that always returns `None`, so the chain
-//!     short-circuits with [`MediaKeyVariantError::VariantsTableUnavailable`].
-//!   - The Encrypted Media Key Variant Data (C) and the Variant Key
-//!     Data (VKD) table are *distinct* sub-fields of the `0x82` record
-//!     per AACS 2.1, but [`variant_data_record`] (C) and
-//!     [`variant_key_data`] (VKD) both currently return the *whole*
-//!     first `0x82` body — so on a single-`0x82` disc they alias. The
-//!     `0x82` sub-field offsets must be fixed against a real Variant
-//!     disc before this chain is wired into `resolve_keys`.
+//! **Status: the chain cannot yet produce a key on a real disc — for two
+//! reasons, one external, one internal:**
+//!   - EXTERNAL: no device key in our pool walks any real variant MKB,
+//!     so `Kp` (and thus the whole chain) can't be produced live. This is
+//!     a key-acquisition gap, not a code gap.
+//!   - INTERNAL: the exact `VARIANTS[uv]` lookup ([`variants_for_uv`])
+//!     and the Nonce / C sub-field offsets can't be pinned without a real
+//!     disc + covering key to run the chain end-to-end against the `0x86`
+//!     verify. Until then [`variants_for_uv`] returns `None` and the
+//!     chain halts at [`MediaKeyVariantError::VariantsTableUnavailable`],
+//!     so a wrong best-effort offset is never silently trusted.
 //!
 //! The chain follows the published spec:
 //!
@@ -128,48 +131,61 @@ pub(crate) fn mkb_records(mkb: &[u8]) -> impl Iterator<Item = (usize, u8, usize)
     })
 }
 
-/// True iff `records` contains at least one Media Key Variant record
-/// (type `0x82` or `0x83`).
+/// True iff `records` contains at least one Media Key Variant record.
+///
+/// The real AACS 2.1 Variant markers — confirmed against a live variant MKB —
+/// are `0x2d` (Encrypted Media Key Variant Data / C) and `0x2f` (Variant Key
+/// Data table, 65,535×16). Both are absent from non-variant 1.0/2.0 MKBs (which
+/// instead carry `0x05` host-revocation-signature and no `0x0c`/`0x2d`/`0x2f`).
+/// The earlier `0x82`/`0x83` guess was speculative and never appeared in any
+/// real MKB.
 pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
-    records.iter().any(|r| matches!(r.rec_type, 0x82 | 0x83))
+    records.iter().any(|r| matches!(r.rec_type, 0x2d | 0x2f))
 }
 
-/// Body of the Encrypted Media Key Variant Data record (type `0x82`).
+/// Body of the Encrypted Media Key Variant Data record (type `0x2d`).
 ///
-/// Returns the whole first `0x82` body; the internal C / VKD sub-field
-/// split is not yet decoded, so this aliases [`variant_key_data`] on a
-/// single-`0x82` disc. `pub(crate)` until the sub-field offsets are fixed
-/// against a real variant disc — it is not part of the public surface
-/// because it knowingly returns an undecoded composite.
+/// Confirmed against a live variant MKB as the `0x2d` record (92,220 bytes on
+/// the reference disc — not a clean multiple of 16, so it is a structured /
+/// count-prefixed record, not a flat C-block table). The exact per-uv C
+/// selection is the one sub-field still unconfirmed without a real disc+key to
+/// test against; the chain currently consumes the leading 16-byte block.
+/// `pub(crate)` until that offset is pinned.
 pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
-        .find(|r| r.rec_type == 0x82)
+        .find(|r| r.rec_type == 0x2d)
         .map(|r| r.body.as_slice())
 }
 
-/// 16-byte Nonce from the Variant Number record (type `0x83`). Returns
-/// the first 16 bytes of the body.
+/// 16-byte Nonce for `Kvn = AES-G(Kp, Nonce)`.
+///
+/// **UNCONFIRMED source.** The speculative `0x83` "Variant Number" record does
+/// not exist on a real variant MKB. The `0x2d` Encrypted-Media-Key-Variant-Data
+/// record is the most likely home for a per-disc nonce, so this best-effort
+/// reads the trailing 16 bytes of `0x2d`. Confirming this (vs. a field inside
+/// `0x21`, or a fixed slice of `0x2d`) needs a real disc+key to test the whole
+/// chain against the `0x86` verify — until then the chain halts earlier at
+/// [`variants_for_uv`], so a wrong nonce here is never silently trusted.
 pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
-    let r = records.iter().find(|r| r.rec_type == 0x83)?;
+    let r = records.iter().find(|r| r.rec_type == 0x2d)?;
     if r.body.len() < 16 {
         return None;
     }
     let mut out = [0u8; 16];
-    out.copy_from_slice(&r.body[..16]);
+    out.copy_from_slice(&r.body[r.body.len() - 16..]);
     Some(out)
 }
 
-/// Body of the Variant Key Data record. Returns the first `0x82` body
-/// that is a non-empty multiple of 16 bytes.
+/// The Variant Key Data (VKD) table — record type `0x2f`.
 ///
-/// Like [`variant_data_record`], this returns the whole `0x82` body and
-/// aliases it on a single-`0x82` disc; the C / VKD sub-field split is
-/// undecoded. `pub(crate)` until fixed against a real variant disc.
+/// Confirmed against a live variant MKB: exactly 65,535 × 16 = 1,048,560 bytes,
+/// indexed by the resolved `VKDidx`. This is disc-public data (it is why the
+/// VKD alone buys nothing without the Media Key chain above it).
 pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
-        .find(|r| r.rec_type == 0x82 && !r.body.is_empty() && r.body.len() % 16 == 0)
+        .find(|r| r.rec_type == 0x2f && !r.body.is_empty() && r.body.len() % 16 == 0)
         .map(|r| r.body.as_slice())
 }
 
@@ -258,7 +274,13 @@ pub fn walk_processing_key(
 ) -> Option<ProcessingKeyMatch> {
     let mk_dv = mkb_find_mk_dv(records)?;
     let uvs = mkb_find_body(records, 0x04)?;
-    let cvalues = mkb_find_body(records, 0x07).or_else(|| mkb_find_body(records, 0x05))?;
+    // Variant cvalue source: a real variant MKB carries its per-uv cvalue table
+    // in record `0x0c` (confirmed 46,101×16, one per `0x04` subset-difference
+    // slot). Fall back to `0x07`/`0x05` for the synthetic fixtures and any MKB
+    // shape that keeps its cvalues there.
+    let cvalues = mkb_find_body(records, 0x0c)
+        .or_else(|| mkb_find_body(records, 0x07))
+        .or_else(|| mkb_find_body(records, 0x05))?;
 
     let num_uvs = uvs
         .chunks(5)
@@ -560,12 +582,14 @@ mod tests {
 
     fn synthetic_mkb_with_variant() -> Vec<u8> {
         let mut mkb = synthetic_mkb_classical();
-        // 0x82 — 16-byte body (Variant data / VKD slot).
-        mkb.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]);
+        // 0x2d — Encrypted Media Key Variant Data: C (head 16) then the
+        // trailing 16-byte Nonce, 32-byte body.
+        mkb.extend_from_slice(&[0x2d, 0x00, 0x00, 0x24]);
         mkb.extend_from_slice(&[0xEE; 16]);
-        // 0x83 — 16-byte body (Variant Nonce).
-        mkb.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0x55; 16]);
+        // 0x2f — Variant Key Data table: one 16-byte VKD entry.
+        mkb.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCC; 16]);
         mkb
     }
 
@@ -594,9 +618,12 @@ mod tests {
     fn variant_detection_positive_on_variant() {
         let recs = walk_mkb(&synthetic_mkb_with_variant());
         assert!(is_variant_mkb(&recs));
+        // Nonce = trailing 16 of 0x2d; VKD = the 0x2f entry; C = the whole 0x2d.
         assert_eq!(variant_nonce(&recs), Some([0x55; 16]));
-        assert_eq!(variant_key_data(&recs), Some(&[0xEE; 16][..]));
-        assert_eq!(variant_data_record(&recs), Some(&[0xEE; 16][..]));
+        assert_eq!(variant_key_data(&recs), Some(&[0xCC; 16][..]));
+        let c = variant_data_record(&recs).unwrap();
+        assert_eq!(&c[..16], &[0xEE; 16][..]);
+        assert_eq!(&c[16..], &[0x55; 16][..]);
     }
 
     // ── Chain entry-point classification ──
@@ -742,17 +769,15 @@ mod tests {
         mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xCD; 16]);
 
-        // 0x82 record: holds C (Encrypted Media Key Variant Data) AND
-        // doubles as the VKD table (single 16-byte entry → VKDidx must
-        // resolve to 0 for `chain_surfaces_variants_table_gap` test —
-        // but the test never reaches the VKD lookup since the
-        // VARIANTS[uv] helper is not yet wired).
-        mkb.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]);
+        // 0x2d record: Encrypted Media Key Variant Data — C (head 16) then a
+        // trailing 16-byte Nonce (variant_nonce reads the tail), 32-byte body.
+        mkb.extend_from_slice(&[0x2d, 0x00, 0x00, 0x24]);
         mkb.extend_from_slice(&c_block);
-
-        // 0x83 record: 16-byte Nonce.
-        mkb.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0x77; 16]);
+
+        // 0x2f record: Variant Key Data table — one 16-byte entry.
+        mkb.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xBB; 16]);
 
         let recs = walk_mkb(&mkb);
 
@@ -860,29 +885,29 @@ mod tests {
     // ── Record selectors ───────────────────────────────────────────────────
 
     #[test]
-    fn is_variant_mkb_true_for_0x82_alone_and_0x83_alone() {
-        // Either record type alone flags the MKB as variant.
-        let only82 = walk_mkb(&{
+    fn is_variant_mkb_true_for_0x2d_alone_and_0x2f_alone() {
+        // Either variant record type alone flags the MKB as variant.
+        let only2d = walk_mkb(&{
             let mut m = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 0];
-            m.extend_from_slice(&[0x82, 0x00, 0x00, 0x14]);
+            m.extend_from_slice(&[0x2d, 0x00, 0x00, 0x14]);
             m.extend_from_slice(&[0xEE; 16]);
             m
         });
-        assert!(is_variant_mkb(&only82));
-        let only83 = walk_mkb(&{
+        assert!(is_variant_mkb(&only2d));
+        let only2f = walk_mkb(&{
             let mut m = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 0];
-            m.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
+            m.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
             m.extend_from_slice(&[0x55; 16]);
             m
         });
-        assert!(is_variant_mkb(&only83));
+        assert!(is_variant_mkb(&only2f));
     }
 
     #[test]
     fn variant_nonce_requires_16_byte_body() {
-        // A 0x83 record with < 16-byte body → None (no panic on the copy).
+        // A 0x2d record with < 16-byte body → None (no panic on the tail copy).
         let recs = walk_mkb(&{
-            let mut m = vec![0x83, 0x00, 0x00, 0x0C]; // 8-byte body
+            let mut m = vec![0x2d, 0x00, 0x00, 0x0C]; // 8-byte body
             m.extend_from_slice(&[0x11; 8]);
             m
         });
@@ -891,16 +916,21 @@ mod tests {
 
     #[test]
     fn variant_key_data_requires_nonempty_multiple_of_16() {
-        // A 0x82 body that is NOT a multiple of 16 is rejected by
+        // A 0x2f VKD body that is NOT a multiple of 16 is rejected by
         // variant_key_data (it needs whole 16-byte VKD slots).
         let recs = walk_mkb(&{
-            let mut m = vec![0x82, 0x00, 0x00, 0x0E]; // 10-byte body (not %16)
+            let mut m = vec![0x2f, 0x00, 0x00, 0x0E]; // 10-byte body (not %16)
             m.extend_from_slice(&[0x22; 10]);
             m
         });
         assert_eq!(variant_key_data(&recs), None);
-        // variant_data_record returns the body regardless of length.
-        assert_eq!(variant_data_record(&recs), Some(&[0x22u8; 10][..]));
+        // variant_data_record reads 0x2d and returns its body regardless of length.
+        let recs2 = walk_mkb(&{
+            let mut m = vec![0x2d, 0x00, 0x00, 0x0E];
+            m.extend_from_slice(&[0x33; 10]);
+            m
+        });
+        assert_eq!(variant_data_record(&recs2), Some(&[0x33u8; 10][..]));
     }
 
     // ── derive_media_key_variant: missing-record classification ────────────
@@ -917,16 +947,14 @@ mod tests {
 
     #[test]
     fn chain_reports_mkb_incomplete_when_nonce_missing() {
-        // Build a variant MKB (has 0x82 so is_variant true, and a DK can walk
-        // it) but WITHOUT a 0x83 nonce record → MkbIncomplete at the
-        // variant_nonce `?`.
-        // Start from the full setup, then rebuild the byte stream dropping
-        // the 0x83 record.
+        // Build a variant MKB (still variant via 0x2f, and a DK can walk it)
+        // but WITHOUT the 0x2d record that carries C + the trailing Nonce →
+        // MkbIncomplete at the variant_nonce `?`.
         let (recs, dk, _, _) = synthetic_variant_setup(0x00);
-        // Reconstruct bytes without the 0x83 record.
+        // Reconstruct bytes without the 0x2d record.
         let mut mkb = Vec::new();
         for r in &recs {
-            if r.rec_type == 0x83 {
+            if r.rec_type == 0x2d {
                 continue;
             }
             mkb.push(r.rec_type);
@@ -936,7 +964,7 @@ mod tests {
             mkb.extend_from_slice(&r.body);
         }
         let recs2 = walk_mkb(&mkb);
-        assert!(is_variant_mkb(&recs2), "still variant via 0x82");
+        assert!(is_variant_mkb(&recs2), "still variant via 0x2f");
         let err = derive_media_key_variant(&recs2, &[dk], &[0xAA; 16], &[0u8; 16])
             .expect_err("missing nonce → MkbIncomplete");
         assert_eq!(err, MediaKeyVariantError::MkbIncomplete);
