@@ -9,8 +9,9 @@ use super::types::DeviceKey;
 ///
 /// The content cert byte distinguishes V10 (`0x00`) from V20 (`0x01`). V21
 /// cannot be detected from the cert alone — a V21 disc carries a V20 cert
-/// and is upgraded to `V21` only after the MKB walk turns up record types
-/// `0x82` / `0x83` (Media Key Variant Data and Variant Number).
+/// and is upgraded to `V21` only after the MKB walk turns up the real Variant
+/// records `0x2d` / `0x2f` (Encrypted Media Key Variant Data and the Variant
+/// Key Data table).
 ///
 /// Key-storage stride in `Unit_Key_RO.inf` is 48 bytes for V10 and 64
 /// bytes for V20 / V21.
@@ -1103,7 +1104,7 @@ pub fn resolve_keys_v1(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 
 /// AACS 2.0 key resolution. Parses `Unit_Key_RO.inf` with 64-byte
 /// stride. Tries paths 1 → 4 in order. When paths 3/4 succeed against
-/// an MKB carrying Variant records (`0x82` / `0x83`), the result's
+/// an MKB carrying Variant records (`0x2d` / `0x2f`), the result's
 /// `version` is upgraded to [`AacsVersion::V21`] — derivation still
 /// runs through the classical V2 path; the V21-specific Variant chain
 /// is wired separately via [`resolve_keys_v21`].
@@ -2595,9 +2596,9 @@ mod tests {
             }),
         };
 
-        // MKB with a 0x83 variant record makes is_variant_mkb true.
+        // MKB with a 0x2f variant record makes is_variant_mkb true.
         let mut mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
-        mkb.extend_from_slice(&[0x83, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0x55; 16]);
 
         let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
