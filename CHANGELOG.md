@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.2.2] — 2026-07-04
+
+### Added
+
+- **AACS 2.1 Media Key Variant support.** The Media Key Variant scheme is now
+  detected and parsed from the real MKB record types found on variant discs —
+  `0x2d` (Encrypted Media Key Variant Data), `0x2f` (Variant Key Data table,
+  65,535 × 16), and `0x0c` (variant cvalues, one per subset-difference slot) —
+  replacing the earlier placeholder `0x82`/`0x83` types, which were a guess and
+  appear on no real MKB. The V2.0→V2.1 upgrade detection and fixtures are updated
+  accordingly, so a genuine AACS 2.1 variant disc now resolves.
+- **`resolve_candidate`** — one composed, pure-derivation boil-down for a
+  candidate key at any ladder rung (DK/PK/MK/VUK → terminal unit keys), parsing
+  `Unit_Key_RO.inf` at the disc's declared AACS version and returning every CPS
+  unit key. Consumers stop re-composing the ladder; every client hardens a single
+  implementation.
+
+### Fixed
+
+- **`mk_from_dk` does the real Subset-Difference walk again.** It previously ran
+  the Media-Key-Variant path, which needed an integrator KCD absent in-tree and
+  errored for every real disc — effectively dead for both consumers. It now
+  performs the genuine device-key SD walk; the Volume ID enters at the VUK step
+  (where it belongs), not the MK step. This revives the DK→MK fallback across the
+  toolchain (`freemkv-keysources` adopts the corrected two-argument call).
+- **autorip: a down online key service is no longer reported as a missing key.**
+  When the online key source resolves no key for an encrypted disc, autorip now
+  runs one bounded reachability probe (SSRF-pinned, ~8 s, no redirects) and
+  distinguishes a transient outage (transport error / 502·503·504 → down; 429 →
+  rate-limited) from a genuine no-key (any real HTTP answer → up). A transient
+  verdict triggers a bounded key-resolution retry (3 attempts, 8/16/32 s backoff)
+  and, if the service stays down, parks the disc in a distinct retryable state
+  ("Key service unavailable — temporary outage, not a missing key; will retry.")
+  instead of the permanent "no keys found". Never hammers the drive or service.
+
+### Performance
+
+- **Processing-Key resolution is ~15× faster on UHD.** A Processing Key is the
+  key at its subset-difference node (one AES-G from the Media Key), so it is now
+  tried directly against the MKB cvalue tables (matching libaacs `_calc_mk_pks`)
+  instead of BFS-walking the SD tree at unknown depth — which was both wrong for
+  terminal PKs and slow on a large UHD MKB (~181k cvalues). PK derivation on UHD
+  drops from ~37 s to ~2.4 s; the SD tree walk now lives solely in the device-key
+  path.
+
+### autorip
+
+- **Clear stuck move errors from the System tab.** Each move-queue error now has
+  a ✕ to dismiss it, plus Clear all and Refresh — so a resolved or stale error
+  can be cleared without restarting the container (the mover re-records any that
+  are still genuinely failing on its next tick).
+
 ## [1.2.1] — 2026-07-02
 
 ### Fixed
