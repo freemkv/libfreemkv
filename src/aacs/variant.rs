@@ -151,7 +151,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 // on) are shared with the classical walk in [`super::keys`] — a single
 // definition keeps the variant SD tree byte-identical to the classical one.
 // (`aesg3` itself is imported separately in the test module.)
-use super::keys::{calc_pk_from_dk, calc_v_mask};
+use super::media_key::{calc_pk_from_dk, calc_v_mask};
 
 /// Outcome of a subset-difference walk against an MKB. Carries the
 /// processing key and the matching `uv` slot — both needed as inputs
@@ -483,7 +483,7 @@ mod tests {
     // `use super::*` does not re-export the parent module's private `use`
     // imports, so pull them in directly for the tests below.
     use super::super::crypto::aesg3;
-    use super::super::keys::calc_pk_from_dk;
+    use super::super::media_key::calc_pk_from_dk;
 
     #[test]
     fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
