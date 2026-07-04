@@ -1,6 +1,6 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
-use super::content::aes_ecb_decrypt;
+use super::crypto::{aes_ecb_decrypt, aesg3};
 use super::types::DeviceKey;
 
 // ── AACS version ────────────────────────────────────────────────────────────
@@ -599,27 +599,6 @@ pub fn mkb_is_uhd(mkb: &[u8]) -> Option<bool> {
 }
 
 // ── AACS-G3 key derivation (subset-difference tree) ─────────────────────────
-
-/// AACS-G3 seed constant (`s0`). [C] §3.2.2.
-const AESG3_SEED: [u8; 16] = [
-    0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
-];
-
-/// AACS-G3: derive a subkey from a parent key. [C] §3.2.2 (Triple AES Generator:
-/// left=`D(k,s0)⊕s0` inc 0, pk=`D(k,s0+1)⊕(s0+1)` inc 1, right=`D(k,s0+2)⊕(s0+2)` inc 2).
-/// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
-///
-/// Shared with [`super::variants`] (its variant chain runs the same SD
-/// tree); a single definition keeps the two walks byte-identical.
-pub(super) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
-    let mut seed = AESG3_SEED;
-    seed[15] = seed[15].wrapping_add(inc);
-    let mut out = aes_ecb_decrypt(key, &seed);
-    for i in 0..16 {
-        out[i] ^= seed[i];
-    }
-    out
-}
 
 /// Compute v_mask from a UV value. [C] §3.2.3. Shared with [`super::variants`].
 pub(super) fn calc_v_mask(uv: u32) -> u32 {
@@ -1536,7 +1515,7 @@ mod tests {
         // keeps the crypto covered in libfreemkv. `aes_ecb_encrypt` is
         // pub(crate), reachable here but not from keysources — the reason this
         // half stays.
-        use super::super::content::aes_ecb_encrypt;
+        use super::super::crypto::aes_ecb_encrypt;
         let vuk = [0x5Au8; 16];
         // A few representative "decrypted" unit keys.
         for expected_uk in [[0x11u8; 16], [0x22u8; 16], [0xCDu8; 16]] {
@@ -1726,7 +1705,7 @@ mod tests {
         // whose derived Media Key satisfies a synthetic verify record; confirm
         // the scan ACCEPTS it against caller-supplied SD/cvalue tables and
         // REJECTS a 1-byte corruption.
-        use super::super::content::aes_ecb_encrypt as enc;
+        use super::super::crypto::aes_ecb_encrypt as enc;
 
         let pk: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -1772,7 +1751,7 @@ mod tests {
         // recovers mk. Catches the bugs that landed pre-fix:
         //   * uv XOR step was missing → mk wrong whenever uv != 0
         //   * AES-128E + 12-zero check instead of AES-128D + magic
-        use super::super::content::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
+        use super::super::crypto::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
 
         let pk: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -2191,7 +2170,7 @@ mod tests {
         // The keyless-disc case: this disc's own hash/VID are NOT in keydb, but its
         // Media Key IS — filed under a sibling disc that shares its MKB. Path
         // 2.5 must km_verifies that MK against the MKB and resolve.
-        use super::super::content::aes_ecb_encrypt as enc;
+        use super::super::crypto::aes_ecb_encrypt as enc;
         let km = [0x11u8; 16];
         let vid = [0x22u8; 16];
         // MKB: 0x10 type/version + 0x86 verify record whose mk_dv decrypts under
@@ -2272,7 +2251,7 @@ mod tests {
         // Independently compute AES-ECB-D(mk, vid) XOR vid and confirm
         // derive_vuk produces the same 16 bytes. A mutation that dropped the
         // XOR-VID step, or used encrypt instead of decrypt, fails this.
-        use super::super::content::aes_ecb_decrypt as dec;
+        use super::super::crypto::aes_ecb_decrypt as dec;
         let mk = [
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
             0x1E, 0x1F,
@@ -2292,7 +2271,7 @@ mod tests {
         // The encrypted unit key in Unit_Key_RO.inf is AES-ECB-E(VUK, uk);
         // decrypt_unit_key must be the matching ECB-decrypt. Round-trip via
         // encrypt to pin the relation.
-        use super::super::content::aes_ecb_encrypt as enc;
+        use super::super::crypto::aes_ecb_encrypt as enc;
         let vuk = [0x9Eu8; 16];
         let uk = [0x3Cu8; 16];
         let enc_uk = enc(&vuk, &uk);
@@ -2692,7 +2671,7 @@ mod tests {
     fn resolve_keys_v21_path4_resolves_by_hash() {
         // resolve_keys_v21 must hit path 4 (hash→VUK) and stamp version V21,
         // deriving unit keys from the VUK.
-        use super::super::content::aes_ecb_encrypt as enc;
+        use super::super::crypto::aes_ecb_encrypt as enc;
         let data = build_unit_key_ro(1, 64);
         // The single encrypted key in build_unit_key_ro is [0x10;16].
         let hash = disc_hash(&data);
@@ -2842,7 +2821,7 @@ mod tests {
         //   - 0x86 Verify Media Key: mk_dv = AES-E(mk, magic || pad)
         // and a DK with node=4, uv=2, u_mask_shift=3 so dev_key_v_mask ==
         // v_mask: the calc_pk_from_dk loop is a no-op and Kp == aesg3(dk, 1).
-        use super::super::content::aes_ecb_encrypt as enc;
+        use super::super::crypto::aes_ecb_encrypt as enc;
 
         let dk_bytes: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,

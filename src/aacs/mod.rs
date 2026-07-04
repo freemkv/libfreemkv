@@ -27,6 +27,7 @@
 
 pub mod boil;
 pub mod content;
+pub mod crypto;
 pub mod host_certs;
 pub mod keys;
 pub mod provider;

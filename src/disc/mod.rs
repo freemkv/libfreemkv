@@ -5220,7 +5220,8 @@ mod tests {
     /// unit algorithm — ECB-derive the per-unit key, then AES-CBC encrypt the
     /// body with the fixed AACS IV.
     fn encrypt_unit_for_test(clear: &[u8], uk: &[u8; 16]) -> Vec<u8> {
-        use crate::aacs::content::{AACS_IV, ALIGNED_UNIT_LEN};
+        use crate::aacs::content::ALIGNED_UNIT_LEN;
+        use crate::aacs::crypto::AACS_IV;
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
         let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();
