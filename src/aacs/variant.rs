@@ -73,6 +73,7 @@
 //! variant path.
 
 use super::crypto::{aes_ecb_decrypt, aes_g};
+use super::mkb::*;
 use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
@@ -85,65 +86,6 @@ use super::types::DeviceKey;
 pub const KEY_CORRECTION_DATA_PLACEHOLDER: [u8; 16] = [0u8; 16];
 
 // ── MKB record walking ────────────────────────────────────────────────────
-
-/// A single MKB record produced by [`walk_mkb`].
-#[derive(Debug, Clone)]
-pub struct MkbRecord {
-    /// Byte offset of the record within the MKB.
-    pub offset: usize,
-    /// Record type byte.
-    pub rec_type: u8,
-    /// Record length in bytes (includes the 4-byte header).
-    pub rec_len: usize,
-    /// Record body (the bytes after the 4-byte header).
-    pub body: Vec<u8>,
-}
-
-/// Walk an MKB into a flat list of records.
-///
-/// MKB record framing per AACS: 1 byte type, 3 bytes BE length
-/// INCLUDING the 4-byte header, followed by payload. The walker stops
-/// at the first `(type=0, len=0)` end marker or at end of buffer.
-pub fn walk_mkb(mkb: &[u8]) -> Vec<MkbRecord> {
-    mkb_records(mkb)
-        .map(|(offset, rec_type, rec_len)| MkbRecord {
-            offset,
-            rec_type,
-            rec_len,
-            body: mkb[offset + 4..offset + rec_len].to_vec(),
-        })
-        .collect()
-}
-
-/// THE single MKB record-framing walker: yields `(offset, rec_type, rec_len)`
-/// for each record — a 4-byte header (type byte + big-endian 24-bit length)
-/// then the body — stopping at the `00 000000` end marker or a
-/// malformed/out-of-bounds length. Lazy (no body clone), so a find-one-record
-/// caller never materialises the multi-MB cvalue table. [`walk_mkb`] and every
-/// MKB record walk in `aacs::keys` are built on this, so the framing rules — and
-/// any future fix to them — live in exactly one place (they had drifted across
-/// six hand-rolled copies).
-pub(crate) fn mkb_records(mkb: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_ {
-    let mut pos = 0usize;
-    std::iter::from_fn(move || {
-        if pos + 4 > mkb.len() {
-            return None;
-        }
-        let rec_type = mkb[pos];
-        let rec_len = ((mkb[pos + 1] as usize) << 16)
-            | ((mkb[pos + 2] as usize) << 8)
-            | (mkb[pos + 3] as usize);
-        if rec_type == 0 && rec_len == 0 {
-            return None;
-        }
-        if rec_len < 4 || pos + rec_len > mkb.len() {
-            return None;
-        }
-        let here = pos;
-        pos += rec_len;
-        Some((here, rec_type, rec_len))
-    })
-}
 
 /// True iff `records` contains at least one Media Key Variant record.
 ///
@@ -224,13 +166,6 @@ pub struct ProcessingKeyMatch {
     pub cvalue: [u8; 16],
     /// Index of the matching cvalue within the cvalues record.
     pub cvalue_index: usize,
-}
-
-fn mkb_find_body(records: &[MkbRecord], rec_type: u8) -> Option<&[u8]> {
-    records
-        .iter()
-        .find(|r| r.rec_type == rec_type && !r.body.is_empty())
-        .map(|r| r.body.as_slice())
 }
 
 fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
