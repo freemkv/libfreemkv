@@ -72,7 +72,7 @@
 //! that final gate — the per-match magic check no longer protects the
 //! variant path.
 
-use super::content::aes_ecb_decrypt;
+use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
@@ -201,23 +201,6 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
         .iter()
         .find(|r| r.rec_type == 0x2f && !r.body.is_empty() && r.body.len() % 16 == 0)
         .map(|r| r.body.as_slice())
-}
-
-// ── AES-G ────────────────────────────────────────────────────────────────
-
-/// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2. [C] §2.1.3 (note: uses AES-128**D**).
-///
-/// The Media Key Variant chain uses AES-G to derive both the variant
-/// number (`Kvn = AES-G(Kp, Nonce)`) and the Volume Unique Key
-/// (`Kvu = AES-G(Km, VID)`). See [`super::keys::derive_vuk`] for the
-/// classical VUK form — the math is identical, this exposes it as a
-/// neutral primitive for the variant chain.
-fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {
-    let mut out = aes_ecb_decrypt(x1, x2);
-    for i in 0..16 {
-        out[i] ^= x2[i];
-    }
-    out
 }
 
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
@@ -564,7 +547,8 @@ mod tests {
     // These three live in `super::keys` now (consolidated SD-walk helpers);
     // `use super::*` does not re-export the parent module's private `use`
     // imports, so pull them in directly for the tests below.
-    use super::super::keys::{aesg3, calc_pk_from_dk};
+    use super::super::crypto::aesg3;
+    use super::super::keys::calc_pk_from_dk;
 
     #[test]
     fn calc_pk_from_dk_terminates_on_nonconvergent_mask() {
@@ -743,7 +727,7 @@ mod tests {
     ///
     /// Returns (records, dk, planted_kp, planted_kmp).
     fn synthetic_variant_setup(kmp15: u8) -> (Vec<MkbRecord>, DeviceKey, [u8; 16], [u8; 16]) {
-        use crate::aacs::content::aes_ecb_encrypt;
+        use crate::aacs::crypto::aes_ecb_encrypt;
 
         // Build header.
         let mut mkb = vec![

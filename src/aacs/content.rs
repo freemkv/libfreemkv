@@ -1,14 +1,16 @@
-//! AACS content decryption — AES primitives, unit decryption, bus encryption.
+//! AACS content decryption — aligned-unit / bus decryption and TS verification.
+//! The low-level AES primitives it uses live in [`super::crypto`].
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+
+use super::crypto::{aes_cbc_decrypt, aes_ecb_encrypt};
+// Available at module scope for this module's test fixtures (they reference
+// `super::AACS_IV` when building CBC ciphertext directly); test-only.
+#[cfg(test)]
+use super::crypto::AACS_IV;
 
 // ── AACS constants ──────────────────────────────────────────────────────────
-
-/// Fixed IV used by AACS for all AES-CBC operations. [C] §2.1.2 (default CBC IV, `iv0`).
-pub(crate) const AACS_IV: [u8; 16] = [
-    0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
-];
 
 /// Size of an AACS aligned unit (3 × 2048-byte sectors). [BD] §3.10.1.
 pub const ALIGNED_UNIT_LEN: usize = 6144;
@@ -46,58 +48,6 @@ use crate::consts::BD_SOURCE_PACKET_BYTES;
 
 /// TS sync byte.
 const TS_SYNC: u8 = 0x47;
-
-// ── AES primitives ──────────────────────────────────────────────────────────
-
-/// AES-128-ECB encrypt a single 16-byte block. [C] §2.1.1 (`AES-128E`).
-pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
-    cipher.encrypt_block(&mut block);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&block);
-    out
-}
-
-/// AES-128-ECB decrypt a single 16-byte block. [C] §2.1.1 (`AES-128D`).
-pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
-    cipher.decrypt_block(&mut block);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&block);
-    out
-}
-
-/// AES-128-CBC decrypt in-place with the fixed AACS IV. [C] §2.1.2 (`AES-128CBCD`).
-///
-/// Precondition: `data.len()` is a multiple of 16. Any trailing partial
-/// block is silently ignored; all callers pass aligned regions (6128 and
-/// 2032 bytes), and the assert documents/enforces that contract.
-pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
-    debug_assert!(
-        data.len() % 16 == 0,
-        "aes_cbc_decrypt requires a block-aligned slice"
-    );
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let num_blocks = data.len() / 16;
-    // Process blocks in reverse to avoid clobbering ciphertext needed for XOR
-    for i in (0..num_blocks).rev() {
-        let offset = i * 16;
-        let prev = if i == 0 {
-            AACS_IV
-        } else {
-            let mut p = [0u8; 16];
-            p.copy_from_slice(&data[(i - 1) * 16..i * 16]);
-            p
-        };
-        let mut block = GenericArray::clone_from_slice(&data[offset..offset + 16]);
-        cipher.decrypt_block(&mut block);
-        for j in 0..16 {
-            data[offset + j] = block[j] ^ prev[j];
-        }
-    }
-}
 
 // ── Content decryption ──────────────────────────────────────────────────────
 
@@ -587,7 +537,9 @@ pub fn decrypt_unit_full(
 
 #[cfg(test)]
 mod tests {
+    use super::super::crypto::aes_ecb_decrypt;
     use super::*;
+    use aes::cipher::BlockEncrypt; // test fixtures build ciphertext directly
 
     #[test]
     fn test_aes_ecb_roundtrip() {
