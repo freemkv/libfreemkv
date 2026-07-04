@@ -5,12 +5,12 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArr
 
 // ── AACS constants ──────────────────────────────────────────────────────────
 
-/// Fixed IV used by AACS for all AES-CBC operations.
+/// Fixed IV used by AACS for all AES-CBC operations. [C] §2.1.2 (default CBC IV, `iv0`).
 pub(crate) const AACS_IV: [u8; 16] = [
     0x0B, 0xA0, 0xF8, 0xDD, 0xFE, 0xA6, 0x1F, 0xB3, 0xD8, 0xDF, 0x9F, 0x56, 0x6A, 0x05, 0x0F, 0x78,
 ];
 
-/// Size of an AACS aligned unit (3 × 2048-byte sectors).
+/// Size of an AACS aligned unit (3 × 2048-byte sectors). [BD] §3.10.1.
 pub const ALIGNED_UNIT_LEN: usize = 6144;
 
 /// An AACS aligned unit spans this many 2048-byte sectors (3).
@@ -49,7 +49,7 @@ const TS_SYNC: u8 = 0x47;
 
 // ── AES primitives ──────────────────────────────────────────────────────────
 
-/// AES-128-ECB encrypt a single 16-byte block.
+/// AES-128-ECB encrypt a single 16-byte block. [C] §2.1.1 (`AES-128E`).
 pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut block = GenericArray::clone_from_slice(data);
@@ -59,7 +59,7 @@ pub(crate) fn aes_ecb_encrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// AES-128-ECB decrypt a single 16-byte block.
+/// AES-128-ECB decrypt a single 16-byte block. [C] §2.1.1 (`AES-128D`).
 pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut block = GenericArray::clone_from_slice(data);
@@ -69,7 +69,7 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// AES-128-CBC decrypt in-place with the fixed AACS IV.
+/// AES-128-CBC decrypt in-place with the fixed AACS IV. [C] §2.1.2 (`AES-128CBCD`).
 ///
 /// Precondition: `data.len()` is a multiple of 16. Any trailing partial
 /// block is silently ignored; all callers pass aligned regions (6128 and
@@ -127,7 +127,7 @@ pub fn ts_sync_destroyed(unit: &[u8]) -> bool {
 }
 
 /// The AUTHORITATIVE AACS "is this aligned unit encrypted?" signal — the Copy
-/// Permission Indicator (CPI) in the top 2 bits of byte 0. Byte 0 is the first
+/// Permission Indicator (CPI) in the top 2 bits of byte 0. [BD] §3.10.2. Byte 0 is the first
 /// byte of the first source packet's `TP_extra_header`, which AACS always leaves
 /// in the clear (the first 16 bytes of every unit are the unencrypted SEED). So
 /// this is readable WITHOUT a key:
@@ -385,7 +385,10 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     }
 
     // Save original first 16 bytes (the plaintext seed / header) and derive the
-    // per-unit decrypt key (identical to `decrypt_unit_checked`).
+    // per-unit Block Key (identical to `decrypt_unit_checked`).
+    // Block Key = AES-128E(Kcu, seed) ⊕ seed  ([BD] §3.10.1 Fig 3-8, two-node
+    // construction: encrypt the clear seed under the CPS Unit Key, then XOR the
+    // seed back in — the trailing ⊕seed is load-bearing).
     let mut header = [0u8; 16];
     header.copy_from_slice(&unit[..16]);
     let derived = aes_ecb_encrypt(unit_key, &header);
@@ -393,6 +396,7 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     for i in 0..16 {
         decrypt_key[i] = derived[i] ^ header[i];
     }
+    // Final 6128 bytes of the aligned unit under the Block Key; first 16 = clear seed. [BD] §3.10.1.
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
     // Verify content packets; zero out padding packets (their decrypted bytes are
