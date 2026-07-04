@@ -146,7 +146,7 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     scratch: Vec<u8>,
     /// MUX loss-concealment switch (P3 / Edit-2). When `true`, a content unit
     /// that genuinely won't decrypt is NOT a read failure: it is overwritten with
-    /// valid NULL TS packets ([`crate::aacs::fill_null_ts_unit`]), tallied into
+    /// valid NULL TS packets ([`crate::aacs::content::fill_null_ts_unit`]), tallied into
     /// [`decrypt_dropped`](Self::decrypt_dropped), logged loud with its LBA, and
     /// the read returns `Ok` so the mux KEEPS GOING (it can never abort over an
     /// undecryptable unit). This is the spec's "decrypt-verify is a RIP gate, not
@@ -197,7 +197,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// (sorted/merged `(start_lba, sector_count)` — see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
     /// Units outside content (UDF filesystem / BDMV nav) pass through untouched,
-    /// so [`ts_sync_destroyed`](crate::aacs::ts_sync_destroyed) is never consulted
+    /// so [`ts_sync_destroyed`](crate::aacs::content::ts_sync_destroyed) is never consulted
     /// about non-content bytes. Whole-disc readers (sweep / patch) set this; the
     /// mux leaves it unset because it only ever reads title extents.
     pub fn with_content_ranges(mut self, ranges: Arc<[(u32, u32)]>) -> Self {
@@ -301,14 +301,14 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         content: Option<&[(u32, u32)]>,
         prev_dropped: usize,
     ) -> usize {
-        let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
+        let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
         // Gather up to MAX_FETCH_SAMPLES still-scrambled aligned units — the
         // exact on-disc ciphertext no held key could open. A trailing partial
         // unit (chunks_exact remainder) can't be a whole scrambled unit, so
         // skipping it is correct.
         let mut samples: Vec<Vec<u8>> = Vec::new();
         for chunk in buf.chunks_exact(unit_len) {
-            if crate::aacs::aacs_unit_needs_decrypt(chunk) {
+            if crate::aacs::content::aacs_unit_needs_decrypt(chunk) {
                 samples.push(chunk.to_vec());
                 if samples.len() >= MAX_FETCH_SAMPLES {
                     break;
@@ -391,7 +391,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
         content: Option<&[(u32, u32)]>,
         keys: &DecryptKeys,
     ) {
-        let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
+        let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
         let unit_sectors = (unit_len / 2048) as u32;
         // Only AACS produces decrypt-verify failures; None / CSS never reach here
         // with a non-zero dropped count.
@@ -415,12 +415,12 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             // A unit that decrypted is no longer sync-destroyed; a CPI-clear or
             // non-content unit is gated out. Only undecryptable in-content units
             // that are flagged encrypted carry signal.
-            if !in_content || !crate::aacs::aacs_unit_needs_decrypt(chunk) {
+            if !in_content || !crate::aacs::content::aacs_unit_needs_decrypt(chunk) {
                 continue;
             }
             let all_zero = chunk.iter().all(|&b| b == 0);
-            let ts_sync = crate::aacs::ts_sync_count(chunk);
-            let ts_total = crate::aacs::ts_packet_total(chunk);
+            let ts_sync = crate::aacs::content::ts_sync_count(chunk);
+            let ts_total = crate::aacs::content::ts_packet_total(chunk);
             let mut seen = [false; 256];
             for &b in chunk {
                 seen[b as usize] = true;
@@ -431,10 +431,10 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             for (_, k) in unit_keys.iter() {
                 let mut attempt = chunk.to_vec();
                 if let Some(ref rdk_key) = rdk {
-                    crate::aacs::decrypt_bus(&mut attempt, rdk_key);
+                    crate::aacs::content::decrypt_bus(&mut attempt, rdk_key);
                 }
-                crate::aacs::decrypt_unit(&mut attempt, k);
-                let s = crate::aacs::ts_sync_count(&attempt);
+                crate::aacs::content::decrypt_unit(&mut attempt, k);
+                let s = crate::aacs::content::ts_sync_count(&attempt);
                 if s > best_sync {
                     best_sync = s;
                 }
@@ -497,7 +497,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // units (else its readable units are wrongly rejected → "Decryption
         // failed" on exactly those titles).
         if matches!(self.keys, DecryptKeys::Aacs { .. })
-            && !crate::aacs::is_unit_aligned(lba, self.unit_base)
+            && !crate::aacs::content::is_unit_aligned(lba, self.unit_base)
         {
             return Err(crate::error::Error::DecryptFailed);
         }
@@ -585,7 +585,7 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             // rip stays fail-loud. Ciphertext is never passed downstream: it is
             // replaced by null packets, not emitted.
             if self.tolerate_decrypt_loss && !self.verify_only {
-                let unit_len = crate::aacs::ALIGNED_UNIT_LEN;
+                let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
                 let mut concealed = 0usize;
                 let mut first_lba = lba;
                 for (i, chunk) in buf[..n].chunks_mut(unit_len).enumerate() {
@@ -604,11 +604,12 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                     // un-restored ciphertext. In-content gating already happened in
                     // `decrypt_buf`, which restored only failed units to ciphertext;
                     // clear nav and decrypted tails pass through clean.
-                    if crate::aacs::aacs_unit_still_ciphertext(chunk) {
+                    if crate::aacs::content::aacs_unit_still_ciphertext(chunk) {
                         if concealed == 0 {
-                            first_lba = lba + (i as u32) * crate::aacs::ALIGNED_UNIT_SECTORS;
+                            first_lba =
+                                lba + (i as u32) * crate::aacs::content::ALIGNED_UNIT_SECTORS;
                         }
-                        crate::aacs::fill_null_ts_unit(chunk);
+                        crate::aacs::content::fill_null_ts_unit(chunk);
                         concealed += 1;
                     }
                 }
@@ -631,8 +632,10 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                     // flags, loudly. Cryptographically unreachable in practice.
                     let mut forced = 0usize;
                     for chunk in buf[..n].chunks_mut(unit_len) {
-                        if chunk.len() == unit_len && crate::aacs::aacs_unit_needs_decrypt(chunk) {
-                            crate::aacs::fill_null_ts_unit(chunk);
+                        if chunk.len() == unit_len
+                            && crate::aacs::content::aacs_unit_needs_decrypt(chunk)
+                        {
+                            crate::aacs::content::fill_null_ts_unit(chunk);
                             forced += 1;
                         }
                     }
@@ -1253,12 +1256,12 @@ mod tests {
     }
 
     /// Build a clear 6144-byte AACS unit (TS syncs at the BD-TS stride) then
-    /// encrypt it under `unit_key` so `aacs::decrypt_unit` recovers it. Mirrors
+    /// encrypt it under `unit_key` so `aacs::content::decrypt_unit` recovers it. Mirrors
     /// the encrypt helper in `crate::decrypt`'s tests.
     fn encrypt_aacs_unit(unit_key: &[u8; 16]) -> Vec<u8> {
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 4;
         while off < unit.len() {
             unit[off] = 0x47;
@@ -1274,7 +1277,7 @@ mod tests {
         }
         let cipher = Aes128::new(GenericArray::from_slice(&k));
         let mut prev = crate::aacs::crypto::AACS_IV;
-        let blocks = (crate::aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        let blocks = (crate::aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
         for i in 0..blocks {
             let o = 16 + i * 16;
             for j in 0..16 {
@@ -1347,7 +1350,7 @@ mod tests {
         );
         assert_eq!(
             loss.load(Ordering::Relaxed),
-            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
             "the undecryptable unit is tallied as loss before the read errors"
         );
 
@@ -1358,7 +1361,7 @@ mod tests {
         );
         assert_eq!(
             loss.load(Ordering::Relaxed),
-            2 * crate::aacs::ALIGNED_UNIT_LEN as u64,
+            2 * crate::aacs::content::ALIGNED_UNIT_LEN as u64,
             "loss must accumulate across reads"
         );
 
@@ -1392,7 +1395,7 @@ mod tests {
         // One unit encrypted under real_key, plus one trailing CLEAR (TS-sync)
         // unit so we can confirm conceal touches ONLY the undecryptable unit.
         let enc = encrypt_aacs_unit(&real_key);
-        let mut clear = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut clear = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut o = 4;
         while o < clear.len() {
             clear[o] = 0x47;
@@ -1441,13 +1444,13 @@ mod tests {
         // The undecryptable unit is tallied as loss.
         assert_eq!(
             loss.load(Ordering::Relaxed),
-            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
             "the concealed unit is still counted as loss"
         );
 
         // Unit 0 is now valid NULL TS packets — sync 0x47 at every 192-byte
         // stride (offset 4), PID 0x1FFF — and carries no ciphertext.
-        let unit0 = &buf[..crate::aacs::ALIGNED_UNIT_LEN];
+        let unit0 = &buf[..crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 0;
         while off + 192 <= unit0.len() {
             assert_eq!(unit0[off + 4], 0x47, "null packet sync at {off}");
@@ -1456,12 +1459,13 @@ mod tests {
             off += 192;
         }
         assert!(
-            !crate::aacs::ts_sync_destroyed(unit0),
+            !crate::aacs::content::ts_sync_destroyed(unit0),
             "concealed unit reads as well-formed TS, not scrambled"
         );
 
         // Unit 1 (clear) passed through untouched.
-        let unit1 = &buf[crate::aacs::ALIGNED_UNIT_LEN..2 * crate::aacs::ALIGNED_UNIT_LEN];
+        let unit1 = &buf
+            [crate::aacs::content::ALIGNED_UNIT_LEN..2 * crate::aacs::content::ALIGNED_UNIT_LEN];
         assert_eq!(unit1, &clear[..], "the clear unit is left exactly as read");
     }
 
@@ -1496,7 +1500,7 @@ mod tests {
         // The byte-exact expected post-decrypt form of unit B (independent decrypt).
         let mut expected_tail = good_tail.clone();
         assert!(
-            crate::aacs::decrypt_unit(&mut expected_tail, &good_key),
+            crate::aacs::content::decrypt_unit(&mut expected_tail, &good_key),
             "padding-tail must decrypt under good_key"
         );
 
@@ -1542,12 +1546,12 @@ mod tests {
         // ONLY the genuinely-undecryptable unit A is tallied / concealed.
         assert_eq!(
             loss.load(Ordering::Relaxed),
-            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
             "exactly one unit (the undecryptable one) is counted as loss"
         );
 
         // Unit A → NULL TS (concealed).
-        let unit0 = &buf[..crate::aacs::ALIGNED_UNIT_LEN];
+        let unit0 = &buf[..crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 0;
         while off + 192 <= unit0.len() {
             assert_eq!(unit0[off + 4], 0x47, "unit A null packet sync at {off}");
@@ -1562,7 +1566,8 @@ mod tests {
         // Unit B → the GOOD decrypted padding tail, byte-for-byte intact (NOT
         // overwritten with NULL TS). This is the silent-data-loss the old
         // majority-vote predicate caused.
-        let unit1 = &buf[crate::aacs::ALIGNED_UNIT_LEN..2 * crate::aacs::ALIGNED_UNIT_LEN];
+        let unit1 = &buf
+            [crate::aacs::content::ALIGNED_UNIT_LEN..2 * crate::aacs::content::ALIGNED_UNIT_LEN];
         assert_eq!(
             unit1,
             &expected_tail[..],
@@ -1587,8 +1592,8 @@ mod tests {
     /// `mux::ts` reads as a concealed gap.
     #[test]
     fn null_ts_fill_is_well_formed_and_invisible_to_real_pids() {
-        let mut unit = vec![0xAAu8; crate::aacs::ALIGNED_UNIT_LEN];
-        crate::aacs::fill_null_ts_unit(&mut unit);
+        let mut unit = vec![0xAAu8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        crate::aacs::content::fill_null_ts_unit(&mut unit);
         // 32 packets, each: sync 0x47, PID 0x1FFF, adaptation-only (0b10) with a
         // discontinuity_indicator in the adaptation field.
         let mut off = 0;
@@ -1679,7 +1684,7 @@ mod tests {
             "callback must be invoked once with the failing unit"
         );
         assert!(
-            crate::aacs::ts_sync_destroyed(&got[0]),
+            crate::aacs::content::ts_sync_destroyed(&got[0]),
             "the sample handed to the callback is the still-scrambled ciphertext"
         );
         assert_eq!(
@@ -1703,7 +1708,7 @@ mod tests {
         );
         assert_eq!(
             nocb_loss.load(Ordering::Relaxed),
-            crate::aacs::ALIGNED_UNIT_LEN as u64,
+            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
             "without a fetch callback the undecryptable unit is loss"
         );
     }
@@ -1784,7 +1789,7 @@ mod tests {
             "fetch fired for BOTH units — the dry result for A did not latch off B"
         );
         assert!(
-            !crate::aacs::ts_sync_destroyed(&buf2),
+            !crate::aacs::content::ts_sync_destroyed(&buf2),
             "unit B is decrypted after its on-demand fetch"
         );
     }
@@ -1899,7 +1904,7 @@ mod tests {
                 let mut u = 0;
                 while u < bytes {
                     buf[u] |= 0xC0;
-                    u += crate::aacs::ALIGNED_UNIT_LEN;
+                    u += crate::aacs::content::ALIGNED_UNIT_LEN;
                 }
                 Ok(bytes)
             }
@@ -1998,7 +2003,7 @@ mod tests {
                 let mut u = 0;
                 while u < b {
                     buf[u] |= 0xC0; // CPI bits → reads as encrypted
-                    u += crate::aacs::ALIGNED_UNIT_LEN;
+                    u += crate::aacs::content::ALIGNED_UNIT_LEN;
                 }
                 Ok(b)
             }

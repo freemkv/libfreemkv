@@ -10,8 +10,8 @@
 pub fn collect_host_certs(
     opts: &crate::disc::ScanOptions,
     mkb: Option<u32>,
-) -> Vec<crate::aacs::HostCert> {
-    let mut host_certs: Vec<crate::aacs::HostCert> = Vec::new();
+) -> Vec<crate::aacs::types::HostCert> {
+    let mut host_certs: Vec<crate::aacs::types::HostCert> = Vec::new();
     if let Some(c) = &opts.credentials {
         host_certs.extend(c.host_certs.iter().cloned());
     }

@@ -89,7 +89,7 @@ impl fu::scsi::ScsiTransport for ScsiAdapter<'_> {
 }
 
 /// Map libfreemkv's host certs (keysource-collected) to the unlock contract's.
-pub(crate) fn map_host_certs(certs: &[crate::aacs::HostCert]) -> Vec<fu::HostCert> {
+pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::HostCert> {
     certs
         .iter()
         .map(|c| fu::HostCert {

@@ -366,7 +366,7 @@ impl TsDemuxer {
 
         // P3/B1 CONCEALMENT MARKER. The decrypt layer fills an undecryptable
         // aligned unit with NULL-TS packets (PID 0x1FFF) that carry an
-        // adaptation-field discontinuity_indicator (see `aacs::fill_null_ts_unit`).
+        // adaptation-field discontinuity_indicator (see `aacs::content::fill_null_ts_unit`).
         // This is the authoritative loss signal — unlike a tracked PID's 4-bit
         // continuity_counter it is CC-INDEPENDENT, so it survives a loss that is
         // an exact multiple of 16 packets and a loss at the very start of a PID
