@@ -41,6 +41,20 @@
 //! Km      = AES-128D(Kpnew, VKD) XOR uv
 //! ```
 //!
+//! **Spec note — Variant Number width (`Kvn`).** The published AACS
+//! Sequence-Key Variant Number (Introduction and Common Cryptographic
+//! Elements book, Rev 0.953, §3.2.5.2.2, record `0x0D`) is the **low 10
+//! bits** of `AES-G(Kp, Nonce)` — a range of ≤1024 variants. This 2.1
+//! chain instead takes the **low 16 bits** (`& 0xFFFF`), because it
+//! indexes the 2.1 VKD table (`0x2f`), which carries up to 65,535 entries:
+//! the wider index is demanded by the larger table, not a mis-transcription
+//! of the 10-bit spec value. Both the 16-bit width and the Nonce source
+//! (tail of `0x2d`) are RE-derived from a single live variant MKB and
+//! remain UNCONFIRMED — the spec's `0x0D` "Variant Number" record does not
+//! appear on a real 2.1 MKB. If a covering key ever lets the chain run
+//! end-to-end against the `0x86` verify, this width is the first thing to
+//! confirm.
+//!
 //! Two condition bits on `Kmp[15]` route off the hardcoded-KCD path
 //! (Soft Correction and Online Challenge). The chain refuses to run in
 //! either case — callers must handle those modes out of band.
@@ -191,7 +205,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 
 // ── AES-G ────────────────────────────────────────────────────────────────
 
-/// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2.
+/// AES-G(x1, x2) = AES-128D(x1, x2) XOR x2. [C] §2.1.3 (note: uses AES-128**D**).
 ///
 /// The Media Key Variant chain uses AES-G to derive both the variant
 /// number (`Kvn = AES-G(Kp, Nonce)`) and the Volume Unique Key
@@ -261,7 +275,7 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 ///     note on [`super::keys::probe::mkb_cvalues`]). They must NOT be
 ///     unified to one order — each is correct for its own MKB shape.
 ///   - finders: this walk operates on parsed [`MkbRecord`]s (needed
-///     because the variant chain also reads `0x82`/`0x83`); the
+///     because the variant chain also reads `0x2d`/`0x2f`); the
 ///     classical walk operates on raw MKB bytes. Same framing, different
 ///     input type.
 ///
@@ -723,9 +737,9 @@ mod tests {
     ///   times — Kp = aesg3(dk, 1).
     /// - one cvalue in record 0x07 chosen so AES-D(Kp, C) ⊕ uv produces a
     ///   Kmp whose byte-15 is exactly `kmp15`.
-    /// - record 0x82 with a 16-byte body (acts as both Variant Data
-    ///   and Variant Key Data; satisfies the parser heuristics).
-    /// - record 0x83 with a 16-byte Nonce.
+    /// - record 0x2d (Encrypted Media Key Variant Data): a 32-byte body
+    ///   carrying C in the head 16 bytes and a 16-byte Nonce in the tail.
+    /// - record 0x2f (Variant Key Data): one 16-byte entry.
     ///
     /// Returns (records, dk, planted_kp, planted_kmp).
     fn synthetic_variant_setup(kmp15: u8) -> (Vec<MkbRecord>, DeviceKey, [u8; 16], [u8; 16]) {

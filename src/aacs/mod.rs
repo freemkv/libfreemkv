@@ -13,6 +13,17 @@
 //!
 //! The VUK decrypts title keys from AACS/Unit_Key_RO.inf on disc.
 //! Title keys decrypt m2ts stream content (AES-128-CBC).
+//!
+//! ## Spec provenance
+//!
+//! The crypto below carries `[TAG] §x.y` citations back to the published AACS
+//! specification (Final Rev 0.953), so each primitive links to the section it
+//! implements:
+//!   - `[C]`  — AACS Introduction and Common Cryptographic Elements Book (primitives, MKB/key-management).
+//!   - `[PR]` — AACS Pre-recorded Video Book (Volume/Title Key layer).
+//!   - `[BD]` — AACS Blu-ray Disc Pre-recorded Book (CPS Unit Key, Aligned Unit, Block Key).
+//!   - `[libaacs]` — the libaacs reference implementation, cited only where the spec
+//!     is silent (the `0x86` verify record and the Category-C MKBType names).
 
 pub mod boil;
 pub mod decrypt;

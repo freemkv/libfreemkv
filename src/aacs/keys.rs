@@ -63,7 +63,8 @@ impl AacsVersion {
 
 // ── VUK derivation ──────────────────────────────────────────────────────────
 
-/// Derive VUK from Media Key and Volume ID.
+/// Derive VUK from Media Key and Volume ID. [PR] §3.3 / [BD] §3.3
+/// (`Kvu = AES-G(Km, IDv)`; AES-G uses AES-128D):
 /// VUK = AES-128-ECB-DECRYPT(media_key, volume_id) XOR volume_id
 pub fn derive_vuk(media_key: &[u8; 16], volume_id: &[u8; 16]) -> [u8; 16] {
     let mut vuk = aes_ecb_decrypt(media_key, volume_id);
@@ -73,7 +74,8 @@ pub fn derive_vuk(media_key: &[u8; 16], volume_id: &[u8; 16]) -> [u8; 16] {
     vuk
 }
 
-/// Decrypt an encrypted unit key using the VUK (AES-128-ECB).
+/// Decrypt an encrypted unit key using the VUK (AES-128-ECB). [PR] §3.5
+/// (Title Key unwrap `Kt = AES-128D(Ku, Kte)`); the BD "CPS Unit Key" synonym is [BD] §3.9.3.
 pub fn decrypt_unit_key(vuk: &[u8; 16], encrypted_uk: &[u8; 16]) -> [u8; 16] {
     aes_ecb_decrypt(vuk, encrypted_uk)
 }
@@ -316,11 +318,11 @@ fn try_pk_against_tables(
 /// Validate a processing key against a cvalue/UV pair.
 /// Returns the Media Key if valid.
 ///
-/// Steps:
-///   1. `mk = AES-128D(pk, cvalue)`
-///   2. `mk[12..16] ^= uv` (4 bytes XOR into the last 4 bytes only)
-///   3. `dec_vd = AES-128D(mk, mk_dv)`
-///   4. If `dec_vd[0..8] == 01 23 45 67 89 AB CD EF` → valid.
+/// Steps (media key: [C] §3.2.4; verify relation: [C] §3.2.5.1.4):
+///   1. `mk = AES-128D(pk, cvalue)`                       [C] §3.2.4
+///   2. `mk[12..16] ^= uv` (4 bytes XOR into the last 4 bytes only)  [C] §3.2.4
+///   3. `dec_vd = AES-128D(mk, mk_dv)`                     [C] §3.2.5.1.4
+///   4. If `dec_vd[0..8] == 01 23 45 67 89 AB CD EF` → valid.  [C] §3.2.5.1.4
 fn validate_processing_key(
     pk: &[u8; 16],
     cvalue: &[u8],
@@ -400,6 +402,7 @@ pub mod probe {
 }
 
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
+/// 0x81: [C] §3.2.5.1.4. 0x86 (AACS 2.x): [libaacs] `mkb.c` — not in the public spec.
 fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
     // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
@@ -430,12 +433,12 @@ fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     }
 }
 
-/// Find Subset-Difference records (type 0x04) in MKB.
+/// Find Subset-Difference records (type 0x04) in MKB. [C] §3.2.5.1.5.
 fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
     find_record_body(mkb, 0x04)
 }
 
-/// Find the Media Key Data Record (cvalues table) in an MKB.
+/// Find the Media Key Data Record (cvalues table) in an MKB. [C] §3.2.4 / §3.2.5.1.7.
 ///
 /// The cvalue table is record type `0x05` (Media Key Data) on BOTH AACS
 /// 1.0 and AACS 2.x MKBs — its 16-byte cvalue entries are 1:1 with the
@@ -575,7 +578,7 @@ impl MkbType {
 }
 
 /// The raw 32-bit MKBType field from the Type-and-Version record (0x10), bytes
-/// 4-7. `None` if no 0x10 record is present.
+/// 4-7. `None` if no 0x10 record is present. [C] §3.2.5.1.1 Table 3-2.
 pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): the 32-bit MKBType is bytes 4-7 (body
     // offset 0). Needs rec_len >= 8 (4 header + 4 type).
@@ -597,12 +600,13 @@ pub fn mkb_is_uhd(mkb: &[u8]) -> Option<bool> {
 
 // ── AACS-G3 key derivation (subset-difference tree) ─────────────────────────
 
-/// AACS-G3 seed constant.
+/// AACS-G3 seed constant (`s0`). [C] §3.2.2.
 const AESG3_SEED: [u8; 16] = [
     0x7B, 0x10, 0x3C, 0x5D, 0xCB, 0x08, 0xC4, 0xE5, 0x1A, 0x27, 0xB0, 0x17, 0x99, 0x05, 0x3B, 0xD9,
 ];
 
-/// AACS-G3: derive a subkey from a parent key.
+/// AACS-G3: derive a subkey from a parent key. [C] §3.2.2 (Triple AES Generator:
+/// left=`D(k,s0)⊕s0` inc 0, pk=`D(k,s0+1)⊕(s0+1)` inc 1, right=`D(k,s0+2)⊕(s0+2)` inc 2).
 /// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
 ///
 /// Shared with [`super::variants`] (its variant chain runs the same SD
@@ -617,7 +621,7 @@ pub(super) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
     out
 }
 
-/// Compute v_mask from a UV value. Shared with [`super::variants`].
+/// Compute v_mask from a UV value. [C] §3.2.3. Shared with [`super::variants`].
 pub(super) fn calc_v_mask(uv: u32) -> u32 {
     let mut v_mask: u32 = 0xFFFF_FFFF;
     while (uv & !v_mask) == 0 && v_mask != 0 {
@@ -627,7 +631,7 @@ pub(super) fn calc_v_mask(uv: u32) -> u32 {
 }
 
 /// Derive processing key from device key using subset-difference tree traversal.
-/// Shared with [`super::variants`].
+/// [C] §3.2.4 (device-tree descent, MSB-branch, terminal PK). Shared with [`super::variants`].
 pub(super) fn calc_pk_from_dk(
     dk: &[u8; 16],
     uv: u32,
@@ -731,9 +735,11 @@ pub fn derive_media_key_and_pk_from_dk(
                 continue;
             }
 
+            // u-mask = shift count of low-order 0 bits ([C] §3.2.5.1.5); v-mask [C] §3.2.3.
             let u_mask: u32 = 0xFFFF_FFFF << u_mask_shift;
             let v_mask = calc_v_mask(uv);
 
+            // Subset-difference applies iff (d&mu)==(uv&mu) && (d&mv)!=(uv&mv). [C] §3.2.4.
             if ((device_number & u_mask) == (uv & u_mask))
                 && ((device_number & v_mask) != (uv & v_mask))
             {
