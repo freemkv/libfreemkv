@@ -28,16 +28,15 @@
 pub mod boil;
 pub mod content;
 pub mod crypto;
+pub mod derive;
 pub mod host_certs;
 pub mod inf;
-pub mod media_key;
 pub mod mkb;
 pub mod provider;
 pub mod resolve;
 pub mod trace;
 pub mod types;
 pub mod variant;
-pub mod volume_key;
 
 /// On-disc UDF paths to the AACS key-input files (with their fallbacks).
 /// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
@@ -71,15 +70,16 @@ pub use content::{
 // `probe` is a reproduction-harness helper (see keys.rs), not part of the
 // documented 1.0 surface; keep it reachable but off the rendered docs so we
 // don't commit semver stability to test primitives.
+#[doc(hidden)]
+pub use derive::probe;
+pub use derive::{decrypt_unit_key, derive_vuk};
+pub use derive::{
+    derive_media_key_and_pk_from_dk, derive_media_key_from_dk, derive_media_key_from_pk,
+    recover_dk_position,
+};
 pub use inf::{
     ContentCert, UnitKeyFile, disc_hash, disc_hash_hex, parse_content_cert, parse_unit_key_ro,
     read_mkb_from_drive,
-};
-#[doc(hidden)]
-pub use media_key::probe;
-pub use media_key::{
-    derive_media_key_and_pk_from_dk, derive_media_key_from_dk, derive_media_key_from_pk,
-    recover_dk_position,
 };
 pub use mkb::{
     AACS_MAJOR_BD, AACS_MAJOR_UHD, AacsVersion, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C,
@@ -96,7 +96,6 @@ pub use variant::{
     KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, ProcessingKeyMatch,
     derive_media_key_variant, is_variant_mkb, variant_nonce, walk_processing_key,
 };
-pub use volume_key::{decrypt_unit_key, derive_vuk};
 
 #[cfg(test)]
 mod tests {
