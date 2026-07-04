@@ -204,7 +204,8 @@ pub fn resolve_candidate(
     unit_key_ro: &[u8],
     vid: Option<Vid>,
 ) -> Option<ResolvedChain> {
-    use super::keys::{AacsVersion, derive_media_key_and_pk_from_dk, mkb_type, parse_unit_key_ro};
+    use super::keys::{derive_media_key_and_pk_from_dk, parse_unit_key_ro};
+    use super::mkb::{AacsVersion, mkb_type};
 
     // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
     // `.inf` parsing lives here: derive the stride version from the disc's own

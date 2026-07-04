@@ -30,6 +30,7 @@ pub mod content;
 pub mod crypto;
 pub mod host_certs;
 pub mod keys;
+pub mod mkb;
 pub mod provider;
 pub mod trace;
 pub mod types;
@@ -70,19 +71,22 @@ pub use content::{
 #[doc(hidden)]
 pub use keys::probe;
 pub use keys::{
-    AACS_MAJOR_BD, AACS_MAJOR_UHD, AacsVersion, ContentCert, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C,
-    MKB_TYPE_3_RECORDABLE, MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbType, ResolveContext,
-    ResolveFailure, ResolvedKeys, UnitKeyFile, decrypt_unit_key, derive_media_key_and_pk_from_dk,
-    derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk, disc_hash, disc_hash_hex,
-    mkb_content_len, mkb_is_uhd, mkb_type, mkb_type_raw, mkb_version, parse_content_cert,
-    parse_unit_key_ro, read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2,
-    resolve_keys_v21, resolve_keys_with_reason, trim_mkb,
+    ContentCert, ResolveContext, ResolveFailure, ResolvedKeys, UnitKeyFile, decrypt_unit_key,
+    derive_media_key_and_pk_from_dk, derive_media_key_from_dk, derive_media_key_from_pk,
+    derive_vuk, disc_hash, disc_hash_hex, parse_content_cert, parse_unit_key_ro,
+    read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2, resolve_keys_v21,
+    resolve_keys_with_reason,
+};
+pub use mkb::{
+    AACS_MAJOR_BD, AACS_MAJOR_UHD, AacsVersion, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C,
+    MKB_TYPE_3_RECORDABLE, MKB_TYPE_4_PRERECORDED, MKB_TYPE_10_CLASS_II, MkbRecord, MkbType,
+    mkb_content_len, mkb_is_uhd, mkb_type, mkb_type_raw, mkb_version, trim_mkb, walk_mkb,
 };
 pub use provider::KeyProvider;
 pub use types::{DeviceKey, DiscEntry, HostCert};
 pub use variant::{
-    KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, MkbRecord, ProcessingKeyMatch,
-    derive_media_key_variant, is_variant_mkb, variant_nonce, walk_mkb, walk_processing_key,
+    KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, ProcessingKeyMatch,
+    derive_media_key_variant, is_variant_mkb, variant_nonce, walk_processing_key,
 };
 
 #[cfg(test)]
