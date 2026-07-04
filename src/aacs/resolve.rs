@@ -1,10 +1,9 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
 use super::crypto::aes_ecb_decrypt;
+use super::derive::*;
 use super::inf::*;
-use super::media_key::*;
 use super::mkb::*;
-use super::volume_key::*;
 
 //
 // Canonical form is `<category>1003` (low 16 bits `0x1003` is a fixed marker).
@@ -457,13 +456,12 @@ mod tests {
     // This suite predates the module split; it white-box-tests items now living
     // in sibling modules. Pull them all in so the tests keep exercising them.
     use super::super::crypto::*;
+    use super::super::derive::*;
     use super::super::inf::*;
-    use super::super::media_key::*;
     use super::super::mkb::*;
     use super::super::provider::SuppliedKey;
     use super::super::types::DiscEntry;
     use super::super::types::*;
-    use super::super::volume_key::*;
     use super::*;
 
     /// Audit #5: the `major` / `from_major` mapping is load-bearing for the
