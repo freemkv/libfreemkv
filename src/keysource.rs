@@ -3,12 +3,12 @@
 //! libfreemkv performs NO key lookup. An application resolves a disc's keys
 //! through one or more [`KeySource`]s, each an adapter over a backing store (a
 //! keydb file, a key server, the mapfile cache). A source's job is to return the
-//! disc's terminal **Unit Keys** ([`crate::aacs::UnitKey`]). It knows what
+//! disc's terminal **Unit Keys** ([`crate::aacs::boil::UnitKey`]). It knows what
 //! material it holds (a DK / MK / VUK / pre-decrypted UK) and what it must fetch
 //! from the disc (VID, MKB, encrypted title keys, content samples) to get there;
 //! it orchestrates the derivation by calling libfreemkv's own boil-down crypto
-//! primitives ([`crate::aacs::mk_from_dk`] / [`crate::aacs::vuk_from_mk`] /
-//! [`crate::aacs::uk_from_vuk`]) through the [`ResolveCtx`] handed to it.
+//! primitives ([`crate::aacs::boil::mk_from_dk`] / [`crate::aacs::boil::vuk_from_mk`] /
+//! [`crate::aacs::boil::uk_from_vuk`]) through the [`ResolveCtx`] handed to it.
 //!
 //! libfreemkv still OWNS the crypto: the boil-down primitives and the AES live
 //! here. A source owns only PATH ORCHESTRATION — deciding which primitive to
@@ -17,7 +17,8 @@
 //! keeping key *policy* (which store, which order, online vs local) out of the
 //! library.
 
-use crate::aacs::{HostCert, UnitKey, Vid};
+use crate::aacs::boil::{UnitKey, Vid};
+use crate::aacs::types::HostCert;
 use crate::disc::Key;
 use crate::error::Error;
 
@@ -74,8 +75,8 @@ pub trait ResolveCtx {
     /// Raw MKB bytes (may be empty when not captured).
     fn mkb(&self) -> Result<&[u8], Error>;
     /// The disc's encrypted title keys, parsed from `Unit_Key_RO.inf` the same
-    /// way the library's resolver parses them ([`crate::aacs::parse_unit_key_ro`]),
-    /// in on-disc order. Feed straight into [`crate::aacs::uk_from_vuk`].
+    /// way the library's resolver parses them ([`crate::aacs::inf::parse_unit_key_ro`]),
+    /// in on-disc order. Feed straight into [`crate::aacs::boil::uk_from_vuk`].
     fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error>;
     /// Up to `n` encrypted on-disc content sample units, for a source that
     /// validates a candidate server-side against real ciphertext.
@@ -113,7 +114,8 @@ impl<'a> DiscInputsCtx<'a> {
     /// title keys — the parse failure is swallowed here, not surfaced as an
     /// error.
     pub fn new(inputs: &'a DiscInputs) -> Self {
-        use crate::aacs::{AacsVersion, parse_unit_key_ro};
+        use crate::aacs::inf::parse_unit_key_ro;
+        use crate::aacs::mkb::AacsVersion;
         let enc_keys = if inputs.unit_key_ro.is_empty() {
             Vec::new()
         } else {
@@ -164,8 +166,8 @@ impl ResolveCtx for DiscInputsCtx<'_> {
 /// holds, orchestrates the derivation down to Unit Keys using the library's
 /// boil-down crypto primitives — never re-implementing AES. A source that holds
 /// pre-decrypted Unit Keys returns them directly; one that holds a VUK calls
-/// [`crate::aacs::uk_from_vuk`]; one that holds device keys calls
-/// [`crate::aacs::mk_from_dk`] → [`crate::aacs::vuk_from_mk`] → `uk_from_vuk`.
+/// [`crate::aacs::boil::uk_from_vuk`]; one that holds device keys calls
+/// [`crate::aacs::boil::mk_from_dk`] → [`crate::aacs::boil::vuk_from_mk`] → `uk_from_vuk`.
 ///
 /// Returning an empty `Vec` means "no key for this disc from this source"; an
 /// `Err` means the source itself failed (I/O, parse, network). The caller
@@ -209,7 +211,7 @@ pub fn resolve_and_apply(
 }
 
 /// Like [`resolve_and_apply`] but also returns a structured
-/// [`crate::aacs::ResolutionTrace`] recording, per source, what happened — for
+/// [`crate::aacs::trace::ResolutionTrace`] recording, per source, what happened — for
 /// applications to render. ZERO English; the trace is typed enums only.
 ///
 /// One-shot per source: each source's [`KeySource::get_uk`] is called exactly
@@ -219,8 +221,8 @@ pub fn resolve_and_apply(
 /// success — so a wrong/partial key set is rejected and the loop continues.
 ///
 /// CPS-unit numbering: a source returns Unit Keys carrying the POSITIONAL index
-/// from [`crate::aacs::uk_from_vuk`]; the library's canonical CPS-unit number is
-/// `position + 1` (matching [`crate::aacs::parse_unit_key_ro`]'s `(i + 1)`), so
+/// from [`crate::aacs::boil::uk_from_vuk`]; the library's canonical CPS-unit number is
+/// `position + 1` (matching [`crate::aacs::inf::parse_unit_key_ro`]'s `(i + 1)`), so
 /// the committed `AacsState.unit_keys` is byte-identical to the library-resolved
 /// path. The number is cosmetic for descramble (the decrypt path strips it and
 /// tries every key) but is kept faithful to the resolver's convention.
@@ -228,10 +230,10 @@ pub fn resolve_and_apply_traced(
     sources: &[Box<dyn KeySource>],
     inputs: &DiscInputs,
     disc: &mut crate::Disc,
-) -> (bool, crate::aacs::ResolutionTrace) {
+) -> (bool, crate::aacs::trace::ResolutionTrace) {
     use crate::aacs::trace::{KeyNode, KeyOutcome, KeyStep};
 
-    let mut trace = crate::aacs::ResolutionTrace::new();
+    let mut trace = crate::aacs::trace::ResolutionTrace::new();
 
     // The ctx parses Unit_Key_RO.inf at the stride for `inputs.version` (the
     // disc's own AACS major), so the stride is the disc's single source of truth.
@@ -341,7 +343,7 @@ pub fn key_fetch(
 /// `start_lba`), which the library owns. A key source is *handed* these bytes
 /// via `DiscInputs.samples`; it never reads the disc itself.
 ///
-/// "Encrypted" is decided by [`crate::aacs::ts_sync_destroyed`] — the SAME
+/// "Encrypted" is decided by [`crate::aacs::content::ts_sync_destroyed`] — the SAME
 /// predicate the decrypt gate uses — so all sides agree. A clip opens with clear
 /// navigation units (PAT/PMT, menus); only the feature body is scrambled, and a
 /// clear unit proves nothing, so this collects only scrambled ones — probing
@@ -352,7 +354,7 @@ pub fn read_encrypted_units(
     title: &crate::disc::DiscTitle,
     n: usize,
 ) -> Vec<Vec<u8>> {
-    use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
     // Probe several evenly-spaced points across EACH extent rather than only the
     // midpoint-and-forward: a title whose encrypted feature starts late, or whose
@@ -413,7 +415,7 @@ pub fn read_encrypted_units(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aacs::UnitKey;
+    use crate::aacs::boil::UnitKey;
     use std::sync::{Arc, Mutex};
 
     // ── KeySource default-method behaviour ────────────────────────────────────
@@ -454,7 +456,7 @@ mod tests {
         let inputs = DiscInputs {
             disc_hash: "0xABC".into(),
             volume_id: [0u8; 16],
-            version: crate::aacs::AACS_MAJOR_BD,
+            version: crate::aacs::mkb::AACS_MAJOR_BD,
             mkb: vec![1, 2, 3],
             unit_key_ro: uk_ro,
             samples: vec![vec![9u8; 4], vec![8u8; 4], vec![7u8; 4]],
@@ -510,7 +512,7 @@ mod tests {
         let inputs = DiscInputs {
             disc_hash: "0x00".into(),
             volume_id: [0u8; 16],
-            version: crate::aacs::AACS_MAJOR_UHD,
+            version: crate::aacs::mkb::AACS_MAJOR_UHD,
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
             samples: Vec::new(),
@@ -531,7 +533,7 @@ mod tests {
         DiscInputs {
             disc_hash: String::new(),
             volume_id: [0u8; 16],
-            version: crate::aacs::AACS_MAJOR_UHD,
+            version: crate::aacs::mkb::AACS_MAJOR_UHD,
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
             samples: Vec::new(),
@@ -621,7 +623,7 @@ mod tests {
         });
 
         let cb = key_fetch(empty_inputs(), make);
-        let samples = vec![vec![0xEEu8; crate::aacs::ALIGNED_UNIT_LEN]];
+        let samples = vec![vec![0xEEu8; crate::aacs::content::ALIGNED_UNIT_LEN]];
         let got = cb(&samples);
         assert_eq!(
             got,
@@ -643,7 +645,7 @@ mod tests {
     /// finds the early scrambled band.
     #[test]
     fn read_encrypted_units_finds_scrambled_content_off_the_midpoint() {
-        use crate::aacs::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
         use crate::error::Result;
         use crate::sector::SectorSource;
 
@@ -725,7 +727,7 @@ mod tests {
     /// prior single-key fixtures passed regardless of stride.
     #[test]
     fn disc_inputs_ctx_parses_unit_keys_at_the_version_stride() {
-        use crate::aacs::{AACS_MAJOR_BD, AACS_MAJOR_UHD};
+        use crate::aacs::mkb::{AACS_MAJOR_BD, AACS_MAJOR_UHD};
         const UK_POS: usize = 64;
         let mut inf = vec![0u8; 200];
         inf[0..4].copy_from_slice(&(UK_POS as u32).to_be_bytes()); // uk_pos

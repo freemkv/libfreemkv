@@ -7,7 +7,7 @@
 //! grid (clips can start off the 6144 grid and fragment across UDF extents). So
 //! this gate BUFFERS the disc-absolute read stream and re-ALIGNS it into
 //! clip-file units, then applies the standards-correct
-//! [`crate::aacs::unit_is_clean_ts`] gate (libaacs `_verify_ts`, all-32 syncs).
+//! [`crate::aacs::content::unit_is_clean_ts`] gate (libaacs `_verify_ts`, all-32 syncs).
 //!
 //! FAIL-SAFE CONTRACT (this sits in the middle of every read, so it must never
 //! break a good read): the gate can ONLY downgrade a unit it is *confident* is
@@ -25,7 +25,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::aacs::{self, ALIGNED_UNIT_LEN};
+use crate::aacs::content::ALIGNED_UNIT_LEN;
+use crate::aacs::{self};
 use crate::consts::SECTOR_BYTES_U64;
 use crate::decrypt::DecryptKeys;
 use crate::sector::KeyFetch;
@@ -57,7 +58,7 @@ pub enum ContainerKind {
     Ts,
     /// HD-DVD `.evo` — MPEG-2 program stream (pack-start `00 00 01 BA`).
     /// NOT yet enabled by enumeration; present so adding HD-DVD is a one-mapping
-    /// change. See [`crate::aacs::unit_is_clean_ps`] for the (unvalidated) check.
+    /// change. See [`crate::aacs::content::unit_is_clean_ps`] for the (unvalidated) check.
     Ps,
 }
 
@@ -187,8 +188,8 @@ impl UnitVerifier {
     /// The post-decrypt structural check for a clip's container.
     fn accept_for(&self, clip: u32) -> fn(&[u8]) -> bool {
         match self.containers[clip as usize] {
-            ContainerKind::Ts => aacs::unit_is_clean_ts,
-            ContainerKind::Ps => aacs::unit_is_clean_ps,
+            ContainerKind::Ts => aacs::content::unit_is_clean_ts,
+            ContainerKind::Ps => aacs::content::unit_is_clean_ps,
         }
     }
 
@@ -301,8 +302,8 @@ impl UnitVerifier {
     }
 
     /// Can this fully-assembled unit be decrypted + verified? `accept` is the
-    /// container's strict structural check ([`aacs::unit_is_clean_ts`] for TS,
-    /// [`aacs::unit_is_clean_ps`] for PS) — the only format-specific part; the
+    /// container's strict structural check ([`aacs::content::unit_is_clean_ts`] for TS,
+    /// [`aacs::content::unit_is_clean_ps`] for PS) — the only format-specific part; the
     /// AACS crypto is container-agnostic. Returns the 3-state [`Decryptability`].
     fn decryptability(
         &mut self,
@@ -318,7 +319,7 @@ impl UnitVerifier {
         // ENCRYPTED units that no key opens are ever flagged. (A real bad READ of
         // clear content is still caught by the normal SCSI read-error path; this
         // gate just won't false-flag it.)
-        if !aacs::aacs_unit_encrypted(raw) {
+        if !aacs::content::aacs_unit_encrypted(raw) {
             return if accept(raw) {
                 Decryptability::Decryptable
             } else {
@@ -363,7 +364,7 @@ impl UnitVerifier {
     fn try_keys(&self, raw: &[u8; ALIGNED_UNIT_LEN], accept: fn(&[u8]) -> bool) -> bool {
         for k in &self.keys {
             let mut scratch = *raw;
-            if aacs::decrypt_unit_checked(&mut scratch, k, accept) {
+            if aacs::content::decrypt_unit_checked(&mut scratch, k, accept) {
                 return true;
             }
         }

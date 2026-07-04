@@ -1068,7 +1068,7 @@ mod tests {
             disc_entry: None,
         };
 
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1111,7 +1111,7 @@ mod tests {
         };
 
         let vid = [0u8; 16];
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1153,7 +1153,7 @@ mod tests {
         };
 
         let vid = [0u8; 16];
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1193,7 +1193,7 @@ mod tests {
         };
 
         let vid = [0u8; 16];
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1240,7 +1240,7 @@ mod tests {
             media_keys: vec![km],
             disc_entry: None,
         };
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1627,7 +1627,7 @@ mod tests {
         mkb.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0x55; 16]);
 
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1663,7 +1663,7 @@ mod tests {
             }),
         };
         let mkb = vec![0x10, 0x00, 0x00, 0x08, 0, 0, 0, 1];
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1697,7 +1697,7 @@ mod tests {
         let mut cc = vec![0u8; 20];
         cc[0] = 0x10;
         cc[1] = 0x80;
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: Some(&cc),
@@ -1731,7 +1731,7 @@ mod tests {
                 unit_keys: Vec::new(),
             }),
         };
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &data,
             content_cert: None,
@@ -1769,7 +1769,7 @@ mod tests {
                 unit_keys: Vec::new(),
             }),
         };
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1786,7 +1786,7 @@ mod tests {
     fn resolve_keys_returns_none_when_no_provider_has_anything() {
         // Empty provider array + VID present + no MKB → all paths miss → None.
         let uk_ro = minimal_unit_key_ro();
-        let providers: &[&dyn super::super::KeyProvider] = &[];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
@@ -1969,7 +1969,7 @@ mod tests {
     #[test]
     fn classify_processing_keys_zero_vid_is_vid_unavailable() {
         let prov = material_provider(Vec::new(), vec![[0u8; 16]]);
-        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&prov];
         let uk_ro = minimal_unit_key_ro();
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn classify_vid_present_with_material_is_no_material_not_vid() {
         let prov = material_provider(vec![one_device_key()], vec![[0u8; 16]]);
-        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&prov];
         let uk_ro = minimal_unit_key_ro();
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
@@ -2017,7 +2017,7 @@ mod tests {
     #[test]
     fn classify_vid_present_no_material_is_no_material() {
         let prov = material_provider(Vec::new(), Vec::new());
-        let providers: &[&dyn super::super::KeyProvider] = &[&prov];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&prov];
         let uk_ro = minimal_unit_key_ro();
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
@@ -2055,7 +2055,7 @@ mod tests {
                 unit_keys: Vec::new(),
             }),
         };
-        let providers: &[&dyn super::super::KeyProvider] = &[&keydb];
+        let providers: &[&dyn super::super::provider::KeyProvider] = &[&keydb];
         let ctx = ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
