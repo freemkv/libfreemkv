@@ -29,12 +29,15 @@ pub mod boil;
 pub mod content;
 pub mod crypto;
 pub mod host_certs;
-pub mod keys;
+pub mod inf;
+pub mod media_key;
 pub mod mkb;
 pub mod provider;
+pub mod resolve;
 pub mod trace;
 pub mod types;
 pub mod variant;
+pub mod volume_key;
 
 /// On-disc UDF paths to the AACS key-input files (with their fallbacks).
 /// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
@@ -68,14 +71,15 @@ pub use content::{
 // `probe` is a reproduction-harness helper (see keys.rs), not part of the
 // documented 1.0 surface; keep it reachable but off the rendered docs so we
 // don't commit semver stability to test primitives.
+pub use inf::{
+    ContentCert, UnitKeyFile, disc_hash, disc_hash_hex, parse_content_cert, parse_unit_key_ro,
+    read_mkb_from_drive,
+};
 #[doc(hidden)]
-pub use keys::probe;
-pub use keys::{
-    ContentCert, ResolveContext, ResolveFailure, ResolvedKeys, UnitKeyFile, decrypt_unit_key,
+pub use media_key::probe;
+pub use media_key::{
     derive_media_key_and_pk_from_dk, derive_media_key_from_dk, derive_media_key_from_pk,
-    derive_vuk, disc_hash, disc_hash_hex, parse_content_cert, parse_unit_key_ro,
-    read_mkb_from_drive, recover_dk_position, resolve_keys_v1, resolve_keys_v2, resolve_keys_v21,
-    resolve_keys_with_reason,
+    recover_dk_position,
 };
 pub use mkb::{
     AACS_MAJOR_BD, AACS_MAJOR_UHD, AacsVersion, MKB_20_CATEGORY_C, MKB_21_CATEGORY_C,
@@ -83,11 +87,16 @@ pub use mkb::{
     mkb_content_len, mkb_is_uhd, mkb_type, mkb_type_raw, mkb_version, trim_mkb, walk_mkb,
 };
 pub use provider::KeyProvider;
+pub use resolve::{
+    ResolveContext, ResolveFailure, ResolvedKeys, resolve_keys_v1, resolve_keys_v2,
+    resolve_keys_v21, resolve_keys_with_reason,
+};
 pub use types::{DeviceKey, DiscEntry, HostCert};
 pub use variant::{
     KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, ProcessingKeyMatch,
     derive_media_key_variant, is_variant_mkb, variant_nonce, walk_processing_key,
 };
+pub use volume_key::{decrypt_unit_key, derive_vuk};
 
 #[cfg(test)]
 mod tests {

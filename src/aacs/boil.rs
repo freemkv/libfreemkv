@@ -26,10 +26,9 @@
 //! the processing-key path starts from a precomputed PK. Neither needs a VID
 //! (the VID enters at `vuk_from_mk`).
 
-use super::keys::{
-    decrypt_unit_key, derive_media_key_and_pk_from_dk, derive_media_key_from_pk, derive_vuk,
-};
+use super::media_key::{derive_media_key_and_pk_from_dk, derive_media_key_from_pk};
 use super::types::DeviceKey;
+use super::volume_key::{decrypt_unit_key, derive_vuk};
 
 /// Volume ID (16 bytes) — read from the disc via the SCSI handshake / OEM path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +203,8 @@ pub fn resolve_candidate(
     unit_key_ro: &[u8],
     vid: Option<Vid>,
 ) -> Option<ResolvedChain> {
-    use super::keys::{derive_media_key_and_pk_from_dk, parse_unit_key_ro};
+    use super::inf::parse_unit_key_ro;
+    use super::media_key::derive_media_key_and_pk_from_dk;
     use super::mkb::{AacsVersion, mkb_type};
 
     // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
@@ -219,7 +219,7 @@ pub fn resolve_candidate(
         if ukf.encrypted_keys.is_empty() {
             return None;
         }
-        Some(super::keys::derive_unit_keys(&ukf, &vuk.0))
+        Some(super::volume_key::derive_unit_keys(&ukf, &vuk.0))
     };
 
     match candidate {
@@ -277,7 +277,7 @@ pub fn resolve_candidate(
 mod tests {
     use super::*;
     use crate::aacs::crypto::aes_ecb_encrypt;
-    use crate::aacs::keys::{decrypt_unit_key, derive_vuk};
+    use crate::aacs::volume_key::{decrypt_unit_key, derive_vuk};
 
     /// `vuk_from_mk` must equal the inline `derive_vuk` path bit-for-bit, for
     /// several known (MK, VID) vectors.
