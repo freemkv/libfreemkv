@@ -244,7 +244,7 @@ fn decrypt_sectors_impl(
             // Strip CPS-unit IDs — the decrypt primitives only want the raw key bytes.
             let raw_keys: Vec<[u8; 16]> = unit_keys.iter().map(|(_, k)| *k).collect();
             let rdk: Option<[u8; 16]> = *read_data_key;
-            let unit_len = aacs::ALIGNED_UNIT_LEN;
+            let unit_len = aacs::content::ALIGNED_UNIT_LEN;
             // AACS decrypts whole 6144-byte aligned units. The live mux path
             // (mux/disc.rs::fill_extents) issues 1- or 2-sector reads at every
             // extent tail, so a buffer is commonly NOT a multiple of the unit
@@ -288,8 +288,8 @@ fn decrypt_sectors_impl(
                 };
                 if partial_in_content {
                     let partial = &buf[buf.len() - partial_len..];
-                    let packets = aacs::ts_packet_total(partial);
-                    if packets > 0 && aacs::ts_sync_count(partial) <= packets / 2 {
+                    let packets = aacs::content::ts_packet_total(partial);
+                    if packets > 0 && aacs::content::ts_sync_count(partial) <= packets / 2 {
                         return Err(crate::error::Error::DecryptFailed);
                     }
                 }
@@ -326,7 +326,7 @@ fn decrypt_sectors_impl(
             // must happen first — it's a shared layer on top that is key-independent
             // across all CPS units on the disc.
             let decrypt_one = |chunk: &mut [u8]| {
-                if chunk.len() != unit_len || !aacs::aacs_unit_needs_decrypt(chunk) {
+                if chunk.len() != unit_len || !aacs::content::aacs_unit_needs_decrypt(chunk) {
                     return;
                 }
                 // Save original bytes so we can restore if no key validates.
@@ -335,7 +335,7 @@ fn decrypt_sectors_impl(
                 // Build a bus-decrypted copy to try unit keys against, or work
                 // in-place when there is no bus layer.
                 if let Some(ref rdk_key) = rdk {
-                    aacs::decrypt_bus(chunk, rdk_key);
+                    aacs::content::decrypt_bus(chunk, rdk_key);
                 }
 
                 // Reorder the key iterator: try the cached hint first, then fall
@@ -349,7 +349,7 @@ fn decrypt_sectors_impl(
                         // Work on a per-key copy so a failing attempt doesn't
                         // clobber the bus-decrypted base we'll retry on.
                         let mut attempt: Vec<u8> = chunk.to_vec();
-                        if aacs::decrypt_unit(&mut attempt, key) {
+                        if aacs::content::decrypt_unit(&mut attempt, key) {
                             chunk.copy_from_slice(&attempt);
                             last_key_idx.store(idx, Ordering::Relaxed);
                             return;
@@ -478,7 +478,7 @@ mod tests {
     /// not left scrambled.
     #[test]
     fn nav_file_unit_survives_decrypt_attempt() {
-        let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+        let mut unit = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
         unit[0] = b'M';
         unit[1] = b'P';
         unit[2] = b'L';
@@ -528,7 +528,7 @@ mod tests {
         let mut u = 0;
         while u < len {
             v[u] |= 0xC0;
-            u += aacs::ALIGNED_UNIT_LEN;
+            u += aacs::content::ALIGNED_UNIT_LEN;
         }
         v
     }
@@ -561,7 +561,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
 
         // base_lba 0, content = [(100,10)] ⇒ the unit at LBA 0 is OUTSIDE content.
         let mut buf = original.clone();
@@ -581,7 +581,7 @@ mod tests {
             decrypt_sectors_in_content(&mut buf2, &mut keys, 0, 100, &[(100, 10)]).unwrap();
         assert_eq!(
             dropped2,
-            aacs::ALIGNED_UNIT_LEN,
+            aacs::content::ALIGNED_UNIT_LEN,
             "an undecryptable CONTENT unit IS counted as loss"
         );
     }
@@ -594,12 +594,12 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let mut buf = scrambled_region(2 * aacs::ALIGNED_UNIT_LEN);
+        let mut buf = scrambled_region(2 * aacs::content::ALIGNED_UNIT_LEN);
         // unit0 @ LBA 0 (clear/skip), unit1 @ LBA 3 (content). Content = [(3,3)].
         let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(3, 3)]).unwrap();
         assert_eq!(
             dropped,
-            aacs::ALIGNED_UNIT_LEN,
+            aacs::content::ALIGNED_UNIT_LEN,
             "only the in-content unit (unit1) is checked; clear unit0 is skipped"
         );
     }
@@ -613,7 +613,7 @@ mod tests {
             read_data_key: None,
         };
         let mut keys_u = keys_g.clone();
-        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut g = original.clone();
         let mut u = original.clone();
         let gated = decrypt_sectors_in_content(&mut g, &mut keys_g, 0, 0, &[(0, 3)]).unwrap();
@@ -662,7 +662,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut buf = original.clone();
         let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[]).unwrap();
         assert_eq!(
@@ -680,7 +680,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let original = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let original = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut buf = original.clone();
         let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
         assert_eq!(dropped, 0, "a clear in-content unit is not ciphertext");
@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn content_gate_none_keys_is_noop() {
         let mut keys = DecryptKeys::None;
-        let original = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let original = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
         let mut buf = original.clone();
         let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
         assert_eq!(dropped, 0);
@@ -721,7 +721,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let u = aacs::ALIGNED_UNIT_LEN;
+        let u = aacs::content::ALIGNED_UNIT_LEN;
         let mut buf = vec![0u8; 3 * u];
         buf[..u].copy_from_slice(&scrambled_region(u)); // unit0 @ LBA0 scrambled
         buf[u..2 * u].copy_from_slice(&clear_ts_region(u)); // unit1 @ LBA3 clear
@@ -738,10 +738,14 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let mut buf = scrambled_region(2 * aacs::ALIGNED_UNIT_LEN);
+        let mut buf = scrambled_region(2 * aacs::content::ALIGNED_UNIT_LEN);
         // unit0 @ LBA0 content, unit1 @ LBA3 out. Content = [(0,3)].
         let dropped = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(0, 3)]).unwrap();
-        assert_eq!(dropped, aacs::ALIGNED_UNIT_LEN, "only unit0 counts");
+        assert_eq!(
+            dropped,
+            aacs::content::ALIGNED_UNIT_LEN,
+            "only unit0 counts"
+        );
     }
 
     /// The trailing-partial reject is ALSO content-gated: a scrambled partial
@@ -755,7 +759,7 @@ mod tests {
         };
         // One full clear unit + a scrambled single-sector partial, all OUTSIDE
         // content → the partial must be tolerated (Ok), not DecryptFailed.
-        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         buf.extend_from_slice(&scrambled_region(2048));
         // content far away → both the full unit and the partial are non-content.
         let res = decrypt_sectors_in_content(&mut buf, &mut keys, 0, 0, &[(1000, 3)]);
@@ -776,7 +780,7 @@ mod tests {
             read_data_key: None,
         };
         // One full scrambled unit + a 2048-byte (single-sector) CLEAR tail.
-        let unit = scrambled_region(aacs::ALIGNED_UNIT_LEN);
+        let unit = scrambled_region(aacs::content::ALIGNED_UNIT_LEN);
         let tail = clear_ts_region(2048);
         let mut buf = unit;
         buf.extend_from_slice(&tail);
@@ -784,7 +788,7 @@ mod tests {
         decrypt_sectors(&mut buf, &mut keys, 0).expect("clear trailing partial is Ok");
 
         assert_eq!(
-            &buf[aacs::ALIGNED_UNIT_LEN..],
+            &buf[aacs::content::ALIGNED_UNIT_LEN..],
             &tail[..],
             "clear trailing partial unit must be left unchanged"
         );
@@ -801,7 +805,7 @@ mod tests {
             read_data_key: None,
         };
         // One full unit + a 4096-byte (two-sector) SCRAMBLED tail.
-        let unit = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let unit = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let tail = scrambled_region(4096);
         let mut buf = unit;
         buf.extend_from_slice(&tail);
@@ -835,7 +839,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN * 2);
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN * 2);
         let snapshot = buf.clone();
 
         decrypt_sectors(&mut buf, &mut keys, 0).expect("exact-multiple buffer is Ok");
@@ -1092,7 +1096,7 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let err = decrypt_sectors(&mut buf, &mut keys, 5)
             .expect_err("unit_key_idx 5 is out of range for a 1-key list");
         assert_eq!(
@@ -1112,7 +1116,7 @@ mod tests {
             unit_keys: vec![],
             read_data_key: None,
         };
-        let mut buf = clear_ts_region(aacs::ALIGNED_UNIT_LEN);
+        let mut buf = clear_ts_region(aacs::content::ALIGNED_UNIT_LEN);
         let err = decrypt_sectors(&mut buf, &mut keys, 0).expect_err("empty unit_keys must error");
         assert_eq!(err.code(), crate::error::Error::DecryptFailed.code());
     }
@@ -1120,7 +1124,7 @@ mod tests {
     // ── Multi-CPS-unit key selection ──────────────────────────────────────
 
     /// Encrypt an aligned unit with the AACS algorithm run in reverse so that
-    /// `aacs::decrypt_unit` with the same key recovers the plaintext. Mirrors
+    /// `aacs::content::decrypt_unit` with the same key recovers the plaintext. Mirrors
     /// the `aacs_encrypt_unit` helper in `aacs::content::tests`.
     fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
         use aes::Aes128;
@@ -1136,7 +1140,7 @@ mod tests {
         }
         let cipher = Aes128::new(GenericArray::from_slice(&k));
         let mut prev = crate::aacs::crypto::AACS_IV;
-        let num_blocks = (aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        let num_blocks = (aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
         for i in 0..num_blocks {
             let off = 16 + i * 16;
             for j in 0..16 {
@@ -1153,9 +1157,9 @@ mod tests {
     /// (offset 4 + k*192) so `ts_sync_destroyed` reports false and
     /// `decrypt_unit` verifies it as clear after decryption.
     fn clear_ts_unit() -> Vec<u8> {
-        let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+        let mut unit = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 4;
-        while off < aacs::ALIGNED_UNIT_LEN {
+        while off < aacs::content::ALIGNED_UNIT_LEN {
             unit[off] = 0x47;
             off += 192;
         }
@@ -1171,7 +1175,7 @@ mod tests {
     /// garbage for content under key ≥ 1. The fix tries every key and
     /// accepts the one whose output passes the TS-sync verify.
     ///
-    /// Grounding: `for idx in try_order { … if aacs::decrypt_unit(&mut attempt, key) { … } }`
+    /// Grounding: `for idx in try_order { … if aacs::content::decrypt_unit(&mut attempt, key) { … } }`
     /// Mutation: revert to the pre-fix `decrypt_unit_full(chunk, &uk, …)` where
     /// `uk = raw_keys[unit_key_idx]` (always key 0) → the unit comes out as
     /// garbled bytes that still look scrambled, failing the `!ts_sync_destroyed`
@@ -1185,7 +1189,7 @@ mod tests {
         let mut unit = clear_ts_unit();
         aacs_encrypt_unit_for_test(&mut unit, &key1);
         assert!(
-            aacs::ts_sync_destroyed(&unit),
+            aacs::content::ts_sync_destroyed(&unit),
             "encrypted unit must look scrambled before decrypt"
         );
 
@@ -1199,13 +1203,13 @@ mod tests {
         decrypt_sectors(&mut buf, &mut keys, 0).expect("multi-CPS decrypt must succeed");
 
         assert!(
-            !aacs::ts_sync_destroyed(&buf),
+            !aacs::content::ts_sync_destroyed(&buf),
             "unit encrypted under key1 must be fully decrypted (TS syncs restored)"
         );
         // Every sync position must carry 0x47.
         assert_eq!(
-            aacs::ts_sync_count(&buf),
-            aacs::ts_packet_total(&buf),
+            aacs::content::ts_sync_count(&buf),
+            aacs::content::ts_packet_total(&buf),
             "all TS sync bytes must be restored after decrypting under key1"
         );
     }
@@ -1230,12 +1234,12 @@ mod tests {
         let mut buf = unit;
         decrypt_sectors(&mut buf, &mut keys, 0).expect("single-key disc must decrypt");
         assert!(
-            !aacs::ts_sync_destroyed(&buf),
+            !aacs::content::ts_sync_destroyed(&buf),
             "single-key disc: TS syncs must be restored"
         );
         assert_eq!(
-            aacs::ts_sync_count(&buf),
-            aacs::ts_packet_total(&buf),
+            aacs::content::ts_sync_count(&buf),
+            aacs::content::ts_packet_total(&buf),
             "all TS sync bytes must be restored for single-key disc"
         );
     }
@@ -1263,7 +1267,7 @@ mod tests {
         aacs_encrypt_unit_for_test(&mut unit, &real_key);
         let ciphertext = unit.clone();
         assert!(
-            aacs::ts_sync_destroyed(&unit),
+            aacs::content::ts_sync_destroyed(&unit),
             "encrypted unit must look scrambled going in"
         );
 
@@ -1277,7 +1281,7 @@ mod tests {
 
         assert_eq!(
             dropped,
-            aacs::ALIGNED_UNIT_LEN,
+            aacs::content::ALIGNED_UNIT_LEN,
             "the whole scrambled unit must be reported as dropped when no key validates"
         );
         assert_eq!(
@@ -1306,7 +1310,7 @@ mod tests {
         aacs_encrypt_unit_for_test(&mut unit_b, &wrong);
         let unit_b_ciphertext = unit_b.clone();
 
-        let mut buf = Vec::with_capacity(2 * aacs::ALIGNED_UNIT_LEN);
+        let mut buf = Vec::with_capacity(2 * aacs::content::ALIGNED_UNIT_LEN);
         buf.extend_from_slice(&unit_a);
         buf.extend_from_slice(&unit_b);
 
@@ -1318,15 +1322,15 @@ mod tests {
 
         assert_eq!(
             dropped,
-            aacs::ALIGNED_UNIT_LEN,
+            aacs::content::ALIGNED_UNIT_LEN,
             "exactly one unit's worth of bytes must be reported dropped"
         );
         assert!(
-            !aacs::ts_sync_destroyed(&buf[..aacs::ALIGNED_UNIT_LEN]),
+            !aacs::content::ts_sync_destroyed(&buf[..aacs::content::ALIGNED_UNIT_LEN]),
             "the decryptable unit must come out clear"
         );
         assert_eq!(
-            &buf[aacs::ALIGNED_UNIT_LEN..],
+            &buf[aacs::content::ALIGNED_UNIT_LEN..],
             &unit_b_ciphertext[..],
             "the undecryptable unit must be restored to ciphertext"
         );

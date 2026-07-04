@@ -1083,13 +1083,13 @@ mod tests {
     }
 
     /// Build a clear 6144-byte AACS unit (TS syncs at the 192-byte BD-TS
-    /// stride) then encrypt it under `unit_key` so `aacs::decrypt_unit`
+    /// stride) then encrypt it under `unit_key` so `aacs::content::decrypt_unit`
     /// recovers it cleanly (zero decrypt loss). Mirrors the encrypt helper in
     /// `sector/decrypting.rs` tests. `tag` distinguishes two units' payloads.
     fn encrypt_aacs_unit(unit_key: &[u8; 16], tag: u8) -> Vec<u8> {
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 4;
         while off < unit.len() {
             unit[off] = 0x47; // TS sync
@@ -1108,7 +1108,7 @@ mod tests {
         }
         let cipher = Aes128::new(GenericArray::from_slice(&k));
         let mut prev = crate::aacs::crypto::AACS_IV;
-        let blocks = (crate::aacs::ALIGNED_UNIT_LEN - 16) / 16;
+        let blocks = (crate::aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
         for i in 0..blocks {
             let o = 16 + i * 16;
             for j in 0..16 {
@@ -1124,7 +1124,7 @@ mod tests {
 
     /// The plaintext that `encrypt_aacs_unit(_, tag)` decrypts back to.
     fn clear_aacs_unit(tag: u8) -> Vec<u8> {
-        let mut unit = vec![0u8; crate::aacs::ALIGNED_UNIT_LEN];
+        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
         let mut off = 4;
         while off < unit.len() {
             unit[off] = 0x47;
@@ -1600,10 +1600,10 @@ mod tests {
     /// own batch starts are always unit-aligned; anchoring a later extent
     /// against the FIRST extent's base mis-aligns whenever the extents' starts
     /// differ by a non-multiple of 3 sectors. This is the exact arithmetic the
-    /// decrypt-on-read gate (`aacs::is_unit_aligned`) performs.
+    /// decrypt-on-read gate (`aacs::content::is_unit_aligned`) performs.
     #[test]
     fn per_extent_base_is_aligned_first_extent_base_is_not() {
-        use crate::aacs::is_unit_aligned;
+        use crate::aacs::content::is_unit_aligned;
         let ext_a_start = 7000u32; // first extent abs LBA
         let ext_b_start = 7004u32; // second extent abs LBA (Δ4 — not mult of 3)
 

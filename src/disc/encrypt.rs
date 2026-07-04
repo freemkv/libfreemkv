@@ -86,9 +86,9 @@ impl AacsCertUnlocker<'_> {
         // MKB generation (best-effort) — forwarded to each source's
         // `host_certs(mkb)` so a source MAY select a generation-appropriate cert
         // (the default impl ignores it). A read failure leaves it `None`.
-        let mkb_gen = aacs::read_mkb_from_drive(session.scsi_mut())
+        let mkb_gen = aacs::inf::read_mkb_from_drive(session.scsi_mut())
             .ok()
-            .and_then(|m| aacs::mkb_version(&m));
+            .and_then(|m| aacs::mkb::mkb_version(&m));
 
         // Host certs are keysource-served, never compiled in — unioned from the
         // explicit `DriveCredentials` and the key-source layer. With ZERO certs
@@ -152,10 +152,10 @@ fn unlock_error_to_error(e: &CertUnlockFailure) -> Error {
     }
 }
 
-/// Map a [`CertUnlockFailure`] to a structured [`crate::aacs::UnlockOutcome`]
+/// Map a [`CertUnlockFailure`] to a structured [`crate::aacs::trace::UnlockOutcome`]
 /// for the resolution trace (English-free).
-fn cert_unlock_outcome(e: &CertUnlockFailure) -> crate::aacs::UnlockOutcome {
-    use crate::aacs::UnlockOutcome;
+fn cert_unlock_outcome(e: &CertUnlockFailure) -> crate::aacs::trace::UnlockOutcome {
+    use crate::aacs::trace::UnlockOutcome;
     use freemkv_unlock::UnlockError;
     match e {
         CertUnlockFailure::NoHostCert { mkb } => UnlockOutcome::NoUsableHostCert { mkb: *mkb },
@@ -230,7 +230,10 @@ impl Disc {
     /// `mkb` is the disc's MKB generation when known, forwarded to each source's
     /// [`crate::KeySource::host_certs`] so a source MAY return only
     /// generation-appropriate certs (the default ignores it).
-    fn collect_host_certs(opts: &ScanOptions, mkb: Option<u32>) -> Vec<crate::aacs::HostCert> {
+    fn collect_host_certs(
+        opts: &ScanOptions,
+        mkb: Option<u32>,
+    ) -> Vec<crate::aacs::types::HostCert> {
         // Delegates to the shared cert primitive (the external freemkv-unlock-aacs
         // plugin uses the same one). Kept as a thin Disc method so the existing
         // collect_host_certs_* unit tests and call sites are unchanged.
@@ -312,14 +315,14 @@ impl Disc {
             .read_file(reader, crate::aacs::PATH_UNIT_KEY_RO)
             .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_UNIT_KEY_RO_DUPLICATE))
             .map_err(|_| Error::AacsNoKeys)?;
-        let dh = aacs::disc_hash(&uk_ro_data);
+        let dh = aacs::inf::disc_hash(&uk_ro_data);
 
         let cc = udf_fs
             .read_file(reader, crate::aacs::PATH_CONTENT_CERT)
             .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
             .ok()
             .as_deref()
-            .and_then(aacs::parse_content_cert);
+            .and_then(aacs::inf::parse_content_cert);
         let bus_encryption = cc.as_ref().map(|c| c.bus_encryption).unwrap_or(false);
         // No-cert default = UHD (V20 stride), matching `read_aacs_version` so the
         // scanned `AacsState.version` and the out-of-band fetch agree. A wrong
@@ -328,7 +331,7 @@ impl Disc {
         let version = cc
             .as_ref()
             .map(|c| c.version.major())
-            .unwrap_or(aacs::AACS_MAJOR_UHD);
+            .unwrap_or(aacs::mkb::AACS_MAJOR_UHD);
 
         // Bus-encryption gate (wrong-keys guard). A bus-encrypted disc (Content
         // Certificate bus-encryption bit set) carries bus encryption on its
@@ -394,12 +397,12 @@ impl Disc {
                 Vec::new()
             }
         };
-        let mkb_ver = aacs::mkb_version(&mkb_bytes);
+        let mkb_ver = aacs::mkb::mkb_version(&mkb_bytes);
 
         tracing::debug!(
             target: "freemkv::disc",
             phase = "scan_aacs_vid_only",
-            disc_hash = %aacs::disc_hash_hex(&dh),
+            disc_hash = %aacs::inf::disc_hash_hex(&dh),
             version,
             bus_encryption,
             has_vid = handshake.is_some(),
@@ -410,7 +413,7 @@ impl Disc {
             version,
             bus_encryption,
             mkb_version: mkb_ver,
-            disc_hash: aacs::disc_hash_hex(&dh),
+            disc_hash: aacs::inf::disc_hash_hex(&dh),
             key_source: KeyOrigin::ExternalUk,
             vuk: None,
             unit_keys: vec![],
@@ -687,14 +690,14 @@ mod tests {
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("state");
         assert_eq!(
             st.version,
-            aacs::AACS_MAJOR_UHD,
+            aacs::mkb::AACS_MAJOR_UHD,
             "no cert → default UHD (major 2)"
         );
         assert!(!st.bus_encryption);
     }
 
     /// disc_hash is SHA1 of the Unit_Key_RO.inf bytes, hex with 0x prefix
-    /// and uppercase (aacs::disc_hash + disc_hash_hex). The state's
+    /// and uppercase (aacs::inf::disc_hash + disc_hash_hex). The state's
     /// disc_hash must match independently computing it over the same bytes.
     #[test]
     fn resolve_vid_only_disc_hash_is_sha1_of_unit_key_ro() {
@@ -710,7 +713,7 @@ mod tests {
             }],
         );
         let st = Disc::resolve_vid_only(&udf, &mut disc, None).expect("state");
-        let expected = aacs::disc_hash_hex(&aacs::disc_hash(&uk));
+        let expected = aacs::inf::disc_hash_hex(&aacs::inf::disc_hash(&uk));
         assert_eq!(st.disc_hash, expected);
         assert!(st.disc_hash.starts_with("0x"));
         // uk_ro must be stashed verbatim for the external resolver.
@@ -746,7 +749,7 @@ mod tests {
         // Real record stream is the single 16-byte type-0x10 record.
         assert_eq!(
             st.mkb.len(),
-            aacs::mkb_content_len(&mkb),
+            aacs::mkb::mkb_content_len(&mkb),
             "MKB must be trimmed to record-stream length, not the zero-pad"
         );
         assert_eq!(st.mkb.len(), 16);
@@ -943,7 +946,7 @@ mod tests {
         // disc_hash must be computed over the DUPLICATE bytes.
         assert_eq!(
             st.disc_hash,
-            aacs::disc_hash_hex(&aacs::disc_hash(&uk)),
+            aacs::inf::disc_hash_hex(&aacs::inf::disc_hash(&uk)),
             "fallback must hash the DUPLICATE Unit_Key_RO.inf"
         );
         assert_eq!(st.uk_ro, uk);
@@ -965,8 +968,8 @@ mod tests {
     // the route fails gracefully (AacsNoHostCert), never panics.
     // ---------------------------------------------------------------
 
-    fn fake_cert(tag: u8) -> aacs::HostCert {
-        aacs::HostCert {
+    fn fake_cert(tag: u8) -> aacs::types::HostCert {
+        aacs::types::HostCert {
             private_key: [tag; 20],
             certificate: vec![tag; 92],
             private_key_v2: None,
@@ -975,15 +978,15 @@ mod tests {
     }
 
     /// A minimal in-test KeySource that yields no keys but a fixed cert list.
-    struct CertSource(Vec<aacs::HostCert>);
+    struct CertSource(Vec<aacs::types::HostCert>);
     impl crate::KeySource for CertSource {
         fn get_uk(
             &self,
             _ctx: &dyn crate::keysource::ResolveCtx,
-        ) -> Result<Vec<crate::aacs::UnitKey>> {
+        ) -> Result<Vec<crate::aacs::boil::UnitKey>> {
             Ok(Vec::new())
         }
-        fn host_certs(&self, _mkb: Option<u32>) -> Vec<aacs::HostCert> {
+        fn host_certs(&self, _mkb: Option<u32>) -> Vec<aacs::types::HostCert> {
             self.0.clone()
         }
     }
@@ -1077,7 +1080,7 @@ mod tests {
 
     #[test]
     fn cert_unlock_outcome_maps_to_structured_trace_step() {
-        use crate::aacs::UnlockOutcome;
+        use crate::aacs::trace::UnlockOutcome;
         use freemkv_unlock::UnlockError;
         // The libfreemkv-side no-cert case carries the MKB generation.
         assert_eq!(

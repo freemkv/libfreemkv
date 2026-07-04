@@ -1413,7 +1413,7 @@ impl KeyOrigin {
 #[derive(Default, Clone)]
 pub struct DriveCredentials {
     /// Host certificate(s) + private key(s) for the SCSI AACS handshake.
-    pub host_certs: Vec<crate::aacs::HostCert>,
+    pub host_certs: Vec<crate::aacs::types::HostCert>,
 }
 
 /// Options for disc scanning.
@@ -1781,8 +1781,8 @@ impl Disc {
         Ok((inf, mkb, version))
     }
 
-    /// AACS major version ([`crate::aacs::AACS_MAJOR_BD`] /
-    /// [`crate::aacs::AACS_MAJOR_UHD`]) from the content certificate. Drives the
+    /// AACS major version ([`crate::aacs::mkb::AACS_MAJOR_BD`] /
+    /// [`crate::aacs::mkb::AACS_MAJOR_UHD`]) from the content certificate. Drives the
     /// `Unit_Key_RO.inf` parse stride (48-byte V10 vs 64-byte V20/V21), so the
     /// out-of-band key-fetch path parses `enc_title_keys` at the right stride (a
     /// server VUK then derives the correct unit keys).
@@ -1798,7 +1798,7 @@ impl Disc {
             .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
             .ok()
             .as_deref()
-            .and_then(crate::aacs::parse_content_cert)
+            .and_then(crate::aacs::inf::parse_content_cert)
         {
             Some(c) => c.version.major(),
             None => {
@@ -1808,7 +1808,7 @@ impl Disc {
                     "no readable AACS content certificate; defaulting to the V20/UHD \
                      Unit_Key_RO stride (a VUK-from-server path would otherwise mis-stride)"
                 );
-                crate::aacs::AACS_MAJOR_UHD
+                crate::aacs::mkb::AACS_MAJOR_UHD
             }
         }
     }
@@ -1817,7 +1817,7 @@ impl Disc {
     ///
     /// `MKB_RO.inf` / `MKB_RW.inf` are allocated to a fixed ~128 MiB and
     /// zero-padded; the actual record stream is a few MiB. We read a bounded
-    /// prefix, find the record-stream length via [`crate::aacs::mkb_content_len`]
+    /// prefix, find the record-stream length via [`crate::aacs::mkb::mkb_content_len`]
     /// and return exactly that, growing the prefix if the records run past it.
     /// This avoids reading 100+ MiB of padding on every scan AND avoids the
     /// `read_file` `MAX_FILE_BYTES` cap that (since 0.31.0) rejected the padded
@@ -1833,13 +1833,13 @@ impl Disc {
                 .read_file_prefix(reader, crate::aacs::PATH_MKB_RO, want)
                 .or_else(|_| udf_fs.read_file_prefix(reader, crate::aacs::PATH_MKB_RW, want))
                 .map_err(|_| Error::AacsNoKeys)?;
-            let n = crate::aacs::mkb_content_len(&buf);
+            let n = crate::aacs::mkb::mkb_content_len(&buf);
             // `n` strictly inside `buf` => the record walk reached the padding
             // boundary (full content captured). `buf` shorter than `want` =>
             // the whole file is already read. Otherwise the records may run
             // past the prefix — grow and retry, bounded by MAX_BYTES.
             if (n > 0 && n < buf.len()) || buf.len() < want || want >= MAX_BYTES {
-                return Ok(crate::aacs::trim_mkb(buf));
+                return Ok(crate::aacs::mkb::trim_mkb(buf));
             }
             want = (want * 2).min(MAX_BYTES);
         }
@@ -2274,7 +2274,7 @@ impl Disc {
     /// else (UDF filesystem, BDMV nav, PLAYLIST/CLIPINF) is always clear.
     ///
     /// The in-read decrypt-verify gate (`DecryptingSectorSource`) uses this so it
-    /// never consults [`ts_sync_destroyed`](crate::aacs::ts_sync_destroyed) about
+    /// never consults [`ts_sync_destroyed`](crate::aacs::content::ts_sync_destroyed) about
     /// non-content bytes — filesystem data has no TS sync and would otherwise be
     /// mistaken for ciphertext (the first-2-GB false-positive this fixes).
     ///
@@ -2567,9 +2567,9 @@ impl Disc {
         } else if self.encrypted && self.css.is_none() {
             self.aacs = Some(AacsState {
                 version: if self.format == DiscFormat::Uhd {
-                    crate::aacs::AACS_MAJOR_UHD
+                    crate::aacs::mkb::AACS_MAJOR_UHD
                 } else {
-                    crate::aacs::AACS_MAJOR_BD
+                    crate::aacs::mkb::AACS_MAJOR_BD
                 },
                 bus_encryption: self.format == DiscFormat::Uhd,
                 mkb_version: None,
@@ -2667,7 +2667,7 @@ impl Disc {
                 Key::Processing(pks) => supplied.processing_keys = pks,
                 Key::Media(mks) => supplied.media_keys = mks,
                 Key::Volume(vuk) => {
-                    supplied.disc_entry = Some(crate::aacs::DiscEntry {
+                    supplied.disc_entry = Some(crate::aacs::types::DiscEntry {
                         disc_hash: aacs.disc_hash.clone(),
                         title: String::new(),
                         media_key: None,
@@ -2685,8 +2685,8 @@ impl Disc {
             let uk_ro = aacs.uk_ro.clone();
             let version_u8 = aacs.version;
 
-            let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
-            let ctx = crate::aacs::ResolveContext {
+            let provider_refs: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied];
+            let ctx = crate::aacs::resolve::ResolveContext {
                 unit_key_ro: &uk_ro,
                 content_cert: None,
                 volume_id: &volume_id,
@@ -2700,7 +2700,7 @@ impl Disc {
             // reason-preserving wrapper threads the no-key cause out so the
             // decrypt gate can report E7017 (had derivation material but no VID)
             // vs E7022 (no usable material) instead of a flat AacsKeyRejected.
-            let resolved = crate::aacs::resolve_keys_with_reason(&ctx, version_u8)
+            let resolved = crate::aacs::resolve::resolve_keys_with_reason(&ctx, version_u8)
                 .map_err(|_reason| crate::error::Error::AacsKeyRejected)?;
 
             if resolved.unit_keys.is_empty() {
@@ -3203,7 +3203,7 @@ impl Disc {
         // decrypts and is AACS-keyed. Region read-starts are aligned DOWN to a
         // unit boundary in the loop below; a fresh sweep starts at LBA 0 (already
         // aligned), so alignment only bites on resume NonTried regions.
-        const UNIT_SECTORS: u16 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u16; // 3
+        const UNIT_SECTORS: u16 = (crate::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16; // 3
         if decrypt_is_aacs && batch % UNIT_SECTORS != 0 {
             batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
         }
@@ -3285,7 +3285,7 @@ impl Disc {
             // sweep's NonTried region starts at 0, already unit-aligned; this only
             // shifts resume regions that begin mid-unit.
             let mut pos = if decrypt_is_aacs {
-                let unit_bytes = crate::aacs::ALIGNED_UNIT_LEN as u64;
+                let unit_bytes = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
                 region_pos - (region_pos % unit_bytes)
             } else {
                 region_pos
@@ -4240,8 +4240,8 @@ mod tests {
     /// `sector::decrypting::tests::aacs_unaligned_start_lba_rejected`.
     #[test]
     fn aacs_sweep_batch_and_region_are_unit_aligned() {
-        const UNIT_SECTORS: u16 = (crate::aacs::ALIGNED_UNIT_LEN / 2048) as u16; // 3
-        let unit_bytes = crate::aacs::ALIGNED_UNIT_LEN as u64; // 6144
+        const UNIT_SECTORS: u16 = (crate::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16; // 3
+        let unit_bytes = crate::aacs::content::ALIGNED_UNIT_LEN as u64; // 6144
 
         // (a) Batch rounding: ecc_sectors() for UHD/BD is 32, not a multiple of 3.
         // The decrypting-AACS path rounds it up to the next multiple of 3 (33).
@@ -4700,7 +4700,7 @@ mod tests {
         // The resolver classifies a device-keys-but-zero-VID context as
         // `VidUnavailable`; that reason rides on `aacs_error`.
         let supplied = crate::aacs::provider::SuppliedKey {
-            device_keys: vec![crate::aacs::DeviceKey {
+            device_keys: vec![crate::aacs::types::DeviceKey {
                 key: [0x11; 16],
                 node: 1,
                 uv: 1,
@@ -4710,14 +4710,14 @@ mod tests {
             media_keys: Vec::new(),
             disc_entry: None,
         };
-        let provider_refs: [&dyn crate::aacs::KeyProvider; 1] = [&supplied];
+        let provider_refs: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied];
         // A minimal but parseable Unit_Key_RO.inf (uk_pos=32, zero unit keys)
         // so resolution proceeds to the path-try logic and fails for lack of a
         // VID — not because the .inf failed to parse.
         let mut uk_ro = vec![0u8; 40];
         uk_ro[0..4].copy_from_slice(&32u32.to_be_bytes()); // uk_pos = 32
         // num_unit_keys = 0 (BE16) at uk_pos -> parses to an empty key file.
-        let ctx = crate::aacs::ResolveContext {
+        let ctx = crate::aacs::resolve::ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &[0u8; 16], // the "no VID" sentinel
@@ -4725,8 +4725,8 @@ mod tests {
             mkb: None,
         };
         assert_eq!(
-            crate::aacs::resolve_keys_with_reason(&ctx, 2).err(),
-            Some(crate::aacs::ResolveFailure::VidUnavailable),
+            crate::aacs::resolve::resolve_keys_with_reason(&ctx, 2).err(),
+            Some(crate::aacs::resolve::ResolveFailure::VidUnavailable),
             "device keys + zero VID must classify as VidUnavailable"
         );
 
@@ -4750,8 +4750,8 @@ mod tests {
             media_keys: Vec::new(),
             disc_entry: None,
         };
-        let provider_refs_none: [&dyn crate::aacs::KeyProvider; 1] = [&supplied_none];
-        let ctx_none = crate::aacs::ResolveContext {
+        let provider_refs_none: [&dyn crate::aacs::provider::KeyProvider; 1] = [&supplied_none];
+        let ctx_none = crate::aacs::resolve::ResolveContext {
             unit_key_ro: &uk_ro,
             content_cert: None,
             volume_id: &[0u8; 16],
@@ -4759,8 +4759,8 @@ mod tests {
             mkb: None,
         };
         assert_eq!(
-            crate::aacs::resolve_keys_with_reason(&ctx_none, 2).err(),
-            Some(crate::aacs::ResolveFailure::NoMaterial),
+            crate::aacs::resolve::resolve_keys_with_reason(&ctx_none, 2).err(),
+            Some(crate::aacs::resolve::ResolveFailure::NoMaterial),
             "no key material must classify as NoMaterial"
         );
 
@@ -5030,8 +5030,8 @@ mod tests {
         let vuk = [0x5au8; 16];
         let enc0 = [0x12u8; 16];
         let enc1 = [0x34u8; 16];
-        let exp0 = crate::aacs::decrypt_unit_key(&vuk, &enc0);
-        let exp1 = crate::aacs::decrypt_unit_key(&vuk, &enc1);
+        let exp0 = crate::aacs::derive::decrypt_unit_key(&vuk, &enc0);
+        let exp1 = crate::aacs::derive::decrypt_unit_key(&vuk, &enc1);
 
         let mut disc = make_test_disc(1000, "UHD");
         disc.encrypted = true;
