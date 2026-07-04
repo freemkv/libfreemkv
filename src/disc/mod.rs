@@ -2201,7 +2201,7 @@ fn aligned_unit_keys_validate(
     read_data_key: Option<&[u8; 16]>,
     samples: &[Vec<u8>],
 ) -> bool {
-    use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit_full};
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, aacs_unit_needs_decrypt, decrypt_unit_full};
     let scrambled: Vec<&[u8]> = samples
         .iter()
         .map(|s| s.as_slice())
@@ -5116,7 +5116,7 @@ mod tests {
 
     #[test]
     fn unit_key_validation_gates_on_real_ciphertext() {
-        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
 
         // No samples -> nothing to disprove against -> accept (sample-less paths
         // like resume / mapfile must be unaffected).
@@ -5174,7 +5174,7 @@ mod tests {
         // CPS-unit-1 sectors then passed through as raw encrypted bytes into the
         // ISO/MKV with no error surfaced. The gate must now reject a key set
         // that leaves any scrambled sample uncovered.
-        use crate::aacs::decrypt::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
 
         let mut clear = vec![0u8; ALIGNED_UNIT_LEN];
         let mut off = 4;
@@ -5220,7 +5220,7 @@ mod tests {
     /// unit algorithm — ECB-derive the per-unit key, then AES-CBC encrypt the
     /// body with the fixed AACS IV.
     fn encrypt_unit_for_test(clear: &[u8], uk: &[u8; 16]) -> Vec<u8> {
-        use crate::aacs::decrypt::{AACS_IV, ALIGNED_UNIT_LEN};
+        use crate::aacs::content::{AACS_IV, ALIGNED_UNIT_LEN};
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
         let mut unit = clear[..ALIGNED_UNIT_LEN].to_vec();

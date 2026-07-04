@@ -1121,7 +1121,7 @@ mod tests {
 
     /// Encrypt an aligned unit with the AACS algorithm run in reverse so that
     /// `aacs::decrypt_unit` with the same key recovers the plaintext. Mirrors
-    /// the `aacs_encrypt_unit` helper in `aacs::decrypt::tests`.
+    /// the `aacs_encrypt_unit` helper in `aacs::content::tests`.
     fn aacs_encrypt_unit_for_test(unit: &mut [u8], unit_key: &[u8; 16]) {
         use aes::Aes128;
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
@@ -1129,13 +1129,13 @@ mod tests {
         // the per-unit key so the recovered plaintext header matches.
         unit[0] |= 0xC0;
         let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = crate::aacs::decrypt::aes_ecb_encrypt(unit_key, &header);
+        let derived = crate::aacs::content::aes_ecb_encrypt(unit_key, &header);
         let mut k = [0u8; 16];
         for i in 0..16 {
             k[i] = derived[i] ^ header[i];
         }
         let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = crate::aacs::decrypt::AACS_IV;
+        let mut prev = crate::aacs::content::AACS_IV;
         let num_blocks = (aacs::ALIGNED_UNIT_LEN - 16) / 16;
         for i in 0..num_blocks {
             let off = 16 + i * 16;

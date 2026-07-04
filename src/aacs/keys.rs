@@ -1,6 +1,6 @@
 //! AACS key resolution — VUK derivation, MKB processing, disc hash, unit key parsing.
 
-use super::decrypt::aes_ecb_decrypt;
+use super::content::aes_ecb_decrypt;
 use super::types::DeviceKey;
 
 // ── AACS version ────────────────────────────────────────────────────────────
@@ -406,7 +406,7 @@ pub mod probe {
 fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
     // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
-    let found = crate::aacs::variants::mkb_records(mkb)
+    let found = crate::aacs::variant::mkb_records(mkb)
         .find(|&(_, rt, len)| (rt == 0x81 || rt == 0x86) && len >= 20);
     match found {
         Some((o, rec_type, rec_len)) => {
@@ -466,7 +466,7 @@ fn mkb_find_cvalues(mkb: &[u8]) -> Option<Vec<u8>> {
 /// record matching `rec_type`. Returns `None` if no such record exists or
 /// the record is empty.
 fn find_record_body(mkb: &[u8], rec_type_wanted: u8) -> Option<Vec<u8>> {
-    crate::aacs::variants::mkb_records(mkb)
+    crate::aacs::variant::mkb_records(mkb)
         .find(|&(_, rt, len)| rt == rec_type_wanted && len > 4)
         .map(|(o, _, len)| mkb[o + 4..o + len].to_vec())
 }
@@ -482,7 +482,7 @@ pub fn mkb_content_len(mkb: &[u8]) -> usize {
     // End of the last framed record = where the fixed-region zero padding begins.
     // (The `00 000000` terminator / overrun stops the walk; real MKBs pad with
     // zeros, so this matches the prior "stop at the first padding byte".)
-    crate::aacs::variants::mkb_records(mkb)
+    crate::aacs::variant::mkb_records(mkb)
         .last()
         .map(|(o, _, len)| o + len)
         .unwrap_or(0)
@@ -511,7 +511,7 @@ pub fn trim_mkb(mut mkb: Vec<u8>) -> Vec<u8> {
 pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): version is the BE u32 at body offset 4
     // (record offset 8). Needs rec_len >= 12 (4 header + 4 type + 4 version).
-    crate::aacs::variants::mkb_records(mkb)
+    crate::aacs::variant::mkb_records(mkb)
         .find(|&(_, rt, len)| rt == 0x10 && len >= 12)
         .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 8], mkb[o + 9], mkb[o + 10], mkb[o + 11]]))
 }
@@ -582,7 +582,7 @@ impl MkbType {
 pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): the 32-bit MKBType is bytes 4-7 (body
     // offset 0). Needs rec_len >= 8 (4 header + 4 type).
-    crate::aacs::variants::mkb_records(mkb)
+    crate::aacs::variant::mkb_records(mkb)
         .find(|&(_, rt, len)| rt == 0x10 && len >= 8)
         .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 4], mkb[o + 5], mkb[o + 6], mkb[o + 7]]))
 }
@@ -1117,8 +1117,8 @@ pub fn resolve_keys_v1(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     let mut resolved = resolve_keys_classical(ctx, AacsVersion::V20)?;
     if let Some(mkb) = ctx.mkb {
-        let recs = super::variants::walk_mkb(mkb);
-        if super::variants::is_variant_mkb(&recs) {
+        let recs = super::variant::walk_mkb(mkb);
+        if super::variant::is_variant_mkb(&recs) {
             resolved.version = AacsVersion::V21;
         }
     }
@@ -1131,7 +1131,7 @@ pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 ///   1. Variant chain: MKB Variant records + device keys → Km → Kvu
 ///      (currently unreachable in production — requires an
 ///      integrator-supplied Key Correction Data constant; see
-///      [`super::variants::KEY_CORRECTION_DATA_PLACEHOLDER`])
+///      [`super::variant::KEY_CORRECTION_DATA_PLACEHOLDER`])
 ///   3. KEYDB MK + matching VID → derived VUK (V21 discs already in
 ///      the keydb decrypt identically to V20)
 ///   4. KEYDB disc-hash → VUK
@@ -1181,12 +1181,12 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
         // Path 1: Variant chain (V21's analogue of classical Path 1's
         // DK derivation). Placeholder until KCD constant is supplied.
         if let Some(mkb) = ctx.mkb {
-            let recs = super::variants::walk_mkb(mkb);
+            let recs = super::variant::walk_mkb(mkb);
             let all_dks = providers.device_keys();
-            match super::variants::derive_media_key_variant(
+            match super::variant::derive_media_key_variant(
                 &recs,
                 &all_dks,
-                &super::variants::KEY_CORRECTION_DATA_PLACEHOLDER,
+                &super::variant::KEY_CORRECTION_DATA_PLACEHOLDER,
                 ctx.volume_id,
             ) {
                 Ok((_km, kvu)) => {
@@ -1536,7 +1536,7 @@ mod tests {
         // keeps the crypto covered in libfreemkv. `aes_ecb_encrypt` is
         // pub(crate), reachable here but not from keysources — the reason this
         // half stays.
-        use super::super::decrypt::aes_ecb_encrypt;
+        use super::super::content::aes_ecb_encrypt;
         let vuk = [0x5Au8; 16];
         // A few representative "decrypted" unit keys.
         for expected_uk in [[0x11u8; 16], [0x22u8; 16], [0xCDu8; 16]] {
@@ -1726,7 +1726,7 @@ mod tests {
         // whose derived Media Key satisfies a synthetic verify record; confirm
         // the scan ACCEPTS it against caller-supplied SD/cvalue tables and
         // REJECTS a 1-byte corruption.
-        use super::super::decrypt::aes_ecb_encrypt as enc;
+        use super::super::content::aes_ecb_encrypt as enc;
 
         let pk: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -1772,7 +1772,7 @@ mod tests {
         // recovers mk. Catches the bugs that landed pre-fix:
         //   * uv XOR step was missing → mk wrong whenever uv != 0
         //   * AES-128E + 12-zero check instead of AES-128D + magic
-        use super::super::decrypt::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
+        use super::super::content::{aes_ecb_decrypt as dec, aes_ecb_encrypt as enc};
 
         let pk: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -2191,7 +2191,7 @@ mod tests {
         // The keyless-disc case: this disc's own hash/VID are NOT in keydb, but its
         // Media Key IS — filed under a sibling disc that shares its MKB. Path
         // 2.5 must km_verifies that MK against the MKB and resolve.
-        use super::super::decrypt::aes_ecb_encrypt as enc;
+        use super::super::content::aes_ecb_encrypt as enc;
         let km = [0x11u8; 16];
         let vid = [0x22u8; 16];
         // MKB: 0x10 type/version + 0x86 verify record whose mk_dv decrypts under
@@ -2272,7 +2272,7 @@ mod tests {
         // Independently compute AES-ECB-D(mk, vid) XOR vid and confirm
         // derive_vuk produces the same 16 bytes. A mutation that dropped the
         // XOR-VID step, or used encrypt instead of decrypt, fails this.
-        use super::super::decrypt::aes_ecb_decrypt as dec;
+        use super::super::content::aes_ecb_decrypt as dec;
         let mk = [
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
             0x1E, 0x1F,
@@ -2292,7 +2292,7 @@ mod tests {
         // The encrypted unit key in Unit_Key_RO.inf is AES-ECB-E(VUK, uk);
         // decrypt_unit_key must be the matching ECB-decrypt. Round-trip via
         // encrypt to pin the relation.
-        use super::super::decrypt::aes_ecb_encrypt as enc;
+        use super::super::content::aes_ecb_encrypt as enc;
         let vuk = [0x9Eu8; 16];
         let uk = [0x3Cu8; 16];
         let enc_uk = enc(&vuk, &uk);
@@ -2692,7 +2692,7 @@ mod tests {
     fn resolve_keys_v21_path4_resolves_by_hash() {
         // resolve_keys_v21 must hit path 4 (hash→VUK) and stamp version V21,
         // deriving unit keys from the VUK.
-        use super::super::decrypt::aes_ecb_encrypt as enc;
+        use super::super::content::aes_ecb_encrypt as enc;
         let data = build_unit_key_ro(1, 64);
         // The single encrypted key in build_unit_key_ro is [0x10;16].
         let hash = disc_hash(&data);
@@ -2842,7 +2842,7 @@ mod tests {
         //   - 0x86 Verify Media Key: mk_dv = AES-E(mk, magic || pad)
         // and a DK with node=4, uv=2, u_mask_shift=3 so dev_key_v_mask ==
         // v_mask: the calc_pk_from_dk loop is a no-op and Kp == aesg3(dk, 1).
-        use super::super::decrypt::aes_ecb_encrypt as enc;
+        use super::super::content::aes_ecb_encrypt as enc;
 
         let dk_bytes: [u8; 16] = [
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
