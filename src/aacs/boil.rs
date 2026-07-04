@@ -275,7 +275,7 @@ pub fn resolve_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aacs::content::aes_ecb_encrypt;
+    use crate::aacs::crypto::aes_ecb_encrypt;
     use crate::aacs::keys::{decrypt_unit_key, derive_vuk};
 
     /// `vuk_from_mk` must equal the inline `derive_vuk` path bit-for-bit, for

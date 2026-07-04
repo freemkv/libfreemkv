@@ -523,13 +523,13 @@ mod tests {
         use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
         unit[0] |= 0xC0; // CPI flag => reads as encrypted
         let header: [u8; 16] = unit[..16].try_into().unwrap();
-        let derived = crate::aacs::content::aes_ecb_encrypt(unit_key, &header);
+        let derived = crate::aacs::crypto::aes_ecb_encrypt(unit_key, &header);
         let mut k = [0u8; 16];
         for i in 0..16 {
             k[i] = derived[i] ^ header[i];
         }
         let cipher = Aes128::new(GenericArray::from_slice(&k));
-        let mut prev = crate::aacs::content::AACS_IV;
+        let mut prev = crate::aacs::crypto::AACS_IV;
         for i in 0..(ALIGNED_UNIT_LEN - 16) / 16 {
             let off = 16 + i * 16;
             for j in 0..16 {
