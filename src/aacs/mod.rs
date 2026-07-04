@@ -26,13 +26,13 @@
 //!     is silent (the `0x86` verify record and the Category-C MKBType names).
 
 pub mod boil;
-pub mod decrypt;
+pub mod content;
 pub mod host_certs;
 pub mod keys;
 pub mod provider;
 pub mod trace;
 pub mod types;
-pub mod variants;
+pub mod variant;
 
 /// On-disc UDF paths to the AACS key-input files (with their fallbacks).
 /// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
@@ -56,7 +56,7 @@ pub use trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, Un
 
 // Explicit re-exports — only items needed by external consumers and sibling crate modules.
 // AES primitives (aes_ecb_encrypt, aes_ecb_decrypt, aes_cbc_decrypt) are pub(crate) in decrypt.rs.
-pub use decrypt::{
+pub use content::{
     ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, UnitKeyResult, aacs_unit_encrypted,
     aacs_unit_needs_decrypt, aacs_unit_still_ciphertext, decrypt_bus, decrypt_unit,
     decrypt_unit_checked, decrypt_unit_full, decrypt_unit_try_keys, fill_null_ts_unit,
@@ -79,7 +79,7 @@ pub use keys::{
 };
 pub use provider::KeyProvider;
 pub use types::{DeviceKey, DiscEntry, HostCert};
-pub use variants::{
+pub use variant::{
     KEY_CORRECTION_DATA_PLACEHOLDER, MediaKeyVariantError, MkbRecord, ProcessingKeyMatch,
     derive_media_key_variant, is_variant_mkb, variant_nonce, walk_mkb, walk_processing_key,
 };

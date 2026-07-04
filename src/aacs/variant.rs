@@ -72,7 +72,7 @@
 //! that final gate — the per-match magic check no longer protects the
 //! variant path.
 
-use super::decrypt::aes_ecb_decrypt;
+use super::content::aes_ecb_decrypt;
 use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
@@ -743,7 +743,7 @@ mod tests {
     ///
     /// Returns (records, dk, planted_kp, planted_kmp).
     fn synthetic_variant_setup(kmp15: u8) -> (Vec<MkbRecord>, DeviceKey, [u8; 16], [u8; 16]) {
-        use crate::aacs::decrypt::aes_ecb_encrypt;
+        use crate::aacs::content::aes_ecb_encrypt;
 
         // Build header.
         let mut mkb = vec![

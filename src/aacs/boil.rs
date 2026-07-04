@@ -162,7 +162,7 @@ pub enum KeyCandidate {
 ///
 /// PURE DERIVATION — no unit sampling, no validation. `unit_keys` holds every
 /// CPS-unit key the disc's `Unit_Key_RO.inf` yields from the VUK (positional
-/// order); the caller runs [`super::decrypt::unit_key_validates`] to find which
+/// order); the caller runs [`super::content::unit_key_validates`] to find which
 /// one actually opens the disc. Rungs above the candidate are `None` (a `Vuk`
 /// candidate has no `mk`/`pk`/`dk`; a `Uk` candidate has only `unit_keys`).
 #[derive(Debug, Clone)]
@@ -193,7 +193,7 @@ pub struct ResolvedChain {
 /// PURE DERIVATION: no sampling, no validation, no position recovery. Every step
 /// is deterministic AES, so the returned keys are only as sound as the input
 /// candidate — validate `unit_keys` against a real encrypted unit with
-/// [`super::decrypt::unit_key_validates`] to prove the candidate opens the disc.
+/// [`super::content::unit_key_validates`] to prove the candidate opens the disc.
 ///
 /// Returns `None` only when derivation itself cannot proceed: a PK its MKB
 /// rejects, a `Dk` the MKB can't process, a missing VID on a path that needs
@@ -275,7 +275,7 @@ pub fn resolve_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aacs::decrypt::aes_ecb_encrypt;
+    use crate::aacs::content::aes_ecb_encrypt;
     use crate::aacs::keys::{decrypt_unit_key, derive_vuk};
 
     /// `vuk_from_mk` must equal the inline `derive_vuk` path bit-for-bit, for
