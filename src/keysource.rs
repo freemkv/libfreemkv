@@ -3,12 +3,13 @@
 //! libfreemkv performs NO key lookup. An application resolves a disc's keys
 //! through one or more [`KeySource`]s, each an adapter over a backing store (a
 //! keydb file, a key server, the mapfile cache). A source's job is to return the
-//! disc's terminal **Unit Keys** ([`crate::aacs::boil::UnitKey`]). It knows what
+//! disc's terminal **Unit Keys** ([`crate::aacs::types::UnitKey`]). It knows what
 //! material it holds (a DK / MK / VUK / pre-decrypted UK) and what it must fetch
 //! from the disc (VID, MKB, encrypted title keys, content samples) to get there;
-//! it orchestrates the derivation by calling libfreemkv's own boil-down crypto
-//! primitives ([`crate::aacs::boil::mk_from_dk`] / [`crate::aacs::boil::vuk_from_mk`] /
-//! [`crate::aacs::boil::uk_from_vuk`]) through the [`ResolveCtx`] handed to it.
+//! it orchestrates the derivation by calling libfreemkv's own derivation
+//! primitives ([`crate::aacs::derive::derive_media_key_from_dk`] /
+//! [`crate::aacs::derive::derive_vuk`] / [`crate::aacs::derive::decrypt_unit_key`])
+//! through the [`ResolveCtx`] handed to it.
 //!
 //! libfreemkv still OWNS the crypto: the boil-down primitives and the AES live
 //! here. A source owns only PATH ORCHESTRATION — deciding which primitive to
@@ -17,8 +18,8 @@
 //! keeping key *policy* (which store, which order, online vs local) out of the
 //! library.
 
-use crate::aacs::boil::{UnitKey, Vid};
 use crate::aacs::types::HostCert;
+use crate::aacs::types::{UnitKey, Vid};
 use crate::disc::Key;
 use crate::error::Error;
 
@@ -415,7 +416,7 @@ pub fn read_encrypted_units(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aacs::boil::UnitKey;
+    use crate::aacs::types::UnitKey;
     use std::sync::{Arc, Mutex};
 
     // ── KeySource default-method behaviour ────────────────────────────────────

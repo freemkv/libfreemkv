@@ -432,7 +432,7 @@ pub fn decrypt_unit_key(vuk: &[u8; 16], encrypted_uk: &[u8; 16]) -> [u8; 16] {
 
 /// Decrypt every encrypted unit key in a parsed `Unit_Key_RO.inf` with a VUK,
 /// paired with its declared CPS-unit number. THE single VUK→unit-keys step:
-/// both classical/v21 resolvers and `boil::resolve_candidate` call this, so the
+/// both classical/v21 resolvers and [`resolve_candidate`] call this, so the
 /// map cannot drift between the player and harvest paths.
 pub(crate) fn derive_unit_keys(uk_file: &UnitKeyFile, vuk: &[u8; 16]) -> Vec<(u32, [u8; 16])> {
     uk_file
@@ -440,4 +440,249 @@ pub(crate) fn derive_unit_keys(uk_file: &UnitKeyFile, vuk: &[u8; 16]) -> Vec<(u3
         .iter()
         .map(|(num, enc_key)| (*num, decrypt_unit_key(vuk, enc_key)))
         .collect()
+}
+
+/// A candidate key at any rung of the AACS ladder, handed to [`resolve_candidate`].
+///
+/// Each variant carries the [`super::types`] newtype for that rung (a `Dk` is a
+/// POSITIONED [`DeviceKey`] — recover an unpositioned one with
+/// [`recover_dk_position`] first).
+#[derive(Debug, Clone)]
+pub enum KeyCandidate {
+    Uk(UnitKey),
+    Vuk(Vuk),
+    Mk(MediaKey),
+    Pk(ProcessingKey),
+    Dk(DeviceKey),
+}
+
+/// The AACS key chain derived from a candidate, from [`resolve_candidate`].
+///
+/// PURE DERIVATION — no unit sampling, no validation. `unit_keys` holds every
+/// CPS-unit key the disc's `Unit_Key_RO.inf` yields from the VUK (paired with
+/// its declared CPS-unit number); the caller runs
+/// [`super::content::unit_key_validates`] to find which one actually opens the
+/// disc. Rungs above the candidate are `None`.
+#[derive(Debug, Clone)]
+pub struct ResolvedChain {
+    pub unit_keys: Vec<(u32, [u8; 16])>,
+    pub vuk: Option<Vuk>,
+    pub mk: Option<MediaKey>,
+    pub pk: Option<ProcessingKey>,
+    /// The positioned device key (for a `Dk` candidate).
+    pub dk: Option<DeviceKey>,
+}
+
+/// Derive the full AACS key chain from a candidate key of ANY ladder rung.
+///
+/// Runs the deterministic derivation DOWNWARD to the disc's terminal unit keys:
+/// `DK → MK → VUK → UKs`, `PK → MK → VUK → UKs`, `MK → VUK → UKs`,
+/// `VUK → UKs`, or `UK → itself`. Composes the raw derivation primitives
+/// ([`derive_media_key_from_pk`], [`derive_media_key_and_pk_from_dk`],
+/// [`derive_vuk`], [`derive_unit_keys`]) and parses `Unit_Key_RO.inf` at the
+/// version the disc's MKB declares, so a multi-CPS disc yields all its unit
+/// keys from the one candidate.
+///
+/// PURE DERIVATION: no sampling, no validation, no position recovery. Validate
+/// `unit_keys` against a real encrypted unit with
+/// [`super::content::unit_key_validates`] to prove the candidate opens the disc.
+///
+/// Returns `None` only when derivation itself cannot proceed: a PK its MKB
+/// rejects, a `Dk` the MKB can't process, a missing VID on a path that needs
+/// one, or an unparseable/empty `Unit_Key_RO.inf`.
+pub fn resolve_candidate(
+    candidate: &KeyCandidate,
+    mkb: &[u8],
+    unit_key_ro: &[u8],
+    vid: Option<Vid>,
+) -> Option<ResolvedChain> {
+    // Boil a VUK → all unit keys, each paired with its declared CPS-unit number.
+    // Derive the stride version from the disc's own MKB, then defer to the shared
+    // `derive_unit_keys` (the one place both resolvers and this path decrypt).
+    let boil = |vuk: Vuk| -> Option<Vec<(u32, [u8; 16])>> {
+        let version = mkb_type(mkb)
+            .map(|t| t.generation())
+            .unwrap_or(AacsVersion::V10);
+        let ukf = parse_unit_key_ro(unit_key_ro, version)?;
+        if ukf.encrypted_keys.is_empty() {
+            return None;
+        }
+        Some(derive_unit_keys(&ukf, &vuk.0))
+    };
+
+    match candidate {
+        KeyCandidate::Uk(uk) => Some(ResolvedChain {
+            unit_keys: vec![(uk.idx, uk.key)],
+            vuk: None,
+            mk: None,
+            pk: None,
+            dk: None,
+        }),
+        KeyCandidate::Vuk(v) => Some(ResolvedChain {
+            unit_keys: boil(*v)?,
+            vuk: Some(*v),
+            mk: None,
+            pk: None,
+            dk: None,
+        }),
+        KeyCandidate::Mk(mk) => {
+            let vuk = Vuk(derive_vuk(&mk.0, &vid?.0));
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(*mk),
+                pk: None,
+                dk: None,
+            })
+        }
+        KeyCandidate::Pk(pk) => {
+            let km = derive_media_key_from_pk(mkb, std::slice::from_ref(&pk.0))?;
+            let vuk = Vuk(derive_vuk(&km, &vid?.0));
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(MediaKey(km)),
+                pk: Some(*pk),
+                dk: None,
+            })
+        }
+        KeyCandidate::Dk(dk) => {
+            let (km, pk) = derive_media_key_and_pk_from_dk(mkb, std::slice::from_ref(dk))?;
+            let vuk = Vuk(derive_vuk(&km, &vid?.0));
+            Some(ResolvedChain {
+                unit_keys: boil(vuk)?,
+                vuk: Some(vuk),
+                mk: Some(MediaKey(km)),
+                pk: Some(ProcessingKey(pk)),
+                dk: Some(dk.clone()),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolve_candidate_tests {
+    use super::*;
+    use crate::aacs::crypto::aes_ecb_encrypt;
+
+    /// Minimal AACS-1.0 (48-byte stride) `Unit_Key_RO.inf` with `n` encrypted
+    /// unit keys — `parse_unit_key_ro` numbers CPS units 1..=n.
+    fn synth_inf(encs: &[[u8; 16]]) -> Vec<u8> {
+        let uk_pos = 32usize;
+        let stride = 48usize;
+        let n = encs.len();
+        let total = uk_pos + 48 + n.saturating_sub(1) * stride + 16;
+        let mut inf = vec![0u8; total.max(20)];
+        inf[..4].copy_from_slice(&(uk_pos as u32).to_be_bytes());
+        inf[uk_pos..uk_pos + 2].copy_from_slice(&(n as u16).to_be_bytes());
+        for (i, k) in encs.iter().enumerate() {
+            let o = uk_pos + 48 + i * stride;
+            inf[o..o + 16].copy_from_slice(k);
+        }
+        inf
+    }
+
+    /// A VUK candidate boils to ALL the disc's unit keys, each paired with its
+    /// declared CPS-unit number, and each key equals the VUK-decrypt of its slot.
+    #[test]
+    fn resolve_candidate_vuk_returns_all_cps_units() {
+        let vuk = Vuk([0x33u8; 16]);
+        let encs = [[0x11u8; 16], [0x22u8; 16], [0x44u8; 16]];
+        let inf = synth_inf(&encs);
+        let r = resolve_candidate(&KeyCandidate::Vuk(vuk), &[], &inf, None).expect("vuk derives");
+        let cps: Vec<u32> = r.unit_keys.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            cps,
+            vec![1, 2, 3],
+            "every CPS unit surfaced, numbered from the inf"
+        );
+        for ((_, key), enc) in r.unit_keys.iter().zip(encs.iter()) {
+            assert_eq!(
+                *key,
+                decrypt_unit_key(&vuk.0, enc),
+                "key = VUK-decrypt of its slot"
+            );
+        }
+        assert_eq!(r.vuk, Some(vuk));
+        assert!(r.mk.is_none() && r.pk.is_none() && r.dk.is_none());
+    }
+
+    /// A bare UK candidate is terminal — it returns itself keyed by its own idx.
+    #[test]
+    fn resolve_candidate_uk_is_itself() {
+        let uk = UnitKey {
+            idx: 2,
+            key: [0x9u8; 16],
+        };
+        let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
+        assert_eq!(r.unit_keys, vec![(2, uk.key)]);
+        assert!(r.vuk.is_none() && r.mk.is_none());
+    }
+
+    /// MK/PK/DK paths derive the VUK from a VID; without one, derivation stops.
+    #[test]
+    fn resolve_candidate_mk_requires_vid() {
+        let r = resolve_candidate(&KeyCandidate::Mk(MediaKey([1u8; 16])), &[], &[], None);
+        assert!(r.is_none(), "MK path returns None without a VID");
+    }
+
+    /// A planted Processing Key resolves against a synthetic MKB and drives the
+    /// FULL chain PK → MK → VUK → UK — proving a PK candidate yields real keys.
+    #[test]
+    fn resolve_candidate_pk_drives_full_chain() {
+        let pk: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+
+        let mut mk_raw = mk;
+        for a in 0..4 {
+            mk_raw[12 + a] ^= uv[a];
+        }
+        let cv = aes_ecb_encrypt(&pk, &mk_raw);
+
+        let mut vd = [0x11u8; 16];
+        vd[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]);
+        let mk_dv = aes_ecb_encrypt(&mk, &vd);
+
+        // 4-byte record header (type + BE24 total length) + body.
+        let rec = |t: u8, body: &[u8]| -> Vec<u8> {
+            let total = 4 + body.len();
+            let mut r = vec![
+                t,
+                ((total >> 16) & 0xFF) as u8,
+                ((total >> 8) & 0xFF) as u8,
+                (total & 0xFF) as u8,
+            ];
+            r.extend_from_slice(body);
+            r
+        };
+        let mut sd = vec![0u8];
+        sd.extend_from_slice(&uv);
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&rec(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&rec(0x86, &mk_dv));
+        mkb.extend_from_slice(&rec(0x04, &sd));
+        mkb.extend_from_slice(&rec(0x05, &cv));
+
+        let vid = Vid([0x42u8; 16]);
+        let plain_uk = [0x7Eu8; 16];
+        let vuk = derive_vuk(&mk, &vid.0);
+        let enc = aes_ecb_encrypt(&vuk, &plain_uk);
+        let inf = synth_inf(std::slice::from_ref(&enc));
+
+        let r = resolve_candidate(&KeyCandidate::Pk(ProcessingKey(pk)), &mkb, &inf, Some(vid))
+            .expect("planted PK resolves the full chain");
+        assert_eq!(r.mk, Some(MediaKey(mk)), "PK recovers the planted MK");
+        assert_eq!(r.unit_keys.len(), 1);
+        assert_eq!(
+            r.unit_keys[0].1, plain_uk,
+            "PK chain recovers the title key"
+        );
+    }
 }
