@@ -141,10 +141,8 @@ pub fn resolve_keys_v2(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
 /// AACS 2.1 key resolution via the Media Key Variant chain.
 ///
 /// Paths run in root-of-trust → per-disc-leaf order:
-///   1. Variant chain: MKB Variant records + device keys → Km → Kvu
-///      (currently unreachable in production — requires an
-///      integrator-supplied Key Correction Data constant; see
-///      [`super::variant::KEY_CORRECTION_DATA_PLACEHOLDER`])
+///   1. Variant chain: device keys → PK → Km → Kvu (needs a covering 2.1
+///      Processing Key; misses cleanly when the device-key pool covers no slot)
 ///   3. KEYDB MK + matching VID → derived VUK (V21 discs already in
 ///      the keydb decrypt identically to V20)
 ///   4. KEYDB disc-hash → VUK
@@ -191,32 +189,32 @@ pub fn resolve_keys_v21(ctx: &ResolveContext<'_>) -> Option<ResolvedKeys> {
     let providers = super::provider::Providers(ctx.providers);
 
     if has_vid {
-        // Path 1: Variant chain (V21's analogue of classical Path 1's
-        // DK derivation). Placeholder until KCD constant is supplied.
+        // Path 1: Variant chain (V21's analogue of classical Path 1's DK
+        // derivation). Derive the Processing Key from device keys first (DK → PK
+        // via the variant walk), then run the PK → Km variant primitive and
+        // derive the per-disc VUK from Km + VID.
         if let Some(mkb) = ctx.mkb {
             let recs = super::mkb::walk_mkb(mkb);
             let all_dks = providers.device_keys();
-            match super::variant::derive_media_key_variant(
-                &recs,
-                &all_dks,
-                &super::variant::KEY_CORRECTION_DATA_PLACEHOLDER,
-                ctx.volume_id,
-            ) {
-                Ok((_km, kvu)) => {
-                    tracing::debug!(
-                        target: "freemkv::disc",
-                        phase = "resolve_keys_v21_path1_hit",
-                        "Variant chain produced Km + Kvu"
-                    );
-                    return Some(build(Some(kvu), derive_uks(&kvu), 1));
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        target: "freemkv::disc",
-                        phase = "resolve_keys_v21_path1_miss",
-                        error_code = %e,
-                        "Variant chain failed"
-                    );
+            if let Some(pkm) = super::variant::walk_processing_key(&recs, &all_dks) {
+                match super::variant::derive_media_key_variant(&recs, &pkm.kp) {
+                    Ok(km) => {
+                        let kvu = derive_vuk(&km, ctx.volume_id);
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "resolve_keys_v21_path1_hit",
+                            "Variant chain produced Km + Kvu"
+                        );
+                        return Some(build(Some(kvu), derive_uks(&kvu), 1));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "resolve_keys_v21_path1_miss",
+                            error_code = %e,
+                            "Variant chain failed"
+                        );
+                    }
                 }
             }
         }

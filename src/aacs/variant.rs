@@ -3,34 +3,19 @@
 //! On AACS 2.1 the Media Key derivation gains a second stage on top of
 //! the classical subset-difference walk. The classical walk yields a
 //! Media Key Precursor (Kmp) rather than the final Media Key; the
-//! Precursor combines with disc-supplied Variant Key Data (VKD) and an
-//! integrator-supplied Key Correction Data (KCD) constant to produce
-//! the Media Key.
+//! Precursor combines with disc-supplied Variant Key Data (VKD) and the
+//! fixed Key Correction Data (KCD) constant to produce the Media Key.
 //!
-//! This module is wiring only — `resolve_keys` is not aware of it. The
-//! entry point is [`derive_media_key_variant`]. The Variant scheme is
-//! detected via the real AACS 2.1 MKB records `0x2d` (Encrypted Media
-//! Key Variant Data / C), `0x2f` (Variant Key Data table, 65,535×16),
-//! and `0x0c` (variant cvalues, one per `0x04` subset-difference slot).
-//! When a disc carries none, callers fall back to the classical
-//! single-stage derivation in [`super::keys`]. (The earlier `0x82`/`0x83`
-//! record types were a speculative guess that never appeared in any real
-//! MKB; they were replaced with the real records once a live variant MKB
-//! was obtained.)
+//! The entry point is [`derive_media_key_variant`] — a `Kp -> Km`
+//! derivation. Deriving `Kp` itself from device keys (DK -> PK) is the
+//! separate [`walk_processing_key`] step. The Variant scheme is detected
+//! via the AACS 2.1 MKB records `0x2d` (Encrypted Media Key Variant Data
+//! / C), `0x2f` (Variant Key Data table, up to 65,535×16), and `0x0c`
+//! (variant cvalues, one per `0x04` subset-difference slot). When a disc
+//! carries none, callers fall back to the classical single-stage
+//! derivation in [`super::derive`].
 //!
-//! **Status: the chain cannot yet produce a key on a real disc — for two
-//! reasons, one external, one internal:**
-//!   - EXTERNAL: no device key in our pool walks any real variant MKB,
-//!     so `Kp` (and thus the whole chain) can't be produced live. This is
-//!     a key-acquisition gap, not a code gap.
-//!   - INTERNAL: the exact `VARIANTS[uv]` lookup ([`variants_for_uv`])
-//!     and the Nonce / C sub-field offsets can't be pinned without a real
-//!     disc + covering key to run the chain end-to-end against the `0x86`
-//!     verify. Until then [`variants_for_uv`] returns `None` and the
-//!     chain halts at [`MediaKeyVariantError::VariantsTableUnavailable`],
-//!     so a wrong best-effort offset is never silently trusted.
-//!
-//! The chain follows the published spec:
+//! The chain:
 //!
 //! ```text
 //! Kmp     = AES-128D(Kp, C) XOR uv
@@ -41,36 +26,26 @@
 //! Km      = AES-128D(Kpnew, VKD) XOR uv
 //! ```
 //!
-//! **Spec note — Variant Number width (`Kvn`).** The published AACS
-//! Sequence-Key Variant Number (Introduction and Common Cryptographic
-//! Elements book, Rev 0.953, §3.2.5.2.2, record `0x0D`) is the **low 10
-//! bits** of `AES-G(Kp, Nonce)` — a range of ≤1024 variants. This 2.1
-//! chain instead takes the **low 16 bits** (`& 0xFFFF`), because it
-//! indexes the 2.1 VKD table (`0x2f`), which carries up to 65,535 entries:
-//! the wider index is demanded by the larger table, not a mis-transcription
-//! of the 10-bit spec value. Both the 16-bit width and the Nonce source
-//! (tail of `0x2d`) are RE-derived from a single live variant MKB and
-//! remain UNCONFIRMED — the spec's `0x0D` "Variant Number" record does not
-//! appear on a real 2.1 MKB. If a covering key ever lets the chain run
-//! end-to-end against the `0x86` verify, this width is the first thing to
-//! confirm.
+//! **Status.** The record layout is pinned against real variant MKBs:
+//! `variants_for_uv` reads the `VARIANTS[uv]` table from `0x2d`, `C` from
+//! the `0x2d` head, `VKD` from `0x2f`, and the Nonce from the `0x2d`
+//! tail. The one input still missing is a covering 2.1 Processing Key to
+//! run the chain end-to-end against the `0x86` Verify-Media-Key record —
+//! which would also confirm the last layout picks (the 16-bit `Kvn` width
+//! vs. a narrower spec value, and Nonce head-vs-tail). Until then the
+//! final verify gate rejects any wrong pick, so a bad key is never
+//! emitted — only an error.
 //!
-//! Two condition bits on `Kmp[15]` route off the hardcoded-KCD path
-//! (Soft Correction and Online Challenge). The chain refuses to run in
-//! either case — callers must handle those modes out of band.
+//! Two condition bits on `Kmp[15]` route off the default KCD path (Soft
+//! Correction and Online Challenge); the chain does not model those modes
+//! and treats such a slot as non-covering.
 //!
-//! # Status: Kp verification
-//!
-//! On the classical path [`walk_processing_key`] gates each match on
-//! the VERIFY_MAGIC relation, which authenticates the Processing Key.
-//! On a variant MKB that magic check does NOT hold (the walk yields a
-//! Media Key *Precursor*, not the Media Key), so the walk accepts a
-//! variant match without it. The replacement gate lives at the END of
-//! [`derive_media_key_variant`]: the derived final `Km` is verified
-//! against the MKB's Verify-Media-Key record before any `(Km, Kvu)` is
-//! returned. A future implementer wiring [`variants_for_uv`] must keep
-//! that final gate — the per-match magic check no longer protects the
-//! variant path.
+//! **Verify gate.** On the classical path [`walk_processing_key`] gates
+//! each match on the VERIFY_MAGIC relation, which authenticates the
+//! Processing Key. On a variant MKB that magic does NOT hold (the walk
+//! yields a Precursor, not the Media Key), so the authoritative gate is
+//! at the END of the chain: the derived `Km` is verified against the
+//! MKB's Verify-Media-Key record before it is ever returned.
 
 use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::mkb::*;
@@ -78,12 +53,10 @@ use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
 
-/// Placeholder Key Correction Data. Sixteen zero bytes.
-///
-/// Integrators MUST supply a non-placeholder KCD via the `kcd` argument
-/// to [`derive_media_key_variant`]; the chain refuses to operate when
-/// the supplied KCD compares equal to this placeholder.
-pub const KEY_CORRECTION_DATA_PLACEHOLDER: [u8; 16] = [0u8; 16];
+/// AACS 2.1 Key Correction Data — a fixed algorithm constant.
+const KEY_CORRECTION_DATA: [u8; 16] = [
+    0x3b, 0x62, 0x8a, 0x78, 0x29, 0x00, 0xca, 0x2f, 0xdb, 0xe7, 0x7a, 0x49, 0xfe, 0x22, 0xd6, 0x6e,
+];
 
 // ── MKB record walking ────────────────────────────────────────────────────
 
@@ -116,13 +89,11 @@ pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
 
 /// 16-byte Nonce for `Kvn = AES-G(Kp, Nonce)`.
 ///
-/// **UNCONFIRMED source.** The speculative `0x83` "Variant Number" record does
-/// not exist on a real variant MKB. The `0x2d` Encrypted-Media-Key-Variant-Data
-/// record is the most likely home for a per-disc nonce, so this best-effort
-/// reads the trailing 16 bytes of `0x2d`. Confirming this (vs. a field inside
-/// `0x21`, or a fixed slice of `0x2d`) needs a real disc+key to test the whole
-/// chain against the `0x86` verify — until then the chain halts earlier at
-/// [`variants_for_uv`], so a wrong nonce here is never silently trusted.
+/// **UNCONFIRMED source.** The `0x2d` Encrypted-Media-Key-Variant-Data record is
+/// the most likely home for a per-disc nonce, so this reads its trailing 16
+/// bytes. Confirming this (vs. a fixed slice elsewhere in `0x2d`) needs a
+/// covering key to run the whole chain against the `0x86` verify; until then a
+/// wrong nonce can only fail that final gate, never emit a bad key.
 pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
     let r = records.iter().find(|r| r.rec_type == 0x2d)?;
     if r.body.len() < 16 {
@@ -325,10 +296,8 @@ pub enum MediaKeyVariantError {
     /// `Kmp[15]` carries bit `0x04`: the online-challenge path applies
     /// for this Precursor. Out of scope for the hardcoded-KCD chain.
     OnlineChallengeRequired,
-    /// Supplied KCD equals [`KEY_CORRECTION_DATA_PLACEHOLDER`]. The
-    /// derivation refuses to run with the all-zero placeholder.
-    KcdNotProvided,
-    /// `VARIANTS[uv]` lookup for the matched uv is not implemented.
+    /// `VARIANTS[uv]` could not be read from the `0x2d` record for the
+    /// matched slot.
     VariantsTableUnavailable,
     /// VKD index resolved out of the supplied `vkd_table`.
     VkdIndexOutOfRange,
@@ -346,7 +315,6 @@ impl std::fmt::Display for MediaKeyVariantError {
             MediaKeyVariantError::ProcessingKeyUnavailable => 7102,
             MediaKeyVariantError::SoftCorrectionRequired => 7103,
             MediaKeyVariantError::OnlineChallengeRequired => 7104,
-            MediaKeyVariantError::KcdNotProvided => 7105,
             MediaKeyVariantError::VariantsTableUnavailable => 7106,
             MediaKeyVariantError::VkdIndexOutOfRange => 7107,
             MediaKeyVariantError::MediaKeyVerifyFailed => 7108,
@@ -381,40 +349,131 @@ fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
-/// Run the Media Key Variant chain on an MKB.
+/// Enumerate the `(uv, slot_index)` pairs of a variant MKB's subset-difference
+/// record (`0x04`), in table order — the same parse [`walk_processing_key`] uses
+/// to index cvalues. Factored out so a bare Processing Key (which arrives without
+/// its slot) can be tried against each slot.
+fn variant_uv_slots(records: &[MkbRecord]) -> Option<Vec<(u32, usize)>> {
+    let uvs = mkb_find_body(records, 0x04)?;
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while (idx + 1) * 5 <= uvs.len() {
+        let u_mask_shift = uvs[5 * idx];
+        // The `0xC0` revoked-marker terminates the table (matches the walk's
+        // `take_while`). Shifts ≥ 32 are out of range and skipped, never wrapped.
+        if u_mask_shift & 0xC0 != 0 {
+            break;
+        }
+        let p_uv = &uvs[1 + 5 * idx..];
+        let uv = u32::from_be_bytes([p_uv[0], p_uv[1], p_uv[2], p_uv[3]]);
+        if uv != 0 && u_mask_shift < 32 {
+            out.push((uv, idx));
+        }
+        idx += 1;
+    }
+    Some(out)
+}
+
+/// The MKB-derived inputs the variant chain needs for every slot it tries against
+/// a given Processing Key. Fetched once by [`derive_media_key_variant`] so the
+/// per-slot body stays a lean `(Kp, uv, slot)` call.
+struct VariantMkb<'a> {
+    records: &'a [MkbRecord],
+    nonce: [u8; 16],
+    vkd_table: &'a [u8],
+    c_block: [u8; 16],
+    mk_dv: [u8; 16],
+}
+
+/// The variant chain body for ONE known `(Kp, uv, slot)`: derive and verify the
+/// Media Key against the MKB's Verify-Media-Key record. VID-free — the Km is
+/// MKB-scoped; the VUK is a separate [`super::derive::derive_vuk`] step. Returns
+/// the verified Km, or a classification of why this slot did not yield one.
+fn variant_km_for_slot(
+    m: &VariantMkb<'_>,
+    kp: &[u8; 16],
+    uv: u32,
+    slot_index: usize,
+) -> Result<[u8; 16], MediaKeyVariantError> {
+    // Step: Kmp = AES-128D(Kp, C) XOR uv  (uv into low 4 bytes).
+    let mut kmp = aes_ecb_decrypt(kp, &m.c_block);
+    let uv_bytes = uv.to_be_bytes();
+    for i in 0..4 {
+        kmp[12 + i] ^= uv_bytes[i];
+    }
+
+    // Condition bits on Kmp[15] select the correction mode. Bit 0x02 (SoftKCD)
+    // and 0x04 (online challenge) need out-of-band data we don't model; the
+    // default path (neither bit set) uses the fixed KCD constant.
+    if kmp[15] & 0b0000_0010 != 0 {
+        return Err(MediaKeyVariantError::SoftCorrectionRequired);
+    }
+    if kmp[15] & 0b0000_0100 != 0 {
+        return Err(MediaKeyVariantError::OnlineChallengeRequired);
+    }
+
+    // Step: Kpnew = Kmp XOR KCD.
+    let mut kpnew = [0u8; 16];
+    for i in 0..16 {
+        kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
+    }
+
+    // Step: Kvn = AES-G(Kp, Nonce) & 0xFFFF  (low 16 bits, BE).
+    let kvn_block = aes_g(kp, &m.nonce);
+    let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
+
+    // Step: VKD_idx = Kvn XOR VARIANTS[uv];  VKD = vkd_table[VKD_idx].
+    let v_for_uv = variants_for_uv(m.records, slot_index)
+        .ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
+    let vkd_idx = kvn ^ v_for_uv;
+    let off = (vkd_idx as usize) * 16;
+    if off + 16 > m.vkd_table.len() {
+        return Err(MediaKeyVariantError::VkdIndexOutOfRange);
+    }
+    let mut vkd = [0u8; 16];
+    vkd.copy_from_slice(&m.vkd_table[off..off + 16]);
+
+    // Step: Km = AES-128D(Kpnew, VKD) XOR uv.
+    let mut km = aes_ecb_decrypt(&kpnew, &vkd);
+    for i in 0..4 {
+        km[12 + i] ^= uv_bytes[i];
+    }
+
+    // Gate: the derived Media Key MUST reproduce the MKB's Verify-Media-Key magic
+    // (the per-match magic in `walk_processing_key` only saw the Precursor). This
+    // is the authoritative check — no unverified key is ever returned.
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    if aes_ecb_decrypt(&km, &m.mk_dv)[..8] != VERIFY_MAGIC {
+        return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
+    }
+    Ok(km)
+}
+
+/// Derive the AACS 2.1 variant **Media Key** from a Processing Key.
 ///
-/// Inputs:
+/// The one deterministic `Kp → Km` derivation for a variant MKB. A leaked 2.1
+/// Processing Key arrives without its subset-difference slot, so this tries `pk`
+/// against every slot and returns the Km for the slot whose full chain passes the
+/// MKB's Verify-Media-Key record — exactly the shape of the classical bare-PK
+/// [`super::derive::derive_media_key_from_pk`], gated by the chain's own verify so
+/// an unverified key is never returned.
 ///
-/// - `mkb_records`  : MKB pre-walked via [`walk_mkb`].
-/// - `device_keys`  : pool of device keys; the chain runs against the
-///   first uv slot any DK covers.
-/// - `kcd`          : integrator-supplied Key Correction Data. Must not
-///   equal [`KEY_CORRECTION_DATA_PLACEHOLDER`].
-/// - `vid`          : 16-byte Volume ID for the disc. Used to derive
-///   the final VUK alongside the Media Key.
+/// VID-free by design: the Media Key is MKB-scoped. Derive the per-disc VUK from
+/// the returned Km with [`super::derive::derive_vuk`]. Deriving a Processing Key
+/// from device keys (DK → PK) is a separate concern — walk it first via
+/// [`walk_processing_key`], then call this.
 ///
-/// Returns `(Km, Kvu)` on success.
-///
-/// STATUS: the chain runs end-to-end on a real variant MKB — record layout pinned
-/// from a live 2.1 disc (`variants_for_uv` reads `0x2d`; `C` = matched cvalue; VKD
-/// = `0x2f`; Nonce = `0x2d`), and the caller supplies the extracted CyberLink `kcd`
-/// constant. It needs only a covering Processing Key to be *validated* against a
-/// known answer, which confirms the last layout picks (Nonce head/tail, C-source,
-/// formula ordering). Until then the final Verify-Media-Key gate rejects any wrong
-/// pick, so a bad layout can never emit a wrong key — only `Err(MediaKeyVerifyFailed)`.
+/// Errors: `NotVariantMkb` (caller should use the classical path), `MkbIncomplete`
+/// (a required record is missing), or `ProcessingKeyUnavailable` (no slot verified
+/// — `pk` does not cover this MKB, or its slot needs the soft-correction / online
+/// path, surfaced as `SoftCorrectionRequired` / `OnlineChallengeRequired`).
 pub fn derive_media_key_variant(
     mkb_records: &[MkbRecord],
-    device_keys: &[DeviceKey],
-    kcd: &[u8; 16],
-    vid: &[u8; 16],
-) -> Result<([u8; 16], [u8; 16]), MediaKeyVariantError> {
+    pk: &[u8; 16],
+) -> Result<[u8; 16], MediaKeyVariantError> {
     if !is_variant_mkb(mkb_records) {
         return Err(MediaKeyVariantError::NotVariantMkb);
     }
-
-    let pkm = walk_processing_key(mkb_records, device_keys)
-        .ok_or(MediaKeyVariantError::ProcessingKeyUnavailable)?;
-
     let nonce = variant_nonce(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let c_value = variant_data_record(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
@@ -423,74 +482,31 @@ pub fn derive_media_key_variant(
     }
     let mut c_block = [0u8; 16];
     c_block.copy_from_slice(&c_value[..16]);
-
-    // Step: Kmp = AES-128D(Kp, C) XOR uv  (uv into low 4 bytes).
-    let mut kmp = aes_ecb_decrypt(&pkm.kp, &c_block);
-    let uv_bytes = pkm.uv.to_be_bytes();
-    for i in 0..4 {
-        kmp[12 + i] ^= uv_bytes[i];
-    }
-
-    // Condition bits on Kmp[15] select the correction mode. Bit 0x02 (SoftKCD) and
-    // 0x04 (online challenge) need out-of-band data we don't model. The DEFAULT
-    // path (neither bit set) uses the fixed CyberLink KCD constant hardcoded in
-    // PowerDVD's CLTA_SW.dll (extracted; a 16-byte NON-zero value the caller must
-    // supply). Refuse the all-zero placeholder so the chain never runs with an
-    // unset/wrong KCD and emits a bad key.
-    if kmp[15] & 0b0000_0010 != 0 {
-        return Err(MediaKeyVariantError::SoftCorrectionRequired);
-    }
-    if kmp[15] & 0b0000_0100 != 0 {
-        return Err(MediaKeyVariantError::OnlineChallengeRequired);
-    }
-    if kcd == &KEY_CORRECTION_DATA_PLACEHOLDER {
-        return Err(MediaKeyVariantError::KcdNotProvided);
-    }
-
-    // Step: Kpnew = Kmp XOR KCD  (KCD = the extracted CyberLink constant).
-    let mut kpnew = [0u8; 16];
-    for i in 0..16 {
-        kpnew[i] = kmp[i] ^ kcd[i];
-    }
-
-    // Step: Kvn = AES-G(Kp, Nonce) & 0xFFFF  (low 16 bits, BE).
-    let kvn_block = aes_g(&pkm.kp, &nonce);
-    let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
-
-    // Step: VKD_idx = Kvn XOR VARIANTS[uv].
-    let v_for_uv = variants_for_uv(mkb_records, pkm.cvalue_index)
-        .ok_or(MediaKeyVariantError::VariantsTableUnavailable)?;
-    let vkd_idx = kvn ^ v_for_uv;
-
-    // Step: VKD = vkd_table[VKD_idx * 16 .. +16].
-    let off = (vkd_idx as usize) * 16;
-    if off + 16 > vkd_table.len() {
-        return Err(MediaKeyVariantError::VkdIndexOutOfRange);
-    }
-    let mut vkd = [0u8; 16];
-    vkd.copy_from_slice(&vkd_table[off..off + 16]);
-
-    // Step: Km = AES-128D(Kpnew, VKD) XOR uv.
-    let mut km = aes_ecb_decrypt(&kpnew, &vkd);
-    for i in 0..4 {
-        km[12 + i] ^= uv_bytes[i];
-    }
-
-    // Gate: verify the derived Media Key against the MKB's Verify-Media-Key
-    // record. On the variant path the per-match magic check in
-    // `walk_processing_key` does NOT hold (it only saw the Precursor), so this
-    // is the authoritative Kp/Km verification — it MUST run before returning a
-    // real key.
     let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-    if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
-        return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
+    let slots = variant_uv_slots(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let m = VariantMkb {
+        records: mkb_records,
+        nonce,
+        vkd_table,
+        c_block,
+        mk_dv,
+    };
+
+    // Try `pk` against each slot; return the first verified Km. If none verify,
+    // surface a correction-mode error over the generic miss so a disc that needs
+    // the soft/online path is distinguishable from a non-covering key.
+    let mut correction: Option<MediaKeyVariantError> = None;
+    for (uv, slot_index) in slots {
+        match variant_km_for_slot(&m, pk, uv, slot_index) {
+            Ok(km) => return Ok(km),
+            Err(e @ MediaKeyVariantError::SoftCorrectionRequired)
+            | Err(e @ MediaKeyVariantError::OnlineChallengeRequired) => {
+                correction.get_or_insert(e);
+            }
+            Err(_) => {}
+        }
     }
-
-    // Step: Kvu = AES-G(Km, VID).
-    let kvu = aes_g(&km, vid);
-
-    Ok((km, kvu))
+    Err(correction.unwrap_or(MediaKeyVariantError::ProcessingKeyUnavailable))
 }
 
 #[cfg(test)]
@@ -581,46 +597,36 @@ mod tests {
     #[test]
     fn chain_rejects_non_variant_mkb() {
         let recs = walk_mkb(&synthetic_mkb_classical());
-        let err = derive_media_key_variant(&recs, &[], &[0xAA; 16], &[0u8; 16])
+        let err = derive_media_key_variant(&recs, &[0xAA; 16])
             .expect_err("classical MKB must be rejected");
         assert_eq!(err, MediaKeyVariantError::NotVariantMkb);
     }
 
     #[test]
-    fn chain_rejects_placeholder_kcd() {
-        // The default 2.1 path needs the real (extracted CyberLink) KCD constant;
-        // the all-zero placeholder must be refused so the chain never runs unset.
-        let (recs, dk, _kp, _expected_kmp) = synthetic_variant_setup(/*kmp15*/ 0x00);
-        let err =
-            derive_media_key_variant(&recs, &[dk], &KEY_CORRECTION_DATA_PLACEHOLDER, &[0u8; 16])
-                .expect_err("placeholder KCD must be rejected");
-        assert_eq!(err, MediaKeyVariantError::KcdNotProvided);
-    }
-
-    #[test]
     fn chain_detects_soft_correction_bit() {
-        let (recs, dk, _, _) = synthetic_variant_setup(/*kmp15*/ 0x02);
-        let err = derive_media_key_variant(&recs, &[dk], &[0xAA; 16], &[0u8; 16])
+        // Kmp[15] bit 0x02 on the covering PK's slot surfaces the soft-correction
+        // classification over the generic no-slot miss.
+        let (recs, _dk, kp, _) = synthetic_variant_setup(/*kmp15*/ 0x02);
+        let err = derive_media_key_variant(&recs, &kp)
             .expect_err("bit 0x02 must surface SoftCorrectionRequired");
         assert_eq!(err, MediaKeyVariantError::SoftCorrectionRequired);
     }
 
     #[test]
     fn chain_detects_online_challenge_bit() {
-        let (recs, dk, _, _) = synthetic_variant_setup(/*kmp15*/ 0x04);
-        let err = derive_media_key_variant(&recs, &[dk], &[0xAA; 16], &[0u8; 16])
+        let (recs, _dk, kp, _) = synthetic_variant_setup(/*kmp15*/ 0x04);
+        let err = derive_media_key_variant(&recs, &kp)
             .expect_err("bit 0x04 must surface OnlineChallengeRequired");
         assert_eq!(err, MediaKeyVariantError::OnlineChallengeRequired);
     }
 
     #[test]
-    fn variants_for_uv_reads_the_table_not_unavailable() {
-        // variants_for_uv now reads the VARIANTS u16 from the 0x2d record, so on a
-        // variant MKB that carries 0x2d the chain advances PAST the per-uv lookup
-        // (into VKD/verify) instead of dead-stopping at VariantsTableUnavailable.
-        let (recs, dk, _, _) = synthetic_variant_setup(/*kmp15*/ 0x00);
-        let out = derive_media_key_variant(&recs, &[dk], &[0xAA; 16], &[0u8; 16]);
-        assert_ne!(out, Err(MediaKeyVariantError::VariantsTableUnavailable));
+    fn variants_for_uv_reads_the_table_from_0x2d() {
+        // variants_for_uv reads the VARIANTS u16 from the 0x2d record, so on a
+        // variant MKB that carries 0x2d it yields Some (never dead-stops the chain
+        // at VariantsTableUnavailable).
+        let (recs, _dk, _kp, _) = synthetic_variant_setup(/*kmp15*/ 0x00);
+        assert!(variants_for_uv(&recs, 0).is_some());
     }
 
     #[test]
@@ -633,7 +639,6 @@ mod tests {
             MediaKeyVariantError::ProcessingKeyUnavailable,
             MediaKeyVariantError::SoftCorrectionRequired,
             MediaKeyVariantError::OnlineChallengeRequired,
-            MediaKeyVariantError::KcdNotProvided,
             MediaKeyVariantError::VariantsTableUnavailable,
             MediaKeyVariantError::VkdIndexOutOfRange,
             MediaKeyVariantError::MediaKeyVerifyFailed,
@@ -883,13 +888,16 @@ mod tests {
     // ── derive_media_key_variant: missing-record classification ────────────
 
     #[test]
-    fn chain_reports_processing_key_unavailable_with_no_dks() {
-        // A complete variant MKB but an empty device-key pool → no uv covered
-        // → ProcessingKeyUnavailable (the walk_processing_key None branch).
+    fn chain_yields_no_key_for_non_covering_pk() {
+        // A complete variant MKB but a Processing Key that covers no slot → no
+        // Km verifies → an error (never a key). A non-covering key resolves to
+        // ProcessingKeyUnavailable, or to a correction-mode classification if its
+        // Kmp happens to set the soft/online bit — either way, no key is emitted.
         let (recs, _dk, _, _) = synthetic_variant_setup(0x00);
-        let err = derive_media_key_variant(&recs, &[], &[0xAA; 16], &[0u8; 16])
-            .expect_err("no DK → ProcessingKeyUnavailable");
-        assert_eq!(err, MediaKeyVariantError::ProcessingKeyUnavailable);
+        let out = derive_media_key_variant(&recs, &[0x11; 16]);
+        assert!(out.is_err(), "non-covering PK must not yield a Media Key");
+        assert_ne!(out, Err(MediaKeyVariantError::NotVariantMkb));
+        assert_ne!(out, Err(MediaKeyVariantError::MkbIncomplete));
     }
 
     #[test]
@@ -897,7 +905,7 @@ mod tests {
         // Build a variant MKB (still variant via 0x2f, and a DK can walk it)
         // but WITHOUT the 0x2d record that carries C + the trailing Nonce →
         // MkbIncomplete at the variant_nonce `?`.
-        let (recs, dk, _, _) = synthetic_variant_setup(0x00);
+        let (recs, _dk, kp, _) = synthetic_variant_setup(0x00);
         // Reconstruct bytes without the 0x2d record.
         let mut mkb = Vec::new();
         for r in &recs {
@@ -912,8 +920,7 @@ mod tests {
         }
         let recs2 = walk_mkb(&mkb);
         assert!(is_variant_mkb(&recs2), "still variant via 0x2f");
-        let err = derive_media_key_variant(&recs2, &[dk], &[0xAA; 16], &[0u8; 16])
-            .expect_err("missing nonce → MkbIncomplete");
+        let err = derive_media_key_variant(&recs2, &kp).expect_err("missing nonce → MkbIncomplete");
         assert_eq!(err, MediaKeyVariantError::MkbIncomplete);
     }
 
@@ -1001,7 +1008,7 @@ mod tests {
     fn error_codes_are_unique_and_in_7100_range() {
         // Each MediaKeyVariantError maps to a distinct E71xx code. A
         // copy-paste collision (two variants sharing a code) would break
-        // operator triage; assert all nine are distinct.
+        // operator triage; assert all are distinct.
         use std::collections::HashSet;
         let cases = [
             MediaKeyVariantError::NotVariantMkb,
@@ -1009,7 +1016,6 @@ mod tests {
             MediaKeyVariantError::ProcessingKeyUnavailable,
             MediaKeyVariantError::SoftCorrectionRequired,
             MediaKeyVariantError::OnlineChallengeRequired,
-            MediaKeyVariantError::KcdNotProvided,
             MediaKeyVariantError::VariantsTableUnavailable,
             MediaKeyVariantError::VkdIndexOutOfRange,
             MediaKeyVariantError::MediaKeyVerifyFailed,

@@ -64,7 +64,7 @@ mod tests {
     use super::content::{ALIGNED_UNIT_LEN, ts_sync_destroyed};
     use super::inf::{disc_hash, disc_hash_hex};
     use super::mkb::{AacsVersion, mkb_content_len, walk_mkb};
-    use super::variant::{KEY_CORRECTION_DATA_PLACEHOLDER, is_variant_mkb};
+    use super::variant::is_variant_mkb;
 
     #[test]
     fn aligned_unit_len_is_three_2048_byte_sectors() {
@@ -83,13 +83,6 @@ mod tests {
         // are distinct values.
         assert_ne!(AacsVersion::V10, AacsVersion::V20);
         assert_ne!(AacsVersion::V20, AacsVersion::V21);
-    }
-
-    #[test]
-    fn key_correction_data_placeholder_is_all_zero() {
-        // The variant chain refuses to run against this all-zero placeholder
-        // KCD; the public constant must therefore be exactly 16 zero bytes.
-        assert_eq!(KEY_CORRECTION_DATA_PLACEHOLDER, [0u8; 16]);
     }
 
     #[test]
