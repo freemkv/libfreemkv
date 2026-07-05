@@ -27,6 +27,38 @@ pub struct HostCert {
     pub certificate_v2: Option<Vec<u8>>,
 }
 
+/// Volume ID (16 bytes) — read from the disc via the SCSI handshake / OEM path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vid(pub [u8; 16]);
+
+/// Media Key (Km, 16 bytes) — the MKB-scoped key derived from device keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaKey(pub [u8; 16]);
+
+/// Volume Unique Key (VUK / Kvu, 16 bytes) — derived from `MediaKey` + `Vid`,
+/// decrypts the per-disc encrypted title keys in `Unit_Key_RO.inf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vuk(pub [u8; 16]);
+
+/// Processing Key (Kp, 16 bytes) — an MKB Subset-Difference key that yields the
+/// Media Key. A leaked/precomputed PK in the keydb, or the intermediate PK a
+/// device-key walk derives at its matching SD node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessingKey(pub [u8; 16]);
+
+/// One decrypted per-CPS-unit AACS title key.
+///
+/// `idx` is the POSITIONAL index of the encrypted title key within the slice
+/// handed to the VUK→UK step (i.e. its order in `Unit_Key_RO.inf`'s key-storage
+/// area). The CPS-unit *number* association is a higher-level concern owned by
+/// [`super::inf::parse_unit_key_ro`], which pairs each positional key with its
+/// declared CPS unit; this primitive only does the AES, so it surfaces position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitKey {
+    pub idx: u32,
+    pub key: [u8; 16],
+}
+
 /// A per-disc entry from the key database.
 #[derive(Debug, Clone)]
 pub struct DiscEntry {

@@ -25,7 +25,6 @@
 //!   - `[libaacs]` — the libaacs reference implementation, cited only where the spec
 //!     is silent (the `0x86` verify record and the Category-C MKBType names).
 
-pub mod boil;
 pub mod content;
 pub mod crypto;
 pub mod derive;
@@ -52,17 +51,16 @@ pub const PATH_CONTENT_CERT_ALT: &str = "/AACS/Content001.cer";
 
 // The module structure IS the public API — consumers import from the owning
 // module directly (e.g. `aacs::content::decrypt_unit`, `aacs::mkb::MkbType`,
-// `aacs::derive::derive_vuk`, `aacs::boil::mk_from_dk`, `aacs::resolve::resolve_keys_v2`).
+// `aacs::derive::{derive_vuk, resolve_candidate}`, `aacs::resolve::resolve_keys_v2`).
 // The `derive::probe` reproduction harness stays reachable via its module path.
 //
 // A small set of flat re-exports is kept for the typed key primitives and the
 // content-decrypt entry points that downstream key-source crates import through
 // the `aacs::` path. These are the stable, load-bearing names; keeping them here
 // lets those crates track the module refactor without a lockstep re-pin.
-pub use boil::{MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk};
 pub use content::{ALIGNED_UNIT_LEN, decrypt_unit_try_keys};
 pub use derive::derive_vuk;
-pub use types::{DeviceKey, HostCert};
+pub use types::{DeviceKey, HostCert, MediaKey, ProcessingKey, UnitKey, Vid, Vuk};
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +100,14 @@ mod tests {
         let _ = mkb_content_len(&[]);
         let _ = is_variant_mkb(&walk_mkb(&[]));
         let _ = disc_hash_hex(&disc_hash(b"x"));
-        let _ = super::boil::mk_from_pk(&[[0u8; 16]], &[]);
+        let _ = super::derive::resolve_candidate(
+            &super::derive::KeyCandidate::Uk(super::types::UnitKey {
+                idx: 0,
+                key: [0u8; 16],
+            }),
+            &[],
+            &[],
+            None,
+        );
     }
 }

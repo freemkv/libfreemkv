@@ -983,7 +983,7 @@ mod tests {
         fn get_uk(
             &self,
             _ctx: &dyn crate::keysource::ResolveCtx,
-        ) -> Result<Vec<crate::aacs::boil::UnitKey>> {
+        ) -> Result<Vec<crate::aacs::types::UnitKey>> {
             Ok(Vec::new())
         }
         fn host_certs(&self, _mkb: Option<u32>) -> Vec<aacs::types::HostCert> {
