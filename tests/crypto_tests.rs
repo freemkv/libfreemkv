@@ -84,9 +84,9 @@ fn aacs_decrypt_unit_roundtrip() {
     ];
 
     // Build plaintext unit with TS sync bytes every 192 bytes starting at offset 4
-    let mut plain = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut plain = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
     let mut offset = 4;
-    while offset < aacs::ALIGNED_UNIT_LEN {
+    while offset < aacs::content::ALIGNED_UNIT_LEN {
         plain[offset] = 0x47; // TS sync byte
         offset += 192;
     }
@@ -118,7 +118,7 @@ fn aacs_decrypt_unit_roundtrip() {
     // Step 3: AES-CBC encrypt bytes 16..6144
     let cipher = Aes128::new(GenericArray::from_slice(&encrypt_key));
     let mut prev = aacs_iv;
-    let num_blocks = (aacs::ALIGNED_UNIT_LEN - 16) / 16;
+    let num_blocks = (aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
     for i in 0..num_blocks {
         let off = 16 + i * 16;
         for j in 0..16 {
@@ -131,29 +131,29 @@ fn aacs_decrypt_unit_roundtrip() {
     }
 
     // Verify it looks encrypted (body TS syncs scrambled)
-    assert!(aacs::ts_sync_destroyed(&plain));
+    assert!(aacs::content::ts_sync_destroyed(&plain));
 
     // Now decrypt
-    let result = aacs::decrypt_unit(&mut plain, &unit_key);
+    let result = aacs::content::decrypt_unit(&mut plain, &unit_key);
     assert!(
         result,
         "decrypt_unit should return true on valid encrypted unit"
     );
     assert!(
-        !aacs::ts_sync_destroyed(&plain),
+        !aacs::content::ts_sync_destroyed(&plain),
         "decrypted unit should read as clear (TS syncs restored)"
     );
 
     // Verify TS sync bytes at expected positions (flag byte is cleared by decrypt)
     let mut sync_count = 0;
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         if plain[off] == 0x47 {
             sync_count += 1;
         }
         off += 192;
     }
-    let expected_syncs = (aacs::ALIGNED_UNIT_LEN - 4) / 192 + 1;
+    let expected_syncs = (aacs::content::ALIGNED_UNIT_LEN - 4) / 192 + 1;
     assert_eq!(
         sync_count, expected_syncs,
         "TS sync bytes not recovered: got {}, expected {}",
@@ -176,11 +176,11 @@ fn aacs_disc_hash_deterministic() {
     let data1 = b"Unit_Key_RO.inf test data for deterministic hashing";
     let data2 = b"Different data should produce different hash";
 
-    let hash1a = aacs::disc_hash(data1);
-    let hash1b = aacs::disc_hash(data1);
+    let hash1a = aacs::inf::disc_hash(data1);
+    let hash1b = aacs::inf::disc_hash(data1);
     assert_eq!(hash1a, hash1b, "disc_hash not deterministic on same input");
 
-    let hash2 = aacs::disc_hash(data2);
+    let hash2 = aacs::inf::disc_hash(data2);
     assert_ne!(
         hash1a, hash2,
         "different inputs should produce different hashes"
@@ -190,7 +190,7 @@ fn aacs_disc_hash_deterministic() {
     assert_eq!(hash1a.len(), 20);
 
     // Verify disc_hash_hex formatting
-    let hex = aacs::disc_hash_hex(&hash1a);
+    let hex = aacs::inf::disc_hash_hex(&hash1a);
     assert!(hex.starts_with("0x"), "hex should start with 0x prefix");
     assert_eq!(
         hex.len(),
@@ -225,7 +225,7 @@ fn aacs_decrypt_unit_key_roundtrip() {
     encrypted_uk.copy_from_slice(&block);
 
     // Decrypt with the public API
-    let decrypted = aacs::decrypt_unit_key(&vuk, &encrypted_uk);
+    let decrypted = aacs::derive::decrypt_unit_key(&vuk, &encrypted_uk);
     assert_eq!(
         decrypted, original_unit_key,
         "decrypt_unit_key did not recover original unit key"
@@ -246,7 +246,7 @@ fn aacs_vuk_derivation_roundtrip() {
         0x30,
     ];
 
-    let vuk = aacs::derive_vuk(&media_key, &volume_id);
+    let vuk = aacs::derive::derive_vuk(&media_key, &volume_id);
 
     // VUK should be non-zero and different from both inputs
     assert_ne!(vuk, [0u8; 16], "VUK should not be all zeros");
@@ -254,7 +254,7 @@ fn aacs_vuk_derivation_roundtrip() {
     assert_ne!(vuk, volume_id, "VUK should differ from volume_id");
 
     // Verify determinism
-    let vuk2 = aacs::derive_vuk(&media_key, &volume_id);
+    let vuk2 = aacs::derive::derive_vuk(&media_key, &volume_id);
     assert_eq!(vuk, vuk2, "derive_vuk not deterministic");
 }
 
@@ -263,14 +263,14 @@ fn aacs_vuk_derivation_roundtrip() {
 fn aacs_ts_sync_destroyed_detection() {
     // A clear unit: TS sync (0x47) intact at every 192-byte packet → not
     // scrambled. (Flag bits play no role.)
-    let mut clear = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut clear = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         clear[off] = 0x47;
         off += 192;
     }
     assert!(
-        !aacs::ts_sync_destroyed(&clear),
+        !aacs::content::ts_sync_destroyed(&clear),
         "clear unit (syncs intact) must not be scrambled"
     );
 
@@ -279,21 +279,21 @@ fn aacs_ts_sync_destroyed_detection() {
     flagged[0] = 0xC0; // copy-control bits
     flagged[7] = 0xC0; // TSC bits
     assert!(
-        !aacs::ts_sync_destroyed(&flagged),
+        !aacs::content::ts_sync_destroyed(&flagged),
         "flag bits must not be read as encryption"
     );
 
     // A scrambled body (syncs destroyed) → scrambled.
-    let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
+    let scrambled = vec![0x99u8; aacs::content::ALIGNED_UNIT_LEN];
     assert!(
-        aacs::ts_sync_destroyed(&scrambled),
+        aacs::content::ts_sync_destroyed(&scrambled),
         "unit with no intact TS syncs must read as scrambled"
     );
 
     // Too short
     let short = vec![0xFFu8; 100];
     assert!(
-        !aacs::ts_sync_destroyed(&short),
+        !aacs::content::ts_sync_destroyed(&short),
         "short buffer should not be detected"
     );
 }
@@ -303,10 +303,10 @@ fn aacs_ts_sync_destroyed_detection() {
 /// A clear unit (TS syncs intact) should pass through decrypt_unit unchanged.
 #[test]
 fn aacs_decrypt_unit_unencrypted_passthrough() {
-    let mut unit = vec![0x42u8; aacs::ALIGNED_UNIT_LEN];
+    let mut unit = vec![0x42u8; aacs::content::ALIGNED_UNIT_LEN];
     // Intact TS syncs every 192 bytes → not scrambled → passthrough.
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         unit[off] = 0x47;
         off += 192;
     }
@@ -315,8 +315,8 @@ fn aacs_decrypt_unit_unencrypted_passthrough() {
     let original = unit.clone();
     let key = [0xAA; 16];
 
-    assert!(!aacs::ts_sync_destroyed(&unit));
-    let result = aacs::decrypt_unit(&mut unit, &key);
+    assert!(!aacs::content::ts_sync_destroyed(&unit));
+    let result = aacs::content::decrypt_unit(&mut unit, &key);
     assert!(result, "clear unit should return true");
     assert_eq!(unit, original, "clear unit should be unchanged");
 }
@@ -370,17 +370,17 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
         0x10,
     ];
 
-    let mut plaintext = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut plaintext = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
     // TS sync bytes every 192 bytes starting at offset 4
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         plaintext[off] = 0x47;
         off += 192;
     }
     // Fill the rest with a recognisable pattern (prime modulus avoids artefacts).
     // Index-arithmetic — clearer with a counted loop than an enumerate chain.
     #[allow(clippy::needless_range_loop)]
-    for i in 16..aacs::ALIGNED_UNIT_LEN {
+    for i in 16..aacs::content::ALIGNED_UNIT_LEN {
         if plaintext[i] == 0 {
             plaintext[i] = (i % 251) as u8;
         }
@@ -402,7 +402,7 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
     ref_aes_cbc_encrypt(
         &dk,
         &CROSS_AACS_IV,
-        &mut plaintext[16..aacs::ALIGNED_UNIT_LEN],
+        &mut plaintext[16..aacs::content::ALIGNED_UNIT_LEN],
     );
 
     // Sanity: ciphertext should differ
@@ -413,7 +413,7 @@ fn aacs_cross_validation_encrypt_then_decrypt() {
     );
 
     // -- Decrypt with the library --
-    let ok = aacs::decrypt_unit(&mut plaintext, &unit_key);
+    let ok = aacs::content::decrypt_unit(&mut plaintext, &unit_key);
     assert!(
         ok,
         "decrypt_unit returned false (TS sync verification failed)"
@@ -436,9 +436,9 @@ fn aacs_cross_validation_alternate_key() {
         0x08,
     ];
 
-    let mut plaintext = vec![0xFFu8; aacs::ALIGNED_UNIT_LEN];
+    let mut plaintext = vec![0xFFu8; aacs::content::ALIGNED_UNIT_LEN];
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         plaintext[off] = 0x47;
         off += 192;
     }
@@ -455,10 +455,10 @@ fn aacs_cross_validation_alternate_key() {
     ref_aes_cbc_encrypt(
         &dk,
         &CROSS_AACS_IV,
-        &mut plaintext[16..aacs::ALIGNED_UNIT_LEN],
+        &mut plaintext[16..aacs::content::ALIGNED_UNIT_LEN],
     );
 
-    assert!(aacs::decrypt_unit(&mut plaintext, &unit_key));
+    assert!(aacs::content::decrypt_unit(&mut plaintext, &unit_key));
 
     // Decryption clears no flag, so the unit round-trips byte-for-byte.
     assert_eq!(&plaintext[..], &expected[..]);
@@ -473,15 +473,15 @@ fn aacs_bus_decrypt_cross_validation() {
         0x00,
     ];
 
-    let mut plaintext = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut plaintext = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
     #[allow(clippy::needless_range_loop)]
-    for i in 0..aacs::ALIGNED_UNIT_LEN {
+    for i in 0..aacs::content::ALIGNED_UNIT_LEN {
         plaintext[i] = ((i * 3 + 17) & 0xFF) as u8;
     }
     let expected = plaintext.clone();
 
     // Encrypt per-sector: AES-CBC encrypt bytes 16..2048 of each 2048-byte sector
-    for sector_start in (0..aacs::ALIGNED_UNIT_LEN).step_by(2048) {
+    for sector_start in (0..aacs::content::ALIGNED_UNIT_LEN).step_by(2048) {
         ref_aes_cbc_encrypt(
             &read_data_key,
             &CROSS_AACS_IV,
@@ -490,7 +490,7 @@ fn aacs_bus_decrypt_cross_validation() {
     }
     assert_ne!(&plaintext[16..32], &expected[16..32]);
 
-    aacs::decrypt_bus(&mut plaintext, &read_data_key);
+    aacs::content::decrypt_bus(&mut plaintext, &read_data_key);
     assert_eq!(
         plaintext, expected,
         "bus decrypt did not recover original plaintext"
@@ -738,7 +738,7 @@ fn aacs_parse_unit_key_ro_minimal() {
         data[key_pos + i] = (0xA0 + i) as u8;
     }
 
-    let result = aacs::parse_unit_key_ro(&data, aacs::AacsVersion::V10);
+    let result = aacs::inf::parse_unit_key_ro(&data, aacs::mkb::AacsVersion::V10);
     assert!(
         result.is_some(),
         "parse_unit_key_ro should succeed on valid data"
@@ -751,6 +751,6 @@ fn aacs_parse_unit_key_ro_minimal() {
     assert_eq!(ukf.disc_hash.len(), 20);
 
     // disc_hash should be deterministic
-    let hash = aacs::disc_hash(&data);
+    let hash = aacs::inf::disc_hash(&data);
     assert_eq!(ukf.disc_hash, hash);
 }
