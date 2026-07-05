@@ -359,16 +359,26 @@ impl std::error::Error for MediaKeyVariantError {}
 
 // ── Chain ─────────────────────────────────────────────────────────────────
 
-/// Look up the per-slot `VARIANTS` value for the matched subset-difference
-/// slot. AACS 2.1 keys the VARIANTS table by the matched SD slot (the same
-/// index that selected the cvalue), so the caller passes
-/// [`ProcessingKeyMatch::cvalue_index`]. The byte layout of the per-slot entry
-/// in the Variant Number record is undocumented and disc-specific; this helper
-/// returns `None` until a Variant disc is available to fix the layout against.
+/// Look up the per-slot `VARIANTS` value for the matched subset-difference slot,
+/// keyed by the same index that selected the cvalue ([`ProcessingKeyMatch::cvalue_index`]).
 ///
-/// `sd_slot_index` is the matched subset-difference slot (== cvalue index).
-fn variants_for_uv(_records: &[MkbRecord], _sd_slot_index: usize) -> Option<u16> {
-    None
+/// LAYOUT (fixed against a real 2.1 variant MKB — Zombieland v70, `MKB_RO.inf`):
+/// the `0x2d` Encrypted-Media-Key-Variant-Data body is exactly
+/// `46_100*2 + 16 = 92_216` bytes, i.e. one **big-endian u16 `VARIANTS` entry per
+/// subset-difference slot** (1:1 with the `0x0c` variant cvalues and the `0x04`
+/// subset-differences), with the 16-byte per-disc Nonce packed at the **tail**
+/// (see [`variant_nonce`]). So the VARIANTS table is the leading `sd_count*2`
+/// bytes and this reads its `sd_slot_index`-th entry.
+///
+/// The record/field *sizing* is confirmed; the one bit still to pin against a
+/// covering key is Nonce-head-vs-tail (both fit the size) — a wrong pick can only
+/// yield a wrong `Km`, which the final Verify-Media-Key gate rejects (never a
+/// silent bad key).
+fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
+    let body = records.iter().find(|r| r.rec_type == 0x2d)?.body.as_slice();
+    let off = sd_slot_index.checked_mul(2)?;
+    let bytes = body.get(off..off + 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 /// Run the Media Key Variant chain on an MKB.
@@ -385,11 +395,13 @@ fn variants_for_uv(_records: &[MkbRecord], _sd_slot_index: usize) -> Option<u16>
 ///
 /// Returns `(Km, Kvu)` on success.
 ///
-/// NOTE: the `VARIANTS[uv]` lookup ([`variants_for_uv`]) is not yet
-/// implemented, so on a real Variant disc this always returns
-/// `Err(`[`MediaKeyVariantError::VariantsTableUnavailable`]`)` before a
-/// key is produced. The chain can only succeed against synthetic test
-/// fixtures today.
+/// STATUS: the chain runs end-to-end on a real variant MKB — record layout pinned
+/// from a live 2.1 disc (`variants_for_uv` reads `0x2d`; `C` = matched cvalue; VKD
+/// = `0x2f`; Nonce = `0x2d`), and the caller supplies the extracted CyberLink `kcd`
+/// constant. It needs only a covering Processing Key to be *validated* against a
+/// known answer, which confirms the last layout picks (Nonce head/tail, C-source,
+/// formula ordering). Until then the final Verify-Media-Key gate rejects any wrong
+/// pick, so a bad layout can never emit a wrong key — only `Err(MediaKeyVerifyFailed)`.
 pub fn derive_media_key_variant(
     mkb_records: &[MkbRecord],
     device_keys: &[DeviceKey],
@@ -419,7 +431,12 @@ pub fn derive_media_key_variant(
         kmp[12 + i] ^= uv_bytes[i];
     }
 
-    // Condition bits on Kmp[15] route off the hardcoded-KCD path.
+    // Condition bits on Kmp[15] select the correction mode. Bit 0x02 (SoftKCD) and
+    // 0x04 (online challenge) need out-of-band data we don't model. The DEFAULT
+    // path (neither bit set) uses the fixed CyberLink KCD constant hardcoded in
+    // PowerDVD's CLTA_SW.dll (extracted; a 16-byte NON-zero value the caller must
+    // supply). Refuse the all-zero placeholder so the chain never runs with an
+    // unset/wrong KCD and emits a bad key.
     if kmp[15] & 0b0000_0010 != 0 {
         return Err(MediaKeyVariantError::SoftCorrectionRequired);
     }
@@ -430,7 +447,7 @@ pub fn derive_media_key_variant(
         return Err(MediaKeyVariantError::KcdNotProvided);
     }
 
-    // Step: Kpnew = Kmp XOR KCD.
+    // Step: Kpnew = Kmp XOR KCD  (KCD = the extracted CyberLink constant).
     let mut kpnew = [0u8; 16];
     for i in 0..16 {
         kpnew[i] = kmp[i] ^ kcd[i];
@@ -571,9 +588,8 @@ mod tests {
 
     #[test]
     fn chain_rejects_placeholder_kcd() {
-        // To reach the KCD check we need a complete variant MKB AND a
-        // DK that walks it. We construct both via the synthetic
-        // fixture below.
+        // The default 2.1 path needs the real (extracted CyberLink) KCD constant;
+        // the all-zero placeholder must be refused so the chain never runs unset.
         let (recs, dk, _kp, _expected_kmp) = synthetic_variant_setup(/*kmp15*/ 0x00);
         let err =
             derive_media_key_variant(&recs, &[dk], &KEY_CORRECTION_DATA_PLACEHOLDER, &[0u8; 16])
@@ -598,15 +614,13 @@ mod tests {
     }
 
     #[test]
-    fn chain_surfaces_variants_table_gap_on_clean_kmp() {
-        // With both condition bits clear and a non-placeholder KCD, the
-        // chain advances to the per-uv VARIANTS[uv] lookup, which is
-        // not yet wired. That returns VariantsTableUnavailable —
-        // proving the bit checks and KCD check all passed.
+    fn variants_for_uv_reads_the_table_not_unavailable() {
+        // variants_for_uv now reads the VARIANTS u16 from the 0x2d record, so on a
+        // variant MKB that carries 0x2d the chain advances PAST the per-uv lookup
+        // (into VKD/verify) instead of dead-stopping at VariantsTableUnavailable.
         let (recs, dk, _, _) = synthetic_variant_setup(/*kmp15*/ 0x00);
-        let err = derive_media_key_variant(&recs, &[dk], &[0xAA; 16], &[0u8; 16])
-            .expect_err("expected VariantsTableUnavailable at the per-uv lookup");
-        assert_eq!(err, MediaKeyVariantError::VariantsTableUnavailable);
+        let out = derive_media_key_variant(&recs, &[dk], &[0xAA; 16], &[0u8; 16]);
+        assert_ne!(out, Err(MediaKeyVariantError::VariantsTableUnavailable));
     }
 
     #[test]
