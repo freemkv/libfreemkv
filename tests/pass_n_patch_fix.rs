@@ -10,7 +10,7 @@ use libfreemkv::{aacs, decrypt::DecryptKeys};
 #[test]
 fn decrypt_sectors_with_aacs_keys_works() {
     // Build an encrypted aligned unit
-    let mut unit = vec![0xFFu8; aacs::ALIGNED_UNIT_LEN];
+    let mut unit = vec![0xFFu8; aacs::content::ALIGNED_UNIT_LEN];
 
     // Set encryption flag (bits 6-7 of byte 0)
     unit[0] |= 0xC0;
@@ -19,7 +19,7 @@ fn decrypt_sectors_with_aacs_keys_works() {
     for (i, byte) in unit
         .iter_mut()
         .enumerate()
-        .take(aacs::ALIGNED_UNIT_LEN)
+        .take(aacs::content::ALIGNED_UNIT_LEN)
         .skip(1)
     {
         *byte = ((i * 3 + 7) & 0xFF) as u8;
@@ -28,7 +28,7 @@ fn decrypt_sectors_with_aacs_keys_works() {
     let unit_key: [u8; 16] = [0xAAu8; 16];
 
     // Encrypt the unit using AACS algorithm
-    aacs::decrypt_unit(&mut unit, &unit_key); // decrypt_unit is idempotent on already-encrypted data
+    aacs::content::decrypt_unit(&mut unit, &unit_key); // decrypt_unit is idempotent on already-encrypted data
 
     // Now we have encrypted data - create DecryptKeys with actual keys
     let mut keys = DecryptKeys::Aacs {
@@ -83,23 +83,23 @@ fn decrypt_sectors_with_css_keys_works() {
 #[test]
 fn aacs_encryption_flag_detection() {
     // A clear unit: TS syncs (0x47) intact at every 192-byte packet.
-    let mut unit = vec![0u8; aacs::ALIGNED_UNIT_LEN];
+    let mut unit = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
     let mut off = 4;
-    while off < aacs::ALIGNED_UNIT_LEN {
+    while off < aacs::content::ALIGNED_UNIT_LEN {
         unit[off] = 0x47;
         off += 192;
     }
     // Encryption is the scrambled body (TS syncs destroyed), NOT a flag bit.
-    assert!(!aacs::ts_sync_destroyed(&unit));
+    assert!(!aacs::content::ts_sync_destroyed(&unit));
 
     // Flag bits on a synced unit do not make it look encrypted.
     unit[0] = 0xC0;
     unit[7] = 0xC0;
-    assert!(!aacs::ts_sync_destroyed(&unit));
+    assert!(!aacs::content::ts_sync_destroyed(&unit));
 
     // Scrambled body (syncs gone) → encrypted.
-    let scrambled = vec![0x99u8; aacs::ALIGNED_UNIT_LEN];
-    assert!(aacs::ts_sync_destroyed(&scrambled));
+    let scrambled = vec![0x99u8; aacs::content::ALIGNED_UNIT_LEN];
+    assert!(aacs::content::ts_sync_destroyed(&scrambled));
 }
 
 /// Test: DecryptKeys::is_encrypted() correctly identifies encrypted state.
