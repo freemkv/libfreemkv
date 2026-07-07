@@ -1644,12 +1644,13 @@ impl Disc {
                 // key). Any failure is non-fatal: continue to the crack, which
                 // simply finds nothing if the drive kept the sectors gated.
                 let drive_id = session.drive_id.clone();
-                if let Err(e) = crate::unlock_bridge::run_unlockers(
+                let (_, css_unlock_res) = crate::unlock_bridge::run_bus(
                     session.scsi_mut(),
                     &drive_id,
                     freemkv_unlock::DiscKind::Css,
                     &[],
-                ) {
+                );
+                if let Err(e) = css_unlock_res {
                     tracing::warn!(
                         target: "freemkv::scan",
                         outcome = ?e,
@@ -2308,18 +2309,23 @@ impl Disc {
     /// that honestly (`AACS: no`), and on a *stock* drive that fell back to the
     /// cert route it reports `LibreDrive: no, AACS: yes` — the real diagnostic.
     pub fn unlocker_matrix(&self, drive: &crate::Drive) -> Vec<(&'static str, bool)> {
-        // LibreDrive firmware-unlocked the drive iff a drive unlocker actually
-        // succeeded at init (name recorded only on success).
-        let ld_worked = drive.unlocker_name().is_some();
+        // The drive-prep unlocker that actually ran (recorded on init):
+        // "LibreDrive" (MediaTek) or "Renesas" — mutually exclusive per drive.
+        let prep = drive.unlocker_name();
+        // Only LibreDrive (MediaTek) removes AACS bus encryption AT THE DRIVE;
+        // Renesas unlocks features but leaves the bus to the cert.
+        let ld_removed_bus = prep == Some("LibreDrive");
         crate::unlock_bridge::unlocker_names()
             .into_iter()
             .map(|name| {
                 let did_work = match name {
-                    // The drive firmware unlock ran and succeeded.
-                    "LibreDrive" => ld_worked,
-                    // The AACS host-cert route removed the bus ONLY when LibreDrive
-                    // didn't (stock drive) AND AACS state was actually obtained.
-                    "AACS" => self.aacs.is_some() && !ld_worked,
+                    // Each firmware unlocker did work iff it was the one that ran.
+                    "LibreDrive" => ld_removed_bus,
+                    "Renesas" => prep == Some("Renesas"),
+                    // The AACS host-cert route removed the bus ONLY when the
+                    // firmware didn't (stock or Renesas drive) AND AACS state was
+                    // actually obtained.
+                    "AACS" => self.aacs.is_some() && !ld_removed_bus,
                     // The CSS handshake/crack succeeded → title keys recovered.
                     "CSS" => self.css.is_some(),
                     // A newly-registered unlocker with no runtime signal wired

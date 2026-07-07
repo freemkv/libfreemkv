@@ -111,13 +111,13 @@ impl AacsCertUnlocker<'_> {
         // through method calls, so clone the (cheap) identity first.
         let drive_id = session.drive_id.clone();
         let fu_certs = crate::unlock_bridge::map_host_certs(&host_certs);
-        let unlocked = crate::unlock_bridge::run_unlockers(
+        let (_, unlock_res) = crate::unlock_bridge::run_bus(
             session.scsi_mut(),
             &drive_id,
             freemkv_unlock::DiscKind::Aacs,
             &fu_certs,
-        )
-        .map_err(CertUnlockFailure::Unlock)?;
+        );
+        let unlocked = unlock_res.map_err(CertUnlockFailure::Unlock)?;
         // The cert handshake yields a VID on success; its absence is VidUnavailable.
         let Some(volume_id) = unlocked.vid else {
             return Err(CertUnlockFailure::Unlock(UnlockError::VidUnavailable));
