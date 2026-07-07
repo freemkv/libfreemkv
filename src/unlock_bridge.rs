@@ -9,6 +9,7 @@ use freemkv_unlock as fu;
 fn to_fu_drive_id(drive_id: &crate::identity::DriveId) -> fu::DriveId {
     fu::DriveId {
         vendor_id: drive_id.vendor_id.clone(),
+        product_id: drive_id.product_id.clone(),
         product_revision: drive_id.product_revision.clone(),
         vendor_specific: drive_id.vendor_specific.clone(),
         firmware_date: drive_id.firmware_date.clone(),
@@ -101,27 +102,70 @@ pub(crate) fn map_host_certs(certs: &[crate::aacs::types::HostCert]) -> Vec<fu::
         .collect()
 }
 
-/// News up the unlockers, build the context for `kind`, and run the FIRST
-/// matching one — returning its `Result` so the caller can both consume what it
-/// learned (vid / bus_key / drive_unlocked) AND render the specific failure
-/// (the AACS cert path maps the `UnlockError` to its outcome trace). `Err(
-/// NotApplicable)` when nothing matched. `host_certs` are collected by the
-/// caller — lazily, only for AACS; pass `&[]` for the drive-prep / CSS kinds.
-pub(crate) fn run_unlockers(
+/// Result of a capability dispatch: `(matched_name, result)`. `matched_name` is
+/// the unlocker that handled it (or `""` if none did) — lets the caller record
+/// WHICH unlocker ran (e.g. `LibreDrive` vs `Renesas`), distinct from the ld-only
+/// identity lookup [`unlocker_name`]. Iterating stops at the first unlocker whose
+/// capability method returns anything other than `NotApplicable` — i.e. an actual
+/// unlock (`Ok`) OR a real failure such as a dead bus (`Err(Transport)`), which
+/// the caller must surface rather than skip.
+type Dispatch = (
+    &'static str,
+    std::result::Result<fu::Unlocked, fu::UnlockError>,
+);
+
+/// Try each unlocker's `capability` (`unlock_features` or `unlock_bus`) in
+/// registration order, stopping at the first that doesn't decline. Shared by
+/// [`run_features`] and [`run_bus`].
+fn dispatch(
     scsi: &mut dyn crate::scsi::ScsiTransport,
     drive_id: &crate::identity::DriveId,
     kind: fu::DiscKind,
     host_certs: &[fu::HostCert],
-) -> std::result::Result<fu::Unlocked, fu::UnlockError> {
+    capability: impl Fn(
+        &dyn fu::Unlocker,
+        &mut dyn fu::scsi::ScsiTransport,
+        &fu::UnlockCtx,
+    ) -> std::result::Result<fu::Unlocked, fu::UnlockError>,
+) -> Dispatch {
     let id = to_fu_drive_id(drive_id);
     let ctx = fu::UnlockCtx::new(&id, kind, host_certs);
     let mut adapter = ScsiAdapter(scsi);
     for u in fu::all_unlockers() {
-        if u.matches(&ctx) {
-            return u.unlock(&mut adapter, &ctx);
+        match capability(u.as_ref(), &mut adapter, &ctx) {
+            // This unlocker doesn't provide the capability for this drive/disc —
+            // try the next one.
+            Err(fu::UnlockError::NotApplicable) => continue,
+            // An actual unlock, or a real failure (e.g. Transport) — stop here.
+            other => return (u.name(), other),
         }
     }
-    Err(fu::UnlockError::NotApplicable)
+    ("", Err(fu::UnlockError::NotApplicable))
+}
+
+/// Drive-prep: unlock DRIVE FEATURES (riplock/speed, OEM VID). `host_certs` are
+/// not needed for features — pass `&[]`; `kind` is `Unknown` at drive-prep.
+pub(crate) fn run_features(
+    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive_id: &crate::identity::DriveId,
+) -> Dispatch {
+    dispatch(scsi, drive_id, fu::DiscKind::Unknown, &[], |u, s, c| {
+        u.unlock_features(s, c)
+    })
+}
+
+/// Content: remove BUS ENCRYPTION for the mounted disc. Called only when the bus
+/// isn't already clear (the `oem_vid`/`bus_encryption_removed` gate). `host_certs`
+/// are the caller-collected certs for the AACS route; `kind` selects Aacs vs Css.
+pub(crate) fn run_bus(
+    scsi: &mut dyn crate::scsi::ScsiTransport,
+    drive_id: &crate::identity::DriveId,
+    kind: fu::DiscKind,
+    host_certs: &[fu::HostCert],
+) -> Dispatch {
+    dispatch(scsi, drive_id, kind, host_certs, |u, s, c| {
+        u.unlock_bus(s, c)
+    })
 }
 
 /// The names of every REGISTERED unlocker, in dispatch order. Registry-driven —

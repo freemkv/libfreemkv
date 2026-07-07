@@ -433,15 +433,14 @@ impl Drive {
         // that used to sit here was the v1.0.0-rc.1 regression — it skipped the
         // drive-prep for DVD, leaving DVDs riplocked at stock speed.
         self.init_ran = true;
-        let r: Result<()> = match crate::unlock_bridge::run_unlockers(
-            self.scsi.as_mut(),
-            &self.drive_id,
-            freemkv_unlock::DiscKind::Unknown,
-            &[],
-        ) {
+        let (matched, unlock_res) =
+            crate::unlock_bridge::run_features(self.scsi.as_mut(), &self.drive_id);
+        let r: Result<()> = match unlock_res {
             Ok(unlocked) => {
-                self.unlocker_name =
-                    crate::unlock_bridge::unlocker_name(&self.drive_id).map(str::to_string);
+                // Record WHICH drive-prep unlocker actually ran — "LibreDrive"
+                // (MediaTek) or "Renesas" — not the ld-only identity lookup, so a
+                // Renesas drive reports itself honestly rather than as nothing.
+                self.unlocker_name = Some(matched.to_string());
                 // Stash the OEM Volume ID the unlocker returned for the AACS
                 // handshake phase (do_handshake reads it via `oem_vid()`). A
                 // drive-prep unlocker always carries a VID; guard anyway.
