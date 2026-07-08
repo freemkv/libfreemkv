@@ -2391,3 +2391,224 @@ mod tests {
         );
     }
 }
+
+/// Shared UDF image fixtures for tests across the `disc::*` format scanners.
+///
+/// Builds an in-memory disc image that [`read_filesystem`] can navigate — a
+/// [`MemDisc`] SectorSource plus a [`DirSpec`] tree laid out via [`lay_dir`] and
+/// [`build_udf_skeleton`]. Format-agnostic: BD (`bluray.rs`), HD-DVD
+/// (`hddvd.rs`), and the format detector (`disc/mod.rs`) all build their own
+/// trees (`BDMV/`, `HVDVD_TS/`, `AACS/…`) on top of these primitives, so each
+/// format's tests live in that format's file, not piled into one.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use crate::sector::SectorSource;
+    use std::collections::HashMap;
+
+    /// PART_START == META_START: file LBAs (partition-relative) and ICB/dir LBAs
+    /// (metadata-relative) share one address space (abs = PART_START + lba), so
+    /// `read_filesystem` takes the single-partition path.
+    pub(crate) const PART_START: u32 = 2000;
+
+    /// In-memory `SectorSource` (absolute-LBA → 2048-byte sector map); unmapped
+    /// sectors read as zeroes.
+    pub(crate) struct MemDisc {
+        sectors: HashMap<u32, [u8; 2048]>,
+    }
+
+    impl MemDisc {
+        pub(crate) fn new() -> Self {
+            Self {
+                sectors: HashMap::new(),
+            }
+        }
+        fn put(&mut self, lba: u32, data: [u8; 2048]) {
+            self.sectors.insert(lba, data);
+        }
+        /// Write arbitrary-length bytes at `lba`, split across 2048-byte sectors.
+        pub(crate) fn put_bytes(&mut self, lba: u32, bytes: &[u8]) {
+            for (i, chunk) in bytes.chunks(2048).enumerate() {
+                let mut s = [0u8; 2048];
+                s[..chunk.len()].copy_from_slice(chunk);
+                self.put(lba + i as u32, s);
+            }
+        }
+    }
+
+    impl SectorSource for MemDisc {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> crate::error::Result<usize> {
+            let need = count as usize * 2048;
+            for i in 0..count as u32 {
+                let off = i as usize * 2048;
+                let s = self.sectors.get(&(lba + i)).copied().unwrap_or([0u8; 2048]);
+                buf[off..off + 2048].copy_from_slice(&s);
+            }
+            Ok(need)
+        }
+    }
+
+    /// One file's placement: ICB metadata LBA, data-extent LBA, byte length,
+    /// Long-AD (16-byte, real BD-ROM layout) vs Short-AD, optional contents.
+    pub(crate) struct FileSpec {
+        pub(crate) name: String,
+        pub(crate) icb_lba: u32,
+        pub(crate) data_lba: u32,
+        pub(crate) size: u32,
+        pub(crate) long_ad: bool,
+        pub(crate) contents: Vec<u8>,
+    }
+
+    /// A directory node: ICB LBA, FID-list LBA, child files and subdirectories.
+    pub(crate) struct DirSpec {
+        pub(crate) name: String,
+        pub(crate) icb_lba: u32,
+        pub(crate) dir_data_lba: u32,
+        pub(crate) files: Vec<FileSpec>,
+        pub(crate) subdirs: Vec<DirSpec>,
+    }
+
+    /// Build an Extended File Entry ICB (tag 266) with one allocation descriptor.
+    pub(crate) fn build_file_icb(size: u32, data_lba: u32, long_ad: bool) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        s[0..2].copy_from_slice(&266u16.to_le_bytes()); // Extended File Entry
+        if long_ad {
+            s[34..36].copy_from_slice(&1u16.to_le_bytes()); // ICB flags → Long AD
+        }
+        s[56..64].copy_from_slice(&(size as u64).to_le_bytes()); // info_length
+        s[208..212].copy_from_slice(&0u32.to_le_bytes()); // l_ea
+        let ad_size: u32 = if long_ad { 16 } else { 8 };
+        s[212..216].copy_from_slice(&ad_size.to_le_bytes()); // l_ad
+        s[216..220].copy_from_slice(&(size & 0x3FFF_FFFF).to_le_bytes());
+        s[220..224].copy_from_slice(&data_lba.to_le_bytes());
+        s
+    }
+
+    fn build_dir_icb(dir_data_lba: u32, dir_data_len: u32) -> [u8; 2048] {
+        build_file_icb(dir_data_len, dir_data_lba, false)
+    }
+
+    /// Append one File Identifier Descriptor (tag 257) to `buf`.
+    fn push_fid(buf: &mut Vec<u8>, name: &str, icb_lba: u32, is_dir: bool, is_parent: bool) {
+        let start = buf.len();
+        let name_field: Vec<u8> = if is_parent {
+            Vec::new()
+        } else {
+            let mut v = vec![0x08u8];
+            v.extend_from_slice(name.as_bytes());
+            v
+        };
+        let l_fi = name_field.len();
+        let mut fid = vec![0u8; 38];
+        fid[0..2].copy_from_slice(&257u16.to_le_bytes()); // FID tag
+        let mut file_chars = 0u8;
+        if is_dir {
+            file_chars |= 0x02;
+        }
+        if is_parent {
+            file_chars |= 0x08;
+        }
+        fid[18] = file_chars;
+        fid[19] = l_fi as u8;
+        fid[24..28].copy_from_slice(&icb_lba.to_le_bytes()); // ICB long_ad LBA @24
+        fid[36..38].copy_from_slice(&0u16.to_le_bytes()); // l_iu @36
+        buf.extend_from_slice(&fid);
+        buf.extend_from_slice(&name_field);
+        let used = buf.len() - start;
+        let pad = (used + 3) & !3;
+        buf.resize(start + pad, 0);
+    }
+
+    /// Recursively lay a [`DirSpec`] into the [`MemDisc`].
+    pub(crate) fn lay_dir(disc: &mut MemDisc, dir: &DirSpec) {
+        let mut fids = Vec::new();
+        push_fid(&mut fids, "", dir.icb_lba, true, true);
+        for f in &dir.files {
+            push_fid(&mut fids, &f.name, f.icb_lba, false, false);
+            disc.put(
+                PART_START + f.icb_lba,
+                build_file_icb(f.size, f.data_lba, f.long_ad),
+            );
+            if !f.contents.is_empty() {
+                disc.put_bytes(PART_START + f.data_lba, &f.contents);
+            }
+        }
+        for sub in &dir.subdirs {
+            push_fid(&mut fids, &sub.name, sub.icb_lba, true, false);
+        }
+        disc.put(
+            PART_START + dir.icb_lba,
+            build_dir_icb(dir.dir_data_lba, fids.len() as u32),
+        );
+        disc.put_bytes(PART_START + dir.dir_data_lba, &fids);
+        for sub in &dir.subdirs {
+            lay_dir(disc, sub);
+        }
+    }
+
+    /// Build the static UDF anchor/VDS/FSD so `read_filesystem` reaches
+    /// `root_icb_lba` (single partition map → metadata_start == PART_START).
+    pub(crate) fn build_udf_skeleton(disc: &mut MemDisc, root_icb_lba: u32) {
+        let mut avdp = [0u8; 2048];
+        avdp[0..2].copy_from_slice(&2u16.to_le_bytes());
+        disc.put(256, avdp);
+
+        let mut pd = [0u8; 2048];
+        pd[0..2].copy_from_slice(&5u16.to_le_bytes());
+        pd[188..192].copy_from_slice(&PART_START.to_le_bytes());
+        disc.put(32, pd);
+
+        let mut lvd = [0u8; 2048];
+        lvd[0..2].copy_from_slice(&6u16.to_le_bytes());
+        lvd[268..272].copy_from_slice(&1u32.to_le_bytes());
+        disc.put(33, lvd);
+
+        let mut td = [0u8; 2048];
+        td[0..2].copy_from_slice(&8u16.to_le_bytes());
+        disc.put(34, td);
+
+        let mut fsd = [0u8; 2048];
+        fsd[0..2].copy_from_slice(&256u16.to_le_bytes());
+        fsd[404..408].copy_from_slice(&root_icb_lba.to_le_bytes());
+        disc.put(PART_START, fsd);
+    }
+
+    pub(crate) fn file(
+        name: &str,
+        icb_lba: u32,
+        data_lba: u32,
+        size: u32,
+        long_ad: bool,
+    ) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba,
+            size,
+            long_ad,
+            contents: Vec::new(),
+        }
+    }
+
+    pub(crate) fn file_with(
+        name: &str,
+        icb_lba: u32,
+        data_lba: u32,
+        contents: Vec<u8>,
+        long_ad: bool,
+    ) -> FileSpec {
+        FileSpec {
+            name: name.to_string(),
+            icb_lba,
+            data_lba,
+            size: contents.len() as u32,
+            long_ad,
+            contents,
+        }
+    }
+}

@@ -344,18 +344,24 @@ pub fn key_fetch(
 /// `start_lba`), which the library owns. A key source is *handed* these bytes
 /// via `DiscInputs.samples`; it never reads the disc itself.
 ///
-/// "Encrypted" is decided by [`crate::aacs::content::ts_sync_destroyed`] — the SAME
-/// predicate the decrypt gate uses — so all sides agree. A clip opens with clear
-/// navigation units (PAT/PMT, menus); only the feature body is scrambled, and a
-/// clear unit proves nothing, so this collects only scrambled ones — probing
-/// several points spread across EACH extent so a title whose encrypted body
-/// starts late (or whose midpoint lands in clear nav) still yields samples.
+/// "Encrypted" is decided by [`crate::aacs::content::aacs_unit_encrypted`] — the
+/// AACS Copy Permission Indicator (CPI) in the top 2 bits of byte 0, the
+/// spec-correct signal (libaacs' `buf[0] & 0xc0`). NOT the `ts_sync_destroyed`
+/// sync heuristic: destroyed TS syncs do not imply encryption (an FMTS variant
+/// frame or an odd clear unit can lack syncs yet be unencrypted), and a clear
+/// unit sent to a key server yields nothing to validate against — the "0
+/// encrypted units" rejection. A clip opens with clear navigation units (PAT/PMT,
+/// menus) whose CPI is clear; only CPI-flagged content units are collected —
+/// probing several points spread across EACH extent so a title whose encrypted
+/// body starts late (or whose midpoint lands in clear nav) still yields samples.
+/// CPI is read at each extent's `start_lba` (clip-file-anchored), so byte 0 is a
+/// real unit start and the flag is meaningful.
 pub fn read_encrypted_units(
     reader: &mut dyn crate::sector::SectorSource,
     title: &crate::disc::DiscTitle,
     n: usize,
 ) -> Vec<Vec<u8>> {
-    use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
+    use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
     const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
     // Probe several evenly-spaced points across EACH extent rather than only the
     // midpoint-and-forward: a title whose encrypted feature starts late, or whose
@@ -401,7 +407,7 @@ pub fn read_encrypted_units(
                     break;
                 }
                 let u = &buf[o..o + ALIGNED_UNIT_LEN];
-                if ts_sync_destroyed(u) {
+                if aacs_unit_encrypted(u) {
                     out.push(u.to_vec());
                     if out.len() >= n {
                         return out;
@@ -646,7 +652,7 @@ mod tests {
     /// finds the early scrambled band.
     #[test]
     fn read_encrypted_units_finds_scrambled_content_off_the_midpoint() {
-        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, ts_sync_destroyed};
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
         use crate::error::Result;
         use crate::sector::SectorSource;
 
@@ -716,7 +722,98 @@ mod tests {
             "the probe-spread must sample the early scrambled band the midpoint misses"
         );
         for s in &samples {
-            assert!(ts_sync_destroyed(s), "every sample is a scrambled unit");
+            assert!(
+                aacs_unit_encrypted(s),
+                "every sample is a CPI-flagged encrypted unit (byte0 & 0xC0 != 0)"
+            );
+        }
+    }
+
+    /// DISCRIMINATING: selection is by the AACS CPI (byte 0), NOT the
+    /// `ts_sync_destroyed` heuristic. Half the units are sync-destroyed but
+    /// CPI-CLEAR (`byte0 & 0xC0 == 0`) — genuinely UNencrypted units that merely
+    /// lack TS syncs; the old sampler collected these and the key server rejected
+    /// the POST as "0 encrypted units". `read_encrypted_units` must skip them and
+    /// return ONLY CPI-flagged units. A regression to `ts_sync_destroyed` would
+    /// collect the CPI-clear units too and fail the `& 0xC0` assertion.
+    #[test]
+    fn read_encrypted_units_selects_by_cpi_not_ts_sync() {
+        use crate::aacs::content::{ALIGNED_UNIT_LEN, ALIGNED_UNIT_SECTORS, aacs_unit_encrypted};
+        use crate::error::Result;
+        use crate::sector::SectorSource;
+
+        // Even units: CPI-clear (byte0 & 0xC0 == 0) AND sync-destroyed (no 0x47).
+        // Odd units:  CPI-set (byte0 = 0xC0) with a scrambled body.
+        // `ts_sync_destroyed` is TRUE for BOTH; `aacs_unit_encrypted` only odd.
+        struct MixSource {
+            ext_start: u32,
+            total_units: u32,
+        }
+        impl SectorSource for MixSource {
+            fn capacity_sectors(&self) -> u32 {
+                self.ext_start + self.total_units * ALIGNED_UNIT_SECTORS + 64
+            }
+            fn read_sectors(
+                &mut self,
+                lba: u32,
+                count: u16,
+                buf: &mut [u8],
+                _r: bool,
+            ) -> Result<usize> {
+                let bytes = count as usize * 2048;
+                for (i, chunk) in buf[..bytes].chunks_mut(ALIGNED_UNIT_LEN).enumerate() {
+                    if chunk.len() < ALIGNED_UNIT_LEN {
+                        break;
+                    }
+                    let abs = (lba - self.ext_start) / ALIGNED_UNIT_SECTORS + i as u32;
+                    if abs % 2 == 0 {
+                        chunk.fill(0x11); // CPI-clear (0x11 & 0xC0 == 0), no TS sync
+                    } else {
+                        chunk.fill(0xAB); // scrambled body (no TS sync)
+                        chunk[0] = 0xC0; // CPI set -> encrypted
+                    }
+                }
+                Ok(bytes)
+            }
+        }
+
+        let total_units = 400u32;
+        let ext_start = 500u32;
+        let mut src = MixSource {
+            ext_start,
+            total_units,
+        };
+        let title = crate::disc::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![crate::disc::Extent {
+                start_lba: ext_start,
+                sector_count: total_units * ALIGNED_UNIT_SECTORS,
+            }],
+            content_format: crate::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        };
+
+        let samples = read_encrypted_units(&mut src, &title, 8);
+        assert!(
+            !samples.is_empty(),
+            "the CPI-flagged (odd) units must still be collected"
+        );
+        for s in &samples {
+            assert!(
+                aacs_unit_encrypted(s),
+                "only CPI-flagged units are selected"
+            );
+            assert_eq!(
+                s[0] & 0xC0,
+                0xC0,
+                "a CPI-clear sync-destroyed unit must never be sampled"
+            );
         }
     }
 
