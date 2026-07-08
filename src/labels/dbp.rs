@@ -35,14 +35,16 @@ use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::BTreeMap;
 
-/// dbp detect can't peek inside a jar without a SectorSource (the
-/// trait function only takes `&UdfFs`), so we trigger on the cheap
-/// signal "any top-level .jar in /BDMV/JAR/." That fires on every
-/// BD-J disc, but parse() does the real `com/dbp/` check and
-/// returns None on a mismatch — so this parser only ever consumes
-/// time on discs that fell through every earlier parser.
-pub fn detect(udf: &UdfFs) -> bool {
-    jar::has_any_top_level_jar(udf)
+/// The real dbp signal is the `com/dbp/` package prefix inside a top-level
+/// jar's central directory. With a reader in `detect`, we check that directly
+/// (a cheap central-directory scan, no class decode) so this parser claims
+/// only dbp discs instead of firing on every BD-J disc. `parse()` repeats the
+/// check as belt-and-suspenders.
+pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
+    jar::for_each_jar(reader, udf, |_entry, archive| {
+        jar::has_path_prefix(archive, "com/dbp/").then_some(())
+    })
+    .is_some()
 }
 
 /// Scan every top-level `/BDMV/JAR/*.jar` for the dbp framework and
