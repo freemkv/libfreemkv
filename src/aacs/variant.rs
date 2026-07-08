@@ -201,14 +201,11 @@ pub fn walk_processing_key(
             // parse stops, no inner re-check needed.
             let u_mask_shift = uvs[5 * uvs_idx];
 
-            if u_mask_shift & 0xC0 != 0 {
-                break;
-            }
-            // 0x20..=0x3F (32..=63) pass the 0xC0 revoked-marker check but are
-            // out of range for a u32 shift. `wrapping_shl` would silently
-            // compute shift % 32 (e.g. 32 → no shift → 0xFFFF_FFFF), matching a
-            // wrong uv slot and deriving a wrong key. Disc-controlled byte:
-            // skip the slot instead.
+            // 0x20..=0x3F (32..=63) have their revoked-marker bits clear (so they
+            // pass the take_while above) but are out of range for a u32 shift.
+            // `wrapping_shl` would silently compute shift % 32 (e.g. 32 → no shift
+            // → 0xFFFF_FFFF), matching a wrong uv slot and deriving a wrong key.
+            // Disc-controlled byte: skip the slot instead.
             if u_mask_shift >= 32 {
                 continue;
             }

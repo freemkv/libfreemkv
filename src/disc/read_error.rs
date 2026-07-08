@@ -196,22 +196,10 @@ impl ReadCtx {
     /// threshold is loose so we don't bail too early on a range that
     /// has scattered good sectors mixed in.
     ///
-    /// `damage_threshold_pct = 6` mirrors `disc/patch.rs`'s
-    /// `PASSN_DAMAGE_THRESHOLD_PCT`. Pass N triggers the damage-skip
-    /// at half the density Pass 1 uses (Pass 1 = 12%) because the
-    /// patch loop's whole job is to chip away at bad ranges — being
-    /// more eager to skip clustered bad sectors converges faster on
-    /// the recoverable good sectors inside a range. The patch-side
-    /// `compute_damage_skip` reads its threshold directly from
-    /// `PASSN_DAMAGE_THRESHOLD_PCT`, which is an alias for this crate's
-    /// `PATCH_DAMAGE_THRESHOLD_PCT`, so the two are always in sync.
-    /// The patch loop's damage-skip is not yet unified with `handle_read_error`'s
-    /// jump path. (v0.20.8 unification attempt found the unification
-    /// itself blocked on the size-aware `range_remaining/4` cap that
-    /// lives in `compute_damage_skip` but not in
-    /// `handle_read_error::JumpAhead` — see
-    /// `tests/passn_handler_ab.rs` for the A/B fixture that pins
-    /// the divergence point.)
+    /// `damage_threshold_pct = 6` is looser than Pass 1 (12%): Pass N triggers
+    /// the damage-skip at half Pass 1 density because the patch loop exists to chip
+    /// away at bad ranges, so being more eager to skip clustered bad sectors
+    /// converges faster on the recoverable good sectors inside a range.
     pub fn for_patch(batch: u16) -> Self {
         Self {
             batch,
@@ -443,8 +431,8 @@ const WEDGE_ABORT_THRESHOLD: u64 = 16;
 const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 
 /// Single source of truth for the Pass-N damage-window threshold.
-/// Both [`ReadCtx::for_patch`] and `disc::patch::compute_damage_skip`
-/// reference this constant so the two damage-skip paths cannot drift.
+/// [`ReadCtx::for_patch`] reads this constant for the Pass-N damage-skip
+/// threshold.
 ///
 /// 6% means: with a 16-entry sliding window, the damage-skip fires
 /// once 1 out of 16 recent reads has failed. Pass 1 uses a 12%

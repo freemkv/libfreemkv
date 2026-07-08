@@ -77,7 +77,7 @@ pub trait ResolveCtx {
     fn mkb(&self) -> Result<&[u8], Error>;
     /// The disc's encrypted title keys, parsed from `Unit_Key_RO.inf` the same
     /// way the library's resolver parses them ([`crate::aacs::inf::parse_unit_key_ro`]),
-    /// in on-disc order. Feed straight into [`crate::aacs::boil::uk_from_vuk`].
+    /// in on-disc order. Feed straight into [`crate::aacs::derive::decrypt_unit_key`].
     fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error>;
     /// Up to `n` encrypted on-disc content sample units, for a source that
     /// validates a candidate server-side against real ciphertext.
@@ -167,8 +167,8 @@ impl ResolveCtx for DiscInputsCtx<'_> {
 /// holds, orchestrates the derivation down to Unit Keys using the library's
 /// boil-down crypto primitives — never re-implementing AES. A source that holds
 /// pre-decrypted Unit Keys returns them directly; one that holds a VUK calls
-/// [`crate::aacs::boil::uk_from_vuk`]; one that holds device keys calls
-/// [`crate::aacs::boil::mk_from_dk`] → [`crate::aacs::boil::vuk_from_mk`] → `uk_from_vuk`.
+/// [`crate::aacs::derive::decrypt_unit_key`]; one that holds device keys calls
+/// [`crate::aacs::derive::derive_media_key_from_dk`] → [`crate::aacs::derive::derive_vuk`] → `decrypt_unit_key`.
 ///
 /// Returning an empty `Vec` means "no key for this disc from this source"; an
 /// `Err` means the source itself failed (I/O, parse, network). The caller
@@ -222,7 +222,7 @@ pub fn resolve_and_apply(
 /// success — so a wrong/partial key set is rejected and the loop continues.
 ///
 /// CPS-unit numbering: a source returns Unit Keys carrying the POSITIONAL index
-/// from [`crate::aacs::boil::uk_from_vuk`]; the library's canonical CPS-unit number is
+/// from [`crate::aacs::derive::decrypt_unit_key`]; the library's canonical CPS-unit number is
 /// `position + 1` (matching [`crate::aacs::inf::parse_unit_key_ro`]'s `(i + 1)`), so
 /// the committed `AacsState.unit_keys` is byte-identical to the library-resolved
 /// path. The number is cosmetic for descramble (the decrypt path strips it and

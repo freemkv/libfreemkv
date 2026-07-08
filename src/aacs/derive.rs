@@ -203,13 +203,14 @@ pub fn derive_media_key_and_pk_from_dk(
             let p_uv = &uvs[1 + 5 * uvs_idx..];
             let u_mask_shift = uvs[5 * uvs_idx]; // byte before the UV value
 
-            if u_mask_shift & 0xC0 != 0 {
-                break; // device revoked
-            }
-            // Shifts of 32..=63 (0x20..=0x3F pass the 0xC0 mask above) would
-            // panic in debug / wrap to a wrong mask in release. The MKB byte
-            // is disc-controlled, so a crafted/corrupt MKB must not crash the
-            // ripper: skip an out-of-range slot rather than `<<` it.
+            // `num_uvs` was computed via `take_while(.. c[0] & 0xC0 == 0)`, so
+            // every iterated slot already has its revoked-marker bits clear — no
+            // inner `& 0xC0` re-check is needed (it would be unreachable).
+            //
+            // Shifts of 32..=63 (0x20..=0x3F) have those bits clear but would
+            // panic in debug / wrap to a wrong mask in release. The MKB byte is
+            // disc-controlled, so a crafted/corrupt MKB must not crash the ripper:
+            // skip an out-of-range slot rather than `<<` it.
             if u_mask_shift >= 32 {
                 continue;
             }
