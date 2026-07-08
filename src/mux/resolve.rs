@@ -358,6 +358,12 @@ pub fn input(url: &str, opts: &InputOptions) -> io::Result<Box<dyn crate::pes::S
             // case must NOT raise a false E7023.
             disc.ensure_title_decryptable(opts.raw, &keys, title_is_clear)
                 .map_err(|e| -> io::Error { e.into() })?;
+            // Upfront FMTS gate, parallel to the unit-key gate above. With
+            // BYPASS_FMTS_KEY this is a no-op and a 2.1 disc's forensic units are
+            // concealed as ordinary decrypt loss below; without it, a 2.1 disc
+            // lacking segment keys fails here rather than emitting a holed mux.
+            disc.ensure_forensic_segments_decryptable(opts.raw)
+                .map_err(|e| -> io::Error { e.into() })?;
             // Correct TrueHD channel counts (MPLS understates 7.1/Atmos as 5.1)
             // by probing the first DECRYPTED access units of the chosen title.
             // A fresh reader avoids disturbing the mux reader below. Skipped in
@@ -638,15 +644,17 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
             .tolerate_decrypt_loss();
     // Install the fresh-key-on-failure callback (if any) so a unit no held key
     // decrypts is re-tried via the application's key source before being counted
-    // as loss.
+    // as loss. An AACS 2.1 forensic-segment unit that no key opens is just an
+    // undecryptable unit like any other: concealed and counted as decrypt loss —
+    // a loss is a loss, no FMTS special casing.
     if let Some(cb) = fetch {
         decrypting = decrypting.with_key_fetch(cb);
     }
-    // Grab the decrypt-loss counter before the decorator is moved into the
-    // producer thread. It tracks bytes of scrambled AACS units no key could
-    // decrypt — silent loss the demux drops; the consuming stream surfaces it
-    // through `lost_bytes()` so the mux abort gate sees a partial decrypt
-    // failure rather than a clean rip.
+    // Grab the loss counters before the decorator is moved into the producer
+    // thread. It tracks bytes of scrambled AACS units no key could decrypt —
+    // silent loss the demux drops; the consuming stream surfaces it through
+    // `lost_bytes()` so the mux abort gate sees a partial decrypt failure rather
+    // than a clean rip. Forensic (2.1) undecryptable units land here too.
     let decrypt_loss = decrypting.decrypt_loss();
 
     // Wrong-substream fix (Silence-of-the-Lambs): before the prefetcher takes

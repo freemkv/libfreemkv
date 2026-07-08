@@ -260,9 +260,6 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     result
 }
 
-/// Inner body of [`crack_title_key`] — the actual AttackPattern search. Split
-/// out so the public entry point can wall-clock the whole attempt for the
-/// runaway guard without threading a timer through every return path.
 /// AttackPattern crib: the predicted 10-byte plaintext at byte 0x80.
 ///
 /// Scans the clear header `sec[0x00..0x80]` (never scrambled) for the longest

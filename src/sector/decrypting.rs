@@ -38,16 +38,6 @@ use super::SectorSource;
 /// so it can ride the mux highway's producer thread.
 pub type KeyFetch = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
 
-/// Cap on how many times one decorator will call the fetch closure over its
-/// lifetime — bounds key-server traffic to roughly O(distinct CPS units) even
-/// if scrambled units keep arriving. A disc has only a handful of unit keys.
-const MAX_FETCH_CALLS: usize = 16;
-
-/// Cap on how many still-scrambled sample units are handed to the fetch
-/// closure per call — a few samples are plenty for a key service to identify
-/// and validate the key, and it bounds the request size.
-const MAX_FETCH_SAMPLES: usize = 8;
-
 /// Cap on how many per-unit decrypt-verify-failure diagnostics one read emits.
 /// The diagnostic runs only on the failure (cold) path and bounds log volume so
 /// a large undecryptable range can't flood the device log; the first few units
@@ -109,21 +99,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     ///
     /// [`decrypt_loss`]: Self::decrypt_loss
     decrypt_dropped: Arc<AtomicU64>,
-    /// Optional "fetch a fresh key for THIS data" callback (see [`KeyFetch`]).
-    /// `None` for the common case (keys fully resolved up front); set via
-    /// [`with_key_fetch`](Self::with_key_fetch) by an application that wants
-    /// to ask its key source for a key when a unit fails to decrypt.
-    fetch: Option<KeyFetch>,
-    /// Fingerprints (hash over the unit ciphertext) of failing units a fetch
-    /// already returned NO new key for. A later failure re-asks the source only
-    /// for units NOT in this set — so on a multi-CPS disc the source is still
-    /// asked for the *second* CPS unit's key even after the first came back dry
-    /// (the old global latch blocked that), while the *same* failing unit is
-    /// never re-fetched (and the total is still bounded by `MAX_FETCH_CALLS`).
-    fetch_dry: std::collections::HashSet<u64>,
-    /// How many times the fetch closure has been invoked, capped at
-    /// [`MAX_FETCH_CALLS`].
-    fetch_calls: usize,
+    /// The miss policy (see [`crate::sector::recovery::Recover`]) — a generic,
+    /// scheme-neutral recovery the input stream (L3) installs and this decorator
+    /// (L2) executes at the one seam when a content unit will not decrypt. `None`
+    /// = no recovery (a miss is loss). Installed via
+    /// [`with_key_fetch`](Self::with_key_fetch).
+    recovery: Option<crate::sector::recovery::Recover>,
     /// Verify-only mode: a read decrypt-CHECKS a scratch copy of the bytes (to
     /// detect undecryptable units) but NEVER mutates `buf` — the inner
     /// ciphertext is returned unchanged. This is what makes a multipass sweep
@@ -173,9 +154,10 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             unit_key_idx: 0,
             unit_base: 0,
             decrypt_dropped: Arc::new(AtomicU64::new(0)),
-            fetch: None,
-            fetch_dry: std::collections::HashSet::new(),
-            fetch_calls: 0,
+            // No recovery by default. CSS self-decrypts in `decrypt_sectors`
+            // (needs no external input); AACS installs a key-fetch via
+            // `with_key_fetch`.
+            recovery: None,
             verify_only: false,
             content_ranges: None,
             scratch: Vec::new(),
@@ -238,7 +220,7 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     /// for [`DecryptKeys::Aacs`]; ignored otherwise. The library makes no network
     /// call — `cb` is the application's seam to its key source.
     pub fn with_key_fetch(mut self, cb: KeyFetch) -> Self {
-        self.fetch = Some(cb);
+        self.recovery = Some(crate::sector::recovery::key_fetch(cb));
         self
     }
 
@@ -284,86 +266,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             Some(ranges) => decrypt_sectors_in_content(buf, keys, unit_key_idx, lba, ranges),
             None => decrypt_sectors(buf, keys, unit_key_idx),
         }
-    }
-
-    /// Collect the still-scrambled aligned units in `buf`, hand them to the
-    /// fetch callback, add any returned keys not already held to the AACS
-    /// pool (the CACHE — every later unit this pass, and any later read, reuses
-    /// them), and re-decrypt `buf`. Returns the post-retry dropped-byte count
-    /// (equal to `prev_dropped` when the callback could not help). The re-decrypt
-    /// is content-gated identically to the first read so a non-content unit is
-    /// never re-attempted. Caller guarantees the keys are `DecryptKeys::Aacs`, a
-    /// callback is installed, and the call budget is not yet spent.
-    fn fetch_failed_units(
-        &mut self,
-        buf: &mut [u8],
-        lba: u32,
-        content: Option<&[(u32, u32)]>,
-        prev_dropped: usize,
-    ) -> usize {
-        let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
-        // Gather up to MAX_FETCH_SAMPLES still-scrambled aligned units — the
-        // exact on-disc ciphertext no held key could open. A trailing partial
-        // unit (chunks_exact remainder) can't be a whole scrambled unit, so
-        // skipping it is correct.
-        let mut samples: Vec<Vec<u8>> = Vec::new();
-        for chunk in buf.chunks_exact(unit_len) {
-            if crate::aacs::content::aacs_unit_needs_decrypt(chunk) {
-                samples.push(chunk.to_vec());
-                if samples.len() >= MAX_FETCH_SAMPLES {
-                    break;
-                }
-            }
-        }
-        if samples.is_empty() {
-            return prev_dropped;
-        }
-        // Skip the call when EVERY failing unit here is one a prior fetch already
-        // came back empty for — re-asking the identical ciphertext only burns a
-        // key-server request. A unit we have NOT asked about yet (e.g. a second
-        // CPS unit on a multi-CPS disc) still gets its one chance, where the old
-        // global `fetch_spent` latch wrongly blocked it.
-        let fps: Vec<u64> = samples.iter().map(|s| Self::sample_fp(s)).collect();
-        if fps.iter().all(|fp| self.fetch_dry.contains(fp)) {
-            return prev_dropped;
-        }
-        // Ask the application's key source for keys that open this ciphertext.
-        self.fetch_calls += 1;
-        let fresh = match self.fetch.as_ref() {
-            Some(cb) => cb(&samples),
-            None => return prev_dropped,
-        };
-        // Add only keys we don't already hold (dedup by value).
-        let mut added = 0usize;
-        if let DecryptKeys::Aacs { unit_keys, .. } = &mut self.keys {
-            for k in fresh {
-                if !unit_keys.iter().any(|(_, have)| *have == k) {
-                    let idx = unit_keys.len() as u32;
-                    unit_keys.push((idx, k));
-                    added += 1;
-                }
-            }
-        }
-        if added == 0 {
-            // Nothing new for THESE units — remember them so we don't re-ask the
-            // same ciphertext, but leave the door open for other units.
-            self.fetch_dry.extend(fps);
-            return prev_dropped;
-        }
-        // Retry now that the pool has grown; a unit that still won't decrypt is
-        // genuine loss. A retry error must not mask the original count.
-        Self::decrypt_buf(buf, &mut self.keys, self.unit_key_idx, lba, content)
-            .unwrap_or(prev_dropped)
-    }
-
-    /// Stable per-run fingerprint of a failing unit's ciphertext, for the
-    /// `fetch_dry` set. `DefaultHasher` is fixed-seed, so equal samples map to
-    /// equal fingerprints within a process — all the dedup needs.
-    fn sample_fp(sample: &[u8]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        sample.hash(&mut h);
-        h.finish()
     }
 
     /// Emit a bounded, structured diagnostic for each undecryptable unit in a
@@ -521,8 +423,11 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         // recover a unit no held key opened.
         let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
         let content_ref = content.as_deref();
-        // Whether a fresh-key fetch is still worth attempting on this decorator.
-        let fetch_viable = self.fetch.is_some() && self.fetch_calls < MAX_FETCH_CALLS;
+        // Copy out the small Copy fields the seam needs, so the `&mut self.recovery`
+        // borrow below does not collide with reads of other `self` fields. The
+        // recovery closure self-limits (its budget lives in its captures), so the
+        // decorator simply calls it whenever there is a miss.
+        let unit_key_idx = self.unit_key_idx;
         // First decrypt, then the FRESH-KEY-ON-FAILURE retry (read → decrypt → on
         // fail fetch a new key → retry → CACHE or fail). This runs in BOTH modes:
         //   * VERIFY-ONLY (multipass sweep): decrypt a reused SCRATCH copy so `buf`
@@ -537,11 +442,11 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         //   * NORMAL (mux / --no-raw): decrypt `buf` in place, same retry.
         // The fetch re-decrypt targets the post-decrypt buffer (scratch / buf),
         // whose still-scrambled units ARE the failures.
-        let dropped = if self.verify_only {
+        let outcome = if self.verify_only {
             let mut scratch = std::mem::take(&mut self.scratch);
             scratch.clear();
             scratch.extend_from_slice(&buf[..n]);
-            let mut d = match Self::decrypt_buf(
+            let d = match Self::decrypt_buf(
                 &mut scratch,
                 &mut self.keys,
                 self.unit_key_idx,
@@ -554,24 +459,45 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
                     return Err(e);
                 }
             };
-            if d > 0 && fetch_viable {
-                d = self.fetch_failed_units(&mut scratch, lba, content_ref, d);
-            }
+            let o = match (d, self.recovery.as_mut()) {
+                (0, _) | (_, None) => crate::sector::recovery::MissOutcome { dropped: d },
+                (d, Some(r)) => {
+                    let rctx = crate::sector::recovery::RecoverCtx {
+                        unit_key_idx,
+                        lba,
+                        content: content.clone(),
+                        prev_dropped: d,
+                    };
+                    r(&mut scratch, &mut self.keys, &rctx)
+                }
+            };
             self.scratch = scratch;
-            d
+            o
         } else {
-            let mut d = Self::decrypt_buf(
+            let d = Self::decrypt_buf(
                 &mut buf[..n],
                 &mut self.keys,
                 self.unit_key_idx,
                 lba,
                 content_ref,
             )?;
-            if d > 0 && fetch_viable {
-                d = self.fetch_failed_units(&mut buf[..n], lba, content_ref, d);
+            match (d, self.recovery.as_mut()) {
+                (0, _) | (_, None) => crate::sector::recovery::MissOutcome { dropped: d },
+                (d, Some(r)) => {
+                    let rctx = crate::sector::recovery::RecoverCtx {
+                        unit_key_idx,
+                        lba,
+                        content: content.clone(),
+                        prev_dropped: d,
+                    };
+                    r(&mut buf[..n], &mut self.keys, &rctx)
+                }
             }
-            d
         };
+        // A loss is a loss: whatever recovery could not decrypt (a missing unit
+        // key, or an AACS 2.1 forensic-segment unit with no variant key — same
+        // thing to the read path) is concealed and counted the same way.
+        let dropped = outcome.dropped;
         if dropped > 0 {
             self.decrypt_dropped
                 .fetch_add(dropped as u64, Ordering::Relaxed);
@@ -656,6 +582,11 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
             // fails (no clean data to mux). Scheme-agnostic (only AACS reaches a
             // non-zero count); clear filesystem (gated out) and zero-fill (not
             // scrambled) never get here.
+            //
+            // An undecryptable unit is an undecryptable unit whatever the scheme —
+            // a missing unit key or an AACS 2.1 forensic-segment unit with no
+            // variant key both land here and fail the verify read the same way.
+            // (`dropped > 0` already holds inside the enclosing block.)
             if DECRYPT_VERIFY_READ {
                 // FACT-FINDING: on a fresh rip these bytes came straight off the
                 // drive, so each failing unit's signature (all-zero? entropy?
