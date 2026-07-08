@@ -176,6 +176,49 @@ const BARE_LANGS: &[(&str, &str)] = &[
     ("galician", "glg"),
 ];
 
+/// Map a short menu-graphic language token (as embedded in authoring
+/// filenames like `Dune_UHD01_Eng_Composite1.png`) to an ISO-639-2/T code.
+///
+/// These filename tokens are compact 2/3-letter abbreviations, NOT the full
+/// language names [`lang`] handles, so they get their own certain table.
+/// Accepts the ISO-639-2/B spellings some tools emit (`ger`, `fre`, `chi`)
+/// and normalizes them to the /T code the rest of the pipeline uses (`deu`,
+/// `fra`, `zho`). Case-insensitive. Returns `None` for anything not in the
+/// table — never guesses, so an unrecognized token drops rather than
+/// mislabels.
+pub fn menu_lang(token: &str) -> Option<&'static str> {
+    let t = token.trim().to_ascii_lowercase();
+    let code = match t.as_str() {
+        "eng" | "en" => "eng",
+        "ger" | "deu" | "de" => "deu",
+        "fre" | "fra" | "fr" => "fra",
+        "spa" | "es" => "spa",
+        "ita" | "it" => "ita",
+        "por" | "pt" => "por",
+        "jpn" | "jap" | "ja" => "jpn",
+        "kor" | "ko" => "kor",
+        "chi" | "zho" | "zh" => "zho",
+        "rus" | "ru" => "rus",
+        "dut" | "nld" | "nl" => "nld",
+        "pol" | "pl" => "pol",
+        "cze" | "ces" | "cs" => "ces",
+        "dan" | "da" => "dan",
+        "fin" | "fi" => "fin",
+        "nor" | "no" => "nor",
+        "swe" | "sv" => "swe",
+        "hun" | "hu" => "hun",
+        "gre" | "ell" | "el" => "ell",
+        "tur" | "tr" => "tur",
+        "ara" | "ar" => "ara",
+        "hin" | "hi" => "hin",
+        "tha" | "th" => "tha",
+        "ukr" | "uk" => "ukr",
+        "cat" | "ca" => "cat",
+        _ => return None,
+    };
+    Some(code)
+}
+
 // ── Purpose ──────────────────────────────────────────────────────────────────
 
 /// Classify a free-form English label string into a [`LabelPurpose`].

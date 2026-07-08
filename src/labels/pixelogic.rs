@@ -25,7 +25,7 @@ const REGIONS: &[&str] = &[
     "US", "UK", "CF", "PF", "CS", "LS", "BP", "PP", "SM", "TM", "CAN", "DUM", "FLE",
 ];
 
-pub fn detect(udf: &UdfFs) -> bool {
+pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "bluray_project.bin")
 }
 

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 /// Cheap signature check: a Criterion disc ships `streamproperties.xml`
 /// inside a `/BDMV/JAR/*` archive.
-pub fn detect(udf: &UdfFs) -> bool {
+pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "streamproperties.xml")
 }
 
@@ -77,11 +77,18 @@ pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> 
 /// `apply_labels` matches on `(type, stream_number)`, so a collision
 /// would mislabel tracks.)
 fn assign_stream_numbers(infos: &[StreamInfo], stream_map: &HashMap<String, u16>) -> Vec<u16> {
-    // Numbers already claimed by the map, per type.
+    // Numbers already claimed by the map, per type. A map value of 0 is NOT a
+    // claim: apply_labels binds on 1-based stream numbers, so 0 is unmatchable.
+    // Treat 0 as "unmapped" here (defense in depth — parse_playback_config also
+    // filters it) so such a stream gets a real synthesized number instead of an
+    // orphan 0 that collides with / shadows a genuine stream 1.
     let mut taken_audio: Vec<u16> = Vec::new();
     let mut taken_sub: Vec<u16> = Vec::new();
     for info in infos {
         if let Some(&n) = stream_map.get(&info.id) {
+            if n == 0 {
+                continue;
+            }
             match info.stream_type {
                 StreamLabelType::Audio => taken_audio.push(n),
                 StreamLabelType::Subtitle => taken_sub.push(n),
@@ -94,8 +101,8 @@ fn assign_stream_numbers(infos: &[StreamInfo], stream_map: &HashMap<String, u16>
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
         let n = match stream_map.get(&info.id).copied() {
-            Some(n) => n,
-            None => {
+            Some(n) if n != 0 => n,
+            _ => {
                 let (idx, taken) = match info.stream_type {
                     StreamLabelType::Audio => (&mut audio_idx, &taken_audio),
                     StreamLabelType::Subtitle => (&mut sub_idx, &taken_sub),
@@ -277,27 +284,34 @@ mod tests {
         assert_eq!(nums[3], 2); // subtitle 2
     }
 
-    /// Spec: map stream_num=0 is explicitly rejected (apply_labels uses 1-based).
-    /// This is documented in parse_playback_config: `if stream_num != 0`.
-    /// Mutation: remove the `!= 0` guard → zero is stored in map.
+    /// Spec: a map value of 0 is unmatchable (apply_labels is 1-based), so
+    /// assign_stream_numbers must treat it as unmapped and synthesize a real
+    /// 1-based number rather than emit an orphan 0.
+    /// Mutation: read the map value verbatim → stream_number 0 leaks out.
     #[test]
-    fn map_zero_stream_num_is_skipped() {
-        // parse_playback_config skips zero; simulate that: the zero shouldn't
-        // end up in the map. We test assign_stream_numbers with a zero-containing
-        // map to verify it won't freeze the fallback counter at 1 forever.
+    fn map_zero_stream_num_is_synthesized_not_emitted() {
         let mut map = HashMap::new();
-        map.insert("a0".to_string(), 0u16); // zero — per spec, was filtered by parse_playback_config
+        map.insert("a0".to_string(), 0u16); // 0 must not be treated as a claim
         let infos = vec![info("a0", StreamLabelType::Audio)];
-        // If 0 IS in the map and assign_stream_numbers uses it, stream_number=0
-        // is not matchable (apply_labels is 1-based). The fallback counter
-        // would assign 1 instead. Test both paths:
         let nums = assign_stream_numbers(&infos, &map);
-        // If the map has 0 for a0, assign_stream_numbers returns 0 (map wins).
-        // This is a known limitation — the guard lives in parse_playback_config.
-        // The test documents the ACTUAL behavior so a code change that introduces
-        // the guard in assign_stream_numbers would be caught.
-        // Current behavior: map wins → 0.
-        assert_eq!(nums[0], 0);
+        // 0 is treated as unmapped → the fallback counter assigns 1.
+        assert_eq!(nums[0], 1);
+    }
+
+    /// A stream genuinely mapped to 1 plus another stream whose map value is 0
+    /// must NOT both land on 1: the 0-stream is synthesized past the claimed 1.
+    #[test]
+    fn map_zero_does_not_collide_with_a_real_stream_one() {
+        let mut map = HashMap::new();
+        map.insert("real".to_string(), 1u16);
+        map.insert("bad".to_string(), 0u16);
+        let infos = vec![
+            info("real", StreamLabelType::Audio),
+            info("bad", StreamLabelType::Audio),
+        ];
+        let nums = assign_stream_numbers(&infos, &map);
+        assert_eq!(nums[0], 1); // the genuinely-mapped stream keeps 1
+        assert_eq!(nums[1], 2); // the 0-stream is synthesized to the next free slot
     }
 
     /// Spec: collision-avoidance works across audio AND subtitle independently.

@@ -29,7 +29,7 @@ use crate::udf::UdfFs;
 
 /// True iff `/BDMV/PLAYLIST/` exists and contains at least one
 /// `.mpls` file. Cheap directory walk only — no sector reads.
-pub fn detect(udf: &UdfFs) -> bool {
+pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     let Some(dir) = udf.find_dir("/BDMV/PLAYLIST") else {
         return false;
     };

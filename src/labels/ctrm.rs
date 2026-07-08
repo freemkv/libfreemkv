@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 /// Cheap signature check: a CTRM disc ships `menu_base.prop` and/or
 /// `language_streams.txt` inside a `/BDMV/JAR/*` archive.
-pub fn detect(udf: &UdfFs) -> bool {
+pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "menu_base.prop")
         || super::jar_file_exists(udf, "language_streams.txt")
 }
