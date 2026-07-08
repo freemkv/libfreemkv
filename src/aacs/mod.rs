@@ -34,6 +34,7 @@ pub mod mkb;
 pub mod provider;
 pub mod resolve;
 pub mod segment;
+pub mod segment_key;
 pub mod trace;
 pub mod types;
 pub mod variant;
