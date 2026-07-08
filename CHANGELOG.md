@@ -1,5 +1,70 @@
 # Changelog
 
+## [1.3.0] — 2026-07-08
+
+### Added
+
+- **AACS 2.1 (FMTS) and HD-DVD are first-class disc formats.** FMTS and HD-DVD
+  discs are detected, labeled, and scanned as their own formats rather than
+  misread as plain UHD/Blu-ray. On a 2.1 disc the forensic variant segments are
+  located from `IndividualSegment.tbl` and the `SegmentKey.tbl` container is
+  parsed; the bulk of the title decrypts with the unit key as usual, and the
+  forensic segments (for which no segment-key source exists yet) are skipped as
+  expected loss, so a 2.1 disc rips mostly-complete instead of failing outright.
+- **AACS 2.1 variant Media Key chain runs end to end.** The variant media key is
+  derived as a clean Processing-Key to media-key primitive, wired from the `0x2d`
+  record, so a genuine variant MKB resolves through the ladder.
+- **Renesas drive unlocker.** The unlock layer splits into feature-unlock and
+  bus-unlock stages and adds a Renesas unlocker; drive reporting distinguishes
+  LibreDrive from Renesas.
+- **Stream-label parsers: reader-backed detection and a menu-language fallback.**
+  Label detection can inspect a jar's contents, so vendor parsers claim only
+  their own discs; a new last-resort parser reads menu-artwork languages.
+- **keydb round-trips AACS 2.0 host certs** (the `HC2` line) so a load/save cycle
+  no longer drops v2 host credentials.
+
+### Changed
+
+- **Generic per-scheme recovery seam.** Decrypt-miss handling is now a
+  scheme-neutral seam the input stream installs (no recovery, or an AACS
+  fresh-key fetch), with CSS self-recovering separately from the data itself. An
+  undecryptable unit is counted the same whatever the scheme, so the separate
+  "undecryptable" loss bucket folds into one loss count.
+- **`aacs` module reorganized.** The former god-module is split into
+  `media_key` / `volume_key` / `inf` / `resolve` / `mkb` / `crypto` / `content`,
+  the `boil` veneer is removed, and module paths (not a `mod.rs` facade) are the
+  public API.
+
+### Fixed
+
+- **Main title is chosen by largest physical size, not clip count**, so a
+  chapter-per-clip disc (e.g. Fast & Furious) is no longer mis-ranked behind a
+  virtual composite.
+- **A fresh-rip ISO `sync_all` failure is no longer swallowed**: `is_regular` is
+  read from the open file handle instead of a pre-create `metadata(path)` that
+  always failed on a path that does not exist yet.
+- **A transient CLIP-info parse failure no longer suppresses a clip's extents**
+  for a later playlist item that references the same clip.
+- **Reverify downgrades that fail to persist are logged, not swallowed**, so a
+  bad unit cannot be silently mismarked good on resume.
+- **The CLI sanitizes on-disc metadata** (title, volume label, playlist, stream
+  labels) before printing, so a crafted disc cannot inject terminal escape
+  sequences.
+- **keydb entry validation matches the parser exactly** — a `0x` line counts only
+  with a ` = ` — so content that parses to zero usable entries can no longer be
+  saved as valid.
+- **autorip** recovers a poisoned config lock in the rip thread instead of
+  panicking it, and corrects the resume pass count.
+- Criterion stream numbering (a map value of 0 no longer shadows stream 1); AACS
+  resolve classifies a media-keys-only source missing the VID as "VID
+  unavailable"; a dropped partial PES flags a discontinuity; the no-demuxer path
+  detects an early consumer disconnect.
+
+### Performance
+
+- **Decrypt thread count is resolved once** and cached off the per-buffer hot
+  path (the env var and `available_parallelism` are no longer probed per call).
+
 ## [1.2.2] — 2026-07-04
 
 ### Added
