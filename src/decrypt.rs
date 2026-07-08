@@ -123,17 +123,24 @@ pub fn decrypt_threads() -> usize {
     if explicit > 0 {
         return explicit;
     }
-    let env = std::env::var("FREEMKV_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    if env > 0 {
-        return env.min(MAX_THREADS);
-    }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    cores.clamp(1, MAX_THREADS)
+    // Resolve the `FREEMKV_THREADS` env var + `available_parallelism()` ONCE and
+    // cache it — this runs on the per-buffer decrypt hot path, and a getenv +
+    // String alloc + parallelism syscall per call is pure overhead. The explicit
+    // `set_decrypt_threads` override above still takes effect dynamically.
+    static DEFAULT_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEFAULT_THREADS.get_or_init(|| {
+        let env = std::env::var("FREEMKV_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if env > 0 {
+            return env.min(MAX_THREADS);
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        cores.clamp(1, MAX_THREADS)
+    })
 }
 
 /// Resolved decryption state from disc scanning.
@@ -418,49 +425,13 @@ fn decrypt_sectors_impl(
             dropped_bytes.into_inner()
         }
         DecryptKeys::Css { title_key } => {
-            // CSS has no supplied key list: the ONLY source of a title key is
-            // cracking the data, and the key changes per VTS/VOB region. So
-            // `title_key` is a CACHE of the last crack, not a fixed disc key —
-            // applying it blindly across a region boundary descrambles with the
-            // wrong key (valid headers, garbage payload). Validate it on every
-            // scrambled sector and re-crack on a miss (libdvdcss's on-demand
-            // per-region rekey; the same validate-then-rekey shape the AACS arm
-            // above uses, but re-cracking instead of picking from a list).
-            //
-            // The clear header (<0x80) is never scrambled, so its periodic crib
-            // predicts the plaintext at 0x80. Descramble with the cached key; if
-            // the crib fails to reappear the key region changed (or the primed
-            // key was wrong) — restore the ciphertext, re-crack from this very
-            // sector, and descramble again. A crib-less sector (no periodic run)
-            // can be neither validated nor cracked, so it rides the cached key —
-            // correct, because it lives in the same region as the nearby crib
-            // sector that set the cache.
-            for chunk in buf.chunks_mut(2048) {
-                if chunk.len() < 2048 || !css::is_scrambled(chunk) {
-                    continue;
-                }
-                let crib = css::stevenson::attack_crib(chunk);
-                // Snapshot the ciphertext into a stack buffer (chunk is exactly
-                // 2048 here — guaranteed by the `< 2048` continue above) only
-                // when there's a crib to validate against, so the common
-                // cache-hit path costs no per-sector heap allocation.
-                let mut original = [0u8; 2048];
-                if crib.is_some() {
-                    original.copy_from_slice(chunk);
-                }
-                css::lfsr::descramble_sector(title_key, chunk);
-                if let Some(crib) = crib {
-                    if chunk[0x80..0x80 + 10] != crib[..] {
-                        // Cached key is stale for this region — restore the
-                        // ciphertext and crack this sector's own key.
-                        chunk.copy_from_slice(&original);
-                        if let Some(fresh) = css::stevenson::crack_title_key(chunk) {
-                            *title_key = fresh;
-                        }
-                        css::lfsr::descramble_sector(title_key, chunk);
-                    }
-                }
-            }
+            // CSS SELF-recovers: the title key changes per VOB region and is
+            // re-cracked constantly, but always FROM THE DATA ITSELF — no external
+            // input. So the whole descramble-and-rekey is self-contained here (see
+            // `css::descramble_region`), and CSS does not need the post-decrypt
+            // recovery seam that AACS key-fetch / FMTS segment-skip use (those DO
+            // consume external inputs a `decrypt_sectors` caller cannot supply).
+            css::descramble_region(buf, title_key);
             0
         }
     };
@@ -713,6 +684,83 @@ mod tests {
         );
     }
 
+    /// Build a Stevenson-crackable scrambled CSS sector for `title_key` (mirrors
+    /// `crackable_sector` in the css::mod tests): a periodic run in the clear
+    /// header continues past 0x80 into the encrypted region, so
+    /// `stevenson::crack_title_key` recovers the key. Distinct `seed` values give
+    /// two sectors different cribs, standing in for two VOB regions.
+    fn crackable_css_sector(title_key: &[u8; 5], seed: &[u8; 5]) -> Vec<u8> {
+        const RUN_START: usize = 0x59;
+        const SEED_OFFSET: usize = 0x54;
+        const PERIOD: usize = 8;
+        let mut plaintext = vec![0u8; 2048];
+        plaintext[0x00..0x04].copy_from_slice(&css::PACK_START);
+        plaintext[0x14] = 0x10; // scramble flag
+        let pat: Vec<u8> = (0..PERIOD)
+            .map(|k| (0xA0u8.wrapping_add(k as u8)) ^ 0x5A)
+            .collect();
+        for (i, b) in plaintext.iter_mut().enumerate().skip(RUN_START) {
+            *b = pat[i % PERIOD];
+        }
+        plaintext[SEED_OFFSET..SEED_OFFSET + 5].copy_from_slice(seed);
+        css::lfsr::scramble_sector(title_key, &mut plaintext);
+        plaintext
+    }
+
+    /// CHARACTERIZATION (recovery refactor safety net): the CSS arm's per-region
+    /// re-crack (the `title_key` cache is stale for a new VOB region → restore
+    /// ciphertext, `crack_title_key` this sector, re-descramble). Two crackable
+    /// sectors scrambled under DIFFERENT keys sit back-to-back; the cache is
+    /// primed to the FIRST key. Sector 0 rides the cache (crib matches); sector 1
+    /// must trip the crib mismatch and re-crack to its own key. Both must land
+    /// correct plaintext, and the cache must end on region 1's key.
+    ///
+    /// This behaviour currently lives inline in `decrypt_sectors` (the `Css`
+    /// arm). It is the delicate logic the recovery refactor will move to the
+    /// input-stream seam, so it must stay green byte-for-byte across that move.
+    #[test]
+    fn css_region_change_recracks_the_title_key() {
+        let key_a = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let key_b = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let sector_a = crackable_css_sector(&key_a, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        let sector_b = crackable_css_sector(&key_b, &[0x09, 0x08, 0x07, 0x06, 0x05]);
+
+        // Expected plaintext bodies: each sector descrambled under its true key.
+        let mut plain_a = sector_a.clone();
+        css::lfsr::descramble_sector(&key_a, &mut plain_a);
+        let mut plain_b = sector_b.clone();
+        css::lfsr::descramble_sector(&key_b, &mut plain_b);
+
+        let mut buf = Vec::with_capacity(4096);
+        buf.extend_from_slice(&sector_a);
+        buf.extend_from_slice(&sector_b);
+
+        // Cache primed to region A's key (as if A was the last crack). CSS
+        // descramble-and-rekey lives in `css::descramble_region` (the recovery
+        // seam calls it); the region change must re-crack region B's key.
+        let mut ended = key_a;
+        css::descramble_region(&mut buf, &mut ended);
+
+        assert_eq!(
+            &buf[0x80..2048],
+            &plain_a[0x80..2048],
+            "sector 0 rides the cached key (crib matches, no re-crack)"
+        );
+        assert_eq!(
+            &buf[2048 + 0x80..4096],
+            &plain_b[0x80..2048],
+            "sector 1 re-cracks its own region key and descrambles correctly"
+        );
+        // The cache must have advanced to a key that descrambles region B.
+        let mut check_b = sector_b.clone();
+        css::lfsr::descramble_sector(&ended, &mut check_b);
+        assert_eq!(
+            &check_b[0x80..2048],
+            &plain_b[0x80..2048],
+            "the ended cache key must round-trip region B's body"
+        );
+    }
+
     /// Mixed 3-unit buffer: only the in-content SCRAMBLED unit is counted; an
     /// in-content CLEAR unit and an out-of-content SCRAMBLED unit are both skipped.
     #[test]
@@ -912,11 +960,12 @@ mod tests {
     /// fixed wrong key -> the body no longer matches the plaintext.
     #[test]
     fn css_descrambles_with_title_key() {
-        let title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
+        let mut title_key = [0x42, 0x13, 0x37, 0xBE, 0xEF];
         let seed = [0xDE, 0xAD, 0xBE, 0xEF, 0x42];
         let (mut sector, plaintext) = make_css_sector(&title_key, &seed, 0xA5);
-        let mut keys = DecryptKeys::Css { title_key };
-        decrypt_sectors(&mut sector, &mut keys, 0).expect("CSS decrypt is Ok");
+        // CSS descramble lives in `css::descramble_region` (the recovery seam
+        // calls it); `decrypt_sectors` only flags CSS sectors for recovery.
+        css::descramble_region(&mut sector, &mut title_key);
         assert_eq!(
             &sector[0x80..2048],
             &plaintext[0x80..2048],
@@ -945,8 +994,8 @@ mod tests {
         let (s1, p1) = make_css_sector(&title_key, &[0x66, 0x77, 0x88, 0x99, 0xAA], 0xC3);
         let mut buf = s0;
         buf.extend_from_slice(&s1);
-        let mut keys = DecryptKeys::Css { title_key };
-        decrypt_sectors(&mut buf, &mut keys, 0).expect("CSS multi-sector decrypt is Ok");
+        let mut title_key = title_key;
+        css::descramble_region(&mut buf, &mut title_key);
         assert_eq!(
             &buf[0x80..2048],
             &p0[0x80..2048],
@@ -1024,8 +1073,8 @@ mod tests {
         buf.extend_from_slice(&s1);
 
         // Cache primed to key_a only — exactly what the one-shot scan crack yields.
-        let mut keys = DecryptKeys::Css { title_key: key_a };
-        decrypt_sectors(&mut buf, &mut keys, 0).expect("CSS multi-region decrypt is Ok");
+        let mut title_key = key_a;
+        css::descramble_region(&mut buf, &mut title_key);
 
         assert_eq!(
             &buf[0x80..2048],
@@ -1038,13 +1087,10 @@ mod tests {
             "region B sector must descramble after the path re-cracks its own key"
         );
         // The cache must have advanced to region B's key.
-        match keys {
-            DecryptKeys::Css { title_key } => assert_eq!(
-                title_key, key_b,
-                "cache must hold region B's key after the rekey"
-            ),
-            _ => unreachable!(),
-        }
+        assert_eq!(
+            title_key, key_b,
+            "cache must hold region B's key after the rekey"
+        );
     }
 
     /// The CSS path leaves UNSCRAMBLED sectors (flag clear) byte-for-byte

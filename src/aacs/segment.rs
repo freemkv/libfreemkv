@@ -29,6 +29,21 @@ pub const SEGMENT_RECORD_LEN: usize = 16;
 /// Bytes per BDAV source packet (188-byte TS + 4-byte arrival-time header).
 pub const SOURCE_PACKET_LEN: u64 = 192;
 
+/// Whether a 2.1 (FMTS) disc may rip WITHOUT segment (variant) keys.
+///
+/// `true` (today): the forensic variant segments are skipped as expected loss
+/// and the bulk of the title decodes with the unit key, so a 2.1 disc rips
+/// mostly-complete. A unit key (VUK) is still required, exactly as for any AACS
+/// disc. `false`: the absence of a segment-key source is a hard, UPFRONT failure
+/// ([`Error::FmtsKeyMissing`]) — the same policy as a missing unit key, so a
+/// forensic-holed rip is refused rather than produced. No segment-key source
+/// exists yet, so `true` is the only value under which a 2.1 disc rips at all;
+/// flip to `false` once segment keys can be sourced and a partial rip should be
+/// refused. Hardcoded on purpose — not a user setting.
+///
+/// [`Error::FmtsKeyMissing`]: crate::error::Error::FmtsKeyMissing
+pub const BYPASS_FMTS_KEY: bool = true;
+
 /// One forensic variant segment: the inclusive source-packet range it occupies
 /// in the FMTS clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +78,47 @@ impl Segment {
     pub fn contains_spn(&self, spn: u32) -> bool {
         spn >= self.start_spn && spn <= self.end_spn
     }
+
+    /// True when the inclusive source-packet span `[first, last]` overlaps this
+    /// segment. Used to decide whether an aligned unit (which spans several
+    /// packets) touches the segment at all, not just whether one packet does.
+    pub fn overlaps_spn(&self, first: u32, last: u32) -> bool {
+        first <= self.end_spn && last >= self.start_spn
+    }
+}
+
+/// Source packets spanned by one AACS aligned unit: `6144 / 192 = 32`.
+pub const PACKETS_PER_UNIT: u32 =
+    (crate::aacs::content::ALIGNED_UNIT_LEN as u64 / SOURCE_PACKET_LEN) as u32;
+
+/// Byte offset within the clip of a clip-relative 2048-byte sector `lba`. The
+/// FMTS decode reads the clip file directly, so `lba` 0 is the clip's first
+/// byte and this offset lines up with the source-packet grid the segment map
+/// uses.
+pub fn lba_byte_offset(lba: u32) -> u64 {
+    lba as u64 * 2048
+}
+
+/// The forensic segment an AACS aligned unit belongs to, if any, given the
+/// unit's clip-relative byte offset.
+///
+/// This is the routing decision behind a 2.1 decrypt-miss: a unit that
+/// overlaps a forensic segment must be opened with that segment's **variant
+/// key** (from `SegmentKeyNNNNN.tbl`), not the CPS Unit Key. Opening it with
+/// the Unit Key is exactly what yields the broken-reference-frame garbage a
+/// plain unit-key rip produces. A unit outside every segment is ordinary
+/// content and a miss on it is a Unit-Key miss, so this returns `None` and the
+/// caller falls back to the normal unit-key fetch.
+///
+/// The unit is tested as a packet *span* (`[off/192, (off+6144-1)/192]`) so a
+/// unit that only partly overlaps a segment edge is still classified as
+/// variant; on the observed disc segments are unit-aligned, but the span test
+/// does not rely on that.
+pub fn variant_segment_for_unit(segments: &[Segment], unit_offset: u64) -> Option<&Segment> {
+    let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN as u64;
+    let first = (unit_offset / SOURCE_PACKET_LEN) as u32;
+    let last = ((unit_offset + unit_len - 1) / SOURCE_PACKET_LEN) as u32;
+    segments.iter().find(|s| s.overlaps_spn(first, last))
 }
 
 /// Parse `IndividualSegment.tbl` into its forensic variant segments, in table
@@ -159,5 +215,59 @@ mod tests {
     fn empty_table_is_empty_not_none() {
         let tbl = build_tbl(&[]);
         assert_eq!(parse_individual_segments(&tbl), Some(Vec::new()));
+    }
+
+    #[test]
+    fn packets_per_unit_is_thirty_two() {
+        // 6144-byte aligned unit / 192-byte source packet.
+        assert_eq!(PACKETS_PER_UNIT, 32);
+    }
+
+    #[test]
+    fn unit_inside_segment_routes_to_variant() {
+        // A real first-record segment: packets [343680, 346239].
+        let segs = parse_individual_segments(&build_tbl(&[(1, 343680, 346239)])).unwrap();
+        // A unit sitting squarely inside: start at packet 344000 → byte 344000*192.
+        let off = 344000u64 * SOURCE_PACKET_LEN;
+        let hit = variant_segment_for_unit(&segs, off).expect("inside the segment");
+        assert_eq!(hit.number, 1);
+    }
+
+    #[test]
+    fn unit_outside_every_segment_is_unit_key_miss() {
+        let segs = parse_individual_segments(&build_tbl(&[(1, 343680, 346239)])).unwrap();
+        // A unit well before the segment is ordinary content → None (unit-key path).
+        let off = 1000u64 * SOURCE_PACKET_LEN;
+        assert!(variant_segment_for_unit(&segs, off).is_none());
+    }
+
+    #[test]
+    fn unit_straddling_a_segment_edge_counts_as_variant() {
+        // Segment starts at packet 100. A unit that ENDS just inside it (its 32
+        // packets straddle the boundary) must still route to the variant key,
+        // because part of its ciphertext is variant-encrypted.
+        let segs = parse_individual_segments(&build_tbl(&[(7, 100, 200)])).unwrap();
+        // Unit covering packets [80, 111]: overlaps [100,200] at the tail.
+        let off = 80u64 * SOURCE_PACKET_LEN;
+        let hit = variant_segment_for_unit(&segs, off).expect("straddles the start edge");
+        assert_eq!(hit.number, 7);
+        // A unit ending exactly at packet 99 (offset s.t. last = 99) does NOT overlap.
+        let before = 68u64 * SOURCE_PACKET_LEN; // [68, 99]
+        assert!(variant_segment_for_unit(&segs, before).is_none());
+    }
+
+    #[test]
+    fn no_segments_never_routes_to_variant() {
+        // The 1.0 / 2.0 case: no forensic map, so every miss is a unit-key miss.
+        assert!(variant_segment_for_unit(&[], lba_byte_offset(0)).is_none());
+        assert!(variant_segment_for_unit(&[], lba_byte_offset(9_999_999)).is_none());
+    }
+
+    #[test]
+    fn lba_maps_to_the_packet_grid() {
+        // A unit is 3 sectors (6144 bytes) = 32 packets. Clip-relative LBA 3 is
+        // the second aligned unit, which starts at packet 32.
+        let off = lba_byte_offset(3);
+        assert_eq!(off / SOURCE_PACKET_LEN, 32);
     }
 }

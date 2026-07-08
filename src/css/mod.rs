@@ -271,6 +271,52 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
     lfsr::descramble_sector(&state.title_key, sector);
 }
 
+/// Descramble a whole CSS buffer in place, re-cracking the title key on a VOB
+/// region boundary. `title_key` is a CACHE of the last crack, not a fixed disc
+/// key: it changes per VTS/VOB region, so it is validated on every scrambled
+/// sector and re-cracked on a miss (libdvdcss's on-demand per-region rekey).
+///
+/// This CSS key acquisition is intrinsic to the cipher — CSS has no external key
+/// source, the ONLY way to a title key is cracking the data — so it lives with
+/// the CSS primitives and runs inside `decrypt::decrypt_sectors` (a public,
+/// self-contained CSS decrypt), NOT at the post-decrypt recovery seam that AACS
+/// key-fetch and FMTS segment-skip use (those consume external inputs).
+///
+/// The clear header (`<0x80`) is never scrambled, so its periodic crib predicts
+/// the plaintext at `0x80`. Descramble with the cached key; if the crib fails to
+/// reappear the key region changed (or the primed key was wrong) — restore the
+/// ciphertext, re-crack from this very sector, and descramble again. A crib-less
+/// sector (no periodic run) can be neither validated nor cracked, so it rides the
+/// cached key — correct, because it lives in the same region as the nearby crib
+/// sector that set the cache.
+pub fn descramble_region(buf: &mut [u8], title_key: &mut [u8; 5]) {
+    for chunk in buf.chunks_mut(2048) {
+        if chunk.len() < 2048 || !is_scrambled(chunk) {
+            continue;
+        }
+        let crib = stevenson::attack_crib(chunk);
+        // Snapshot the ciphertext (chunk is exactly 2048 here) only when there is
+        // a crib to validate against, so the common cache-hit path costs no
+        // per-sector heap allocation.
+        let mut original = [0u8; 2048];
+        if crib.is_some() {
+            original.copy_from_slice(chunk);
+        }
+        lfsr::descramble_sector(title_key, chunk);
+        if let Some(crib) = crib {
+            if chunk[0x80..0x80 + 10] != crib[..] {
+                // Cached key is stale for this region — restore the ciphertext and
+                // crack this sector's own key.
+                chunk.copy_from_slice(&original);
+                if let Some(fresh) = stevenson::crack_title_key(chunk) {
+                    *title_key = fresh;
+                }
+                lfsr::descramble_sector(title_key, chunk);
+            }
+        }
+    }
+}
+
 /// Check if a sector has the CSS scramble flag set.
 ///
 /// This is the RAW flag test — bits 4-5 of the sub-header byte 0x14 — used by

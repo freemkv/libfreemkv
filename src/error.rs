@@ -88,6 +88,7 @@ pub const E_NO_DISC_KEY: u16 = 7022;
 pub const E_CSS_KEY_MISSING: u16 = 7023;
 pub const E_AACS_NO_HOST_CERT: u16 = 7024;
 pub const E_AACS_BUS_KEY_UNAVAILABLE: u16 = 7025;
+pub const E_FMTS_KEY_MISSING: u16 = 7026;
 
 // Keydb (8xxx)
 pub const E_KEYDB_CONNECT: u16 = 8000;
@@ -360,6 +361,15 @@ pub enum Error {
     /// time and no handshake runs.
     AacsBusKeyUnavailable,
 
+    /// AACS 2.1 (FMTS) disc carries forensic variant segments, but no segment
+    /// (variant) key is available to open them, and `BYPASS_FMTS_KEY` is `false`
+    /// (strict mode). Raised UPFRONT — before the mux — exactly like a missing
+    /// unit key, so a 2.1 disc that would rip with holes is refused rather than
+    /// silently producing a forensic-holed output. When `BYPASS_FMTS_KEY` is
+    /// `true` (the default today) this is never raised: the bulk decodes with the
+    /// unit key and the forensic segments are skipped as expected loss.
+    FmtsKeyMissing,
+
     // Keydb (8xxx)
     KeydbConnect {
         host: String,
@@ -573,6 +583,7 @@ impl Error {
             Error::CssKeyMissing => E_CSS_KEY_MISSING,
             Error::AacsNoHostCert { .. } => E_AACS_NO_HOST_CERT,
             Error::AacsBusKeyUnavailable => E_AACS_BUS_KEY_UNAVAILABLE,
+            Error::FmtsKeyMissing => E_FMTS_KEY_MISSING,
             Error::KeydbConnect { .. } => E_KEYDB_CONNECT,
             Error::KeydbHttp { .. } => E_KEYDB_HTTP,
             Error::KeydbInvalid => E_KEYDB_INVALID,
@@ -1209,6 +1220,7 @@ mod tests {
             E_CSS_KEY_MISSING,
             E_AACS_NO_HOST_CERT,
             E_AACS_BUS_KEY_UNAVAILABLE,
+            E_FMTS_KEY_MISSING,
             E_KEYDB_CONNECT,
             E_KEYDB_HTTP,
             E_KEYDB_INVALID,

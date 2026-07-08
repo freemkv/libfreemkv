@@ -22,7 +22,6 @@ use crate::sector::{DecryptingSectorSource, SectorSource};
 use crate::udf::{self, DirEntry, UdfFs};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 /// AACS aligned unit = 3 sectors / 6144 bytes. Content reads are issued in
@@ -66,10 +65,9 @@ pub struct FileResult {
     pub path: PathBuf,
     /// Bytes written that decrypted cleanly.
     pub bytes_good: u64,
-    /// Bytes lost to unreadable sectors (zero-filled holes).
+    /// Bytes lost — unreadable sectors AND undecryptable units both land here
+    /// (extract fails a bad decrypt loud, so it is zero-filled like a bad sector).
     pub bytes_unreadable: u64,
-    /// Bytes lost to undecryptable AACS/CSS units (still ciphertext / dropped).
-    pub bytes_undecryptable: u64,
     /// True when the file was fully written (renamed from `.partial`).
     pub complete: bool,
 }
@@ -81,10 +79,8 @@ pub struct ExtractResult {
     pub files: Vec<FileResult>,
     /// Aggregate good bytes across all files.
     pub bytes_good: u64,
-    /// Aggregate unreadable (bad-sector) bytes.
+    /// Aggregate lost bytes — bad sectors AND undecryptable units (one bucket).
     pub bytes_unreadable: u64,
-    /// Aggregate undecryptable (decrypt-loss) bytes.
-    pub bytes_undecryptable: u64,
     /// True when every file completed and no loss was recorded.
     pub complete: bool,
     /// True when the run stopped early on an interrupt / progress halt.
@@ -92,11 +88,10 @@ pub struct ExtractResult {
 }
 
 impl ExtractResult {
-    /// Total bytes lost (unreadable + undecryptable). A non-zero value means
-    /// the extraction is holed; the CLI exits non-zero so a script can re-run
-    /// through the `iso://` multipass path.
+    /// Total bytes lost. A non-zero value means the extraction is holed; the CLI
+    /// exits non-zero so a script can re-run through the `iso://` multipass path.
     pub fn bytes_lost(&self) -> u64 {
-        self.bytes_unreadable + self.bytes_undecryptable
+        self.bytes_unreadable
     }
 }
 
@@ -197,7 +192,6 @@ impl Disc {
         // borrowing wrapper (so the caller keeps `reader`), swap keys per CSS
         // VTS group via `set_keys`; AACS/None keep `base_keys` throughout.
         let mut dec = DecryptingSectorSource::new(Borrowed(reader), base_keys.clone());
-        let decrypt_loss = dec.decrypt_loss();
 
         let mut result = ExtractResult::default();
         let total_bytes = required;
@@ -232,26 +226,15 @@ impl Disc {
                 }
             }
 
-            // Acquire (rather than Relaxed) on these per-file delta loads:
-            // `extract_tree` drives `dec` single-threaded so there is no race
-            // today, and Acquire costs nothing on x86. Note this is only half
-            // the synchronisation: the paired counter store
-            // (sector/decrypting.rs `fetch_add`) is Relaxed, so an Acquire
-            // load alone does NOT yet establish a happens-before edge. Before
-            // file extraction is parallelised, upgrade that store to Release
-            // (or stronger) so the delta cannot read a stale counter.
-            let before_loss = decrypt_loss.load(Ordering::Acquire);
-            let (mut fr, halted) =
+            // A unit that fails to decrypt fails the read loud (extract runs
+            // non-tolerate), so extract_one_file already zero-filled it and
+            // counted it in bytes_unreadable — one 'lost' bucket covers both
+            // media damage and decrypt failure.
+            let (fr, halted) =
                 extract_one_file(&mut dec, dest, pf, total_bytes, &mut done_bytes, opts)?;
-            let after_loss = decrypt_loss.load(Ordering::Acquire);
-            fr.bytes_undecryptable = after_loss.saturating_sub(before_loss);
-            fr.bytes_good = fr.bytes_good.saturating_sub(fr.bytes_undecryptable);
 
             result.bytes_good = result.bytes_good.saturating_add(fr.bytes_good);
             result.bytes_unreadable = result.bytes_unreadable.saturating_add(fr.bytes_unreadable);
-            result.bytes_undecryptable = result
-                .bytes_undecryptable
-                .saturating_add(fr.bytes_undecryptable);
             result.files.push(fr);
             if halted {
                 result.halted = true;
@@ -261,7 +244,6 @@ impl Disc {
 
         result.complete = !result.halted
             && result.bytes_unreadable == 0
-            && result.bytes_undecryptable == 0
             && result.files.iter().all(|f| f.complete);
         Ok(result)
     }
@@ -492,7 +474,6 @@ fn extract_one_file<S: SectorSource>(
         path: pf.host_rel.clone(),
         bytes_good: 0,
         bytes_unreadable: 0,
-        bytes_undecryptable: 0,
         complete: false,
     };
 
@@ -1584,10 +1565,6 @@ mod tests {
         assert_eq!(
             res.bytes_unreadable, 0,
             "per-extent unit base must keep the second extent off the hole path"
-        );
-        assert_eq!(
-            res.bytes_undecryptable, 0,
-            "clear units decrypt-restore clean"
         );
         assert!(
             res.complete,

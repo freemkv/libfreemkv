@@ -24,13 +24,12 @@ use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
 /// hierarchy, not the content cipher). Bytes 0x80..0x800 are recovered with
 /// `*p = TAB1[*p] ^ (i_t5 & 0xff)`.
 ///
-/// The scramble flag at byte 0x14 (bits 4-5) indicates encryption. Like
-/// libdvdcss, the flag byte is NOT modified here — the caller treats a
-/// nonzero `sector[0x14] & 0x30` as "needs unscrambling" and the descramble
-/// is its own inverse, so re-running it on plaintext would re-scramble.
-/// (freemkv historically cleared the flag; we keep clearing it so callers
-/// and the existing tests can distinguish a descrambled sector. This does
-/// not affect the recovered body.)
+/// The scramble flag at byte 0x14 (bits 4-5) indicates encryption. This
+/// descrambler CLEARS that flag after unscrambling, so a descrambled sector
+/// reads as `sector[0x14] & 0x30 == 0`; callers and the tests use that to tell
+/// it from ciphertext, and re-running descramble on an already-cleared sector
+/// is a no-op (the flag guard below skips it). Clearing does not affect the
+/// recovered body.
 ///
 /// No-op (returns without modifying `sector`) in two cases:
 /// - `sector.len() < 2048`: the encrypted region (0x80..0x800) is not
