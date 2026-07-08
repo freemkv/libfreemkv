@@ -167,6 +167,10 @@ impl PesAssembler {
                 self.buffer.clear();
                 self.active = false;
                 self.header_remaining = 0;
+                // A dropped partial PES is a gap in the elementary stream — flag
+                // it so the NEXT completed PES carries a discontinuity, matching
+                // every other partial-drop path in this file (lines 395/479/504).
+                self.pending_discontinuity = true;
                 return;
             }
             self.buffer.extend_from_slice(data);

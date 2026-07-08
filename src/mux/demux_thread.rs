@@ -204,6 +204,14 @@ impl DemuxThread {
                         }
                     } else {
                         let _ = recycle_tx.send(buf);
+                        // No demuxer (a BdTs title with zero streams): still send
+                        // an empty batch so an early consumer disconnect is
+                        // detected here too, exactly like the ts/ps branches above.
+                        // Without it this worker reads the whole disc even after
+                        // the consumer has dropped.
+                        if tx.send(DemuxBatch::Ts(Vec::new())).is_err() {
+                            return;
+                        }
                     }
                 }
                 // Flush tail packets at EOF.
@@ -479,7 +487,7 @@ mod tests {
     #[test]
     fn no_demuxer_configured_still_recycles_and_eofs() {
         // With neither ts nor ps set, the worker must still recycle buffers
-        // and terminate with Eof — never emit a spurious Ts/Ps batch.
+        // and terminate with Eof — also forward an empty batch per buffer for disconnect detection.
         let (pf_tx, pf_rx) = bounded::<std::io::Result<Vec<u8>>>(4);
         let (rc_tx, rc_rx) = bounded::<Vec<u8>>(4);
         let (_dt, rx) = DemuxThread::spawn_zero_copy(pf_rx, rc_tx, (), None, None, None).unwrap();
@@ -492,8 +500,16 @@ mod tests {
         drop(pf_tx);
 
         let batches = collect_batches(&rx, Duration::from_secs(5));
-        assert_eq!(batches.len(), 1, "only the Eof sentinel");
-        assert!(matches!(batches[0], DemuxBatch::Eof));
+        // The no-demuxer branch now forwards an empty Ts batch per buffer for
+        // early consumer-disconnect detection (same rationale as the ts/ps
+        // branches), then the Eof sentinel.
+        assert_eq!(
+            batches.len(),
+            2,
+            "empty Ts disconnect-probe batch, then Eof"
+        );
+        assert!(matches!(batches[0], DemuxBatch::Ts(ref v) if v.is_empty()));
+        assert!(matches!(batches[1], DemuxBatch::Eof));
     }
 
     #[test]

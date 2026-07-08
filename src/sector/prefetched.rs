@@ -358,7 +358,6 @@ impl PrefetchedSectorSource {
         // and suppresses `self`'s own `Drop` (which would otherwise
         // double-`join`), leaving NO extra live endpoint behind. This
         // is the panic-free equivalent of the `Option::take` approach.
-        let total = self.total_sectors;
         let me = std::mem::ManuallyDrop::new(self);
         // SAFETY: `me` is `ManuallyDrop`, so none of these fields will
         // be dropped by `me`. Each `ptr::read` performs exactly one
@@ -367,7 +366,7 @@ impl PrefetchedSectorSource {
         let producer = unsafe { std::ptr::read(&me.producer) };
         let rx = unsafe { std::ptr::read(&me.rx) };
         let recycle = unsafe { std::ptr::read(&me.recycle_tx) };
-        (rx, recycle, PrefetchShell { producer, total })
+        (rx, recycle, PrefetchShell { producer })
     }
 }
 
@@ -376,8 +375,6 @@ impl PrefetchedSectorSource {
 /// producer, even though the channels have been peeled off.
 pub struct PrefetchShell {
     producer: Option<JoinHandle<()>>,
-    #[allow(dead_code)]
-    total: u32,
 }
 
 impl Drop for PrefetchShell {
