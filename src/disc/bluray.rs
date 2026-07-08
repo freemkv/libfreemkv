@@ -85,12 +85,17 @@ impl Disc {
         for play_item in &parsed.play_items {
             let clip_dur = play_item.out_time.saturating_sub(play_item.in_time) as f64 / 45000.0;
             let mut pkt_count: u32 = 0;
-            let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
             let clpi_path = format!("/BDMV/CLIPINF/{}.clpi", play_item.clip_id);
             if let Ok(clpi_data) = udf_fs.read_file(reader, &clpi_path) {
                 if let Ok(clip_info) = clpi::parse(&clpi_data) {
                     pkt_count = clip_info.source_packet_count;
+
+                    // Mark the clip seen ONLY after its .clpi parses — a transient
+                    // read/parse failure on the first PlayItem referencing a clip
+                    // must not permanently suppress its extents/size for a later
+                    // PlayItem referencing the same clip that succeeds.
+                    let first_ref = seen_clips.insert(play_item.clip_id.clone());
 
                     // Only fetch/push the physical extents and add to the
                     // total size the first time this clip_id is seen.

@@ -1520,11 +1520,15 @@ mod tests {
                 "read at lba {lba} is not unit-aligned (offset {} % {ALIGN} != 0)",
                 lba - ext_start
             );
-            // Non-tail reads must be a whole number of units; the only
-            // permitted short read is the final partial unit (here COUNT is a
-            // multiple of ALIGN, so every read should be unit-multiple unless
-            // it shrank below one unit — which is itself a single unit).
-            let _ = count;
+            // Non-tail reads must be a whole number of units; the only permitted
+            // short read is a final partial unit (below one unit). Assert it
+            // rather than documenting it — a mid-stream non-unit-multiple read
+            // would straddle AACS unit boundaries and decrypt under the wrong
+            // alignment.
+            assert!(
+                count as u32 % ALIGN == 0 || (count as u32) < ALIGN,
+                "read count {count} is neither a whole number of units nor a sub-unit tail"
+            );
         }
 
         // At least one error was skipped (the bad unit) and a SectorSkipped

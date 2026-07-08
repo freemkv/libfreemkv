@@ -449,7 +449,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                     } else {
                         // Benign per-item OK: trace-level (L4) only; the
                         // apply-side rolling summary carries throughput.
-                        tracing::trace!("Pipeline send: OK in {:.3}ms", elapsed.as_micros());
+                        tracing::trace!(
+                            "Pipeline send: OK in {:.3}ms",
+                            elapsed.as_secs_f64() * 1000.0
+                        );
                     }
                 }
                 Ok(())
@@ -464,7 +467,10 @@ impl<I: Send + 'static, R: Send + 'static> Pipeline<I, R> {
                             std::any::type_name::<I>()
                         );
                     } else {
-                        tracing::debug!("Pipeline send: failed after {:.3}ms", elapsed.as_micros());
+                        tracing::debug!(
+                            "Pipeline send: failed after {:.3}ms",
+                            elapsed.as_secs_f64() * 1000.0
+                        );
                     }
                 }
                 Err(e.0)

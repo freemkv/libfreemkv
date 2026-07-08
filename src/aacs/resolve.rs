@@ -106,8 +106,12 @@ pub fn resolve_keys_with_reason(
 pub(crate) fn classify_resolve_failure(ctx: &ResolveContext<'_>) -> ResolveFailure {
     let has_vid = *ctx.volume_id != [0u8; 16];
     let providers = super::provider::Providers(ctx.providers);
-    let has_derivation_material =
-        !providers.device_keys().is_empty() || !providers.processing_keys().is_empty();
+    // Media keys are also derivation material: with an MK you can derive the VUK
+    // once you have the VID, so a media-keys-only provider that is merely missing
+    // the VID is VidUnavailable, not NoMaterial.
+    let has_derivation_material = !providers.device_keys().is_empty()
+        || !providers.processing_keys().is_empty()
+        || !providers.media_keys().is_empty();
     if !has_vid && has_derivation_material {
         ResolveFailure::VidUnavailable
     } else {

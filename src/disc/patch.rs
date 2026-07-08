@@ -473,9 +473,7 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
 /// gets recorded NonTrimmed. Pure data structure — no I/O — so each phase
 /// helper is unit-testable by asserting the residual `SubRanges`.
 ///
-/// Foundation for the phased `recover_section` orchestrator; not yet wired
-/// into the live loop (see the deferral note in the #50 work).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The residue tracker used by the phased `recover_section` orchestrator.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct SubRanges {
     /// (pos, len) pairs, sorted by pos, non-overlapping, all non-zero len.
@@ -1461,13 +1459,22 @@ impl Disc {
                     if !bad.is_empty() {
                         let n: usize = bad.len();
                         for (lba, cnt) in bad {
-                            let _ = m.record(
+                            if let Err(e) = m.record(
                                 lba as u64 * 2048,
                                 cnt as u64 * 2048,
                                 mapfile::SectorStatus::NonTrimmed,
+                            ) {
+                                tracing::warn!(
+                                    lba,
+                                    "reverify downgrade: mapfile record failed ({e}) — unit may stay mismarked as good"
+                                );
+                            }
+                        }
+                        if let Err(e) = m.flush() {
+                            tracing::warn!(
+                                "reverify downgrade: mapfile flush failed ({e}) — downgrade not persisted; a resume could mismark it good"
                             );
                         }
-                        let _ = m.flush();
                         // The re-verify ran AFTER `pipe.finish()` snapshotted
                         // `summary.stats`, so those stats still count the just-
                         // downgraded units as good. Refresh from the mapfile so
@@ -1547,14 +1554,13 @@ mod tests {
         assert!(on("true"));
     }
 
-    /// Transport failure (status=0xFF, USB-bridge crash) must be recognised by
-    /// the gate `handle_read_failure` now checks FIRST, so it aborts the pass
-    /// (wedged_exit + BreakOuter) instead of treating the bridge crash as an
-    /// ordinary bad sector and hammering the crashed device for up to the
-    /// per-range watchdog budget. `handle_read_failure` is not unit-testable in
-    /// isolation, so this guards the classification predicate the production
-    /// early-return keys off, and the contrast that an ordinary read error is
-    /// NOT misclassified as a transport failure.
+    /// Transport failure (status=0xFF, USB-bridge crash) must be recognised and
+    /// abort the pass, rather than being treated as an ordinary bad sector and
+    /// hammering the crashed device for up to the per-range watchdog budget. The
+    /// transport-failure classification predicate is not unit-testable in
+    /// isolation, so this guards the predicate the production early-return keys
+    /// off, and the contrast that an ordinary read error is NOT misclassified as
+    /// a transport failure.
     #[test]
     fn transport_failure_is_recognised_for_patch_abort() {
         use crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE;
