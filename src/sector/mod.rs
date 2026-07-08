@@ -16,6 +16,7 @@
 pub mod decrypting;
 pub mod file;
 pub mod prefetched;
+pub mod recovery;
 
 use crate::error::Result;
 

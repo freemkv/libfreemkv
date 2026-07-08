@@ -2041,10 +2041,10 @@ impl Disc {
     /// 1. Real titles (`size_bytes ≤ capacity_bytes`) before virtual
     ///    composites. The capacity check is a hard "physically
     ///    possible data on this disc" gate.
-    /// 2. Among real titles, fewer clips first. A 1-clip playlist is
-    ///    the canonical main feature; multi-clip playlists are either
-    ///    chapter-stitched (small count) or virtual composites
-    ///    (large count). Fewer wins.
+    /// 2. Among real titles, LARGEST physical size first — the main
+    ///    feature is the biggest real title on the disc. (This replaced
+    ///    the old clip-count ordering, which mis-ranked chapter-per-clip
+    ///    discs like Fast & Furious.)
     /// 3. Tiebreak on longer duration first.
     ///
     /// **Effect on non-branching discs:** unchanged — the main movie
@@ -2614,6 +2614,28 @@ impl Disc {
             return Ok(());
         }
         self.ensure_decryptable_keys(raw, keys)
+    }
+
+    /// Upfront FMTS (AACS 2.1) key gate, parallel to
+    /// [`ensure_title_decryptable`](Self::ensure_title_decryptable). A 2.1 disc
+    /// carries forensic variant segments that need segment (variant) keys the
+    /// unit-key path cannot provide. When
+    /// [`BYPASS_FMTS_KEY`](crate::aacs::segment::BYPASS_FMTS_KEY) is `false`,
+    /// their absence is a hard upfront failure ([`Error::FmtsKeyMissing`]) — the
+    /// same policy as a missing unit key, so a forensic-holed rip is refused, not
+    /// produced. When `true` (the default today) the segments are skipped as
+    /// expected loss and this passes. `raw` mode and non-FMTS discs always pass.
+    pub fn ensure_forensic_segments_decryptable(&self, raw: bool) -> Result<()> {
+        if raw || crate::aacs::segment::BYPASS_FMTS_KEY {
+            return Ok(());
+        }
+        // A 2.1 (FMTS) disc carries forensic variant segments with no segment-key
+        // source (none exists yet), so its variant segments cannot be opened.
+        // Refuse upfront rather than emit a forensic-holed rip.
+        if self.format == DiscFormat::Fmts {
+            return Err(Error::FmtsKeyMissing);
+        }
+        Ok(())
     }
 
     /// Inject pre-resolved AACS unit keys into a scanned disc — the deferred-mux
@@ -3231,25 +3253,37 @@ impl Disc {
         // ISO file: if resuming and mapfile has Finished ranges, open existing;
         // otherwise create fresh and pre-size to total_bytes (sparse holes for
         // non-tried regions).
-        let is_regular = std::fs::metadata(path)
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-        let file = if resume
+        //
+        // `is_regular` MUST be read from the OPEN file handle, not from
+        // `metadata(path)` — on a fresh rip the path does not exist yet, so a
+        // pre-create `metadata(path)` always fails (is_regular=false), which both
+        // skips the pre-size AND makes `SweepSink::close` swallow a real
+        // `sync_all()` failure on the just-written ISO as if it were /dev/null.
+        let (file, is_regular) = if resume
             && std::fs::metadata(path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
-            std::fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(path)
-                .map_err(|e| Error::IoError { source: e })?
+                .map_err(|e| Error::IoError { source: e })?;
+            let reg = f
+                .metadata()
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            (f, reg)
         } else {
             let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
-            if is_regular {
+            let reg = f
+                .metadata()
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if reg {
                 f.set_len(total_bytes)
                     .map_err(|e| Error::IoError { source: e })?;
             }
-            f
+            (f, reg)
         };
 
         // Wrap the raw `File` in our bounded-cache `WritebackFile`
