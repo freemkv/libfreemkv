@@ -2056,17 +2056,27 @@ impl Disc {
         b: &DiscTitle,
         capacity_bytes: u64,
     ) -> std::cmp::Ordering {
+        // A title bigger than the whole disc is a "play-all" composite artifact
+        // (its declared size double-counts clips shared with other playlists) —
+        // demote it below any real single title.
         let a_oversize = a.size_bytes > capacity_bytes;
         let b_oversize = b.size_bytes > capacity_bytes;
         a_oversize
             .cmp(&b_oversize)
-            .then_with(|| a.clips.len().cmp(&b.clips.len()))
+            // PRIMARY: largest physical size = the main feature. Robust where
+            // duration and clip-count are not — a decoy "play-all" playlist runs
+            // long (e.g. 1h31m) but is tiny (0.4 GB of reused/junk clips), and the
+            // real feature is often chaptered into MANY clips (one per chapter),
+            // which the old clip-count-ascending key wrongly demoted below 1-clip
+            // bonus reels. Validated across 23 UHD/BD discs — fixes F9 / Fast Five
+            // / Fast & Furious 6 / Furious 7 (feature was ranked ~#13–36), no
+            // regressions on the 19 already correct.
+            .then_with(|| b.size_bytes.cmp(&a.size_bytes))
+            // Tiebreak for equal-size twins: longer duration, then richer audio —
+            // the same feature authored as sibling playlists (a full-audio main
+            // vs an audio-reduced twin, e.g. Fight Club's 00800 [DTS-HD MA + 13
+            // tracks] vs 00004 [stereo AC-3 only]). Prefer lossless-multichannel.
             .then_with(|| b.duration_secs.total_cmp(&a.duration_secs))
-            // Same length + clip count = the same feature authored as multiple
-            // playlists (a full-audio main vs an audio-reduced twin, e.g. Fight
-            // Club's 00800 [DTS-HD MA + 13 tracks] vs 00004 [stereo AC-3 only]).
-            // Prefer the richer audio so we never rip a stereo-only variant over
-            // the lossless-multichannel main feature.
             .then_with(|| Self::audio_richness(b).cmp(&Self::audio_richness(a)))
     }
 
@@ -4453,14 +4463,14 @@ mod tests {
         );
     }
 
-    /// Non-branching disc: longest 1-clip title is the movie. Sort
-    /// must not change behaviour — the existing "duration descending"
-    /// expectation holds when no titles overflow capacity.
+    /// Non-branching disc: largest title is the movie. With realistic sizes
+    /// (bytes track duration for same-codec content) size-first yields the same
+    /// ranking as duration — biggest/longest feature, then extra, then menu.
     #[test]
     fn canonical_order_preserves_natural_ranking_on_normal_disc() {
         const CAPACITY: u64 = 60_000_000_000;
         let mut titles = vec![
-            title_with("00100.mpls", 600.0, 5_000_000_000, 1), // 10 min menu
+            title_with("00100.mpls", 600.0, 500_000_000, 1), // 10 min menu (small)
             title_with("00800.mpls", 7320.0, 55_000_000_000, 1), // 2h02m main feature
             title_with("00200.mpls", 1800.0, 2_000_000_000, 1), // 30 min extra
         ];
@@ -4492,21 +4502,6 @@ mod tests {
             titles[0].playlist, "VTS_02_main",
             "titles[0] (== what `freemkv -t 1` selects) must be the DVD main feature"
         );
-    }
-
-    /// Tiebreak: equal duration + equal capacity-validity → fewer
-    /// clips wins. A chapter-stitched 3-clip movie should beat a
-    /// 50-clip virtual composite of the same duration.
-    #[test]
-    fn canonical_order_fewer_clips_wins_tiebreak() {
-        const CAPACITY: u64 = 100_000_000_000;
-        let mut titles = vec![
-            title_with("00050.mpls", 7200.0, 50_000_000_000, 50),
-            title_with("00800.mpls", 7200.0, 50_000_000_000, 3),
-        ];
-        titles.sort_by(|a, b| Disc::canonical_title_order(a, b, CAPACITY));
-        assert_eq!(titles[0].playlist, "00800.mpls");
-        assert_eq!(titles[1].playlist, "00050.mpls");
     }
 
     #[test]
@@ -4616,6 +4611,46 @@ mod tests {
         assert_eq!(
             Disc::detect_disc_format(&mut disc, &udf, &[]),
             DiscFormat::HdDvd
+        );
+    }
+
+    /// Title selection is by largest physical size, NOT clip count or duration.
+    /// Real-disc shape (Fast Five): a 57 GB / 11-clip feature must outrank both a
+    /// small 1-clip bonus reel and a long-but-tiny decoy "play-all" (91 reused
+    /// clips, 1h31m, 0.4 GB). The old clip-count-ascending key put the bonus t1.
+    #[test]
+    fn canonical_title_order_picks_largest_feature() {
+        fn title_sized(size_bytes: u64, duration_secs: f64, n_clips: usize) -> DiscTitle {
+            DiscTitle {
+                playlist: String::new(),
+                playlist_id: 0,
+                duration_secs,
+                size_bytes,
+                clips: (0..n_clips)
+                    .map(|i| Clip {
+                        clip_id: format!("{i:05}"),
+                        in_time: 0,
+                        out_time: 0,
+                        duration_secs: 0.0,
+                        source_packets: 0,
+                    })
+                    .collect(),
+                streams: Vec::new(),
+                chapters: Vec::new(),
+                extents: Vec::new(),
+                content_format: ContentFormat::BdTs,
+                codec_privates: Vec::new(),
+            }
+        }
+        let capacity = 66_000_000_000u64;
+        let feature = title_sized(57_000_000_000, 7860.0, 11); // 2h11m, 11 chapters
+        let bonus = title_sized(1_200_000_000, 600.0, 1); // 10m, 1 clip
+        let decoy = title_sized(400_000_000, 5460.0, 91); // 1h31m but tiny (reused)
+        let mut v = vec![bonus, decoy, feature];
+        v.sort_by(|a, b| Disc::canonical_title_order(a, b, capacity));
+        assert_eq!(
+            v[0].size_bytes, 57_000_000_000,
+            "the largest real title is the main feature"
         );
     }
 
