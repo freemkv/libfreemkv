@@ -13,6 +13,7 @@ mod dvd;
 pub mod dvd_audio_probe;
 mod encrypt;
 mod extract;
+mod hddvd;
 pub mod mapfile;
 mod patch;
 pub mod read_error;
@@ -93,8 +94,16 @@ pub enum ContentFormat {
 pub enum DiscFormat {
     /// 4K UHD Blu-ray (HEVC 2160p)
     Uhd,
+    /// UHD Blu-ray with AACS 2.1 FMTS content — the main feature is a `.fmts`
+    /// clip (M2TS transport stream plus interleaved forensic variant segments).
+    /// A BD-tree disc (enumerated by [`Disc::scan_bluray_titles`]); distinct
+    /// from [`DiscFormat::Uhd`] only in the container + AACS generation.
+    Fmts,
     /// Standard Blu-ray (1080p/1080i)
     BluRay,
+    /// HD-DVD — `HVDVD_TS/` tree with `.evo` (Enhanced VOB, MPEG program stream)
+    /// clips. A tree-level peer of DVD/BD, enumerated by its own scanner.
+    HdDvd,
     /// DVD
     Dvd,
     /// Unknown
@@ -1481,13 +1490,10 @@ impl Disc {
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
 
         let meta_title = Self::read_meta_title(&mut buffered, &udf_fs);
-        let format = if udf_fs.find_dir("/BDMV").is_some() {
-            DiscFormat::BluRay // full scan distinguishes UHD vs BD
-        } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            DiscFormat::Dvd
-        } else {
-            DiscFormat::Unknown
-        };
+        // Authoritative up front — same MKB-driven detector as the full scan
+        // (no titles needed: BD/UHD/FMTS come from the MKB generation). This
+        // no longer defaults to BluRay and defers UHD/FMTS to the full scan.
+        let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
@@ -1907,11 +1913,19 @@ impl Disc {
             }
         };
 
-        // 3. Titles — BD (MPLS playlists) or DVD (IFO title sets)
+        // 3. Titles + container — dispatched by on-disc tree. HD-DVD and DVD are
+        //    tree-level peers, each with its own enumerator; FMTS shares the BD
+        //    tree (a `.fmts` stream variant). Disc FORMAT is a separate axis
+        //    derived below from the AACS MKB generation, not the tree.
         let (mut titles, content_format) = if udf_fs.find_dir("/BDMV").is_some() {
             (
                 Self::scan_bluray_titles(reader, &udf_fs),
                 ContentFormat::BdTs,
+            )
+        } else if udf_fs.find_dir("/HVDVD_TS").is_some() {
+            (
+                Self::scan_hddvd_titles(reader, &udf_fs),
+                ContentFormat::MpegPs,
             )
         } else if udf_fs.find_dir("/VIDEO_TS").is_some() {
             (
@@ -1936,8 +1950,9 @@ impl Disc {
         crate::labels::apply(reader, &udf_fs, &mut titles);
         crate::labels::fill_defaults(&mut titles);
 
-        // 5. Derive format, layers, region
-        let format = Self::detect_format(&titles);
+        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD),
+        //    layers, region.
+        let format = Self::detect_disc_format(reader, &udf_fs, &titles);
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = DiscRegion::Free;
 
@@ -2085,6 +2100,48 @@ impl Disc {
             }
         }
         (lossless, max_ch, count)
+    }
+
+    /// The disc format, from the two on-disc axes:
+    ///   * **tree** → HD-DVD (`HVDVD_TS/`) and DVD (`VIDEO_TS/`) are tree-level
+    ///     peers with their own enumerators;
+    ///   * **AACS MKB generation** → within the BD tree (`BDMV/`), the MKB Type
+    ///     record decides BD (1.0) / UHD (2.0) / FMTS (2.1). This is the
+    ///     authoritative, cheap signal (the Type record is the first bytes of
+    ///     `MKB_RO.inf`) — reusing [`crate::aacs::mkb::mkb_type`] /
+    ///     [`crate::aacs::mkb::MkbType::generation`], not a filesystem heuristic.
+    ///
+    /// An unencrypted / MKB-less BD tree falls back to video resolution (still a
+    /// BD-tree disc, so never below [`DiscFormat::BluRay`]).
+    fn detect_disc_format(
+        reader: &mut dyn SectorSource,
+        udf_fs: &crate::udf::UdfFs,
+        titles: &[DiscTitle],
+    ) -> DiscFormat {
+        use crate::aacs::mkb::{AacsVersion, mkb_type};
+        if udf_fs.find_dir("/HVDVD_TS").is_some() {
+            return DiscFormat::HdDvd;
+        }
+        if udf_fs.find_dir("/VIDEO_TS").is_some() {
+            return DiscFormat::Dvd;
+        }
+        if udf_fs.find_dir("/BDMV").is_some() {
+            // Only the Type-and-Version record (first record) is needed.
+            if let Ok(mkb) = udf_fs.read_file_prefix(reader, "/AACS/MKB_RO.inf", 64) {
+                match mkb_type(&mkb).map(|t| t.generation()) {
+                    Some(AacsVersion::V21) => return DiscFormat::Fmts,
+                    Some(AacsVersion::V20) => return DiscFormat::Uhd,
+                    Some(AacsVersion::V10) => return DiscFormat::BluRay,
+                    None => {}
+                }
+            }
+            // Unencrypted / unreadable MKB: refine by resolution, default BD.
+            return match Self::detect_format(titles) {
+                DiscFormat::Unknown => DiscFormat::BluRay,
+                other => other,
+            };
+        }
+        DiscFormat::Unknown
     }
 
     fn detect_format(titles: &[DiscTitle]) -> DiscFormat {
@@ -3977,8 +4034,10 @@ const MIN_BATCH_SECTORS: u16 = 3;
 
 pub(crate) fn ecc_sectors(format: DiscFormat) -> u16 {
     match format {
-        DiscFormat::Uhd | DiscFormat::BluRay => 32,
-        DiscFormat::Dvd => 16,
+        // BD-family 64 KiB ECC block (32 × 2048). FMTS is a UHD BD disc.
+        DiscFormat::Uhd | DiscFormat::Fmts | DiscFormat::BluRay => 32,
+        // 32 KiB ECC block (16 × 2048) — DVD and HD-DVD.
+        DiscFormat::Dvd | DiscFormat::HdDvd => 16,
         DiscFormat::Unknown => 32,
     }
 }
@@ -4472,6 +4531,92 @@ mod tests {
     fn detect_format_empty() {
         let titles: Vec<DiscTitle> = Vec::new();
         assert_eq!(Disc::detect_format(&titles), DiscFormat::Unknown);
+    }
+
+    /// An AACS MKB Type-and-Version record (0x10) carrying `raw_type` — the only
+    /// record [`Disc::detect_disc_format`] reads to decide BD/UHD/FMTS.
+    fn mkb_type_record(raw_type: u32) -> Vec<u8> {
+        let mut v = vec![0x10, 0x00, 0x00, 0x0c]; // record type 0x10, rec_len 12
+        v.extend_from_slice(&raw_type.to_be_bytes()); // MKBType @ body offset 0
+        v.extend_from_slice(&0u32.to_be_bytes()); // version @ body offset 4
+        v
+    }
+
+    /// FORMAT derives from the AACS MKB generation, not the tree or filesystem:
+    /// 2.1 → FMTS, 2.0 → UHD, 1.0 → BD — all from the MKB Type record.
+    #[test]
+    fn detect_format_from_mkb_generation() {
+        use crate::udf::fixture::*;
+        for (raw, expected) in [
+            (0x4815_1003u32, DiscFormat::Fmts),
+            (0x4814_1003u32, DiscFormat::Uhd),
+            (0x0004_1003u32, DiscFormat::BluRay),
+        ] {
+            let mut disc = MemDisc::new();
+            let root = DirSpec {
+                name: String::new(),
+                icb_lba: 10,
+                dir_data_lba: 11,
+                files: Vec::new(),
+                subdirs: vec![
+                    DirSpec {
+                        name: "BDMV".into(),
+                        icb_lba: 12,
+                        dir_data_lba: 13,
+                        files: Vec::new(),
+                        subdirs: vec![],
+                    },
+                    DirSpec {
+                        name: "AACS".into(),
+                        icb_lba: 14,
+                        dir_data_lba: 15,
+                        files: vec![file_with(
+                            "MKB_RO.inf",
+                            16,
+                            5000,
+                            mkb_type_record(raw),
+                            true,
+                        )],
+                        subdirs: vec![],
+                    },
+                ],
+            };
+            build_udf_skeleton(&mut disc, 10);
+            lay_dir(&mut disc, &root);
+            let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+            assert_eq!(
+                Disc::detect_disc_format(&mut disc, &udf, &[]),
+                expected,
+                "MKB type {raw:#010x}"
+            );
+        }
+    }
+
+    /// HD-DVD is a tree-level format — recognized from `HVDVD_TS/`, no MKB.
+    #[test]
+    fn detect_format_hddvd_from_tree() {
+        use crate::udf::fixture::*;
+        let mut disc = MemDisc::new();
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".into(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+        assert_eq!(
+            Disc::detect_disc_format(&mut disc, &udf, &[]),
+            DiscFormat::HdDvd
+        );
     }
 
     #[test]
