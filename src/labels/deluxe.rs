@@ -64,11 +64,15 @@ use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 use std::collections::{HashMap, HashSet};
 
-pub fn detect(udf: &UdfFs) -> bool {
-    // Cheap pre-check at the dir level; the real signal is
-    // `com/bydeluxe/` inside any top-level jar's central directory,
-    // which `parse()` confirms when given a `SectorSource`.
-    jar::has_any_top_level_jar(udf)
+pub fn detect(reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
+    // The real signal is `com/bydeluxe/` inside a top-level jar's central
+    // directory. With a reader in detect we check it directly (cheap
+    // central-directory scan, no bytecode walk) so this parser claims only
+    // Deluxe discs; `parse()` repeats the check.
+    jar::for_each_jar(reader, udf, |_entry, archive| {
+        jar::has_path_prefix(archive, "com/bydeluxe/").then_some(())
+    })
+    .is_some()
 }
 
 pub fn parse(reader: &mut dyn SectorSource, udf: &UdfFs) -> Option<ParseResult> {

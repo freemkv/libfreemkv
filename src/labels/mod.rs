@@ -20,6 +20,7 @@ pub(crate) mod jar;
 mod mpls_universal;
 mod paramount;
 mod pixelogic;
+mod png_filenames;
 pub(crate) mod text;
 pub mod vocab;
 pub(crate) mod xml;
@@ -91,7 +92,11 @@ pub enum LabelQualifier {
 // the registry picks the highest-confidence parse result, falling back
 // to array order on confidence ties.
 
-type DetectFn = fn(&UdfFs) -> bool;
+// `detect` takes the reader too, so a parser can look INSIDE a jar's central
+// directory (real vendor-prefix / project-file check) rather than firing on
+// "any jar present". Precise detection is what lets the registry scale to many
+// parsers without cross-parser collisions.
+type DetectFn = fn(&mut dyn SectorSource, &UdfFs) -> bool;
 type ParseFn = fn(&mut dyn SectorSource, &UdfFs) -> Option<ParseResult>;
 
 /// Per-parser claim of how reliable its output is. Used by the
@@ -158,11 +163,11 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
     ("criterion", criterion::detect, criterion::parse),
     ("pixelogic", pixelogic::detect, pixelogic::parse),
     ("ctrm", ctrm::detect, ctrm::parse),
-    // dbp and deluxe both detect on "any top-level .jar in /BDMV/JAR/"
-    // (every BD-J disc trips that) and do the real vendor-prefix check
-    // in parse(). Order between them is the tiebreaker on equal
-    // confidence; dbp goes first because its parse path is cheaper
-    // (constant-pool iteration vs. deluxe's bytecode walking).
+    // dbp and deluxe now detect via the real `com/<vendor>/` central-directory
+    // prefix (reader-backed), so they claim only their own discs. Order between
+    // them is the tiebreaker on equal confidence; dbp goes first because its
+    // parse path is cheaper (constant-pool iteration vs. deluxe's bytecode
+    // walking).
     ("dbp", dbp::detect, dbp::parse),
     ("deluxe", deluxe::detect, deluxe::parse),
     // Universal MPLS fallback. Returns Confidence::Low so framework
@@ -176,6 +181,11 @@ const PARSERS: &[(&str, DetectFn, ParseFn)] = &[
         mpls_universal::detect,
         mpls_universal::parse,
     ),
+    // Menu-graphic filename language hints (Low). AFTER mpls_universal so the
+    // richer spec-derived floor wins the Low tie whenever it produces anything;
+    // this only becomes the chosen parser when even MPLS yields nothing but the
+    // menu artwork still names its languages. A last-resort language source.
+    ("png_filenames", png_filenames::detect, png_filenames::parse),
 ];
 
 /// Search disc for config files, extract labels, apply to streams.
@@ -521,7 +531,7 @@ fn generate_audio_label_inner(
 fn extract(reader: &mut dyn SectorSource, udf: &UdfFs) -> Vec<StreamLabel> {
     let mut best: Option<(&'static str, ParseResult)> = None;
     for (name, detect, parse) in PARSERS {
-        if !detect(udf) {
+        if !detect(reader, udf) {
             continue;
         }
         tracing::info!(parser = name, "label parser detected");
@@ -788,7 +798,7 @@ pub fn analyze(reader: &mut dyn SectorSource, udf: &UdfFs) -> LabelAnalysis {
     let mut all_results: Vec<(&'static str, ParseResult)> = Vec::new();
 
     for (name, detect, parse) in PARSERS {
-        if !detect(udf) {
+        if !detect(reader, udf) {
             continue;
         }
         tracing::info!(parser = name, "label parser detected");
@@ -961,8 +971,9 @@ pub struct ChapterSummary {
 
 /// List filenames found under any `/BDMV/JAR/<x>/` subdirectory of
 /// the disc. Deduped, sorted. Returns an empty vec if no JAR dir is
-/// present.
-fn jar_inventory(udf: &UdfFs) -> Vec<String> {
+/// present. `pub(crate)` so filename-based parsers (e.g. `png_filenames`)
+/// can scan menu-asset names without a reader.
+pub(crate) fn jar_inventory(udf: &UdfFs) -> Vec<String> {
     let Some(jar_dir) = udf.find_dir("/BDMV/JAR") else {
         return Vec::new();
     };
@@ -1042,12 +1053,14 @@ mod registry_tests {
                 "dbp",
                 "deluxe",
                 "mpls_universal",
+                "png_filenames",
             ],
-            "PARSERS array order changed — confirm dbp + deluxe stay just \
-             before mpls_universal (loose detect, real check in parse), \
-             stricter parsers (paramount/criterion/pixelogic/ctrm — all \
-             file-presence gated detect) stay first, and mpls_universal \
-             stays LAST as the universal Low-confidence fallback."
+            "PARSERS array order changed — file-presence/reader-gated High \
+             parsers (paramount/criterion/pixelogic/ctrm) stay first; dbp + \
+             deluxe (now real com/<vendor>/ prefix detect) stay before \
+             mpls_universal; mpls_universal stays the universal Low fallback; \
+             png_filenames (Low, language-only hint) stays LAST so MPLS wins \
+             the Low tie whenever it produces anything."
         );
     }
 

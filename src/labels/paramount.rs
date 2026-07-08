@@ -16,7 +16,7 @@ use super::{LabelPurpose, LabelQualifier, ParseResult, StreamLabel, StreamLabelT
 use crate::sector::SectorSource;
 use crate::udf::UdfFs;
 
-pub fn detect(udf: &UdfFs) -> bool {
+pub fn detect(_reader: &mut dyn SectorSource, udf: &UdfFs) -> bool {
     super::jar_file_exists(udf, "playlists.xml")
 }
 
