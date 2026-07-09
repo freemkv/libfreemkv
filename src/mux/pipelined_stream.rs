@@ -75,6 +75,24 @@ pub struct PipelinedPesStream {
     /// Per-track "is inter-coded video" flag (only video has cross-frame
     /// references the gate must protect). Indexed by stream index.
     is_video: Vec<bool>,
+    /// Per-track access-unit assembler. On the PS path a program-stream video AU
+    /// is split across many fixed-size PES fragments; this reassembles them to the
+    /// codec's AU boundary so the parser sees AU-complete PES — the same shape the
+    /// TS demuxer already delivers via PUSI. Self-framing codecs (MPEG-2, audio)
+    /// use passthrough, so every track runs through it uniformly. Indexed by
+    /// stream index. (TS titles are AU-complete already, so this is a passthrough
+    /// there too — `consume_ts` does not use it.)
+    au_asm: Vec<super::au_assembly::AuAssembler>,
+}
+
+/// The `Codec` of a stream, for configuring its [`AuAssembler`].
+fn stream_codec(s: &crate::disc::Stream) -> crate::disc::Codec {
+    use crate::disc::Stream;
+    match s {
+        Stream::Video(v) => v.codec,
+        Stream::Audio(a) => a.codec,
+        Stream::Subtitle(sub) => sub.codec,
+    }
 }
 
 impl PipelinedPesStream {
@@ -102,6 +120,11 @@ impl PipelinedPesStream {
         let resync = (0..title.streams.len())
             .map(|_| super::resync::ResyncGate::new())
             .collect();
+        let au_asm = title
+            .streams
+            .iter()
+            .map(|s| super::au_assembly::AuAssembler::for_codec(stream_codec(s)))
+            .collect();
         Self {
             title,
             parsers,
@@ -115,6 +138,7 @@ impl PipelinedPesStream {
             dropped_nav_packets: 0,
             resync,
             is_video,
+            au_asm,
         }
     }
 
@@ -254,23 +278,50 @@ impl PipelinedPesStream {
                 );
                 continue;
             };
-            let pes = PesPacket {
-                // Carry the PS demuxer's byte-exact source stamp through to the
-                // codec parser, exactly as the TS path does — provenance must
-                // survive the PsPacket → PesPacket seam so the frame's `source`
-                // reaches the mux/index (FVI `src`), never reconstructed.
-                source: ps.source,
-                pid,
-                pts: ps.pts.map(|p| p as i64),
-                dts: ps.dts.map(|d| d as i64),
-                data: ps.data,
-                // PS (DVD/CSS) path: no AACS conceal → no continuity-gap flag.
-                discontinuity: false,
+            // Carry the PS demuxer's byte-exact source stamp through to the codec
+            // parser, exactly as the TS path does — provenance must survive the
+            // PsPacket → PesPacket seam so the frame's `source` reaches the
+            // mux/index (FVI `src`), never reconstructed.
+            let (pts_i64, dts_i64, src) = (
+                ps.pts.map(|p| p as i64),
+                ps.dts.map(|d| d as i64),
+                ps.source,
+            );
+            // Reassemble the PS fragments into AU-complete PES for this track
+            // (passthrough for self-framing codecs — MPEG-2/audio), so the parser
+            // sees exactly the AU-complete shape a transport stream delivers. The
+            // AU-start PTS/source survive the reassembly. A track with no assembler
+            // (only reachable via a hand-built `pid_to_track` outrunning the stream
+            // list) passes the fragment straight through. (PS path: no AACS conceal
+            // → no continuity-gap flag.)
+            let pkts: Vec<PesPacket> = match self.au_asm.get_mut(track) {
+                Some(asm) => asm
+                    .push(&ps.data, pts_i64, dts_i64, src, false)
+                    .into_iter()
+                    .map(|au| PesPacket {
+                        source: au.source,
+                        pid,
+                        pts: au.pts,
+                        dts: au.dts,
+                        data: au.data,
+                        discontinuity: au.discontinuity,
+                    })
+                    .collect(),
+                None => vec![PesPacket {
+                    source: src,
+                    pid,
+                    pts: pts_i64,
+                    dts: dts_i64,
+                    data: ps.data,
+                    discontinuity: false,
+                }],
             };
-            if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
-                for frame in parser.parse(&pes) {
-                    self.pending_frames
-                        .push_back(PesFrame::from_codec_frame(track, frame));
+            for pes in &pkts {
+                if let Some((_, parser)) = self.parsers.iter_mut().find(|(p, _)| *p == pid) {
+                    for frame in parser.parse(pes) {
+                        self.pending_frames
+                            .push_back(PesFrame::from_codec_frame(track, frame));
+                    }
                 }
             }
         }
@@ -315,11 +366,30 @@ impl Stream for PipelinedPesStream {
                     let pending = &mut self.pending_frames;
                     let resync = &mut self.resync;
                     let is_video = &self.is_video;
+                    let au_asm = &mut self.au_asm;
                     for (pid, parser) in self.parsers.iter_mut() {
                         let Some(&(_, track)) = pid_to_track.iter().find(|(p, _)| p == pid) else {
                             continue;
                         };
-                        for frame in parser.flush() {
+                        // First: the trailing access unit(s) the PS assembler
+                        // buffered past the final fragment (the last AU has no
+                        // following boundary). Parse them, THEN drain the parser's
+                        // own internal buffer (MPEG-2 final GOP, DTS-HD tail).
+                        let mut frames = Vec::new();
+                        let tail = au_asm.get_mut(track).map(|a| a.flush()).unwrap_or_default();
+                        for au in tail {
+                            let pes = PesPacket {
+                                source: au.source,
+                                pid: *pid,
+                                pts: au.pts,
+                                dts: au.dts,
+                                data: au.data,
+                                discontinuity: au.discontinuity,
+                            };
+                            frames.extend(parser.parse(&pes));
+                        }
+                        frames.extend(parser.flush());
+                        for frame in frames {
                             let emit = match resync.get_mut(track) {
                                 Some(gate) => gate.admit(
                                     is_video.get(track).copied().unwrap_or(false),
@@ -799,6 +869,109 @@ mod tests {
         assert_eq!(f.track, 1, "routed by dvd_pid to track 1");
         assert_eq!(f.data, vec![0x12, 0x34]);
         assert!(stream.read().unwrap().is_none(), "unmappable PS dropped");
+    }
+
+    /// Build a single-video-stream title on `codec`, a [`CountingParser`] (1 frame
+    /// per PES it is handed), and feed three 0xE0 program-stream fragments that
+    /// together form TWO H.264 access units (AUD-delimited); only AU-start
+    /// fragments carry a PTS. Returns every emitted frame.
+    fn run_ps_fragments(codec: Codec) -> Vec<crate::pes::PesFrame> {
+        let mut title = DiscTitle::empty();
+        title.streams.push(crate::disc::Stream::Video(VideoStream {
+            pid: crate::mux::ps::DVD_VIDEO_PID,
+            codec,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F23_976,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        }));
+        let parsers: Vec<(u16, Box<dyn CodecParser>)> = vec![(
+            crate::mux::ps::DVD_VIDEO_PID,
+            Box::new(CountingParser {
+                per_pes: 1,
+                flush_n: 0,
+                cp: None,
+            }),
+        )];
+        let pid_to_track = vec![(crate::mux::ps::DVD_VIDEO_PID, 0usize)];
+        let (mut stream, tx) = make_stream(title, parsers, pid_to_track);
+
+        let frag = |pts, data: &[u8]| PsPacket {
+            source: None,
+            stream_id: 0xE0,
+            sub_stream_id: None,
+            pts,
+            dts: None,
+            data: data.to_vec(),
+        };
+        tx.send(DemuxBatch::Ps(vec![
+            frag(Some(9_000), &[0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xAA]), // AU1: AUD + slice head
+            frag(None, &[0xBB, 0xCC]), // AU1: slice tail (no PTS)
+            frag(Some(18_000), &[0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xDD]), // AU2 opener (AUD closes AU1)
+        ]))
+        .unwrap();
+        tx.send(DemuxBatch::Eof).unwrap();
+
+        let mut out = Vec::new();
+        while let Some(f) = stream.read().unwrap() {
+            out.push(f);
+        }
+        out
+    }
+
+    /// PS-path integration: an H.264 access unit split across several fixed-size
+    /// PES fragments (only the first with a PTS) must be REJOINED so the parser
+    /// sees one AU-complete PES with the AU-START pts — not one bogus per-fragment
+    /// frame each with pts 0 (the HD-DVD truncation/corruption bug). The
+    /// `CountingParser` makes it observable: 3 fragments forming 2 AUs → 2 frames.
+    #[test]
+    fn ps_h264_au_split_across_fragments_reassembles_to_one_frame() {
+        let frames = run_ps_fragments(Codec::H264);
+        assert_eq!(
+            frames.len(),
+            2,
+            "3 fragments → 2 access units, not 3 frames"
+        );
+        assert_eq!(frames[0].track, 0);
+        assert_eq!(
+            frames[0].data,
+            vec![0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xAA, 0xBB, 0xCC],
+            "AU1 = fragment1 + fragment2 rejoined"
+        );
+        assert_eq!(
+            frames[0].pts, 9_000,
+            "AU carries its START pts, not the mid-fragment None→0"
+        );
+        assert_eq!(
+            frames[1].data,
+            vec![0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0xDD],
+            "AU2 flushed at EOF (no following boundary)"
+        );
+        assert_eq!(frames[1].pts, 18_000);
+    }
+
+    /// Contrast: a self-framing codec (MPEG-2 reassembles in its own parser) uses
+    /// a Passthrough assembler — the SAME three fragments pass straight through as
+    /// three frames, byte-identical to the pre-assembler behaviour. This proves the
+    /// reassembly is gated by codec and does not disturb the DVD/MPEG-2 path.
+    #[test]
+    fn ps_self_framing_codec_is_not_reassembled() {
+        let frames = run_ps_fragments(Codec::Mpeg2);
+        assert_eq!(
+            frames.len(),
+            3,
+            "MPEG-2 passthrough: one frame per fragment"
+        );
+        assert_eq!(frames[0].pts, 9_000);
+        assert_eq!(
+            frames[1].pts, 0,
+            "mid-fragment has no PTS under passthrough"
+        );
+        assert_eq!(frames[2].pts, 18_000);
     }
 
     /// A batch with no trackable packets must NOT terminate the stream early:
