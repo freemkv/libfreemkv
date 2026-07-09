@@ -9,15 +9,21 @@
 //! rule: a genuinely different format is a new enumerator, not an extension
 //! bolted into the BD path.
 //!
-//! Scope today: enumerate the `.evo` clips and yield one [`DiscTitle`] per clip
-//! (container [`ContentFormat::MpegPs`], so the existing PS mux path handles it).
-//! Per-clip streams ARE enumerated: the clip head is demuxed through the PS
-//! demuxer and one [`Stream`] is built per distinct elementary stream (video +
-//! DD+ audio sub-streams), with the codec sniffed from the ES bytes — this is
-//! what the mux path needs to route packets.
+//! Title composition: the `HVA*.VTI` navigation file (the DVD-IFO analogue) names
+//! every clip in authored order. Standard Content splits the main feature across
+//! clips at the layer break (`FEATURE_1`/`FEATURE_2`, or `feature`/`feature_Divide`);
+//! the scanner parses the VTI clip table and concatenates those parts into ONE
+//! [`DiscTitle`] (so the largest-title pick is the whole movie, not just part 1),
+//! emitting every other clip as its own title. Container is
+//! [`ContentFormat::MpegPs`], so the existing PS mux path handles it. Per-clip
+//! streams ARE enumerated: the clip head is demuxed through the PS demuxer and one
+//! [`Stream`] is built per distinct elementary stream (video + DD+ audio
+//! sub-streams), with the codec sniffed from the ES bytes.
 //!
 //! What is NOT parsed yet — and is honestly stubbed, not faked:
-//!   * `.xpl` playlist ordering (title composition / chapters, FEATURE_1+2 join),
+//!   * full VTI program-chain parsing (chapters, non-feature title grouping) —
+//!     the feature join uses the clip table + the `feature*` naming convention,
+//!     not the authoritative PGC,
 //!   * `.map` timemap → real durations,
 //!   * subtitles (8-bit RLC on `0xBD` sub `0x20..=0x3F`).
 //!
@@ -44,6 +50,77 @@ const EVO_PROBE_SECTORS: u32 = 8192;
 /// video SPS / audio syncword lands well inside the first few KiB, so 128 KiB
 /// is generous while bounding probe memory.
 const EVO_ES_SAMPLE_CAP: usize = 128 * 1024;
+
+/// HD-DVD Standard Content navigation file magic (`HVDVD_TS/HVA*.VTI`). The VTI
+/// is the DVD-IFO analogue: it holds a fixed-stride clip table naming every
+/// `.evo` in authored order.
+const HDDVD_VTI_MAGIC: &[u8] = b"ADVANCED-VTS";
+
+/// Byte stride between clip-table entries in the VTI. Each entry holds a
+/// NUL-terminated `<name>.EVO` at a constant sub-offset, so every clip name
+/// shares one residue modulo this stride — the signal used to isolate the table.
+const VTI_CLIP_ENTRY_STRIDE: usize = 0x140;
+
+/// Parse the clip-name table from an `ADVANCED-VTS` VTI, returning clip
+/// filenames in authored (table) order.
+///
+/// The table is a run of `VTI_CLIP_ENTRY_STRIDE`-spaced records, each carrying a
+/// NUL-terminated `<name>.EVO`. Rather than trust the (imprecise) header pointer,
+/// this collects every NUL-terminated `*.EVO` name and keeps the largest group
+/// sharing one residue modulo the stride — the clip table — in offset order.
+/// Returns empty for a non-VTI blob or one with no recognizable table.
+fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
+    if !vti.starts_with(HDDVD_VTI_MAGIC) {
+        return Vec::new();
+    }
+    // Collect (offset, name) for every NUL-terminated printable run ending `.EVO`.
+    let is_name_byte = |b: u8| b.is_ascii_graphic();
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < vti.len() {
+        if !is_name_byte(vti[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < vti.len() && is_name_byte(vti[i]) {
+            i += 1;
+        }
+        let name = &vti[start..i];
+        let nul_terminated = i < vti.len() && vti[i] == 0;
+        if nul_terminated && name.len() >= 5 && name[name.len() - 4..].eq_ignore_ascii_case(b".EVO")
+        {
+            hits.push((start, String::from_utf8_lossy(name).into_owned()));
+        }
+    }
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    // The clip-table entries all share one residue mod stride; other stray `.EVO`
+    // references (if any) fall in different residues. Keep the largest group.
+    let mut best: Vec<(usize, String)> = Vec::new();
+    for res in 0..VTI_CLIP_ENTRY_STRIDE {
+        let group: Vec<(usize, String)> = hits
+            .iter()
+            .filter(|(o, _)| o % VTI_CLIP_ENTRY_STRIDE == res)
+            .cloned()
+            .collect();
+        if group.len() > best.len() {
+            best = group;
+        }
+    }
+    best.sort_by_key(|(o, _)| *o);
+    best.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Whether a clip belongs to the main feature. HD-DVD Standard Content authors
+/// the feature as one or more clips whose name begins `feature` (case-insensitive)
+/// — `FEATURE_1`/`FEATURE_2` (a layer-break split) or `feature`/`feature_Divide`.
+/// The feature is imaged as ONE title by concatenating these in authored order.
+fn is_feature_clip(name: &str) -> bool {
+    let base = name.rsplit_once('.').map(|(b, _)| b).unwrap_or(name);
+    base.to_ascii_lowercase().starts_with("feature")
+}
 
 /// Sniff a video codec from a program-stream video elementary-stream sample by
 /// its MPEG / Annex-B start codes:
@@ -216,31 +293,48 @@ fn collect_es(
 impl Disc {
     /// Scan HD-DVD titles from the `HVDVD_TS/` `.evo` clips.
     ///
-    /// One [`DiscTitle`] per `.evo` with real physical extents (from the UDF
-    /// allocation descriptors) and declared size; `streams`/`chapters`/duration
-    /// are left empty pending `.xpl`/EVO parsing (see module docs). Returns an
-    /// empty vec when `HVDVD_TS/` is absent or holds no readable `.evo`.
+    /// The main feature is authored as one or more `.evo` clips (a layer-break
+    /// split — `FEATURE_1`/`FEATURE_2` or `feature`/`feature_Divide`). The
+    /// `HVA*.VTI` navigation file names every clip in authored order; this parses
+    /// it to concatenate the feature clips into ONE title (so the largest-title
+    /// pick gets the whole movie, not just part 1), emitting every other clip as
+    /// its own title. Falls back to one title per clip when the VTI is absent or
+    /// unparseable, so a disc with no readable navigation still enumerates.
+    /// `chapters`/duration are left empty pending deeper VTI parsing.
     pub(super) fn scan_hddvd_titles(
         reader: &mut dyn SectorSource,
         udf_fs: &udf::UdfFs,
     ) -> Vec<DiscTitle> {
-        let mut titles = Vec::new();
         let Some(ts_dir) = udf_fs.find_dir("/HVDVD_TS") else {
-            return titles;
+            return Vec::new();
         };
-        // Snapshot clip (name, size) first: the `ts_dir` borrow must end before
-        // the `udf_fs.file_extents` calls below re-borrow `udf_fs`.
-        let clips: Vec<(String, u64)> = ts_dir
-            .entries
-            .iter()
-            .filter(|e| !e.is_dir && e.name.to_ascii_lowercase().ends_with(HDDVD_CLIP_EXT))
-            .map(|e| (e.name.clone(), e.size))
-            .collect();
+        // Snapshot clips (name, size) and the VTI navigation file. The `ts_dir`
+        // borrow must end before the `udf_fs` reads below re-borrow it.
+        let mut clips: Vec<(String, u64)> = Vec::new();
+        let mut vti_name: Option<String> = None;
+        for e in &ts_dir.entries {
+            if e.is_dir {
+                continue;
+            }
+            let lower = e.name.to_ascii_lowercase();
+            if lower.ends_with(HDDVD_CLIP_EXT) {
+                clips.push((e.name.clone(), e.size));
+            } else if lower.ends_with(".vti") && vti_name.is_none() {
+                vti_name = Some(e.name.clone());
+            }
+        }
 
-        for (idx, (name, size)) in clips.iter().enumerate() {
-            let path = format!("/HVDVD_TS/{name}");
+        // Authored clip order from the VTI clip table (empty if no VTI).
+        let order: Vec<String> = vti_name
+            .and_then(|n| udf_fs.read_file(reader, &format!("/HVDVD_TS/{n}")).ok())
+            .map(|b| parse_vti_clip_order(&b))
+            .unwrap_or_default();
+
+        // Resolve each clip's physical extents once, keyed by lower-case name.
+        let mut clip_extents: BTreeMap<String, (String, u64, Vec<Extent>)> = BTreeMap::new();
+        for (name, size) in &clips {
             let mut extents = Vec::new();
-            if let Ok(file_exts) = udf_fs.file_extents(reader, &path) {
+            if let Ok(file_exts) = udf_fs.file_extents(reader, &format!("/HVDVD_TS/{name}")) {
                 for (lba, sectors) in file_exts {
                     if sectors > 0 && lba > 0 {
                         extents.push(Extent {
@@ -250,21 +344,84 @@ impl Disc {
                     }
                 }
             }
-            if extents.is_empty() {
+            if !extents.is_empty() {
+                clip_extents.insert(name.to_ascii_lowercase(), (name.clone(), *size, extents));
+            }
+        }
+
+        // Feature clips, in authored order, that actually resolved to extents.
+        let feature: Vec<String> = order
+            .iter()
+            .filter(|n| is_feature_clip(n))
+            .filter(|n| clip_extents.contains_key(&n.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+        let feature_set: std::collections::HashSet<String> =
+            feature.iter().map(|n| n.to_ascii_lowercase()).collect();
+
+        let mut titles = Vec::new();
+        let mut next_id = 0u16;
+
+        // The composed feature title: concatenate its parts' extents in authored
+        // order. Streams are probed from the head (the first part). One `Clip` per
+        // part records the composition.
+        if !feature.is_empty() {
+            let mut extents = Vec::new();
+            let mut size_bytes = 0u64;
+            let mut parts = Vec::new();
+            for n in &feature {
+                if let Some((orig, size, exts)) = clip_extents.get(&n.to_ascii_lowercase()) {
+                    extents.extend_from_slice(exts);
+                    size_bytes += *size;
+                    parts.push(Clip {
+                        clip_id: orig
+                            .rsplit_once('.')
+                            .map(|(b, _)| b)
+                            .unwrap_or(orig)
+                            .to_string(),
+                        in_time: 0,
+                        out_time: 0,
+                        duration_secs: 0.0,
+                        source_packets: 0,
+                    });
+                }
+            }
+            let streams = probe_evo_streams(reader, &extents);
+            titles.push(DiscTitle {
+                playlist: "FEATURE".to_string(),
+                playlist_id: next_id,
+                duration_secs: 0.0,
+                size_bytes,
+                clips: parts,
+                streams,
+                chapters: Vec::new(),
+                extents,
+                content_format: ContentFormat::MpegPs,
+                codec_privates: Vec::new(),
+            });
+            next_id += 1;
+        }
+
+        // Every remaining clip is its own title (unchanged behaviour). Iterated in
+        // directory order; when there is no VTI/feature this emits ALL clips.
+        for (name, _size) in &clips {
+            let key = name.to_ascii_lowercase();
+            if feature_set.contains(&key) {
                 continue;
             }
+            let Some((orig, size, extents)) = clip_extents.get(&key) else {
+                continue;
+            };
             // Probe the clip head for its elementary streams so the mux path
             // builds a non-empty `pid_to_track` and actually routes packets.
-            // Without this the PS demuxer drops every packet and the mux emits
-            // nothing (the historical HD-DVD blocker).
-            let streams = probe_evo_streams(reader, &extents);
-            let clip_id = name
+            let streams = probe_evo_streams(reader, extents);
+            let clip_id = orig
                 .rsplit_once('.')
                 .map(|(base, _)| base.to_string())
-                .unwrap_or_else(|| name.clone());
+                .unwrap_or_else(|| orig.clone());
             titles.push(DiscTitle {
-                playlist: name.clone(),
-                playlist_id: idx as u16,
+                playlist: orig.clone(),
+                playlist_id: next_id,
                 duration_secs: 0.0,
                 size_bytes: *size,
                 clips: vec![Clip {
@@ -276,10 +433,11 @@ impl Disc {
                 }],
                 streams,
                 chapters: Vec::new(),
-                extents,
+                extents: extents.clone(),
                 content_format: ContentFormat::MpegPs,
                 codec_privates: Vec::new(),
             });
+            next_id += 1;
         }
         titles
     }
@@ -343,6 +501,110 @@ mod tests {
             feature.clips[0].clip_id, "FEATURE",
             "clip_id drops the extension"
         );
+    }
+
+    // ── VTI playlist parsing + feature composition ────────────────────────
+
+    /// Build a synthetic `ADVANCED-VTS` VTI whose clip table lists `clips` in
+    /// order — one fixed-stride entry each, NUL-terminated name at `entry+0x42`.
+    fn synthetic_vti(clips: &[&str]) -> Vec<u8> {
+        let table_start = 0x200usize;
+        let mut v = vec![0u8; table_start + clips.len() * VTI_CLIP_ENTRY_STRIDE];
+        v[..HDDVD_VTI_MAGIC.len()].copy_from_slice(HDDVD_VTI_MAGIC);
+        for (i, name) in clips.iter().enumerate() {
+            let off = table_start + i * VTI_CLIP_ENTRY_STRIDE + 0x42;
+            v[off..off + name.len()].copy_from_slice(name.as_bytes());
+            // The byte after the name stays 0 (NUL terminator).
+        }
+        v
+    }
+
+    #[test]
+    fn parse_vti_clip_order_reads_table_in_authored_order() {
+        let vti = synthetic_vti(&[
+            "DELOGO.EVO",
+            "FEATURE_1.EVO",
+            "FEATURE_2.EVO",
+            "TRAILER.EVO",
+        ]);
+        let order = parse_vti_clip_order(&vti);
+        assert_eq!(
+            order,
+            vec![
+                "DELOGO.EVO".to_string(),
+                "FEATURE_1.EVO".to_string(),
+                "FEATURE_2.EVO".to_string(),
+                "TRAILER.EVO".to_string(),
+            ]
+        );
+        // A non-VTI blob yields nothing.
+        assert!(parse_vti_clip_order(b"not a vti").is_empty());
+    }
+
+    #[test]
+    fn is_feature_clip_matches_the_feature_naming_variants() {
+        // Layer-break split (Shaun / Anchorman) and the divide form (Harry Potter).
+        assert!(is_feature_clip("FEATURE_1.EVO"));
+        assert!(is_feature_clip("FEATURE_2.EVO"));
+        assert!(is_feature_clip("feature.EVO"));
+        assert!(is_feature_clip("feature_Divide.EVO"));
+        // Extras are not the feature.
+        assert!(!is_feature_clip("TRAILER.EVO"));
+        assert!(!is_feature_clip("DLS_01.EVO"));
+        assert!(!is_feature_clip("EPK.EVO"));
+    }
+
+    #[test]
+    fn scan_hddvd_composes_split_feature_into_one_title() {
+        // A disc whose feature is FEATURE_1 + FEATURE_2 (a layer-break split), plus
+        // a TRAILER extra. The VTI names them in authored order; the scan must
+        // JOIN the two feature parts into one title (so the largest-title pick is
+        // the whole movie) and keep the trailer as its own title.
+        let mut disc = MemDisc::new();
+        let vti = synthetic_vti(&["FEATURE_1.EVO", "FEATURE_2.EVO", "TRAILER.EVO"]);
+        let files = vec![
+            file("FEATURE_1.EVO", 100, 5000, 10 * 2048, true),
+            file("FEATURE_2.EVO", 101, 8000, 6 * 2048, true),
+            file("TRAILER.EVO", 102, 12000, 2 * 2048, true),
+            file_with("HVA00001.VTI", 103, 15000, vti, true),
+        ];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "HVDVD_TS".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files,
+                subdirs: vec![],
+            }],
+        };
+        build_udf_skeleton(&mut disc, 10);
+        lay_dir(&mut disc, &root);
+        let udf = crate::udf::read_filesystem(&mut disc).expect("fs");
+
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        // One composed FEATURE title + the trailer.
+        assert_eq!(titles.len(), 2, "feature parts merged, trailer separate");
+        let feat = titles
+            .iter()
+            .find(|t| t.playlist == "FEATURE")
+            .expect("composed feature title");
+        assert_eq!(feat.clips.len(), 2, "both feature parts recorded");
+        assert_eq!(feat.size_bytes, (10 + 6) * 2048, "part sizes summed");
+        // Extents concatenated in authored order: FEATURE_1 (lba 5000) then
+        // FEATURE_2 (lba 8000) — the movie plays through in order.
+        assert_eq!(feat.extents.len(), 2);
+        assert_eq!(feat.extents[0].start_lba, PART_START + 5000);
+        assert_eq!(feat.extents[0].sector_count, 10);
+        assert_eq!(feat.extents[1].start_lba, PART_START + 8000);
+        assert_eq!(feat.extents[1].sector_count, 6);
+        // The largest title is the whole feature, not just part 1.
+        let largest = titles.iter().max_by_key(|t| t.size_bytes).unwrap();
+        assert_eq!(largest.playlist, "FEATURE");
+        assert!(titles.iter().any(|t| t.playlist == "TRAILER.EVO"));
     }
 
     // ── codec sniffing ────────────────────────────────────────────────────
