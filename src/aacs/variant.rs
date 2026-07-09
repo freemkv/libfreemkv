@@ -62,19 +62,17 @@ use super::types::DeviceKey;
 
 // ── Public constants ──────────────────────────────────────────────────────
 
-/// AACS 2.1 Key Correction Data.
+/// AACS 2.1 Key Correction Data — a zero placeholder, NOT real key material.
 ///
 /// **KCD is PER-LICENSEE** (per player manufacturer) — there is no single
-/// universal value, so this one constant cannot be correct across discs. We do
-/// NOT have the real per-manufacturer KCDs coded, and won't: libfreemkv compiles
-/// in no AACS key material (keydb.cfg is the single source of truth). The bytes
-/// below only let the chain's SHAPE exercise against synthetic fixtures; on a
-/// real variant disc they yield a wrong Media Key that the final
-/// Verify-Media-Key gate rejects. So the variant chain cannot complete on a real
-/// disc today — a key-acquisition gap, not a code gap.
-const KEY_CORRECTION_DATA: [u8; 16] = [
-    0x3b, 0x62, 0x8a, 0x78, 0x29, 0x00, 0xca, 0x2f, 0xdb, 0xe7, 0x7a, 0x49, 0xfe, 0x22, 0xd6, 0x6e,
-];
+/// universal value. libfreemkv compiles in no AACS key material (keydb.cfg is
+/// the single source of truth), so this stays all-zero: the chain's SHAPE still
+/// runs, but on a real variant disc the derivation yields a wrong Media Key that
+/// the final Verify-Media-Key gate rejects. The variant chain therefore cannot
+/// complete on a real disc today — a key-acquisition gap, not a code gap. If a
+/// real per-licensee KCD is ever available it must come from keydb.cfg, never a
+/// compiled constant.
+const KEY_CORRECTION_DATA: [u8; 16] = [0u8; 16];
 
 // ── MKB record walking ────────────────────────────────────────────────────
 

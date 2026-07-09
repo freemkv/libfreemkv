@@ -68,7 +68,7 @@ pub fn walk_mkb(mkb: &[u8]) -> Vec<MkbRecord> {
 /// then the body — stopping at the `00 000000` end marker or a
 /// malformed/out-of-bounds length. Lazy (no body clone), so a find-one-record
 /// caller never materialises the multi-MB cvalue table. [`walk_mkb`] and every
-/// MKB record walk in `aacs::keys` are built on this, so the framing rules — and
+/// MKB record walk in `aacs::resolve`/`aacs::derive` are built on this, so the framing rules — and
 /// any future fix to them — live in exactly one place (they had drifted across
 /// six hand-rolled copies).
 pub(crate) fn mkb_records(mkb: &[u8]) -> impl Iterator<Item = (usize, u8, usize)> + '_ {
