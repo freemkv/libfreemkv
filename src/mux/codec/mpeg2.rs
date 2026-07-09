@@ -26,13 +26,10 @@
 //! - Extension (seq/pic):00 00 01 B5
 //! - GOP header:         00 00 01 B8
 
-use std::collections::VecDeque;
-
 use super::coding::{CodingType, Mpeg2Coding, PictureInfo};
 use super::startcode::find_start_code;
 use super::{CodecParser, Frame, pts_to_ns};
 use crate::mux::ts::PesPacket;
-use crate::pes::SourcePos;
 
 /// Sequence header start code suffix.
 const SEQ_HEADER_CODE: u8 = 0xB3;
@@ -94,20 +91,11 @@ pub struct Mpeg2Parser {
     /// Raw bytes of the last seen sequence header (+ sequence extension if
     /// present), captured for MKV codecPrivate.
     seq_header: Option<Vec<u8>>,
-    /// Unemitted elementary-stream bytes: the in-progress access unit plus any
-    /// lookahead needed to detect the next AU boundary.
-    buf: Vec<u8>,
-    /// Absolute ES byte offset of `buf[0]`. Used to associate PES PTS marks
-    /// (recorded by absolute offset) with the access units they belong to.
-    base_offset: u64,
-    /// `(absolute ES offset of a PES's first byte, PTS in ns)` for every PES
-    /// that carried a timestamp, in ascending offset order.
-    pts_marks: VecDeque<(u64, i64)>,
-    /// `(absolute ES offset of a PES's first byte, SourcePos)` for every PES
-    /// that carried byte-exact provenance, parallel to `pts_marks` and drained
-    /// by the SAME mark-drain invariant. Attaches the source position to each
-    /// access unit so the index carries it — never reconstructed.
-    source_marks: VecDeque<(u64, SourcePos)>,
+    /// Reassembles PES fragments into complete access units (one coded picture
+    /// with its leading sequence/GOP headers) and carries each AU's start
+    /// timing / source / discontinuity forward — the shared machinery the
+    /// H.264/HEVC/VC-1 parsers also use, in its MPEG-2 mode.
+    au_asm: crate::mux::au_assembly::AuAssembler,
     /// Full-frame presentation interval (ns) at the sequence-header display rate
     /// (`1/frame_rate`). The field period is half this. Per-frame durations are
     /// `nb_fields × field_period`, so 2:3-telecined frames alternate 2- and
@@ -129,15 +117,6 @@ pub struct Mpeg2Parser {
     /// each GOP's first PES PTS so video stays in sync with the PES-timestamped
     /// audio. None until the first PES timestamp is seen.
     origin_pts_ns: Option<i64>,
-    /// B1: absolute ES offsets at which a concealed/lost-gap PES began, parallel
-    /// to `pts_marks`/`source_marks` and drained by the SAME mark-drain invariant.
-    /// MPEG-2 emits whole GOPs asynchronously, so a per-PES flag can't ride
-    /// through to the right frame (the PES that carries the gap completes the
-    /// PREVIOUS picture); associating by OFFSET instead stamps `discontinuity` on
-    /// the access unit whose own bytes begin after the gap — the first post-gap
-    /// picture — surviving GOP buffering + temporal reorder. The consumer's
-    /// ResyncGate then arms at that exact picture, mid-GOP if need be.
-    disc_marks: VecDeque<u64>,
 }
 
 /// One coded picture buffered awaiting its GOP's completion (see `gop_buf`).
@@ -165,16 +144,12 @@ impl Mpeg2Parser {
     pub fn new() -> Self {
         Self {
             seq_header: None,
-            buf: Vec::with_capacity(128 * 1024),
-            base_offset: 0,
-            pts_marks: VecDeque::new(),
-            source_marks: VecDeque::new(),
+            au_asm: crate::mux::au_assembly::AuAssembler::mpeg2(),
             frame_duration_ns: 0,
             progressive_sequence: false,
             gop_buf: Vec::new(),
             emitted_fields: 0,
             origin_pts_ns: None,
-            disc_marks: VecDeque::new(),
         }
     }
 
@@ -202,192 +177,95 @@ impl Mpeg2Parser {
     /// Drain every complete access unit from `buf`, returning one Frame each.
     /// When `force` is true (EOF flush, or buffer-cap backstop) the trailing
     /// in-progress access unit is emitted even without a following boundary.
-    fn drain_complete_aus(&mut self, force: bool) -> Vec<Frame> {
-        let mut out = Vec::new();
-        loop {
-            // An access unit must contain a coded picture; without one there is
-            // nothing to emit yet (leading sequence/GOP headers wait for it).
-            let Some(pic) = find_code(&self.buf, 0, PICTURE_CODE) else {
-                // No coded picture in an over-cap buffer means we are
-                // accumulating unparseable data (a stream with no picture
-                // start codes). Drop all but a 3-byte tail — enough to catch a
-                // start-code prefix straddling the boundary — and advance the
-                // absolute offset so the PES-mark invariant holds. Mirrors the
-                // post-picture buffer backstop in the AU-boundary search below.
-                if self.buf.len() > MAX_AU_BUFFER {
-                    let drop = self.buf.len() - 3;
-                    self.base_offset += drop as u64;
-                    self.buf.drain(..drop);
-                    let cutoff = self.base_offset;
-                    while let Some(&(off, _)) = self.pts_marks.front() {
-                        if off < cutoff {
-                            self.pts_marks.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    while let Some(&(off, _)) = self.source_marks.front() {
-                        if off < cutoff {
-                            self.source_marks.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    while let Some(&off) = self.disc_marks.front() {
-                        if off < cutoff {
-                            self.disc_marks.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                break;
-            };
-            // The current AU ends where the next one begins: the first
-            // picture / sequence / GOP start code after this picture.
-            let end = match find_au_start(&self.buf, pic + 4) {
-                Some(b) => b,
-                None if force => self.buf.len(),
-                None if self.buf.len() > MAX_AU_BUFFER => self.buf.len(),
-                None => break, // AU not yet complete — await the next boundary
-            };
-            if end == 0 {
-                break;
-            }
-
-            // Phase 1 — read everything from `buf` before any mutation of self
-            // (the slice borrow must end before we touch self fields).
-            let hdr = extract_seq_header(&self.buf[..end]);
-            // A GOP header (0xB8) or a fresh sequence header (0xB3) starts a new
-            // GOP, resetting temporal_reference to 0.
-            let gop_boundary = find_code(&self.buf[..end], 0, GOP_CODE).is_some()
-                || find_code(&self.buf[..end], 0, SEQ_HEADER_CODE).is_some();
-            // picture_coding_type: the full 3-bit value (bits 5-3 of buf[pic+5]).
-            // 0 when the picture header is truncated (no coding type available).
-            let raw_coding_type = if pic + 5 < end {
-                (self.buf[pic + 5] >> 3) & 0x07
-            } else {
-                0
-            };
-            // temporal_reference: the 10 bits immediately after the picture
-            // start code = display order within the GOP.
-            let tr = if pic + 5 < end {
-                (((self.buf[pic + 4] as u64) << 2) | ((self.buf[pic + 5] as u64) >> 6)) & 0x3FF
-            } else {
-                0
-            };
-            let end_abs = self.base_offset + end as u64;
-            let data = self.buf[..end].to_vec();
-
-            // Phase 2 — mutate self.
-            if let Some(h) = hdr {
-                self.progressive_sequence = parse_progressive_sequence(&h);
-                self.seq_header = Some(h);
-                if let Some((num, den)) = self.frame_rate() {
-                    if num > 0 {
-                        self.frame_duration_ns = 1_000_000_000i64 * den as i64 / num as i64;
-                    }
-                }
-            }
-            // Decode the picture coding extension ONCE here and fold every
-            // per-picture datum (coding type + tff/rff/progressive_frame/
-            // frame_picture, plus the sequence's progressive flag) into one
-            // codec-agnostic `PictureInfo`. `nb_fields()`, `keyframe()`, and
-            // `field_order()` all derive from it; nothing downstream re-parses
-            // the elementary stream.
-            let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
-            let info = PictureInfo::mpeg2(
-                coding_type_from_raw(raw_coding_type),
-                Mpeg2Coding {
-                    top_field_first: tff,
-                    repeat_first_field: rff,
-                    progressive_frame,
-                    progressive_sequence: self.progressive_sequence,
-                    frame_picture,
-                },
-            );
-            let keyframe = info.keyframe();
-
-            // An explicit PES PTS for this access unit, if any. By the mark-drain
-            // invariant the front mark's offset is >= this AU's start, so a front
-            // mark inside [start, end) is this AU's own timestamp.
-            let explicit = self
-                .pts_marks
-                .front()
-                .filter(|&&(off, _)| off < end_abs)
-                .map(|&(_, p)| p);
-
-            // Byte-exact source provenance for this AU, by the same mark-drain
-            // invariant as the PTS: the front source mark inside [start, end)
-            // belongs to this access unit.
-            let src = self
-                .source_marks
-                .front()
-                .filter(|&&(off, _)| off < end_abs)
-                .map(|&(_, s)| s);
-
-            // A GOP boundary means the buffered run is a COMPLETE GOP (all its
-            // pictures display before the next GOP's), so flush it before
-            // starting the new one. `temporal_reference` resets to 0 at the
-            // boundary, keeping each GOP's display order self-contained.
-            if gop_boundary && !self.gop_buf.is_empty() {
-                self.flush_gop(&mut out);
-            }
-            // A concealed-gap mark inside this AU's range [start, end_abs) means
-            // this picture's own bytes begin after the gap — the first post-gap
-            // AU. Same front-mark invariant as PTS/source. Carries through GOP
-            // buffering/reorder to the ResyncGate (which arms at this picture).
-            let discontinuity = self.disc_marks.front().is_some_and(|&off| off < end_abs);
-            self.gop_buf.push(BufferedPicture {
-                tr,
-                info,
-                explicit_pts: explicit,
-                frame: Frame {
-                    pts_ns: 0,
-                    keyframe,
-                    discontinuity,
-                    data,
-                    duration_ns: None,
-                    coding: Some(info),
-                    source: src,
-                },
-            });
-            // Safety cap: a stream with no GOP/sequence boundaries would buffer
-            // unbounded. Force-flush a pathologically long run as its own GOP.
-            if self.gop_buf.len() >= MAX_PENDING_FRAMES {
-                self.flush_gop(&mut out);
-            }
-            self.buf.drain(..end);
-            self.base_offset = end_abs;
-            // Drop PTS marks fully consumed by the emitted AU; keep the mark at
-            // the boundary (it belongs to the next AU).
-            while let Some(&(off, _)) = self.pts_marks.front() {
-                if off < end_abs {
-                    self.pts_marks.pop_front();
-                } else {
-                    break;
-                }
-            }
-            while let Some(&(off, _)) = self.source_marks.front() {
-                if off < end_abs {
-                    self.source_marks.pop_front();
-                } else {
-                    break;
-                }
-            }
-            while let Some(&off) = self.disc_marks.front() {
-                if off < end_abs {
-                    self.disc_marks.pop_front();
-                } else {
-                    break;
+    /// Process one reassembled access unit (from [`AuAssembler`]): decode its
+    /// per-picture coding info, capture a new sequence header, and buffer the
+    /// picture into the current GOP for display-order timestamping. The AU's
+    /// timing / source / discontinuity were already attributed by the assembler.
+    fn process_au(&mut self, au: crate::mux::au_assembly::AssembledAu, out: &mut Vec<Frame>) {
+        let data = au.data;
+        // An access unit must contain a coded picture; a fragment that assembled
+        // without one (only headers, or truncated at EOF) yields nothing.
+        let Some(pic) = find_code(&data, 0, PICTURE_CODE) else {
+            return;
+        };
+        let end = data.len();
+        // Capture a sequence header for codecPrivate; a new one replaces the
+        // stored value and re-locks the frame duration.
+        if let Some(h) = extract_seq_header(&data) {
+            self.progressive_sequence = parse_progressive_sequence(&h);
+            self.seq_header = Some(h);
+            if let Some((num, den)) = self.frame_rate() {
+                if num > 0 {
+                    self.frame_duration_ns = 1_000_000_000i64 * den as i64 / num as i64;
                 }
             }
         }
-        // EOF: emit the final (possibly incomplete) GOP so nothing is dropped.
-        if force {
-            self.flush_gop(&mut out);
+        // A GOP header (0xB8) or a fresh sequence header (0xB3) starts a new GOP,
+        // resetting temporal_reference to 0.
+        let gop_boundary = find_code(&data, 0, GOP_CODE).is_some()
+            || find_code(&data, 0, SEQ_HEADER_CODE).is_some();
+        // picture_coding_type: the full 3-bit value (bits 5-3 of data[pic+5]).
+        // 0 when the picture header is truncated (no coding type available).
+        let raw_coding_type = if pic + 5 < end {
+            (data[pic + 5] >> 3) & 0x07
+        } else {
+            0
+        };
+        // temporal_reference: the 10 bits immediately after the picture start
+        // code = display order within the GOP.
+        let tr = if pic + 5 < end {
+            (((data[pic + 4] as u64) << 2) | ((data[pic + 5] as u64) >> 6)) & 0x3FF
+        } else {
+            0
+        };
+        // Decode the picture coding extension ONCE here and fold every
+        // per-picture datum (coding type + tff/rff/progressive_frame/
+        // frame_picture, plus the sequence's progressive flag) into one
+        // codec-agnostic `PictureInfo`. `nb_fields()`, `keyframe()`, and
+        // `field_order()` all derive from it; nothing downstream re-parses the
+        // elementary stream.
+        let (tff, rff, progressive_frame, frame_picture) = picture_coding_flags(&data);
+        let info = PictureInfo::mpeg2(
+            coding_type_from_raw(raw_coding_type),
+            Mpeg2Coding {
+                top_field_first: tff,
+                repeat_first_field: rff,
+                progressive_frame,
+                progressive_sequence: self.progressive_sequence,
+                frame_picture,
+            },
+        );
+        let keyframe = info.keyframe();
+
+        // A GOP boundary means the buffered run is a COMPLETE GOP (all its
+        // pictures display before the next GOP's), so flush it before starting
+        // the new one. `temporal_reference` resets to 0 at the boundary, keeping
+        // each GOP's display order self-contained.
+        if gop_boundary && !self.gop_buf.is_empty() {
+            self.flush_gop(out);
         }
-        out
+        self.gop_buf.push(BufferedPicture {
+            tr,
+            info,
+            explicit_pts: au.pts,
+            frame: Frame {
+                pts_ns: 0,
+                keyframe,
+                // The assembler attributes the concealed-gap flag to the AU whose
+                // own bytes begin after the gap — the first post-gap picture — so
+                // it rides through GOP buffering/reorder to the ResyncGate.
+                discontinuity: au.discontinuity,
+                data,
+                duration_ns: None,
+                coding: Some(info),
+                source: au.source,
+            },
+        });
+        // Safety cap: a stream with no GOP/sequence boundaries would buffer
+        // unbounded. Force-flush a pathologically long run as its own GOP.
+        if self.gop_buf.len() >= MAX_PENDING_FRAMES {
+            self.flush_gop(out);
+        }
     }
 
     /// Emit the buffered GOP. Each frame's PTS is the display-order prefix-sum of
@@ -448,31 +326,31 @@ impl CodecParser for Mpeg2Parser {
         if pes.data.is_empty() {
             return Vec::new();
         }
-        // Record this PES's timestamp against the absolute offset of its first
-        // ES byte, BEFORE appending. MKV block timecodes are presentation
-        // timestamps; prefer PTS (DTS shows B-frames in decode order — judder
-        // and broken seeking), falling back to DTS only when PTS is absent.
-        let off = self.base_offset + self.buf.len() as u64;
-        if let Some(ts) = pes.pts.or(pes.dts) {
-            self.pts_marks.push_back((off, pts_to_ns(ts)));
+        // Feed the fragment to the assembler, which reframes the elementary
+        // stream on picture boundaries and hands back each complete access unit
+        // with its start timing. MKV block timecodes are presentation timestamps;
+        // prefer PTS (DTS shows B-frames in decode order — judder and broken
+        // seeking), falling back to DTS only when PTS is absent.
+        let pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let aus = self
+            .au_asm
+            .push(&pes.data, pts, None, pes.source, pes.discontinuity);
+        let mut out = Vec::new();
+        for au in aus {
+            self.process_au(au, &mut out);
         }
-        if let Some(src) = pes.source {
-            self.source_marks.push_back((off, src));
-        }
-        // A concealed/lost gap on this PES marks the access unit its bytes begin —
-        // associated by offset (like PTS/source) so it lands on the first post-gap
-        // picture, not the previous one that completes when this PES arrives.
-        if pes.discontinuity {
-            self.disc_marks.push_back(off);
-        }
-        self.buf.extend_from_slice(&pes.data);
-        self.drain_complete_aus(false)
+        out
     }
 
     fn flush(&mut self) -> Vec<Frame> {
-        // drain_complete_aus(true) force-completes the trailing access unit and
-        // flushes the final GOP, so nothing is left buffered at EOF.
-        self.drain_complete_aus(true)
+        // Force-complete the trailing access unit, then flush the final GOP so
+        // nothing is left buffered at EOF.
+        let mut out = Vec::new();
+        for au in self.au_asm.flush() {
+            self.process_au(au, &mut out);
+        }
+        self.flush_gop(&mut out);
+        out
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -511,25 +389,6 @@ fn find_code(data: &[u8], from: usize, want: u8) -> Option<usize> {
             return None;
         }
         if data[sc + 3] == want {
-            return Some(sc);
-        }
-        pos = sc + 4;
-    }
-    None
-}
-
-/// Find the next access-unit boundary at or after `from`: the position of a
-/// picture (0x00), sequence header (0xB3), or GOP (0xB8) start code. Extension
-/// (0xB5), slice (0x01..=0xAF), user-data (0xB2) and sequence-end (0xB7) codes
-/// belong to the current access unit and are NOT boundaries.
-fn find_au_start(data: &[u8], from: usize) -> Option<usize> {
-    let mut pos = from;
-    while let Some(sc) = find_start_code(data, pos) {
-        if sc + 3 >= data.len() {
-            return None;
-        }
-        let code = data[sc + 3];
-        if code == PICTURE_CODE || code == SEQ_HEADER_CODE || code == GOP_CODE {
             return Some(sc);
         }
         pos = sc + 4;
