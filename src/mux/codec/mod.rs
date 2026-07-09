@@ -25,6 +25,8 @@ pub mod lpcm;
 pub mod mpeg2;
 /// HDMV PGS (Presentation Graphics Stream) subtitle parser.
 pub mod pgs;
+/// Display-order PTS reconstruction for sparse-PTS program-stream video.
+pub(crate) mod reorder;
 /// Shared MPEG/Annex-B start-code scanning helpers.
 pub(crate) mod startcode;
 /// Dolby TrueHD / Atmos elementary-stream parser.
@@ -166,10 +168,14 @@ pub fn parser_for_codec(
     is_dvd_ps: bool,
 ) -> Box<dyn CodecParser> {
     match codec {
-        Codec::H264 => Box::new(h264::H264Parser::new()),
-        Codec::Hevc => Box::new(hevc::HevcParser::new()),
+        // `is_dvd_ps` marks a program-stream source (DVD VOB / HD-DVD EVO), whose
+        // video is timestamped only at GOP granularity. On that path the H.264 /
+        // HEVC / VC-1 parsers reconstruct a display-order PTS per frame; on the
+        // BD/UHD transport path (per-frame PTS) they leave timestamps untouched.
+        Codec::H264 => Box::new(h264::H264Parser::new().with_ps_reorder(is_dvd_ps)),
+        Codec::Hevc => Box::new(hevc::HevcParser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Mpeg2 => Box::new(mpeg2::Mpeg2Parser::new()),
-        Codec::Vc1 => Box::new(vc1::Vc1Parser::new()),
+        Codec::Vc1 => Box::new(vc1::Vc1Parser::new().with_ps_reorder(is_dvd_ps)),
         Codec::Ac3 | Codec::Ac3Plus => Box::new(ac3::Ac3Parser::new()),
         Codec::DtsHdMa | Codec::DtsHdHr | Codec::Dts => Box::new(dts::DtsParser::new()),
         Codec::TrueHd => Box::new(truehd::TrueHdParser::new()),

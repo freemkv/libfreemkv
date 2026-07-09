@@ -166,6 +166,10 @@ pub struct HevcParser {
     // colour-volume metadata is ever fabricated.
     sei_mastering: Option<MasteringDisplay>,
     sei_content_light: Option<ContentLightLevel>,
+    /// Display-order PTS reconstruction, enabled only on the program-stream
+    /// path where the source stamps a PTS once per GOP. `None` on the BD/UHD
+    /// transport path (the common HEVC case), which carries a per-frame PTS.
+    reorder: Option<super::reorder::SparsePtsReorder>,
 }
 
 /// Mastering Display Colour Volume payload (Rec. ITU-T H.265 D.2.28),
@@ -234,6 +238,25 @@ impl HevcParser {
             pts_wrap_offset: 0,
             sei_mastering: None,
             sei_content_light: None,
+            reorder: None,
+        }
+    }
+
+    /// Enable display-order PTS reconstruction for a program-stream source.
+    /// No-op (leaves timestamps as parsed) for a transport-stream source.
+    pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.reorder = Some(super::reorder::SparsePtsReorder::new());
+        }
+        self
+    }
+
+    /// Route a finished frame through the PTS reorderer when enabled, else emit
+    /// it directly (unchanged transport-stream behaviour).
+    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.push(explicit, frame),
+            None => vec![frame],
         }
     }
 
@@ -443,7 +466,8 @@ impl CodecParser for HevcParser {
         // block timecode monotonic in storage order, which presents B-frames in
         // decode order (visible judder / wrong frames) and breaks PTS-based
         // seeking. Fall back to DTS only if PTS is somehow absent.
-        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let pts_ns = explicit_pts.unwrap_or(0);
 
         // Auto-detect a non-seamless clip boundary from the bitstream. freemkv
         // reads a BD title's clips as ONE concatenated sector stream and the
@@ -651,7 +675,7 @@ impl CodecParser for HevcParser {
         // from the first coded picture before writing the track header). `None`
         // until both SEI present → SDR / no-SEI tracks carry nothing.
         let hdr10 = self.hdr10();
-        vec![Frame {
+        let frame = Frame {
             // Coding-type only: HEVC field order (pic_struct, from a pic_timing
             // SEI) is not decoded here, so field_order() stays None — honestly
             // absent, never guessed. HDR10 metadata is attached when measured.
@@ -666,7 +690,15 @@ impl CodecParser for HevcParser {
             discontinuity: pes.discontinuity,
             data: frame_data,
             duration_ns: None,
-        }]
+        };
+        self.finish(explicit_pts, frame)
+    }
+
+    fn flush(&mut self) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.flush(),
+            None => Vec::new(),
+        }
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {

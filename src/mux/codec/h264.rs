@@ -52,6 +52,10 @@ pub struct H264Parser {
     // the stale avcC copy after a mid-title redefinition.
     cur_sps: Option<Vec<u8>>,
     cur_pps: Option<Vec<u8>>,
+    /// Display-order PTS reconstruction, enabled only on the program-stream
+    /// (HD-DVD EVO) path where the source stamps a PTS once per GOP. `None` on
+    /// the BD/UHD transport path, which carries a per-frame PTS.
+    reorder: Option<super::reorder::SparsePtsReorder>,
 }
 
 impl Default for H264Parser {
@@ -68,6 +72,25 @@ impl H264Parser {
             pps: None,
             cur_sps: None,
             cur_pps: None,
+            reorder: None,
+        }
+    }
+
+    /// Enable display-order PTS reconstruction for a program-stream source.
+    /// No-op (leaves timestamps as parsed) for a transport-stream source.
+    pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.reorder = Some(super::reorder::SparsePtsReorder::new());
+        }
+        self
+    }
+
+    /// Route a finished frame through the PTS reorderer when enabled, else emit
+    /// it directly (unchanged transport-stream behaviour).
+    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.push(explicit, frame),
+            None => vec![frame],
         }
     }
 }
@@ -152,7 +175,8 @@ impl CodecParser for H264Parser {
         // decode order and the player reorders by timecode. Use PTS, not DTS —
         // DTS presents B-frames in decode order (visible judder) and breaks
         // PTS-based seeking. Fall back to DTS only if PTS is absent.
-        let pts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let pts_ns = explicit_pts.unwrap_or(0);
 
         // Single pass: detect IDR keyframes, seed/strip param sets, and convert
         // Annex B (start-code prefixed) NALUs to length-prefixed NALUs (MKV with
@@ -236,7 +260,7 @@ impl CodecParser for H264Parser {
             }
         }
 
-        vec![Frame {
+        let frame = Frame {
             // Coding-type only: H.264 field order is not decoded here, so
             // `field_order()` stays `None` — honestly absent, never guessed.
             coding: coding_type.map(PictureInfo::coding_type_only),
@@ -248,7 +272,15 @@ impl CodecParser for H264Parser {
             discontinuity: pes.discontinuity,
             data: frame_data,
             duration_ns: None,
-        }]
+        };
+        self.finish(explicit_pts, frame)
+    }
+
+    fn flush(&mut self) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.flush(),
+            None => Vec::new(),
+        }
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
@@ -664,6 +696,71 @@ mod tests {
             fb[0].coding.unwrap().coding_type(),
             CodingType::B,
             "slice_type 6 → B"
+        );
+    }
+
+    /// End-to-end sparse-PTS reconstruction through the REAL parser + reorder:
+    /// a program-stream source (`with_ps_reorder(true)`) that stamps a PTS only
+    /// on each GOP's I-frame must yield distinct, display-ordered PTS for every
+    /// frame — the property the mkv muxer needs so a decoder derives monotonic
+    /// DTS. Without the reorder the non-anchor frames all collapse to one PTS.
+    #[test]
+    fn h264_ps_reorder_reconstructs_distinct_display_pts() {
+        use super::super::coding::CodingType;
+        // slice bodies: 0x88 → I (IDR), 0x98 → P, 0x9C → B (non-IDR).
+        // Decode order of a classic single-B GOP: I P B P B.
+        let gop = |anchor_pts: Option<i64>| {
+            vec![
+                (NAL_SLICE_IDR, 0x88u8, anchor_pts),
+                (NAL_SLICE_NON_IDR, 0x98, None),
+                (NAL_SLICE_NON_IDR, 0x9C, None),
+                (NAL_SLICE_NON_IDR, 0x98, None),
+                (NAL_SLICE_NON_IDR, 0x9C, None),
+            ]
+        };
+
+        let feed = |reorder: bool| -> Vec<super::super::Frame> {
+            let mut p = H264Parser::new().with_ps_reorder(reorder);
+            let mut out = Vec::new();
+            // Two GOPs; the second I carries an anchor 5 frames later (90 kHz:
+            // 5 * 3750 = 18750 ticks) so the reorder can calibrate a duration.
+            for (nal, body, pts) in gop(Some(0)).into_iter().chain(gop(Some(18750))) {
+                out.extend(p.parse(&make_pes(h264_nal(nal, &[body]), pts)));
+            }
+            out.extend(p.flush());
+            out
+        };
+
+        // With reorder ON: all 10 frames emitted, every PTS distinct.
+        let recon = feed(true);
+        assert_eq!(recon.len(), 10, "no frame dropped");
+        let mut pts: Vec<i64> = recon.iter().map(|f| f.pts_ns).collect();
+        let n = pts.len();
+        pts.sort_unstable();
+        pts.dedup();
+        assert_eq!(
+            pts.len(),
+            n,
+            "reconstructed PTS are all distinct (no DTS collision)"
+        );
+
+        // The GOP's first-displayed frame is the I; the B in decode position 2
+        // must display BEFORE the P in decode position 1 (classic reorder).
+        let g1 = &recon[0..5];
+        assert_eq!(g1[0].coding.unwrap().coding_type(), CodingType::I);
+        assert!(
+            g1[2].pts_ns < g1[1].pts_ns,
+            "B (decode idx 2) displays before its forward-anchor P (decode idx 1)"
+        );
+        assert_eq!(g1[0].pts_ns, 0, "GOP anchor locks the I to its true PTS");
+
+        // With reorder OFF (transport-stream behaviour): the non-anchor frames
+        // collapse to a single colliding PTS — the bug this fix removes.
+        let raw = feed(false);
+        let collisions = raw.iter().filter(|f| f.pts_ns == 0).count();
+        assert!(
+            collisions >= 8,
+            "without reorder the sparse-PTS frames collide on 0 (got {collisions})"
         );
     }
 
