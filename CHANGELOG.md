@@ -30,9 +30,6 @@
   (duration self-calibrated from anchor spacing), so a decoder no longer sees
   colliding DTS. Gated to the program-stream path — the BD/UHD transport path
   (per-frame PTS) is unchanged.
-- **Renesas drive unlocker.** The unlock layer splits into feature-unlock and
-  bus-unlock stages and adds a Renesas unlocker; drive reporting distinguishes
-  LibreDrive from Renesas.
 - **Stream-label parsers: reader-backed detection and a menu-language fallback.**
   Label detection can inspect a jar's contents, so vendor parsers claim only
   their own discs; a new last-resort parser reads menu-artwork languages.
