@@ -4,29 +4,26 @@
 
 ### Added
 
-- **AACS 2.1 (FMTS) and HD-DVD are first-class disc formats.** FMTS and HD-DVD
-  discs are detected, labeled, and scanned as their own formats rather than
-  misread as plain UHD/Blu-ray. On a 2.1 disc the forensic variant segments are
-  located from `IndividualSegment.tbl` and the `SegmentKey.tbl` container is
-  parsed; the bulk of the title decrypts with the unit key as usual, and the
-  forensic segments (for which no segment-key source exists yet) are skipped as
-  expected loss, so a 2.1 disc rips mostly-complete instead of failing outright.
+- **AACS 2.1 (FMTS) is a first-class disc format.** FMTS discs are detected,
+  labeled, and scanned as their own format rather than misread as plain UHD. The
+  forensic variant segments are located from `IndividualSegment.tbl` and the
+  `SegmentKey.tbl` container is parsed; the bulk of the title decrypts with the
+  unit key as usual, and the forensic segments (for which no segment-key source
+  exists yet) are skipped as expected loss, so a 2.1 disc rips mostly-complete
+  instead of failing outright.
 - **AACS 2.1 variant Media Key chain runs end to end.** The variant media key is
   derived as a clean Processing-Key to media-key primitive, with the record
   layout pinned against reference variant MKBs — the per-slot `C` block from the
   `0x0c` cvalue table, the `VARIANTS` table plus trailing nonce at `0x2d`, and
   `VKD` at `0x2f` — so a genuine variant MKB resolves through the ladder.
-- **HD-DVD titles mux as a pipeline input, including VC-1.** HD-DVD EVO video is
-  demuxed from the MPEG program stream; VC-1 titles carried on extended stream
-  id `0xFD` (real selector in the PES `stream_id_extension`) route to their own
-  track, and the VC-1 access units are reframed so each I-frame keeps its
-  preceding sequence and entry-point headers.
-- **The HD-DVD feature is composed from its VTI clip table.** Standard Content
-  splits the main feature at the layer break (`FEATURE_1`/`FEATURE_2`,
-  `feature`/`feature_Divide`); the `HVA*.VTI` clip table is parsed and the parts
-  concatenated into one title in authored order, so the main title is the whole
-  movie instead of just part 1. Falls back to one title per clip when the disc
-  carries no readable navigation.
+- **Partial HD-DVD support.** HD-DVD is detected as its own format and its
+  `HVDVD_TS` `.evo` clips mux through the pipeline: EVO video is demuxed from the
+  MPEG program stream, including VC-1 titles carried on extended stream id `0xFD`
+  (real selector in the PES `stream_id_extension`), with the VC-1 access units
+  reframed so each I-frame keeps its preceding sequence and entry-point headers.
+  Title composition is heuristic for now (authoritative program-chain parsing is
+  planned), so a disc that authors two distinct features under the layer-break
+  naming may present them as one title.
 - **Display-order timestamps for program-stream H.264 / VC-1 / HEVC.** A program
   stream stamps a PES PTS only once per GOP; the parsers now reconstruct a
   display-order PTS per frame from the coded picture type and the sparse anchor
