@@ -12,8 +12,21 @@
   forensic segments (for which no segment-key source exists yet) are skipped as
   expected loss, so a 2.1 disc rips mostly-complete instead of failing outright.
 - **AACS 2.1 variant Media Key chain runs end to end.** The variant media key is
-  derived as a clean Processing-Key to media-key primitive, wired from the `0x2d`
-  record, so a genuine variant MKB resolves through the ladder.
+  derived as a clean Processing-Key to media-key primitive, with the record
+  layout pinned against reference variant MKBs — the per-slot `C` block from the
+  `0x0c` cvalue table, the `VARIANTS` table plus trailing nonce at `0x2d`, and
+  `VKD` at `0x2f` — so a genuine variant MKB resolves through the ladder.
+- **HD-DVD titles mux as a pipeline input, including VC-1.** HD-DVD EVO video is
+  demuxed from the MPEG program stream; VC-1 titles carried on extended stream
+  id `0xFD` (real selector in the PES `stream_id_extension`) route to their own
+  track, and the VC-1 access units are reframed so each I-frame keeps its
+  preceding sequence and entry-point headers.
+- **Display-order timestamps for program-stream H.264 / VC-1 / HEVC.** A program
+  stream stamps a PES PTS only once per GOP; the parsers now reconstruct a
+  display-order PTS per frame from the coded picture type and the sparse anchor
+  (duration self-calibrated from anchor spacing), so a decoder no longer sees
+  colliding DTS. Gated to the program-stream path — the BD/UHD transport path
+  (per-frame PTS) is unchanged.
 - **Renesas drive unlocker.** The unlock layer splits into feature-unlock and
   bus-unlock stages and adds a Renesas unlocker; drive reporting distinguishes
   LibreDrive from Renesas.
