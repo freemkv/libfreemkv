@@ -42,7 +42,7 @@ use super::types::{DeviceKey, DiscEntry, HostCert};
 /// Source of AACS key material.
 ///
 /// Implementors return raw material only — the resolver in
-/// `aacs::keys` owns all the crypto (DK→PK walking, PK validation,
+/// `aacs::resolve` and `aacs::derive` own the crypto (DK→PK walking, PK validation,
 /// MK→VUK→TK derivation). See module docs for method semantics.
 pub trait KeyProvider: Send + Sync {
     /// Device keys (top-of-tree, walked by the resolver).

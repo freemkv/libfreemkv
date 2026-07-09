@@ -36,6 +36,14 @@ use super::coding::CodingType;
 /// the timeline across GOPs.
 const FALLBACK_FRAME_DUR_NS: i64 = 1_001_000_000 / 24;
 
+/// Force-complete the current GOP once it reaches this many buffered pictures
+/// even without a keyframe. A GOP is normally a few dozen frames; a stream that
+/// never signals a keyframe (open-GOP recovery-point coding, or crafted/corrupt
+/// disc bytes) would otherwise buffer every access unit — the whole title — in
+/// RAM. Mirrors the MPEG-2 parser's `MAX_PENDING_FRAMES` backstop so no
+/// reassembly buffer grows unbounded on disc-controlled input.
+const MAX_GOP_FRAMES: usize = 600;
+
 /// One buffered coded picture awaiting its GOP's completion.
 struct Pending {
     /// Explicit PES PTS (ns) for this AU, or `None` when the source omitted it.
@@ -92,9 +100,11 @@ impl SparsePtsReorder {
             .map(|c| c.coding_type())
             .unwrap_or(CodingType::P);
         // A keyframe opens a new GOP: the picture already accumulated in `cur` is
-        // a complete GOP. Complete it (this frame belongs to the NEW GOP).
+        // a complete GOP. Complete it (this frame belongs to the NEW GOP). Also
+        // force-complete a pathologically long run that never signalled a
+        // keyframe, so a crafted/corrupt stream cannot buffer without bound.
         let mut out = Vec::new();
-        if frame.keyframe && !self.cur.is_empty() {
+        if (frame.keyframe || self.cur.len() >= MAX_GOP_FRAMES) && !self.cur.is_empty() {
             out = self.complete_current_gop();
         }
         self.cur.push(Pending {
@@ -293,6 +303,24 @@ mod tests {
             &got[5..10],
             &[5 * dur, 7 * dur, 6 * dur, 9 * dur, 8 * dur],
             "GOP2 display PTS continue monotonically per display order"
+        );
+    }
+
+    #[test]
+    fn force_flushes_a_gop_that_never_signals_a_keyframe() {
+        use CodingType::*;
+        // A stream that never flags a keyframe (open-GOP recovery points, or a
+        // crafted/corrupt disc) must not buffer the whole title: the cap
+        // force-completes GOPs so frames are emitted well before flush().
+        let mut r = SparsePtsReorder::new();
+        let mut emitted = 0usize;
+        for i in 0..(MAX_GOP_FRAMES * 3) {
+            let pts = (i == 0).then_some(0);
+            emitted += r.push(pts, frame(P, false)).len();
+        }
+        assert!(
+            emitted >= MAX_GOP_FRAMES,
+            "cap force-flushed GOPs before EOF (emitted {emitted})"
         );
     }
 
