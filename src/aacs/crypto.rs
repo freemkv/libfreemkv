@@ -69,7 +69,7 @@ pub(crate) fn aes_cbc_decrypt(key: &[u8; 16], data: &mut [u8]) {
 ///
 /// The Media Key Variant chain uses AES-G to derive both the variant
 /// number (`Kvn = AES-G(Kp, Nonce)`) and the Volume Unique Key
-/// (`Kvu = AES-G(Km, VID)`). See [`super::keys::derive_vuk`] for the
+/// (`Kvu = AES-G(Km, VID)`). See [`super::derive::derive_vuk`] for the
 /// classical VUK form — the math is identical, this exposes it as a
 /// neutral primitive for the variant chain.
 pub(crate) fn aes_g(x1: &[u8; 16], x2: &[u8; 16]) -> [u8; 16] {

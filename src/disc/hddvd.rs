@@ -73,11 +73,18 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
     if !vti.starts_with(HDDVD_VTI_MAGIC) {
         return Vec::new();
     }
-    // Collect (offset, name) for every NUL-terminated printable run ending `.EVO`.
+    // A real VTI clip table holds a few dozen entries; cap the collected hits so
+    // a crafted VTI packed with millions of `.EVO` tokens (up to the 64 MiB UDF
+    // read cap) can't burn CPU or memory during a routine scan.
+    const MAX_VTI_HITS: usize = 8192;
     let is_name_byte = |b: u8| b.is_ascii_graphic();
-    let mut hits: Vec<(usize, String)> = Vec::new();
+    // Bucket hits by residue-mod-stride in a SINGLE pass — the clip table shares
+    // one residue, so the largest bucket is it (avoids an O(stride*hits) rescan).
+    let mut buckets: std::collections::HashMap<usize, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    let mut count = 0usize;
     let mut i = 0usize;
-    while i < vti.len() {
+    while i < vti.len() && count < MAX_VTI_HITS {
         if !is_name_byte(vti[i]) {
             i += 1;
             continue;
@@ -90,25 +97,16 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
         let nul_terminated = i < vti.len() && vti[i] == 0;
         if nul_terminated && name.len() >= 5 && name[name.len() - 4..].eq_ignore_ascii_case(b".EVO")
         {
-            hits.push((start, String::from_utf8_lossy(name).into_owned()));
+            buckets
+                .entry(start % VTI_CLIP_ENTRY_STRIDE)
+                .or_default()
+                .push((start, String::from_utf8_lossy(name).into_owned()));
+            count += 1;
         }
     }
-    if hits.is_empty() {
+    let Some(mut best) = buckets.into_values().max_by_key(|g| g.len()) else {
         return Vec::new();
-    }
-    // The clip-table entries all share one residue mod stride; other stray `.EVO`
-    // references (if any) fall in different residues. Keep the largest group.
-    let mut best: Vec<(usize, String)> = Vec::new();
-    for res in 0..VTI_CLIP_ENTRY_STRIDE {
-        let group: Vec<(usize, String)> = hits
-            .iter()
-            .filter(|(o, _)| o % VTI_CLIP_ENTRY_STRIDE == res)
-            .cloned()
-            .collect();
-        if group.len() > best.len() {
-            best = group;
-        }
-    }
+    };
     best.sort_by_key(|(o, _)| *o);
     best.into_iter().map(|(_, n)| n).collect()
 }
