@@ -1490,9 +1490,9 @@ impl Disc {
         let (capacity, mut buffered, udf_fs) = Self::read_udf(session)?;
 
         let meta_title = Self::read_meta_title(&mut buffered, &udf_fs);
-        // Authoritative up front — same MKB-driven detector as the full scan
-        // (no titles needed: BD/UHD/FMTS come from the MKB generation). This
-        // no longer defaults to BluRay and defers UHD/FMTS to the full scan.
+        // Authoritative here — the same MKB-driven detector the full scan uses
+        // (no titles needed: BD/UHD/FMTS come from the MKB generation). It no
+        // longer defaults to BluRay or defers UHD/FMTS to the full scan.
         let format = Self::detect_disc_format(&mut buffered, &udf_fs, &[]);
         let encrypted =
             udf_fs.find_dir("/AACS").is_some() || udf_fs.find_dir("/BDMV/AACS").is_some();
@@ -2660,13 +2660,15 @@ impl Disc {
             aacs.unit_keys = keys;
             aacs.key_source = KeyOrigin::ExternalUk;
         } else if self.encrypted && self.css.is_none() {
+            // FMTS is AACS 2.1, a UHD-family (bus-encrypted) format — not BD.
+            let uhd_family = matches!(self.format, DiscFormat::Uhd | DiscFormat::Fmts);
             self.aacs = Some(AacsState {
-                version: if self.format == DiscFormat::Uhd {
+                version: if uhd_family {
                     crate::aacs::mkb::AACS_MAJOR_UHD
                 } else {
                     crate::aacs::mkb::AACS_MAJOR_BD
                 },
-                bus_encryption: self.format == DiscFormat::Uhd,
+                bus_encryption: uhd_family,
                 mkb_version: None,
                 disc_hash: String::new(),
                 key_source: KeyOrigin::ExternalUk,

@@ -105,7 +105,7 @@ pub(crate) fn validate_processing_key(
     None
 }
 
-/// Compute v_mask from a UV value. [C] §3.2.3. Shared with [`super::variants`].
+/// Compute v_mask from a UV value. [C] §3.2.3. Shared with [`super::variant`].
 pub(super) fn calc_v_mask(uv: u32) -> u32 {
     let mut v_mask: u32 = 0xFFFF_FFFF;
     while (uv & !v_mask) == 0 && v_mask != 0 {
@@ -115,7 +115,7 @@ pub(super) fn calc_v_mask(uv: u32) -> u32 {
 }
 
 /// Derive processing key from device key using subset-difference tree traversal.
-/// [C] §3.2.4 (device-tree descent, MSB-branch, terminal PK). Shared with [`super::variants`].
+/// [C] §3.2.4 (device-tree descent, MSB-branch, terminal PK). Shared with [`super::variant`].
 pub(super) fn calc_pk_from_dk(
     dk: &[u8; 16],
     uv: u32,

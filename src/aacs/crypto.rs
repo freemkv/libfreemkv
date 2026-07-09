@@ -89,7 +89,7 @@ pub(crate) const AESG3_SEED: [u8; 16] = [
 /// left=`D(k,s0)⊕s0` inc 0, pk=`D(k,s0+1)⊕(s0+1)` inc 1, right=`D(k,s0+2)⊕(s0+2)` inc 2).
 /// seed[15] += inc, then AES-DEC(key, seed) XOR seed.
 ///
-/// Shared with [`super::variants`] (its variant chain runs the same SD
+/// Shared with [`super::variant`] (its variant chain runs the same SD
 /// tree); a single definition keeps the two walks byte-identical.
 pub(crate) fn aesg3(key: &[u8; 16], inc: u8) -> [u8; 16] {
     let mut seed = AESG3_SEED;
