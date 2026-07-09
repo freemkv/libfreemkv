@@ -3,8 +3,9 @@
 //! On AACS 2.1 the Media Key derivation gains a second stage on top of
 //! the classical subset-difference walk. The classical walk yields a
 //! Media Key Precursor (Kmp) rather than the final Media Key; the
-//! Precursor combines with disc-supplied Variant Key Data (VKD) and the
-//! fixed Key Correction Data (KCD) constant to produce the Media Key.
+//! Precursor combines with disc-supplied Variant Key Data (VKD) and a
+//! per-licensee Key Correction Data (KCD) constant to produce the Media
+//! Key.
 //!
 //! The entry point is [`derive_media_key_variant`] — a `Kp -> Km`
 //! derivation. Deriving `Kp` itself from device keys (DK -> PK) is the
@@ -27,14 +28,16 @@
 //! ```
 //!
 //! **Status.** The record layout is pinned against real variant MKBs:
-//! `variants_for_uv` reads the `VARIANTS[uv]` table from `0x2d`, `C` from
-//! the `0x2d` head, `VKD` from `0x2f`, and the Nonce from the `0x2d`
-//! tail. The one input still missing is a covering 2.1 Processing Key to
-//! run the chain end-to-end against the `0x86` Verify-Media-Key record —
-//! which would also confirm the last layout picks (the 16-bit `Kvn` width
-//! vs. a narrower spec value, and Nonce head-vs-tail). Until then the
-//! final verify gate rejects any wrong pick, so a bad key is never
-//! emitted — only an error.
+//! `C` is the per-slot block of the `0x0c` cvalue table (indexed by the
+//! matched subset-difference — NOT the `0x2d` head), `VARIANTS[uv]` is the
+//! `0x2d` VARIANTS table (leading `body-16` bytes, Nonce at the `0x2d`
+//! tail), and `VKD` is `0x2f`. Two inputs still block an end-to-end run
+//! against the `0x86` Verify-Media-Key record: the real per-licensee KCD
+//! (see [`KEY_CORRECTION_DATA`] — not coded, per-manufacturer), and a
+//! covering 2.1 Processing Key. Either one missing yields a wrong `Km`
+//! that the final verify gate rejects, so a bad key is never emitted —
+//! only an error. (A covering key would also confirm the last layout
+//! picks: the 16-bit `Kvn` width and Nonce head-vs-tail.)
 //!
 //! Two condition bits on `Kmp[15]` route off the default KCD path (Soft
 //! Correction and Online Challenge); the chain does not model those modes
@@ -51,9 +54,24 @@ use super::crypto::{aes_ecb_decrypt, aes_g};
 use super::mkb::*;
 use super::types::DeviceKey;
 
+// The MKB record types this chain selects — `REC_MEDIA_KEY_VARIANT_DATA`
+// (`0x0c`, the per-slot C table), `REC_VARIANT_DATA_AND_NONCE` (`0x2d`, VARIANTS
+// + tail Nonce), `REC_VKD_TABLE` (`0x2f`), the subset-difference / cvalue records
+// (`0x04` / `0x05` / `0x07`), and the verify records (`0x81` / `0x86`) — are the
+// canonical set in [`super::mkb`], in scope here via the `use super::mkb::*` glob.
+
 // ── Public constants ──────────────────────────────────────────────────────
 
-/// AACS 2.1 Key Correction Data — a fixed algorithm constant.
+/// AACS 2.1 Key Correction Data.
+///
+/// **KCD is PER-LICENSEE** (per player manufacturer) — there is no single
+/// universal value, so this one constant cannot be correct across discs. We do
+/// NOT have the real per-manufacturer KCDs coded, and won't: libfreemkv compiles
+/// in no AACS key material (keydb.cfg is the single source of truth). The bytes
+/// below only let the chain's SHAPE exercise against synthetic fixtures; on a
+/// real variant disc they yield a wrong Media Key that the final
+/// Verify-Media-Key gate rejects. So the variant chain cannot complete on a real
+/// disc today — a key-acquisition gap, not a code gap.
 const KEY_CORRECTION_DATA: [u8; 16] = [
     0x3b, 0x62, 0x8a, 0x78, 0x29, 0x00, 0xca, 0x2f, 0xdb, 0xe7, 0x7a, 0x49, 0xfe, 0x22, 0xd6, 0x6e,
 ];
@@ -69,38 +87,41 @@ const KEY_CORRECTION_DATA: [u8; 16] = [
 /// The earlier `0x82`/`0x83` guess was speculative and never appeared in any
 /// real MKB.
 pub fn is_variant_mkb(records: &[MkbRecord]) -> bool {
-    records.iter().any(|r| matches!(r.rec_type, 0x2d | 0x2f))
+    records
+        .iter()
+        .any(|r| matches!(r.rec_type, REC_VARIANT_DATA_AND_NONCE | REC_VKD_TABLE))
 }
 
-/// Body of the Encrypted Media Key Variant Data record (type `0x2d`).
-///
-/// Confirmed against a live variant MKB as the `0x2d` record (92,220 bytes on
-/// the reference disc — not a clean multiple of 16, so it is a structured /
-/// count-prefixed record, not a flat C-block table). The exact per-uv C
-/// selection is the one sub-field still unconfirmed without a real disc+key to
-/// test against; the chain currently consumes the leading 16-byte block.
-/// `pub(crate)` until that offset is pinned.
+/// Body of the `0x2d` record: the `VARIANTS` table followed by the trailing
+/// 16-byte `Kvn` Nonce. Measured `46_100*2 + 16 = 92_216` on Zombieland v70 and
+/// `92_220` on Stand By Me v70 — in both, the leading `body.len() - 16` bytes are
+/// the big-endian `u16` `VARIANTS` table (one per subset-difference) and the last
+/// 16 bytes are the Nonce, with NO leading header. This does NOT hold the C used
+/// for `Kmp` — that is the per-slot block in `0x0c`
+/// ([`REC_MEDIA_KEY_VARIANT_DATA`]). Both [`variant_nonce`] and
+/// [`variants_for_uv`] read this body.
 pub(crate) fn variant_data_record(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
-        .find(|r| r.rec_type == 0x2d)
+        .find(|r| r.rec_type == REC_VARIANT_DATA_AND_NONCE)
         .map(|r| r.body.as_slice())
 }
 
-/// 16-byte Nonce for `Kvn = AES-G(Kp, Nonce)`.
+/// 16-byte Nonce for `Kvn = AES-G(Kp, Nonce)` — the trailing 16 bytes of the
+/// `0x2d` record ([`variant_data_record`]).
 ///
-/// **UNCONFIRMED source.** The `0x2d` Encrypted-Media-Key-Variant-Data record is
-/// the most likely home for a per-disc nonce, so this reads its trailing 16
-/// bytes. Confirming this (vs. a fixed slice elsewhere in `0x2d`) needs a
-/// covering key to run the whole chain against the `0x86` verify; until then a
-/// wrong nonce can only fail that final gate, never emit a bad key.
+/// The Nonce-at-tail placement is consistent across both reference MKBs (the
+/// leading `body-16` bytes form the `VARIANTS` table exactly), but head-vs-tail
+/// is only truly pinned by running the full chain against the `0x86` verify with
+/// a covering key. Until then a wrong nonce can only fail that final gate, never
+/// emit a bad key.
 pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
-    let r = records.iter().find(|r| r.rec_type == 0x2d)?;
-    if r.body.len() < 16 {
+    let body = variant_data_record(records)?;
+    if body.len() < 16 {
         return None;
     }
     let mut out = [0u8; 16];
-    out.copy_from_slice(&r.body[r.body.len() - 16..]);
+    out.copy_from_slice(&body[body.len() - 16..]);
     Some(out)
 }
 
@@ -112,7 +133,7 @@ pub fn variant_nonce(records: &[MkbRecord]) -> Option<[u8; 16]> {
 pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
     records
         .iter()
-        .find(|r| r.rec_type == 0x2f && !r.body.is_empty() && r.body.len() % 16 == 0)
+        .find(|r| r.rec_type == REC_VKD_TABLE && !r.body.is_empty() && r.body.len() % 16 == 0)
         .map(|r| r.body.as_slice())
 }
 
@@ -140,9 +161,10 @@ pub struct ProcessingKeyMatch {
 }
 
 fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
-    let r = records
-        .iter()
-        .find(|r| (r.rec_type == 0x81 || r.rec_type == 0x86) && r.body.len() >= 16)?;
+    let r = records.iter().find(|r| {
+        (r.rec_type == REC_VERIFY_MEDIA_KEY_V1 || r.rec_type == REC_VERIFY_MEDIA_KEY_V2)
+            && r.body.len() >= 16
+    })?;
     let mut out = [0u8; 16];
     out.copy_from_slice(&r.body[..16]);
     Some(out)
@@ -176,14 +198,14 @@ pub fn walk_processing_key(
     device_keys: &[DeviceKey],
 ) -> Option<ProcessingKeyMatch> {
     let mk_dv = mkb_find_mk_dv(records)?;
-    let uvs = mkb_find_body(records, 0x04)?;
+    let uvs = mkb_find_body(records, REC_SUBSET_DIFFERENCE)?;
     // Variant cvalue source: a real variant MKB carries its per-uv cvalue table
     // in record `0x0c` (confirmed 46,101×16, one per `0x04` subset-difference
     // slot). Fall back to `0x07`/`0x05` for the synthetic fixtures and any MKB
     // shape that keeps its cvalues there.
-    let cvalues = mkb_find_body(records, 0x0c)
-        .or_else(|| mkb_find_body(records, 0x07))
-        .or_else(|| mkb_find_body(records, 0x05))?;
+    let cvalues = mkb_find_body(records, REC_MEDIA_KEY_VARIANT_DATA)
+        .or_else(|| mkb_find_body(records, REC_EXPLICIT_SUBSET_DIFF))
+        .or_else(|| mkb_find_body(records, REC_MEDIA_KEY_DATA))?;
 
     let num_uvs = uvs
         .chunks(5)
@@ -340,10 +362,18 @@ impl std::error::Error for MediaKeyVariantError {}
 /// yield a wrong `Km`, which the final Verify-Media-Key gate rejects (never a
 /// silent bad key).
 fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
-    let body = records.iter().find(|r| r.rec_type == 0x2d)?.body.as_slice();
+    let body = variant_data_record(records)?;
+    // The VARIANTS table is the leading bytes; the 16-byte Kvn Nonce is packed at
+    // the TAIL (see [`variant_nonce`]). Bound the read to the table region so a
+    // near-end slot can never read Nonce bytes as a VARIANTS entry. NO leading
+    // header (measured: Zombieland v70 `0x2d` body = 46_100*2 + 16 = 92_216).
+    const NONCE: usize = 16;
+    let table_len = body.len().checked_sub(NONCE)?;
     let off = sd_slot_index.checked_mul(2)?;
-    let bytes = body.get(off..off + 2)?;
-    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    if off + 2 > table_len {
+        return None;
+    }
+    Some(u16::from_be_bytes([body[off], body[off + 1]]))
 }
 
 /// Enumerate the `(uv, slot_index)` pairs of a variant MKB's subset-difference
@@ -351,7 +381,7 @@ fn variants_for_uv(records: &[MkbRecord], sd_slot_index: usize) -> Option<u16> {
 /// to index cvalues. Factored out so a bare Processing Key (which arrives without
 /// its slot) can be tried against each slot.
 fn variant_uv_slots(records: &[MkbRecord]) -> Option<Vec<(u32, usize)>> {
-    let uvs = mkb_find_body(records, 0x04)?;
+    let uvs = mkb_find_body(records, REC_SUBSET_DIFFERENCE)?;
     let mut out = Vec::new();
     let mut idx = 0usize;
     while (idx + 1) * 5 <= uvs.len() {
@@ -378,7 +408,11 @@ struct VariantMkb<'a> {
     records: &'a [MkbRecord],
     nonce: [u8; 16],
     vkd_table: &'a [u8],
-    c_block: [u8; 16],
+    /// The per-subset-difference Encrypted-Media-Key-Variant-Data (C) table from
+    /// record `0x0c` — one 16-byte C per slot. C for slot `i` is
+    /// `cvalues[i*16..][..16]`, the SAME source/index [`walk_processing_key`]
+    /// uses. (NOT `0x2d`, which is VARIANTS + Nonce.)
+    cvalues: &'a [u8],
     mk_dv: [u8; 16],
 }
 
@@ -392,8 +426,21 @@ fn variant_km_for_slot(
     uv: u32,
     slot_index: usize,
 ) -> Result<[u8; 16], MediaKeyVariantError> {
+    // C for THIS subset-difference: the slot's 16-byte block in the `0x0c`
+    // Encrypted-Media-Key-Variant-Data table (same index that selected the
+    // cvalue in `walk_processing_key`). `0x2d` is VARIANTS + Nonce, not C.
+    let cv_off = slot_index
+        .checked_mul(16)
+        .ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let c_slice = m
+        .cvalues
+        .get(cv_off..cv_off + 16)
+        .ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let mut c_block = [0u8; 16];
+    c_block.copy_from_slice(c_slice);
+
     // Step: Kmp = AES-128D(Kp, C) XOR uv  (uv into low 4 bytes).
-    let mut kmp = aes_ecb_decrypt(kp, &m.c_block);
+    let mut kmp = aes_ecb_decrypt(kp, &c_block);
     let uv_bytes = uv.to_be_bytes();
     for i in 0..4 {
         kmp[12 + i] ^= uv_bytes[i];
@@ -473,19 +520,21 @@ pub fn derive_media_key_variant(
     }
     let nonce = variant_nonce(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    let c_value = variant_data_record(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
-    if c_value.len() < 16 {
-        return Err(MediaKeyVariantError::MkbIncomplete);
-    }
-    let mut c_block = [0u8; 16];
-    c_block.copy_from_slice(&c_value[..16]);
+    // C for the Kmp step is the per-subset-difference `0x0c` table (one 16-byte
+    // C per slot) — the SAME source and index `walk_processing_key` uses. `0x2d`
+    // holds VARIANTS + Nonce, NOT C. Fall back to `0x07`/`0x05` for the synthetic
+    // fixtures that keep a single cvalue there.
+    let cvalues = mkb_find_body(mkb_records, REC_MEDIA_KEY_VARIANT_DATA)
+        .or_else(|| mkb_find_body(mkb_records, REC_EXPLICIT_SUBSET_DIFF))
+        .or_else(|| mkb_find_body(mkb_records, REC_MEDIA_KEY_DATA))
+        .ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let slots = variant_uv_slots(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
     let m = VariantMkb {
         records: mkb_records,
         nonce,
         vkd_table,
-        c_block,
+        cvalues,
         mk_dv,
     };
 
@@ -504,6 +553,79 @@ pub fn derive_media_key_variant(
         }
     }
     Err(correction.unwrap_or(MediaKeyVariantError::ProcessingKeyUnavailable))
+}
+
+/// Run the variant chain from a caller-supplied Processing Key and EXPLICIT
+/// per-slot inputs — the harness entry that tries a captured `Kp` against known
+/// slot material, bypassing both the device-key walk and the on-MKB
+/// `VARIANTS[uv]` lookup. The caller supplies the `0x0c` C block, the slot's
+/// subset-difference number `uv`, and its `VARIANTS[uv]`; the MKB supplies the
+/// Nonce, the VKD table, and the Verify-Media-Key value.
+///
+/// Returns `(Km, Kvu)`. The terminal Verify-Media-Key gate is identical to
+/// [`derive_media_key_variant`], so a wrong `c_block` / `uv` / `variants_uv`
+/// returns [`MediaKeyVariantError::MediaKeyVerifyFailed`] rather than a bogus
+/// key. The soft-correction / online-challenge bits on `Kmp[15]` are classified
+/// the same way, so a slot needing an out-of-band correction path is
+/// distinguishable from a non-matching input.
+///
+/// (Note the KCD caveat on [`KEY_CORRECTION_DATA`]: without the real per-licensee
+/// KCD this fails the verify gate on a real disc — a key-acquisition gap.)
+pub fn media_key_variant_from_kp(
+    kp: &[u8; 16],
+    c_block: &[u8; 16],
+    uv: u32,
+    variants_uv: u16,
+    mkb_records: &[MkbRecord],
+    vid: &[u8; 16],
+) -> Result<([u8; 16], [u8; 16]), MediaKeyVariantError> {
+    let nonce = variant_nonce(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let vkd_table = variant_key_data(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+    let mk_dv = mkb_find_mk_dv(mkb_records).ok_or(MediaKeyVariantError::MkbIncomplete)?;
+
+    // Kmp = AES-128D(Kp, C) XOR uv.
+    let mut kmp = aes_ecb_decrypt(kp, c_block);
+    let uv_bytes = uv.to_be_bytes();
+    for i in 0..4 {
+        kmp[12 + i] ^= uv_bytes[i];
+    }
+    if kmp[15] & 0b0000_0010 != 0 {
+        return Err(MediaKeyVariantError::SoftCorrectionRequired);
+    }
+    if kmp[15] & 0b0000_0100 != 0 {
+        return Err(MediaKeyVariantError::OnlineChallengeRequired);
+    }
+
+    // Kpnew = Kmp XOR KCD.
+    let mut kpnew = [0u8; 16];
+    for i in 0..16 {
+        kpnew[i] = kmp[i] ^ KEY_CORRECTION_DATA[i];
+    }
+
+    // Kvn = AES-G(Kp, Nonce) & 0xFFFF; VKD_idx = Kvn XOR VARIANTS[uv].
+    let kvn_block = aes_g(kp, &nonce);
+    let kvn = u16::from_be_bytes([kvn_block[14], kvn_block[15]]);
+    let vkd_idx = kvn ^ variants_uv;
+    let off = (vkd_idx as usize) * 16;
+    if off + 16 > vkd_table.len() {
+        return Err(MediaKeyVariantError::VkdIndexOutOfRange);
+    }
+    let mut vkd = [0u8; 16];
+    vkd.copy_from_slice(&vkd_table[off..off + 16]);
+
+    // Km = AES-128D(Kpnew, VKD) XOR uv, then the authoritative Verify-Media-Key gate.
+    let mut km = aes_ecb_decrypt(&kpnew, &vkd);
+    for i in 0..4 {
+        km[12 + i] ^= uv_bytes[i];
+    }
+    const VERIFY_MAGIC: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+    if aes_ecb_decrypt(&km, &mk_dv)[..8] != VERIFY_MAGIC {
+        return Err(MediaKeyVariantError::MediaKeyVerifyFailed);
+    }
+
+    // Kvu = AES-G(Km, VID).
+    let kvu = aes_g(&km, vid);
+    Ok((km, kvu))
 }
 
 #[cfg(test)]
@@ -707,21 +829,24 @@ mod tests {
         aes_d_result[15] ^= 0x02;
         let c_block = aes_ecb_encrypt(&kp, &aes_d_result);
 
-        // cvalues record (0x07): one 16-byte cvalue. The walker
-        // indexes it for the magic-check step; on a variant MKB the
-        // magic check fails but `variant_present` is true so the
-        // walker still returns the match. Content is don't-care.
+        // cvalues record (0x07): the per-SD C the chain reads for `Kmp`. This
+        // fixture has no `0x0c`, so both the walk and the chain fall back to
+        // `0x07` — plant the computed `c_block` HERE so `AES-D(Kp, C) XOR uv ==
+        // Kmp` and the chosen `kmp15` bit lands. On a variant MKB the per-match
+        // magic check fails, but `variant_present` is true, so the walk still
+        // returns the match.
         mkb.extend_from_slice(&[0x07, 0x00, 0x00, 0x14]);
-        mkb.extend_from_slice(&[0xAB; 16]);
+        mkb.extend_from_slice(&c_block);
 
         // Verify Media Key (0x86): body content is don't-care.
         mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
         mkb.extend_from_slice(&[0xCD; 16]);
 
-        // 0x2d record: Encrypted Media Key Variant Data — C (head 16) then a
-        // trailing 16-byte Nonce (variant_nonce reads the tail), 32-byte body.
+        // 0x2d record: VARIANTS table (head, don't-care for these tests) then the
+        // trailing 16-byte Nonce (`variant_nonce` reads the tail), 32-byte body.
+        // (C is NOT here — it is the `0x07`/`0x0c` cvalue above.)
         mkb.extend_from_slice(&[0x2d, 0x00, 0x00, 0x24]);
-        mkb.extend_from_slice(&c_block);
+        mkb.extend_from_slice(&[0x11; 16]);
         mkb.extend_from_slice(&[0x77; 16]);
 
         // 0x2f record: Variant Key Data table — one 16-byte entry.
@@ -1019,5 +1144,32 @@ mod tests {
         ];
         let codes: HashSet<String> = cases.iter().map(|e| e.to_string()).collect();
         assert_eq!(codes.len(), cases.len(), "all error codes must be unique");
+    }
+
+    /// `media_key_variant_from_kp` runs the full chain from explicit inputs and
+    /// classifies the `Kmp[15]` soft-correction bit. A `c_block` chosen so
+    /// `AES-D(Kp, C) == Kmp` with bit `0x02` set (uv=0) must surface
+    /// `SoftCorrectionRequired` before it touches the VKD / verify steps —
+    /// proving the explicit-input entry runs the same chain and gates.
+    #[test]
+    fn media_key_variant_from_kp_classifies_soft_correction() {
+        use crate::aacs::crypto::aes_ecb_encrypt;
+        let kp = [0x11u8; 16];
+        // Plant Kmp[15]=0x02 (soft-correction) with uv=0 so Kmp == AES-D(kp, C).
+        let mut target_kmp = [0x00u8; 16];
+        target_kmp[15] = 0x02;
+        let c_block = aes_ecb_encrypt(&kp, &target_kmp);
+        // Minimal variant MKB: 0x2d (16-byte body = tail Nonce), 0x2f (one VKD
+        // entry), 0x86 (Verify-Media-Key).
+        let mut mkb = vec![0x2d, 0x00, 0x00, 0x14];
+        mkb.extend_from_slice(&[0x99; 16]);
+        mkb.extend_from_slice(&[0x2f, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xBB; 16]);
+        mkb.extend_from_slice(&[0x86, 0x00, 0x00, 0x14]);
+        mkb.extend_from_slice(&[0xCD; 16]);
+        let recs = walk_mkb(&mkb);
+        let err = media_key_variant_from_kp(&kp, &c_block, 0, 0, &recs, &[0u8; 16])
+            .expect_err("soft-correction bit → classified, not a key");
+        assert_eq!(err, MediaKeyVariantError::SoftCorrectionRequired);
     }
 }
