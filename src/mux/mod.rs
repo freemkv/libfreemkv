@@ -39,6 +39,7 @@ pub mod resolve;
 // accessors and an alternate `DemuxThread` spawn path. They are kept as
 // part of the parser/demux surface and covered by unit tests; allow the
 // dead-code lint rather than delete still-relevant scaffolding.
+pub(crate) mod au_assembly;
 #[allow(dead_code)]
 pub(crate) mod codec;
 pub(crate) mod demux_sink;

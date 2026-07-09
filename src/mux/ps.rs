@@ -27,6 +27,12 @@ const PRIVATE_STREAM_1: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_1;
 /// Private stream 2 (0xBF) — DVD navigation (PCI/DSI). Carries no muxable
 /// elementary stream; expected to be dropped on every disc.
 const PRIVATE_STREAM_2: u8 = crate::consts::pes_stream_id::PRIVATE_STREAM_2;
+/// Extended stream id (0xFD) — the H.222.0 escape whereby the real stream id is
+/// the `stream_id_extension` carried in the PES extension. HD-DVD `.evo` puts its
+/// VC-1 video (and HD audio) here (Shaun of the Dead: VC-1 on `0xFD` ext `0x55`);
+/// a transport stream never uses it. The elementary-stream bytes follow the PES
+/// header exactly like any other PES — only the routing key differs.
+const EXTENDED_STREAM_ID: u8 = 0xFD;
 
 /// Hard cap on the demuxer's reassembly buffer. A length-0 (unbounded) video
 /// PES is delimited by the next PS-layer boundary; if a corrupt stream declares
@@ -73,9 +79,16 @@ pub const DVD_VIDEO_PID: u16 = 0xE0;
 /// source of truth shared with `Disc::scan_dvd_titles`
 /// (`src/disc/dvd.rs`), which sets each `AudioStream.pid` from the same
 /// function so demuxer output routes through the title's `pid_to_track`.
+///
+/// HD-DVD (`.evo` Enhanced VOB) carries Dolby Digital Plus (E-AC-3) on
+/// `private_stream_1` sub-stream ids `0xC0..=0xC7` — a range DVD never uses
+/// (DVD audio is `0x80..=0x8F` / `0xA0..=0xA7`), so admitting it here is purely
+/// additive and cannot change any DVD mapping. The PID is `0xBD00 | sub` just
+/// like the DVD audio ranges, so a mixed HD-DVD title (four DD+ tracks
+/// `0xC0..0xC3`) routes each track to its own distinct PID.
 pub fn dvd_audio_pid(sub_stream_id: u8) -> Option<u16> {
     match sub_stream_id {
-        0x80..=0x8F | 0xA0..=0xA7 => Some(0xBD00 | sub_stream_id as u16),
+        0x80..=0x8F | 0xA0..=0xA7 | 0xC0..=0xC7 => Some(0xBD00 | sub_stream_id as u16),
         _ => None,
     }
 }
@@ -88,6 +101,17 @@ pub fn dvd_subtitle_pid(sub_stream_id: u8) -> Option<u16> {
         0x20..=0x3F => Some(sub_stream_id as u16),
         _ => None,
     }
+}
+
+/// Canonical PID for an HD-DVD extended-stream-id (`0xFD`) stream, keyed by its
+/// `stream_id_extension`: `0xFD00 | ext`. Disjoint from the DVD video (`0xE0`) and
+/// `private_stream_1` (`0xBD00..`) PID spaces, so several elementary streams
+/// multiplexed on `0xFD` (VC-1 video, MLP/TrueHD audio) never collide. The
+/// scanner's head probe and `PsPacket::dvd_pid` derive the same PID from the same
+/// `stream_id_extension`, so demux output routes through the title's
+/// `pid_to_track`.
+pub fn hddvd_extended_pid(stream_id_extension: u8) -> u16 {
+    0xFD00 | stream_id_extension as u16
 }
 
 impl PsPacket {
@@ -112,6 +136,12 @@ impl PsPacket {
                 let sub = self.sub_stream_id?;
                 dvd_audio_pid(sub).or_else(|| dvd_subtitle_pid(sub))
             }
+            // HD-DVD extended-stream-id (0xFD): route by the stream_id_extension
+            // (carried in `sub_stream_id`) to a distinct `0xFD00 | ext` PID, so a
+            // disc that puts several elementary streams on 0xFD keeps them apart.
+            // The codec (VC-1 etc.) is decided by the scanner's head probe, not
+            // here — this only assigns a stable routing key.
+            EXTENDED_STREAM_ID => self.sub_stream_id.map(hddvd_extended_pid),
             _ => None,
         }
     }
@@ -347,9 +377,74 @@ fn find_ps_boundary(data: &[u8], from: usize) -> Option<usize> {
 /// Check whether a start code byte is a valid PES stream ID that carries payload.
 fn is_pes_stream_id(id: u8) -> bool {
     // Video: 0xE0-0xEF, MPEG audio: 0xC0-0xDF, private stream 1: 0xBD,
-    // private stream 2: 0xBF, padding: 0xBE, ECM/EMM etc.
-    // We parse anything in the payload-bearing PES range.
-    crate::consts::pes_stream_id::PAYLOAD_RANGE.contains(&id)
+    // private stream 2: 0xBF, padding: 0xBE, ECM/EMM etc. — plus the HD-DVD
+    // extended-stream-id (0xFD), which carries VC-1 video / HD audio.
+    crate::consts::pes_stream_id::PAYLOAD_RANGE.contains(&id) || id == EXTENDED_STREAM_ID
+}
+
+/// For an extended-stream-id (`0xFD`) PES, walk the optional PES-header fields to
+/// the PES extension and read the 7-bit `stream_id_extension` — the real stream
+/// id. `data` starts at the PES start code; the optional fields live in
+/// `data[9..header_end]` (all bounds-checked against `header_end`). Returns `None`
+/// if the extension is absent or malformed.
+fn parse_stream_id_extension(data: &[u8], flags2: u8, header_end: usize) -> Option<u8> {
+    let get = |p: usize| -> Option<u8> {
+        if p < header_end {
+            data.get(p).copied()
+        } else {
+            None
+        }
+    };
+    let mut pos = 9usize;
+    let pts_dts = (flags2 >> 6) & 0x03;
+    if pts_dts & 0x02 != 0 {
+        pos += 5; // PTS
+    }
+    if pts_dts == 0x03 {
+        pos += 5; // DTS
+    }
+    if flags2 & 0x20 != 0 {
+        pos += 6; // ESCR
+    }
+    if flags2 & 0x10 != 0 {
+        pos += 3; // ES_rate
+    }
+    if flags2 & 0x08 != 0 {
+        pos += 1; // DSM_trick_mode
+    }
+    if flags2 & 0x04 != 0 {
+        pos += 1; // additional_copy_info
+    }
+    if flags2 & 0x02 != 0 {
+        pos += 2; // PES_CRC
+    }
+    if flags2 & 0x01 == 0 {
+        return None; // no PES_extension
+    }
+    let ext_flags = get(pos)?;
+    pos += 1;
+    if ext_flags & 0x80 != 0 {
+        pos += 16; // PES_private_data
+    }
+    if ext_flags & 0x40 != 0 {
+        // pack_header_field: 1-byte length + that many bytes.
+        pos += 1 + get(pos)? as usize;
+    }
+    if ext_flags & 0x20 != 0 {
+        pos += 2; // program_packet_sequence_counter
+    }
+    if ext_flags & 0x10 != 0 {
+        pos += 2; // P-STD_buffer
+    }
+    if ext_flags & 0x01 == 0 {
+        return None; // no PES_extension_flag_2
+    }
+    // PES_extension_field_length (7 bits, marker in the top bit), then the
+    // stream_id_extension byte: present when its top bit (the extension flag) is 0.
+    let _field_len = get(pos)? & 0x7F;
+    pos += 1;
+    let b = get(pos)?;
+    (b & 0x80 == 0).then_some(b & 0x7F)
 }
 
 /// Parse a single PES packet from a byte slice that starts at the start code.
@@ -416,10 +511,30 @@ fn parse_pes_packet(data: &[u8]) -> Option<PsPacket> {
 
     // For private stream 1, the first payload byte is the sub-stream ID,
     // followed by a sub-header whose length depends on the sub-stream type.
-    let (sub_stream_id, es_data) = if stream_id == PRIVATE_STREAM_1 && !payload.is_empty() {
+    let (sub_stream_id, es_data) = if stream_id == EXTENDED_STREAM_ID {
+        // HD-DVD extended-stream-id: the real stream id lives in the
+        // stream_id_extension inside the PES extension. There is no leading
+        // sub-header byte on the payload (unlike private_stream_1), so the ES
+        // is the payload verbatim.
+        (
+            parse_stream_id_extension(data, data[7], header_end),
+            payload.to_vec(),
+        )
+    } else if stream_id == PRIVATE_STREAM_1 && !payload.is_empty() {
         let sub_id = payload[0];
         let skip = match sub_id {
             0x80..=0x8F => 4, // AC3/DTS: sub_id + frame_count + access_unit_ptr(2)
+            // HD-DVD Dolby Digital Plus (E-AC-3): the sub-header is the same
+            // 4-byte shape as DVD AC-3 — sub_id + number_of_frames(1) +
+            // first_access_unit_pointer(2). Verified empirically on ANCHORMAN
+            // EVO: across every 0xC0..=0xC7 packet the 0x0B77 E-AC-3 syncword
+            // sits `first_access_unit_pointer` bytes past this 4-byte header
+            // (the leading bytes are the tail of the previous frame). Stripping
+            // exactly these 4 bytes on EVERY packet yields a clean, continuous
+            // E-AC-3 elementary stream that the ac3 parser reassembles across
+            // PES boundaries; a shorter skip would splice the sub-header bytes
+            // into a straddling frame and corrupt it.
+            0xC0..=0xC7 => 4,
             0xA0..=0xA7 => 7, // LPCM: sub_id + frames + ptr(2) + emphasis + quant_freq + channels
             _ => 1,
         };
@@ -837,6 +952,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_extended_stream_id_extracts_stream_id_extension() {
+        // SHAUN's VC-1 video PES: stream_id 0xFD, flags2=0x01 (PES_extension
+        // only), header_data_length=3, optional bytes 0x0F/... — build the
+        // minimal well-formed variant: ext_flags=0x01 (PES_extension_flag_2),
+        // field_len=0x81, stream_id_extension=0x55. Payload is the ES.
+        let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+        let opt = [0x01u8, 0x81, 0x55];
+        let es = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let len = (3 + opt.len() + es.len()) as u16;
+        pkt.extend_from_slice(&len.to_be_bytes());
+        pkt.extend_from_slice(&[0x80, 0x01, opt.len() as u8]);
+        pkt.extend_from_slice(&opt);
+        pkt.extend_from_slice(&es);
+
+        let parsed = parse_pes_packet(&pkt).expect("parses");
+        assert_eq!(parsed.stream_id, EXTENDED_STREAM_ID);
+        assert_eq!(
+            parsed.sub_stream_id,
+            Some(0x55),
+            "stream_id_extension extracted from PES extension"
+        );
+        // ES is the payload verbatim — no leading sub-header byte stripped.
+        assert_eq!(parsed.data, es);
+        // Routes to the extended-stream-id PID space.
+        assert_eq!(parsed.dvd_pid(), Some(hddvd_extended_pid(0x55)));
+        assert_eq!(parsed.dvd_pid(), Some(0xFD55));
+    }
+
+    #[test]
+    fn parse_extended_stream_id_without_extension_yields_no_sub_id() {
+        // A 0xFD PES that declares no PES_extension (flags2=0x00) can't carry a
+        // stream_id_extension → sub_stream_id None, and dvd_pid falls through.
+        let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+        let es = [0x11u8, 0x22];
+        let len = (3 + es.len()) as u16;
+        pkt.extend_from_slice(&len.to_be_bytes());
+        pkt.extend_from_slice(&[0x80, 0x00, 0x00]);
+        pkt.extend_from_slice(&es);
+
+        let parsed = parse_pes_packet(&pkt).expect("parses");
+        assert_eq!(parsed.sub_stream_id, None);
+        assert_eq!(parsed.dvd_pid(), None);
+        assert_eq!(parsed.data, es);
+    }
+
+    #[test]
     fn dvd_pid_matches_scanner_assignment() {
         // Video → 0xE0 (matches dvd.rs VideoStream pid).
         assert_eq!(mk(0xE0, None).dvd_pid(), Some(DVD_VIDEO_PID));
@@ -1173,6 +1334,51 @@ mod tests {
         assert_eq!(dvd_audio_pid(0x90), None);
         assert_eq!(dvd_audio_pid(0x9F), None);
         assert_eq!(dvd_audio_pid(0xA8), None);
+    }
+
+    #[test]
+    fn hddvd_ddplus_substream_maps_to_bd_pid() {
+        // HD-DVD Dolby Digital Plus sub-ids 0xC0..=0xC7 map to 0xBD00|sub,
+        // distinct per track and disjoint from the DVD audio space. A DVD never
+        // emits these, so the range is purely additive.
+        assert_eq!(dvd_audio_pid(0xC0), Some(0xBDC0));
+        assert_eq!(dvd_audio_pid(0xC3), Some(0xBDC3));
+        assert_eq!(dvd_audio_pid(0xC7), Some(0xBDC7));
+        // Just outside the range.
+        assert_eq!(dvd_audio_pid(0xBF), None);
+        assert_eq!(dvd_audio_pid(0xC8), None);
+        // Four DD+ tracks (ANCHORMAN) get four distinct PIDs.
+        let pids: Vec<u16> = (0xC0u8..=0xC3).map(|s| dvd_audio_pid(s).unwrap()).collect();
+        assert_eq!(pids, vec![0xBDC0, 0xBDC1, 0xBDC2, 0xBDC3]);
+        // And route through dvd_pid on a private_stream_1 packet.
+        assert_eq!(mk(0xBD, Some(0xC0)).dvd_pid(), Some(0xBDC0));
+        assert_eq!(mk(0xBD, Some(0xC3)).dvd_pid(), Some(0xBDC3));
+    }
+
+    #[test]
+    fn hddvd_ddplus_pes_strips_4byte_subheader_to_syncword() {
+        // A private_stream_1 PES carrying DD+ (sub-id 0xC0) has a 4-byte
+        // sub-header (sub_id + num_frames(1) + access_unit_ptr(2)); the demuxer
+        // must strip exactly those 4 bytes so es_data begins at the E-AC-3
+        // payload — here the 0x0B77 syncword sits right after the sub-header.
+        let mut demuxer = PsDemuxer::new();
+        let mut data = vec![
+            0x00, 0x00, 0x01, 0xBD, // private stream 1
+            0x00, 0x0B, // PES_packet_length = 11 (flags2 + hdl1 + 8 payload)
+            0x80, 0x00, 0x00, // no PTS, header_data_len = 0
+            0xC0, // sub-stream id: DD+ track 0
+            0x01, 0x00, 0x00, // num_frames(1) + access_unit_ptr(2)
+            0x0B, 0x77, 0xDE, 0xAD, // E-AC-3 syncword + payload
+        ];
+        data.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
+        let p = demuxer.feed(&data);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].sub_stream_id, Some(0xC0));
+        assert_eq!(
+            p[0].data,
+            vec![0x0B, 0x77, 0xDE, 0xAD],
+            "4-byte DD+ sub-header stripped; es_data starts at the syncword"
+        );
     }
 
     #[test]
