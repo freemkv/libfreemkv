@@ -21,6 +21,12 @@
   id `0xFD` (real selector in the PES `stream_id_extension`) route to their own
   track, and the VC-1 access units are reframed so each I-frame keeps its
   preceding sequence and entry-point headers.
+- **The HD-DVD feature is composed from its VTI clip table.** Standard Content
+  splits the main feature at the layer break (`FEATURE_1`/`FEATURE_2`,
+  `feature`/`feature_Divide`); the `HVA*.VTI` clip table is parsed and the parts
+  concatenated into one title in authored order, so the main title is the whole
+  movie instead of just part 1. Falls back to one title per clip when the disc
+  carries no readable navigation.
 - **Display-order timestamps for program-stream H.264 / VC-1 / HEVC.** A program
   stream stamps a PES PTS only once per GOP; the parsers now reconstruct a
   display-order PTS per frame from the coded picture type and the sparse anchor
@@ -38,6 +44,11 @@
 
 ### Changed
 
+- **MPEG-2 reassembles through the shared `AuAssembler`.** The MPEG-2 parser's
+  hand-rolled PES buffer and offset-keyed mark queues are replaced by the same
+  access-unit assembler the H.264/HEVC/VC-1 parsers use (in a new MPEG-2 mode);
+  the GOP-buffered `temporal_reference` reorder and PTS origin-locking are
+  unchanged, so DVD output is identical.
 - **Generic per-scheme recovery seam.** Decrypt-miss handling is now a
   scheme-neutral seam the input stream installs (no recovery, or an AACS
   fresh-key fetch), with CSS self-recovering separately from the data itself. An
