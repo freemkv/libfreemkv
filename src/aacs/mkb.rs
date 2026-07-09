@@ -7,6 +7,33 @@
 //! is `mkb`. A follow-up collapses the remaining duplicate finders (see the
 //! private refactor notes) — for now both dialects live here side by side.
 
+// ── MKB record types ([C] Chapter 3) ──────────────────────────────────────
+// The ONE canonical set. Every record-type comparison in the `aacs` module
+// references these, so a type byte is never a bare literal scattered across
+// files (the `0x0c` variant-data record in particular used to appear in several
+// hand-rolled forms).
+
+/// Type-and-Version — carries the 32-bit MKBType / AACS generation.
+pub(crate) const REC_TYPE_AND_VERSION: u8 = 0x10;
+/// Subset-Difference index — the per-slot `(u_mask_shift, uv)` table.
+pub(crate) const REC_SUBSET_DIFFERENCE: u8 = 0x04;
+/// Media Key Data — the classical (1.0 / 2.0) per-subset cvalue table.
+pub(crate) const REC_MEDIA_KEY_DATA: u8 = 0x05;
+/// Explicit Subset-Difference — the smaller cvalue table some MKBs use.
+pub(crate) const REC_EXPLICIT_SUBSET_DIFF: u8 = 0x07;
+/// Media Key Variant Data (AACS 2.1) — the per-subset-difference `C` table
+/// (one 16-byte C per slot); the `Kmp` step reads C from HERE, not `0x2d`.
+pub(crate) const REC_MEDIA_KEY_VARIANT_DATA: u8 = 0x0c;
+/// Variant Data + Nonce (AACS 2.1) — the `VARIANTS[uv]` table (leading bytes)
+/// with the 16-byte `Kvn` Nonce at the tail.
+pub(crate) const REC_VARIANT_DATA_AND_NONCE: u8 = 0x2d;
+/// Variant Key Data table (AACS 2.1) — 65,535×16, indexed by the resolved VKD index.
+pub(crate) const REC_VKD_TABLE: u8 = 0x2f;
+/// Verify-Media-Key — AACS 1.0.
+pub(crate) const REC_VERIFY_MEDIA_KEY_V1: u8 = 0x81;
+/// Verify-Media-Key — AACS 2.x.
+pub(crate) const REC_VERIFY_MEDIA_KEY_V2: u8 = 0x86;
+
 /// A single MKB record produced by [`walk_mkb`].
 #[derive(Debug, Clone)]
 pub struct MkbRecord {
@@ -135,7 +162,9 @@ impl AacsVersion {
 pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
     // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
-    let found = mkb_records(mkb).find(|&(_, rt, len)| (rt == 0x81 || rt == 0x86) && len >= 20);
+    let found = mkb_records(mkb).find(|&(_, rt, len)| {
+        (rt == REC_VERIFY_MEDIA_KEY_V1 || rt == REC_VERIFY_MEDIA_KEY_V2) && len >= 20
+    });
     match found {
         Some((o, rec_type, rec_len)) => {
             let mut dv = [0u8; 16];
@@ -240,7 +269,7 @@ pub fn mkb_version(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): version is the BE u32 at body offset 4
     // (record offset 8). Needs rec_len >= 12 (4 header + 4 type + 4 version).
     mkb_records(mkb)
-        .find(|&(_, rt, len)| rt == 0x10 && len >= 12)
+        .find(|&(_, rt, len)| rt == REC_TYPE_AND_VERSION && len >= 12)
         .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 8], mkb[o + 9], mkb[o + 10], mkb[o + 11]]))
 }
 
@@ -309,7 +338,7 @@ pub fn mkb_type_raw(mkb: &[u8]) -> Option<u32> {
     // Type-and-Version record (0x10): the 32-bit MKBType is bytes 4-7 (body
     // offset 0). Needs rec_len >= 8 (4 header + 4 type).
     mkb_records(mkb)
-        .find(|&(_, rt, len)| rt == 0x10 && len >= 8)
+        .find(|&(_, rt, len)| rt == REC_TYPE_AND_VERSION && len >= 8)
         .map(|(o, _, _)| u32::from_be_bytes([mkb[o + 4], mkb[o + 5], mkb[o + 6], mkb[o + 7]]))
 }
 
