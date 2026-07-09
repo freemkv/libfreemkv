@@ -138,7 +138,7 @@ pub(crate) fn variant_key_data(records: &[MkbRecord]) -> Option<&[u8]> {
 // ── Subset-difference walk that exposes (Kp, uv) ──────────────────────────
 
 // `calc_v_mask` and `calc_pk_from_dk` (and the AES-G3 seed step they ride
-// on) are shared with the classical walk in [`super::keys`] — a single
+// on) are shared with the classical walk in [`super::derive`] — a single
 // definition keeps the variant SD tree byte-identical to the classical one.
 // (`aesg3` itself is imported separately in the test module.)
 use super::derive::{calc_pk_from_dk, calc_v_mask};
@@ -172,7 +172,7 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 /// `device_keys` covers. Returns `None` if no DK walks any uv.
 ///
 /// This is the AACS-2.1 **variant** walk; the classical walk lives in
-/// [`super::keys::derive_media_key_and_pk_from_dk`]. The two are kept
+/// [`super::derive::derive_media_key_and_pk_from_dk`]. The two are kept
 /// separate on purpose and select MKB records in DELIBERATELY different
 /// order:
 ///
@@ -181,7 +181,7 @@ fn mkb_find_mk_dv(records: &[MkbRecord]) -> Option<[u8; 16]> {
 ///     small `0x07` Explicit-Subset-Difference record carries the
 ///     cvalue the Precursor chain consumes, whereas a classical UHD MKB
 ///     keeps its 1:1 cvalue table in the large `0x05` record (see the
-///     note on [`super::keys::probe::mkb_cvalues`]). They must NOT be
+///     note on [`super::derive::probe::mkb_cvalues`]). They must NOT be
 ///     unified to one order — each is correct for its own MKB shape.
 ///   - finders: this walk operates on parsed [`MkbRecord`]s (needed
 ///     because the variant chain also reads `0x2d`/`0x2f`); the
@@ -629,7 +629,7 @@ pub fn media_key_variant_from_kp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // These three live in `super::keys` now (consolidated SD-walk helpers);
+    // These three live in `super::derive` now (consolidated SD-walk helpers);
     // `use super::*` does not re-export the parent module's private `use`
     // imports, so pull them in directly for the tests below.
     use super::super::crypto::aesg3;
