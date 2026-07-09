@@ -102,6 +102,18 @@ pub(crate) struct AuAssembler {
     marks: VecDeque<Mark>,
     /// Absolute offsets of fragments flagged with an upstream discontinuity.
     disc_marks: VecDeque<u64>,
+    /// Incremental boundary-scan cursor: the offset into `buf` up to which the
+    /// current AU has already been searched for its end without finding one. Each
+    /// `push` resumes the boundary search from here instead of rescanning the
+    /// whole buffer, so reassembling one AU split across N PES fragments costs
+    /// O(AU bytes) total, not O(AU bytes²/fragment). Reset to 0 whenever `buf[0]`
+    /// moves (an AU drained, or leading bytes dropped).
+    scan_pos: usize,
+    /// Whether the current AU has already contained a coded frame/picture — the
+    /// state the VC-1/MPEG-2 boundary rule carries across a resumed scan (their
+    /// boundary is "the next opener after a frame is already seen"). Meaningless
+    /// for `Mode::StartCode`. Reset with `scan_pos`.
+    seen_unit: bool,
 }
 
 impl AuAssembler {
@@ -122,6 +134,8 @@ impl AuAssembler {
             base: 0,
             marks: VecDeque::new(),
             disc_marks: VecDeque::new(),
+            scan_pos: 0,
+            seen_unit: false,
         }
     }
 
@@ -136,6 +150,8 @@ impl AuAssembler {
             base: 0,
             marks: VecDeque::new(),
             disc_marks: VecDeque::new(),
+            scan_pos: 0,
+            seen_unit: false,
         }
     }
 
@@ -199,6 +215,7 @@ impl AuAssembler {
                     let drop = self.buf.len() - 3;
                     self.buf.drain(..drop);
                     self.base += drop as u64;
+                    self.reset_scan();
                     self.drop_marks_before(self.base);
                 }
                 break;
@@ -208,11 +225,14 @@ impl AuAssembler {
                 // before we synced (or junk) — discard them and any stale marks.
                 self.buf.drain(..a0);
                 self.base += a0 as u64;
+                self.reset_scan();
                 self.drop_marks_before(self.base);
                 continue;
             }
-            // The AU runs from here (buf[0]) to the NEXT AU boundary.
-            let end = match au_boundary(mode, &self.buf) {
+            // The AU runs from here (buf[0]) to the NEXT AU boundary. The search
+            // resumes from `scan_pos` (bytes already searched with no boundary),
+            // so one AU spread across many fragments is scanned once, not per push.
+            let end = match self.au_boundary_resumable() {
                 Some(next) => next,
                 // No next boundary yet: on EOF (or over-cap backstop) the rest of
                 // the buffer is this AU; otherwise wait for more data.
@@ -250,6 +270,7 @@ impl AuAssembler {
             let data = self.buf[..end].to_vec();
             self.buf.drain(..end);
             self.base += end as u64;
+            self.reset_scan();
             out.push(AssembledAu {
                 data,
                 pts,
@@ -259,6 +280,72 @@ impl AuAssembler {
             });
         }
         out
+    }
+
+    /// Reset the incremental boundary-scan cursor. Called whenever `buf[0]` moves
+    /// (an AU drained, or leading bytes discarded) so the next scan starts fresh
+    /// from the new AU opener.
+    fn reset_scan(&mut self) {
+        self.scan_pos = 0;
+        self.seen_unit = false;
+    }
+
+    /// Find the end of the AU that opens at `buf[0]`, resuming from `scan_pos`
+    /// (and, for VC-1/MPEG-2, the carried `seen_unit`) instead of rescanning the
+    /// whole buffer. On no boundary yet, advances `scan_pos`/`seen_unit` so the
+    /// next call continues where this one stopped. Equivalent result to a
+    /// from-scratch whole-buffer scan, but O(total AU bytes) across all pushes.
+    fn au_boundary_resumable(&mut self) -> Option<usize> {
+        match self.mode {
+            Mode::StartCode(marker) => {
+                // Stateless: the AU ends at the next delimiter after the opener at
+                // buf[0]. Resume from the furthest searched offset (never before 4,
+                // to skip the opening delimiter). find_start_code needs 4 bytes, so
+                // back up 3 to catch a code straddling the previous buffer end.
+                let from = self.scan_pos.max(4);
+                match find_start_code(&self.buf, from, marker) {
+                    Some(e) => Some(e),
+                    None => {
+                        self.scan_pos = self.buf.len().saturating_sub(3).max(from);
+                        None
+                    }
+                }
+            }
+            Mode::Vc1 => self.scan_unit_boundary(VC1_FRAME, &[VC1_ENTRY, VC1_SEQ]),
+            Mode::Mpeg2 => self.scan_unit_boundary(MP2_PICTURE, &[MP2_SEQ, MP2_GOP]),
+            Mode::Passthrough => None,
+        }
+    }
+
+    /// Resumable form of the VC-1/MPEG-2 boundary rule: scan from `scan_pos`,
+    /// carrying `seen_unit`; the AU ends at the next `frame` / `header` start code
+    /// once a frame is already seen. Advances `scan_pos`/`seen_unit` when no
+    /// boundary is found so the next push continues, not restarts.
+    fn scan_unit_boundary(&mut self, frame: u8, headers: &[u8]) -> Option<usize> {
+        let buf = &self.buf;
+        let mut i = self.scan_pos;
+        let mut seen = self.seen_unit;
+        while i + 4 <= buf.len() {
+            if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+                let c = buf[i + 3];
+                let is_frame = c == frame;
+                if (is_frame || headers.contains(&c)) && i > 0 && seen {
+                    // The AU ends at the next frame/header once a frame is seen.
+                    return Some(i);
+                }
+                if is_frame {
+                    seen = true;
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        // No boundary yet. Persist the scan state so the next append resumes here
+        // rather than rescanning from 0 (the i+=4 stride is preserved exactly).
+        self.scan_pos = i;
+        self.seen_unit = seen;
+        None
     }
 
     fn drop_marks_before(&mut self, off: u64) {
@@ -280,18 +367,6 @@ fn au_opener(mode: Mode, buf: &[u8]) -> Option<usize> {
         Mode::Vc1 => find_vc1_start(buf, 0),
         // A sequence header, GOP header, or picture opens an MPEG-2 access unit.
         Mode::Mpeg2 => find_mpeg2_start(buf, 0),
-        Mode::Passthrough => None,
-    }
-}
-
-/// Offset where the AU that opens at `buf[0]` ends (the start of the next AU), or
-/// `None` if the next boundary is not yet buffered.
-fn au_boundary(mode: Mode, buf: &[u8]) -> Option<usize> {
-    match mode {
-        // AU ends at the next delimiter; skip the opening one at buf[0].
-        Mode::StartCode(marker) => find_start_code(buf, 4, marker),
-        Mode::Vc1 => find_vc1_au_end(buf),
-        Mode::Mpeg2 => find_mpeg2_au_end(buf),
         Mode::Passthrough => None,
     }
 }
@@ -325,38 +400,6 @@ fn find_vc1_start(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// End offset of the VC-1 access unit that opens at `buf[0]`: the next
-/// sequence-header / entry-point / frame BDU that appears *after* this AU already
-/// contains a frame (`0x0D`). Returns `None` while the AU is still open (no frame
-/// yet, or no following BDU buffered). A leading `0x0F`/`0x0E` header group thus
-/// stays attached to the frame it precedes rather than the previous AU.
-fn find_vc1_au_end(buf: &[u8]) -> Option<usize> {
-    let mut seen_frame = false;
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            match buf[i + 3] {
-                VC1_FRAME => {
-                    if i > 0 && seen_frame {
-                        return Some(i);
-                    }
-                    seen_frame = true;
-                }
-                VC1_ENTRY | VC1_SEQ => {
-                    if i > 0 && seen_frame {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
 /// Find the next MPEG-2 AU-opening start code (`00 00 01` followed by a picture,
 /// sequence header, or GOP header) at or after `from`.
 fn find_mpeg2_start(buf: &[u8], from: usize) -> Option<usize> {
@@ -370,39 +413,6 @@ fn find_mpeg2_start(buf: &[u8], from: usize) -> Option<usize> {
             return Some(i);
         }
         i += 1;
-    }
-    None
-}
-
-/// End offset of the MPEG-2 access unit that opens at `buf[0]`: the next picture
-/// / sequence / GOP start code that appears *after* this AU already contains a
-/// picture (`0x00`). Returns `None` while the AU is still open (no picture yet,
-/// or no following boundary buffered). A leading sequence/GOP header thus stays
-/// attached to the picture it introduces. Slice / extension / user-data /
-/// sequence-end codes are skipped — they belong to the current AU.
-fn find_mpeg2_au_end(buf: &[u8]) -> Option<usize> {
-    let mut seen_picture = false;
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            match buf[i + 3] {
-                MP2_PICTURE => {
-                    if i > 0 && seen_picture {
-                        return Some(i);
-                    }
-                    seen_picture = true;
-                }
-                MP2_SEQ | MP2_GOP => {
-                    if i > 0 && seen_picture {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-            i += 4;
-        } else {
-            i += 1;
-        }
     }
     None
 }
@@ -635,6 +645,72 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].pts, Some(500), "AU carries its START pts");
         assert_eq!(out[0].data, full);
+    }
+
+    /// Split `stream` into fragments of `frag` bytes, push them through the given
+    /// assembler mode, and return the reassembled AU byte-payloads.
+    fn reassemble_with(mut a: AuAssembler, stream: &[u8], frag: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < stream.len() {
+            let end = (i + frag).min(stream.len());
+            for au in a.push(&stream[i..end], None, None, None, false) {
+                out.push(au.data);
+            }
+            i = end;
+        }
+        for au in a.flush() {
+            out.push(au.data);
+        }
+        out
+    }
+
+    #[test]
+    fn resumable_boundary_matches_from_scratch_across_all_fragmentations() {
+        // The incremental scan_pos cursor must produce byte-identical AUs to a
+        // whole-buffer rescan, at EVERY fragment granularity (this is what makes
+        // the O(n) resume equivalent to the old O(n^2) from-scratch scan). Build a
+        // multi-AU stream per codec, reassemble it fed 1 byte at a time up to
+        // whole, and require one canonical result.
+        let h264 = {
+            let mut s = au(0x11, 40); // AU1 (AUD + payload)
+            s.extend(au(0x22, 70)); // AU2
+            s.extend(au(0x33, 25)); // AU3
+            s
+        };
+        let vc1 = {
+            let mut s = bdu(VC1_SEQ, 0xAA, 8);
+            s.extend(bdu(VC1_ENTRY, 0xBB, 6));
+            s.extend(bdu(VC1_FRAME, 0xCC, 50)); // I-frame AU
+            s.extend(bdu(VC1_FRAME, 0xDD, 30)); // P-frame AU
+            s.extend(bdu(VC1_FRAME, 0xEE, 20)); // P-frame AU
+            s
+        };
+        let mpeg2 = {
+            let mut s = bdu(MP2_SEQ, 0xAA, 10);
+            s.extend(bdu(MP2_GOP, 0xBB, 8));
+            s.extend(bdu(MP2_PICTURE, 0xCC, 60)); // GOP-opening picture AU
+            s.extend(bdu(MP2_PICTURE, 0xDD, 40)); // picture AU
+            s
+        };
+        // (label, stream, assembler factory). MPEG-2 uses the dedicated mpeg2()
+        // assembler (Mode::Mpeg2); the AUD/VC-1 codecs use for_codec().
+        let cases: [(&str, &[u8], fn() -> AuAssembler); 3] = [
+            ("h264", &h264, || AuAssembler::for_codec(Codec::H264)),
+            ("vc1", &vc1, || AuAssembler::for_codec(Codec::Vc1)),
+            ("mpeg2", &mpeg2, AuAssembler::mpeg2),
+        ];
+        for (label, stream, make) in cases {
+            let whole = reassemble_with(make(), stream, stream.len());
+            assert!(!whole.is_empty(), "{label}: baseline produced AUs");
+            for frag in 1..=stream.len() {
+                let got = reassemble_with(make(), stream, frag);
+                assert_eq!(
+                    got, whole,
+                    "{label}: fragmented at {frag} differs from whole-buffer reassembly"
+                );
+            }
+        }
     }
 
     #[test]
