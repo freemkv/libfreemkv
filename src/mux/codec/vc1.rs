@@ -103,6 +103,10 @@ pub struct Vc1Parser {
     cur_entry_point: Option<Vec<u8>>,
     width: u32,
     height: u32,
+    /// Display-order PTS reconstruction, enabled only on the program-stream
+    /// (HD-DVD EVO) path where the source stamps a PTS once per GOP. `None` on
+    /// the BD/UHD transport path, which carries a per-frame PTS.
+    reorder: Option<super::reorder::SparsePtsReorder>,
 }
 
 impl Default for Vc1Parser {
@@ -120,6 +124,25 @@ impl Vc1Parser {
             cur_entry_point: None,
             width: 1920,
             height: 1080,
+            reorder: None,
+        }
+    }
+
+    /// Enable display-order PTS reconstruction for a program-stream source.
+    /// No-op (leaves timestamps as parsed) for a transport-stream source.
+    pub(crate) fn with_ps_reorder(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.reorder = Some(super::reorder::SparsePtsReorder::new());
+        }
+        self
+    }
+
+    /// Route a finished frame through the PTS reorderer when enabled, else emit
+    /// it directly (unchanged transport-stream behaviour).
+    fn finish(&mut self, explicit: Option<i64>, frame: Frame) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.push(explicit, frame),
+            None => vec![frame],
         }
     }
 }
@@ -169,7 +192,8 @@ impl CodecParser for Vc1Parser {
         // decode order and the player reorders by timecode. Use PTS, not DTS —
         // DTS presents B-frames in decode order (visible judder) and breaks
         // PTS-based seeking. Fall back to DTS only if PTS is absent.
-        let ts_ns = pes.pts.or(pes.dts).map(pts_to_ns).unwrap_or(0);
+        let explicit_pts = pes.pts.or(pes.dts).map(pts_to_ns);
+        let ts_ns = explicit_pts.unwrap_or(0);
         let mut has_seq_header = false;
         let mut has_entry_point = false;
         let mut frame_start: Option<usize> = None;
@@ -321,7 +345,7 @@ impl CodecParser for Vc1Parser {
             vc1_frame_coding_type(data.get(fs + 4..)?, self.cur_seq_header.as_deref())
         });
 
-        vec![Frame {
+        let frame = Frame {
             // Coding-type only: VC-1 field order is not decoded here, so
             // field_order() stays None — honestly absent, never guessed.
             coding: coding_type.map(PictureInfo::coding_type_only),
@@ -333,7 +357,15 @@ impl CodecParser for Vc1Parser {
             discontinuity: pes.discontinuity,
             data: frame_data,
             duration_ns: None,
-        }]
+        };
+        self.finish(explicit_pts, frame)
+    }
+
+    fn flush(&mut self) -> Vec<Frame> {
+        match self.reorder.as_mut() {
+            Some(r) => r.flush(),
+            None => Vec::new(),
+        }
     }
 
     fn codec_private(&self) -> Option<Vec<u8>> {
