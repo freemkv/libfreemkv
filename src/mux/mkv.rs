@@ -557,6 +557,14 @@ pub struct MkvMuxer<W: Write + Seek> {
     track_uids: Vec<u64>,
     /// Segment duration in seconds (from `Info`), for the BPS denominator.
     duration_secs: f64,
+    /// Byte offset of the DURATION element's 8-byte payload when it was written
+    /// as a patch-later placeholder — the source supplied no duration (e.g.
+    /// HD-DVD, whose `.MAP` timemaps are not parsed). `None` when a real duration
+    /// was written up-front. Back-patched at `finish()` from the muxed timeline.
+    duration_patch_pos: Option<u64>,
+    /// Highest block timestamp (TimestampScale ticks) written across all tracks —
+    /// the muxed runtime, used to back-patch the DURATION placeholder.
+    max_block_ticks: i64,
     /// Per-AC-3-audio-track channel-correction state. The DVD IFO audio nibble
     /// is unreliable, so the channel count written in the track header is
     /// corrected from the AC-3 bitstream `acmod` of the first frame on the
@@ -766,11 +774,21 @@ impl<W: Write + Seek> MkvMuxer<W> {
             ebml::TIMESTAMP_SCALE,
             TIMESTAMP_SCALE_NS as u64,
         )?;
-        if duration_secs > 0.0 {
+        let duration_patch_pos = if duration_secs > 0.0 {
             // Duration is expressed in TimestampScale ticks (not ms).
             let duration_ticks = duration_secs * 1_000_000_000.0 / TIMESTAMP_SCALE_NS as f64;
             ebml::write_float(&mut writer, ebml::DURATION, duration_ticks)?;
-        }
+            None
+        } else {
+            // The source declared no duration (e.g. HD-DVD — its `.MAP` timemaps
+            // are not parsed). Reserve a DURATION placeholder now and back-patch
+            // it at finish() from the muxed timeline, so the file still declares a
+            // runtime instead of showing "unknown". The 8-byte float payload sits
+            // 3 bytes in (2-byte ID `0x4489` + 1-byte size `0x88`).
+            let pos = writer.stream_position()?;
+            ebml::write_float(&mut writer, ebml::DURATION, 0.0)?;
+            Some(pos + 3)
+        };
         // Stamp the freemkv version so any muxed file is traceable to the build
         // that produced it (MediaInfo "Writing application"/"library").
         ebml::write_string(&mut writer, ebml::MUXING_APP, crate::MUX_APP)?;
@@ -1007,6 +1025,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             track_bytes: vec![0u64; tracks.len()],
             track_uids,
             duration_secs,
+            duration_patch_pos,
+            max_block_ticks: 0,
             ac3_channel_fixups,
             opening_capture: None,
         })
@@ -1196,6 +1216,9 @@ impl<W: Write + Seek> MkvMuxer<W> {
         // Committed to writing this frame — record its (monotonic) timestamp so
         // the next block on this track is forced strictly later.
         self.last_pts_ticks.insert(track_idx, pts_ticks);
+        // Track the highest block timestamp so a missing source duration can be
+        // back-patched from the real muxed runtime at finish().
+        self.max_block_ticks = self.max_block_ticks.max(pts_ticks);
 
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
         match duration_ns {
@@ -1268,6 +1291,13 @@ impl<W: Write + Seek> MkvMuxer<W> {
         if self.frame_count == 0 {
             return Err(crate::error::Error::MkvInvalid.into());
         }
+        // The source declared no duration up-front (DURATION was reserved as a
+        // placeholder). Derive the real runtime from the muxed timeline so the
+        // Segment declares it — and so the BPS tags below can be computed.
+        if self.duration_patch_pos.is_some() && self.max_block_ticks > 0 {
+            self.duration_secs =
+                self.max_block_ticks as f64 * TIMESTAMP_SCALE_NS as f64 / 1_000_000_000.0;
+        }
         // Close final cluster
         self.end_cluster()?;
 
@@ -1322,6 +1352,17 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 .seek(std::io::SeekFrom::Start(fixup.value_offset))?;
             self.writer.write_all(&offset.to_be_bytes())?;
         }
+        // Back-patch the DURATION placeholder (source supplied no duration) with
+        // the real runtime from the muxed timeline. The CUES-void and seek-to-end
+        // below re-seek absolutely, so no position restore is needed here.
+        if let Some(pos) = self.duration_patch_pos {
+            if self.max_block_ticks > 0 {
+                self.writer.seek(std::io::SeekFrom::Start(pos))?;
+                self.writer
+                    .write_all(&(self.max_block_ticks as f64).to_be_bytes())?;
+            }
+        }
+
         // Neutralise the unused CUES Seek entry. The entry is a fixed 21-byte
         // Seek master: SEEK(2 ID + 1 size) + SEEK_ID(2+1) + 4-byte target id +
         // SEEK_POSITION(2+1) + 8-byte value = 21 bytes. A Void (0xEC, 1-byte ID)
@@ -2849,6 +2890,32 @@ mod tests {
             ebml::SEEK_HEAD,
             "first child of segment must be SeekHead, got id 0x{:X}",
             children[0].0
+        );
+    }
+
+    /// Scan for the first DURATION element (`0x4489`, 8-byte float payload) and
+    /// return its value in TimestampScale ticks.
+    fn find_duration_ticks(data: &[u8]) -> Option<f64> {
+        data.windows(3)
+            .position(|w| w == [0x44, 0x89, 0x88])
+            .and_then(|i| data.get(i + 3..i + 11))
+            .map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+    }
+
+    #[test]
+    fn duration_backpatched_from_timeline_when_source_gives_none() {
+        // `mux_to_bytes` muxes with `duration_secs = 0.0` (as an HD-DVD title
+        // does), so DURATION is reserved as a placeholder and must be
+        // back-patched from the muxed timeline at finish() — not left 0/absent.
+        let tracks = [make_video_track()];
+        let frames = frames_for(5.0, 1.0); // ~5 s of 24 fps video
+        let (data, _) = mux_to_bytes(&tracks, &[], &frames);
+        let dur = find_duration_ticks(&data).expect("DURATION element present");
+        let expect = 5.0 * 1_000_000_000.0 / TIMESTAMP_SCALE_NS as f64; // ~50000 ticks
+        assert!(dur > 0.0, "duration back-patched from timeline, not 0");
+        assert!(
+            (dur - expect).abs() < 60.0,
+            "duration ~ real runtime: got {dur} ticks, expected ~{expect}"
         );
     }
 
