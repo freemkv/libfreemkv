@@ -981,6 +981,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_extended_stream_id_skips_pts_and_dts_before_the_extension() {
+        // The common real case: an AU-opening 0xFD VC-1 video PES carries a PTS
+        // (and often DTS) in the optional-header region, which the parser must
+        // SKIP (PTS +5, DTS +5) to reach the PES_extension → stream_id_extension.
+        // Both branches were previously untested (flags2 there was 0x01, skipping
+        // everything), so an off-by-one in the skip would silently misroute video.
+        let build = |flags2: u8, skip: usize| {
+            let mut pkt = vec![0x00, 0x00, 0x01, EXTENDED_STREAM_ID];
+            // optional region: `skip` bytes (PTS/DTS placeholders) then
+            // ext_flags=0x01, field_len=0x81, stream_id_extension=0x55.
+            let mut opt = vec![0xFFu8; skip];
+            opt.extend_from_slice(&[0x01, 0x81, 0x55]);
+            let es = [0xDEu8, 0xAD];
+            let len = (3 + opt.len() + es.len()) as u16;
+            pkt.extend_from_slice(&len.to_be_bytes());
+            // flags1=0x80, flags2, header_data_length = optional region length.
+            pkt.extend_from_slice(&[0x80, flags2, opt.len() as u8]);
+            pkt.extend_from_slice(&opt);
+            pkt.extend_from_slice(&es);
+            pkt
+        };
+        // PTS present (pts_dts bits = 10 → flags2 0x80) + PES_extension (0x01).
+        let pts_only = parse_pes_packet(&build(0x81, 5)).expect("parses");
+        assert_eq!(
+            pts_only.sub_stream_id,
+            Some(0x55),
+            "extension found after skipping a 5-byte PTS"
+        );
+        // PTS+DTS present (pts_dts bits = 11 → flags2 0xC0) + PES_extension.
+        let pts_dts = parse_pes_packet(&build(0xC1, 10)).expect("parses");
+        assert_eq!(
+            pts_dts.sub_stream_id,
+            Some(0x55),
+            "extension found after skipping a 10-byte PTS+DTS"
+        );
+    }
+
+    #[test]
     fn parse_extended_stream_id_without_extension_yields_no_sub_id() {
         // A 0xFD PES that declares no PES_extension (flags2=0x00) can't carry a
         // stream_id_extension → sub_stream_id None, and dvd_pid falls through.

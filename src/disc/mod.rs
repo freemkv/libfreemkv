@@ -2142,10 +2142,14 @@ impl Disc {
                     None => {}
                 }
             }
-            // Unencrypted / unreadable MKB: refine by resolution, default BD.
+            // Unencrypted / unreadable MKB: refine by resolution, but a BD-tree
+            // disc is never below Blu-ray — only UHD can promote it. detect_format
+            // is a general resolution classifier that can return Dvd for an SD
+            // bonus/menu title, which must NOT tag a BDMV disc as DVD (that
+            // mis-sizes the ECC-block sweep). Clamp anything but UHD up to BluRay.
             return match Self::detect_format(titles) {
-                DiscFormat::Unknown => DiscFormat::BluRay,
-                other => other,
+                DiscFormat::Uhd => DiscFormat::Uhd,
+                _ => DiscFormat::BluRay,
             };
         }
         if udf_fs.find_dir("/HVDVD_TS").is_some() {
