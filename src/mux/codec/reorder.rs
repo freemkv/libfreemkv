@@ -190,6 +190,10 @@ impl SparsePtsReorder {
         let mut out = Vec::with_capacity(pend.len());
         for (mut p, didx) in pend.into_iter().zip(dispidx) {
             p.frame.pts_ns = origin + didx * dur;
+            // Carry the calibrated per-frame duration so the muxer emits a
+            // BlockDuration and the back-patched Segment Duration covers the
+            // final frame (the source gives no duration on this path).
+            p.frame.duration_ns = Some(dur as u64);
             out.push(p.frame);
         }
         // Next GOP with no anchor continues after this one's last display slot.
@@ -295,7 +299,7 @@ mod tests {
         // GOP 1 decode order I P B P B -> display indices 0 2 1 4 3 -> PTS:
         assert_eq!(
             &got[0..5],
-            &[0, 2 * dur, 1 * dur, 4 * dur, 3 * dur],
+            &[0, 2 * dur, dur, 4 * dur, 3 * dur],
             "GOP1 display PTS in decode order"
         );
         // GOP 2 re-locks origin to 5*dur.
