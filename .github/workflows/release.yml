@@ -39,29 +39,11 @@ jobs:
       # would always fail (no lockfile to lock against on a fresh runner).
       - run: cargo test
 
-  # crates.io publish is an INDEPENDENT job: it serves EXTERNAL consumers only.
-  # The freemkv binaries no longer depend on it (they git-tag-pin libfreemkv via
-  # a committed [patch.crates-io]), so this publish runs in parallel with their
-  # release builds rather than gating them. It `needs: [verify, test]` so a
-  # failing test suite still blocks publication to crates.io — external
-  # consumers who `cargo add libfreemkv` must never receive a release whose
-  # tests were failing. (The two upstream jobs run in parallel, so this gate
-  # does not serialize publish behind test beyond their own completion.)
-  publish:
-    needs: [verify, test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.86.0
-      - uses: Swatinem/rust-cache@v2
-      # --no-verify: CI already compiled this exact commit (in the `test` job
-      # and on every push via ci.yml). cargo publish's default re-verify does a
-      # full cold release build of the packaged tarball, which here is pure
-      # redundant work (~a cold lib build). Skip it.
-      - name: Publish to crates.io
-        run: cargo publish --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  # NOTE: there is no crates.io publish job. libfreemkv is git-tag-only
+  # (`package.publish = false` — it git-deps the firmware crate freemkv-unlock,
+  # which never ships to crates.io). Every consumer git-tag-pins libfreemkv via
+  # a committed [patch.crates-io]; the git tag itself IS the release artifact.
+  # A `cargo publish` here fails hard on `publish = false`, so it was removed.
 
   release:
     # Only needs `verify`; the GitHub Release can be cut as soon as the version
