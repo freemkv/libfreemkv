@@ -110,6 +110,10 @@ pub struct Mpeg2Parser {
     /// without ever reordering emitted blocks (B-frames keep decode order; only
     /// their PTS is lower).
     gop_buf: Vec<BufferedPicture>,
+    /// Running total of `data` bytes buffered in `gop_buf` — the byte-cap counter,
+    /// incremented on each push and reset when the GOP flushes. Avoids re-summing
+    /// the whole buffer per picture (which would be O(pictures²)).
+    gop_bytes: usize,
     /// Total field-display periods of all frames already emitted, in display
     /// order — the running base for each new frame's display time.
     emitted_fields: u64,
@@ -148,6 +152,7 @@ impl Mpeg2Parser {
             frame_duration_ns: 0,
             progressive_sequence: false,
             gop_buf: Vec::new(),
+            gop_bytes: 0,
             emitted_fields: 0,
             origin_pts_ns: None,
         }
@@ -241,6 +246,7 @@ impl Mpeg2Parser {
         if gop_boundary && !self.gop_buf.is_empty() {
             self.flush_gop(out);
         }
+        self.gop_bytes += data.len();
         self.gop_buf.push(BufferedPicture {
             tr,
             info,
@@ -262,8 +268,7 @@ impl Mpeg2Parser {
         // unbounded. Force-flush a pathologically long run as its own GOP —
         // bounded by BOTH the frame count and the total buffered bytes, so a
         // crafted stream of few-but-huge pictures cannot over-allocate either.
-        let gop_bytes: usize = self.gop_buf.iter().map(|p| p.frame.data.len()).sum();
-        if self.gop_buf.len() >= MAX_PENDING_FRAMES || gop_bytes >= MAX_PENDING_BYTES {
+        if self.gop_buf.len() >= MAX_PENDING_FRAMES || self.gop_bytes >= MAX_PENDING_BYTES {
             self.flush_gop(out);
         }
     }
@@ -281,6 +286,8 @@ impl Mpeg2Parser {
         if n == 0 {
             return;
         }
+        // The GOP is fully drained below; reset the running byte counter.
+        self.gop_bytes = 0;
         let field_period = self.frame_duration_ns / 2;
         if field_period <= 0 {
             // No sequence header / frame rate yet (malformed lead-in): emit in
