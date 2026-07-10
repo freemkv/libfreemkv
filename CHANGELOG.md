@@ -5,12 +5,7 @@
 ### Licensing
 
 - **Relicensed to the MIT License, from 1.3.1 onwards** (releases up to and
-  including 1.3.0 remain under AGPL-3.0). All code is an independent Rust
-  implementation of the public/standard disc formats and cryptographic
-  algorithms; comments that cross-referenced GPL/LGPL C projects (libdvdcss,
-  libaacs, libbluray, libdvdread, libdvdnav) were dropped, and the CSS content
-  cipher and the Stevenson title-key attack are attributed to their published
-  cryptanalysis rather than any particular software.
+  including 1.3.0 remain under AGPL-3.0).
 
 ### Added
 
