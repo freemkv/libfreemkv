@@ -61,6 +61,11 @@ const HDDVD_VTI_MAGIC: &[u8] = b"ADVANCED-VTS";
 /// shares one residue modulo this stride — the signal used to isolate the table.
 const VTI_CLIP_ENTRY_STRIDE: usize = 0x140;
 
+/// Cap on clip-name hits collected from a VTI. A real clip table holds a few
+/// dozen entries; this bounds the scan so a crafted VTI packed with millions of
+/// `.EVO` tokens (up to the 64 MiB UDF read cap) can't burn CPU/memory.
+const MAX_VTI_HITS: usize = 8192;
+
 /// Parse the clip-name table from an `ADVANCED-VTS` VTI, returning clip
 /// filenames in authored (table) order.
 ///
@@ -73,10 +78,6 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
     if !vti.starts_with(HDDVD_VTI_MAGIC) {
         return Vec::new();
     }
-    // A real VTI clip table holds a few dozen entries; cap the collected hits so
-    // a crafted VTI packed with millions of `.EVO` tokens (up to the 64 MiB UDF
-    // read cap) can't burn CPU or memory during a routine scan.
-    const MAX_VTI_HITS: usize = 8192;
     let is_name_byte = |b: u8| b.is_ascii_graphic();
     // Bucket hits by residue-mod-stride in a SINGLE pass — the clip table shares
     // one residue, so the largest bucket is it (avoids an O(stride*hits) rescan).
@@ -269,11 +270,28 @@ fn collect_es(
 ) {
     use crate::consts::pes_stream_id::{PRIVATE_STREAM_1, VIDEO, VIDEO_MAX};
     const EXTENDED_STREAM_ID: u8 = 0xFD;
+    /// VC-1 video rides extended-stream-id `0xFD` with `stream_id_extension`
+    /// `0x55`. HD audio (MLP/TrueHD) can also use `0xFD` with other extensions —
+    /// routing those to their own audio tracks is deferred (see the HD-DVD
+    /// program-chain follow-up); until then only the VC-1 extension is treated as
+    /// video, so an audio `0xFD` sub-stream can never mis-stamp the video PID.
+    const VC1_STREAM_ID_EXT: u8 = 0x55;
+    // Whether this packet is the VC-1 video sub-stream of the 0xFD extended id.
+    let is_vc1_ext =
+        pkt.stream_id == EXTENDED_STREAM_ID && pkt.sub_stream_id == Some(VC1_STREAM_ID_EXT);
     match pkt.stream_id {
-        // Plain MPEG video (0xE0-0xEF), or the HD-DVD extended-stream-id (0xFD)
-        // that carries VC-1 video. Both feed the single video ES sample; the
+        // Plain MPEG video (0xE0-0xEF), or the VC-1 sub-stream of the HD-DVD
+        // extended-stream-id (0xFD). Both feed the single video ES sample; the
         // routing PID comes from `PsPacket::dvd_pid` so it matches the demuxer.
-        VIDEO..=VIDEO_MAX | EXTENDED_STREAM_ID => {
+        VIDEO..=VIDEO_MAX => {
+            if video_pid.is_none() {
+                *video_pid = pkt.dvd_pid();
+            }
+            if video.len() < EVO_ES_SAMPLE_CAP {
+                video.extend_from_slice(&pkt.data);
+            }
+        }
+        EXTENDED_STREAM_ID if is_vc1_ext => {
             if video_pid.is_none() {
                 *video_pid = pkt.dvd_pid();
             }
@@ -544,6 +562,25 @@ mod tests {
         );
         // A non-VTI blob yields nothing.
         assert!(parse_vti_clip_order(b"not a vti").is_empty());
+    }
+
+    #[test]
+    fn parse_vti_clip_order_caps_hits_on_a_crafted_vti() {
+        // A crafted VTI packed with far more than MAX_VTI_HITS `.EVO` tokens must
+        // not scan/collect them all (a CPU/memory amplification on a routine
+        // scan). The result is capped, and parsing stays fast.
+        let mut vti = Vec::with_capacity(1_000_000);
+        vti.extend_from_slice(HDDVD_VTI_MAGIC);
+        // ~160k tokens of the form "X.EVO\0" — well over the 8192 cap.
+        for _ in 0..(MAX_VTI_HITS * 20) {
+            vti.extend_from_slice(b"X.EVO\0");
+        }
+        let out = parse_vti_clip_order(&vti);
+        assert!(
+            out.len() <= MAX_VTI_HITS,
+            "collected hits capped at MAX_VTI_HITS, got {}",
+            out.len()
+        );
     }
 
     #[test]
