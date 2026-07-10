@@ -346,7 +346,7 @@ pub fn key_fetch(
 ///
 /// "Encrypted" is decided by [`crate::aacs::content::aacs_unit_encrypted`] — the
 /// AACS Copy Permission Indicator (CPI) in the top 2 bits of byte 0, the
-/// spec-correct signal (libaacs' `buf[0] & 0xc0`). NOT the `ts_sync_destroyed`
+/// spec-correct signal (`buf[0] & 0xc0`). NOT the `ts_sync_destroyed`
 /// sync heuristic: destroyed TS syncs do not imply encryption (an FMTS variant
 /// frame or an odd clear unit can lack syncs yet be unencrypted), and a clear
 /// unit sent to a key server yields nothing to validate against — the "0

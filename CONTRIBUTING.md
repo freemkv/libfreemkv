@@ -24,4 +24,4 @@ cargo test
 
 ## License
 
-By contributing, you agree your code will be licensed under AGPL-3.0.
+By contributing, you agree your code will be licensed under MIT.

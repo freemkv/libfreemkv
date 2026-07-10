@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.3.1] — 2026-07-10
+
+### Licensing
+
+- **Relicensed to the MIT License, from 1.3.1 onwards** (releases up to and
+  including 1.3.0 remain under AGPL-3.0). All code is an independent Rust
+  implementation of the public/standard disc formats and cryptographic
+  algorithms; comments that cross-referenced GPL/LGPL C projects (libdvdcss,
+  libaacs, libbluray, libdvdread, libdvdnav) were dropped, and the CSS content
+  cipher and the Stevenson title-key attack are attributed to their published
+  cryptanalysis rather than any particular software.
+
+### Added
+
+- **Authoritative HD-DVD title composition** from the Advanced-Content playlist
+  (`ADV_OBJ/VPLST000.XPL`): each title's clips, real duration, display name, and
+  chapters come from the disc's own playlist instead of a clip-name heuristic. A
+  layer-break split (`FEATURE_1`+`FEATURE_2`, `feature`/`feature_Divide`) composes
+  into ONE title with the two parts as clips and their title-time offsets. Falls
+  back to the clip-name heuristic when no playlist is present.
+
 ## [1.3.0] — 2026-07-08
 
 ### Added
@@ -122,7 +143,7 @@
 
 - **Processing-Key resolution is ~15× faster on UHD.** A Processing Key is the
   key at its subset-difference node (one AES-G from the Media Key), so it is now
-  tried directly against the MKB cvalue tables (matching libaacs `_calc_mk_pks`)
+  tried directly against the MKB cvalue tables (direct PK × cvalue iteration)
   instead of BFS-walking the SD tree at unknown depth — which was both wrong for
   terminal PKs and slow on a large UHD MKB (~181k cvalues). PK derivation on UHD
   drops from ~37 s to ~2.4 s; the SD tree walk now lives solely in the device-key
@@ -355,7 +376,7 @@ consumers are the in-tree toolchain crates.
 
 - **Post-read decrypt-verify gate.** Every AACS unit read off the disc is now
   buffered, re-aligned to its clip-file 6144-byte unit grid, and verified
-  (CPI flag → decrypt → strict all-32 TS-sync, matching libaacs `_verify_ts`)
+  (CPI flag → decrypt → strict all-32 TS-sync)
   before it is signed off as good. A unit that no held or freshly-fetched key
   decrypts is treated exactly like a bad read — re-read by
   the patch pass, terminal loss only if truly unrecoverable — closing the
@@ -376,7 +397,7 @@ consumers are the in-tree toolchain crates.
 
 - **AACS decrypt acceptance is now standards-strict.** A key is accepted only
   when the decrypted unit has the TS sync byte on *all* 32 source packets
-  (libaacs `_verify_ts`), replacing a majority-vote heuristic where a wrong key
+  (all-32 TS-sync verify), replacing a majority-vote heuristic where a wrong key
   could coincidentally restore enough syncs to pass and silently corrupt a unit.
 - keydb download/save moved out of the library into freemkv-keysources;
   libfreemkv no longer has any keydb I/O (it already held no keys).
@@ -384,7 +405,7 @@ consumers are the in-tree toolchain crates.
 ### Fixed
 
 - **AACS content-certificate bus-encryption flag read from the wrong bit.** The
-  flag is bit 7 of byte 1 (libaacs `p[1] >> 7`) but was read as bit 0, so a
+  flag is bit 7 of byte 1 (`p[1] >> 7`) but was read as bit 0, so a
   bus-encrypted disc parsed as *not* bus-encrypted — defeating the fail-loud
   guard that refuses to decrypt bus-wrapped data to garbage when no bus key was
   obtained. Also corrected the cc_id offset (byte 14) and the AACS2 type marker
@@ -684,7 +705,7 @@ hardening.
 
 - **Keyless DVD/CSS title-key recovery.** A CSS-protected DVD decrypts with no
   key database — the title key is recovered directly from the scrambled disc
-  data via the Stevenson known-plaintext attack (ported from libdvdcss) and
+  data via the Stevenson known-plaintext attack and
   validated by descrambling a sector and confirming the known plaintext
   reappears, so a wrong key fails cleanly instead of producing silent garbage
   (`src/css/stevenson.rs`). `Disc::scan_image` recovers the same title key from

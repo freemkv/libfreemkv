@@ -58,7 +58,7 @@ pub struct DvdTitle {
 pub struct DvdCell {
     pub first_sector: u32,
     pub last_sector: u32,
-    /// Raw cell-category byte at `cell_playback + 0` (libdvdread layout).
+    /// Raw cell-category byte at `cell_playback + 0` (DVD-Video IFO layout).
     /// Packs block_mode (bits 7-6), block_type (bits 5-4), seamless_play
     /// (bit 3), interleaved (bit 2), stc_discontinuity (bit 1),
     /// seamless_angle (bit 0). Carried so the extent builder can recognise
@@ -72,7 +72,7 @@ pub struct DvdCell {
 }
 
 /// Decoded view of a cell-category byte (`cell_playback + 0`), per the
-/// DVD-Video spec / libdvdread `cell_playback_t` layout. Byte-0 bitfields,
+/// DVD-Video IFO cell-playback layout. Byte-0 bitfields,
 /// MSB-first: `block_mode`(7-6), `block_type`(5-4), `seamless_play`(3),
 /// `interleaved`(2), `stc_discontinuity`(1), `seamless_angle`(0). (The real
 /// `cell_type` is a karaoke-only field in byte 1, not used here.)
@@ -93,7 +93,7 @@ pub struct CellCategory {
 }
 
 impl CellCategory {
-    /// Decode the raw `cell_playback + 0` byte (libdvdread `read_cell_playback`).
+    /// Decode the raw `cell_playback + 0` byte (DVD-Video IFO cell playback).
     pub fn decode(raw: u8) -> Self {
         CellCategory {
             block_mode: (raw >> 6) & 0x03,
@@ -423,7 +423,7 @@ fn parse_vts(
     }
 
     // VTSI_MAT (VTS_xx_0.IFO header) field offsets — fixed by the DVD-Video
-    // spec (libdvdread `vtsi_mat_t`). The offsets are constant; the sector
+    // spec (the VTSI management table). The offsets are constant; the sector
     // values they point to are per-disc.
     const VTSTT_VOBS_OFFSET: usize = 0xC4; // VTS title VOBS start sector (feature)
     const VTS_PGCIT_OFFSET: usize = 0xCC; // VTS_PGCIT sector pointer
@@ -580,7 +580,7 @@ fn parse_audio_attr(data: &[u8], offset: usize) -> Result<DvdAudioAttr> {
         _ => Codec::Unknown(coding_mode),
     };
 
-    let sample_rate_flag = (b1 >> 4) & 0x03; // sample_frequency: byte 1 bits 5-4 (libdvdread audio_attr_t)
+    let sample_rate_flag = (b1 >> 4) & 0x03; // sample_frequency: byte 1 bits 5-4 (DVD-Video audio attributes)
     let sample_rate = match sample_rate_flag {
         0 => 48000,
         1 => 96000,
@@ -1071,7 +1071,7 @@ mod tests {
     /// reads with — a co-edit of constant + helper would silently re-introduce
     /// the PAL-as-NTSC bug and every test would still pass. This test feeds
     /// `parse_video_attr` HARDCODED bytes captured from real DVD-Video layouts
-    /// (DVD spec / libdvdread `video_attr_t`: mpeg_version[7-6] video_format[5-4]
+    /// (DVD-Video video attributes: mpeg_version[7-6] video_format[5-4]
     /// display_aspect[3-2] permitted_df[1-0]) — no `v_atr_byte`. If the parser's
     /// bit positions drift, these fail.
     #[test]
@@ -1238,7 +1238,7 @@ mod tests {
 
     // ─────────────────────────────────────────────────────────────────────
     // Added hardening tests. Grounded in the DVD-Video IFO spec
-    // (dvd_udf / libdvdread ifo_types.h; http://dvd.sourceforge.net).
+    // (DVD-Video IFO format; http://dvd.sourceforge.net).
     // ─────────────────────────────────────────────────────────────────────
 
     /// BCD frame-rate flag: bits 7-6 of byte[3]. 0b01 = 25fps (PAL),
@@ -1593,7 +1593,7 @@ mod tests {
         }
     }
 
-    /// CellCategory decodes the libdvdread byte-0 bitfields: block_mode (7-6),
+    /// CellCategory decodes the DVD-Video cell-category byte-0 bitfields: block_mode (7-6),
     /// block_type (5-4), seamless_play (3), interleaved (2),
     /// stc_discontinuity (1), seamless_angle (0).
     #[test]

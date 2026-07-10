@@ -1,4 +1,4 @@
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 # libfreemkv
 
@@ -190,4 +190,4 @@ Run `freemkv info disc:// --share` with the [freemkv CLI](https://github.com/fre
 
 ## License
 
-AGPL-3.0-only
+MIT
