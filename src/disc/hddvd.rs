@@ -152,7 +152,9 @@ fn sniff_video_codec(es: &[u8]) -> Option<Codec> {
                 _ if (code & 0x9F) == 0x07 => saw_h264_sps = true,
                 _ => {}
             }
-            i += 3;
+            // Skip the whole consumed `00 00 01 <code>` marker (4 bytes) so the
+            // code byte isn't re-read as the start of an overlapping start code.
+            i += 4;
         } else {
             i += 1;
         }
@@ -423,7 +425,7 @@ impl Disc {
                 content_format: ContentFormat::MpegPs,
                 codec_privates: Vec::new(),
             });
-            next_id += 1;
+            next_id = next_id.saturating_add(1);
         }
 
         // Every remaining clip is its own title (unchanged behaviour). Iterated in
@@ -461,7 +463,7 @@ impl Disc {
                 content_format: ContentFormat::MpegPs,
                 codec_privates: Vec::new(),
             });
-            next_id += 1;
+            next_id = next_id.saturating_add(1);
         }
         titles
     }
