@@ -157,7 +157,7 @@ impl AacsVersion {
 }
 
 /// Find Verify Media Key Record (type 0x81 for AACS 1.0, 0x86 for AACS 2.0/2.1) in MKB.
-/// 0x81: [C] §3.2.5.1.4. 0x86 (AACS 2.x): [libaacs] `mkb.c` — not in the public spec.
+/// 0x81: [C] §3.2.5.1.4. 0x86 (AACS 2.x): [RE] — not in the public spec (from real 2.x MKBs).
 pub(crate) fn mkb_find_mk_dv(mkb: &[u8]) -> Option<[u8; 16]> {
     // Verify-Media-Key record (0x81 for AACS 1.0, 0x86 for AACS 2.x): mk_dv is
     // the 16 bytes at record offset 4 (body offset 0). Needs rec_len >= 20.
@@ -198,9 +198,8 @@ pub(crate) fn mkb_find_subdiff_records(mkb: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The cvalue table is record type `0x05` (Media Key Data) on BOTH AACS
 /// 1.0 and AACS 2.x MKBs — its 16-byte cvalue entries are 1:1 with the
-/// 5-byte Subset-Difference index entries in record `0x04`. This matches
-/// libaacs, whose `mkb_cvalues()` reads `0x05` and `mkb_subdiff_records()`
-/// reads `0x04`.
+/// 5-byte Subset-Difference index entries in record `0x04` — the standard AACS
+/// MKB layout (`0x05` cvalues 1:1 with the `0x04` subset-difference index).
 ///
 /// On AACS 2.x in-drive UHD MKBs the `0x05` table is large (the full
 /// subset-difference cvalue set: ~181k entries on a retail MKB, 1:1 with
@@ -281,10 +280,10 @@ pub const MKB_TYPE_4_PRERECORDED: u32 = 0x0004_1003;
 /// `0x000A1003` — Class II / Unified MKB (Sequence-Key-Block functionality).
 pub const MKB_TYPE_10_CLASS_II: u32 = 0x000A_1003;
 
-/// `0x48141003` — AACS 2.0 Category C (UHD content). libaacs `MKB_20_CATEGORY_C`.
+/// `0x48141003` — AACS 2.0 Category C (UHD content) MKB type value.
 pub const MKB_20_CATEGORY_C: u32 = 0x4814_1003;
 
-/// `0x48151003` — AACS 2.1 Category C (UHD content). libaacs `MKB_21_CATEGORY_C`.
+/// `0x48151003` — AACS 2.1 Category C (UHD content) MKB type value.
 pub const MKB_21_CATEGORY_C: u32 = 0x4815_1003;
 
 /// The AACS MKB Type field, decoded.

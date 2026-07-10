@@ -121,7 +121,7 @@ pub fn parse_unit_key_ro(data: &[u8], version: AacsVersion) -> Option<UnitKeyFil
         return None;
     }
 
-    // Title → CPS unit mapping. libaacs (unit_key.c) validates each on-disc CPS
+    // Title → CPS unit mapping (AACS Unit_Key_RO format): each on-disc CPS
     // value is in `1..=num_uk` (else zeroes it) and converts the 1-based on-disc
     // index to a 0-based key index. We mirror that so the stored value is a safe,
     // ready-to-use key index rather than a raw 1-based number.
@@ -261,10 +261,10 @@ pub fn parse_content_cert(data: &[u8]) -> Option<ContentCert> {
         return None;
     }
 
-    // Content Certificate layout (matches libaacs content_cert.c):
+    // Content Certificate layout (per the AACS content-cert format):
     //   [0]      certificate type (0x00 = AACS1, 0x10 = AACS2)
-    //   [1] bit7 bus_encryption_enabled_flag  (libaacs: `p[1] >> 7`)
-    //   [14..20] cc_id (6 bytes)             (libaacs: `p + 14`)
+    //   [1] bit7 bus_encryption_enabled_flag  (`p[1] >> 7`)
+    //   [14..20] cc_id (6 bytes)             (`p + 14`)
     let version = if data[0] == 0x00 {
         AacsVersion::V10
     } else {

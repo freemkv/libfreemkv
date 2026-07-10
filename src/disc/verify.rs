@@ -7,7 +7,7 @@
 //! grid (clips can start off the 6144 grid and fragment across UDF extents). So
 //! this gate BUFFERS the disc-absolute read stream and re-ALIGNS it into
 //! clip-file units, then applies the standards-correct
-//! [`crate::aacs::content::unit_is_clean_ts`] gate (libaacs `_verify_ts`, all-32 syncs).
+//! [`crate::aacs::content::unit_is_clean_ts`] gate (all-32 TS syncs).
 //!
 //! FAIL-SAFE CONTRACT (this sits in the middle of every read, so it must never
 //! break a good read): the gate can ONLY downgrade a unit it is *confident* is

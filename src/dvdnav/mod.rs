@@ -6,7 +6,7 @@
 //!
 //! Byte layout follows the DVD-Video specification (VMGI/VTSI headers,
 //! PGC/cell tables, PCI/HLI button packets); the VM command decoder is
-//! verified against libdvdnav's decoder.
+//! verified against real discs.
 //!
 //! Current contents: [`vmcmd`] — the VM command decoder (proven against the
 //! SOTL/Greenland test discs). The IFO/PCI parsing and the navigation executor

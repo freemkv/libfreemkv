@@ -1,48 +1,37 @@
 //! CSS title-key recovery — Frank A. Stevenson's divide-and-conquer attack
-//! (1999), ported exactly from libdvdcss `RecoverTitleKey` + `AttackPattern`
-//! (css.c).
-//!
-//! Recovers the 5-byte CSS title key from a single scrambled DVD sector with
-//! no player keys and no disc-key crack, using only known plaintext.
+//! (1999), implemented from his published cryptanalysis ("Cryptanalysis of
+//! Contents Scrambling System"). It recovers the 5-byte CSS title key from a
+//! single scrambled DVD sector with no player keys and no disc-key crack, using
+//! only known plaintext. Implemented from that public description; nothing here
+//! is copied or translated from any particular CSS software.
 //!
 //! # The cipher this attacks
 //!
-//! The content descrambler ([`super::lfsr::descramble_sector`], = libdvdcss
-//! `dvdcss_unscramble`) seeds its two LFSRs **directly** from
-//! `key = title_key XOR sector_seed` (seed = `sector[0x54..0x59]`):
-//!
-//! ```text
-//! i_t1 = (key[0] ^ sec[0x54]) | 0x100;          // LFSR1 low (9-bit)
-//! i_t2 =  key[1] ^ sec[0x55];                    // LFSR1 high
-//! i_t3 = (key[2]|key[3]<<8|key[4]<<16) ^ seed3;  // LFSR0 (24-bit feedback)
-//! i_t3 = i_t3*2 + 8 - (i_t3 & 7);
-//! // per byte:  *p = TAB1[*p] ^ (i_t5 & 0xff)
-//! ```
-//!
-//! There is NO `decrypt_key` mangling on the content path. So the recovery
-//! is a single inversion of `dvdcss_unscramble`, not the multi-stage
-//! working-key inversion the previous (non-CSS) implementation used.
+//! The content descrambler ([`super::lfsr::descramble_sector`]) seeds its two
+//! LFSRs **directly** from `key = title_key XOR sector_seed` (seed =
+//! `sector[0x54..0x59]`): LFSR1 from key/seed bytes 0-1, LFSR0 (24-bit) from
+//! bytes 2-4 with the pre-conditioning `r0 = r0*2 + 8 - (r0 & 7)`, and each body
+//! byte recovered as `plain = TAB1[cipher] ^ (keystream & 0xff)`. There is no
+//! title-key mangling on the content path, so the recovery is a single inversion
+//! of the sector cipher.
 //!
 //! # The attack
 //!
-//! 1. **Known plaintext → keystream.** Because the descramble applies TAB1
-//!    to the ciphertext, the per-byte keystream is
-//!    `buf[i] = TAB1[cipher[i]] ^ plain[i]` (matching libdvdcss
-//!    `RecoverTitleKey`'s `p_buffer`).
+//! 1. **Known plaintext → keystream.** Because descramble applies TAB1 to the
+//!    ciphertext, the per-byte keystream is `TAB1[cipher[i]] ^ plain[i]`.
 //! 2. **Brute the 16-bit LFSR1 seed.** For each of 2^16 seeds, run LFSR1
-//!    forward; for the first four steps deduce the LFSR0 output bytes from
-//!    the keystream (carry-tracked), reconstructing `i_t3`. For the next six
-//!    steps clock LFSR0 normally and check it reproduces the keystream — a
-//!    wrong LFSR1 seed fails fast.
-//! 3. **Back-clock LFSR0.** Run four backward `i_t3` steps (each a 256-way
-//!    search for the byte shifted in) to reach the initial state, then undo
-//!    `i_t3 = i_t3*2 + 8 - (i_t3 & 7)` to recover key[2..5].
-//! 4. **XOR back the seed.** `key[0..5] ^= sector_seed[0..5]` (plain XOR —
-//!    the descramble seeds directly, so there is no inversion).
+//!    forward; for the first four steps deduce the LFSR0 output bytes from the
+//!    keystream (carry-tracked), reconstructing LFSR0's state. For the next six
+//!    steps clock LFSR0 normally and check it reproduces the keystream — a wrong
+//!    LFSR1 seed fails fast.
+//! 3. **Back-clock LFSR0.** Run four backward steps (each a 256-way search for
+//!    the byte shifted in) to reach the initial state, then undo the
+//!    `r0*2 + 8 - (r0 & 7)` pre-conditioning to recover key[2..5].
+//! 4. **XOR back the seed.** `key[0..5] ^= sector_seed[0..5]`.
 //!
-//! `AttackPattern` finds known plaintext for step 1: the longest periodic
-//! run in the cleartext `sec[0x00..0x80]`, assumed to continue into the
-//! encrypted region at 0x80.
+//! Known plaintext for step 1 comes from the longest periodic run in the
+//! cleartext `sec[0x00..0x80]`, assumed to continue into the encrypted region at
+//! 0x80.
 
 use super::lfsr::descramble_sector;
 use super::tables::{TAB1, TAB2, TAB3, TAB4, TAB5};
@@ -52,13 +41,11 @@ const ENCRYPTED_START: usize = 0x80; // byte 128
 const SEED_OFFSET: usize = 0x54; // sector seed at bytes 0x54-0x58
 const FLAG_BYTE: usize = 0x14;
 
-/// RecoverTitleKey: recover the title key from cipher + known plaintext.
-///
-/// Exact port of libdvdcss `RecoverTitleKey` (css.c). `crypted` is the
-/// ciphertext starting at sector byte 0x80; `decrypted` is the matching
-/// known plaintext; `seed` is `sector[0x54..0x59]`. On success returns the
-/// recovered 5-byte title key; `None` if no LFSR seed reproduces the
-/// keystream.
+/// Recover the title key from cipher + known plaintext (the core of Stevenson's
+/// attack). `crypted` is the ciphertext starting at sector byte 0x80;
+/// `decrypted` is the matching known plaintext; `seed` is `sector[0x54..0x59]`.
+/// On success returns the recovered 5-byte title key; `None` if no LFSR seed
+/// reproduces the keystream.
 ///
 /// At least 10 bytes of `crypted`/`decrypted` are required (the cipher is
 /// iterated 10 times: 4 to reconstruct LFSR0, 6 to validate).
@@ -222,16 +209,13 @@ fn descramble_matches(sector: &[u8], title: &[u8; 5], plain: &[u8]) -> bool {
     test[ENCRYPTED_START..ENCRYPTED_START + n] == plain[..n]
 }
 
-/// AttackPattern: find a repeating pattern just before the encrypted region
-/// and assume the plaintext at 0x80 continues it.
-///
-/// Functionally-equivalent port of libdvdcss `AttackPattern` (css.c) — finds the
-/// same periodic cribs on real DVD data, though its byte-comparison anchor
-/// differs from the C on phase-misaligned runs. Scans cleartext
-/// `sec[0x00..0x80]` for the longest run that repeats with a cycle length in
-/// 2..0x2F. If the run is long enough (`plen > 3` and at least two full
-/// cycles), the known plaintext at 0x80 is taken to be the periodic run
-/// continuing forward, and [`recover_title_key_from_plain`] is applied.
+/// Find a repeating pattern just before the encrypted region and assume the
+/// plaintext at 0x80 continues it — the known-plaintext step of Stevenson's
+/// attack. Scans cleartext `sec[0x00..0x80]` for the longest run that repeats
+/// with a cycle length in 2..0x2F. If the run is long enough (`plen > 3` and at
+/// least two full cycles), the known plaintext at 0x80 is taken to be the
+/// periodic run continuing forward, and [`recover_title_key_from_plain`] is
+/// applied.
 pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     if sector.len() < SECTOR_BYTES {
         return None;
@@ -260,7 +244,7 @@ pub fn crack_title_key(sector: &[u8]) -> Option<[u8; 5]> {
     result
 }
 
-/// AttackPattern crib: the predicted 10-byte plaintext at byte 0x80.
+/// Crib: the predicted 10-byte plaintext at byte 0x80.
 ///
 /// Scans the clear header `sec[0x00..0x80]` (never scrambled) for the longest
 /// run that repeats with a cycle length in 2..0x2F. If the run is long enough
@@ -366,7 +350,7 @@ mod tests {
 
     /// Build a synthetic scrambled sector whose CLEARTEXT (0x00..0x80) ends
     /// in a periodic run that continues into the encrypted region — the case
-    /// `AttackPattern` (crack_title_key) is designed to crack.
+    /// `crack_title_key` is designed to crack.
     fn synth_periodic_sector(
         title_key: &[u8; 5],
         seed: &[u8; 5],
@@ -379,7 +363,7 @@ mod tests {
         // (RUN_START..0x80) and continuing into the encrypted region. This
         // mirrors a real VOB: a periodic data run just before the scrambled
         // part. The run must NOT overlap the seed bytes (0x54..0x59), or the
-        // AttackPattern detector would break mid-run. The phase is anchored to
+        // the crib detector would break mid-run. The phase is anchored to
         // offset 0 so the run is consistent across the 0x80 boundary.
         // Just above the seed (0x54..0x59); gives a 39-byte run (0x59..0x80)
         // — enough for >=2 cycles of every tested period (<=19).
@@ -466,7 +450,7 @@ mod tests {
         }
     }
 
-    /// MANDATORY (Task C.1): the AttackPattern entry point crack_title_key —
+    /// MANDATORY (Task C.1): the crib-based entry point crack_title_key —
     /// no plaintext supplied — recovers a round-tripping key when the
     /// cleartext ends in a periodic run that continues into 0x80.
     #[test]
@@ -488,7 +472,7 @@ mod tests {
         }
     }
 
-    /// recover_title_key_from_plain inverts dvdcss_unscramble exactly: scramble
+    /// recover_title_key_from_plain inverts descramble_sector exactly: scramble
     /// a known body, hand back the keystream-derived key, and the recovered
     /// key (XOR-back included) reproduces the plaintext.
     #[test]

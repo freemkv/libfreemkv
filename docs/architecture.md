@@ -7,7 +7,7 @@ AACS decryption requires an external `keydb.cfg` (default
 material is compiled in; DVD CSS player keys are the only compiled-in keys.
 
 **Repository:** <https://github.com/freemkv/libfreemkv>
-**License:** AGPL-3.0-only
+**License:** MIT
 
 ---
 

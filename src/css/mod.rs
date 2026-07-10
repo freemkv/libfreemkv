@@ -46,7 +46,7 @@ pub struct CssState {
 /// Recover the CSS title key with no keys, by scanning scrambled sectors and
 /// running the Stevenson known-plaintext attack (see the [`stevenson`] module).
 ///
-/// The crib comes from `AttackPattern`: a scrambled sector's cleartext region
+/// The crib comes from the periodic-run detector: a scrambled sector's cleartext region
 /// (bytes 0x00..0x80) often ends in a short-period repeating run (stuffing /
 /// constant fill); the attack assumes that run continues across the 0x80
 /// boundary into the encrypted region, giving the known plaintext the 2^16
@@ -274,7 +274,7 @@ pub fn descramble_sector(state: &CssState, sector: &mut [u8]) {
 /// Descramble a whole CSS buffer in place, re-cracking the title key on a VOB
 /// region boundary. `title_key` is a CACHE of the last crack, not a fixed disc
 /// key: it changes per VTS/VOB region, so it is validated on every scrambled
-/// sector and re-cracked on a miss (libdvdcss's on-demand per-region rekey).
+/// sector and re-cracked on a miss (the standard on-demand per-region rekey).
 ///
 /// This CSS key acquisition is intrinsic to the cipher — CSS has no external key
 /// source, the ONLY way to a title key is cracking the data — so it lives with

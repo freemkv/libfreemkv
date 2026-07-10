@@ -84,7 +84,7 @@ pub fn ts_sync_destroyed(unit: &[u8]) -> bool {
 ///   * `(buf[0] & 0xC0) == 0` → CPI clear → the unit is plaintext; pass through.
 ///   * non-zero → bytes `16..6144` are AES-CBC encrypted; decrypt.
 ///
-/// This is exactly libaacs' test (`if (!(buf[0] & 0xc0)) return; /* clear */`)
+/// This is exactly the spec CPI test (`buf[0] & 0xc0 == 0` means clear)
 /// and is the spec-correct replacement for the [`ts_sync_destroyed`] byte
 /// heuristic. CRITICAL: it is only meaningful when `unit` is read at the correct
 /// clip-FILE-anchored boundary — byte 0 must be the real unit start. A
@@ -238,7 +238,7 @@ fn ts_syncs_intact(unit: &[u8]) -> bool {
 }
 
 /// STRICT, standards-correct "is this a clean MPEG-TS aligned unit?" check —
-/// byte-for-byte libaacs' `_verify_ts` (`aacs.c`): EVERY one of the 32 BD source
+/// the standards-correct all-32-sync verify: EVERY one of the 32 BD source
 /// packets (192-byte stride) must carry its TS sync `0x47` at offset 4; the first
 /// miss fails. This is the authoritative gate for the POST-READ verify stage,
 /// independent of (and not coupled to) `decrypt_unit`.
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn unit_is_clean_ts_is_strict_all_32_syncs() {
-        // Standards-correct gate (libaacs `_verify_ts`): EVERY one of the 32
+        // Standards-correct gate (all-32 TS syncs): EVERY one of the 32
         // packet syncs is required. A fully-synced clear unit passes.
         let clear = clear_unit();
         assert!(unit_is_clean_ts(&clear), "all-32-sync unit is clean");

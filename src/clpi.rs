@@ -236,7 +236,7 @@ pub fn parse(data: &[u8]) -> Result<ClipInfo> {
 }
 
 /// Parse the ProgramInfo section: per-stream (pid, coding_type,
-/// language, codec sub-fields). Layout per BD spec / libbluray
+/// language, codec sub-fields). Layout per the BD CLPI spec
 /// clpi_parse.c:
 ///
 /// ```text
@@ -394,7 +394,7 @@ fn parse_cpi(data: &[u8]) -> Result<(Vec<EpCoarse>, Vec<EpFine>)> {
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Stream PID entry — bit-packed per BD spec (libbluray clpi_parse.c):
+    // Stream PID entry — bit-packed per the BD CLPI spec:
     //   stream_PID: 16 bits           → ep_map[2..4]
     //   reserved: 10 bits             ┐
     //   EP_stream_type: 4 bits        │ ep_map[4..14] = 80 bits
@@ -821,7 +821,7 @@ mod tests {
 
     // ─────────────────────────────────────────────────────────────────────
     // Added hardening tests. Grounded in the BD-ROM CLPI spec
-    // (https://github.com/lw/BluRay/wiki/CLPI) and libbluray clpi_parse.c.
+    // (https://github.com/lw/BluRay/wiki/CLPI).
     // ─────────────────────────────────────────────────────────────────────
 
     /// Build a ProgramInfo section. `streams` = Vec<(pid, sci_bytes)>.
