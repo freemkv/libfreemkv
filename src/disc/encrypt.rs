@@ -572,7 +572,7 @@ mod tests {
     }
 
     /// A content certificate: type byte@0 (0x00 = V10, else V20),
-    /// bus_encryption bit7@1, cc_id@14..20 (aacs/keys.rs parse_content_cert,
+    /// bus_encryption bit7@1, cc_id@14..20 (aacs/inf.rs parse_content_cert,
     /// which requires ≥20 bytes and reads the bus flag from `data[1] >> 7`).
     fn build_content_cert(cert_type: u8, bus_encryption: bool) -> Vec<u8> {
         let mut v = vec![0u8; 20];
@@ -584,7 +584,7 @@ mod tests {
     /// An MKB with one Type-and-Version record (type 0x10) carrying the
     /// version as BE u32 at record offset 8, followed by a recorded EOF
     /// record then trailing zero padding. mkb_content_len walks records
-    /// and stops at the first padding (type 0) byte (aacs/keys.rs).
+    /// and stops at the first padding (type 0) byte (aacs/inf.rs).
     fn build_mkb(version: u32, pad_to: usize) -> Vec<u8> {
         let mut v = Vec::new();
         // Type 0x10 record, length 16 (>= 12 so version is read).

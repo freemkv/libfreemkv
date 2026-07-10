@@ -1345,7 +1345,7 @@ mod tests {
     }
     #[test]
     fn stride_v10_is_48_v20_is_64_and_picks_distinct_keys() {
-        // AACS 1.0 stride = 48, AACS 2.0/2.1 stride = 64 (keys.rs:30-35).
+        // AACS 1.0 stride = 48, AACS 2.0/2.1 stride = 64 (aacs/inf.rs).
         // Lay keys at 64-byte stride. Parsing at V20 stride must pick exactly
         // those keys; parsing the SAME bytes at V10 (48) stride would read the
         // wrong (intermediate) bytes for key 2 onward — proving the stride
@@ -1447,7 +1447,7 @@ mod tests {
     }
     #[test]
     fn parse_unit_key_ro_cps_unit_numbers_are_1_based() {
-        // The disc's CPS unit numbers are emitted as (i+1) — keys.rs:162.
+        // The disc's CPS unit numbers are emitted as (i+1) — aacs/inf.rs.
         let data = build_unit_key_ro(3, 48);
         let p = parse_unit_key_ro(&data, AacsVersion::V10).unwrap();
         assert_eq!(
@@ -1936,7 +1936,7 @@ mod tests {
     //
     // The rc.6 E7017/E7022 split is also exercised end-to-end through the
     // `ensure_decryptable` gate in `disc/mod.rs`. These tests pin the
-    // *classifier* directly at the keys.rs seam and cover the branches the
+    // *classifier* directly at the aacs::resolve seam and cover the branches the
     // gate test does not: VID-present (must never be VidUnavailable), the
     // processing-keys-only material path, and the version dispatch / Ok path.
 
