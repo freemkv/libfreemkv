@@ -367,6 +367,7 @@ pub(crate) fn resolve_dk_node(
 /// independent reproduction harnesses (e.g. `examples/prove_hkd_aacs.rs`) can
 /// exercise the exact same parser + verify primitives the production walk uses.
 /// These are thin wrappers — no new logic.
+#[doc(hidden)]
 pub mod probe {
     use super::super::crypto::aes_ecb_decrypt;
 

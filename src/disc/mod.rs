@@ -4854,6 +4854,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inject_unit_keys_labels_fmts_as_uhd_family() {
+        // FMTS is AACS 2.1 — a UHD-family, bus-encrypted format. Injecting a UK
+        // on an FMTS disc must synthesize the UHD version + bus encryption, not
+        // mislabel it AACS 1.0 / bus-off (which would break FMTS decryption on
+        // the mapfile-recovered-UK path).
+        let mut disc = make_test_disc(1000, "FMTS");
+        disc.format = DiscFormat::Fmts;
+        disc.encrypted = true;
+        disc.inject_unit_keys(vec![(0u32, [0x22u8; 16])]);
+        let aacs = disc.aacs.as_ref().expect("aacs state synthesized");
+        assert_eq!(
+            aacs.version,
+            crate::aacs::mkb::AACS_MAJOR_UHD,
+            "FMTS is AACS 2.x (UHD major), not BD"
+        );
+        assert!(aacs.bus_encryption, "FMTS is bus-encrypted like UHD");
+    }
+
     /// Build an AacsState carrying the given unit keys (other fields are inert
     /// defaults — these tests only exercise the unit-key/decrypt-keys plumbing).
     fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {

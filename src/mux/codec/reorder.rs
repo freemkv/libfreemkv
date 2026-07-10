@@ -44,6 +44,13 @@ const FALLBACK_FRAME_DUR_NS: i64 = 1_001_000_000 / 24;
 /// reassembly buffer grows unbounded on disc-controlled input.
 const MAX_GOP_FRAMES: usize = 600;
 
+/// Byte cap on the buffered GOP, complementing [`MAX_GOP_FRAMES`]. A GOP holds a
+/// couple hundred MB at most in practice; this force-completes a run of
+/// few-but-huge access units so a crafted/corrupt stream cannot over-allocate
+/// (the AU assembler caps each frame at 8 MiB, so 600 frames alone could reach
+/// ~5 GiB without this).
+const MAX_GOP_BYTES: usize = 64 * 1024 * 1024;
+
 /// One buffered coded picture awaiting its GOP's completion.
 struct Pending {
     /// Explicit PES PTS (ns) for this AU, or `None` when the source omitted it.
@@ -72,6 +79,9 @@ struct Gop {
 pub(crate) struct SparsePtsReorder {
     /// Frames of the GOP currently accumulating, in decode order.
     cur: Vec<Pending>,
+    /// Total `data` bytes buffered in `cur` — the byte-cap counter, reset each
+    /// time `cur` is drained into a completed GOP.
+    cur_bytes: usize,
     /// The previously-completed GOP, held one step so its duration can be
     /// calibrated from the next GOP's anchor before it is emitted.
     held: Option<Gop>,
@@ -86,6 +96,7 @@ impl SparsePtsReorder {
     pub(crate) fn new() -> Self {
         Self {
             cur: Vec::new(),
+            cur_bytes: 0,
             held: None,
             dur_ns: 0,
             next_start_ns: 0,
@@ -102,11 +113,15 @@ impl SparsePtsReorder {
         // A keyframe opens a new GOP: the picture already accumulated in `cur` is
         // a complete GOP. Complete it (this frame belongs to the NEW GOP). Also
         // force-complete a pathologically long run that never signalled a
-        // keyframe, so a crafted/corrupt stream cannot buffer without bound.
+        // keyframe — bounded by BOTH frame count and total buffered bytes, so a
+        // crafted/corrupt stream of few-but-huge access units cannot buffer
+        // without bound.
         let mut out = Vec::new();
-        if (frame.keyframe || self.cur.len() >= MAX_GOP_FRAMES) && !self.cur.is_empty() {
+        let over_cap = self.cur.len() >= MAX_GOP_FRAMES || self.cur_bytes >= MAX_GOP_BYTES;
+        if (frame.keyframe || over_cap) && !self.cur.is_empty() {
             out = self.complete_current_gop();
         }
+        self.cur_bytes += frame.data.len();
         self.cur.push(Pending {
             explicit,
             ctype,
@@ -131,6 +146,7 @@ impl SparsePtsReorder {
             return Vec::new();
         }
         let pend = std::mem::take(&mut self.cur);
+        self.cur_bytes = 0;
         let dispidx = display_indices(pend.iter().map(|p| p.ctype));
         let count = pend.len() as i64;
         let anchor = pend
@@ -307,6 +323,29 @@ mod tests {
             &got[5..10],
             &[5 * dur, 7 * dur, 6 * dur, 9 * dur, 8 * dur],
             "GOP2 display PTS continue monotonically per display order"
+        );
+    }
+
+    #[test]
+    fn force_flushes_a_gop_that_exceeds_the_byte_cap() {
+        use CodingType::*;
+        // Few-but-huge access units with no keyframe must not accumulate past the
+        // byte cap: a handful of ~MAX_GOP_BYTES/4-sized frames force-completes the
+        // GOP well before the frame-count cap, bounding memory.
+        let big = MAX_GOP_BYTES / 4 + 1;
+        let mut r = SparsePtsReorder::new();
+        let mut emitted = 0usize;
+        // Enough huge frames to trigger several byte-cap completions (a GOP is
+        // held one step for duration calibration, so the first emit lands after
+        // the second cap fires) — well under the 600-frame count cap.
+        for i in 0..16 {
+            let mut f = frame(P, false);
+            f.data = vec![0u8; big];
+            emitted += r.push((i == 0).then_some(0), f).len();
+        }
+        assert!(
+            emitted >= 1,
+            "byte cap force-flushed (emitted {emitted}) before the frame-count cap"
         );
     }
 
