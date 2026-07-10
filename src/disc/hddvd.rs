@@ -9,26 +9,28 @@
 //! rule: a genuinely different format is a new enumerator, not an extension
 //! bolted into the BD path.
 //!
-//! Title composition: the `HVA*.VTI` navigation file (the DVD-IFO analogue) names
-//! every clip in authored order. Standard Content splits the main feature across
-//! clips at the layer break (`FEATURE_1`/`FEATURE_2`, or `feature`/`feature_Divide`);
-//! the scanner parses the VTI clip table and concatenates those parts into ONE
-//! [`DiscTitle`] (so the largest-title pick is the whole movie, not just part 1),
-//! emitting every other clip as its own title. Container is
-//! [`ContentFormat::MpegPs`], so the existing PS mux path handles it. Per-clip
-//! streams ARE enumerated: the clip head is demuxed through the PS demuxer and one
-//! [`Stream`] is built per distinct elementary stream (video + DD+ audio
-//! sub-streams), with the codec sniffed from the ES bytes.
+//! Title composition — authoritative, from the Advanced-Content playlist. HD-DVD
+//! ships a real player playlist at `ADV_OBJ/VPLST000.XPL` (DVD-Forum
+//! `HDDVDVideo/Playlist` XML). The scanner parses it (with a real XML parser,
+//! `roxmltree`) into one [`DiscTitle`] per `<Title>`: its `<PrimaryAudioVideoClip>`
+//! clips in playback order (each an EVO, referenced via its `.MAP` sidecar), the
+//! `titleDuration`, the `displayName`, and the `<ChapterList>`. A layer-break
+//! split (`FEATURE_1` + `FEATURE_2`, or `feature`/`feature_Divide`) is composed
+//! into ONE title with the two parts as clips, carrying each clip's title-time
+//! in/out points (45 kHz ticks) so a seamless join can be spliced onto one
+//! timeline. Container is [`ContentFormat::MpegPs`], so the existing PS mux path
+//! handles it. Per-clip streams are enumerated by demuxing the clip head and
+//! building one [`Stream`] per distinct elementary stream (video + DD+ audio),
+//! codec sniffed from the ES bytes.
 //!
-//! What is NOT parsed yet — and is honestly stubbed, not faked:
-//!   * full VTI program-chain parsing (chapters, non-feature title grouping) —
-//!     the feature join uses the clip table + the `feature*` naming convention,
-//!     not the authoritative PGC,
-//!   * `.map` timemap → real durations,
-//!   * subtitles (8-bit RLC on `0xBD` sub `0x20..=0x3F`).
+//! When no playlist is present (or it fails to parse), the scanner falls back to
+//! the older clip-name heuristic: parse the `HVA*.VTI` clip table, join the
+//! `feature*`-named clips into one title, and emit every other clip on its own.
 //!
-//! Extents and size ARE real (the ripper needs those to image a clip); durations
-//! and chapters are left empty rather than guessed.
+//! Not parsed yet: subtitles (8-bit RLC on `0xBD` sub `0x20..=0x3F`) and per-track
+//! audio languages (the XPL carries `<Audio description=...>` but they are not yet
+//! wired onto the streams). Extents and size are real (the ripper images the
+//! clips).
 
 use super::*;
 use crate::mux::ps::{PsDemuxer, dvd_audio_pid};
@@ -316,6 +318,229 @@ fn collect_es(
     }
 }
 
+// ─────────────────────── Advanced-Content playlist (XPL) ──────────────────
+//
+// HD-DVD Advanced Content ships an authoritative playlist at
+// `ADV_OBJ/VPLST000.XPL` (DVD-Forum `HDDVDVideo/Playlist` XML). It is the real
+// player playlist: a `<TitleSet>` of `<Title>`s, each naming its
+// `<PrimaryAudioVideoClip>` clips (an EVO, via its `.MAP` sidecar) in playback
+// order with title-time in/out points, a `titleDuration`, a `displayName`, and a
+// `<ChapterList>`. Parsing it gives authoritative title composition — clips,
+// duration, name, chapters — instead of the `feature*` clip-name heuristic, plus
+// the per-clip title-time offsets needed to splice a layer-break split
+// (`FEATURE_1` + `FEATURE_2`) onto one continuous timeline. Parsed with a real
+// XML parser (`roxmltree`), not a hand-rolled scanner — the XPL is genuine XML.
+
+/// One clip reference inside an XPL `<Title>`: the resolved `.evo` name (lower
+/// case) and the clip's placement on the title timeline, in seconds.
+struct XplClip {
+    evo: String,
+    begin_secs: f64,
+    end_secs: f64,
+}
+
+/// One `<Title>` from the XPL: number, display name, total duration, its clips
+/// in playback order, and chapter start times (seconds).
+struct XplTitle {
+    number: u16,
+    name: String,
+    duration_secs: f64,
+    clips: Vec<XplClip>,
+    chapters: Vec<f64>,
+}
+
+/// Parse an `HH:MM:SS:FF` (or `MM:SS:FF`) timecode at `tick_base` frames/sec into
+/// seconds. `None` on a malformed field.
+fn parse_timecode(s: &str, tick_base: u32) -> Option<f64> {
+    let n: Vec<u32> = s
+        .split(':')
+        .map(|p| p.trim().parse::<u32>())
+        .collect::<std::result::Result<Vec<u32>, _>>()
+        .ok()?;
+    let tb = tick_base.max(1) as f64;
+    let (h, m, sec, f) = match n.as_slice() {
+        [h, m, s, f] => (*h, *m, *s, *f),
+        [m, s, f] => (0, *m, *s, *f),
+        _ => return None,
+    };
+    Some(h as f64 * 3600.0 + m as f64 * 60.0 + sec as f64 + f as f64 / tb)
+}
+
+/// `tickBase="60fps"` → 60. Defaults to 60 when absent/unparseable.
+fn parse_tick_base(s: &str) -> u32 {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(60)
+}
+
+/// `<PrimaryAudioVideoClip src="file:///.../FEATURE_1.MAP">` → `feature_1.evo`:
+/// take the basename, drop the extension, normalise to a lower-case `.evo` name
+/// (the playlist references the `.MAP` sidecar; the A/V is the same-stem `.EVO`).
+fn evo_from_src(src: &str) -> Option<String> {
+    let base = src.rsplit(['/', '\\']).next().unwrap_or(src);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(format!("{}.evo", stem.to_ascii_lowercase()))
+}
+
+/// Parse the Advanced-Content playlist into its titles. Elements are matched by
+/// LOCAL name (the document is in the `HDDVDVideo/Playlist` default namespace).
+/// Returns empty for a non-XML / non-playlist blob so the caller falls back to
+/// the clip-name heuristic.
+fn parse_xpl_titles(xpl: &[u8]) -> Vec<XplTitle> {
+    let text = String::from_utf8_lossy(xpl);
+    let Ok(doc) = roxmltree::Document::parse(&text) else {
+        return Vec::new();
+    };
+    let local = |n: &roxmltree::Node, name: &str| n.tag_name().name() == name;
+
+    // tickBase lives on <TitleSet> (default 60fps).
+    let tick_base = doc
+        .descendants()
+        .find(|n| local(n, "TitleSet"))
+        .and_then(|n| n.attribute("tickBase"))
+        .map(parse_tick_base)
+        .unwrap_or(60);
+
+    let mut titles = Vec::new();
+    for tnode in doc.descendants().filter(|n| local(n, "Title")) {
+        let number = tnode
+            .attribute("titleNumber")
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(0);
+        let name = tnode
+            .attribute("displayName")
+            .or_else(|| tnode.attribute("id"))
+            .unwrap_or("")
+            .to_string();
+        let duration_secs = tnode
+            .attribute("titleDuration")
+            .and_then(|s| parse_timecode(s, tick_base))
+            .unwrap_or(0.0);
+
+        let mut clips = Vec::new();
+        for c in tnode
+            .descendants()
+            .filter(|n| local(n, "PrimaryAudioVideoClip"))
+        {
+            let Some(evo) = c.attribute("src").and_then(evo_from_src) else {
+                continue;
+            };
+            let begin_secs = c
+                .attribute("titleTimeBegin")
+                .and_then(|s| parse_timecode(s, tick_base))
+                .unwrap_or(0.0);
+            let end_secs = c
+                .attribute("titleTimeEnd")
+                .and_then(|s| parse_timecode(s, tick_base))
+                .unwrap_or(begin_secs);
+            clips.push(XplClip {
+                evo,
+                begin_secs,
+                end_secs,
+            });
+        }
+        if clips.is_empty() {
+            continue;
+        }
+
+        let chapters = tnode
+            .descendants()
+            .filter(|n| local(n, "Chapter"))
+            .filter_map(|ch| {
+                ch.attribute("titleTimeBegin")
+                    .and_then(|s| parse_timecode(s, tick_base))
+            })
+            .collect();
+
+        titles.push(XplTitle {
+            number,
+            name,
+            duration_secs,
+            clips,
+            chapters,
+        });
+    }
+    titles
+}
+
+/// Read the Advanced-Content playlist `ADV_OBJ/VPLST*.XPL`, if present.
+fn read_adv_obj_xpl(reader: &mut dyn SectorSource, udf_fs: &udf::UdfFs) -> Option<Vec<u8>> {
+    let dir = udf_fs.find_dir("/ADV_OBJ")?;
+    let name = dir.entries.iter().find_map(|e| {
+        let lower = e.name.to_ascii_lowercase();
+        (!e.is_dir && lower.starts_with("vplst") && lower.ends_with(".xpl")).then(|| e.name.clone())
+    })?;
+    udf_fs.read_file(reader, &format!("/ADV_OBJ/{name}")).ok()
+}
+
+/// Compose [`DiscTitle`]s from parsed XPL titles: resolve each title's clips to
+/// physical extents, concatenate them in playback order, carry the title-time
+/// in/out points onto each [`Clip`] (45 kHz ticks — the offset that splices a
+/// layer-break split onto one timeline), and attach the duration, name, and
+/// chapters. A title whose clips resolve to no on-disc extents is skipped.
+fn compose_xpl_titles(
+    reader: &mut dyn SectorSource,
+    xpl_titles: &[XplTitle],
+    clip_extents: &BTreeMap<String, (String, u64, Vec<Extent>)>,
+) -> Vec<DiscTitle> {
+    let mut titles = Vec::new();
+    for t in xpl_titles {
+        let mut extents = Vec::new();
+        let mut size_bytes = 0u64;
+        let mut parts = Vec::new();
+        for c in &t.clips {
+            let Some((orig, size, exts)) = clip_extents.get(&c.evo) else {
+                continue;
+            };
+            extents.extend_from_slice(exts);
+            size_bytes += *size;
+            parts.push(Clip {
+                clip_id: orig
+                    .rsplit_once('.')
+                    .map(|(b, _)| b)
+                    .unwrap_or(orig)
+                    .to_string(),
+                in_time: (c.begin_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
+                out_time: (c.end_secs * 45000.0).clamp(0.0, u32::MAX as f64) as u32,
+                duration_secs: (c.end_secs - c.begin_secs).max(0.0),
+                source_packets: 0,
+            });
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        let streams = probe_evo_streams(reader, &extents);
+        let chapters = t
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, &ts)| Chapter {
+                time_secs: ts.max(0.0),
+                name: super::chapter_name(i),
+            })
+            .collect();
+        titles.push(DiscTitle {
+            playlist: if t.name.is_empty() {
+                format!("Title {}", t.number)
+            } else {
+                t.name.clone()
+            },
+            playlist_id: t.number,
+            duration_secs: t.duration_secs,
+            size_bytes,
+            clips: parts,
+            streams,
+            chapters,
+            extents,
+            content_format: ContentFormat::MpegPs,
+            codec_privates: Vec::new(),
+        });
+    }
+    titles
+}
+
 impl Disc {
     /// Scan HD-DVD titles from the `HVDVD_TS/` `.evo` clips.
     ///
@@ -372,6 +597,18 @@ impl Disc {
             }
             if !extents.is_empty() {
                 clip_extents.insert(name.to_ascii_lowercase(), (name.clone(), *size, extents));
+            }
+        }
+
+        // Authoritative composition from the Advanced-Content playlist
+        // (`ADV_OBJ/VPLST*.XPL`): real per-title clip lists, durations, names,
+        // chapters, and title-time offsets. This is the primary path; the
+        // clip-name heuristic below is the fallback when the playlist is absent
+        // or unparseable (or resolves to no on-disc clips).
+        if let Some(xpl) = read_adv_obj_xpl(reader, udf_fs) {
+            let composed = compose_xpl_titles(reader, &parse_xpl_titles(&xpl), &clip_extents);
+            if !composed.is_empty() {
+                return composed;
             }
         }
 
@@ -965,5 +1202,194 @@ mod tests {
             crate::mux::ps::hddvd_extended_pid(0x55),
             "VC-1 routes to the extended-stream-id PID 0xFD55"
         );
+    }
+
+    // ─────────────────────── Advanced-Content playlist (XPL) ──────────────
+
+    /// A minimal but faithful VPLST000.XPL: the DVD-Forum default namespace, an
+    /// XML comment, a `<TitleSet tickBase="60fps">`, a MainMovie title whose main
+    /// feature is a two-clip layer-break split (FEATURE_1 + FEATURE_2, seamless)
+    /// with two chapters, and a separate deleted-scene title. Attribute order
+    /// varies (as it does across real discs).
+    const SYNTH_XPL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Playlist majorVersion="1" minorVersion="0" xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist">
+  <!-- Authored with TOSHIBA AdvMain -->
+  <TitleSet timeBase="60fps" tickBase="60fps" defaultLanguage="en">
+    <Title titleNumber="2" titleDuration="01:37:20:00" id="MainMovie" displayName="Main Movie">
+      <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:48:29:50" src="file:///dvddisc/HVDVD_TS/FEATURE_1.MAP" dataSource="Disc">
+        <Video track="1" mediaAttr="2"/>
+        <Audio track="1" streamNumber="1" description="English DD+"/>
+      </PrimaryAudioVideoClip>
+      <PrimaryAudioVideoClip titleTimeBegin="00:48:29:50" clipTimeBegin="00:00:00:00" titleTimeEnd="01:37:20:00" src="file:///dvddisc/HVDVD_TS/FEATURE_2.MAP" seamless="true">
+        <Video track="1" mediaAttr="2"/>
+      </PrimaryAudioVideoClip>
+      <ChapterList>
+        <Chapter displayName="Chapter  1" titleTimeBegin="00:00:00:00" />
+        <Chapter displayName="Chapter  2" titleTimeBegin="00:03:40:30" />
+      </ChapterList>
+    </Title>
+    <Title titleNumber="7" titleDuration="00:00:44:29" id="Deleted5" displayName="Deleted Scenes - Veronica Past">
+      <PrimaryAudioVideoClip titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:44:29" src="file:///dvddisc/HVDVD_TS/DEL5_VERONICAPAST.MAP" />
+    </Title>
+  </TitleSet>
+</Playlist>"#;
+
+    #[test]
+    fn parse_timecode_hhmmssff_at_60fps() {
+        // 01:37:20:00 = 5840 s exactly.
+        assert!((parse_timecode("01:37:20:00", 60).unwrap() - 5840.0).abs() < 1e-6);
+        // 00:48:29:50 = 48m29s + 50/60 frames.
+        let want = 48.0 * 60.0 + 29.0 + 50.0 / 60.0;
+        assert!((parse_timecode("00:48:29:50", 60).unwrap() - want).abs() < 1e-6);
+        // MM:SS:FF short form (hours omitted).
+        assert!((parse_timecode("02:05:15", 60).unwrap() - (125.0 + 15.0 / 60.0)).abs() < 1e-6);
+        assert_eq!(parse_timecode("garbage", 60), None);
+        assert_eq!(parse_timecode("", 60), None);
+    }
+
+    #[test]
+    fn evo_from_src_maps_map_sidecar_to_evo() {
+        assert_eq!(
+            evo_from_src("file:///dvddisc/HVDVD_TS/FEATURE_1.MAP").as_deref(),
+            Some("feature_1.evo")
+        );
+        // Already an EVO, or lowercase feature — normalise to lower `.evo`.
+        assert_eq!(evo_from_src("feature.EVO").as_deref(), Some("feature.evo"));
+        assert_eq!(
+            evo_from_src("file:///x/feature_Divide.MAP").as_deref(),
+            Some("feature_divide.evo")
+        );
+        // Empty stem → None (defensive against a malformed src).
+        assert_eq!(evo_from_src("file:///x/").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_xpl_titles_reads_titles_clips_chapters_durations() {
+        let titles = parse_xpl_titles(SYNTH_XPL.as_bytes());
+        assert_eq!(titles.len(), 2, "MainMovie + one deleted-scene title");
+
+        let mm = &titles[0];
+        assert_eq!(mm.number, 2);
+        assert_eq!(mm.name, "Main Movie");
+        assert!(
+            (mm.duration_secs - 5840.0).abs() < 1e-6,
+            "97:20 from titleDuration"
+        );
+        // The layer-break split is ONE title with TWO clips, contiguous timeline.
+        assert_eq!(mm.clips.len(), 2);
+        assert_eq!(mm.clips[0].evo, "feature_1.evo");
+        assert_eq!(mm.clips[1].evo, "feature_2.evo");
+        assert!(
+            (mm.clips[0].end_secs - mm.clips[1].begin_secs).abs() < 1e-6,
+            "FEATURE_2 begins exactly where FEATURE_1 ends (seamless join)"
+        );
+        assert!(
+            mm.clips[1].begin_secs > 0.0,
+            "second clip carries a title-time offset"
+        );
+        assert_eq!(mm.chapters.len(), 2);
+        assert!((mm.chapters[1] - (3.0 * 60.0 + 40.0 + 30.0 / 60.0)).abs() < 1e-6);
+
+        let del = &titles[1];
+        assert_eq!(del.name, "Deleted Scenes - Veronica Past");
+        assert_eq!(del.clips.len(), 1);
+        assert_eq!(del.clips[0].evo, "del5_veronicapast.evo");
+    }
+
+    #[test]
+    fn parse_xpl_titles_returns_empty_on_non_xml() {
+        assert!(parse_xpl_titles(b"not xml at all").is_empty());
+        assert!(parse_xpl_titles(&[0xFF, 0x00, 0x01, 0x02]).is_empty());
+        assert!(parse_xpl_titles(b"<Playlist></Playlist>").is_empty());
+    }
+
+    /// Build a UDF with `HVDVD_TS/` `.evo` clips plus an `ADV_OBJ/VPLST000.XPL`
+    /// carrying `xpl`, so `scan_hddvd_titles` takes the playlist path.
+    fn make_hddvd_fs_xpl(
+        disc: &mut MemDisc,
+        evos: &[(&str, u32, u32)],
+        xpl: &[u8],
+    ) -> crate::udf::UdfFs {
+        let mut hv_files = Vec::new();
+        let mut icb = 100u32;
+        for (name, sectors, data_lba) in evos {
+            hv_files.push(file(name, icb, *data_lba, sectors * 2048, true));
+            icb += 1;
+        }
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![
+                DirSpec {
+                    name: "HVDVD_TS".to_string(),
+                    icb_lba: 20,
+                    dir_data_lba: 21,
+                    files: hv_files,
+                    subdirs: vec![],
+                },
+                DirSpec {
+                    name: "ADV_OBJ".to_string(),
+                    icb_lba: 30,
+                    dir_data_lba: 31,
+                    files: vec![file_with("VPLST000.XPL", 40, 4000, xpl.to_vec(), true)],
+                    subdirs: vec![],
+                },
+            ],
+        };
+        build_udf_skeleton(disc, 10);
+        lay_dir(disc, &root);
+        crate::udf::read_filesystem(disc).expect("fs")
+    }
+
+    /// The authoritative path: when a VPLST000.XPL is present, titles come from
+    /// the playlist — the layer-break split (FEATURE_1 + FEATURE_2) is composed
+    /// into ONE title with the real duration, name, chapters, and per-clip
+    /// title-time offsets — not the clip-name heuristic.
+    #[test]
+    fn scan_hddvd_composes_titles_from_xpl_playlist() {
+        let mut disc = MemDisc::new();
+        let udf = make_hddvd_fs_xpl(
+            &mut disc,
+            &[
+                ("FEATURE_1.EVO", 2000, 5000),
+                ("FEATURE_2.EVO", 1800, 9000),
+                ("DEL5_VERONICAPAST.EVO", 100, 12000),
+            ],
+            SYNTH_XPL.as_bytes(),
+        );
+        let titles = Disc::scan_hddvd_titles(&mut disc, &udf);
+        assert_eq!(
+            titles.len(),
+            2,
+            "the two playlist titles that resolve to clips"
+        );
+
+        let mm = titles
+            .iter()
+            .find(|t| t.playlist == "Main Movie")
+            .expect("MainMovie composed from the playlist");
+        assert_eq!(mm.playlist_id, 2);
+        assert!(
+            (mm.duration_secs - 5840.0).abs() < 1.0,
+            "97:20 duration from titleDuration, not 0/unknown"
+        );
+        assert_eq!(
+            mm.clips.len(),
+            2,
+            "layer-break split kept as ONE title, two clips"
+        );
+        // FEATURE_2's clip carries the 48:29 offset (45 kHz ticks) — the datum
+        // that splices it onto FEATURE_1's timeline instead of restarting at 0.
+        assert!(
+            mm.clips[1].in_time > 100_000_000,
+            "FEATURE_2 offset onto the title timeline (48:29 * 45000), got {}",
+            mm.clips[1].in_time
+        );
+        assert_eq!(mm.chapters.len(), 2);
+        assert_eq!(mm.chapters[0].name, "1", "bare ordinal chapter name");
+        // Both feature halves are in ONE title's extents.
+        assert!(!mm.extents.is_empty());
     }
 }

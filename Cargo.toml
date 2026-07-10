@@ -36,6 +36,12 @@ rand = "0.8"
 cmac = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22.1"
+# Read-only XML DOM parser (pure Rust, forbid(unsafe_code), entity-expansion
+# bounded). Parses the HD-DVD Advanced-Content playlist `ADV_OBJ/VPLST000.XPL`
+# — untrusted disc bytes — into authoritative titles/clips/chapters. A real
+# parser, not a hand-rolled scanner: the XPL is genuine XML (comments, varied
+# attribute order, self-closing tags).
+roxmltree = "0.20"
 # Trace-level instrumentation for Disc::copy + SgIoTransport::execute. Permitted
 # under CLAUDE.md ("Acceptable strings: debug/trace logging"). Consumers (autorip)
 # wire a tracing subscriber and pipe events into the JSONL debug log.
