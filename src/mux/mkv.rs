@@ -1365,6 +1365,19 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 self.writer.seek(std::io::SeekFrom::Start(pos))?;
                 self.writer
                     .write_all(&(self.max_block_ticks as f64).to_be_bytes())?;
+            } else {
+                // The timeline never advanced past tick 0 (a degenerate
+                // single-frame recovery at t=0 with no per-frame duration): we
+                // can't derive a runtime, so DON'T leave a literal DURATION=0.0
+                // (players read that as a zero-length/corrupt file). Void the
+                // whole 11-byte DURATION element (ID 2 + size 1 + 8-byte payload)
+                // so the Segment simply omits it, as an unknown-duration source
+                // did before the back-patch. `pos` is the payload start (+3 from
+                // the element start), so back up 3.
+                self.writer.seek(std::io::SeekFrom::Start(pos - 3))?;
+                ebml::write_id(&mut self.writer, ebml::VOID)?;
+                ebml::write_size(&mut self.writer, 9)?; // 11 - 1 (Void id) - 1 (size)
+                self.writer.write_all(&[0u8; 9])?;
             }
         }
 
@@ -2905,6 +2918,23 @@ mod tests {
             .position(|w| w == [0x44, 0x89, 0x88])
             .and_then(|i| data.get(i + 3..i + 11))
             .map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+    }
+
+    #[test]
+    fn duration_placeholder_voided_when_timeline_never_advances() {
+        // Degenerate recovery: a source with no declared duration muxes exactly
+        // one keyframe at tick 0 with no per-frame duration, so max_block_ticks
+        // stays 0. The reserved DURATION placeholder must be VOIDED (element
+        // omitted) rather than left as a bogus 0.0 that players read as a
+        // zero-length file.
+        let tracks = [make_video_track()];
+        let one_frame = vec![(0usize, 0i64, true, vec![0xAAu8; 16])];
+        let (data, _) = mux_to_bytes(&tracks, &[], &one_frame);
+        assert_eq!(
+            find_duration_ticks(&data),
+            None,
+            "no DURATION element (placeholder voided), not a 0.0 duration"
+        );
     }
 
     #[test]
