@@ -1218,7 +1218,12 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.last_pts_ticks.insert(track_idx, pts_ticks);
         // Track the highest block timestamp so a missing source duration can be
         // back-patched from the real muxed runtime at finish().
-        self.max_block_ticks = self.max_block_ticks.max(pts_ticks);
+        // Track the block END (start + its own duration when known), not just
+        // the start, so a back-patched Segment Duration covers the final frame's
+        // full presentation instead of understating the runtime by one frame.
+        let block_end_ticks =
+            pts_ticks + duration_ns.map_or(0, |d| (d as i64 / TIMESTAMP_SCALE_NS).max(1));
+        self.max_block_ticks = self.max_block_ticks.max(block_end_ticks);
 
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
         match duration_ns {

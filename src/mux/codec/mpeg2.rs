@@ -174,9 +174,6 @@ impl Mpeg2Parser {
         parse_aspect_ratio(hdr)
     }
 
-    /// Drain every complete access unit from `buf`, returning one Frame each.
-    /// When `force` is true (EOF flush, or buffer-cap backstop) the trailing
-    /// in-progress access unit is emitted even without a following boundary.
     /// Process one reassembled access unit (from [`AuAssembler`]): decode its
     /// per-picture coding info, capture a new sequence header, and buffer the
     /// picture into the current GOP for display-order timestamping. The AU's
