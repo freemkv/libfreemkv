@@ -612,10 +612,7 @@ mod resolve_candidate_tests {
     /// A bare UK candidate is terminal — it returns itself keyed by its own idx.
     #[test]
     fn resolve_candidate_uk_is_itself() {
-        let uk = UnitKey {
-            idx: 2,
-            key: [0x9u8; 16],
-        };
+        let uk = UnitKey::new(2, [0x9u8; 16]);
         let r = resolve_candidate(&KeyCandidate::Uk(uk), &[], &[], None).expect("uk is terminal");
         assert_eq!(r.unit_keys, vec![(2, uk.key)]);
         assert!(r.vuk.is_none() && r.mk.is_none());

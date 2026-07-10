@@ -57,6 +57,42 @@ pub struct ProcessingKey(pub [u8; 16]);
 pub struct UnitKey {
     pub idx: u32,
     pub key: [u8; 16],
+    /// AACS 2.1 (FMTS) forensic-variant tag.
+    ///
+    /// `0` = ordinary (non-forensic) content — the value for every 1.0 / 2.0
+    /// key and for the bulk of a 2.1 title. `1..=32` = a variant key that
+    /// decrypts the forensic segments tagged with that same variant in
+    /// `IndividualSegment.tbl`. A disc resolves to exactly one variant, so at
+    /// most one non-zero value is ever in play for a given rip; the decode
+    /// selects the segments matching it and drops the other variants.
+    pub variant_number: u8,
+}
+
+impl UnitKey {
+    /// An ordinary (non-forensic) unit key: `variant_number == 0`. The value
+    /// for every AACS 1.0 / 2.0 key and the bulk of a 2.1 title.
+    pub const fn new(idx: u32, key: [u8; 16]) -> Self {
+        Self {
+            idx,
+            key,
+            variant_number: 0,
+        }
+    }
+
+    /// A forensic-variant key: `variant_number` in `1..=32`, decrypting the
+    /// `IndividualSegment.tbl` segments tagged with that variant.
+    pub const fn variant(idx: u32, key: [u8; 16], variant_number: u8) -> Self {
+        Self {
+            idx,
+            key,
+            variant_number,
+        }
+    }
+
+    /// Whether this key decrypts ordinary (non-forensic) content.
+    pub const fn is_default_variant(&self) -> bool {
+        self.variant_number == 0
+    }
 }
 
 /// A per-disc entry from the key database.

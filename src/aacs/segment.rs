@@ -17,12 +17,15 @@
 //! ```text
 //!   header (8 bytes):  u32 type | u16 count | u16 record_size (= 16)
 //!   record[count] (16 bytes each):
-//!     u32 marker (= 0x01000000) | u16 segment_number | u16 flag (= 1)
+//!     u32 marker (= 0x01000000) | u16 variant | u16 flag (= 1)
 //!     u32 start_spn | u32 end_spn        (source-packet numbers, inclusive)
 //! ```
-//! Source-packet numbers are the 192-byte BDAV packet index: byte offset =
-//! `spn * 192`. Observed on one disc: 792 segments, each ~2560 packets
-//! (~480 KB), spread across the entire 54 GB feature (one roughly every 67 MB).
+//! `variant` is the 1..32 forensic-variant tag, NOT a sequential segment id:
+//! measured on a retail 2.1 disc (Zombieland) it cycles 1,2,…,32,1,2,… across
+//! records in file order — 24 full cycles of 32 plus a final partial cycle of
+//! 24 = 792 records. Source-packet numbers are the 192-byte BDAV packet index:
+//! byte offset = `spn * 192`. Each segment is ~2560 packets (~480 KB), spread
+//! across the entire 54 GB feature (one roughly every 67 MB).
 
 /// Fixed size of one `IndividualSegment.tbl` record.
 pub const SEGMENT_RECORD_LEN: usize = 16;
@@ -48,8 +51,11 @@ pub const BYPASS_FMTS_KEY: bool = true;
 /// in the FMTS clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
-    /// 1-based segment number (table order).
-    pub number: u16,
+    /// Forensic variant tag, 1..=32 (field@4 of the record). Cycles across the
+    /// table rather than counting up — it selects WHICH variant this range is,
+    /// which is what a variant-keyed decode routes on. (`0` is not used here;
+    /// the default/non-forensic content carries no segment record at all.)
+    pub variant: u16,
     /// First source packet of the segment (inclusive).
     pub start_spn: u32,
     /// Last source packet of the segment (inclusive).
@@ -141,12 +147,12 @@ pub fn parse_individual_segments(tbl: &[u8]) -> Option<Vec<Segment>> {
     let mut segments = Vec::with_capacity(count);
     for i in 0..count {
         let o = 8 + i * record_size;
-        // o+4..o+8 = segment_number (u16) + flag (u16); o+8..o+16 = start/end SPN.
-        let number = u16::from_be_bytes([tbl[o + 4], tbl[o + 5]]);
+        // o+4..o+8 = variant (u16, 1..32) + flag (u16); o+8..o+16 = start/end SPN.
+        let variant = u16::from_be_bytes([tbl[o + 4], tbl[o + 5]]);
         let start_spn = u32::from_be_bytes([tbl[o + 8], tbl[o + 9], tbl[o + 10], tbl[o + 11]]);
         let end_spn = u32::from_be_bytes([tbl[o + 12], tbl[o + 13], tbl[o + 14], tbl[o + 15]]);
         segments.push(Segment {
-            number,
+            variant,
             start_spn,
             end_spn,
         });
@@ -159,7 +165,7 @@ mod tests {
     use super::*;
 
     /// Build a table with the real on-disc layout: 8-byte header + N 16-byte
-    /// records. `recs` are `(segment_number, start_spn, end_spn)`.
+    /// records. `recs` are `(variant, start_spn, end_spn)`.
     fn build_tbl(recs: &[(u16, u32, u32)]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // type
@@ -177,7 +183,9 @@ mod tests {
 
     #[test]
     fn parses_real_disc_layout() {
-        // First three records observed on a retail 2.1 disc: 2560-packet segments.
+        // First three records observed on retail 2.1 (Zombieland): the variant
+        // field counts 1,2,3,… (it wraps at 32 further into the table — see
+        // `variant_field_cycles_one_to_thirty_two`), segments are 2560 packets.
         let tbl = build_tbl(&[
             (1, 343680, 346239),
             (2, 695616, 698175),
@@ -185,7 +193,9 @@ mod tests {
         ]);
         let segs = parse_individual_segments(&tbl).expect("parse");
         assert_eq!(segs.len(), 3);
-        assert_eq!(segs[0].number, 1);
+        assert_eq!(segs[0].variant, 1);
+        assert_eq!(segs[1].variant, 2);
+        assert_eq!(segs[2].variant, 3);
         assert_eq!(segs[0].start_spn, 343680);
         assert_eq!(segs[0].end_spn, 346239);
         assert_eq!(segs[0].packet_count(), 2560);
@@ -230,7 +240,27 @@ mod tests {
         // A unit sitting squarely inside: start at packet 344000 → byte 344000*192.
         let off = 344000u64 * SOURCE_PACKET_LEN;
         let hit = variant_segment_for_unit(&segs, off).expect("inside the segment");
-        assert_eq!(hit.number, 1);
+        assert_eq!(hit.variant, 1);
+    }
+
+    #[test]
+    fn variant_field_cycles_one_to_thirty_two() {
+        // Reality on Zombieland: field@4 is the variant, cycling 1..=32 in file
+        // order (NOT a sequential segment id). Reproduce one-and-a-bit cycles.
+        let mut recs = Vec::new();
+        let mut spn = 1000u32;
+        for row in 0..2 {
+            for v in 1..=32u16 {
+                recs.push((v, spn, spn + 2559));
+                spn += 50_000; // ~one segment every ~67 MB
+            }
+            let _ = row;
+        }
+        let segs = parse_individual_segments(&build_tbl(&recs)).unwrap();
+        assert_eq!(segs.len(), 64);
+        assert_eq!(segs[31].variant, 32); // end of first cycle
+        assert_eq!(segs[32].variant, 1); // wraps, does not become 33
+        assert!(segs.iter().all(|s| (1..=32).contains(&s.variant)));
     }
 
     #[test]
@@ -250,7 +280,7 @@ mod tests {
         // Unit covering packets [80, 111]: overlaps [100,200] at the tail.
         let off = 80u64 * SOURCE_PACKET_LEN;
         let hit = variant_segment_for_unit(&segs, off).expect("straddles the start edge");
-        assert_eq!(hit.number, 7);
+        assert_eq!(hit.variant, 7);
         // A unit ending exactly at packet 99 (offset s.t. last = 99) does NOT overlap.
         let before = 68u64 * SOURCE_PACKET_LEN; // [68, 99]
         assert!(variant_segment_for_unit(&segs, before).is_none());
