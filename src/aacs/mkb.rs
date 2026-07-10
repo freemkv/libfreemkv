@@ -2,10 +2,9 @@
 //!
 //! The MKB record format (framing walker, the `MkbRecord` view, record-body
 //! finders), the MKBType / AACS-generation classification, and MKB-file
-//! utilities (content length, trimming, version). Consolidated here from the
-//! former `keys.rs` / `variant.rs` so the one place that understands MKB bytes
-//! is `mkb`. A follow-up collapses the remaining duplicate finders (see the
-//! private refactor notes) — for now both dialects live here side by side.
+//! utilities (content length, trimming, version). Consolidated here so the one
+//! place that understands MKB bytes is `mkb`. Some duplicate record finders
+//! still live side by side pending a follow-up that collapses them.
 
 // ── MKB record types ([C] Chapter 3) ──────────────────────────────────────
 // The ONE canonical set. Every record-type comparison in the `aacs` module
