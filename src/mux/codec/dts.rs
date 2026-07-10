@@ -37,7 +37,7 @@ pub struct DtsParser {
     /// timestamp instead of the later PES's. Offsets are kept relative to the
     /// current `buf` start and rebased whenever bytes are drained from the
     /// front.
-    pts_marks: Vec<(usize, i64)>,
+    pts_marks: std::collections::VecDeque<(usize, i64)>,
     /// The `front_pts` of the PREVIOUS emitted access unit. When the current
     /// AU's `front_pts` differs, it began a new PES → re-base to it. When it is
     /// unchanged, this AU shares the previous AU's PES → advance one frame
@@ -62,7 +62,7 @@ impl DtsParser {
         Self {
             buf: Vec::with_capacity(32768),
             pending_pts: 0,
-            pts_marks: Vec::new(),
+            pts_marks: std::collections::VecDeque::new(),
             last_front_pts: PTS_UNSET,
             next_pts_ns: PTS_UNSET,
         }
@@ -200,7 +200,7 @@ impl CodecParser for DtsParser {
         // discontinuity-carrying PES is a PUSI with a PTS in practice.
         let pts_ns = pes.pts.map(pts_to_ns).unwrap_or_else(|| {
             self.pts_marks
-                .last()
+                .back()
                 .map(|&(_, p)| p)
                 .filter(|&p| p >= 0)
                 .unwrap_or(if self.pending_pts >= 0 {
@@ -236,14 +236,14 @@ impl CodecParser for DtsParser {
         // (see `front_pts`), so an AU whose core arrived in an earlier PES keeps
         // that core's timestamp even when its extensions / the following core
         // arrive (with a later PTS) in this same parse() call.
-        self.pts_marks.push((self.buf.len(), pts_ns));
+        self.pts_marks.push_back((self.buf.len(), pts_ns));
         // Backstop: a run of zero-length (sub-header-only) PES packets that each
         // carry a PTS grows no buffer bytes, so `drain_front` (which prunes marks)
         // never runs. Bound the deque directly — drop the oldest, which belongs to
         // an already-emitted or lost AU — so hostile PS input can't accumulate
         // marks without bound.
         if self.pts_marks.len() > MAX_PTS_MARKS {
-            self.pts_marks.remove(0);
+            self.pts_marks.pop_front();
         }
         self.buf.extend_from_slice(&pes.data);
 
