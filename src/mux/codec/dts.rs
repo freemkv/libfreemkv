@@ -140,12 +140,6 @@ impl DtsParser {
 /// this without a clean boundary we resync rather than stall or balloon.
 const MAX_AU_BYTES: usize = 65536;
 
-/// Cap on buffered PTS marks. A real AU spans a few PES; this bounds the deque so
-/// a run of zero-length timed PES packets (which grow no buffer bytes, so the
-/// `drain_front` prune never fires) cannot accumulate marks without bound on
-/// hostile program-stream input.
-const MAX_PTS_MARKS: usize = 64 * 1024;
-
 /// Number of leading bytes that must be buffered before the core `fsize` field
 /// (bytes 5-7) can be decoded. This is a HEADER-LAYOUT minimum — "enough bytes
 /// to read the size field" — and is deliberately distinct from
@@ -236,15 +230,10 @@ impl CodecParser for DtsParser {
         // (see `front_pts`), so an AU whose core arrived in an earlier PES keeps
         // that core's timestamp even when its extensions / the following core
         // arrive (with a later PTS) in this same parse() call.
+        // (pts_marks is bounded implicitly: an empty PES returns above without
+        // pushing a mark, and a non-empty run grows `buf`, which is cleared —
+        // along with pts_marks — once it exceeds MAX_AU_BYTES.)
         self.pts_marks.push_back((self.buf.len(), pts_ns));
-        // Backstop: a run of zero-length (sub-header-only) PES packets that each
-        // carry a PTS grows no buffer bytes, so `drain_front` (which prunes marks)
-        // never runs. Bound the deque directly — drop the oldest, which belongs to
-        // an already-emitted or lost AU — so hostile PS input can't accumulate
-        // marks without bound.
-        if self.pts_marks.len() > MAX_PTS_MARKS {
-            self.pts_marks.pop_front();
-        }
         self.buf.extend_from_slice(&pes.data);
 
         let mut frames = Vec::new();
@@ -927,22 +916,6 @@ mod tests {
         let mut core = make_dts_core(512);
         core[8] = 0; // SFREQ = 0 (reserved)
         assert_eq!(dts_core_sample_rate(&core), 48_000);
-    }
-
-    #[test]
-    fn pts_marks_stay_bounded_on_zero_length_pes() {
-        // A run of zero-length (sub-header-only) DTS PES packets that each carry a
-        // PTS grows no buffer bytes, so drain_front (which prunes marks) never
-        // runs. The MAX_PTS_MARKS backstop must bound the deque regardless.
-        let mut parser = DtsParser::new();
-        for i in 0..(MAX_PTS_MARKS * 2) {
-            parser.parse(&make_pes(Vec::new(), Some(i as i64)));
-        }
-        assert!(
-            parser.pts_marks.len() <= MAX_PTS_MARKS,
-            "pts_marks bounded, got {}",
-            parser.pts_marks.len()
-        );
     }
 
     #[test]

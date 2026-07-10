@@ -142,7 +142,13 @@ impl AuAssembler {
         };
         Self {
             mode,
-            buf: Vec::with_capacity(256 * 1024),
+            // Passthrough never writes `buf` (one fragment → one unit); only the
+            // reassembling modes need reserve. Avoids ~256 KiB per audio/subtitle
+            // stream (and every TS/BD stream, which never feeds the assembler).
+            buf: match mode {
+                Mode::Passthrough => Vec::new(),
+                _ => Vec::with_capacity(256 * 1024),
+            },
             base: 0,
             marks: VecDeque::new(),
             disc_marks: VecDeque::new(),
