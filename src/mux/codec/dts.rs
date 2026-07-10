@@ -919,6 +919,37 @@ mod tests {
     }
 
     #[test]
+    fn dts_core_sfreq_table_matches_the_dca_spec() {
+        // Lock the SFREQ → sample-rate table to ffmpeg's authoritative
+        // `avpriv_dca_sample_rates` (ETSI TS 102 114 Table 6-4). The high-rate
+        // triad in particular — 48 k / 96 k / 192 k at indices 13/14/15 — must not
+        // be shifted; a wrong entry would compute an N× frame duration and
+        // reintroduce PTS drift on a 96/192 kHz DTS stream.
+        let mut core = make_dts_core(512);
+        let set_sfreq = |c: &mut [u8], idx: u8| c[8] = (c[8] & !0x3C) | ((idx & 0x0F) << 2);
+        for (idx, want) in [
+            (1u8, 8_000u32),
+            (2, 16_000),
+            (3, 32_000),
+            (6, 11_025),
+            (7, 22_050),
+            (8, 44_100),
+            (11, 12_000),
+            (12, 24_000),
+            (13, 48_000),
+            (14, 96_000),
+            (15, 192_000),
+        ] {
+            set_sfreq(&mut core, idx);
+            assert_eq!(
+                dts_core_sample_rate(&core),
+                want,
+                "SFREQ {idx} must be {want} Hz"
+            );
+        }
+    }
+
+    #[test]
     fn new_pes_rebases_to_its_own_pts_no_drift() {
         // Regression for the drift bug: a global running clock overshot a
         // feature-long DTS track by minutes (2h44 for a 2h03 film). When a NEW

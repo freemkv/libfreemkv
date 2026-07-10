@@ -832,8 +832,11 @@ mod tests {
 
     struct MemDisc {
         sectors: HashMap<u32, [u8; 2048]>,
-        /// Absolute LBAs that fail to read (bad-sector fixture).
+        /// Absolute LBAs that fail to read (bad-sector fixture → DiscRead).
         bad: std::collections::HashSet<u32>,
+        /// Absolute LBAs whose read fails to DECRYPT (no/wrong key fixture →
+        /// DecryptFailed), exercising the undecryptable-unit loss path.
+        decrypt_fail: std::collections::HashSet<u32>,
     }
 
     impl MemDisc {
@@ -841,6 +844,7 @@ mod tests {
             Self {
                 sectors: HashMap::new(),
                 bad: std::collections::HashSet::new(),
+                decrypt_fail: std::collections::HashSet::new(),
             }
         }
         fn put(&mut self, lba: u32, data: [u8; 2048]) {
@@ -871,6 +875,9 @@ mod tests {
                         status: None,
                         sense: None,
                     });
+                }
+                if self.decrypt_fail.contains(&(lba + i)) {
+                    return Err(Error::DecryptFailed);
                 }
             }
             for i in 0..count as u32 {
@@ -1390,6 +1397,64 @@ mod tests {
         assert!(!res.complete, "lossy extraction is not complete");
         assert_eq!(res.bytes_unreadable, good.len() as u64);
         assert_eq!(res.files.len(), 1);
+        assert_eq!(res.files[0].bytes_unreadable, good.len() as u64);
+    }
+
+    /// An UNDECRYPTABLE unit (DecryptFailed — wrong/missing key) is zero-filled
+    /// and counted as loss through the public API exactly like a bad sector:
+    /// the recovery-seam consolidation folded the old bytes_undecryptable bucket
+    /// into bytes_unreadable, and the run must still report complete == false and
+    /// bytes_lost() > 0 (this gates the CLI exit code / multipass re-run).
+    #[test]
+    fn undecryptable_unit_holes_file_and_accounts_loss() {
+        let good = vec![0x55u8; 4 * 2048];
+        let root = DirSpec {
+            name: String::new(),
+            icb_lba: 10,
+            dir_data_lba: 11,
+            files: Vec::new(),
+            subdirs: vec![DirSpec {
+                name: "BDMV".to_string(),
+                icb_lba: 20,
+                dir_data_lba: 21,
+                files: Vec::new(),
+                subdirs: vec![DirSpec {
+                    name: "STREAM".to_string(),
+                    icb_lba: 22,
+                    dir_data_lba: 23,
+                    files: vec![file("00001.m2ts", 24, 5000, good.clone(), true)],
+                    subdirs: vec![],
+                }],
+            }],
+        };
+        let mut disc = build_disc(root);
+        // The whole extent fails to decrypt (no/wrong key) rather than to read.
+        for i in 0..4u32 {
+            disc.decrypt_fail.insert(PART_START + 5000 + i);
+        }
+        let out = TmpDir::new("decryptfail");
+        let res = clear_disc()
+            .extract_tree(&mut disc, out.path(), &ExtractOptions::default())
+            .expect("extract does not abort on an undecryptable unit");
+        let got = read_out(out.path(), "BDMV/STREAM/00001.m2ts").expect("file written");
+        assert_eq!(
+            got.len(),
+            good.len(),
+            "holed file still sized to declared size"
+        );
+        assert!(
+            got.iter().all(|&b| b == 0),
+            "undecryptable range zero-filled"
+        );
+        assert!(
+            !res.complete,
+            "an undecryptable unit makes the rip incomplete"
+        );
+        assert!(
+            res.bytes_lost() > 0,
+            "decrypt loss counted, not reported clean"
+        );
+        assert_eq!(res.bytes_unreadable, good.len() as u64);
         assert_eq!(res.files[0].bytes_unreadable, good.len() as u64);
     }
 
