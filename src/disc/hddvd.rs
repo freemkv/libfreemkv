@@ -708,6 +708,22 @@ mod tests {
         // A slice/picture-only sample (no SPS/sequence) is indeterminate.
         assert_eq!(sniff_video_codec(&[0x00, 0x00, 0x01, 0x61, 0x9A]), None);
         assert_eq!(sniff_video_codec(&[0xDE, 0xAD, 0xBE, 0xEF]), None);
+
+        // Overlap regression: a picture_start_code (0x00) whose payload begins
+        // with 00 00 must advance a full 4 bytes so the code byte isn't re-read
+        // as the start of a new marker. Here the picture is followed by a real
+        // MPEG-2 sequence header — the scan must reach it cleanly and return
+        // Mpeg2 (and, critically, not be confused by the 1-byte overlap).
+        assert_eq!(
+            sniff_video_codec(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xB3, 0x2D]),
+            Some(Codec::Mpeg2)
+        );
+        // A lone picture_start_code with a 00-heavy payload and no following real
+        // start code stays indeterminate (the overlap must not fabricate one).
+        assert_eq!(
+            sniff_video_codec(&[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None
+        );
     }
 
     #[test]
