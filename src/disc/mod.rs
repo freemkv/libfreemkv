@@ -1950,8 +1950,10 @@ impl Disc {
         crate::labels::apply(reader, &udf_fs, &mut titles);
         crate::labels::fill_defaults(&mut titles);
 
-        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD),
-        //    layers, region.
+        // 5. Format (AACS MKB generation → BD/UHD/FMTS; tree → HD-DVD/DVD) and
+        //    layers. Region coding is not yet decoded from the disc — every disc
+        //    reports Region-free for now (correct for all UHD; a stub for
+        //    region-locked BD/DVD until region detection is implemented).
         let format = Self::detect_disc_format(reader, &udf_fs, &titles);
         let layers = if capacity > 24_000_000 { 2 } else { 1 };
         let region = DiscRegion::Free;
