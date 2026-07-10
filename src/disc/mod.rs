@@ -2129,12 +2129,9 @@ impl Disc {
         titles: &[DiscTitle],
     ) -> DiscFormat {
         use crate::aacs::mkb::{AacsVersion, mkb_type};
-        if udf_fs.find_dir("/HVDVD_TS").is_some() {
-            return DiscFormat::HdDvd;
-        }
-        if udf_fs.find_dir("/VIDEO_TS").is_some() {
-            return DiscFormat::Dvd;
-        }
+        // Tree priority MUST match the title-scan dispatch (BDMV → HVDVD_TS →
+        // VIDEO_TS): otherwise a disc carrying two trees would be classified as
+        // one format but enumerated as another (e.g. BD titles tagged HdDvd).
         if udf_fs.find_dir("/BDMV").is_some() {
             // Only the Type-and-Version record (first record) is needed.
             if let Ok(mkb) = udf_fs.read_file_prefix(reader, "/AACS/MKB_RO.inf", 64) {
@@ -2150,6 +2147,12 @@ impl Disc {
                 DiscFormat::Unknown => DiscFormat::BluRay,
                 other => other,
             };
+        }
+        if udf_fs.find_dir("/HVDVD_TS").is_some() {
+            return DiscFormat::HdDvd;
+        }
+        if udf_fs.find_dir("/VIDEO_TS").is_some() {
+            return DiscFormat::Dvd;
         }
         DiscFormat::Unknown
     }

@@ -889,7 +889,7 @@ mod tests {
     fn mkb_records_matches_walk_mkb_framing() {
         // The lazy `mkb_records` iterator and the owning `walk_mkb` must agree on
         // (offset, type, len) for every record — they share the one framing
-        // walker, and every keys.rs MKB walk now relies on this equivalence.
+        // walker, and every aacs::resolve/derive MKB walk now relies on this equivalence.
         let mut mkb = vec![0x10, 0x00, 0x00, 0x06, 0xAA, 0xBB];
         mkb.extend_from_slice(&[0x05, 0x00, 0x00, 0x08, 1, 2, 3, 4]);
         mkb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0xFF]); // terminator + trailing
