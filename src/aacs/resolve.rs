@@ -8,7 +8,7 @@ use super::mkb::*;
 //
 // Canonical form is `<category>1003` (low 16 bits `0x1003` is a fixed marker).
 // Types 3/4/10 are from the AACS Common Cryptographic Elements spec (0.953,
-// §3.2.5.1.1); the Category-C 2.0/2.1 values match libaacs `mkb.h` constants.
+// §3.2.5.1.1); the Category-C 2.0/2.1 values are the standard MKB type constants.
 
 // ── Full VUK resolution chain ───────────────────────────────────────────────
 
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn validate_processing_key_round_trip_with_nonzero_uv() {
         // Synthesise a (pk, uv, mk, cvalue, mk_dv) tuple that satisfies the
-        // libaacs _validate_pk relation, then confirm validate_processing_key
+        // AACS PK-validation relation, then confirm validate_processing_key
         // recovers mk. Catches the bugs that landed pre-fix:
         //   * uv XOR step was missing → mk wrong whenever uv != 0
         //   * AES-128E + 12-zero check instead of AES-128D + magic
@@ -844,8 +844,8 @@ mod tests {
     // ── MKB cvalue-record selection (issue #259 / #281) ─────────────────
     //
     // The cvalue (Media Key Data) table is record 0x05; the
-    // Subset-Difference index is record 0x04. This matches libaacs
-    // (`mkb_cvalues` → 0x05, `mkb_subdiff_records` → 0x04). Record 0x07
+    // Subset-Difference index is record 0x04 (the standard AACS MKB layout:
+    // 0x05 = cvalues, 0x04 = subset-difference index). Record 0x07
     // (Explicit Subset-Difference Record) is NOT the cvalue table. On real
     // in-drive AACS 2.x UHD MKBs 0x07 is small (~96 entries) while the 0x05
     // table is large (181270 entries, 1:1 with 0x04). An earlier
@@ -1264,7 +1264,7 @@ mod tests {
     }
     #[test]
     fn test_content_cert_parse() {
-        // AACS 1.0 cert, bus encryption OFF. Layout matches libaacs: flag in
+        // AACS 1.0 cert, bus encryption OFF. Content-cert layout: flag in
         // BIT 7 of byte 1, cc_id at bytes 14..20.
         let mut data = vec![0u8; 20];
         data[0] = 0x00; // AACS 1.0
@@ -1460,7 +1460,7 @@ mod tests {
         // [20..22] first_play, [22..24] top_menu, [24..26] num_titles, then
         // per-title 2-byte pad + 2-byte CPS unit at 26 + i*4 + 2. Each on-disc
         // 1-based CPS number in `1..=num_uk` is validated and converted to a
-        // 0-based key index (libaacs unit_key.c); an out-of-range number → 0.
+        // 0-based key index (per the AACS Unit_Key_RO format); an out-of-range number → 0.
         let mut data = build_unit_key_ro(4, 64); // num_uk = 4 → CPS 1..=4 valid
         data[20..22].copy_from_slice(&1u16.to_be_bytes()); // first_play CPS 1
         data[22..24].copy_from_slice(&2u16.to_be_bytes()); // top_menu  CPS 2
@@ -1580,7 +1580,7 @@ mod tests {
     }
     #[test]
     fn parse_content_cert_extracts_cc_id_and_nonzero_type_is_v20() {
-        // libaacs layout: [0]=type, [1] bit7=bus-enc, [14..20]=cc_id. Any
+        // Content-cert layout: [0]=type, [1] bit7=bus-enc, [14..20]=cc_id. Any
         // non-0x00 type → V20.
         let mut data = vec![0u8; 20];
         data[0] = 0x10; // AACS2 type marker → V20
@@ -1593,7 +1593,7 @@ mod tests {
     }
     #[test]
     fn parse_content_cert_bus_encryption_reads_bit7() {
-        // bus_encryption = (data[1] >> 7) & 1 (libaacs). Low bits set with bit7
+        // bus_encryption = (data[1] >> 7) & 1. Low bits set with bit7
         // clear → false; bit7 set → true. Pins the bit, not a truthiness of the byte.
         let mut data = vec![0u8; 20];
         data[1] = 0x7F; // bits 0..6 set, bit 7 clear

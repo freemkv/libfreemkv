@@ -2,7 +2,7 @@
 //!
 //! An 8-byte navigation command as found in PGC command tables (pre/post/cell)
 //! and PCI button info. Decoded per the DVD-Video VM instruction set and
-//! verified against libdvdnav's command decoder.
+//! verified against real discs.
 //!
 //! Bit model: the 8 bytes are a big-endian 64-bit word. `byte0` bits 7-5 are the
 //! command **type**; for type 1, `byte0` bit 4 selects Link (0) vs Jump (1), and
@@ -133,7 +133,7 @@ const JP_JUMP_SS: u8 = 6;
 const JP_CALL_SS: u8 = 8;
 
 // Link (type 1, direct=0) sub-commands. NOTE: sub-op 0 is NOP/no-link and 1 is
-// the LinkSub form (libdvdnav `decoder.c` `eval_link_instruction`).
+// the LinkSub form (the DVD-Video VM link instruction).
 const LK_SUB: u8 = 1;
 const LK_PGCN: u8 = 4;
 const LK_PTTN: u8 = 5;
@@ -159,7 +159,7 @@ fn be16(b: &[u8; 8], o: usize) -> u16 {
     ((b[o] as u16) << 8) | b[o + 1] as u16
 }
 
-// Compare-operand layouts ("if_version"s) per libdvdnav `decoder.c`. The op
+// Compare-operand layouts ("if_version"s) per the DVD-Video VM. The op
 // nibble is always `byte1` bits 6-4; the immediate flag is `byte1` bit 7. The
 // operand *offsets* differ by command family.
 //
@@ -205,7 +205,7 @@ pub fn decode(b: &[u8; 8]) -> Command {
     let cmd = b[1] & 0x0F;
 
     // Compare predicate, with the operand layout for this command family
-    // (libdvdnav `decoder.c` `vm_eval_command` type dispatch).
+    // (the DVD-Video VM command type dispatch).
     let compare = match (typ, direct) {
         (TYPE_SPECIAL, _) => if_v1(b),
         (TYPE_LINK_JUMP, 1) => if_v2(b), // jump
@@ -372,7 +372,7 @@ mod tests {
         }
     }
 
-    // Regression for the libdvdnav cross-check: link sub-op 0 = NOP, 1 = LinkSub.
+    // Regression for the link sub-op decode: 0 = NOP, 1 = LinkSub.
     #[test]
     fn link_subop_zero_is_nop_one_is_linksub() {
         assert_eq!(decode(&h("2000000000000000")).instr, Instr::Nop);

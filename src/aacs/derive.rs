@@ -10,8 +10,8 @@ use super::types::*;
 ///
 /// A Processing Key is **terminal**: it is the key at its Subset-Difference
 /// node, one `AES-G` from the Media Key. So this is the fast path — each PK is
-/// tried *directly* against the MKB cvalue tables (no tree descent), matching
-/// libaacs `_calc_mk_pks` (iterate PKs × cvalues). On a large AACS 2.x UHD MKB
+/// tried *directly* against the MKB cvalue tables (no tree descent) — the
+/// direct PK × cvalue iteration. On a large AACS 2.x UHD MKB
 /// (~181k cvalues) this is ~15x faster than treating a PK as a device-node
 /// label and walking the tree.
 ///

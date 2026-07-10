@@ -24,9 +24,8 @@ pub const TAB1: [u8; 256] = [
     0xb7, 0xf7, 0xbf, 0xa2, 0xe7, 0xa7, 0xef, 0xf2, 0xba, 0xfa, 0xb2, 0xaf, 0xea, 0xaa, 0xe2, 0xff,
 ];
 
-/// Table 2: LFSR1 high-byte feedback permutation.
-///
-/// Byte-identical to libdvdcss `p_css_tab2` (csstables.h).
+/// Table 2: LFSR1 high-byte feedback permutation — a fixed constant of the CSS
+/// cipher (per the published algorithm).
 pub const TAB2: [u8; 256] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09, 0x08, 0x0b, 0x0a, 0x0d, 0x0c, 0x0f, 0x0e,
     0x12, 0x13, 0x10, 0x11, 0x16, 0x17, 0x14, 0x15, 0x1b, 0x1a, 0x19, 0x18, 0x1f, 0x1e, 0x1d, 0x1c,
@@ -46,12 +45,12 @@ pub const TAB2: [u8; 256] = [
     0xed, 0xec, 0xef, 0xee, 0xe9, 0xe8, 0xeb, 0xea, 0xe4, 0xe5, 0xe6, 0xe7, 0xe0, 0xe1, 0xe2, 0xe3,
 ];
 
-/// Table 3: LFSR1 9-bit low-word feedback table (512 entries).
+/// Table 3: LFSR1 9-bit low-word feedback table (512 entries) — a fixed constant
+/// of the CSS cipher (per the published algorithm).
 ///
-/// Byte-identical to libdvdcss `p_css_tab3` (csstables.h): the 8-value
-/// block `BASE[i & 7]` repeated 64 times. The CSS LFSR1 step indexes this
-/// table with the 9-bit low register (0x100..=0x1FF), but only the low 3
-/// bits select the output — the high bits are ignored, hence the constant
+/// It is the 8-value block `BASE[i & 7]` repeated 64 times. The CSS LFSR1 step
+/// indexes this table with the 9-bit low register (0x100..=0x1FF), but only the
+/// low 3 bits select the output — the high bits are ignored, hence the constant
 /// blocks. The 512-entry width simply lets the 9-bit index be used without
 /// masking.
 pub const TAB3: [u8; 512] = [
@@ -197,12 +196,12 @@ mod tests {
         }
     }
 
-    /// TAB3 is the libdvdcss `p_css_tab3`: the 8-value feedback block
+    /// TAB3 is the CSS LFSR1 low-word table: the 8-value feedback block
     ///   BASE = [0x00,0x24,0x49,0x6d,0x92,0xb6,0xdb,0xff]
     /// repeated 64 times — `TAB3[i] == BASE[i & 7]`. The high bits of the
-    /// 9-bit index do not affect the output (libdvdcss's LFSR1 step indexes
-    /// with the full 9-bit low register but only `& 7` matters). This pins
-    /// all 512 entries to the published table.
+    /// 9-bit index do not affect the output (the LFSR1 step indexes with the
+    /// full 9-bit low register but only `& 7` matters). This pins all 512
+    /// entries to the published cipher's table.
     ///
     /// Mutation: flip any single byte in the TAB3 literal -> the formula
     /// check fails at that index.
