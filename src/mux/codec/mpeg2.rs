@@ -46,10 +46,10 @@ const PICTURE_CODE: u8 = 0x00;
 /// Picture coding type: I-frame.
 const PICTURE_TYPE_I: u8 = 1;
 
-/// Hard cap on the access-unit reassembly buffer. A real MPEG-2 frame is well
-/// under 1 MiB (DVD I-frames ~100 KB); past this cap a corrupt stream that
-/// never produces a second access-unit boundary is force-flushed as a single
-/// frame rather than driving unbounded allocation.
+/// The access-unit reassembly cap now lives in [`crate::mux::au_assembly`] (the
+/// `AuAssembler` owns cross-PES buffering); this mirror exists only so the
+/// force-flush test below can size an over-cap fixture against the same bound.
+#[cfg(test)]
 const MAX_AU_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Cap on frames held awaiting the first PES PTS anchor. A DVD stamps a PTS in
@@ -259,8 +259,11 @@ impl Mpeg2Parser {
             },
         });
         // Safety cap: a stream with no GOP/sequence boundaries would buffer
-        // unbounded. Force-flush a pathologically long run as its own GOP.
-        if self.gop_buf.len() >= MAX_PENDING_FRAMES {
+        // unbounded. Force-flush a pathologically long run as its own GOP —
+        // bounded by BOTH the frame count and the total buffered bytes, so a
+        // crafted stream of few-but-huge pictures cannot over-allocate either.
+        let gop_bytes: usize = self.gop_buf.iter().map(|p| p.frame.data.len()).sum();
+        if self.gop_buf.len() >= MAX_PENDING_FRAMES || gop_bytes >= MAX_PENDING_BYTES {
             self.flush_gop(out);
         }
     }
@@ -1402,13 +1405,12 @@ mod tests {
         let mut data = make_picture_header(PICTURE_TYPE_I);
         // > MAX_AU_BUFFER of slice bytes with no following picture/seq/GOP.
         data.extend(std::iter::repeat_n(0xAA, MAX_AU_BUFFER + 1024));
-        let frames = parser.parse(&make_pes(data, Some(0)));
-        assert!(
-            frames.is_empty(),
-            "over-cap AU is force-COMPLETED (bounded) but buffered in its GOP"
-        );
-        let frames = parser.flush();
-        assert_eq!(frames.len(), 1, "force-flushed at EOF, not dropped");
+        // The AU assembler force-completes the ~8 MiB AU (no boundary), and the
+        // GOP byte cap (MAX_PENDING_BYTES) then force-flushes that oversized GOP
+        // during parse rather than buffering it unbounded.
+        let mut frames = parser.parse(&make_pes(data, Some(0)));
+        frames.extend(parser.flush());
+        assert_eq!(frames.len(), 1, "over-cap AU force-flushed, not dropped");
         assert!(frames[0].keyframe);
     }
 
