@@ -352,3 +352,86 @@ pub fn mkb_type(mkb: &[u8]) -> Option<MkbType> {
 pub fn mkb_is_uhd(mkb: &[u8]) -> Option<bool> {
     mkb_type(mkb).map(MkbType::is_uhd)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One MKB record: 1 type byte + big-endian 24-bit total length + body.
+    fn rec(rec_type: u8, body: &[u8]) -> Vec<u8> {
+        let len = 4 + body.len();
+        let mut v = vec![rec_type, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Type-and-Version record (0x10): body = 4-byte MKBType + 4-byte version.
+    fn type_and_version(mkb_type: u32, version: u32) -> Vec<u8> {
+        let mut body = mkb_type.to_be_bytes().to_vec();
+        body.extend_from_slice(&version.to_be_bytes());
+        rec(REC_TYPE_AND_VERSION, &body)
+    }
+
+    #[test]
+    fn walker_frames_records_and_stops_at_end_marker() {
+        let mut mkb = type_and_version(MKB_20_CATEGORY_C, 77);
+        mkb.extend(rec(REC_VKD_TABLE, &[0xAA; 16]));
+        mkb.extend([0x00, 0x00, 0x00, 0x00]); // end marker
+        mkb.extend(rec(0x99, &[0xFF; 8])); // must NOT be walked (past the marker)
+
+        let recs = walk_mkb(&mkb);
+        assert_eq!(recs.len(), 2, "walk stops at the 00 000000 end marker");
+        assert_eq!(recs[0].rec_type, REC_TYPE_AND_VERSION);
+        assert_eq!(recs[1].rec_type, REC_VKD_TABLE);
+        assert_eq!(recs[1].body, vec![0xAA; 16]);
+    }
+
+    #[test]
+    fn walker_stops_on_malformed_or_out_of_bounds_length() {
+        // A record whose declared length runs past the buffer end must terminate
+        // the walk rather than panic or read OOB.
+        let mkb = vec![REC_VKD_TABLE, 0x00, 0xFF, 0xFF, 0x01, 0x02]; // len=0xFFFF, only 6 bytes
+        assert!(
+            walk_mkb(&mkb).is_empty(),
+            "over-long record yields no records"
+        );
+        // A sub-4 length (shorter than the header itself) is also rejected.
+        let short = vec![REC_VKD_TABLE, 0x00, 0x00, 0x02];
+        assert!(walk_mkb(&short).is_empty(), "sub-4 length is rejected");
+        // A truncated header (< 4 bytes) yields nothing.
+        assert!(walk_mkb(&[0x10, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn mkb_type_and_version_decode_from_the_type_record() {
+        let mut mkb = type_and_version(MKB_21_CATEGORY_C, 100);
+        mkb.extend([0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(mkb_type_raw(&mkb), Some(MKB_21_CATEGORY_C));
+        assert_eq!(mkb_version(&mkb), Some(100));
+        assert_eq!(mkb_is_uhd(&mkb), Some(true), "2.1 Category C is UHD");
+
+        let bd = type_and_version(MKB_TYPE_4_PRERECORDED, 68);
+        assert_eq!(
+            mkb_is_uhd(&bd),
+            Some(false),
+            "AACS 1.0 prerecorded is not UHD"
+        );
+        // No Type record → None (not a panic, not a fabricated value).
+        assert_eq!(mkb_version(&rec(REC_VKD_TABLE, &[0; 16])), None);
+        assert_eq!(mkb_type_raw(&[]), None);
+    }
+
+    #[test]
+    fn trim_mkb_keeps_only_the_framed_records() {
+        let mut mkb = type_and_version(MKB_20_CATEGORY_C, 1);
+        let content_len = mkb.len(); // the single framed record, no end marker
+        mkb.extend([0x00, 0x00, 0x00, 0x00]); // end marker
+        mkb.extend([0xDE; 4096]); // trailing padding past the end marker
+        let trimmed = trim_mkb(mkb);
+        assert_eq!(
+            trimmed.len(),
+            content_len,
+            "trim keeps the framed records, dropping the end marker and padding"
+        );
+    }
+}

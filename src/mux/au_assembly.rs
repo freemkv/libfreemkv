@@ -32,6 +32,13 @@ use std::collections::VecDeque;
 /// at the cap rather than buffering without bound on hostile/corrupt input.
 const MAX_AU_BUFFER: usize = 8 * 1024 * 1024;
 
+/// Cap on buffered timing/discontinuity marks. A real access unit spans a few
+/// hundred PES fragments at most; this bounds the mark deques so a run of
+/// zero-length (or start-code-free) timed fragments — which grow no buffer bytes
+/// and so never trip the `MAX_AU_BUFFER` mark-prune — cannot accumulate marks
+/// without bound on hostile/corrupt disc input.
+const MAX_MARKS: usize = 64 * 1024;
+
 /// One AU-complete unit drained from the buffer: its elementary-stream bytes plus
 /// the timing/source/discontinuity of the fragment that opened the AU.
 pub(crate) struct AssembledAu {
@@ -155,7 +162,31 @@ impl AuAssembler {
         }
     }
 
-    /// Feed one PES fragment; return every AU that is now complete.
+    /// Feed one PES fragment the caller OWNS; return every AU now complete. For
+    /// a self-framing (`Passthrough`) stream the payload is MOVED straight into
+    /// the emitted unit with no copy — the common DVD/HD-DVD case (MPEG-2 video,
+    /// all audio). A buffering mode copies into `buf` exactly as [`Self::push`].
+    pub(crate) fn push_owned(
+        &mut self,
+        data: Vec<u8>,
+        pts: Option<i64>,
+        dts: Option<i64>,
+        source: Option<SourcePos>,
+        discontinuity: bool,
+    ) -> Vec<AssembledAu> {
+        if matches!(self.mode, Mode::Passthrough) {
+            return vec![AssembledAu {
+                data,
+                pts,
+                dts,
+                source,
+                discontinuity,
+            }];
+        }
+        self.push(&data, pts, dts, source, discontinuity)
+    }
+
+    /// Feed one PES fragment (borrowed); return every AU that is now complete.
     pub(crate) fn push(
         &mut self,
         data: &[u8],
@@ -183,9 +214,20 @@ impl AuAssembler {
                 dts,
                 source,
             });
+            // Backstop: the `buf`-size cap prunes marks only when bytes accumulate.
+            // A run of zero-length (or start-code-free) timed fragments grows no
+            // bytes, so bound the deque directly — drop the oldest (stalest) mark,
+            // which belongs to an already-emitted or lost AU. A real AU spans far
+            // fewer fragments than this cap.
+            if self.marks.len() > MAX_MARKS {
+                self.marks.pop_front();
+            }
         }
         if discontinuity {
             self.disc_marks.push_back(off);
+            if self.disc_marks.len() > MAX_MARKS {
+                self.disc_marks.pop_front();
+            }
         }
         self.buf.extend_from_slice(data);
         self.drain(false)
@@ -245,19 +287,18 @@ impl AuAssembler {
             }
             let end_abs = self.base + end as u64;
 
-            // The AU's own timing/source/discontinuity: by the mark-drain
-            // invariant (stale marks below `base` were already dropped) the front
-            // mark, if it sits before this AU's end, belongs to this AU.
+            // The AU's own timing/source: take the FIRST Some of each field
+            // across every mark in this AU's range [base, end_abs), independently
+            // — one PES fragment may carry the source while a later fragment of
+            // the same AU carries the PTS (and vice versa), so reading only the
+            // front mark would drop the other field. This restores the semantics
+            // of the pre-consolidation separate pts/source mark deques.
             let (mut pts, mut dts, mut source) = (None, None, None);
-            if let Some(m) = self.marks.front() {
-                if m.off < end_abs {
-                    pts = m.pts;
-                    dts = m.dts;
-                    source = m.source;
-                }
-            }
             while self.marks.front().is_some_and(|m| m.off < end_abs) {
-                self.marks.pop_front();
+                let m = self.marks.pop_front().unwrap();
+                pts = pts.or(m.pts);
+                dts = dts.or(m.dts);
+                source = source.or(m.source);
             }
             let mut discontinuity = false;
             if self.disc_marks.front().is_some_and(|&o| o < end_abs) {
@@ -497,6 +538,32 @@ mod tests {
         let out2 = a.flush();
         assert_eq!(out2.len(), 1);
         assert_eq!(out2[0].data, au2);
+    }
+
+    #[test]
+    fn au_merges_pts_and_source_from_different_fragments() {
+        // One fragment of an AU may carry the source stamp while a later fragment
+        // of the SAME AU carries the PTS (each PES gets a source; only the anchor
+        // gets a PTS). The AU must keep BOTH — reading only the front mark would
+        // drop whichever field the first fragment lacked.
+        let src = crate::pes::SourcePos::at_byte(4242);
+        let mut a = AuAssembler::for_codec(Codec::H264);
+        let full = au(0xAB, 80);
+        // Fragment 1: source only, no PTS.
+        assert!(a.push(&full[..30], None, None, Some(src), false).is_empty());
+        // Fragment 2 (same AU): PTS only, no source.
+        assert!(
+            a.push(&full[30..], Some(9000), None, None, false)
+                .is_empty()
+        );
+        let out = a.flush();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pts, Some(9000), "PTS from the 2nd fragment retained");
+        assert_eq!(
+            out[0].source.map(|s| s.byte),
+            Some(4242),
+            "source from the 1st fragment retained"
+        );
     }
 
     #[test]

@@ -296,7 +296,7 @@ impl PipelinedPesStream {
             // → no continuity-gap flag.)
             let pkts: Vec<PesPacket> = match self.au_asm.get_mut(track) {
                 Some(asm) => asm
-                    .push(&ps.data, pts_i64, dts_i64, src, false)
+                    .push_owned(ps.data, pts_i64, dts_i64, src, false)
                     .into_iter()
                     .map(|au| PesPacket {
                         source: au.source,

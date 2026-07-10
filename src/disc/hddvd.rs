@@ -104,7 +104,14 @@ fn parse_vti_clip_order(vti: &[u8]) -> Vec<String> {
             count += 1;
         }
     }
-    let Some(mut best) = buckets.into_values().max_by_key(|g| g.len()) else {
+    // Pick the largest residue bucket (the clip table). On a size tie, break
+    // deterministically by the bucket's smallest offset — `HashMap` iteration
+    // order is randomized, so `max_by_key` alone could pick a different bucket
+    // run-to-run on identical bytes.
+    let Some(mut best) = buckets
+        .into_values()
+        .max_by_key(|g| (g.len(), std::cmp::Reverse(g.iter().map(|(o, _)| *o).min())))
+    else {
         return Vec::new();
     };
     best.sort_by_key(|(o, _)| *o);
@@ -537,6 +544,36 @@ mod tests {
         );
         // A non-VTI blob yields nothing.
         assert!(parse_vti_clip_order(b"not a vti").is_empty());
+    }
+
+    #[test]
+    fn parse_vti_clip_order_is_deterministic_on_a_bucket_size_tie() {
+        // Two residue buckets of EQUAL size must resolve to the SAME winner every
+        // call — `HashMap` iteration is randomized, so a `max_by_key` without a
+        // deterministic tie-break could pick a different bucket run-to-run on
+        // identical bytes. Build a VTI whose stray `.EVO` names tie the real
+        // table's bucket count, then assert the result is stable across calls.
+        let mut vti = vec![0u8; 0x600];
+        vti[..HDDVD_VTI_MAGIC.len()].copy_from_slice(HDDVD_VTI_MAGIC);
+        let put = |v: &mut Vec<u8>, off: usize, name: &str| {
+            v[off..off + name.len()].copy_from_slice(name.as_bytes());
+        };
+        // Bucket A (residue 0x42): two names at stride 0x140.
+        put(&mut vti, 0x142, "A1.EVO");
+        put(&mut vti, 0x282, "A2.EVO");
+        // Bucket B (residue 0x50): two names — same count, different residue.
+        put(&mut vti, 0x150, "B1.EVO");
+        put(&mut vti, 0x290, "B2.EVO");
+
+        let first = parse_vti_clip_order(&vti);
+        for _ in 0..20 {
+            assert_eq!(
+                parse_vti_clip_order(&vti),
+                first,
+                "tie-break must be deterministic across repeated calls"
+            );
+        }
+        assert!(!first.is_empty());
     }
 
     #[test]
