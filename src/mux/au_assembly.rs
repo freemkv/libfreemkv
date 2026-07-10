@@ -466,7 +466,7 @@ mod tests {
 
     fn au(payload: u8, len: usize) -> Vec<u8> {
         let mut v = AUD.to_vec();
-        v.extend(std::iter::repeat(payload).take(len));
+        v.extend(std::iter::repeat_n(payload, len));
         v
     }
 
@@ -598,7 +598,7 @@ mod tests {
 
     fn bdu(ty: u8, payload: u8, len: usize) -> Vec<u8> {
         let mut v = vec![0x00, 0x00, 0x01, ty];
-        v.extend(std::iter::repeat(payload).take(len));
+        v.extend(std::iter::repeat_n(payload, len));
         v
     }
 
@@ -762,7 +762,8 @@ mod tests {
         };
         // (label, stream, assembler factory). MPEG-2 uses the dedicated mpeg2()
         // assembler (Mode::Mpeg2); the AUD/VC-1 codecs use for_codec().
-        let cases: [(&str, &[u8], fn() -> AuAssembler); 3] = [
+        type MakeAsm = fn() -> AuAssembler;
+        let cases: [(&str, &[u8], MakeAsm); 3] = [
             ("h264", &h264, || AuAssembler::for_codec(Codec::H264)),
             ("vc1", &vc1, || AuAssembler::for_codec(Codec::Vc1)),
             ("mpeg2", &mpeg2, AuAssembler::mpeg2),
@@ -778,6 +779,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn marks_deques_stay_bounded_on_zero_length_timed_fragments() {
+        // A run of zero-length fragments that each carry a PTS (or a
+        // discontinuity) grows no buffer bytes, so the buf-size cap never prunes
+        // the mark deques. The MAX_MARKS backstop must bound them regardless.
+        let mut a = AuAssembler::for_codec(Codec::H264);
+        for i in 0..(MAX_MARKS * 2) {
+            a.push(&[], Some(i as i64), None, None, true);
+        }
+        assert!(
+            a.marks.len() <= MAX_MARKS,
+            "marks bounded at MAX_MARKS, got {}",
+            a.marks.len()
+        );
+        assert!(
+            a.disc_marks.len() <= MAX_MARKS,
+            "disc_marks bounded at MAX_MARKS, got {}",
+            a.disc_marks.len()
+        );
     }
 
     #[test]
