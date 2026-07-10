@@ -215,12 +215,13 @@ fn probe_evo_streams(reader: &mut dyn SectorSource, extents: &[Extent]) -> Vec<S
     }
 
     let mut streams = Vec::new();
-    if let Some(pid) = video_pid {
-        // Default to H.264 when a video PES was seen but the codec could not be
-        // sniffed from the sampled head — the demux found video, just no
-        // recognizable start code yet; dropping it would leave the title with no
-        // video track and fail the mux.
-        let codec = sniff_video_codec(&video).unwrap_or(Codec::H264);
+    // Emit the video stream only when the codec was actually identified from the
+    // sampled head. Guessing (e.g. defaulting to H.264) would tag a VC-1 — or a
+    // still-encrypted — clip with the wrong codec, so the mux applies the wrong
+    // parser and produces a corrupt track; dropping it is the honest outcome
+    // (matches the audio path below), and a real clear clip always carries its
+    // sequence header / SPS at the head, so this never fires on a normal disc.
+    if let (Some(pid), Some(codec)) = (video_pid, sniff_video_codec(&video)) {
         streams.push(Stream::Video(VideoStream {
             pid,
             codec,
@@ -870,6 +871,55 @@ mod tests {
         d.extend_from_slice(&pes(0xBD, &audio_payload));
         d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB9]);
         d
+    }
+
+    /// Build a bare PsPacket for the collect_es routing test.
+    fn ps_pkt(stream_id: u8, sub: Option<u8>, data: Vec<u8>) -> crate::mux::ps::PsPacket {
+        crate::mux::ps::PsPacket {
+            stream_id,
+            sub_stream_id: sub,
+            pts: None,
+            dts: None,
+            data,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn collect_es_routes_only_vc1_0xfd_to_video() {
+        use crate::mux::ps::hddvd_extended_pid;
+        // The 0xFD guard: only the VC-1 extension (0x55) is video. An HD-audio
+        // 0xFD sub-stream (e.g. 0x72) that arrives FIRST must NOT stamp video_pid
+        // with its PID or pollute the video sample — else the real video track is
+        // lost. (Routing 0xFD audio to its own track is deferred.)
+        let mut video = Vec::new();
+        let mut video_pid: Option<u16> = None;
+        let mut audio = BTreeMap::new();
+        // Audio-on-0xFD (ext 0x72) first — must be ignored by the video path.
+        collect_es(
+            &ps_pkt(0xFD, Some(0x72), vec![0xAA; 32]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert!(
+            video.is_empty(),
+            "0xFD audio sub-stream not routed to video"
+        );
+        assert_eq!(video_pid, None, "0xFD audio did not stamp the video PID");
+        // Then the real VC-1 video (ext 0x55).
+        collect_es(
+            &ps_pkt(0xFD, Some(0x55), vec![0xBB; 32]),
+            &mut video,
+            &mut video_pid,
+            &mut audio,
+        );
+        assert_eq!(
+            video_pid,
+            Some(hddvd_extended_pid(0x55)),
+            "video PID stamped from the VC-1 0xFD sub-stream (0xFD55)"
+        );
+        assert_eq!(video.len(), 32, "VC-1 0xFD payload accumulated as video");
     }
 
     /// End-to-end: an `.evo` whose video rides the extended-stream-id 0xFD yields

@@ -121,6 +121,11 @@ pub(crate) struct AuAssembler {
     /// boundary is "the next opener after a frame is already seen"). Meaningless
     /// for `Mode::StartCode`. Reset with `scan_pos`.
     seen_unit: bool,
+    /// Pre-sync opener-search cursor: the offset up to which the buffer has been
+    /// searched for the FIRST AU opener with none found. Resumes the opener scan
+    /// so a long run of junk with no start code (hostile/corrupt input) costs
+    /// O(bytes) total, not O(buffer) per push. Reset when `buf[0]` moves.
+    opener_pos: usize,
 }
 
 impl AuAssembler {
@@ -143,6 +148,7 @@ impl AuAssembler {
             disc_marks: VecDeque::new(),
             scan_pos: 0,
             seen_unit: false,
+            opener_pos: 0,
         }
     }
 
@@ -159,6 +165,7 @@ impl AuAssembler {
             disc_marks: VecDeque::new(),
             scan_pos: 0,
             seen_unit: false,
+            opener_pos: 0,
         }
     }
 
@@ -245,11 +252,11 @@ impl AuAssembler {
         if matches!(self.mode, Mode::Passthrough) {
             return Vec::new();
         }
-        let mode = self.mode;
         let mut out = Vec::new();
         loop {
-            // Locate the AU start code that opens the buffered run.
-            let Some(a0) = au_opener(mode, &self.buf) else {
+            // Locate the AU start code that opens the buffered run (resumes from
+            // opener_pos so an unsynced junk run is scanned once, not per push).
+            let Some(a0) = self.au_opener_resumable() else {
                 // No AU boundary buffered. Bound memory: drop all but a 3-byte
                 // tail (enough to catch a start-code prefix straddling the cut)
                 // once over the cap; otherwise wait for more data.
@@ -329,6 +336,22 @@ impl AuAssembler {
     fn reset_scan(&mut self) {
         self.scan_pos = 0;
         self.seen_unit = false;
+        self.opener_pos = 0;
+    }
+
+    /// Locate the first AU opener in `buf`, resuming the search from `opener_pos`
+    /// (bytes already searched with no opener) so a long unsynced run costs
+    /// O(bytes) total, not O(buffer) per push. Advances `opener_pos` on a miss.
+    fn au_opener_resumable(&mut self) -> Option<usize> {
+        match au_opener_from(self.mode, &self.buf, self.opener_pos) {
+            Some(o) => Some(o),
+            None => {
+                // Nothing yet; next call resumes here (back up 3 for a straddling
+                // start-code prefix). Never advance past what is searchable.
+                self.opener_pos = self.buf.len().saturating_sub(3).max(self.opener_pos);
+                None
+            }
+        }
     }
 
     /// Find the end of the AU that opens at `buf[0]`, resuming from `scan_pos`
@@ -401,13 +424,13 @@ impl AuAssembler {
 
 /// Offset of the start code that opens the next AU in `buf` (at or after 0), or
 /// `None` if no AU-opening start code is buffered yet.
-fn au_opener(mode: Mode, buf: &[u8]) -> Option<usize> {
+fn au_opener_from(mode: Mode, buf: &[u8], from: usize) -> Option<usize> {
     match mode {
-        Mode::StartCode(marker) => find_start_code(buf, 0, marker),
+        Mode::StartCode(marker) => find_start_code(buf, from, marker),
         // Any of the three AU-opening BDU types opens a VC-1 access unit.
-        Mode::Vc1 => find_vc1_start(buf, 0),
+        Mode::Vc1 => find_vc1_start(buf, from),
         // A sequence header, GOP header, or picture opens an MPEG-2 access unit.
-        Mode::Mpeg2 => find_mpeg2_start(buf, 0),
+        Mode::Mpeg2 => find_mpeg2_start(buf, from),
         Mode::Passthrough => None,
     }
 }
