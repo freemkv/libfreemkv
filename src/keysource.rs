@@ -563,10 +563,7 @@ mod tests {
     struct HasKey([u8; 16]);
     impl KeySource for HasKey {
         fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-            Ok(vec![UnitKey {
-                idx: 0,
-                key: self.0,
-            }])
+            Ok(vec![UnitKey::new(0, self.0)])
         }
     }
 
@@ -612,10 +609,7 @@ mod tests {
                 if let Ok(s) = ctx.samples(8) {
                     self.seen.lock().unwrap().extend(s);
                 }
-                Ok(vec![UnitKey {
-                    idx: 0,
-                    key: self.key,
-                }])
+                Ok(vec![UnitKey::new(0, self.key)])
             }
         }
 

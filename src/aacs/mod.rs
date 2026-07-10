@@ -38,6 +38,7 @@ pub mod segment_key;
 pub mod trace;
 pub mod types;
 pub mod variant;
+pub mod variant_select;
 
 /// On-disc UDF paths to the AACS key-input files (with their fallbacks).
 /// Centralised so every reader (`resolve_vid_only`, `read_aacs_inputs`,
@@ -103,10 +104,7 @@ mod tests {
         let _ = is_variant_mkb(&walk_mkb(&[]));
         let _ = disc_hash_hex(&disc_hash(b"x"));
         let _ = super::derive::resolve_candidate(
-            &super::derive::KeyCandidate::Uk(super::types::UnitKey {
-                idx: 0,
-                key: [0u8; 16],
-            }),
+            &super::derive::KeyCandidate::Uk(super::types::UnitKey::new(0, [0u8; 16])),
             &[],
             &[],
             None,

@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.3.2] — 2026-07-10
+
+### Added
+
+- **AACS 2.1 (FMTS) variant-decode foundation.** `UnitKey` gains a
+  `variant_number` field (`0` = ordinary content, `1..=32` = a forensic
+  variant) with `UnitKey::new` / `UnitKey::variant` constructors, and a new
+  `aacs::variant_select` module resolves a disc's single forensic variant and
+  classifies each aligned unit — decrypt with the default key, decrypt with the
+  variant key, drop a foreign variant, or conceal a keyless forensic unit. This
+  is the groundwork for selecting one variant's segments and dropping the other
+  31; the decrypt-pipeline wiring lands with the variant key source.
+
+### Fixed
+
+- **`IndividualSegment.tbl`: the per-record field is the variant, not a segment
+  number.** `Segment.number` → `Segment.variant`. Verified against a retail 2.1
+  disc, the field cycles `1..=32` across the table (a per-variant tag) rather
+  than counting up, so variant selection routes on the correct value.
+
 ## [1.3.1] — 2026-07-10
 
 ### Licensing
