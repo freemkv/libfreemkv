@@ -715,6 +715,54 @@ mod tests {
     }
 
     #[test]
+    fn parser_for_mvc_dependent_h264_is_passthrough() {
+        // The dependent-view stream must get a passthrough parser: a PPS in a
+        // non-keyframe AU is kept in-band, not stripped like the base parser.
+        let mut p = crate::mux::codec::parser_for_mvc_dependent(crate::disc::Codec::H264, false);
+        let mut d = Vec::new();
+        d.extend_from_slice(&h264_nal(0x68, &[0xCE, 0x01])); // PPS (8)
+        d.extend_from_slice(&h264_nal(0x74, &[0x11, 0x22])); // slice-ext (20)
+        let f = p.parse(&make_pes(d, Some(90000)));
+        assert_eq!(f.len(), 1);
+        let types: Vec<u8> = h264_nals_in(&f[0].data)
+            .iter()
+            .map(|n| n[0] & 0x1F)
+            .collect();
+        assert!(
+            types.contains(&8),
+            "dependent parser keeps PPS in-band (passthrough): {types:?}"
+        );
+    }
+
+    #[test]
+    fn mvc_passthrough_with_idr_does_not_reassert_param_sets() {
+        // With an IDR present (keyframe=true), passthrough must NOT re-assert the
+        // param sets (the `keyframe && !mvc` guard), so SPS/PPS appear exactly
+        // once — a duplicate would corrupt the dependent BlockAdditional.
+        let mut p = H264Parser::new().with_mvc_passthrough(true);
+        let mut d = Vec::new();
+        d.extend_from_slice(&h264_nal(0x67, &[0x42, 0x00, 0x1E, 0x01])); // SPS (7)
+        d.extend_from_slice(&h264_nal(0x68, &[0xCE, 0x01])); // PPS (8)
+        d.extend_from_slice(&h264_nal(0x65, &[0x88, 0x00])); // IDR slice (5)
+        let f = p.parse(&make_pes(d, Some(90000)));
+        assert_eq!(f.len(), 1);
+        let types: Vec<u8> = h264_nals_in(&f[0].data)
+            .iter()
+            .map(|n| n[0] & 0x1F)
+            .collect();
+        assert_eq!(
+            types.iter().filter(|&&t| t == 7).count(),
+            1,
+            "exactly one SPS, no keyframe re-assert under passthrough: {types:?}"
+        );
+        assert_eq!(
+            types.iter().filter(|&&t| t == 8).count(),
+            1,
+            "exactly one PPS, no keyframe re-assert under passthrough: {types:?}"
+        );
+    }
+
+    #[test]
     fn h264_populates_measured_coding_type_and_source() {
         use super::super::coding::CodingType;
         // Slice-header body = first_mb_in_slice=0 ('1') then slice_type ue(v):

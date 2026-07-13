@@ -257,6 +257,15 @@ impl Disc {
         // dependent view (it lives in the MPLS STN_table_SS), so we use the
         // BD-3D PID convention: dependent = base-view video PID + 1
         // (e.g. 0x1011 -> 0x1012). Reading the SSIF (above) provides its packets.
+        //
+        // Limitation: `is_3d` latches per PLAYLIST, not per clip. A playlist that
+        // mixed a 3D clip (has an SSIF) with a 2D clip (no SSIF) would tag the
+        // whole title 3D; the 2D clip's frames then mux as plain Blocks (no
+        // dependent PID → no BlockAdditional) under a track that still advertises
+        // the mvcC mapping. That output is valid (per-frame BlockAdditional is
+        // optional) but over-claims 3D for those frames. Real 3D main-feature
+        // playlists are single-clip or uniformly 3D, so this is not exercised;
+        // per-clip 3D would need per-clip stream sets (a larger change).
         if is_3d {
             if let Some(base) = streams.iter().find_map(|s| match s {
                 Stream::Video(v) => Some(v.clone()),
