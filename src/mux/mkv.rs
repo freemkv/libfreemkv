@@ -68,6 +68,59 @@ const COLOUR_RANGE_LIMITED: u8 = 1;
 /// Vision configuration record (RFC 9559 + Dolby Vision-in-Matroska spec).
 const BLOCK_ADD_ID_TYPE_DVCC: u64 = 0x6476_6343;
 
+/// BlockAddIDType "mvcC" — the MVCDecoderConfigurationRecord fourcc, big-endian
+/// ASCII 'm''v''c''C'. Matroska BlockAdditionMapping/BlockAddIDType for a
+/// Blu-ray 3D MVC configuration (RFC 9559 + Matroska Codec Specifications
+/// §4.1.5; equals ISO/IEC 14496-15 MVCConfigurationBox('mvcC')). The per-frame
+/// dependent (right-eye) view rides as a BlockAdditional under this mapping.
+const BLOCK_ADD_ID_TYPE_MVCC: u64 = 0x6D76_6343;
+
+/// BlockAddIDValue for the MVC mapping — the value each per-frame `BlockAddID`
+/// references (RFC 9559 requires ≥ 2; 1 is the default plain BlockAdditional).
+const BLOCK_ADD_ID_VALUE_MVC: u64 = 2;
+
+/// Build an `MVCDecoderConfigurationRecord` (ISO/IEC 14496-15:2013 §7.6.2) from
+/// the dependent view's subset-SPS (NAL type 15) and PPS NAL units. This is the
+/// `BlockAddIDExtraData` for the `mvcC` BlockAdditionMapping (and, in the ISO
+/// container, the `MVCConfigurationBox('mvcC')` payload).
+///
+/// Layout mirrors the AVCDecoderConfigurationRecord except byte[4] repurposes
+/// the AVC record's `bit(6) reserved` as
+/// `complete_representation(1) | explicit_au_track(1) | reserved '1111'(4)`.
+/// `profile`/`compat`/`level` describe the WHOLE MVC stream and come from the
+/// subset SPS (bytes 1..=3). `length_size_minus_one` MUST match the base avcC
+/// (freemkv always emits 4-byte length prefixes → 3). SPSs precede subset SPSs
+/// in the array; here the array carries the dependent view's parameter sets.
+///
+/// Returns `None` if either param set is absent, too short, or exceeds the
+/// 16-bit length field (a param set > 65535 bytes is non-conforming and would
+/// mis-frame the record).
+fn mvc_decoder_config_record(subset_sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
+    if subset_sps.len() < 4 || subset_sps.len() > 0xFFFF || pps.is_empty() || pps.len() > 0xFFFF {
+        return None;
+    }
+    let mut record = vec![
+        1,             // configurationVersion
+        subset_sps[1], // AVCProfileIndication (whole MVC stream, from subset SPS)
+        subset_sps[2], // profile_compatibility
+        subset_sps[3], // AVCLevelIndication
+        // complete_representation(1)=1 | explicit_au_track(1)=0 |
+        // reserved '1111'(4) | lengthSizeMinusOne(2)=3(11) → 1_0_1111_11 = 0xBF.
+        0xBF,
+        // reserved '0'(1) | numOfSequenceParameterSets(7)=1 → 0_0000001 = 0x01.
+        // NB: distinct from the AVC record's byte[5] (reserved(3)|numSPS(5)).
+        0x01,
+        (subset_sps.len() >> 8) as u8,
+        subset_sps.len() as u8,
+    ];
+    record.extend_from_slice(subset_sps);
+    record.push(1); // numOfPictureParameterSets
+    record.push((pps.len() >> 8) as u8);
+    record.push(pps.len() as u8);
+    record.extend_from_slice(pps);
+    Some(record)
+}
+
 /// Resolve a video stream's CICP colour code points — `(matrix, transfer,
 /// primaries, range)`, ITU-T H.273 — using a single precedence so EVERY sink
 /// (the MKV muxer here AND the FVI sidecar in `videomap.rs`) agrees and can
@@ -176,6 +229,14 @@ pub struct MkvTrack {
     /// stream is parsed. When `Some`, the serializer emits MasteringMetadata +
     /// MaxCLL/MaxFALL inside Colour; when `None` they are omitted entirely.
     pub hdr10: Option<crate::mux::codec::Hdr10Metadata>,
+    /// Blu-ray 3D (MVC): the dependent (right-eye) view's `(subset_sps, pps)`
+    /// NAL units, from which the serializer builds the `mvcC`
+    /// MVCDecoderConfigurationRecord (ISO/IEC 14496-15 §7.6.2) for the track's
+    /// BlockAdditionMapping, and emits `StereoMode`. `None` for non-3D tracks.
+    /// Set at muxer activation from the dependent stream's parameter sets — the
+    /// same deferred path `hdr10`/FieldOrder use — never at construction. When
+    /// `Some`, the per-frame dependent view rides as a `BlockAdditional`.
+    pub mvc_params: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Build a DOVIDecoderConfigurationRecord (dvcC) — 24 bytes — for the Matroska
@@ -380,6 +441,7 @@ impl MkvTrack {
             // coded picture's PictureInfo before the header is written (the same
             // deferred path FieldOrder uses). `None` here → omitted unless seen.
             hdr10: None,
+            mvc_params: None,
         }
     }
 
@@ -448,6 +510,7 @@ impl MkvTrack {
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
+            mvc_params: None,
         }
     }
 
@@ -485,6 +548,7 @@ impl MkvTrack {
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
+            mvc_params: None,
         }
     }
 }
@@ -565,6 +629,11 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// Highest block timestamp (TimestampScale ticks) written across all tracks —
     /// the muxed runtime, used to back-patch the DURATION placeholder.
     max_block_ticks: i64,
+    /// Timestamp (TimestampScale ticks) of the last video keyframe written on the
+    /// primary video track. A non-keyframe MVC base frame lives in a BlockGroup
+    /// (to carry its dependent-view BlockAdditional) and needs a `ReferenceBlock`
+    /// so players don't mistake it for a keyframe; it references this keyframe.
+    last_video_keyframe_ticks: Option<i64>,
     /// Per-AC-3-audio-track channel-correction state. The DVD IFO audio nibble
     /// is unreliable, so the channel count written in the track header is
     /// corrected from the AC-3 bitstream `acmod` of the first frame on the
@@ -923,6 +992,33 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 ebml::end_master(&mut writer, vid_pos)?;
             }
 
+            // Blu-ray 3D (MVC) signaling — BlockAdditionMapping (sibling of
+            // Video) carries the mvcC MVCDecoderConfigurationRecord so players /
+            // mediainfo recognise the dependent (right-eye) view that rides as a
+            // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
+            if let Some((subset_sps, pps)) = track.mvc_params.as_ref() {
+                if let Some(record) = mvc_decoder_config_record(subset_sps, pps) {
+                    let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
+                    ebml::write_uint(
+                        &mut writer,
+                        ebml::BLOCK_ADD_ID_VALUE,
+                        BLOCK_ADD_ID_VALUE_MVC,
+                    )?;
+                    ebml::write_uint(&mut writer, ebml::BLOCK_ADD_ID_TYPE, BLOCK_ADD_ID_TYPE_MVCC)?;
+                    ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, &record)?;
+                    ebml::end_master(&mut writer, map_pos)?;
+                } else {
+                    tracing::warn!(
+                        target: "mux",
+                        "MVC track: could not build MVCDecoderConfigurationRecord from the \
+                         dependent view's parameter sets (subset_sps={} B, pps={} B); \
+                         emitting no mvcC mapping — the 3D pairing will not be signalled.",
+                        subset_sps.len(),
+                        pps.len(),
+                    );
+                }
+            }
+
             // Dolby Vision signaling — BlockAdditionMapping is a child of the
             // TrackEntry (sibling of Video). Carries the dvcC so players /
             // mediainfo recognise the track as Dolby Vision.
@@ -1027,6 +1123,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             duration_secs,
             duration_patch_pos,
             max_block_ticks: 0,
+            last_video_keyframe_ticks: None,
             ac3_channel_fixups,
             opening_capture: None,
         })
@@ -1065,6 +1162,43 @@ impl<W: Write + Seek> MkvMuxer<W> {
         keyframe: bool,
         data: &[u8],
         duration_ns: Option<u64>,
+    ) -> io::Result<()> {
+        self.write_frame_inner(track_idx, pts_ns, keyframe, data, duration_ns, None)
+    }
+
+    /// As [`write_frame`](Self::write_frame), but attaches `block_additional` to
+    /// the frame as a Matroska `BlockAdditional` (BlockAddID=2). Used for Blu-ray
+    /// 3D (MVC): the base view is the Block, the dependent (right-eye) access
+    /// unit rides as the BlockAdditional under the track's `mvcC` mapping. A frame
+    /// carrying an additional is always written as a `BlockGroup` (never a
+    /// SimpleBlock), with a `ReferenceBlock` when it is not a keyframe.
+    pub fn write_frame_with_additional(
+        &mut self,
+        track_idx: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: &[u8],
+        duration_ns: Option<u64>,
+        block_additional: Option<&[u8]>,
+    ) -> io::Result<()> {
+        self.write_frame_inner(
+            track_idx,
+            pts_ns,
+            keyframe,
+            data,
+            duration_ns,
+            block_additional,
+        )
+    }
+
+    fn write_frame_inner(
+        &mut self,
+        track_idx: usize,
+        pts_ns: i64,
+        keyframe: bool,
+        data: &[u8],
+        duration_ns: Option<u64>,
+        block_additional: Option<&[u8]>,
     ) -> io::Result<()> {
         // --log-level 3: capture the first ~100 coded frames per track to the
         // side file BEFORE any timeline mangling, with the codec parser's own
@@ -1226,15 +1360,45 @@ impl<W: Write + Seek> MkvMuxer<W> {
         self.max_block_ticks = self.max_block_ticks.max(block_end_ticks);
 
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
-        match duration_ns {
-            Some(dur_ns) => {
-                // BlockDuration is in TimestampScale ticks, floored at 1.
-                let duration_ticks = (dur_ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64;
-                self.write_block_group(track_idx + 1, relative_ts, keyframe, data, duration_ticks)?;
+        let duration_ticks =
+            duration_ns.map(|dur_ns| (dur_ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64);
+        match block_additional {
+            // MVC: base view Block + dependent-view BlockAdditional, always a
+            // BlockGroup. Non-keyframe base frames get a ReferenceBlock to the
+            // last keyframe (a keyframe carries none), so a player never treats a
+            // P/B frame as a seek point.
+            Some(additional) => {
+                let reference = if keyframe {
+                    None
+                } else {
+                    // Offset (ticks) of the referenced keyframe relative to this
+                    // block. `None` only if no keyframe preceded (unreachable for a
+                    // real non-keyframe); then the ReferenceBlock is simply omitted.
+                    self.last_video_keyframe_ticks.map(|kf| kf - pts_ticks)
+                };
+                self.write_block_group_mvc(
+                    track_idx + 1,
+                    relative_ts,
+                    data,
+                    additional,
+                    reference,
+                    duration_ticks,
+                )?;
             }
-            None => {
-                self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
-            }
+            None => match duration_ticks {
+                // BlockDuration present (PGS subtitles) → BlockGroup.
+                Some(dt) => {
+                    self.write_block_group(track_idx + 1, relative_ts, keyframe, data, dt)?;
+                }
+                None => {
+                    self.write_simple_block(track_idx + 1, relative_ts, keyframe, data)?;
+                }
+            },
+        }
+        // Remember the last video keyframe's tick so a later non-keyframe MVC
+        // base frame can reference it (see block_additional path above).
+        if is_video && keyframe {
+            self.last_video_keyframe_ticks = Some(pts_ticks);
         }
         self.frame_count += 1;
 
@@ -1519,6 +1683,52 @@ impl<W: Write + Seek> MkvMuxer<W> {
         ebml::end_master(&mut self.writer, bg_pos)?;
         Ok(())
     }
+
+    /// Write a BlockGroup carrying the base view Block plus the MVC dependent
+    /// (right-eye) access unit as a `BlockAdditional` (BlockAddID=2), per the
+    /// track's `mvcC` BlockAdditionMapping. A non-keyframe frame gets a
+    /// `ReferenceBlock` (`reference` = referenced keyframe offset in ticks) so it
+    /// is not mistaken for a seek point; `BlockDuration` is written when known.
+    fn write_block_group_mvc(
+        &mut self,
+        track_num: usize,
+        relative_ts: i16,
+        data: &[u8],
+        additional: &[u8],
+        reference: Option<i64>,
+        duration_ticks: Option<u64>,
+    ) -> io::Result<()> {
+        let (tv, tv_len) = track_vint(track_num);
+        let track_vint = &tv[..tv_len];
+        // The 0x80 Keyframe flag is SimpleBlock-only; inside a BlockGroup Block
+        // it is reserved and MUST be 0 — keyframe-ness is signalled by the
+        // presence/absence of ReferenceBlock.
+        let flags: u8 = 0x00;
+        let block_size = track_vint.len() + 2 + 1 + data.len();
+
+        let bg_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_GROUP)?;
+        ebml::write_id(&mut self.writer, ebml::BLOCK)?;
+        ebml::write_size(&mut self.writer, block_size as u64)?;
+        self.writer.write_all(track_vint)?;
+        self.writer.write_all(&relative_ts.to_be_bytes())?;
+        self.writer.write_all(&[flags])?;
+        self.writer.write_all(data)?;
+        if let Some(dt) = duration_ticks {
+            ebml::write_uint(&mut self.writer, ebml::BLOCK_DURATION, dt)?;
+        }
+        if let Some(ref_off) = reference {
+            ebml::write_int(&mut self.writer, ebml::REFERENCE_BLOCK, ref_off)?;
+        }
+        // BlockAdditions → BlockMore { BlockAddID=2, BlockAdditional=dependent AU }.
+        let adds_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_ADDITIONS)?;
+        let more_pos = ebml::start_master(&mut self.writer, ebml::BLOCK_MORE)?;
+        ebml::write_uint(&mut self.writer, ebml::BLOCK_ADD_ID, BLOCK_ADD_ID_VALUE_MVC)?;
+        ebml::write_binary(&mut self.writer, ebml::BLOCK_ADDITIONAL, additional)?;
+        ebml::end_master(&mut self.writer, more_pos)?;
+        ebml::end_master(&mut self.writer, adds_pos)?;
+        ebml::end_master(&mut self.writer, bg_pos)?;
+        Ok(())
+    }
 }
 
 // ============================================================
@@ -1702,6 +1912,7 @@ mod tests {
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
+            mvc_params: None,
         }
     }
 
@@ -1731,6 +1942,7 @@ mod tests {
             bit_depth: 0,
             dv_config: None,
             hdr10: None,
+            mvc_params: None,
         }
     }
 
@@ -4222,6 +4434,76 @@ mod tests {
             "DV track must emit BlockAdditionMapping"
         );
         // Without dv_config, no mapping.
+        let muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_none());
+    }
+
+    #[test]
+    fn mvc_decoder_config_record_matches_iso_14496_15_layout() {
+        // subset SPS (NAL type 15): [nal_hdr, profile, compat, level, ...].
+        let subset_sps = vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22];
+        let pps = vec![0x68, 0xEE, 0x3C];
+        let rec = mvc_decoder_config_record(&subset_sps, &pps).expect("record builds");
+
+        // ISO/IEC 14496-15:2013 §7.6.2 byte layout, verbatim:
+        let expected: Vec<u8> = [
+            vec![
+                1,    // configurationVersion
+                0x80, // AVCProfileIndication  = subset_sps[1]
+                0x00, // profile_compatibility = subset_sps[2]
+                0x33, // AVCLevelIndication    = subset_sps[3]
+                0xBF, // complete_rep(1) explicit_au(0) reserved'1111' lengthSizeMinusOne=3
+                0x01, // reserved'0'(1) numOfSequenceParameterSets(7)=1
+                0x00, 0x06, // sequenceParameterSetLength = 6
+            ],
+            subset_sps.clone(),
+            vec![
+                1, // numOfPictureParameterSets
+                0x00, 0x03, // pictureParameterSetLength = 3
+            ],
+            pps.clone(),
+        ]
+        .concat();
+        assert_eq!(rec, expected, "MVCDecoderConfigurationRecord byte layout");
+
+        // Guards: too-short SPS and empty PPS both refuse (no corrupt record).
+        assert!(mvc_decoder_config_record(&[0x6F, 0x80, 0x00], &pps).is_none());
+        assert!(mvc_decoder_config_record(&subset_sps, &[]).is_none());
+    }
+
+    #[test]
+    fn mvc_track_emits_mvcc_block_addition_mapping() {
+        // A track with mvc_params must emit BlockAdditionMapping (0x41E4) with the
+        // mvcC BlockAddIDType (0x6D766343) and a BlockAddIDValue (0x41F0), so
+        // players / mediainfo recognise the Blu-ray 3D dependent view.
+        let mut v = make_video_track();
+        v.mvc_params = Some((
+            vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22],
+            vec![0x68, 0xEE, 0x3C],
+        ));
+        let muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_some(),
+            "MVC track must emit BlockAdditionMapping"
+        );
+        assert!(
+            find_id(&data, ebml::BLOCK_ADD_ID_VALUE).is_some(),
+            "MVC mapping must carry BlockAddIDValue"
+        );
+        assert!(
+            data.windows(4).any(|w| w == [0x6D, 0x76, 0x63, 0x43]),
+            "mvcC fourcc must be present as the BlockAddIDType value"
+        );
+        // Without mvc_params, no mapping.
         let muxer = MkvMuxer::new(
             Cursor::new(Vec::new()),
             &[make_video_track()],

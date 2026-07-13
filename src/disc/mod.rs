@@ -216,6 +216,22 @@ pub struct VideoStream {
     pub measured_cicp: Option<MeasuredCicp>,
 }
 
+/// Label marking a video stream as the Blu-ray 3D **MVC dependent (right-eye)
+/// view** — the paired substream of the AVC base view. Set by the BD scan
+/// (`bluray.rs`) and recognised by the mux path (`resolve.rs` builds its parser
+/// in param-set-preserving mode; `mkvstream.rs` folds it into the base track as
+/// per-frame `BlockAdditional`). Single source of truth for the contract.
+pub const MVC_DEPENDENT_LABEL: &str = "MVC dependent view (3D right eye)";
+
+impl VideoStream {
+    /// Whether this video stream is the MVC dependent (right-eye) view — the
+    /// 3D substream that the muxer merges into the base track as a per-frame
+    /// `BlockAdditional` rather than emitting as an independent track.
+    pub fn is_mvc_dependent(&self) -> bool {
+        self.label == MVC_DEPENDENT_LABEL
+    }
+}
+
 /// Measured CICP colour signalling read directly from a video elementary stream
 /// (ITU-T H.273). Preferred over the coarse [`ColorSpace`] enum when present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

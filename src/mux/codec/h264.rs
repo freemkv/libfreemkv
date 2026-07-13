@@ -56,6 +56,13 @@ pub struct H264Parser {
     /// (HD-DVD EVO) path where the source stamps a PTS once per GOP. `None` on
     /// the BD/UHD transport path, which carries a per-frame PTS.
     reorder: Option<super::reorder::SparsePtsReorder>,
+    /// MVC dependent-view (Blu-ray 3D right-eye) passthrough mode. When set, the
+    /// parser does NOT strip SPS/PPS (nor re-assert at keyframes): every NAL —
+    /// subset SPS (type 15), prefix (14), coded-slice-extension (20), PPS (8) —
+    /// is length-prefixed in-band, so each emitted frame is a self-contained
+    /// dependent access unit suitable for a Matroska `BlockAdditional`. The base
+    /// view's avcC/param-set stripping is unchanged (separate parser instance).
+    mvc_passthrough: bool,
 }
 
 impl Default for H264Parser {
@@ -73,6 +80,7 @@ impl H264Parser {
             cur_sps: None,
             cur_pps: None,
             reorder: None,
+            mvc_passthrough: false,
         }
     }
 
@@ -82,6 +90,15 @@ impl H264Parser {
         if enabled {
             self.reorder = Some(super::reorder::SparsePtsReorder::new());
         }
+        self
+    }
+
+    /// Enable MVC dependent-view passthrough (see the `mvc_passthrough` field):
+    /// keep every parameter set in-band so each frame is a self-contained
+    /// dependent access unit for a Matroska `BlockAdditional`. Used only for the
+    /// Blu-ray 3D dependent (right-eye) stream.
+    pub(crate) fn with_mvc_passthrough(mut self, enabled: bool) -> Self {
+        self.mvc_passthrough = enabled;
         self
     }
 
@@ -192,17 +209,23 @@ impl CodecParser for H264Parser {
         // frame in the mux hot path (mirrors the HEVC parser).
         let mut frame_data = Vec::with_capacity(pes.data.len() + 64);
 
+        // MVC dependent-view passthrough: keep ALL param sets in-band (the frame
+        // is a self-contained BlockAdditional access unit), never strip/re-assert.
+        let mvc = self.mvc_passthrough;
+
         for nal in NalIterator::new(&pes.data) {
             let nal_type = nal[0] & 0x1F;
 
             match nal_type {
                 // Param sets: seed avcC, strip if unchanged vs the active set,
                 // emit in-band on any change (incl. reverting to the avcC copy).
-                NAL_SPS => {
+                // In MVC passthrough these fall through to the default arm so the
+                // subset SPS / PPS stay in-band (self-contained dependent AU).
+                NAL_SPS if !mvc => {
                     emitted_sps |=
                         handle_param_set(&mut self.sps, &mut self.cur_sps, nal, &mut frame_data)
                 }
-                NAL_PPS => {
+                NAL_PPS if !mvc => {
                     emitted_pps |=
                         handle_param_set(&mut self.pps, &mut self.cur_pps, nal, &mut frame_data)
                 }
@@ -250,7 +273,7 @@ impl CodecParser for H264Parser {
         // ahead of the slices (even when unchanged vs codecPrivate) so a decoder
         // that dropped the set at a reset recovers, and a stale avcC re-apply
         // can't revert it. Skipped per-type only when this AU already carried it.
-        if keyframe {
+        if keyframe && !mvc {
             let mut prefix = Vec::new();
             reassert_active(&mut prefix, &self.cur_sps, emitted_sps);
             reassert_active(&mut prefix, &self.cur_pps, emitted_pps);

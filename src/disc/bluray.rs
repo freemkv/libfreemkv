@@ -277,7 +277,7 @@ impl Disc {
                     streams.push(Stream::Video(VideoStream {
                         pid: dep_pid,
                         secondary: true,
-                        label: "MVC dependent view (3D right eye)".to_string(),
+                        label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
                         ..base
                     }));
                 }

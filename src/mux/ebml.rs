@@ -94,6 +94,31 @@ pub fn write_uint(w: &mut impl Write, id: u32, val: u64) -> io::Result<()> {
     }
 }
 
+/// Write a complete EBML signed-integer element (two's-complement, big-endian,
+/// minimal width). Used for `ReferenceBlock` (0xFB), whose value is a signed
+/// tick offset relative to the current block's timestamp.
+pub fn write_int(w: &mut impl Write, id: u32, val: i64) -> io::Result<()> {
+    write_id(w, id)?;
+    // Minimal two's-complement width: shrink while the top byte is pure sign
+    // extension of the next byte's MSB.
+    let be = val.to_be_bytes();
+    let mut start = 0usize;
+    while start < 7 {
+        let sign_ext = if be[start + 1] & 0x80 != 0 {
+            0xFF
+        } else {
+            0x00
+        };
+        if be[start] != sign_ext {
+            break;
+        }
+        start += 1;
+    }
+    let bytes = &be[start..];
+    write_size(w, bytes.len() as u64)?;
+    w.write_all(bytes)
+}
+
 /// Write a complete EBML float element (8-byte double).
 pub fn write_float(w: &mut impl Write, id: u32, val: f64) -> io::Result<()> {
     write_id(w, id)?;
@@ -481,6 +506,25 @@ pub const LUMINANCE_MIN: u32 = 0x55DA;
 pub const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
 pub const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
 pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
+/// BlockAddIDValue (RFC 9559) — the value a per-frame `BlockAddID` references
+/// to select this BlockAdditionMapping. Values ≥ 2 (1 is the default plain
+/// BlockAdditional). Used by the MVC (`mvcC`) mapping for Blu-ray 3D.
+pub const BLOCK_ADD_ID_VALUE: u32 = 0x41F0;
+
+// Block additions carried inside a BlockGroup — per-frame side data. For
+// Blu-ray 3D (MVC) the dependent (right-eye) view NAL units for an access unit
+// ride here as a BlockAdditional under the track's `mvcC` mapping (RFC 9559
+// §5.1.4.1.4; Matroska Codec Specifications §4.1.5).
+pub const BLOCK_ADDITIONS: u32 = 0x75A1;
+pub const BLOCK_MORE: u32 = 0xA6;
+pub const BLOCK_ADDITIONAL: u32 = 0xA5;
+pub const BLOCK_ADD_ID: u32 = 0xEE;
+/// ReferenceBlock (RFC 9559 element 0xFB, child of BlockGroup) — signed
+/// timestamp (in TimestampScale ticks) of a block this one references, relative
+/// to this block's own timestamp. Its PRESENCE marks the Block as non-keyframe
+/// (a keyframe Block in a BlockGroup carries none). Written for non-keyframe
+/// video frames that must live in a BlockGroup to carry an MVC BlockAdditional.
+pub const REFERENCE_BLOCK: u32 = 0xFB;
 
 // Audio
 pub const AUDIO: u32 = 0xE1;
