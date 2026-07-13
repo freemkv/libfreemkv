@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4.0] — 2026-07-13
+
+### Added
+
+- **Blu-ray 3D (MVC) support.** A 3D disc now rips to an MKV that preserves
+  **both eyes** as a single MVC video track — the AVC base (left) view in each
+  Block, and the MVC dependent (right-eye) view as a per-frame `BlockAdditional`
+  under an `mvcC` `BlockAdditionMapping` (`MVCDecoderConfigurationRecord` per
+  ISO/IEC 14496-15 §7.6.2), paired to the base by PTS. Remux only — no
+  transcode, no side-by-side conversion. The Blu-ray scan reads the interleaved
+  `STREAM/SSIF/<clip>.ssif`, enumerates the dependent view (stream_type `0x20`)
+  by the BD-3D PID convention, and parses it in a parameter-set-passthrough mode
+  so every dependent frame is a self-contained access unit. Verified on
+  *300: Rise of an Empire*: one MVC track, ~8.7 GB dependent payload carried in
+  per-frame BlockAdditionals, base view byte-identical to the 2D rip.
+
 ## [1.3.2] — 2026-07-10
 
 ### Added
