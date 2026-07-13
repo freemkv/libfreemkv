@@ -66,6 +66,10 @@ pub mod coding_type {
     pub const MPEG2_VIDEO: u8 = 0x02;
     /// H.264 / AVC video (ISO/IEC 13818-1 Table 2-34).
     pub const H264: u8 = 0x1B;
+    /// H.264 / MVC dependent view (Blu-ray 3D right-eye substream). Carried in
+    /// the SSIF interleaved stream under its own PID; the base view is [`H264`].
+    /// ISO/IEC 13818-1 stream_type 0x20 (MVC video sub-bitstream).
+    pub const H264_MVC: u8 = 0x20;
     /// HEVC / H.265 video (ISO/IEC 13818-1 Table 2-34, 2015 amendment).
     pub const HEVC: u8 = 0x24;
     /// SMPTE VC-1 video (BD-ROM convention, ISO user-private range).
