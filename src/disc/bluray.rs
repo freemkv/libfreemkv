@@ -72,6 +72,11 @@ impl Disc {
         // Parse each clip for size, duration, and sector extents
         let mut extents = Vec::new();
         let mut total_size: u64 = 0;
+        // Set when any clip resolves to a STREAM/SSIF/<clip>.ssif — a Blu-ray 3D
+        // interleaved stream carrying both the base (left) and MVC dependent
+        // (right) views. Drives reading the SSIF for both eyes and adding the
+        // dependent-view stream below.
+        let mut is_3d = false;
         let mut clips = Vec::with_capacity(parsed.play_items.len());
         // BD playlists legally reference the same .m2ts clip_id from
         // multiple PlayItems (multi-angle, seamless splits, looped
@@ -110,10 +115,23 @@ impl Disc {
                         // use `.ssif` (see [`CLIP_STREAM_EXTS`]). A normal `.m2ts`
                         // clip is unchanged — the fallback only runs when `.m2ts`
                         // is absent, which is exactly when `file_extents` errors.
-                        let file_exts = CLIP_STREAM_EXTS.iter().find_map(|ext| {
-                            let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
-                            udf_fs.file_extents(reader, &path).ok()
-                        });
+                        // 3D discs interleave the left (base) and right (MVC
+                        // dependent) views in STREAM/SSIF/<clip>.ssif — note the
+                        // SSIF/ subdir. Prefer it when present: the SSIF is one
+                        // transport stream carrying BOTH eyes on distinct PIDs,
+                        // so muxing it captures the full 3D. 2D clips fall back to
+                        // the base .m2ts / .fmts as before.
+                        let ssif = format!("/BDMV/STREAM/SSIF/{}.ssif", play_item.clip_id);
+                        let file_exts = match udf_fs.file_extents(reader, &ssif) {
+                            Ok(exts) => {
+                                is_3d = true;
+                                Some(exts)
+                            }
+                            Err(_) => CLIP_STREAM_EXTS.iter().find_map(|ext| {
+                                let path = format!("/BDMV/STREAM/{}.{}", play_item.clip_id, ext);
+                                udf_fs.file_extents(reader, &path).ok()
+                            }),
+                        };
                         if let Some(file_exts) = file_exts {
                             for (lba, sectors) in file_exts {
                                 if sectors > 0 && lba > 0 {
@@ -138,7 +156,7 @@ impl Disc {
         }
 
         // Build streams from STN table
-        let streams: Vec<Stream> = parsed
+        let mut streams: Vec<Stream> = parsed
             .streams
             .iter()
             .filter_map(|s| {
@@ -231,6 +249,40 @@ impl Disc {
                 }
             })
             .collect();
+
+        // 3D: the base STN table lists only the left-eye video. The right-eye
+        // MVC substream is a SECOND video PID (stream_type 0x20) in the SSIF.
+        // Read the SSIF head — the PAT/PMT sit in the clear, so no key is needed
+        // — and add any video PID the STN table didn't already list. This reuses
+        // the same PAT/PMT scanner the m2ts:// path uses; 0x20 now resolves to
+        // H.264 video (see `Codec::from_coding_type`), so the dependent view is
+        // enumerated instead of dropped.
+        // 3D: add the MVC dependent (right-eye) video stream. The base STN table
+        // lists only the left-eye video; the dependent view is a second video
+        // PID (stream_type 0x20) carried in the SSIF. The on-disc PAT/PMT are
+        // AACS-encrypted (unreadable pre-key) and the base STN omits the
+        // dependent view (it lives in the MPLS STN_table_SS), so we use the
+        // BD-3D PID convention: dependent = base-view video PID + 1
+        // (e.g. 0x1011 -> 0x1012). Reading the SSIF (above) provides its packets.
+        if is_3d {
+            if let Some(base) = streams.iter().find_map(|s| match s {
+                Stream::Video(v) => Some(v.clone()),
+                _ => None,
+            }) {
+                let dep_pid = base.pid.wrapping_add(1);
+                let have_dep = streams
+                    .iter()
+                    .any(|s| matches!(s, Stream::Video(v) if v.pid == dep_pid));
+                if !have_dep {
+                    streams.push(Stream::Video(VideoStream {
+                        pid: dep_pid,
+                        secondary: true,
+                        label: "MVC dependent view (3D right eye)".to_string(),
+                        ..base
+                    }));
+                }
+            }
+        }
 
         // Convert marks to chapters. mark_type == 1 is an entry-mark
         // (chapter); type 2 is a link point and type 0 is reserved, so
