@@ -299,7 +299,13 @@ fn extract_mvc_params(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     while i + 4 <= data.len() {
         let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
         i += 4;
-        if len == 0 || i + len > data.len() {
+        // A zero-length NAL (a stray length prefix) is skipped, not fatal — the
+        // subset SPS / PPS may still follow. A length that runs past the buffer
+        // end IS unrecoverable (the NAL can't be read), so stop there.
+        if len == 0 {
+            continue;
+        }
+        if i + len > data.len() {
             break;
         }
         let nal = &data[i..i + len];
@@ -1315,12 +1321,19 @@ mod tests {
         assert!(extract_mvc_params(&[0, 0, 0]).is_none());
         assert!(
             extract_mvc_params(&[0, 0, 0, 0]).is_none(),
-            "zero-length NAL breaks"
+            "lone zero-length NAL yields no params"
         );
         assert!(
             extract_mvc_params(&[0, 0, 0, 10, 0x6F]).is_none(),
             "length prefix past end breaks, no slice panic"
         );
+        // A zero-length NAL is SKIPPED, not fatal: valid param sets that follow
+        // are still found (a stray length prefix must not abandon the whole AU).
+        let mut d = vec![0, 0, 0, 0];
+        d.extend_from_slice(&lp(&[&SUBSET_SPS, &DEP_PPS]));
+        let (s, p) = extract_mvc_params(&d).expect("params found past the zero-length NAL");
+        assert_eq!(s, SUBSET_SPS);
+        assert_eq!(p, DEP_PPS);
     }
 
     #[test]
