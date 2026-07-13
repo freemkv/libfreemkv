@@ -232,10 +232,12 @@ pub struct MkvTrack {
     /// Blu-ray 3D (MVC): the dependent (right-eye) view's `(subset_sps, pps)`
     /// NAL units, from which the serializer builds the `mvcC`
     /// MVCDecoderConfigurationRecord (ISO/IEC 14496-15 §7.6.2) for the track's
-    /// BlockAdditionMapping, and emits `StereoMode`. `None` for non-3D tracks.
-    /// Set at muxer activation from the dependent stream's parameter sets — the
-    /// same deferred path `hdr10`/FieldOrder use — never at construction. When
-    /// `Some`, the per-frame dependent view rides as a `BlockAdditional`.
+    /// BlockAdditionMapping. `None` for non-3D tracks. Set at muxer activation
+    /// from the dependent stream's parameter sets — the same deferred path
+    /// `hdr10`/FieldOrder use — never at construction. When `Some`, the per-frame
+    /// dependent view rides as a `BlockAdditional`. (No `StereoMode` is written:
+    /// RFC 9559 assigns no StereoMode value to MVC-in-BlockAdditional; the mvcC
+    /// mapping is the 3D signal.)
     pub mvc_params: Option<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -594,6 +596,12 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// the primary video. `None` when the title has no video track (no track
     /// drives epochs).
     primary_video_track: Option<usize>,
+    /// Per-track: whether the track declared an `mvcC` BlockAdditionMapping (its
+    /// `mvc_params` was set at activation). A `BlockAdditional` with BlockAddID=2
+    /// is only conforming when the track carries the matching mapping, so
+    /// `write_frame`'s additional is dropped for a track without it (e.g. the
+    /// dependent view's parameter sets were never captured before activation).
+    track_has_mvc_mapping: Vec<bool>,
     /// Cross-clip timeline-continuity corrector (clip-boundary PTS rebasing).
     continuity: TimelineContinuity,
     cues: Vec<CuePoint>,
@@ -1109,6 +1117,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             primary_video_track: tracks
                 .iter()
                 .position(|t| t.track_type == ebml::TRACK_TYPE_VIDEO),
+            track_has_mvc_mapping: tracks.iter().map(|t| t.mvc_params.is_some()).collect(),
             continuity: TimelineContinuity::new(),
             cues: Vec::new(),
             frame_count: 0,
@@ -1155,43 +1164,14 @@ impl<W: Write + Seek> MkvMuxer<W> {
     /// (`None`) leaves the written value untouched: an interlaced track keeps
     /// its guess rather than being cleared via a multi-element change. The byte
     /// width is fixed (FieldOrder is 0..=14), so the in-place rewrite is valid.
+    ///
+    /// `block_additional`, when `Some`, is attached to the frame as a Matroska
+    /// `BlockAdditional` (BlockAddID=2) — Blu-ray 3D (MVC): the base view is the
+    /// Block and the dependent (right-eye) access unit rides as the
+    /// BlockAdditional under the track's `mvcC` mapping. Such a frame is always a
+    /// `BlockGroup` (never a SimpleBlock), with a `ReferenceBlock` when it is not
+    /// a keyframe. `None` for every non-3D frame.
     pub fn write_frame(
-        &mut self,
-        track_idx: usize,
-        pts_ns: i64,
-        keyframe: bool,
-        data: &[u8],
-        duration_ns: Option<u64>,
-    ) -> io::Result<()> {
-        self.write_frame_inner(track_idx, pts_ns, keyframe, data, duration_ns, None)
-    }
-
-    /// As [`write_frame`](Self::write_frame), but attaches `block_additional` to
-    /// the frame as a Matroska `BlockAdditional` (BlockAddID=2). Used for Blu-ray
-    /// 3D (MVC): the base view is the Block, the dependent (right-eye) access
-    /// unit rides as the BlockAdditional under the track's `mvcC` mapping. A frame
-    /// carrying an additional is always written as a `BlockGroup` (never a
-    /// SimpleBlock), with a `ReferenceBlock` when it is not a keyframe.
-    pub fn write_frame_with_additional(
-        &mut self,
-        track_idx: usize,
-        pts_ns: i64,
-        keyframe: bool,
-        data: &[u8],
-        duration_ns: Option<u64>,
-        block_additional: Option<&[u8]>,
-    ) -> io::Result<()> {
-        self.write_frame_inner(
-            track_idx,
-            pts_ns,
-            keyframe,
-            data,
-            duration_ns,
-            block_additional,
-        )
-    }
-
-    fn write_frame_inner(
         &mut self,
         track_idx: usize,
         pts_ns: i64,
@@ -1362,6 +1342,24 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let relative_ts = (pts_ticks - self.cluster_ts_ticks) as i16;
         let duration_ticks =
             duration_ns.map(|dur_ns| (dur_ns as i64 / TIMESTAMP_SCALE_NS).max(1) as u64);
+        // A BlockAdditional with BlockAddID=2 is only conforming when the track
+        // declared the matching mvcC BlockAdditionMapping. If it did not (the
+        // dependent view's parameter sets were never captured before the header
+        // was written), drop the additional and emit a plain block rather than a
+        // non-conforming file with an orphaned BlockAddID.
+        let block_additional = match block_additional {
+            Some(a)
+                if self
+                    .track_has_mvc_mapping
+                    .get(track_idx)
+                    .copied()
+                    .unwrap_or(false) =>
+            {
+                Some(a)
+            }
+            Some(_) => None,
+            None => None,
+        };
         match block_additional {
             // MVC: base view Block + dependent-view BlockAdditional, always a
             // BlockGroup. Non-keyframe base frames get a ReferenceBlock to the
@@ -1372,9 +1370,16 @@ impl<W: Write + Seek> MkvMuxer<W> {
                     None
                 } else {
                     // Offset (ticks) of the referenced keyframe relative to this
-                    // block. `None` only if no keyframe preceded (unreachable for a
-                    // real non-keyframe); then the ReferenceBlock is simply omitted.
-                    self.last_video_keyframe_ticks.map(|kf| kf - pts_ticks)
+                    // block. A non-keyframe MUST carry a ReferenceBlock or a reader
+                    // treats it as a seek point; fall back to 0 (self-relative) in
+                    // the pre-first-keyframe corner (unreachable in practice — such
+                    // frames are dropped before a cluster opens) so the marker is
+                    // never absent.
+                    Some(
+                        self.last_video_keyframe_ticks
+                            .map(|kf| kf - pts_ticks)
+                            .unwrap_or(0),
+                    )
                 };
                 self.write_block_group_mvc(
                     track_idx + 1,
@@ -1395,9 +1400,11 @@ impl<W: Write + Seek> MkvMuxer<W> {
                 }
             },
         }
-        // Remember the last video keyframe's tick so a later non-keyframe MVC
-        // base frame can reference it (see block_additional path above).
-        if is_video && keyframe {
+        // Remember the last PRIMARY-video keyframe's tick so a later non-keyframe
+        // MVC base frame references a keyframe on its OWN track (see the
+        // block_additional path above). Gating to the primary video track avoids a
+        // secondary video track's keyframe becoming a cross-track reference target.
+        if keyframe && Some(track_idx) == self.primary_video_track {
             self.last_video_keyframe_ticks = Some(pts_ticks);
         }
         self.frame_count += 1;
@@ -2026,7 +2033,7 @@ mod tests {
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(buf, &tracks, None, 60.0, &[]).unwrap();
         muxer
-            .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF], None)
+            .write_frame(0, 0, true, &[0xDE, 0xAD, 0xBE, 0xEF], None, None)
             .unwrap();
         let data = muxer.writer.into_inner();
         assert!(
@@ -2046,7 +2053,7 @@ mod tests {
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(writer, &tracks, Some("Cue Test"), 60.0, &[]).unwrap();
         muxer
-            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None)
+            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None, None)
             .unwrap();
         muxer.finish().unwrap();
 
@@ -2072,7 +2079,7 @@ mod tests {
         let tracks = [make_video_track()];
         let mut muxer = MkvMuxer::new(writer, &tracks, Some("NoCue"), 60.0, &[]).unwrap();
         muxer
-            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None)
+            .write_frame(0, 0, true, &[0x01, 0x02, 0x03], None, None)
             .unwrap();
         // Force the zero-cue branch: drop every cue before finalizing.
         let cues_entry_pos = muxer.cues_seek_entry_pos.expect("CUES seek entry recorded");
@@ -2323,16 +2330,16 @@ mod tests {
         let mut muxer = MkvMuxer::new(buf, &tracks, Some("Multi"), 120.0, &[]).unwrap();
         // Write frames to both tracks
         muxer
-            .write_frame(0, 0, true, &[0x00, 0x00, 0x01], None)
+            .write_frame(0, 0, true, &[0x00, 0x00, 0x01], None, None)
             .unwrap();
         muxer
-            .write_frame(1, 0, false, &[0x0B, 0x77, 0x00], None)
+            .write_frame(1, 0, false, &[0x0B, 0x77, 0x00], None, None)
             .unwrap();
         muxer
-            .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01], None)
+            .write_frame(0, 40_000_000, false, &[0x00, 0x00, 0x01], None, None)
             .unwrap();
         muxer
-            .write_frame(1, 32_000_000, false, &[0x0B, 0x77, 0x01], None)
+            .write_frame(1, 32_000_000, false, &[0x0B, 0x77, 0x01], None, None)
             .unwrap();
         // Should not panic
         let data = muxer.writer.into_inner();
@@ -2347,11 +2354,11 @@ mod tests {
 
         // Record position before first frame
         let pos_before_kf = muxer.writer.position();
-        muxer.write_frame(0, 0, true, &[0xAA], None).unwrap();
+        muxer.write_frame(0, 0, true, &[0xAA], None, None).unwrap();
         let pos_after_kf = muxer.writer.position();
 
         muxer
-            .write_frame(0, 1_000_000, false, &[0xBB], None)
+            .write_frame(0, 1_000_000, false, &[0xBB], None, None)
             .unwrap();
         let pos_after_nkf = muxer.writer.position();
 
@@ -2597,7 +2604,7 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, tracks, None, 0.0, chapters).unwrap();
         for (t, pts, kf, data) in frames {
-            muxer.write_frame(*t, *pts, *kf, data, None).unwrap();
+            muxer.write_frame(*t, *pts, *kf, data, None, None).unwrap();
         }
         let frame_count = muxer.frame_count;
         muxer.finish().unwrap();
@@ -2959,7 +2966,7 @@ mod tests {
         let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
         for f in &frames {
             muxer
-                .write_frame(0, f.pts_ns, f.keyframe, &f.data, f.duration_ns)
+                .write_frame(0, f.pts_ns, f.keyframe, &f.data, f.duration_ns, None)
                 .unwrap();
         }
         muxer.finish().unwrap();
@@ -3348,12 +3355,14 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
         // Audio frames (track 1) and non-keyframe video — no track-0 keyframe.
-        muxer.write_frame(1, 0, true, &[0xAA; 8], None).unwrap();
         muxer
-            .write_frame(0, 10_000_000, false, &[0xBB; 8], None)
+            .write_frame(1, 0, true, &[0xAA; 8], None, None)
             .unwrap();
         muxer
-            .write_frame(1, 20_000_000, true, &[0xCC; 8], None)
+            .write_frame(0, 10_000_000, false, &[0xBB; 8], None, None)
+            .unwrap();
+        muxer
+            .write_frame(1, 20_000_000, true, &[0xCC; 8], None, None)
             .unwrap();
         let err = muxer.finish().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -3428,7 +3437,7 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, &tracks, None, 0.0, &[]).unwrap();
         for (t, pts, kf, data) in &frames_in_order {
-            muxer.write_frame(*t, *pts, *kf, data, None).unwrap();
+            muxer.write_frame(*t, *pts, *kf, data, None, None).unwrap();
         }
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
@@ -3498,7 +3507,7 @@ mod tests {
         let writer = SharedWriter(shared.clone());
         let mut muxer = MkvMuxer::new(writer, tracks, None, 0.0, &[]).unwrap();
         for (t, pts, kf, data, dur) in frames {
-            muxer.write_frame(*t, *pts, *kf, data, *dur).unwrap();
+            muxer.write_frame(*t, *pts, *kf, data, *dur, None).unwrap();
         }
         muxer.finish().unwrap();
         shared.lock().unwrap().clone().into_inner()
@@ -4347,10 +4356,10 @@ mod tests {
         let mut muxer = MkvMuxer::new(writer, &tracks, None, 10.0, &[]).unwrap();
         // Video keyframe 1000 bytes; audio frame 500 bytes.
         muxer
-            .write_frame(0, 0, true, &vec![0xABu8; 1000], None)
+            .write_frame(0, 0, true, &vec![0xABu8; 1000], None, None)
             .unwrap();
         muxer
-            .write_frame(1, 0, false, &vec![0xCDu8; 500], None)
+            .write_frame(1, 0, false, &vec![0xCDu8; 500], None, None)
             .unwrap();
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
@@ -4400,8 +4409,10 @@ mod tests {
         // lfeon(0) = 0b0100_0000 = 0x40. acmod_channels only needs >= 8 bytes.
         let ac3 = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 8 << 3, 0x40, 0x00];
         // Open a cluster with a video keyframe first (cluster invariant).
-        muxer.write_frame(0, 0, true, &[0x01, 0x02], None).unwrap();
-        muxer.write_frame(1, 0, false, &ac3, None).unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0x01, 0x02], None, None)
+            .unwrap();
+        muxer.write_frame(1, 0, false, &ac3, None, None).unwrap();
         muxer.finish().unwrap();
         let data = shared.lock().unwrap().clone().into_inner();
 
@@ -4477,6 +4488,79 @@ mod tests {
         // Guards: too-short SPS and empty PPS both refuse (no corrupt record).
         assert!(mvc_decoder_config_record(&[0x6F, 0x80, 0x00], &pps).is_none());
         assert!(mvc_decoder_config_record(&subset_sps, &[]).is_none());
+        // Over-length param sets (> 65535) would mis-frame the 16-bit length
+        // field; both must refuse rather than emit a truncated record.
+        let huge = vec![0u8; 0x1_0000];
+        assert!(mvc_decoder_config_record(&huge, &pps).is_none());
+        assert!(mvc_decoder_config_record(&subset_sps, &huge).is_none());
+    }
+
+    #[test]
+    fn mvc_frame_emits_blockgroup_additional_and_reference() {
+        // A track declaring an mvcC mapping: a keyframe base frame carrying a
+        // dependent AU emits BlockGroup > BlockAdditions > BlockMore
+        // {BlockAddID=2, BlockAdditional=dep}; a following non-keyframe adds a
+        // ReferenceBlock so it is not mistaken for a seek point.
+        let mut v = make_video_track();
+        v.mvc_params = Some((
+            vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22],
+            vec![0x68, 0xEE, 0x3C],
+        ));
+        let mut muxer = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[]).unwrap();
+        let dep_kf = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let dep_p = [0xCAu8, 0xFE];
+        muxer
+            .write_frame(0, 0, true, &[0x65, 0x01, 0x02], None, Some(&dep_kf))
+            .unwrap();
+        muxer
+            .write_frame(0, 40_000_000, false, &[0x41, 0x03], None, Some(&dep_p))
+            .unwrap();
+        let data = muxer.writer.into_inner();
+
+        assert!(
+            find_id(&data, ebml::BLOCK_ADDITIONS).is_some(),
+            "BlockAdditions (0x75A1) present"
+        );
+        // BlockAddID = 2 (uint): element 0xEE, size 0x81, value 0x02.
+        assert!(
+            data.windows(3).any(|w| w == [0xEE, 0x81, 0x02]),
+            "BlockAddID must be 2"
+        );
+        assert!(
+            data.windows(4).any(|w| w == dep_kf),
+            "keyframe dependent AU present as BlockAdditional"
+        );
+        assert!(
+            data.windows(2).any(|w| w == dep_p),
+            "non-keyframe dependent AU present"
+        );
+        assert!(
+            find_id(&data, ebml::REFERENCE_BLOCK).is_some(),
+            "non-keyframe MVC base frame must carry a ReferenceBlock"
+        );
+    }
+
+    #[test]
+    fn additional_dropped_when_track_has_no_mvc_mapping() {
+        // If a track did NOT declare an mvcC mapping (mvc_params None), a stray
+        // block_additional must be dropped (no orphaned BlockAddID=2 / no
+        // BlockAdditions) so the file stays conforming.
+        let mut muxer = MkvMuxer::new(
+            Cursor::new(Vec::new()),
+            &[make_video_track()],
+            None,
+            0.0,
+            &[],
+        )
+        .unwrap();
+        muxer
+            .write_frame(0, 0, true, &[0x65, 0x01], None, Some(&[0xDE, 0xAD]))
+            .unwrap();
+        let data = muxer.writer.into_inner();
+        assert!(
+            find_id(&data, ebml::BLOCK_ADDITIONS).is_none(),
+            "no BlockAdditions without a declared mvcC mapping"
+        );
     }
 
     #[test]
