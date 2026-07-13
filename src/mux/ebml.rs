@@ -1004,6 +1004,31 @@ mod tests {
         assert_eq!(buf, [0x42, 0x86, 0x81, 0x00]);
     }
 
+    #[test]
+    fn write_int_minimal_two_complement_width() {
+        // ReferenceBlock (0xFB) signed offsets, minimal two's-complement width.
+        let enc = |v: i64| {
+            let mut b = Vec::new();
+            write_int(&mut b, REFERENCE_BLOCK, v).unwrap();
+            b
+        };
+        assert_eq!(enc(0), [0xFB, 0x81, 0x00], "0 -> 1 byte 0x00");
+        assert_eq!(enc(-1), [0xFB, 0x81, 0xFF], "-1 -> 1 byte 0xFF");
+        assert_eq!(enc(127), [0xFB, 0x81, 0x7F], "127 -> 1 byte");
+        assert_eq!(
+            enc(128),
+            [0xFB, 0x82, 0x00, 0x80],
+            "128 needs 2 bytes (0x80 alone is -128)"
+        );
+        assert_eq!(enc(-128), [0xFB, 0x81, 0x80], "-128 -> 1 byte 0x80");
+        assert_eq!(enc(-129), [0xFB, 0x82, 0xFF, 0x7F], "-129 needs 2 bytes");
+        // i64::MIN is the widest: 8 bytes, size 0x88.
+        let mn = enc(i64::MIN);
+        assert_eq!(mn[0], 0xFB);
+        assert_eq!(mn[1], 0x88);
+        assert_eq!(&mn[2..], &i64::MIN.to_be_bytes());
+    }
+
     // ============================================================
     // write_float — EBML floats here are always 8-byte IEEE-754 doubles,
     // big-endian (Matroska SamplingFrequency/Duration). size byte = 0x88.

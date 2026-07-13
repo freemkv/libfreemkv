@@ -250,13 +250,6 @@ impl Disc {
             })
             .collect();
 
-        // 3D: the base STN table lists only the left-eye video. The right-eye
-        // MVC substream is a SECOND video PID (stream_type 0x20) in the SSIF.
-        // Read the SSIF head — the PAT/PMT sit in the clear, so no key is needed
-        // — and add any video PID the STN table didn't already list. This reuses
-        // the same PAT/PMT scanner the m2ts:// path uses; 0x20 now resolves to
-        // H.264 video (see `Codec::from_coding_type`), so the dependent view is
-        // enumerated instead of dropped.
         // 3D: add the MVC dependent (right-eye) video stream. The base STN table
         // lists only the left-eye video; the dependent view is a second video
         // PID (stream_type 0x20) carried in the SSIF. The on-disc PAT/PMT are

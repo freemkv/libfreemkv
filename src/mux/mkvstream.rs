@@ -198,12 +198,24 @@ impl MvcMerge {
             {
                 pb.additional = Some(frame.data.clone());
             } else {
-                self.dep_by_pts.insert(frame.pts, frame.data.clone());
-                // Bound the orphan map: if dependents pile up unpaired (pairing
-                // badly drifted), drop the surplus rather than grow unbounded.
-                if self.dep_by_pts.len() > MVC_PAIR_WINDOW * 4 {
+                // Bound the orphan map BEFORE inserting: if dependents pile up
+                // unpaired (pairing badly drifted), drop the drifted buffer so it
+                // stays bounded — but keep THIS just-arrived dependent, whose base
+                // frame commonly arrives next. Clearing after the insert would
+                // discard it and overcount orphans by one.
+                if self.dep_by_pts.len() >= MVC_PAIR_WINDOW * 4 {
                     self.orphan_deps += self.dep_by_pts.len() as u64;
                     self.dep_by_pts.clear();
+                }
+                // A duplicate-PTS dependent (e.g. a stale repeat after a stream
+                // discontinuity) displaces the prior one — count it as an orphan
+                // rather than losing it silently.
+                if self
+                    .dep_by_pts
+                    .insert(frame.pts, frame.data.clone())
+                    .is_some()
+                {
+                    self.orphan_deps += 1;
                 }
             }
         } else if frame.track == self.base_stream_idx {
@@ -257,30 +269,22 @@ impl MvcMerge {
     }
 }
 
-/// Hand a frame to the muxer: the plain path (`write_frame`) when there is no
-/// MVC dependent view to attach, the BlockAdditional path otherwise.
+/// Hand a frame to the muxer, attaching the MVC dependent view as a
+/// `BlockAdditional` when `additional` is `Some` (a 3D base frame), else a
+/// plain block.
 fn emit_to_muxer(
     m: &mut MkvMuxer<Box<dyn WriteSeek + Send>>,
     frame: &crate::pes::PesFrame,
     additional: Option<&[u8]>,
 ) -> io::Result<()> {
-    match additional {
-        None => m.write_frame(
-            frame.track,
-            frame.pts,
-            frame.keyframe,
-            &frame.data,
-            frame.duration_ns,
-        ),
-        Some(_) => m.write_frame_with_additional(
-            frame.track,
-            frame.pts,
-            frame.keyframe,
-            &frame.data,
-            frame.duration_ns,
-            additional,
-        ),
-    }
+    m.write_frame(
+        frame.track,
+        frame.pts,
+        frame.keyframe,
+        &frame.data,
+        frame.duration_ns,
+        additional,
+    )
 }
 
 /// Scan a length-prefixed (4-byte big-endian) H.264 NAL stream for the first
@@ -336,10 +340,18 @@ impl MkvStream {
             .streams
             .iter()
             .position(|s| matches!(s, crate::disc::Stream::Video(v) if v.is_mvc_dependent()));
+        // The base is the first NON-dependent video. Excluding the dependent here
+        // means a (malformed / hand-built) title whose only video IS the dependent
+        // yields `base_stream_idx == None` → no merge (the dependent is muxed as an
+        // ordinary track) instead of `base == dep` and a panic on the skipped slot.
         let base_stream_idx = title
             .streams
             .iter()
-            .position(|s| matches!(s, crate::disc::Stream::Video(_)));
+            .position(|s| matches!(s, crate::disc::Stream::Video(v) if !v.is_mvc_dependent()));
+        // The merge is only active when BOTH a dependent and a distinct base exist;
+        // only then is the dependent's track skipped/folded.
+        let mvc_active = dep_stream_idx.is_some() && base_stream_idx.is_some();
+        let skip_stream_idx = if mvc_active { dep_stream_idx } else { None };
 
         let mut tracks = Vec::new();
         let mut has_default_video = false;
@@ -348,7 +360,7 @@ impl MkvStream {
         // which has no track). Streams after the dependent shift down by one.
         let mut stream_to_track: Vec<Option<usize>> = Vec::with_capacity(title.streams.len());
         for (idx, s) in title.streams.iter().enumerate() {
-            if Some(idx) == dep_stream_idx {
+            if Some(idx) == skip_stream_idx {
                 stream_to_track.push(None);
                 continue;
             }
@@ -372,13 +384,15 @@ impl MkvStream {
             tracks.push(track);
         }
 
-        // Assemble the MVC merge when a dependent view is present and paired with
-        // a base video track.
-        let mvc = match (dep_stream_idx, base_stream_idx) {
-            (Some(dep_stream_idx), Some(base_stream_idx)) => {
-                let base_track_idx =
-                    stream_to_track[base_stream_idx].expect("base video stream always has a track");
-                Some(MvcMerge {
+        // Assemble the MVC merge only when active — i.e. a dependent AND a
+        // distinct base video both exist (established above). `base_stream_idx`
+        // then always has a built track, so its remap is `Some` (no panic path).
+        let mvc = match (mvc_active, dep_stream_idx, base_stream_idx) {
+            (true, Some(dep_stream_idx), Some(base_stream_idx)) => stream_to_track
+                .get(base_stream_idx)
+                .copied()
+                .flatten()
+                .map(|base_track_idx| MvcMerge {
                     base_stream_idx,
                     dep_stream_idx,
                     base_track_idx,
@@ -387,8 +401,7 @@ impl MkvStream {
                     dep_by_pts: std::collections::HashMap::new(),
                     captured_params: None,
                     orphan_deps: 0,
-                })
-            }
+                }),
             _ => None,
         };
 
@@ -466,7 +479,7 @@ impl MkvStream {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
         for (f, additional) in pending.buffered.drain(..) {
-            muxer.write_frame_with_additional(
+            muxer.write_frame(
                 f.track,
                 f.pts,
                 f.keyframe,
@@ -1292,6 +1305,99 @@ mod tests {
         let tail = m.flush();
         assert_eq!(tail.len(), 1, "unpaired base still emitted");
         assert!(tail[0].1.is_none(), "no BlockAdditional when unpaired");
+    }
+
+    #[test]
+    fn extract_mvc_params_no_panic_on_truncated_or_empty() {
+        // Empty, sub-header, zero-length NAL, and a length prefix claiming more
+        // than is present must all return None without panicking (untrusted AU).
+        assert!(extract_mvc_params(&[]).is_none());
+        assert!(extract_mvc_params(&[0, 0, 0]).is_none());
+        assert!(
+            extract_mvc_params(&[0, 0, 0, 0]).is_none(),
+            "zero-length NAL breaks"
+        );
+        assert!(
+            extract_mvc_params(&[0, 0, 0, 10, 0x6F]).is_none(),
+            "length prefix past end breaks, no slice panic"
+        );
+    }
+
+    #[test]
+    fn mvc_merge_flushes_oldest_base_once_past_window() {
+        let mut m = empty_merge();
+        // Push more unpaired base frames than the window; the excess flush as
+        // plain (unpaired) blocks in FIFO order once len exceeds MVC_PAIR_WINDOW.
+        let n = MVC_PAIR_WINDOW + 8;
+        let mut emitted = 0usize;
+        for pts in 0..n {
+            emitted += m
+                .ingest(&mvc_frame(0, pts as i64, false, vec![0, 0, 0, 1]))
+                .len();
+        }
+        assert_eq!(emitted, 8, "the {n} bases beyond the window flush unpaired");
+        assert_eq!(m.pending_base.len(), MVC_PAIR_WINDOW, "window still held");
+        assert!(m.flush().iter().all(|(_, add)| add.is_none()));
+    }
+
+    #[test]
+    fn mvc_merge_dep_overflow_drops_old_keeps_newest() {
+        let mut m = empty_merge();
+        // Fill dep_by_pts to the bound with unpaired dependents (unique PTS).
+        for pts in 0..(MVC_PAIR_WINDOW * 4) {
+            assert!(
+                m.ingest(&mvc_frame(2, pts as i64, false, lp(&[&DEP_SLICE])))
+                    .is_empty()
+            );
+        }
+        assert_eq!(m.dep_by_pts.len(), MVC_PAIR_WINDOW * 4);
+        // One more overflows: the drifted buffer is cleared BUT the newest survives
+        // so its (soon-to-arrive) base can still pair.
+        let dep_new = lp(&[&DEP_SLICE]);
+        m.ingest(&mvc_frame(2, 9_999, false, dep_new.clone()));
+        assert_eq!(m.dep_by_pts.len(), 1, "old cleared, newest kept");
+        assert!(m.dep_by_pts.contains_key(&9_999));
+        assert_eq!(
+            m.orphan_deps,
+            (MVC_PAIR_WINDOW * 4) as u64,
+            "old buffer counted once"
+        );
+        // The surviving dependent pairs with its base.
+        let e = m.ingest(&mvc_frame(0, 9_999, false, vec![0x61, 1]));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1.as_deref(), Some(dep_new.as_slice()));
+    }
+
+    #[test]
+    fn create_does_not_panic_when_only_video_is_mvc_dependent() {
+        // A (malformed / hand-built) title whose single video IS the dependent
+        // must NOT panic: base_stream_idx is None, so no merge is set up and the
+        // dependent is muxed as an ordinary track.
+        use crate::disc::{
+            Codec, ColorSpace, DiscTitle, FrameRate, HdrFormat, Resolution, Stream, VideoStream,
+        };
+        let dep = VideoStream {
+            pid: 0x1012,
+            codec: Codec::H264,
+            resolution: Resolution::R1080p,
+            frame_rate: FrameRate::F24,
+            hdr: HdrFormat::Sdr,
+            color_space: ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: true,
+            label: crate::disc::MVC_DEPENDENT_LABEL.to_string(),
+            measured_cicp: None,
+        };
+        let title = DiscTitle {
+            streams: vec![Stream::Video(dep)],
+            ..DiscTitle::empty()
+        };
+        let s = MkvStream::create(Box::new(Cursor::new(Vec::new())), &title)
+            .expect("create must succeed, not panic");
+        assert!(
+            s.mvc.is_none(),
+            "no merge when there is no distinct base view"
+        );
     }
 
     #[test]

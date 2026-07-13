@@ -675,6 +675,46 @@ mod tests {
     }
 
     #[test]
+    fn mvc_passthrough_keeps_param_sets_inband() {
+        // A dependent-view access unit: subset SPS (NAL 15) + PPS (NAL 8) +
+        // coded-slice-extension (NAL 20). No IDR (type 5), so keyframe stays
+        // false and there is no keyframe re-assertion.
+        let au = || {
+            let mut d = Vec::new();
+            d.extend_from_slice(&h264_nal(0x6F, &[0x80, 0x00, 0x33, 0xAA])); // subset SPS (15)
+            d.extend_from_slice(&h264_nal(0x68, &[0xCE, 0x01])); // PPS (8)
+            d.extend_from_slice(&h264_nal(0x74, &[0x11, 0x22])); // slice-ext (20)
+            d
+        };
+        let nal_types =
+            |f: &Frame| -> Vec<u8> { h264_nals_in(&f.data).iter().map(|n| n[0] & 0x1F).collect() };
+
+        // Normal parser strips the PPS from a non-keyframe AU (it is captured for
+        // the avcC and, without an IDR, never re-asserted in-band).
+        let mut normal = H264Parser::new();
+        let f = normal.parse(&make_pes(au(), Some(90000)));
+        assert_eq!(f.len(), 1);
+        assert!(
+            !nal_types(&f[0]).contains(&8),
+            "normal parser strips PPS from a non-keyframe AU: {:?}",
+            nal_types(&f[0])
+        );
+
+        // Passthrough keeps EVERY parameter set in-band, so each dependent frame
+        // is a self-contained access unit for a BlockAdditional.
+        let mut pt = H264Parser::new().with_mvc_passthrough(true);
+        let f = pt.parse(&make_pes(au(), Some(90000)));
+        assert_eq!(f.len(), 1);
+        let types = nal_types(&f[0]);
+        assert!(types.contains(&15), "subset SPS kept in-band: {types:?}");
+        assert!(
+            types.contains(&8),
+            "PPS kept in-band under passthrough: {types:?}"
+        );
+        assert!(types.contains(&20), "slice kept: {types:?}");
+    }
+
+    #[test]
     fn h264_populates_measured_coding_type_and_source() {
         use super::super::coding::CodingType;
         // Slice-header body = first_mb_in_slice=0 ('1') then slice_type ue(v):
