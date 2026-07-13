@@ -593,10 +593,27 @@ impl UdfFs {
             match next_block {
                 Some(cont_lba) => {
                     read_sector(reader, self.meta_to_abs(cont_lba)?, &mut block)?;
-                    // A continuation block is a list of Short ADs from byte 0,
-                    // spanning the whole sector.
-                    ad_start = 0;
-                    ad_bytes = block.len();
+                    // A continuation block does NOT begin with allocation
+                    // descriptors — it begins with a 24-byte Allocation Extent
+                    // Descriptor (ECMA-167 4/14.5, tag id 258): the 16-byte
+                    // descriptor tag, then prev_allocation_extent_location
+                    // (Uint32 @16) and length_of_allocation_descriptors
+                    // (Uint32 @20). The real ADs (same Short/Long/Extended type
+                    // as the file) start at offset 24, and their total byte
+                    // length is that @20 field.
+                    //
+                    // Reading from offset 0 parses the AED's own tag header as
+                    // allocation descriptors → one garbage extent, then an
+                    // unknown extent_type break — silently truncating every
+                    // file whose ADs spill into a continuation block (a heavily
+                    // fragmented file, e.g. a Blu-ray 3D interleaved base-view
+                    // .m2ts with ~1600 fragments). A normal few-extent .m2ts
+                    // fits inline and never reaches here, which is why this
+                    // stayed hidden.
+                    let aed_l_ad =
+                        u32::from_le_bytes([block[20], block[21], block[22], block[23]]) as usize;
+                    ad_start = 24;
+                    ad_bytes = aed_l_ad.min(block.len().saturating_sub(24));
                 }
                 None => break,
             }
@@ -1535,8 +1552,15 @@ mod tests {
 
     /// A continuation block: a bare list of short ADs from byte 0.
     fn build_cont_block(ads: &[(u32, u32, u32)]) -> [u8; 2048] {
+        // A continuation block is an Allocation Extent Descriptor (ECMA-167
+        // 4/14.5): a 16-byte descriptor tag, then prev_allocation_extent_location
+        // (Uint32 @16) and length_of_allocation_descriptors (Uint32 @20). The
+        // actual allocation descriptors begin at offset 24. The parser skips the
+        // 24-byte header and reads `l_ad` bytes of ADs from there.
         let mut s = [0u8; 2048];
-        let mut off = 0usize;
+        let l_ad = (ads.len() * 8) as u32;
+        s[20..24].copy_from_slice(&l_ad.to_le_bytes());
+        let mut off = 24usize;
         for &(etype, dlen, dlba) in ads {
             let raw_len = (etype << 30) | (dlen & 0x3FFF_FFFF);
             s[off..off + 4].copy_from_slice(&raw_len.to_le_bytes());
@@ -1588,6 +1612,35 @@ mod tests {
         let fs = fs_with(part_start, meta_start, file_entry("X", 5, 6144));
         let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
         assert_eq!(extents, vec![(10, 4096), (20, 2048)]);
+    }
+
+    #[test]
+    fn icb_extents_continuation_skips_aed_header_not_read_as_extent() {
+        // Regression (Blu-ray 3D): a continuation block begins with a 24-byte
+        // Allocation Extent Descriptor whose 16-byte descriptor tag holds
+        // NON-zero bytes (tag id 258, CRC, location, ...). Reading allocation
+        // descriptors from offset 0 parses that tag header as an AD → a garbage
+        // extent, then an unknown extent_type break → every fragment past the
+        // first continuation is lost. On a 3D disc that truncated the 25.8 GB
+        // interleaved base-view feature to ~1.8 GB (113 of ~1600 fragments) and
+        // then choked the mux on the bogus, non-unit-aligned extent. The parser
+        // MUST skip the 24-byte AED header and read the real ADs from offset 24.
+        let icb = build_efe(6144, &[(0, 4096, 10), (3, 2048, 50)]);
+        let mut cont = build_cont_block(&[(0, 2048, 20)]);
+        // Stamp a realistic AED descriptor tag (id 258) into the header so a
+        // regression that reads from offset 0 mis-parses it as a bogus extent
+        // instead of finding the real (20, 2048) at offset 24.
+        cont[0..2].copy_from_slice(&258u16.to_le_bytes());
+        let mut reader = MapReader::new();
+        reader.put(5, icb);
+        reader.put(50, cont);
+        let fs = fs_with(0, 0, file_entry("3D", 5, 6144));
+        let extents = fs.read_icb_extents(&mut reader, 5).expect("extents");
+        assert_eq!(
+            extents,
+            vec![(10, 4096), (20, 2048)],
+            "continuation ADs must be read past the 24-byte AED header, not from offset 0"
+        );
     }
 
     #[test]
