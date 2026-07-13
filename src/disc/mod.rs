@@ -811,7 +811,11 @@ impl Codec {
         use crate::consts::coding_type as c;
         match ct {
             c::HEVC => Codec::Hevc,
-            c::H264 => Codec::H264,
+            // 0x1B base-view AVC and 0x20 MVC dependent-view (Blu-ray 3D right
+            // eye) are both H.264. Mapping 0x20 to video is what makes the PMT
+            // scan enumerate the dependent view as a second H.264 stream (its
+            // own PID in the SSIF) instead of dropping it — the basis of 3D.
+            c::H264 | c::H264_MVC => Codec::H264,
             c::VC1 => Codec::Vc1,
             c::MPEG2_VIDEO => Codec::Mpeg2,
             c::TRUEHD => Codec::TrueHd,
