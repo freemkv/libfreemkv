@@ -207,6 +207,22 @@ pub fn parser_for_codec(
     }
 }
 
+/// Build the codec parser for a Blu-ray 3D **MVC dependent (right-eye)** video
+/// stream. Same codec space as the base view (H.264), but in param-set
+/// passthrough mode so each emitted frame is a self-contained dependent access
+/// unit for a Matroska `BlockAdditional`. Non-H.264 (unexpected) falls back to
+/// the ordinary parser.
+pub fn parser_for_mvc_dependent(codec: Codec, is_dvd_ps: bool) -> Box<dyn CodecParser> {
+    match codec {
+        Codec::H264 => Box::new(
+            h264::H264Parser::new()
+                .with_ps_reorder(is_dvd_ps)
+                .with_mvc_passthrough(true),
+        ),
+        _ => parser_for_codec(codec, None, is_dvd_ps),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

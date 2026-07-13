@@ -575,7 +575,17 @@ fn build_demux_state(title: &DiscTitle, format: ContentFormat) -> DemuxState {
         pids.push(pid);
         pid_to_track.push((pid, idx));
         let is_dvd_ps = matches!(format, ContentFormat::MpegPs);
-        parsers.push((pid, super::codec::parser_for_codec(codec, None, is_dvd_ps)));
+        // The Blu-ray 3D MVC dependent (right-eye) view uses a param-set-
+        // passthrough H.264 parser so each frame is a self-contained dependent
+        // access unit for a BlockAdditional; every other stream uses the
+        // ordinary parser for its codec.
+        let parser = match s {
+            crate::disc::Stream::Video(v) if v.is_mvc_dependent() => {
+                super::codec::parser_for_mvc_dependent(codec, is_dvd_ps)
+            }
+            _ => super::codec::parser_for_codec(codec, None, is_dvd_ps),
+        };
+        parsers.push((pid, parser));
     }
     let (ts, ps) = match format {
         ContentFormat::MpegPs => (None, Some(super::ps::PsDemuxer::new())),
