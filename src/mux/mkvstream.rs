@@ -120,14 +120,196 @@ struct PendingMux {
     video_track: Option<usize>,
     /// `--log-level 3` opening-capture side-file path (if any).
     opening_capture_path: Option<std::path::PathBuf>,
-    /// Frames received before activation, replayed in order once built.
-    buffered: Vec<crate::pes::PesFrame>,
+    /// Frames received before activation, replayed in order once built. Each
+    /// carries an optional MVC dependent-view `BlockAdditional` (present only
+    /// for a 3D base-view frame that was already paired before activation).
+    buffered: Vec<(crate::pes::PesFrame, Option<Vec<u8>>)>,
 }
 
 /// Matroska container stream.
 pub struct MkvStream {
     disc_title: DiscTitle,
     mode: Mode,
+    /// Blu-ray 3D (MVC) merge state — present iff the title carries an MVC
+    /// dependent (right-eye) view. Folds the dependent stream's frames into the
+    /// base video track as per-frame `BlockAdditional`, paired by PTS, so the
+    /// output is a single MVC track instead of two independent H.264 tracks.
+    mvc: Option<MvcMerge>,
+}
+
+/// Largest number of base frames held awaiting their PTS-matching dependent AU
+/// before the oldest is flushed unpaired (a plain Block). The SSIF interleaves
+/// base and dependent access units per unit, so a base's dependent normally
+/// arrives within one or two frames; this window only bounds memory/latency for
+/// a stream where the pairing drifts.
+const MVC_PAIR_WINDOW: usize = 32;
+
+/// A base-view frame (track already remapped to the muxer's base track index)
+/// awaiting — or already carrying — its dependent-view `BlockAdditional`.
+struct PendingBase {
+    frame: crate::pes::PesFrame,
+    additional: Option<Vec<u8>>,
+}
+
+/// State for folding the MVC dependent (right-eye) view into the base track.
+struct MvcMerge {
+    /// `title.streams` index of the base (left-eye) video stream.
+    base_stream_idx: usize,
+    /// `title.streams` index of the dependent (right-eye) video stream.
+    dep_stream_idx: usize,
+    /// Muxer track index of the base view — where the dependent AU is attached
+    /// as a `BlockAdditional` and where `mvc_params` (the `mvcC` mapping) lives.
+    base_track_idx: usize,
+    /// `title.streams` index → muxer track index. The dependent maps to `None`
+    /// (it becomes a BlockAdditional, not a track); every other stream shifts
+    /// down by one if it followed the dependent in stream order.
+    stream_to_track: Vec<Option<usize>>,
+    /// Base frames (decode order) awaiting their dependent or a window flush.
+    pending_base: std::collections::VecDeque<PendingBase>,
+    /// Dependent AU data keyed by PTS, waiting for the matching base.
+    dep_by_pts: std::collections::HashMap<i64, Vec<u8>>,
+    /// `(subset_sps, pps)` from the first dependent AU — builds the `mvcC`
+    /// MVCDecoderConfigurationRecord for the base track's BlockAdditionMapping.
+    captured_params: Option<(Vec<u8>, Vec<u8>)>,
+    /// Count of dependent AUs dropped with no matching base (diagnostic).
+    orphan_deps: u64,
+}
+
+impl MvcMerge {
+    /// Ingest one incoming frame; returns `(frame, additional)` pairs ready to
+    /// hand to the muxer, in emit order. Base frames buffer briefly to pair with
+    /// their dependent by PTS; the dependent stream produces no frames of its own
+    /// (it becomes `BlockAdditional`); all other streams pass straight through
+    /// with their track index remapped.
+    fn ingest(
+        &mut self,
+        frame: &crate::pes::PesFrame,
+    ) -> Vec<(crate::pes::PesFrame, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        if frame.track == self.dep_stream_idx {
+            if self.captured_params.is_none() {
+                self.captured_params = extract_mvc_params(&frame.data);
+            }
+            // Attach to a waiting base of the same PTS, else stash by PTS.
+            if let Some(pb) = self
+                .pending_base
+                .iter_mut()
+                .find(|pb| pb.frame.pts == frame.pts && pb.additional.is_none())
+            {
+                pb.additional = Some(frame.data.clone());
+            } else {
+                self.dep_by_pts.insert(frame.pts, frame.data.clone());
+                // Bound the orphan map: if dependents pile up unpaired (pairing
+                // badly drifted), drop the surplus rather than grow unbounded.
+                if self.dep_by_pts.len() > MVC_PAIR_WINDOW * 4 {
+                    self.orphan_deps += self.dep_by_pts.len() as u64;
+                    self.dep_by_pts.clear();
+                }
+            }
+        } else if frame.track == self.base_stream_idx {
+            let additional = self.dep_by_pts.remove(&frame.pts);
+            let mut remapped = frame.clone();
+            remapped.track = self.base_track_idx;
+            self.pending_base.push_back(PendingBase {
+                frame: remapped,
+                additional,
+            });
+        } else {
+            // Audio / subtitle / other video: remap the track index and forward.
+            let mut remapped = frame.clone();
+            if let Some(Some(t)) = self.stream_to_track.get(frame.track) {
+                remapped.track = *t;
+                out.push((remapped, None));
+            }
+        }
+        self.drain_ready(&mut out);
+        out
+    }
+
+    /// Emit base frames from the FIFO front once each has its dependent attached,
+    /// or flush the oldest unpaired base as a plain Block when the window is full.
+    fn drain_ready(&mut self, out: &mut Vec<(crate::pes::PesFrame, Option<Vec<u8>>)>) {
+        loop {
+            let front_ready = self
+                .pending_base
+                .front()
+                .map(|pb| pb.additional.is_some())
+                .unwrap_or(false);
+            if front_ready || self.pending_base.len() > MVC_PAIR_WINDOW {
+                if let Some(pb) = self.pending_base.pop_front() {
+                    out.push((pb.frame, pb.additional));
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    /// Flush every remaining buffered base frame (unpaired → plain Block) at EOF.
+    fn flush(&mut self) -> Vec<(crate::pes::PesFrame, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        for pb in self.pending_base.drain(..) {
+            out.push((pb.frame, pb.additional));
+        }
+        self.orphan_deps += self.dep_by_pts.len() as u64;
+        self.dep_by_pts.clear();
+        out
+    }
+}
+
+/// Hand a frame to the muxer: the plain path (`write_frame`) when there is no
+/// MVC dependent view to attach, the BlockAdditional path otherwise.
+fn emit_to_muxer(
+    m: &mut MkvMuxer<Box<dyn WriteSeek + Send>>,
+    frame: &crate::pes::PesFrame,
+    additional: Option<&[u8]>,
+) -> io::Result<()> {
+    match additional {
+        None => m.write_frame(
+            frame.track,
+            frame.pts,
+            frame.keyframe,
+            &frame.data,
+            frame.duration_ns,
+        ),
+        Some(_) => m.write_frame_with_additional(
+            frame.track,
+            frame.pts,
+            frame.keyframe,
+            &frame.data,
+            frame.duration_ns,
+            additional,
+        ),
+    }
+}
+
+/// Scan a length-prefixed (4-byte big-endian) H.264 NAL stream for the first
+/// subset SPS (NAL type 15) and first PPS (NAL type 8) — the two parameter sets
+/// that populate the `mvcC` MVCDecoderConfigurationRecord. Returns
+/// `Some((subset_sps, pps))` only when BOTH are found; `None` otherwise (the
+/// serializer then emits no mvcC mapping and logs it).
+fn extract_mvc_params(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut subset_sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        i += 4;
+        if len == 0 || i + len > data.len() {
+            break;
+        }
+        let nal = &data[i..i + len];
+        i += len;
+        match nal[0] & 0x1F {
+            15 if subset_sps.is_none() => subset_sps = Some(nal.to_vec()),
+            8 if pps.is_none() => pps = Some(nal.to_vec()),
+            _ => {}
+        }
+        if subset_sps.is_some() && pps.is_some() {
+            break;
+        }
+    }
+    Some((subset_sps?, pps?))
 }
 
 impl MkvStream {
@@ -146,10 +328,30 @@ impl MkvStream {
         title: &DiscTitle,
         output_path: Option<&std::path::Path>,
     ) -> io::Result<Self> {
+        // Blu-ray 3D (MVC): a dependent (right-eye) view stream is NOT emitted as
+        // its own track — it is folded into the base track as per-frame
+        // BlockAdditional. Detect it so we skip building a track for it and set up
+        // the merge. `base_stream_idx` is the first video stream.
+        let dep_stream_idx = title
+            .streams
+            .iter()
+            .position(|s| matches!(s, crate::disc::Stream::Video(v) if v.is_mvc_dependent()));
+        let base_stream_idx = title
+            .streams
+            .iter()
+            .position(|s| matches!(s, crate::disc::Stream::Video(_)));
+
         let mut tracks = Vec::new();
         let mut has_default_video = false;
         let mut has_default_audio = false;
+        // `title.streams` index → muxer track index (`None` = the dependent view,
+        // which has no track). Streams after the dependent shift down by one.
+        let mut stream_to_track: Vec<Option<usize>> = Vec::with_capacity(title.streams.len());
         for (idx, s) in title.streams.iter().enumerate() {
+            if Some(idx) == dep_stream_idx {
+                stream_to_track.push(None);
+                continue;
+            }
             let mut track = match s {
                 crate::disc::Stream::Video(v) => MkvTrack::video(v),
                 crate::disc::Stream::Audio(a) => MkvTrack::audio(a),
@@ -166,8 +368,29 @@ impl MkvStream {
             if let Some(cp) = title.codec_privates.get(idx).and_then(|c| c.as_ref()) {
                 track.codec_private = Some(cp.clone());
             }
+            stream_to_track.push(Some(tracks.len()));
             tracks.push(track);
         }
+
+        // Assemble the MVC merge when a dependent view is present and paired with
+        // a base video track.
+        let mvc = match (dep_stream_idx, base_stream_idx) {
+            (Some(dep_stream_idx), Some(base_stream_idx)) => {
+                let base_track_idx =
+                    stream_to_track[base_stream_idx].expect("base video stream always has a track");
+                Some(MvcMerge {
+                    base_stream_idx,
+                    dep_stream_idx,
+                    base_track_idx,
+                    stream_to_track,
+                    pending_base: std::collections::VecDeque::new(),
+                    dep_by_pts: std::collections::HashMap::new(),
+                    captured_params: None,
+                    orphan_deps: 0,
+                })
+            }
+            _ => None,
+        };
 
         // Defer muxer construction (and the TrackEntry dump) until the first
         // coded picture arrives, so the primary video track's FieldOrder is set
@@ -177,6 +400,7 @@ impl MkvStream {
 
         Ok(Self {
             disc_title: title.clone(),
+            mvc,
             mode: Mode::Write(WriteMode::Pending(Box::new(PendingMux {
                 writer,
                 tracks,
@@ -209,6 +433,24 @@ impl MkvStream {
         if let Some(vt) = pending.video_track {
             apply_coding_to_track(&mut pending.tracks[vt], coding, video_picture_seen);
         }
+        // Blu-ray 3D: set the base video track's `mvc_params` from the dependent
+        // view's captured subset-SPS/PPS BEFORE the header is written, so the
+        // TrackEntry carries the `mvcC` BlockAdditionMapping. Captured from the
+        // first dependent AU (which arrives right after the first base AU in the
+        // SSIF), so it is available by the time the first base frame activates.
+        if let Some(mvc) = &self.mvc {
+            if let Some(params) = &mvc.captured_params {
+                if let Some(t) = pending.tracks.get_mut(mvc.base_track_idx) {
+                    t.mvc_params = Some(params.clone());
+                }
+            } else {
+                tracing::warn!(
+                    target: "mux",
+                    "MVC: no dependent-view subset-SPS/PPS captured before activation; \
+                     the base track will carry no mvcC mapping (3D not signalled)."
+                );
+            }
+        }
         // --log-level 3: dump the FINAL TrackEntry metadata (field order set).
         for (i, track) in pending.tracks.iter().enumerate() {
             crate::diag::dump_mkv_track((i + 1) as u64, track);
@@ -223,11 +465,64 @@ impl MkvStream {
         if let Some(path) = &pending.opening_capture_path {
             muxer.set_opening_capture(crate::diag::OpeningCapture::new(path, pending.tracks.len()));
         }
-        for f in pending.buffered.drain(..) {
-            muxer.write_frame(f.track, f.pts, f.keyframe, &f.data, f.duration_ns)?;
+        for (f, additional) in pending.buffered.drain(..) {
+            muxer.write_frame_with_additional(
+                f.track,
+                f.pts,
+                f.keyframe,
+                &f.data,
+                f.duration_ns,
+                additional.as_deref(),
+            )?;
         }
         self.mode = Mode::Write(WriteMode::Active(Box::new(muxer)));
         Ok(())
+    }
+
+    /// Emit one frame (track index already muxer-relative) with an optional MVC
+    /// dependent-view `BlockAdditional`, honouring the deferred-activation
+    /// machinery: the first video frame triggers muxer construction (its coding
+    /// sets FieldOrder); earlier frames buffer. `additional` is `None` for every
+    /// non-3D frame and for the 3D base frames that had no paired dependent.
+    fn emit(&mut self, frame: &crate::pes::PesFrame, additional: Option<&[u8]>) -> io::Result<()> {
+        match &mut self.mode {
+            Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
+            Mode::Write(WriteMode::Active(m)) => {
+                return emit_to_muxer(m, frame, additional);
+            }
+            Mode::Write(WriteMode::Building) => return Ok(()),
+            Mode::Write(WriteMode::Pending(_)) => {}
+        }
+        // Pending: the first video frame (or the safety cap) triggers muxer
+        // construction; that frame's coding sets the field order. Other frames
+        // buffer until then.
+        let (activate_now, use_coding) = match &self.mode {
+            Mode::Write(WriteMode::Pending(p)) => {
+                let is_video = match p.video_track {
+                    Some(vt) => frame.track == vt,
+                    // No video track: nothing to wait for — build on frame one.
+                    None => true,
+                };
+                (is_video || p.buffered.len() >= MAX_PENDING_FRAMES, is_video)
+            }
+            _ => unreachable!("guarded above"),
+        };
+        if activate_now {
+            // Pass the trigger frame's coding only when it IS the video frame; a
+            // cap-triggered build never saw the video frame, so nothing measured
+            // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
+            self.activate(if use_coding { frame.coding } else { None }, use_coding)?;
+            if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
+                return emit_to_muxer(m, frame, additional);
+            }
+            Ok(())
+        } else {
+            if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
+                p.buffered
+                    .push((frame.clone(), additional.map(|a| a.to_vec())));
+            }
+            Ok(())
+        }
     }
 
     /// Open an MKV file for reading → PES frames.
@@ -235,6 +530,7 @@ impl MkvStream {
         let (disc_title, codec_privates, ts_scale_ns) = parse_mkv_header(&mut reader)?;
         Ok(Self {
             disc_title,
+            mvc: None,
             mode: Mode::Read(ReadState {
                 reader: Box::new(reader),
                 cluster_ts_ticks: 0,
@@ -425,59 +721,40 @@ impl crate::pes::Stream for MkvStream {
     }
 
     fn write(&mut self, frame: &crate::pes::PesFrame) -> io::Result<()> {
-        // Fast paths.
-        match &mut self.mode {
-            Mode::Read(_) => return Err(crate::error::Error::StreamReadOnly.into()),
-            Mode::Write(WriteMode::Active(m)) => {
-                return m.write_frame(
-                    frame.track,
-                    frame.pts,
-                    frame.keyframe,
-                    &frame.data,
-                    frame.duration_ns,
-                );
-            }
-            Mode::Write(WriteMode::Building) => return Ok(()),
-            Mode::Write(WriteMode::Pending(_)) => {}
+        if matches!(self.mode, Mode::Read(_)) {
+            return Err(crate::error::Error::StreamReadOnly.into());
         }
-        // Pending: the first video frame (or the safety cap) triggers muxer
-        // construction; that frame's coding sets the field order. Other frames
-        // buffer until then.
-        let (activate_now, use_coding) = match &self.mode {
-            Mode::Write(WriteMode::Pending(p)) => {
-                let is_video = match p.video_track {
-                    Some(vt) => frame.track == vt,
-                    // No video track: nothing to wait for — build on frame one.
-                    None => true,
-                };
-                (is_video || p.buffered.len() >= MAX_PENDING_FRAMES, is_video)
-            }
-            _ => unreachable!("guarded above"),
-        };
-        if activate_now {
-            // Pass the trigger frame's coding only when it IS the video frame; a
-            // cap-triggered build never saw the video frame, so nothing measured
-            // is passed (apply_coding_to_track then logs + leaves UNDETERMINED).
-            self.activate(if use_coding { frame.coding } else { None }, use_coding)?;
-            if let Mode::Write(WriteMode::Active(m)) = &mut self.mode {
-                return m.write_frame(
-                    frame.track,
-                    frame.pts,
-                    frame.keyframe,
-                    &frame.data,
-                    frame.duration_ns,
-                );
-            }
-            Ok(())
-        } else {
-            if let Mode::Write(WriteMode::Pending(p)) = &mut self.mode {
-                p.buffered.push(frame.clone());
-            }
-            Ok(())
+        // Non-3D fast path: emit the frame directly, no clone, no buffering.
+        if self.mvc.is_none() {
+            return self.emit(frame, None);
         }
+        // Blu-ray 3D: run the frame through the MVC merge, which remaps track
+        // indices, folds the dependent view into the base as BlockAdditional
+        // (paired by PTS), and yields 0+ frames ready to emit. `ingest` returns
+        // owned pairs so the `self.mvc` borrow is released before `emit`.
+        let emits = self.mvc.as_mut().unwrap().ingest(frame);
+        for (f, additional) in emits {
+            self.emit(&f, additional.as_deref())?;
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> io::Result<()> {
+        // Blu-ray 3D: flush any base frames still awaiting a dependent (emitted
+        // unpaired as plain Blocks) before finalizing.
+        if let Some(mvc) = self.mvc.as_mut() {
+            let tail = mvc.flush();
+            let orphans = mvc.orphan_deps;
+            if orphans > 0 {
+                tracing::debug!(
+                    target: "mux",
+                    "MVC: {orphans} dependent-view access units had no matching base frame (dropped)"
+                );
+            }
+            for (f, additional) in tail {
+                self.emit(&f, additional.as_deref())?;
+            }
+        }
         // A title that produced no frames (or only buffered ones) is still
         // finalized into a valid MKV: activate now with no measured coding.
         if matches!(self.mode, Mode::Write(WriteMode::Pending(_))) {
@@ -915,6 +1192,107 @@ mod tests {
     use super::*;
     use crate::pes::Stream as _;
     use std::io::Cursor;
+
+    /// Length-prefix (4-byte big-endian) each NAL, as the H.264 parser emits.
+    fn lp(nals: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in nals {
+            v.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            v.extend_from_slice(n);
+        }
+        v
+    }
+
+    fn mvc_frame(track: usize, pts: i64, keyframe: bool, data: Vec<u8>) -> crate::pes::PesFrame {
+        crate::pes::PesFrame {
+            track,
+            pts,
+            keyframe,
+            data,
+            duration_ns: None,
+            source: None,
+            coding: None,
+        }
+    }
+
+    // A subset SPS (NAL type 15), a PPS (type 8), and a coded-slice-extension
+    // (type 20) — the shape of a dependent-view access unit.
+    const SUBSET_SPS: [u8; 5] = [0x6F, 0x80, 0x00, 0x33, 0xAA]; // 0x6F & 0x1F = 15
+    const DEP_PPS: [u8; 3] = [0x68, 0xEE, 0x3C]; // 0x68 & 0x1F = 8
+    const DEP_SLICE: [u8; 3] = [0x74, 0x11, 0x22]; // 0x74 & 0x1F = 20
+
+    #[test]
+    fn extract_mvc_params_finds_subset_sps_and_pps() {
+        let data = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
+        let (s, p) = extract_mvc_params(&data).expect("both param sets present");
+        assert_eq!(s, SUBSET_SPS, "subset SPS (NAL 15) captured verbatim");
+        assert_eq!(p, DEP_PPS, "PPS (NAL 8) captured verbatim");
+        // Missing PPS → None (the serializer then emits no mvcC mapping).
+        assert!(extract_mvc_params(&lp(&[&SUBSET_SPS, &DEP_SLICE])).is_none());
+        // Missing subset SPS → None.
+        assert!(extract_mvc_params(&lp(&[&DEP_PPS, &DEP_SLICE])).is_none());
+    }
+
+    fn empty_merge() -> MvcMerge {
+        MvcMerge {
+            base_stream_idx: 0,
+            dep_stream_idx: 2,
+            base_track_idx: 0,
+            stream_to_track: vec![Some(0), Some(1), None],
+            pending_base: std::collections::VecDeque::new(),
+            dep_by_pts: std::collections::HashMap::new(),
+            captured_params: None,
+            orphan_deps: 0,
+        }
+    }
+
+    #[test]
+    fn mvc_merge_pairs_base_and_dependent_by_pts() {
+        let mut m = empty_merge();
+        let dep = lp(&[&SUBSET_SPS, &DEP_PPS, &DEP_SLICE]);
+
+        // Base arrives first (SSIF order): buffered, nothing emitted yet.
+        let e = m.ingest(&mvc_frame(0, 100, true, lp(&[&[0x65, 1, 2]])));
+        assert!(e.is_empty(), "base held until its dependent arrives");
+
+        // Dependent arrives → base is emitted, remapped to the base track, with
+        // the dependent AU as its BlockAdditional; params are captured.
+        let e = m.ingest(&mvc_frame(2, 100, false, dep.clone()));
+        assert_eq!(e.len(), 1, "the paired base frame is emitted");
+        assert_eq!(e[0].0.track, 0, "remapped to the base muxer track");
+        assert_eq!(
+            e[0].1.as_deref(),
+            Some(dep.as_slice()),
+            "dependent attached"
+        );
+        assert!(m.captured_params.is_some(), "mvcC params captured");
+
+        // Audio passes straight through (remapped, no additional).
+        let e = m.ingest(&mvc_frame(1, 100, true, vec![0xAA]));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].0.track, 1);
+        assert!(e[0].1.is_none());
+
+        // Dependent-before-base (reordered) also pairs.
+        let dep2 = lp(&[&DEP_SLICE]);
+        assert!(m.ingest(&mvc_frame(2, 200, false, dep2.clone())).is_empty());
+        let e = m.ingest(&mvc_frame(0, 200, false, lp(&[&[0x61, 3, 4]])));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].1.as_deref(), Some(dep2.as_slice()));
+    }
+
+    #[test]
+    fn mvc_merge_flushes_unpaired_base_at_eof() {
+        let mut m = empty_merge();
+        // Base with no dependent ever → held, then flushed unpaired at EOF.
+        assert!(
+            m.ingest(&mvc_frame(0, 10, true, vec![0, 0, 0, 1]))
+                .is_empty()
+        );
+        let tail = m.flush();
+        assert_eq!(tail.len(), 1, "unpaired base still emitted");
+        assert!(tail[0].1.is_none(), "no BlockAdditional when unpaired");
+    }
 
     #[test]
     fn apply_coding_to_track_sets_measured_field_order_never_guesses() {
