@@ -6,8 +6,11 @@
 //! decrypt-verify are meaningful is each clip's FILE-anchored 6144-byte unit
 //! grid (clips can start off the 6144 grid and fragment across UDF extents). So
 //! this gate BUFFERS the disc-absolute read stream and re-ALIGNS it into
-//! clip-file units, then applies the standards-correct
-//! [`crate::aacs::content::unit_is_clean_ts`] gate (all-32 TS syncs).
+//! clip-file units, then decrypts each with the SAME primitive the mux/rip path
+//! uses ([`crate::aacs::content::decrypt_unit`] for TS) so verify and the real
+//! decrypt can never disagree. That verdict is "did a key OPEN this unit?" —
+//! defect-TOLERANT: an opened unit carrying a few authored-bad packets (pressing
+//! defects / forensic-variant frames) is NOT bad; only a unit no key opens is.
 //!
 //! FAIL-SAFE CONTRACT (this sits in the middle of every read, so it must never
 //! break a good read): the gate can ONLY downgrade a unit it is *confident* is
@@ -60,6 +63,15 @@ pub enum ContainerKind {
     /// NOT yet enabled by enumeration; present so adding HD-DVD is a one-mapping
     /// change. See [`crate::aacs::content::unit_is_clean_ps`] for the (unvalidated) check.
     Ps,
+}
+
+/// PS-container per-unit decrypt for the verify gate — the analogue of
+/// [`aacs::content::decrypt_unit`] (TS) for HD-DVD program-stream content. Wraps
+/// [`aacs::content::decrypt_unit_checked`] with the pack-start structural check.
+/// A free `fn` (not a closure) so it has the same `fn(&mut [u8], &[u8;16]) -> bool`
+/// type as `decrypt_unit`, letting [`Verifier::decrypt_for`] return either.
+fn decrypt_unit_ps(unit: &mut [u8], key: &[u8; 16]) -> bool {
+    aacs::content::decrypt_unit_checked(unit, key, aacs::content::unit_is_clean_ps)
 }
 
 /// A clip's on-disc layout: declared file size, its absolute disc extents in
@@ -185,11 +197,28 @@ impl UnitVerifier {
         })
     }
 
-    /// The post-decrypt structural check for a clip's container.
+    /// The post-decrypt structural check for a clip's container — used ONLY on the
+    /// CPI-clear branch (a plaintext unit that is structurally clean is
+    /// decryptable-as-is; if not, we return Unknown, never bad).
     fn accept_for(&self, clip: u32) -> fn(&[u8]) -> bool {
         match self.containers[clip as usize] {
             ContainerKind::Ts => aacs::content::unit_is_clean_ts,
             ContainerKind::Ps => aacs::content::unit_is_clean_ps,
+        }
+    }
+
+    /// The per-unit DECRYPT for a clip's container — the key-selection primitive
+    /// verify uses to prove a candidate key opens an ENCRYPTED unit. It MUST be
+    /// the exact same primitive the mux/rip decrypt path uses, so verify and the
+    /// real decrypt never disagree (a unit the mux will happily decrypt must not
+    /// be marked bad here). For TS that is [`aacs::content::decrypt_unit`], whose
+    /// verdict is defect-TOLERANT (a supermajority of content packets restored) —
+    /// an authored-bad packet or forensic-variant frame no longer false-flags the
+    /// whole unit as undecryptable.
+    fn decrypt_for(&self, clip: u32) -> fn(&mut [u8], &[u8; 16]) -> bool {
+        match self.containers[clip as usize] {
+            ContainerKind::Ts => aacs::content::decrypt_unit,
+            ContainerKind::Ps => decrypt_unit_ps,
         }
     }
 
@@ -215,7 +244,8 @@ impl UnitVerifier {
             self.fill(clip, unit, slot, lba, &bytes[off..off + sector]);
             if let Some((raw, lbas)) = self.take_if_complete(clip, unit) {
                 let accept = self.accept_for(clip);
-                match self.decryptability(&raw, accept) {
+                let decrypt = self.decrypt_for(clip);
+                match self.decryptability(&raw, accept, decrypt) {
                     Decryptability::Undecryptable => push_ranges(&mut bad, &lbas),
                     Decryptability::Decryptable | Decryptability::Unknown => {}
                 }
@@ -309,6 +339,7 @@ impl UnitVerifier {
         &mut self,
         raw: &[u8; ALIGNED_UNIT_LEN],
         accept: fn(&[u8]) -> bool,
+        decrypt: fn(&mut [u8], &[u8; 16]) -> bool,
     ) -> Decryptability {
         // CPI clear -> the unit is plaintext by spec (no key needed). If it is
         // structurally clean, it is decryptable-as-is. If it ISN'T, we
@@ -327,7 +358,7 @@ impl UnitVerifier {
             };
         }
         // Encrypted: any held key that decrypts to a structurally-clean unit.
-        if self.try_keys(raw, accept) {
+        if self.try_keys(raw, decrypt) {
             return Decryptability::Decryptable;
         }
         // No held key works. Ask the application's key source ONCE for this
@@ -350,7 +381,7 @@ impl UnitVerifier {
                     self.fetch_spent = true; // service has nothing new; stop asking
                     return Decryptability::Unknown;
                 }
-                if self.try_keys(raw, accept) {
+                if self.try_keys(raw, decrypt) {
                     return Decryptability::Decryptable;
                 }
                 return Decryptability::Undecryptable; // service's keys don't open it -> bad ciphertext
@@ -359,12 +390,18 @@ impl UnitVerifier {
         Decryptability::Unknown
     }
 
-    /// True if any currently-held key decrypts `raw` to a structurally-clean unit
-    /// under the container's `accept` check.
-    fn try_keys(&self, raw: &[u8; ALIGNED_UNIT_LEN], accept: fn(&[u8]) -> bool) -> bool {
+    /// True if any currently-held key OPENS `raw` — i.e. the container's per-unit
+    /// `decrypt` (the same primitive the mux uses) reports the key restored the
+    /// unit's TS structure. Defect-tolerant for TS: an opened unit carrying a few
+    /// authored-bad packets still counts as decryptable (never marked bad).
+    fn try_keys(
+        &self,
+        raw: &[u8; ALIGNED_UNIT_LEN],
+        decrypt: fn(&mut [u8], &[u8; 16]) -> bool,
+    ) -> bool {
         for k in &self.keys {
             let mut scratch = *raw;
-            if aacs::content::decrypt_unit_checked(&mut scratch, k, accept) {
+            if decrypt(&mut scratch, k) {
                 return true;
             }
         }
@@ -439,9 +476,10 @@ impl UnitVerifier {
                     }
                 }
                 let accept = self.accept_for(clip);
+                let decrypt = self.decrypt_for(clip);
                 if readable
                     && matches!(
-                        self.decryptability(&raw, accept),
+                        self.decryptability(&raw, accept, decrypt),
                         Decryptability::Undecryptable
                     )
                 {
@@ -895,6 +933,31 @@ mod tests {
             bad,
             vec![(100, 3)],
             "undecryptable unit -> full 3-sector range"
+        );
+    }
+
+    #[test]
+    fn reverify_iso_defect_packet_unit_is_not_flagged_bad() {
+        // A unit with ONE authored-bad content packet (a pressing defect). The
+        // held key OPENS it (31/32 syncs restored), so verify must AGREE with the
+        // mux decrypt and NOT mark it bad — the bad packet is the muxer's problem,
+        // not a read/decrypt failure. (Old strict all-32 gate flagged it bad.)
+        let key = [0x5a; 16];
+        let mut u = clear_unit();
+        let off = 17 * 192; // corrupt packet 17's sync in the plaintext
+        u[off + 4] = 0x80;
+        u[off + 5] = 0xAB;
+        encrypt_unit(&mut u, &key);
+        let mut iso = MockIso {
+            sectors: Default::default(),
+            err_lba: None,
+        };
+        place_unit(&mut iso, [100, 101, 102], &u);
+        let mut v = UnitVerifier::new(&one_clip(100), &aacs_keys(&[key]), None).unwrap();
+        let bad = v.reverify_iso(&mut iso, &[(100 * 2048, 3 * 2048)], &|_| true);
+        assert!(
+            bad.is_empty(),
+            "defect-packet unit is opened by the held key -> not flagged bad"
         );
     }
 
