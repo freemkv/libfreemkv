@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.4.1] — 2026-07-14
+
+### Fixed
+
+- **Mux no longer discards good video over a single defective packet.** AACS
+  content decryption judged a 6144-byte aligned unit "undecryptable" unless
+  **every** content packet was conformant MPEG-TS. A single authored-bad packet
+  — a pressing/encoding defect, or an AACS 2.1 forensic-variant frame — made the
+  mux conceal the **whole** unit as NULL TS, destroying up to 31 of 32 good
+  packets and tallying them as loss. On discs carrying such packets this
+  surfaced as false "corruption" over large runs of otherwise-perfect video
+  (observed across two UHD titles: ~466 MB concealed, every unit decryptable).
+  The decrypt path now asks only *"did a key OPEN this unit?"* — a padding-aware
+  **≥75% supermajority** of content packets restoring their `0x47` sync, a gate
+  no wrong key can reach (uniform-AES noise floor ≈ 256⁻ⁿ) yet one that tolerates
+  a minority of authored-bad packets. Opened units pass through **verbatim**; a
+  non-conforming packet is left for the demuxer to drop on sync-loss and resync
+  past — TS-sync conformance is a muxer concern, never a decryption verdict. The
+  read/decrypt path no longer rewrites content bytes. The post-read verify/sweep
+  gate now shares the exact same primitive (`decrypt_unit` for TS), so verify can
+  never disagree with the mux decrypt and never false-marks a defect unit as a
+  bad read.
+- **MVC (Blu-ray 3D) track signals unified and hardened.** The `mvcC`
+  `CodecPrivate` extension, the `BlockAdditionMapping`, and each frame's
+  `BlockAdditional` now all derive from a single `MVCDecoderConfigurationRecord`
+  built once per track, so they can no longer diverge. A track is flagged 3D
+  only when that record actually builds — a malformed dependent-view parameter
+  set no longer emits a mapping with no matching record (previously the flag was
+  taken from `mvc_params.is_some()`, which could orphan a `BlockAddID`). The base
+  track's `CodecPrivate` now carries the `mvcC` extension block
+  (`avcC ‖ u32be(size) ‖ "mvcC" ‖ record`, Matroska-spec size = block − 4) so
+  players and mediainfo detect MVC at the track level.
+
 ## [1.4.0] — 2026-07-13
 
 ### Added

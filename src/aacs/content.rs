@@ -113,51 +113,68 @@ pub fn aacs_unit_needs_decrypt(unit: &[u8]) -> bool {
     aacs_unit_encrypted(unit) && ts_sync_destroyed(unit)
 }
 
-/// PADDING-AWARE "is this aligned unit STILL genuine ciphertext?" — the conceal-
-/// path twin of [`decrypt_unit`]'s acceptance criterion, run on the POST-decrypt
-/// bytes.
+/// The one canonical "did a key OPEN this unit?" signal — a padding-aware,
+/// defect-TOLERANT structural check on the POST-decrypt bytes.
 ///
-/// [`aacs_unit_needs_decrypt`] cannot answer this: it composes CPI with the
-/// MAJORITY-VOTE [`ts_sync_destroyed`] (`ts_sync_count <= total/2`). A
-/// successfully padding-aware-decrypted content-fragment TAIL unit (e.g. 11 of 32
-/// packets are real content, the other 21 source-zero padding) carries only 11 TS
-/// syncs after decrypt, so the majority vote calls it "destroyed" and
-/// `aacs_unit_needs_decrypt` returns true — even though the unit decrypted
-/// PERFECTLY. Concealing on that predicate overwrites the good decrypted tail with
-/// NULL-TS, silently discarding correct video (the bug this fixes; the 1.2.0
-/// fragment-tail fix in [`decrypt_unit`] must not be undone by the conceal loop).
+/// ARCHITECTURE (why this is the only TS-sync test the read/decrypt path may
+/// use): TS-sync presence is a *muxer* concern, not a decryption verdict. The
+/// read/decrypt path is not allowed to reject or conceal a unit just because a
+/// packet isn't conformant MPEG-TS — a non-conforming packet inside an otherwise
+/// perfectly-decrypted unit is an authoring/pressing defect (or an AACS 2.1
+/// forensic-variant frame), which the demuxer drops on sync-loss and resyncs
+/// past. The ONLY thing the decrypt path legitimately needs from TS structure is
+/// KEY SELECTION: "did this candidate key turn ciphertext back into MPEG-TS at
+/// all?" — used to pick among held keys (multi-CPS-unit discs) and to detect a
+/// genuinely-missing key. That is a coarse, all-or-nothing question, and this is
+/// its answer.
 ///
-/// The correct, padding-aware notion of "still ciphertext", checkable on the
-/// post-decrypt bytes, uses the SAME discriminator [`decrypt_unit`] uses:
-///   * A genuinely-FAILED unit was restored to on-disc ciphertext by
-///     `decrypt_unit_try_keys`/`decrypt_buf` → its packets are scrambled: a
-///     non-padding (non-zero payload) packet LACKS the `0x47` sync at offset 4.
-///   * A SUCCESSFULLY-decrypted unit (full OR padding-tail) → every non-zero
-///     (content) packet carries `0x47`; padding packets are all-zero.
+/// Verdict: the key opened the unit iff a SUPERMAJORITY (>= 75%) of the
+/// non-padding content packets carry their `0x47` TS sync. Rationale:
+///   * WRONG key → AES output is uniform random → each content packet carries
+///     `0x47` at offset 4 with probability 1/256 → ~0 synced. Reaching 75% by
+///     chance is cryptographically impossible (e.g. 17-of-22 ≈ 256^-17). So a
+///     wrong key can NEVER pass — no silent-corruption hole.
+///   * RIGHT key → every real content packet decrypts to clear TS. A handful of
+///     authored-bad packets (pressing defects / variant frames) legitimately
+///     lack `0x47`, but they are a small minority and MUST NOT reject the unit —
+///     the decrypted bytes (defects and all) pass through verbatim; the muxer
+///     handles the bad packets. This is the whole point: correctness of a
+///     *packet* is not a decryption verdict.
 ///
-/// So this is true iff `aacs_unit_encrypted` AND at least one 192-byte packet
-/// whose 188-byte payload (`[off+4..off+192]`) is NOT all-zero is missing its
-/// `0x47` sync at `off+4`. A full content unit (no zero-payload packets) reduces
-/// to the strict all-32 check, so the common cases are unchanged: a fully-clear /
-/// fully-decrypted unit is never flagged; a fully-ciphertext unit always is.
-pub fn aacs_unit_still_ciphertext(unit: &[u8]) -> bool {
-    if !aacs_unit_encrypted(unit) {
-        return false;
-    }
+/// Padding-aware: a 192-byte packet whose 188-byte payload is all-zero is source
+/// padding (or a NULL packet) and is excluded from the count, so a legitimate
+/// content-fragment TAIL (a few real packets + source-zero padding) is judged on
+/// its real packets only. A full content unit reduces to "nearly all 32 synced".
+pub fn unit_content_decrypted(unit: &[u8]) -> bool {
     const PKT: usize = BD_SOURCE_PACKET_BYTES; // 192
     let limit = ALIGNED_UNIT_LEN.min(unit.len());
+    let mut content = 0usize;
+    let mut synced = 0usize;
     let mut off = 0;
     while off + PKT <= limit {
-        // A packet whose 188-byte payload is all-zero is padding (source zeros) —
-        // excluded from the verdict, exactly as `decrypt_unit` excludes it. Any
-        // other (content) packet that lacks its TS sync is un-restored ciphertext.
+        // All-zero payload → padding / NULL packet → excluded from the verdict.
         let payload = &unit[off + 4..off + PKT];
-        if !payload.iter().all(|&b| b == 0) && unit[off + 4] != TS_SYNC {
-            return true;
+        if !payload.iter().all(|&b| b == 0) {
+            content += 1;
+            if unit[off + 4] == TS_SYNC {
+                synced += 1;
+            }
         }
         off += PKT;
     }
-    false
+    // No content packets (all padding) → trivially "opened". Otherwise require a
+    // >=75% supermajority of content packets restored — the wrong-key-proof gate.
+    content == 0 || synced * 4 >= content * 3
+}
+
+/// "Is this aligned unit STILL genuine ciphertext (no held key opened it)?" — the
+/// conceal-path twin of [`unit_content_decrypted`], run on the POST-decrypt
+/// bytes. True iff the unit is flagged encrypted (CPI set) AND no key opened it
+/// (below the supermajority-sync gate). A unit the right key opened — even one
+/// carrying a few defective packets — is NOT ciphertext and is never concealed;
+/// its bytes belong to the muxer.
+pub fn aacs_unit_still_ciphertext(unit: &[u8]) -> bool {
+    aacs_unit_encrypted(unit) && !unit_content_decrypted(unit)
 }
 
 /// Overwrite an aligned unit (6144 bytes) IN PLACE with valid NULL MPEG-TS
@@ -349,20 +366,25 @@ pub fn decrypt_unit(unit: &mut [u8], unit_key: &[u8; 16]) -> bool {
     // Final 6128 bytes of the aligned unit under the Block Key; first 16 = clear seed. [BD] §3.10.1.
     aes_cbc_decrypt(&decrypt_key, &mut unit[16..ALIGNED_UNIT_LEN]);
 
-    // Verify content packets; zero out padding packets (their decrypted bytes are
-    // garbage from AES-decrypting zeros, but the source was zero so a clean zero
-    // fill is lossless and gives the demux a tidy gap instead of garbage).
+    // Restore source-zero padding packets to zero (their decrypted bytes are
+    // garbage from AES-decrypting zeros, but the source WAS zero, so writing the
+    // true source back is faithful — not concealment — and gives the demux a tidy
+    // gap instead of AES noise). Content packets are left EXACTLY as decrypted:
+    // the read/decrypt path never rewrites content, so an authored-bad packet
+    // (no `0x47`) passes through verbatim for the muxer to drop.
     for (p, &is_pad) in pad.iter().enumerate().take(npkt) {
-        let off = p * PKT;
         if is_pad {
+            let off = p * PKT;
             for b in unit[off..off + PKT].iter_mut() {
                 *b = 0;
             }
-        } else if unit[off + 4] != TS_SYNC {
-            return false; // a real content packet failed → genuinely undecryptable
         }
     }
-    true
+    // KEY-SELECTION verdict only: did this key OPEN the unit (restore the TS
+    // structure of a supermajority of content packets)? A wrong key can't; the
+    // right key can even when a few content packets are authored-bad. This is NOT
+    // a per-packet conformance gate — that belongs to the muxer.
+    unit_content_decrypted(unit)
 }
 
 /// Decrypt an AACS aligned unit in place, accepting the key only when `accept`
@@ -880,6 +902,192 @@ mod tests {
             !decrypt_unit(&mut unit, &key),
             "real prefix + non-zero garbage tail is NOT decryptable (misread)"
         );
+    }
+
+    // ── Defect-tolerant "did a key OPEN this unit?" verdict ─────────────────
+    //
+    // The Bourne-UHD bug: a commercial disc carries the odd authored-bad TS
+    // packet (a pressing/encoding defect, or an AACS 2.1 forensic-variant frame)
+    // — one non-conforming packet inside an otherwise perfectly-decrypted 6144
+    // unit. The OLD strict per-packet acceptance rejected the WHOLE unit over
+    // that single packet, so the mux concealed ~all of it as NULL and 21/22 good
+    // video packets were destroyed and tallied as loss ("false corruption").
+    // The read/decrypt path must instead ACCEPT the unit (the key opened it) and
+    // pass the defective packet through VERBATIM for the muxer to drop. TS-sync
+    // conformance is a muxer concern, never a decryption verdict.
+
+    /// Build a unit that decrypts to 32 content packets, with `defect_pkts`
+    /// marked authored-bad (a non-`0x47` at the sync position + non-zero payload
+    /// so they count as genuine content, not padding), encrypted under `key`.
+    fn unit_with_defects(key: &[u8; 16], defect_pkts: &[usize]) -> Vec<u8> {
+        let mut unit = clear_unit();
+        for &p in defect_pkts {
+            let off = p * BD_SOURCE_PACKET_BYTES;
+            unit[off + 4] = 0x80; // NOT a TS sync
+            unit[off + 5] = 0xAB; // non-zero payload => real content, not padding
+        }
+        aacs_encrypt_unit(&mut unit, key);
+        unit
+    }
+
+    /// A POST-DECRYPT-looking unit: `content` non-padding packets, `synced` of
+    /// them carrying `0x47`; the remaining packets are source-zero padding. CPI
+    /// (encrypted flag) set iff `cpi`. Feeds the key-independent predicates.
+    fn decrypted_shape(content: usize, synced: usize, cpi: bool) -> Vec<u8> {
+        let mut u = vec![0u8; ALIGNED_UNIT_LEN];
+        for p in 0..content {
+            let off = p * BD_SOURCE_PACKET_BYTES;
+            u[off + 5] = 0xAB; // non-zero payload => counted as content
+            u[off + 4] = if p < synced { TS_SYNC } else { 0x80 };
+        }
+        if cpi {
+            u[0] |= 0xC0;
+        }
+        u
+    }
+
+    #[test]
+    fn single_authored_bad_packet_still_decrypts_and_passes_verbatim() {
+        // 1 defective content packet in an otherwise-perfect unit (the real case).
+        let key = [0x5Au8; 16];
+        let mut unit = unit_with_defects(&key, &[17]);
+        assert!(
+            decrypt_unit(&mut unit, &key),
+            "31/32 content packets synced -> the key OPENED the unit"
+        );
+        let off = 17 * BD_SOURCE_PACKET_BYTES;
+        assert_eq!(
+            unit[off + 4],
+            0x80,
+            "defect packet's bytes pass through VERBATIM (no null-fill, no zeroing)"
+        );
+        assert_eq!(unit[off + 5], 0xAB, "defect payload untouched");
+        assert!(
+            !aacs_unit_still_ciphertext(&unit),
+            "an opened unit is NOT ciphertext -> the mux never conceals it"
+        );
+        for p in 0..32 {
+            if p == 17 {
+                continue;
+            }
+            assert_eq!(
+                unit[p * BD_SOURCE_PACKET_BYTES + 4],
+                TS_SYNC,
+                "every other packet restored its sync (pkt {p})"
+            );
+        }
+    }
+
+    #[test]
+    fn several_defect_packets_within_tolerance_still_decrypt() {
+        // Up to 25% authored-bad content packets are tolerated (opened + passed
+        // through); the muxer drops them.
+        let key = [0x33u8; 16];
+        let mut unit = unit_with_defects(&key, &[3, 9, 17, 24, 30]); // 5/32 ≈ 16%
+        assert!(
+            decrypt_unit(&mut unit, &key),
+            "27/32 synced (>=75%) -> opened"
+        );
+    }
+
+    #[test]
+    fn wrong_key_never_opens_a_unit() {
+        // A wrong key restores ~0 syncs -> far below the supermajority gate.
+        let key = [0x5Au8; 16];
+        let mut unit = clear_unit();
+        aacs_encrypt_unit(&mut unit, &key);
+        assert!(
+            !decrypt_unit(&mut unit, &[0x22u8; 16]),
+            "wrong key cannot open the unit"
+        );
+    }
+
+    #[test]
+    fn threshold_accepts_at_75pct_and_rejects_just_below() {
+        // 24/32 = exactly 75% opens; 23/32 does not.
+        assert!(unit_content_decrypted(&decrypted_shape(32, 24, false)));
+        assert!(!unit_content_decrypted(&decrypted_shape(32, 23, false)));
+    }
+
+    #[test]
+    fn still_ciphertext_tracks_the_open_verdict() {
+        // Fully clean -> opened, not ciphertext.
+        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 32, true)));
+        // One defect -> still opened, still not ciphertext.
+        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 31, true)));
+        // Wrong-key noise floor -> not opened -> ciphertext (concealable).
+        assert!(aacs_unit_still_ciphertext(&decrypted_shape(32, 3, true)));
+        // CPI-clear bytes are never "ciphertext" regardless of sync count.
+        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 0, false)));
+    }
+
+    #[test]
+    fn all_padding_unit_is_trivially_opened() {
+        // CPI set but every packet is source-zero padding: nothing to decrypt.
+        assert!(unit_content_decrypted(&decrypted_shape(0, 0, true)));
+        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(0, 0, true)));
+    }
+
+    #[test]
+    fn defect_count_boundary_via_real_decrypt() {
+        // Pin the 75% gate on the REAL decrypt path (not just the predicate):
+        // 8/32 defects => 24 synced = exactly 75% => opens; 9/32 => 23 synced =>
+        // does NOT open. Packets 1.. avoid the clear-seed packet 0.
+        let key = [0x77u8; 16];
+        let eight: Vec<usize> = (1..9).collect();
+        let mut u_ok = unit_with_defects(&key, &eight);
+        assert!(
+            decrypt_unit(&mut u_ok, &key),
+            "8 defects (24/32 = 75%) -> opened"
+        );
+        let nine: Vec<usize> = (1..10).collect();
+        let mut u_no = unit_with_defects(&key, &nine);
+        assert!(
+            !decrypt_unit(&mut u_no, &key),
+            "9 defects (23/32 < 75%) -> NOT opened (too corrupt / wrong key)"
+        );
+    }
+
+    #[test]
+    fn small_content_units_keep_the_wrong_key_floor() {
+        // Tiny content units are where a coincidental wrong-key sync matters most.
+        // The gate stays strict enough that a single fluke can't "open" them.
+        assert!(unit_content_decrypted(&decrypted_shape(2, 2, false))); // 2/2 -> open
+        assert!(!unit_content_decrypted(&decrypted_shape(2, 1, false))); // 1/2 -> not
+        assert!(unit_content_decrypted(&decrypted_shape(4, 3, false))); // 3/4=75% -> open
+        assert!(!unit_content_decrypted(&decrypted_shape(4, 2, false))); // 2/4 -> not
+    }
+
+    #[test]
+    fn fragment_tail_padding_plus_one_defect_still_decrypts() {
+        // Both tolerances at once: source-zero padding tail EXCLUDED, and the one
+        // authored-bad packet in the real prefix TOLERATED. 20 real packets
+        // (pkt 5 defective) => 19/20 synced => opened; padding emitted as zeros.
+        let key = [0x5Au8; 16];
+        let mut unit = clear_unit();
+        let off = 5 * BD_SOURCE_PACKET_BYTES;
+        unit[off + 4] = 0x80; // defect inside the real content
+        unit[off + 5] = 0xAB;
+        for b in unit[20 * BD_SOURCE_PACKET_BYTES..].iter_mut() {
+            *b = 0; // source-zero padding tail (packets 20..32)
+        }
+        aacs_encrypt_unit(&mut unit, &key);
+        assert!(
+            decrypt_unit(&mut unit, &key),
+            "19/20 real packets synced + zero pad -> opened"
+        );
+        assert_eq!(
+            unit[off + 4],
+            0x80,
+            "the defect packet passes through verbatim"
+        );
+        for p in 20..32 {
+            let o = p * BD_SOURCE_PACKET_BYTES;
+            assert!(
+                unit[o..o + BD_SOURCE_PACKET_BYTES].iter().all(|&b| b == 0),
+                "padding pkt {p} emitted as clean zeros"
+            );
+        }
     }
 
     #[test]
