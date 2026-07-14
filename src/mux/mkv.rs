@@ -121,6 +121,29 @@ fn mvc_decoder_config_record(subset_sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
     Some(record)
 }
 
+/// Build the `CodecPrivate` for an MVC (Blu-ray 3D) base track: the base view's
+/// `AVCDecoderConfigurationRecord` (`avcc`) followed by an `mvcC` extension
+/// block, per the Matroska Codec Specifications §4.3.9:
+///
+/// ```text
+/// avcC ‖ u32be(extension_block_size − 4) ‖ "mvcC" ‖ MVCDecoderConfigurationRecord
+/// ```
+///
+/// The size field is the extension block length **excluding the 4-byte size
+/// field itself** — i.e. `4 ("mvcC") + record.len()`. This is the track-level
+/// MVC signal that decoders and mediainfo read (the per-frame `BlockAdditional`
+/// under the `mvcC` BlockAdditionMapping carries the dependent view's data). A
+/// plain (2D) track never calls this — it writes its `avcc` verbatim.
+fn mvc_codec_private(avcc: &[u8], record: &[u8]) -> Vec<u8> {
+    let ext_size = (4 + record.len()) as u32; // "mvcC" (4) + record; = block size − 4
+    let mut out = Vec::with_capacity(avcc.len() + 8 + record.len());
+    out.extend_from_slice(avcc);
+    out.extend_from_slice(&ext_size.to_be_bytes());
+    out.extend_from_slice(b"mvcC");
+    out.extend_from_slice(record);
+    out
+}
+
 /// Resolve a video stream's CICP colour code points — `(matrix, transfer,
 /// primaries, range)`, ITU-T H.273 — using a single precedence so EVERY sink
 /// (the MKV muxer here AND the FVI sidecar in `videomap.rs`) agrees and can
@@ -882,9 +905,23 @@ impl<W: Write + Seek> MkvMuxer<W> {
         let mut track_uids: Vec<u64> = Vec::with_capacity(tracks.len());
         let mut ac3_channel_fixups: std::collections::HashMap<usize, Ac3ChannelFixup> =
             std::collections::HashMap::new();
+        // Per track: whether it emitted a conforming `mvcC` BlockAdditionMapping.
+        // Filled below from the SAME built record that drives the CodecPrivate
+        // mvcC extension, so the three MVC signals never diverge.
+        let mut track_has_mvc_mapping: Vec<bool> = Vec::with_capacity(tracks.len());
         for (i, track) in tracks.iter().enumerate() {
             let track_uid = (i + 1) as u64 | 0x100_0000;
             track_uids.push(track_uid);
+            // Build the MVC (Blu-ray 3D) MVCDecoderConfigurationRecord ONCE per
+            // track from the dependent view's subset-SPS/PPS. `None` for every
+            // non-3D track (and if the params are malformed) — the single source
+            // of truth for the CodecPrivate mvcC extension, the
+            // BlockAdditionMapping, and whether BlockAdditionals are conforming.
+            let mvc_record = track
+                .mvc_params
+                .as_ref()
+                .and_then(|(sps, pps)| mvc_decoder_config_record(sps, pps));
+            track_has_mvc_mapping.push(mvc_record.is_some());
             let entry_pos = ebml::start_master(&mut writer, ebml::TRACK_ENTRY)?;
             ebml::write_uint(&mut writer, ebml::TRACK_NUMBER, (i + 1) as u64)?;
             ebml::write_uint(&mut writer, ebml::TRACK_UID, track_uid)?;
@@ -904,7 +941,20 @@ impl<W: Write + Seek> MkvMuxer<W> {
             }
 
             if let Some(ref cp) = track.codec_private {
-                ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, cp)?;
+                match mvc_record.as_ref() {
+                    // MVC (Blu-ray 3D) base track: CodecPrivate = base-view avcC
+                    // followed by the `mvcC` extension block. This is the
+                    // track-level signal decoders/mediainfo read to recognise the
+                    // stereoscopic MVC track (the per-frame dependent view rides
+                    // in BlockAdditional under the mapping below).
+                    Some(record) => {
+                        let cp_mvc = mvc_codec_private(cp, record);
+                        ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, &cp_mvc)?;
+                    }
+                    // Non-MVC (2D/UHD/audio/…): write the codec_private verbatim —
+                    // the unchanged path, byte-identical to a 2D mux.
+                    None => ebml::write_binary(&mut writer, ebml::CODEC_PRIVATE, cp)?,
+                }
             }
             // Pre-0.13 a deferred codecPrivate path existed for video tracks
             // (placeholder reserve + later seek-back fill via
@@ -1004,8 +1054,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             // Video) carries the mvcC MVCDecoderConfigurationRecord so players /
             // mediainfo recognise the dependent (right-eye) view that rides as a
             // per-frame BlockAdditional under this mapping (BlockAddIDValue = 2).
-            if let Some((subset_sps, pps)) = track.mvc_params.as_ref() {
-                if let Some(record) = mvc_decoder_config_record(subset_sps, pps) {
+            match mvc_record.as_ref() {
+                Some(record) => {
                     let map_pos = ebml::start_master(&mut writer, ebml::BLOCK_ADDITION_MAPPING)?;
                     ebml::write_uint(
                         &mut writer,
@@ -1013,18 +1063,25 @@ impl<W: Write + Seek> MkvMuxer<W> {
                         BLOCK_ADD_ID_VALUE_MVC,
                     )?;
                     ebml::write_uint(&mut writer, ebml::BLOCK_ADD_ID_TYPE, BLOCK_ADD_ID_TYPE_MVCC)?;
-                    ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, &record)?;
+                    ebml::write_binary(&mut writer, ebml::BLOCK_ADD_ID_EXTRA_DATA, record)?;
                     ebml::end_master(&mut writer, map_pos)?;
-                } else {
+                }
+                // `mvc_params` present but the record failed to build (malformed
+                // parameter sets): no mapping, and `track_has_mvc_mapping` above
+                // is already `false`, so BlockAdditionals are dropped — the file
+                // stays conforming rather than carrying an orphaned BlockAddID.
+                None if track.mvc_params.is_some() => {
+                    let (s, p) = track.mvc_params.as_ref().unwrap();
                     tracing::warn!(
                         target: "mux",
                         "MVC track: could not build MVCDecoderConfigurationRecord from the \
                          dependent view's parameter sets (subset_sps={} B, pps={} B); \
                          emitting no mvcC mapping — the 3D pairing will not be signalled.",
-                        subset_sps.len(),
-                        pps.len(),
+                        s.len(),
+                        p.len(),
                     );
                 }
+                None => {}
             }
 
             // Dolby Vision signaling — BlockAdditionMapping is a child of the
@@ -1117,7 +1174,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             primary_video_track: tracks
                 .iter()
                 .position(|t| t.track_type == ebml::TRACK_TYPE_VIDEO),
-            track_has_mvc_mapping: tracks.iter().map(|t| t.mvc_params.is_some()).collect(),
+            track_has_mvc_mapping,
             continuity: TimelineContinuity::new(),
             cues: Vec::new(),
             frame_count: 0,
@@ -4598,6 +4655,60 @@ mod tests {
         .unwrap();
         let data = muxer.writer.into_inner();
         assert!(find_id(&data, ebml::BLOCK_ADDITION_MAPPING).is_none());
+    }
+
+    #[test]
+    fn mvc_codec_private_appends_mvcc_extension_block() {
+        // avcC ‖ u32be(4 + record.len()) ‖ "mvcC" ‖ record (Matroska Codec Spec §4.3.9).
+        let avcc = vec![0x01, 0x64, 0x00, 0x33, 0xFF, 0xE1, 0xAA];
+        let record = vec![0x01, 0x80, 0x00, 0x33, 0xBF, 0x01, 0xCC]; // 7 bytes
+        let out = mvc_codec_private(&avcc, &record);
+        assert_eq!(&out[..avcc.len()], &avcc[..], "avcC preserved verbatim");
+        // size field = 4 ("mvcC") + 7 (record) = 11 = extension block size minus 4.
+        assert_eq!(&out[avcc.len()..avcc.len() + 4], &11u32.to_be_bytes());
+        assert_eq!(&out[avcc.len() + 4..avcc.len() + 8], b"mvcC");
+        assert_eq!(
+            &out[avcc.len() + 8..],
+            &record[..],
+            "record after the mvcC fourcc"
+        );
+    }
+
+    #[test]
+    fn mvc_track_codec_private_carries_avcc_plus_mvcc() {
+        // An MVC base track's CodecPrivate must be the base avcC followed by the
+        // mvcC extension — the track-level signal mediainfo/decoders read.
+        let avcc = vec![
+            0x01, 0x64, 0x00, 0x33, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x64, 0x00, 0x33, 0x99,
+        ];
+        let subset_sps = vec![0x6F, 0x80, 0x00, 0x33, 0x11, 0x22];
+        let pps = vec![0x68, 0xEE, 0x3C];
+        let mut v = make_video_track();
+        v.codec_private = Some(avcc.clone());
+        v.mvc_params = Some((subset_sps.clone(), pps.clone()));
+        let data = MkvMuxer::new(Cursor::new(Vec::new()), &[v], None, 0.0, &[])
+            .unwrap()
+            .writer
+            .into_inner();
+        let record = mvc_decoder_config_record(&subset_sps, &pps).unwrap();
+        let expected = mvc_codec_private(&avcc, &record);
+        assert!(
+            data.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "emitted CodecPrivate must be avcC + mvcC extension"
+        );
+
+        // A non-MVC (2D) track writes its avcC VERBATIM — no mvcC appended.
+        let mut v2 = make_video_track();
+        v2.codec_private = Some(avcc.clone());
+        let d2 = MkvMuxer::new(Cursor::new(Vec::new()), &[v2], None, 0.0, &[])
+            .unwrap()
+            .writer
+            .into_inner();
+        assert!(
+            !d2.windows(4).any(|w| w == b"mvcC"),
+            "2D track CodecPrivate must not carry an mvcC extension"
+        );
     }
 
     // ---- CodecPrivate emission (avcC / hvcC / VC-1 / MPEG-2) -------------
