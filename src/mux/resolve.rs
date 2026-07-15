@@ -645,26 +645,20 @@ pub fn build_iso_pipeline<S: SectorSource + Send + 'static>(
         crate::decrypt::DecryptKeys::Aacs { .. } => 3,
         _ => 1,
     };
-    // MUX path: tolerate decrypt loss. An undecryptable content unit is concealed
-    // (NULL TS fill) + tallied + logged, never an abort — decrypt-verify is a RIP
-    // gate, not a mux gate (P3). The rip's own read paths keep their fail-loud
-    // decorator; only this mux pipeline opts in.
+    // MUX path: read > decrypt > mux. The decrypt seam applies the CPS unit key and
+    // passes the bytes to the muxer; a unit that decrypts to broken TS is the
+    // muxer's problem, not a decrypt failure, so the mux never conceals, re-fetches
+    // a key, or counts it as loss — it fails only when it genuinely can't decrypt
+    // (no key / misaligned unit). The `fetch` key-recovery seam is a rip/verify
+    // concern (Disc::sweep / Disc::patch), deliberately NOT installed on the mux:
+    // key recovery happens up front, and the mux never re-asks mid-stream.
     let mut decrypting =
         crate::sector::DecryptingSectorSource::new(Box::new(reader) as Box<dyn SectorSource>, keys)
             .tolerate_decrypt_loss();
-    // Install the fresh-key-on-failure callback (if any) so a unit no held key
-    // decrypts is re-tried via the application's key source before being counted
-    // as loss. An AACS 2.1 forensic-segment unit that no key opens is just an
-    // undecryptable unit like any other: concealed and counted as decrypt loss —
-    // a loss is a loss, no FMTS special casing.
-    if let Some(cb) = fetch {
-        decrypting = decrypting.with_key_fetch(cb);
-    }
-    // Grab the loss counters before the decorator is moved into the producer
-    // thread. It tracks bytes of scrambled AACS units no key could decrypt —
-    // silent loss the demux drops; the consuming stream surfaces it through
-    // `lost_bytes()` so the mux abort gate sees a partial decrypt failure rather
-    // than a clean rip. Forensic (2.1) undecryptable units land here too.
+    let _ = &fetch; // rip/verify key-recovery seam; the mux does not consume it
+    // Loss counter: the mux does not tally broken-TS units (the muxer handles them),
+    // so for a keyed disc this stays 0; it still surfaces via `lost_bytes()` for the
+    // abort gate, which now reflects only a genuine can't-decrypt.
     let decrypt_loss = decrypting.decrypt_loss();
 
     // Wrong-substream fix (Silence-of-the-Lambs): before the prefetcher takes

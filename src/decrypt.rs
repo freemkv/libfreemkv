@@ -180,14 +180,16 @@ impl DecryptKeys {
 /// Returns `Err` if decryption was expected but keys are missing or invalid.
 /// Never produces silently corrupted output.
 ///
-/// On success returns the number of bytes belonging to scrambled AACS units
-/// that **no available key could decrypt** — those units are restored to their
-/// original encrypted bytes (so a clear nav-file is never corrupted), but for
-/// genuine encrypted content this is silent data loss the downstream TS
-/// assembler will drop without a sync. The decrypt-on-read decorator folds this
-/// count into the mux loss accounting so a partial key failure can't be reported
-/// as a perfect rip. `0` for `None` / `Css` and for any AACS buffer where every
-/// scrambled unit decrypted.
+/// Pure decrypt: every encrypted unit has a key APPLIED in place and the
+/// plaintext is left as-is — this function applies NO policy (it never restores
+/// ciphertext, nulls, or re-fetches). On success it returns the number of bytes
+/// belonging to units a key was applied to but that did NOT reassemble to clean
+/// MPEG-TS ("unverified"). "Did a key open it to clean TS?" is a key-SELECTION /
+/// read-VERIFY signal, NOT a "did we decrypt?" verdict — a correct key can
+/// decrypt content whose encoding is broken. The caller decides what an
+/// unverified unit means: the mux passes the bytes to the muxer; the sweep/patch
+/// verify path recovers a key and retries, or fails the read. `0` for `None` /
+/// `Css` and for any AACS buffer where every unit reached clean TS.
 pub fn decrypt_sectors(
     buf: &mut [u8],
     keys: &mut DecryptKeys,
@@ -320,27 +322,31 @@ fn decrypt_sectors_impl(
             // accounting so a partial key failure isn't reported as a clean rip.
             let dropped_bytes = AtomicUsize::new(0);
 
-            // Per-unit decrypt closure. For a scrambled full aligned unit:
+            // Per-unit PURE decrypt closure. For a scrambled full aligned unit:
             //   1. Try the cached key index first (avoids scanning all keys on the
             //      common case where a disc run uses one CPS unit throughout).
             //   2. On miss, try every key in order (multi-CPS-unit discs).
-            //   3. Accept the first key whose output passes the TS-sync verify.
-            //   4. Only restore-to-original if NO key validates (non-m2ts unit or
-            //      genuine decrypt failure). See test
-            //      `nav_file_unit_survives_decrypt_attempt`.
+            //   3. Select the first key whose output passes the TS-sync verify.
+            //   4. If NONE yields clean TS, keep the applied-key plaintext anyway
+            //      (a key WAS applied — bad TS is the caller's/muxer's concern) and
+            //      tally the unit as unverified. Never restore ciphertext / null.
+            //      Nav protection is the caller's content gate, not a restore here.
             //
             // If a read_data_key is present (AACS 2.0 bus encryption), bus-decrypt
             // must happen first — it's a shared layer on top that is key-independent
             // across all CPS units on the disc.
             let decrypt_one = |chunk: &mut [u8]| {
+                // Gate on `aacs_unit_needs_decrypt` (CPI set AND TS syncs not yet
+                // restored): CPI alone isn't enough because the plaintext seed keeps
+                // the CPI bit set after decryption, so an already-decrypted unit would
+                // be decrypted a SECOND time (scrambling it) on any re-run of this
+                // pass. The intact-TS half makes it idempotent.
                 if chunk.len() != unit_len || !aacs::content::aacs_unit_needs_decrypt(chunk) {
                     return;
                 }
-                // Save original bytes so we can restore if no key validates.
-                let original: Vec<u8> = chunk.to_vec();
 
-                // Build a bus-decrypted copy to try unit keys against, or work
-                // in-place when there is no bus layer.
+                // Bus-decrypt (AACS 2.0) in place first — a shared layer under every
+                // CPS unit key. Whatever we do below operates on the bus-clear bytes.
                 if let Some(ref rdk_key) = rdk {
                     aacs::content::decrypt_bus(chunk, rdk_key);
                 }
@@ -351,6 +357,17 @@ fn decrypt_sectors_impl(
                 let try_order =
                     std::iter::once(hint).chain((0..raw_keys.len()).filter(move |&i| i != hint));
 
+                // DECRYPT the unit — apply a key, leave the plaintext. "Did a key
+                // produce clean TS?" is NOT "did we decrypt?": a correct key can
+                // decrypt content whose underlying encoding is broken (bad TS sync),
+                // which is a MUXER concern, never a decrypt verdict. Clean TS is used
+                // ONLY as a key-SELECTION hint on multi-CPS-unit discs — the first
+                // key that yields clean TS is the definite match. When none does we
+                // STILL decrypted (the cached-hint key is applied): keep those bytes
+                // and report the unit as UNVERIFIED. This function applies no policy;
+                // the caller decides what an unverified unit means (the mux passes it
+                // to the muxer; sweep/patch treat it as a read to recover or fail).
+                let mut applied: Option<Vec<u8>> = None;
                 for idx in try_order {
                     if let Some(key) = raw_keys.get(idx) {
                         // Work on a per-key copy so a failing attempt doesn't
@@ -361,17 +378,19 @@ fn decrypt_sectors_impl(
                             last_key_idx.store(idx, Ordering::Relaxed);
                             return;
                         }
+                        if applied.is_none() {
+                            applied = Some(attempt);
+                        }
                     }
                 }
 
-                // No key validated — restore the original encrypted bytes and
-                // tally the loss. The unit is flagged encrypted (we only reach
-                // here past the CPI gate) but no key applied: genuine encrypted
-                // content with a missing/wrong sub-key. We always tally; the mux
-                // read path treats
-                // the count as loss (its extents are real content), while
-                // metadata-probe callers that don't install a loss sink ignore it.
-                chunk.copy_from_slice(&original);
+                // No key yielded clean TS. Keep the applied-key plaintext (the pool is
+                // non-empty past the guard, so `applied` is always `Some`) and tally
+                // the unit as unverified. Never restore ciphertext; that is a caller
+                // concern, threaded through the recovery ciphertext, not this seam.
+                if let Some(decrypted) = applied {
+                    chunk.copy_from_slice(&decrypted);
+                }
                 dropped_bytes.fetch_add(chunk.len(), Ordering::Relaxed);
             };
 
@@ -442,13 +461,15 @@ fn decrypt_sectors_impl(
 mod tests {
     use super::*;
 
-    /// Regression for the 0.18.1 nav-file scramble bug. A non-m2ts unit (here
-    /// an MPLS file: starts "MPLS", carries no TS syncs) reads as scrambled
-    /// under `ts_sync_destroyed`, gets AES-decrypted with the unit key, fails
-    /// the TS-sync verification, and must be restored to its original bytes —
-    /// not left scrambled.
+    /// Regression for the 0.18.1 nav-file scramble bug, modern form. A non-m2ts
+    /// unit (here an MPLS file: starts "MPLS", whose byte-0 'M'=0x4D coincidentally
+    /// sets the CPI bits, so it reads as encrypted) must never be scrambled by a
+    /// decrypt attempt. The decrypter applies NO policy and no longer restores — so
+    /// nav protection is the CALLER's content gate: a real read (sweep/patch) is
+    /// content-gated, and every whole-disc caller passes the encrypted-content
+    /// extents so nav LBAs are skipped entirely and left untouched.
     #[test]
-    fn nav_file_unit_survives_decrypt_attempt() {
+    fn nav_file_unit_survives_when_gated_out_of_content() {
         let mut unit = vec![0u8; aacs::content::ALIGNED_UNIT_LEN];
         unit[0] = b'M';
         unit[1] = b'P';
@@ -463,10 +484,12 @@ mod tests {
             unit_keys: vec![(0, [0xAB; 16])],
             read_data_key: None,
         };
-        decrypt_sectors(&mut unit, &mut keys, 0).unwrap();
+        // The unit sits at LBA 0..3; the content extents are elsewhere (100..110),
+        // so this nav unit is OUTSIDE content and the gate skips it untouched.
+        decrypt_sectors_in_content(&mut unit, &mut keys, 0, 0, &[(100, 10)]).unwrap();
         assert_eq!(
             unit, snapshot,
-            "non-m2ts unit must be restored after failed decrypt"
+            "a nav unit outside the content extents must be left untouched by the gate"
         );
     }
 
@@ -1290,21 +1313,18 @@ mod tests {
         );
     }
 
-    /// Regression for the silent partial-decrypt-loss defect: a scrambled AACS
-    /// unit that NO supplied key can decrypt is restored to its original
-    /// ciphertext (so a clear nav-file is never corrupted) AND `decrypt_sectors`
-    /// returns the unit's byte length as the dropped count. Before the fix this
-    /// returned `()` and the still-encrypted bytes flowed downstream to be
-    /// silently dropped by the TS assembler with zero loss accounting — a rip
-    /// missing real content reported `lost_video_secs=0` and passed the abort
-    /// gate even under `abort_on_lost_secs=0`.
+    /// A unit no supplied key opens to clean TS is still DECRYPTED in place (the
+    /// key is applied — decryption ran; a broken result is bad data, not a decrypt
+    /// failure) and NEVER restored to ciphertext. `decrypt_sectors` still returns
+    /// the unit's byte length as the UNVERIFIED count — the read-verify signal the
+    /// sweep/patch caller consumes (the mux ignores it and passes the bytes to the
+    /// muxer). This is the single decrypt authority applying no policy.
     ///
-    /// Grounding: the `dropped_bytes.fetch_add(chunk.len(), …)` on the
-    /// no-key-validated restore path; the function returns that tally.
-    /// Mutation: drop the `fetch_add` (or return a constant 0) → dropped == 0,
-    /// this fails.
+    /// Grounding: `dropped_bytes.fetch_add(chunk.len(), …)` in `decrypt_one`, and
+    /// the removal of the `copy_from_slice(&original)` restore.
+    /// Mutation: re-add the restore → `buf == ciphertext`, this fails.
     #[test]
-    fn aacs_undecryptable_unit_reports_dropped_bytes() {
+    fn aacs_undecryptable_unit_is_decrypted_not_restored() {
         let real_key = [0x33u8; 16];
         let wrong_key = [0x44u8; 16]; // not the encrypting key
 
@@ -1322,17 +1342,17 @@ mod tests {
             read_data_key: None,
         };
         let mut buf = unit;
-        let dropped = decrypt_sectors(&mut buf, &mut keys, 0)
-            .expect("undecryptable unit is not a hard error");
+        let unverified =
+            decrypt_sectors(&mut buf, &mut keys, 0).expect("applying a key is never a hard error");
 
         assert_eq!(
-            dropped,
+            unverified,
             aacs::content::ALIGNED_UNIT_LEN,
-            "the whole scrambled unit must be reported as dropped when no key validates"
+            "a unit that did not reach clean TS is reported unverified"
         );
-        assert_eq!(
+        assert_ne!(
             buf, ciphertext,
-            "an undecryptable unit must be restored to its original ciphertext, not garbled"
+            "the unit must be DECRYPTED in place (key applied), never restored to ciphertext"
         );
     }
 
@@ -1369,16 +1389,16 @@ mod tests {
         assert_eq!(
             dropped,
             aacs::content::ALIGNED_UNIT_LEN,
-            "exactly one unit's worth of bytes must be reported dropped"
+            "exactly one unit's worth of bytes must be reported unverified"
         );
         assert!(
             !aacs::content::ts_sync_destroyed(&buf[..aacs::content::ALIGNED_UNIT_LEN]),
             "the decryptable unit must come out clear"
         );
-        assert_eq!(
+        assert_ne!(
             &buf[aacs::content::ALIGNED_UNIT_LEN..],
             &unit_b_ciphertext[..],
-            "the undecryptable unit must be restored to ciphertext"
+            "the unverified unit is DECRYPTED in place (key applied), never restored to ciphertext"
         );
     }
 
