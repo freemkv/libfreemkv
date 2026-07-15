@@ -1,5 +1,47 @@
 # Changelog
 
+## [1.4.2] — 2026-07-15
+
+### Fixed
+
+- **Mux no longer nulls decryptable video or storms the key server on a
+  bad-encoded region.** 1.4.1 relaxed the decrypt gate but left the surrounding
+  machinery in place. On a unit that a key *decrypted* but that did not
+  reassemble to clean MPEG-TS, the read path still restored the ciphertext,
+  tallied it as loss, re-asked the online key server (which returned the same
+  correct key, forever), and the mux concealed the unit as NULL TS. On a UHD
+  title with an authored bad-encoded run this stalled each region for 30–90 s per
+  unit — the key server brute-forcing and re-returning the one right key — while
+  nulling video that had, in fact, already decrypted. The root cause was one
+  conflation duplicated across several sites: *"did a key produce clean TS?"* was
+  treated as the verdict *"did we decrypt?"*. They are not the same — a correct
+  key can decrypt content whose underlying encoding is broken, and broken TS is a
+  muxer concern (the demuxer drops the packet and resyncs), never a decrypt
+  verdict.
+
+### Changed
+
+- **One decrypt authority; policy at the caller.** `decrypt_sectors` is now a
+  pure decrypt: it applies the CPS unit key to every encrypted unit in place,
+  leaves the plaintext, and reports how many bytes did not reach clean TS
+  ("unverified"). It never restores ciphertext, nulls, or re-fetches a key.
+  Clean TS is used only as a multi-key *selection* hint and a read *verify*
+  signal. The callers decide what an unverified unit means:
+  - **mux** (`read → decrypt → mux`): pass the decrypted bytes to the muxer,
+    whatever they are; the muxer handles bad TS. The mux never conceals,
+    re-fetches, or counts broken TS as loss — it fails loud only when it
+    genuinely cannot decrypt (no key / misaligned unit), since a mux over
+    already-captured data must otherwise always succeed.
+  - **sweep / patch** (reading from a disc): an unverified unit means the read
+    did not prove out; recover a fresh key and retry, or fail the read so the
+    disc-recovery path re-reads it.
+
+  This removes three duplicated decisions — the decrypt-time ciphertext restore,
+  the mux NULL-TS conceal loop, and the per-unit key-server refetch — and the
+  dead `aacs_unit_still_ciphertext` predicate. The key-fetch recovery now samples
+  the on-disc ciphertext explicitly (a pure decrypt leaves the buffer plaintext)
+  and lives only on the rip/verify path, never the mux.
+
 ## [1.4.1] — 2026-07-14
 
 ### Fixed

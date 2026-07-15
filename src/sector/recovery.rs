@@ -103,25 +103,30 @@ pub struct RecoverCtx {
     pub prev_dropped: usize,
 }
 
-/// A recovery: given a read's still-scrambled `buf` and the **generic**
-/// [`DecryptKeys`], make units decrypt (crack or fetch a key into `keys`) and/or
-/// classify the loss (see [`MissOutcome`]). The type names NO encryption scheme
-/// — the installed recovery decides what to do with the generic keys, so any
-/// scheme (an AACS key-fetch, a future CSS re-crack) is just a different
-/// [`Recover`] the input stream installs. `FnMut` so per-recovery
-/// state (the AACS dedup set / call budget) lives in the closure's captures with
-/// no lock; `Send` so it can ride the mux highway's producer thread.
-pub type Recover = Box<dyn FnMut(&mut [u8], &mut DecryptKeys, &RecoverCtx) -> MissOutcome + Send>;
+/// A recovery: given a read's post-decrypt `target` (pure decrypt leaves the
+/// applied-key plaintext), the matching on-disc `ciphertext`, and the **generic**
+/// [`DecryptKeys`], make units decrypt (fetch a key into `keys` and retry) and/or
+/// classify the loss (see [`MissOutcome`]). Decryption itself lives in ONE place
+/// (`decrypt_sectors`); a recovery only supplies the missing KEY and re-runs it.
+/// `ciphertext` is separate from `target` because a pure decrypt overwrites the
+/// target with plaintext — the key server still needs the original on-disc bytes,
+/// and the retry re-decrypts from them. The type names NO encryption scheme; any
+/// scheme is just a different [`Recover`] the input stream installs. `FnMut` so
+/// per-recovery state (dedup set / call budget) lives in the closure's captures;
+/// `Send` so it can ride the mux highway's producer thread.
+pub type Recover =
+    Box<dyn FnMut(&mut [u8], &[u8], &mut DecryptKeys, &RecoverCtx) -> MissOutcome + Send>;
 
-/// The AACS key-fetch step used by [`key_fetch`]: gather the
-/// still-scrambled units, ask `fetch` for keys, add any new ones to the pool and
-/// re-decrypt. `dry` / `calls` are the caller-owned dedup set and call budget.
-/// Returns the post-retry dropped-byte count.
+/// The AACS key-fetch step used by [`key_fetch`]: gather the units the pool did
+/// NOT open, ask `fetch` for keys, add any new ones to the pool and re-decrypt.
+/// `dry` / `calls` are the caller-owned dedup set and call budget. Returns the
+/// post-retry unverified-byte count.
 fn aacs_fetch_step(
     dry: &mut HashSet<u64>,
     calls: &mut usize,
     fetch: &KeyFetch,
-    buf: &mut [u8],
+    target: &mut [u8],
+    ciphertext: &[u8],
     keys: &mut DecryptKeys,
     ctx: &RecoverCtx,
 ) -> usize {
@@ -130,14 +135,19 @@ fn aacs_fetch_step(
         return prev_dropped;
     }
     let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
-    // Gather up to MAX_FETCH_SAMPLES still-scrambled aligned units — the exact
-    // on-disc ciphertext no held key could open. A trailing partial unit
+    // Gather up to MAX_FETCH_SAMPLES units the current pool did NOT open. Detect
+    // them on the post-decrypt TARGET (a failed unit stays TS-destroyed; an opened
+    // one is now clean TS and is skipped), but SAMPLE the matching on-disc
+    // `ciphertext` — the exact bytes the key server needs. A trailing partial unit
     // (chunks_exact remainder) can't be a whole scrambled unit, so skipping it is
     // correct.
     let mut samples: Vec<Vec<u8>> = Vec::new();
-    for chunk in buf.chunks_exact(unit_len) {
-        if crate::aacs::content::aacs_unit_needs_decrypt(chunk) {
-            samples.push(chunk.to_vec());
+    for (t, c) in target
+        .chunks_exact(unit_len)
+        .zip(ciphertext.chunks_exact(unit_len))
+    {
+        if crate::aacs::content::aacs_unit_needs_decrypt(t) {
+            samples.push(c.to_vec());
             if samples.len() >= MAX_FETCH_SAMPLES {
                 break;
             }
@@ -172,10 +182,13 @@ fn aacs_fetch_step(
         dry.extend(fps);
         return prev_dropped;
     }
-    // Retry now that the pool has grown; a unit that still won't decrypt is
-    // genuine loss. A retry error must not mask the original count.
+    // Retry now that the pool has grown. Reset the target to the on-disc
+    // ciphertext first (a pure decrypt already overwrote it with the failed
+    // plaintext), then re-run the ONE decrypt. A unit that still won't reach clean
+    // TS stays unverified; a retry error must not mask the original count.
+    target.copy_from_slice(ciphertext);
     redecrypt(
-        buf,
+        target,
         keys,
         ctx.unit_key_idx,
         ctx.lba,
@@ -187,7 +200,7 @@ fn aacs_fetch_step(
 /// No recovery: a miss is loss. Equivalent to installing nothing — provided so a
 /// caller that wants an explicit "give up" recovery has one.
 pub fn none() -> Recover {
-    Box::new(|_buf, _keys, ctx| MissOutcome::loss(ctx.prev_dropped))
+    Box::new(|_target, _ciphertext, _keys, ctx| MissOutcome::loss(ctx.prev_dropped))
 }
 
 /// AACS key-fetch recovery (BD / UHD): on a miss, ask the application's key
@@ -195,9 +208,9 @@ pub fn none() -> Recover {
 pub fn key_fetch(fetch: KeyFetch) -> Recover {
     let mut dry: HashSet<u64> = HashSet::new();
     let mut calls: usize = 0;
-    Box::new(move |buf, keys, ctx| {
+    Box::new(move |target, ciphertext, keys, ctx| {
         MissOutcome::loss(aacs_fetch_step(
-            &mut dry, &mut calls, &fetch, buf, keys, ctx,
+            &mut dry, &mut calls, &fetch, target, ciphertext, keys, ctx,
         ))
     })
 }
@@ -244,7 +257,8 @@ mod tests {
             unit_keys: vec![],
             read_data_key: None,
         };
-        let out = r(&mut buf, &mut keys, &ctx(0, 6144));
+        let cipher = buf.clone();
+        let out = r(&mut buf, &cipher, &mut keys, &ctx(0, 6144));
         assert_eq!(out.dropped, 6144);
     }
 
@@ -266,7 +280,8 @@ mod tests {
             unit_keys: vec![],
             read_data_key: None,
         };
-        r(&mut buf, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
+        let cipher = buf.clone();
+        r(&mut buf, &cipher, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "fetch called once");
         let DecryptKeys::Aacs { unit_keys, .. } = &keys else {
             unreachable!()
@@ -291,9 +306,11 @@ mod tests {
             read_data_key: None,
         };
         let mut buf = scrambled_unit(0x44);
-        r(&mut buf, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
+        let cipher = buf.clone();
+        r(&mut buf, &cipher, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
         let mut buf2 = scrambled_unit(0x44); // identical ciphertext
-        r(&mut buf2, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
+        let cipher2 = buf2.clone();
+        r(&mut buf2, &cipher2, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -319,7 +336,8 @@ mod tests {
         // so the decorator can call it unconditionally.
         for i in 0..(MAX_FETCH_CALLS as u8 + 5) {
             let mut buf = scrambled_unit(i);
-            r(&mut buf, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
+            let cipher = buf.clone();
+            r(&mut buf, &cipher, &mut keys, &ctx(0, ALIGNED_UNIT_LEN));
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),

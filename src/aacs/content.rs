@@ -167,16 +167,6 @@ pub fn unit_content_decrypted(unit: &[u8]) -> bool {
     content == 0 || synced * 4 >= content * 3
 }
 
-/// "Is this aligned unit STILL genuine ciphertext (no held key opened it)?" — the
-/// conceal-path twin of [`unit_content_decrypted`], run on the POST-decrypt
-/// bytes. True iff the unit is flagged encrypted (CPI set) AND no key opened it
-/// (below the supermajority-sync gate). A unit the right key opened — even one
-/// carrying a few defective packets — is NOT ciphertext and is never concealed;
-/// its bytes belong to the muxer.
-pub fn aacs_unit_still_ciphertext(unit: &[u8]) -> bool {
-    aacs_unit_encrypted(unit) && !unit_content_decrypted(unit)
-}
-
 /// Overwrite an aligned unit (6144 bytes) IN PLACE with valid NULL MPEG-TS
 /// source packets — the [A2] mux loss-concealment fill for a content unit that
 /// genuinely would not decrypt.
@@ -962,10 +952,6 @@ mod tests {
             "defect packet's bytes pass through VERBATIM (no null-fill, no zeroing)"
         );
         assert_eq!(unit[off + 5], 0xAB, "defect payload untouched");
-        assert!(
-            !aacs_unit_still_ciphertext(&unit),
-            "an opened unit is NOT ciphertext -> the mux never conceals it"
-        );
         for p in 0..32 {
             if p == 17 {
                 continue;
@@ -1010,22 +996,9 @@ mod tests {
     }
 
     #[test]
-    fn still_ciphertext_tracks_the_open_verdict() {
-        // Fully clean -> opened, not ciphertext.
-        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 32, true)));
-        // One defect -> still opened, still not ciphertext.
-        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 31, true)));
-        // Wrong-key noise floor -> not opened -> ciphertext (concealable).
-        assert!(aacs_unit_still_ciphertext(&decrypted_shape(32, 3, true)));
-        // CPI-clear bytes are never "ciphertext" regardless of sync count.
-        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(32, 0, false)));
-    }
-
-    #[test]
     fn all_padding_unit_is_trivially_opened() {
         // CPI set but every packet is source-zero padding: nothing to decrypt.
         assert!(unit_content_decrypted(&decrypted_shape(0, 0, true)));
-        assert!(!aacs_unit_still_ciphertext(&decrypted_shape(0, 0, true)));
     }
 
     #[test]
@@ -1605,61 +1578,5 @@ mod tests {
         assert_eq!(ts_packet_total(&[0u8; 191]), 0);
         // 6144 = 32 packets.
         assert_eq!(ts_packet_total(&[0u8; ALIGNED_UNIT_LEN]), 32);
-    }
-
-    /// Direct coverage for the padding-aware conceal predicate. It must conceal
-    /// ONLY genuinely-undecryptable ciphertext — never a decrypted unit (full or
-    /// short padding-tail), a clear/non-encrypted unit, or an all-zero unit.
-    #[test]
-    fn aacs_unit_still_ciphertext_is_padding_aware() {
-        let pkt = BD_SOURCE_PACKET_BYTES;
-        // Build a 32-packet aligned unit. `cpi` sets the AACS CPI bits (byte 0).
-        // Per packet: b'S' = decrypted TS (0x47 sync + non-zero payload),
-        // b'C' = ciphertext (non-zero payload, no sync), b'P' = zero padding.
-        let build = |cpi: bool, kinds: &[u8]| {
-            let mut u = vec![0u8; ALIGNED_UNIT_LEN];
-            if cpi {
-                u[0] = 0xC0; // CPI bits in the packet-0 header (not the payload)
-            }
-            for (i, &k) in kinds.iter().enumerate() {
-                let off = i * pkt;
-                match k {
-                    b'S' => {
-                        u[off + 4] = TS_SYNC;
-                        for b in &mut u[off + 5..off + pkt] {
-                            *b = 0x10;
-                        }
-                    }
-                    b'C' => {
-                        // Scrambled: non-zero payload, no 0x47 at the sync position.
-                        for b in &mut u[off + 4..off + pkt] {
-                            *b = 0x5A;
-                        }
-                    }
-                    _ => {} // b'P' → leave zero
-                }
-            }
-            u
-        };
-
-        // Not encrypted (CPI clear) → never concealed, even if it looks scrambled.
-        assert!(!aacs_unit_still_ciphertext(&build(false, &[b'C'; 32])));
-        // All-zero unit (CPI clear) → not encrypted → false.
-        assert!(!aacs_unit_still_ciphertext(&build(false, &[b'P'; 32])));
-        // Fully decrypted (all packets carry their sync) → false.
-        assert!(!aacs_unit_still_ciphertext(&build(true, &[b'S'; 32])));
-        // Fully ciphertext (no packet carries its sync) → true.
-        assert!(aacs_unit_still_ciphertext(&build(true, &[b'C'; 32])));
-        // Decrypted SHORT padding-tail: 11 content packets + 21 zero padding. The
-        // majority vote would mis-flag it (<16 syncs); the padding-aware predicate
-        // skips the zero padding and sees every non-zero packet has its sync.
-        let mut tail = [b'P'; 32];
-        for k in tail.iter_mut().take(11) {
-            *k = b'S';
-        }
-        assert!(
-            !aacs_unit_still_ciphertext(&build(true, &tail)),
-            "a decrypted short padding-tail must NOT be flagged as ciphertext"
-        );
     }
 }
