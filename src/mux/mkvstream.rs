@@ -1016,7 +1016,11 @@ fn parse_track(
                     arem = arem.saturating_sub(ahlen as u64 + as_);
                     match aid {
                         ebml::SAMPLING_FREQUENCY => sr = ebml::read_float_val(r, as_ as usize)?,
-                        ebml::CHANNELS => ch = read_uint_bounded(r, as_)? as u8,
+                        // Clamp instead of `as u8`: a foreign/corrupt MKV with a
+                        // CHANNELS value that is a multiple of 256 would truncate to
+                        // 0 (an invalid channel count) on a bare cast. Saturate to
+                        // u8::MAX so an absurd count degrades to "many", never to 0.
+                        ebml::CHANNELS => ch = read_uint_bounded(r, as_)?.min(u8::MAX as u64) as u8,
                         _ => {
                             skip_bytes(r, as_)?;
                         }

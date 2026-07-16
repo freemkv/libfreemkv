@@ -311,15 +311,11 @@ impl Disc {
     ) -> Result<AacsState> {
         use crate::aacs;
 
-        let uk_ro_data = udf_fs
-            .read_file(reader, crate::aacs::PATH_UNIT_KEY_RO)
-            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_UNIT_KEY_RO_DUPLICATE))
-            .map_err(|_| Error::AacsNoKeys)?;
+        let uk_ro_data =
+            aacs::read_first(aacs::UNIT_KEY_RO_PATHS, |p| udf_fs.read_file(reader, p))?;
         let dh = aacs::inf::disc_hash(&uk_ro_data);
 
-        let cc = udf_fs
-            .read_file(reader, crate::aacs::PATH_CONTENT_CERT)
-            .or_else(|_| udf_fs.read_file(reader, crate::aacs::PATH_CONTENT_CERT_ALT))
+        let cc = aacs::read_first(aacs::CONTENT_CERT_PATHS, |p| udf_fs.read_file(reader, p))
             .ok()
             .as_deref()
             .and_then(aacs::inf::parse_content_cert);

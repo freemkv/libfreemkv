@@ -12,9 +12,11 @@ use crate::consts::TS_PACKET_BYTES;
 
 /// TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
-/// MPEG-TS null-packet PID (0x1FFF). Carries no elementary stream; the P3
-/// concealment fill emits null packets on this PID, tagged with an
-/// adaptation-field discontinuity_indicator to signal a concealed gap.
+/// MPEG-TS null-packet PID (0x1FFF). Carries no elementary stream. The demuxer
+/// still recognises a `0x1FFF` packet with an adaptation-field
+/// discontinuity_indicator as a concealed-gap loss signal, but the in-tree WRITER
+/// that emitted these (the removed NULL-TS concealment fill) is gone — the mux no
+/// longer conceals; only externally-authored markers reach this path now.
 const NULL_PID: u16 = 0x1FFF;
 
 /// A reassembled PES packet with timestamp info.
@@ -34,8 +36,10 @@ pub struct PesPacket {
     pub source: Option<crate::pes::SourcePos>,
     /// True when one or more packets for this stream were lost before this PES —
     /// a continuity break (CC gap or adaptation-field discontinuity_indicator) on
-    /// a tracked PID, or the CC-independent concealment marker the mux emits when
-    /// it replaces an undecryptable unit with NULL-TS packets (P3/A2). This PES is
+    /// a tracked PID, or a CC-independent NULL-TS concealment marker (P3/B1). NOTE:
+    /// the mux no longer emits such markers (the concealment writer was removed);
+    /// this now flags only real discontinuities and externally-authored markers.
+    /// This PES is
     /// the FIRST whose data is entirely after the gap: a mid-frame loss drops the
     /// truncated partial and flags the next complete PES; a loss landing on a PES
     /// boundary flags the PES STARTING after it (never the one just flushed). So
@@ -200,7 +204,7 @@ impl PesAssembler {
 /// BD Transport Stream demuxer.
 pub struct TsDemuxer {
     assemblers: Vec<PesAssembler>,
-    pid_index: Vec<i16>, // PID → index into assemblers, -1 = not tracked
+    pid_index: Vec<i32>, // PID → index into assemblers, -1 = not tracked
     remainder: Vec<u8>,  // leftover bytes from previous feed() call
     /// Absolute source byte offset of the NEXT byte to be fed — the running
     /// base that turns an in-buffer packet offset into a source position.
@@ -224,20 +228,17 @@ impl TsDemuxer {
     /// limits. Empty `pids` yields max_pid 0; the floor still produces a
     /// valid (wholly-unused) table.
     pub fn new(pids: &[u16]) -> Self {
-        // The PID→assembler index is stored as i16 (-1 = untracked), so a
-        // 32768th+ tracked PID would truncate to a negative value and be
-        // silently treated as untracked. Callers pass a handful of PIDs
-        // (BD-TS has at most ~8192), so this is a programmer-error guard.
-        debug_assert!(
-            pids.len() <= i16::MAX as usize,
-            "TsDemuxer: too many PIDs for an i16 index table"
-        );
+        // The PID→assembler index is stored as i32 (-1 = untracked). PIDs are
+        // u16 (≤ 65535) and the assembler index `i` is bounded by the number of
+        // distinct PIDs (≤ 65536), both far below i32::MAX, so `i as i32` can
+        // never truncate to a negative value and be mis-read as untracked —
+        // unlike an i16 table, this is safe in RELEASE, not just under debug.
         let max_pid = pids.iter().copied().max().unwrap_or(0) as usize;
         let table_size = (max_pid + 1).max(8192);
-        let mut pid_index = vec![-1i16; table_size];
+        let mut pid_index = vec![-1i32; table_size];
         let mut assemblers = Vec::with_capacity(pids.len());
         for (i, &pid) in pids.iter().enumerate() {
-            pid_index[pid as usize] = i as i16;
+            pid_index[pid as usize] = i as i32;
             assemblers.push(PesAssembler::new(pid));
         }
         Self {
@@ -368,10 +369,13 @@ impl TsDemuxer {
         let pusi = ts[1] & 0x40 != 0; // Payload Unit Start Indicator
         let adaptation = (ts[3] >> 4) & 0x03;
 
-        // P3/B1 CONCEALMENT MARKER. The decrypt layer fills an undecryptable
-        // aligned unit with NULL-TS packets (PID 0x1FFF) that carry an
-        // adaptation-field discontinuity_indicator (see `aacs::content::fill_null_ts_unit`).
-        // This is the authoritative loss signal — unlike a tracked PID's 4-bit
+        // P3/B1 CONCEALMENT MARKER: a NULL-TS packet (PID 0x1FFF) carrying an
+        // adaptation-field discontinuity_indicator. NOTE: the in-tree writer that
+        // laid these down on an undecryptable unit was removed with the pure-decrypt
+        // passthrough change (the mux no longer conceals), so this recognition now
+        // only fires on externally-authored markers — a candidate for removal with
+        // the rest of the retired concealment path.
+        // As a loss signal it is CC-INDEPENDENT — unlike a tracked PID's 4-bit
         // continuity_counter it is CC-INDEPENDENT, so it survives a loss that is
         // an exact multiple of 16 packets and a loss at the very start of a PID
         // (no prior CC to diff against). The decrypt layer cannot know which
@@ -1057,7 +1061,7 @@ mod tests {
 
     /// One 192-byte BD source packet that is a B1 concealment marker: a PID-0x1FFF
     /// null packet carrying the adaptation-field discontinuity_indicator (the byte
-    /// shape `fill_null_ts_unit` writes for every packet of a concealed unit).
+    /// shape of a concealed-unit packet).
     fn null_marker_packet() -> Vec<u8> {
         let mut pkt = vec![0u8; BD_SOURCE_PACKET_BYTES];
         pkt[4] = SYNC_BYTE; // 0x47

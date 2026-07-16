@@ -16,7 +16,6 @@
 use crate::decrypt::{DecryptKeys, decrypt_sectors, decrypt_sectors_in_content};
 use crate::error::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::SectorSource;
 
@@ -37,34 +36,6 @@ use super::SectorSource;
 /// path (sweep / patch / mux); no per-decorator factory is needed. `Send + Sync`
 /// so it can ride the mux highway's producer thread.
 pub type KeyFetch = std::sync::Arc<dyn Fn(&[Vec<u8>]) -> Vec<[u8; 16]> + Send + Sync>;
-
-/// Cap on how many per-unit decrypt-verify-failure diagnostics one read emits.
-/// The diagnostic runs only on the failure (cold) path and bounds log volume so
-/// a large undecryptable range can't flood the device log; the first few units
-/// of any failed read fully characterise it (all-zero vs ciphertext, latency,
-/// best-key-fit).
-const MAX_DIAG_UNITS_PER_READ: usize = 4;
-
-/// Master switch: "a read is not successful unless it also DECRYPTS."
-///
-/// When `true`, a read that returns scrambled AACS units which NO held key
-/// (after any fetch) could decrypt fails loud with [`Error::DecryptFailed`]
-/// instead of silently passing the still-encrypted bytes downstream. This turns
-/// an undecryptable unit into a *read failure*, so:
-///   * the rip's existing read-error recovery (sweep skip-ahead → patch
-///     re-read) re-reads it off the disc while the disc is still present, and
-///   * the mux path hard-fails (there is no clean data to mux) rather than
-///     dropping content without a TS sync and reporting a clean rip.
-///
-/// All-zero (zero-filled) units are NOT `ts_sync_destroyed`, so they never trip
-/// this — allowed-loss zero-fill that some authoring deliberately leaves stays
-/// allowed (logged loud + continue elsewhere). Only the keyless raw sweep is
-/// unaffected: it carries [`DecryptKeys::None`], so the `Aacs` guard below is
-/// never met there and ciphertext is written verbatim.
-///
-/// Hardcoded `true`. Flip to `false` to ship without the behaviour — the unit
-/// is then counted as decrypt loss exactly as before (the prior contract).
-pub const DECRYPT_VERIFY_READ: bool = true;
 
 /// Decorator: read from `inner`, then run the configured
 /// AACS / CSS decrypt over the bytes that landed in `buf`.
@@ -87,31 +58,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     ///
     /// [`set_unit_base`]: Self::set_unit_base
     unit_base: u32,
-    /// Cumulative bytes of AACS units that did not reassemble to clean TS on the
-    /// VERIFY paths (sweep / patch / --no-raw verify). `decrypt_sectors` is a pure
-    /// decrypt (it leaves the applied-key plaintext and never restores/nulls), so
-    /// this counter is populated only on the fail-loud verify path — the mux path
-    /// returns pass-through before tallying, treating broken TS as a muxer concern
-    /// rather than decrypt loss. Where it is populated it feeds [`decrypt_loss`]
-    /// so a partial verify failure can't be reported as a perfect rip. Shared `Arc`
-    /// so the highway's producer thread and the consuming `Stream` see one tally.
-    ///
-    /// [`decrypt_loss`]: Self::decrypt_loss
-    decrypt_dropped: Arc<AtomicU64>,
     /// The miss policy (see [`crate::sector::recovery::Recover`]) — a generic,
     /// scheme-neutral recovery the input stream (L3) installs and this decorator
     /// (L2) executes at the one seam when a content unit will not decrypt. `None`
     /// = no recovery (a miss is loss). Installed via
     /// [`with_key_fetch`](Self::with_key_fetch).
     recovery: Option<crate::sector::recovery::Recover>,
-    /// Verify-only mode: a read decrypt-CHECKS a scratch copy of the bytes (to
-    /// detect undecryptable units) but NEVER mutates `buf` — the inner
-    /// ciphertext is returned unchanged. This is what makes a multipass sweep
-    /// decrypt-aware: the sweep must write the *encrypted* bytes to the ISO, yet
-    /// a unit that won't decrypt must still fail the read (`DECRYPT_VERIFY_READ`)
-    /// so the existing read-error recovery (skip / NonTrimmed / patch) handles
-    /// it. Default `false` (decrypt in place, the mux / `--no-raw` path).
-    verify_only: bool,
     /// Encrypted-content extent map — the disc's m2ts ranges as sorted/merged
     /// `(start_lba, sector_count)` (see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
@@ -121,23 +73,12 @@ pub struct DecryptingSectorSource<S: SectorSource> {
     /// reads encrypted content" (the mux reads title extents only) → every unit
     /// is treated as content (the legacy behaviour).
     content_ranges: Option<Arc<[(u32, u32)]>>,
-    /// Reused scratch buffer for verify-only decrypt checks — avoids a per-read
-    /// allocation on the sweep's hot path. Grown on demand, never shrunk.
-    scratch: Vec<u8>,
-    /// MUX pass-through switch (read > decrypt > mux). When `true`, every
-    /// encrypted unit is decrypted in place and the bytes pass straight to the
-    /// muxer — a unit that decrypts to broken TS is the muxer's concern, so the mux
-    /// never conceals, re-fetches a key, or counts it as loss, and the read returns
-    /// `Ok` (it can never abort over a bad-encoded unit). It hard-fails only on a
-    /// genuine can't-decrypt (no key / misaligned unit), which surfaces as `Err`.
-    /// This is "decrypt-verify is a RIP gate, not a MUX gate": the rip/verify path
-    /// leaves this `false` (default) and fails loud via [`DECRYPT_VERIFY_READ`] so
-    /// its read-error recovery re-reads the disc. Ciphertext is NEVER passed
-    /// downstream either way — with a keyed disc every unit has a key applied.
-    ///
-    /// Mutually meaningful only with `!verify_only` (the in-place decrypt path
-    /// the mux uses); a verify-only sweep keeps the rip's fail-loud contract.
-    tolerate_decrypt_loss: bool,
+    /// Reused scratch holding the pre-decrypt on-disc ciphertext for the
+    /// key-fetch retry. Only touched when `recovery` is installed; kept on the
+    /// struct (rather than a per-read `Vec`) so the mux hot path — 16 MiB
+    /// batches at highway speed, now that the mux installs a key-fetch for
+    /// multi-CPS — reuses one allocation instead of alloc/free-ing every read.
+    cipher_scratch: Vec<u8>,
 }
 
 impl<S: SectorSource> DecryptingSectorSource<S> {
@@ -152,29 +93,16 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             keys,
             unit_key_idx: 0,
             unit_base: 0,
-            decrypt_dropped: Arc::new(AtomicU64::new(0)),
             // No recovery by default. CSS self-decrypts in `decrypt_sectors`
             // (needs no external input); AACS installs a key-fetch via
             // `with_key_fetch`.
             recovery: None,
-            verify_only: false,
             content_ranges: None,
-            scratch: Vec::new(),
-            tolerate_decrypt_loss: false,
+            cipher_scratch: Vec::new(),
         }
     }
 
-    /// Opt into the MUX pass-through policy (read > decrypt > mux): decrypt every
-    /// unit in place and pass the bytes to the muxer, never conceal / re-fetch /
-    /// count broken TS as loss; fail loud only on a genuine can't-decrypt. See the
-    /// [`tolerate_decrypt_loss`](Self::tolerate_decrypt_loss) field. The rip/verify
-    /// path must NOT set this (it relies on fail-loud read-error recovery).
-    pub fn tolerate_decrypt_loss(mut self) -> Self {
-        self.tolerate_decrypt_loss = true;
-        self
-    }
-
-    /// Restrict decrypt/verify to the disc's encrypted-content extents
+    /// Restrict decrypt to the disc's encrypted-content extents
     /// (sorted/merged `(start_lba, sector_count)` — see
     /// [`Disc::encrypted_content_ranges`](crate::Disc::encrypted_content_ranges)).
     /// Units outside content (UDF filesystem / BDMV nav) pass through untouched,
@@ -184,26 +112,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
     pub fn with_content_ranges(mut self, ranges: Arc<[(u32, u32)]>) -> Self {
         self.content_ranges = Some(ranges);
         self
-    }
-
-    /// Switch to verify-only mode: decrypt-CHECK each read on a scratch copy and
-    /// fail the read (`DECRYPT_VERIFY_READ`) when a scrambled AACS unit won't
-    /// decrypt, but leave `buf` as the original ciphertext. The multipass sweep
-    /// uses this so its ISO stays encrypted while still rejecting silent-bad
-    /// reads. No-op effect for `DecryptKeys::None` (nothing to check).
-    pub fn verify_only(mut self) -> Self {
-        self.verify_only = true;
-        self
-    }
-
-    /// A handle to this decorator's decrypt-loss counter — the cumulative bytes
-    /// of scrambled AACS units that no key could decrypt (see
-    /// [`decrypt_dropped`](Self::decrypt_dropped)). The mux pipelines read this
-    /// to fold decrypt-time loss into their `lost_bytes` accounting; the highway
-    /// shares it across the producer thread and the consuming `Stream`. Returns
-    /// the live counter, so reads after a decrypt observe the updated total.
-    pub fn decrypt_loss(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.decrypt_dropped)
     }
 
     /// Override the AACS unit-key index. Only meaningful for
@@ -266,98 +174,6 @@ impl<S: SectorSource> DecryptingSectorSource<S> {
             None => decrypt_sectors(buf, keys, unit_key_idx),
         }
     }
-
-    /// Emit a bounded, structured diagnostic for each undecryptable unit in a
-    /// failed verify read. Called only on the failure (cold) path. On a fresh
-    /// rip `buf` holds the post-decrypt bytes straight off the drive, so the
-    /// per-unit signature is source ground truth (see the call site).
-    ///
-    /// Fields, per failing in-content unit:
-    /// * `lba` — absolute disc LBA of the unit
-    /// * `read_ms` — how long the inner drive read took (recovery grind vs clean
-    ///   fast read)
-    /// * `all_zero` — the unit is every-byte-`0x00` (source zero-fill, seen fresh
-    ///   off the disc — no ISO ambiguity)
-    /// * `ts_sync`/`ts_total` — TS sync bytes present vs possible (0/32 ⇒
-    ///   scrambled-looking)
-    /// * `distinct` — distinct byte values (entropy proxy: 1 ⇒ constant fill,
-    ///   ~256 ⇒ ciphertext/garbage)
-    /// * `best_sync` — the most TS syncs ANY held key restores (≈0 ⇒ no key fits
-    ///   → missing key / garbage; high ⇒ a key nearly works → marginal bytes)
-    /// * `head` — first 16 bytes (the plaintext TP_extra header) in hex
-    fn diagnose_decrypt_failure(
-        base_lba: u32,
-        buf: &[u8],
-        read_ms: u64,
-        content: Option<&[(u32, u32)]>,
-        keys: &DecryptKeys,
-    ) {
-        let unit_len = crate::aacs::content::ALIGNED_UNIT_LEN;
-        let unit_sectors = (unit_len / 2048) as u32;
-        // Only AACS produces decrypt-verify failures; None / CSS never reach here
-        // with a non-zero dropped count.
-        let (unit_keys, rdk) = match keys {
-            DecryptKeys::Aacs {
-                unit_keys,
-                read_data_key,
-            } => (unit_keys, *read_data_key),
-            _ => return,
-        };
-        let mut emitted = 0usize;
-        for (i, chunk) in buf.chunks_exact(unit_len).enumerate() {
-            if emitted >= MAX_DIAG_UNITS_PER_READ {
-                break;
-            }
-            let unit_lba = base_lba.saturating_add(i as u32 * unit_sectors);
-            let in_content = match content {
-                Some(r) => crate::decrypt::lba_in_ranges(unit_lba, r),
-                None => true,
-            };
-            // A unit that decrypted is no longer sync-destroyed; a CPI-clear or
-            // non-content unit is gated out. Only undecryptable in-content units
-            // that are flagged encrypted carry signal.
-            if !in_content || !crate::aacs::content::aacs_unit_needs_decrypt(chunk) {
-                continue;
-            }
-            let all_zero = chunk.iter().all(|&b| b == 0);
-            let ts_sync = crate::aacs::content::ts_sync_count(chunk);
-            let ts_total = crate::aacs::content::ts_packet_total(chunk);
-            let mut seen = [false; 256];
-            for &b in chunk {
-                seen[b as usize] = true;
-            }
-            let distinct = seen.iter().filter(|&&x| x).count();
-            // Does ANY held key get this unit closer to clear TS?
-            let mut best_sync = ts_sync;
-            for (_, k) in unit_keys.iter() {
-                let mut attempt = chunk.to_vec();
-                if let Some(ref rdk_key) = rdk {
-                    crate::aacs::content::decrypt_bus(&mut attempt, rdk_key);
-                }
-                crate::aacs::content::decrypt_unit(&mut attempt, k);
-                let s = crate::aacs::content::ts_sync_count(&attempt);
-                if s > best_sync {
-                    best_sync = s;
-                }
-            }
-            let head: String = chunk[..16].iter().map(|b| format!("{b:02x}")).collect();
-            tracing::warn!(
-                target: "freemkv::decrypt",
-                lba = unit_lba,
-                in_content,
-                read_ms,
-                all_zero,
-                ts_sync,
-                ts_total,
-                distinct,
-                best_sync,
-                keys_held = unit_keys.len(),
-                head,
-                "decrypt-verify fail"
-            );
-            emitted += 1;
-        }
-    }
 }
 
 impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
@@ -402,180 +218,64 @@ impl<S: SectorSource> SectorSource for DecryptingSectorSource<S> {
         {
             return Err(crate::error::Error::DecryptFailed);
         }
-        let read_t0 = std::time::Instant::now();
         let n = self
             .inner
             .read_sectors_fua(lba, count, buf, recovery, fua)?;
-        let read_ms = read_t0.elapsed().as_millis() as u64;
-        // Decrypt the bytes just read. Scheme-agnostic: `decrypt_sectors*`
-        // dispatches on the keys (None / CSS / AACS) and returns the count of
-        // bytes that SHOULD have decrypted but couldn't — the silent-bad-read
-        // signal. Only AACS ever produces a non-zero count, so nothing below
-        // needs a per-scheme check. When a content map is installed (whole-disc
-        // readers), the `*_in_content` entry skips units OUTSIDE the encrypted
-        // content extents, so clear filesystem / nav bytes are never mistaken for
-        // ciphertext. The mux installs no map (it reads title extents only).
-        //
-        // VERIFY-ONLY (multipass sweep): decrypt a reused SCRATCH copy so `buf`
-        // keeps its ciphertext (the ISO stays encrypted) and the hot path pays no
-        // per-read allocation. NORMAL: decrypt in place; a fetch callback may
-        // recover a unit no held key opened.
+        // Decrypt the bytes just read IN PLACE. Scheme-agnostic (None / CSS / AACS).
+        // With a content map installed the `*_in_content` entry skips units OUTSIDE
+        // the encrypted extents (clear filesystem / nav pass through untouched); the
+        // mux installs no map (it reads title extents only). A genuine can't-decrypt
+        // (no key / misaligned unit) surfaces as `Err` and propagates; otherwise
+        // every unit gets its key applied and the bytes pass through — a unit that
+        // decrypts to broken TS is the consumer's concern (the muxer drops it),
+        // never a read failure. (The decrypt-verify read gate was removed: bad
+        // sectors are marked by physical read success, not by TS structure.)
         let content = self.content_ranges.clone(); // cheap Arc bump; frees the &self borrow
         let content_ref = content.as_deref();
-        // Copy out the small Copy fields the seam needs, so the `&mut self.recovery`
-        // borrow below does not collide with reads of other `self` fields. The
-        // recovery closure self-limits (its budget lives in its captures), so the
-        // decorator simply calls it whenever there is a miss.
         let unit_key_idx = self.unit_key_idx;
 
-        // ── MUX: read > decrypt > mux ──────────────────────────────────────────
-        // `tolerate_decrypt_loss` (and not verify_only) is the mux path: it is fed
-        // already-captured data and reads only content extents. `decrypt_buf`
-        // applies the CPS unit key to every encrypted unit IN PLACE; the resulting
-        // bytes — clean MPEG-TS or a bad-encoded region — belong to the muxer, which
-        // drops broken packets and resyncs. TS validity is NOT a decrypt verdict, so
-        // the mux never conceals, never re-fetches a key, and never counts broken TS
-        // as loss. Its ONLY failure is a genuine can't-decrypt (no key for a unit, or
-        // a misaligned unit), which `decrypt_buf` surfaces as `Err` — propagate it
-        // (fail loud), because a mux over captured data must otherwise always succeed.
-        if self.tolerate_decrypt_loss && !self.verify_only {
-            Self::decrypt_buf(
-                &mut buf[..n],
-                &mut self.keys,
-                self.unit_key_idx,
-                lba,
-                content_ref,
-            )?;
-            return Ok(n);
-        }
+        let dropped = Self::decrypt_buf(
+            &mut buf[..n],
+            &mut self.keys,
+            self.unit_key_idx,
+            lba,
+            content_ref,
+        )?;
 
-        // ── SWEEP / PATCH / VERIFY: decrypt to verify the disc read ─────────────
-        // First decrypt, then the FRESH-KEY-ON-FAILURE retry (read → decrypt → on
-        // fail fetch a new key → retry → CACHE or fail). This runs in BOTH modes:
-        //   * VERIFY-ONLY (multipass sweep): decrypt a reused SCRATCH copy so `buf`
-        //     keeps its ciphertext (the ISO stays encrypted), but STILL fetch —
-        //     the whole point is to CACHE the key. The fetched key is added to the
-        //     pool, so the unit that triggered it now verifies clean (no false
-        //     read-failure / damage-jump) and every later unit this pass — and any
-        //     later read on this decorator — reuses it instead of re-asking the key
-        //     server. Without this a CPS unit whose key wasn't sampled up front
-        //     (an orphan clip not reachable from any playlist) hard-fails the whole
-        //     range even though one key fetch would recover it.
-        //   * NORMAL (mux / --no-raw): decrypt `buf` in place, same retry.
-        // The fetch re-decrypt targets the post-decrypt buffer (scratch / buf),
-        // whose still-scrambled units ARE the failures.
-        let outcome = if self.verify_only {
-            let mut scratch = std::mem::take(&mut self.scratch);
-            scratch.clear();
-            scratch.extend_from_slice(&buf[..n]);
-            let d = match Self::decrypt_buf(
-                &mut scratch,
-                &mut self.keys,
-                self.unit_key_idx,
+        // FRESH-KEY-ON-FAILURE: hand a unit no held key opened (as its on-disc
+        // ciphertext) to the application's key source; any returned key is added to
+        // the pool and the read is re-decrypted, caching the key for later units.
+        // The pass-through result is the consumer's concern — the decorator never
+        // counts a decrypt-quality miss as loss. Genuine missing data is the
+        // zero-filled sectors the physical read layer records, not a TS-structure
+        // miss; a real can't-decrypt (empty pool / misalignment) already surfaced
+        // as `Err` from `decrypt_buf`.
+        if dropped > 0 && self.recovery.is_some() {
+            // Rare miss only: the in-place decrypt overwrote `buf`, so RE-READ the
+            // on-disc ciphertext for the key-fetch retry. This keeps the happy path
+            // zero-copy — the common single-CPS mux batch (dropped == 0) never
+            // captures or copies; a genuine miss pays one re-read into the reused
+            // `cipher_scratch`.
+            self.cipher_scratch.resize(n, 0);
+            self.inner.read_sectors_fua(
                 lba,
-                content_ref,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    self.scratch = scratch;
-                    return Err(e);
-                }
-            };
-            let o = match (d, self.recovery.as_mut()) {
-                (0, _) | (_, None) => crate::sector::recovery::MissOutcome { dropped: d },
-                (d, Some(r)) => {
-                    let rctx = crate::sector::recovery::RecoverCtx {
-                        unit_key_idx,
-                        lba,
-                        content: content.clone(),
-                        prev_dropped: d,
-                    };
-                    // Target = the decrypted scratch; ciphertext = the untouched
-                    // `buf` (verify-only keeps the ISO encrypted).
-                    r(&mut scratch, &buf[..n], &mut self.keys, &rctx)
-                }
-            };
-            self.scratch = scratch;
-            o
-        } else {
-            // In-place decrypt (decrypt-sweep / decrypt-patch). Pure decrypt
-            // overwrites `buf` with plaintext, so keep the on-disc ciphertext for
-            // the recovery retry BEFORE decrypting — but only when recovery is
-            // installed (the retry's sole consumer).
-            let ciphertext: Option<Vec<u8>> = if self.recovery.is_some() {
-                Some(buf[..n].to_vec())
-            } else {
-                None
-            };
-            let d = Self::decrypt_buf(
-                &mut buf[..n],
-                &mut self.keys,
-                self.unit_key_idx,
-                lba,
-                content_ref,
+                count,
+                &mut self.cipher_scratch[..n],
+                recovery,
+                fua,
             )?;
-            match (d, self.recovery.as_mut()) {
-                (0, _) | (_, None) => crate::sector::recovery::MissOutcome { dropped: d },
-                (d, Some(r)) => {
-                    let rctx = crate::sector::recovery::RecoverCtx {
-                        unit_key_idx,
-                        lba,
-                        content: content.clone(),
-                        prev_dropped: d,
-                    };
-                    let cipher = ciphertext
-                        .as_deref()
-                        .expect("recovery installed → captured");
-                    r(&mut buf[..n], cipher, &mut self.keys, &rctx)
-                }
-            }
-        };
-        // A loss is a loss: whatever recovery could not decrypt (a missing unit
-        // key, or an AACS 2.1 forensic-segment unit with no variant key — same
-        // thing to the read path) is concealed and counted the same way.
-        let dropped = outcome.dropped;
-        if dropped > 0 {
-            self.decrypt_dropped
-                .fetch_add(dropped as u64, Ordering::Relaxed);
-            // The mux path already returned above (read > decrypt > mux); only the
-            // verify callers (sweep / patch / --no-raw verify) reach here. An
-            // unverified unit means this disc read did NOT prove out.
-            // DECRYPT_VERIFY_READ: a unit that SHOULD have decrypted but didn't
-            // means this read did NOT truly succeed — it returned ciphertext the
-            // TS assembler would silently drop. Fail the read loud so the caller's
-            // read-error recovery re-reads it off the disc (rip) or the mux hard-
-            // fails (no clean data to mux). Scheme-agnostic (only AACS reaches a
-            // non-zero count); clear filesystem (gated out) and zero-fill (not
-            // scrambled) never get here.
-            //
-            // An undecryptable unit is an undecryptable unit whatever the scheme —
-            // a missing unit key or an AACS 2.1 forensic-segment unit with no
-            // variant key both land here and fail the verify read the same way.
-            // (`dropped > 0` already holds inside the enclosing block.)
-            if DECRYPT_VERIFY_READ {
-                // FACT-FINDING: on a fresh rip these bytes came straight off the
-                // drive, so each failing unit's signature (all-zero? entropy?
-                // does any held key get it closer to clear TS?) plus the inner
-                // read latency are ground truth about the SOURCE — enough to
-                // classify the failure as source-zeros, marginal-media garbage,
-                // or a clean read no held key opens. In verify-only mode `buf` is
-                // untouched ciphertext, so the post-decrypt `scratch` is what
-                // distinguishes failed units (still TS-destroyed) from succeeded
-                // ones (now clean TS).
-                let diag: &[u8] = if self.verify_only {
-                    &self.scratch
-                } else {
-                    &buf[..n]
-                };
-                Self::diagnose_decrypt_failure(
-                    lba,
-                    diag,
-                    read_ms,
-                    self.content_ranges.as_deref(),
-                    &self.keys,
-                );
-                return Err(crate::error::Error::DecryptFailed);
-            }
+            let rctx = crate::sector::recovery::RecoverCtx {
+                unit_key_idx,
+                lba,
+                content: content.clone(),
+                prev_dropped: dropped,
+            };
+            let r = self
+                .recovery
+                .as_mut()
+                .expect("recovery.is_some() checked above");
+            let cipher = &self.cipher_scratch[..n];
+            let _ = r(&mut buf[..n], cipher, &mut self.keys, &rctx);
         }
         Ok(n)
     }
@@ -893,6 +593,7 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: Vec::new(),
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         );
         let mut buf = vec![0u8; 2048];
@@ -945,6 +646,7 @@ mod tests {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0u32, [0u8; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // 3 sectors = one 6144-byte aligned unit (so partial_len == 0).
         let mut buf = vec![0u8; 3 * 2048];
@@ -1053,6 +755,7 @@ mod tests {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0u32, [0u8; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // Unaligned starts (1, 2, 4, 5, 32 — note 32 % 3 == 2) must all reject.
         for lba in [1u32, 2, 4, 5, 32, 64] {
@@ -1090,6 +793,7 @@ mod tests {
         let keys = DecryptKeys::Aacs {
             unit_keys: vec![(0u32, [0u8; 16])],
             read_data_key: None,
+            format: crate::disc::ContentFormat::BdTs,
         };
         // base = 64 (abs % 3 == 1): the non-3-aligned clip start that triggered
         // the bug. The old absolute gate rejected every read here; the clip-
@@ -1187,104 +891,53 @@ mod tests {
         unit
     }
 
-    /// Regression: when the decrypt step can't decrypt a scrambled AACS unit
-    /// (wrong/missing key), the decorator must accumulate the dropped bytes in
-    /// its `decrypt_loss()` counter while STILL returning `Ok` (per-unit
-    /// tolerance). The mux pipelines read this counter into `lost_bytes()` so a
-    /// partial decrypt failure can't be reported as a perfect rip. A
-    /// decryptable unit must leave the counter at zero.
-    ///
-    /// Grounding: `read_sectors` folds `decrypt_sectors`' dropped count into
-    /// `decrypt_dropped`; `decrypt_loss()` exposes it.
-    #[test]
-    fn decrypt_loss_counter_accumulates_undecryptable_units() {
-        let real_key = [0x33u8; 16];
-        let wrong_key = [0x44u8; 16];
-
-        // A source that always yields one unit encrypted under `real_key`.
-        struct EncUnitSource {
-            unit: Vec<u8>,
+    /// Like [`encrypt_aacs_unit`] but knocks out the TS sync on `bad_pkts` (kept as
+    /// NON-zero content, so they read as authored-bad packets, not padding) BEFORE
+    /// encryption — a unit the correct key still OPENS on its remaining good
+    /// packets, but that carries bad-encoded content the muxer must drop.
+    fn encrypt_aacs_unit_bad(unit_key: &[u8; 16], bad_pkts: &[usize]) -> Vec<u8> {
+        use aes::Aes128;
+        use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+        let mut unit = vec![0u8; crate::aacs::content::ALIGNED_UNIT_LEN];
+        let mut off = 4;
+        while off < unit.len() {
+            unit[off] = 0x47;
+            off += 192;
         }
-        impl SectorSource for EncUnitSource {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                count: u16,
-                buf: &mut [u8],
-                _recovery: bool,
-            ) -> Result<usize> {
-                let bytes = count as usize * 2048;
-                assert_eq!(bytes, self.unit.len(), "test reads one whole unit");
-                buf[..bytes].copy_from_slice(&self.unit);
-                Ok(bytes)
+        for &p in bad_pkts {
+            let o = p * 192;
+            unit[o + 4] = 0x00; // no TS sync after decrypt
+            unit[o + 5] = 0xAB; // non-zero payload => real content, not padding
+        }
+        unit[0] |= 0xC0;
+        let header: [u8; 16] = unit[..16].try_into().unwrap();
+        let derived = crate::aacs::crypto::aes_ecb_encrypt(unit_key, &header);
+        let mut k = [0u8; 16];
+        for i in 0..16 {
+            k[i] = derived[i] ^ header[i];
+        }
+        let cipher = Aes128::new(GenericArray::from_slice(&k));
+        let mut prev = crate::aacs::crypto::AACS_IV;
+        let blocks = (crate::aacs::content::ALIGNED_UNIT_LEN - 16) / 16;
+        for i in 0..blocks {
+            let o = 16 + i * 16;
+            for j in 0..16 {
+                unit[o + j] ^= prev[j];
             }
+            let mut blk = GenericArray::clone_from_slice(&unit[o..o + 16]);
+            cipher.encrypt_block(&mut blk);
+            unit[o..o + 16].copy_from_slice(&blk);
+            prev.copy_from_slice(&unit[o..o + 16]);
         }
-
-        let unit = encrypt_aacs_unit(&real_key);
-
-        // Wrong key → undecryptable → loss counted AND the read fails loud
-        // (DECRYPT_VERIFY_READ: a read that returns an undecryptable AACS unit
-        // did not truly succeed). The loss counter is still bumped before the
-        // error so the abort accounting sees the byte count.
-        let mut wrapped = DecryptingSectorSource::new(
-            EncUnitSource { unit: unit.clone() },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, wrong_key)],
-                read_data_key: None,
-            },
-        );
-        let loss = wrapped.decrypt_loss();
-        assert_eq!(loss.load(Ordering::Relaxed), 0, "starts at zero");
-
-        let mut buf = vec![0u8; 3 * 2048];
-        let err = wrapped
-            .read_sectors(0, 3, &mut buf, false)
-            .expect_err("DECRYPT_VERIFY_READ: an undecryptable AACS unit fails the read loud");
-        assert!(
-            matches!(err, crate::error::Error::DecryptFailed),
-            "undecryptable unit errors with DecryptFailed, got {err:?}"
-        );
-        assert_eq!(
-            loss.load(Ordering::Relaxed),
-            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
-            "the undecryptable unit is tallied as loss before the read errors"
-        );
-
-        // A second read of the same bad unit accumulates further (and errors).
-        assert!(
-            wrapped.read_sectors(0, 3, &mut buf, false).is_err(),
-            "the same bad unit fails the read again"
-        );
-        assert_eq!(
-            loss.load(Ordering::Relaxed),
-            2 * crate::aacs::content::ALIGNED_UNIT_LEN as u64,
-            "loss must accumulate across reads"
-        );
-
-        // Correct key → no loss.
-        let mut good = DecryptingSectorSource::new(
-            EncUnitSource { unit },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, real_key)],
-                read_data_key: None,
-            },
-        );
-        let good_loss = good.decrypt_loss();
-        good.read_sectors(0, 3, &mut buf, false).unwrap();
-        assert_eq!(
-            good_loss.load(Ordering::Relaxed),
-            0,
-            "a decryptable unit must not register any loss"
-        );
+        unit
     }
 
-    /// MUX (read > decrypt > mux): with `tolerate_decrypt_loss()` an undecryptable
-    /// AACS content unit must NOT fail the read and must NOT be nulled. The best key
-    /// is applied and the (bad) bytes pass through to the muxer; broken TS is a
-    /// muxer concern, so it is NOT counted as decrypt loss. The mux only hard-fails
-    /// on a genuine can't-decrypt (no key at all / misaligned unit).
+    /// MUX (read > decrypt > mux): an undecryptable AACS content unit must NOT
+    /// fail the read and must NOT be nulled. The best key is applied and the (bad)
+    /// bytes pass through to the muxer; broken TS is a muxer concern. The read only
+    /// hard-fails on a genuine can't-decrypt (no key at all / misaligned unit).
     #[test]
-    fn tolerate_decrypt_loss_passes_undecryptable_unit_through() {
+    fn mux_passes_undecryptable_unit_through_without_nulling() {
         let real_key = [0x33u8; 16];
         let wrong_key = [0x44u8; 16];
 
@@ -1325,10 +978,9 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, wrong_key)], // can't open the encrypted unit
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
-        )
-        .tolerate_decrypt_loss();
-        let loss = wrapped.decrypt_loss();
+        );
 
         let mut buf = vec![0u8; 6 * 2048];
         // Must SUCCEED (no DecryptFailed) — the mux never aborts on bad decrypt.
@@ -1336,13 +988,6 @@ mod tests {
             .read_sectors(0, 6, &mut buf, false)
             .expect("the mux never aborts on a bad-decrypt unit");
         assert_eq!(n, 6 * 2048);
-
-        // Broken TS is a muxer concern, not decrypt loss — the mux counts none.
-        assert_eq!(
-            loss.load(Ordering::Relaxed),
-            0,
-            "the mux does not count broken TS as decrypt loss"
-        );
 
         // Unit 0 is passed through DECRYPTED (the wrong key was applied), NOT
         // null-TS concealed: it is not the all-0x47/PID-0x1FFF null pattern.
@@ -1386,10 +1031,7 @@ mod tests {
 
         // The byte-exact expected post-decrypt form of unit B (independent decrypt).
         let mut expected_tail = good_tail.clone();
-        assert!(
-            crate::aacs::content::decrypt_unit(&mut expected_tail, &good_key),
-            "padding-tail must decrypt under good_key"
-        );
+        crate::aacs::content::decrypt_unit(&mut expected_tail, &good_key);
 
         let mut two_units = bad_unit;
         two_units.extend_from_slice(&good_tail);
@@ -1419,23 +1061,15 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, good_key)], // opens unit B, NOT unit A
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
-        )
-        .tolerate_decrypt_loss();
-        let loss = wrapped.decrypt_loss();
+        );
 
         let mut buf = vec![0u8; 6 * 2048];
         let n = wrapped
             .read_sectors(0, 6, &mut buf, false)
             .expect("the mux never aborts on a bad-decrypt unit");
         assert_eq!(n, 6 * 2048);
-
-        // Broken TS is a muxer concern — the mux counts no loss.
-        assert_eq!(
-            loss.load(Ordering::Relaxed),
-            0,
-            "the mux does not count broken TS as decrypt loss"
-        );
 
         // Unit A (absent key) → passed through best-effort, NOT null-TS concealed.
         let unit0 = &buf[..crate::aacs::content::ALIGNED_UNIT_LEN];
@@ -1464,39 +1098,6 @@ mod tests {
                 "padding pkt {p} stayed zero (not NULL-TS-filled)"
             );
         }
-    }
-
-    /// `fill_null_ts_unit` round-trip: every BD source packet in the unit becomes
-    /// a well-formed TS null packet (PID 0x1FFF, invisible to any real PID) that
-    /// carries the B1 adaptation-field discontinuity_indicator — the marker
-    /// `mux::ts` reads as a concealed gap.
-    #[test]
-    fn null_ts_fill_is_well_formed_and_invisible_to_real_pids() {
-        let mut unit = vec![0xAAu8; crate::aacs::content::ALIGNED_UNIT_LEN];
-        crate::aacs::content::fill_null_ts_unit(&mut unit);
-        // 32 packets, each: sync 0x47, PID 0x1FFF, adaptation-only (0b10) with a
-        // discontinuity_indicator in the adaptation field.
-        let mut off = 0;
-        let mut pkts = 0;
-        while off + 192 <= unit.len() {
-            assert_eq!(unit[off + 4], 0x47, "sync");
-            let pid = ((unit[off + 5] as u16 & 0x1F) << 8) | unit[off + 6] as u16;
-            assert_eq!(pid, 0x1FFF, "null PID");
-            assert_eq!(
-                (unit[off + 7] >> 4) & 0x03,
-                0x02,
-                "adaptation_field_control = AF only (no payload)"
-            );
-            assert!(unit[off + 8] > 0, "adaptation_field_length > 0");
-            assert_eq!(
-                unit[off + 9] & 0x80,
-                0x80,
-                "adaptation-field discontinuity_indicator set (the B1 marker)"
-            );
-            off += 192;
-            pkts += 1;
-        }
-        assert_eq!(pkts, 32, "32 source packets per aligned unit");
     }
 
     /// Fresh-key-on-failure: a unit encrypted under a key NOT in the initial set
@@ -1544,18 +1145,19 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, wrong_key)],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
         .with_key_fetch(fetch);
-        let loss = wrapped.decrypt_loss();
 
         let mut buf = vec![0u8; 3 * 2048];
         wrapped.read_sectors(0, 3, &mut buf, false).unwrap();
 
-        assert_eq!(
-            loss.load(Ordering::Relaxed),
-            0,
-            "fetch supplied the key → the unit decrypts → zero loss"
+        // The recovered key decrypts the unit: it is now clean TS in `buf`.
+        let unit0 = &buf[..crate::aacs::content::ALIGNED_UNIT_LEN];
+        assert!(
+            !crate::aacs::content::ts_sync_destroyed(unit0),
+            "fetch supplied the key → the unit decrypts to clean TS"
         );
         let got = seen.lock().unwrap();
         assert_eq!(
@@ -1570,26 +1172,6 @@ mod tests {
         assert_eq!(
             got[0], unit,
             "the exact on-disc unit is forwarded for fetch"
-        );
-
-        // Baseline: same setup WITHOUT a callback accumulates loss.
-        let mut nocb = DecryptingSectorSource::new(
-            EncUnitSource { unit },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, wrong_key)],
-                read_data_key: None,
-            },
-        );
-        let nocb_loss = nocb.decrypt_loss();
-        let mut buf2 = vec![0u8; 3 * 2048];
-        assert!(
-            nocb.read_sectors(0, 3, &mut buf2, false).is_err(),
-            "without a fetch callback the undecryptable unit fails the read (DECRYPT_VERIFY_READ)"
-        );
-        assert_eq!(
-            nocb_loss.load(Ordering::Relaxed),
-            crate::aacs::content::ALIGNED_UNIT_LEN as u64,
-            "without a fetch callback the undecryptable unit is loss"
         );
     }
 
@@ -1607,23 +1189,29 @@ mod tests {
 
         struct AltSource {
             units: Vec<Vec<u8>>,
-            idx: usize,
         }
         impl SectorSource for AltSource {
             fn capacity_sectors(&self) -> u32 {
                 6
             }
+            // LBA-addressable (like a real File/drive): unit A at LBA 0..3, unit B
+            // at LBA 3..6. Re-reading the same LBA returns the same ciphertext — the
+            // key-fetch recovery re-reads on a miss, so a call-order-stateful mock
+            // would hand it the wrong unit.
             fn read_sectors(
                 &mut self,
-                _lba: u32,
+                lba: u32,
                 count: u16,
                 buf: &mut [u8],
                 _r: bool,
             ) -> Result<usize> {
                 let bytes = count as usize * 2048;
-                let u = &self.units[self.idx.min(self.units.len() - 1)];
+                let u = if lba < 3 {
+                    &self.units[0]
+                } else {
+                    &self.units[1]
+                };
                 buf[..bytes].copy_from_slice(u);
-                self.idx += 1;
                 Ok(bytes)
             }
         }
@@ -1644,11 +1232,11 @@ mod tests {
         let mut wrapped = DecryptingSectorSource::new(
             AltSource {
                 units: vec![unit_a, unit_b],
-                idx: 0,
             },
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, [0x11u8; 16])], // neither real key held up front
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
         .with_key_fetch(fetch);
@@ -1686,134 +1274,6 @@ mod tests {
         assert_eq!(recovered.capacity_sectors(), 42);
     }
 
-    /// Verify-only mode (the multipass sweep/patch path): a read decrypt-CHECKS
-    /// the bytes but NEVER mutates `buf`, so the ISO keeps its ciphertext. An
-    /// undecryptable unit still fails the read (DECRYPT_VERIFY_READ) so the
-    /// existing read-error recovery treats it like a SCSI failure; a decryptable
-    /// unit returns Ok with the ciphertext intact (the check is non-destructive).
-    #[test]
-    fn verify_only_checks_without_mutating_and_fails_on_undecryptable() {
-        let real_key = [0x33u8; 16];
-        let wrong_key = [0x44u8; 16];
-
-        struct EncUnitSource {
-            unit: Vec<u8>,
-        }
-        impl SectorSource for EncUnitSource {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                count: u16,
-                buf: &mut [u8],
-                _recovery: bool,
-            ) -> Result<usize> {
-                let bytes = count as usize * 2048;
-                buf[..bytes].copy_from_slice(&self.unit);
-                Ok(bytes)
-            }
-        }
-
-        let unit = encrypt_aacs_unit(&real_key);
-
-        // Wrong key → undecryptable → read FAILS, but buf is untouched ciphertext.
-        let mut bad = DecryptingSectorSource::new(
-            EncUnitSource { unit: unit.clone() },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, wrong_key)],
-                read_data_key: None,
-            },
-        )
-        .verify_only();
-        let mut buf = vec![0u8; 3 * 2048];
-        let err = bad
-            .read_sectors(0, 3, &mut buf, false)
-            .expect_err("verify-only: an undecryptable unit must fail the read");
-        assert!(matches!(err, crate::error::Error::DecryptFailed));
-        assert_eq!(
-            buf, unit,
-            "verify-only must NOT mutate buf — ISO stays ciphertext"
-        );
-
-        // Right key → read OK, and buf is STILL the original ciphertext (the
-        // decrypt happened on a scratch copy, not in place).
-        let mut good = DecryptingSectorSource::new(
-            EncUnitSource { unit: unit.clone() },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, real_key)],
-                read_data_key: None,
-            },
-        )
-        .verify_only();
-        let mut buf2 = vec![0u8; 3 * 2048];
-        good.read_sectors(0, 3, &mut buf2, false)
-            .expect("verify-only: a decryptable unit reads OK");
-        assert_eq!(
-            buf2, unit,
-            "verify-only leaves ciphertext in buf even when the unit decrypts"
-        );
-    }
-
-    /// THE first-2 GB regression at the READ level. With a content map installed,
-    /// a verify-only read of a scrambled-LOOKING but CLEAR region (UDF filesystem
-    /// OUTSIDE the content extents) must read OK — not false-fail — while a read
-    /// INSIDE content that won't decrypt still fails. Before the content gate, the
-    /// filesystem read was mis-classified as undecryptable ciphertext and the
-    /// whole opening of every disc was marked NonTrimmed.
-    #[test]
-    fn verify_only_content_gate_passes_clear_filesystem_fails_content() {
-        // Source returns sync-destroyed bytes (looks like ciphertext) for any LBA.
-        struct ScrambledSource;
-        impl SectorSource for ScrambledSource {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                count: u16,
-                buf: &mut [u8],
-                _recovery: bool,
-            ) -> Result<usize> {
-                let bytes = count as usize * 2048;
-                for (i, b) in buf[..bytes].iter_mut().enumerate() {
-                    *b = (i as u8).wrapping_mul(31);
-                }
-                let mut off = 4;
-                while off < bytes {
-                    buf[off] = 0xA5; // force a NON-sync byte at every TS probe stride
-                    off += 192;
-                }
-                // CPI bits on each aligned unit's byte 0 so it reads as encrypted.
-                let mut u = 0;
-                while u < bytes {
-                    buf[u] |= 0xC0;
-                    u += crate::aacs::content::ALIGNED_UNIT_LEN;
-                }
-                Ok(bytes)
-            }
-        }
-
-        let keys = DecryptKeys::Aacs {
-            unit_keys: vec![(0, [0xAB; 16])],
-            read_data_key: None,
-        };
-        // Content lives at LBA 1002..1101 (3-aligned start so reads pass the
-        // unit-alignment gate). Everything before it is "filesystem".
-        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(1002u32, 99u32)]);
-        let mut dec = DecryptingSectorSource::new(ScrambledSource, keys)
-            .verify_only()
-            .with_content_ranges(ranges);
-        let mut buf = vec![0u8; 3 * 2048];
-
-        // LBA 0 — OUTSIDE content (filesystem). Scrambled-looking, but clear by
-        // position → must read OK (the regression that broke the first 2 GB).
-        dec.read_sectors(0, 3, &mut buf, false)
-            .expect("a clear filesystem region must read OK — no false decrypt-fail");
-
-        // LBA 1002 — INSIDE content, undecryptable → the read must fail loud.
-        let err = dec
-            .read_sectors(1002, 3, &mut buf, false)
-            .expect_err("an undecryptable content unit must fail the read");
-        assert!(matches!(err, crate::error::Error::DecryptFailed));
-    }
-
     /// Source that returns a fixed unit's bytes for any read.
     struct FixedUnit {
         unit: Vec<u8>,
@@ -1832,77 +1292,6 @@ mod tests {
         }
     }
 
-    /// verify-only + content map: an in-content unit that DOES decrypt reads OK,
-    /// and `buf` keeps its CIPHERTEXT (the verify is non-mutating).
-    #[test]
-    fn verify_only_content_gate_decryptable_unit_keeps_ciphertext() {
-        let key = [0x5a; 16];
-        let unit = encrypt_aacs_unit(&key);
-        let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(0u32, 3u32)]); // LBA 0..3 is content
-        let mut dec = DecryptingSectorSource::new(
-            FixedUnit { unit: unit.clone() },
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, key)],
-                read_data_key: None,
-            },
-        )
-        .verify_only()
-        .with_content_ranges(ranges);
-        let mut buf = vec![0u8; 3 * 2048];
-        dec.read_sectors(0, 3, &mut buf, false)
-            .expect("a decryptable content unit reads OK");
-        assert_eq!(
-            buf, unit,
-            "verify-only keeps ciphertext even when the unit decrypts"
-        );
-    }
-
-    /// NO content map (None) ⇒ ungated legacy behaviour: a scrambled-looking read
-    /// fails. This is what the mux relies on (it only reads content), and the very
-    /// reason the whole-disc sweep MUST install the map.
-    #[test]
-    fn verify_only_without_content_map_is_ungated() {
-        struct ScrambledSource;
-        impl SectorSource for ScrambledSource {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                count: u16,
-                buf: &mut [u8],
-                _r: bool,
-            ) -> Result<usize> {
-                let b = count as usize * 2048;
-                for (i, x) in buf[..b].iter_mut().enumerate() {
-                    *x = (i as u8).wrapping_mul(31);
-                }
-                let mut o = 4;
-                while o < b {
-                    buf[o] = 0xA5;
-                    o += 192;
-                }
-                let mut u = 0;
-                while u < b {
-                    buf[u] |= 0xC0; // CPI bits → reads as encrypted
-                    u += crate::aacs::content::ALIGNED_UNIT_LEN;
-                }
-                Ok(b)
-            }
-        }
-        let mut dec = DecryptingSectorSource::new(
-            ScrambledSource,
-            DecryptKeys::Aacs {
-                unit_keys: vec![(0, [0xAB; 16])],
-                read_data_key: None,
-            },
-        )
-        .verify_only(); // no content map installed
-        let mut buf = vec![0u8; 3 * 2048];
-        let err = dec
-            .read_sectors(0, 3, &mut buf, false)
-            .expect_err("ungated verify fails on scrambled bytes (legacy / mux behaviour)");
-        assert!(matches!(err, crate::error::Error::DecryptFailed));
-    }
-
     /// In-place decrypt + content map: a NON-content read passes through unchanged
     /// (ciphertext, not decrypted); an in-content read is decrypted IN PLACE.
     #[test]
@@ -1917,9 +1306,10 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, key)],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
-        .with_content_ranges(ranges); // in-place (NOT verify_only)
+        .with_content_ranges(ranges); // decrypt in place, content-gated
 
         // Non-content read (LBA 0): not decrypted → buf stays ciphertext.
         let mut buf = vec![0u8; 3 * 2048];
@@ -1958,14 +1348,13 @@ mod tests {
         }
     }
 
-    /// THE cps2 fix at the read level. Verify-only (sweep) mode now fetches: a
-    /// content unit no HELD key opens hands its ciphertext to the fetch closure,
-    /// the returned key is added to the pool (the CACHE), the unit re-verifies
-    /// clean — and `buf` is left as ciphertext (the ISO stays encrypted). Then the
-    /// cached key serves the NEXT unit WITHOUT another callback (≈one fetch per CPS
-    /// unit). This is what stops an orphan CPS unit from hard-failing the sweep.
+    /// CPS-2 key recovery at the read level: a content unit no HELD key opens hands
+    /// its on-disc ciphertext to the fetch closure, the returned key is added to the
+    /// pool (the CACHE) and the read is re-decrypted IN PLACE. The cached key then
+    /// serves the NEXT unit WITHOUT another callback (≈one fetch per CPS unit) —
+    /// what stops an orphan CPS unit from producing garbage.
     #[test]
-    fn verify_only_fetch_recovers_caches_and_keeps_ciphertext() {
+    fn fetch_recovers_and_caches_the_cps_key() {
         let real_key = [0x5au8; 16]; // the key the unit is actually under
         let wrong_key = [0x11u8; 16]; // the only key we start with
         let unit = encrypt_aacs_unit(&real_key);
@@ -1976,6 +1365,7 @@ mod tests {
             *calls_cb.lock().unwrap() += 1;
             // The closure is handed the still-scrambled on-disc ciphertext.
             assert!(!samples.is_empty(), "fetch receives the failing units");
+            assert_eq!(samples[0].len(), crate::aacs::content::ALIGNED_UNIT_LEN);
             vec![real_key]
         });
 
@@ -1985,18 +1375,22 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, wrong_key)],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
-        .verify_only()
         .with_content_ranges(ranges)
         .with_key_fetch(fetch);
 
-        // First read (LBA 0): wrong key fails → fetch supplies real_key → Ok,
-        // and buf is still ciphertext (verify-only never mutates the ISO bytes).
+        // First read (LBA 0): wrong key fails → fetch supplies real_key → the read
+        // is re-decrypted IN PLACE, so buf comes out clean TS (not the ciphertext).
         let mut buf = vec![0u8; 3 * 2048];
         dec.read_sectors(0, 3, &mut buf, false)
             .expect("fetch recovers the orphan unit's key");
-        assert_eq!(buf, unit, "verify-only keeps ciphertext even after a fetch");
+        assert_ne!(buf, unit, "the fetched key decrypts the unit in place");
+        assert!(
+            !crate::aacs::content::ts_sync_destroyed(&buf),
+            "the recovered read is clean TS"
+        );
         assert_eq!(*calls.lock().unwrap(), 1, "fetch called exactly once");
 
         // Second read (LBA 3): real_key now CACHED → decrypts with no new callback.
@@ -2010,37 +1404,43 @@ mod tests {
         );
     }
 
-    /// Verify-only fetch that comes back empty (the key source can't help) must
-    /// still hard-fail the read (DECRYPT_VERIFY_READ) — recovery, not silent loss.
+    /// Bad-encoding pass-through: a unit the held key OPENS (the proof floor is >=4
+    /// good packets) but that carries many authored-bad packets reads Ok and is
+    /// DECRYPTED in place — never fails loud, never grinds on a physically fine
+    /// read. The old 75% proportion false-failed this exact unit.
     #[test]
-    fn verify_only_fetch_exhausted_still_hard_fails() {
-        let real_key = [0x5au8; 16];
-        let wrong = [0x11u8; 16];
-        let unit = encrypt_aacs_unit(&real_key);
-        let fetch: super::KeyFetch = std::sync::Arc::new(|_: &[Vec<u8>]| Vec::new());
+    fn bad_encoded_unit_the_key_opened_passes_through_decrypted() {
+        let key = [0x5au8; 16];
+        // 20 authored-bad packets (1..21); packets 0 + 21..31 stay clean → 11 good
+        // encrypted packets ≥ the 4-packet proof floor, so the key OPENED the unit.
+        let bad: Vec<usize> = (1..21).collect();
+        let unit = encrypt_aacs_unit_bad(&key, &bad);
         let ranges: Arc<[(u32, u32)]> = Arc::from(vec![(0u32, 3u32)]);
         let mut dec = DecryptingSectorSource::new(
             FixedUnit { unit: unit.clone() },
             DecryptKeys::Aacs {
-                unit_keys: vec![(0, wrong)],
+                unit_keys: vec![(0, key)],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
-        .verify_only()
-        .with_content_ranges(ranges)
-        .with_key_fetch(fetch);
+        .with_content_ranges(ranges);
         let mut buf = vec![0u8; 3 * 2048];
-        let err = dec
-            .read_sectors(0, 3, &mut buf, false)
-            .expect_err("a fetch that returns no key must still fail the read");
-        assert!(matches!(err, crate::error::Error::DecryptFailed));
+        dec.read_sectors(0, 3, &mut buf, false)
+            .expect("a bad-encoded unit the key OPENED reads Ok, never fail-loud");
+        assert_ne!(
+            buf, unit,
+            "the unit is decrypted in place, not left ciphertext"
+        );
+        // The 11 good packets recovered their TS sync (the muxer drops the bad ones).
+        assert_eq!(buf[21 * 192 + 4], 0x47, "a good packet restored its sync");
     }
 
     /// The fetch is content-gated: a scrambled unit OUTSIDE the content extents
     /// is clear filesystem, not ciphertext, so the read succeeds and the fetch
     /// callback is never consulted (no wasted key-server traffic on nav/UDF).
     #[test]
-    fn verify_only_fetch_not_called_outside_content() {
+    fn fetch_not_called_outside_content() {
         let real_key = [0x5au8; 16];
         let wrong = [0x11u8; 16];
         let unit = encrypt_aacs_unit(&real_key);
@@ -2057,9 +1457,9 @@ mod tests {
             DecryptKeys::Aacs {
                 unit_keys: vec![(0, wrong)],
                 read_data_key: None,
+                format: crate::disc::ContentFormat::BdTs,
             },
         )
-        .verify_only()
         .with_content_ranges(ranges)
         .with_key_fetch(fetch);
         let mut buf = vec![0u8; 3 * 2048];

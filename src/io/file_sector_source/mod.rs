@@ -78,8 +78,8 @@ use crate::consts::{SECTOR_BYTES, SECTOR_BYTES_U64};
 /// read side. Mirrors `WRITEBACK_CHUNK_BYTES` so the read-side page
 /// cache stays bounded the same way the write side does.
 ///
-/// 32 MiB is the empirically tuned value on the rip1 test bed (single
-/// 7200rpm HDD via SATA): smaller windows (8 / 16 MiB) shorten the
+/// 32 MiB is the empirically tuned value on a 7200rpm HDD via SATA:
+/// smaller windows (8 / 16 MiB) shorten the
 /// kernel-readahead overlap and slow the producer; larger windows
 /// (64 / 128 MiB) let the page cache pin enough of the ISO to
 /// pressure concurrent writes. Override via `FREEMKV_READ_DROP_CHUNK_MIB`.

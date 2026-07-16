@@ -407,7 +407,7 @@ pub fn read_encrypted_units(
                     break;
                 }
                 let u = &buf[o..o + ALIGNED_UNIT_LEN];
-                if aacs_unit_encrypted(u) {
+                if aacs_unit_encrypted(u, title.content_format) {
                     out.push(u.to_vec());
                     if out.len() >= n {
                         return out;
@@ -717,7 +717,7 @@ mod tests {
         );
         for s in &samples {
             assert!(
-                aacs_unit_encrypted(s),
+                aacs_unit_encrypted(s, crate::disc::ContentFormat::BdTs),
                 "every sample is a CPI-flagged encrypted unit (byte0 & 0xC0 != 0)"
             );
         }
@@ -800,7 +800,7 @@ mod tests {
         );
         for s in &samples {
             assert!(
-                aacs_unit_encrypted(s),
+                aacs_unit_encrypted(s, crate::disc::ContentFormat::BdTs),
                 "only CPI-flagged units are selected"
             );
             assert_eq!(

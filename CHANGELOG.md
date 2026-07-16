@@ -6,64 +6,57 @@
 
 - **Mux no longer nulls decryptable video or storms the key server on a
   bad-encoded region.** 1.4.1 relaxed the decrypt gate but left the surrounding
-  machinery in place. On a unit that a key *decrypted* but that did not
-  reassemble to clean MPEG-TS, the read path still restored the ciphertext,
-  tallied it as loss, re-asked the online key server (which returned the same
-  correct key, forever), and the mux concealed the unit as NULL TS. On a UHD
-  title with an authored bad-encoded run this stalled each region for 30–90 s per
-  unit — the key server brute-forcing and re-returning the one right key — while
-  nulling video that had, in fact, already decrypted. The root cause was one
-  conflation duplicated across several sites: *"did a key produce clean TS?"* was
-  treated as the verdict *"did we decrypt?"*. They are not the same — a correct
-  key can decrypt content whose underlying encoding is broken, and broken TS is a
-  muxer concern (the demuxer drops the packet and resyncs), never a decrypt
-  verdict.
+  machinery in place. On a unit whose key *decrypted* but whose plaintext didn't
+  reassemble to clean MPEG-TS, the read path still restored ciphertext, tallied
+  loss, and re-asked the online key server (forever returning the same correct key)
+  while the mux concealed the unit as NULL TS. The root cause: *"did a key produce
+  clean TS?"* was used as the verdict *"did we decrypt?"* — they are not the same.
+  A correct key can decrypt content with broken encoding; broken TS is a muxer
+  concern, never a decrypt verdict.
 
 ### Changed
 
 - **One decrypt authority; policy at the caller.** `decrypt_sectors` is now a
-  pure decrypt: it applies the CPS unit key to every encrypted unit in place,
-  leaves the plaintext, and reports how many bytes did not reach clean TS
-  ("unverified"). It never restores ciphertext, nulls, or re-fetches a key.
-  Clean TS is used only as a multi-key *selection* hint and a read *verify*
-  signal. The callers decide what an unverified unit means:
-  - **mux** (`read → decrypt → mux`): pass the decrypted bytes to the muxer,
-    whatever they are; the muxer handles bad TS. The mux never conceals,
-    re-fetches, or counts broken TS as loss — it fails loud only when it
-    genuinely cannot decrypt (no key / misaligned unit), since a mux over
-    already-captured data must otherwise always succeed.
-  - **sweep / patch** (reading from a disc): an unverified unit means the read
-    did not prove out; recover a fresh key and retry, or fail the read so the
-    disc-recovery path re-reads it.
+  pure decrypt: applies the CPS unit key in place, leaves plaintext, and reports
+  unverified bytes. It never restores ciphertext, nulls, or re-fetches a key.
+  Clean-TS status is only a key-*selection* hint (multi-CPS) or a read-*verify*
+  signal (sweep/patch). Callers own the policy: the mux passes decrypted bytes
+  through unconditionally (the demuxer handles bad TS); sweep/patch treat an
+  unverified unit as a failed read and re-read it. Removes the decrypt-time
+  ciphertext restore, the mux NULL-TS conceal loop, and the per-unit key-server
+  refetch, plus the dead `aacs_unit_still_ciphertext` predicate.
 
-  This removes three duplicated decisions — the decrypt-time ciphertext restore,
-  the mux NULL-TS conceal loop, and the per-unit key-server refetch — and the
-  dead `aacs_unit_still_ciphertext` predicate. The key-fetch recovery now samples
-  the on-disc ciphertext explicitly (a pure decrypt leaves the buffer plaintext)
-  and lives only on the rip/verify path, never the mux.
+- **Decrypt and TS-structure are now separate primitives.** AACS has no MAC;
+  the only "did it decrypt?" signal is whether plaintext looks like MPEG-TS —
+  a data-quality / key-selection question, not a decrypt verdict. The old
+  `decrypt_unit(...) -> bool` is split into `decrypt_unit_raw` (pure crypto) and
+  `is_clean_ts` (structural check), composed explicitly only where needed. The
+  mux calls only `decrypt_unit_raw`.
+
+- **Key-proof floor replaces the 75% supermajority.** The old proportion
+  (≥75% of content packets synced) conflated *the key worked* with *the content
+  is well-encoded*. `is_clean_ts` now requires `synced >= min(E, 4)` on
+  **encrypted** packets (skipping packet 0 whose `0x47` is in the clear seed):
+  four synced packets ≈ 1-in-4-billion false-positive; `min(E, 4)` scales to
+  short fragment tails so they're never false-rejected. A unit is "opened" when
+  a handful of packets prove the key — bad-encoded packets are the muxer's job.
 
 ## [1.4.1] — 2026-07-14
 
 ### Fixed
 
 - **Mux no longer discards good video over a single defective packet.** AACS
-  content decryption judged a 6144-byte aligned unit "undecryptable" unless
-  **every** content packet was conformant MPEG-TS. A single authored-bad packet
-  — a pressing/encoding defect, or an AACS 2.1 forensic-variant frame — made the
-  mux conceal the **whole** unit as NULL TS, destroying up to 31 of 32 good
-  packets and tallying them as loss. On discs carrying such packets this
-  surfaced as false "corruption" over large runs of otherwise-perfect video
-  (observed across two UHD titles: ~466 MB concealed, every unit decryptable).
-  The decrypt path now asks only *"did a key OPEN this unit?"* — a padding-aware
-  **≥75% supermajority** of content packets restoring their `0x47` sync, a gate
-  no wrong key can reach (uniform-AES noise floor ≈ 256⁻ⁿ) yet one that tolerates
-  a minority of authored-bad packets. Opened units pass through **verbatim**; a
-  non-conforming packet is left for the demuxer to drop on sync-loss and resync
-  past — TS-sync conformance is a muxer concern, never a decryption verdict. The
-  read/decrypt path no longer rewrites content bytes. The post-read verify/sweep
-  gate now shares the exact same primitive (`decrypt_unit` for TS), so verify can
-  never disagree with the mux decrypt and never false-marks a defect unit as a
-  bad read.
+  decryption required **every** content packet to be conformant MPEG-TS: one
+  authored-bad packet (encoding defect, AACS 2.1 forensic-variant frame) made
+  the mux conceal the **whole** 6144-byte aligned unit as NULL TS (up to 31/32
+  good packets discarded, tallied as loss). On affected discs this produced
+  false "corruption" over otherwise-perfect video (~466 MB concealed across two
+  UHD titles). The gate is now a padding-aware **≥75% supermajority** of content
+  packets restoring their `0x47` sync — no wrong key reaches this threshold
+  (uniform-AES noise floor ≈ 256⁻ⁿ), but a minority of authored-bad packets
+  still passes. Opened units flow through verbatim; the demuxer drops
+  non-conforming packets on sync-loss. TS-sync conformance is a muxer concern,
+  never a decrypt verdict. (The supermajority threshold is tightened in 1.4.2.)
 - **MVC (Blu-ray 3D) track signals unified and hardened.** The `mvcC`
   `CodecPrivate` extension, the `BlockAdditionMapping`, and each frame's
   `BlockAdditional` now all derive from a single `MVCDecoderConfigurationRecord`
